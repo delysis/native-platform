@@ -16,13 +16,59 @@ const requiredText = (value, label) => {
   }
 };
 const sameSet = (left, right) =>
-  left.length === right.length && left.every((value) => right.includes(value));
+  left.length === right.length &&
+  new Set(left).size === left.length &&
+  left.every((value) => right.includes(value));
+
+const externalMcpEffectIds = new Set([
+  "mom_llama.effects.mcp_stdio.v1",
+  "mom_llama.effects.mention_tool_approval.v1",
+  "mom_llama.effects.tool_loop.v1",
+]);
+const externalMcpNetwork = ["configured_mcp_process_may_access_network"];
+const externalMcpProcess = ["configured_external_mcp_stdio_process"];
+const externalMcpSecrets = ["configured_mcp_process_may_access_os_permitted_secrets"];
+const externalMcpPlatforms = ["macos", "linux"];
+const approvalRecoveryEffectId = "mom_llama.effects.mention_tool_approval_recovery.v1";
+const approvalRecoveryReads = [
+  "encrypted_persona_tool_approval_active_index",
+  "encrypted_frozen_mention_invocations",
+  "persisted_approval_deadline_clocks",
+  "exact_os_process_lease_state",
+];
+const approvalRecoveryWrites = [
+  "encrypted_terminal_persona_tool_approvals",
+  "encrypted_terminal_mention_invocations",
+  "encrypted_conversations",
+  "encrypted_persona_tool_approval_active_index",
+  "encrypted_unknown_effect_receipts",
+  "command_receipt",
+];
+const unixMcpCommandIds = new Set([
+  "mom_llama.mention_tool_approval_decide",
+  "mom_llama.mcp_status",
+  "mom_llama.mcp_configure",
+  "mom_llama.mcp_list_servers",
+  "mom_llama.mcp_list_tools",
+  "mom_llama.mcp_call_tool",
+  "mom_llama.mcp_list_resources",
+  "mom_llama.mcp_read_resource",
+  "mom_llama.mcp_list_prompts",
+  "mom_llama.mcp_get_prompt",
+  "mom_llama.tool_loop_prepare",
+  "mom_llama.tool_loop_run",
+  "mom_llama.tool_loop_cancel",
+  "mom_llama.tool_loop_status",
+]);
+const lifecycleCommandIds = new Set(["mom_llama.persona_tool_approval_recover"]);
+const allowedCommandSurfaces = new Set(["native_view", "backend_only", "lifecycle"]);
 
 const commandsDocument = readJson("contracts/commands.json");
 const effectsDocument = readJson("contracts/effects.json");
 const parityDocument = readJson("contracts/upstream-parity.json");
 const settingsParityDocument = readJson("contracts/settings-parity.json");
 const viewSource = readText("apps/mom-llama/src-tauri/src/view.rs");
+const viewProductionSource = viewSource.split("#[cfg(test)]", 1)[0];
 const configSource = readText("crates/mom-llama-runtime/src/config.rs");
 const tauriSource = readText("apps/mom-llama/src-tauri/src/commands.rs");
 const tauriMain = readText("apps/mom-llama/src-tauri/src/main.rs");
@@ -45,15 +91,55 @@ for (const effect of effectsDocument.effects ?? []) {
   ]) {
     if (!Array.isArray(effect[key])) fail(`${effect.effect_id}.${key} must be an array`);
   }
-  if (effect.network.length !== 0) {
-    fail(`${effect.effect_id} violates the native-local no-network profile`);
+  if (externalMcpEffectIds.has(effect.effect_id)) {
+    if (!sameSet(effect.network, externalMcpNetwork)) {
+      fail(`${effect.effect_id} must declare the exact external MCP network authority`);
+    }
+    if (!sameSet(effect.process, externalMcpProcess)) {
+      fail(`${effect.effect_id} must declare the exact external MCP process authority`);
+    }
+    if (!sameSet(effect.secrets, externalMcpSecrets)) {
+      fail(`${effect.effect_id} must declare the exact external MCP secret boundary`);
+    }
+    if (!sameSet(effect.platforms ?? [], externalMcpPlatforms)) {
+      fail(`${effect.effect_id} must remain limited to macOS and Linux`);
+    }
+    for (const authority of [
+      "configured_mcp_process_may_read_os_permitted_files",
+      "configured_mcp_process_may_write_os_permitted_files",
+    ]) {
+      const declared = authority.includes("may_read") ? effect.reads : effect.writes;
+      if (!declared.includes(authority)) {
+        fail(`${effect.effect_id} omits ${authority}`);
+      }
+    }
+    if (!sameSet(effect.external_apps, ["configured_external_mcp_process"])) {
+      fail(`${effect.effect_id} must name only the configured external MCP process`);
+    }
+  } else {
+    if (effect.network.length !== 0) {
+      fail(`${effect.effect_id} violates the zero-network product boundary`);
+    }
+    if (effect.process.length !== 0) {
+      fail(`${effect.effect_id} has process authority outside the MCP boundary`);
+    }
+    if (effect.platforms !== undefined) {
+      fail(`${effect.effect_id} has an unreviewed platform restriction`);
+    }
   }
-  const processAllowed = new Set([
-    "mom_llama.effects.mcp_stdio.v1",
-    "mom_llama.effects.tool_loop.v1",
-  ]);
-  if (effect.process.length !== 0 && !processAllowed.has(effect.effect_id)) {
-    fail(`${effect.effect_id} has process authority outside the MCP boundary`);
+  if (effect.effect_id === approvalRecoveryEffectId) {
+    if (!sameSet(effect.reads, approvalRecoveryReads)) {
+      fail(`${effect.effect_id} reads disagree with the recovery boundary`);
+    }
+    if (!sameSet(effect.writes, approvalRecoveryWrites)) {
+      fail(`${effect.effect_id} writes disagree with the recovery boundary`);
+    }
+    if (!sameSet(effect.persistence, ["encrypted_sqlite", "encrypted_receipts"])) {
+      fail(`${effect.effect_id} persistence must remain encrypted`);
+    }
+    if (effect.destructive !== "irreversible") {
+      fail(`${effect.effect_id} must disclose terminal recovery transitions`);
+    }
   }
   if (!["none", "reversible", "irreversible"].includes(effect.destructive)) {
     fail(`${effect.effect_id}.destructive is invalid`);
@@ -63,7 +149,7 @@ for (const effect of effectsDocument.effects ?? []) {
 const controlPattern =
   /ControlSpec \{\s*affordance: "([^"]+)",\s*command: "([^"]+)",\s*tauri_command: "([^"]+)",\s*cli: "([^"]+)",\s*effect: "([^"]+)",\s*label: "([^"]+)"/g;
 const controls = [];
-for (const match of viewSource.matchAll(controlPattern)) {
+for (const match of viewProductionSource.matchAll(controlPattern)) {
   controls.push({
     affordance: match[1],
     command: match[2],
@@ -98,8 +184,8 @@ for (const command of commandsDocument.commands ?? []) {
   ]) {
     requiredText(command[key], `${command.command_id ?? "command"}.${key}`);
   }
-  if (!Array.isArray(command.affordances) || command.affordances.length === 0) {
-    fail(`${command.command_id}.affordances must be a non-empty array`);
+  if (!Array.isArray(command.affordances)) {
+    fail(`${command.command_id}.affordances must be an array`);
   }
   if (commandIds.has(command.command_id)) fail(`duplicate command ${command.command_id}`);
   commandIds.add(command.command_id);
@@ -109,6 +195,40 @@ for (const command of commandsDocument.commands ?? []) {
   if (command.blocker_behavior !== "typed_result") {
     fail(`${command.command_id} must fail through a typed result`);
   }
+  const expectedPlatforms = unixMcpCommandIds.has(command.command_id)
+    ? externalMcpPlatforms
+    : [];
+  if (!sameSet(command.platforms ?? [], expectedPlatforms)) {
+    fail(
+      `${command.command_id} platform boundary disagrees: contract=${(command.platforms ?? []).join(",")} expected=${expectedPlatforms.join(",")}`,
+    );
+  }
+  const surface = command.surface ?? "native_view";
+  if (!allowedCommandSurfaces.has(surface)) {
+    fail(`${command.command_id} has an invalid command surface ${surface}`);
+  }
+  if (lifecycleCommandIds.has(command.command_id) !== (surface === "lifecycle")) {
+    fail(`${command.command_id} lifecycle classification disagrees`);
+  }
+  if (surface === "lifecycle") {
+    if (command.tauri_command !== "lifecycle_only") {
+      fail(`${command.command_id} must not expose a Tauri handler`);
+    }
+    if (!command.affordances.every((affordance) => affordance.startsWith("cli."))) {
+      fail(`${command.command_id} lifecycle affordances must be CLI-only`);
+    }
+    if (
+      command.effect_spec_id !== approvalRecoveryEffectId ||
+      command.cli !== "automatic before mom-llama mention approval-list/approval-decide" ||
+      !sameSet(command.affordances, ["cli.persona_tool_approval_recovery"])
+    ) {
+      fail(`${command.command_id} lifecycle recovery contract disagrees`);
+    }
+    if (controls.some((control) => control.command === command.command_id)) {
+      fail(`${command.command_id} lifecycle command must not have a native view projection`);
+    }
+    continue;
+  }
   if (!tauriSource.match(new RegExp(`pub (?:async )?fn ${command.tauri_command}\\b`))) {
     fail(`${command.command_id} has no Tauri handler ${command.tauri_command}`);
   }
@@ -116,6 +236,18 @@ for (const command of commandsDocument.commands ?? []) {
     fail(`${command.command_id} Tauri handler is not registered`);
   }
   const actual = controls.filter((control) => control.command === command.command_id);
+  if (surface === "backend_only") {
+    if (command.affordances.length !== 0) {
+      fail(`${command.command_id} backend-only command must not claim visible affordances`);
+    }
+    if (actual.length !== 0) {
+      fail(`${command.command_id} backend-only command must not have a native view projection`);
+    }
+    continue;
+  }
+  if (command.affordances.length === 0) {
+    fail(`${command.command_id} native-view affordances must be non-empty`);
+  }
   if (actual.length === 0) fail(`${command.command_id} has no native view projection`);
   const actualAffordances = actual.map((control) => control.affordance);
   if (!sameSet(command.affordances, actualAffordances)) {
@@ -226,16 +358,16 @@ if (!sameSet(settingKeys, runtimeUpstreamKeys)) {
     `runtime upstream settings disagree with ledger: runtime=${runtimeUpstreamKeys.join(",")} ledger=${settingKeys.join(",")}`,
   );
 }
-const settingsFieldStart = viewSource.indexOf("const SETTINGS_FIELDS");
-const settingsFieldEnd = viewSource.indexOf("const NATIVE_SETTINGS_FIELDS", settingsFieldStart);
+const settingsFieldStart = viewProductionSource.indexOf("const SETTINGS_FIELDS");
+const settingsFieldEnd = viewProductionSource.indexOf("const NATIVE_SETTINGS_FIELDS", settingsFieldStart);
 if (settingsFieldStart < 0 || settingsFieldEnd < 0) fail("native settings field registry is missing");
 const visibleUpstreamKeys = [
-  ...viewSource
+  ...viewProductionSource
     .slice(settingsFieldStart, settingsFieldEnd)
     .matchAll(/key: "([A-Za-z][A-Za-z0-9_]*)"/g),
 ].map((match) => match[1]);
 const directlyRenderedSettingKeys = settingsParityDocument.settings
-  .filter((setting) => setting.ui_projection !== "derived")
+  .filter((setting) => !["derived", "backend_only"].includes(setting.ui_projection))
   .map((setting) => setting.key);
 if (!sameSet(directlyRenderedSettingKeys, visibleUpstreamKeys)) {
   fail(
@@ -248,8 +380,18 @@ for (const setting of settingsParityDocument.settings.filter(
   if (!setting.derived_by || !setting.evidence) {
     fail(`derived setting ${setting.key} must name its native control and evidence`);
   }
-  if (!viewSource.includes(`name="${setting.derived_by}"`)) {
+  if (!viewProductionSource.includes(`name="${setting.derived_by}"`)) {
     fail(`derived setting ${setting.key} references missing native control ${setting.derived_by}`);
+  }
+}
+for (const setting of settingsParityDocument.settings.filter(
+  (candidate) => candidate.ui_projection === "backend_only",
+)) {
+  if (!setting.runtime_policy || !setting.evidence) {
+    fail(`backend-only setting ${setting.key} must name its runtime policy and evidence`);
+  }
+  if (viewProductionSource.includes(`name="${setting.runtime_policy}"`)) {
+    fail(`backend-only setting ${setting.key} leaks native control ${setting.runtime_policy}`);
   }
 }
 const runtimeExtensionKeys = extractConstStringValues(

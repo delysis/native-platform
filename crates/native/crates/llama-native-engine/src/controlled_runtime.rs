@@ -447,7 +447,7 @@ impl NativeModelHandle {
             .zip(&flags)
             .map(|(case, flag)| (case.case_id().to_string(), Arc::clone(flag)))
             .collect::<Vec<_>>();
-        let control = self.inner.admit_command(
+        let control = self.inner.admit_foreground_generation(
             request_id.clone(),
             RequestClass::ControlledGeneration,
             RequestControls::ControlledGeneration {
@@ -3736,6 +3736,7 @@ mod tests {
     #[test]
     fn controlled_submission_rejects_a_generation_namespace_duplicate_before_queueing() {
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let (speculative_tx, _speculative_rx) = bounded(SPECULATIVE_COMMAND_CAPACITY);
         let (shutdown_tx, _shutdown_rx) = bounded(1);
         let requests = Arc::new(RequestRegistry::new());
         let (_control, _lease) = requests
@@ -3753,9 +3754,13 @@ mod tests {
                 worker_identity: Arc::new(WorkerIdentity),
                 worker_id: "controlled-duplicate-test-worker".to_owned(),
                 command_tx,
+                speculative_tx,
                 shutdown_tx,
                 closing: AtomicBool::new(false),
-                admission: Mutex::new(()),
+                admission: Arc::new(Mutex::new(())),
+                speculative_admission: Arc::new(SpeculativeAdmission::new(Arc::new(
+                    SystemAdmissionClock::default(),
+                ))),
                 requests,
                 status: Arc::new(RwLock::new(ready_status())),
             }),
@@ -3776,15 +3781,20 @@ mod tests {
     #[test]
     fn dropped_controlled_ticket_keeps_request_id_reserved_until_executor_terminal() {
         let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
+        let (speculative_tx, _speculative_rx) = bounded(SPECULATIVE_COMMAND_CAPACITY);
         let (shutdown_tx, _shutdown_rx) = bounded(1);
         let handle = NativeModelHandle {
             inner: Arc::new(NativeModelInner {
                 worker_identity: Arc::new(WorkerIdentity),
                 worker_id: "controlled-drop-test-worker".to_owned(),
                 command_tx,
+                speculative_tx,
                 shutdown_tx,
                 closing: AtomicBool::new(false),
-                admission: Mutex::new(()),
+                admission: Arc::new(Mutex::new(())),
+                speculative_admission: Arc::new(SpeculativeAdmission::new(Arc::new(
+                    SystemAdmissionClock::default(),
+                ))),
                 requests: Arc::new(RequestRegistry::new()),
                 status: Arc::new(RwLock::new(ready_status())),
             }),

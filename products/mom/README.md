@@ -10,7 +10,8 @@ It does **not** contain a copied llama.cpp engine or a generic provider gateway:
 - [`delysis/llama-native-kit`](https://github.com/delysis/llama-native-kit)
   owns the in-process GGUF runtime.
 - [`delysis/free-token-energy`](https://github.com/delysis/free-token-energy)
-  owns protocol routing, hosted providers and optional loopback compatibility.
+  remains a separate product for protocol routing, hosted providers and
+  optional loopback compatibility; Mom does not compose it.
 - [`delysis/speech-native-kit`](https://github.com/delysis/speech-native-kit)
   owns local STT/TTS contracts, routing, backends and optional Tauri IPC.
 - [`delysis/attachment-native-kit`](https://github.com/delysis/attachment-native-kit)
@@ -25,19 +26,21 @@ dependency graph and the exact present status of speech.
 
 ## Workspace
 
-- `crates/mom-llama-runtime`: conversations, Skills, editable/versioned
-  Personas, `@mention` dispatch, attachment lifecycle, storage, tools and
-  product cache policy.
+- `crates/mom-llama-runtime`: conversations, editable/versioned Personas,
+  `@mention` dispatch, attachment lifecycle, storage, tools, compatibility
+  Skill records and product cache policy. Skills and cache operations are
+  backend-only compatibility capabilities, not ordinary UI sections.
 - `crates/mom-llama-cli`: the complete machine-exercisable product boundary.
 - `apps/mom-llama`: the thin Maud/Tauri application.
-- `contracts`: visible command, effect, settings and upstream-parity ledgers.
+- `contracts`: command-surface, effect, settings and upstream-parity ledgers.
 - `receipts`: preserved historical product evidence. A receipt counts as
   current proof only when it is explicitly source-bound; older path/date-only
   receipts remain informative.
 
-Native, Attachment, Free Token Energy, and the shared platform contracts are
-resolved from their imported monorepo paths and one root lock. No retired
-first-party Git source remains in Mom's dependency graph.
+Native, Attachment, Speech, and the shared platform contracts are resolved from their
+imported monorepo paths and one root lock. FTE remains in the root workspace for
+its standalone product, but no FTE crate or permission is in Mom's dependency
+graph. No retired first-party Git source remains in Mom's dependency graph.
 
 ## Gates
 
@@ -53,11 +56,21 @@ products/mom/scripts/check-persona-product-ux.sh
 
 ## Run the app
 
-Set `MOM_LLAMA_MODEL_PATH` to a GGUF or select one in Settings, then:
+Choose a GGUF from the composer dropdown (or use its **Choose GGUF file…**
+action), then:
 
 ```sh
 cargo run --locked -p mom-llama-app
 ```
+
+`MOM_LLAMA_MODEL_PATH` remains an explicit runtime override. For a
+set-and-forget product build, set `MOM_LLAMA_DEFAULT_MODEL_PATH` while compiling
+and, only when automatic same-directory pairing is not unique, optionally set
+`MOM_LLAMA_DEFAULT_MMPROJ_PATH`. A persisted user choice wins over the compiled
+default; the explicit runtime override wins over both. Compile defaults must be
+absolute and all selected model/projector files are still validated at runtime.
+When no compile default is supplied, Mom embeds no developer model path and does
+not fall back to the build directory.
 
 The extraction deliberately retains the existing Tauri identifier, data paths,
 environment variables and Keychain service. That preserves current local data
@@ -71,3 +84,5 @@ Keychain-backed store.
 Prompt caching remains a product runtime preference: `automatic` (conversation
 checkpoints plus stable Persona/Skill prefixes), `prefixes-only`, or `off`.
 Compatibility fingerprints and safety ceilings are enforced by native-kit.
+This policy is exercised through the typed backend and CLI; Mom does not expose
+cache internals, cache mutation or cache-policy controls in the ordinary UI.

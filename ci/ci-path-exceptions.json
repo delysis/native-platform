@@ -1,0 +1,279 @@
+{
+  "schema": "native-platform.ci-path-exceptions.v2",
+  "rules": [
+    {
+      "prefix": "products/fte/src",
+      "kind": "asset",
+      "primary_groups": ["product-fte"],
+      "effects": ["frontend_fte"],
+      "evidence": "pnpm-owned FTE frontend source outside a Cargo package"
+    },
+    {
+      "path": "products/fte/package.json",
+      "kind": "asset",
+      "primary_groups": ["product-fte"],
+      "effects": ["frontend_fte"],
+      "evidence": "pnpm-owned FTE package manifest outside a Cargo package"
+    },
+    {
+      "prefix": "products/fte/tests/fixtures",
+      "kind": "asset",
+      "primary_groups": ["product-fte"],
+      "effects": [],
+      "evidence": "FTE non-Cargo compatibility fixtures"
+    },
+    {
+      "prefix": "products/mom/apps/mom-llama/ui",
+      "kind": "asset",
+      "primary_groups": ["product-mom"],
+      "effects": ["frontend_mom"],
+      "evidence": "Mom renderer assets live beside the Tauri Cargo package"
+    },
+    {
+      "path": "products/mom/apps/mom-llama/package.json",
+      "kind": "asset",
+      "primary_groups": ["product-mom"],
+      "effects": ["frontend_mom"],
+      "evidence": "Mom renderer package manifest lives beside the Tauri Cargo package"
+    },
+    {
+      "prefix": "products/mom/contracts",
+      "kind": "asset",
+      "primary_groups": ["product-mom"],
+      "effects": [],
+      "evidence": "Mom command and effect contracts are non-Cargo product assets"
+    },
+    {
+      "prefix": "products/loom/apps/loom/src",
+      "kind": "asset",
+      "primary_groups": ["product-loom"],
+      "effects": ["frontend_loom"],
+      "evidence": "Loom renderer source lives beside the Tauri Cargo package"
+    },
+    {
+      "prefix": "products/loom/apps/loom/tests",
+      "kind": "asset",
+      "primary_groups": ["product-loom"],
+      "effects": ["frontend_loom"],
+      "evidence": "Loom browser tests are non-Cargo product assets"
+    },
+    {
+      "path": "products/loom/apps/loom/index.html",
+      "kind": "asset",
+      "primary_groups": ["product-loom"],
+      "effects": ["frontend_loom"],
+      "evidence": "Loom renderer entry point is outside the Tauri Cargo package"
+    },
+    {
+      "path": "products/loom/apps/loom/package.json",
+      "kind": "asset",
+      "primary_groups": ["product-loom"],
+      "effects": ["frontend_loom"],
+      "evidence": "Loom renderer package manifest is outside the Tauri Cargo package"
+    },
+    {
+      "path": "products/loom/apps/loom/tsconfig.json",
+      "kind": "asset",
+      "primary_groups": ["product-loom"],
+      "effects": ["frontend_loom"],
+      "evidence": "Loom renderer TypeScript configuration"
+    },
+    {
+      "path": "products/loom/apps/loom/vite.config.ts",
+      "kind": "asset",
+      "primary_groups": ["product-loom"],
+      "effects": ["frontend_loom"],
+      "evidence": "Loom renderer build configuration"
+    },
+    {
+      "path": "products/loom/apps/loom/vitest.browser.config.ts",
+      "kind": "asset",
+      "primary_groups": ["product-loom"],
+      "effects": ["frontend_loom"],
+      "evidence": "Loom browser-test configuration"
+    },
+    {
+      "prefix": "products/loom/fixtures",
+      "kind": "asset",
+      "primary_groups": ["product-loom"],
+      "effects": [],
+      "evidence": "Loom non-Cargo compatibility fixtures"
+    },
+    {
+      "prefix": "products/loom/model-policies",
+      "kind": "asset",
+      "primary_groups": ["product-loom"],
+      "effects": [],
+      "evidence": "Loom model-policy assets are consumed outside Cargo dependency edges"
+    },
+    {
+      "prefix": ".github",
+      "kind": "workflow",
+      "effects": ["ignored_tests"],
+      "evidence": "GitHub workflow policy is not a Cargo package"
+    },
+    {
+      "prefix": "ci",
+      "kind": "workflow",
+      "effects": ["ignored_tests"],
+      "evidence": "checked-in CI policy is not a Cargo package"
+    },
+    {
+      "path": "scripts/ci/ci-plan.mjs",
+      "kind": "workflow",
+      "effects": ["ignored_tests", "platform_macos", "root"],
+      "evidence": "planner changes retain the established root and macOS policy lanes"
+    },
+    {
+      "prefix": "scripts/ci",
+      "kind": "workflow",
+      "effects": ["ignored_tests"],
+      "evidence": "CI planner and policy scripts are not Cargo packages"
+    },
+    {
+      "prefix": "docs",
+      "kind": "documentation",
+      "effects": [],
+      "authorizes_legacy_reduction": true,
+      "evidence": "root documentation is policy-only"
+    },
+    {
+      "prefix": "migration",
+      "kind": "provenance",
+      "effects": ["import"],
+      "authorizes_legacy_reduction": true,
+      "evidence": "immutable migration provenance is policy-only"
+    },
+    {
+      "prefix": "crates/services/speech/docs",
+      "kind": "documentation",
+      "primary_groups": ["service-speech"],
+      "effects": [],
+      "evidence": "Speech documentation retains the established service and platform lanes"
+    },
+    {
+      "prefix": "products/fte/docs",
+      "kind": "documentation",
+      "effects": [],
+      "authorizes_legacy_reduction": true,
+      "evidence": "FTE documentation is policy-only"
+    },
+    {
+      "prefix": "products/fte/receipts",
+      "kind": "provenance",
+      "effects": [],
+      "authorizes_legacy_reduction": true,
+      "evidence": "historical FTE evidence is immutable policy input"
+    },
+    {
+      "prefix": "products/fte/research",
+      "kind": "research",
+      "effects": [],
+      "authorizes_legacy_reduction": true,
+      "evidence": "research records do not select product builds"
+    },
+    {
+      "prefix": "products/mom/docs",
+      "kind": "documentation",
+      "effects": [],
+      "authorizes_legacy_reduction": true,
+      "evidence": "Mom documentation is policy-only"
+    },
+    {
+      "prefix": "products/mom/receipts",
+      "kind": "provenance",
+      "effects": [],
+      "authorizes_legacy_reduction": true,
+      "evidence": "historical Mom evidence is immutable policy input"
+    },
+    {
+      "prefix": "products/loom/docs",
+      "kind": "documentation",
+      "effects": [],
+      "authorizes_legacy_reduction": true,
+      "evidence": "Loom documentation is policy-only"
+    },
+    {
+      "prefix": "release",
+      "kind": "platform",
+      "effects": ["force_full", "release"],
+      "evidence": "release policy changes retain the full gate"
+    },
+    {
+      "path": "README.md",
+      "kind": "documentation",
+      "effects": [],
+      "authorizes_legacy_reduction": true,
+      "evidence": "root documentation is policy-only"
+    },
+    {
+      "path": "AGENTS.md",
+      "kind": "documentation",
+      "effects": [],
+      "authorizes_legacy_reduction": true,
+      "evidence": "root contributor instruction is policy-only"
+    },
+    {
+      "path": "CONTRIBUTING.md",
+      "kind": "documentation",
+      "effects": [],
+      "authorizes_legacy_reduction": true,
+      "evidence": "root contributor documentation is policy-only"
+    },
+    {
+      "path": "SECURITY.md",
+      "kind": "documentation",
+      "effects": [],
+      "authorizes_legacy_reduction": true,
+      "evidence": "root security documentation is policy-only"
+    },
+    {
+      "path": "package.json",
+      "kind": "workspace",
+      "effects": ["dependency_graph", "frontend_fte", "frontend_loom", "frontend_mom"],
+      "evidence": "root pnpm workspace manifest has no Cargo owner"
+    },
+    {
+      "path": "pnpm-lock.yaml",
+      "kind": "workspace",
+      "effects": ["dependency_graph", "frontend_fte", "frontend_loom", "frontend_mom"],
+      "evidence": "root pnpm lock has no Cargo owner"
+    },
+    {
+      "path": "pnpm-workspace.yaml",
+      "kind": "workspace",
+      "effects": ["dependency_graph", "frontend_fte", "frontend_loom", "frontend_mom"],
+      "evidence": "root pnpm topology has no Cargo owner"
+    },
+    {
+      "path": "rust-toolchain.toml",
+      "kind": "platform",
+      "effects": ["force_full", "ignored_tests"],
+      "evidence": "toolchain changes retain the full gate"
+    },
+    {
+      "path": "scripts/release-macos.sh",
+      "kind": "platform",
+      "effects": ["platform_macos", "release"],
+      "evidence": "macOS release script has no Cargo owner"
+    },
+    {
+      "path": "scripts/smoke-macos-app.sh",
+      "kind": "platform",
+      "effects": ["platform_macos", "release"],
+      "evidence": "macOS product smoke has no Cargo owner"
+    },
+    {
+      "path": "scripts/find-embedded-model.mjs",
+      "kind": "platform",
+      "effects": ["platform_macos", "release"],
+      "evidence": "release asset scanner has no Cargo owner"
+    },
+    {
+      "path": "scripts/product-state-backup.mjs",
+      "kind": "platform",
+      "effects": ["platform_macos", "release"],
+      "evidence": "macOS state backup helper has no Cargo owner"
+    }
+  ]
+}

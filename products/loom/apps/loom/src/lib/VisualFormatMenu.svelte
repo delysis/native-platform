@@ -1,6 +1,6 @@
 <script context="module" lang="ts">
   export interface VisualFormattingEditor {
-    captureFormattingSelection(): boolean;
+    captureFormattingSelection(focusTransitionFrom?: EventTarget | null): boolean;
     clearFormattingSelection(): void;
     focusPreservingSelection(): boolean;
     applyFormatting(action: VisualFormatAction, href?: string): boolean;
@@ -9,6 +9,7 @@
 </script>
 
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import type { VisualFormatAction, VisualFormatState } from './visualFormatting';
 
   export let editor: VisualFormattingEditor | null | undefined;
@@ -22,17 +23,53 @@
   let menu: HTMLDivElement;
   let open = false;
   let href = '';
+  let leaseEditor: VisualFormattingEditor | null = null;
+  let observedEditor: VisualFormattingEditor | null = editor ?? null;
+
+  function captureSelection(focusTransitionFrom: EventTarget | null = null): boolean {
+    const currentEditor = editor ?? null;
+    if (!currentEditor) return false;
+    if (leaseEditor && leaseEditor !== currentEditor) {
+      leaseEditor.clearFormattingSelection();
+      leaseEditor = null;
+    }
+    if (!currentEditor.captureFormattingSelection(focusTransitionFrom)) {
+      if (leaseEditor === currentEditor) releaseSelection();
+      return false;
+    }
+    leaseEditor = currentEditor;
+    return true;
+  }
+
+  function releaseSelection(): void {
+    const capturedEditor = leaseEditor;
+    leaseEditor = null;
+    capturedEditor?.clearFormattingSelection();
+  }
 
   function preserveSelection(event: PointerEvent): void {
-    editor?.captureFormattingSelection();
+    captureSelection();
     // These controls operate on the editor selection. Prevent WebKit from
     // moving focus before the subsequent click invokes the command.
     event.preventDefault();
   }
 
+  function preserveSelectionFromFocus(event: FocusEvent): void {
+    captureSelection(event.relatedTarget);
+  }
+
   function run(action: VisualFormatAction, destination = ''): void {
-    const applied = editor?.applyFormatting(action, destination) ?? false;
-    onCommandResult(action, applied, editor?.formattingDiagnostic?.() ?? 'editor_unavailable');
+    const currentEditor = editor ?? null;
+    const applied = Boolean(
+      currentEditor &&
+      currentEditor === leaseEditor &&
+      currentEditor.applyFormatting(action, destination)
+    );
+    onCommandResult(
+      action,
+      applied,
+      currentEditor?.formattingDiagnostic?.() ?? 'editor_unavailable'
+    );
     if (!applied) return;
     if (action === 'link') href = destination.trim();
   }
@@ -42,15 +79,18 @@
       close();
       return;
     }
-    editor?.captureFormattingSelection();
+    if (!captureSelection()) return;
     href = formatting.linkHref;
     open = true;
   }
 
   export function close(refocus = true): void {
     open = false;
-    if (refocus) editor?.focusPreservingSelection();
-    editor?.clearFormattingSelection();
+    const capturedEditor = leaseEditor;
+    if (refocus && capturedEditor && capturedEditor === editor) {
+      capturedEditor.focusPreservingSelection();
+    }
+    releaseSelection();
   }
 
   export function isOpen(): boolean {
@@ -60,9 +100,24 @@
   export function contains(target: Node): boolean {
     return menu.contains(target);
   }
+
+  // Component ownership is the outer lifetime of an editor selection lease.
+  // Never leave the old owner's palette open or let its captured selection
+  // follow this component to a replacement editor.
+  $: {
+    const currentEditor = editor ?? null;
+    if (currentEditor !== observedEditor) {
+      open = false;
+      href = '';
+      releaseSelection();
+      observedEditor = currentEditor;
+    }
+  }
+
+  onDestroy(releaseSelection);
 </script>
 
-<div class="format-menu" bind:this={menu}>
+<div class="format-menu" bind:this={menu} on:focusin={preserveSelectionFromFocus}>
   <button
     class="titlebar-button format-button"
     type="button"

@@ -2,7 +2,7 @@
   import { baseKeymap, setBlockType, toggleMark, wrapIn } from 'prosemirror-commands';
   import { history, redo, undo } from 'prosemirror-history';
   import { keymap } from 'prosemirror-keymap';
-  import { defaultMarkdownSerializer, schema } from 'prosemirror-markdown';
+  import { schema } from 'prosemirror-markdown';
   import type { Node as ProseMirrorNode } from 'prosemirror-model';
   import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
@@ -19,6 +19,7 @@
     setGhostText,
     visualCaretBoundaryProof,
     visibleGhostWidgetPresentationKey,
+    type GhostTextPresentation,
     type VisualCaretBoundaryFailure,
     visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
@@ -27,7 +28,12 @@
     type CompletionInsertionAction,
     type SuggestionAlternative
   } from './suggestionInteraction';
-  import type { VisualCompletionAccessibilityWitness } from './completionAccessibility';
+  import {
+    unavailableVisualSelectionWitness,
+    type VisualCompletionAccessibilityWitness,
+    type VisualSelectionAccessibilityWitness
+  } from './completionAccessibility';
+  import { allocateCompletionPopupDomIds } from './completionPopup';
   import {
     applyVisualFormat,
     visualFormatState,
@@ -35,12 +41,39 @@
     type VisualFormatState
   } from './visualFormatting';
   import { visualMarkdownInputRules } from './visualInputRules';
+  import { visualListKeymap } from './visualListEditing';
+  import {
+    STALE_IMAGE_ATTACHMENT_ERROR,
+    UNREADABLE_TRANSFER_IMAGE_ERROR,
+    UNVERIFIED_DROP_FILE_ERROR,
+    imageAttachmentErrorMessage,
+    imageFilesFromTransfer,
+    transferContainsEphemeralImage,
+    transferMayContainImageFile
+  } from './attachments';
 
   const formattingSelectionRestoreMeta = 'loomFormattingSelectionRestore';
+  const completionPopupDomIds = allocateCompletionPopupDomIds('visual');
+
+  interface GhostPresentationSnapshot {
+    label: string;
+    readonly: boolean;
+    composing: boolean;
+    text: string;
+    candidateId: string;
+    presentationKey: string;
+    anchorByteOffset: number | null;
+    insertsOnAccept: boolean;
+    alternatives: readonly SuggestionAlternative[];
+    hidden: boolean;
+    unconsumeText: string;
+    surfaceKey: string;
+    suppressedKey: string;
+    optionHeld: boolean;
+  }
 
   export let value = '';
   export let label = 'Manuscript editor';
-  export let placeholder = 'Start writing…';
   export let readonly = false;
   export let autofocus = false;
   export let ghostText = '';
@@ -52,6 +85,11 @@
   export let ghostHidden = false;
   export let ghostUnconsumeText = '';
   export let surfaceKey = '';
+  export let onImageAttachments: (files: readonly File[]) => Promise<readonly string[]> =
+    async () => [];
+  export let onImageAttachmentsCommitted: (count: number) => void = () => {};
+  export let onImageAttachmentError: (message: string) => void = () => {};
+  export let resolveImageAssetUrl: (markdownPath: string) => string | null = () => null;
   export let onChange: (markdown: string) => void = () => {};
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onImmediateDocumentMutation: () => void = () => {};
@@ -79,6 +117,9 @@
   ) => void = () => {};
   export let onCaretNavigation: () => void = () => {};
   export let onFormatStateChange: (state: VisualFormatState) => void = () => {};
+  export let onSelectionAccessibilityChange: (
+    witness: VisualSelectionAccessibilityWitness
+  ) => void = () => {};
   export let onCompletionAccessibilityChange: (
     witness: VisualCompletionAccessibilityWitness
   ) => void = () => {};
@@ -87,7 +128,6 @@
   let scrollViewport: HTMLElement | null = null;
   let view: EditorView | undefined;
   let lastEmitted = normalizeVisualMarkdownSource(value);
-  let editorEmpty = lastEmitted.length === 0;
   let projectionTimer: number | undefined;
   let normalizationTimer: number | undefined;
   let localDocumentChanged = false;
@@ -98,6 +138,8 @@
   let reportedRejectedPresentationIdentity = '';
   let optionHeld = false;
   let visibilityFrame: number | undefined;
+  let ghostSynchronizationFrame: number | undefined;
+  let ghostSynchronizationRequiresRender = false;
   let selectionReportTimer: number | undefined;
   let boundaryCacheDocument: ProseMirrorNode | null = null;
   let boundaryCacheCanonical = '';
@@ -109,7 +151,14 @@
   let formattingSelectionDocument: ProseMirrorNode | null = null;
   let formattingSelection: Selection | null = null;
   let formattingRestoreFrame: number | undefined;
+  let formattingRestoreTimer: number | undefined;
+  let formattingRestoreIntentEpoch = 0;
+  let formattingRestoreDocument: ProseMirrorNode | null = null;
+  let formattingRestoreSelection: Selection | null = null;
+  let formattingRestoreDeadline = 0;
   let reportedCompletionAccessibilityIdentity = '';
+  let reportedSelectionAccessibilityIdentity = '';
+  let selectionAccessibilityEpoch = 0;
 
   function reportCompletionAccessibility(): void {
     const plan = view ? currentGhostTextPlan(view.state) : null;
@@ -185,6 +234,123 @@
     });
   }
 
+  function currentGhostPresentationSnapshot(): GhostPresentationSnapshot {
+    return {
+      label,
+      readonly,
+      composing,
+      text: ghostText,
+      candidateId: ghostCandidateId,
+      presentationKey: ghostPresentationKey,
+      anchorByteOffset: ghostAnchorByteOffset,
+      insertsOnAccept: ghostInsertsOnAccept,
+      alternatives: ghostAlternatives,
+      hidden: ghostHidden,
+      unconsumeText: ghostUnconsumeText,
+      surfaceKey,
+      suppressedKey: suppressedGhostKey,
+      optionHeld
+    };
+  }
+
+  function synchronizeGhostPresentation(
+    snapshot: GhostPresentationSnapshot,
+    forceRender = false
+  ): void {
+    const editorView = view;
+    if (!editorView || editorView.isDestroyed) return;
+    editorView.setProps({
+      editable: () => !snapshot.readonly,
+      attributes: editorAttributes(snapshot.label)
+    });
+    const anchorByteOffset = snapshot.anchorByteOffset;
+    const provenAnchorByteOffset = anchorByteOffset ?? -1;
+    const exactAnchor = anchorByteOffset !== null &&
+      selectionBoundary(editorView.state) === anchorByteOffset;
+    const rollbackOnly = snapshot.text === '' && snapshot.unconsumeText !== '';
+    const faithful = exactAnchor && (
+      rollbackOnly || visualGhostTextIsFaithfulAtSelection(
+        editorView.state,
+        lastEmitted,
+        provenAnchorByteOffset,
+        snapshot.text
+      )
+    );
+    const rejectionIdentity = anchorByteOffset === null
+      ? ''
+      : `${snapshot.presentationKey}\u0000${snapshot.surfaceKey}\u0000${anchorByteOffset}`;
+    if (
+      !snapshot.readonly &&
+      !snapshot.composing &&
+      snapshot.candidateId &&
+      snapshot.presentationKey &&
+      snapshot.surfaceKey &&
+      exactAnchor &&
+      !faithful &&
+      reportedRejectedPresentationIdentity !== rejectionIdentity
+    ) {
+      reportedRejectedPresentationIdentity = rejectionIdentity;
+      onGhostPresentationRejected(
+        snapshot.candidateId,
+        snapshot.presentationKey,
+        snapshot.surfaceKey,
+        provenAnchorByteOffset
+      );
+    }
+    const presentation: GhostTextPresentation | null = snapshot.presentationKey &&
+      snapshot.surfaceKey &&
+      faithful &&
+      snapshot.presentationKey !== snapshot.suppressedKey ? {
+      active: !snapshot.readonly && !snapshot.composing,
+      candidateId: snapshot.candidateId,
+      presentationKey: snapshot.presentationKey,
+      surfaceKey: snapshot.surfaceKey,
+      anchorByteOffset: provenAnchorByteOffset,
+      text: snapshot.text,
+      insertsOnAccept: snapshot.insertsOnAccept,
+      alternatives: snapshot.alternatives,
+      hidden: snapshot.hidden || rollbackOnly,
+      unconsumeText: snapshot.unconsumeText,
+      // Once a word is consumed the session is locked to one candidate. Do
+      // not hide its cached remainder behind a now-empty alternatives fan
+      // while Option is still held.
+      fanVisible: snapshot.optionHeld && snapshot.alternatives.length > 1
+    } : null;
+    setGhostText(editorView, presentation, forceRender);
+    reportCompletionAccessibility();
+    scheduleGhostVisibilityReport();
+  }
+
+  function scheduleGhostPresentationSynchronization(forceRender = false): void {
+    ghostSynchronizationRequiresRender ||= forceRender;
+    if (ghostSynchronizationFrame !== undefined) {
+      window.cancelAnimationFrame(ghostSynchronizationFrame);
+    }
+    ghostSynchronizationFrame = window.requestAnimationFrame(() => {
+      ghostSynchronizationFrame = undefined;
+      const requiresRender = ghostSynchronizationRequiresRender;
+      ghostSynchronizationRequiresRender = false;
+      synchronizeGhostPresentation(currentGhostPresentationSnapshot(), requiresRender);
+    });
+  }
+
+  /**
+   * Rebuild an unchanged ProseMirror decoration when the native window wakes.
+   * macOS can hide and reactivate a WKWebView without changing the browser
+   * document's focus or visibility state, so App's native focus event is the
+   * authoritative lifecycle edge for this repair.
+   */
+  export function refreshGhostPresentation(): boolean {
+    if (!view || view.isDestroyed) return false;
+    if (ghostSynchronizationFrame !== undefined) {
+      window.cancelAnimationFrame(ghostSynchronizationFrame);
+      ghostSynchronizationFrame = undefined;
+    }
+    ghostSynchronizationRequiresRender = false;
+    synchronizeGhostPresentation(currentGhostPresentationSnapshot(), true);
+    return true;
+  }
+
   function projectDocument(): void {
     if (!view || composing || !localDocumentChanged) return;
     if (projectionTimer !== undefined) {
@@ -230,9 +396,13 @@
 
   export function focusPreservingSelection(): boolean {
     if (!view || readonly) return false;
+    const currentDocumentLease = Boolean(
+      formattingSelection && formattingSelectionDocument === view.state.doc
+    );
+    if (!view.hasFocus() && !currentDocumentLease) return false;
     if (
+      currentDocumentLease &&
       formattingSelection &&
-      formattingSelectionDocument === view.state.doc &&
       !view.state.selection.eq(formattingSelection)
     ) {
       view.dispatch(view.state.tr.setSelection(formattingSelection));
@@ -248,66 +418,124 @@
     return view.hasFocus();
   }
 
-  export function captureFormattingSelection(): boolean {
+  /** Reassert the current immutable selection without treating it as navigation. */
+  export function reconcileCurrentSelection(): boolean {
+    if (!view || view.isDestroyed) return false;
+    view.dispatch(view.state.tr
+      .setSelection(view.state.selection)
+      .setMeta('addToHistory', false));
+    return true;
+  }
+
+  export function captureFormattingSelection(
+    focusTransitionFrom: EventTarget | null = null
+  ): boolean {
     if (!view || readonly || composing) return false;
-    if (formattingSelection && formattingSelectionDocument === view.state.doc && !view.hasFocus()) {
-      return true;
-    }
+    const currentDocumentLease = Boolean(
+      formattingSelection && formattingSelectionDocument === view.state.doc
+    );
+    const exactEditorFocusHandoff = focusTransitionFrom instanceof Node && (
+      focusTransitionFrom === view.dom || view.dom.contains(focusTransitionFrom)
+    );
+    // A palette control may retain a lease after it takes focus, but it must
+    // not manufacture one from an arbitrary stale editor selection. Keyboard
+    // and macOS Accessibility activation can focus the Aa button before its
+    // click handler runs, so admit only the browser-proven direct focus handoff
+    // from this exact editor DOM.
+    if (!view.hasFocus() && !exactEditorFocusHandoff) return currentDocumentLease;
     formattingSelectionDocument = view.state.doc;
     formattingSelection = view.state.selection;
     return true;
   }
 
-  export function clearFormattingSelection(): void {
+  function cancelFormattingSelectionRestore(): void {
+    formattingRestoreIntentEpoch += 1;
+    formattingRestoreDocument = null;
+    formattingRestoreSelection = null;
+    formattingRestoreDeadline = 0;
     if (formattingRestoreFrame !== undefined) {
       window.cancelAnimationFrame(formattingRestoreFrame);
       formattingRestoreFrame = undefined;
     }
+    if (formattingRestoreTimer !== undefined) {
+      window.clearTimeout(formattingRestoreTimer);
+      formattingRestoreTimer = undefined;
+    }
+  }
+
+  function restoreProtectedFormattingSelection(intentEpoch: number): boolean {
+    if (
+      formattingRestoreIntentEpoch !== intentEpoch ||
+      !view ||
+      readonly ||
+      composing ||
+      performance.now() > formattingRestoreDeadline ||
+      view.state.doc !== formattingRestoreDocument ||
+      !formattingRestoreSelection
+    ) return false;
+    // Reassert even when ProseMirror's immutable state already matches.
+    // WebKit can reconcile its DOM/Accessibility selection independently
+    // after a contenteditable mutation.
+    view.dispatch(view.state.tr
+      .setSelection(formattingRestoreSelection)
+      .setMeta(formattingSelectionRestoreMeta, true));
+    view.focus();
+    formattingSelectionDocument = view.state.doc;
+    formattingSelection = view.state.selection;
+    return true;
+  }
+
+  function scheduleFormattingSelectionRestore(intentEpoch: number, armLateRepair = false): void {
+    if (
+      formattingRestoreIntentEpoch !== intentEpoch ||
+      formattingRestoreFrame !== undefined
+    ) return;
+    formattingRestoreFrame = window.requestAnimationFrame(() => {
+      if (formattingRestoreIntentEpoch !== intentEpoch) return;
+      // Give WebKit one render turn to publish any late contenteditable
+      // selection reconciliation before installing the authoritative state.
+      formattingRestoreFrame = window.requestAnimationFrame(() => {
+        formattingRestoreFrame = undefined;
+        if (!restoreProtectedFormattingSelection(intentEpoch) || !armLateRepair) return;
+        formattingRestoreTimer = window.setTimeout(() => {
+          formattingRestoreTimer = undefined;
+          restoreProtectedFormattingSelection(intentEpoch);
+        }, 900);
+      });
+    });
+  }
+
+  export function clearFormattingSelection(): void {
+    cancelFormattingSelectionRestore();
     formattingSelectionDocument = null;
     formattingSelection = null;
   }
 
   export function applyFormatting(action: VisualFormatAction, href = ''): boolean {
     if (!view || readonly || composing) return false;
-    focusPreservingSelection();
+    const currentDocumentLease = Boolean(
+      formattingSelection && formattingSelectionDocument === view.state.doc
+    );
+    if (!view.hasFocus() && !currentDocumentLease) return false;
+    if (!focusPreservingSelection()) return false;
     const applied = applyVisualFormat(view.state, action, href, (transaction) => view?.dispatch(transaction));
     if (applied) {
       const formattedView = view;
       const formattedDocument = formattedView.state.doc;
       const formattedSelection = formattedView.state.selection;
+      cancelFormattingSelectionRestore();
       formattingSelectionDocument = formattedDocument;
       formattingSelection = formattedSelection;
+      formattingRestoreDocument = formattedDocument;
+      formattingRestoreSelection = formattedSelection;
+      // Keep the immutable command result authoritative through a bounded
+      // WebKit/AX reconciliation window. An editor key or pointer intent
+      // cancels this lease before its selection transaction is admitted.
+      formattingRestoreDeadline = performance.now() + 3_000;
       formattedView.focus();
       onFormatStateChange(visualFormatState(formattedView.state));
-      // WebKit may reconcile an Accessibility activation or a structurally
-      // changed contenteditable after the click handler, overwriting both DOM
-      // focus and the mutable palette selection cache. Restore the immutable
-      // post-command selection once activation has settled.
-      if (formattingRestoreFrame !== undefined) {
-        window.cancelAnimationFrame(formattingRestoreFrame);
-      }
-      formattingRestoreFrame = window.requestAnimationFrame(() => {
-        // Give WebKit one render turn to publish any late contenteditable
-        // selection reconciliation before installing the authoritative state.
-        formattingRestoreFrame = window.requestAnimationFrame(() => {
-          formattingRestoreFrame = undefined;
-          if (
-            !view ||
-            view !== formattedView ||
-            readonly ||
-            composing ||
-            formattedView.state.doc !== formattedDocument
-          ) return;
-          if (!formattedView.state.selection.eq(formattedSelection)) {
-            formattedView.dispatch(formattedView.state.tr
-              .setSelection(formattedSelection)
-              .setMeta(formattingSelectionRestoreMeta, true));
-          }
-          formattedView.focus();
-          formattingSelectionDocument = formattedView.state.doc;
-          formattingSelection = formattedView.state.selection;
-        });
-      });
+      const restoreIntentEpoch = formattingRestoreIntentEpoch;
+      scheduleFormattingSelectionRestore(restoreIntentEpoch, true);
     }
     return applied;
   }
@@ -388,7 +616,17 @@
           'Mod-Alt-2': setBlockType(heading, { level: 2 }),
           'Mod->': wrapIn(blockquote)
         }),
-        keymap(baseKeymap),
+        // An exact visible completion reserves Tab for the following ghost
+        // plugin. Otherwise list structure gets first refusal before Loom's
+        // ordinary literal-tab fallback.
+        visualListKeymap((state, editorView) => {
+          const plan = currentGhostTextPlan(state);
+          return Boolean(
+            plan &&
+            editorView &&
+            visibleGhostWidgetPresentationKey(editorView) === plan.presentationKey
+          );
+        }),
         createGhostTextPlugin({
           accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
           insert: authorizeCompletionInsertion,
@@ -402,27 +640,160 @@
             anchorByteOffset === ghostAnchorByteOffset &&
             selectionBoundary(view!.state) === anchorByteOffset &&
             visibleGhostWidgetPresentationKey(view!) === presentationKey
-        })
+        }, completionPopupDomIds),
+        keymap(baseKeymap)
       ]
     });
   }
 
-  function editorAttributes(): Record<string, string> {
-    return {
-      'aria-label': label,
-      'aria-placeholder': placeholder,
-      'data-placeholder': placeholder,
+  function editorAttributes(currentLabel = label): Record<string, string> {
+    const attributes: Record<string, string> = {
+      'aria-label': currentLabel,
       class: 'loom-prosemirror',
       role: 'textbox',
       'aria-multiline': 'true',
       spellcheck: 'true'
     };
+    const plan = view ? currentGhostTextPlan(view.state) : null;
+    const selectedIndex = plan?.fanVisible
+      ? plan.alternatives.findIndex(
+          (alternative) => alternative.presentationKey === plan.presentationKey
+        )
+      : -1;
+    if (view && plan?.fanVisible && plan.alternatives.length > 1 && selectedIndex >= 0) {
+      const fan = view.dom.ownerDocument.getElementById(completionPopupDomIds.listboxId);
+      const activeOptionId = completionPopupDomIds.optionId(selectedIndex);
+      const activeOption = view.dom.ownerDocument.getElementById(activeOptionId);
+      if (fan && activeOption && view.dom.contains(fan) && fan.contains(activeOption)) {
+        attributes['aria-controls'] = completionPopupDomIds.listboxId;
+        attributes['aria-activedescendant'] = activeOptionId;
+      }
+    }
+    return attributes;
+  }
+
+  function imageNodeView(node: ProseMirrorNode): { dom: HTMLImageElement } {
+    const dom = document.createElement('img');
+    const markdownPath = typeof node.attrs.src === 'string' ? node.attrs.src : '';
+    const resolved = resolveImageAssetUrl(markdownPath);
+    if (resolved) dom.src = resolved;
+    if (typeof node.attrs.alt === 'string') dom.alt = node.attrs.alt;
+    if (typeof node.attrs.title === 'string' && node.attrs.title) dom.title = node.attrs.title;
+    return { dom };
+  }
+
+  function attachmentSelection(event: DragEvent | ClipboardEvent): Selection | null {
+    if (!view) return null;
+    if (event instanceof DragEvent) {
+      const position = view.posAtCoords({ left: event.clientX, top: event.clientY });
+      if (position) return Selection.near(view.state.doc.resolve(position.pos));
+    }
+    return view.state.selection;
+  }
+
+  function handleImageTransfer(event: DragEvent | ClipboardEvent): boolean {
+    const transfer = event instanceof ClipboardEvent ? event.clipboardData : event.dataTransfer;
+    const files = imageFilesFromTransfer(transfer);
+    const ephemeralImage = transferContainsEphemeralImage(transfer);
+    const claimedFileDrop = event instanceof DragEvent && transferMayContainImageFile(transfer);
+    if (files.length === 0 && !ephemeralImage && !claimedFileDrop) return false;
+    event.preventDefault();
+    event.stopPropagation();
+    if (files.length === 0) {
+      onImageAttachmentError(
+        claimedFileDrop && !ephemeralImage
+          ? UNVERIFIED_DROP_FILE_ERROR
+          : UNREADABLE_TRANSFER_IMAGE_ERROR
+      );
+      return true;
+    }
+    if (!view || readonly || composing) {
+      onImageAttachmentError('Images cannot be attached while this editor is unavailable.');
+      return true;
+    }
+
+    const capturedView = view;
+    const capturedDocument = capturedView.state.doc;
+    const capturedMarkdown = lastEmitted;
+    const capturedSurfaceKey = surfaceKey;
+    const capturedSelection = attachmentSelection(event);
+    if (!capturedSelection) return true;
+    void onImageAttachments(files).then((snippets) => {
+      const committedSnippets = snippets.filter((snippet) => snippet.length > 0);
+      if (
+        !view ||
+        view !== capturedView ||
+        capturedView.isDestroyed ||
+        readonly ||
+        composing ||
+        surfaceKey !== capturedSurfaceKey ||
+        lastEmitted !== capturedMarkdown ||
+        !capturedView.state.doc.eq(capturedDocument)
+      ) {
+        if (committedSnippets.length > 0) {
+          onImageAttachmentError(STALE_IMAGE_ATTACHMENT_ERROR);
+        }
+        return;
+      }
+      const markdown = committedSnippets.join('\n\n');
+      if (!markdown) return;
+      const attachmentDocument = parse(markdown);
+      capturedView.dispatch(capturedView.state.tr.replaceRange(
+        capturedSelection.from,
+        capturedSelection.to,
+        attachmentDocument.slice(0, attachmentDocument.content.size)
+      ));
+      // Attachment insertion is already an explicit async user action. Project
+      // it to the parent in this turn so the acknowledgement cannot precede the
+      // editor's canonical Markdown commit.
+      projectDocument();
+      onImageAttachmentsCommitted(committedSnippets.length);
+    }).catch((error: unknown) => onImageAttachmentError(imageAttachmentErrorMessage(error)));
+    return true;
+  }
+
+  function handleImageDragOver(event: DragEvent): boolean {
+    const claimed = transferMayContainImageFile(event.dataTransfer) ||
+      transferContainsEphemeralImage(event.dataTransfer);
+    if (claimed) event.preventDefault();
+    return claimed;
   }
 
   function reportSelection(state: EditorState): void {
     const proof = selectionBoundaryProof(state);
     onSelectionChange(proof.byteOffset, proof.failure, proof.diagnostic);
     onFormatStateChange(visualFormatState(state));
+    const firstVisibleSelection = Selection.atStart(state.doc);
+    const lastVisibleSelection = Selection.atEnd(state.doc);
+    const witness: VisualSelectionAccessibilityWitness = {
+      available: true,
+      epoch: selectionAccessibilityEpoch,
+      selectionKind: state.selection.constructor.name,
+      from: state.selection.from,
+      to: state.selection.to,
+      empty: state.selection.empty,
+      allVisibleText: !state.selection.empty &&
+        state.selection.from <= firstVisibleSelection.from &&
+        state.selection.to >= lastVisibleSelection.to,
+      caretAtEnd: state.selection.empty &&
+        state.selection.from === lastVisibleSelection.from,
+      caretByteOffset: proof.byteOffset
+    };
+    const witnessIdentity = JSON.stringify(witness);
+    if (witnessIdentity !== reportedSelectionAccessibilityIdentity) {
+      reportedSelectionAccessibilityIdentity = witnessIdentity;
+      onSelectionAccessibilityChange(witness);
+    }
+  }
+
+  function invalidateSelectionAccessibility(): void {
+    selectionAccessibilityEpoch += 1;
+    const witness = unavailableVisualSelectionWitness(selectionAccessibilityEpoch);
+    const witnessIdentity = JSON.stringify(witness);
+    if (witnessIdentity !== reportedSelectionAccessibilityIdentity) {
+      reportedSelectionAccessibilityIdentity = witnessIdentity;
+      onSelectionAccessibilityChange(witness);
+    }
   }
 
   function scheduleSelectionReport(delay = 48): void {
@@ -464,21 +835,34 @@
     setOptionHeld(false);
   }
 
+  function handleWindowFocus(): void {
+    scheduleGhostPresentationSynchronization(true);
+  }
+
+  function handleVisibilityChange(): void {
+    releaseOptionState();
+    if (document.visibilityState === 'visible') scheduleGhostPresentationSynchronization(true);
+  }
+
   onMount(() => {
     const initialMarkdown = normalizeVisualMarkdownSource(value);
     lastEmitted = initialMarkdown;
     view = new EditorView(mount, {
       state: stateFor(initialMarkdown),
+      nodeViews: { image: imageNodeView },
       editable: () => !readonly,
       attributes: editorAttributes(),
       dispatchTransaction(transaction) {
         if (!view) return;
+        const previousSelection = view.state.selection;
+        const selectionMoved = transaction.selectionSet &&
+          !transaction.selection.eq(previousSelection);
         const completionMutation = transaction.docChanged && completionMutationAuthorized;
         if (transaction.docChanged) completionMutationAuthorized = false;
         const next = view.state.apply(transaction);
         view.updateState(next);
-        editorEmpty = next.doc.textContent.length === 0;
         if (transaction.docChanged) {
+          invalidateSelectionAccessibility();
           clearFormattingSelection();
           clearBoundaryCache();
           if (selectionReportTimer !== undefined) {
@@ -487,6 +871,14 @@
           }
           onSelectionChange(null, 'selection_settling', null);
         } else if (transaction.selectionSet) {
+          const protectedSelectionDrift = Boolean(
+            selectionMoved &&
+            transaction.getMeta(formattingSelectionRestoreMeta) !== true &&
+            formattingRestoreDocument === next.doc &&
+            formattingRestoreSelection &&
+            performance.now() <= formattingRestoreDeadline &&
+            !next.selection.eq(formattingRestoreSelection)
+          );
           // An open formatting palette owns a selection snapshot while its
           // controls have focus. Keep that snapshot synchronized when the
           // editor itself is still focused, including keyboard and AX-driven
@@ -494,16 +886,30 @@
           if (
             formattingSelection &&
             formattingSelectionDocument === next.doc &&
-            view.hasFocus()
+            view.hasFocus() &&
+            !protectedSelectionDrift
           ) {
             formattingSelection = next.selection;
           }
+          if (protectedSelectionDrift) {
+            scheduleFormattingSelectionRestore(formattingRestoreIntentEpoch);
+          }
           if (
             view.hasFocus() &&
+            selectionMoved &&
+            !protectedSelectionDrift &&
             transaction.getMeta(formattingSelectionRestoreMeta) !== true
           ) onCaretNavigation();
-          onSelectionChange(null, 'selection_settling', null);
-          scheduleSelectionReport();
+          if (selectionMoved) {
+            invalidateSelectionAccessibility();
+            onSelectionChange(null, 'selection_settling', null);
+            scheduleSelectionReport();
+          } else {
+            // A same-selection transaction is an explicit reconciliation, not
+            // a transient unknown caret. Preserve the exact boundary so the
+            // parent cannot briefly de-authorize an otherwise exact session.
+            reportSelection(next);
+          }
         }
         if (transaction.docChanged || transaction.selectionSet) {
           reportGhostVisibility();
@@ -526,11 +932,33 @@
         }
       },
       handleDOMEvents: {
+        keydown() {
+          // A focused editor key event starts a new interaction epoch. Any
+          // delayed WebKit repair belongs to the palette activation that came
+          // before it and must never overwrite the resulting navigation.
+          cancelFormattingSelectionRestore();
+          return false;
+        },
+        pointerdown() {
+          // Cancel before WebKit publishes the pointer-derived selection; the
+          // later ProseMirror transaction will refresh the still-open lease.
+          cancelFormattingSelectionRestore();
+          return false;
+        },
+        paste(_view, event) {
+          return handleImageTransfer(event);
+        },
+        dragover(_view, event) {
+          return handleImageDragOver(event);
+        },
+        drop(_view, event) {
+          return handleImageTransfer(event);
+        },
         focus() {
           // Focus acquisition is a new interaction epoch. If Option is still
           // physically held, its next key event will re-establish that fact.
           releaseOptionState();
-          scheduleGhostVisibilityReport();
+          scheduleGhostPresentationSynchronization(true);
           return false;
         },
         blur() {
@@ -561,24 +989,29 @@
     reportSelection(view.state);
     scheduleExternalNormalization(value, initialMarkdown);
     scrollViewport = mount.closest<HTMLElement>('.editor-pane');
-    scheduleGhostVisibilityReport();
+    scheduleGhostPresentationSynchronization();
     window.addEventListener('resize', reportGhostVisibility);
+    window.addEventListener('focus', handleWindowFocus);
     window.addEventListener('keydown', handleWindowKeyDown, true);
     window.addEventListener('keyup', handleWindowKeyUp, true);
     window.addEventListener('blur', releaseOptionState);
     window.addEventListener('pagehide', releaseOptionState);
     window.addEventListener('pointerdown', releaseOptionState, true);
-    document.addEventListener('visibilitychange', releaseOptionState);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     scrollViewport?.addEventListener('scroll', reportGhostVisibility, { passive: true });
     if (autofocus) view.focus();
   });
 
   $: if (view && value !== lastEmitted && !composing && !localDocumentChanged) {
     const normalized = normalizeVisualMarkdownSource(value);
+    // The parent replaced the document authority. Neither a captured
+    // selection nor a delayed repair from the previous node tree can cross
+    // this boundary.
+    clearFormattingSelection();
+    invalidateSelectionAccessibility();
     lastEmitted = normalized;
     const next = stateFor(normalized);
     view.updateState(next);
-    editorEmpty = next.doc.textContent.length === 0;
     clearBoundaryCache();
     reportSelection(next);
     scheduleGhostVisibilityReport();
@@ -586,62 +1019,22 @@
   }
 
   $: if (view) {
-    view.setProps({ editable: () => !readonly, attributes: editorAttributes() });
-    const anchorByteOffset = ghostAnchorByteOffset;
-    const exactAnchor = anchorByteOffset !== null &&
-      selectionBoundary(view.state) === anchorByteOffset;
-    const rollbackOnly = ghostText === '' && ghostUnconsumeText !== '';
-    const faithful = exactAnchor && (
-      rollbackOnly || visualGhostTextIsFaithfulAtSelection(
-          view.state,
-          lastEmitted,
-          anchorByteOffset!,
-          ghostText
-        )
-    );
-    const rejectionIdentity = anchorByteOffset === null
-      ? ''
-      : `${ghostPresentationKey}\u0000${surfaceKey}\u0000${anchorByteOffset}`;
-    if (
-      !readonly &&
-      !composing &&
-      ghostCandidateId &&
-      ghostPresentationKey &&
-      surfaceKey &&
-      exactAnchor &&
-      !faithful &&
-      reportedRejectedPresentationIdentity !== rejectionIdentity
-    ) {
-      reportedRejectedPresentationIdentity = rejectionIdentity;
-      onGhostPresentationRejected(
-        ghostCandidateId,
-        ghostPresentationKey,
-        surfaceKey,
-        anchorByteOffset!
-      );
-    }
-    const presentation = ghostPresentationKey &&
-      surfaceKey &&
-      faithful &&
-      ghostPresentationKey !== suppressedGhostKey ? {
-      active: !readonly && !composing,
+    synchronizeGhostPresentation({
+      label,
+      readonly,
+      composing,
+      text: ghostText,
       candidateId: ghostCandidateId,
       presentationKey: ghostPresentationKey,
-      surfaceKey,
-      anchorByteOffset,
-      text: ghostText,
+      anchorByteOffset: ghostAnchorByteOffset,
       insertsOnAccept: ghostInsertsOnAccept,
       alternatives: ghostAlternatives,
-      hidden: ghostHidden || rollbackOnly,
+      hidden: ghostHidden,
       unconsumeText: ghostUnconsumeText,
-      // Once a word is consumed the session is locked to one candidate. Do
-      // not hide its cached remainder behind a now-empty alternatives fan
-      // while Option is still held.
-      fanVisible: optionHeld && ghostAlternatives.length > 1
-    } : null;
-    setGhostText(view, presentation);
-    reportCompletionAccessibility();
-    scheduleGhostVisibilityReport();
+      surfaceKey,
+      suppressedKey: suppressedGhostKey,
+      optionHeld
+    });
   }
 
   onDestroy(() => {
@@ -649,6 +1042,9 @@
     if (projectionTimer !== undefined) window.clearTimeout(projectionTimer);
     if (normalizationTimer !== undefined) window.clearTimeout(normalizationTimer);
     if (visibilityFrame !== undefined) window.cancelAnimationFrame(visibilityFrame);
+    if (ghostSynchronizationFrame !== undefined) {
+      window.cancelAnimationFrame(ghostSynchronizationFrame);
+    }
     if (selectionReportTimer !== undefined) window.clearTimeout(selectionReportTimer);
     if (composing) onCompositionChange(false);
     onSelectionChange(null, 'selection_settling', null);
@@ -664,21 +1060,20 @@
       alternativePresentationKeys: [],
       alternativeRunIds: []
     });
+    invalidateSelectionAccessibility();
     window.removeEventListener('resize', reportGhostVisibility);
+    window.removeEventListener('focus', handleWindowFocus);
     window.removeEventListener('keydown', handleWindowKeyDown, true);
     window.removeEventListener('keyup', handleWindowKeyUp, true);
     window.removeEventListener('blur', releaseOptionState);
     window.removeEventListener('pagehide', releaseOptionState);
     window.removeEventListener('pointerdown', releaseOptionState, true);
-    document.removeEventListener('visibilitychange', releaseOptionState);
+    document.removeEventListener('visibilitychange', handleVisibilityChange);
     scrollViewport?.removeEventListener('scroll', reportGhostVisibility);
     view?.destroy();
   });
 </script>
 
 <div class="loom-editor-shell">
-  {#if editorEmpty}
-    <div class="loom-editor-placeholder" aria-hidden="true">{placeholder}</div>
-  {/if}
   <div class="editor-mount" bind:this={mount}></div>
 </div>

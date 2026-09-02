@@ -3,7 +3,7 @@
   "fixture_id": "loom-prior-store-v10-v1",
   "evidence_class": "state",
   "prior_store_schema_version": 10,
-  "current_store_schema_version": 11,
+  "current_store_schema_version": 14,
   "producer": {
     "source_commit": "d0aca6ff4883ac51514fea5e5fb75ffbb3c8c264",
     "migration_sha256": [

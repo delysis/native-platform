@@ -731,6 +731,34 @@ impl GenerationRegistry {
         route_for_branch_locked(&state, branch_id).map(Some)
     }
 
+    /// Returns one stable, identity-scoped view of the live cancellation
+    /// routes for a document. Durable generation facts remain in
+    /// `loom-store`; this observation only enumerates process-local families
+    /// so a caller can join them to the authoritative generation supervisor.
+    pub fn active_routes_for_document(
+        &self,
+        project_id: ProjectId,
+        session_id: CommandId,
+        document_id: DocumentId,
+    ) -> Result<Vec<ActiveGenerationRoute>, GenerationRegistryError> {
+        let state = self.lock()?;
+        let mut routes = Vec::new();
+        for family in state.families.values().filter(|family| {
+            family.identity.project_id == project_id
+                && family.identity.session_id == session_id
+                && family.identity.document_id == document_id
+        }) {
+            for (expected_run_id, branch_id) in &family.branches {
+                let route = route_for_branch_locked(&state, *branch_id)?;
+                if route.run_id != *expected_run_id || route.identity != family.identity {
+                    return Err(GenerationRegistryError::CorruptRegistry);
+                }
+                routes.push(route);
+            }
+        }
+        Ok(routes)
+    }
+
     pub fn cancel_run(
         &self,
         project_id: ProjectId,
@@ -1635,6 +1663,50 @@ mod tests {
         assert_eq!(completed.project_id, project_id);
         assert_eq!(registry.active_branch_count().expect("active count"), 0);
         assert!(registry.route_for_run(run_id).expect("route").is_none());
+    }
+
+    #[test]
+    fn completion_snapshot_routes_are_exactly_scoped_to_project_session_and_document() {
+        let registry = GenerationRegistry::new(4).expect("registry");
+        let project_id = ProjectId::new();
+        let session_id = CommandId::new();
+        let document_id = DocumentId::new();
+        let first = (GenerationRunId::new(), BranchId::new());
+        let second = (GenerationRunId::new(), BranchId::new());
+        registry
+            .reserve(
+                GenerationFamilyIdentity {
+                    request_id: "scoped-family".to_owned(),
+                    project_id,
+                    session_id,
+                    document_id,
+                },
+                vec![first, second],
+            )
+            .expect("reserve scoped family");
+
+        let routes = registry
+            .active_routes_for_document(project_id, session_id, document_id)
+            .expect("observe scoped routes");
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| (route.run_id, route.branch_id))
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert!(
+            registry
+                .active_routes_for_document(project_id, session_id, DocumentId::new())
+                .expect("observe foreign document")
+                .is_empty()
+        );
+        assert!(
+            registry
+                .active_routes_for_document(project_id, CommandId::new(), document_id)
+                .expect("observe stale session")
+                .is_empty()
+        );
     }
 
     #[test]

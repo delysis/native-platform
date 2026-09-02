@@ -1,9 +1,9 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 
 use crate::{Result, StoreError};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
-pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 11;
+pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 14;
 
 pub(crate) fn configure(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -24,90 +24,10 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<()> {
     }
 
     let transaction = connection.transaction()?;
-    if version < 1 {
-        transaction.execute_batch(include_str!("../migrations/0001_initial.sql"))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (1, ?1)",
-            [loom_types::now_unix_ms()],
-        )?;
-    }
-    if version < 2 {
-        transaction.execute_batch(include_str!("../migrations/0002_generation_provenance.sql"))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (2, ?1)",
-            [loom_types::now_unix_ms()],
-        )?;
-    }
-    if version < 3 {
-        transaction.execute_batch(include_str!("../migrations/0003_transient_drafts.sql"))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (3, ?1)",
-            [loom_types::now_unix_ms()],
-        )?;
-    }
-    if version < 4 {
-        transaction.execute_batch(include_str!("../migrations/0004_draft_generations.sql"))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (4, ?1)",
-            [loom_types::now_unix_ms()],
-        )?;
-    }
-    if version < 5 {
-        transaction.execute_batch(include_str!(
-            "../migrations/0005_generation_command_hardening.sql"
-        ))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (5, ?1)",
-            [loom_types::now_unix_ms()],
-        )?;
-    }
-    if version < 6 {
-        transaction.execute_batch(include_str!("../migrations/0006_bounded_branch_index.sql"))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (6, ?1)",
-            [loom_types::now_unix_ms()],
-        )?;
-    }
-    if version < 7 {
-        transaction.execute_batch(include_str!("../migrations/0007_research_admission.sql"))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (7, ?1)",
-            [loom_types::now_unix_ms()],
-        )?;
-    }
-    if version < 8 {
-        transaction.execute_batch(include_str!(
-            "../migrations/0008_verified_inference_batches.sql"
-        ))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (8, ?1)",
-            [loom_types::now_unix_ms()],
-        )?;
-    }
-    if version < 9 {
-        transaction.execute_batch(include_str!(
-            "../migrations/0009_research_execution_ledger.sql"
-        ))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (9, ?1)",
-            [loom_types::now_unix_ms()],
-        )?;
-    }
-    if version < 10 {
-        transaction.execute_batch(include_str!("../migrations/0010_token_piece_evidence.sql"))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (10, ?1)",
-            [loom_types::now_unix_ms()],
-        )?;
-    }
-    if version < 11 {
-        transaction.execute_batch(include_str!(
-            "../migrations/0011_foreground_command_receipts.sql"
-        ))?;
-        transaction.execute(
-            "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (11, ?1)",
-            [loom_types::now_unix_ms()],
-        )?;
+    for (target, sql) in MIGRATIONS {
+        if version < *target {
+            apply_migration(&transaction, *target, sql)?;
+        }
     }
     transaction.pragma_update(
         None,
@@ -116,6 +36,62 @@ pub(crate) fn migrate(connection: &mut Connection) -> Result<()> {
     )?;
     transaction.commit()?;
 
+    Ok(())
+}
+
+const MIGRATIONS: &[(u32, &str)] = &[
+    (1, include_str!("../migrations/0001_initial.sql")),
+    (
+        2,
+        include_str!("../migrations/0002_generation_provenance.sql"),
+    ),
+    (3, include_str!("../migrations/0003_transient_drafts.sql")),
+    (4, include_str!("../migrations/0004_draft_generations.sql")),
+    (
+        5,
+        include_str!("../migrations/0005_generation_command_hardening.sql"),
+    ),
+    (
+        6,
+        include_str!("../migrations/0006_bounded_branch_index.sql"),
+    ),
+    (7, include_str!("../migrations/0007_research_admission.sql")),
+    (
+        8,
+        include_str!("../migrations/0008_verified_inference_batches.sql"),
+    ),
+    (
+        9,
+        include_str!("../migrations/0009_research_execution_ledger.sql"),
+    ),
+    (
+        10,
+        include_str!("../migrations/0010_token_piece_evidence.sql"),
+    ),
+    (
+        11,
+        include_str!("../migrations/0011_foreground_command_receipts.sql"),
+    ),
+    (
+        12,
+        include_str!("../migrations/0012_document_display_titles.sql"),
+    ),
+    (
+        13,
+        include_str!("../migrations/0013_generation_weave_commands.sql"),
+    ),
+    (
+        14,
+        include_str!("../migrations/0014_document_lifecycle.sql"),
+    ),
+];
+
+fn apply_migration(transaction: &Transaction<'_>, version: u32, sql: &str) -> Result<()> {
+    transaction.execute_batch(sql)?;
+    transaction.execute(
+        "INSERT OR IGNORE INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
+        (version, loom_types::now_unix_ms()),
+    )?;
     Ok(())
 }
 
@@ -142,6 +118,61 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read version");
         assert_eq!(version, CURRENT_STORE_SCHEMA_VERSION + 1);
+    }
+
+    #[test]
+    fn version_fourteen_adds_durable_document_lifecycle_authority() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure(&connection).expect("configure SQLite");
+        migrate(&mut connection).expect("migrate current schema");
+
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("current store schema");
+        assert_eq!(version, 14);
+        for table in [
+            "document_deletions",
+            "document_delete_operations",
+            "document_rename_operations",
+        ] {
+            let strict: i64 = connection
+                .query_row(
+                    "SELECT strict FROM pragma_table_list WHERE name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("lifecycle table");
+            assert_eq!(strict, 1, "{table} must be STRICT");
+        }
+        for trigger in [
+            "document_deletions_are_immutable_update",
+            "document_deletions_are_immutable_delete",
+            "document_delete_operations_validate_insert",
+            "document_delete_operations_state_machine",
+            "document_delete_operations_are_immutable_delete",
+            "document_rename_operations_validate_insert",
+            "document_rename_operations_state_machine",
+            "document_rename_operations_are_immutable_delete",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                    [trigger],
+                    |row| row.get(0),
+                )
+                .expect("lifecycle trigger");
+            assert_eq!(count, 1, "missing {trigger}");
+        }
+        let delete_operation_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'document_delete_operations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("delete operation schema SQL");
+        assert!(delete_operation_sql.contains("length(CAST(recovery_file_name AS BLOB))"));
+        assert!(delete_operation_sql.contains("recovery_file_name NOT GLOB '*[/\\\\]*'"));
     }
 
     #[test]
@@ -224,7 +255,7 @@ mod tests {
         let version: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read migrated version");
-        assert_eq!(version, 11);
+        assert_eq!(version, CURRENT_STORE_SCHEMA_VERSION);
         for (table, expected_columns) in [
             ("research_token_piece_evidence", 7_i64),
             ("research_foreground_command_receipts", 15_i64),
@@ -258,7 +289,121 @@ mod tests {
         let version_after_reopen: u32 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read reopened version");
-        assert_eq!(version_after_reopen, 11);
+        assert_eq!(version_after_reopen, CURRENT_STORE_SCHEMA_VERSION);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn version_twelve_adds_nullable_document_titles_without_rewriting_existing_rows() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure(&connection).expect("configure SQLite");
+        for migration in [
+            include_str!("../migrations/0001_initial.sql"),
+            include_str!("../migrations/0002_generation_provenance.sql"),
+            include_str!("../migrations/0003_transient_drafts.sql"),
+            include_str!("../migrations/0004_draft_generations.sql"),
+            include_str!("../migrations/0005_generation_command_hardening.sql"),
+            include_str!("../migrations/0006_bounded_branch_index.sql"),
+            include_str!("../migrations/0007_research_admission.sql"),
+            include_str!("../migrations/0008_verified_inference_batches.sql"),
+            include_str!("../migrations/0009_research_execution_ledger.sql"),
+            include_str!("../migrations/0010_token_piece_evidence.sql"),
+            include_str!("../migrations/0011_foreground_command_receipts.sql"),
+        ] {
+            connection
+                .execute_batch(migration)
+                .expect("apply through v11");
+        }
+        connection
+            .execute(
+                "INSERT INTO documents(document_id, relative_path, document_kind, created_at_ms)
+                 VALUES ('document', 'manuscript/Untitled.md', 'prose', 1)",
+                [],
+            )
+            .expect("insert legacy document");
+        connection
+            .pragma_update(None, "user_version", 11_i64)
+            .expect("mark version eleven");
+
+        migrate(&mut connection).expect("migrate document titles");
+
+        let title: Option<String> = connection
+            .query_row(
+                "SELECT display_title FROM documents WHERE document_id = 'document'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read legacy title fallback");
+        assert_eq!(title, None);
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("read migrated version");
+        assert_eq!(version, CURRENT_STORE_SCHEMA_VERSION);
+        let (strict, columns): (i64, i64) = connection
+            .query_row(
+                "SELECT strict,
+                        (SELECT COUNT(*) FROM pragma_table_info('generation_weave_commands'))
+                 FROM pragma_table_list
+                 WHERE schema = 'main' AND name = 'generation_weave_commands'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read generation weave authority schema");
+        assert_eq!((strict, columns), (1, 3));
+        for migration in [12_i64, 13_i64] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM schema_migrations WHERE version = ?1",
+                    [migration],
+                    |row| row.get(0),
+                )
+                .expect("read migration ledger");
+            assert_eq!(count, 1, "migration {migration} must be recorded once");
+        }
+        for invalid in [
+            "  padded  ",
+            "\u{00a0}leading nonbreaking space",
+            "trailing ogham\u{1680}",
+            "\u{3000}leading ideographic space",
+            "embedded\ncontrol",
+            "embedded\u{007f}delete",
+            "embedded\u{0085}c1 control",
+            "embedded\0nul",
+        ] {
+            assert!(
+                connection
+                    .execute(
+                        "UPDATE documents SET display_title = ?1 WHERE document_id = 'document'",
+                        [invalid],
+                    )
+                    .is_err(),
+                "the database accepted noncanonical display title {invalid:?}"
+            );
+        }
+        let overlong = "é".repeat(129);
+        assert!(
+            connection
+                .execute(
+                    "UPDATE documents SET display_title = ?1 WHERE document_id = 'document'",
+                    [overlong],
+                )
+                .is_err(),
+            "the database accepted a title above the 256-byte limit"
+        );
+        let exact_bound = "é".repeat(128);
+        connection
+            .execute(
+                "UPDATE documents SET display_title = ?1 WHERE document_id = 'document'",
+                [&exact_bound],
+            )
+            .expect("accept a canonical title at the exact byte limit");
+        connection
+            .execute(
+                "UPDATE documents SET display_title = 'inner' || char(160) || 'space'
+                 WHERE document_id = 'document'",
+                [],
+            )
+            .expect("accept non-control Unicode whitespace away from the edges");
     }
 
     #[test]

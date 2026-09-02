@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-completion-snapshot"
+description = "Enables the completion_snapshot command without any pre-configured scope."
+commands.allow = ["completion_snapshot"]
+
+[[permission]]
+identifier = "deny-completion-snapshot"
+description = "Denies the completion_snapshot command without any pre-configured scope."
+commands.deny = ["completion_snapshot"]

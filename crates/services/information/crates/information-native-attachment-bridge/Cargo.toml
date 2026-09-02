@@ -1,0 +1,26 @@
+[package]
+name = "information-native-attachment-bridge"
+version = "0.1.0"
+edition.workspace = true
+description = "Exact canonical Attachment text materialization into Information managed documents"
+license.workspace = true
+readme = "../../README.md"
+rust-version.workspace = true
+
+[dependencies]
+attachment-native-types.workspace = true
+chrono.workspace = true
+information-native-store.workspace = true
+information-native-types.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+attachment-native-host.workspace = true
+flate2.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

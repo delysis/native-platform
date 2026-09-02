@@ -15,6 +15,7 @@ information-native-backend-community.workspace = true
 information-native-backend-encyclopedia.workspace = true
 information-native-backend-scripture.workspace = true
 information-native-backend-sqlite.workspace = true
+information-native-backend-zim.workspace = true
 information-native-catalog.workspace = true
 information-native-retrieval.workspace = true
 information-native-store.workspace = true

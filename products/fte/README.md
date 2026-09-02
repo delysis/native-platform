@@ -131,12 +131,18 @@ by Git.
 
 ## Speech composition
 
-Local speech execution is owned by
-[`speech-native-kit`](https://github.com/delysis/speech-native-kit). A product
-may embed that Tauri plugin directly without importing FTE's hosted providers
-or loopback server. Future OpenAI-compatible `/v1/audio/*` codecs and hosted
-speech adapters belong in a thin optional FTE bridge that depends on speech
-contracts; neither core owns the other.
+<!-- current-service-surface: speech -->
+<!-- retired-edge-parent: 84f65a9c1313bc0e4218156507cedd9fd905903f -->
+
+Local speech execution is currently owned by the transport-neutral
+`crates/services/speech/crates/speech-native-host`; FTE does not currently
+compose it and no generic
+`crates/services/speech/crates/tauri-plugin-speech-native` crate is shipped.
+The deleted plugin remains inspectable only at exact historical parent
+[`84f65a9c1313bc0e4218156507cedd9fd905903f`](https://github.com/delysis/native-platform/tree/84f65a9c1313bc0e4218156507cedd9fd905903f/crates/services/speech/crates/tauri-plugin-speech-native).
+Future OpenAI-compatible `/v1/audio/*` codecs or hosted adapters would require
+a new, explicitly composed FTE bridge that depends on Speech contracts;
+neither core owns the other today.
 
 ## Privacy and security
 

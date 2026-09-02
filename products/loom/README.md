@@ -2,7 +2,7 @@
 
 Loom Native is an early, local-first desktop writing environment for prose and poetry. Active manuscripts remain ordinary UTF-8 files; a hidden `.loom/` sidecar holds revisions, provenance, transient crash-recovery drafts, branch records, and visible-file recovery state.
 
-This repository is an executable development foundation, not a finished release. Editing, storage, model inspection, private local suggestions, and the headless native fiction-research kernel work today. The exact quiet desktop has completed a real Gemma 4 E2B base Q8 Metal suggestion, caret-ghost acceptance, durable promotion, loaded-model quit, and immediate-relaunch exercise. There are no signed installers, hosted-provider adapter, attachment or speech adapters, or release-certified platform backends.
+This repository is an executable development foundation, not a finished release. Editing, storage, model inspection, private local suggestions, and the headless native fiction-research kernel work today. The desktop also ingests bounded PNG, JPEG, GIF, and WebP manuscript images from paste or drag-and-drop into content-addressed project assets. The exact quiet desktop has completed a real Gemma 4 E2B base Q8 Metal suggestion, caret-ghost acceptance, durable promotion, loaded-model quit, and immediate-relaunch exercise. There are no signed installers, hosted-provider or speech adapters, multimodal model-input attachment adapter, or release-certified platform backends.
 
 See [Implementation status](docs/implementation-status.md) for the exact verified/deferred boundary and live migration number. [Project format v1](docs/format-v1.md) records the format rationale.
 
@@ -106,7 +106,7 @@ That test passed locally on CPU. A companion real-model test in the pinned nativ
 | `crates/loom-cli` | Storage, recovery, and external-reconciliation command-line oracle |
 | `apps/loom` | Quiet Svelte 5/ProseMirror authoring shell, automatic private-suggestion interaction, and Tauri 2 application |
 
-There is no `loom-backend-fte` crate yet. Speech, attachment ingestion, general source indexing, and hosted-provider composition are not implemented Loom product paths. W9 retired the unowned, unqualified research engine; the protected W8 HOME tag preserves it for archaeology or a future explicitly owned experiment.
+There is no `loom-backend-fte` crate yet. Speech, multimodal model-input attachments, general source indexing, and hosted-provider composition are not implemented Loom product paths. Raster manuscript image ingestion is a separate bounded local storage/editor path. W9 retired the unowned, unqualified research engine; the protected W8 HOME tag preserves it for archaeology or a future explicitly owned experiment.
 
 ## Project layout
 

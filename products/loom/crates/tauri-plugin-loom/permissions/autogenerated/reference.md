@@ -11,18 +11,24 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-project-current`
 - `allow-project-recover`
 - `allow-document-create`
+- `allow-document-rename`
+- `allow-document-delete`
+- `allow-attachment-ingest`
 - `allow-document-open`
 - `allow-document-checkpoint`
 - `allow-document-export-choose`
+- `allow-document-reveal`
 - `allow-document-draft-upsert`
 - `allow-document-draft-clear`
 - `allow-document-reconciliation-preview`
 - `allow-document-reconcile-apply`
 - `allow-build-model-policy-get`
+- `allow-model-catalog-list`
 - `allow-model-list`
 - `allow-model-choose`
 - `allow-model-download-status`
 - `allow-model-download-list`
+- `allow-completion-snapshot`
 - `allow-branch-page`
 - `allow-branch-get`
 - `allow-branch-body`
@@ -153,6 +159,32 @@ Enables the application_close_pending command without any pre-configured scope.
 <td>
 
 Denies the application_close_pending command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-attachment-ingest`
+
+</td>
+<td>
+
+Enables the attachment_ingest command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-attachment-ingest`
+
+</td>
+<td>
+
+Denies the attachment_ingest command without any pre-configured scope.
 
 </td>
 </tr>
@@ -316,6 +348,32 @@ Denies the candidate_promote command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-completion-snapshot`
+
+</td>
+<td>
+
+Enables the completion_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-completion-snapshot`
+
+</td>
+<td>
+
+Denies the completion_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-document-checkpoint`
 
 </td>
@@ -361,6 +419,32 @@ Enables the document_create command without any pre-configured scope.
 <td>
 
 Denies the document_create command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-delete`
+
+</td>
+<td>
+
+Enables the document_delete command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-delete`
+
+</td>
+<td>
+
+Denies the document_delete command without any pre-configured scope.
 
 </td>
 </tr>
@@ -524,6 +608,58 @@ Denies the document_reconciliation_preview command without any pre-configured sc
 <tr>
 <td>
 
+`loom:allow-document-rename`
+
+</td>
+<td>
+
+Enables the document_rename command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-rename`
+
+</td>
+<td>
+
+Denies the document_rename command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-reveal`
+
+</td>
+<td>
+
+Enables the document_reveal command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-reveal`
+
+</td>
+<td>
+
+Denies the document_reveal command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-focus-mode-set`
 
 </td>
@@ -569,6 +705,32 @@ Enables the generation_cancel command without any pre-configured scope.
 <td>
 
 Denies the generation_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-model-catalog-list`
+
+</td>
+<td>
+
+Enables the model_catalog_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-model-catalog-list`
+
+</td>
+<td>
+
+Denies the model_catalog_list command without any pre-configured scope.
 
 </td>
 </tr>
@@ -751,6 +913,32 @@ Enables the model_load command without any pre-configured scope.
 <td>
 
 Denies the model_load command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-model-load-catalog-candidate`
+
+</td>
+<td>
+
+Enables the model_load_catalog_candidate command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-model-load-catalog-candidate`
+
+</td>
+<td>
+
+Denies the model_load_catalog_candidate command without any pre-configured scope.
 
 </td>
 </tr>

@@ -5,20 +5,21 @@ use crate::conversation_store::{
 };
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
-use crate::store::RuntimeStore;
+use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use anyhow::{Context, Result, anyhow};
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
 use attachment_native_types::{
-    ArtifactPayload, AttachmentGraph, CanonicalArtifact, Coverage, DetectedFormat, MediaFamily,
-    ObjectId,
+    ArtifactPayload, AttachmentBundle, AttachmentGraph, AttachmentReceipt, BlobValidationGrade,
+    CanonicalArtifact, Coverage, DetectedFormat, MediaFamily, ObjectId, SegmentKind, TextFormat,
 };
 use llama_native_types::{MediaInput, MediaKind};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use uuid::Uuid;
 
 const ATTACHMENTS_FILE: &str = "attachments.json";
@@ -26,7 +27,16 @@ const ATTACHMENTS_NAMESPACE_V2: &str = "attachments.v2";
 const ATTACHMENTS_NAMESPACE: &str = "attachments.v3";
 const ATTACHMENT_DB_SCHEMA: &str = "mom_llama.attachments.v3";
 const ATTACHMENT_MANIFEST_SCHEMA: &str = "mom_llama.attachment_manifest.v1";
+const ATTACHMENT_PREVIEW_CATALOG_SCHEMA: &str = "mom_llama.attachment_preview_catalog.v1";
+const ATTACHMENT_PREVIEW_CONTENT_SCHEMA: &str = "mom_llama.attachment_preview_content.v1";
 const MAX_PASTED_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ATTACHMENT_PREVIEW_MEDIA_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_ATTACHMENT_PREVIEW_TEXT_BYTES: usize = 128 * 1024;
+const MAX_ATTACHMENT_PREVIEW_TEXT_LINES: usize = 1_200;
+const MAX_ATTACHMENT_PREVIEW_TEXT_SECTIONS: usize = 256;
+const MAX_ATTACHMENT_PREVIEW_ARTIFACTS: usize = 64;
+const MAX_ATTACHMENT_PREVIEW_NOTICES: usize = 32;
+const MAX_ATTACHMENT_PREVIEW_NOTICE_BYTES: usize = 512;
 const MAX_ACTIVE_ATTACHMENT_REFERENCES: usize = 32;
 const MAX_ACTIVE_ATTACHMENT_TEXT_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ACTIVE_ATTACHMENT_MEDIA_OBJECTS: u32 = 16;
@@ -114,6 +124,21 @@ struct AttachmentManifest {
     graph: AttachmentGraph,
     artifacts: Vec<CanonicalArtifact>,
     policy_fingerprint: String,
+    #[serde(default)]
+    receipt: Option<AttachmentReceipt>,
+}
+
+/// Host-only exact source authority for the Attachment -> Information bridge.
+///
+/// This capability deliberately has no serialization implementation. The
+/// renderer may name an [`AttachmentPreviewAnchor`], but only Mom's Rust host
+/// can reconstruct verified retained blobs and the matching Attachment receipt.
+#[derive(Clone)]
+pub struct AttachmentLibraryInput {
+    pub anchor: AttachmentPreviewAnchor,
+    pub bundle: AttachmentBundle,
+    pub receipt: AttachmentReceipt,
+    pub artifact_id: attachment_native_types::ArtifactId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -124,15 +149,149 @@ pub struct AttachmentImportOutput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AttachmentPreview {
-    pub attachment: AttachmentRecord,
+pub struct AttachmentPreviewAnchor {
+    pub attachment_id: String,
+    pub root_sha256: String,
+    pub artifact_id: String,
+    pub policy_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentPreviewState {
+    Ready,
+    Partial,
+    MetadataOnly,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentPreviewKind {
+    Text,
+    Image,
+    Audio,
+    Video,
+    Opaque,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentPreviewTransform {
+    OcrImage,
+    TranscribeAudio,
+    ExtractVideoAudio,
+    SampleVideoFrames,
+    RasterizePdfPages,
+    ExtractDocumentText,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreviewNotice {
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreviewArtifact {
+    pub artifact_id: String,
+    pub source_object_id: String,
+    pub source_label: String,
+    pub kind: AttachmentPreviewKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub bytes: Option<Vec<u8>>,
+    pub media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_len: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation: Option<BlobValidationGrade>,
+    pub processor: String,
+    pub processor_version: String,
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocker_code: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreviewCatalog {
+    pub schema: String,
+    pub attachment_id: String,
+    pub root_sha256: String,
+    pub policy_fingerprint: String,
+    pub state: AttachmentPreviewState,
+    pub coverage: Coverage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary: Option<AttachmentPreviewArtifact>,
+    pub artifacts: Vec<AttachmentPreviewArtifact>,
+    pub notices: Vec<AttachmentPreviewNotice>,
+    pub required_transforms: Vec<AttachmentPreviewTransform>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreviewTextStats {
+    pub total_bytes: u64,
+    pub returned_bytes: u64,
+    pub omitted_bytes: u64,
+    pub total_characters: u64,
+    pub returned_characters: u64,
+    pub omitted_characters: u64,
+    pub total_lines: u64,
+    pub returned_lines: u64,
+    pub omitted_lines: u64,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreviewTextSection {
+    pub source_object_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SegmentKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub coordinates: BTreeMap<String, String>,
+    pub text: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentPreviewContent {
+    pub schema: String,
+    pub anchor: AttachmentPreviewAnchor,
+    pub format: TextFormat,
+    pub sections: Vec<AttachmentPreviewTextSection>,
+    pub stats: AttachmentPreviewTextStats,
+    pub notices: Vec<AttachmentPreviewNotice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentPreviewMedia {
+    pub anchor: AttachmentPreviewAnchor,
+    pub media_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// Exact, path-free attachment authority admitted for one complete-input STT
+/// request. The caller must re-present the full preview anchor; a file name or
+/// attachment id alone is never enough to recover model input bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentTranscriptionInput {
+    pub anchor: AttachmentPreviewAnchor,
+    pub source_object_id: String,
+    pub blob_object_id: String,
+    pub media_type: String,
+    pub byte_len: u64,
+    pub bytes_sha256: String,
+    pub validation: BlobValidationGrade,
+    pub processor: String,
+    pub processor_version: String,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ChatAttachmentContext {
     pub staged_ids: Vec<String>,
+    pub draft_snapshot: Option<DraftMessage>,
     pub text_by_message_id: HashMap<String, String>,
     pub current_text: String,
     pub media: Vec<MediaInput>,
@@ -385,6 +544,7 @@ fn canonicalize_and_stage(
         graph: canonicalized.bundle.graph,
         artifacts: canonicalized.bundle.artifacts,
         policy_fingerprint: host.policy_fingerprint().to_string(),
+        receipt: Some(canonicalized.receipt),
     };
     let _lifecycle = lock_attachment_lifecycle()?;
     let mut attachment_db = load_attachment_db()?;
@@ -446,11 +606,9 @@ pub fn attachment_list(
     ))
 }
 
-pub fn attachment_preview(
-    attachment_id: &str,
-    include_payload: bool,
-) -> Result<CommandResult<AttachmentPreview>> {
-    let Some(attachment) = load_attachment_db()?
+pub fn attachment_preview(attachment_id: &str) -> Result<CommandResult<AttachmentPreviewCatalog>> {
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let Some(record) = load_attachment_db()?
         .attachments
         .into_iter()
         .find(|attachment| attachment.id == attachment_id)
@@ -458,40 +616,305 @@ pub fn attachment_preview(
         return Ok(CommandResult::blocked(
             "mom_llama.attachment_preview",
             "stub_blocked",
-            Blocker::new(
+            preview_blocker(
                 "attachment_not_found",
                 format!("Attachment {attachment_id} was not found."),
-                vec!["Refresh the conversation and try again.".to_string()],
             ),
         ));
     };
-    let bytes = include_payload
-        .then(|| attachment_bytes(attachment_id))
-        .transpose()?
-        .flatten();
-    if include_payload && bytes.is_none() {
-        return Ok(CommandResult::blocked(
-            "mom_llama.attachment_preview",
-            "stub_blocked",
-            Blocker::new(
-                "attachment_content_missing",
-                "The attachment metadata exists, but its content is unavailable.",
-                vec!["Remove the attachment and import it again.".to_string()],
-            ),
-        ));
-    }
+    let store = RuntimeStore::current()?;
+    let catalog = match validated_preview_manifest(&store, &record)? {
+        Ok(manifest) => preview_catalog(&record, &manifest),
+        Err(problem) => metadata_only_preview_catalog(&record, problem),
+    };
     Ok(CommandResult::passed(
         "mom_llama.attachment_preview",
         "contracted",
-        AttachmentPreview { attachment, bytes },
+        catalog,
         Vec::new(),
-        Vec::new(),
+        vec![format!("attachment-preview:{attachment_id}")],
         false,
         false,
     ))
 }
 
-pub fn attachment_bytes(attachment_id: &str) -> Result<Option<Vec<u8>>> {
+pub fn attachment_preview_content(
+    anchor: &AttachmentPreviewAnchor,
+) -> Result<CommandResult<AttachmentPreviewContent>> {
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let store = RuntimeStore::current()?;
+    let authority = match exact_preview_authority(&store, anchor)? {
+        Ok(authority) => authority,
+        Err(problem) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.attachment_preview_content",
+                "stub_blocked",
+                preview_blocker(&problem.code, problem.message),
+            ));
+        }
+    };
+    let Some(artifact) = authority
+        .manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id.0 == anchor.artifact_id)
+    else {
+        return Ok(CommandResult::blocked(
+            "mom_llama.attachment_preview_content",
+            "stub_blocked",
+            preview_blocker(
+                "attachment_preview_artifact_mismatch",
+                "The requested canonical preview artifact is no longer current.".to_string(),
+            ),
+        ));
+    };
+    let ArtifactPayload::Text {
+        format,
+        text,
+        segments,
+    } = &artifact.payload
+    else {
+        return Ok(CommandResult::blocked(
+            "mom_llama.attachment_preview_content",
+            "stub_blocked",
+            preview_blocker(
+                "attachment_preview_not_text",
+                "The requested canonical artifact is not a text preview.".to_string(),
+            ),
+        ));
+    };
+    let content = bounded_text_preview(
+        anchor.clone(),
+        *format,
+        &artifact.source,
+        text,
+        segments,
+        preview_notices(&authority.record, &authority.manifest, Some(artifact)),
+    );
+    Ok(CommandResult::passed(
+        "mom_llama.attachment_preview_content",
+        "contracted",
+        content,
+        Vec::new(),
+        vec![format!("attachment-artifact:{}", anchor.artifact_id)],
+        false,
+        false,
+    ))
+}
+
+pub fn attachment_preview_media(
+    anchor: &AttachmentPreviewAnchor,
+) -> Result<std::result::Result<AttachmentPreviewMedia, Blocker>> {
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let store = RuntimeStore::current()?;
+    let authority = match exact_preview_authority(&store, anchor)? {
+        Ok(authority) => authority,
+        Err(problem) => return Ok(Err(preview_blocker(&problem.code, problem.message))),
+    };
+    let Some(artifact) = authority
+        .manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id.0 == anchor.artifact_id)
+    else {
+        return Ok(Err(preview_blocker(
+            "attachment_preview_artifact_mismatch",
+            "The requested canonical preview artifact is no longer current.".to_string(),
+        )));
+    };
+    let ArtifactPayload::Media { family, blob, .. } = &artifact.payload else {
+        return Ok(Err(preview_blocker(
+            "attachment_preview_not_media",
+            "The requested canonical artifact is not an admitted media preview.".to_string(),
+        )));
+    };
+    if let Err(problem) = media_preview_admission(*family, &blob.media_type, blob.byte_len) {
+        return Ok(Err(preview_blocker(&problem.code, problem.message)));
+    }
+    let bytes = match load_verified_object(&store, &authority.manifest.graph, &blob.object_id) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Ok(Err(preview_blocker(
+                "attachment_content_mismatch",
+                "The retained media bytes no longer match the inspected attachment graph."
+                    .to_string(),
+            )));
+        }
+    };
+    Ok(Ok(AttachmentPreviewMedia {
+        anchor: anchor.clone(),
+        media_type: blob.media_type.clone(),
+        bytes,
+    }))
+}
+
+/// Reconstruct the exact canonical Attachment authority required by the
+/// Information materializer. Historical manifests pre-dating receipt
+/// persistence fail closed and must be re-imported; no receipt is fabricated.
+pub fn attachment_library_input(
+    anchor: &AttachmentPreviewAnchor,
+) -> Result<std::result::Result<AttachmentLibraryInput, Blocker>> {
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let store = RuntimeStore::current()?;
+    let authority = match exact_preview_authority(&store, anchor)? {
+        Ok(authority) => authority,
+        Err(problem) => return Ok(Err(preview_blocker(&problem.code, problem.message))),
+    };
+    let Some(artifact) = authority
+        .manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id.0 == anchor.artifact_id)
+    else {
+        return Ok(Err(preview_blocker(
+            "attachment_preview_artifact_mismatch",
+            "The requested canonical text artifact is no longer current.".to_string(),
+        )));
+    };
+    if !matches!(artifact.payload, ArtifactPayload::Text { .. }) {
+        return Ok(Err(preview_blocker(
+            "attachment_library_not_text",
+            "Only a canonical text artifact can be added to the Information library.".to_string(),
+        )));
+    }
+    let artifact_id = artifact.id.clone();
+    let Some(receipt) = authority.manifest.receipt.clone() else {
+        return Ok(Err(preview_blocker(
+            "attachment_library_receipt_missing",
+            "This historical attachment predates exact canonicalization receipts and must be re-imported before it can be added to the library."
+                .to_string(),
+        )));
+    };
+    let mut blobs = BTreeMap::new();
+    for object in &authority.manifest.graph.objects {
+        let bytes = match load_verified_object(&store, &authority.manifest.graph, &object.id) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return Ok(Err(preview_blocker(
+                    "attachment_content_mismatch",
+                    "Retained attachment bytes no longer match the canonical graph.".to_string(),
+                )));
+            }
+        };
+        blobs.insert(object.id.clone(), Arc::<[u8]>::from(bytes));
+    }
+    let bundle = AttachmentBundle {
+        graph: authority.manifest.graph,
+        artifacts: authority.manifest.artifacts,
+        blobs,
+    };
+    if bundle.validate().is_err() || receipt.validate_against(&bundle, None).is_err() {
+        return Ok(Err(preview_blocker(
+            "attachment_library_authority_mismatch",
+            "The retained Attachment graph, blobs, and receipt no longer agree.".to_string(),
+        )));
+    }
+    Ok(Ok(AttachmentLibraryInput {
+        anchor: anchor.clone(),
+        artifact_id,
+        bundle,
+        receipt,
+    }))
+}
+
+pub fn attachment_transcription_input(
+    conversation_id: &str,
+    anchor: &AttachmentPreviewAnchor,
+) -> Result<std::result::Result<AttachmentTranscriptionInput, Blocker>> {
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let store = RuntimeStore::current()?;
+    let authority = match exact_preview_authority(&store, anchor)? {
+        Ok(authority) => authority,
+        Err(problem) => return Ok(Err(preview_blocker(&problem.code, problem.message))),
+    };
+    if authority.record.conversation_id != conversation_id {
+        return Ok(Err(preview_blocker(
+            "attachment_transcription_conversation_mismatch",
+            "The requested audio attachment does not belong to this conversation.".to_string(),
+        )));
+    }
+    if authority.record.kind != AttachmentKind::Audio {
+        return Ok(Err(preview_blocker(
+            "attachment_transcription_not_audio",
+            "Only an admitted audio attachment can be transcribed.".to_string(),
+        )));
+    }
+    if !matches!(authority.manifest.graph.coverage, Coverage::Complete) {
+        return Ok(Err(preview_blocker(
+            "attachment_transcription_incomplete",
+            "The attachment graph is incomplete, so its audio cannot be sent to complete-input transcription."
+                .to_string(),
+        )));
+    }
+    let Some(artifact) = authority
+        .manifest
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.id.0 == anchor.artifact_id)
+    else {
+        return Ok(Err(preview_blocker(
+            "attachment_preview_artifact_mismatch",
+            "The requested canonical audio artifact is no longer current.".to_string(),
+        )));
+    };
+    let ArtifactPayload::Media {
+        family,
+        blob,
+        validation,
+        ..
+    } = &artifact.payload
+    else {
+        return Ok(Err(preview_blocker(
+            "attachment_transcription_not_media",
+            "The requested canonical artifact is not an admitted media blob.".to_string(),
+        )));
+    };
+    if *family != MediaFamily::Audio || blob.media_type != "audio/wav" {
+        return Ok(Err(preview_blocker(
+            "attachment_transcription_wav_required",
+            "Initial local transcription accepts only a canonical WAV audio artifact.".to_string(),
+        )));
+    }
+    // Audio artifacts intentionally remain HeaderOrStructureOnly until an
+    // explicit transform decodes them. This complete-input STT call is that
+    // transform; direct multimodal model admission still requires the stronger
+    // PayloadDecoded grade elsewhere.
+    if let Err(problem) = media_preview_admission(*family, &blob.media_type, blob.byte_len) {
+        return Ok(Err(preview_blocker(&problem.code, problem.message)));
+    }
+    let bytes = match load_verified_object(&store, &authority.manifest.graph, &blob.object_id) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Ok(Err(preview_blocker(
+                "attachment_content_mismatch",
+                "The retained audio bytes no longer match the inspected attachment graph."
+                    .to_string(),
+            )));
+        }
+    };
+    let bytes_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if bytes_sha256 != blob.object_id.0 {
+        return Ok(Err(preview_blocker(
+            "attachment_content_mismatch",
+            "The retained audio bytes no longer match the selected canonical artifact.".to_string(),
+        )));
+    }
+    Ok(Ok(AttachmentTranscriptionInput {
+        anchor: anchor.clone(),
+        source_object_id: artifact.source.0.clone(),
+        blob_object_id: blob.object_id.0.clone(),
+        media_type: blob.media_type.clone(),
+        byte_len: blob.byte_len,
+        bytes_sha256,
+        validation: validation.grade,
+        processor: artifact.processor.name.clone(),
+        processor_version: artifact.processor.version.clone(),
+        bytes,
+    }))
+}
+
+#[cfg(test)]
+fn attachment_bytes(attachment_id: &str) -> Result<Option<Vec<u8>>> {
     let Some(record) = load_attachment_db()?
         .attachments
         .into_iter()
@@ -521,12 +944,18 @@ pub(crate) fn prepare_chat_attachments(
         .iter()
         .map(|record| (record.id.as_str(), record))
         .collect::<HashMap<_, _>>();
-    let draft_ids = if regenerate_user_id.is_none() {
+    let draft_snapshot = if regenerate_user_id.is_none() {
         load_drafts()?
             .drafts
             .into_iter()
             .find(|draft| draft.conversation_id.as_deref() == Some(conversation_id))
-            .map(|draft| draft.attachment_ids)
+    } else {
+        None
+    };
+    let draft_ids = if regenerate_user_id.is_none() {
+        draft_snapshot
+            .as_ref()
+            .map(|draft| draft.attachment_ids.clone())
             .unwrap_or_default()
     } else {
         active_messages
@@ -586,6 +1015,7 @@ pub(crate) fn prepare_chat_attachments(
         } else {
             Vec::new()
         },
+        draft_snapshot,
         text_by_message_id,
         current_text: current.text,
         media,
@@ -596,50 +1026,173 @@ pub(crate) fn commit_generated_exchange(
     fallback_db: ConversationDb,
     conversation: Conversation,
     expected_active_leaf: Option<&str>,
+    generated_message_ids: &[String],
     staged_ids: &[String],
     user_message_id: &str,
-    clear_draft: bool,
+    expected_draft: Option<&DraftMessage>,
 ) -> Result<PathBuf> {
     let _lifecycle = lock_attachment_lifecycle()?;
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    let mut conversation_db = load_db().unwrap_or(fallback_db);
-    merge_generated_conversation(&mut conversation_db, &conversation, expected_active_leaf);
-    let mut attachment_db = load_attachment_db()?;
-    for attachment_id in staged_ids {
-        let record = attachment_db
-            .attachments
-            .iter_mut()
-            .find(|record| record.id == *attachment_id)
-            .ok_or_else(|| {
-                anyhow!("staged attachment {attachment_id} disappeared before commit")
-            })?;
-        if record.conversation_id != conversation.id || record.state != AttachmentState::Staged {
-            return Err(anyhow!(
-                "staged attachment {attachment_id} changed ownership or state before commit"
-            ));
-        }
-        record.state = AttachmentState::Committed;
-        record.message_id = user_message_id.to_string();
-    }
-    let mut drafts = load_drafts()?;
-    if clear_draft {
-        drafts
-            .drafts
-            .retain(|draft| draft.conversation_id.as_deref() != Some(conversation.id.as_str()));
-    }
-    store.put_documents_atomically([
-        (
-            CONVERSATIONS_NAMESPACE.to_string(),
-            serde_json::to_vec(&conversation_db)?,
-        ),
-        (
-            ATTACHMENTS_NAMESPACE.to_string(),
-            serde_json::to_vec(&attachment_db)?,
-        ),
-        (DRAFTS_NAMESPACE.to_string(), serde_json::to_vec(&drafts)?),
-    ])?;
+    let migrated_conversation_db = load_db().unwrap_or(fallback_db);
+    let migrated_attachment_db = load_attachment_db()?;
+    let migrated_drafts = load_drafts()?;
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        || migrated_conversation_db,
+        |conversation_db, documents| {
+            crate::personas::reject_removed_conversation_id_from_documents(
+                &conversation.id,
+                documents,
+            )?;
+            crate::personas::reject_removed_conversation_writes_from_documents(
+                conversation_db,
+                documents,
+            )?;
+            merge_generated_conversation(
+                conversation_db,
+                &conversation,
+                expected_active_leaf,
+                generated_message_ids,
+            )?;
+
+            let mut attachment_db = documents
+                .get(ATTACHMENTS_NAMESPACE)?
+                .unwrap_or(migrated_attachment_db);
+            for attachment_id in staged_ids {
+                let record = attachment_db
+                    .attachments
+                    .iter_mut()
+                    .find(|record| record.id == *attachment_id)
+                    .ok_or_else(|| {
+                        anyhow!("staged attachment {attachment_id} disappeared before commit")
+                    })?;
+                if record.conversation_id != conversation.id
+                    || record.state != AttachmentState::Staged
+                {
+                    return Err(anyhow!(
+                        "staged attachment {attachment_id} changed ownership or state before commit"
+                    ));
+                }
+                record.state = AttachmentState::Committed;
+                record.message_id = user_message_id.to_string();
+            }
+            let mut drafts = documents.get(DRAFTS_NAMESPACE)?.unwrap_or(migrated_drafts);
+            consume_exact_draft(&mut drafts, expected_draft, staged_ids);
+            documents.put_bytes(ATTACHMENTS_NAMESPACE, &serde_json::to_vec(&attachment_db)?)?;
+            documents.put_bytes(DRAFTS_NAMESPACE, &serde_json::to_vec(&drafts)?)?;
+            Ok(())
+        },
+    )?;
     Ok(store.path().to_path_buf())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_generated_exchange_with_journal<T, R>(
+    fallback_db: ConversationDb,
+    conversation: Conversation,
+    expected_active_leaf: Option<&str>,
+    generated_message_ids: &[String],
+    staged_ids: &[String],
+    user_message_id: &str,
+    expected_draft: Option<&DraftMessage>,
+    journal_namespace: &str,
+    journal_default: impl FnOnce() -> T,
+    journal_mutation: impl FnOnce(&mut T) -> Result<R>,
+    journal_projection: impl FnOnce(&T, &mut DocumentMutations<'_, '_, '_>) -> Result<()>,
+) -> Result<(PathBuf, R)>
+where
+    T: Serialize + DeserializeOwned,
+{
+    let _lifecycle = lock_attachment_lifecycle()?;
+    let settings = resolve_settings()?;
+    let store = RuntimeStore::open(&settings.data_dir)?;
+
+    // Complete one-time imports and schema repair before opening the journal
+    // transaction. The authoritative reads still happen through that same
+    // transaction below, so another process cannot be overwritten with a
+    // stale pre-transaction snapshot.
+    let migrated_conversation_db = load_db().unwrap_or(fallback_db);
+    let migrated_attachment_db = load_attachment_db()?;
+    let migrated_drafts = load_drafts()?;
+    let result =
+        store.mutate_documents(journal_namespace, journal_default, |journal, documents| {
+            let mut conversation_db = documents
+                .get(CONVERSATIONS_NAMESPACE)?
+                .unwrap_or(migrated_conversation_db);
+            crate::personas::reject_removed_conversation_id_from_documents(
+                &conversation.id,
+                documents,
+            )?;
+            crate::personas::reject_removed_conversation_writes_from_documents(
+                &conversation_db,
+                documents,
+            )?;
+            merge_generated_conversation(
+                &mut conversation_db,
+                &conversation,
+                expected_active_leaf,
+                generated_message_ids,
+            )?;
+
+            let mut attachment_db = documents
+                .get(ATTACHMENTS_NAMESPACE)?
+                .unwrap_or(migrated_attachment_db);
+            for attachment_id in staged_ids {
+                let record = attachment_db
+                    .attachments
+                    .iter_mut()
+                    .find(|record| record.id == *attachment_id)
+                    .ok_or_else(|| {
+                        anyhow!("staged attachment {attachment_id} disappeared before commit")
+                    })?;
+                if record.conversation_id != conversation.id
+                    || record.state != AttachmentState::Staged
+                {
+                    return Err(anyhow!(
+                        "staged attachment {attachment_id} changed ownership or state before commit"
+                    ));
+                }
+                record.state = AttachmentState::Committed;
+                record.message_id = user_message_id.to_string();
+            }
+
+            let mut drafts = documents.get(DRAFTS_NAMESPACE)?.unwrap_or(migrated_drafts);
+            consume_exact_draft(&mut drafts, expected_draft, staged_ids);
+
+            let result = journal_mutation(journal)?;
+            journal_projection(journal, documents)?;
+            documents.put_bytes(
+                CONVERSATIONS_NAMESPACE,
+                &serde_json::to_vec(&conversation_db)?,
+            )?;
+            documents.put_bytes(ATTACHMENTS_NAMESPACE, &serde_json::to_vec(&attachment_db)?)?;
+            documents.put_bytes(DRAFTS_NAMESPACE, &serde_json::to_vec(&drafts)?)?;
+            Ok(result)
+        })?;
+    Ok((store.path().to_path_buf(), result))
+}
+
+fn consume_exact_draft(
+    drafts: &mut DraftDb,
+    expected_draft: Option<&DraftMessage>,
+    committed_attachment_ids: &[String],
+) {
+    let Some(expected_draft) = expected_draft else {
+        return;
+    };
+    let committed_attachment_ids = committed_attachment_ids.iter().collect::<BTreeSet<_>>();
+    drafts.drafts.retain_mut(|draft| {
+        if draft == expected_draft {
+            return false;
+        }
+        if draft.conversation_id == expected_draft.conversation_id {
+            draft
+                .attachment_ids
+                .retain(|attachment_id| !committed_attachment_ids.contains(attachment_id));
+        }
+        true
+    });
 }
 
 pub(crate) fn snapshot_message_attachments(
@@ -647,15 +1200,50 @@ pub(crate) fn snapshot_message_attachments(
     messages: &mut [Message],
 ) -> Result<()> {
     let _lifecycle = lock_attachment_lifecycle()?;
-    let mut db = load_attachment_db()?;
+    let migrated = load_attachment_db()?;
+    RuntimeStore::current()?.mutate_documents(
+        ATTACHMENTS_NAMESPACE,
+        || migrated,
+        |db, documents| {
+            snapshot_message_attachments_in_documents(
+                target_conversation_id,
+                messages,
+                db,
+                documents,
+            )
+        },
+    )
+}
+
+pub(crate) fn snapshot_message_attachments_from_documents(
+    target_conversation_id: &str,
+    messages: &mut [Message],
+    documents: &mut DocumentMutations<'_, '_, '_>,
+) -> Result<()> {
+    let mut db = documents
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default();
+    snapshot_message_attachments_in_documents(
+        target_conversation_id,
+        messages,
+        &mut db,
+        documents,
+    )?;
+    documents.put_bytes(ATTACHMENTS_NAMESPACE, &serde_json::to_vec(&db)?)
+}
+
+fn snapshot_message_attachments_in_documents(
+    target_conversation_id: &str,
+    messages: &mut [Message],
+    db: &mut AttachmentDb,
+    documents: &mut DocumentMutations<'_, '_, '_>,
+) -> Result<()> {
     let by_id = db
         .attachments
         .iter()
         .cloned()
         .map(|record| (record.id.clone(), record))
         .collect::<HashMap<_, _>>();
-    let store = RuntimeStore::current()?;
-    let mut manifests = Vec::new();
     for message in messages {
         let mut replacements = Vec::with_capacity(message.attachment_ids.len());
         for source_id in &message.attachment_ids {
@@ -672,22 +1260,19 @@ pub(crate) fn snapshot_message_attachments(
             snapshot.message_id = message.id.clone();
             snapshot.created_at = now_ms().to_string();
             if let Some(namespace) = source.manifest_namespace.as_deref() {
-                let mut manifest = store
+                let mut manifest = documents
                     .get::<AttachmentManifest>(namespace)?
                     .ok_or_else(|| anyhow!("source attachment manifest is missing"))?;
                 let new_namespace = format!("attachment.manifest.{snapshot_id}");
                 manifest.attachment_id = snapshot_id.clone();
                 snapshot.manifest_namespace = Some(new_namespace.clone());
-                manifests.push((new_namespace, serde_json::to_vec(&manifest)?));
+                documents.put_bytes(&new_namespace, &serde_json::to_vec(&manifest)?)?;
             }
             db.attachments.push(snapshot);
             replacements.push(snapshot_id);
         }
         message.attachment_ids = replacements;
     }
-    let mut documents = vec![(ATTACHMENTS_NAMESPACE.to_string(), serde_json::to_vec(&db)?)];
-    documents.extend(manifests);
-    store.put_documents_atomically(documents)?;
     Ok(())
 }
 
@@ -705,6 +1290,199 @@ struct AttachmentGcState<'a> {
     removed_attachment_ids: &'a BTreeSet<String>,
     deleted_conversation_ids: &'a BTreeSet<String>,
     mode: AttachmentGcMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersonaAttachmentRemovalImpact {
+    pub draft_attachment_ids: Vec<String>,
+    pub draft_only_unshared_attachment_ids: Vec<String>,
+    pub retained_supporting_attachment_ids: Vec<String>,
+}
+
+pub(crate) fn persona_attachment_impact_from_snapshot(
+    snapshot: &DocumentSnapshot<'_, '_, '_>,
+    persona: &Conversation,
+    conversations: &ConversationDb,
+    drafts: &DraftDb,
+) -> Result<PersonaAttachmentRemovalImpact> {
+    let attachment_db = snapshot
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(persona_attachment_impact(
+        &attachment_db,
+        persona,
+        conversations,
+        drafts,
+    ))
+}
+
+pub(crate) fn persona_attachment_impact_from_documents(
+    documents: &DocumentMutations<'_, '_, '_>,
+    persona: &Conversation,
+    conversations: &ConversationDb,
+    drafts: &DraftDb,
+) -> Result<PersonaAttachmentRemovalImpact> {
+    let attachment_db = documents
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(persona_attachment_impact(
+        &attachment_db,
+        persona,
+        conversations,
+        drafts,
+    ))
+}
+
+fn persona_attachment_impact(
+    attachment_db: &AttachmentDb,
+    persona: &Conversation,
+    conversations: &ConversationDb,
+    drafts: &DraftDb,
+) -> PersonaAttachmentRemovalImpact {
+    let draft_attachment_ids = drafts
+        .drafts
+        .iter()
+        .filter(|draft| draft.conversation_id.as_deref() == Some(persona.id.as_str()))
+        .flat_map(|draft| draft.attachment_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let retained_supporting_attachment_ids = persona
+        .messages
+        .iter()
+        .flat_map(|message| message.attachment_ids.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let shared = conversations
+        .conversations
+        .iter()
+        .flat_map(|conversation| conversation.messages.iter())
+        .flat_map(|message| message.attachment_ids.iter())
+        .chain(
+            drafts
+                .drafts
+                .iter()
+                .filter(|draft| draft.conversation_id.as_deref() != Some(persona.id.as_str()))
+                .flat_map(|draft| draft.attachment_ids.iter()),
+        )
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let draft_only_unshared_attachment_ids = attachment_db
+        .attachments
+        .iter()
+        .filter(|record| {
+            record.conversation_id == persona.id
+                && record.state == AttachmentState::Staged
+                && draft_attachment_ids.contains(&record.id)
+                && !shared.contains(&record.id)
+        })
+        .map(|record| record.id.clone())
+        .collect::<BTreeSet<_>>();
+    PersonaAttachmentRemovalImpact {
+        draft_attachment_ids: draft_attachment_ids.into_iter().collect(),
+        draft_only_unshared_attachment_ids: draft_only_unshared_attachment_ids
+            .into_iter()
+            .collect(),
+        retained_supporting_attachment_ids: retained_supporting_attachment_ids
+            .into_iter()
+            .collect(),
+    }
+}
+
+pub(crate) fn remove_persona_draft_attachments_from_documents(
+    documents: &mut DocumentMutations<'_, '_, '_>,
+    expected_ids: &[String],
+) -> Result<Vec<String>> {
+    let expected = expected_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if expected.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut attachment_db = documents
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default();
+    let manifests = load_manifests_for_gc_from_documents(documents, &attachment_db)?;
+    let mut removed_ids = BTreeSet::new();
+    let mut removed_manifests = BTreeSet::new();
+    let mut removed_objects = BTreeSet::new();
+    attachment_db.attachments.retain(|record| {
+        if !expected.contains(&record.id) || record.state != AttachmentState::Staged {
+            return true;
+        }
+        removed_ids.insert(record.id.clone());
+        if let Some((namespace, manifest)) = record
+            .manifest_namespace
+            .as_ref()
+            .and_then(|namespace| {
+                manifests
+                    .get(namespace)
+                    .map(|manifest| (namespace, manifest))
+            })
+            .filter(|(_, manifest)| {
+                manifest.schema == ATTACHMENT_MANIFEST_SCHEMA && manifest.attachment_id == record.id
+            })
+        {
+            removed_objects.extend(manifest_object_ids(manifest));
+            removed_manifests.insert(namespace.clone());
+        }
+        false
+    });
+    if removed_ids != expected {
+        anyhow::bail!("Persona draft attachment impact changed before removal commit");
+    }
+
+    let mut retained_objects = BTreeSet::new();
+    let mut object_gc_is_safe = true;
+    for record in &attachment_db.attachments {
+        match record
+            .manifest_namespace
+            .as_ref()
+            .and_then(|namespace| manifests.get(namespace))
+        {
+            Some(manifest)
+                if manifest.schema == ATTACHMENT_MANIFEST_SCHEMA
+                    && manifest.attachment_id == record.id =>
+            {
+                retained_objects.extend(manifest_object_ids(manifest));
+            }
+            _ if record.state == AttachmentState::LegacyCommitted
+                && record.root_object_id.is_none()
+                && !record
+                    .stored_path
+                    .starts_with("encrypted://attachment.object.") => {}
+            _ => {
+                object_gc_is_safe = false;
+                if let Some(root) = &record.root_object_id {
+                    retained_objects.insert(root.clone());
+                }
+            }
+        }
+    }
+    documents.put_bytes(ATTACHMENTS_NAMESPACE, &serde_json::to_vec(&attachment_db)?)?;
+    for namespace in removed_manifests {
+        documents.delete(&namespace);
+    }
+    if object_gc_is_safe {
+        for object_id in removed_objects.difference(&retained_objects) {
+            documents.delete(&object_namespace_str(object_id));
+        }
+    }
+    Ok(removed_ids.into_iter().collect())
+}
+
+fn load_manifests_for_gc_from_documents(
+    documents: &DocumentMutations<'_, '_, '_>,
+    db: &AttachmentDb,
+) -> Result<HashMap<String, AttachmentManifest>> {
+    let mut manifests = HashMap::new();
+    for namespace in db
+        .attachments
+        .iter()
+        .filter_map(|record| record.manifest_namespace.as_ref())
+    {
+        if !manifests.contains_key(namespace)
+            && let Some(manifest) = documents.get::<AttachmentManifest>(namespace)?
+        {
+            manifests.insert(namespace.clone(), manifest);
+        }
+    }
+    Ok(manifests)
 }
 
 /// Persist a draft mutation and reclaim only staged attachments explicitly
@@ -761,11 +1539,8 @@ fn persist_state_with_attachment_gc(state: AttachmentGcState<'_>) -> Result<Path
     let manifests = load_manifests_for_gc(&store, &attachment_snapshot)?;
     let referenced =
         referenced_attachment_ids(state.effective_conversations, state.effective_drafts);
-    let encoded_conversations = state
-        .conversations_to_write
-        .map(serde_json::to_vec)
-        .transpose()?;
-    let encoded_drafts = state.drafts_to_write.map(serde_json::to_vec).transpose()?;
+    let conversations_to_write = state.conversations_to_write.cloned();
+    let drafts_to_write = state.drafts_to_write.cloned();
 
     store.mutate_documents(
         ATTACHMENTS_NAMESPACE,
@@ -842,11 +1617,22 @@ fn persist_state_with_attachment_gc(state: AttachmentGcState<'_>) -> Result<Path
                 }
             }
 
-            if let Some(encoded) = &encoded_conversations {
-                documents.put_bytes(CONVERSATIONS_NAMESPACE, encoded)?;
+            if let Some(conversations) = conversations_to_write.clone() {
+                crate::personas::reject_removed_conversation_writes_from_documents(
+                    &conversations,
+                    documents,
+                )?;
+                documents.put_bytes(
+                    CONVERSATIONS_NAMESPACE,
+                    &serde_json::to_vec(&conversations)?,
+                )?;
             }
-            if let Some(encoded) = &encoded_drafts {
-                documents.put_bytes(DRAFTS_NAMESPACE, encoded)?;
+            if let Some(mut drafts) = drafts_to_write.clone() {
+                crate::personas::filter_removed_persona_drafts_from_documents(
+                    &mut drafts,
+                    documents,
+                )?;
+                documents.put_bytes(DRAFTS_NAMESPACE, &serde_json::to_vec(&drafts)?)?;
             }
             for namespace in removed_manifests {
                 documents.delete(&namespace);
@@ -916,6 +1702,734 @@ fn manifest_object_ids(manifest: &AttachmentManifest) -> BTreeSet<String> {
                 }),
         )
         .collect()
+}
+
+#[derive(Debug)]
+struct PreviewProblem {
+    code: String,
+    message: String,
+}
+
+impl PreviewProblem {
+    fn new(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: code.to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+struct PreviewAuthority {
+    record: AttachmentRecord,
+    manifest: AttachmentManifest,
+}
+
+fn validated_preview_manifest(
+    store: &RuntimeStore,
+    record: &AttachmentRecord,
+) -> Result<std::result::Result<AttachmentManifest, PreviewProblem>> {
+    let Some(namespace) = record.manifest_namespace.as_deref() else {
+        return Ok(Err(PreviewProblem::new(
+            "attachment_preview_legacy_metadata_only",
+            "This historical attachment has no canonical manifest and remains metadata-only.",
+        )));
+    };
+    let Some(manifest) = store.get::<AttachmentManifest>(namespace)? else {
+        return Ok(Err(PreviewProblem::new(
+            "attachment_preview_manifest_missing",
+            "The canonical preview manifest is unavailable; the retained metadata remains visible.",
+        )));
+    };
+    if let Err(problem) = validate_preview_manifest(record, &manifest) {
+        return Ok(Err(problem));
+    }
+    let current_policy_fingerprint = attachment_host()?.policy_fingerprint().to_string();
+    if manifest.policy_fingerprint != current_policy_fingerprint {
+        return Ok(Err(PreviewProblem::new(
+            "attachment_preview_policy_mismatch",
+            "The attachment was inspected under a different safety policy and must be re-imported before preview.",
+        )));
+    }
+    Ok(Ok(manifest))
+}
+
+fn validate_preview_manifest(
+    record: &AttachmentRecord,
+    manifest: &AttachmentManifest,
+) -> std::result::Result<(), PreviewProblem> {
+    if manifest.schema != ATTACHMENT_MANIFEST_SCHEMA || manifest.attachment_id != record.id {
+        return Err(PreviewProblem::new(
+            "attachment_preview_manifest_invalid",
+            "Attachment metadata does not match its canonical preview manifest.",
+        ));
+    }
+    manifest.graph.validate().map_err(|_| {
+        PreviewProblem::new(
+            "attachment_preview_graph_invalid",
+            "The retained attachment graph failed canonical validation.",
+        )
+    })?;
+    if record.root_object_id.as_deref() != Some(manifest.graph.root.0.as_str())
+        || record.sha256 != manifest.graph.root.0
+        || record.coverage.as_ref() != Some(&manifest.graph.coverage)
+        || record.policy_fingerprint.as_deref() != Some(manifest.policy_fingerprint.as_str())
+    {
+        return Err(PreviewProblem::new(
+            "attachment_preview_identity_mismatch",
+            "Attachment identity, coverage, or policy no longer matches its canonical graph.",
+        ));
+    }
+    let Some(root) = manifest
+        .graph
+        .objects
+        .iter()
+        .find(|object| object.id == manifest.graph.root)
+    else {
+        return Err(PreviewProblem::new(
+            "attachment_preview_root_missing",
+            "The canonical attachment graph has no root object.",
+        ));
+    };
+    if root.sha256 != record.sha256
+        || root.byte_len != record.bytes
+        || root.detection.selected != record.detected_format
+    {
+        return Err(PreviewProblem::new(
+            "attachment_preview_root_mismatch",
+            "The retained root object no longer matches attachment metadata.",
+        ));
+    }
+
+    let objects = manifest
+        .graph
+        .objects
+        .iter()
+        .map(|object| (&object.id, object))
+        .collect::<HashMap<_, _>>();
+    let mut artifact_ids = BTreeSet::new();
+    let mut artifacts_by_source = BTreeMap::<&ObjectId, BTreeSet<_>>::new();
+    let mut text_bytes = 0_u64;
+    let mut media_objects = 0_u32;
+    let mut media_bytes = 0_u64;
+    for artifact in &manifest.artifacts {
+        artifact.validate().map_err(|_| {
+            PreviewProblem::new(
+                "attachment_preview_artifact_invalid",
+                "A canonical preview artifact failed validation.",
+            )
+        })?;
+        if artifact.processor.policy_fingerprint != manifest.policy_fingerprint
+            || !artifact_ids.insert(&artifact.id)
+        {
+            return Err(PreviewProblem::new(
+                "attachment_preview_artifact_identity_mismatch",
+                "Canonical preview artifact identity or policy is inconsistent.",
+            ));
+        }
+        let Some(source) = objects.get(&artifact.source).copied() else {
+            return Err(PreviewProblem::new(
+                "attachment_preview_artifact_source_missing",
+                "A canonical preview artifact refers to a missing source object.",
+            ));
+        };
+        artifacts_by_source
+            .entry(&artifact.source)
+            .or_default()
+            .insert(&artifact.id);
+        match &artifact.payload {
+            ArtifactPayload::Text { text, .. } => {
+                text_bytes = text_bytes
+                    .checked_add(u64::try_from(text.len()).map_err(|_| {
+                        PreviewProblem::new(
+                            "attachment_preview_accounting_overflow",
+                            "Canonical preview text accounting overflowed.",
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        PreviewProblem::new(
+                            "attachment_preview_accounting_overflow",
+                            "Canonical preview text accounting overflowed.",
+                        )
+                    })?;
+            }
+            ArtifactPayload::Media { blob, .. } => {
+                if blob.byte_len != source.byte_len {
+                    return Err(PreviewProblem::new(
+                        "attachment_preview_media_identity_mismatch",
+                        "Canonical media length no longer matches its source object.",
+                    ));
+                }
+                media_objects = media_objects.checked_add(1).ok_or_else(|| {
+                    PreviewProblem::new(
+                        "attachment_preview_accounting_overflow",
+                        "Canonical preview media accounting overflowed.",
+                    )
+                })?;
+                media_bytes = media_bytes.checked_add(blob.byte_len).ok_or_else(|| {
+                    PreviewProblem::new(
+                        "attachment_preview_accounting_overflow",
+                        "Canonical preview media accounting overflowed.",
+                    )
+                })?;
+            }
+            ArtifactPayload::Opaque { blob } => {
+                if blob.byte_len != source.byte_len {
+                    return Err(PreviewProblem::new(
+                        "attachment_preview_opaque_identity_mismatch",
+                        "Opaque artifact length no longer matches its source object.",
+                    ));
+                }
+            }
+        }
+    }
+    for object in &manifest.graph.objects {
+        let declared = object.artifact_ids.iter().collect::<BTreeSet<_>>();
+        let actual = artifacts_by_source.remove(&object.id).unwrap_or_default();
+        if declared.len() != object.artifact_ids.len() || declared != actual {
+            return Err(PreviewProblem::new(
+                "attachment_preview_artifact_index_mismatch",
+                "The attachment graph and canonical artifact index disagree.",
+            ));
+        }
+    }
+    if !artifacts_by_source.is_empty()
+        || manifest.graph.usage.text_bytes != text_bytes
+        || manifest.graph.usage.media_objects != media_objects
+        || manifest.graph.usage.media_bytes != media_bytes
+        || record.artifact_count != manifest.artifacts.len()
+        || record.canonical_text_bytes != text_bytes
+        || record.media_objects != media_objects
+    {
+        return Err(PreviewProblem::new(
+            "attachment_preview_accounting_mismatch",
+            "Attachment metadata and canonical preview accounting disagree.",
+        ));
+    }
+    Ok(())
+}
+
+fn exact_preview_authority(
+    store: &RuntimeStore,
+    anchor: &AttachmentPreviewAnchor,
+) -> Result<std::result::Result<PreviewAuthority, PreviewProblem>> {
+    let Some(record) = load_attachment_db()?
+        .attachments
+        .into_iter()
+        .find(|record| record.id == anchor.attachment_id)
+    else {
+        return Ok(Err(PreviewProblem::new(
+            "attachment_not_found",
+            "The attachment was removed before its preview completed.",
+        )));
+    };
+    let manifest = match validated_preview_manifest(store, &record)? {
+        Ok(manifest) => manifest,
+        Err(problem) => return Ok(Err(problem)),
+    };
+    if anchor.root_sha256 != record.sha256
+        || anchor.policy_fingerprint != manifest.policy_fingerprint
+    {
+        return Ok(Err(PreviewProblem::new(
+            "attachment_preview_stale",
+            "The attachment root or safety policy changed before its preview completed.",
+        )));
+    }
+    Ok(Ok(PreviewAuthority { record, manifest }))
+}
+
+fn preview_catalog(
+    record: &AttachmentRecord,
+    manifest: &AttachmentManifest,
+) -> AttachmentPreviewCatalog {
+    let mut notices = preview_notices(record, manifest, None);
+    let mut artifacts = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| preview_artifact(manifest, artifact))
+        .collect::<Vec<_>>();
+    let preferred_kind = match record.kind {
+        AttachmentKind::Text | AttachmentKind::Pdf => Some(AttachmentPreviewKind::Text),
+        AttachmentKind::Image => Some(AttachmentPreviewKind::Image),
+        AttachmentKind::Audio => Some(AttachmentPreviewKind::Audio),
+        AttachmentKind::Video => Some(AttachmentPreviewKind::Video),
+        AttachmentKind::Other => None,
+    };
+    let primary = preferred_kind
+        .and_then(|kind| {
+            artifacts
+                .iter()
+                .find(|artifact| artifact.available && artifact.kind == kind)
+        })
+        .or_else(|| artifacts.iter().find(|artifact| artifact.available))
+        .cloned();
+    if artifacts.len() > MAX_ATTACHMENT_PREVIEW_ARTIFACTS {
+        notices.push(AttachmentPreviewNotice {
+            code: "attachment_preview_artifact_list_truncated".to_string(),
+            message: format!(
+                "The preview catalog shows the first {MAX_ATTACHMENT_PREVIEW_ARTIFACTS} canonical artifacts."
+            ),
+        });
+        artifacts.truncate(MAX_ATTACHMENT_PREVIEW_ARTIFACTS);
+        if let Some(primary) = &primary
+            && !artifacts
+                .iter()
+                .any(|artifact| artifact.artifact_id == primary.artifact_id)
+            && let Some(last) = artifacts.last_mut()
+        {
+            *last = primary.clone();
+        }
+    }
+    let required_transforms = preview_required_transforms(record, primary.as_ref());
+    if record.kind == AttachmentKind::Pdf && primary.is_none() {
+        notices.push(AttachmentPreviewNotice {
+            code: "attachment_preview_pdf_text_unavailable".to_string(),
+            message: "The PDF has no canonical extracted text. A separately composed bounded raster/OCR transform is required; no raster page was fabricated."
+                .to_string(),
+        });
+    }
+    let state = if primary.is_some() {
+        if matches!(manifest.graph.coverage, Coverage::Complete) {
+            AttachmentPreviewState::Ready
+        } else {
+            AttachmentPreviewState::Partial
+        }
+    } else if artifacts
+        .iter()
+        .any(|artifact| artifact.kind == AttachmentPreviewKind::Opaque)
+    {
+        AttachmentPreviewState::MetadataOnly
+    } else {
+        AttachmentPreviewState::Unsupported
+    };
+    AttachmentPreviewCatalog {
+        schema: ATTACHMENT_PREVIEW_CATALOG_SCHEMA.to_string(),
+        attachment_id: record.id.clone(),
+        root_sha256: record.sha256.clone(),
+        policy_fingerprint: manifest.policy_fingerprint.clone(),
+        state,
+        coverage: manifest.graph.coverage.clone(),
+        primary,
+        artifacts,
+        notices: bounded_preview_notices(notices),
+        required_transforms,
+    }
+}
+
+fn metadata_only_preview_catalog(
+    record: &AttachmentRecord,
+    problem: PreviewProblem,
+) -> AttachmentPreviewCatalog {
+    AttachmentPreviewCatalog {
+        schema: ATTACHMENT_PREVIEW_CATALOG_SCHEMA.to_string(),
+        attachment_id: record.id.clone(),
+        root_sha256: record.sha256.clone(),
+        policy_fingerprint: record.policy_fingerprint.clone().unwrap_or_default(),
+        state: AttachmentPreviewState::MetadataOnly,
+        coverage: record
+            .coverage
+            .clone()
+            .unwrap_or_else(|| Coverage::Partial {
+                reasons: vec![problem.code.clone()],
+            }),
+        primary: None,
+        artifacts: Vec::new(),
+        notices: bounded_preview_notices(vec![AttachmentPreviewNotice {
+            code: problem.code,
+            message: problem.message,
+        }]),
+        required_transforms: preview_required_transforms(record, None),
+    }
+}
+
+fn preview_artifact(
+    manifest: &AttachmentManifest,
+    artifact: &CanonicalArtifact,
+) -> AttachmentPreviewArtifact {
+    let source_label = preview_source_label(&manifest.graph, &artifact.source);
+    let (kind, media_type, byte_len, validation, admission) = match &artifact.payload {
+        ArtifactPayload::Text { .. } => (AttachmentPreviewKind::Text, None, None, None, Ok(())),
+        ArtifactPayload::Media {
+            family,
+            blob,
+            validation,
+            ..
+        } => {
+            let kind = match family {
+                MediaFamily::Image => AttachmentPreviewKind::Image,
+                MediaFamily::Audio => AttachmentPreviewKind::Audio,
+                MediaFamily::Video => AttachmentPreviewKind::Video,
+            };
+            (
+                kind,
+                Some(blob.media_type.clone()),
+                Some(blob.byte_len),
+                Some(validation.grade),
+                media_preview_admission(*family, &blob.media_type, blob.byte_len),
+            )
+        }
+        ArtifactPayload::Opaque { blob } => (
+            AttachmentPreviewKind::Opaque,
+            Some(blob.media_type.clone()),
+            Some(blob.byte_len),
+            None,
+            Err(PreviewProblem::new(
+                "attachment_preview_opaque",
+                "The canonical artifact remains opaque and is not executed or rendered.",
+            )),
+        ),
+    };
+    let (available, blocker_code) = match admission {
+        Ok(()) => (true, None),
+        Err(problem) => (false, Some(problem.code)),
+    };
+    AttachmentPreviewArtifact {
+        artifact_id: artifact.id.0.clone(),
+        source_object_id: artifact.source.0.clone(),
+        source_label,
+        kind,
+        media_type,
+        byte_len,
+        validation,
+        processor: artifact.processor.name.clone(),
+        processor_version: artifact.processor.version.clone(),
+        available,
+        blocker_code,
+        warnings: artifact
+            .warnings
+            .iter()
+            .take(8)
+            .map(|warning| bounded_preview_string(warning))
+            .collect(),
+    }
+}
+
+fn preview_source_label(graph: &AttachmentGraph, source: &ObjectId) -> String {
+    if source == &graph.root {
+        return bounded_preview_string(&graph.root_name.display);
+    }
+    graph
+        .edges
+        .iter()
+        .find(|edge| edge.child.as_ref() == Some(source))
+        .map(|edge| bounded_preview_string(&edge.name.display))
+        .unwrap_or_else(|| format!("object {}", &source.0[..source.0.len().min(12)]))
+}
+
+fn preview_notices(
+    record: &AttachmentRecord,
+    manifest: &AttachmentManifest,
+    artifact: Option<&CanonicalArtifact>,
+) -> Vec<AttachmentPreviewNotice> {
+    let mut notices = Vec::new();
+    if let Coverage::Partial { reasons } = &manifest.graph.coverage {
+        notices.extend(reasons.iter().map(|reason| AttachmentPreviewNotice {
+            code: "attachment_coverage_partial".to_string(),
+            message: bounded_preview_string(reason),
+        }));
+    }
+    notices.extend(
+        manifest
+            .graph
+            .issues
+            .iter()
+            .map(|issue| AttachmentPreviewNotice {
+                code: issue.code.clone(),
+                message: bounded_preview_string(&issue.safe_message),
+            }),
+    );
+    if let Some(artifact) = artifact {
+        notices.extend(
+            artifact
+                .warnings
+                .iter()
+                .map(|warning| AttachmentPreviewNotice {
+                    code: "attachment_artifact_warning".to_string(),
+                    message: bounded_preview_string(warning),
+                }),
+        );
+    }
+    if record.kind == AttachmentKind::Video {
+        notices.push(AttachmentPreviewNotice {
+            code: "attachment_preview_native_video".to_string(),
+            message: "Video preview uses local native controls over an exact content-addressed blob; it does not autoplay, upload, extract frames, or claim a complete payload decode."
+                .to_string(),
+        });
+    }
+    notices
+}
+
+fn preview_required_transforms(
+    record: &AttachmentRecord,
+    primary: Option<&AttachmentPreviewArtifact>,
+) -> Vec<AttachmentPreviewTransform> {
+    if primary.is_some() {
+        return Vec::new();
+    }
+    match record.kind {
+        AttachmentKind::Text => vec![AttachmentPreviewTransform::ExtractDocumentText],
+        AttachmentKind::Pdf => vec![AttachmentPreviewTransform::RasterizePdfPages],
+        AttachmentKind::Image => vec![AttachmentPreviewTransform::OcrImage],
+        AttachmentKind::Audio => vec![AttachmentPreviewTransform::TranscribeAudio],
+        AttachmentKind::Video => vec![
+            AttachmentPreviewTransform::SampleVideoFrames,
+            AttachmentPreviewTransform::ExtractVideoAudio,
+        ],
+        AttachmentKind::Other => vec![AttachmentPreviewTransform::ExtractDocumentText],
+    }
+}
+
+fn media_preview_admission(
+    family: MediaFamily,
+    media_type: &str,
+    byte_len: u64,
+) -> std::result::Result<(), PreviewProblem> {
+    if byte_len > MAX_ATTACHMENT_PREVIEW_MEDIA_BYTES {
+        return Err(PreviewProblem::new(
+            "attachment_preview_too_large",
+            format!(
+                "The canonical media blob is {byte_len} bytes; local inline preview is limited to {MAX_ATTACHMENT_PREVIEW_MEDIA_BYTES} bytes."
+            ),
+        ));
+    }
+    let admitted = match family {
+        MediaFamily::Image => matches!(
+            media_type,
+            "image/png"
+                | "image/jpeg"
+                | "image/gif"
+                | "image/webp"
+                | "image/bmp"
+                | "image/tiff"
+                | "image/heif"
+                | "image/avif"
+        ),
+        MediaFamily::Audio => matches!(
+            media_type,
+            "audio/wav"
+                | "audio/aiff"
+                | "audio/x-caf"
+                | "audio/flac"
+                | "audio/mpeg"
+                | "audio/ogg"
+                | "audio/mp4"
+        ),
+        MediaFamily::Video => matches!(
+            media_type,
+            "video/mp4" | "video/quicktime" | "video/webm" | "video/ogg"
+        ),
+    };
+    if !admitted {
+        return Err(PreviewProblem::new(
+            "attachment_preview_media_type_not_admitted",
+            format!("Canonical media type {media_type} is not admitted for local native preview."),
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_text_preview(
+    anchor: AttachmentPreviewAnchor,
+    format: TextFormat,
+    source: &ObjectId,
+    text: &str,
+    segments: &[attachment_native_types::TextSegment],
+    notices: Vec<AttachmentPreviewNotice>,
+) -> AttachmentPreviewContent {
+    let target_end = preview_text_prefix_end(
+        text,
+        MAX_ATTACHMENT_PREVIEW_TEXT_BYTES,
+        MAX_ATTACHMENT_PREVIEW_TEXT_LINES,
+    );
+    let mut sections = Vec::new();
+    let mut cursor = 0_usize;
+    for segment in segments {
+        if cursor >= target_end || sections.len() >= MAX_ATTACHMENT_PREVIEW_TEXT_SECTIONS {
+            break;
+        }
+        if segment.start_byte > cursor {
+            push_preview_text_section(
+                &mut sections,
+                source,
+                None,
+                None,
+                BTreeMap::new(),
+                text,
+                cursor,
+                segment.start_byte.min(target_end),
+                segment.start_byte > target_end,
+            );
+            cursor = segment.start_byte.min(target_end);
+        }
+        if sections.len() >= MAX_ATTACHMENT_PREVIEW_TEXT_SECTIONS
+            || segment.start_byte >= target_end
+        {
+            break;
+        }
+        push_preview_text_section(
+            &mut sections,
+            source,
+            Some(segment.kind),
+            segment.label.clone(),
+            segment.coordinates.clone().unwrap_or_default(),
+            text,
+            segment.start_byte,
+            segment.end_byte.min(target_end),
+            segment.end_byte > target_end,
+        );
+        cursor = segment.end_byte;
+    }
+    if segments.is_empty() && target_end > 0 {
+        push_preview_text_section(
+            &mut sections,
+            source,
+            None,
+            None,
+            BTreeMap::new(),
+            text,
+            0,
+            target_end,
+            target_end < text.len(),
+        );
+    } else if cursor < target_end && sections.len() < MAX_ATTACHMENT_PREVIEW_TEXT_SECTIONS {
+        push_preview_text_section(
+            &mut sections,
+            source,
+            None,
+            None,
+            BTreeMap::new(),
+            text,
+            cursor,
+            target_end,
+            target_end < text.len(),
+        );
+    }
+    let returned_bytes = sections.iter().fold(0_usize, |total, section| {
+        total.saturating_add(section.text.len())
+    });
+    let actual_end = returned_bytes.min(text.len());
+    if actual_end < text.len()
+        && let Some(last) = sections.last_mut()
+    {
+        last.truncated = true;
+    }
+    let returned_text = &text[..actual_end];
+    let total_bytes = usize_to_u64(text.len());
+    let returned_bytes = usize_to_u64(actual_end);
+    let total_characters = usize_to_u64(text.chars().count());
+    let returned_characters = usize_to_u64(returned_text.chars().count());
+    let total_lines = usize_to_u64(logical_line_count(text));
+    let returned_lines = usize_to_u64(logical_line_count(returned_text));
+    AttachmentPreviewContent {
+        schema: ATTACHMENT_PREVIEW_CONTENT_SCHEMA.to_string(),
+        anchor,
+        format,
+        sections,
+        stats: AttachmentPreviewTextStats {
+            total_bytes,
+            returned_bytes,
+            omitted_bytes: total_bytes.saturating_sub(returned_bytes),
+            total_characters,
+            returned_characters,
+            omitted_characters: total_characters.saturating_sub(returned_characters),
+            total_lines,
+            returned_lines,
+            omitted_lines: total_lines.saturating_sub(returned_lines),
+            truncated: actual_end < text.len(),
+        },
+        notices: bounded_preview_notices(notices),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_preview_text_section(
+    sections: &mut Vec<AttachmentPreviewTextSection>,
+    source: &ObjectId,
+    kind: Option<SegmentKind>,
+    label: Option<String>,
+    coordinates: BTreeMap<String, String>,
+    text: &str,
+    start: usize,
+    end: usize,
+    truncated: bool,
+) {
+    if start >= end || sections.len() >= MAX_ATTACHMENT_PREVIEW_TEXT_SECTIONS {
+        return;
+    }
+    sections.push(AttachmentPreviewTextSection {
+        source_object_id: source.0.clone(),
+        kind,
+        label: label.map(|label| bounded_preview_string(&label)),
+        coordinates,
+        text: text[start..end].to_string(),
+        truncated,
+    });
+}
+
+fn preview_text_prefix_end(text: &str, max_bytes: usize, max_lines: usize) -> usize {
+    if text.is_empty() || max_bytes == 0 || max_lines == 0 {
+        return 0;
+    }
+    let byte_limit = utf8_prefix_len(text, max_bytes.min(text.len()));
+    let mut lines = 1_usize;
+    for (index, character) in text[..byte_limit].char_indices() {
+        if character == '\n' {
+            if lines >= max_lines {
+                return index;
+            }
+            lines = lines.saturating_add(1);
+        }
+    }
+    byte_limit
+}
+
+fn logical_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            .saturating_add(1)
+    }
+}
+
+fn bounded_preview_notices(notices: Vec<AttachmentPreviewNotice>) -> Vec<AttachmentPreviewNotice> {
+    let mut seen = BTreeSet::new();
+    notices
+        .into_iter()
+        .filter_map(|mut notice| {
+            notice.message = bounded_preview_string(&notice.message);
+            seen.insert((notice.code.clone(), notice.message.clone()))
+                .then_some(notice)
+        })
+        .take(MAX_ATTACHMENT_PREVIEW_NOTICES)
+        .collect()
+}
+
+fn bounded_preview_string(value: &str) -> String {
+    value[..utf8_prefix_len(value, MAX_ATTACHMENT_PREVIEW_NOTICE_BYTES.min(value.len()))]
+        .to_string()
+}
+
+fn utf8_prefix_len(value: &str, max_bytes: usize) -> usize {
+    let mut end = max_bytes.min(value.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn preview_blocker(code: &str, message: String) -> Blocker {
+    Blocker::new(
+        code,
+        message,
+        vec!["Refresh the conversation; if the attachment remains unavailable, remove it and import the original file again."
+            .to_string()],
+    )
 }
 
 pub fn load_attachment_db() -> Result<AttachmentDb> {
@@ -992,7 +2506,7 @@ fn attachment_kind(format: Option<DetectedFormat>) -> AttachmentKind {
     }
 }
 
-fn lock_attachment_lifecycle() -> Result<MutexGuard<'static, ()>> {
+pub(crate) fn lock_attachment_lifecycle() -> Result<MutexGuard<'static, ()>> {
     ATTACHMENT_LIFECYCLE_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
@@ -1317,51 +2831,68 @@ fn merge_generated_conversation(
     db: &mut ConversationDb,
     conversation: &Conversation,
     expected_active_leaf: Option<&str>,
-) {
-    if let Some(existing) = db
+    generated_message_ids: &[String],
+) -> Result<()> {
+    let existing = db
         .conversations
         .iter_mut()
         .find(|candidate| candidate.id == conversation.id)
-    {
-        let new_messages = conversation
-            .messages
-            .iter()
-            .filter(|message| {
-                !existing
-                    .messages
-                    .iter()
-                    .any(|candidate| candidate.id == message.id)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        let generation_message_ids = new_messages
-            .iter()
-            .map(|message| message.id.as_str())
-            .collect::<BTreeSet<_>>();
-        let active_branch_is_unchanged = existing.active_leaf_message_id.as_deref()
-            == expected_active_leaf
-            || existing
-                .active_leaf_message_id
-                .as_deref()
-                .is_some_and(|active| generation_message_ids.contains(active));
-        existing.messages.extend(new_messages);
-        if active_branch_is_unchanged {
-            existing.active_leaf_message_id = conversation.active_leaf_message_id.clone();
-        }
-        if is_placeholder_title(&existing.title, &existing.id)
-            && !is_placeholder_title(&conversation.title, &conversation.id)
+        .ok_or_else(|| anyhow!("host conversation was removed before generation committed"))?;
+    let generated_ids = generated_message_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if generated_ids.len() != generated_message_ids.len() {
+        anyhow::bail!("generated message identities must be unique");
+    }
+    let generated_messages = conversation
+        .messages
+        .iter()
+        .filter(|message| generated_ids.contains(message.id.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if generated_messages.len() != generated_ids.len() {
+        anyhow::bail!("one or more exact generated messages disappeared before commit");
+    }
+    let existing_ids = existing
+        .messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<BTreeSet<_>>();
+    for message in &generated_messages {
+        if let Some(parent_id) = message.parent_id.as_deref()
+            && !existing_ids.contains(parent_id)
+            && !generated_ids.contains(parent_id)
         {
-            existing.title = conversation.title.clone();
-        }
-        if timestamp_value(&conversation.updated_at) > timestamp_value(&existing.updated_at) {
-            existing.updated_at = conversation.updated_at.clone();
-        }
-    } else {
-        db.conversations.insert(0, conversation.clone());
-        if db.selected_conversation_id.is_none() {
-            db.selected_conversation_id = Some(conversation.id.clone());
+            anyhow::bail!(
+                "generated message {} lost its exact parent before commit",
+                message.id
+            );
         }
     }
+    let active_branch_is_unchanged = existing.active_leaf_message_id.as_deref()
+        == expected_active_leaf
+        || existing
+            .active_leaf_message_id
+            .as_deref()
+            .is_some_and(|active| generated_ids.contains(active));
+    existing.messages.extend(
+        generated_messages
+            .into_iter()
+            .filter(|message| !existing_ids.contains(&message.id)),
+    );
+    if active_branch_is_unchanged {
+        existing.active_leaf_message_id = conversation.active_leaf_message_id.clone();
+    }
+    if is_placeholder_title(&existing.title, &existing.id)
+        && !is_placeholder_title(&conversation.title, &conversation.id)
+    {
+        existing.title = conversation.title.clone();
+    }
+    if timestamp_value(&conversation.updated_at) > timestamp_value(&existing.updated_at) {
+        existing.updated_at = conversation.updated_at.clone();
+    }
+    Ok(())
 }
 
 fn is_placeholder_title(title: &str, conversation_id: &str) -> bool {
@@ -1422,8 +2953,11 @@ fn multimodal_readiness(
             false,
             Some(Blocker::new(
                 "mmproj_configured_not_verified",
-                "The multimodal projector is configured but has not been loaded with the selected model yet.",
-                vec!["Run a model check to verify the model and projector pair.".to_string()],
+                "The selected model's vision support has not been loaded yet.",
+                vec![
+                    "Reselect the model to load its automatically paired vision support."
+                        .to_string(),
+                ],
             )),
         );
     }
@@ -1431,8 +2965,11 @@ fn multimodal_readiness(
         false,
         Some(Blocker::new(
             "mmproj_path_missing",
-            "This attachment contains native image or audio media, but no matching multimodal projector is configured.",
-            vec!["Choose the matching mmproj GGUF in Settings.".to_string()],
+            "This image or audio attachment needs a vision-capable model.",
+            vec![
+                "Choose or reselect a model and Mom will pair its vision support automatically."
+                    .to_string(),
+            ],
         )),
     )
 }
@@ -1441,7 +2978,6 @@ fn multimodal_readiness(
 mod tests {
     use super::*;
     use crate::config::set_data_dir_override_for_tests;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     const VALID_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\
         \x00\x00\x00\x0dIHDR\x00\x00\x00\x02\x00\x00\x00\x04\x08\x02\x00\x00\x00\x2b\x8d\x79\x6e\
@@ -1451,29 +2987,21 @@ mod tests {
     const STRUCTURALLY_VALID_WAV: &[u8] = b"RIFF\x26\x00\x00\x00WAVE\
         fmt \x10\x00\x00\x00\x01\x00\x01\x00\x40\x1f\x00\x00\x80\x3e\x00\x00\x02\x00\x10\x00\
         data\x02\x00\x00\x00\x00\x00";
+    const STRUCTURALLY_VALID_MP4: &[u8] = b"\0\0\0\x10ftypisom\0\0\0\0\0\0\0\x08mdat";
 
     struct TestDataDir {
-        _guard: MutexGuard<'static, ()>,
         path: PathBuf,
     }
 
     impl TestDataDir {
         fn new(label: &str) -> Self {
-            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-            let guard = LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let path = std::env::temp_dir().join(format!(
                 "mom-llama-attachment-unit-{label}-{}",
                 Uuid::new_v4().simple()
             ));
             std::fs::create_dir_all(&path).expect("create attachment test data dir");
             set_data_dir_override_for_tests(Some(path.clone()));
-            Self {
-                _guard: guard,
-                path,
-            }
+            Self { path }
         }
     }
 
@@ -1520,7 +3048,30 @@ mod tests {
             .attachment
     }
 
+    fn preview_anchor(catalog: &AttachmentPreviewCatalog) -> AttachmentPreviewAnchor {
+        let primary = catalog
+            .primary
+            .as_ref()
+            .expect("fixture must have a primary preview artifact");
+        AttachmentPreviewAnchor {
+            attachment_id: catalog.attachment_id.clone(),
+            root_sha256: catalog.root_sha256.clone(),
+            artifact_id: primary.artifact_id.clone(),
+            policy_fingerprint: catalog.policy_fingerprint.clone(),
+        }
+    }
+
     fn send_staged_attachment(conversation_id: &str) -> Conversation {
+        let draft = crate::conversation_store::draft_get(Some(conversation_id))
+            .expect("load staged attachment draft")
+            .result
+            .expect("staged attachment draft");
+        crate::conversation_store::draft_update(
+            Some(conversation_id),
+            "Use the attached material.".to_string(),
+            draft.attachment_ids,
+        )
+        .expect("bind exact sent text to staged attachment draft");
         crate::chat::chat_send(
             crate::chat::ChatSendInput {
                 conversation_id: conversation_id.to_string(),
@@ -1612,6 +3163,258 @@ mod tests {
     }
 
     #[test]
+    fn canonical_text_preview_is_path_free_exact_and_stale_after_removal() {
+        let _session = TestDataDir::new("canonical-preview");
+        let hostile = "<script>window.evil = true</script>\n# inert markdown";
+        let attachment = attachment_import_pasted_text("chat", hostile.to_string())
+            .expect("stage hostile text")
+            .result
+            .expect("hostile text result")
+            .attachment;
+        let catalog = attachment_preview(&attachment.id)
+            .expect("load preview catalog")
+            .result
+            .expect("preview catalog");
+        assert_eq!(catalog.state, AttachmentPreviewState::Ready);
+        assert_eq!(catalog.root_sha256, attachment.sha256);
+        assert_eq!(
+            catalog.primary.as_ref().map(|artifact| artifact.kind),
+            Some(AttachmentPreviewKind::Text)
+        );
+        let encoded = serde_json::to_value(&catalog).expect("serialize path-free preview catalog");
+        let object = encoded.as_object().expect("catalog JSON object");
+        assert!(!object.contains_key("source_path"));
+        assert!(!object.contains_key("stored_path"));
+
+        let anchor = preview_anchor(&catalog);
+        let content = attachment_preview_content(&anchor)
+            .expect("load exact canonical text")
+            .result
+            .expect("canonical text preview");
+        let rendered = content
+            .sections
+            .iter()
+            .map(|section| section.text.as_str())
+            .collect::<String>();
+        let store = RuntimeStore::current().expect("open attachment store");
+        let manifest = validated_preview_manifest(&store, &attachment)
+            .expect("read canonical manifest")
+            .expect("validate canonical manifest");
+        let canonical_text = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.id.0 == anchor.artifact_id)
+            .and_then(|artifact| match &artifact.payload {
+                ArtifactPayload::Text { text, .. } => Some(text.as_str()),
+                ArtifactPayload::Media { .. } | ArtifactPayload::Opaque { .. } => None,
+            })
+            .expect("selected preview artifact must contain canonical text");
+        assert_eq!(rendered, canonical_text);
+        assert!(!rendered.contains("<script>"));
+        assert!(!rendered.contains("window.evil"));
+        assert!(rendered.contains("# inert markdown"));
+        assert!(!content.stats.truncated);
+        let library = attachment_library_input(&anchor)
+            .expect("library authority")
+            .expect("exact library input");
+        assert_eq!(library.anchor, anchor);
+        assert_eq!(library.artifact_id.0, anchor.artifact_id);
+        library
+            .receipt
+            .validate_against(&library.bundle, None)
+            .expect("persisted receipt must bind the reconstructed bundle");
+
+        for field in ["root", "artifact", "policy"] {
+            let mut stale = anchor.clone();
+            match field {
+                "root" => stale.root_sha256 = "0".repeat(64),
+                "artifact" => stale.artifact_id = "missing-artifact".to_string(),
+                "policy" => stale.policy_fingerprint = "sha256:stale".to_string(),
+                _ => unreachable!("fixed stale-anchor fixture"),
+            }
+            let blocked = attachment_preview_content(&stale)
+                .expect("stale preview must return a typed blocker");
+            assert!(blocked.result.is_none());
+            assert!(matches!(
+                blocked
+                    .blocker
+                    .as_ref()
+                    .map(|blocker| blocker.code.as_str()),
+                Some("attachment_preview_stale" | "attachment_preview_artifact_mismatch")
+            ));
+            assert!(
+                attachment_library_input(&stale)
+                    .expect("stale library authority must return a blocker")
+                    .is_err()
+            );
+        }
+
+        crate::conversation_store::draft_update(Some("chat"), String::new(), Vec::new())
+            .expect("remove staged attachment");
+        let removed = attachment_preview_content(&anchor)
+            .expect("removed preview must return a typed blocker");
+        assert_eq!(
+            removed
+                .blocker
+                .as_ref()
+                .map(|blocker| blocker.code.as_str()),
+            Some("attachment_not_found")
+        );
+        assert!(
+            attachment_library_input(&anchor)
+                .expect("removed library authority must return a blocker")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn canonical_text_preview_preserves_page_locator_and_exact_caps() {
+        let text = (1..=MAX_ATTACHMENT_PREVIEW_TEXT_LINES + 2)
+            .map(|line| format!("page line {line}\n"))
+            .collect::<String>();
+        let segment = attachment_native_types::TextSegment {
+            kind: SegmentKind::Page,
+            label: Some("Page 1".to_string()),
+            start_byte: 0,
+            end_byte: text.len(),
+            coordinates: Some(BTreeMap::from([("page".to_string(), "1".to_string())])),
+        };
+        let content = bounded_text_preview(
+            AttachmentPreviewAnchor {
+                attachment_id: "attachment".to_string(),
+                root_sha256: "a".repeat(64),
+                artifact_id: "artifact".to_string(),
+                policy_fingerprint: "sha256:policy".to_string(),
+            },
+            TextFormat::Markdown,
+            &ObjectId("a".repeat(64)),
+            &text,
+            &[segment],
+            Vec::new(),
+        );
+        assert!(content.stats.truncated);
+        assert_eq!(
+            content.stats.returned_lines,
+            usize_to_u64(MAX_ATTACHMENT_PREVIEW_TEXT_LINES)
+        );
+        assert!(content.stats.omitted_bytes > 0);
+        assert!(content.stats.omitted_characters > 0);
+        assert!(content.stats.omitted_lines > 0);
+        assert_eq!(content.sections[0].kind, Some(SegmentKind::Page));
+        assert_eq!(content.sections[0].label.as_deref(), Some("Page 1"));
+        assert_eq!(
+            content.sections[0]
+                .coordinates
+                .get("page")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(content.sections[0].truncated);
+    }
+
+    #[test]
+    fn exact_media_preview_adds_bounded_native_video_without_transform_execution() {
+        let session = TestDataDir::new("media-preview");
+        for (name, bytes, kind) in [
+            ("image.png", VALID_PNG, AttachmentPreviewKind::Image),
+            (
+                "clip.mp4",
+                STRUCTURALLY_VALID_MP4,
+                AttachmentPreviewKind::Video,
+            ),
+        ] {
+            let path = session.path.join(name);
+            std::fs::write(&path, bytes).expect("write media preview fixture");
+            let attachment = attachment_import("chat", &path)
+                .expect("import media preview fixture")
+                .result
+                .expect("media import result")
+                .attachment;
+            let catalog = attachment_preview(&attachment.id)
+                .expect("load media preview catalog")
+                .result
+                .expect("media preview catalog");
+            assert_eq!(
+                catalog.primary.as_ref().map(|artifact| artifact.kind),
+                Some(kind)
+            );
+            assert!(catalog.required_transforms.is_empty());
+            if kind == AttachmentPreviewKind::Video {
+                assert!(catalog.notices.iter().any(|notice| {
+                    notice.code == "attachment_preview_native_video"
+                        && notice.message.contains("does not autoplay")
+                }));
+            }
+            let anchor = preview_anchor(&catalog);
+            let media = attachment_preview_media(&anchor)
+                .expect("load exact media preview")
+                .expect("media preview admitted");
+            assert_eq!(media.bytes.as_slice(), bytes);
+            assert_eq!(media.anchor, anchor);
+        }
+        assert!(
+            media_preview_admission(
+                MediaFamily::Video,
+                "video/mp4",
+                MAX_ATTACHMENT_PREVIEW_MEDIA_BYTES
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            media_preview_admission(
+                MediaFamily::Video,
+                "video/mp4",
+                MAX_ATTACHMENT_PREVIEW_MEDIA_BYTES.saturating_add(1)
+            )
+            .expect_err("one media byte beyond the cap must block")
+            .code,
+            "attachment_preview_too_large"
+        );
+    }
+
+    #[test]
+    fn pdf_without_canonical_text_is_explicitly_metadata_only() {
+        let record = AttachmentRecord {
+            id: "pdf".to_string(),
+            conversation_id: "chat".to_string(),
+            message_id: String::new(),
+            kind: AttachmentKind::Pdf,
+            file_name: "scan.pdf".to_string(),
+            source_path: "/must/not/escape".to_string(),
+            stored_path: "encrypted://root".to_string(),
+            mime: "application/pdf".to_string(),
+            bytes: 10,
+            sha256: "a".repeat(64),
+            created_at: "1".to_string(),
+            state: AttachmentState::Staged,
+            root_object_id: Some("a".repeat(64)),
+            detected_format: Some(DetectedFormat::Pdf),
+            coverage: Some(Coverage::Partial {
+                reasons: vec!["pdf_text_unavailable".to_string()],
+            }),
+            manifest_namespace: None,
+            policy_fingerprint: Some("sha256:policy".to_string()),
+            artifact_count: 0,
+            canonical_text_bytes: 0,
+            media_objects: 0,
+        };
+        let catalog = metadata_only_preview_catalog(
+            &record,
+            PreviewProblem::new(
+                "attachment_preview_pdf_text_unavailable",
+                "No canonical PDF text is available.",
+            ),
+        );
+        assert_eq!(catalog.state, AttachmentPreviewState::MetadataOnly);
+        assert_eq!(
+            catalog.required_transforms,
+            vec![AttachmentPreviewTransform::RasterizePdfPages]
+        );
+        let encoded = serde_json::to_string(&catalog).expect("serialize PDF metadata preview");
+        assert!(!encoded.contains(&record.source_path));
+    }
+
+    #[test]
     fn untrusted_boundary_is_explicit_and_identity_scoped() {
         let record = AttachmentRecord {
             id: "attachment-1".to_string(),
@@ -1658,6 +3461,7 @@ mod tests {
             .expect("fixture graph"),
             artifacts: vec![artifact],
             policy_fingerprint: "fixture".to_string(),
+            receipt: None,
         };
         let value = canonical_text(&record, &manifest);
         assert!(value.contains("BEGIN UNTRUSTED ATTACHMENT DATA id=attachment-1"));
@@ -2070,7 +3874,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_a_persona_reclaims_only_its_snapshot_records() {
+    fn removing_a_persona_preserves_supporting_snapshot_records() {
         let _session = TestDataDir::new("persona-snapshot-gc");
         let source = new_conversation("Persona source");
         let source_attachment = stage_text(&source.id, "persona source notes");
@@ -2098,20 +3902,29 @@ mod tests {
             .expect("persona snapshot")
             .clone();
         let snapshot = load_attachment_db()
-            .expect("attachment db before persona delete")
+            .expect("attachment db before Persona removal")
             .attachments
             .into_iter()
             .find(|record| record.id == snapshot_id)
             .expect("persona snapshot record");
 
-        crate::personas::persona_delete(&persona.id).expect("delete persona");
-        let db = load_attachment_db().expect("attachment db after persona deletion");
+        let impact = crate::personas::persona_removal_preview(&persona.id)
+            .expect("preview Persona removal")
+            .result
+            .expect("Persona removal impact");
+        crate::personas::persona_remove_from_library(crate::personas::PersonaRemovalCommitInput {
+            persona_id: persona.id.clone(),
+            persona_version: impact.persona_version,
+            impact_sha256: impact.impact_sha256,
+        })
+        .expect("remove Persona from library");
+        let db = load_attachment_db().expect("attachment db after Persona removal");
         assert!(
             db.attachments
                 .iter()
                 .any(|record| record.id == source_attachment.id)
         );
-        assert!(db.attachments.iter().all(|record| record.id != snapshot_id));
+        assert!(db.attachments.iter().any(|record| record.id == snapshot_id));
         assert_eq!(
             attachment_bytes(&source_attachment.id).expect("source blob after persona deletion"),
             Some(b"persona source notes".to_vec())
@@ -2125,8 +3938,38 @@ mod tests {
                         .as_deref()
                         .expect("snapshot manifest"),
                 )
-                .expect("read deleted snapshot manifest")
-                .is_none()
+                .expect("read retained snapshot manifest")
+                .is_some()
+        );
+        assert_eq!(
+            attachment_bytes(&snapshot_id).expect("Persona snapshot blob after removal"),
+            Some(b"persona source notes".to_vec())
+        );
+
+        crate::conversation_store::conversation_delete(&source.id)
+            .expect("delete original source after Persona removal");
+        let db = load_attachment_db().expect("attachment db after source deletion");
+        assert!(
+            db.attachments
+                .iter()
+                .all(|record| record.id != source_attachment.id)
+        );
+        assert!(db.attachments.iter().any(|record| record.id == snapshot_id));
+        assert!(
+            RuntimeStore::current()
+                .expect("store")
+                .get::<AttachmentManifest>(
+                    snapshot
+                        .manifest_namespace
+                        .as_deref()
+                        .expect("snapshot manifest"),
+                )
+                .expect("read snapshot manifest after source deletion")
+                .is_some()
+        );
+        assert_eq!(
+            attachment_bytes(&snapshot_id).expect("Persona snapshot blob after source deletion"),
+            Some(b"persona source notes".to_vec())
         );
     }
 
@@ -2239,7 +4082,13 @@ mod tests {
             selected_conversation_id: Some("another-chat".to_string()),
         };
 
-        merge_generated_conversation(&mut db, &stale_generation, Some("base"));
+        merge_generated_conversation(
+            &mut db,
+            &stale_generation,
+            Some("base"),
+            &["generated-user".to_string(), generated_assistant.id.clone()],
+        )
+        .expect("merge exact generated messages");
         existing = db.conversations.remove(0);
         assert_eq!(existing.title, "Renamed while generating");
         assert_eq!(
@@ -2262,6 +4111,105 @@ mod tests {
                 .any(|message| message.id == generated_assistant.id)
         );
         assert_eq!(db.selected_conversation_id.as_deref(), Some("another-chat"));
+    }
+
+    #[test]
+    fn generation_merge_never_resurrects_deleted_messages_or_deleted_hosts() {
+        let base = message("base", Vec::new());
+        let deleted = message("deleted-concurrently", Vec::new());
+        let mut generated_user = message("generated-user", Vec::new());
+        generated_user.parent_id = Some(base.id.clone());
+        let mut generated_assistant = message("generated-assistant", Vec::new());
+        generated_assistant.role = crate::conversation_store::MessageRole::Assistant;
+        generated_assistant.parent_id = Some(generated_user.id.clone());
+        let stale_generation = Conversation {
+            id: "chat".to_string(),
+            title: "Chat".to_string(),
+            created_at: "1".to_string(),
+            updated_at: "2".to_string(),
+            kind: crate::conversation_store::ConversationKind::Chat,
+            execution_profile: crate::conversation_store::ConversationExecutionProfile::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: Some(generated_assistant.id.clone()),
+            current_skill_ids: Vec::new(),
+            messages: vec![
+                base.clone(),
+                deleted.clone(),
+                generated_user.clone(),
+                generated_assistant.clone(),
+            ],
+        };
+        let mut db = ConversationDb {
+            conversations: vec![Conversation {
+                messages: vec![base],
+                active_leaf_message_id: Some("base".to_string()),
+                ..stale_generation.clone()
+            }],
+            selected_conversation_id: Some("chat".to_string()),
+        };
+        merge_generated_conversation(
+            &mut db,
+            &stale_generation,
+            Some("base"),
+            &[generated_user.id.clone(), generated_assistant.id.clone()],
+        )
+        .expect("merge exact generated allowlist");
+        let committed = &db.conversations[0];
+        assert!(
+            !committed
+                .messages
+                .iter()
+                .any(|message| message.id == deleted.id)
+        );
+        assert!(
+            committed
+                .messages
+                .iter()
+                .any(|message| message.id == generated_assistant.id)
+        );
+
+        db.conversations.clear();
+        assert!(
+            merge_generated_conversation(
+                &mut db,
+                &stale_generation,
+                Some("base"),
+                &[generated_user.id, generated_assistant.id],
+            )
+            .expect_err("deleted host must remain deleted")
+            .to_string()
+            .contains("host conversation was removed")
+        );
+    }
+
+    #[test]
+    fn concurrent_draft_edit_keeps_new_text_and_releases_sent_attachment_ids() {
+        let expected = crate::conversation_store::DraftMessage {
+            conversation_id: Some("chat".to_string()),
+            message: "sent text".to_string(),
+            attachment_ids: vec!["sent".to_string()],
+            updated_at: "1".to_string(),
+        };
+        let newer = crate::conversation_store::DraftMessage {
+            conversation_id: Some("chat".to_string()),
+            message: "newer unsent text".to_string(),
+            attachment_ids: vec!["sent".to_string(), "new".to_string()],
+            updated_at: "2".to_string(),
+        };
+        let mut drafts = crate::conversation_store::DraftDb {
+            drafts: vec![newer],
+        };
+        consume_exact_draft(&mut drafts, Some(&expected), &["sent".to_string()]);
+        assert_eq!(drafts.drafts.len(), 1);
+        assert_eq!(drafts.drafts[0].message, "newer unsent text");
+        assert_eq!(drafts.drafts[0].attachment_ids, vec!["new"]);
+
+        drafts.drafts = vec![expected.clone()];
+        consume_exact_draft(&mut drafts, Some(&expected), &["sent".to_string()]);
+        assert!(drafts.drafts.is_empty(), "the exact sent draft is consumed");
     }
 
     #[test]
@@ -2313,9 +4261,14 @@ mod tests {
             mutated_fallback,
             generated.clone(),
             None,
+            &[
+                user.id.clone(),
+                "mention-first".to_string(),
+                second.id.clone(),
+            ],
             &[],
             &user.id,
-            true,
+            None,
         )
         .expect("commit attributed generation");
 
@@ -2336,6 +4289,69 @@ mod tests {
                 .map(|attribution| attribution.label.as_str())
                 .collect::<Vec<_>>(),
             vec!["First", "Second"]
+        );
+    }
+
+    #[test]
+    fn generated_exchange_and_private_journal_roll_back_as_one_fact() {
+        #[derive(Default, Serialize, Deserialize)]
+        struct Journal {
+            invocation_ids: Vec<String>,
+        }
+
+        let _session = TestDataDir::new("generated-journal-rollback");
+        let mut generated = new_conversation("Journal host");
+        let staged = stage_text(&generated.id, "staged journal text");
+        let mut user = message("journal-user", vec![staged.id.clone()]);
+        user.conversation_id = generated.id.clone();
+        generated.messages.push(user.clone());
+        generated.active_leaf_message_id = Some(user.id.clone());
+
+        let failed = commit_generated_exchange_with_journal(
+            load_db().expect("fallback db"),
+            generated.clone(),
+            None,
+            std::slice::from_ref(&user.id),
+            std::slice::from_ref(&staged.id),
+            &user.id,
+            None,
+            "test.mention-journal",
+            Journal::default,
+            |journal| {
+                journal.invocation_ids.push("invocation".to_string());
+                Ok(())
+            },
+            |_, documents| {
+                documents.put_bytes("test.mention-active-index", b"derived")?;
+                Err(anyhow!("force derived projection rollback"))
+            },
+        );
+        assert!(failed.is_err());
+        let conversation = crate::conversation_store::conversation_select(&generated.id)
+            .expect("select unchanged host")
+            .result
+            .expect("unchanged host");
+        assert!(conversation.messages.is_empty());
+        let attachment = load_attachment_db()
+            .expect("load attachments")
+            .attachments
+            .into_iter()
+            .find(|record| record.id == staged.id)
+            .expect("staged attachment remains");
+        assert_eq!(attachment.state, AttachmentState::Staged);
+        assert!(
+            RuntimeStore::current()
+                .expect("store")
+                .get::<Journal>("test.mention-journal")
+                .expect("journal read")
+                .is_none()
+        );
+        assert!(
+            RuntimeStore::current()
+                .expect("store")
+                .get_bytes("test.mention-active-index")
+                .expect("derived projection read")
+                .is_none()
         );
     }
 
@@ -2420,6 +4436,51 @@ mod tests {
             blocked.blocker.code,
             "attachment_audio_transcription_required"
         );
+    }
+
+    #[test]
+    fn transcription_input_rebinds_exact_audio_authority_and_rejects_stale_targets() {
+        let _session = TestDataDir::new("speech-audio-authority");
+        let audio_path = resolve_settings()
+            .expect("settings")
+            .data_dir
+            .join("sample.wav");
+        std::fs::write(&audio_path, STRUCTURALLY_VALID_WAV).expect("write audio fixture");
+        let attachment = attachment_import("chat", &audio_path)
+            .expect("stage audio")
+            .result
+            .expect("audio import result")
+            .attachment;
+        let catalog = attachment_preview(&attachment.id)
+            .expect("catalog")
+            .result
+            .expect("catalog result");
+        let anchor = preview_anchor(&catalog);
+        let input = attachment_transcription_input("chat", &anchor)
+            .expect("transcription authority")
+            .expect("admitted transcription input");
+        assert_eq!(input.anchor, anchor);
+        assert_eq!(input.media_type, "audio/wav");
+        assert_eq!(input.bytes.as_slice(), STRUCTURALLY_VALID_WAV);
+        assert_eq!(input.bytes_sha256, input.blob_object_id);
+        assert!(matches!(
+            input.validation,
+            BlobValidationGrade::HeaderOrStructureOnly
+        ));
+
+        let wrong_conversation = attachment_transcription_input("other", &anchor)
+            .expect("typed conversation mismatch")
+            .expect_err("cross-conversation audio must fail closed");
+        assert_eq!(
+            wrong_conversation.code,
+            "attachment_transcription_conversation_mismatch"
+        );
+        let mut stale = anchor;
+        stale.policy_fingerprint = "sha256:stale".to_string();
+        let blocker = attachment_transcription_input("chat", &stale)
+            .expect("typed stale result")
+            .expect_err("stale audio authority must fail closed");
+        assert_eq!(blocker.code, "attachment_preview_stale");
     }
 
     #[test]

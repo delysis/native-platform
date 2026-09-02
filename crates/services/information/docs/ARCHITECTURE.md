@@ -9,12 +9,31 @@ catalogue bytes -> normalized release -> install plan -> staged blobs -> receipt
 external read-only library --------------------> installed representation
                                                                |
 query/tool call -> capability routing -> backend -> evidence + stable locators
+
+trusted native producer -> managed.documents.v1 -> staged SQLite/FTS5
+                                                  -> immutable activation
 ```
 
 The contract, catalogue, and retrieval crates are pure policy layers.
 Filesystem mutation begins in `information-native-store`; network authority is
-isolated in `information-native-acquire`; SQLite authority is isolated in
-the four compiled `information-native-backend-*` crates; Tauri is a leaf.
+isolated in `information-native-acquire`; SQLite authority is isolated in the
+four compiled SQLite `information-native-backend-*` crates. The current product
+boundary is the transport-neutral
+`crates/services/information/crates/information-native-host` plus the operator
+`crates/services/information/crates/information-native-cli`; there is no Tauri
+leaf in the current workspace.
+
+<!-- current-service-surface: information -->
+<!-- retired-edge-parent: 5390edfcfb6b8412ae45f1e51d44644be3f7e8e3 -->
+
+The former
+`crates/services/information/crates/tauri-plugin-information-native` edge is
+historical. Its last-present tree is retained at exact parent
+[`5390edfcfb6b8412ae45f1e51d44644be3f7e8e3`](https://github.com/delysis/native-platform/tree/5390edfcfb6b8412ae45f1e51d44644be3f7e8e3/crates/services/information/crates/tauri-plugin-information-native);
+commit `5f98777d1bad8b9399978931418531080e5336fb` deleted the unconsumed edge.
+Historical permissions and receipts prove only that historical implementation.
+The Overture backend has read-only local-file authority but no network, SQLite,
+process, or renderer authority.
 
 A catalogue's declared trust is data, not authority. Parsing JSON always yields
 an unverified `CatalogAuthority`; only a pinned digest or an explicit local
@@ -40,10 +59,14 @@ artifacts, size, digest, and optional subset dimensions.
 
 This separation matters. English Wikipedia is one resource with many releases
 and representations. A full-text ZIM and a title-only ZIM are not interchangeable.
-An Overture release is global, while a bounding-box/theme selection would be a
-derived representation. The contract models that selection, but this release
-rejects it until a materializer can produce deterministic artifacts and record
-their derivation.
+An Overture release is global, while an explicit bounding-box/theme/type query
+selects exact GeoParquet partitions. The Overture boundary does not reinterpret
+the mutable root's `latest` marker as authority: it separately binds the bytes,
+length, SHA-256, URI, and release ID of a release-specific catalog, then binds
+each STAC item and acquired partition. Partitions remain source representations,
+not `managed.documents.v1` text. A heavy engine receives only bounded
+random-access reads over open file leases plus a fixed bbox intersection predicate and must return an exact
+row-group/predicate receipt before bounded typed features are accepted.
 
 ## Installation state machine
 
@@ -114,6 +137,82 @@ External imports never enter this state machine: they are registrations of a
 caller-granted path with an observed identity and an explicit live-read-only or
 immutable-read-only policy.
 
+## Managed documents v1
+
+`managed.documents.v1` is the source-neutral derived-text boundary. It is not
+an Alexandria schema and it does not flatten source-specific query
+capabilities. A complete materialization binds resource/release/representation
+identity, exact immutable source artifacts, provenance, immutable documents,
+ordered zero-based text segments, typed document/segment/source locators,
+source-record hashes, transformation lineage, rights, and operational use
+policy. Inputs are fingerprinted and bounded to 10,000 documents, 250,000
+segments, one MiB per segment, and one GiB of text per activation.
+
+The store builds a strict SQLite database and FTS5 index in a private staging
+directory. It file-syncs the database and manifest/receipt, then activates the
+three-file representation with one same-filesystem rename. Exact retries are
+idempotent; reusing a materialization ID for different content fails. Searches
+bind the requested content hash, open the database read-only, and accept only a
+bounded literal-term query. The default promoted policy is private local
+search: model context remains unknown and therefore forbidden at enforcement,
+while excerpt export and redistribution are explicitly forbidden.
+
+Removal planning reveals only an Information-derived relative path and exact
+content/database hashes. Commit accepts those identities rather than a path,
+atomically hides the active directory, and removes only the managed database,
+manifest, and receipt. The store never opens a source archive during generic
+materialization, and source archives are outside the removal target by
+construction.
+
+## Attachment canonical-text producer boundary
+
+`information-native-attachment-bridge` is a service adapter downstream of
+Attachment and Information. Its path-free request binds one Attachment root
+SHA-256, ordered graph locator and graph hash, canonical artifact ID,
+processor/version/policy fingerprint, exact inert text bytes and hash, title,
+and explicitly confirmed rights. The adapter revalidates those facts against
+the in-memory Attachment bundle and receipt before calling the existing
+managed-document store. A deterministic binding fingerprint supplies the
+managed resource, release, representation, document, and segment identities;
+an exact retry reopens the same immutable release.
+
+The source remains Attachment-owned and unchanged. Information copies only the
+bounded canonical text into its separately rooted staged database, manifest,
+and receipt, then publishes them with the existing atomic rename. Every search
+hit reproduces the root, graph, artifact, processor/policy, canonical-text, and
+rights lineage. The bridge has no picker, path, URL, network, renderer, Mom
+store, or transform-execution authority. Product `Add to Library` UX and native
+acceptance remain separate work.
+
+## OpenZIM producer boundary
+
+`information-native-backend-zim` is a native-only producer, not a renderer or
+network backend. Its request contains a caller-authorized local path plus the
+exact acquisition-bound byte length and SHA-256. It rejects symlinks, split
+archives, non-regular files, identity changes during parsing, unchecked
+counts/offsets, overlapping structural regions, unordered namespace/path
+identities, invalid redirect/cluster references, and configured work or memory
+limit violations. The same file handle is hashed before and after bounded
+random-access parsing; canonical archive bytes are never modified.
+
+The initial parser deliberately supports modern OpenZIM major version 6 and
+cluster compression `none`/legacy-none and Zstandard. Zstandard window,
+compressed-cluster, decoded-cluster, cumulative decoded bytes, selected blob,
+candidate, document, per-article text, and total text bounds are all explicit.
+Historical LZMA, zip, and bzip2 compression, v5 headers, split archives,
+non-UTF-8 article decoding, dictionaries/skippable frames, and arbitrary
+binary MIME content fail or are omitted explicitly; there is no `xz2`, mmap,
+libzim FFI, sidecar, subprocess, or network fallback.
+
+Only `A`/`C` namespace `text/html`, `application/xhtml+xml`, and `text/plain`
+items become documents. HTML tags, comments, scripts, styles, templates, and
+noscript content are discarded; bounded normalized inert UTF-8 is the only
+content passed to `managed.documents.v1`. Each lineage record binds the raw
+blob SHA-256 and an exact `ZimArticle` locator containing archive UUID,
+namespace/path, and URL pointer-table entry index. The host composes this typed
+producer with the existing staged/atomic managed-document activation. It does
+not expose the local path or archive HTML to tool or renderer contracts.
+
 Managed installation is currently a synchronous host operation. The acquire
 layer accepts a cooperative progress callback, but a durable job identifier,
 progress subscription, and cancel command are not yet part of the Tauri or CLI
@@ -150,8 +249,8 @@ deadlines so long queries are interrupted inside the database engine.
 
 ## SQLite boundary
 
-SQLite adapters inspect schema before querying and accept only four compiled
-profiles:
+Canonical-source SQLite adapters inspect schema before querying and accept only
+four compiled profiles:
 
 - `alexandria.blocks.v1`: Alexandria blocks and FTS;
 - `community-archive.messages.v28`: Community Archive v28 messages and FTS;
@@ -174,6 +273,11 @@ rejected in live mode.
 Writable sidecars, if introduced by a backend, must be placed under the managed
 root and link to the canonical source by fingerprint. They may never share the
 canonical database path.
+
+The managed-document database is a separate Information-owned derived format,
+not a fifth external profile. Its schema is created only by the store from a
+validated `managed.documents.v1` value and is never applied to a canonical
+source database.
 
 On Unix, the store enforces owner-only directory and file modes for managed
 state. The portable path/symlink/identity checks still run on Windows, but this

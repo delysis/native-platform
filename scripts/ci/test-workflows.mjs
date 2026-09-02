@@ -15,6 +15,7 @@ const releasePath = path.join(root, ".github/workflows/release-macos.yml");
 const releaseScriptPath = path.join(root, "scripts/release-macos.sh");
 const smokeScriptPath = path.join(root, "scripts/smoke-macos-app.sh");
 const embeddedModelScriptPath = path.join(root, "scripts/find-embedded-model.mjs");
+const workflowSnapshotPath = path.join(root, "ci/ci-workflow-snapshot.json");
 const momPackagePath = path.join(
   root,
   "products/mom/apps/mom-llama/package.json",
@@ -26,6 +27,11 @@ const momWindowsIconPath = path.join(
 
 function read(file) {
   return fs.readFileSync(file, "utf8");
+}
+
+function workflowJobIds(source) {
+  const jobs = source.slice(source.indexOf("\njobs:\n") + "\njobs:\n".length);
+  return [...jobs.matchAll(/^  ([a-z][a-z0-9-]+):$/gm)].map((match) => match[1]);
 }
 
 function sha256(file) {
@@ -73,6 +79,16 @@ function macSmokeFixture(t, weightPath = null, weightContents = "fixture model b
     path.join(fakeTools, "shasum"),
     `#!/bin/sh
 node -e 'const fs=require("fs"),crypto=require("crypto"),p=process.argv[1]; console.log(crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex")+"  "+p)' "$3"
+`,
+  );
+  writeExecutable(
+    path.join(fakeTools, "stat"),
+    `#!/bin/sh
+if [ "$#" -ne 3 ] || [ "$1" != "-Lf" ] || [ "$2" != "%d:%i" ]; then
+  printf 'unsupported fake stat invocation\n' >&2
+  exit 2
+fi
+node -e 'const fs=require("fs"),s=fs.statSync(process.argv[1],{bigint:true}); process.stdout.write(String(s.dev)+":"+String(s.ino)+"\\n")' "$3"
 `,
   );
 
@@ -158,10 +174,13 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /stat -Lf '%d:%i' "\$LOOM_SMOKE_GGUF_MODEL_PATH"/);
   assert.doesNotMatch(smoke, /acceptance-writer/);
   assert.match(smoke, /exercise_loom_completion_word_reversal/);
-  assert.match(smoke, /characterDown\.postToPid\(pid\)/);
+  assert.match(smoke, /kAXValueAttribute as CFString/);
+  assert.match(smoke, /kAXSelectedTextRangeAttribute as CFString/);
+  assert.match(smoke, /virtualKey: 49/);
+  assert.match(smoke, /"terminal_space_key_event": terminalSpace/);
   assert.match(smoke, /event\.postToPid\(pid\)/);
-  assert.match(smoke, /native keyboard input never produced the exact observable editor value/);
-  assert.match(smoke, /native keyboard input did not leave one collapsed caret at the manuscript end/);
+  assert.match(smoke, /native Accessibility input did not stabilize at the exact value and collapsed end caret/);
+  assert.match(smoke, /"stable_seconds": 0\.4/);
   assert.match(smoke, /observed_editor_value/);
   assert.match(smoke, /observed_caret_utf16/);
   assert.match(smoke, /Option-Right did not persist one cached completion word/);
@@ -244,9 +263,121 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /start_loom_generation_guard/);
   assert.match(smoke, /fifth_run_observed/);
   assert.match(smoke, /generation_family_guard: generationGuard/);
+  assert.match(smoke, /start_loom_live_streaming_monitor/);
+  assert.match(smoke, /delysis\.loom-live-stream-witness\.v1/);
+  assert.match(smoke, /family_terminal_before_live_witness/);
+  assert.match(smoke, /event_kind = 'text_delta'/);
+  assert.match(smoke, /durableCumulativeText\.hasPrefix\(visibleSuffix\)/);
+  assert.match(smoke, /selectedPresentationKey == renderedPresentationKey/);
+  assert.match(smoke, /selectedPresentationKey == inlineVisibleKey/);
+  assert.match(smoke, /selectedRunIsTerminal\(selectedRunId\)/);
+  assert.match(smoke, /selected_run_terminal_after_accessibility": false/);
+  assert.match(smoke, /visible_suffix_is_durable_leading_projection": true/);
+  assert.match(smoke, /live_streaming_preterminal: liveStreaming/);
+  const liveObserverStart = smoke.indexOf("if ! start_loom_live_streaming_monitor");
+  const liveObserverWait = smoke.indexOf("if ! wait_for_loom_live_streaming_monitor");
+  const terminalFamilyWait = smoke.indexOf(
+    "RUN_1_REAL_GENERATION_EVIDENCE=$(wait_for_loom_generation_family",
+  );
+  assert.ok(
+    liveObserverStart >= 0 &&
+      liveObserverStart < autocompleteEnable &&
+      autocompleteEnable < liveObserverWait &&
+      liveObserverWait < terminalFamilyWait,
+    "the initialized AX/store observer must witness live text before terminal-family hydration",
+  );
+  assert.match(
+    smoke,
+    /RUN_1_LIVE_STREAMING_EVIDENCE=\$\(cat "\$LOOM_LIVE_STREAM_MONITOR_OUTPUT"\)/,
+  );
+
+  assert.match(smoke, /exercise_loom_idle_resume_ghost/);
+  assert.match(smoke, /delysis\.loom-idle-resume-ghost-witness\.v1/);
+  assert.match(smoke, /runningApplication\.hide\(\)/);
+  assert.match(smoke, /kAXHiddenAttribute as CFString/);
+  assert.match(smoke, /"PID-addressed AXHidden"/);
+  assert.match(smoke, /exact-PID System Events visible=false/);
+  assert.match(smoke, /exact-PID System Events visible=true/);
+  assert.match(smoke, /kCFBooleanFalse/);
+  assert.match(smoke, /"resume_dispatch": resumeDispatch/);
+  assert.match(smoke, /runningApplication\.isHidden/);
+  assert.match(smoke, /withBundleIdentifier: "com\.apple\.finder"/);
+  assert.match(smoke, /NSAppleScript\(/);
+  assert.match(smoke, /Finder Apple event/);
+  assert.match(smoke, /let minimumIdleSeconds: TimeInterval = 75/);
+  assert.match(smoke, /ProcessInfo\.processInfo\.systemUptime - idleStartedAtUptime/);
+  assert.match(smoke, /let deadlineUptime = ProcessInfo\.processInfo\.systemUptime \+ 120/);
+  assert.match(smoke, /Cross a full minute hidden/);
+  assert.match(
+    smoke,
+    /NSWorkspace\.shared\.frontmostApplication\?\.processIdentifier ==\s+backgroundApplication\.processIdentifier/,
+  );
+  assert.match(smoke, /generationCount\(\) == expectedGenerationCount/);
+  assert.match(smoke, /struct DurableCandidateIdentity: Equatable/);
+  assert.match(
+    smoke,
+    /SELECT f\.run_id, t\.candidate_id, c\.output_blob_id FROM family f/,
+  );
+  assert.match(smoke, /candidate\.candidateId == "run:\\[(]candidate\.runId[)]"/);
+  assert.match(smoke, /!candidate\.presentationKey\.hasPrefix\("stream:"\)/);
+  assert.match(smoke, /presentationMatchesDurableCandidate\(candidate, durable\)/);
+  assert.match(
+    smoke,
+    /waitForGhostIdentity\([\s\S]*?durableCandidates: durableFamilyCandidates,[\s\S]*?expected: before/,
+  );
+  assert.match(smoke, /"terminal_candidate_authority"/);
+  assert.match(smoke, /"before_identity"/);
+  assert.match(smoke, /"last_observed_identity"/);
+  assert.match(smoke, /"before_raw_observation"/);
+  assert.match(smoke, /"last_raw_observation"/);
+  assert.match(smoke, /"frontmost_matches_expected"/);
+  assert.match(smoke, /"application_hidden"/);
+  assert.match(smoke, /"application_active"/);
+  assert.match(smoke, /"writing_surface_present"/);
+  assert.match(smoke, /"selected_text_range"/);
+  assert.match(smoke, /"ax_value_utf8_bytes"/);
+  assert.match(smoke, /"ax_value_sha256"/);
+  assert.match(smoke, /"ax_value_suffix_sha256"/);
+  assert.match(smoke, /"completion_witness_text_found"/);
+  assert.match(smoke, /"completion_witness_parsed"/);
+  assert.match(smoke, /func completionWitnessCore/);
+  assert.match(smoke, /"rendered_presentation_key"/);
+  assert.match(smoke, /"inline_visible_key"/);
+  assert.doesNotMatch(smoke, /"ax_value":/);
+  assert.match(smoke, /launch-1-idle-resume-identity-diagnostics\.json/);
+  assert.match(smoke, /data\.write\(to: URL\(fileURLWithPath: identityFailurePath\), options: \.atomic\)/);
+  assert.match(smoke, /authority_frozen_before": before\.authorityFrozen/);
+  assert.match(smoke, /exact_ghost_identity_resynchronized": true/);
+  assert.match(smoke, /new_generation_started": false/);
+  assert.match(smoke, /ghost_stole_editor_focus": false/);
+  assert.match(smoke, /idle_resume_ghost: idleResumeGhost/);
+  const terminalGhostWait = smoke.indexOf(
+    "RUN_1_REAL_GHOST_EVIDENCE=$(wait_for_loom_accessibility_text",
+  );
+  const idleResumeWitness = smoke.indexOf(
+    "RUN_1_IDLE_RESUME_GHOST_EVIDENCE=$(exercise_loom_idle_resume_ghost",
+  );
+  const cachedInteractionWitness = smoke.indexOf(
+    "RUN_1_REAL_WORD_REVERSAL_EVIDENCE=$(exercise_loom_completion_word_reversal",
+  );
+  assert.ok(
+    terminalFamilyWait < terminalGhostWait &&
+      terminalGhostWait < idleResumeWitness &&
+      idleResumeWitness < cachedInteractionWitness,
+    "native hide/idle/resume must preserve the terminal ghost before cached interactions mutate it",
+  );
   assert.match(smoke, /launch-1-ghost-timeout-diagnostics\.json/);
   assert.match(smoke, /latest_generation_runs/);
   assert.match(smoke, /completion diagnostics:/);
+  assert.match(smoke, /restoreExactEditorFocus/);
+  assert.match(smoke, /NSWorkspace\.shared\.frontmostApplication\?\.processIdentifier == pid/);
+  assert.match(smoke, /observed\.hasPrefix\(expectedManuscript\)/);
+  assert.match(smoke, /selection\?\.location == expectedManuscript\.utf16\.count/);
+  assert.match(smoke, /did not restore exact foreground editor focus before visible completion proof/);
+  assert.match(
+    smoke,
+    /wait_for_loom_accessibility_text \\\n+\s+"\$ACTIVE_PID" "Suggestion available\." "\$RUN_1_EDITOR_SENTINEL"/,
+  );
 
   assert.match(smoke, /start_loom_project_busy_monitor/);
   assert.match(smoke, /another bounded project operation is still running/);
@@ -261,15 +392,45 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
     );
   }
   assert.match(smoke, /PID-targeted Command-A/);
-  assert.match(smoke, /if textField\(named: "Link destination"\) == nil/);
+  assert.match(smoke, /NSRunningApplication\.runningApplications/);
+  assert.match(smoke, /foreground_loom_process "\$ACTIVE_PID"/);
+  assert.match(smoke, /runningApplication\.unhide\(\)/);
+  assert.match(smoke, /Activation requested only once at that boundary is lost/);
+  assert.match(smoke, /System Events.*frontmost of first application process/s);
+  assert.match(smoke, /same-identifier macOS activation is not PID-addressable/);
+  assert.match(smoke, /DELYSIS_ACCEPTANCE_SOURCE_SHA/);
+  assert.match(smoke, /acceptance source SHA requires a clean repository worktree/);
+  assert.match(smoke, /DELYSIS_SMOKE_SOURCE_SHA="\$ACCEPTANCE_SOURCE_SHA"/);
+  assert.match(smoke, /attribute\(format, kAXExpandedAttribute as CFString\)/);
+  assert.match(smoke, /button\(named: "Title"\) != nil/);
+  assert.match(smoke, /sameSemanticSelection\(beforeSelectionWitness, current\)/);
+  assert.match(smoke, /sameAXSelectionSemantics\(beforeSelection, currentAX\)/);
+  assert.match(smoke, /caret_byte_offset/);
+  assert.match(smoke, /all_visible_text/);
+  assert.match(smoke, /integer\(witness, "epoch"\)/);
+  assert.match(smoke, /\.max \{ left, right in/);
+  assert.match(smoke, /selection\.canonical\.location == expected\.utf16\.count/);
+  assert.match(smoke, /terminal_line_break_utf16/);
+  assert.match(smoke, /delysis\.loom-completion-witness\.v1/);
+  assert.match(smoke, /editor_selection/);
+  assert.match(smoke, /internal_selection/);
+  assert.match(smoke, /bool\(witness, "caret_at_end"\)/);
+  assert.match(smoke, /bool\(observedSelectionWitness, "all_visible_text"\)/);
+  assert.match(smoke, /Date\(\)\.timeIntervalSince\(exactSelectionSince\) >= 0\.25/);
+  assert.match(smoke, /did not stably restore the exact manuscript selection/);
   assert.match(smoke, /editor_refocused/);
   assert.match(smoke, /observed_persisted_markdown/);
 });
 
 test("Loom's required macOS lane runs the headless WebKit editor interactions", () => {
   const workflow = read(".github/workflows/ci-pr.yml");
-  assert.match(workflow, /pnpm --filter @delysis\/loom exec playwright install webkit/);
-  assert.match(workflow, /pnpm --filter @delysis\/loom run test:browser/);
+  const macos = workflow.match(/^  platform-macos:[\s\S]*?(?=^  dependency-graph:)/m)?.[0];
+  assert.ok(macos, "platform-macos job block is missing");
+  assert.match(macos, /component: \$\{\{ fromJSON\(needs\.plan\.outputs\.macos_matrix\) \}\}/);
+  assert.match(macos, /if: \$\{\{ matrix\.component == 'loom' \}\}[\s\S]*pnpm --filter @delysis\/loom exec playwright install webkit/);
+  assert.match(macos, /name: Loom macOS[\s\S]*if: \$\{\{ matrix\.component == 'loom' \}\}[\s\S]*pnpm --filter @delysis\/loom run test:browser/);
+  const required = workflow.match(/^  ci-required:[\s\S]*$/m)?.[0];
+  assert.match(required, /^\s{6}- platform-macos$/m);
 });
 
 test("stable macOS packaging adds only the real distribution gates", () => {
@@ -381,7 +542,100 @@ test("PR workflow is always triggered and has one truthful aggregate", () => {
   assert.match(source, /^\s{4}if: always\(\)$/m);
   assert.match(source, /CI_NEEDS_JSON:\s*\$\{\{ toJSON\(needs\) \}\}/);
   assert.match(source, /node scripts\/ci\/ci-required\.mjs/);
-  assert.match(source, /node --test scripts\/ci\/test-ci-plan\.mjs scripts\/ci\/test-ci-required\.mjs scripts\/ci\/test-product-state-backup\.mjs scripts\/ci\/test-workflows\.mjs/);
+  assert.match(
+    source,
+    /node --test scripts\/ci\/test-ci-metadata-shadow\.mjs scripts\/ci\/test-ci-plan\.mjs scripts\/ci\/test-ci-required\.mjs scripts\/ci\/test-ignored-tests\.mjs scripts\/ci\/test-product-state-backup\.mjs scripts\/ci\/test-workflows\.mjs/,
+  );
+});
+
+test("required job names and workflow matrices match the checked-in R3 snapshot", () => {
+  const snapshot = JSON.parse(read(workflowSnapshotPath));
+  const pr = read(prPath);
+  const full = read(fullPath);
+  assert.equal(snapshot.schema, "native-platform.ci-workflow-snapshot.v1");
+  assert.match(pr, new RegExp(`^name: ${snapshot.pr.workflow_name}$`, "m"));
+  assert.match(full, new RegExp(`^name: ${snapshot.full.workflow_name}$`, "m"));
+  assert.deepEqual(workflowJobIds(pr), snapshot.pr.job_ids);
+  assert.deepEqual(workflowJobIds(full), snapshot.full.job_ids);
+  assert.match(
+    pr,
+    new RegExp(
+      `^  ${snapshot.pr.required_check}:\\n    name: ${snapshot.pr.required_check}$`,
+      "m",
+    ),
+  );
+
+  const commandMatrices = [...pr.matchAll(/^\s+command: \[([^\]]+)\]$/gm)].map(
+    (match) => match[1].split(",").map((value) => value.trim()),
+  );
+  assert.ok(commandMatrices.length > 0);
+  for (const matrix of commandMatrices) {
+    assert.deepEqual(matrix, snapshot.pr.command_matrix);
+  }
+
+  const ignoredBlock = pr.match(/^  ignored-tests:[\s\S]*?(?=^  fuzz-build:)/m)?.[0];
+  const ignoredMatrix = ignoredBlock
+    ?.match(/^\s+os: \[([^\]]+)\]$/m)?.[1]
+    .split(",")
+    .map((value) => value.trim());
+  assert.deepEqual(ignoredMatrix, snapshot.pr.ignored_test_os_matrix);
+
+  const macosComponents = [
+    ...new Set(
+      [...pr.matchAll(/matrix\.component (?:==|!=) '([^']+)'/g)].map(
+        (match) => match[1],
+      ),
+    ),
+  ].sort();
+  assert.deepEqual(macosComponents, [...snapshot.pr.macos_component_superset].sort());
+
+  const fullMatrices = [...full.matchAll(/^\s+os: \[([^\]]+)\]$/gm)].map(
+    (match) => match[1].split(",").map((value) => value.trim()),
+  );
+  assert.ok(fullMatrices.length > 0);
+  for (const matrix of fullMatrices) assert.deepEqual(matrix, snapshot.full.os_matrix);
+});
+
+test("full CI reconciles each current-platform ignored-test subset through guarded listing", () => {
+  const source = read(fullPath);
+  assert.match(
+    source,
+    /name: Reconcile ignored-test evidence registry with guarded list arguments/,
+  );
+  assert.match(source, /os: \[ubuntu-latest, macos-latest, windows-latest\]/);
+  const reconciliation = source.match(
+    /- name: Reconcile ignored-test evidence registry[\s\S]*?--cargo-list/,
+  )?.[0];
+  assert.ok(reconciliation, "full ignored-test reconciliation step is missing");
+  assert.doesNotMatch(reconciliation, /if: runner\.os/);
+  assert.match(source, /node scripts\/ci\/validate-ignored-tests\.mjs --cargo-list/);
+  assert.doesNotMatch(source, /without executing test bodies/);
+  assert.doesNotMatch(source, /cargo test[^\n]*--ignored(?! --list)/);
+});
+
+test("relevant PRs require exact guarded-list ignored-test reconciliation", () => {
+  const source = read(prPath);
+  assert.match(
+    source,
+    /^\s{6}ignored_tests: \$\{\{ steps\.plan\.outputs\.ignored_tests \}\}$/m,
+  );
+  const block = source.match(/^  ignored-tests:[\s\S]*?(?=^  fuzz-build:)/m)?.[0];
+  assert.ok(block, "ignored-tests PR job block is missing");
+  assert.match(block, /fail-fast: false/);
+  assert.match(block, /os: \[ubuntu-latest, macos-latest, windows-latest\]/);
+  assert.match(block, /runs-on: \$\{\{ matrix\.os \}\}/);
+  assert.match(block, /if: runner\.os == 'Windows'/);
+  assert.match(block, /if: runner\.os == 'Linux'/);
+  assert.match(block, /needs\.plan\.outputs\.ignored_tests == 'true'/);
+  assert.match(
+    block,
+    /name: Reconcile exact ignored-test inventory with guarded list arguments/,
+  );
+  assert.match(block, /node scripts\/ci\/validate-ignored-tests\.mjs --cargo-list/);
+  assert.doesNotMatch(block, /without executing test bodies/);
+  assert.doesNotMatch(block, /cargo test[^\n]*--ignored(?! --list)/);
+  const required = source.match(/^  ci-required:[\s\S]*$/m)?.[0];
+  assert.match(required, /^\s{6}- ignored-tests$/m);
 });
 
 test("PR workflow exposes every targeted partition and future product guards", () => {
@@ -399,6 +653,7 @@ test("PR workflow exposes every targeted partition and future product guards", (
     "loom-linux",
     "frontend",
     "platform-macos",
+    "ignored-tests",
     "dependency-graph",
     "fuzz-build",
   ]) {
@@ -460,6 +715,7 @@ test("PR frontend runs only selected product frontend commands", () => {
   );
   assert.match(prFrontend, /name: Mom frontend/);
   assert.match(prFrontend, /pnpm --filter @delysis\/mom-llama run check:frontend/);
+  assert.match(prFrontend, /pnpm --filter @delysis\/mom-llama run test:frontend/);
   assert.match(prFrontend, /name: Loom frontend/);
   assert.match(prFrontend, /pnpm --filter @delysis\/loom run test/);
   assert.match(prFrontend, /pnpm --filter @delysis\/loom run check/);
@@ -473,8 +729,22 @@ test("Mom exposes the frontend syntax check used by PR CI", () => {
   const scripts = JSON.parse(read(momPackagePath)).scripts;
   assert.equal(
     scripts["check:frontend"],
-    "node --check ui/cache-inspector.js && node --check ui/coop-hx.js",
+    "node --check ui/composer-key-policy.js && node --check ui/coop-hx.js && node --check ui/product-surface-contract.test.js",
   );
+  assert.match(scripts["test:frontend"], /(?:^|\s)ui\/persona-sidebar-wiring\.test\.js(?:\s|$)/);
+});
+
+test("PR and full CI enforce current service documentation paths", () => {
+  const pr = read(prPath);
+  const full = read(fullPath);
+  const prPolicy = pr.match(/^  policy:[\s\S]*?(?=^  root-linux:)/m)?.[0];
+  const fullRoot = full.match(/^  root:[\s\S]*?(?=^  attachment:)/m)?.[0];
+  for (const block of [prPolicy, fullRoot]) {
+    assert.ok(block, "documentation policy job block is missing");
+    assert.match(block, /node --test scripts\/ci\/test-current-docs\.mjs/);
+    assert.match(block, /node scripts\/ci\/validate-current-docs\.mjs/);
+  }
+  assert.match(fullRoot, /if: runner\.os == 'Linux'/);
 });
 
 test("full frontend coverage remains unchanged", () => {
@@ -565,10 +835,12 @@ test("full workflow covers main, nightly, dispatch, products, policy, and fuzz",
   assert.match(source, /^\s{4}if: always\(\)$/m);
 });
 
-test("Windows compatibility remains in full CI, not the blocking PR lane", () => {
+test("Windows remains full CI plus the exact ignored-inventory PR matrix only", () => {
   const pr = read(prPath);
   const full = read(fullPath);
-  assert.doesNotMatch(pr, /windows-latest/);
+  const ignored = pr.match(/^  ignored-tests:[\s\S]*?(?=^  fuzz-build:)/m)?.[0];
+  assert.match(ignored, /windows-latest/);
+  assert.doesNotMatch(pr.replace(ignored, ""), /windows-latest/);
   assert.match(full, /windows-latest/);
   assert.match(full, /ci-full-/);
 });

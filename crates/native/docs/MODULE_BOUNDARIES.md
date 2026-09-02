@@ -25,6 +25,11 @@ store, load bounded resident models and submit `llama-native-types` requests.
 This repository never selects a database, key manager, network policy, hosted
 provider, application data directory or user interface.
 
+Every prefix lookup has an explicit `CacheOwnerScope`: `Unowned` matches only
+artifacts without an owner, while `Exact(owner)` matches only that owner. A
+generic chat lookup cannot borrow a persona-, conversation-, or skill-owned
+artifact merely because its tokens are compatible.
+
 New products should use `GenerationBatchRequest` for branch families. Legacy
 `GenerationRequest` completion/chat calls remain wrappers over the same raw
 case path, while `SharedPrefixBatchRequest` remains available for existing

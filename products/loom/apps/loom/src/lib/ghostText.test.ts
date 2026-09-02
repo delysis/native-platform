@@ -55,7 +55,8 @@ describe('planGhostText', () => {
       alternatives: [],
       hidden: false,
       unconsumeText: '',
-      fanVisible: false
+      fanVisible: false,
+      renderEpoch: 0
     });
   });
 
@@ -279,6 +280,61 @@ describe('visual ghost widget', () => {
     expect(modifierStates).toEqual([true, false]);
   });
 
+  it('keeps Option held while an exact hidden rollback restores the fan family', () => {
+    const modifierStates: boolean[] = [];
+    const unconsumed: string[] = [];
+    const plugin = createGhostTextPlugin({
+      accept: () => true,
+      dismiss() {},
+      // An exhausted completion has no visible inline text. Its exact bytes
+      // immediately before the caret, not a widget visibility witness, own
+      // the one authorized rollback.
+      visible: () => false,
+      unconsume: (_candidateId, _presentationKey, text) => {
+        unconsumed.push(text);
+        return true;
+      },
+      modifier: (held) => modifierStates.push(held)
+    });
+    const doc = defaultMarkdownParser.parse('A waits for rain.');
+    let state = EditorState.create({
+      doc,
+      selection: Selection.atEnd(doc),
+      plugins: [plugin]
+    });
+    state = state.apply(state.tr.setMeta(ghostTextPluginKey, {
+      kind: 'set',
+      presentation: {
+        ...suggestion,
+        anchorByteOffset: 17,
+        text: '',
+        hidden: true,
+        unconsumeText: ' for rain.',
+        fanVisible: false,
+        alternatives: [
+          { candidateId: suggestion.candidateId, presentationKey: suggestion.presentationKey, text: ' for rain.' },
+          { candidateId: 'b', presentationKey: 'b:1', text: ' until dawn.' }
+        ]
+      }
+    }));
+    const view = {
+      get state() { return state; },
+      dispatch(transaction: Parameters<EditorState['apply']>[0]) {
+        state = state.apply(transaction);
+      }
+    } as unknown as EditorView;
+
+    const handled = plugin.props.handleKeyDown?.call(plugin, view, {
+      key: 'ArrowLeft', altKey: true, metaKey: false, ctrlKey: false,
+      isComposing: false, keyCode: 37, preventDefault() {}
+    } as unknown as KeyboardEvent);
+
+    expect(handled).toBe(true);
+    expect(modifierStates).toEqual([true]);
+    expect(unconsumed).toEqual([' for rain.']);
+    expect(state.doc.textContent).toBe('A waits');
+  });
+
   it('chooses the highlighted alternative with Option-Return while the inline ghost is hidden', () => {
     const inserted: string[] = [];
     const modifierStates: boolean[] = [];
@@ -306,8 +362,38 @@ describe('visual ghost widget', () => {
         ]
       }
     }));
+    const clip = { left: 0, top: 0, right: 500, bottom: 500 };
+    let widget: Record<string, unknown>;
+    const ownerDocument = {
+      defaultView: {
+        getComputedStyle: (element: unknown) => ({
+          display: 'inline',
+          visibility: element === widget ? 'hidden' : 'visible',
+          opacity: '1',
+          direction: 'ltr'
+        })
+      }
+    };
+    const dom = {
+      isConnected: true,
+      hidden: false,
+      ownerDocument,
+      parentElement: null,
+      querySelectorAll: () => [widget],
+      closest: () => ({ getBoundingClientRect: () => clip })
+    };
+    widget = {
+      isConnected: true,
+      hidden: false,
+      ownerDocument,
+      parentElement: dom,
+      getAttribute: () => suggestion.presentationKey,
+      getBoundingClientRect: () => ({ left: 40, top: 40, right: 120, bottom: 60 })
+    };
     const view = {
       get state() { return state; },
+      dom,
+      coordsAtPos: () => ({ left: 40, top: 40, right: 40, bottom: 60 }),
       dispatch(transaction: Parameters<EditorState['apply']>[0]) { state = state.apply(transaction); }
     } as unknown as EditorView;
     const handled = plugin.props.handleKeyDown?.call(plugin, view, {
@@ -573,6 +659,34 @@ describe('faithful visual ghost projection', () => {
 });
 
 describe('ghost-text plugin state', () => {
+  it('rebuilds an unchanged widget only for an explicit lifecycle refresh', () => {
+    let state = stateAtEnd('The sentence waits', true);
+    let dispatchCount = 0;
+    const view = {
+      get state() { return state; },
+      dispatch(transaction: Parameters<EditorView['dispatch']>[0]) {
+        dispatchCount += 1;
+        state = state.apply(transaction);
+      }
+    } as unknown as EditorView;
+
+    setGhostText(view, suggestion);
+    expect(dispatchCount).toBe(1);
+    expect(ghostTextPluginKey.getState(state)?.renderEpoch).toBe(0);
+
+    setGhostText(view, suggestion);
+    expect(dispatchCount).toBe(1);
+
+    setGhostText(view, suggestion, true);
+    expect(dispatchCount).toBe(2);
+    expect(ghostTextPluginKey.getState(state)?.renderEpoch).toBe(1);
+    expect(renderedGhostPresentationKey(state)).toBe(suggestion.presentationKey);
+
+    setGhostText(view, suggestion, true);
+    expect(dispatchCount).toBe(3);
+    expect(ghostTextPluginKey.getState(state)?.renderEpoch).toBe(2);
+  });
+
   it('clears synchronously on the first document-changing transaction', () => {
     let state = stateAtEnd('The sentence waits', true);
     const view = {
@@ -586,6 +700,35 @@ describe('ghost-text plugin state', () => {
     expect(ghostTextPluginKey.getState(state)?.presentationKey).toBe(suggestion.presentationKey);
     expect(renderedGhostPresentationKey(state)).toBe(suggestion.presentationKey);
     state = state.apply(state.tr.insertText('!'));
+    expect(ghostTextPluginKey.getState(state)).toBeNull();
+    expect(renderedGhostPresentationKey(state)).toBe('');
+  });
+
+  it('survives an explicit same-selection reconciliation but clears when the caret moves', () => {
+    let state = stateAtEnd('The sentence waits', true);
+    const view = {
+      get state() { return state; },
+      dispatch(transaction: Parameters<EditorView['dispatch']>[0]) {
+        state = state.apply(transaction);
+      }
+    } as unknown as EditorView;
+
+    setGhostText(view, suggestion);
+    const exactSelection = state.selection;
+    const sameSelection = state.tr.setSelection(TextSelection.create(
+      state.doc,
+      exactSelection.from,
+      exactSelection.to
+    ));
+    expect(sameSelection.selectionSet).toBe(true);
+    state = state.apply(sameSelection);
+    expect(ghostTextPluginKey.getState(state)?.presentationKey).toBe(suggestion.presentationKey);
+    expect(renderedGhostPresentationKey(state)).toBe(suggestion.presentationKey);
+
+    state = state.apply(state.tr.setSelection(TextSelection.create(
+      state.doc,
+      exactSelection.from - 1
+    )));
     expect(ghostTextPluginKey.getState(state)).toBeNull();
     expect(renderedGhostPresentationKey(state)).toBe('');
   });

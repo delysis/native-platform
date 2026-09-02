@@ -9,9 +9,10 @@ use loom_types::{
     CancelGenerationCommand, CandidateId, CommandId, CommandKind, CommandReceipt, ContextRecipe,
     DocumentId, DocumentKind, GeneratedSpan, GenerationEvent, GenerationEventId,
     GenerationEventKind, GenerationRunId, GenerationStart, GenerationTerminalEvent,
-    GenerationTerminalStatus, KeepAlternativeCommand, ModelEnvironment, ModelEnvironmentId,
-    ModelRole, OperationId, PromoteCandidateCommand, PromptRecipe, RevisionId, SelectionDecision,
-    SelectionEvent, SelectionId, TokenTrace, now_unix_ms,
+    GenerationTerminalStatus, KeepAlternativeCommand, MAX_GENERATION_TEXT_DELTA_BYTES,
+    ModelEnvironment, ModelEnvironmentId, ModelRole, OperationId, PromoteCandidateCommand,
+    PromptRecipe, RevisionId, SelectionDecision, SelectionEvent, SelectionId, TokenTrace,
+    now_unix_ms,
 };
 use loom_types::{AuthorshipAttestation, AuthorshipEvidenceClass, ContributionKind};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -33,8 +34,13 @@ const MAX_PROVENANCE_JSON_BYTES: usize = 16 * 1024 * 1024;
 const MAX_EVENT_JSON_BYTES: usize = 1024 * 1024;
 const MAX_BRANCH_ERROR_CHARACTERS: usize = 1_024;
 const MAX_INDEXED_MODEL_IDENTIFIER_BYTES: usize = 4_096;
+const MAX_GENERATION_PROGRESS_TEXT_EVENTS: usize = 4_096;
 pub const MAX_BRANCH_PAGE_SIZE: usize = 64;
 pub const MAX_BRANCH_BODY_BYTES: u64 = 4 * 1024 * 1024;
+/// Hard IPC/read ceiling for the cumulative, non-promotable text projection of
+/// one active generation. Terminal candidate bodies have a separate authority
+/// path and a larger independent bound.
+pub const MAX_GENERATION_PROGRESS_TEXT_BYTES: usize = 256 * 1024;
 const BRANCH_SUMMARY_SELECT: &str = "SELECT gr.run_id, gr.branch_id, gr.source_revision_id,
             gr.target_start_byte, gr.target_end_byte, gr.created_at_ms,
             gri.sequence, gri.seed_decimal, gri.model_identifier,
@@ -47,13 +53,16 @@ const BRANCH_SUMMARY_SELECT: &str = "SELECT gr.run_id, gr.branch_id, gr.source_r
             (SELECT se.decision FROM selection_events se
              WHERE se.candidate_id = gc.candidate_id
              ORDER BY se.created_at_ms DESC, se.selection_id DESC
-             LIMIT 1)
+             LIMIT 1),
+            weave_family.command_id
      FROM generation_runs gr
      JOIN generation_run_index gri ON gri.run_id = gr.run_id
      LEFT JOIN generation_terminals gt ON gt.run_id = gr.run_id
      LEFT JOIN generation_candidates gc ON gc.run_id = gr.run_id
      LEFT JOIN blobs output_blob
-       ON output_blob.blob_id = gc.output_blob_id";
+       ON output_blob.blob_id = gc.output_blob_id
+     LEFT JOIN generation_weave_commands weave_family
+       ON weave_family.run_id = gr.run_id";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RecordedArtifact {
@@ -183,6 +192,8 @@ pub struct KeepAlternativeOutcome {
 pub struct StoredBranchRecord {
     pub run_id: GenerationRunId,
     pub branch_id: BranchId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weave_command_id: Option<CommandId>,
     pub document_id: DocumentId,
     pub source_revision_id: RevisionId,
     pub target_range: ByteRange,
@@ -221,6 +232,8 @@ pub struct BranchPageCursor {
 pub struct StoredBranchSummary {
     pub run_id: GenerationRunId,
     pub branch_id: BranchId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weave_command_id: Option<CommandId>,
     pub document_id: DocumentId,
     pub source_revision_id: RevisionId,
     pub target_range: ByteRange,
@@ -257,6 +270,19 @@ pub struct StoredBranchBody {
     pub run_id: GenerationRunId,
     pub output_blob_id: BlobId,
     pub byte_len: u64,
+    pub text: String,
+}
+
+/// A bounded replay of the canonical text deltas already committed for one
+/// generation run. This is presentation state only: it cannot be promoted and
+/// never substitutes for a terminal candidate body.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredGenerationProgressText {
+    pub run_id: GenerationRunId,
+    pub branch_id: BranchId,
+    pub last_event_sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_text_delta_sequence: Option<u64>,
     pub text: String,
 }
 
@@ -689,6 +715,17 @@ impl ProjectStore {
             CommandKind::Weave,
             started_at_ms,
         )?;
+        for generation in &prepared {
+            transaction.execute(
+                "INSERT INTO generation_weave_commands(run_id, command_id, run_artifact_id)
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    generation.generation.run_id.to_string(),
+                    command_id.to_string(),
+                    generation.run_artifact_id.to_string(),
+                ],
+            )?;
+        }
         transaction.commit()?;
         Ok(GenerationFamilyStarted {
             generations: prepared
@@ -714,6 +751,13 @@ impl ProjectStore {
     ) -> Result<GenerationEvent> {
         if matches!(kind, GenerationEventKind::CandidateReady { .. }) {
             return Err(StoreError::CandidateReadyRequiresTerminalCandidate);
+        }
+        if let GenerationEventKind::TextDelta { text } = &kind {
+            ensure_payload_size(
+                "generation text delta",
+                text.len(),
+                MAX_GENERATION_TEXT_DELTA_BYTES,
+            )?;
         }
         let run = self.run_identity(run_id)?;
         let payload = bounded_json("generation event", &kind, MAX_EVENT_JSON_BYTES)?;
@@ -2016,6 +2060,96 @@ impl ProjectStore {
         }
     }
 
+    /// Replays the exact UTF-8 text deltas durably recorded for one run under
+    /// an exact document identity. Callers receive one bounded cumulative
+    /// prefix, so renderer wakeup loss or suspension cannot lose presentation
+    /// state. The terminal candidate remains the only promotable authority.
+    pub fn generation_progress_text(
+        &self,
+        document_id: DocumentId,
+        run_id: GenerationRunId,
+    ) -> Result<StoredGenerationProgressText> {
+        let identity: Option<(String, i64)> = self
+            .connection
+            .query_row(
+                "SELECT gr.branch_id, MAX(ge.sequence)
+                 FROM generation_runs gr
+                 JOIN generation_events ge ON ge.run_id = gr.run_id
+                 WHERE gr.document_id = ?1 AND gr.run_id = ?2
+                 GROUP BY gr.branch_id",
+                params![document_id.to_string(), run_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((branch_id, last_event_sequence)) = identity else {
+            return Err(StoreError::GenerationRunNotFound(run_id));
+        };
+        let branch_id = parse_id(&branch_id, "generation progress branch_id")?;
+        let last_event_sequence = u64::try_from(last_event_sequence).map_err(|_| {
+            StoreError::CorruptDatabase("negative generation event sequence".into())
+        })?;
+
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, payload_json
+             FROM generation_events
+             WHERE run_id = ?1 AND event_kind = 'text_delta'
+             ORDER BY sequence ASC",
+        )?;
+        let rows = statement.query_map([run_id.to_string()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut text = String::new();
+        let mut last_text_delta_sequence = None;
+        for (index, row) in rows.enumerate() {
+            if index >= MAX_GENERATION_PROGRESS_TEXT_EVENTS {
+                return Err(StoreError::CorruptDatabase(format!(
+                    "generation run {run_id} exceeds the bounded text-delta event count"
+                )));
+            }
+            let (sequence, payload_json) = row?;
+            let sequence = u64::try_from(sequence).map_err(|_| {
+                StoreError::CorruptDatabase("negative text-delta event sequence".into())
+            })?;
+            if last_text_delta_sequence.is_some_and(|previous| sequence <= previous)
+                || sequence > last_event_sequence
+            {
+                return Err(StoreError::CorruptDatabase(
+                    "text-delta event sequences are not strictly increasing".into(),
+                ));
+            }
+            let kind: GenerationEventKind = serde_json::from_str(&payload_json)?;
+            let GenerationEventKind::TextDelta { text: delta } = kind else {
+                return Err(StoreError::CorruptDatabase(
+                    "text_delta index row contains another generation event kind".into(),
+                ));
+            };
+            ensure_payload_size(
+                "generation text delta",
+                delta.len(),
+                MAX_GENERATION_TEXT_DELTA_BYTES,
+            )?;
+            let projected_bytes = text.len().checked_add(delta.len()).ok_or_else(|| {
+                StoreError::CorruptDatabase(format!(
+                    "generation run {run_id} overflows the progress-text byte count"
+                ))
+            })?;
+            if projected_bytes > MAX_GENERATION_PROGRESS_TEXT_BYTES {
+                return Err(StoreError::CorruptDatabase(format!(
+                    "generation run {run_id} exceeds the bounded progress-text byte count"
+                )));
+            }
+            text.push_str(&delta);
+            last_text_delta_sequence = Some(sequence);
+        }
+        Ok(StoredGenerationProgressText {
+            run_id,
+            branch_id,
+            last_event_sequence,
+            last_text_delta_sequence,
+            text,
+        })
+    }
+
     /// Loads one canonical candidate output under both a caller budget and
     /// Loom's hard ceiling. Arbitrary terminal partial evidence remains in the
     /// provenance API because cancellation may end between UTF-8 boundaries.
@@ -2147,6 +2281,7 @@ impl ProjectStore {
         Ok(Some(StoredBranchRecord {
             run_id: summary.run_id,
             branch_id: summary.branch_id,
+            weave_command_id: summary.weave_command_id,
             document_id: summary.document_id,
             source_revision_id: summary.source_revision_id,
             target_range: summary.target_range,
@@ -3211,6 +3346,14 @@ fn insert_generation_event_with_payload(
     payload: &[u8],
     terminal: bool,
 ) -> Result<()> {
+    if let GenerationEventKind::TextDelta { text } = &event.kind {
+        ensure_payload_size(
+            "generation text delta",
+            text.len(),
+            MAX_GENERATION_TEXT_DELTA_BYTES,
+        )?;
+        ensure_generation_progress_append_budget(transaction, event.run_id, text.len())?;
+    }
     transaction.execute(
         "INSERT INTO generation_events(event_id, run_id, sequence, event_kind, payload_json, is_terminal, created_at_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -3228,6 +3371,76 @@ fn insert_generation_event_with_payload(
             event.occurred_at_ms,
         ],
     )?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GenerationProgressUsage {
+    text_events: usize,
+    text_bytes: usize,
+}
+
+fn ensure_generation_progress_append_budget(
+    transaction: &Transaction<'_>,
+    run_id: GenerationRunId,
+    incoming_bytes: usize,
+) -> Result<()> {
+    let (text_events, text_bytes, canonical_events): (i64, i64, i64) = transaction.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(length(CAST(json_extract(payload_json, '$.text') AS BLOB))), 0),
+                COALESCE(SUM(
+                    CASE
+                        WHEN json_extract(payload_json, '$.kind') = 'text_delta'
+                         AND json_type(payload_json, '$.text') = 'text'
+                        THEN 1 ELSE 0
+                    END
+                ), 0)
+         FROM generation_events
+         WHERE run_id = ?1 AND event_kind = 'text_delta'",
+        [run_id.to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if canonical_events != text_events {
+        return Err(StoreError::CorruptDatabase(format!(
+            "generation run {run_id} contains a malformed text-delta event"
+        )));
+    }
+    let usage = GenerationProgressUsage {
+        text_events: usize::try_from(text_events).map_err(|_| {
+            StoreError::CorruptDatabase("negative generation text-event count".into())
+        })?,
+        text_bytes: usize::try_from(text_bytes).map_err(|_| {
+            StoreError::CorruptDatabase("negative generation progress byte count".into())
+        })?,
+    };
+    validate_generation_progress_append(usage, incoming_bytes)
+}
+
+fn validate_generation_progress_append(
+    usage: GenerationProgressUsage,
+    incoming_bytes: usize,
+) -> Result<()> {
+    let actual_events = usage.text_events.checked_add(1).ok_or_else(|| {
+        StoreError::CorruptDatabase("generation text-event count overflow".into())
+    })?;
+    if actual_events > MAX_GENERATION_PROGRESS_TEXT_EVENTS {
+        return Err(StoreError::GenerationProgressEventLimitExceeded {
+            actual_events,
+            max_events: MAX_GENERATION_PROGRESS_TEXT_EVENTS,
+        });
+    }
+    let actual_bytes = usage
+        .text_bytes
+        .checked_add(incoming_bytes)
+        .ok_or_else(|| {
+            StoreError::CorruptDatabase("generation progress byte count overflow".into())
+        })?;
+    if actual_bytes > MAX_GENERATION_PROGRESS_TEXT_BYTES {
+        return Err(StoreError::GenerationProgressTextLimitExceeded {
+            actual_bytes,
+            max_bytes: MAX_GENERATION_PROGRESS_TEXT_BYTES,
+        });
+    }
     Ok(())
 }
 
@@ -3497,6 +3710,7 @@ type BranchSummaryRow = (
     Option<String>,
     Option<i64>,
     Option<String>,
+    Option<String>,
 );
 
 fn query_branch_summary_rows<P>(
@@ -3527,6 +3741,7 @@ where
                 row.get(13)?,
                 row.get(14)?,
                 row.get(15)?,
+                row.get(16)?,
             ))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -3600,9 +3815,15 @@ fn parse_branch_summary_row(
             "generation output blob identity and byte length disagree".into(),
         ));
     }
+    let weave_command_id = row
+        .16
+        .as_deref()
+        .map(|command_id| parse_id(command_id, "weave_command_id"))
+        .transpose()?;
     Ok(StoredBranchSummary {
         run_id,
         branch_id: parse_id(&row.1, "branch_id")?,
+        weave_command_id,
         document_id,
         source_revision_id: parse_id(&row.2, "source_revision_id")?,
         target_range,
@@ -3689,6 +3910,66 @@ mod tests {
         explicit_review_candidate_count: usize,
         ordinary_tab: String,
         forbidden_primary_chrome: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct CompletionRecoveryFixture {
+        schema_version: u32,
+        fixture_id: String,
+        evidence_class: String,
+        source: CompletionRecoverySource,
+        autosave: CompletionRecoveryAutosave,
+        models: CompletionRecoveryModels,
+        family: Vec<CompletionRecoveryRun>,
+    }
+
+    #[derive(Deserialize)]
+    struct CompletionRecoverySource {
+        relative_path: String,
+        revision_text: String,
+        caret_byte: u64,
+    }
+
+    #[derive(Deserialize)]
+    struct CompletionRecoveryAutosave {
+        revision_text: String,
+    }
+
+    #[derive(Deserialize)]
+    struct CompletionRecoveryModels {
+        initial: String,
+        replacement: String,
+    }
+
+    #[derive(Deserialize)]
+    struct CompletionRecoveryRun {
+        run_id: String,
+        branch_id: String,
+        seed: u64,
+        terminal: CompletionRecoveryTerminal,
+    }
+
+    #[derive(Deserialize)]
+    struct CompletionRecoveryTerminal {
+        status: String,
+        candidate_id: Option<String>,
+        text: Option<String>,
+        sha256: Option<BlobId>,
+        error: Option<String>,
+    }
+
+    struct CompletionRecoveryWitness {
+        logical_run_id: String,
+        logical_branch_id: String,
+        run_id: GenerationRunId,
+        branch_id: BranchId,
+        seed: u64,
+        status: StoredBranchStatus,
+        terminal_status: GenerationTerminalStatus,
+        candidate_id: Option<CandidateId>,
+        output_blob_id: Option<BlobId>,
+        output_text: Option<String>,
+        error: Option<String>,
     }
 
     struct W1FamilyReopenWitness {
@@ -3872,6 +4153,42 @@ mod tests {
         }
     }
 
+    fn insert_legacy_text_events(
+        store: &mut ProjectStore,
+        run_id: GenerationRunId,
+        event_count: usize,
+    ) {
+        let transaction = store
+            .connection
+            .transaction()
+            .expect("open legacy progress transaction");
+        {
+            let mut statement = transaction
+                .prepare(
+                    "INSERT INTO generation_events(
+                         event_id, run_id, sequence, event_kind, payload_json, is_terminal,
+                         created_at_ms
+                     ) VALUES (?1, ?2, ?3, 'text_delta', ?4, 0, ?5)",
+                )
+                .expect("prepare legacy text-event insertion");
+            let payload =
+                serde_json::to_string(&GenerationEventKind::TextDelta { text: "x".into() })
+                    .expect("serialize legacy text event");
+            for sequence in 1..=event_count {
+                statement
+                    .execute(params![
+                        GenerationEventId::new().to_string(),
+                        run_id.to_string(),
+                        i64::try_from(sequence).expect("fixture sequence fits i64"),
+                        &payload,
+                        now_unix_ms(),
+                    ])
+                    .expect("insert legacy progress event");
+            }
+        }
+        transaction.commit().expect("commit legacy progress");
+    }
+
     fn assert_w1_promotion_survives_reopen(
         fixture: Fixture,
         spec: &W1SuggestionFixture,
@@ -4004,6 +4321,80 @@ mod tests {
                 .expect("read promoted document")
                 .text,
             "Once upon a time"
+        );
+    }
+
+    #[test]
+    fn tombstoned_document_rejects_stale_candidate_promotion_after_path_recreation() {
+        let mut fixture = Fixture::new();
+        let start = fixture.start(fixture.writer_environment);
+        let terminal = fixture.finish(start.generation.run_id, "must not promote");
+        fixture
+            .store
+            .delete_document_file_idempotent(
+                CommandId::new(),
+                fixture.loaded.document_id,
+                fixture.loaded.revision_id,
+                fixture.loaded.blob_id,
+            )
+            .expect("delete active document");
+        let visible_path = fixture.store.root.join("manuscript/001.md");
+        fs::write(&visible_path, fixture.loaded.text.as_bytes())
+            .expect("recreate historical path with exact old bytes");
+        let counts_before = fixture
+            .store
+            .counts()
+            .expect("counts before stale promotion");
+        let outbox_before: i64 = fixture
+            .store
+            .connection
+            .query_row("SELECT COUNT(*) FROM visible_file_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("outbox count before stale promotion");
+
+        let failure = fixture
+            .store
+            .accept_diagnostic_candidate_with_command(
+                CommandId::new(),
+                PromoteCandidateCommand {
+                    candidate_id: terminal.candidate.candidate_id,
+                    expected_source_revision_id: fixture.loaded.revision_id,
+                    expected_visible_blob_id: fixture.loaded.blob_id,
+                },
+            )
+            .expect_err("tombstone is immutable mutation authority");
+        assert!(matches!(
+            failure,
+            StoreError::DocumentExplicitlyDeleted(id) if id == fixture.loaded.document_id
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .counts()
+                .expect("counts after stale promotion"),
+            counts_before
+        );
+        assert_eq!(
+            fixture
+                .store
+                .connection
+                .query_row("SELECT COUNT(*) FROM visible_file_outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("outbox count after stale promotion"),
+            outbox_before
+        );
+        assert_eq!(
+            fs::read_to_string(visible_path).expect("recreated bytes remain unmanaged"),
+            fixture.loaded.text
+        );
+        assert!(
+            fixture
+                .store
+                .list_documents()
+                .expect("active documents")
+                .is_empty()
         );
     }
 
@@ -4291,6 +4682,527 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM generation_runs", [], |row| row.get(0))
             .expect("count family runs");
         assert_eq!(run_count, 3);
+    }
+
+    #[test]
+    fn branch_reads_keep_distinct_weave_families_and_ignore_cancellation_receipts() {
+        let mut fixture = Fixture::new();
+        let document_id = fixture.loaded.document_id;
+        let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
+        let target = ByteRange { start: end, end };
+        let first_command_id = CommandId::new();
+        let first_family = fixture
+            .store
+            .start_generation_family_with_command(
+                first_command_id,
+                vec![
+                    fixture.generation_start(fixture.writer_environment, target, 71),
+                    fixture.generation_start(fixture.writer_environment, target, 72),
+                ],
+            )
+            .expect("start first weave family");
+        let second_command_id = CommandId::new();
+        let second_family = fixture
+            .store
+            .start_generation_family_with_command(
+                second_command_id,
+                vec![
+                    fixture.generation_start(fixture.writer_environment, target, 73),
+                    fixture.generation_start(fixture.writer_environment, target, 74),
+                ],
+            )
+            .expect("start second weave family");
+        let cancelled_run_id = first_family.generations[0].generation.run_id;
+        let cancelled_run_artifact_id = first_family.generations[0].run_artifact_id;
+        let cancellation_command_id = CommandId::new();
+        fixture
+            .store
+            .request_cancel_generation_with_command(
+                cancellation_command_id,
+                CancelGenerationCommand {
+                    run_id: cancelled_run_id,
+                },
+            )
+            .expect("record cancellation event");
+
+        // Even a direct association attempt cannot turn cancellation authority
+        // into weave-family authority.
+        assert!(
+            fixture
+                .store
+                .connection
+                .execute(
+                    "INSERT INTO generation_weave_commands(run_id, command_id, run_artifact_id)
+                 VALUES (?1, ?2, ?3)",
+                    params![
+                        cancelled_run_id.to_string(),
+                        cancellation_command_id.to_string(),
+                        cancelled_run_artifact_id.to_string()
+                    ],
+                )
+                .is_err()
+        );
+
+        let page = fixture
+            .store
+            .branch_page(document_id, None, MAX_BRANCH_PAGE_SIZE)
+            .expect("read branch families");
+        assert_eq!(page.branches.len(), 4);
+        assert_family_authority(&page, &first_family, first_command_id);
+        assert_family_authority(&page, &second_family, second_command_id);
+        let cancelled_record = fixture
+            .store
+            .branch_record(document_id, cancelled_run_id, MAX_BRANCH_BODY_BYTES)
+            .expect("read cancelled branch record")
+            .expect("cancelled branch exists");
+        assert_eq!(cancelled_record.weave_command_id, Some(first_command_id));
+
+        let mut legacy_summary_json =
+            serde_json::to_value(&page.branches[0]).expect("serialize branch summary");
+        legacy_summary_json
+            .as_object_mut()
+            .expect("branch summary object")
+            .remove("weave_command_id");
+        let legacy_summary: StoredBranchSummary =
+            serde_json::from_value(legacy_summary_json).expect("deserialize legacy summary");
+        assert_eq!(legacy_summary.weave_command_id, None);
+
+        let (_directory, reopened) = fixture.reopen();
+        let reopened_page = reopened
+            .branch_page(document_id, None, MAX_BRANCH_PAGE_SIZE)
+            .expect("read durable branch families after reopen");
+        assert_eq!(reopened_page.branches.len(), 4);
+        assert_family_authority(&reopened_page, &first_family, first_command_id);
+        assert_family_authority(&reopened_page, &second_family, second_command_id);
+    }
+
+    fn assert_family_authority(
+        page: &StoredBranchPage,
+        family: &GenerationFamilyStarted,
+        command_id: CommandId,
+    ) {
+        for generation in &family.generations {
+            let summary = page
+                .branches
+                .iter()
+                .find(|branch| branch.run_id == generation.generation.run_id)
+                .expect("family branch summary");
+            assert_eq!(summary.weave_command_id, Some(command_id));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn weave_command_migration_backfills_modern_and_legacy_receipts_once() {
+        let mut fixture = Fixture::new();
+        let document_id = fixture.loaded.document_id;
+        let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
+        let target = ByteRange { start: end, end };
+        let first_command_id = CommandId::new();
+        let first_family = fixture
+            .store
+            .start_generation_family_with_command(
+                first_command_id,
+                vec![fixture.generation_start(fixture.writer_environment, target, 81)],
+            )
+            .expect("start historical first family");
+        let second_command_id = CommandId::new();
+        let second_family = fixture
+            .store
+            .start_generation_family_with_command(
+                second_command_id,
+                vec![
+                    fixture.generation_start(fixture.writer_environment, target, 83),
+                    fixture.generation_start(fixture.writer_environment, target, 84),
+                ],
+            )
+            .expect("start historical second family");
+        fixture
+            .store
+            .request_cancel_generation_with_command(
+                CommandId::new(),
+                CancelGenerationCommand {
+                    run_id: first_family.generations[0].generation.run_id,
+                },
+            )
+            .expect("record historical cancellation");
+
+        fixture
+            .store
+            .connection
+            .execute_batch(
+                "DROP TABLE generation_weave_commands;
+                 DROP TABLE document_delete_operations;
+                 DROP TABLE document_rename_operations;
+                 DROP TABLE document_deletions;
+                 DROP TRIGGER command_requests_are_immutable_delete;
+                 DROP TRIGGER generation_run_index_are_immutable_update;",
+            )
+            .expect("open a legacy receipt-only fixture");
+        fixture
+            .store
+            .connection
+            .execute(
+                "DELETE FROM command_requests WHERE command_id = ?1",
+                [first_command_id.to_string()],
+            )
+            .expect("remove the request absent from pre-family stores");
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE generation_run_index
+                 SET seed_decimal = NULL
+                 WHERE run_id = ?1",
+                [first_family.generations[0].generation.run_id.to_string()],
+            )
+            .expect("mark the run as migration-0006 legacy evidence");
+        fixture
+            .store
+            .connection
+            .execute_batch(
+                "CREATE TRIGGER command_requests_are_immutable_delete
+                 BEFORE DELETE ON command_requests BEGIN
+                     SELECT RAISE(ABORT, 'command requests are immutable');
+                 END;
+                 CREATE TRIGGER generation_run_index_are_immutable_update
+                 BEFORE UPDATE ON generation_run_index BEGIN
+                     SELECT RAISE(ABORT, 'generation run index entries are immutable');
+                 END;
+                 PRAGMA user_version = 12;",
+            )
+            .expect("restore a version-twelve store with one legacy receipt-only family");
+        let legacy_request_count: i64 = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM command_requests WHERE command_id = ?1",
+                [first_command_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("count legacy command request");
+        assert_eq!(legacy_request_count, 0);
+        crate::schema::migrate(&mut fixture.store.connection)
+            .expect("backfill indexed weave commands");
+
+        let page = fixture
+            .store
+            .branch_page(document_id, None, MAX_BRANCH_PAGE_SIZE)
+            .expect("read migrated families");
+        for generation in &first_family.generations {
+            assert_eq!(
+                page.branches
+                    .iter()
+                    .find(|branch| branch.run_id == generation.generation.run_id)
+                    .expect("migrated first-family branch")
+                    .weave_command_id,
+                Some(first_command_id)
+            );
+        }
+        for generation in &second_family.generations {
+            assert_eq!(
+                page.branches
+                    .iter()
+                    .find(|branch| branch.run_id == generation.generation.run_id)
+                    .expect("migrated second-family branch")
+                    .weave_command_id,
+                Some(second_command_id)
+            );
+        }
+
+        let explain_sql = format!(
+            "EXPLAIN QUERY PLAN {BRANCH_SUMMARY_SELECT}
+             WHERE gr.document_id = ?1
+             ORDER BY gri.sequence DESC, gr.run_id DESC
+             LIMIT ?2"
+        );
+        let mut statement = fixture
+            .store
+            .connection
+            .prepare(&explain_sql)
+            .expect("prepare branch query plan");
+        let details = statement
+            .query_map(params![document_id.to_string(), 4_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("explain branch query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect branch query plan");
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("weave_family") && detail.contains("PRIMARY KEY")),
+            "branch query must use the run-keyed weave association: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.contains("command_receipts") && !detail.contains("json_each")),
+            "branch query must not scan receipt JSON: {details:?}"
+        );
+    }
+
+    #[test]
+    fn weave_migration_preserves_old_families_above_the_current_product_cap() {
+        const ABOVE_CURRENT_PRODUCT_CAP: u64 = 65;
+
+        let mut fixture = Fixture::new();
+        let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
+        let target = ByteRange { start: end, end };
+        fixture
+            .store
+            .connection
+            .execute_batch("DROP TRIGGER generation_weave_commands_validate_insert;")
+            .expect("remove the post-v12 insert guard while building a v12 fixture");
+        let historical_starts = (0..ABOVE_CURRENT_PRODUCT_CAP)
+            .map(|seed| fixture.generation_start(fixture.writer_environment, target, 1_000 + seed))
+            .collect();
+        fixture
+            .store
+            .start_generation_family_with_command(CommandId::new(), historical_starts)
+            .expect("the pre-v13 store API accepted this bounded family");
+        fixture
+            .store
+            .connection
+            .execute_batch(
+                "DROP TABLE generation_weave_commands;
+                 DROP TABLE document_delete_operations;
+                 DROP TABLE document_rename_operations;
+                 DROP TABLE document_deletions;
+                 PRAGMA user_version = 12;",
+            )
+            .expect("restore the historical version-twelve shape");
+
+        crate::schema::migrate(&mut fixture.store.connection)
+            .expect("v13 preserves a valid historical family up to the hard 4096 ceiling");
+        let migrated_count: i64 = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM generation_weave_commands",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count migrated weave authority");
+        assert_eq!(
+            migrated_count,
+            i64::try_from(ABOVE_CURRENT_PRODUCT_CAP).expect("test bound fits the SQL count domain")
+        );
+
+        let current_command_id = CommandId::new();
+        let current_starts = (0..ABOVE_CURRENT_PRODUCT_CAP)
+            .map(|seed| fixture.generation_start(fixture.writer_environment, target, 2_000 + seed))
+            .collect();
+        assert!(
+            fixture
+                .store
+                .start_generation_family_with_command(current_command_id, current_starts)
+                .is_err(),
+            "the post-migration insert trigger must enforce the shipped 64-branch cap"
+        );
+        let rejected_receipt_count: i64 = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM command_receipts WHERE command_id = ?1",
+                [current_command_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("count rejected command receipt");
+        assert_eq!(rejected_receipt_count, 0, "the rejection must be atomic");
+    }
+
+    #[test]
+    fn weave_command_migration_fails_closed_on_duplicate_or_mismatched_authority() {
+        for corruption in ["duplicate", "mismatch"] {
+            let mut fixture = Fixture::new();
+            let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
+            let target = ByteRange { start: end, end };
+            let family = fixture
+                .store
+                .start_generation_family_with_command(
+                    CommandId::new(),
+                    vec![fixture.generation_start(fixture.writer_environment, target, 91)],
+                )
+                .expect("start historical family");
+            let artifact_id = match corruption {
+                "duplicate" => family.generations[0].run_artifact_id,
+                "mismatch" => ArtifactId::new(),
+                _ => unreachable!(),
+            };
+            let command_id = CommandId::new();
+            let mut receipt = family.receipt.clone();
+            receipt.command_id = command_id;
+            receipt.resulting_artifact_ids = vec![artifact_id];
+            receipt.resulting_operation_ids.clear();
+            fixture
+                .store
+                .connection
+                .execute(
+                    "INSERT INTO command_receipts(
+                         command_id, command_kind, receipt_json, completed_at_ms
+                     ) VALUES (?1, 'weave', ?2, ?3)",
+                    params![
+                        command_id.to_string(),
+                        serde_json::to_string(&receipt).expect("serialize synthetic receipt"),
+                        receipt.completed_at_ms,
+                    ],
+                )
+                .expect("insert synthetic weave receipt");
+            fixture
+                .store
+                .connection
+                .execute(
+                    "INSERT INTO command_requests(
+                         command_id, request_fingerprint, command_kind, created_at_ms
+                     ) VALUES (?1, ?2, 'weave', ?3)",
+                    params![
+                        command_id.to_string(),
+                        fixture.loaded.blob_id.to_string(),
+                        receipt.started_at_ms,
+                    ],
+                )
+                .expect("insert synthetic weave request");
+            fixture
+                .store
+                .connection
+                .execute_batch(
+                    "DROP TABLE generation_weave_commands;
+                     PRAGMA user_version = 12;",
+                )
+                .expect("restore corrupt version-twelve shape");
+
+            assert!(
+                crate::schema::migrate(&mut fixture.store.connection).is_err(),
+                "{corruption} weave authority must abort migration"
+            );
+            let version: u32 = fixture
+                .store
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("read version after rejected migration");
+            assert_eq!(version, 12, "failed migration must roll back completely");
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn weave_command_migration_rejects_malformed_version_twelve_receipts() {
+        for corruption in [
+            "invalid_json",
+            "row_command_kind",
+            "embedded_command_id",
+            "embedded_command_kind",
+            "source_revision",
+            "artifact_scalar",
+            "artifact_empty",
+            "operation_empty",
+            "operation_not_authoritative",
+            "revision_nonempty",
+        ] {
+            let mut fixture = Fixture::new();
+            let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
+            let target = ByteRange { start: end, end };
+            let family = fixture
+                .store
+                .start_generation_family_with_command(
+                    CommandId::new(),
+                    vec![fixture.generation_start(fixture.writer_environment, target, 92)],
+                )
+                .expect("start historical family");
+            let command_id = family.receipt.command_id;
+            let mut receipt_json =
+                serde_json::to_value(&family.receipt).expect("serialize historical receipt");
+            let row_command_kind = if corruption == "row_command_kind" {
+                "cancel_generation"
+            } else {
+                "weave"
+            };
+            let serialized_receipt = if corruption == "invalid_json" {
+                "{".to_owned()
+            } else {
+                let receipt = receipt_json
+                    .as_object_mut()
+                    .expect("receipt serializes as an object");
+                match corruption {
+                    "row_command_kind" => {}
+                    "embedded_command_id" => {
+                        receipt.insert(
+                            "command_id".into(),
+                            serde_json::Value::String(CommandId::new().to_string()),
+                        );
+                    }
+                    "embedded_command_kind" => {
+                        receipt.insert("command".into(), json!("cancel_generation"));
+                    }
+                    "source_revision" => {
+                        receipt.insert("source_revision_id".into(), json!("not-the-source"));
+                    }
+                    "artifact_scalar" => {
+                        receipt.insert(
+                            "resulting_artifact_ids".into(),
+                            json!(family.generations[0].run_artifact_id),
+                        );
+                    }
+                    "artifact_empty" => {
+                        receipt.insert("resulting_artifact_ids".into(), json!([]));
+                    }
+                    "operation_empty" => {
+                        receipt.insert("resulting_operation_ids".into(), json!([]));
+                    }
+                    "operation_not_authoritative" => {
+                        receipt.insert(
+                            "resulting_operation_ids".into(),
+                            json!([OperationId::new()]),
+                        );
+                    }
+                    "revision_nonempty" => {
+                        receipt.insert("resulting_revision_ids".into(), json!(["unexpected"]));
+                    }
+                    _ => unreachable!(),
+                }
+                serde_json::to_string(&receipt_json).expect("serialize corrupted receipt")
+            };
+
+            fixture
+                .store
+                .connection
+                .execute_batch("DROP TRIGGER command_receipts_are_immutable_update;")
+                .expect("open malformed v12 receipt fixture");
+            fixture
+                .store
+                .connection
+                .execute(
+                    "UPDATE command_receipts
+                     SET command_kind = ?2, receipt_json = ?3
+                     WHERE command_id = ?1",
+                    params![command_id.to_string(), row_command_kind, serialized_receipt,],
+                )
+                .expect("write malformed v12 receipt");
+            fixture
+                .store
+                .connection
+                .execute_batch(
+                    "CREATE TRIGGER command_receipts_are_immutable_update
+                     BEFORE UPDATE ON command_receipts BEGIN
+                         SELECT RAISE(ABORT, 'command receipts are immutable');
+                     END;
+                     DROP TABLE generation_weave_commands;
+                     PRAGMA user_version = 12;",
+                )
+                .expect("restore malformed version-twelve shape");
+
+            assert!(
+                crate::schema::migrate(&mut fixture.store.connection).is_err(),
+                "{corruption} receipt authority must abort migration"
+            );
+            let version: u32 = fixture
+                .store
+                .connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .expect("read version after rejected migration");
+            assert_eq!(version, 12, "failed migration must roll back completely");
+        }
     }
 
     #[test]
@@ -4964,6 +5876,242 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn completion_recovery_fixture_survives_autosave_and_store_reopen() {
+        let specification: CompletionRecoveryFixture = serde_json::from_str(include_str!(
+            "../../../fixtures/compat/completion-recovery-v1.json"
+        ))
+        .expect("parse completion recovery fixture");
+        assert_eq!(specification.schema_version, 1);
+        assert_eq!(specification.fixture_id, "loom-completion-recovery-v1");
+        assert_eq!(specification.evidence_class, "model_free_characterization");
+        assert_eq!(specification.models.initial, "test/writer");
+        assert_ne!(
+            specification.models.initial,
+            specification.models.replacement
+        );
+        assert_eq!(specification.family.len(), 6);
+
+        let mut fixture = Fixture::with_source(
+            &specification.source.relative_path,
+            &specification.source.revision_text,
+        );
+        let source_revision_id = fixture.loaded.revision_id;
+        let source_blob_id = fixture.loaded.blob_id;
+        assert_eq!(fixture.loaded.text, specification.source.revision_text);
+        assert_eq!(
+            u64::try_from(fixture.loaded.text.len()).expect("fixture source length"),
+            specification.source.caret_byte
+        );
+
+        let mut witnesses = Vec::with_capacity(specification.family.len());
+        for run in &specification.family {
+            assert!(!run.run_id.is_empty());
+            assert!(!run.branch_id.is_empty());
+            let generation = fixture.generation_start(
+                fixture.writer_environment,
+                ByteRange {
+                    start: specification.source.caret_byte,
+                    end: specification.source.caret_byte,
+                },
+                run.seed,
+            );
+            let started = fixture
+                .store
+                .start_generation(generation)
+                .expect("start recovery fixture generation");
+            let (status, terminal_status, candidate_id, output_blob_id, output_text) =
+                match run.terminal.status.as_str() {
+                    "ready" => {
+                        let expected_candidate = run
+                            .terminal
+                            .candidate_id
+                            .as_deref()
+                            .expect("ready fixture candidate alias");
+                        assert!(!expected_candidate.is_empty());
+                        assert!(run.terminal.error.is_none());
+                        let text = run.terminal.text.as_deref().expect("ready fixture text");
+                        let expected_blob_id = run.terminal.sha256.expect("ready fixture digest");
+                        let outcome = fixture.finish(started.generation.run_id, text);
+                        assert_eq!(outcome.candidate.output_blob_id, expected_blob_id);
+                        assert_eq!(
+                            outcome.terminal_event.candidate_id,
+                            Some(outcome.candidate.candidate_id)
+                        );
+                        (
+                            StoredBranchStatus::Completed,
+                            GenerationTerminalStatus::Completed,
+                            Some(outcome.candidate.candidate_id),
+                            Some(outcome.candidate.output_blob_id),
+                            Some(text.to_owned()),
+                        )
+                    }
+                    "failed" => {
+                        assert!(run.terminal.candidate_id.is_none());
+                        assert!(run.terminal.text.is_none());
+                        assert!(run.terminal.sha256.is_none());
+                        let terminal = fixture
+                            .store
+                            .finish_generation(
+                                started.generation.run_id,
+                                GenerationTerminalStatus::Failed,
+                                run.terminal.error.clone(),
+                            )
+                            .expect("finish failed recovery fixture generation");
+                        assert_eq!(terminal.error, run.terminal.error);
+                        (
+                            StoredBranchStatus::Failed,
+                            GenerationTerminalStatus::Failed,
+                            None,
+                            None,
+                            None,
+                        )
+                    }
+                    "cancelled" => {
+                        assert!(run.terminal.candidate_id.is_none());
+                        assert!(run.terminal.text.is_none());
+                        assert!(run.terminal.sha256.is_none());
+                        assert!(run.terminal.error.is_none());
+                        fixture
+                            .store
+                            .finish_generation(
+                                started.generation.run_id,
+                                GenerationTerminalStatus::Cancelled,
+                                None,
+                            )
+                            .expect("finish cancelled recovery fixture generation");
+                        (
+                            StoredBranchStatus::Cancelled,
+                            GenerationTerminalStatus::Cancelled,
+                            None,
+                            None,
+                            None,
+                        )
+                    }
+                    status => panic!("unsupported recovery fixture terminal `{status}`"),
+                };
+            assert_eq!(
+                fixture
+                    .store
+                    .generation_terminal_count(started.generation.run_id)
+                    .expect("count fixture terminal"),
+                1
+            );
+            witnesses.push(CompletionRecoveryWitness {
+                logical_run_id: run.run_id.clone(),
+                logical_branch_id: run.branch_id.clone(),
+                run_id: started.generation.run_id,
+                branch_id: started.generation.branch_id,
+                seed: run.seed,
+                status,
+                terminal_status,
+                candidate_id,
+                output_blob_id,
+                output_text,
+                error: run.terminal.error.clone(),
+            });
+        }
+
+        fixture
+            .store
+            .save_document(
+                &specification.source.relative_path,
+                DocumentContent::Prose(specification.autosave.revision_text.clone()),
+                "completion recovery autosave characterization",
+            )
+            .expect("autosave after completion family");
+        let autosaved = fixture
+            .store
+            .read_document(&specification.source.relative_path)
+            .expect("read autosaved fixture document");
+        assert_ne!(autosaved.revision_id, source_revision_id);
+        assert_ne!(autosaved.blob_id, source_blob_id);
+        assert_eq!(autosaved.text, specification.autosave.revision_text);
+
+        let (_directory, reopened) = fixture.reopen();
+        let reopened_document = reopened
+            .read_document(&specification.source.relative_path)
+            .expect("read document after renderer/store recovery");
+        assert_eq!(reopened_document.revision_id, autosaved.revision_id);
+        assert_eq!(reopened_document.blob_id, autosaved.blob_id);
+        assert_eq!(reopened_document.text, specification.autosave.revision_text);
+
+        let page = reopened
+            .branch_page(reopened_document.document_id, None, MAX_BRANCH_PAGE_SIZE)
+            .expect("rebuild exact terminal projection after reopen");
+        assert_eq!(page.branches.len(), witnesses.len());
+        assert!(!page.has_more);
+        assert!(page.next_cursor.is_none());
+
+        for witness in witnesses {
+            let summary = page
+                .branches
+                .iter()
+                .find(|branch| branch.run_id == witness.run_id)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing durable run {} ({})",
+                        witness.logical_run_id, witness.logical_branch_id
+                    )
+                });
+            assert_eq!(summary.branch_id, witness.branch_id);
+            assert_eq!(summary.document_id, reopened_document.document_id);
+            assert_eq!(summary.source_revision_id, source_revision_id);
+            assert_ne!(summary.source_revision_id, reopened_document.revision_id);
+            assert_eq!(summary.target_range.start, specification.source.caret_byte);
+            assert_eq!(summary.target_range.end, specification.source.caret_byte);
+            assert_eq!(summary.model_identifier.as_deref(), Some("test/writer"));
+            assert_eq!(summary.seed, Some(witness.seed));
+            assert_eq!(summary.status, witness.status);
+            assert_eq!(summary.candidate_id, witness.candidate_id);
+            assert_eq!(summary.output_blob_id, witness.output_blob_id);
+            assert_eq!(
+                summary.output_byte_len,
+                witness
+                    .output_text
+                    .as_ref()
+                    .map(|text| u64::try_from(text.len()).expect("fixture output length"))
+            );
+            assert_eq!(summary.error, witness.error);
+
+            let record = reopened
+                .branch_record(
+                    reopened_document.document_id,
+                    witness.run_id,
+                    MAX_BRANCH_BODY_BYTES,
+                )
+                .expect("read exact branch record after reopen")
+                .expect("durable branch record");
+            assert_eq!(record.status, witness.status);
+            assert_eq!(record.candidate_id, witness.candidate_id);
+            assert_eq!(record.output_blob_id, witness.output_blob_id);
+            assert_eq!(record.output_text, witness.output_text);
+            assert_eq!(record.error, witness.error);
+
+            let terminal = reopened
+                .generation_terminal_evidence(witness.run_id)
+                .expect("read exact terminal evidence after reopen")
+                .expect("durable terminal evidence");
+            assert_eq!(terminal.evidence.status, witness.terminal_status);
+            assert_eq!(terminal.evidence.candidate_id, witness.candidate_id);
+            assert_eq!(
+                terminal.output_bytes,
+                witness
+                    .output_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes()
+            );
+            assert_eq!(
+                reopened
+                    .generation_terminal_count(witness.run_id)
+                    .expect("count terminal after reopen"),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn branch_cursor_is_stable_across_newer_insertions_and_bound_to_its_run() {
         let mut fixture = Fixture::new();
         for seed in 10..15 {
@@ -5021,6 +6169,297 @@ mod tests {
                 .store
                 .branch_page(fixture.loaded.document_id, Some(forged), 2),
             Err(StoreError::InvalidBranchPageCursor)
+        ));
+    }
+
+    #[test]
+    fn generation_progress_replays_durable_unicode_deltas_without_mutating_manuscript() {
+        let mut fixture = Fixture::new();
+        let source_text = fixture.loaded.text.clone();
+        let document_id = fixture.loaded.document_id;
+        let start = fixture.start(fixture.writer_environment);
+        let run_id = start.generation.run_id;
+        let branch_id = start.generation.branch_id;
+
+        let queued = fixture
+            .store
+            .generation_progress_text(document_id, run_id)
+            .expect("read queued progress");
+        assert_eq!(queued.last_event_sequence, 0);
+        assert_eq!(queued.last_text_delta_sequence, None);
+        assert!(queued.text.is_empty());
+
+        for delta in [" world", " 🌍", " grows"] {
+            fixture
+                .store
+                .append_generation_event(
+                    run_id,
+                    GenerationEventKind::TextDelta {
+                        text: delta.to_owned(),
+                    },
+                )
+                .expect("append canonical text delta");
+        }
+        fixture
+            .store
+            .append_generation_event(
+                run_id,
+                GenerationEventKind::Warning {
+                    code: "fixture".to_owned(),
+                    message: "non-text progress".to_owned(),
+                },
+            )
+            .expect("append non-text progress");
+
+        let progress = fixture
+            .store
+            .generation_progress_text(document_id, run_id)
+            .expect("replay canonical text deltas");
+        assert_eq!(progress.run_id, run_id);
+        assert_eq!(progress.branch_id, branch_id);
+        assert_eq!(progress.last_event_sequence, 4);
+        assert_eq!(progress.last_text_delta_sequence, Some(3));
+        assert_eq!(progress.text, " world 🌍 grows");
+        assert!(matches!(
+            fixture
+                .store
+                .generation_progress_text(DocumentId::new(), run_id),
+            Err(StoreError::GenerationRunNotFound(found)) if found == run_id
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .read_document("manuscript/001.md")
+                .expect("read unchanged manuscript")
+                .text,
+            source_text
+        );
+
+        let (_directory, reopened) = fixture.reopen();
+        assert_eq!(
+            reopened
+                .generation_progress_text(document_id, run_id)
+                .expect("replay identical progress after reopen"),
+            progress
+        );
+    }
+
+    #[test]
+    fn generation_text_delta_accepts_exact_utf8_bound_and_rejects_larger_events() {
+        let mut fixture = Fixture::new();
+        let start = fixture.start(fixture.writer_environment);
+        let exact_bound = "é".repeat(MAX_GENERATION_TEXT_DELTA_BYTES / 2);
+        let accepted = fixture
+            .store
+            .append_generation_event(
+                start.generation.run_id,
+                GenerationEventKind::TextDelta {
+                    text: exact_bound.clone(),
+                },
+            )
+            .expect("accept an exact-bound UTF-8 text delta");
+        assert!(matches!(
+            accepted.kind,
+            GenerationEventKind::TextDelta { text } if text == exact_bound
+        ));
+
+        let over_bound = format!("{}é", "é".repeat(MAX_GENERATION_TEXT_DELTA_BYTES / 2));
+        assert!(matches!(
+            fixture.store.append_generation_event(
+                start.generation.run_id,
+                GenerationEventKind::TextDelta { text: over_bound },
+            ),
+            Err(StoreError::ProvenancePayloadTooLarge {
+                field: "generation text delta",
+                max_bytes: MAX_GENERATION_TEXT_DELTA_BYTES,
+            })
+        ));
+    }
+
+    #[test]
+    fn generation_progress_text_budget_is_enforced_before_append() {
+        let mut fixture = Fixture::new();
+        let start = fixture.start(fixture.writer_environment);
+        let run_id = start.generation.run_id;
+        assert_eq!(
+            MAX_GENERATION_PROGRESS_TEXT_BYTES % MAX_GENERATION_TEXT_DELTA_BYTES,
+            0,
+            "the cumulative snapshot bound should compose from whole event bounds"
+        );
+        let unicode_chunk = "é".repeat(MAX_GENERATION_TEXT_DELTA_BYTES / "é".len());
+        for _ in 0..(MAX_GENERATION_PROGRESS_TEXT_BYTES / MAX_GENERATION_TEXT_DELTA_BYTES) {
+            fixture
+                .store
+                .append_generation_event(
+                    run_id,
+                    GenerationEventKind::TextDelta {
+                        text: unicode_chunk.clone(),
+                    },
+                )
+                .expect("persist an event-bounded progress chunk");
+        }
+        let exact = fixture
+            .store
+            .generation_progress_text(fixture.loaded.document_id, run_id)
+            .expect("read progress at the exact cumulative byte bound");
+        assert_eq!(exact.text.len(), MAX_GENERATION_PROGRESS_TEXT_BYTES);
+        assert!(matches!(
+            fixture
+                .store
+                .append_generation_event(
+                    run_id,
+                    GenerationEventKind::TextDelta { text: "x".into() },
+                ),
+            Err(StoreError::GenerationProgressTextLimitExceeded {
+                actual_bytes,
+                max_bytes: MAX_GENERATION_PROGRESS_TEXT_BYTES,
+            }) if actual_bytes == MAX_GENERATION_PROGRESS_TEXT_BYTES + 1
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .generation_progress_text(fixture.loaded.document_id, run_id)
+                .expect("rejected append must leave exact-bound progress unchanged"),
+            exact
+        );
+
+        let corrupt_sequence = exact.last_event_sequence + 1;
+        let corrupt_kind = GenerationEventKind::TextDelta { text: "x".into() };
+        fixture
+            .store
+            .connection
+            .execute(
+                "INSERT INTO generation_events(
+                     event_id, run_id, sequence, event_kind, payload_json, is_terminal, created_at_ms
+                 ) VALUES (?1, ?2, ?3, 'text_delta', ?4, 0, ?5)",
+                params![
+                    GenerationEventId::new().to_string(),
+                    run_id.to_string(),
+                    i64::try_from(corrupt_sequence).expect("corrupt sequence fits i64"),
+                    serde_json::to_string(&corrupt_kind).expect("serialize corruption fixture"),
+                    now_unix_ms(),
+                ],
+            )
+            .expect("inject a legacy over-bound progress event");
+        assert!(matches!(
+            fixture
+                .store
+                .generation_progress_text(fixture.loaded.document_id, run_id),
+            Err(StoreError::CorruptDatabase(message))
+                if message.contains("bounded progress-text byte count")
+        ));
+    }
+
+    #[test]
+    fn generation_progress_event_budget_validator_accepts_exact_and_rejects_plus_one() {
+        assert!(
+            validate_generation_progress_append(
+                GenerationProgressUsage {
+                    text_events: MAX_GENERATION_PROGRESS_TEXT_EVENTS - 1,
+                    text_bytes: MAX_GENERATION_PROGRESS_TEXT_EVENTS - 1,
+                },
+                1,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_generation_progress_append(
+                GenerationProgressUsage {
+                    text_events: MAX_GENERATION_PROGRESS_TEXT_EVENTS,
+                    text_bytes: MAX_GENERATION_PROGRESS_TEXT_EVENTS,
+                },
+                1,
+            ),
+            Err(StoreError::GenerationProgressEventLimitExceeded {
+                actual_events,
+                max_events: MAX_GENERATION_PROGRESS_TEXT_EVENTS,
+            }) if actual_events == MAX_GENERATION_PROGRESS_TEXT_EVENTS + 1
+        ));
+    }
+
+    #[test]
+    fn generation_progress_event_budget_is_enforced_before_append() {
+        let mut fixture = Fixture::new();
+        let start = fixture.start(fixture.writer_environment);
+        let run_id = start.generation.run_id;
+        insert_legacy_text_events(
+            &mut fixture.store,
+            run_id,
+            MAX_GENERATION_PROGRESS_TEXT_EVENTS - 1,
+        );
+
+        let exact_event = fixture
+            .store
+            .append_generation_event(run_id, GenerationEventKind::TextDelta { text: "x".into() })
+            .expect("public append accepts the exact event-count bound");
+        assert_eq!(
+            exact_event.sequence,
+            u64::try_from(MAX_GENERATION_PROGRESS_TEXT_EVENTS).expect("event-count bound fits u64")
+        );
+
+        let exact = fixture
+            .store
+            .generation_progress_text(fixture.loaded.document_id, run_id)
+            .expect("read exact event-count bound");
+        assert_eq!(exact.text.len(), MAX_GENERATION_PROGRESS_TEXT_EVENTS);
+        assert_eq!(
+            exact.last_text_delta_sequence,
+            Some(
+                u64::try_from(MAX_GENERATION_PROGRESS_TEXT_EVENTS)
+                    .expect("event-count bound fits u64")
+            )
+        );
+        assert!(matches!(
+            fixture.store.append_generation_event(
+                run_id,
+                GenerationEventKind::TextDelta { text: "x".into() },
+            ),
+            Err(StoreError::GenerationProgressEventLimitExceeded {
+                actual_events,
+                max_events: MAX_GENERATION_PROGRESS_TEXT_EVENTS,
+            }) if actual_events == MAX_GENERATION_PROGRESS_TEXT_EVENTS + 1
+        ));
+        let stored_events: i64 = fixture
+            .store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM generation_events
+                 WHERE run_id = ?1 AND event_kind = 'text_delta'",
+                [run_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("count progress after rejected append");
+        assert_eq!(
+            stored_events,
+            i64::try_from(MAX_GENERATION_PROGRESS_TEXT_EVENTS).expect("event-count bound fits i64")
+        );
+
+        fixture
+            .store
+            .connection
+            .execute(
+                "INSERT INTO generation_events(
+                     event_id, run_id, sequence, event_kind, payload_json, is_terminal, created_at_ms
+                 ) VALUES (?1, ?2, ?3, 'text_delta', ?4, 0, ?5)",
+                params![
+                    GenerationEventId::new().to_string(),
+                    run_id.to_string(),
+                    i64::try_from(MAX_GENERATION_PROGRESS_TEXT_EVENTS + 1)
+                        .expect("corrupt event sequence fits i64"),
+                    serde_json::to_string(&GenerationEventKind::TextDelta {
+                        text: "x".into(),
+                    })
+                    .expect("serialize corruption fixture"),
+                    now_unix_ms(),
+                ],
+            )
+            .expect("inject an over-count legacy progress event");
+        assert!(matches!(
+            fixture
+                .store
+                .generation_progress_text(fixture.loaded.document_id, run_id),
+            Err(StoreError::CorruptDatabase(message))
+                if message.contains("bounded text-delta event count")
         ));
     }
 

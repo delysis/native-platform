@@ -1,12 +1,18 @@
-# Optional speech bridge
+# Historical speech bridge design
+
+<!-- current-service-surface: speech -->
+<!-- retired-edge-parent: 84f65a9c1313bc0e4218156507cedd9fd905903f -->
 
 Free Token Energy does not own local STT/TTS execution. The independently
-versioned [`speech-native-kit`](https://github.com/delysis/speech-native-kit)
-owns speech contracts, local/platform backends, request lifecycle, and its
-optional Tauri plugin.
+composed `crates/services/speech/crates/speech-native-host` owns transport-
+neutral host execution. FTE has no current Speech bridge and the workspace has
+no current `crates/services/speech/crates/tauri-plugin-speech-native` crate.
+That plugin's last-present tree is retained at exact parent
+[`84f65a9c1313bc0e4218156507cedd9fd905903f`](https://github.com/delysis/native-platform/tree/84f65a9c1313bc0e4218156507cedd9fd905903f/crates/services/speech/crates/tauri-plugin-speech-native).
 
-An FTE speech integration, when implemented, is an optional edge adapter with
-this dependency direction:
+The remainder of this document is a design constraint for a possible future
+FTE speech integration, not a shipped command, permission, or product surface.
+If implemented, it is an optional edge adapter with this dependency direction:
 
 ```text
 speech-native-types ◄── fte-speech-providers

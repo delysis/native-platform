@@ -11,10 +11,13 @@ members = [
     "crates/services/attachment/crates/attachment-native-plan",
     "crates/services/attachment/crates/attachment-native-types",
     "crates/services/information/crates/information-native-acquire",
+    "crates/services/information/crates/information-native-attachment-bridge",
     "crates/services/information/crates/information-native-backend-community",
     "crates/services/information/crates/information-native-backend-encyclopedia",
+    "crates/services/information/crates/information-native-backend-overture",
     "crates/services/information/crates/information-native-backend-scripture",
     "crates/services/information/crates/information-native-backend-sqlite",
+    "crates/services/information/crates/information-native-backend-zim",
     "crates/services/information/crates/information-native-catalog",
     "crates/services/information/crates/information-native-cli",
     "crates/services/information/crates/information-native-host",
@@ -79,6 +82,8 @@ http-body-util = "0.1"
 hound = "3.5.1"
 jsonschema = { version = "0.49.8", default-features = false }
 ndarray = { version = "0.17.2", default-features = false, features = ["std"] }
+nix = { version = "0.30.1", features = ["fs", "process", "signal", "time"] }
+notify = "8.2.0"
 parakeet-rs = "0.3.7"
 rand = "0.9"
 rand_chacha = "0.9.0"
@@ -91,6 +96,7 @@ serde_json = "1.0.145"
 serde_yaml = "0.9"
 sha2 = "0.10.9"
 similar = "3.1.1"
+sysinfo = { version = "0.38.4", default-features = false, features = ["system"] }
 tempfile = "3.27.0"
 thiserror = "2"
 tokio = { version = "1.52.1", features = ["full"] }
@@ -101,6 +107,8 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["limit", "timeout"] }
 tracing = "0.1.44"
 ulid = { version = "1.2.1", features = ["serde"] }
+unicase = "2.9.0"
+unicode-normalization = "0.1.25"
 url = { version = "2.5.7", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
@@ -137,15 +145,21 @@ fte-types = { path = "products/fte/crates/fte-types" }
 tauri-plugin-free-token-energy = { path = "products/fte/crates/tauri-plugin-free-token-energy" }
 information-native-host = { path = "crates/services/information/crates/information-native-host" }
 information-native-acquire = { path = "crates/services/information/crates/information-native-acquire" }
+information-native-attachment-bridge = { path = "crates/services/information/crates/information-native-attachment-bridge" }
 information-native-backend-community = { path = "crates/services/information/crates/information-native-backend-community" }
 information-native-backend-encyclopedia = { path = "crates/services/information/crates/information-native-backend-encyclopedia" }
+information-native-backend-overture = { path = "crates/services/information/crates/information-native-backend-overture" }
 information-native-backend-scripture = { path = "crates/services/information/crates/information-native-backend-scripture" }
 information-native-backend-sqlite = { path = "crates/services/information/crates/information-native-backend-sqlite" }
+information-native-backend-zim = { path = "crates/services/information/crates/information-native-backend-zim" }
 information-native-catalog = { path = "crates/services/information/crates/information-native-catalog" }
 information-native-retrieval = { path = "crates/services/information/crates/information-native-retrieval" }
 information-native-store = { path = "crates/services/information/crates/information-native-store" }
 information-native-types = { path = "crates/services/information/crates/information-native-types" }
 speech-native-host = { path = "crates/services/speech/crates/speech-native-host" }
+speech-native-types = { path = "crates/services/speech/crates/speech-native-types" }
+speech-native-platform = { path = "crates/services/speech/crates/speech-native-platform" }
+speech-native-backend-parakeet = { path = "crates/services/speech/crates/speech-native-backend-parakeet" }
 mom-llama-runtime = { path = "products/mom/crates/mom-llama-runtime" }
 
 [workspace.lints.rust]

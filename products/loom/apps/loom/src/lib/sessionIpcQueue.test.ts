@@ -19,7 +19,13 @@ import {
   exportDocumentCopy,
   getBranch,
   getBranchPage,
-  listModels
+  getCompletionSnapshot,
+  listCuratedModels,
+  listModels,
+  loadCatalogModelCandidate,
+  openDocument,
+  previewDocumentReconciliation,
+  revealDocument
 } from './ipc';
 
 const priorWindow = globalThis.window;
@@ -55,6 +61,35 @@ afterEach(() => {
 });
 
 describe('session IPC admission', () => {
+  it('reads the embedded model catalog outside the project session lane', async () => {
+    installDesktopRuntime();
+    const projectRead = deferred<never>();
+    mocks.invoke.mockImplementation((command: string) => {
+      if (command === 'plugin:loom|branch_page') return projectRead.promise;
+      if (command === 'plugin:loom|model_catalog_list') {
+        return Promise.resolve({ schema_version: 1, entries: [] });
+      }
+      if (command === 'plugin:loom|model_load_catalog_candidate') {
+        return Promise.resolve({ model_id: 'catalog-model' });
+      }
+      return Promise.resolve(null);
+    });
+
+    const page = getBranchPage('project', 'session', 'document', null, 10);
+    await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
+    await expect(listCuratedModels()).resolves.toEqual({ schema_version: 1, entries: [] });
+    expect(mocks.invoke).toHaveBeenLastCalledWith('plugin:loom|model_catalog_list', {});
+    await expect(loadCatalogModelCandidate('catalog-id', '/models/catalog.gguf'))
+      .resolves.toEqual({ model_id: 'catalog-model' });
+    expect(mocks.invoke).toHaveBeenLastCalledWith(
+      'plugin:loom|model_load_catalog_candidate',
+      { catalogId: 'catalog-id', modelPath: '/models/catalog.gguf' }
+    );
+
+    projectRead.reject(new Error('done'));
+    await expect(page).rejects.toThrow('done');
+  });
+
   it('starts session-bound commands in FIFO order and continues after a failure', async () => {
     installDesktopRuntime();
     const first = deferred<never>();
@@ -68,6 +103,12 @@ describe('session IPC admission', () => {
     const page = getBranchPage('project', 'session', 'document', null, 10);
     await vi.waitFor(() => expect(mocks.invoke).toHaveBeenCalledTimes(1));
     const branch = getBranch('project', 'session', 'document', 'run');
+    const snapshot = getCompletionSnapshot(
+      'project',
+      'session',
+      'document',
+      ['run']
+    );
 
     await Promise.resolve();
     expect(mocks.invoke).toHaveBeenCalledTimes(1);
@@ -75,10 +116,18 @@ describe('session IPC admission', () => {
 
     await expect(page).rejects.toThrow('page failed');
     await expect(branch).resolves.toBeNull();
+    await expect(snapshot).resolves.toBeNull();
     expect(order).toEqual([
       'plugin:loom|branch_page',
-      'plugin:loom|branch_get'
+      'plugin:loom|branch_get',
+      'plugin:loom|completion_snapshot'
     ]);
+    expect(mocks.invoke).toHaveBeenLastCalledWith('plugin:loom|completion_snapshot', {
+      projectId: 'project',
+      sessionId: 'session',
+      documentId: 'document',
+      observedRunIds: ['run']
+    });
   });
 
   it('waits for a detached native chooser or close transition to settle', async () => {
@@ -107,7 +156,7 @@ describe('session IPC admission', () => {
 
     mocks.invoke.mockRejectedValueOnce({ code: 'project_busy', retryable: true });
     await expect(
-      exportDocumentCopy('project', 'session', 'document', 'draft.md')
+      exportDocumentCopy('project', 'session', 'document', 'revision', 'a'.repeat(64))
     ).rejects.toMatchObject({ code: 'project_busy' });
 
     mocks.invoke.mockRejectedValueOnce({ code: 'project_busy', retryable: true });
@@ -115,6 +164,59 @@ describe('session IPC admission', () => {
       code: 'project_busy'
     });
     expect(mocks.invoke).toHaveBeenCalledTimes(3);
+  });
+
+  it('sends only captured immutable identity for document context operations', async () => {
+    installDesktopRuntime();
+    mocks.invoke.mockResolvedValue(null);
+    const blob = 'a'.repeat(64);
+
+    await openDocument('project', 'session', 'document', 'revision', blob);
+    await exportDocumentCopy('project', 'session', 'document', 'revision', blob);
+    await revealDocument('project', 'session', 'document', 'revision', blob);
+    await previewDocumentReconciliation(
+      'project',
+      'session',
+      'document',
+      'revision',
+      blob,
+      null
+    );
+
+    expect(mocks.invoke.mock.calls).toEqual([
+      ['plugin:loom|document_open', {
+        projectId: 'project',
+        sessionId: 'session',
+        documentId: 'document',
+        expectedRevisionId: 'revision',
+        expectedBlobId: blob
+      }],
+      ['plugin:loom|document_export_choose', {
+        projectId: 'project',
+        sessionId: 'session',
+        documentId: 'document',
+        expectedRevisionId: 'revision',
+        expectedBlobId: blob
+      }],
+      ['plugin:loom|document_reveal', {
+        projectId: 'project',
+        sessionId: 'session',
+        documentId: 'document',
+        expectedRevisionId: 'revision',
+        expectedBlobId: blob
+      }],
+      ['plugin:loom|document_reconciliation_preview', {
+        projectId: 'project',
+        sessionId: 'session',
+        documentId: 'document',
+        expectedRevisionId: 'revision',
+        expectedBaseBlobId: blob,
+        appText: null
+      }]
+    ]);
+    for (const [, args] of mocks.invoke.mock.calls) {
+      expect(args).not.toHaveProperty('relativePath');
+    }
   });
 
   it('keeps model and application lifecycle calls outside the session FIFO', async () => {

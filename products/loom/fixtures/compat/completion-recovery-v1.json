@@ -1,0 +1,191 @@
+{
+  "schema_version": 1,
+  "fixture_id": "loom-completion-recovery-v1",
+  "evidence_class": "model_free_characterization",
+  "source": {
+    "relative_path": "manuscript/001.md",
+    "revision_text": "The last train was gone, and the platform smelled of wet iron",
+    "revision_id": "revision-before-autosave",
+    "visible_blob_id": "blob-before-autosave",
+    "caret_byte": 61
+  },
+  "autosave": {
+    "revision_text": "The last train was gone, and the platform smelled of wet iron, while ",
+    "revision_id": "revision-after-autosave",
+    "visible_blob_id": "blob-after-autosave",
+    "accepted_text": ", while "
+  },
+  "models": {
+    "initial": "test/writer",
+    "replacement": "test/writer-next"
+  },
+  "interaction": {
+    "project_session_id": "session-1",
+    "document_id": "document-1",
+    "document_epoch": 3,
+    "edit_version": 7,
+    "post_composition_edit_version": 8
+  },
+  "family": [
+    {
+      "run_id": "run-ready-a",
+      "branch_id": "branch-ready-a",
+      "seed": 7,
+      "terminal": {
+        "status": "ready",
+        "candidate_id": "candidate-a",
+        "text": ", while somewhere beyond the rain a signal clicked from red to green.",
+        "sha256": "e94bcffd1eb3f286191c378e69ff387918f696fea94e8072fbc01a0cf971d4f5",
+        "error": null
+      }
+    },
+    {
+      "run_id": "run-ready-b",
+      "branch_id": "branch-ready-b",
+      "seed": 11,
+      "terminal": {
+        "status": "ready",
+        "candidate_id": "candidate-b",
+        "text": ", and under the empty canopy a paper timetable trembled in the wind.",
+        "sha256": "1e293d189eae05036f0df31d5ebffdac43653e1d3309e2851d934cbfebeacf3b",
+        "error": null
+      }
+    },
+    {
+      "run_id": "run-ready-c",
+      "branch_id": "branch-ready-c",
+      "seed": 19,
+      "terminal": {
+        "status": "ready",
+        "candidate_id": "candidate-c",
+        "text": "; the rails held a thin silver line from the lamps and vanished east.",
+        "sha256": "0bce36b7696bba959b9a533c7aaf4cb88e00bfc9a269d66bfdee630e6145c5d7",
+        "error": null
+      }
+    },
+    {
+      "run_id": "run-ready-d",
+      "branch_id": "branch-ready-d",
+      "seed": 23,
+      "terminal": {
+        "status": "ready",
+        "candidate_id": "candidate-d",
+        "text": ", until a station clock struck once behind the locked ticket hall.",
+        "sha256": "ea7e1387ba4936e9fdb8b8207d380bfc5c03a7ba7a5d341b9fc7af0bbd7c0ed4",
+        "error": null
+      }
+    },
+    {
+      "run_id": "run-failed",
+      "branch_id": "branch-failed",
+      "seed": 29,
+      "terminal": {
+        "status": "failed",
+        "candidate_id": null,
+        "text": null,
+        "sha256": null,
+        "error": "backend decode failed"
+      }
+    },
+    {
+      "run_id": "run-cancelled",
+      "branch_id": "branch-cancelled",
+      "seed": 31,
+      "terminal": {
+        "status": "cancelled",
+        "candidate_id": null,
+        "text": null,
+        "sha256": null,
+        "error": null
+      }
+    }
+  ],
+  "primary_event_stream": [
+    {
+      "sequence": 0,
+      "event": "queued"
+    },
+    {
+      "sequence": 1,
+      "event": "generating"
+    },
+    {
+      "sequence": 2,
+      "event": "text_delta",
+      "text": ", while somewhere beyond the rain a signal clicked from red to green."
+    },
+    {
+      "sequence": 3,
+      "event": "candidate_ready",
+      "candidate_id": "candidate-a"
+    },
+    {
+      "sequence": 4,
+      "event": "terminal",
+      "status": "completed",
+      "candidate_id": "candidate-a"
+    }
+  ],
+  "delivery_cases": [
+    {
+      "case_id": "all-events",
+      "event_indexes": [0, 1, 2, 3, 4],
+      "expected_applied_sequences": [0, 1, 2, 3, 4],
+      "expected_event_projection": {
+        "status": "ready",
+        "candidate_id": "candidate-a",
+        "text": ", while somewhere beyond the rain a signal clicked from red to green."
+      }
+    },
+    {
+      "case_id": "all-events-dropped",
+      "event_indexes": [],
+      "expected_applied_sequences": [],
+      "expected_event_projection": {
+        "status": "queued",
+        "candidate_id": null,
+        "text": ""
+      }
+    },
+    {
+      "case_id": "every-event-duplicated",
+      "event_indexes": [0, 0, 1, 1, 2, 2, 3, 3, 4, 4],
+      "expected_applied_sequences": [0, 1, 2, 3, 4],
+      "expected_event_projection": {
+        "status": "ready",
+        "candidate_id": "candidate-a",
+        "text": ", while somewhere beyond the rain a signal clicked from red to green."
+      }
+    },
+    {
+      "case_id": "terminal-delivered-first",
+      "event_indexes": [4, 2, 3, 1, 0],
+      "expected_applied_sequences": [4],
+      "expected_event_projection": {
+        "status": "ready",
+        "candidate_id": "candidate-a",
+        "text": ""
+      }
+    },
+    {
+      "case_id": "terminal-event-dropped",
+      "event_indexes": [0, 1, 2, 3],
+      "expected_applied_sequences": [0, 1, 2, 3],
+      "expected_event_projection": {
+        "status": "ready",
+        "candidate_id": "candidate-a",
+        "text": ", while somewhere beyond the rain a signal clicked from red to green."
+      }
+    },
+    {
+      "case_id": "progress-events-dropped",
+      "event_indexes": [0, 4],
+      "expected_applied_sequences": [0, 4],
+      "expected_event_projection": {
+        "status": "ready",
+        "candidate_id": "candidate-a",
+        "text": ""
+      }
+    }
+  ]
+}

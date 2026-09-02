@@ -25,6 +25,7 @@ const knownJobs = [
   "loom-linux",
   "frontend",
   "platform-macos",
+  "ignored-tests",
   "dependency-graph",
   "fuzz-build",
 ];
@@ -50,6 +51,18 @@ if (needs.plan?.result !== "success") {
   failures.push(`plan: expected success, observed ${needs.plan?.result ?? "missing"}`);
 }
 
+if (plan.flags?.frontend_loom === true) {
+  if (plan.presence?.loom !== true) {
+    failures.push("Loom frontend plan selected without Loom being present");
+  }
+  for (const job of ["frontend", "platform-macos"]) {
+    if (!plan.jobs.includes(job)) failures.push(`Loom frontend plan omitted ${job}`);
+  }
+  if (!Array.isArray(plan.macos_matrix) || !plan.macos_matrix.includes("loom")) {
+    failures.push("Loom frontend plan omitted the macOS Loom WebKit matrix entry");
+  }
+}
+
 if (plan.flags?.full === true) {
   const fullJobs = [
     "policy",
@@ -61,6 +74,7 @@ if (plan.flags?.full === true) {
     "speech-linux",
     "frontend",
     "platform-macos",
+    "ignored-tests",
     "dependency-graph",
     "fuzz-build",
   ];

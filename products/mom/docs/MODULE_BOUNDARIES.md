@@ -1,12 +1,14 @@
 # Ecosystem module boundaries
 
 ```text
-llama-native-kit ───────> free-token-energy ──> mom-llama
-       └───────────────────────────────────────────^
+llama-native-kit ─────────────────────────────> mom-llama
+       └──────────────> free-token-energy (standalone)
 
-speech-native-kit ────────────────────────────────> mom-llama (only when UX ships)
+speech-native-kit ────────────────────────────────> mom-llama (narrow product-owned UX)
 
 attachment-native-kit ────────────────────────────> mom-llama
+
+attachment-native-kit ──typed canonical text──> information-native-kit ──narrow host──> mom-llama
 
 mom-llama ──contracts/black-box CLI──> capability-system-compiler
 ```
@@ -18,9 +20,10 @@ graph.
 | Repository | Authoritative ownership |
 |---|---|
 | `llama-native-kit` | in-process llama.cpp DTOs, engine, resident host and cache contracts |
-| `free-token-energy` | text gateway, protocols, hosted providers and optional authenticated loopback |
+| `free-token-energy` | standalone text gateway, protocols, hosted providers and optional authenticated loopback; not composed by Mom |
 | `speech-native-kit` | STT/TTS contracts, routing, and local/platform backends |
 | `attachment-native-kit` | content-first bounded inspection, recursive container graph, canonical artifacts, provenance and capability-aware media/transform planning |
+| `information-native-kit` | immutable external registrations, exact Alexandria adapter, bounded retrieval/citation, and atomic managed-document staging/activation/removal |
 | `mom-llama` | product runtime, CLI, Personas, contracts, receipts and native interface |
 | `capability-system-compiler` | Loom compiler/specs and black-box acceptance |
 
@@ -36,12 +39,21 @@ this app or bundled into the provider gateway:
 - `speech-native-backend-parakeet`: resident local Parakeet STT using the Hugging Face
   cache.
 
-Mom Llama does not yet register a speech backend or expose microphone/read-aloud
-UX. Consequently it installs only the FTE text gateway plugin and grants no
-speech IPC permissions. When speech UX ships, Mom Llama may consume the speech
-crates directly and own the narrow IPC/permission edge without inheriting
-hosted providers or loopback authority. Audio attachments for multimodal
-llama.cpp input are a separate product feature and are not STT.
+Mom Llama's shared `AppRuntime` owns one `SpeechHost` with two intentionally
+narrow operations. Read Aloud captures an exact assistant message ID and text
+hash, selects an installed never-network Apple voice from the bound descriptor,
+and accepts only one complete WAV. Mom owns the bounded WebView audio session,
+progress, Stop, byte revocation and Quit join. Apple's synchronous inner
+synthesis call is non-preemptive: Stop suppresses late publication/playback,
+while shutdown waits for that call rather than claiming to interrupt it.
+
+Audio-attachment transcription re-presents the exact Attachment ID, root hash,
+artifact ID and policy fingerprint, then sends the verified canonical WAV as a
+complete input to the exact manifest-bound Parakeet model. Mom displays the
+transcript and provenance. Insertion is a separate explicit ordinary composer
+edit; transcription never mutates a draft or sends a message. There is no
+microphone, streaming TTS, hosted route, FTE composition, loopback, generic
+speech Tauri plugin or speech permission.
 
 ## Attachment status
 
@@ -55,11 +67,55 @@ validation and typed transform requests.
 The core never performs OCR, transcription, video decoding, network fallback or
 subprocess conversion. Mom may satisfy a typed audio-transcription request with
 `speech-native-kit`, send payload-decoded image/audio bytes only when the pinned
-native model advertises that exact capability, or surface a typed blocker.
+native model advertises that exact capability, or surface a typed blocker. The
+preview edge is narrower than model input: Rust first returns a path-free
+canonical artifact catalog, then requires the exact attachment ID, root SHA,
+artifact ID and policy fingerprint again before returning bounded text or an
+admitted content-addressed media blob. Canonical Markdown/HTML/SVG is displayed
+only as inert text. PDF is text-first with page locators and honest partial/OCR
+warnings; video uses local native controls without autoplay. Preview does not
+execute OCR, rasterization, transcription, frame extraction, network or a
+subprocess.
+
+## Information status
+
+Mom's `AppRuntime` owns one `InformationHost`. The renderer can ask a native
+picker for an opaque single-use grant but never receives the selected path.
+Before a registration event is durable, the exact Alexandria adapter opens the
+selected database query-only and proves the compiled `alexandria.blocks.v1`
+schema. Information then binds the immutable file identity and SHA-256, rejects
+a non-empty WAL or rollback journal, remounts the registration on relaunch, and
+returns only path-free source identities, bounded evidence, and exact citation
+anchors. There is no generic SQL surface.
+
+Model-context retrieval is a second, explicit process-local capability bound to
+one conversation and one exact resource/release/representation/source hash. Its
+bounded evidence is serialized as untrusted JSON and length/SHA-bound before the
+ordinary native chat path invokes llama.cpp. Cross-conversation and disallowed
+rights use fail closed.
+
+The Attachment bridge is the sole materializer composed here. It verifies the
+retained Attachment receipt, root, graph, canonical artifact, processor/policy,
+text bytes/hash, title, and confirmed private-use rights, then activates a
+deterministic managed release through Information's staging protocol. Active
+Information receipts/manifests—not a second Mom ledger—own discovery. Listing is
+a bounded lightweight projection; every search, citation, or removal first does
+the exact manifest/database/provenance validation. Removal requires an opaque
+server-held preview and never removes Attachment or external source bytes.
+
+## Persona tool authority
+
+Persona answer text is presentation data and is never scanned for JSON or tool
+syntax. A tool-bound Persona drafts ordinary prose, then the resident Native
+worker runs a separate JSON-schema-constrained `PersonaToolDecision` phase.
+Only a complete verified `Call` decision for one attached server/tool and its
+exact input schema can reach MCP policy validation; `Final` leaves the draft
+untouched. Denied and ask-policy tools still fail closed, and one Persona turn
+can execute at most one exact tool call.
 
 ## Enforced negative boundaries
 
 `scripts/check-architecture.sh` rejects copied native/attachment crates,
-undeclared speech dependencies, retired first-party Git sources in Mom's
-locked graph, child-manifest path overrides, and product network/process
+FTE/generic-plugin speech dependencies outside the reviewed set, retired first-party Git sources in
+Mom's locked graph, child-manifest path overrides, and product network/process
 authority outside the bounded MCP adapter.

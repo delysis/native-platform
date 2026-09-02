@@ -20,8 +20,12 @@ export interface InlineGhostSuggestion extends SuggestionAlternative {
 
 export interface InlineSuggestionState {
   branches: BranchCard[];
+  /** Exact live weave command authority. Null/absent derives the newest durable family. */
+  authoritativeFamilyId?: string | null;
   verifiedBodyByRun: Record<string, VerifiedBranchBody>;
   liveTextByRun: Record<string, string>;
+  /** Missing sequence authority fails closed instead of using byte length as identity. */
+  liveTextSequenceByRun?: Record<string, string>;
   currentModel: ModelCapabilitySummary | null | undefined;
   document: OpenDocument | null;
   suggestionsEnabled: boolean;
@@ -30,6 +34,61 @@ export interface InlineSuggestionState {
   unpresentableVisualKeys: string[];
   manuscriptText: string;
   sourceNewline: VerseNewlineKind | null;
+}
+
+const WEAVE_FAMILY_SIZE = 4;
+
+function branchBelongsToSuggestionScope(
+  branch: BranchCard,
+  targetByte: number,
+  state: InlineSuggestionState
+): boolean {
+  return Boolean(
+    state.document &&
+    state.currentModel &&
+    branch.document_id === state.document.summary.document_id &&
+    branch.source_revision_id === state.document.summary.revision_id &&
+    branch.model_id === state.currentModel.model_id &&
+    branch.target_start_byte === targetByte &&
+    branch.target_end_byte === targetByte
+  );
+}
+
+/**
+ * Resolve one explicit four-run weave authority. ULIDs sort chronologically,
+ * so reopen recovery chooses the greatest complete family ID without relying
+ * on renderer timestamps, branch adjacency, or array slicing.
+ */
+export function authoritativeInlineFamilyId(
+  targetByte: number,
+  state: InlineSuggestionState
+): string | null {
+  const families = new Map<string, { count: number; runIds: Set<string> }>();
+  for (const branch of state.branches) {
+    if (!branch.weave_command_id || !branchBelongsToSuggestionScope(branch, targetByte, state)) {
+      continue;
+    }
+    const family = families.get(branch.weave_command_id) ?? { count: 0, runIds: new Set() };
+    family.count += 1;
+    family.runIds.add(branch.run_id);
+    families.set(branch.weave_command_id, family);
+  }
+  const complete = (familyId: string): boolean => {
+    const family = families.get(familyId);
+    return Boolean(
+      family &&
+      family.count === WEAVE_FAMILY_SIZE &&
+      family.runIds.size === WEAVE_FAMILY_SIZE
+    );
+  };
+  if (state.authoritativeFamilyId) {
+    return complete(state.authoritativeFamilyId) ? state.authoritativeFamilyId : null;
+  }
+  let newest: string | null = null;
+  for (const familyId of families.keys()) {
+    if (complete(familyId) && (newest === null || familyId > newest)) newest = familyId;
+  }
+  return newest;
 }
 
 /**
@@ -83,14 +142,14 @@ export function inlineSuggestionFamily(
     !state.currentModel
   ) return [];
 
-  const encoder = new TextEncoder();
+  const familyId = authoritativeInlineFamilyId(targetByte, state);
+  if (!familyId) return [];
+
   const family: InlineGhostSuggestion[] = [];
   for (const branch of state.branches) {
     if (
-      branch.source_revision_id !== state.document.summary.revision_id ||
-      branch.model_id !== state.currentModel.model_id ||
-      branch.target_start_byte !== targetByte ||
-      branch.target_end_byte !== targetByte ||
+      branch.weave_command_id !== familyId ||
+      !branchBelongsToSuggestionScope(branch, targetByte, state) ||
       branch.selection === 'promote' ||
       branch.selection === 'reject' ||
       !['queued', 'generating', 'ready'].includes(branch.status)
@@ -99,7 +158,10 @@ export function inlineSuggestionFamily(
     const candidateId = `run:${branch.run_id}`;
     if (state.dismissedCandidateIds.includes(candidateId)) continue;
     const verified = verifiedGhostSuggestion(branch, state.verifiedBodyByRun[branch.run_id]);
-    const rawText = verified?.text ?? state.liveTextByRun[branch.run_id] ?? branch.text;
+    const liveText = state.liveTextByRun[branch.run_id];
+    const liveSequence = state.liveTextSequenceByRun?.[branch.run_id];
+    const hasLiveProjection = liveText !== undefined && liveSequence !== undefined;
+    const rawText = verified?.text ?? (hasLiveProjection ? liveText : branch.text);
     const text = projectInlineCandidateText(
       targetByte,
       editorMode,
@@ -109,7 +171,7 @@ export function inlineSuggestionFamily(
     );
     if (!text) continue;
     const rawPresentationKey = verified?.presentationKey ??
-      `stream:${branch.run_id}:${encoder.encode(rawText).byteLength}`;
+      (hasLiveProjection ? `stream:${branch.run_id}:${liveSequence}` : `branch:${branch.branch_id}`);
     const presentationKey = projectedInlinePresentationKey(rawPresentationKey, rawText, text);
     if (editorMode === 'visual') {
       if (

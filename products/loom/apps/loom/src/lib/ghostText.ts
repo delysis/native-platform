@@ -11,6 +11,11 @@ import {
   type CompletionInsertionAction,
   type SuggestionAlternative
 } from './suggestionInteraction';
+import {
+  allocateCompletionPopupDomIds,
+  placeCompletionPopup,
+  type CompletionPopupDomIds
+} from './completionPopup';
 
 export interface GhostTextPresentation {
   active: boolean;
@@ -24,6 +29,8 @@ export interface GhostTextPresentation {
   hidden?: boolean;
   unconsumeText?: string;
   fanVisible?: boolean;
+  /** Internal render identity; callers should normally omit this. */
+  renderEpoch?: number;
 }
 
 export interface GhostTextPlan {
@@ -38,6 +45,11 @@ export interface GhostTextPlan {
   hidden: boolean;
   unconsumeText: string;
   fanVisible: boolean;
+  /**
+   * Ephemeral DOM identity used only to rebuild an otherwise identical
+   * widget after WebKit resumes from a hidden/suspended window.
+   */
+  renderEpoch: number;
 }
 
 export interface GhostTextHandlers {
@@ -146,7 +158,10 @@ export function planGhostText(
     alternatives: presentation.alternatives ?? [],
     hidden: Boolean(presentation.hidden),
     unconsumeText: presentation.unconsumeText ?? '',
-    fanVisible: Boolean(presentation.fanVisible)
+    fanVisible: Boolean(presentation.fanVisible),
+    renderEpoch: Number.isSafeInteger(presentation.renderEpoch)
+      ? presentation.renderEpoch ?? 0
+      : 0
   };
 }
 
@@ -445,14 +460,20 @@ export function visualGhostInsertionIsVisible(
     verticallyIntersects(firstGhostFragment, clip);
 }
 
-function elementAndAncestorsAreVisible(element: HTMLElement, root: HTMLElement): boolean {
+function elementAndAncestorsAreVisible(
+  element: HTMLElement,
+  root: HTMLElement,
+  allowHiddenElement = false
+): boolean {
   for (let current: HTMLElement | null = element; current; current = current.parentElement) {
     const style = current.ownerDocument.defaultView?.getComputedStyle(current);
     if (!style) return false;
     if (
       style.display === 'none' ||
-      style.visibility === 'hidden' ||
-      style.visibility === 'collapse' ||
+      (!allowHiddenElement || current !== element) && (
+        style.visibility === 'hidden' ||
+        style.visibility === 'collapse'
+      ) ||
       Number.parseFloat(style.opacity) <= 0
     ) return false;
     if (current === root) return true;
@@ -460,8 +481,10 @@ function elementAndAncestorsAreVisible(element: HTMLElement, root: HTMLElement):
   return false;
 }
 
-/** Return the key only when the exact widget is connected and on screen. */
-export function visibleGhostWidgetPresentationKey(view: EditorView): string {
+function ghostWidgetPresentationKeyInViewport(
+  view: EditorView,
+  allowFanHiddenWidget: boolean
+): string {
   const plan = currentGhostTextPlan(view.state);
   if (!plan) return '';
   const widget = Array.from(
@@ -472,7 +495,12 @@ export function visibleGhostWidgetPresentationKey(view: EditorView): string {
   if (
     !widget?.isConnected ||
     widget.hidden ||
-    !elementAndAncestorsAreVisible(widget, view.dom)
+    plan.hidden ||
+    !elementAndAncestorsAreVisible(
+      widget,
+      view.dom,
+      allowFanHiddenWidget && plan.fanVisible
+    )
   ) return '';
   const clip = view.dom.closest<HTMLElement>('.editor-pane')?.getBoundingClientRect();
   if (!clip) return '';
@@ -496,7 +524,12 @@ export function visibleGhostWidgetPresentationKey(view: EditorView): string {
   return plan.presentationKey;
 }
 
-function ghostWidget(plan: GhostTextPlan): HTMLElement {
+/** Return the key only when the exact visible inline widget is connected and on screen. */
+export function visibleGhostWidgetPresentationKey(view: EditorView): string {
+  return ghostWidgetPresentationKeyInViewport(view, false);
+}
+
+function ghostWidget(plan: GhostTextPlan, domIds: CompletionPopupDomIds): HTMLElement {
   const container = document.createElement('span');
   container.className = 'loom-ghost-widget';
   container.contentEditable = 'false';
@@ -517,12 +550,15 @@ function ghostWidget(plan: GhostTextPlan): HTMLElement {
   if (plan.alternatives.length > 1) {
     const fan = document.createElement('span');
     fan.className = 'loom-ghost-fan';
+    fan.id = domIds.listboxId;
+    fan.dataset.presentationKey = plan.presentationKey;
     fan.setAttribute('role', 'listbox');
     fan.setAttribute('aria-label', 'Completion suggestions');
     fan.setAttribute('aria-keyshortcuts', 'Alt+ArrowUp Alt+ArrowDown Alt+Enter Alt+Tab');
     plan.alternatives.forEach((alternative, index) => {
       const row = document.createElement('span');
       row.className = 'loom-ghost-fan-row';
+      row.id = domIds.optionId(index);
       const selected = alternative.presentationKey === plan.presentationKey;
       if (selected) row.classList.add('active');
       setCompletionOptionAccessibility(
@@ -588,10 +624,12 @@ export function clearGhostText(view: EditorView): void {
 
 export function setGhostText(
   view: EditorView,
-  presentation: GhostTextPresentation | null
+  presentation: GhostTextPresentation | null,
+  forceRender = false
 ): void {
   const current = ghostTextPluginKey.getState(view.state);
   if (
+    !forceRender &&
     current?.presentationKey === presentation?.presentationKey &&
     current?.active === presentation?.active &&
     current?.candidateId === presentation?.candidateId &&
@@ -613,23 +651,36 @@ export function setGhostText(
     // The editor owns the actual modifier state. Reconcile every candidate
     // update to that state so a 1→4 streamed family opens while Option is held,
     // and a consumed 4→1 family cannot leave its inline remainder hidden.
-    fanVisible: Boolean(presentation.fanVisible)
+    fanVisible: Boolean(presentation.fanVisible),
+    // WebKit can discard or stop exposing an unchanged contenteditable
+    // decoration while a native window is hidden. A lifecycle refresh must
+    // therefore create a new widget DOM identity without changing completion
+    // authority or manuscript state.
+    renderEpoch: forceRender ? (current?.renderEpoch ?? 0) + 1 : 0
   };
   view.dispatch(view.state.tr
     .setMeta(ghostTextPluginKey, { kind: 'set', presentation: next } satisfies GhostTextMeta)
     .setMeta('addToHistory', false));
 }
 
-export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<GhostTextPresentation | null> {
+export function createGhostTextPlugin(
+  handlers: GhostTextHandlers,
+  domIds: CompletionPopupDomIds = allocateCompletionPopupDomIds('visual')
+): Plugin<GhostTextPresentation | null> {
   return new Plugin<GhostTextPresentation | null>({
     key: ghostTextPluginKey,
     state: {
       init: () => null,
-      apply(transaction, current) {
+      apply(transaction, current, oldState) {
         const meta = transactionMeta(transaction);
         if (meta?.kind === 'set') return meta.presentation;
         if (meta?.kind === 'fan') return current ? { ...current, fanVisible: meta.visible } : current;
-        if (meta?.kind === 'clear' || transaction.docChanged || transaction.selectionSet) return null;
+        if (meta?.kind === 'clear' || transaction.docChanged) return null;
+        // WebKit and ProseMirror may explicitly reassert the current selection
+        // while restoring focus after an idle period. That transaction is not
+        // caret navigation and must not discard an otherwise exact decoration.
+        // A genuinely different selection still invalidates synchronously.
+        if (transaction.selectionSet && !transaction.selection.eq(oldState.selection)) return null;
         return current;
       }
     },
@@ -638,13 +689,14 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
         const plan = currentGhostTextPlan(state);
         if (!plan) return null;
         return DecorationSet.create(state.doc, [
-          Decoration.widget(plan.position, () => ghostWidget(plan), {
+          Decoration.widget(plan.position, () => ghostWidget(plan, domIds), {
             // ProseMirror reuses widget DOM when this key is unchanged. Fan,
             // hidden, and streamed-alternative changes are render identity,
             // not merely plugin metadata; include them so stale pixels cannot
             // survive Option-up or rollback.
             key: JSON.stringify([
               plan.presentationKey,
+              plan.renderEpoch,
               plan.hidden,
               plan.fanVisible,
               plan.alternatives.map((item) => [
@@ -662,18 +714,49 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
       handleKeyDown(view, event) {
         const plan = planGhostText(view.state, ghostTextPluginKey.getState(view.state) ?? null);
         if (event.isComposing || event.keyCode === 229) return false;
-        if (
+        const optionChord =
           (event.key === 'Alt' || event.altKey) &&
           !event.metaKey &&
-          !event.ctrlKey
-        ) handlers.modifier?.(true);
-        else if (!event.altKey || event.metaKey || event.ctrlKey) handlers.modifier?.(false);
+          !event.ctrlKey;
+        const exactAnchorVisible = Boolean(plan && (
+          plan.fanVisible
+            ? ghostWidgetPresentationKeyInViewport(view, true) === plan.presentationKey
+            : handlers.visible(
+                plan.presentationKey,
+                plan.surfaceKey,
+                plan.anchorByteOffset
+              )
+        ));
+        const rollbackEnd = view.state.selection.from;
+        const rollbackStart = plan?.unconsumeText
+          ? rollbackEnd - plan.unconsumeText.length
+          : -1;
+        const exactRollbackAvailable = Boolean(
+          plan?.unconsumeText &&
+          rollbackStart >= 0 &&
+          view.state.doc.textBetween(rollbackStart, rollbackEnd, '\n', '\n') ===
+            plan.unconsumeText
+        );
+        // Keep reporting the physical modifier when there is no completion.
+        // When a plan does exist, however, only its live viewport witness may
+        // project Option-held fan state back through the Svelte owner. The one
+        // exception is a hidden rollback-only plan: its exact preceding bytes
+        // are the authority for Option-Left, and keeping that physical Option
+        // witness lets the restored multi-candidate fan reopen after reversal.
+        handlers.modifier?.(
+          optionChord && (!plan || exactAnchorVisible || exactRollbackAvailable)
+        );
         if (event.key === 'Alt' && !event.metaKey && !event.ctrlKey) {
-          if (plan && plan.alternatives.length > 1) setGhostFanVisible(view, true);
+          if (plan && plan.alternatives.length > 1 && exactAnchorVisible) {
+            setGhostFanVisible(view, true);
+          } else if (plan?.fanVisible) {
+            setGhostFanVisible(view, false);
+          }
           return false;
         }
         if (
           plan &&
+          exactAnchorVisible &&
           event.altKey &&
           !event.metaKey &&
           !event.ctrlKey &&
@@ -692,11 +775,8 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           !event.ctrlKey &&
           event.key === 'ArrowLeft'
         ) {
-          const end = view.state.selection.from;
-          const start = end - plan.unconsumeText.length;
           if (
-            start >= 0 &&
-            view.state.doc.textBetween(start, end, '\n', '\n') === plan.unconsumeText &&
+            exactRollbackAvailable &&
             handlers.unconsume?.(plan.candidateId, plan.presentationKey, plan.unconsumeText)
           ) {
             event.preventDefault();
@@ -704,7 +784,7 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
             const anchorByteOffset = plan.anchorByteOffset - removedBytes;
             if (anchorByteOffset < 0) return false;
             view.dispatch(view.state.tr
-              .delete(start, end)
+              .delete(rollbackStart, rollbackEnd)
               .setMeta(ghostTextPluginKey, {
                 kind: 'set',
                 presentation: {
@@ -727,6 +807,7 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
         if (
           plan &&
           plan.fanVisible &&
+          exactAnchorVisible &&
           event.altKey &&
           !event.metaKey &&
           !event.ctrlKey &&
@@ -748,11 +829,7 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           !event.metaKey &&
           !event.ctrlKey &&
           event.key === 'ArrowRight' &&
-          (plan.fanVisible || handlers.visible(
-            plan.presentationKey,
-            plan.surfaceKey,
-            plan.anchorByteOffset
-          ))
+          exactAnchorVisible
         ) {
           const word = nextVisualSuggestionWord(plan.text);
           if (!word || !handlers.insert?.(
@@ -822,6 +899,97 @@ export function createGhostTextPlugin(handlers: GhostTextHandlers): Plugin<Ghost
           return false;
         }
       }
+    },
+    view(editorView) {
+      let placementFrame: number | undefined;
+
+      const clearFanAccessibility = (): void => {
+        editorView.dom.removeAttribute('aria-controls');
+        editorView.dom.removeAttribute('aria-activedescendant');
+      };
+
+      const synchronizeFanAccessibility = (): void => {
+        if (editorView.isDestroyed) return;
+        const plan = currentGhostTextPlan(editorView.state);
+        const selectedIndex = plan?.fanVisible
+          ? plan.alternatives.findIndex(
+              (alternative) => alternative.presentationKey === plan.presentationKey
+            )
+          : -1;
+        if (!plan?.fanVisible || plan.alternatives.length < 2 || selectedIndex < 0) {
+          clearFanAccessibility();
+          return;
+        }
+        const ownerDocument = editorView.dom.ownerDocument;
+        const fan = ownerDocument.getElementById(domIds.listboxId);
+        const activeOptionId = domIds.optionId(selectedIndex);
+        const activeOption = ownerDocument.getElementById(activeOptionId);
+        if (
+          !fan ||
+          !activeOption ||
+          !editorView.dom.contains(fan) ||
+          !fan.contains(activeOption)
+        ) {
+          clearFanAccessibility();
+          return;
+        }
+        editorView.dom.setAttribute('aria-controls', domIds.listboxId);
+        editorView.dom.setAttribute('aria-activedescendant', activeOptionId);
+      };
+
+      const placeFan = (): void => {
+        placementFrame = undefined;
+        if (editorView.isDestroyed) return;
+        const plan = currentGhostTextPlan(editorView.state);
+        if (!plan?.fanVisible) return;
+        if (
+          ghostWidgetPresentationKeyInViewport(editorView, true) !== plan.presentationKey
+        ) {
+          // A fixed popup must never outlive the inline insertion witness that
+          // gives it meaning. Clear both the modifier projection and fan state
+          // before viewport clamping can make an offscreen completion appear
+          // attached to an unrelated visible edge.
+          handlers.modifier?.(false);
+          setGhostFanVisible(editorView, false);
+          return;
+        }
+        const fan = Array.from(
+          editorView.dom.querySelectorAll<HTMLElement>('.loom-ghost-fan')
+        ).find((candidate) => candidate.dataset.presentationKey === plan.presentationKey);
+        if (!fan?.isConnected) return;
+        try {
+          const caret = editorView.coordsAtPos(plan.position);
+          fan.style.maxHeight = '';
+          placeCompletionPopup(fan, {
+            ...caret,
+            width: caret.right - caret.left,
+            height: caret.bottom - caret.top
+          });
+        } catch {
+          // Concurrent destruction or replacement invalidates the caret.
+        }
+      };
+      const requestPlacement = (): void => {
+        if (placementFrame !== undefined || editorView.isDestroyed) return;
+        placementFrame = window.requestAnimationFrame(placeFan);
+      };
+
+      window.addEventListener('resize', requestPlacement);
+      window.addEventListener('scroll', requestPlacement, true);
+      synchronizeFanAccessibility();
+      requestPlacement();
+      return {
+        update() {
+          synchronizeFanAccessibility();
+          requestPlacement();
+        },
+        destroy() {
+          clearFanAccessibility();
+          window.removeEventListener('resize', requestPlacement);
+          window.removeEventListener('scroll', requestPlacement, true);
+          if (placementFrame !== undefined) window.cancelAnimationFrame(placementFrame);
+        }
+      };
     }
   });
 }

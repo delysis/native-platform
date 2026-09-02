@@ -1,9 +1,11 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
+  import { convertFileSrc } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
+  import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
     applicationClosePending,
@@ -17,20 +19,26 @@
     closeProject as closeProjectSession,
     createDocument,
     currentProjectSession,
+    deleteDocument,
     exportDocumentCopy,
     getBranch,
     getBranchBody,
     getBranchPage,
+    getCompletionSnapshot,
     getBuildModelPolicy,
     getModelDownloadStatus,
     getWeaveStatus,
+    ingestImageAttachment,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
+    listenForDocumentFilesystemHints,
     listenForFileCommands,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
+    loadCatalogModelCandidate,
     loadModel,
     loadPolicyModelCandidate,
+    listCuratedModels,
     listModels,
     listModelDownloads,
     openDefaultProject,
@@ -38,6 +46,8 @@
     previewDocumentReconciliation,
     promoteCandidate,
     recoverProject,
+    renameDocument,
+    revealDocument,
     requestApplicationClose,
     setFocusMode,
     setSuggestions as setSuggestionsPolicy,
@@ -48,10 +58,15 @@
     upsertTransientDraft
   } from './lib/ipc';
   import {
+    attachmentMarkdown,
+    encodeImageAttachment,
+    imageAttachmentTransferError,
+    projectAssetProtocolToken
+  } from './lib/attachments';
+  import {
     decodeVerseForEditor,
     encodeVerseFromEditor,
-    type VerseEditorCodec,
-    type VerseNewlineKind
+    type VerseEditorCodec
   } from './lib/verseCodec';
   import { canUseVisualMarkdown } from './lib/markdownSafety';
   import {
@@ -89,6 +104,8 @@
     branchBodyDisposition,
     mergeNewestPage
   } from './lib/branchPaging';
+  import { completionSnapshotFacts } from './lib/completionSnapshot';
+  import { shouldCaptureFormatMenuEscape } from './lib/appKeyboardRouting';
   import { writeRebindsStaleDraft } from './lib/draftRecovery';
   import { documentProjectionDecision } from './lib/projectionState';
   import {
@@ -117,11 +134,24 @@
   import { DetachedProjectCloseCoordinator } from './lib/detachedProjectClose';
   import { suggestionsEnabledFromStoredPreference } from './lib/suggestionPreference';
   import {
-    appearancePreference,
+    loadAppearancePreference,
+    persistAppearancePreference,
     resolveAppearance,
     toggledAppearance,
     type AppearancePreference
   } from './lib/appearance';
+  import {
+    catalogDownloadRequest,
+    isVerifiedCatalogWriter,
+    legacyLocalCatalogMatch,
+    validateCuratedModelCatalog
+  } from './lib/modelCatalog';
+  import {
+    AUTOCOMPLETE_MODEL_MENU_LONG_PRESS_MS,
+    autocompleteModelMenuLongPressMoved,
+    canStartAutocompleteModelMenuLongPress,
+    isAutocompleteModelMenuKey
+  } from './lib/autocompleteModelMenu';
   import {
     captureProjectCloseAgency,
     restoreProjectCloseAgency,
@@ -137,26 +167,14 @@
   } from './lib/startupSafety';
   import { newUlid } from './lib/ulid';
   import {
-    cycleSuggestionIndex,
     type CompletionInsertionAction
   } from './lib/suggestionInteraction';
   import {
-    advanceCompletionExhaustionLatch,
     acceptedCompletionText,
     completionPresentation as completionSessionPresentation,
     completionSessionContextKey,
-    completionSessionMatchesPresentation,
     completionShouldRequestNextBatch,
-    consumeCompletionText,
-    cycleCompletionSession,
-    insertAtUtf8Boundary,
-    remainingCompletionText,
-    removeBeforeUtf8Boundary,
     selectedCompletionCandidate,
-    startCompletionSession,
-    synchronizeCompletionCandidates,
-    unconsumeCompletionWord,
-    updateCompletionCandidate,
     type CompletionSession
   } from './lib/completionSession';
   import {
@@ -167,17 +185,79 @@
   } from './lib/completionModes';
   import {
     unavailableVisualCompletionWitness,
-    type VisualCompletionAccessibilityWitness
+    unavailableVisualSelectionWitness,
+    type VisualCompletionAccessibilityWitness,
+    type VisualSelectionAccessibilityWitness
   } from './lib/completionAccessibility';
   import { observeNativeFullscreen } from './lib/nativeFullscreen';
   import {
-    armCompletionGeneration,
-    bindCompletionGenerationAnchor,
+    applyDocumentRenameProjection,
+    boundedDocumentTitleInput,
+    captureDocumentTarget,
+    capturedDocumentBelongsToSession,
+    capturedDocumentIdentityIsCurrent,
+    clampDocumentMenuPoint,
+    createDocumentRenameCompositionGuard,
+    documentDeleteMenuIndex,
+    documentMenuKeyAction,
+    documentRevealLabel,
+    isDocumentContextTriggerKey,
+    refreshDocumentDeleteTarget,
+    refreshDocumentRenameTarget,
+    releaseDocumentRenameAndRestoreFocus,
+    visibleDocumentActionsMenuPoint,
+    type CapturedDocumentTarget,
+    type DocumentContextAction,
+    type MenuPoint
+  } from './lib/documentContextActions';
+  import {
+    applyGuardedProjectFilesystemRefresh,
+    beginMissingDocumentCaptureBoundary,
+    captureProjectFilesystemRefreshBoundary,
+    documentBoundaryNeedsRecovery,
+    documentRefreshDecision,
+    missingDocumentJournalIsDurable,
+    missingDocumentRecoveryRequiresCopy,
+    openedDocumentSubsumesMissingRecovery,
+    projectFilesystemRefreshBoundaryDisposition,
+    type MissingDocumentCaptureIdentity,
+    type ProjectFilesystemRefreshBoundaryState
+  } from './lib/documentLifecycle';
+  import { routeDocumentFilesystemHint } from './lib/documentFilesystemHint';
+  import {
     completionGenerationIsArmed,
-    disarmCompletionGeneration,
-    type CompletionGenerationIntent,
     type CompletionGenerationTrigger
   } from './lib/completionGenerationIntent';
+  import {
+    armCompletionScheduleIntent,
+    authorizeCompletionInsertion,
+    authorizeCompletionUnconsume,
+    bindCompletionAnchor,
+    cancelCompletionSchedule,
+    clearCompletionSession as clearCompletionControllerSession,
+    clearUnpresentableVisualKeys,
+    completionActivityExists as controllerHasCompletionActivity,
+    completionControllerView,
+    completionExhausted,
+    cycleCompletion,
+    dismissCompletion,
+    initialCompletionControllerState,
+    invalidateCompletionNavigation as invalidateControllerNavigation,
+    invalidateVisualMutation,
+    observeTextMutation,
+    reconcileCompletionController,
+    refreshCompletionCandidate,
+    rejectVisualPresentation,
+    resetCompletionDiscovery,
+    resetCompletionSurface,
+    setCompletionSchedule,
+    setDismissedCompletionCandidates,
+    settleCompletionNavigation,
+    shuttleScheduleKey as completionShuttleScheduleKey,
+    type AutocompleteRetryTicket,
+    type CompletionControllerEffect,
+    type CompletionSchedule
+  } from './lib/completionController';
   import {
     automaticCompletionLifecycle,
     completionLifecycleDescription,
@@ -215,6 +295,7 @@
     BranchSummary,
     BuildModelPolicySummary,
     CommandReceipt,
+    CuratedModelCatalogEntry,
     DesktopGenerationEnvelope,
     DocumentKind,
     DocumentSummary,
@@ -247,10 +328,32 @@
   let search = '';
   let outlineOpen = false;
   let outlineToggle: HTMLButtonElement | undefined;
+  const documentContextLongPressMilliseconds = 550;
+  const documentContextLongPressSlop = 10;
+  let documentContextTarget: CapturedDocumentTarget | null = null;
+  let documentContextTrigger: HTMLButtonElement | null = null;
+  let documentContextMenu: HTMLDivElement | undefined;
+  let documentContextPoint: MenuPoint = { x: 8, y: 8 };
+  let documentContextFocusIndex = 0;
+  let documentContextActionInFlight = false;
+  let documentContextRevealLabel: string | null = null;
+  let documentContextLongPressTimer: number | undefined;
+  let documentContextLongPress: {
+    pointerId: number;
+    x: number;
+    y: number;
+    target: CapturedDocumentTarget;
+    trigger: HTMLButtonElement;
+  } | null = null;
+  let documentContextSuppressClickId: string | null = null;
+  let documentContextSuppressClickTimer: number | undefined;
   let appearance: AppearancePreference = 'system';
   let systemDark = false;
   let appearanceMedia: MediaQueryList | null = null;
   let models: ModelCapabilitySummary[] = [];
+  let curatedModels: CuratedModelCatalogEntry[] = [];
+  let curatedModelsLoading = false;
+  let curatedModelsError = '';
   let selectedModelPath = '';
   let compatibleWriterModels: ModelCapabilitySummary[] = [];
   let otherLocalModels: ModelCapabilitySummary[] = [];
@@ -261,25 +364,11 @@
   let modelManagerOpen = false;
   let modelManagerPanel: HTMLElement | undefined;
   let modelManagerReturnFocus: HTMLElement | null = null;
-  let activeSuggestionRunId: string | null = null;
-  let completionSession: CompletionSession | null = null;
+  let completionController = initialCompletionControllerState();
   let visualCompletionAccessibility: VisualCompletionAccessibilityWitness =
     unavailableVisualCompletionWitness();
-  let completionActionSequence = 0;
-  let lastCompletionAction: {
-    sequence: number;
-    kind: CompletionInsertionAction;
-    context_key: string;
-    run_id: string;
-    candidate_id: string;
-    presentation_key: string;
-    inserted_utf8_bytes: number;
-    accepted_utf8_bytes: number;
-  } | null = null;
-  let pendingCompletionText: string | null = null;
-  let handledCompletionExhaustionKey = '';
-  let projectMenu: HTMLDetailsElement | undefined;
-  let projectMenuTrigger: HTMLElement | undefined;
+  let visualSelectionAccessibility: VisualSelectionAccessibilityWitness =
+    unavailableVisualSelectionWitness();
   let formatMenu: VisualFormatMenu | undefined;
   let visualFormatting: VisualFormatState = {
     block: 'body',
@@ -292,19 +381,47 @@
     selectionEmpty: true
   };
   let unlistenFileCommands: (() => void) | undefined;
+  let unlistenDocumentFilesystemHints: (() => void) | undefined;
   let fileCommandInFlight = false;
+  let renamingDocumentId: string | null = null;
+  let renameDocumentTitle = '';
+  let renameDocumentInput: HTMLInputElement | undefined;
+  let renameDocumentTarget: CapturedDocumentTarget | null = null;
+  let renameDocumentTrigger: HTMLElement | null = null;
+  let renameDocumentInFlight = false;
+  let renameDocumentEditorLocked = false;
+  const renameDocumentComposition = createDocumentRenameCompositionGuard();
+  let deleteDocumentTarget: CapturedDocumentTarget | null = null;
+  let deleteDocumentTrigger: HTMLElement | null = null;
+  let deleteDocumentCommandId: string | null = null;
+  let deleteDocumentDialog: HTMLDivElement | undefined;
+  let deleteDocumentCancelButton: HTMLButtonElement | undefined;
+  let deleteDocumentInFlight = false;
+  let deleteDocumentUncertain = false;
+  let deleteDocumentEditorLocked = false;
+  let projectFilesystemRefreshTimer: number | undefined;
+  let projectFilesystemRefreshInFlight = false;
+  let missingDocumentBoundaryInFlight = false;
+  let missingDocumentCapturePending: MissingDocumentCaptureIdentity | null = null;
+  let projectFilesystemRefreshQueued = false;
+  let projectFilesystemRefreshSerial = 0;
+  let missingDocumentRecovery: MissingDocumentRecovery | null = null;
+  let missingDocumentCopyState: 'idle' | 'copied' | 'failed' = 'idle';
   let appliedNativeTitle = '';
   let suggestionsEnabled = false;
   let suggestionsChanging = false;
+  let autocompleteModelMenuLongPressTimer: number | undefined;
+  let autocompleteModelMenuLongPress: {
+    pointerId: number;
+    x: number;
+    y: number;
+    trigger: HTMLButtonElement;
+  } | null = null;
+  let suppressAutocompleteToggleClick = false;
+  let suppressAutocompleteToggleClickTimer: number | undefined;
   let suggestionsIdleTimer: number | undefined;
-  let scheduledSuggestion: SuggestionSchedule | null = null;
   let suggestionWakeQueued = false;
-  let completionGenerationIntent: CompletionGenerationIntent | null = null;
-  let completionNavigationPending = false;
-  let suggestionIntentEpoch = 0;
   let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
-  let dismissedCandidateIds: string[] = [];
-  let unpresentableVisualGhostPresentationKeys: string[] = [];
   let announcedGhostPresentationKey = '';
   let modelDownloadUrl = '';
   let modelDownloadFileName = '';
@@ -336,6 +453,8 @@
   let branchLoadedPastFirstPage = false;
   let branchBodyBlobByRun: Record<string, string> = {};
   let verifiedBranchBodyByRun: Record<string, VerifiedBranchBody> = {};
+  let liveBranchTextByRun: Record<string, string> = {};
+  let liveBranchTextSequenceByRun: Record<string, string> = {};
   let branchBodyErrorByRun: Record<string, string> = {};
   let branchRefreshSerial = 0;
   let branchRefreshInFlightCount = 0;
@@ -350,9 +469,8 @@
   let branchPollInFlight = false;
   let branchPollAttempt = 0;
   let branchPollEpoch = 0;
-  let liveBranchText: Record<string, string> = {};
-  let liveBranchState: Record<string, BranchEventOverlay> = {};
-  let generationSequenceByRun: Record<string, number> = {};
+  let completionActiveRunIds: string[] = [];
+  let authoritativeCompletionFamilyId: string | null = null;
   let cancellingRunIds: string[] = [];
   let cancellationCommandByRun: Record<string, string> = {};
   let promotionArmedCandidateId: string | null = null;
@@ -364,6 +482,7 @@
   let uncertainPromotion: PromotionCapture | null = null;
   let unlistenGenerationEvents: (() => void) | undefined;
   let generationListenerDisposed = false;
+  let generationListenerPromise: Promise<void> | null = null;
   let saveTimer: number | undefined;
   let saveInFlight: Promise<void> | null = null;
   let saveQueued = false;
@@ -390,6 +509,7 @@
     focusPreservingSelection: () => boolean;
     captureFormattingSelection: () => boolean;
     clearFormattingSelection: () => void;
+    refreshGhostPresentation: () => boolean;
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
   } | null = null;
@@ -482,12 +602,32 @@
     sessionId: string;
   }
 
-  interface BranchEventOverlay {
-    branchId: string;
-    status?: BranchCard['status'];
-    candidateId?: string;
-    error?: string;
+  interface MissingDocumentRecovery {
+    projectId: string;
+    sessionId: string;
+    documentId: string;
+    relativePath: string;
+    title: string;
+    text: string;
+    hadUnsavedText: boolean;
+    journalDurable: boolean;
+    sourceRevisionId: string | null;
+    visibleBlobId: string;
+    draftVersion: string;
+    draftWasUncertain: boolean;
+    saveWasUncertain: boolean;
   }
+
+  type MissingDocumentRecoveryBoundaryResult =
+    | { readonly kind: 'ready'; readonly project: ProjectSnapshot }
+    | {
+        readonly kind: 'deferred';
+        readonly reason:
+          | 'live_document_changed'
+          | 'editor_not_flushable'
+          | 'workspace_changed'
+          | 'document_reappeared';
+      };
 
   interface PromotionCapture {
     commandId: string;
@@ -517,26 +657,6 @@
     intentEpoch: number;
     modelId: string;
   }
-
-  interface AutocompleteRetryTicket {
-    projectId: string;
-    sessionId: string;
-    documentId: string;
-    sourceRevisionId: string;
-    visibleBlobId: string;
-    documentEpoch: number;
-    editVersion: number;
-    intentEpoch: number;
-    mode: 'visual' | 'source';
-    targetByte: number;
-    modelId: string;
-    sourceNewline: VerseNewlineKind | null;
-    waitsRemaining: number;
-  }
-
-  type SuggestionSchedule =
-    | { kind: 'edit_pause'; editVersion: number }
-    | { kind: 'exhausted_retry'; ticket: AutocompleteRetryTicket };
 
   interface ModelDownloadCapture extends VerifiedDownloadForm {
     commandId: string;
@@ -582,8 +702,31 @@
   const applicationCloseCoordinator = new ApplicationCloseCoordinator({
     begin: () => {
       applicationClosePhase = 'closing';
+      clearDocumentContextLongPress();
+      closeDocumentContextMenu(false);
+      closeDocumentDeleteConfirmation(false);
       clearPreferredWriterRequest();
       cancelSuggestionTimer();
+      if (
+        missingDocumentRecovery &&
+        !missingDocumentRecovery.journalDurable &&
+        missingDocumentCopyState !== 'copied'
+      ) {
+        recordLocalFailure(
+          'missing_document_recovery_not_durable',
+          'Copy the preserved missing-document text before closing Loom; its draft durability is not confirmed.'
+        );
+        announce(errorMessage);
+        return false;
+      }
+      if (missingDocumentCapturePending) {
+        recordLocalFailure(
+          'missing_document_capture_pending',
+          'Wait for Loom to preserve the newly missing manuscript before closing.'
+        );
+        announce(errorMessage);
+        return false;
+      }
       if (compositionActive) {
         recordLocalFailure(
           'composition_active',
@@ -618,14 +761,19 @@
   const suggestionsRetryDelayMs = 350;
   const maximumAutomaticSuggestionRetries = 1;
   const maximumAutocompleteRetryWaits = 50;
-  const appearancePreferenceKey = 'loom.appearance.v1';
-
   function completionAutomationEnabled(
     autocomplete = suggestionsEnabled,
     shuttle = shuttleEnabled
   ): boolean {
     return completionEngineEnabled({ autocomplete, shuttle });
   }
+
+  $: completionSession = completionController.session;
+  $: pendingCompletionText = completionController.pendingText;
+  $: completionGenerationIntent = completionController.generationIntent;
+  $: dismissedCandidateIds = completionController.dismissedCandidateIds;
+  $: unpresentableVisualGhostPresentationKeys = completionController.unpresentableVisualKeys;
+  $: scheduledSuggestion = completionController.scheduled;
 
   $: visibleDocuments = project?.documents.filter((candidate) => {
     const query = search.trim().toLocaleLowerCase();
@@ -709,8 +857,10 @@
     : null;
   $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual', {
     branches,
+    authoritativeFamilyId: authoritativeCompletionFamilyId,
     verifiedBodyByRun: verifiedBranchBodyByRun,
-    liveTextByRun: liveBranchText,
+    liveTextByRun: liveBranchTextByRun,
+    liveTextSequenceByRun: liveBranchTextSequenceByRun,
     currentModel,
     document,
     suggestionsEnabled: completionAutomationEnabled(),
@@ -722,8 +872,10 @@
   });
   $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source', {
     branches,
+    authoritativeFamilyId: authoritativeCompletionFamilyId,
     verifiedBodyByRun: verifiedBranchBodyByRun,
-    liveTextByRun: liveBranchText,
+    liveTextByRun: liveBranchTextByRun,
+    liveTextSequenceByRun: liveBranchTextSequenceByRun,
     currentModel,
     document,
     suggestionsEnabled: completionAutomationEnabled(),
@@ -738,10 +890,13 @@
     : mode === 'source'
       ? sourceSuggestionFamily
       : [];
-  $: synchronizeVisibleCompletionSession(completionContextKey, baseSuggestionFamily);
-  $: boundCompletionSession = completionSession?.contextKey === completionContextKey
-    ? completionSession
-    : null;
+  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily);
+  $: completionView = completionControllerView(
+    completionController,
+    completionContextKey,
+    baseSuggestionFamily
+  );
+  $: boundCompletionSession = completionView.boundSession;
   $: if (boundCompletionSession) {
     const selected = selectedCompletionCandidate(boundCompletionSession);
     const branch = selected
@@ -750,8 +905,11 @@
     const verified = selected && branch
       ? verifiedGhostSuggestion(branch, verifiedBranchBodyByRun[selected.runId])
       : null;
+    const liveText = selected ? liveBranchTextByRun[selected.runId] : undefined;
+    const liveSequence = selected ? liveBranchTextSequenceByRun[selected.runId] : undefined;
+    const hasLiveProjection = liveText !== undefined && liveSequence !== undefined;
     const rawText = selected && branch
-      ? verified?.text ?? liveBranchText[selected.runId] ?? branch.text
+      ? verified?.text ?? (hasLiveProjection ? liveText : branch.text)
       : '';
     const text = selected
       ? projectInlineCandidateText(
@@ -764,43 +922,23 @@
       : null;
     if (selected && text && candidateTextIsSurfaceable(text)) {
       const rawPresentationKey = verified?.presentationKey ??
-        `stream:${selected.runId}:${new TextEncoder().encode(rawText).byteLength}`;
-      const updated = updateCompletionCandidate(
+        (hasLiveProjection
+          ? `stream:${selected.runId}:${liveSequence}`
+          : `branch:${branch?.branch_id ?? selected.runId}`);
+      refreshVisibleCompletionCandidate(
         boundCompletionSession,
         selected.runId,
         text,
         projectedInlinePresentationKey(rawPresentationKey, rawText, text)
       );
-      syncCompletionCandidate(boundCompletionSession, updated);
     }
   }
-  $: sessionSuggestion = boundCompletionSession
-    ? completionSessionPresentation(boundCompletionSession) as InlineGhostSuggestion | null
-    : null;
-  $: sessionSuggestionFamily = boundCompletionSession
-    ? boundCompletionSession.acceptedChunks.length === 0
-      ? boundCompletionSession.candidates as InlineGhostSuggestion[]
-      : sessionSuggestion ? [sessionSuggestion] : []
-    : [];
-  $: activeSuggestionFamily = pendingCompletionText !== null
-    ? []
-    : boundCompletionSession ? sessionSuggestionFamily : baseSuggestionFamily;
-  $: if (
-    activeSuggestionFamily.length > 0 &&
-    !activeSuggestionFamily.some((suggestion) => suggestion.runId === activeSuggestionRunId)
-  ) activeSuggestionRunId = activeSuggestionFamily[0].runId;
-  $: selectedInlineSuggestion = activeSuggestionFamily.find(
-    (suggestion) => suggestion.runId === activeSuggestionRunId
-  ) ?? activeSuggestionFamily[0] ?? null;
+  $: activeSuggestionFamily = completionView.activeFamily;
+  $: selectedInlineSuggestion = completionView.selected;
   $: ghostSuggestion = mode === 'visual' ? selectedInlineSuggestion : null;
   $: sourceGhostSuggestion = mode === 'source' ? selectedInlineSuggestion : null;
-  $: ghostAlternatives = activeSuggestionFamily.map((suggestion) => ({
-    candidateId: suggestion.candidateId,
-    presentationKey: suggestion.presentationKey,
-    text: suggestion.text,
-    runId: suggestion.runId
-  }));
-  $: ghostUnconsumeText = boundCompletionSession?.acceptedChunks.at(-1) ?? '';
+  $: ghostAlternatives = completionView.alternatives;
+  $: ghostUnconsumeText = completionView.unconsumeText;
   $: activeGhostSuggestion = mode === 'visual'
     ? ghostSuggestion?.presentationKey === visibleVisualGhostPresentationKey
       ? ghostSuggestion
@@ -810,9 +948,7 @@
         ? sourceGhostSuggestion
         : null
       : null;
-  $: completionWitnessSelected = boundCompletionSession
-    ? selectedCompletionCandidate(boundCompletionSession)
-    : null;
+  $: completionWitnessSelected = completionView.witnessSelected;
   $: completionAccessibilityWitness = JSON.stringify({
     schema: 'delysis.loom-completion-witness.v1',
     mode,
@@ -847,7 +983,18 @@
         ? visibleSourceGhostPresentationKey
         : '',
     visual: visualCompletionAccessibility,
-    last_action: lastCompletionAction
+    editor_selection: {
+      available: visualSelectionAccessibility.available,
+      epoch: visualSelectionAccessibility.epoch,
+      selection_kind: visualSelectionAccessibility.selectionKind,
+      from: visualSelectionAccessibility.from,
+      to: visualSelectionAccessibility.to,
+      empty: visualSelectionAccessibility.empty,
+      all_visible_text: visualSelectionAccessibility.allVisibleText,
+      caret_at_end: visualSelectionAccessibility.caretAtEnd,
+      caret_byte_offset: visualSelectionAccessibility.caretByteOffset
+    },
+    last_action: completionController.lastAction
   });
   $: completionExhaustionKey = boundCompletionSession && completionShouldRequestNextBatch(
     boundCompletionSession,
@@ -887,15 +1034,6 @@
           : 'Set up';
   $: nativeWindowTitle = document?.summary.title ?? project?.title ?? 'Loom';
   $: resolvedAppearance = resolveAppearance(appearance, systemDark);
-  $: autosaveLabel = saveState === 'saving'
-    ? 'Saving…'
-    : saveState === 'dirty'
-      ? 'Autosave pending'
-      : saveState === 'error' || saveState === 'uncertain'
-        ? saveMessage
-        : project
-          ? 'Autosaved'
-          : 'No document';
   $: if (desktop) void syncNativeWindowTitle(nativeWindowTitle);
   $: if (componentMounted) {
     window.document.documentElement.dataset.theme = resolvedAppearance;
@@ -911,9 +1049,14 @@
     announce('Suggestion available. Tab accepts all; Option Right accepts one word; Option Up or Down switches.');
   }
   $: shuttleCandidate = shuttleEnabled ? selectedInlineSuggestion : activeGhostSuggestion;
-  $: shuttleScheduleKey = shuttleEnabled && windowFocused && shuttleCandidate
-    ? `${shuttleCandidate.candidateId}:${boundCompletionSession?.acceptedChunks.length ?? 0}:${editVersion}:${mode}`
-    : '';
+  $: shuttleScheduleKey = completionShuttleScheduleKey(
+    shuttleEnabled,
+    windowFocused,
+    shuttleCandidate,
+    boundCompletionSession?.acceptedChunks.length ?? 0,
+    editVersion,
+    mode
+  );
   $: syncShuttleTimer(shuttleScheduleKey);
   $: automaticBoundaryIsExact = mode === 'visual'
     ? visualSelectionByte !== null
@@ -984,7 +1127,7 @@
   $: showVisual = mode === 'visual';
   $: showSource = mode === 'source';
   $: exactTextSurface = document?.summary.kind === 'verse';
-  $: editorReadonly = transition !== 'idle' || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
+  $: editorReadonly = transition !== 'idle' || renameDocumentEditorLocked || deleteDocumentEditorLocked || missingDocumentBoundaryInFlight || missingDocumentCapturePending !== null || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
   $: reconciliationResolutionLocked = reconciliationApplying || pendingReconciliationApply !== null;
   $: reconciliationResolutionIsExact = Boolean(
     reconciliation && (
@@ -997,7 +1140,7 @@
 
   onMount(() => {
     componentMounted = true;
-    appearance = appearancePreference(window.localStorage.getItem(appearancePreferenceKey));
+    appearance = loadAppearancePreference(window);
     appearanceMedia = window.matchMedia('(prefers-color-scheme: dark)');
     systemDark = appearanceMedia.matches;
     const syncSystemAppearance = (event: MediaQueryListEvent): void => {
@@ -1005,6 +1148,10 @@
     };
     appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
+    if (desktop) void refreshCuratedModels();
+    documentContextRevealLabel = desktop
+      ? documentRevealLabel(window.navigator.platform, window.navigator.userAgent)
+      : null;
     if (desktop) {
       stopNativeFullscreenObservation = observeNativeFullscreen(
         getCurrentWindow(),
@@ -1034,23 +1181,45 @@
         }
       })();
     }
+    window.addEventListener('keydown', handleGlobalKeydownCapture, true);
     window.addEventListener('keydown', handleGlobalKeydown);
     window.addEventListener('pointerdown', handleGlobalPointerdown);
+    window.addEventListener('pageshow', handleRendererResume);
+    window.document.addEventListener('visibilitychange', handleRendererResume);
     return () => {
       componentMounted = false;
       startupHeldForApplicationClose = false;
       workspaceRestoreSerial += 1;
+      projectFilesystemRefreshSerial += 1;
       modelRefreshSerial += 1;
       modelLoadSerial += 1;
       clearPreferredWriterRequest();
+      window.removeEventListener('keydown', handleGlobalKeydownCapture, true);
       window.removeEventListener('keydown', handleGlobalKeydown);
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
+      window.removeEventListener('pageshow', handleRendererResume);
+      window.document.removeEventListener('visibilitychange', handleRendererResume);
       appearanceMedia?.removeEventListener('change', syncSystemAppearance);
       appearanceMedia = null;
+      clearAutocompleteModelMenuLongPress();
+      if (suppressAutocompleteToggleClickTimer !== undefined) {
+        window.clearTimeout(suppressAutocompleteToggleClickTimer);
+        suppressAutocompleteToggleClickTimer = undefined;
+      }
+      clearDocumentContextLongPress();
+      if (documentContextSuppressClickTimer !== undefined) {
+        window.clearTimeout(documentContextSuppressClickTimer);
+        documentContextSuppressClickTimer = undefined;
+      }
+      closeDocumentContextMenu(false);
       stopNativeFullscreenObservation?.();
       stopNativeFullscreenObservation = undefined;
       if (saveTimer !== undefined) window.clearTimeout(saveTimer);
       if (sourceProjectionTimer !== undefined) window.clearTimeout(sourceProjectionTimer);
+      if (projectFilesystemRefreshTimer !== undefined) {
+        window.clearTimeout(projectFilesystemRefreshTimer);
+        projectFilesystemRefreshTimer = undefined;
+      }
       if (draftTimer !== undefined) window.clearTimeout(draftTimer);
       if (branchRefreshTimer !== undefined) window.clearTimeout(branchRefreshTimer);
       if (branchPollTimer !== undefined) window.clearTimeout(branchPollTimer);
@@ -1073,6 +1242,7 @@
       weaveStatusPollTimers.clear();
       unlistenWindowFocus?.();
       unlistenFileCommands?.();
+      unlistenDocumentFilesystemHints?.();
     };
   });
 
@@ -1082,6 +1252,7 @@
       desktopWorkspaceStarted = true;
       void installWindowFocusHandler();
       void installFileCommandListener();
+      void installDocumentFilesystemHintListener();
       void installGenerationEventListener();
       void restoreDesktopWorkspace();
       return;
@@ -1137,7 +1308,7 @@
     stopBranchPolling();
     for (const timer of weaveStatusPollTimers) window.clearTimeout(timer);
     weaveStatusPollTimers.clear();
-    unpresentableVisualGhostPresentationKeys = [];
+    completionController = clearUnpresentableVisualKeys(completionController);
     branchRefreshSerial += 1;
     branchRefreshQueued = false;
     branchNextCursor = null;
@@ -1148,10 +1319,11 @@
     branchLoadedPastFirstPage = false;
     branchBodyBlobByRun = {};
     verifiedBranchBodyByRun = {};
+    liveBranchTextByRun = {};
+    liveBranchTextSequenceByRun = {};
     branchBodyErrorByRun = {};
-    liveBranchText = {};
-    liveBranchState = {};
-    generationSequenceByRun = {};
+    completionActiveRunIds = [];
+    authoritativeCompletionFamilyId = null;
     cancellingRunIds = [];
     cancellationCommandByRun = {};
     uncertainWeave = null;
@@ -1226,7 +1398,7 @@
   }
 
   async function requestReconciliationPreview(
-    summary: Pick<DocumentSummary, 'document_id' | 'relative_path' | 'kind' | 'revision_id' | 'active_blob_id'>,
+    summary: Pick<DocumentSummary, 'document_id' | 'kind' | 'revision_id' | 'active_blob_id'>,
     appText: string | null,
     expectedScope?: ProjectRestoreScope
   ): Promise<ReconciliationPreview> {
@@ -1247,7 +1419,6 @@
       scope.projectId,
       scope.sessionId,
       summary.document_id,
-      summary.relative_path,
       summary.revision_id,
       summary.active_blob_id,
       appText
@@ -1259,7 +1430,6 @@
       preview.project_id !== scope.projectId ||
       preview.session_id !== scope.sessionId ||
       preview.document_id !== summary.document_id ||
-      preview.relative_path !== summary.relative_path ||
       preview.kind !== summary.kind ||
       preview.active_revision_id !== summary.revision_id ||
       preview.base_blob_id !== summary.active_blob_id
@@ -1421,6 +1591,14 @@
     try {
       const unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
         windowFocused = focused;
+        if (focused) {
+          resumeCompletionObservation();
+          scheduleProjectFilesystemRefresh();
+          // A hidden WKWebView may stay DOM-focused and emit neither browser
+          // focus nor visibilitychange on native resume. Rebuild the exact
+          // cached visual decoration from the native window focus edge.
+          if (mode === 'visual') visualEditor?.refreshGhostPresentation();
+        }
         if (!focused && !compositionActive && !reconciliation) {
           flushEditors();
           void saveNow();
@@ -1437,21 +1615,478 @@
     }
   }
 
-  async function installGenerationEventListener(): Promise<void> {
+  function handleRendererResume(): void {
+    if (window.document.visibilityState === 'hidden') return;
+    resumeCompletionObservation();
+    scheduleProjectFilesystemRefresh();
+  }
+
+  async function installDocumentFilesystemHintListener(): Promise<void> {
     try {
-      const unlisten = await listenForGenerationEvents(handleGenerationEnvelope);
-      if (generationListenerDisposed) {
+      const unlisten = await listenForDocumentFilesystemHints((hint) => {
+        routeDocumentFilesystemHint(hint, project, scheduleProjectFilesystemRefresh);
+      });
+      if (!componentMounted) {
         unlisten();
-      } else {
-        unlistenGenerationEvents?.();
-        unlistenGenerationEvents = unlisten;
+        return;
+      }
+      unlistenDocumentFilesystemHints?.();
+      unlistenDocumentFilesystemHints = unlisten;
+    } catch (error) {
+      if (componentMounted) recordFailure(error);
+    }
+  }
+
+  function scheduleProjectFilesystemRefresh(delayMilliseconds = 80): void {
+    if (!componentMounted || !desktop || window.document.visibilityState === 'hidden') return;
+    projectFilesystemRefreshQueued = true;
+    if (projectFilesystemRefreshTimer !== undefined) {
+      window.clearTimeout(projectFilesystemRefreshTimer);
+    }
+    projectFilesystemRefreshTimer = window.setTimeout(() => {
+      projectFilesystemRefreshTimer = undefined;
+      void refreshProjectFilesystemState();
+    }, Math.max(0, delayMilliseconds));
+  }
+
+  function currentProjectFilesystemRefreshBoundary(): ProjectFilesystemRefreshBoundaryState {
+    return {
+      projectToken: project,
+      documentId: document?.summary.document_id ?? null,
+      documentEpoch,
+      editVersion,
+      navigationSerial,
+      lifecycleIdle: Boolean(
+        applicationClosePhase === 'running' &&
+        transition === 'idle' &&
+        !compositionActive &&
+        !renamingDocumentId &&
+        !renameDocumentInFlight &&
+        !deleteDocumentInFlight &&
+        !fileCommandInFlight &&
+        !documentContextActionInFlight
+      )
+    };
+  }
+
+  async function settleMissingDocumentRecoveryBoundary(
+    boundProject: ProjectSnapshot,
+    missingDocumentId: string
+  ): Promise<MissingDocumentRecoveryBoundaryResult> {
+    if (!document || document.summary.document_id !== missingDocumentId) {
+      return { kind: 'deferred', reason: 'live_document_changed' };
+    }
+    if (!flushEditors()) {
+      projectFilesystemRefreshQueued = true;
+      return { kind: 'deferred', reason: 'editor_not_flushable' };
+    }
+    if (saveTimer !== undefined) {
+      window.clearTimeout(saveTimer);
+      saveTimer = undefined;
+    }
+
+    const saveWasUncertain = uncertainSave !== null || saveState === 'uncertain';
+    const draftWasUncertain = uncertainDraft !== null;
+    const hadUnsavedText = documentBoundaryNeedsRecovery({
+      sourceDirty,
+      editVersion,
+      savedVersion,
+      saveState,
+      saveInFlight: saveInFlight !== null,
+      draftInFlight: draftInFlight !== null,
+      uncertainSave: uncertainSave !== null,
+      uncertainDraft: uncertainDraft !== null
+    });
+
+    if (saveInFlight) await saveInFlight;
+    if (draftInFlight) await draftInFlight;
+    if (
+      !componentMounted ||
+      project?.project_id !== boundProject.project_id ||
+      project.session_id !== boundProject.session_id ||
+      document?.summary.document_id !== missingDocumentId
+    ) return {
+      kind: 'deferred',
+      reason: document?.summary.document_id === missingDocumentId
+        ? 'workspace_changed'
+        : 'live_document_changed'
+    };
+
+    // A save that was already admitted may have restored the visible file.
+    // Recheck native authority before classifying the document as missing.
+    const rechecked = await currentProjectSession();
+    if (
+      rechecked.project_id !== boundProject.project_id ||
+      rechecked.session_id !== boundProject.session_id
+    ) return { kind: 'deferred', reason: 'workspace_changed' };
+    if (rechecked.documents.some((candidate) => candidate.document_id === missingDocumentId)) {
+      project = rechecked;
+      clearFailure();
+      projectFilesystemRefreshQueued = true;
+      return { kind: 'deferred', reason: 'document_reappeared' };
+    }
+
+    const journalSettled = await flushDraftJournal();
+    if (
+      !componentMounted ||
+      project?.project_id !== boundProject.project_id ||
+      project.session_id !== boundProject.session_id ||
+      document?.summary.document_id !== missingDocumentId
+    ) return {
+      kind: 'deferred',
+      reason: document?.summary.document_id === missingDocumentId
+        ? 'workspace_changed'
+        : 'live_document_changed'
+    };
+    const latestText = documentText;
+    const latestEditVersion = editVersion;
+    const journalDurable = missingDocumentJournalIsDurable(
+      hadUnsavedText,
+      journalSettled,
+      uncertainDraft !== null,
+      draftSavedEditVersion,
+      latestEditVersion
+    );
+    missingDocumentRecovery = {
+      projectId: boundProject.project_id,
+      sessionId: boundProject.session_id,
+      documentId: missingDocumentId,
+      relativePath: document.summary.relative_path,
+      title: document.summary.title,
+      text: latestText,
+      hadUnsavedText,
+      journalDurable,
+      sourceRevisionId: document.summary.revision_id,
+      visibleBlobId: document.visible_blob_id,
+      draftVersion,
+      draftWasUncertain: draftWasUncertain || uncertainDraft !== null,
+      saveWasUncertain: saveWasUncertain || uncertainSave !== null
+    };
+    missingDocumentCopyState = 'idle';
+    clearFailure();
+    return { kind: 'ready', project: rechecked };
+  }
+
+  async function copyMissingDocumentRecoveryText(): Promise<void> {
+    const recovery = missingDocumentRecovery;
+    if (!recovery) return;
+    try {
+      await window.navigator.clipboard.writeText(recovery.text);
+      if (
+        missingDocumentRecovery !== recovery ||
+        project?.project_id !== recovery.projectId ||
+        project.session_id !== recovery.sessionId
+      ) return;
+      missingDocumentCopyState = 'copied';
+      announce('Preserved manuscript text copied');
+      scheduleProjectFilesystemRefresh(0);
+    } catch {
+      if (
+        missingDocumentRecovery !== recovery ||
+        project?.project_id !== recovery.projectId ||
+        project.session_id !== recovery.sessionId
+      ) return;
+      missingDocumentCopyState = 'failed';
+      announce('Select and copy the preserved manuscript text manually');
+    }
+  }
+
+  function clearMissingDocumentCapturePending(
+    capture: MissingDocumentCaptureIdentity
+  ): void {
+    if (missingDocumentCapturePending === capture) {
+      missingDocumentCapturePending = null;
+    }
+  }
+
+  function clearReappearedMissingDocumentCapture(
+    projectId: string,
+    sessionId: string,
+    documentId: string
+  ): void {
+    if (
+      missingDocumentCapturePending?.projectId === projectId &&
+      missingDocumentCapturePending.sessionId === sessionId &&
+      missingDocumentCapturePending.documentId === documentId
+    ) missingDocumentCapturePending = null;
+  }
+
+  async function reconcileMissingCurrentDocument(
+    boundProject: ProjectSnapshot,
+    previousDocuments: readonly DocumentSummary[],
+    currentDocumentId: string
+  ): Promise<void> {
+    const liveDocument = document;
+    if (!liveDocument || liveDocument.summary.document_id !== currentDocumentId) {
+      projectFilesystemRefreshQueued = true;
+      return;
+    }
+    const admission = beginMissingDocumentCaptureBoundary(
+      missingDocumentRecovery && {
+        documentId: missingDocumentRecovery.documentId,
+        journalDurable: missingDocumentRecovery.journalDurable,
+        copied: missingDocumentCopyState === 'copied'
+      },
+      {
+        projectId: boundProject.project_id,
+        sessionId: boundProject.session_id,
+        documentId: currentDocumentId,
+        revisionId: liveDocument.summary.revision_id,
+        blobId: liveDocument.visible_blob_id
+      },
+      missingDocumentCapturePending
+    );
+    missingDocumentCapturePending = admission.pending;
+    if (admission.kind === 'wait_for_recovery_copy') {
+      // Retain the row and mounted editor until the earlier recovery is safe.
+      // Copy success or a later native wakeup retries; do not timer-spin here.
+      projectFilesystemRefreshQueued = false;
+      announce('Copy the earlier preserved manuscript before Loom captures another missing file');
+      return;
+    }
+
+    missingDocumentBoundaryInFlight = true;
+    try {
+      const boundary = await settleMissingDocumentRecoveryBoundary(boundProject, currentDocumentId);
+      if (boundary.kind !== 'ready') {
+        if (boundary.reason !== 'editor_not_flushable') {
+          clearMissingDocumentCapturePending(admission.pending);
+        }
+        projectFilesystemRefreshQueued = true;
+        return;
+      }
+      const settledProject = boundary.project;
+      project = settledProject;
+      const settledDecision = documentRefreshDecision(
+        previousDocuments,
+        settledProject.documents,
+        currentDocumentId
+      );
+      closeDocumentContextMenu(false);
+      if (renamingDocumentId === currentDocumentId) cancelDocumentRename(false);
+      if (deleteDocumentTarget?.documentId === currentDocumentId) {
+        closeDocumentDeleteConfirmation(false);
+      }
+      cancelSuggestionTimer();
+      clearCompletionSession();
+      detachDocumentForReconciliation();
+      clearMissingDocumentCapturePending(admission.pending);
+      clearReconciliationState();
+      saveState = 'clean';
+      saveMessage = settledProject.documents.length === 0
+        ? 'Recovery text preserved'
+        : 'All changes saved';
+      if (settledProject.documents.length === 0) outlineOpen = false;
+      clearFailure();
+      announce('A manuscript deleted outside Loom was removed from the outline; its editor text remains available for recovery');
+      await tick();
+      if (settledDecision.successor) await selectDocument(settledDecision.successor, true);
+    } finally {
+      missingDocumentBoundaryInFlight = false;
+    }
+  }
+
+  async function refreshProjectFilesystemState(): Promise<void> {
+    if (projectFilesystemRefreshInFlight) {
+      projectFilesystemRefreshQueued = true;
+      return;
+    }
+    if (
+      !componentMounted ||
+      !desktop ||
+      !project ||
+      applicationClosePhase !== 'running'
+    ) return;
+    if (deleteDocumentUncertain) {
+      // The identical delete retry is the only authority that can classify
+      // this result. A watcher hint must not evict its frozen target or spin.
+      projectFilesystemRefreshQueued = false;
+      return;
+    }
+    if (reconciliation) {
+      scheduleProjectFilesystemRefresh(240);
+      return;
+    }
+    if (
+      transition !== 'idle' ||
+      compositionActive ||
+      renamingDocumentId ||
+      deleteDocumentInFlight
+    ) {
+      scheduleProjectFilesystemRefresh(180);
+      return;
+    }
+    if (fileCommandInFlight) {
+      scheduleProjectFilesystemRefresh(160);
+      return;
+    }
+
+    const boundProject = project;
+    const previousDocuments = boundProject.documents;
+    const currentDocumentId = document?.summary.document_id ?? null;
+    const restoreSerial = workspaceRestoreSerial;
+    const refreshSerial = ++projectFilesystemRefreshSerial;
+    const refreshBoundary = captureProjectFilesystemRefreshBoundary(
+      currentProjectFilesystemRefreshBoundary()
+    );
+    let retryDelayMilliseconds = 100;
+    projectFilesystemRefreshQueued = false;
+    projectFilesystemRefreshInFlight = true;
+    try {
+      const guarded = await applyGuardedProjectFilesystemRefresh(
+        refreshBoundary,
+        currentProjectSession,
+        currentProjectFilesystemRefreshBoundary,
+        async (refreshed) => {
+          if (
+            refreshSerial !== projectFilesystemRefreshSerial ||
+            !componentMounted ||
+            workspaceRestoreSerial !== restoreSerial ||
+            project?.project_id !== boundProject.project_id ||
+            project.session_id !== boundProject.session_id ||
+            refreshed.project_id !== boundProject.project_id ||
+            refreshed.session_id !== boundProject.session_id
+          ) return;
+
+          const decision = documentRefreshDecision(
+            previousDocuments,
+            refreshed.documents,
+            currentDocumentId
+          );
+          if (!currentDocumentId || !document) {
+            project = refreshed;
+            missingDocumentCapturePending = null;
+            return;
+          }
+
+          if (decision.currentDisappeared) {
+            await reconcileMissingCurrentDocument(
+              boundProject,
+              previousDocuments,
+              currentDocumentId
+            );
+            return;
+          }
+
+          const current = decision.current;
+          if (!current) return;
+          clearReappearedMissingDocumentCapture(
+            refreshed.project_id,
+            refreshed.session_id,
+            currentDocumentId
+          );
+          project = refreshed;
+          if (current.externally_modified) {
+            const previewBoundary = captureProjectFilesystemRefreshBoundary(
+              currentProjectFilesystemRefreshBoundary()
+            );
+            const preview = await requestReconciliationPreview(current, documentText, {
+              projectId: refreshed.project_id,
+              sessionId: refreshed.session_id,
+              restoreSerial
+            });
+            const previewDisposition = projectFilesystemRefreshBoundaryDisposition(
+              previewBoundary,
+              currentProjectFilesystemRefreshBoundary()
+            );
+            if (previewDisposition.kind === 'retry') {
+              retryDelayMilliseconds = 180;
+              projectFilesystemRefreshQueued = !deleteDocumentUncertain;
+              return;
+            }
+            if (
+              refreshSerial === projectFilesystemRefreshSerial &&
+              project?.project_id === refreshed.project_id &&
+              project.session_id === refreshed.session_id
+            ) activateReconciliation(preview);
+            return;
+          }
+
+          const liveCurrent = document?.summary.document_id === currentDocumentId
+            ? document.summary
+            : null;
+          if (
+            !liveCurrent ||
+            current.revision_id !== liveCurrent.revision_id ||
+            current.active_blob_id !== liveCurrent.active_blob_id
+          ) {
+            cancelSuggestionTimer();
+            clearCompletionSession();
+            detachDocumentForReconciliation();
+            clearReconciliationState();
+            await tick();
+            await selectDocument(current, true);
+            return;
+          }
+          document = { ...document, summary: current };
+          if (
+            lastFailure?.code === 'external_file_deleted' ||
+            lastFailure?.code === 'filesystem_error'
+          ) clearFailure();
+        }
+      );
+      if (guarded.kind === 'retry') {
+        retryDelayMilliseconds = guarded.reason === 'lifecycle_busy' ? 180 : 100;
+        projectFilesystemRefreshQueued = !deleteDocumentUncertain;
+        return;
       }
     } catch (error) {
-      if (!generationListenerDisposed) {
-        recordFailure(error);
-        announce('Private strand events are unavailable');
+      const failure = normalizeFailure(error);
+      if (
+        failure.code === 'external_file_deleted' ||
+        failureIsDefiniteContention(failure)
+      ) {
+        retryDelayMilliseconds = 240;
+        projectFilesystemRefreshQueued = true;
+        return;
+      }
+      if (
+        componentMounted &&
+        project?.project_id === boundProject.project_id &&
+        project.session_id === boundProject.session_id
+      ) recordFailure(failure);
+    } finally {
+      projectFilesystemRefreshInFlight = false;
+      if (projectFilesystemRefreshQueued) {
+        scheduleProjectFilesystemRefresh(retryDelayMilliseconds);
       }
     }
+  }
+
+  function resumeCompletionObservation(): void {
+    if (!componentMounted || !desktop) return;
+    if (!unlistenGenerationEvents) void installGenerationEventListener();
+    if (branchPollTimer !== undefined) window.clearTimeout(branchPollTimer);
+    branchPollTimer = undefined;
+    branchPollAttempt = 0;
+    // A suspended WebView can miss every event and timer. The scoped native
+    // snapshot is authoritative, so foregrounding always forces a fresh pull;
+    // that pull rearms active polling without depending on an event replay.
+    scheduleBranchRefresh();
+  }
+
+  function installGenerationEventListener(): Promise<void> {
+    if (unlistenGenerationEvents || generationListenerDisposed) return Promise.resolve();
+    if (!generationListenerPromise) {
+      generationListenerPromise = (async () => {
+        try {
+          const unlisten = await listenForGenerationEvents(handleGenerationEnvelope);
+          if (generationListenerDisposed) {
+            unlisten();
+          } else {
+            unlistenGenerationEvents = unlisten;
+          }
+        } catch (error) {
+          if (!generationListenerDisposed) {
+            recordFailure(error);
+            announce('Private strand events are unavailable');
+          }
+        } finally {
+          generationListenerPromise = null;
+        }
+      })();
+    }
+    return generationListenerPromise;
   }
 
   async function ensureModelDownloadEventListener(): Promise<void> {
@@ -1676,6 +2311,53 @@
     lastDerivedModelFileName = derived;
   }
 
+  function localCatalogModel(
+    entry: CuratedModelCatalogEntry
+  ): ModelCapabilitySummary | undefined {
+    return models.find((model) => legacyLocalCatalogMatch(entry, model));
+  }
+
+  function loadedCatalogModel(
+    entry: CuratedModelCatalogEntry
+  ): ModelCapabilitySummary | undefined {
+    return models.find((model) => isVerifiedCatalogWriter(entry, model));
+  }
+
+  function catalogDownload(
+    entry: CuratedModelCatalogEntry
+  ): ModelDownloadSnapshot | undefined {
+    return modelDownloads.find((download) =>
+      download.expected_sha256 === entry.expected_sha256 &&
+      download.display_name.toLocaleLowerCase('en-US') ===
+        entry.artifact_name.toLocaleLowerCase('en-US')
+    );
+  }
+
+  async function beginCatalogModelDownload(entry: CuratedModelCatalogEntry): Promise<void> {
+    if (
+      pendingModelDownload ||
+      modelDownloadStarting ||
+      modelDownloads.some((download) =>
+        download.expected_sha256 === entry.expected_sha256 &&
+        !modelDownloadIsTerminal(download)
+      )
+    ) return;
+    try {
+      const request = catalogDownloadRequest(entry);
+      updateModelDownloadUrl(request.url);
+      modelDownloadFileName = request.fileName;
+      modelDownloadSha256 = request.sha256;
+      modelDownloadExpectedBytes = String(request.expectedBytes);
+      modelDownloadMaximumGiB = String(request.maxBytes / 1024 ** 3);
+      pendingModelDownload = { commandId: newUlid(), ...request };
+      await beginOrRetryModelDownload();
+    } catch (error) {
+      modelDownloadError = error instanceof Error
+        ? error.message
+        : 'The curated model entry could not be downloaded safely.';
+    }
+  }
+
   async function beginOrRetryModelDownload(): Promise<void> {
     if (modelDownloadStarting) return;
     let capture = pendingModelDownload;
@@ -1767,154 +2449,10 @@
       sessionId: project.session_id,
       documentId: document.summary.document_id
     })) return;
-
-    const stream = envelope.event;
-    const generation = stream.payload;
-    if (!Number.isSafeInteger(generation.sequence) || generation.sequence < 0) {
-      recordLocalFailure(
-        'unsafe_generation_sequence',
-        'Loom ignored a generation event whose sequence cannot be represented safely.'
-      );
-      return;
-    }
-    const previousSequence = generationSequenceByRun[generation.run_id];
-    if (previousSequence !== undefined && generation.sequence <= previousSequence) return;
-    const nextSequences = {
-      ...generationSequenceByRun,
-      [generation.run_id]: generation.sequence
-    };
-    const sequencedRunIds = Object.keys(nextSequences);
-    while (sequencedRunIds.length > 64) delete nextSequences[sequencedRunIds.shift() as string];
-    generationSequenceByRun = nextSequences;
-
-    if (stream.event === 'generation_terminal') {
-      const status = stream.payload.status === 'completed' ? 'ready' : stream.payload.status;
-      recordLiveBranchState(generation.run_id, generation.branch_id, {
-        status,
-        candidateId: stream.payload.candidate_id,
-        error: stream.payload.error
-      });
-      updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
-        ...branch,
-        candidate_id: stream.payload.candidate_id ?? branch.candidate_id,
-        status,
-        error: stream.payload.error ?? branch.error,
-        text: liveBranchText[generation.run_id] ?? branch.text
-      }));
-      cancellingRunIds = cancellingRunIds.filter((runId) => runId !== generation.run_id);
-      scheduleBranchRefresh();
-      if (status !== 'ready') announce(`A private strand ${status}`);
-      return;
-    }
-
-    const kind = stream.payload.kind;
-    switch (kind.kind) {
-      case 'queued':
-        recordLiveBranchState(generation.run_id, generation.branch_id, { status: 'queued' });
-        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
-          ...branch,
-          status: 'queued'
-        }));
-        break;
-      case 'prefilling':
-      case 'generating':
-      case 'token':
-        recordLiveBranchState(generation.run_id, generation.branch_id, { status: 'generating' });
-        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
-          ...branch,
-          status: 'generating'
-        }));
-        break;
-      case 'text_delta': {
-        const text = `${liveBranchText[generation.run_id] ?? ''}${kind.text}`;
-        recordLiveBranchText(generation.run_id, text);
-        recordLiveBranchState(generation.run_id, generation.branch_id, { status: 'generating' });
-        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
-          ...branch,
-          status: 'generating',
-          text
-        }));
-        break;
-      }
-      case 'warning':
-        recordLiveBranchState(generation.run_id, generation.branch_id, { error: kind.message });
-        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
-          ...branch,
-          error: kind.message
-        }));
-        break;
-      case 'cancellation_requested':
-        recordLiveBranchState(generation.run_id, generation.branch_id, { status: 'generating' });
-        if (!cancellingRunIds.includes(generation.run_id)) {
-          cancellingRunIds = [...cancellingRunIds, generation.run_id];
-        }
-        break;
-      case 'candidate_ready':
-        recordLiveBranchState(generation.run_id, generation.branch_id, {
-          status: 'ready',
-          candidateId: kind.candidate_id
-        });
-        updateBranchFromEvent(generation.run_id, generation.branch_id, (branch) => ({
-          ...branch,
-          candidate_id: kind.candidate_id,
-          status: 'ready',
-          text: liveBranchText[generation.run_id] ?? branch.text
-        }));
-        break;
-    }
-  }
-
-  function recordLiveBranchText(runId: string, text: string): void {
-    const next = { ...liveBranchText, [runId]: text };
-    const runIds = Object.keys(next);
-    while (runIds.length > 32) delete next[runIds.shift() as string];
-    liveBranchText = next;
-  }
-
-  function recordLiveBranchState(
-    runId: string,
-    branchId: string,
-    patch: Omit<BranchEventOverlay, 'branchId'>
-  ): void {
-    const next = {
-      ...liveBranchState,
-      [runId]: {
-        ...liveBranchState[runId],
-        ...patch,
-        branchId
-      }
-    };
-    const runIds = Object.keys(next);
-    while (runIds.length > 32) delete next[runIds.shift() as string];
-    liveBranchState = next;
-  }
-
-  function applyLiveBranchState(branch: BranchCard, persisted: boolean): BranchCard {
-    const overlay = liveBranchState[branch.run_id];
-    if (!overlay || overlay.branchId !== branch.branch_id) return branch;
-    const storedIsTerminal = branch.status !== 'queued' && branch.status !== 'generating';
-    if (persisted && storedIsTerminal) return branch;
-    return {
-      ...branch,
-      candidate_id: overlay.candidateId ?? branch.candidate_id,
-      status: overlay.status ?? branch.status,
-      error: overlay.error ?? branch.error,
-      text: liveBranchText[branch.run_id] ?? branch.text
-    };
-  }
-
-  function updateBranchFromEvent(
-    runId: string,
-    branchId: string,
-    update: (branch: BranchCard) => BranchCard
-  ): void {
-    let matched = false;
-    const next = branches.map((branch) => {
-      if (branch.run_id !== runId || branch.branch_id !== branchId) return branch;
-      matched = true;
-      return update(branch);
-    });
-    if (matched) branches = next;
+    // Desktop delivery is intentionally lossy. A scoped event only wakes the
+    // identity-bound completion snapshot; it never projects lifecycle,
+    // candidate, terminal, or text facts into renderer state.
+    if (branchRefreshTimer === undefined) scheduleBranchRefresh();
   }
 
   function validateBranchSnapshots(
@@ -1924,6 +2462,12 @@
     for (const branch of snapshots) {
       if (branch.document_id !== expectedDocumentId) {
         throw new Error('The desktop returned a branch for a different manuscript.');
+      }
+      if (
+        branch.weave_command_id !== null &&
+        !/^[0-9A-HJKMNP-TV-Z]{26}$/u.test(branch.weave_command_id)
+      ) {
+        throw new Error('The desktop returned an invalid weave-family identity.');
       }
       if (
         !Number.isSafeInteger(branch.target_start_byte) ||
@@ -1971,8 +2515,8 @@
       const verifiedBody = verifiedBranchBodyByRun[summary.run_id];
       const text = verifiedBodyMatchesBranch(verifiedBody, summary)
         ? verifiedBody.text
-        : liveBranchText[summary.run_id] ?? '';
-      return applyLiveBranchState({ ...summary, text }, true);
+        : '';
+      return { ...summary, text };
     });
   }
 
@@ -2117,7 +2661,7 @@
         visibleBlobId: document.visible_blob_id,
         documentEpoch,
         editVersion,
-        intentEpoch: suggestionIntentEpoch,
+        intentEpoch: completionController.intentEpoch,
         mode: retryMode,
         targetByte,
         modelId: currentModel.model_id,
@@ -2147,12 +2691,11 @@
     const refreshSerial = ++branchRefreshSerial;
     branchRefreshInFlightCount += 1;
     try {
-      const page = await getBranchPage(
+      const snapshot = await getCompletionSnapshot(
         projectId,
         sessionId,
         documentId,
-        null,
-        branchPageSize
+        [...completionActiveRunIds]
       );
       if (!branchScopeMatches(
         projectId,
@@ -2161,22 +2704,43 @@
         expectedViewEpoch,
         refreshSerial
       )) return false;
-      validateBranchSnapshots(page.branches, documentId);
-      validateBranchCursor(page.next_cursor);
-      if (page.has_more !== (page.next_cursor !== null)) {
+      const completionFacts = completionSnapshotFacts(snapshot, {
+        projectId,
+        sessionId,
+        documentId
+      });
+      validateBranchSnapshots(snapshot.branches, documentId);
+      validateBranchCursor(snapshot.next_cursor);
+      if (snapshot.has_more !== (snapshot.next_cursor !== null)) {
         throw new Error('The desktop returned inconsistent branch page metadata.');
       }
-      const firstPageCards = cardsFromSummaries(page.branches);
+      const completingActivePresentation = completionActiveRunIds.length > 0 &&
+        completionFacts.activeRunIds.length === 0;
+      if (!completingActivePresentation) {
+        // Active partials are already bounded and scope-validated. Publish them
+        // before unrelated terminal-body I/O so streaming latency never depends
+        // on shelf hydration. The all-terminal transition is applied atomically
+        // with immutable candidate bodies below to avoid a blank frame.
+        liveBranchTextByRun = completionFacts.liveTextByRun;
+        liveBranchTextSequenceByRun = completionFacts.liveTextSequenceByRun;
+        completionActiveRunIds = completionFacts.activeRunIds;
+      }
+      cancellingRunIds = [...new Set([
+        ...cancellingRunIds,
+        ...completionFacts.cancellationRequestedRunIds
+      ])];
+      if (completionFacts.activeRunIds.length > 0) scheduleActiveBranchPoll();
+      const firstPageCards = cardsFromSummaries(snapshot.branches);
       branches = mergeNewestPage(firstPageCards, branches);
       const firstPageCursorChanged =
-        page.next_cursor?.sequence !== branchFirstPageCursor?.sequence ||
-        page.next_cursor?.run_id !== branchFirstPageCursor?.run_id;
+        snapshot.next_cursor?.sequence !== branchFirstPageCursor?.sequence ||
+        snapshot.next_cursor?.run_id !== branchFirstPageCursor?.run_id;
       if (!branchLoadedPastFirstPage || firstPageCursorChanged) {
-        branchNextCursor = page.next_cursor;
-        branchHasMore = page.has_more;
+        branchNextCursor = snapshot.next_cursor;
+        branchHasMore = snapshot.has_more;
         branchLoadedPastFirstPage = false;
       }
-      branchFirstPageCursor = page.next_cursor;
+      branchFirstPageCursor = snapshot.next_cursor;
       const hydration = await hydrateBranchBodies(
         projectId,
         sessionId,
@@ -2195,10 +2759,13 @@
       const hydratedByRun = new Map(hydration.cards.map((branch) => [branch.run_id, branch]));
       branchBodyBlobByRun = hydration.bodyBlobByRun;
       verifiedBranchBodyByRun = hydration.verifiedBodyByRun;
+      liveBranchTextByRun = completionFacts.liveTextByRun;
+      liveBranchTextSequenceByRun = completionFacts.liveTextSequenceByRun;
       branchBodyErrorByRun = hydration.bodyErrorByRun;
       branches = branches.map((branch) => hydratedByRun.get(branch.run_id) ?? branch);
+      completionActiveRunIds = completionFacts.activeRunIds;
       reconcileBranchActionState();
-      if (branches.some(isBranchActive)) scheduleActiveBranchPoll();
+      if (completionActiveRunIds.length > 0) scheduleActiveBranchPoll();
       return true;
     } catch (error) {
       const failure = normalizeFailure(error);
@@ -2228,6 +2795,8 @@
   function refreshCurrentBranches(reportFailure = true): Promise<boolean> {
     if (!project || !document) {
       branches = [];
+      liveBranchTextByRun = {};
+      liveBranchTextSequenceByRun = {};
       return Promise.resolve(false);
     }
     return refreshBranchesFor(
@@ -2331,7 +2900,7 @@
       branchPollInFlight ||
       !project ||
       !document ||
-      !branches.some(isBranchActive)
+      completionActiveRunIds.length === 0
     ) return;
     const pollEpoch = branchPollEpoch;
     const scope = {
@@ -2375,7 +2944,7 @@
       project.session_id !== scope.sessionId ||
       document?.summary.document_id !== scope.documentId
     ) return;
-    if (!refreshed || branches.some(isBranchActive)) {
+    if (!refreshed || completionActiveRunIds.length > 0) {
       branchPollAttempt += 1;
       scheduleActiveBranchPoll();
       return;
@@ -2611,23 +3180,21 @@
     return refreshed;
   }
 
-  function closeProjectMenu(): void {
-    if (projectMenu) projectMenu.open = false;
-  }
-
   function closeFormatMenu(refocus = true): void {
     formatMenu?.close(refocus);
   }
 
   async function setOutlineOpen(open: boolean): Promise<void> {
+    if (!open) closeDocumentContextMenu(false);
     outlineOpen = open;
     await tick();
   }
 
   function setAppearance(next: AppearancePreference): void {
     appearance = next;
-    window.localStorage.setItem(appearancePreferenceKey, next);
-    announce(next === 'system' ? 'Appearance follows the system' : `${next} appearance`);
+    const persisted = persistAppearancePreference(window, next);
+    const label = next === 'system' ? 'Appearance follows the system' : `${next} appearance`;
+    announce(persisted ? label : `${label} for this session`);
   }
 
   function toggleAppearance(): void {
@@ -2640,7 +3207,6 @@
   }
 
   function openModelManager(trigger: HTMLElement): void {
-    closeProjectMenu();
     if (lastFailure?.code.startsWith('model_') || lastFailure?.code.startsWith('writing_model_')) {
       clearFailure();
     }
@@ -2648,6 +3214,7 @@
     modelManagerReturnFocus = trigger;
     modelManagerOpen = true;
     modelDownloadError = '';
+    if (curatedModels.length === 0) void refreshCuratedModels();
     void recoverModelDownloads();
     void refreshCurrentModelsAndEnsureWriter();
     void tick().then(() => {
@@ -2657,6 +3224,20 @@
       );
       (preferred ?? focusableElementsWithin(modelManagerPanel)[0] ?? modelManagerPanel).focus();
     });
+  }
+
+  async function refreshCuratedModels(): Promise<void> {
+    if (!desktop || curatedModelsLoading) return;
+    curatedModelsLoading = true;
+    curatedModelsError = '';
+    try {
+      curatedModels = validateCuratedModelCatalog(await listCuratedModels());
+    } catch (error) {
+      curatedModels = [];
+      curatedModelsError = normalizeFailure(error).message;
+    } finally {
+      curatedModelsLoading = false;
+    }
   }
 
   function closeModelManager(focusWritingSurface = false): void {
@@ -2669,7 +3250,6 @@
         return;
       }
       if (focusConnectedControl(trigger)) return;
-      if (focusConnectedControl(projectMenuTrigger)) return;
       focusCurrentWritingSurfaceAtEnd();
     });
   }
@@ -2678,6 +3258,727 @@
     if (!target?.isConnected || target.hidden || target.getClientRects().length === 0) return false;
     target.focus();
     return window.document.activeElement === target;
+  }
+
+  function clearDocumentContextLongPress(): void {
+    if (documentContextLongPressTimer !== undefined) {
+      window.clearTimeout(documentContextLongPressTimer);
+      documentContextLongPressTimer = undefined;
+    }
+    const pending = documentContextLongPress;
+    if (pending?.trigger.hasPointerCapture(pending.pointerId)) {
+      pending.trigger.releasePointerCapture(pending.pointerId);
+    }
+    documentContextLongPress = null;
+  }
+
+  function closeDocumentContextMenu(refocus = true): void {
+    clearDocumentContextLongPress();
+    const trigger = documentContextTrigger;
+    documentContextTarget = null;
+    documentContextTrigger = null;
+    documentContextFocusIndex = 0;
+    if (!refocus) return;
+    void tick().then(() => {
+      if (focusConnectedControl(trigger)) return;
+      if (focusConnectedControl(outlineToggle)) return;
+      focusCurrentWritingSurfaceAtEnd();
+    });
+  }
+
+  function documentContextMenuItems(): HTMLButtonElement[] {
+    if (!documentContextMenu) return [];
+    return Array.from(
+      documentContextMenu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not([disabled])')
+    );
+  }
+
+  async function focusDocumentContextMenu(
+    target: CapturedDocumentTarget,
+    requestedIndex = 0
+  ): Promise<void> {
+    await tick();
+    if (documentContextTarget !== target || !documentContextMenu) return;
+    const bounds = documentContextMenu.getBoundingClientRect();
+    documentContextPoint = clampDocumentMenuPoint(
+      documentContextPoint,
+      bounds.width,
+      bounds.height,
+      window.innerWidth,
+      window.innerHeight
+    );
+    await tick();
+    if (documentContextTarget !== target) return;
+    const items = documentContextMenuItems();
+    if (items.length === 0) return;
+    documentContextFocusIndex = Math.min(Math.max(requestedIndex, 0), items.length - 1);
+    items[documentContextFocusIndex]?.focus();
+  }
+
+  function openDocumentContextMenu(
+    target: CapturedDocumentTarget,
+    trigger: HTMLButtonElement,
+    point: MenuPoint
+  ): void {
+    if (
+      documentContextActionInFlight ||
+      fileCommandInFlight ||
+      applicationClosePhase !== 'running' ||
+      transition !== 'idle'
+    ) return;
+    closeFormatMenu(false);
+    closeDocumentContextMenu(false);
+    closeDocumentDeleteConfirmation(false);
+    documentContextTarget = target;
+    documentContextTrigger = trigger;
+    documentContextPoint = point;
+    documentContextFocusIndex = 0;
+    void focusDocumentContextMenu(target);
+  }
+
+  function captureDocumentContextTarget(summary: DocumentSummary): CapturedDocumentTarget | null {
+    if (!project) return null;
+    const target = captureDocumentTarget(project, summary);
+    if (!target) {
+      announce(`${summary.title} does not expose a complete active revision yet`);
+    }
+    return target;
+  }
+
+  function handleDocumentContextPointer(
+    event: MouseEvent,
+    summary: DocumentSummary
+  ): void {
+    event.preventDefault();
+    event.stopPropagation();
+    clearDocumentContextLongPress();
+    const target = captureDocumentContextTarget(summary);
+    if (!target) return;
+    openDocumentContextMenu(target, event.currentTarget as HTMLButtonElement, {
+      x: event.clientX,
+      y: event.clientY
+    });
+  }
+
+  function handleDocumentContextKey(
+    event: KeyboardEvent,
+    summary: DocumentSummary
+  ): void {
+    if (!isDocumentContextTriggerKey(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = captureDocumentContextTarget(summary);
+    if (!target) return;
+    const trigger = event.currentTarget as HTMLButtonElement;
+    const bounds = trigger.getBoundingClientRect();
+    openDocumentContextMenu(target, trigger, {
+      x: bounds.left + 12,
+      y: bounds.top + Math.min(bounds.height, 28)
+    });
+  }
+
+  function handleVisibleDocumentActions(
+    event: MouseEvent,
+    summary: DocumentSummary
+  ): void {
+    event.preventDefault();
+    event.stopPropagation();
+    const target = captureDocumentContextTarget(summary);
+    if (!target) return;
+    const trigger = event.currentTarget as HTMLButtonElement;
+    openDocumentContextMenu(
+      target,
+      trigger,
+      visibleDocumentActionsMenuPoint(trigger.getBoundingClientRect())
+    );
+  }
+
+  function beginDocumentContextLongPress(
+    event: PointerEvent,
+    summary: DocumentSummary
+  ): void {
+    if (event.pointerType !== 'touch' || event.button !== 0) return;
+    clearDocumentContextLongPress();
+    const target = captureDocumentContextTarget(summary);
+    if (!target) return;
+    const trigger = event.currentTarget as HTMLButtonElement;
+    const pending = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      target,
+      trigger
+    };
+    documentContextLongPress = pending;
+    try {
+      trigger.setPointerCapture(event.pointerId);
+    } catch {
+      // A detached row cancels through the session/menu guards below.
+    }
+    documentContextLongPressTimer = window.setTimeout(() => {
+      if (documentContextLongPress !== pending) return;
+      documentContextLongPressTimer = undefined;
+      clearDocumentContextLongPress();
+      documentContextSuppressClickId = pending.target.documentId;
+      if (documentContextSuppressClickTimer !== undefined) {
+        window.clearTimeout(documentContextSuppressClickTimer);
+      }
+      documentContextSuppressClickTimer = window.setTimeout(() => {
+        if (documentContextSuppressClickId === pending.target.documentId) {
+          documentContextSuppressClickId = null;
+        }
+        documentContextSuppressClickTimer = undefined;
+      }, 1_000);
+      openDocumentContextMenu(pending.target, pending.trigger, {
+        x: pending.x,
+        y: pending.y
+      });
+    }, documentContextLongPressMilliseconds);
+  }
+
+  function updateDocumentContextLongPress(event: PointerEvent): void {
+    const pending = documentContextLongPress;
+    if (!pending || pending.pointerId !== event.pointerId) return;
+    if (
+      Math.abs(event.clientX - pending.x) > documentContextLongPressSlop ||
+      Math.abs(event.clientY - pending.y) > documentContextLongPressSlop
+    ) clearDocumentContextLongPress();
+  }
+
+  function finishDocumentContextLongPress(event: PointerEvent): void {
+    if (documentContextLongPress?.pointerId === event.pointerId) {
+      clearDocumentContextLongPress();
+    }
+  }
+
+  function handleDocumentRowClick(event: MouseEvent, summary: DocumentSummary): void {
+    if (documentContextSuppressClickId === summary.document_id) {
+      documentContextSuppressClickId = null;
+      if (documentContextSuppressClickTimer !== undefined) {
+        window.clearTimeout(documentContextSuppressClickTimer);
+        documentContextSuppressClickTimer = undefined;
+      }
+      event.preventDefault();
+      return;
+    }
+    if (
+      summary.document_id === document?.summary.document_id &&
+      event.target instanceof Element &&
+      event.target.closest('[data-document-title]')
+    ) {
+      event.preventDefault();
+      const target = captureDocumentContextTarget(summary);
+      if (target) void beginDocumentRename(target, event.currentTarget as HTMLElement);
+      return;
+    }
+    void selectDocument(summary, true);
+  }
+
+  async function beginDocumentRename(
+    target: CapturedDocumentTarget,
+    trigger: HTMLElement | null
+  ): Promise<void> {
+    if (
+      renameDocumentInFlight ||
+      renameDocumentEditorLocked ||
+      fileCommandInFlight ||
+      editorReadonly ||
+      !capturedDocumentBelongsToSession(target, project)
+    ) return;
+    closeDocumentContextMenu(false);
+    const targetIsCurrent = document?.summary.document_id === target.documentId;
+    if (compositionActive) {
+      announce('Finish composing text before renaming a manuscript');
+      return;
+    }
+    // Freeze the manuscript before preparing rename authority and retain that
+    // lock until the rename is committed or explicitly cancelled. Otherwise a
+    // click back into the editor can start an autosave against the captured
+    // revision while the native rename command is still in flight.
+    renameDocumentEditorLocked = true;
+    if (targetIsCurrent && !flushEditors()) {
+      renameDocumentEditorLocked = false;
+      return;
+    }
+    fileCommandInFlight = true;
+    let refreshedTarget: CapturedDocumentTarget | null = null;
+    try {
+      refreshedTarget = await refreshDocumentRenameTarget(
+        target,
+        document?.summary.document_id ?? null,
+        flushCurrentDocument,
+        () => project
+      );
+    } catch (error) {
+      recordDocumentContextFailure(target, error);
+    } finally {
+      fileCommandInFlight = false;
+    }
+    if (!refreshedTarget) {
+      renameDocumentEditorLocked = false;
+      announce('The manuscript changed before its rename authority could be prepared');
+      return;
+    }
+    renameDocumentComposition.reset();
+    renamingDocumentId = refreshedTarget.documentId;
+    renameDocumentTitle = refreshedTarget.title;
+    renameDocumentTarget = refreshedTarget;
+    renameDocumentTrigger = trigger;
+    await tick();
+    renameDocumentInput?.focus();
+    renameDocumentInput?.select();
+  }
+
+  function synchronizeDocumentRenameTitle(input: HTMLInputElement): void {
+    const bounded = boundedDocumentTitleInput(input.value);
+    if (input.value !== bounded) input.value = bounded;
+    renameDocumentTitle = bounded;
+  }
+
+  function handleDocumentRenameInput(event: Event): void {
+    synchronizeDocumentRenameTitle(event.currentTarget as HTMLInputElement);
+  }
+
+  function handleDocumentRenameCompositionStart(): void {
+    renameDocumentComposition.start();
+  }
+
+  function handleDocumentRenameCompositionEnd(event: CompositionEvent): void {
+    const input = event.currentTarget as HTMLInputElement;
+    synchronizeDocumentRenameTitle(input);
+    const commitAfterBlur = renameDocumentComposition.finish();
+    if (
+      commitAfterBlur &&
+      input === renameDocumentInput &&
+      renamingDocumentId !== null &&
+      !renameDocumentInFlight
+    ) void commitDocumentRename(false);
+  }
+
+  function handleDocumentRenameBlur(): void {
+    if (renameDocumentInFlight || !renameDocumentComposition.blurShouldCommit()) return;
+    void commitDocumentRename(false);
+  }
+
+  function cancelDocumentRename(refocus = true): void {
+    const documentId = renamingDocumentId;
+    const trigger = renameDocumentTrigger;
+    renamingDocumentId = null;
+    renameDocumentTitle = '';
+    renameDocumentTarget = null;
+    renameDocumentTrigger = null;
+    renameDocumentEditorLocked = false;
+    renameDocumentComposition.reset();
+    if (refocus) void tick().then(() => {
+      const row = Array.from(
+        window.document.querySelectorAll<HTMLButtonElement>('[data-document-row]')
+      ).find((candidate) => candidate.dataset.documentRow === documentId);
+      if (focusConnectedControl(row)) return;
+      if (focusConnectedControl(trigger)) return;
+      if (focusConnectedControl(outlineToggle)) return;
+      focusCurrentWritingSurfaceAtEnd();
+    });
+  }
+
+  async function commitDocumentRename(refocus = true): Promise<void> {
+    const target = renameDocumentTarget;
+    if (!target || renameDocumentInFlight || renameDocumentComposition.active) return;
+    if (!capturedDocumentBelongsToSession(target, project)) {
+      cancelDocumentRename(false);
+      announce('The project session changed before the manuscript could be renamed');
+      return;
+    }
+    const title = renameDocumentTitle.trim();
+    renameDocumentInFlight = true;
+    fileCommandInFlight = true;
+    let restoreFailedRenameFocus = false;
+    try {
+      const renamed = await renameDocument(
+        target.projectId,
+        target.sessionId,
+        target.documentId,
+        target.expectedRevisionId,
+        target.expectedBlobId,
+        title
+      );
+      if (
+        !project ||
+        !capturedDocumentBelongsToSession(target, project) ||
+        !capturedDocumentIdentityIsCurrent(target, project) ||
+        renamed.document_id !== target.documentId ||
+        renamed.revision_id !== target.expectedRevisionId ||
+        renamed.active_blob_id !== target.expectedBlobId
+      ) throw new Error('The rename receipt did not match the captured manuscript.');
+      const projection = applyDocumentRenameProjection(project, document, renamed);
+      project = projection.project;
+      document = projection.document;
+      cancelDocumentRename(refocus);
+      announce(`Renamed manuscript to ${renamed.title}`);
+    } catch (error) {
+      recordDocumentContextFailure(target, error);
+      restoreFailedRenameFocus = true;
+    } finally {
+      if (restoreFailedRenameFocus) {
+        await releaseDocumentRenameAndRestoreFocus(
+          () => {
+            fileCommandInFlight = false;
+            renameDocumentInFlight = false;
+          },
+          tick,
+          () => renameDocumentInput
+        );
+      } else {
+        fileCommandInFlight = false;
+        renameDocumentInFlight = false;
+      }
+    }
+  }
+
+  function handleDocumentRenameKeydown(event: KeyboardEvent): void {
+    const compositionOwnsCommand = renameDocumentComposition.ownsCommandKey(event);
+    if (
+      compositionOwnsCommand &&
+      (event.key === 'Escape' || event.key === 'Enter')
+    ) {
+      // Keep the event's default behavior available to the IME, but prevent a
+      // rename-owned composition command from reaching global Shuttle/menu
+      // routing.
+      event.stopPropagation();
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      cancelDocumentRename();
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      void commitDocumentRename(true);
+    }
+  }
+
+  function openDocumentDeleteConfirmation(
+    target: CapturedDocumentTarget,
+    trigger: HTMLElement | null
+  ): void {
+    if (
+      deleteDocumentInFlight ||
+      fileCommandInFlight ||
+      editorReadonly ||
+      !capturedDocumentBelongsToSession(target, project)
+    ) return;
+    closeDocumentContextMenu(false);
+    deleteDocumentTarget = target;
+    deleteDocumentTrigger = trigger;
+    deleteDocumentCommandId = newUlid();
+    deleteDocumentUncertain = false;
+    void tick().then(() => {
+      if (deleteDocumentTarget === target) {
+        (deleteDocumentCancelButton ?? deleteDocumentDialog)?.focus();
+      }
+    });
+  }
+
+  function closeDocumentDeleteConfirmation(refocus = true): void {
+    if (deleteDocumentUncertain) return;
+    const trigger = deleteDocumentTrigger;
+    deleteDocumentTarget = null;
+    deleteDocumentTrigger = null;
+    deleteDocumentCommandId = null;
+    deleteDocumentUncertain = false;
+    deleteDocumentEditorLocked = false;
+    if (!refocus) return;
+    void tick().then(() => {
+      if (focusConnectedControl(trigger)) return;
+      if (focusConnectedControl(outlineToggle)) return;
+      focusCurrentWritingSurfaceAtEnd();
+    });
+  }
+
+  function handleDocumentDeleteDialogKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Escape' && !deleteDocumentInFlight && !deleteDocumentUncertain) {
+      event.preventDefault();
+      event.stopPropagation();
+      closeDocumentDeleteConfirmation();
+      return;
+    }
+    trapFocusWithin(event, deleteDocumentDialog);
+  }
+
+  async function confirmDocumentDelete(): Promise<void> {
+    const initialTarget = deleteDocumentTarget;
+    const commandId = deleteDocumentCommandId;
+    if (
+      !initialTarget ||
+      !commandId ||
+      deleteDocumentInFlight ||
+      !capturedDocumentBelongsToSession(initialTarget, project)
+    ) return;
+    if (compositionActive) {
+      announce('Finish composing text before deleting a manuscript');
+      return;
+    }
+
+    deleteDocumentInFlight = true;
+    deleteDocumentEditorLocked = true;
+    fileCommandInFlight = true;
+    let committed:
+      | {
+          deletedWasCurrent: boolean;
+          successor: DocumentSummary | null;
+          title: string;
+        }
+      | null = null;
+    try {
+      const retryingUncertainDelete = deleteDocumentUncertain;
+      const targetIsCurrent = document?.summary.document_id === initialTarget.documentId;
+      if (targetIsCurrent && !retryingUncertainDelete && !flushEditors()) return;
+      const prepared = await refreshDocumentDeleteTarget(
+        initialTarget,
+        document?.summary.document_id ?? null,
+        flushCurrentDocument,
+        () => project,
+        retryingUncertainDelete
+      );
+      if (!prepared || !project) {
+        announce('The manuscript changed before deletion could be authorized');
+        return;
+      }
+      deleteDocumentTarget = prepared;
+      const previousDocuments = project.documents;
+      const currentDocumentId = document?.summary.document_id ?? null;
+      const refreshed = await deleteDocument(
+        prepared.projectId,
+        prepared.sessionId,
+        prepared.documentId,
+        prepared.expectedRevisionId,
+        prepared.expectedBlobId,
+        commandId
+      );
+      if (
+        !project ||
+        refreshed.project_id !== prepared.projectId ||
+        refreshed.session_id !== prepared.sessionId ||
+        refreshed.documents.some((candidate) => candidate.document_id === prepared.documentId)
+      ) throw new Error('The desktop did not return the authoritative project after deletion.');
+
+      const decision = documentRefreshDecision(
+        previousDocuments,
+        refreshed.documents,
+        currentDocumentId
+      );
+      const deletedWasCurrent = currentDocumentId === prepared.documentId;
+      project = refreshed;
+      if (deletedWasCurrent) {
+        cancelSuggestionTimer();
+        clearCompletionSession();
+        detachDocumentForReconciliation();
+        clearReconciliationState();
+        saveState = 'clean';
+        saveMessage = refreshed.documents.length === 0 ? 'Project is ready' : 'All changes saved';
+        if (refreshed.documents.length === 0) outlineOpen = false;
+      } else if (document && decision.current) {
+        document = { ...document, summary: decision.current };
+      }
+      clearFailure();
+      committed = {
+        deletedWasCurrent,
+        successor: deletedWasCurrent ? decision.successor : null,
+        title: prepared.title
+      };
+    } catch (error) {
+      const failure = normalizeFailure(error);
+      if (
+        failure.code === 'external_file_deleted' ||
+        failure.code === 'document_not_found' ||
+        failure.code === 'stale_document_action'
+      ) {
+        deleteDocumentUncertain = false;
+        announce(`${initialTarget.title} changed outside Loom; refreshing the outline`);
+        closeDocumentDeleteConfirmation(false);
+        scheduleProjectFilesystemRefresh(0);
+      } else {
+        deleteDocumentUncertain = captureForIdempotentRetry(commandId, failure) !== null;
+        recordDocumentContextFailure(deleteDocumentTarget ?? initialTarget, failure);
+        if (deleteDocumentUncertain) {
+          announce('Deletion result is uncertain; check the identical command before continuing');
+        }
+      }
+    } finally {
+      fileCommandInFlight = false;
+      deleteDocumentInFlight = false;
+      deleteDocumentEditorLocked = deleteDocumentUncertain;
+    }
+
+    if (!committed) return;
+    const returnFocus = deleteDocumentTrigger;
+    deleteDocumentUncertain = false;
+    closeDocumentDeleteConfirmation(false);
+    announce(`Deleted ${committed.title}`);
+    if (!committed.deletedWasCurrent) {
+      await tick();
+      if (!focusConnectedControl(returnFocus)) focusConnectedControl(outlineToggle);
+      return;
+    }
+    await tick();
+    if (committed.successor) {
+      await selectDocument(committed.successor, true);
+    } else {
+      const newDocumentButton = window.document.querySelector<HTMLButtonElement>(
+        '.new-document-button:not([disabled])'
+      );
+      focusConnectedControl(newDocumentButton);
+    }
+  }
+
+  function handleDocumentContextMenuKeydown(event: KeyboardEvent): void {
+    const items = documentContextMenuItems();
+    const action = documentMenuKeyAction(event, documentContextFocusIndex, items.length);
+    switch (action.kind) {
+      case 'focus':
+        event.preventDefault();
+        documentContextFocusIndex = action.index;
+        items[action.index]?.focus();
+        return;
+      case 'activate':
+        event.preventDefault();
+        items[action.index]?.click();
+        return;
+      case 'dismiss':
+        event.preventDefault();
+        closeDocumentContextMenu();
+        return;
+      case 'none':
+        return;
+      default: {
+        const unreachable: never = action;
+        return unreachable;
+      }
+    }
+  }
+
+  function recordDocumentContextFailure(
+    target: CapturedDocumentTarget,
+    error: unknown
+  ): void {
+    if (
+      applicationClosePhase !== 'running' ||
+      !capturedDocumentBelongsToSession(target, project)
+    ) return;
+    const failure = normalizeFailure(error);
+    if (
+      failure.code === 'application_quiescing' ||
+      failure.code === 'application_close_in_progress' ||
+      failure.code === 'application_exit_authorized'
+    ) return;
+    if (
+      failure.code === 'stale_document_action' ||
+      failure.code === 'document_not_found' ||
+      failure.code === 'source_revision_conflict' ||
+      failure.code === 'source_blob_conflict'
+    ) {
+      recordLocalFailure(
+        failure.code,
+        `${target.title} changed after its menu was opened. Open the current outline entry and try again.`
+      );
+      return;
+    }
+    if (
+      failure.code === 'external_file_change' ||
+      failure.code === 'external_file_deleted' ||
+      failure.code === 'external_file_conflict'
+    ) {
+      recordLocalFailure(
+        failure.code,
+        `${target.title} changed outside Loom. Open it from the outline to review the exact external bytes before continuing.`
+      );
+      return;
+    }
+    if (
+      failure.code === 'document_reveal_path_changed' ||
+      failure.code === 'document_reveal_path_refused' ||
+      failure.code === 'document_reveal_path_unavailable'
+    ) {
+      recordLocalFailure(
+        failure.code,
+        `${target.title} could not be revealed from its current registered file. Open it from the outline and try again.`
+      );
+      return;
+    }
+    recordFailure(error);
+  }
+
+  async function runDocumentContextAction(action: DocumentContextAction): Promise<void> {
+    if (documentContextActionInFlight || fileCommandInFlight) return;
+    const target = documentContextTarget;
+    const trigger = documentContextTrigger;
+    if (!target) return;
+    documentContextActionInFlight = true;
+    closeDocumentContextMenu(false);
+    if (
+      applicationClosePhase !== 'running' ||
+      !capturedDocumentBelongsToSession(target, project)
+    ) {
+      documentContextActionInFlight = false;
+      return;
+    }
+
+    let restoreTrigger = action !== 'open';
+    try {
+      switch (action) {
+        case 'open':
+          await selectCapturedDocument(target, true, true);
+          restoreTrigger =
+            document?.summary.document_id !== target.documentId &&
+            reconciliation?.document_id !== target.documentId;
+          break;
+        case 'rename':
+          await beginDocumentRename(target, trigger);
+          restoreTrigger = false;
+          break;
+        case 'delete':
+          openDocumentDeleteConfirmation(target, trigger);
+          restoreTrigger = false;
+          break;
+        case 'export_text': {
+          fileCommandInFlight = true;
+          const receipt = await exportDocumentCopy(
+            target.projectId,
+            target.sessionId,
+            target.documentId,
+            target.expectedRevisionId,
+            target.expectedBlobId
+          );
+          if (receipt) announce(`Exported ${target.title} as text`);
+          break;
+        }
+        case 'reveal':
+          fileCommandInFlight = true;
+          await revealDocument(
+            target.projectId,
+            target.sessionId,
+            target.documentId,
+            target.expectedRevisionId,
+            target.expectedBlobId
+          );
+          announce(`${target.title} revealed in its containing folder`);
+          break;
+        default: {
+          const unreachable: never = action;
+          return unreachable;
+        }
+      }
+    } catch (error) {
+      recordDocumentContextFailure(target, error);
+      restoreTrigger = action !== 'open';
+    } finally {
+      fileCommandInFlight = false;
+      documentContextActionInFlight = false;
+      if (restoreTrigger) {
+        await tick();
+        if (!focusConnectedControl(trigger)) focusConnectedControl(outlineToggle);
+      }
+    }
   }
 
   function suggestionPreferenceKey(projectId: string): string {
@@ -2745,12 +4046,14 @@
     }
   }
 
-  function cancelSuggestionTimer(): void {
+  function clearSuggestionTimerHandle(): void {
     if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
     suggestionsIdleTimer = undefined;
-    scheduledSuggestion = null;
-    completionGenerationIntent = disarmCompletionGeneration();
-    suggestionIntentEpoch += 1;
+  }
+
+  function cancelSuggestionTimer(): void {
+    clearSuggestionTimerHandle();
+    completionController = cancelCompletionSchedule(completionController);
   }
 
   async function setSuggestionsEnabled(enabled: boolean, persist = true): Promise<void> {
@@ -2765,7 +4068,7 @@
     }
     const boundProject = project;
     const previousEnabled = suggestionsEnabled;
-    const previousDismissedCandidateIds = dismissedCandidateIds;
+    const previousDismissedCandidateIds = completionController.dismissedCandidateIds;
     const engineBecameEnabled = completionEngineBecameEnabled(
       { autocomplete: previousEnabled, shuttle: shuttleEnabled },
       { autocomplete: enabled, shuttle: shuttleEnabled }
@@ -2778,9 +4081,12 @@
     if (!enabled && !shuttleEnabled) {
       suggestionsEnabled = false;
       cancelSuggestionTimer();
-      dismissedCandidateIds = currentReadyBranches
-        .map((branch) => branch.candidate_id)
-        .filter((candidateId): candidateId is string => Boolean(candidateId));
+      completionController = setDismissedCompletionCandidates(
+        completionController,
+        currentReadyBranches
+          .map((branch) => branch.candidate_id)
+          .filter((candidateId): candidateId is string => Boolean(candidateId))
+      );
     }
     try {
       const automationEnabled = completionAutomationEnabled(enabled, shuttleEnabled);
@@ -2827,7 +4133,10 @@
       }
     } catch (error) {
       suggestionsEnabled = previousEnabled;
-      dismissedCandidateIds = previousDismissedCandidateIds;
+      completionController = setDismissedCompletionCandidates(
+        completionController,
+        previousDismissedCandidateIds
+      );
       clearPreferredWriterRequest();
       cancelSuggestionTimer();
       if (!enabled && activeBranchCount > 0) void cancelActiveBranches();
@@ -2843,6 +4152,97 @@
     await tick();
     if (mode === 'source') sourceEditor?.focusCurrentSelection();
     else visualEditor?.focusCurrentSelection();
+  }
+
+  function clearAutocompleteModelMenuLongPress(): void {
+    if (autocompleteModelMenuLongPressTimer !== undefined) {
+      window.clearTimeout(autocompleteModelMenuLongPressTimer);
+      autocompleteModelMenuLongPressTimer = undefined;
+    }
+    const pending = autocompleteModelMenuLongPress;
+    if (pending?.trigger.hasPointerCapture(pending.pointerId)) {
+      pending.trigger.releasePointerCapture(pending.pointerId);
+    }
+    autocompleteModelMenuLongPress = null;
+  }
+
+  function suppressNextAutocompleteToggleClick(): void {
+    suppressAutocompleteToggleClick = true;
+    if (suppressAutocompleteToggleClickTimer !== undefined) {
+      window.clearTimeout(suppressAutocompleteToggleClickTimer);
+    }
+    suppressAutocompleteToggleClickTimer = window.setTimeout(() => {
+      suppressAutocompleteToggleClick = false;
+      suppressAutocompleteToggleClickTimer = undefined;
+    }, 1_000);
+  }
+
+  function handleAutocompleteToggleClick(event: MouseEvent): void {
+    if (suppressAutocompleteToggleClick) {
+      event.preventDefault();
+      event.stopPropagation();
+      suppressAutocompleteToggleClick = false;
+      if (suppressAutocompleteToggleClickTimer !== undefined) {
+        window.clearTimeout(suppressAutocompleteToggleClickTimer);
+        suppressAutocompleteToggleClickTimer = undefined;
+      }
+      return;
+    }
+    void toggleSuggestionsFromTitlebar();
+  }
+
+  function openAutocompleteModelMenu(event: MouseEvent | KeyboardEvent): void {
+    event.preventDefault();
+    event.stopPropagation();
+    clearAutocompleteModelMenuLongPress();
+    openModelManager(event.currentTarget as HTMLButtonElement);
+  }
+
+  function handleAutocompleteModelMenuKey(event: KeyboardEvent): void {
+    if (isAutocompleteModelMenuKey(event)) openAutocompleteModelMenu(event);
+  }
+
+  function beginAutocompleteModelMenuLongPress(event: PointerEvent): void {
+    if (!canStartAutocompleteModelMenuLongPress(event)) return;
+    clearAutocompleteModelMenuLongPress();
+    const trigger = event.currentTarget as HTMLButtonElement;
+    const pending = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      trigger
+    };
+    autocompleteModelMenuLongPress = pending;
+    try {
+      trigger.setPointerCapture(event.pointerId);
+    } catch {
+      // A detached titlebar button cancels through the identity check below.
+    }
+    autocompleteModelMenuLongPressTimer = window.setTimeout(() => {
+      autocompleteModelMenuLongPressTimer = undefined;
+      if (autocompleteModelMenuLongPress !== pending || !pending.trigger.isConnected) {
+        clearAutocompleteModelMenuLongPress();
+        return;
+      }
+      clearAutocompleteModelMenuLongPress();
+      suppressNextAutocompleteToggleClick();
+      openModelManager(pending.trigger);
+    }, AUTOCOMPLETE_MODEL_MENU_LONG_PRESS_MS);
+  }
+
+  function updateAutocompleteModelMenuLongPress(event: PointerEvent): void {
+    const pending = autocompleteModelMenuLongPress;
+    if (!pending || pending.pointerId !== event.pointerId) return;
+    if (autocompleteModelMenuLongPressMoved(
+      { x: pending.x, y: pending.y },
+      { x: event.clientX, y: event.clientY }
+    )) clearAutocompleteModelMenuLongPress();
+  }
+
+  function finishAutocompleteModelMenuLongPress(event: PointerEvent): void {
+    if (autocompleteModelMenuLongPress?.pointerId === event.pointerId) {
+      clearAutocompleteModelMenuLongPress();
+    }
   }
 
   function focusableElementsWithin(container: HTMLElement): HTMLElement[] {
@@ -2972,9 +4372,15 @@
 
   async function activateSuggestionWriter(
     selected: ModelCapabilitySummary,
-    captured: WorkspaceRestoreCapture
+    captured: WorkspaceRestoreCapture,
+    catalogEntry: CuratedModelCatalogEntry | null = null
   ): Promise<boolean> {
     if (modelLoading || modelUnloading || !workspaceRestoreIsCurrent(captured)) return false;
+    if (catalogEntry && !legacyLocalCatalogMatch(catalogEntry, selected)) {
+      modelSetupError = 'That local file no longer matches the embedded catalog hint.';
+      announce('The catalog model changed before verification');
+      return false;
+    }
     const policyCandidate = selected.policy_candidate;
     if (looksLikeVisionAdapter(selected)) {
       modelSetupError = 'That file is a vision or projector adapter, not a standalone writing model.';
@@ -2989,18 +4395,22 @@
     modelSetupError = '';
     announce('Inspecting the writing model locally');
     try {
-      const loaded = policyCandidate
-        ? await loadPolicyModelCandidate(policyCandidate.profile_id, selected.model_path)
-        : await loadModel(selected.model_path);
+      const loaded = catalogEntry
+        ? await loadCatalogModelCandidate(catalogEntry.catalog_id, selected.model_path)
+        : policyCandidate
+          ? await loadPolicyModelCandidate(policyCandidate.profile_id, selected.model_path)
+          : await loadModel(selected.model_path);
       if (
         !componentMounted ||
         !applicationAllowsModelPreparation(applicationClosePhase) ||
         loadSerial !== modelLoadSerial ||
         !workspaceRestoreIsCurrent(captured)
       ) return false;
-      if (policyCandidate
-        ? !isVerifiedPolicyWriter(loaded, policyCandidate.profile_id)
-        : !isUsableSuggestionWriter(loaded)) {
+      if (catalogEntry
+        ? !isVerifiedCatalogWriter(catalogEntry, loaded)
+        : policyCandidate
+          ? !isVerifiedPolicyWriter(loaded, policyCandidate.profile_id)
+          : !isUsableSuggestionWriter(loaded)) {
         throw new Error('Native inspection did not find a text-completion model suitable for writing suggestions.');
       }
       if (!(await installLoadedModel(loaded, true, captured))) {
@@ -3063,6 +4473,15 @@
     const captured = currentWorkspaceCapture();
     if (!captured) return;
     await activateSuggestionWriter(model, captured);
+  }
+
+  async function useCatalogSuggestionWriter(
+    entry: CuratedModelCatalogEntry,
+    model: ModelCapabilitySummary
+  ): Promise<void> {
+    const captured = currentWorkspaceCapture();
+    if (!captured) return;
+    await activateSuggestionWriter(model, captured, entry);
   }
 
   async function unloadCurrentModel(): Promise<void> {
@@ -3381,13 +4800,17 @@
     try {
       await saveNow();
       if (!project || !document || uncertainSave || saveState === 'error' || saveState === 'uncertain') return;
+      if (!document.summary.revision_id || !document.summary.active_blob_id) {
+        throw new Error('The active document does not expose a complete export identity.');
+      }
       const receipt = await exportDocumentCopy(
         project.project_id,
         project.session_id,
         document.summary.document_id,
-        document.summary.relative_path
+        document.summary.revision_id,
+        document.summary.active_blob_id
       );
-      if (receipt) announce(`Exported a copy of ${document.summary.title}`);
+      if (receipt) announce(`Exported ${document.summary.title} as text`);
     } catch (error) {
       recordFailure(error);
     } finally {
@@ -3434,13 +4857,47 @@
       sessionId: opened.session_id
     };
     if (!workspaceRestoreIsCurrent(captured)) return false;
+    closeDocumentContextMenu(false);
+    closeDocumentDeleteConfirmation(false);
+    if (missingDocumentCapturePending) {
+      recordLocalFailure(
+        'missing_document_capture_pending',
+        'Loom refused to replace the workspace while a missing manuscript still needs preservation.'
+      );
+      return false;
+    }
+    const unsafeRecovery = missingDocumentRecoveryRequiresCopy(
+      missingDocumentRecovery && {
+        documentId: missingDocumentRecovery.documentId,
+        journalDurable: missingDocumentRecovery.journalDurable,
+        copied: missingDocumentCopyState === 'copied'
+      }
+    );
+    if (
+      unsafeRecovery &&
+      missingDocumentRecovery &&
+      (
+        missingDocumentRecovery.projectId !== opened.project_id ||
+        missingDocumentRecovery.sessionId !== opened.session_id
+      )
+    ) {
+      recordLocalFailure(
+        'missing_document_recovery_not_durable',
+        'Loom refused to replace the workspace before its preserved manuscript text was copied.'
+      );
+      return false;
+    }
+    if (!unsafeRecovery) {
+      missingDocumentRecovery = null;
+      missingDocumentCopyState = 'idle';
+    }
     outlineOpen = false;
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
     clearCompletionSession();
     suggestionsEnabled = false;
     shuttleEnabled = false;
-    dismissedCandidateIds = [];
+    completionController = resetCompletionDiscovery(completionController);
     if (opened.pending_recovery > 0) {
       const recovered = await runCurrentWorkspaceStep({
         capture: captured,
@@ -3487,6 +4944,10 @@
       saveState = 'clean';
       saveMessage = 'Project is ready';
     }
+    if (!workspaceRestoreIsCurrent(captured)) return false;
+    // Close the listener/snapshot handoff gap: a watcher hint emitted before
+    // this project became current was correctly ignored, so pull once now.
+    scheduleProjectFilesystemRefresh(0);
     return true;
   }
 
@@ -3494,15 +4955,44 @@
     summary: DocumentSummary,
     focusWritingSurface = false
   ): Promise<void> {
-    if (transition !== 'idle' || !project || applicationClosePhase !== 'running') return;
+    if (!project) return;
+    const target = captureDocumentTarget(project, summary);
+    if (!target) {
+      recordLocalFailure(
+        'incomplete_document_identity',
+        `${summary.title} does not expose the complete active revision required to open it safely.`
+      );
+      return;
+    }
+    await selectCapturedDocument(target, focusWritingSurface);
+  }
+
+  async function selectCapturedDocument(
+    target: CapturedDocumentTarget,
+    focusWritingSurface = false,
+    fromContextMenu = false
+  ): Promise<void> {
+    if (
+      transition !== 'idle' ||
+      applicationClosePhase !== 'running' ||
+      !capturedDocumentBelongsToSession(target, project)
+    ) return;
+    if (renamingDocumentId && renamingDocumentId !== target.documentId) {
+      cancelDocumentRename(false);
+    }
     const requestedScope: ProjectRestoreScope = {
-      projectId: project.project_id,
-      sessionId: project.session_id,
+      projectId: target.projectId,
+      sessionId: target.sessionId,
       restoreSerial: workspaceRestoreSerial
     };
     const projectNavigationIsCurrent = () => Boolean(
       applicationClosePhase === 'running' &&
       projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, requestedScope)
+    );
+    const targetWasCurrent = Boolean(
+      document?.summary.document_id === target.documentId &&
+      document.summary.revision_id === target.expectedRevisionId &&
+      document.summary.active_blob_id === target.expectedBlobId
     );
     if (compositionActive) {
       announce('Finish composing text before changing documents');
@@ -3511,7 +5001,7 @@
     if (!flushEditors()) return;
     cancelSuggestionTimer();
     clearCompletionSession();
-    dismissedCandidateIds = [];
+    completionController = resetCompletionDiscovery(completionController);
     transition = 'navigation';
     announce('Opening document; editing is briefly locked');
     const requestSerial = ++navigationSerial;
@@ -3523,7 +5013,7 @@
       return;
     }
     if (!projectNavigationIsCurrent()) return;
-    if (!(await flushCurrentDocument())) {
+    if (!targetWasCurrent && !(await flushCurrentDocument())) {
       if (
         requestSerial === navigationSerial &&
         projectNavigationIsCurrent()
@@ -3546,8 +5036,13 @@
     };
     clearFailure();
     try {
-      if (summary.externally_modified) {
-        const preview = await requestReconciliationPreview(summary, null, source);
+      if (target.externallyModified) {
+        const preview = await requestReconciliationPreview({
+          document_id: target.documentId,
+          kind: target.kind,
+          revision_id: target.expectedRevisionId,
+          active_blob_id: target.expectedBlobId
+        }, null, source);
         if (
           applicationClosePhase !== 'running' ||
           requestSerial !== navigationSerial ||
@@ -3579,8 +5074,9 @@
       const opened = await openDocument(
         source.projectId,
         source.sessionId,
-        summary.document_id,
-        summary.relative_path
+        target.documentId,
+        target.expectedRevisionId,
+        target.expectedBlobId
       );
       if (
         applicationClosePhase !== 'running' ||
@@ -3594,10 +5090,14 @@
           source
         )
       ) return;
-      if (opened.summary.document_id !== summary.document_id) {
+      if (
+        opened.summary.document_id !== target.documentId ||
+        opened.summary.revision_id !== target.expectedRevisionId ||
+        opened.summary.active_blob_id !== target.expectedBlobId
+      ) {
         throw new Error('The desktop returned a different document identity.');
       }
-      if (summary.active_blob_id && opened.visible_blob_id !== summary.active_blob_id) {
+      if (opened.visible_blob_id !== target.expectedBlobId) {
         throw new Error('The desktop returned document bytes from a different active revision.');
       }
       documentEpoch += 1;
@@ -3618,6 +5118,22 @@
       );
       const effectiveText = draftIsCurrent && draft ? draft.text : opened.text;
       document = { ...opened, text: effectiveText };
+      if (
+        missingDocumentRecovery &&
+        openedDocumentSubsumesMissingRecovery(
+          {
+            documentId: missingDocumentRecovery.documentId,
+            text: missingDocumentRecovery.text,
+            journalDurable: missingDocumentRecovery.journalDurable,
+            copied: missingDocumentCopyState === 'copied'
+          },
+          opened.summary.document_id,
+          effectiveText
+        )
+      ) {
+        missingDocumentRecovery = null;
+        missingDocumentCopyState = 'idle';
+      }
       documentText = effectiveText;
       setSourceDocument(effectiveText, opened.summary.kind);
       editVersion = draftIsCurrent ? 1 : 0;
@@ -3637,13 +5153,13 @@
         saveState = 'dirty';
         saveMessage = 'Recovered an unsaved local draft';
         scheduleSave();
-        announce(`Recovered a local draft for ${summary.title}`);
+        announce(`Recovered a local draft for ${target.title}`);
       } else {
         saveState = 'clean';
         saveMessage = 'All changes saved';
-        announce(`Opened ${summary.title}`);
+        announce(`Opened ${target.title}`);
       }
-      mode = summary.kind === 'prose' && canUseVisualMarkdown(effectiveText, false)
+      mode = opened.summary.kind === 'prose' && canUseVisualMarkdown(effectiveText, false)
         ? preferredProseMode
         : 'source';
       void refreshBranchesFor(
@@ -3657,7 +5173,62 @@
         applicationClosePhase !== 'running' ||
         !projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source)
       ) return;
-      recordFailure(error);
+      if (normalizeFailure(error).code === 'external_file_deleted') {
+        clearFailure();
+        announce(`${target.title} was deleted outside Loom; refreshing the outline`);
+        scheduleProjectFilesystemRefresh(0);
+        return;
+      }
+      let reportedError = error;
+      if (normalizeFailure(error).code === 'external_file_change') {
+        try {
+          const refreshed = await currentProjectSession();
+          if (
+            refreshed.project_id === target.projectId &&
+            refreshed.session_id === target.sessionId &&
+            requestSerial === navigationSerial &&
+            navigationScopeIsCurrent(
+              project,
+              document,
+              documentEpoch,
+              editVersion,
+              workspaceRestoreSerial,
+              source
+            )
+          ) {
+            const changedTarget = refreshed.documents.find(
+              (candidate) => candidate.document_id === target.documentId
+            );
+            if (
+              changedTarget?.externally_modified &&
+              changedTarget.revision_id === target.expectedRevisionId &&
+              changedTarget.active_blob_id === target.expectedBlobId
+            ) {
+              project = refreshed;
+              const preview = await requestReconciliationPreview(changedTarget, null, source);
+              if (
+                requestSerial === navigationSerial &&
+                navigationScopeIsCurrent(
+                  project,
+                  document,
+                  documentEpoch,
+                  editVersion,
+                  workspaceRestoreSerial,
+                  source
+                )
+              ) {
+                documentEpoch += 1;
+                activateReconciliation(preview);
+                return;
+              }
+            }
+          }
+        } catch (reconciliationError) {
+          reportedError = reconciliationError;
+        }
+      }
+      if (fromContextMenu) recordDocumentContextFailure(target, reportedError);
+      else recordFailure(reportedError);
       if (navigationScopeIsCurrent(
         project,
         document,
@@ -3676,13 +5247,13 @@
       ) {
         transition = 'idle';
         wakePreferredWriterEnsure();
-        if (focusWritingSurface && document?.summary.document_id === summary.document_id) {
+        if (focusWritingSurface && document?.summary.document_id === target.documentId) {
           await tick();
           if (
             applicationClosePhase === 'running' &&
             requestSerial === navigationSerial &&
             projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source) &&
-            document?.summary.document_id === summary.document_id
+            document?.summary.document_id === target.documentId
           ) focusCurrentWritingSurfaceAtEnd();
         }
       }
@@ -3691,50 +5262,45 @@
 
   function updateText(text: string): void {
     if (transition !== 'idle') return;
-    const completionMutation = pendingCompletionText === text;
-    pendingCompletionText = null;
     const mutationWasInvalidated = visualMutationPending;
+    const mutation = observeTextMutation(
+      completionController,
+      text,
+      documentText,
+      mutationWasInvalidated
+    );
+    completionController = mutation.state;
     visualMutationPending = false;
     if (text === documentText) return;
     documentText = text;
     editVersion += 1;
-    if (!completionMutation && !mutationWasInvalidated) suggestionIntentEpoch += 1;
     uncertainWeave = null;
     saveState = 'dirty';
     saveMessage = saveInFlight ? 'Saving earlier changes…' : 'Unsaved changes';
     promotionArmedCandidateId = null;
-    if (!completionMutation) {
-      completionSession = null;
-      dismissedCandidateIds = [];
-      unpresentableVisualGhostPresentationKeys = [];
-      if (activeBranchCount > 0) void cancelActiveBranches();
-    }
+    if (mutation.cancelActiveBranches && activeBranchCount > 0) void cancelActiveBranches();
     scheduleDraftJournal();
     scheduleSave();
-    if (!completionMutation) scheduleAutomaticSuggestions(editVersion);
+    if (!mutation.completionOwned) scheduleAutomaticSuggestions(editVersion);
   }
 
   function clearCompletionSession(): void {
-    completionSession = null;
-    pendingCompletionText = null;
+    completionController = clearCompletionControllerSession(completionController);
   }
 
   function invalidateVisualSuggestionImmediately(): void {
     if (transition !== 'idle' || visualMutationPending) return;
-    if (pendingCompletionText !== null) return;
+    if (completionController.pendingText !== null) return;
     visualMutationPending = true;
-    completionSession = null;
-    suggestionIntentEpoch += 1;
+    const invalidated = invalidateVisualMutation(completionController);
+    completionController = invalidated.state;
     uncertainWeave = null;
     promotionArmedCandidateId = null;
-    dismissedCandidateIds = [];
-    unpresentableVisualGhostPresentationKeys = [];
-    if (activeBranchCount > 0) void cancelActiveBranches();
+    applyCompletionEffects(invalidated.effects);
   }
 
   function setSourceDocument(text: string, kind: DocumentKind): void {
-    clearCompletionSession();
-    lastCompletionAction = null;
+    completionController = resetCompletionSurface(completionController);
     if (sourceProjectionTimer !== undefined) {
       window.clearTimeout(sourceProjectionTimer);
       sourceProjectionTimer = undefined;
@@ -3748,7 +5314,6 @@
     visualBoundaryFailure = 'uninitialized';
     visualBoundaryDiagnostic = null;
     visualMutationPending = false;
-    unpresentableVisualGhostPresentationKeys = [];
     if (kind === 'verse') {
       const decoded = decodeVerseForEditor(text);
       verseCodec = decoded.codec;
@@ -3788,9 +5353,81 @@
       // synchronously. Project them in the same event turn so the cached
       // remainder and reversal affordance never disappear behind the ordinary
       // source-edit debounce.
-      if (pendingCompletionText !== null) commitSourceDraft();
+      if (completionController.pendingText !== null) commitSourceDraft();
       else scheduleSourceProjection();
     }
+  }
+
+  async function storeImageAttachments(files: readonly File[]): Promise<readonly string[]> {
+    if (!project || !document || editorReadonly || files.length === 0) return [];
+    const transferError = imageAttachmentTransferError(files);
+    if (transferError) {
+      reportImageAttachmentError(transferError);
+      return [];
+    }
+    const captured = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id,
+      relativePath: document.summary.relative_path,
+      documentEpoch
+    };
+    const snippets: string[] = [];
+    try {
+      // Encode and transmit one image at a time. A single paste/drop therefore
+      // never retains every ArrayBuffer, binary string, and base64 payload at
+      // once, even at the explicit transfer ceiling.
+      for (const file of files) {
+        const encoded = await encodeImageAttachment(file);
+        const receipt = await ingestImageAttachment(
+          captured.projectId,
+          captured.sessionId,
+          encoded.mediaType,
+          encoded.base64
+        );
+        if (
+          project?.project_id !== captured.projectId ||
+          project.session_id !== captured.sessionId ||
+          document?.summary.document_id !== captured.documentId ||
+          documentEpoch !== captured.documentEpoch
+        ) {
+          const message =
+            'The image was stored in the original project, but the manuscript changed before insertion.';
+          recordLocalFailure('image_attachment_stale', message);
+          announce(message);
+          return [];
+        }
+        snippets.push(attachmentMarkdown(receipt, encoded.originalName, captured.relativePath));
+      }
+      return snippets;
+    } catch (error) {
+      recordFailure(error);
+      if (snippets.length > 0) {
+        return snippets;
+      }
+      announce('The image could not be attached; your manuscript is unchanged');
+      return [];
+    }
+  }
+
+  function resolveImageAssetUrl(markdownPath: string): string | null {
+    if (!project) return null;
+    const token = projectAssetProtocolToken(
+      project.project_id,
+      project.session_id,
+      markdownPath
+    );
+    return token ? convertFileSrc(token, 'loom-asset') : null;
+  }
+
+  function reportImageAttachmentError(message: string): void {
+    recordLocalFailure('image_attachment_unreadable', message);
+    announce(message);
+  }
+
+  function reportImageAttachmentsCommitted(count: number): void {
+    if (!Number.isSafeInteger(count) || count <= 0) return;
+    announce(count === 1 ? 'Image attached' : `${count} images attached`);
   }
 
   function updateSourceSelection(textarea: HTMLTextAreaElement): void {
@@ -3800,7 +5437,7 @@
     sourceSelectionStart = textarea.selectionStart;
     sourceSelectionEnd = textarea.selectionEnd;
     if (
-      pendingCompletionText !== null ||
+      completionController.pendingText !== null ||
       (previousStart === sourceSelectionStart && previousEnd === sourceSelectionEnd)
     ) return;
     const target = sourceGhostTargetByteFor(
@@ -3813,13 +5450,13 @@
       documentText,
       verseCodec
     );
-    const expected = completionSession
-      ? completionSessionPresentation(completionSession)?.targetByte ?? null
-      : selectedInlineSuggestion?.targetByte ?? completionGenerationIntent?.anchorByte ?? null;
+    const expected = completionController.session
+      ? completionSessionPresentation(completionController.session)?.targetByte ?? null
+      : selectedInlineSuggestion?.targetByte ?? completionController.generationIntent?.anchorByte ?? null;
     if (expected === null && target !== null) {
       if (completionWasActive) {
-        completionGenerationIntent = bindCompletionGenerationAnchor(
-          completionGenerationIntent,
+        completionController = bindCompletionAnchor(
+          completionController,
           completionContextKey,
           editVersion,
           target
@@ -3845,23 +5482,27 @@
     visualSelectionByte = markdownByteOffset;
     visualBoundaryFailure = failure;
     visualBoundaryDiagnostic = diagnostic;
-    if (completionNavigationPending && markdownByteOffset !== null) {
-      completionNavigationPending = false;
+    const settledNavigation = settleCompletionNavigation(
+      completionController,
+      markdownByteOffset !== null
+    );
+    completionController = settledNavigation.state;
+    if (settledNavigation.scheduleFresh) {
       scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'caret_navigation');
       return;
     }
     if (
-      pendingCompletionText !== null ||
+      completionController.pendingText !== null ||
       markdownByteOffset === null ||
       markdownByteOffset === previous ||
       !completionWasActive
     ) return;
-    const expected = completionSession
-      ? completionSessionPresentation(completionSession)?.targetByte ?? null
-      : selectedInlineSuggestion?.targetByte ?? completionGenerationIntent?.anchorByte ?? null;
+    const expected = completionController.session
+      ? completionSessionPresentation(completionController.session)?.targetByte ?? null
+      : selectedInlineSuggestion?.targetByte ?? completionController.generationIntent?.anchorByte ?? null;
     if (expected === null) {
-      completionGenerationIntent = bindCompletionGenerationAnchor(
-        completionGenerationIntent,
+      completionController = bindCompletionAnchor(
+        completionController,
         completionContextKey,
         editVersion,
         markdownByteOffset
@@ -3910,19 +5551,21 @@
     delay = suggestionsIdleDelayMs,
     trigger: CompletionGenerationTrigger = 'document_edit'
   ): void {
-    completionGenerationIntent = armCompletionGeneration(
+    const armed = armCompletionScheduleIntent(
+      completionController,
       completionContextKey,
       targetEditVersion,
       trigger,
       mode === 'visual' ? visualSelectionByte : sourceGhostTargetByte
     );
-    if (!completionGenerationIntent) return;
+    completionController = armed;
+    if (!armed.generationIntent) return;
     armSuggestionSchedule({ kind: 'edit_pause', editVersion: targetEditVersion }, delay);
   }
 
   function scheduleAutocompleteRetry(ticket: AutocompleteRetryTicket): void {
     if (!completionGenerationIsArmed(
-      completionGenerationIntent,
+      completionController.generationIntent,
       completionContextKey,
       ticket.editVersion
     )) return;
@@ -3932,23 +5575,26 @@
     );
   }
 
-  function armSuggestionSchedule(schedule: SuggestionSchedule, delay: number): void {
-    if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
-    suggestionsIdleTimer = undefined;
-    scheduledSuggestion = null;
+  function armSuggestionSchedule(schedule: CompletionSchedule, delay: number): void {
+    clearSuggestionTimerHandle();
+    completionController = setCompletionSchedule(completionController, null);
     if (
       !desktop ||
       !completionAutomationEnabled() ||
       !project ||
       !document ||
-      !completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion) ||
+      !completionGenerationIsArmed(
+        completionController.generationIntent,
+        completionContextKey,
+        editVersion
+      ) ||
       document.summary.kind === 'hybrid'
     ) return;
-    scheduledSuggestion = schedule;
+    completionController = setCompletionSchedule(completionController, schedule);
     queueScheduledSuggestionAttempt(schedule, delay);
   }
 
-  function queueScheduledSuggestionAttempt(schedule: SuggestionSchedule, delay: number): void {
+  function queueScheduledSuggestionAttempt(schedule: CompletionSchedule, delay: number): void {
     if (suggestionsIdleTimer !== undefined) window.clearTimeout(suggestionsIdleTimer);
     suggestionsIdleTimer = window.setTimeout(() => {
       suggestionsIdleTimer = undefined;
@@ -3961,15 +5607,15 @@
       !wakeKey ||
       suggestionWakeQueued ||
       suggestionsIdleTimer !== undefined ||
-      !scheduledSuggestion ||
+      !completionController.scheduled ||
       completionLifecycle.phase !== 'ready'
     ) return;
-    const schedule = scheduledSuggestion;
+    const schedule = completionController.scheduled;
     suggestionWakeQueued = true;
     queueMicrotask(() => {
       suggestionWakeQueued = false;
       if (
-        scheduledSuggestion === schedule &&
+        completionController.scheduled === schedule &&
         suggestionsIdleTimer === undefined &&
         completionLifecycle.phase === 'ready'
       ) void tryStartAutomaticSuggestions(schedule);
@@ -3977,16 +5623,16 @@
   }
 
   function rearmBoundedSuggestionSchedule(
-    schedule: SuggestionSchedule,
+    schedule: CompletionSchedule,
     delay: number
   ): boolean {
     if (schedule.kind === 'edit_pause') {
-      scheduledSuggestion = schedule;
+      completionController = setCompletionSchedule(completionController, schedule);
       queueScheduledSuggestionAttempt(schedule, delay);
       return true;
     }
     if (schedule.ticket.waitsRemaining <= 0) {
-      scheduledSuggestion = null;
+      completionController = setCompletionSchedule(completionController, null);
       return false;
     }
     armSuggestionSchedule({
@@ -4014,7 +5660,7 @@
       document.visible_blob_id !== ticket.visibleBlobId ||
       documentEpoch !== ticket.documentEpoch ||
       editVersion !== ticket.editVersion ||
-      suggestionIntentEpoch !== ticket.intentEpoch ||
+      completionController.intentEpoch !== ticket.intentEpoch ||
       mode !== ticket.mode ||
       currentModel.model_id !== ticket.modelId ||
       sourceGhostNewline !== ticket.sourceNewline ||
@@ -4041,33 +5687,39 @@
     });
   }
 
-  async function tryStartAutomaticSuggestions(schedule: SuggestionSchedule): Promise<void> {
+  async function tryStartAutomaticSuggestions(schedule: CompletionSchedule): Promise<void> {
     const targetEditVersion = schedule.kind === 'edit_pause'
       ? schedule.editVersion
       : schedule.ticket.editVersion;
     if (
-      scheduledSuggestion !== schedule ||
+      completionController.scheduled !== schedule ||
       targetEditVersion !== editVersion ||
       !completionAutomationEnabled() ||
       !project ||
       !document ||
-      !completionGenerationIsArmed(completionGenerationIntent, completionContextKey, targetEditVersion)
+      !completionGenerationIsArmed(
+        completionController.generationIntent,
+        completionContextKey,
+        targetEditVersion
+      )
     ) {
-      scheduledSuggestion = null;
+      completionController = setCompletionSchedule(completionController, null);
       return;
     }
     if (!canStartAutomaticSuggestions) {
-      if (!retainsScheduledCompletion(completionLifecycle)) scheduledSuggestion = null;
+      if (!retainsScheduledCompletion(completionLifecycle)) {
+        completionController = setCompletionSchedule(completionController, null);
+      }
       return;
     }
     if (schedule.kind === 'exhausted_retry') {
       const disposition = retryTicketDisposition(schedule.ticket);
       if (!disposition) {
-        scheduledSuggestion = null;
+        completionController = setCompletionSchedule(completionController, null);
         return;
       }
       if (disposition.kind === 'available' || disposition.kind === 'inactive') {
-        scheduledSuggestion = null;
+        completionController = setCompletionSchedule(completionController, null);
         return;
       }
       if (
@@ -4079,9 +5731,9 @@
       }
     }
     const attempted = await startAutomaticWeave();
-    if (scheduledSuggestion !== schedule) return;
+    if (completionController.scheduled !== schedule) return;
     if (attempted || !retainsScheduledCompletion(completionLifecycle)) {
-      scheduledSuggestion = null;
+      completionController = setCompletionSchedule(completionController, null);
     } else {
       // A preflight race (for example, an editor projection completing while
       // it is flushed) must not erase the only request. Recheck once the
@@ -4411,7 +6063,6 @@
         try {
           const preview = await requestReconciliationPreview({
             document_id: captured.documentId,
-            relative_path: captured.relativePath,
             kind: captured.kind,
             revision_id: captured.revisionId,
             active_blob_id: captured.visibleBlobId
@@ -4493,30 +6144,21 @@
     }
   }
 
-  function dismissInlineSuggestion(candidateId: string | null | undefined): void {
-    if (!candidateId || dismissedCandidateIds.includes(candidateId)) return;
-    dismissedCandidateIds = [...dismissedCandidateIds, candidateId];
-    announce('Suggestion dismissed');
-  }
-
   function rejectVisualGhostPresentation(
     candidateId: string,
     presentationKey: string,
     surfaceKey: string,
     anchorByteOffset: number
   ): void {
-    if (
-      mode !== 'visual' ||
-      ghostSuggestion?.candidateId !== candidateId ||
-      ghostSuggestion.presentationKey !== presentationKey ||
-      ghostSuggestion.targetByte !== anchorByteOffset ||
-      surfaceKey !== visualGhostSurfaceKey ||
-      unpresentableVisualGhostPresentationKeys.includes(presentationKey)
-    ) return;
-    unpresentableVisualGhostPresentationKeys = [
-      ...unpresentableVisualGhostPresentationKeys,
-      presentationKey
-    ].slice(-64);
+    completionController = rejectVisualPresentation(completionController, {
+      mode,
+      eligible: ghostSuggestion,
+      candidateId,
+      presentationKey,
+      surfaceKey,
+      currentSurfaceKey: visualGhostSurfaceKey,
+      anchorByte: anchorByteOffset
+    });
   }
 
   async function acceptInlineSuggestion(branch: BranchCard): Promise<void> {
@@ -4533,79 +6175,86 @@
         : null;
   }
 
-  function syncCompletionCandidate(
-    expected: CompletionSession,
-    updated: CompletionSession | null
-  ): void {
-    if (completionSession !== expected) return;
-    completionSession = updated;
-    if (!updated) pendingCompletionText = null;
-  }
-
-  function finishCompletionIfExhausted(key: string): void {
-    const edge = advanceCompletionExhaustionLatch(handledCompletionExhaustionKey, key);
-    handledCompletionExhaustionKey = edge.handledKey;
-    if (!edge.shouldSchedule) return;
-    // An exhausted frozen session is still the exact authority for immediate
-    // Option-Left rollback. Queue the next family independently; deliberate
-    // dismissal, navigation, typing, or shared-engine off clears this cache.
-    scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'candidate_exhausted');
-  }
-
-  function completionActivityExists(): boolean {
-    return Boolean(
-      completionGenerationIntent ||
-      completionSession ||
-      pendingCompletionText !== null ||
-      scheduledSuggestion ||
-      weaveStarting ||
-      activeBranchCount > 0 ||
-      selectedInlineSuggestion
-    );
-  }
-
-  function invalidateCompletionForCaretNavigation(): void {
-    completionNavigationPending = mode === 'visual';
-    if (!completionActivityExists()) return;
-    completionSession = null;
-    pendingCompletionText = null;
-    promotionArmedCandidateId = null;
-    dismissedCandidateIds = [];
-    unpresentableVisualGhostPresentationKeys = [];
-    cancelSuggestionTimer();
-    if (activeBranchCount > 0) void cancelActiveBranches();
-  }
-
-  function sessionForEligibleGhost(eligible: InlineGhostSuggestion): CompletionSession | null {
-    if (completionSession && completionSessionMatchesPresentation(
-      completionSession,
-      completionContextKey,
-      eligible
-    )) return completionSession;
-    completionSession = null;
-    return startCompletionSession(
-      completionContextKey,
-      activeSuggestionFamily,
-      eligible.runId
-    );
-  }
-
-  function synchronizeVisibleCompletionSession(
+  function reconcileVisibleCompletionController(
     contextKey: string,
     family: readonly InlineGhostSuggestion[]
   ): void {
-    if (completionSession?.contextKey !== contextKey) {
-      completionSession = null;
-      pendingCompletionText = null;
+    const reconciled = reconcileCompletionController(
+      completionController,
+      contextKey,
+      family
+    );
+    if (reconciled !== completionController) completionController = reconciled;
+  }
+
+  function refreshVisibleCompletionCandidate(
+    expected: CompletionSession,
+    runId: string,
+    text: string,
+    presentationKey: string
+  ): void {
+    const refreshed = refreshCompletionCandidate(
+      completionController,
+      expected,
+      runId,
+      text,
+      presentationKey
+    );
+    if (refreshed !== completionController) completionController = refreshed;
+  }
+
+  function applyCompletionEffects(effects: readonly CompletionControllerEffect[]): void {
+    for (const effect of effects) {
+      switch (effect.kind) {
+        case 'announce':
+          announce(effect.message);
+          break;
+        case 'cancel_active_branches':
+          if (activeBranchCount > 0) void cancelActiveBranches();
+          break;
+        case 'schedule_generation':
+          scheduleAutomaticSuggestions(
+            effect.editVersion,
+            effect.delayMs,
+            effect.trigger
+          );
+          break;
+      }
     }
-    if (!contextKey) return;
-    if (!completionSession) {
-      if (family.length === 0) return;
-      completionSession = startCompletionSession(contextKey, family, family[0].runId);
-      return;
-    }
-    completionSession = synchronizeCompletionCandidates(completionSession, family);
-    if (!completionSession) pendingCompletionText = null;
+  }
+
+  function finishCompletionIfExhausted(key: string): void {
+    const exhausted = completionExhausted(
+      completionController,
+      key,
+      editVersion,
+      suggestionsIdleDelayMs
+    );
+    completionController = exhausted.state;
+    applyCompletionEffects(exhausted.effects);
+  }
+
+  function completionActivityExists(): boolean {
+    return controllerHasCompletionActivity(completionController, {
+      weaveStarting,
+      activeBranchCount,
+      selected: selectedInlineSuggestion
+    });
+  }
+
+  function invalidateCompletionForCaretNavigation(): void {
+    const active = completionActivityExists();
+    const invalidated = invalidateControllerNavigation(
+      completionController,
+      mode,
+      active,
+      activeBranchCount
+    );
+    completionController = invalidated.state;
+    if (!active) return;
+    promotionArmedCandidateId = null;
+    clearSuggestionTimerHandle();
+    applyCompletionEffects(invalidated.effects);
   }
 
   function acceptActiveGhost(candidateId: string, presentationKey: string): boolean {
@@ -4632,38 +6281,19 @@
     text: string,
     action: CompletionInsertionAction
   ): boolean {
-    const eligible = eligibleGhostForCurrentMode();
-    if (
-      !eligible ||
-      eligible.candidateId !== candidateId ||
-      eligible.presentationKey !== presentationKey ||
-      !text ||
-      !eligible.text.startsWith(text) ||
-      pendingCompletionText !== null ||
-      (!completionSession && !branchPromotionReady)
-    ) return false;
-    const initial = sessionForEligibleGhost(eligible);
-    if (!initial) return false;
-    const consumed = consumeCompletionText(initial, text);
-    if (!consumed) return false;
-    const expected = insertAtUtf8Boundary(documentText, eligible.targetByte, text);
-    if (expected === null) return false;
-    completionSession = consumed.session;
-    completionActionSequence += 1;
-    lastCompletionAction = {
-      sequence: completionActionSequence,
-      kind: action,
-      context_key: completionContextKey,
-      run_id: eligible.runId,
-      candidate_id: eligible.candidateId,
-      presentation_key: eligible.presentationKey,
-      inserted_utf8_bytes: new TextEncoder().encode(text).byteLength,
-      accepted_utf8_bytes: new TextEncoder().encode(
-        acceptedCompletionText(consumed.session)
-      ).byteLength
-    };
-    pendingCompletionText = expected;
-    return true;
+    const authorization = authorizeCompletionInsertion(completionController, {
+      contextKey: completionContextKey,
+      family: activeSuggestionFamily,
+      eligible: eligibleGhostForCurrentMode(),
+      candidateId,
+      presentationKey,
+      text,
+      action,
+      manuscriptText: documentText,
+      promotionReady: branchPromotionReady
+    });
+    completionController = authorization.state;
+    return authorization.authorized;
   }
 
   function authorizeGhostUnconsume(
@@ -4671,43 +6301,27 @@
     presentationKey: string,
     text: string
   ): boolean {
-    const eligible = eligibleGhostForCurrentMode();
-    if (
-      !completionSession ||
-      !eligible ||
-      eligible.candidateId !== candidateId ||
-      eligible.presentationKey !== presentationKey ||
-      pendingCompletionText !== null
-    ) return false;
-    const step = unconsumeCompletionWord(completionSession);
-    if (!step || step.text !== text) return false;
-    const expected = removeBeforeUtf8Boundary(documentText, eligible.targetByte, text);
-    if (expected === null) return false;
-    completionSession = step.session;
-    pendingCompletionText = expected;
-    return true;
+    const authorization = authorizeCompletionUnconsume(completionController, {
+      eligible: eligibleGhostForCurrentMode(),
+      candidateId,
+      presentationKey,
+      text,
+      manuscriptText: documentText
+    });
+    completionController = authorization.state;
+    return authorization.authorized;
   }
 
   function cycleActiveSuggestion(offset: number): void {
-    if (completionSession) {
-      const next = cycleCompletionSession(completionSession, offset);
-      if (next === completionSession) return;
-      completionSession = next;
-      activeSuggestionRunId = next.selectedRunId;
-      promotionArmedCandidateId = null;
-      const index = next.candidates.findIndex((candidate) => candidate.runId === next.selectedRunId);
-      announce(`Suggestion ${index + 1} of ${next.candidates.length}`);
-      return;
-    }
-    if (activeSuggestionFamily.length < 2) return;
-    const current = activeSuggestionFamily.findIndex(
-      (suggestion) => suggestion.runId === activeSuggestionRunId
+    const cycled = cycleCompletion(
+      completionController,
+      activeSuggestionFamily,
+      offset
     );
-    const next = cycleSuggestionIndex(activeSuggestionFamily.length, current, offset);
-    if (next < 0) return;
-    activeSuggestionRunId = activeSuggestionFamily[next].runId;
+    if (cycled.state === completionController) return;
+    completionController = cycled.state;
     promotionArmedCandidateId = null;
-    announce(`Suggestion ${next + 1} of ${activeSuggestionFamily.length}`);
+    applyCompletionEffects(cycled.effects);
   }
 
   async function setShuttleEnabled(enabled: boolean): Promise<void> {
@@ -4819,23 +6433,40 @@
       void setShuttleEnabled(false);
       return;
     }
-    if (
-      completionSession &&
-      completionSessionMatchesPresentation(completionSession, completionContextKey, eligible)
-    ) clearCompletionSession();
-    dismissInlineSuggestion(candidateId);
+    const dismissed = dismissCompletion(
+      completionController,
+      completionContextKey,
+      eligible,
+      candidateId,
+      presentationKey
+    );
+    completionController = dismissed.state;
+    if (dismissed.authorized) announce('Suggestion dismissed');
+  }
+
+  function handleGlobalKeydownCapture(event: KeyboardEvent): void {
+    if (!shouldCaptureFormatMenuEscape(event, {
+      formatMenuOpen: formatMenu?.isOpen() ?? false,
+      compositionActive,
+      documentRenameOwnsEscape: renameDocumentEditorLocked || renamingDocumentId !== null,
+      documentMenuOwnsEscape: documentContextTarget !== null,
+      modelManagerOwnsEscape: modelManagerOpen
+    })) return;
+    event.preventDefault();
+    event.stopPropagation();
+    closeFormatMenu();
   }
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
+    if (event.defaultPrevented) return;
+    if (event.key === 'Escape' && documentContextTarget) {
+      event.preventDefault();
+      closeDocumentContextMenu();
+      return;
+    }
     if (event.key === 'Escape' && modelManagerOpen) {
       event.preventDefault();
       closeModelManager();
-      return;
-    }
-    if (event.key === 'Escape' && projectMenu?.open) {
-      event.preventDefault();
-      closeProjectMenu();
-      projectMenuTrigger?.focus();
       return;
     }
     if (event.key === 'Escape' && formatMenu?.isOpen()) {
@@ -4868,10 +6499,10 @@
 
   function handleGlobalPointerdown(event: PointerEvent): void {
     if (
-      projectMenu?.open &&
+      documentContextTarget &&
       event.target instanceof Node &&
-      !projectMenu.contains(event.target)
-    ) closeProjectMenu();
+      !documentContextMenu?.contains(event.target)
+    ) closeDocumentContextMenu(false);
     if (
       formatMenu?.isOpen() &&
       event.target instanceof Node &&
@@ -4911,7 +6542,9 @@
       started.document_id !== captured.documentId ||
       started.source_revision_id !== captured.sourceRevisionId ||
       !started.exact_prompt_blob_id ||
-      started.branches.length !== 4
+      started.branches.length !== 4 ||
+      new Set(started.branches.map((branch) => branch.run_id)).size !== 4 ||
+      started.branches.some((branch) => branch.weave_command_id !== started.command_id)
     ) {
       throw new Error('The desktop returned a branch family for different source identities.');
     }
@@ -4926,8 +6559,9 @@
     }
     if (!weaveCaptureStillCurrent(captured)) return false;
     const runIds = new Set(started.branches.map((branch) => branch.run_id));
+    authoritativeCompletionFamilyId = started.command_id;
     branches = [
-      ...started.branches.map((branch) => applyLiveBranchState(branch, false)),
+      ...started.branches,
       ...branches.filter((branch) => !runIds.has(branch.run_id))
     ];
     // A lost-reply replay may already be terminal. Only the authoritative body
@@ -4947,7 +6581,7 @@
       document.visible_blob_id === captured.visibleBlobId &&
       documentEpoch === captured.epoch &&
       editVersion === captured.editVersion &&
-      suggestionIntentEpoch === captured.intentEpoch &&
+      completionController.intentEpoch === captured.intentEpoch &&
       currentModel?.model_id === captured.modelId &&
       completionAutomationEnabled()
     );
@@ -5092,7 +6726,7 @@
       visibleBlobId: document.visible_blob_id,
       cursorByte,
       editVersion,
-      intentEpoch: suggestionIntentEpoch,
+      intentEpoch: completionController.intentEpoch,
       modelId: currentModel.model_id
     };
     weaveStarting = true;
@@ -5462,7 +7096,8 @@
       captured.projectId,
       captured.sessionId,
       captured.documentId,
-      captured.relativePath
+      target.revision_id,
+      target.active_blob_id
     );
     if (
       opened.summary.document_id !== captured.documentId ||
@@ -5810,9 +7445,20 @@
       announce('Finish composing text before changing editor modes');
       return;
     }
-    if (next === 'visual' && !canUseVisual) return;
     if (next === mode) return;
-    flushEditors();
+    if (!flushEditors()) return;
+    if (next === 'visual' && document?.summary.kind !== 'prose') {
+      announce('Visual editing is available for prose manuscripts');
+      return;
+    }
+    if (next === 'visual' && !canUseVisualMarkdown(documentText, false)) {
+      recordLocalFailure(
+        'visual_markdown_not_exact',
+        'This Markdown uses syntax the visual editor cannot preserve exactly yet. The Markdown editor remains available without changing your text.'
+      );
+      announce('Visual editor unavailable for this Markdown; your source text is unchanged');
+      return;
+    }
     invalidateCompletionForCaretNavigation();
     if (next === 'source' && document) setSourceDocument(documentText, document.summary.kind);
     if (document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')) {
@@ -5834,6 +7480,8 @@
 
   async function closeProject(): Promise<ProjectCloseOutcome> {
     if (closeInFlight) return closeInFlight;
+    clearDocumentContextLongPress();
+    closeDocumentContextMenu(false);
     const operation = performCloseProject();
     closeInFlight = operation;
     try {
@@ -5905,6 +7553,24 @@
   async function performCloseProject(): Promise<ProjectCloseOutcome> {
     if (!project) return { status: 'closed' };
     const retryingPreparedClose = transition === 'closing' && pendingCloseCommandId !== null;
+    if (
+      missingDocumentRecoveryRequiresCopy(
+        missingDocumentRecovery && {
+          documentId: missingDocumentRecovery.documentId,
+          journalDurable: missingDocumentRecovery.journalDurable,
+          copied: missingDocumentCopyState === 'copied'
+        }
+      ) &&
+      !retryingPreparedClose
+    ) {
+      announce('Copy the preserved missing-document text before closing the project');
+      return { status: 'resume' };
+    }
+    if (missingDocumentCapturePending && !retryingPreparedClose) {
+      announce('Wait for Loom to preserve the newly missing manuscript before closing the project');
+      scheduleProjectFilesystemRefresh(0);
+      return { status: 'resume' };
+    }
     if (compositionActive && !retryingPreparedClose) {
       announce('Finish composing text before closing the project');
       return { status: 'resume' };
@@ -6051,12 +7717,14 @@
     resetLiveGenerationView();
     saveState = 'clean';
     saveMessage = 'No project open';
+    cancelDocumentRename(false);
+    closeDocumentContextMenu(false);
     outlineOpen = false;
     suggestionsEnabled = false;
     shuttleEnabled = false;
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
-    dismissedCandidateIds = [];
+    completionController = resetCompletionDiscovery(completionController);
     pendingCloseCommandId = null;
     pendingCloseMayHaveCommitted = false;
     pendingCloseAgency = null;
@@ -6098,7 +7766,7 @@
       aria-label="Writing controls"
     >
       <div class="canvas-controls-left" data-no-window-drag>
-        {#if project.documents.length > 1}
+        {#if project.documents.length > 0}
           <button
             bind:this={outlineToggle}
             class="titlebar-button outline-toggle"
@@ -6119,14 +7787,14 @@
             on:click={() => void newDocument()}
           ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
         {/if}
-        {#if document}
+        {#if document?.summary.kind === 'prose'}
           <button
             class="titlebar-button mode-toggle"
             type="button"
             aria-label={mode === 'visual' ? 'Switch to Markdown editor' : 'Switch to visual editor'}
             aria-pressed={mode === 'source'}
             title={mode === 'visual' ? 'Markdown source' : 'Visual writing'}
-            disabled={editorReadonly || (mode === 'source' && !canUseVisual)}
+            disabled={editorReadonly}
             on:click={() => void setMode(mode === 'visual' ? 'source' : 'visual')}
           >
             {#if mode === 'visual'}
@@ -6161,15 +7829,25 @@
           class="titlebar-button suggestions-toggle"
           type="button"
           aria-label={suggestionsEnabled ? 'Turn autocomplete off' : 'Turn autocomplete on'}
-          aria-describedby="completion-lifecycle-help"
+          aria-describedby="completion-lifecycle-help autocomplete-model-menu-help"
+          aria-haspopup="dialog"
+          aria-keyshortcuts="Shift+F10"
           aria-pressed={suggestionsEnabled}
-          title={suggestionsEnabled ? `Autocomplete: ${suggestionMenuState}` : 'Autocomplete: Off'}
+          title={`${suggestionsEnabled ? `Autocomplete: ${suggestionMenuState}` : 'Autocomplete: Off'} · right-click or hold for models`}
           disabled={!project || suggestionsChanging}
-          on:click={() => void toggleSuggestionsFromTitlebar()}
+          on:click={handleAutocompleteToggleClick}
+          on:contextmenu={openAutocompleteModelMenu}
+          on:keydown={handleAutocompleteModelMenuKey}
+          on:pointerdown={beginAutocompleteModelMenuLongPress}
+          on:pointermove={updateAutocompleteModelMenuLongPress}
+          on:pointerup={finishAutocompleteModelMenuLongPress}
+          on:pointercancel={finishAutocompleteModelMenuLongPress}
+          on:lostpointercapture={finishAutocompleteModelMenuLongPress}
         >
           <svg aria-hidden="true" viewBox="0 0 18 18"><path d="m9 2 .65 2.1L12 5l-2.35.9L9 8l-.65-2.1L6 5l2.35-.9L9 2ZM4.4 8.4l.45 1.45 1.55.55-1.55.55-.45 1.45-.45-1.45-1.55-.55 1.55-.55.45-1.45ZM12.4 9.2l.85 2.55 2.55.85-2.55.85L12.4 16l-.85-2.55L9 12.6l2.55-.85.85-2.55Z"/></svg>
         </button>
         <span id="completion-lifecycle-help" class="sr-only">{completionLifecycleHelp}</span>
+        <span id="autocomplete-model-menu-help" class="sr-only">Right-click, touch and hold, or press the Menu key or Shift F10 to open local writing model setup.</span>
         <button
           class:active={shuttleEnabled}
           class:preparing={shuttleEnabled && !currentModel}
@@ -6183,9 +7861,6 @@
         >
           <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M4 4.5 10.5 9 4 13.5v-9ZM13.5 4.5v9"/></svg>
         </button>
-        <div class="save-status state-{saveState}" role="status" aria-label={autosaveLabel}>
-          <span class="status-dot"></span>
-        </div>
         <button
           class="titlebar-button appearance-button"
           type="button"
@@ -6199,43 +7874,12 @@
             <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M14.7 11.7A6.4 6.4 0 0 1 6.3 3.3a6.4 6.4 0 1 0 8.4 8.4Z"/></svg>
           {/if}
         </button>
-      <details class="project-menu" bind:this={projectMenu}>
-        <summary class="titlebar-button gear-button" bind:this={projectMenuTrigger} title="Settings" aria-label="Settings">
-          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M9 6.4A2.6 2.6 0 1 0 9 11.6 2.6 2.6 0 0 0 9 6.4Z" /><path d="M15 9a6 6 0 0 0-.08-.96l1.35-1.05-1.5-2.6-1.58.65a6 6 0 0 0-1.65-.96L11.3 2.4h-3l-.24 1.68a6 6 0 0 0-1.65.96l-1.58-.65-1.5 2.6 1.35 1.05A6 6 0 0 0 4.6 9c0 .33.03.65.08.96l-1.35 1.05 1.5 2.6 1.58-.65c.5.4 1.06.72 1.65.96l.24 1.68h3l.24-1.68a6 6 0 0 0 1.65-.96l1.58.65 1.5-2.6-1.35-1.05c.05-.31.08-.63.08-.96Z" /></svg>
-        </summary>
-        <div class="project-menu-popover" aria-label="Editor and suggestion settings">
-          <div class="project-menu-label">Appearance</div>
-          {#each ['system', 'light', 'dark'] as choice}
-            <button
-              class:active={appearance === choice}
-              type="button"
-              aria-pressed={appearance === choice}
-              on:click={() => setAppearance(choice as AppearancePreference)}
-            >
-              <span>{choice === 'system' ? 'System' : choice === 'light' ? 'Light' : 'Dark'}</span>
-              <span aria-hidden="true">{appearance === choice ? '✓' : ''}</span>
-            </button>
-          {/each}
-          <div class="project-menu-separator"></div>
-          <button
-            class:active={suggestionsEnabled && Boolean(currentModel)}
-            type="button"
-            aria-haspopup="dialog"
-            on:click={(event) => openModelManager(projectMenuTrigger ?? event.currentTarget)}
-          >
-            <span>Suggestions</span>
-            <span class:ready={suggestionMenuState === 'Ready'} class="menu-state">
-              {suggestionMenuState}
-            </span>
-          </button>
-        </div>
-      </details>
       </div>
     </div>
   {/if}
 
   {#if project}
-    <div class:single-document={project.documents.length === 1} class:outline-open={outlineOpen} class="workspace-grid">
+    <div class:outline-open={outlineOpen} class="workspace-grid">
       <aside
         id="project-outline"
         class:open={outlineOpen}
@@ -6249,25 +7893,140 @@
         </label>
         <nav class="document-list" aria-label="Documents">
           {#each visibleDocuments as candidate (candidate.document_id)}
-            <button
+            {#if renamingDocumentId === candidate.document_id}
+              <div class:active={candidate.document_id === document?.summary.document_id} class="document-row editing">
+                <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
+                <span class="document-label">
+                  <input
+                    bind:this={renameDocumentInput}
+                    bind:value={renameDocumentTitle}
+                    type="text"
+                    maxlength="256"
+                    aria-label={`Rename ${candidate.title}`}
+                    disabled={renameDocumentInFlight}
+                    on:input={handleDocumentRenameInput}
+                    on:compositionstart={handleDocumentRenameCompositionStart}
+                    on:compositionend={handleDocumentRenameCompositionEnd}
+                    on:keydown={handleDocumentRenameKeydown}
+                    on:blur={handleDocumentRenameBlur}
+                  />
+                  <small>{candidate.word_count.toLocaleString()} {candidate.word_count === 1 ? 'word' : 'words'}</small>
+                </span>
+              </div>
+            {:else}
+            <div
+              class="document-row-group"
               class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}
-              type="button"
-              disabled={editorReadonly}
-              on:click={() => void selectDocument(candidate, true)}
             >
-              <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
-              <span class="document-label">
-                <strong>{candidate.title}</strong>
-                <small>{candidate.word_count.toLocaleString()} {candidate.word_count === 1 ? 'word' : 'words'}</small>
-              </span>
-            </button>
+              <button
+                class="document-row"
+                data-document-row={candidate.document_id}
+                type="button"
+                disabled={editorReadonly}
+                aria-haspopup="menu"
+                aria-expanded={documentContextTarget?.documentId === candidate.document_id}
+                on:click={(event) => handleDocumentRowClick(event, candidate)}
+                on:contextmenu={(event) => handleDocumentContextPointer(event, candidate)}
+                on:keydown={(event) => handleDocumentContextKey(event, candidate)}
+                on:pointerdown={(event) => beginDocumentContextLongPress(event, candidate)}
+                on:pointermove={updateDocumentContextLongPress}
+                on:pointerup={finishDocumentContextLongPress}
+                on:pointercancel={finishDocumentContextLongPress}
+              >
+                <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
+                <span class="document-label">
+                  <strong data-document-title>{candidate.title}</strong>
+                  <small>{candidate.word_count.toLocaleString()} {candidate.word_count === 1 ? 'word' : 'words'}</small>
+                </span>
+              </button>
+              <button
+                class="document-row-actions"
+                type="button"
+                aria-label={`Actions for ${candidate.title}`}
+                aria-haspopup="menu"
+                aria-expanded={documentContextTarget?.documentId === candidate.document_id}
+                title={`Actions for ${candidate.title}`}
+                disabled={editorReadonly || fileCommandInFlight || documentContextActionInFlight}
+                on:click={(event) => handleVisibleDocumentActions(event, candidate)}
+              ><span aria-hidden="true">•••</span></button>
+            </div>
+            {/if}
           {:else}
             <p class="empty-copy">No notes.</p>
           {/each}
         </nav>
+        {#if documentContextTarget}
+          <div
+            bind:this={documentContextMenu}
+            class="document-context-menu"
+            role="menu"
+            tabindex="-1"
+            aria-label={`Actions for ${documentContextTarget.title}`}
+            style={`left: ${documentContextPoint.x}px; top: ${documentContextPoint.y}px;`}
+            on:keydown={handleDocumentContextMenuKeydown}
+            on:contextmenu|preventDefault={() => {}}
+          >
+            <button
+              type="button"
+              role="menuitem"
+              tabindex={documentContextFocusIndex === 0 ? 0 : -1}
+              disabled={editorReadonly || fileCommandInFlight || documentContextActionInFlight}
+              on:focus={() => documentContextFocusIndex = 0}
+              on:click={() => void runDocumentContextAction('open')}
+            >Open</button>
+            <button
+              type="button"
+              role="menuitem"
+              tabindex={documentContextFocusIndex === 1 ? 0 : -1}
+              disabled={editorReadonly || fileCommandInFlight || documentContextActionInFlight}
+              on:focus={() => documentContextFocusIndex = 1}
+              on:click={() => void runDocumentContextAction('rename')}
+            >Rename…</button>
+            <button
+              type="button"
+              role="menuitem"
+              tabindex={documentContextFocusIndex === 2 ? 0 : -1}
+              disabled={fileCommandInFlight || documentContextActionInFlight}
+              on:focus={() => documentContextFocusIndex = 2}
+              on:click={() => void runDocumentContextAction('export_text')}
+            >Export Text…</button>
+            {#if documentContextRevealLabel}
+              <button
+                type="button"
+                role="menuitem"
+                tabindex={documentContextFocusIndex === 3 ? 0 : -1}
+                disabled={fileCommandInFlight || documentContextActionInFlight}
+                on:focus={() => documentContextFocusIndex = 3}
+                on:click={() => void runDocumentContextAction('reveal')}
+              >{documentContextRevealLabel}</button>
+            {/if}
+            <button
+              class="document-delete-menu-item"
+              type="button"
+              role="menuitem"
+              tabindex={documentContextFocusIndex === documentDeleteMenuIndex(Boolean(documentContextRevealLabel)) ? 0 : -1}
+              disabled={editorReadonly || fileCommandInFlight || documentContextActionInFlight}
+              on:focus={() => documentContextFocusIndex = documentDeleteMenuIndex(Boolean(documentContextRevealLabel))}
+              on:click={() => void runDocumentContextAction('delete')}
+            >Delete Manuscript…</button>
+          </div>
+        {/if}
       </aside>
 
       <main id="manuscript" class="manuscript-area" tabindex="-1">
+        {#if missingDocumentRecovery}
+          <MissingDocumentRecoveryNotice
+            title={missingDocumentRecovery.title}
+            relativePath={missingDocumentRecovery.relativePath}
+            text={missingDocumentRecovery.text}
+            hadUnsavedText={missingDocumentRecovery.hadUnsavedText}
+            journalDurable={missingDocumentRecovery.journalDurable}
+            draftWasUncertain={missingDocumentRecovery.draftWasUncertain}
+            saveWasUncertain={missingDocumentRecovery.saveWasUncertain}
+            copyState={missingDocumentCopyState}
+            onCopy={() => void copyMissingDocumentRecoveryText()}
+          />
+        {/if}
         {#if reconciliation}
           <section class="reconciliation-workspace" aria-labelledby="reconciliation-title">
             <header class="document-header">
@@ -6388,6 +8147,10 @@
                       {ghostUnconsumeText}
                       surfaceKey={visualGhostSurfaceKey}
                       onChange={updateText}
+                      onImageAttachments={storeImageAttachments}
+                      onImageAttachmentsCommitted={reportImageAttachmentsCommitted}
+                      onImageAttachmentError={reportImageAttachmentError}
+                      {resolveImageAssetUrl}
                       onCompositionChange={setVisualComposition}
                       onImmediateDocumentMutation={invalidateVisualSuggestionImmediately}
                       onGhostAccept={acceptActiveGhost}
@@ -6401,6 +8164,9 @@
                       }}
                       onCompletionAccessibilityChange={(witness) => {
                         visualCompletionAccessibility = witness;
+                      }}
+                      onSelectionAccessibilityChange={(witness) => {
+                        visualSelectionAccessibility = witness;
                       }}
                       onSelectionChange={updateVisualSelection}
                       onCaretNavigation={invalidateCompletionForCaretNavigation}
@@ -6445,6 +8211,9 @@
                     updateSourceSelection(textarea);
                     updateFromSource(textarea.value);
                   }}
+                  onImageAttachments={storeImageAttachments}
+                  onImageAttachmentsCommitted={reportImageAttachmentsCommitted}
+                  onImageAttachmentError={reportImageAttachmentError}
                   onSelectionChange={updateSourceSelection}
                   onGhostAccept={acceptActiveGhost}
                   onGhostInsert={authorizeGhostInsertion}
@@ -6506,6 +8275,55 @@
     </main>
   {/if}
 
+  {#if deleteDocumentTarget}
+    <div
+      class="document-delete-backdrop"
+      role="presentation"
+      on:click={(event) => {
+        if (
+          event.target === event.currentTarget &&
+          !deleteDocumentInFlight &&
+          !deleteDocumentUncertain
+        ) {
+          closeDocumentDeleteConfirmation();
+        }
+      }}
+    >
+      <div
+        bind:this={deleteDocumentDialog}
+        class="document-delete-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="document-delete-title"
+        aria-describedby="document-delete-description"
+        aria-busy={deleteDocumentInFlight}
+        tabindex="-1"
+        on:keydown={handleDocumentDeleteDialogKeydown}
+      >
+        <h2 id="document-delete-title">Delete “{deleteDocumentTarget.title}”?</h2>
+        <p id="document-delete-description">
+          This deletes the manuscript file and removes it from this project. Other manuscripts are not affected.
+          {#if deleteDocumentUncertain} The first result was interrupted, so Loom will check the identical deletion command without issuing a new one.{/if}
+        </p>
+        <div class="document-delete-actions">
+          <button
+            bind:this={deleteDocumentCancelButton}
+            class="secondary-button"
+            type="button"
+            disabled={deleteDocumentInFlight || deleteDocumentUncertain}
+            on:click={() => closeDocumentDeleteConfirmation()}
+          >Cancel</button>
+          <button
+            class="danger-button"
+            type="button"
+            disabled={deleteDocumentInFlight}
+            on:click={() => void confirmDocumentDelete()}
+          >{deleteDocumentInFlight ? 'Checking…' : deleteDocumentUncertain ? 'Check Deletion' : 'Delete Manuscript'}</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if modelManagerOpen}
     <div
       class="model-manager-backdrop"
@@ -6557,6 +8375,70 @@
                     : 'Needs setup'}
               </strong>
             </div>
+          </section>
+
+          <section class="curated-model-catalog" aria-labelledby="curated-model-catalog-title">
+            <div class="section-heading">
+              <div>
+                <h3 id="curated-model-catalog-title">Recommended local model</h3>
+                <p>Publisher artifact, revision, size, and checksum are embedded in this Loom build.</p>
+              </div>
+            </div>
+
+            {#if curatedModelsLoading}
+              <div class="runtime-note" role="status">Reading the embedded catalog…</div>
+            {:else if curatedModelsError}
+              <div class="model-setup-error" role="alert">
+                The embedded catalog is unavailable. No download metadata was accepted.
+                <button class="bare-button compact" type="button" on:click={() => void refreshCuratedModels()}>Retry</button>
+              </div>
+            {:else}
+              {#each curatedModels as entry (entry.catalog_id)}
+                {@const installed = localCatalogModel(entry)}
+                {@const resident = loadedCatalogModel(entry)}
+                {@const transfer = catalogDownload(entry)}
+                <article class="curated-model-card">
+                  <div class="curated-model-copy">
+                    <strong>{entry.display_name}</strong>
+                    <span>{entry.publisher} · {formatByteCount(entry.expected_bytes)} · {entry.context_tokens.toLocaleString()} token context</span>
+                    <span>{formatByteCount(entry.memory_fit.recommended_system_memory_bytes)} or more system memory recommended</span>
+                    <span>Local only · {entry.license.name} · native inspection required before use</span>
+                    <details class="model-technical">
+                      <summary>Pinned artifact details</summary>
+                      <dl class="model-evidence">
+                        <div><dt>Repository</dt><dd><code>{entry.repository}</code></dd></div>
+                        <div><dt>Revision</dt><dd><code>{entry.revision}</code></dd></div>
+                        <div><dt>File</dt><dd><code>{entry.artifact_name}</code></dd></div>
+                        <div><dt>SHA-256</dt><dd><code>{entry.expected_sha256}</code></dd></div>
+                        <div><dt>License</dt><dd>{entry.license.spdx_id}</dd></div>
+                        <div><dt>License source</dt><dd><code>{entry.license.url}</code></dd></div>
+                      </dl>
+                    </details>
+                  </div>
+                  <div class="curated-model-action">
+                    {#if resident}
+                      <button class="secondary-button compact" type="button" disabled>In use</button>
+                    {:else if installed}
+                      <button
+                        class="primary-button compact"
+                        type="button"
+                        on:click={() => void useCatalogSuggestionWriter(entry, installed)}
+                        disabled={!desktop || modelLoading || modelChoosing || modelUnloading}
+                      >{modelLoading && selectedModelPath === installed.model_path ? 'Verifying…' : 'Verify local copy'}</button>
+                    {:else if transfer?.status.status === 'completed'}
+                      <button class="secondary-button compact" type="button" on:click={() => void refreshCurrentModelsAndEnsureWriter()}>Refresh installed copy</button>
+                    {:else}
+                      <button
+                        class="primary-button compact"
+                        type="button"
+                        on:click={() => void beginCatalogModelDownload(entry)}
+                        disabled={!desktop || modelDownloadStarting || pendingModelDownload !== null || (transfer !== undefined && !modelDownloadIsTerminal(transfer))}
+                      >{transfer !== undefined && !modelDownloadIsTerminal(transfer) ? 'Downloading…' : transfer?.status.status === 'failed' || transfer?.status.status === 'cancelled' ? 'Retry verified download' : 'Download and verify'}</button>
+                    {/if}
+                  </div>
+                </article>
+              {/each}
+            {/if}
           </section>
 
           {#if suggestionSetupNeeded}

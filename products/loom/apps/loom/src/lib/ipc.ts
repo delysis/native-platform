@@ -7,8 +7,11 @@ import type {
   BranchSummary,
   BuildModelPolicySummary,
   CommandReceipt,
+  CompletionSnapshot,
+  CuratedModelCatalogSnapshot,
   DesktopGenerationEnvelope,
   DocumentKind,
+  DocumentSummary,
   ModelCapabilitySummary,
   ModelDownloadSnapshot,
   ModelUnloadOutcome,
@@ -23,6 +26,10 @@ import type {
   WeaveStarted
 } from './types';
 import { decodeBuildModelPolicy } from './buildModelPolicy';
+import type { ImageAttachmentReceipt } from './attachments';
+import type { DocumentFilesystemHint } from './documentFilesystemHint';
+
+export type { DocumentFilesystemHint } from './documentFilesystemHint';
 
 const PREFIX = 'plugin:loom|';
 
@@ -35,12 +42,14 @@ const INDEPENDENT_COMMANDS = new Set([
   'application_close_abort',
   'application_close_pending',
   'build_model_policy_get',
+  'model_catalog_list',
   'model_download_cancel',
   'model_download_list',
   'model_download_start',
   'model_download_status',
   'model_list',
   'model_load',
+  'model_load_catalog_candidate',
   'model_load_policy_candidate',
   'model_unload'
 ]);
@@ -125,6 +134,56 @@ export function createDocument(projectId: string, sessionId: string): Promise<Pr
   return call('document_create', { projectId, sessionId });
 }
 
+export function renameDocument(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  expectedRevisionId: string,
+  expectedBlobId: string,
+  title: string
+): Promise<DocumentSummary> {
+  return call('document_rename', {
+    projectId,
+    sessionId,
+    documentId,
+    expectedRevisionId,
+    expectedBlobId,
+    title
+  });
+}
+
+export function deleteDocument(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  expectedRevisionId: string,
+  expectedBlobId: string,
+  commandId: string
+): Promise<ProjectSnapshot> {
+  return call('document_delete', {
+    projectId,
+    sessionId,
+    documentId,
+    expectedRevisionId,
+    expectedBlobId,
+    commandId
+  });
+}
+
+export function ingestImageAttachment(
+  projectId: string,
+  sessionId: string,
+  mediaType: string,
+  base64: string
+): Promise<ImageAttachmentReceipt> {
+  return call('attachment_ingest', {
+    projectId,
+    sessionId,
+    mediaType,
+    encoded: base64
+  });
+}
+
 export async function getBuildModelPolicy(): Promise<BuildModelPolicySummary> {
   const value = await call<unknown>('build_model_policy_get');
   return decodeBuildModelPolicy(value);
@@ -134,18 +193,48 @@ export function openDocument(
   projectId: string,
   sessionId: string,
   documentId: string,
-  relativePath: string
+  expectedRevisionId: string,
+  expectedBlobId: string
 ): Promise<OpenDocument> {
-  return call('document_open', { projectId, sessionId, documentId, relativePath });
+  return call('document_open', {
+    projectId,
+    sessionId,
+    documentId,
+    expectedRevisionId,
+    expectedBlobId
+  });
 }
 
 export function exportDocumentCopy(
   projectId: string,
   sessionId: string,
   documentId: string,
-  relativePath: string
+  expectedRevisionId: string,
+  expectedBlobId: string
 ): Promise<CommandReceipt | null> {
-  return call('document_export_choose', { projectId, sessionId, documentId, relativePath });
+  return call('document_export_choose', {
+    projectId,
+    sessionId,
+    documentId,
+    expectedRevisionId,
+    expectedBlobId
+  });
+}
+
+export function revealDocument(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  expectedRevisionId: string,
+  expectedBlobId: string
+): Promise<void> {
+  return call('document_reveal', {
+    projectId,
+    sessionId,
+    documentId,
+    expectedRevisionId,
+    expectedBlobId
+  });
 }
 
 export function checkpointDocument(
@@ -216,7 +305,6 @@ export function previewDocumentReconciliation(
   projectId: string,
   sessionId: string,
   documentId: string,
-  relativePath: string,
   expectedRevisionId: string,
   expectedBaseBlobId: string,
   appText: string | null
@@ -225,7 +313,6 @@ export function previewDocumentReconciliation(
     projectId,
     sessionId,
     documentId,
-    relativePath,
     expectedRevisionId,
     expectedBaseBlobId,
     appText
@@ -276,12 +363,23 @@ export function listModels(): Promise<ModelCapabilitySummary[]> {
   return call('model_list');
 }
 
+export function listCuratedModels(): Promise<CuratedModelCatalogSnapshot> {
+  return call('model_catalog_list');
+}
+
 export function chooseModel(): Promise<ModelCapabilitySummary | null> {
   return call('model_choose');
 }
 
 export function loadModel(modelPath: string): Promise<ModelCapabilitySummary> {
   return call('model_load', { modelPath });
+}
+
+export function loadCatalogModelCandidate(
+  catalogId: string,
+  modelPath: string
+): Promise<ModelCapabilitySummary> {
+  return call('model_load_catalog_candidate', { catalogId, modelPath });
 }
 
 export function loadPolicyModelCandidate(
@@ -358,6 +456,20 @@ export function getBranchPage(
   limit: number
 ): Promise<BranchPage> {
   return call('branch_page', { projectId, sessionId, documentId, after, limit });
+}
+
+export function getCompletionSnapshot(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  observedRunIds: string[]
+): Promise<CompletionSnapshot> {
+  return call('completion_snapshot', {
+    projectId,
+    sessionId,
+    documentId,
+    observedRunIds
+  });
 }
 
 export function getBranch(
@@ -456,6 +568,21 @@ export function listenForGenerationEvents(
     });
   }
   return listen<DesktopGenerationEnvelope>('loom://generation', ({ payload }) => handler(payload));
+}
+
+export function listenForDocumentFilesystemHints(
+  handler: (event: DocumentFilesystemHint) => void
+): Promise<UnlistenFn> {
+  if (!isDesktopRuntime()) {
+    return Promise.reject({
+      code: 'desktop_runtime_required',
+      message: 'Document filesystem hints require the Loom desktop runtime.'
+    });
+  }
+  return listen<DocumentFilesystemHint>(
+    'loom://document-filesystem-hint',
+    ({ payload }) => handler(payload)
+  );
 }
 
 export function listenForApplicationCloseRequests(

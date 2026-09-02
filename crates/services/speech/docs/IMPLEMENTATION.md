@@ -29,8 +29,8 @@ This slice establishes five reusable crates:
   relays backend finals through host-owned monitor tasks.
 - `speech-native-backend-parakeet`: an executable, embedded Parakeet Realtime EOU 120M
   backend over `parakeet-rs` and ONNX Runtime. It loads one shared model handle
-  from the Hugging Face cache and creates independent decoder state per
-  request.
+  from exact manifest-verified content-addressed managed bytes and creates
+  independent decoder state per request.
 
 On macOS, `AppleCapabilitySource` now performs a real, noninteractive runtime
 inventory through safe Speech and AVSpeechSynthesizer bindings. It does not ask
@@ -52,6 +52,12 @@ upstream bridge collects buffers synchronously and has an internal timeout, so
 it would be dishonest to claim live audio streaming or pre-emptive native
 cancellation. Those capabilities remain false until a truly asynchronous
 bridge is implemented and tested.
+
+Synthesis responses carry an explicit output disposition. `Complete` owns the
+returned bytes and format; `Streamed` records the format and byte count already
+delivered through bounded audio events. An empty final audio buffer is never a
+compatibility marker for streaming. Apple advertises and returns WAV bytes
+only; playback remains a product responsibility.
 
 The reusable speech crates have no Tauri dependency. W9 removed the generic
 speech Tauri plugin because no current product installs it. A product that
@@ -76,7 +82,9 @@ A product edge must perform this joined shutdown during its native application
 exit event and surface failure rather than discarding it. If live
 transcription is exposed, the product edge must preserve both halves of the
 typed contract: bounded output events and the backpressured input audio sink.
-Closing either side cancels only that request.
+One bounded sink actor owns push admission and the irreversible finish commit;
+an acknowledged finish closes downstream delivery and makes every later or
+still-blocked push fail. Closing either side cancels only that request.
 
 Applications that do not use speech need no speech crate, permission, backend
 registration, or shutdown path.
@@ -133,25 +141,52 @@ capability.
 ## Embedded Parakeet Runtime
 
 `speech-native-backend-parakeet` is the first executable cross-platform fallback. Its
-current model is `parakeet-realtime-eou-120m-v1-onnx` from
-`altunenes/parakeet-rs`. Discovery checks, in order:
+current model is `parakeet-realtime-eou-120m-v1-onnx` from immutable revision
+`altunenes/parakeet-rs@a61d2818df4659c956b9661a9447f46e98c15126`.
+The checked-in manifest binds the ordered three-file bundle to 480,708,981
+bytes and combined SHA-256
+`c710ae82b52aa969f89874e7e7b35ad570fec50cc3d943a4fdde0bb874948756`.
+Discovery performs a bounded metadata-only presence/shape probe, in order:
 
-1. `SPEECH_NATIVE_PARAKEET_MODEL_DIR` (with the legacy
+1. the exact content-addressed bundle already in application-managed storage;
+2. `ParakeetBackendConfig::model_dir`, when explicitly injected;
+3. `SPEECH_NATIVE_PARAKEET_MODEL_DIR` (with the legacy
    `FTE_PARAKEET_MODEL_DIR` alias retained for the 0.1 line);
-2. `HUGGINGFACE_HUB_CACHE`;
-3. `HF_HOME/hub`;
-4. the standard `~/.cache/huggingface/hub` location.
+4. the exact immutable revision under `HUGGINGFACE_HUB_CACHE`;
+5. the exact immutable revision under `HF_HOME/hub`;
+6. the exact immutable revision under the standard
+   `~/.cache/huggingface/hub` location.
 
-It follows the cache snapshot/reference structure and never copies weights.
-When files are absent, the registered descriptor reports a Hugging Face-managed
-`asset_install_required` blocker; discovery does not download anything.
+The startup probe checks only the exact names, regular-file/private-file shape,
+and manifest lengths; it does not read model bytes or construct ONNX sessions.
+A shape-admitted source is reported as a nonresident
+`CapabilityAvailability::DeferredLoad` with inconclusive system-inventory
+evidence, never runtime proof. The router admits that state only for an exact
+embedded-backend plus exact-model selector; automatic, fallback, hosted, and
+non-embedded routes cannot select it.
+
+Mutable refs and arbitrary snapshots are never admission authority. On the
+first exact dispatch, one supervised single-flight loader streams a candidate
+through the per-file length/SHA-256 manifest into private staging, reverifies
+it there, and atomically publishes it under the combined content hash in
+application-managed storage. Cache data is copied, never hard-linked. The
+managed bundle is reverified immediately before and after session construction.
+Only then does the descriptor transition to resident `Available` with confirmed
+runtime evidence. Concurrent first-use requests share that publication;
+cancellation and quiesce wake waiters, and shutdown joins the non-preemptible
+loader before completing. The managed root may be injected in
+`ParakeetBackendConfig` or set with `SPEECH_NATIVE_PARAKEET_MANAGED_ROOT`;
+otherwise the platform application-data location is used. When exact files are
+absent, the descriptor reports an application-managed
+`asset_install_required` blocker. Neither discovery nor first use downloads
+anything.
 
 The model is English-only and advertises PCM/WAV input, streaming, and partial
 results. It does not claim timestamps, diarization, translation, hotwords, or
 generative transcription. Complete and live audio are downmixed and linearly
-resampled to the model's exact mono 16 kHz input. One ONNX handle remains
-resident, while each request has separate encoder/decoder state and an
-independent cancellation flag.
+resampled to the model's exact mono 16 kHz input. After the first successful
+exact dispatch, one verified ONNX handle remains resident, while each request
+has separate encoder/decoder state and an independent cancellation flag.
 
 The second embedded lane remains intentional rather than forgotten:
 

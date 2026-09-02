@@ -38,6 +38,12 @@ pub enum StoreError {
     UnsupportedSchema { found: u32, supported: u32 },
     #[error("project name must contain 1 to {max_bytes} UTF-8 bytes")]
     InvalidProjectName { max_bytes: usize },
+    #[error("document title must contain 1 to {max_bytes} UTF-8 bytes and no control characters")]
+    InvalidDocumentTitle { max_bytes: usize },
+    #[error(
+        "document filename must be one portable filename component of at most {max_bytes} UTF-8 bytes"
+    )]
+    InvalidDocumentFileName { max_bytes: usize },
     #[error("reason must contain at most {max_bytes} UTF-8 bytes")]
     ReasonTooLong { max_bytes: usize },
     #[error("document has {actual_bytes} bytes; limit is {max_bytes} bytes")]
@@ -56,6 +62,24 @@ pub enum StoreError {
     DocumentAlreadyExists(String),
     #[error("visible file `{0}` has uncheckpointed changes")]
     UncheckpointedVisibleChange(String),
+    #[error("visible file path changed while it was held open: {0:?}")]
+    VisibleFileIdentityChanged(PathBuf),
+    #[error("the held document file authority no longer matches this project's active identity")]
+    DocumentFileAuthorityMismatch,
+    #[error("document {0} was explicitly deleted and is no longer mutable")]
+    DocumentExplicitlyDeleted(loom_types::DocumentId),
+    #[error(
+        "document {0} has a recoverable transient draft; checkpoint or discard it before deletion"
+    )]
+    DocumentHasTransientDraft(loom_types::DocumentId),
+    #[error(
+        "document {0} has a pending visible-file projection; recover it before renaming or deleting the document"
+    )]
+    DocumentHasPendingOutbox(loom_types::DocumentId),
+    #[error("document lifecycle completion is uncertain but durably retryable: {0}")]
+    DocumentLifecycleUncertain(String),
+    #[error("this platform does not expose a proven atomic no-clobber document move")]
+    UnsupportedDocumentLifecyclePlatform,
     #[error("visible file `{0}` was deleted; deletion reconciliation requires a distinct command")]
     ExternalVisibleFileDeleted(String),
     #[error("external visible file `{0}` is not valid UTF-8")]
@@ -128,6 +152,18 @@ pub enum StoreError {
     CompletedGenerationRequiresCandidate,
     #[error("candidate-ready events are created only by terminal candidate recording")]
     CandidateReadyRequiresTerminalCandidate,
+    #[error("generation progress would contain {actual_events} text events; limit is {max_events}")]
+    GenerationProgressEventLimitExceeded {
+        actual_events: usize,
+        max_events: usize,
+    },
+    #[error(
+        "generation progress would contain {actual_bytes} UTF-8 text bytes; limit is {max_bytes} bytes"
+    )]
+    GenerationProgressTextLimitExceeded {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
     #[error("failed generation requires a non-empty error")]
     FailedGenerationRequiresError,
     #[error("model environment is a critic under the generation authority policy")]

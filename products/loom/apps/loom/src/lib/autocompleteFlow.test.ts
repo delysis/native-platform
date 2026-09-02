@@ -19,6 +19,7 @@ function readyBranch(
   return {
     run_id: runId,
     branch_id: `branch-${runId}`,
+    weave_command_id: null,
     document_id: 'document-1',
     candidate_id: candidateId,
     source_revision_id: 'revision-1',

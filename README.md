@@ -20,6 +20,8 @@ source: it is the separately reviewed unsafe upstream boundary.
   Loom applications. Each resolves the same pinned local Tauri CLI version.
 - `ci/package-groups.json` assigns every package to exactly one primary group
   and optional secondary gates.
+- `ci/ignored-tests.json` registers every opt-in test with its exact source,
+  prerequisite, evidence class, and prohibition on automatic promotion.
 - The Attachment fuzz target is the only deliberately excluded auxiliary
   Cargo workspace.
 
@@ -36,9 +38,19 @@ node scripts/ci/cargo-group.mjs test product-mom
 node scripts/ci/cargo-group.mjs clippy product-mom
 ```
 
-`./scripts/check-shell-policy.sh` remains the exhaustive local gate for broad
-workspace, lockfile, and release changes. `cargo xtask lean verify` is an
-explicit historical W8/W9 census check, not part of ordinary policy.
+`./scripts/check-shell-policy.sh` remains the broad structural local gate for
+workspace, lockfile, and release changes. It does not run the guarded
+ignored-test inventory listing; when the planner selects `ignored-tests`, run
+`node scripts/ci/validate-ignored-tests.mjs --cargo-list` separately.
+`cargo xtask lean verify` is an explicit historical W8/W9 census check, not
+part of ordinary policy.
+
+PR selection derives changed packages and local reverse consumers from locked
+Cargo metadata. `dependency_selection` is applied; unknown or unavailable
+metadata forces the full plan. `ci/ci-path-exceptions.json` contains only
+evidenced non-Cargo asset, platform, workspace, and workflow rules. The former
+path planner remains under `dependency_shadow` as an observational equivalence
+report, and any unexplained reduction against it also forces full coverage.
 
 Lifecycle, migration, and SQLite identity checks live with the product or
 service that owns the behavior. Product UI, real-model, and loaded-model

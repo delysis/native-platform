@@ -35,6 +35,47 @@ pub const MAX_MIROSTAT_V1_FILTER_WINDOW: i32 = 262_144;
 const MAX_DTO_ID_BYTES: usize = 256;
 const MAX_MIROSTAT_TARGET_SURPRISE: f32 = 100.0;
 
+mod serde_u128_as_u64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S>(value: &u128, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let value = u64::try_from(*value).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_u64(value)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<u128, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        u64::deserialize(deserializer).map(u128::from)
+    }
+}
+
+mod serde_option_u128_as_u64 {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S>(value: &Option<u128>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value
+            .map(u64::try_from)
+            .transpose()
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Option<u128>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<u64>::deserialize(deserializer).map(|value| value.map(u128::from))
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum NativeDevice {
@@ -756,7 +797,9 @@ pub struct GenerationMetrics {
     /// This is the number of prompt tokens whose KV work was reused either
     /// from a supplied state or from token-exact sharing inside the batch.
     pub shared_prefix_tokens: usize,
+    #[serde(with = "serde_u128_as_u64")]
     pub duration_ms: u128,
+    #[serde(default, with = "serde_option_u128_as_u64")]
     pub first_token_ms: Option<u128>,
     pub tokens_per_second: f64,
     #[serde(default)]

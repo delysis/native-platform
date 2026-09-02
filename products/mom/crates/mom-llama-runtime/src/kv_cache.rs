@@ -3,7 +3,7 @@ use crate::native_runtime::{clear_native_prefix_cache, resident_model};
 use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
 use crate::skill_store::load_skill_db;
-use crate::store::RuntimeStore;
+use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use anyhow::{Result, anyhow};
 pub use llama_native_cache::{CacheEntryState, CacheFingerprint, CacheTier};
 use llama_native_cache::{
@@ -17,6 +17,7 @@ use llama_native_types::{
     SequenceStateBlob, SharedPrefixBatchRequest,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
@@ -66,10 +67,73 @@ pub struct KvCacheStatus {
     pub persistent_capacity_entries: usize,
 }
 
-static MEMORY_CACHE: OnceLock<Mutex<MemoryPrefixCache>> = OnceLock::new();
+struct MemoryCacheState {
+    cache: MemoryPrefixCache,
+    global_generation: u64,
+    owner_generations: HashMap<String, u64>,
+}
 
-fn memory_cache() -> &'static Mutex<MemoryPrefixCache> {
-    MEMORY_CACHE.get_or_init(|| Mutex::new(MemoryPrefixCache::new(DEFAULT_MEMORY_CACHE_BYTES)))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemoryCacheGeneration {
+    global: u64,
+    owner: u64,
+}
+
+impl MemoryCacheState {
+    fn new() -> Self {
+        Self {
+            cache: MemoryPrefixCache::new(DEFAULT_MEMORY_CACHE_BYTES),
+            global_generation: 0,
+            owner_generations: HashMap::new(),
+        }
+    }
+
+    fn generation(&self, owner_id: Option<&str>) -> MemoryCacheGeneration {
+        MemoryCacheGeneration {
+            global: self.global_generation,
+            owner: owner_id
+                .and_then(|owner_id| self.owner_generations.get(owner_id).copied())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn promote_if_current(
+        &mut self,
+        value: PrefixCacheValue,
+        expected: MemoryCacheGeneration,
+    ) -> bool {
+        if self.generation(value.metadata.owner_id.as_deref()) != expected {
+            return false;
+        }
+        if !value.is_valid() || value.metadata.state_bytes > self.cache.capacity_bytes() {
+            return false;
+        }
+        if self.cache.contains_id(&value.metadata.id) {
+            self.global_generation = self.global_generation.saturating_add(1);
+        }
+        self.cache.insert(value);
+        true
+    }
+
+    fn invalidate_owner(&mut self, owner_id: &str) -> usize {
+        let generation = self
+            .owner_generations
+            .entry(owner_id.to_string())
+            .or_default();
+        *generation = generation.saturating_add(1);
+        self.cache.invalidate_owner(owner_id).len()
+    }
+
+    fn clear(&mut self) {
+        self.global_generation = self.global_generation.saturating_add(1);
+        self.cache.clear();
+    }
+}
+
+static MEMORY_CACHE: OnceLock<Mutex<MemoryCacheState>> = OnceLock::new();
+
+fn memory_cache() -> &'static Mutex<MemoryCacheState> {
+    MEMORY_CACHE.get_or_init(|| Mutex::new(MemoryCacheState::new()))
 }
 
 pub fn kv_cache_status() -> Result<CommandResult<KvCacheStatus>> {
@@ -168,8 +232,17 @@ pub fn kv_cache_save(skill_id: Option<String>) -> Result<CommandResult<KvCacheMe
             ),
         ));
     }
-    persist_value(&settings, &value)?;
-    promote_to_memory(value.clone());
+    if !persist_value(&settings, &value)? {
+        return Ok(CommandResult::blocked(
+            "mom_llama.kv_cache_save",
+            "stub_blocked",
+            Blocker::new(
+                "kv_cache_owner_removed",
+                "The selected cache owner was removed from the Persona library.",
+                vec!["Choose an available Persona or Skill.".to_string()],
+            ),
+        ));
+    }
     Ok(CommandResult::passed(
         "mom_llama.kv_cache_save",
         "prompt_smoke_verified",
@@ -211,7 +284,7 @@ pub fn kv_cache_restore(cache_id: Option<String>) -> Result<CommandResult<KvCach
             ));
         }
     };
-    let mut db = load_db()?;
+    let db = load_db()?;
     let Some(index) = cache_id
         .as_deref()
         .and_then(|id| db.entries.iter().position(|entry| entry.id == id))
@@ -267,14 +340,73 @@ pub fn kv_cache_restore(cache_id: Option<String>) -> Result<CommandResult<KvCach
             ),
         ));
     }
-    let value = value.ok_or_else(|| anyhow!("compatible cache value disappeared"))?;
+    let verified_value = value.ok_or_else(|| anyhow!("compatible cache value disappeared"))?;
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    let Some(lease) =
+        MomCachePromotionLease::acquire(&store, verified_value.metadata.owner_id.as_deref())?
+    else {
+        return Ok(CommandResult::blocked(
+            "mom_llama.kv_cache_restore",
+            "stub_blocked",
+            Blocker::new(
+                "kv_cache_owner_removed",
+                "The cache owner was removed before restore admission.",
+                vec!["Refresh saved caches and choose an available owner.".to_string()],
+            ),
+        ));
+    };
+    let Some(current_value) = load_current_persistent_value(&store, &verified_value.metadata.id)?
+    else {
+        return Ok(CommandResult::blocked(
+            "mom_llama.kv_cache_restore",
+            "stub_blocked",
+            Blocker::new(
+                "kv_cache_not_found",
+                "The saved cache changed before restore admission.",
+                vec!["Refresh saved caches and try again.".to_string()],
+            ),
+        ));
+    };
+    if current_value.sequence != verified_value.sequence
+        || !same_cache_authority(&current_value.metadata, &verified_value.metadata)
+    {
+        return Ok(CommandResult::blocked(
+            "mom_llama.kv_cache_restore",
+            "stub_blocked",
+            Blocker::new(
+                "kv_cache_changed",
+                "The saved cache changed after verification.",
+                vec!["Verify the current cache again.".to_string()],
+            ),
+        ));
+    }
+    let Some(value) = touch_persistent_value_for_promotion(&store, &current_value, now_ms())?
+    else {
+        return Ok(CommandResult::blocked(
+            "mom_llama.kv_cache_restore",
+            "stub_blocked",
+            Blocker::new(
+                "kv_cache_owner_removed",
+                "The cache owner changed before restore admission.",
+                vec!["Refresh saved caches and choose an available owner.".to_string()],
+            ),
+        ));
+    };
     handle
         .restore_sequence(value.sequence.clone(), 0)
         .map_err(|error| anyhow!(error))?;
-    db.entries[index].last_used_at_ms = now_ms();
-    let restored = db.entries[index].clone();
-    save_db(&db)?;
-    promote_to_memory(value);
+    let restored = value.metadata.clone();
+    if !lease.promote(value)? {
+        return Ok(CommandResult::blocked(
+            "mom_llama.kv_cache_restore",
+            "stub_blocked",
+            Blocker::new(
+                "kv_cache_owner_removed",
+                "The cache owner changed before live restore promotion.",
+                vec!["Refresh saved caches and choose an available owner.".to_string()],
+            ),
+        ));
+    }
     Ok(CommandResult::passed(
         "mom_llama.kv_cache_restore",
         "prompt_smoke_verified",
@@ -361,18 +493,33 @@ fn compatible_cached_prefix_for_owner(
     let tokenized = handle
         .tokenize_messages(messages.to_vec())
         .map_err(|error| anyhow!(error))?;
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    let Some(lease) = MomCachePromotionLease::acquire(&store, owner_id)? else {
+        return Ok(None);
+    };
     let now = now_ms();
-    let memory_match = memory_cache().lock().ok().and_then(|cache| match owner_id {
-        Some(owner) => cache.best_match_for_owner(&fingerprint, &tokenized.token_ids, owner),
-        None => cache.best_match(&fingerprint, &tokenized.token_ids),
+    let memory_match = memory_cache().lock().ok().and_then(|state| {
+        if state.generation(owner_id) != lease.memory_generation {
+            return None;
+        }
+        match owner_id {
+            Some(owner) => {
+                state
+                    .cache
+                    .best_match_for_owner(&fingerprint, &tokenized.token_ids, owner)
+            }
+            None => state.cache.best_match(&fingerprint, &tokenized.token_ids),
+        }
     });
-    let mut db = load_db()?;
+    let db = store
+        .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+        .unwrap_or_default();
     let persistent_match = match owner_id {
         Some(owner) => longest_compatible_prefix_for_owner(
             &db.entries,
             &fingerprint,
             &tokenized.token_ids,
-            Some(owner),
+            owner,
         ),
         None => longest_compatible_prefix(&db.entries, &fingerprint, &tokenized.token_ids),
     };
@@ -381,29 +528,37 @@ fn compatible_cached_prefix_for_owner(
         return Ok(None);
     };
     if selected.tier == CacheTier::MemoryLru {
-        let value = memory_cache()
-            .lock()
-            .ok()
-            .and_then(|mut cache| cache.get(&selected.id, now));
-        return Ok(value
-            .filter(PrefixCacheValue::is_valid)
-            .map(|value| (value.metadata.id, value.sequence)));
+        if !lease.validate()? {
+            return Ok(None);
+        }
+        return Ok(selected_memory_value(
+            memory_cache(),
+            &selected,
+            lease.memory_generation,
+            owner_id,
+            &fingerprint,
+            &tokenized.token_ids,
+            now,
+        )
+        .map(|value| (value.metadata.id, value.sequence)));
     }
     let Some(index) = db.entries.iter().position(|entry| entry.id == selected.id) else {
         return Ok(None);
     };
     let metadata = db.entries[index].clone();
-    let Some(mut value) = load_persistent_value_or_invalidate(&settings, &metadata)? else {
+    let Some(value) = load_persistent_value_or_invalidate_from_store(&store, &metadata)? else {
         return Ok(None);
     };
     if !value.is_valid() {
-        invalidate_persistent_entry(&settings, &metadata.id)?;
+        invalidate_persistent_entry_in_store(&store, &metadata.id)?;
         return Ok(None);
     }
-    db.entries[index].last_used_at_ms = now;
-    value.metadata.last_used_at_ms = now;
-    save_db(&db)?;
-    promote_to_memory(value.clone());
+    let Some(value) = touch_persistent_value_for_promotion(&store, &value, now)? else {
+        return Ok(None);
+    };
+    if !lease.promote(value.clone())? {
+        return Ok(None);
+    }
     Ok(Some((value.metadata.id, value.sequence)))
 }
 
@@ -441,8 +596,9 @@ pub(crate) fn ensure_persona_prefix(
         label.to_string(),
         stable_messages,
     )?;
-    persist_value(&settings, &value)?;
-    promote_to_memory(value);
+    if !persist_value(&settings, &value)? {
+        return Ok(None);
+    }
     Ok(
         compatible_cached_prefix_for_owner(handle, target_messages, Some(owner_id))?.map(
             |(cache_id, sequence)| PersonaPrefixUse {
@@ -486,8 +642,9 @@ pub fn persist_session_checkpoint(
     if !value.is_valid() {
         return Ok(None);
     }
-    persist_value(&settings, &value)?;
-    promote_to_memory(value.clone());
+    if !persist_value(&settings, &value)? {
+        return Ok(None);
+    }
     Ok(Some(value.metadata.id))
 }
 
@@ -704,13 +861,74 @@ fn skill_label(skill_id: Option<&str>) -> Result<String> {
     Ok("Built-in kind local assistant".to_string())
 }
 
-fn persist_value(settings: &Settings, value: &PrefixCacheValue) -> Result<()> {
-    persist_value_to_store(
-        &RuntimeStore::open(&settings.data_dir)?,
+struct MomCachePromotionLease {
+    owner: Option<crate::personas::PersonaCacheOwnerLease>,
+    memory_generation: MemoryCacheGeneration,
+}
+
+impl MomCachePromotionLease {
+    fn acquire(store: &RuntimeStore, owner_id: Option<&str>) -> Result<Option<Self>> {
+        let owner = match owner_id {
+            Some(owner_id) => {
+                let Some(lease) =
+                    crate::personas::acquire_persona_cache_owner_lease(store, owner_id)?
+                else {
+                    return Ok(None);
+                };
+                Some(lease)
+            }
+            None => None,
+        };
+        let memory_generation = memory_generation(owner_id)?;
+        Ok(Some(Self {
+            owner,
+            memory_generation,
+        }))
+    }
+
+    fn validate(&self) -> Result<bool> {
+        match &self.owner {
+            Some(owner) => owner.validate(),
+            None => Ok(true),
+        }
+    }
+
+    fn promote(&self, value: PrefixCacheValue) -> Result<bool> {
+        if !self.validate()? {
+            return Ok(false);
+        }
+        promote_to_memory_if_current(value, self.memory_generation)
+    }
+}
+
+fn persist_value(settings: &Settings, value: &PrefixCacheValue) -> Result<bool> {
+    let store = RuntimeStore::open(&settings.data_dir)?;
+    persist_value_with_promotion_hook(&store, value, || {})
+}
+
+fn persist_value_with_promotion_hook(
+    store: &RuntimeStore,
+    value: &PrefixCacheValue,
+    before_promotion: impl FnOnce(),
+) -> Result<bool> {
+    let Some(lease) = MomCachePromotionLease::acquire(store, value.metadata.owner_id.as_deref())?
+    else {
+        return Ok(false);
+    };
+    if !persist_value_to_store(
+        store,
         value,
         DEFAULT_PERSISTENT_CACHE_ENTRIES,
         DEFAULT_PERSISTENT_CACHE_BYTES,
-    )
+    )? {
+        return Ok(false);
+    }
+    before_promotion();
+    if lease.promote(value.clone())? {
+        return Ok(true);
+    }
+    invalidate_persistent_entry_in_store(store, &value.metadata.id)?;
+    Ok(false)
 }
 
 fn persist_value_to_store(
@@ -718,7 +936,7 @@ fn persist_value_to_store(
     value: &PrefixCacheValue,
     max_entries: usize,
     max_bytes: usize,
-) -> Result<()> {
+) -> Result<bool> {
     if !value.is_valid() {
         return Err(anyhow!(
             "refusing to persist an invalid native prefix cache"
@@ -733,6 +951,13 @@ fn persist_value_to_store(
         KV_CACHE_NAMESPACE,
         KvCacheDb::default,
         |db: &mut KvCacheDb, documents| {
+            if let Some(owner_id) = value.metadata.owner_id.as_deref()
+                && crate::personas::persona_cache_owner_is_removed_from_documents(
+                    documents, owner_id,
+                )?
+            {
+                return Ok(false);
+            }
             let replaced_ids = db
                 .entries
                 .iter()
@@ -761,9 +986,65 @@ fn persist_value_to_store(
                 documents.delete(&blob_namespace(id));
             }
             db.entries.retain(|entry| !evicted.contains(&entry.id));
-            Ok(())
+            Ok(true)
         },
     )
+}
+
+pub(crate) fn persona_cache_ids_from_snapshot(
+    snapshot: &DocumentSnapshot<'_, '_, '_>,
+    owner_id: &str,
+) -> Result<Vec<String>> {
+    let db = snapshot
+        .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(cache_ids_for_owner(&db, owner_id))
+}
+
+pub(crate) fn persona_cache_ids_from_documents(
+    documents: &DocumentMutations<'_, '_, '_>,
+    owner_id: &str,
+) -> Result<Vec<String>> {
+    let db = documents
+        .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+        .unwrap_or_default();
+    Ok(cache_ids_for_owner(&db, owner_id))
+}
+
+pub(crate) fn remove_persona_cache_from_documents(
+    documents: &mut DocumentMutations<'_, '_, '_>,
+    owner_id: &str,
+) -> Result<Vec<String>> {
+    let mut db = documents
+        .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+        .unwrap_or_default();
+    let removed = cache_ids_for_owner(&db, owner_id);
+    db.entries
+        .retain(|entry| entry.owner_id.as_deref() != Some(owner_id));
+    for id in &removed {
+        documents.delete(&blob_namespace(id));
+    }
+    documents.put_bytes(KV_CACHE_NAMESPACE, &serde_json::to_vec(&db)?)?;
+    Ok(removed)
+}
+
+pub(crate) fn invalidate_persona_memory_cache(owner_id: &str) -> Result<usize> {
+    let removed = memory_cache()
+        .lock()
+        .map_err(|_| anyhow!("Persona prefix memory cache is unavailable"))?
+        .invalidate_owner(owner_id);
+    Ok(removed)
+}
+
+fn cache_ids_for_owner(db: &KvCacheDb, owner_id: &str) -> Vec<String> {
+    let mut ids = db
+        .entries
+        .iter()
+        .filter(|entry| entry.owner_id.as_deref() == Some(owner_id))
+        .map(|entry| entry.id.clone())
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids
 }
 
 fn load_persistent_value_or_invalidate(
@@ -799,6 +1080,68 @@ fn load_persistent_value_or_invalidate_from_store(
         return Ok(None);
     }
     Ok(Some(value))
+}
+
+fn load_current_persistent_value(
+    store: &RuntimeStore,
+    cache_id: &str,
+) -> Result<Option<PrefixCacheValue>> {
+    let db = store
+        .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+        .unwrap_or_default();
+    let Some(metadata) = db.entries.iter().find(|entry| entry.id == cache_id) else {
+        return Ok(None);
+    };
+    load_persistent_value_or_invalidate_from_store(store, metadata)
+}
+
+fn touch_persistent_value_for_promotion(
+    store: &RuntimeStore,
+    value: &PrefixCacheValue,
+    now: u128,
+) -> Result<Option<PrefixCacheValue>> {
+    let metadata = store.mutate_documents(
+        KV_CACHE_NAMESPACE,
+        KvCacheDb::default,
+        |db: &mut KvCacheDb, documents| {
+            if let Some(owner_id) = value.metadata.owner_id.as_deref()
+                && crate::personas::persona_cache_owner_is_removed_from_documents(
+                    documents, owner_id,
+                )?
+            {
+                return Ok(None);
+            }
+            let Some(metadata) = db
+                .entries
+                .iter_mut()
+                .find(|entry| entry.id == value.metadata.id)
+            else {
+                return Ok(None);
+            };
+            if !same_cache_authority(metadata, &value.metadata) {
+                return Ok(None);
+            }
+            metadata.last_used_at_ms = now;
+            Ok(Some(metadata.clone()))
+        },
+    )?;
+    Ok(metadata.map(|metadata| PrefixCacheValue {
+        metadata,
+        sequence: value.sequence.clone(),
+    }))
+}
+
+fn same_cache_authority(left: &PrefixCacheMetadata, right: &PrefixCacheMetadata) -> bool {
+    left.id == right.id
+        && left.tier == right.tier
+        && left.owner_id == right.owner_id
+        && left.label == right.label
+        && left.fingerprint == right.fingerprint
+        && left.token_ids == right.token_ids
+        && left.token_sha256 == right.token_sha256
+        && left.state_bytes == right.state_bytes
+        && left.created_at_ms == right.created_at_ms
+        && left.state == right.state
 }
 
 fn invalidate_persistent_entry(settings: &Settings, cache_id: &str) -> Result<()> {
@@ -875,22 +1218,67 @@ fn save_db(db: &KvCacheDb) -> Result<PathBuf> {
     Ok(store.path().to_path_buf())
 }
 
-fn promote_to_memory(value: PrefixCacheValue) {
-    if let Ok(mut cache) = memory_cache().lock() {
-        cache.insert(value);
+fn memory_generation(owner_id: Option<&str>) -> Result<MemoryCacheGeneration> {
+    Ok(memory_cache()
+        .lock()
+        .map_err(|_| anyhow!("Persona prefix memory cache is unavailable"))?
+        .generation(owner_id))
+}
+
+fn selected_memory_value(
+    cache: &Mutex<MemoryCacheState>,
+    selected: &CacheMatch,
+    expected_generation: MemoryCacheGeneration,
+    owner_id: Option<&str>,
+    fingerprint: &CacheFingerprint,
+    prompt_token_ids: &[i32],
+    now: u128,
+) -> Option<PrefixCacheValue> {
+    let mut state = cache.lock().ok()?;
+    if state.generation(owner_id) != expected_generation {
+        return None;
     }
+    let value = state.cache.get(&selected.id, now)?;
+    let matched_tokens = value.metadata.token_ids.len();
+    (value.is_valid()
+        && value.metadata.id == selected.id
+        && value.metadata.tier == selected.tier
+        && value.metadata.owner_id.as_deref() == owner_id
+        && &value.metadata.fingerprint == fingerprint
+        && matched_tokens == selected.matched_tokens
+        && matched_tokens < prompt_token_ids.len()
+        && prompt_token_ids.starts_with(&value.metadata.token_ids)
+        && selected.exact == (matched_tokens.saturating_add(1) == prompt_token_ids.len()))
+    .then_some(value)
+}
+
+fn promote_to_memory_if_current(
+    value: PrefixCacheValue,
+    expected: MemoryCacheGeneration,
+) -> Result<bool> {
+    Ok(memory_cache()
+        .lock()
+        .map_err(|_| anyhow!("Persona prefix memory cache is unavailable"))?
+        .promote_if_current(value, expected))
 }
 
 fn invalidate_memory(cache_id: &str) {
-    if let Ok(mut cache) = memory_cache().lock() {
-        cache.invalidate(cache_id);
+    if let Ok(mut state) = memory_cache().lock() {
+        state.global_generation = state.global_generation.saturating_add(1);
+        state.cache.invalidate(cache_id);
     }
 }
 
 fn memory_totals() -> (usize, usize, usize) {
     memory_cache()
         .lock()
-        .map(|cache| (cache.len(), cache.used_bytes(), cache.capacity_bytes()))
+        .map(|state| {
+            (
+                state.cache.len(),
+                state.cache.used_bytes(),
+                state.cache.capacity_bytes(),
+            )
+        })
         .unwrap_or((0, 0, DEFAULT_MEMORY_CACHE_BYTES))
 }
 
@@ -921,6 +1309,8 @@ mod tests {
     use super::*;
     use crate::conversation_store::{Conversation, ConversationDb};
     use sha2::{Digest, Sha256};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     #[derive(Debug, Deserialize)]
     struct W1CacheCorruptionFixture {
@@ -1026,14 +1416,175 @@ mod tests {
 
     #[test]
     fn memory_cache_budget_is_global_across_model_fingerprints() {
-        let mut cache = memory_cache().lock().expect("memory cache lock");
-        cache.clear();
-        cache.insert(test_cache_value("model-a", "fingerprint-a"));
-        cache.insert(test_cache_value("model-b", "fingerprint-b"));
-        assert_eq!(cache.len(), 2);
-        assert_eq!(cache.used_bytes(), 2);
-        assert_eq!(cache.capacity_bytes(), DEFAULT_MEMORY_CACHE_BYTES);
-        cache.clear();
+        let mut state = memory_cache().lock().expect("memory cache lock");
+        state.clear();
+        state
+            .cache
+            .insert(test_cache_value("model-a", "fingerprint-a"));
+        state
+            .cache
+            .insert(test_cache_value("model-b", "fingerprint-b"));
+        assert_eq!(state.cache.len(), 2);
+        assert_eq!(state.cache.used_bytes(), 2);
+        assert_eq!(state.cache.capacity_bytes(), DEFAULT_MEMORY_CACHE_BYTES);
+        state.clear();
+    }
+
+    #[test]
+    fn owner_generation_rejects_promotion_after_exact_invalidation() {
+        let mut state = MemoryCacheState::new();
+        let mut value = test_cache_value("stale-promotion", "fingerprint");
+        value.metadata = value.metadata.with_owner("removed-persona");
+        let captured = state.generation(Some("removed-persona"));
+
+        assert_eq!(state.invalidate_owner("removed-persona"), 0);
+        assert!(!state.promote_if_current(value, captured));
+        assert_eq!(state.cache.len(), 0);
+    }
+
+    #[test]
+    fn owner_invalidation_after_persistence_rejects_memory_promotion() -> Result<()> {
+        let suffix = Uuid::new_v4();
+        let data_dir =
+            std::env::temp_dir().join(format!("mom-llama-cache-stale-promotion-{suffix}"));
+        let store = RuntimeStore::open_with_key(&data_dir, [31_u8; 32])?;
+        let owner_id = format!("persona-{suffix}");
+        let cache_id = format!("cache-{suffix}");
+        let mut value = test_cache_value(&cache_id, "fingerprint");
+        value.metadata = value.metadata.with_owner(owner_id.clone());
+
+        let promoted = persist_value_with_promotion_hook(&store, &value, || {
+            invalidate_persona_memory_cache(&owner_id)
+                .expect("exact owner invalidation must remain available");
+        })?;
+
+        assert!(!promoted);
+        assert!(
+            memory_cache()
+                .lock()
+                .expect("memory cache lock")
+                .cache
+                .get(&cache_id, now_ms())
+                .is_none()
+        );
+        let metadata = store
+            .get::<KvCacheDb>(KV_CACHE_NAMESPACE)?
+            .ok_or_else(|| anyhow!("cache metadata missing after rejected promotion"))?;
+        assert_eq!(
+            metadata
+                .entries
+                .iter()
+                .find(|entry| entry.id == cache_id)
+                .map(|entry| entry.state),
+            Some(CacheEntryState::Invalidated)
+        );
+        assert_eq!(store.get_bytes(&blob_namespace(&cache_id))?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn same_id_owned_ownerless_replacement_invalidates_selected_memory_authority() {
+        const OWNER: &str = "persona-memory-owner-race";
+        let cache = Arc::new(Mutex::new(MemoryCacheState::new()));
+        let prompt_token_ids = vec![1, 2];
+        let ownerless = test_cache_value("same-id-owner-race", "fingerprint");
+        let fingerprint = ownerless.metadata.fingerprint.clone();
+        {
+            let mut state = cache.lock().expect("memory cache lock");
+            let generation = state.generation(None);
+            assert!(state.promote_if_current(ownerless.clone(), generation));
+        }
+
+        let (selected_ownerless, ownerless_generation) = {
+            let state = cache.lock().expect("memory cache lock");
+            (
+                state
+                    .cache
+                    .best_match(&fingerprint, &prompt_token_ids)
+                    .expect("ownerless selection"),
+                state.generation(None),
+            )
+        };
+        let before_ownerless_fetch = Arc::new(Barrier::new(2));
+        let release_ownerless_fetch = Arc::new(Barrier::new(2));
+        let worker_cache = Arc::clone(&cache);
+        let worker_before = Arc::clone(&before_ownerless_fetch);
+        let worker_release = Arc::clone(&release_ownerless_fetch);
+        let worker_fingerprint = fingerprint.clone();
+        let worker_prompt = prompt_token_ids.clone();
+        let ownerless_worker = thread::spawn(move || {
+            worker_before.wait();
+            worker_release.wait();
+            selected_memory_value(
+                worker_cache.as_ref(),
+                &selected_ownerless,
+                ownerless_generation,
+                None,
+                &worker_fingerprint,
+                &worker_prompt,
+                now_ms(),
+            )
+        });
+
+        before_ownerless_fetch.wait();
+        let mut owned = ownerless.clone();
+        owned.metadata = owned.metadata.with_owner(OWNER);
+        {
+            let mut state = cache.lock().expect("memory cache lock");
+            let generation = state.generation(Some(OWNER));
+            assert!(state.promote_if_current(owned.clone(), generation));
+        }
+        release_ownerless_fetch.wait();
+        assert!(
+            ownerless_worker
+                .join()
+                .expect("ownerless fetch worker")
+                .is_none(),
+            "an owned replacement must not inherit a prior ownerless selection"
+        );
+
+        let (selected_owned, owned_generation) = {
+            let state = cache.lock().expect("memory cache lock");
+            (
+                state
+                    .cache
+                    .best_match_for_owner(&fingerprint, &prompt_token_ids, OWNER)
+                    .expect("owned selection"),
+                state.generation(Some(OWNER)),
+            )
+        };
+        let before_owned_fetch = Arc::new(Barrier::new(2));
+        let release_owned_fetch = Arc::new(Barrier::new(2));
+        let worker_cache = Arc::clone(&cache);
+        let worker_before = Arc::clone(&before_owned_fetch);
+        let worker_release = Arc::clone(&release_owned_fetch);
+        let worker_fingerprint = fingerprint.clone();
+        let worker_prompt = prompt_token_ids.clone();
+        let owned_worker = thread::spawn(move || {
+            worker_before.wait();
+            worker_release.wait();
+            selected_memory_value(
+                worker_cache.as_ref(),
+                &selected_owned,
+                owned_generation,
+                Some(OWNER),
+                &worker_fingerprint,
+                &worker_prompt,
+                now_ms(),
+            )
+        });
+
+        before_owned_fetch.wait();
+        {
+            let mut state = cache.lock().expect("memory cache lock");
+            let generation = state.generation(None);
+            assert!(state.promote_if_current(ownerless, generation));
+        }
+        release_owned_fetch.wait();
+        assert!(
+            owned_worker.join().expect("owned fetch worker").is_none(),
+            "an ownerless replacement must not inherit a prior owned selection"
+        );
     }
 
     #[test]

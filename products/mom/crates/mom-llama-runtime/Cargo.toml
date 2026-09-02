@@ -17,21 +17,23 @@ llama-native-host.workspace = true
 llama-native-types.workspace = true
 crossbeam-channel.workspace = true
 chacha20poly1305.workspace = true
+fs2.workspace = true
 getrandom.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
+sysinfo.workspace = true
 uuid.workspace = true
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+nix.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7"
 
 [dev-dependencies]
-fte-backend-llama.workspace = true
-fte-router.workspace = true
-fte-types.workspace = true
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [lints]

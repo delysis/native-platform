@@ -14,12 +14,17 @@ product conversation state.
 | `speech-native-router` | Privacy and capability gates plus deterministic model and voice selection. |
 | `speech-native-host` | Backend registry, dispatch, cancellation, and orderly shutdown. |
 | `speech-native-platform` | Conservative platform capability discovery and the proven Apple TTS adapter. |
-| `speech-native-backend-parakeet` | Resident local Parakeet STT using Hugging Face-managed weights. |
+| `speech-native-backend-parakeet` | Resident local Parakeet STT using exact manifest-verified, content-addressed managed weights. |
 
 STT and TTS live together because they share audio formats, streaming and
 backpressure, cancellation, platform permission semantics, voice/model
 discovery, and real-audio tests. Text generation and hosted-provider routing do
 not live here.
+
+Synthesis finals distinguish complete returned audio from already-delivered
+streamed audio with explicit `Complete` and `Streamed` output variants. No
+empty byte buffer stands in for a stream, and platform backends never own
+speaker playback.
 
 ## Composition
 

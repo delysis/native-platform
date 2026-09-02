@@ -16,10 +16,17 @@ represent these families even when a query backend is not yet present:
 - local managed or external read-only resources.
 
 Catalogue support does not imply query support. Each representation advertises
-what an installed backend can really do. Current content querying is limited to
-the four compiled SQLite profiles. Kiwix ZIM reading and OSM/Overture
-materialization or querying are not shipped; those backends can be added later
-without changing lifecycle, receipt, tool, or citation contracts.
+what an installed backend can really do. Current external-source querying is
+limited to the four compiled SQLite profiles. A bounded OpenZIM v6 producer can
+now convert exact local Kiwix archives into the separate Information-owned
+`managed.documents.v1` FTS representation using stable archive UUID,
+namespace/path, and entry-index locators. This is not a direct ZIM query
+backend or product UI. The Overture core now ships an exact-byte local
+partition admission and typed heavy-engine boundary. It validates explicit
+bbox/theme/type selection, predicate receipts, GERS UUID locators, inert WKB,
+and full release/item/partition provenance. It does not yet ship a production
+GeoParquet engine, acquisition/UI composition, or real-partition acceptance.
+OSM PBF querying remains unimplemented.
 
 ## OSM, Daylight, and Overture
 
@@ -37,9 +44,10 @@ different representations:
 
 Overture's live STAC root discovers releases and assets without hardcoding
 `latest`. Core data remains GeoParquet; PMTiles is a visualization artifact, not
-the semantic source. Region/theme materialization is still roadmap work, so the
-current planner refuses to pretend that a global cloud asset has already become
-a deterministic local subset.
+the semantic source. The typed backend admits only a release-specific STAC
+catalog with exact content identity, explicit bbox/theme/type selection, exact
+local partition bytes, and engine-attested Parquet statistics plus row-filter
+pushdown. STAC metadata alone is never treated as acquired bytes or query proof.
 
 Curated catalogue policy should favor redistributable, provenance-rich sources:
 Kiwix, Wikimedia dumps, Project Gutenberg, Standard Ebooks, OpenAlex, Crossref,

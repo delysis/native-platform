@@ -12,14 +12,20 @@
 //! ASCII zeroes. [`compute_plan_sha256`] delegates to the contract crate's
 //! canonical implementation so planners and stores cannot drift.
 
+mod managed_documents;
+pub use managed_documents::{
+    ActiveManagedDocument, ActiveManagedDocumentsProjection, ActiveManagedMaterialization,
+    ActiveManagedReceipt, ActiveManagedSegment,
+};
+
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use information_native_types::{
     AcquisitionTransport, ArtifactAcquisition, ArtifactId, ContractError,
     EXTERNAL_REGISTRATION_SCHEMA, ExternalAccessMode, ExternalRegistration, INSTALL_RECEIPT_SCHEMA,
-    InstallPlan, InstallReceipt, InstallationId, InstallationState, InstalledArtifact, Provenance,
-    ReleaseId, RepresentationFormat, RepresentationId, ResourceId, RightsStatement, SourceIdentity,
-    UsePolicy,
+    InstallPlan, InstallReceipt, InstallationId, InstallationState, InstalledArtifact,
+    ManagedMaterializationId, Provenance, ReleaseId, RepresentationFormat, RepresentationId,
+    ResourceId, RightsStatement, SourceIdentity, UsePolicy,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -115,6 +121,18 @@ pub enum StoreError {
     RegistryCorrupt(String),
     #[error("installation was not found: {0}")]
     InstallationNotFound(InstallationId),
+    #[error("managed document materialization was not found: {0}")]
+    ManagedDocumentsNotFound(ManagedMaterializationId),
+    #[error("managed document materialization {0} conflicts with existing immutable content")]
+    ManagedDocumentsConflict(ManagedMaterializationId),
+    #[error("managed document materialization identity does not match exact confirmation")]
+    ManagedDocumentsIdentityMismatch,
+    #[error("managed document SQLite operation {operation} failed: {source}")]
+    ManagedDocumentsSqlite {
+        operation: &'static str,
+        #[source]
+        source: rusqlite::Error,
+    },
     #[error("arithmetic overflow while accounting for local bytes")]
     IntegerOverflow,
     #[error("managed store has {available} bytes available; installation requires {required}")]

@@ -89,11 +89,18 @@ export type SourceGhostKeyAction =
   | 'cycle_previous'
   | 'dismiss'
   | 'insert_tab'
+  | 'remove_tab_indent'
   | null;
 
 export interface SourceTabEdit {
   value: string;
   caret: number;
+}
+
+export interface SourceShiftTabEdit {
+  value: string;
+  selectionStart: number;
+  selectionEnd: number;
 }
 
 /** Exact textarea replacement semantics for an ordinary literal Tab edit. */
@@ -112,6 +119,55 @@ export function sourceTabEdit(
   return {
     value: `${value.slice(0, selectionStart)}\t${value.slice(selectionEnd)}`,
     caret: selectionStart + 1
+  };
+}
+
+/** Remove one leading Tab or one Markdown indentation level from selected lines. */
+export function sourceShiftTabEdit(
+  value: string,
+  selectionStart: number,
+  selectionEnd: number
+): SourceShiftTabEdit | null {
+  if (
+    !Number.isSafeInteger(selectionStart) ||
+    !Number.isSafeInteger(selectionEnd) ||
+    selectionStart < 0 ||
+    selectionEnd < selectionStart ||
+    selectionEnd > value.length
+  ) return null;
+
+  const firstLineStart = selectionStart === 0
+    ? 0
+    : value.lastIndexOf('\n', selectionStart - 1) + 1;
+  const inclusiveEnd = selectionEnd > selectionStart && value[selectionEnd - 1] === '\n'
+    ? selectionEnd - 1
+    : selectionEnd;
+  const lineStarts = [firstLineStart];
+  for (let index = firstLineStart; index < inclusiveEnd; index += 1) {
+    if (value[index] === '\n') lineStarts.push(index + 1);
+  }
+
+  const removed = lineStarts.flatMap((lineStart) => {
+    if (value[lineStart] === '\t') return [{ offset: lineStart, length: 1 }];
+    let length = 0;
+    while (length < 4 && value[lineStart + length] === ' ') length += 1;
+    return length > 0 ? [{ offset: lineStart, length }] : [];
+  });
+  if (removed.length === 0) return null;
+
+  let next = value;
+  for (let index = removed.length - 1; index >= 0; index -= 1) {
+    const { offset, length } = removed[index];
+    next = `${next.slice(0, offset)}${next.slice(offset + length)}`;
+  }
+  const adjustedPosition = (position: number): number => position - removed.reduce(
+    (total, indent) => total + Math.min(indent.length, Math.max(0, position - indent.offset)),
+    0
+  );
+  return {
+    value: next,
+    selectionStart: adjustedPosition(selectionStart),
+    selectionEnd: adjustedPosition(selectionEnd)
   };
 }
 
@@ -352,5 +408,6 @@ export function sourceGhostKeyAction(
   if (event.key === 'Tab' && !event.shiftKey) {
     return hasVisibleGhost ? 'accept' : 'insert_tab';
   }
+  if (event.key === 'Tab' && event.shiftKey) return 'remove_tab_indent';
   return null;
 }

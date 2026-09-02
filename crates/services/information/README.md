@@ -12,17 +12,31 @@ contract. It does not pretend that all formats support the same operations.
 Query support in this release is deliberately narrower: the compiled backends
 cover Alexandria blocks, Community Archive v28 messages, encyclopedia
 articles, and Scripture citation occurrences/passages in SQLite. Kiwix OPDS
-and Overture STAC are discovery surfaces. ZIM reading and OSM/Overture
-materialization or query backends remain future work.
+and exact Metalink discovery feed a bounded native OpenZIM v6 producer: it
+binds one exact local archive size/SHA-256, validates directory identities,
+decodes modern uncompressed or Zstandard clusters, strips article HTML to
+inert text, and activates `managed.documents.v1`. The Overture core separately
+pins one immutable release catalog and exact STAC items, verifies already-
+acquired local GeoParquet files by length and SHA-256, and admits only an
+explicit bbox/theme/type query through a typed heavy-engine interface. That
+interface requires a predicate-pushdown receipt and validates bounded WKB
+features with canonical UUID GERS locators and byte-level provenance. No
+production GeoParquet engine, Overture download command, Mom composition, or
+real-partition acceptance is included yet.
 
 ## Workspace
 
 - `information-native-types`: versioned resource, release, representation,
-  install, query, evidence, citation, trust, and tool contracts.
+  install, query, evidence, citation, trust, managed-document, and tool
+  contracts.
 - `information-native-catalog`: validation and normalization for built-in
   manifests and remote catalogue providers such as OPDS and STAC.
-- `information-native-store`: private staging, same-filesystem activation, external
-  read-only imports, full-byte verification, and append-only receipts.
+- `information-native-store`: private staging, same-filesystem activation,
+  external read-only imports, full-byte verification, append-only receipts,
+  and the strict source-neutral managed-document/FTS5 materializer.
+- `information-native-attachment-bridge`: path-free validation and deterministic
+  promotion of one exact canonical Attachment text artifact into managed
+  documents, downstream of both services.
 - `information-native-acquire`: the sole network-authority crate; bounded
   streaming fetch, durable HTTP resume, redirect/DNS attestations, and
   digest/length verification.
@@ -33,8 +47,12 @@ materialization or query backends remain future work.
   v28 messages/FTS adapter.
 - `information-native-backend-encyclopedia`: origin-aware Encarta, Britannica,
   and Wikipedia article adapter.
+- `information-native-backend-overture`: exact STAC/partition admission plus a
+  narrow typed GeoParquet engine and predicate-proof boundary.
 - `information-native-backend-scripture`: normalized Scripture-passage and
   citation-occurrence adapter.
+- `information-native-backend-zim`: safe first-party bounded random-access
+  OpenZIM v6 parser and inert-text managed-document producer.
 - `information-native-host`: immutable composition root and agent-tool surface.
 - `information-native-cli`: an operator oracle for catalogues, installs,
   imports, queries, and receipts.
@@ -54,6 +72,36 @@ materialization or query backends remain future work.
   with no pending WAL or rollback journal; immutable-read-only additionally
   pins full-file identity and SHA-256.
 - Managed state, indexes, and receipts are physically separate from sources.
+- Attachment promotion revalidates the root SHA, ordered graph locator and
+  hash, artifact, processor/policy fingerprint, canonical text bytes/hash,
+  title, and explicitly confirmed rights before Information stages anything.
+  The immutable managed release retains that lineage after its caller-owned
+  source disappears; the bridge never receives a source path or mutates the
+  Attachment bundle.
+- OpenZIM parsing uses ordinary bounded file reads, checked offset/count
+  arithmetic, and a bounded pure-Rust Zstandard codec. It has no memory map,
+  libzim FFI, `xz2`, sidecar, subprocess, active archive HTML, or network
+  fallback. Historical OpenZIM v5, LZMA/zip/bzip2 clusters, split archives,
+  and non-UTF-8 article decoding are explicitly unsupported in this slice.
+- Overture never resolves the mutable STAC root as release authority. A caller
+  supplies exact bytes, length, and SHA-256 for a release-specific catalog,
+  each selected item, and every already-acquired local partition. Successful
+  catalog admission yields an opaque, non-serializable capability; persisted
+  release provenance is audit data and cannot be replayed as authority. The
+  query engine receives bounded random-access reads over open file leases and a
+  fixed bbox-intersection predicate, not paths, URLs, raw SQL, or network
+  authority. Engine receipts
+  are checked against exact partition identities and selected row groups, and
+  each bounded feature retains release/item/partition/predicate provenance.
+- `managed.documents.v1` inputs bind exact immutable source artifacts,
+  source-record hashes, typed locators, lineage, rights, and use policy. The
+  default is private: local search allowed, model use unknown and therefore
+  fail-closed, excerpt export forbidden, and redistribution forbidden.
+- Managed-document activation publishes one immutable database, manifest, and
+  receipt directory by same-filesystem rename. Removal requires the exact
+  materialization/content/database hashes and deletes only those three
+  Information-owned representation files; source paths are evidence, never
+  deletion targets.
 - Managed installation is crash-recoverable at verified staging and atomic
   activation boundaries. Verified acquisitions are published as immutable,
   per-artifact journal entries; the staging manifest is never rewritten. Each

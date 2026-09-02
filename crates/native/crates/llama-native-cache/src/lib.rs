@@ -178,13 +178,34 @@ pub struct CacheMatch {
     pub exact: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheOwnerScope<'a> {
+    Unowned,
+    Exact(&'a str),
+}
+
+impl CacheOwnerScope<'_> {
+    #[must_use]
+    pub fn matches(self, owner_id: Option<&str>) -> bool {
+        match self {
+            Self::Unowned => owner_id.is_none(),
+            Self::Exact(expected) => owner_id == Some(expected),
+        }
+    }
+}
+
 #[must_use]
 pub fn longest_compatible_prefix(
     entries: &[PrefixCacheMetadata],
     fingerprint: &CacheFingerprint,
     prompt_token_ids: &[i32],
 ) -> Option<CacheMatch> {
-    longest_compatible_prefix_for_owner(entries, fingerprint, prompt_token_ids, None)
+    longest_compatible_prefix_for_scope(
+        entries,
+        fingerprint,
+        prompt_token_ids,
+        CacheOwnerScope::Unowned,
+    )
 }
 
 #[must_use]
@@ -192,14 +213,29 @@ pub fn longest_compatible_prefix_for_owner(
     entries: &[PrefixCacheMetadata],
     fingerprint: &CacheFingerprint,
     prompt_token_ids: &[i32],
-    owner_id: Option<&str>,
+    owner_id: &str,
+) -> Option<CacheMatch> {
+    longest_compatible_prefix_for_scope(
+        entries,
+        fingerprint,
+        prompt_token_ids,
+        CacheOwnerScope::Exact(owner_id),
+    )
+}
+
+#[must_use]
+pub fn longest_compatible_prefix_for_scope(
+    entries: &[PrefixCacheMetadata],
+    fingerprint: &CacheFingerprint,
+    prompt_token_ids: &[i32],
+    owner_scope: CacheOwnerScope<'_>,
 ) -> Option<CacheMatch> {
     entries
         .iter()
         .filter(|entry| {
             entry.is_valid()
                 && &entry.fingerprint == fingerprint
-                && owner_id.is_none_or(|owner| entry.owner_id.as_deref() == Some(owner))
+                && owner_scope.matches(entry.owner_id.as_deref())
                 && entry.token_ids.len() < prompt_token_ids.len()
                 && prompt_token_ids.starts_with(&entry.token_ids)
         })
@@ -262,6 +298,11 @@ impl MemoryPrefixCache {
         self.values.is_empty()
     }
 
+    #[must_use]
+    pub fn contains_id(&self, id: &str) -> bool {
+        self.values.contains_key(id)
+    }
+
     pub fn insert(&mut self, mut value: PrefixCacheValue) -> Vec<String> {
         if !value.is_valid() || value.metadata.state_bytes > self.capacity_bytes {
             return Vec::new();
@@ -297,7 +338,22 @@ impl MemoryPrefixCache {
         prompt_token_ids: &[i32],
         now_ms: u128,
     ) -> Option<PrefixCacheValue> {
-        let matched = self.best_match(fingerprint, prompt_token_ids)?;
+        self.lookup_in_scope(
+            fingerprint,
+            prompt_token_ids,
+            CacheOwnerScope::Unowned,
+            now_ms,
+        )
+    }
+
+    pub fn lookup_in_scope(
+        &mut self,
+        fingerprint: &CacheFingerprint,
+        prompt_token_ids: &[i32],
+        owner_scope: CacheOwnerScope<'_>,
+        now_ms: u128,
+    ) -> Option<PrefixCacheValue> {
+        let matched = self.best_match_in_scope(fingerprint, prompt_token_ids, owner_scope)?;
         self.get(&matched.id, now_ms)
     }
 
@@ -307,12 +363,22 @@ impl MemoryPrefixCache {
         fingerprint: &CacheFingerprint,
         prompt_token_ids: &[i32],
     ) -> Option<CacheMatch> {
+        self.best_match_in_scope(fingerprint, prompt_token_ids, CacheOwnerScope::Unowned)
+    }
+
+    #[must_use]
+    pub fn best_match_in_scope(
+        &self,
+        fingerprint: &CacheFingerprint,
+        prompt_token_ids: &[i32],
+        owner_scope: CacheOwnerScope<'_>,
+    ) -> Option<CacheMatch> {
         let metadata = self
             .values
             .values()
             .map(|value| value.metadata.clone())
             .collect::<Vec<_>>();
-        longest_compatible_prefix(&metadata, fingerprint, prompt_token_ids)
+        longest_compatible_prefix_for_scope(&metadata, fingerprint, prompt_token_ids, owner_scope)
     }
 
     #[must_use]
@@ -322,16 +388,10 @@ impl MemoryPrefixCache {
         prompt_token_ids: &[i32],
         owner_id: &str,
     ) -> Option<CacheMatch> {
-        let metadata = self
-            .values
-            .values()
-            .map(|value| value.metadata.clone())
-            .collect::<Vec<_>>();
-        longest_compatible_prefix_for_owner(
-            &metadata,
+        self.best_match_in_scope(
             fingerprint,
             prompt_token_ids,
-            Some(owner_id),
+            CacheOwnerScope::Exact(owner_id),
         )
     }
 
@@ -353,6 +413,19 @@ impl MemoryPrefixCache {
         self.used_bytes = self.used_bytes.saturating_sub(value.metadata.state_bytes);
         self.remove_from_order(id);
         true
+    }
+
+    pub fn invalidate_owner(&mut self, owner_id: &str) -> Vec<String> {
+        let ids = self
+            .values
+            .values()
+            .filter(|value| value.metadata.owner_id.as_deref() == Some(owner_id))
+            .map(|value| value.metadata.id.clone())
+            .collect::<Vec<_>>();
+        for id in &ids {
+            self.invalidate(id);
+        }
+        ids
     }
 
     pub fn clear(&mut self) {
@@ -425,6 +498,18 @@ mod tests {
         }
     }
 
+    fn owned_value(
+        id: &str,
+        owner_id: &str,
+        tokens: &[i32],
+        bytes: usize,
+        now_ms: u128,
+    ) -> PrefixCacheValue {
+        let mut value = value(id, CacheTier::PersonaPack, tokens, bytes, now_ms);
+        value.metadata.owner_id = Some(owner_id.to_string());
+        value
+    }
+
     #[test]
     fn longest_token_exact_compatible_prefix_wins() {
         let entries = [
@@ -450,7 +535,7 @@ mod tests {
             &entries,
             &fingerprint(),
             &[1, 2, 3, 4],
-            Some("persona:alice:v1"),
+            "persona:alice:v1",
         )
         .expect("Alice's cache must remain independently addressable");
         assert_eq!(matched.id, "alice");
@@ -459,9 +544,28 @@ mod tests {
                 &entries,
                 &fingerprint(),
                 &[1, 2, 3, 4],
-                Some("persona:carol:v1"),
+                "persona:carol:v1",
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn ownerless_lookup_never_admits_owned_prefixes() {
+        let unowned = value("unowned", CacheTier::SessionPersistent, &[1], 3, 1).metadata;
+        let owned = value("persona", CacheTier::PersonaPack, &[1, 2], 3, 2)
+            .metadata
+            .with_owner("persona:archived:v7");
+
+        let matched =
+            longest_compatible_prefix(&[unowned, owned.clone()], &fingerprint(), &[1, 2, 3])
+                .expect("the ownerless artifact remains independently addressable");
+
+        assert_eq!(matched.id, "unowned");
+        assert_eq!(matched.matched_tokens, 1);
+        assert!(
+            longest_compatible_prefix(&[owned], &fingerprint(), &[1, 2, 3]).is_none(),
+            "an ownerless lookup must be a miss when only owner-bound artifacts exist"
         );
     }
 
@@ -570,6 +674,22 @@ mod tests {
         assert!(cache.lookup(&fingerprint(), &[1, 9], 5).is_some());
         assert!(cache.lookup(&fingerprint(), &[3, 9], 5).is_some());
         assert_eq!(cache.used_bytes(), 8);
+    }
+
+    #[test]
+    fn memory_owner_invalidation_is_exact_and_updates_capacity_accounting() {
+        let mut cache = MemoryPrefixCache::new(16);
+        cache.insert(owned_value("alice-a", "alice", &[1], 4, 1));
+        cache.insert(owned_value("alice-b", "alice", &[2], 4, 2));
+        cache.insert(owned_value("bob", "bob", &[3], 4, 3));
+
+        let mut removed = cache.invalidate_owner("alice");
+        removed.sort();
+        assert_eq!(removed, ["alice-a".to_string(), "alice-b".to_string()]);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.used_bytes(), 4);
+        assert!(cache.get("bob", 4).is_some());
+        assert!(cache.get("alice-a", 4).is_none());
     }
 
     #[test]

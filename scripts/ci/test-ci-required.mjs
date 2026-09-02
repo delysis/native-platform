@@ -55,6 +55,37 @@ test("a focused Mom plan accepts skipped root and requires its selected lanes", 
   assert.notEqual(run(momPlan, needs).status, 0);
 });
 
+test("a Loom frontend plan cannot omit or skip its macOS WebKit gate", () => {
+  const loomPlan = {
+    ...docsPlan,
+    risk: "behavior",
+    flags: { full: false, frontend_loom: true },
+    presence: { mom: false, loom: true },
+    jobs: ["policy", "loom-linux", "frontend", "platform-macos"],
+    macos_matrix: ["release", "loom"],
+  };
+  const needs = {
+    plan: { result: "success" },
+    policy: { result: "success" },
+    "loom-linux": { result: "success" },
+    frontend: { result: "success" },
+    "platform-macos": { result: "success" },
+  };
+  assert.equal(run(loomPlan, needs).status, 0);
+
+  const skippedMac = structuredClone(needs);
+  skippedMac["platform-macos"].result = "skipped";
+  assert.notEqual(run(loomPlan, skippedMac).status, 0);
+
+  const omittedJob = structuredClone(loomPlan);
+  omittedJob.jobs = omittedJob.jobs.filter((job) => job !== "platform-macos");
+  assert.notEqual(run(omittedJob, needs).status, 0);
+
+  const omittedMatrixEntry = structuredClone(loomPlan);
+  omittedMatrixEntry.macos_matrix = ["release"];
+  assert.notEqual(run(omittedMatrixEntry, needs).status, 0);
+});
+
 test("matrix-backed job IDs are consumed as one fail-closed aggregate result", () => {
   const matrixPlan = {
     ...docsPlan,
@@ -75,6 +106,23 @@ test("matrix-backed job IDs are consumed as one fail-closed aggregate result", (
     failed[job].result = "failure";
     assert.notEqual(run(matrixPlan, failed).status, 0, `${job} must fail closed`);
   }
+});
+
+test("a selected ignored-test reconciliation is an authoritative required job", () => {
+  const ignoredPlan = {
+    ...docsPlan,
+    risk: "behavior",
+    flags: { full: false, ignored_tests: true },
+    jobs: ["policy", "ignored-tests"],
+  };
+  const needs = {
+    plan: { result: "success" },
+    policy: { result: "success" },
+    "ignored-tests": { result: "success" },
+  };
+  assert.equal(run(ignoredPlan, needs).status, 0);
+  needs["ignored-tests"] = { result: "skipped" };
+  assert.notEqual(run(ignoredPlan, needs).status, 0);
 });
 
 test("a required skipped, failed, or missing job fails", () => {

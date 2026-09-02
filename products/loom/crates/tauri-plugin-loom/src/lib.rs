@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+mod attachments;
+mod document_watcher;
+mod model_catalog;
 mod model_download;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,14 +27,17 @@ use loom_backend_llama::{
 };
 use loom_document::{DocumentContent, MergeError, MergeOutcome, three_way_merge};
 use loom_host::{
-    AgencyGate, BranchCancellation, DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES,
-    ForegroundCommandRegistry, ForegroundWindowId, GenerationFamilyIdentity, GenerationRegistry,
+    ActiveGenerationRoute, AgencyGate, BranchCancellation, DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES,
+    ForegroundCommandRegistry, ForegroundWindowId, GenerationFamilyIdentity,
+    GenerationOperationPhase, GenerationOperationSnapshot, GenerationRegistry,
     GenerationRegistryError, GenerationSupervisor, GenerationTerminalClass,
+    GenerationTerminalRecord,
 };
 use loom_store::{
-    BranchPageCursor, DocumentReconciliationSnapshot, ExternalReconciliationOutcome,
-    ExternalReconciliationRequest, IdempotentSaveOutcome, LoadedDocument, MAX_BRANCH_BODY_BYTES,
-    ProjectStore, StoredBranchBody, StoredBranchRecord, StoredBranchStatus, StoredBranchSummary,
+    BranchPageCursor, DocumentFileAuthority, DocumentReconciliationSnapshot,
+    ExternalReconciliationOutcome, ExternalReconciliationRequest, IdempotentSaveOutcome,
+    LoadedDocument, MAX_BRANCH_BODY_BYTES, ProjectStore, StoredBranchBody, StoredBranchPage,
+    StoredBranchRecord, StoredBranchStatus, StoredBranchSummary, StoredGenerationProgressText,
     TerminalCandidateInput, TerminalEvidenceInput, TerminalGenerationInput, TransientDraft,
     VisibleProjectionState,
 };
@@ -49,6 +55,12 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
 
+use crate::attachments::{
+    AttachmentStoreError, LoadedImageAsset, StoredImageAsset, is_canonical_image_asset_file_name,
+    read_image_asset, store_image_asset,
+};
+use crate::document_watcher::DocumentFilesystemWatcher;
+use crate::model_catalog::{ModelCatalogSnapshot, catalog_model_identity, embedded_model_catalog};
 use crate::model_download::{
     ModelDownloadRegistry, ModelDownloadRegistryError, ModelDownloadSnapshot, ModelDownloadSpec,
     ModelLibraryError, ReservationOutcome, model_target_path, prepare_model_library,
@@ -61,6 +73,8 @@ const PROJECT_CLOSE_GENERATION_WAIT: Duration = Duration::from_secs(3);
 const MAX_MODEL_DOWNLOAD_URL_BYTES: usize = 16 * 1024;
 const POLICY_MODEL_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_TRACKED_GENERATION_WORKERS: usize = DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES;
+const COMPLETION_SNAPSHOT_BRANCH_LIMIT: usize = 24;
+const COMPLETION_SNAPSHOT_CAPTURE_ATTEMPTS: usize = 3;
 #[cfg(test)]
 const FOREGROUND_COMMAND_TEST_TTL: Duration = Duration::from_secs(30);
 pub const APPLICATION_QUIT_MENU_ID: &str = "loom.application.quit";
@@ -69,6 +83,8 @@ pub const FILE_OPEN_PROJECT_MENU_ID: &str = "loom.file.open-project";
 pub const FILE_SAVE_MENU_ID: &str = "loom.file.save";
 pub const FILE_EXPORT_COPY_MENU_ID: &str = "loom.file.export-copy";
 pub const FILE_COMMAND_EVENT: &str = "loom://file-command";
+const LOOM_ASSET_SCHEME: &str = "loom-asset";
+const LOOM_ASSET_TOKEN_VERSION: &str = "v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -146,6 +162,7 @@ enum SessionPhase {
 #[derive(Debug, Default)]
 struct Session {
     phase: SessionPhase,
+    document_filesystem_watcher: Option<DocumentFilesystemWatcher>,
     store: Option<ProjectStore>,
     active_session_id: Option<CommandId>,
     agency: AgencyGate,
@@ -333,6 +350,14 @@ impl Drop for PluginState {
         self.close_requested.store(true, Ordering::Release);
         self.exit_authorized.store(false, Ordering::Release);
         let _ = self.foreground_commands.revoke_all();
+        let session = self
+            .session
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Stop filesystem callbacks before tearing down any session-owned
+        // native authority that those callbacks can wake in the renderer.
+        let document_filesystem_watcher = session.document_filesystem_watcher.take();
+        drop(document_filesystem_watcher);
         if let Ok(phase) = self.application.get_mut() {
             *phase = ApplicationPhase::Closing;
         }
@@ -1754,11 +1779,19 @@ impl Builder {
         self
     }
 
+    // Keep the renderer authority surface as one explicit, auditable registry.
+    #[allow(clippy::too_many_lines)]
     pub fn build<R: Runtime>(self) -> TauriPlugin<R> {
         let build_model_policy = self.build_model_policy;
         let app_local_data_root = self.app_local_data_root;
         let isolate_model_discovery = self.isolate_model_discovery;
         PluginBuilder::new("loom")
+            .register_uri_scheme_protocol(LOOM_ASSET_SCHEME, |context, request| {
+                let Some(state) = context.app_handle().try_state::<PluginState>() else {
+                    return empty_loom_asset_response(http::StatusCode::SERVICE_UNAVAILABLE);
+                };
+                loom_asset_protocol_response(&state, context.webview_label(), &request)
+            })
             .invoke_handler(tauri::generate_handler![
                 project_open_default,
                 project_choose_create,
@@ -1767,23 +1800,30 @@ impl Builder {
                 project_current,
                 project_recover,
                 document_create,
+                document_rename,
+                document_delete,
+                attachment_ingest,
                 document_open,
                 document_checkpoint,
                 document_export_choose,
+                document_reveal,
                 document_draft_upsert,
                 document_draft_clear,
                 document_reconciliation_preview,
                 document_reconcile_apply,
                 build_model_policy_get,
+                model_catalog_list,
                 model_list,
                 model_choose,
                 model_load,
+                model_load_catalog_candidate,
                 model_load_policy_candidate,
                 model_unload,
                 model_download_start,
                 model_download_cancel,
                 model_download_status,
                 model_download_list,
+                completion_snapshot,
                 branch_page,
                 branch_get,
                 branch_body,
@@ -1887,6 +1927,37 @@ impl IpcFailure {
         }
     }
 
+    fn attachment(error: &AttachmentStoreError) -> Self {
+        let code = match error {
+            AttachmentStoreError::Empty => "attachment_empty",
+            AttachmentStoreError::TooLarge => "attachment_too_large",
+            AttachmentStoreError::InvalidBase64 => "attachment_invalid_base64",
+            AttachmentStoreError::UnsupportedImage => "attachment_unsupported_image",
+            AttachmentStoreError::MediaTypeMismatch => "attachment_media_type_mismatch",
+            AttachmentStoreError::MalformedImage => "attachment_malformed_image",
+            AttachmentStoreError::ImageDimensionsExceeded { .. } => {
+                "attachment_dimensions_exceeded"
+            }
+            AttachmentStoreError::ImageDecodeLimit { .. } => "attachment_decode_limit_exceeded",
+            AttachmentStoreError::ProjectImageQuotaExceeded { .. } => {
+                "attachment_project_quota_exceeded"
+            }
+            AttachmentStoreError::AssetDirectoryEntryLimit { .. } => {
+                "attachment_asset_directory_too_large"
+            }
+            AttachmentStoreError::UnsafeAssetDirectory => "attachment_asset_directory_refused",
+            AttachmentStoreError::UnsafeAssetPath => "attachment_asset_path_refused",
+            AttachmentStoreError::DigestCollision => "attachment_digest_collision",
+            AttachmentStoreError::DirectoryDurability(_) => "attachment_durability_unconfirmed",
+            AttachmentStoreError::Io(_) => "attachment_storage_failed",
+        };
+        let retryable = matches!(
+            error,
+            AttachmentStoreError::DirectoryDurability(_) | AttachmentStoreError::Io(_)
+        );
+        Self::new(code, error.to_string(), retryable)
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     fn store(error: loom_store::StoreError) -> Self {
         use loom_store::StoreError;
@@ -1907,6 +1978,8 @@ impl IpcFailure {
             StoreError::UnsupportedFormat(_) => "unsupported_project_format",
             StoreError::UnsupportedSchema { .. } => "unsupported_project_schema",
             StoreError::InvalidProjectName { .. } => "invalid_project_name",
+            StoreError::InvalidDocumentTitle { .. } => "invalid_document_title",
+            StoreError::InvalidDocumentFileName { .. } => "invalid_document_file_name",
             StoreError::ReasonTooLong { .. } => "checkpoint_reason_too_long",
             StoreError::DocumentTooLarge { .. } => "document_too_large",
             StoreError::DocumentKindMismatch { .. } => "document_kind_mismatch",
@@ -1914,6 +1987,13 @@ impl IpcFailure {
             StoreError::VisibleFileAlreadyExists(_) => "visible_file_already_exists",
             StoreError::DocumentAlreadyExists(_) => "document_already_exists",
             StoreError::UncheckpointedVisibleChange(_) => "external_file_change",
+            StoreError::VisibleFileIdentityChanged(_) => "document_path_changed",
+            StoreError::DocumentFileAuthorityMismatch => "stale_document_action",
+            StoreError::DocumentExplicitlyDeleted(_) => "document_explicitly_deleted",
+            StoreError::DocumentHasTransientDraft(_) => "document_has_transient_draft",
+            StoreError::DocumentHasPendingOutbox(_) => "document_has_pending_projection",
+            StoreError::DocumentLifecycleUncertain(_) => "document_lifecycle_uncertain",
+            StoreError::UnsupportedDocumentLifecyclePlatform => "document_lifecycle_unsupported",
             StoreError::ExternalVisibleFileDeleted(_) => "external_file_deleted",
             StoreError::ExternalVisibleBlobMismatch { .. } => "external_file_conflict",
             StoreError::ExternalVisibleInvalidUtf8(_) => "external_file_invalid_utf8",
@@ -1946,6 +2026,10 @@ impl IpcFailure {
             StoreError::CandidateReadyRequiresTerminalCandidate => {
                 "candidate_ready_requires_terminal"
             }
+            StoreError::GenerationProgressEventLimitExceeded { .. }
+            | StoreError::GenerationProgressTextLimitExceeded { .. } => {
+                "generation_progress_limit_exceeded"
+            }
             StoreError::FailedGenerationRequiresError => "failed_generation_requires_error",
             StoreError::CriticCannotPromote => "critic_cannot_promote",
             StoreError::ModelRoleNotAssigned => "model_role_not_assigned",
@@ -1961,7 +2045,10 @@ impl IpcFailure {
                 "transient_draft_identity_mismatch"
             }
         };
-        let retryable = matches!(error, StoreError::ProjectAlreadyOpen(_));
+        let retryable = matches!(
+            error,
+            StoreError::ProjectAlreadyOpen(_) | StoreError::DocumentLifecycleUncertain(_)
+        );
         Self::new(code, error.to_string(), retryable)
     }
 
@@ -2181,6 +2268,7 @@ pub struct ModelUnloadOutcome {
 pub struct BranchSnapshot {
     run_id: String,
     branch_id: String,
+    weave_command_id: Option<String>,
     document_id: String,
     candidate_id: Option<String>,
     source_revision_id: String,
@@ -2240,6 +2328,7 @@ impl From<BranchPageCursor> for BranchCursorSnapshot {
 pub struct BranchSummarySnapshot {
     run_id: String,
     branch_id: String,
+    weave_command_id: Option<String>,
     document_id: String,
     candidate_id: Option<String>,
     source_revision_id: String,
@@ -2258,6 +2347,59 @@ pub struct BranchSummarySnapshot {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct BranchPageSnapshot {
+    branches: Vec<BranchSummarySnapshot>,
+    next_cursor: Option<BranchCursorSnapshot>,
+    has_more: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionOperationBranchSnapshot {
+    run_id: String,
+    branch_id: String,
+    partial_text: Option<CompletionPartialTextSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionPartialTextSnapshot {
+    /// Decimal u64, preserved as text across the JavaScript boundary.
+    sequence: String,
+    /// Decimal u64, preserved as text across the JavaScript boundary.
+    utf8_byte_len: String,
+    text: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionTerminalSnapshot {
+    operation_id: String,
+    attempt_id: String,
+    /// Decimal u64, preserved as text across the JavaScript boundary.
+    sequence: String,
+    class: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionOperationSnapshot {
+    request_id: String,
+    attempt_id: String,
+    /// Decimal u64, preserved as text across the JavaScript boundary.
+    operation_sequence: String,
+    phase: &'static str,
+    cancellation_requested: bool,
+    authoritative_terminal: Option<CompletionTerminalSnapshot>,
+    final_projection: Option<CompletionTerminalSnapshot>,
+    /// Decimal u64 values, preserved as text across the JavaScript boundary.
+    progress_sequences: Vec<String>,
+    branches: Vec<CompletionOperationBranchSnapshot>,
+}
+
+/// One identity-scoped, read-only join over the process-local supervisor and
+/// durable store projections. It creates no lifecycle or persistence state.
+#[derive(Clone, Debug, Serialize)]
+pub struct CompletionSnapshot {
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    active_operations: Vec<CompletionOperationSnapshot>,
     branches: Vec<BranchSummarySnapshot>,
     next_cursor: Option<BranchCursorSnapshot>,
     has_more: bool,
@@ -2345,14 +2487,15 @@ struct DesktopLoomEvent {
 /// first launch. The folder is still an ordinary Loom project; this command
 /// merely removes file-management ceremony from the default authoring path.
 #[tauri::command]
-async fn project_open_default(
+async fn project_open_default<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
     ensure_application_running(&state, "a project session")?;
     let choice = reserve_project_choice(&state)?;
     let result =
         default_project_path(&state).and_then(|path| open_or_initialize_default_project(&path));
-    choice.finish(result)
+    choice.finish(&app, result)
 }
 
 fn default_project_path(state: &PluginState) -> Result<PathBuf, IpcFailure> {
@@ -2378,7 +2521,7 @@ async fn project_choose_create<R: Runtime>(
     ensure_application_running(&state, "a project session")?;
     let choice = reserve_project_choice(&state)?;
     let result = choose_project_folder(&app).and_then(|path| initialize_project(&path, title));
-    choice.finish(result)
+    choice.finish(&app, result)
 }
 
 fn reserve_project_choice(state: &PluginState) -> Result<ProjectChoiceReservation<'_>, IpcFailure> {
@@ -2407,12 +2550,44 @@ struct ProjectChoiceReservation<'a> {
 }
 
 impl ProjectChoiceReservation<'_> {
-    fn finish(
+    fn finish<R: Runtime>(
+        self,
+        app: &AppHandle<R>,
+        result: Result<ProjectStore, IpcFailure>,
+    ) -> Result<ProjectSnapshot, IpcFailure> {
+        self.finish_with_document_filesystem_watcher(result, |store, session_id| {
+            DocumentFilesystemWatcher::start(
+                app,
+                store.root(),
+                store.manifest().project_id.to_string(),
+                session_id.to_string(),
+            )
+            .map(Some)
+            .map_err(|_| {
+                IpcFailure::new(
+                    "document_filesystem_watcher_unavailable",
+                    "Loom could not observe manuscript filesystem changes for this project",
+                    true,
+                )
+            })
+        })
+    }
+
+    fn finish_with_document_filesystem_watcher(
         mut self,
         result: Result<ProjectStore, IpcFailure>,
+        start_watcher: impl FnOnce(
+            &ProjectStore,
+            CommandId,
+        ) -> Result<Option<DocumentFilesystemWatcher>, IpcFailure>,
     ) -> Result<ProjectSnapshot, IpcFailure> {
         let store = result?;
         let session_id = CommandId::new();
+        let document_filesystem_watcher = start_watcher(&store, session_id)?;
+        // Establish observation before reading the handoff snapshot. The
+        // renderer performs one coalesced refresh after attaching it, closing
+        // the small interval in which correctly scoped early hints are still
+        // rejected because no renderer session is attached yet.
         let snapshot = snapshot_for(&store, session_id)?;
         let mut session = lock_session_internal(self.state)?;
         if session.phase != SessionPhase::Choosing {
@@ -2422,6 +2597,7 @@ impl ProjectChoiceReservation<'_> {
                 false,
             ));
         }
+        session.document_filesystem_watcher = document_filesystem_watcher;
         session.store = Some(store);
         session.active_session_id = Some(session_id);
         session.agency = AgencyGate::default();
@@ -2429,6 +2605,14 @@ impl ProjectChoiceReservation<'_> {
         drop(session);
         self.committed = true;
         Ok(snapshot)
+    }
+
+    #[cfg(test)]
+    fn finish_without_document_filesystem_watcher(
+        self,
+        result: Result<ProjectStore, IpcFailure>,
+    ) -> Result<ProjectSnapshot, IpcFailure> {
+        self.finish_with_document_filesystem_watcher(result, |_store, _session_id| Ok(None))
     }
 }
 
@@ -2585,11 +2769,11 @@ fn validate_default_document_candidate(path: &Path) -> Result<(), IpcFailure> {
 
 fn ensure_default_document(store: &mut ProjectStore) -> Result<(), IpcFailure> {
     if store
-        .list_documents()
+        .has_registered_documents()
         .map_err(IpcFailure::store)?
-        .iter()
-        .any(|document| document.relative_path == INITIAL_DOCUMENT)
     {
+        // Initialization is one-shot. A renamed document stays renamed, and a
+        // catalogue containing only tombstones is intentionally empty.
         return Ok(());
     }
 
@@ -2648,7 +2832,7 @@ async fn project_choose_open<R: Runtime>(
         store.record_open().map_err(IpcFailure::store)?;
         Ok(store)
     });
-    choice.finish(result)
+    choice.finish(&app, result)
 }
 
 #[tauri::command]
@@ -2776,11 +2960,17 @@ fn close_project_with_wait(
         session_id,
         closed_at_unix_ms: now_unix_ms(),
     };
+    let document_filesystem_watcher = session.document_filesystem_watcher.take();
     session.store = None;
     session.active_session_id = None;
     session.agency = AgencyGate::default();
     session.phase = SessionPhase::Closed;
     session.last_close = Some(receipt.clone());
+    drop(session);
+    // The callback carries the closed session identity, so even an event
+    // already queued by the backend is rejected by the renderer. Drop the OS
+    // watcher outside the session mutex in case backend shutdown blocks.
+    drop(document_filesystem_watcher);
     Ok(receipt)
 }
 
@@ -2911,21 +3101,302 @@ async fn document_create(
     snapshot_for(store, active_session_id)
 }
 
-fn create_untitled_document(store: &mut ProjectStore) -> Result<String, IpcFailure> {
-    let registered_paths = store
-        .list_documents()
-        .map_err(IpcFailure::store)?
-        .into_iter()
-        .map(|document| document.relative_path)
-        .collect::<BTreeSet<_>>();
+#[tauri::command]
+async fn document_rename(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    expected_revision_id: String,
+    expected_blob_id: String,
+    title: String,
+    state: State<'_, PluginState>,
+) -> Result<DocumentSummary, IpcFailure> {
+    let _application_admission = lock_application_admission(&state, "a document rename")?;
+    let identity =
+        parse_document_action_identity(&document_id, &expected_revision_id, &expected_blob_id)?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    rename_registered_document(store, identity, &title)
+}
 
+#[tauri::command]
+async fn document_delete(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    expected_revision_id: String,
+    expected_blob_id: String,
+    command_id: String,
+    state: State<'_, PluginState>,
+) -> Result<ProjectSnapshot, IpcFailure> {
+    let _application_admission = lock_application_admission(&state, "a document deletion")?;
+    let identity =
+        parse_document_action_identity(&document_id, &expected_revision_id, &expected_blob_id)?;
+    let command_id = command_id.parse::<CommandId>().map_err(|_| {
+        IpcFailure::new(
+            "invalid_command_id",
+            "the document deletion command ID is invalid",
+            false,
+        )
+    })?;
+    let mut session = lock_session(&state)?;
+    let active_session_id = session.active_session_id.ok_or_else(|| {
+        IpcFailure::new(
+            "corrupt_project_session",
+            "the live project session is missing its session ID",
+            false,
+        )
+    })?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    delete_registered_document(store, active_session_id, command_id, identity)
+}
+
+#[tauri::command]
+async fn attachment_ingest(
+    project_id: String,
+    session_id: String,
+    media_type: String,
+    encoded: String,
+    state: State<'_, PluginState>,
+) -> Result<StoredImageAsset, IpcFailure> {
+    ingest_image_attachment_for_session(&state, &project_id, &session_id, &media_type, &encoded)
+}
+
+fn ingest_image_attachment_for_session(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    media_type: &str,
+    encoded: &str,
+) -> Result<StoredImageAsset, IpcFailure> {
+    let _application_admission = lock_application_admission(state, "an image attachment")?;
+    let mut session = lock_session(state)?;
+    let store = require_bound_store(&mut session, project_id, session_id)?;
+    store_image_asset(store.root(), media_type, encoded)
+        .map_err(|error| IpcFailure::attachment(&error))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoomAssetRequest {
+    project_id: ProjectId,
+    session_id: CommandId,
+    file_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoomAssetAuthority {
+    project_id: ProjectId,
+    session_id: CommandId,
+    project_root: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoomAssetReadFailure {
+    NotFound,
+    Unavailable,
+}
+
+fn loom_asset_token(
+    project_id: ProjectId,
+    session_id: CommandId,
+    file_name: &str,
+) -> Option<String> {
+    if !is_canonical_image_asset_file_name(file_name) {
+        return None;
+    }
+    Some(format!(
+        "{LOOM_ASSET_TOKEN_VERSION}-{project_id}-{session_id}-{file_name}"
+    ))
+}
+
+fn parse_loom_asset_uri(uri: &http::Uri) -> Option<LoomAssetRequest> {
+    let canonical_origin = matches!(
+        (
+            uri.scheme_str(),
+            uri.authority().map(http::uri::Authority::as_str)
+        ),
+        (Some(LOOM_ASSET_SCHEME), Some("localhost")) | (Some("http"), Some("loom-asset.localhost"))
+    );
+    if !canonical_origin || uri.query().is_some() {
+        return None;
+    }
+    let token = uri.path().strip_prefix('/')?;
+    if token.is_empty() || token.contains('/') || !token.is_ascii() || token.contains('%') {
+        return None;
+    }
+    let identity = token.strip_prefix("v1-")?;
+    let (project_id_text, remainder) = identity.split_once('-')?;
+    let (session_id_text, file_name) = remainder.split_once('-')?;
+    if file_name.contains('-') {
+        return None;
+    }
+    let project_id = project_id_text.parse::<ProjectId>().ok()?;
+    let session_id = session_id_text.parse::<CommandId>().ok()?;
+    if project_id.to_string() != project_id_text || session_id.to_string() != session_id_text {
+        return None;
+    }
+    let canonical_token = loom_asset_token(project_id, session_id, file_name)?;
+    if canonical_token != token {
+        return None;
+    }
+    Some(LoomAssetRequest {
+        project_id,
+        session_id,
+        file_name: file_name.to_owned(),
+    })
+}
+
+fn read_authorized_loom_asset(
+    state: &PluginState,
+    request: &LoomAssetRequest,
+) -> Result<LoadedImageAsset, LoomAssetReadFailure> {
+    read_authorized_loom_asset_with(state, request, read_image_asset)
+}
+
+fn read_authorized_loom_asset_with(
+    state: &PluginState,
+    request: &LoomAssetRequest,
+    reader: impl FnOnce(&Path, &str) -> Result<LoadedImageAsset, AttachmentStoreError>,
+) -> Result<LoadedImageAsset, LoomAssetReadFailure> {
+    let authority = capture_loom_asset_authority(state, request)?;
+    // Hashing and structural image decode are bounded, but still substantially
+    // slower than an in-memory authority check. Never serialize unrelated
+    // session work behind that filesystem and decoder latency.
+    let asset = reader(&authority.project_root, &request.file_name)
+        .map_err(|_| LoomAssetReadFailure::NotFound)?;
+    if !loom_asset_authority_is_current(state, &authority)? {
+        return Err(LoomAssetReadFailure::NotFound);
+    }
+    Ok(asset)
+}
+
+fn capture_loom_asset_authority(
+    state: &PluginState,
+    request: &LoomAssetRequest,
+) -> Result<LoomAssetAuthority, LoomAssetReadFailure> {
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| LoomAssetReadFailure::Unavailable)?;
+    if session.phase != SessionPhase::Open || session.active_session_id != Some(request.session_id)
+    {
+        return Err(LoomAssetReadFailure::NotFound);
+    }
+    let store = session
+        .store
+        .as_ref()
+        .filter(|store| store.manifest().project_id == request.project_id)
+        .ok_or(LoomAssetReadFailure::NotFound)?;
+    Ok(LoomAssetAuthority {
+        project_id: request.project_id,
+        session_id: request.session_id,
+        project_root: store.root().to_path_buf(),
+    })
+}
+
+fn loom_asset_authority_is_current(
+    state: &PluginState,
+    authority: &LoomAssetAuthority,
+) -> Result<bool, LoomAssetReadFailure> {
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| LoomAssetReadFailure::Unavailable)?;
+    Ok(session.phase == SessionPhase::Open
+        && session.active_session_id == Some(authority.session_id)
+        && session.store.as_ref().is_some_and(|store| {
+            store.manifest().project_id == authority.project_id
+                && store.root() == authority.project_root
+        }))
+}
+
+fn loom_asset_protocol_response(
+    state: &PluginState,
+    webview_label: &str,
+    request: &http::Request<Vec<u8>>,
+) -> http::Response<Vec<u8>> {
+    if webview_label != "main" {
+        return empty_loom_asset_response(http::StatusCode::FORBIDDEN);
+    }
+    let is_head = request.method() == http::Method::HEAD;
+    if request.method() != http::Method::GET && !is_head {
+        return empty_loom_asset_response_with_header(
+            http::StatusCode::METHOD_NOT_ALLOWED,
+            http::header::ALLOW,
+            "GET, HEAD",
+        );
+    }
+    if !request.body().is_empty() {
+        return empty_loom_asset_response(http::StatusCode::BAD_REQUEST);
+    }
+    if request.headers().contains_key(http::header::RANGE) {
+        return empty_loom_asset_response(http::StatusCode::RANGE_NOT_SATISFIABLE);
+    }
+    let Some(asset_request) = parse_loom_asset_uri(request.uri()) else {
+        return empty_loom_asset_response(http::StatusCode::BAD_REQUEST);
+    };
+    match read_authorized_loom_asset(state, &asset_request) {
+        Ok(asset) => successful_loom_asset_response(asset, is_head),
+        Err(LoomAssetReadFailure::NotFound) => {
+            empty_loom_asset_response(http::StatusCode::NOT_FOUND)
+        }
+        Err(LoomAssetReadFailure::Unavailable) => {
+            empty_loom_asset_response(http::StatusCode::SERVICE_UNAVAILABLE)
+        }
+    }
+}
+
+fn successful_loom_asset_response(
+    asset: LoadedImageAsset,
+    is_head: bool,
+) -> http::Response<Vec<u8>> {
+    let content_length = asset.bytes.len();
+    let body = if is_head { Vec::new() } else { asset.bytes };
+    http::Response::builder()
+        .status(http::StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, asset.media_type)
+        .header(http::header::CONTENT_LENGTH, content_length.to_string())
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(body)
+        .expect("static Loom asset response headers are valid")
+}
+
+fn empty_loom_asset_response(status: http::StatusCode) -> http::Response<Vec<u8>> {
+    http::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_LENGTH, "0")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .body(Vec::new())
+        .expect("static Loom asset response headers are valid")
+}
+
+fn empty_loom_asset_response_with_header(
+    status: http::StatusCode,
+    header: http::header::HeaderName,
+    value: &'static str,
+) -> http::Response<Vec<u8>> {
+    http::Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_LENGTH, "0")
+        .header(http::header::CACHE_CONTROL, "no-store")
+        .header("x-content-type-options", "nosniff")
+        .header(header, value)
+        .body(Vec::new())
+        .expect("static Loom asset response headers are valid")
+}
+
+fn create_untitled_document(store: &mut ProjectStore) -> Result<String, IpcFailure> {
     for ordinal in 1..=MAX_UNTITLED_DOCUMENT_CANDIDATES {
         let relative_path = if ordinal == 1 {
             INITIAL_DOCUMENT.to_owned()
         } else {
             format!("manuscript/Untitled-{ordinal}.md")
         };
-        if registered_paths.contains(&relative_path)
+        if store
+            .document_path_is_reserved(&relative_path)
+            .map_err(IpcFailure::store)?
             || !document_path_is_absent(store.root(), &relative_path)?
         {
             continue;
@@ -2964,17 +3435,24 @@ async fn document_open(
     project_id: String,
     session_id: String,
     document_id: String,
-    relative_path: String,
+    expected_revision_id: String,
+    expected_blob_id: String,
     state: State<'_, PluginState>,
 ) -> Result<OpenDocument, IpcFailure> {
+    let _application_admission = lock_application_admission(&state, "a document open")?;
+    let identity =
+        parse_document_action_identity(&document_id, &expected_revision_id, &expected_blob_id)?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    let document = store
-        .read_document(&relative_path)
-        .map_err(IpcFailure::store)?;
-    ensure_document_id(&document, &document_id)?;
+    let authority = resolve_document_action_file(store, identity)?;
+    let document = finish_document_open(authority)?;
+    let display_title = store
+        .registered_document(document.document_id)
+        .map_err(IpcFailure::store)?
+        .ok_or_else(stale_document_action_failure)?
+        .display_title;
     let mut draft = store
-        .load_transient_draft(&relative_path)
+        .load_transient_draft(&document.relative_path)
         .map_err(IpcFailure::store)?;
     if let Some(existing) = &draft
         && existing.document_id == document.document_id
@@ -2982,11 +3460,11 @@ async fn document_open(
         && existing.blob_id == document.blob_id
     {
         store
-            .clear_transient_draft(&relative_path, existing.version)
+            .clear_transient_draft(&document.relative_path, existing.version)
             .map_err(IpcFailure::store)?;
         draft = None;
     }
-    Ok(open_document_from(document, draft))
+    Ok(open_document_from(document, draft, display_title))
 }
 
 #[tauri::command]
@@ -2995,21 +3473,23 @@ async fn document_export_choose<R: Runtime>(
     project_id: String,
     session_id: String,
     document_id: String,
-    relative_path: String,
+    expected_revision_id: String,
+    expected_blob_id: String,
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<Option<Receipt>, IpcFailure> {
-    let suggested_name = Path::new(&relative_path)
+    let identity =
+        parse_document_action_identity(&document_id, &expected_revision_id, &expected_blob_id)?;
+    let reservation = reserve_document_export(&state, project_id, session_id, identity)?;
+    let suggested_name = Path::new(reservation.suggested_relative_path())
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("Loom-export.md")
         .to_owned();
-    let reservation =
-        reserve_document_export(&state, project_id, session_id, document_id, relative_path)?;
     let Some(destination) = app
         .dialog()
         .file()
-        .set_title("Export a copy")
+        .set_title("Export Text")
         .set_file_name(&suggested_name)
         .add_filter("Markdown or plain text", &["md", "markdown", "txt"])
         .blocking_save_file()
@@ -3027,12 +3507,218 @@ async fn document_export_choose<R: Runtime>(
     reservation.export(&destination).map(Some)
 }
 
+#[tauri::command]
+async fn document_reveal(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    expected_revision_id: String,
+    expected_blob_id: String,
+    state: State<'_, PluginState>,
+) -> Result<(), IpcFailure> {
+    let _application_admission = lock_application_admission(&state, "a document reveal")?;
+    let identity =
+        parse_document_action_identity(&document_id, &expected_revision_id, &expected_blob_id)?;
+    let mut authority = {
+        let mut session = lock_session(&state)?;
+        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        resolve_document_action_file(store, identity)?
+    };
+    let path = validated_document_reveal_path(&mut authority)?;
+    let reveal_result = tauri_plugin_opener::reveal_item_in_dir(&path);
+    authority
+        .reveal_path()
+        .map_err(document_reveal_store_failure)?;
+    reveal_result.map_err(|error| match error {
+        tauri_plugin_opener::Error::UnsupportedPlatform => IpcFailure::new(
+            "document_reveal_unsupported",
+            "revealing a document is not available on this platform",
+            false,
+        ),
+        tauri_plugin_opener::Error::Io(error) => IpcFailure::new(
+            "document_reveal_path_changed",
+            format!("the validated document path changed before reveal: {error}"),
+            false,
+        ),
+        other => IpcFailure::new(
+            "document_reveal_failed",
+            format!("the operating system could not reveal the validated document: {other}"),
+            true,
+        ),
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DocumentActionIdentity {
+    document: DocumentId,
+    revision: RevisionId,
+    blob: BlobId,
+}
+
+fn parse_document_action_identity(
+    document_id: &str,
+    expected_revision_id: &str,
+    expected_blob_id: &str,
+) -> Result<DocumentActionIdentity, IpcFailure> {
+    let document_id = document_id.parse::<DocumentId>().map_err(|_| {
+        IpcFailure::new(
+            "invalid_document_id",
+            "the captured document ID is invalid",
+            false,
+        )
+    })?;
+    let expected_revision_id = expected_revision_id.parse::<RevisionId>().map_err(|_| {
+        IpcFailure::new(
+            "invalid_revision_id",
+            "the captured document revision ID is invalid",
+            false,
+        )
+    })?;
+    let expected_blob_id = expected_blob_id.parse::<BlobId>().map_err(|_| {
+        IpcFailure::new(
+            "invalid_blob_id",
+            "the captured document blob ID is invalid",
+            false,
+        )
+    })?;
+    Ok(DocumentActionIdentity {
+        document: document_id,
+        revision: expected_revision_id,
+        blob: expected_blob_id,
+    })
+}
+
+fn resolve_document_action_file(
+    store: &ProjectStore,
+    identity: DocumentActionIdentity,
+) -> Result<DocumentFileAuthority, IpcFailure> {
+    store
+        .reconcile_document_lifecycle()
+        .map_err(IpcFailure::store)?;
+    let relative_path = registered_document_action_path(store, identity)?;
+    let authority = store
+        .open_document_file(&relative_path)
+        .map_err(IpcFailure::store)?;
+    let loaded = authority.document();
+    if loaded.document_id != identity.document
+        || loaded.revision_id != identity.revision
+        || loaded.blob_id != identity.blob
+    {
+        return Err(stale_document_action_failure());
+    }
+    Ok(authority)
+}
+
+fn finish_document_open(authority: DocumentFileAuthority) -> Result<LoadedDocument, IpcFailure> {
+    authority.into_document().map_err(IpcFailure::store)
+}
+
+fn rename_registered_document(
+    store: &mut ProjectStore,
+    identity: DocumentActionIdentity,
+    title: &str,
+) -> Result<DocumentSummary, IpcFailure> {
+    let mut authority = resolve_document_action_file(store, identity)?;
+    let renamed = store
+        .rename_document(&mut authority, title)
+        .map_err(IpcFailure::store)?;
+    Ok(DocumentSummary {
+        document_id: renamed.document_id.to_string(),
+        relative_path: renamed.relative_path.clone(),
+        title: renamed
+            .display_title
+            .unwrap_or_else(|| title_for_path(&renamed.relative_path)),
+        kind: renamed.kind,
+        revision_id: renamed.active_revision_id.map(|id| id.to_string()),
+        active_blob_id: Some(identity.blob.to_string()),
+        word_count: count_words(&authority.document().text),
+        externally_modified: false,
+    })
+}
+
+fn delete_registered_document(
+    store: &mut ProjectStore,
+    session_id: CommandId,
+    command_id: CommandId,
+    identity: DocumentActionIdentity,
+) -> Result<ProjectSnapshot, IpcFailure> {
+    store
+        .delete_document_file_idempotent(
+            command_id,
+            identity.document,
+            identity.revision,
+            identity.blob,
+        )
+        .map_err(IpcFailure::store)?;
+    snapshot_for(store, session_id).map_err(|mut failure| {
+        // The immutable deletion receipt may already be committed. Retaining
+        // the exact command ID lets the renderer replay and recover the
+        // authoritative snapshot without issuing a second deletion.
+        failure.retryable = true;
+        failure
+    })
+}
+
+fn registered_document_action_path(
+    store: &ProjectStore,
+    identity: DocumentActionIdentity,
+) -> Result<String, IpcFailure> {
+    let registered = store
+        .registered_document(identity.document)
+        .map_err(IpcFailure::store)?
+        .ok_or_else(|| {
+            IpcFailure::new(
+                "document_not_found",
+                "the captured document is not registered in this project",
+                false,
+            )
+        })?;
+    if registered.active_revision_id != Some(identity.revision) {
+        return Err(stale_document_action_failure());
+    }
+    Ok(registered.relative_path)
+}
+
+fn stale_document_action_failure() -> IpcFailure {
+    IpcFailure::new(
+        "stale_document_action",
+        "the captured document revision is no longer the active store identity",
+        false,
+    )
+}
+
+fn validated_document_reveal_path(
+    authority: &mut DocumentFileAuthority,
+) -> Result<PathBuf, IpcFailure> {
+    authority
+        .reveal_path()
+        .map_err(document_reveal_store_failure)
+}
+
+fn document_reveal_store_failure(error: loom_store::StoreError) -> IpcFailure {
+    match error {
+        loom_store::StoreError::SymbolicLink(_) | loom_store::StoreError::NotRegularFile(_) => {
+            IpcFailure::new(
+                "document_reveal_path_refused",
+                "the registered document path is not a regular non-symbolic file",
+                false,
+            )
+        }
+        loom_store::StoreError::VisibleFileIdentityChanged(_) => IpcFailure::new(
+            "document_reveal_path_changed",
+            "the document path changed while Loom prepared the reveal",
+            false,
+        ),
+        error => IpcFailure::store(error),
+    }
+}
+
 struct DocumentExportReservation<'a> {
     state: &'a PluginState,
     project_id: String,
     session_id: String,
-    document_id: String,
-    relative_path: String,
+    identity: DocumentActionIdentity,
+    suggested_relative_path: String,
     _application_admission: MutexGuard<'a, ApplicationPhase>,
 }
 
@@ -3040,42 +3726,47 @@ fn reserve_document_export(
     state: &PluginState,
     project_id: String,
     session_id: String,
-    document_id: String,
-    relative_path: String,
+    identity: DocumentActionIdentity,
 ) -> Result<DocumentExportReservation<'_>, IpcFailure> {
     let application_admission = lock_application_admission(state, "a document export")?;
-    {
+    let suggested_relative_path = {
         let mut session = lock_session_internal(state)?;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;
-        ensure_registered_document(store, &relative_path, &document_id)?;
-    }
+        resolve_document_action_file(store, identity)?
+            .document()
+            .relative_path
+            .clone()
+    };
     Ok(DocumentExportReservation {
         state,
         project_id,
         session_id,
-        document_id,
-        relative_path,
+        identity,
+        suggested_relative_path,
         _application_admission: application_admission,
     })
 }
 
 impl DocumentExportReservation<'_> {
+    fn suggested_relative_path(&self) -> &str {
+        &self.suggested_relative_path
+    }
+
     fn export(self, destination: &Path) -> Result<Receipt, IpcFailure> {
         let mut session = lock_session_internal(self.state)?;
         let store = require_bound_store(&mut session, &self.project_id, &self.session_id)?;
-        export_registered_document(store, &self.document_id, &self.relative_path, destination)
+        export_registered_document(store, self.identity, destination)
     }
 }
 
 fn export_registered_document(
     store: &mut ProjectStore,
-    document_id: &str,
-    relative_path: &str,
+    identity: DocumentActionIdentity,
     destination: &Path,
 ) -> Result<Receipt, IpcFailure> {
-    ensure_registered_document(store, relative_path, document_id)?;
+    let mut authority = resolve_document_action_file(store, identity)?;
     store
-        .export_document(relative_path, destination)
+        .export_document_file(&mut authority, destination)
         .map(Receipt::from)
         .map_err(IpcFailure::store)
 }
@@ -3339,28 +4030,21 @@ async fn document_reconciliation_preview(
     project_id: String,
     session_id: String,
     document_id: String,
-    relative_path: String,
     expected_revision_id: String,
     expected_base_blob_id: String,
     app_text: Option<String>,
     state: State<'_, PluginState>,
 ) -> Result<ReconciliationPreview, IpcFailure> {
-    let expected_revision_id = expected_revision_id.parse::<RevisionId>().map_err(|_| {
-        IpcFailure::new(
-            "invalid_revision_id",
-            "reconciliation source revision ID is invalid",
-            false,
-        )
-    })?;
-    let expected_base_blob_id = expected_base_blob_id.parse::<BlobId>().map_err(|_| {
-        IpcFailure::new(
-            "invalid_blob_id",
-            "reconciliation base-blob ID is invalid",
-            false,
-        )
-    })?;
+    let _application_admission =
+        lock_application_admission(&state, "a document reconciliation preview")?;
+    let identity = parse_document_action_identity(
+        &document_id,
+        &expected_revision_id,
+        &expected_base_blob_id,
+    )?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    let relative_path = registered_document_action_path(store, identity)?;
     reconciliation_preview_for_store(
         store,
         PreviewRequest {
@@ -3368,8 +4052,8 @@ async fn document_reconciliation_preview(
             session_id,
             document_id,
             relative_path,
-            expected_revision_id,
-            expected_base_blob_id,
+            expected_revision_id: identity.revision,
+            expected_base_blob_id: identity.blob,
             app_text,
         },
     )
@@ -3670,6 +4354,11 @@ fn build_model_policy_get(state: State<'_, PluginState>) -> BuildModelPolicyIden
 }
 
 #[tauri::command]
+fn model_catalog_list() -> ModelCatalogSnapshot {
+    embedded_model_catalog()
+}
+
+#[tauri::command]
 async fn model_list(
     state: State<'_, PluginState>,
 ) -> Result<Vec<ModelCapabilitySummary>, IpcFailure> {
@@ -3881,10 +4570,37 @@ async fn model_load_policy_candidate<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ModelCapabilitySummary, IpcFailure> {
+    // Resolve authority before touching the renderer-supplied path. Unknown
+    // identities therefore cannot be used as filesystem-probing oracles.
+    let expectation = policy_writer_expectation(&state.build_model_policy, &profile_id)?;
+    model_load_exact_writer(expectation, model_path, app, state).await
+}
+
+/// Loads one local artifact through the exact identity embedded in the model
+/// catalog. A legacy filename/size discovery hint cannot reach generic model
+/// admission through this command.
+#[tauri::command]
+async fn model_load_catalog_candidate<R: Runtime>(
+    catalog_id: String,
+    model_path: String,
+    app: AppHandle<R>,
+    state: State<'_, PluginState>,
+) -> Result<ModelCapabilitySummary, IpcFailure> {
+    // Resolve catalog authority before touching the renderer-supplied path.
+    let expectation = catalog_writer_expectation(&catalog_id)?;
+    model_load_exact_writer(expectation, model_path, app, state).await
+}
+
+async fn model_load_exact_writer<R: Runtime>(
+    expectation: PolicyWriterExpectation,
+    model_path: String,
+    app: AppHandle<R>,
+    state: State<'_, PluginState>,
+) -> Result<ModelCapabilitySummary, IpcFailure> {
     let (model_load, plan) = {
         let application_admission = lock_application_admission(&state, "local model verification")?;
         let model_load = state.model_loads.reserve(&application_admission)?;
-        let plan = prepare_policy_model_load(&profile_id, &model_path, &state)?;
+        let plan = prepare_exact_model_load(expectation, &model_path, &state)?;
         (model_load, plan)
     };
     let (canonical_path, profile, expectation) = match plan {
@@ -3945,20 +4661,17 @@ async fn model_load_policy_candidate<R: Runtime>(
     .map_err(|error| {
         IpcFailure::new(
             "model_worker_failed",
-            format!("the policy model verification worker stopped: {error}"),
+            format!("the exact model verification worker stopped: {error}"),
             true,
         )
     })?
 }
 
-fn prepare_policy_model_load(
-    profile_id: &str,
+fn prepare_exact_model_load(
+    expectation: PolicyWriterExpectation,
     model_path: &str,
     state: &State<'_, PluginState>,
 ) -> Result<PolicyModelLoadPlan, IpcFailure> {
-    // Resolve the profile before touching the path so an unknown policy name
-    // cannot be used as a filesystem-probing oracle.
-    let expectation = policy_writer_expectation(&state.build_model_policy, profile_id)?;
     let requested = PathBuf::from(model_path);
     let canonical_path = requested.canonicalize().map_err(|error| {
         IpcFailure::new(
@@ -4051,6 +4764,31 @@ fn policy_writer_expectation(
         prompt_mode: writer.prompt_mode(),
         model_sha256: writer.model_sha256(),
         model_file_bytes: writer.model_file_bytes(),
+    })
+}
+
+fn catalog_writer_expectation(catalog_id: &str) -> Result<PolicyWriterExpectation, IpcFailure> {
+    let identity = catalog_model_identity(catalog_id).ok_or_else(|| {
+        IpcFailure::new(
+            "unknown_catalog_model",
+            "the requested model is not in this Loom catalog",
+            false,
+        )
+    })?;
+    let model_sha256 = identity.model_sha256.parse::<BlobId>().map_err(|_| {
+        IpcFailure::new(
+            "invalid_embedded_catalog_model",
+            "the embedded model catalog contains an invalid SHA-256 identity",
+            false,
+        )
+    })?;
+    Ok(PolicyWriterExpectation {
+        profile_id: identity.catalog_id.to_owned(),
+        rank: 0,
+        role: ModelRole::Writer,
+        prompt_mode: PromptMode::Completion,
+        model_sha256,
+        model_file_bytes: identity.model_file_bytes,
     })
 }
 
@@ -5257,6 +5995,389 @@ fn policy_candidate_summary(
         })
 }
 
+fn completion_operation_phase(phase: GenerationOperationPhase) -> &'static str {
+    match phase {
+        GenerationOperationPhase::Reserved => "reserved",
+        GenerationOperationPhase::Queued => "queued",
+        GenerationOperationPhase::Running => "running",
+        GenerationOperationPhase::Terminal => "terminal",
+        GenerationOperationPhase::Released => "released",
+    }
+}
+
+fn completion_terminal_class(class: GenerationTerminalClass) -> &'static str {
+    match class {
+        GenerationTerminalClass::Completed => "completed",
+        GenerationTerminalClass::Cancelled => "cancelled",
+        GenerationTerminalClass::Failed => "failed",
+    }
+}
+
+fn completion_terminal_snapshot(terminal: GenerationTerminalRecord) -> CompletionTerminalSnapshot {
+    CompletionTerminalSnapshot {
+        operation_id: terminal.identity.operation_id,
+        attempt_id: terminal.identity.attempt_id,
+        sequence: terminal.identity.sequence.to_string(),
+        class: completion_terminal_class(terminal.class),
+    }
+}
+
+fn completion_operation_snapshots(
+    state: &PluginState,
+    routes: &[ActiveGenerationRoute],
+    progress_by_run: &BTreeMap<GenerationRunId, StoredGenerationProgressText>,
+) -> Result<Option<Vec<CompletionOperationSnapshot>>, IpcFailure> {
+    let mut families = BTreeMap::<
+        String,
+        (
+            GenerationFamilyIdentity,
+            Vec<CompletionOperationBranchSnapshot>,
+        ),
+    >::new();
+    for route in routes {
+        let request_id = route.identity.request_id.clone();
+        let family = families
+            .entry(request_id)
+            .or_insert_with(|| (route.identity.clone(), Vec::new()));
+        if family.0 != route.identity {
+            return Err(IpcFailure::new(
+                "generation_lifecycle_identity_mismatch",
+                "active generation routes disagree about their owning family",
+                false,
+            ));
+        }
+        let progress = progress_by_run.get(&route.run_id).ok_or_else(|| {
+            IpcFailure::new(
+                "generation_provenance_missing",
+                "an active generation route has no durable progress projection",
+                false,
+            )
+        })?;
+        if progress.run_id != route.run_id || progress.branch_id != route.branch_id {
+            return Err(IpcFailure::new(
+                "generation_lifecycle_identity_mismatch",
+                "an active generation route disagrees with its durable progress identity",
+                false,
+            ));
+        }
+        let partial_text = match progress.last_text_delta_sequence {
+            Some(sequence) => Some(CompletionPartialTextSnapshot {
+                sequence: sequence.to_string(),
+                utf8_byte_len: u64::try_from(progress.text.len())
+                    .map_err(|_| {
+                        IpcFailure::new(
+                            "generation_progress_size_overflow",
+                            "the cumulative generation progress length does not fit u64",
+                            false,
+                        )
+                    })?
+                    .to_string(),
+                text: progress.text.clone(),
+            }),
+            None if progress.text.is_empty() => None,
+            None => {
+                return Err(IpcFailure::new(
+                    "generation_provenance_corrupt",
+                    "durable generation progress has text without a text-delta sequence",
+                    false,
+                ));
+            }
+        };
+        family.1.push(CompletionOperationBranchSnapshot {
+            run_id: route.run_id.to_string(),
+            branch_id: route.branch_id.to_string(),
+            partial_text,
+        });
+    }
+
+    let mut snapshots = Vec::with_capacity(families.len());
+    for (request_id, (_identity, branches)) in families {
+        let Some(operation) = state
+            .generation_lifecycle
+            .current_snapshot(&request_id)
+            .map_err(|error| {
+                IpcFailure::new(
+                    "generation_lifecycle_observation_failed",
+                    error.to_string(),
+                    false,
+                )
+            })?
+        else {
+            return Ok(None);
+        };
+        snapshots.push(completion_operation_snapshot(
+            request_id, operation, branches,
+        )?);
+    }
+    Ok(Some(snapshots))
+}
+
+fn completion_operation_snapshot(
+    request_id: String,
+    operation: GenerationOperationSnapshot,
+    branches: Vec<CompletionOperationBranchSnapshot>,
+) -> Result<CompletionOperationSnapshot, IpcFailure> {
+    if operation.identity.operation_id != request_id
+        || operation.authoritative_terminal != operation.final_projection
+        || operation
+            .authoritative_terminal
+            .as_ref()
+            .is_some_and(|terminal| terminal.identity != operation.identity)
+        || operation
+            .final_projection
+            .as_ref()
+            .is_some_and(|terminal| terminal.identity != operation.identity)
+    {
+        return Err(IpcFailure::new(
+            "generation_lifecycle_identity_mismatch",
+            "the generation supervisor returned facts for another operation attempt",
+            false,
+        ));
+    }
+    Ok(CompletionOperationSnapshot {
+        request_id,
+        attempt_id: operation.identity.attempt_id,
+        operation_sequence: operation.identity.sequence.to_string(),
+        phase: completion_operation_phase(operation.phase),
+        cancellation_requested: operation.cancellation_requested,
+        authoritative_terminal: operation
+            .authoritative_terminal
+            .map(completion_terminal_snapshot),
+        final_projection: operation.final_projection.map(completion_terminal_snapshot),
+        progress_sequences: operation
+            .progress_projection
+            .into_iter()
+            .map(|sequence| sequence.to_string())
+            .collect(),
+        branches,
+    })
+}
+
+fn ensure_registered_completion_document(
+    store: &ProjectStore,
+    document_id: DocumentId,
+) -> Result<(), IpcFailure> {
+    if store
+        .document_is_registered(document_id)
+        .map_err(IpcFailure::store)?
+    {
+        return Ok(());
+    }
+    Err(IpcFailure::new(
+        "document_not_found",
+        "the requested completion document is not registered in this project",
+        false,
+    ))
+}
+
+fn parse_observed_completion_runs(
+    observed_run_ids: &[String],
+) -> Result<BTreeSet<GenerationRunId>, IpcFailure> {
+    if observed_run_ids.len() > DEFAULT_MAX_ACTIVE_GENERATION_BRANCHES {
+        return Err(IpcFailure::new(
+            "completion_snapshot_observed_limit",
+            "the completion snapshot observes at most the active-generation capacity",
+            false,
+        ));
+    }
+    let parsed = observed_run_ids
+        .iter()
+        .map(|run_id| parse_generation_run_id(run_id))
+        .collect::<Result<BTreeSet<_>, IpcFailure>>()?;
+    if parsed.len() != observed_run_ids.len() {
+        return Err(IpcFailure::new(
+            "completion_snapshot_duplicate_run",
+            "the completion snapshot repeated an observed generation run",
+            false,
+        ));
+    }
+    Ok(parsed)
+}
+
+struct CompletionStoreProjection {
+    page: StoredBranchPage,
+    requested_summaries: Vec<StoredBranchSummary>,
+    progress_by_run: BTreeMap<GenerationRunId, StoredGenerationProgressText>,
+}
+
+fn read_completion_store_projection(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    document_id: DocumentId,
+    routes: &[ActiveGenerationRoute],
+    observed_run_ids: &BTreeSet<GenerationRunId>,
+) -> Result<CompletionStoreProjection, IpcFailure> {
+    let mut session = lock_session(state)?;
+    let store = require_bound_store(&mut session, project_id, session_id)?;
+    ensure_registered_completion_document(store, document_id)?;
+    let page = store
+        .branch_page(document_id, None, COMPLETION_SNAPSHOT_BRANCH_LIMIT)
+        .map_err(IpcFailure::store)?;
+    let active_routes_by_run = routes
+        .iter()
+        .map(|route| (route.run_id, route))
+        .collect::<BTreeMap<_, _>>();
+    let progress_by_run = active_routes_by_run
+        .iter()
+        .map(|(&run_id, route)| {
+            let progress = store
+                .generation_progress_text(document_id, run_id)
+                .map_err(IpcFailure::store)?;
+            if progress.branch_id != route.branch_id {
+                return Err(IpcFailure::new(
+                    "generation_lifecycle_identity_mismatch",
+                    "an active generation route disagrees with its durable progress identity",
+                    false,
+                ));
+            }
+            Ok((run_id, progress))
+        })
+        .collect::<Result<BTreeMap<_, _>, IpcFailure>>()?;
+    let requested_run_ids = active_routes_by_run
+        .keys()
+        .copied()
+        .chain(observed_run_ids.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let requested_summaries = requested_run_ids
+        .into_iter()
+        .map(|run_id| {
+            let summary = store
+                .branch_summary(document_id, run_id)
+                .map_err(IpcFailure::store)?
+                .ok_or_else(|| {
+                    IpcFailure::new(
+                        "generation_provenance_missing",
+                        "an observed generation run has no durable branch occurrence",
+                        false,
+                    )
+                })?;
+            if active_routes_by_run
+                .get(&run_id)
+                .is_some_and(|route| summary.branch_id != route.branch_id)
+            {
+                return Err(IpcFailure::new(
+                    "generation_lifecycle_identity_mismatch",
+                    "an active generation route disagrees with its durable branch identity",
+                    false,
+                ));
+            }
+            Ok(summary)
+        })
+        .collect::<Result<Vec<_>, IpcFailure>>()?;
+    Ok(CompletionStoreProjection {
+        page,
+        requested_summaries,
+        progress_by_run,
+    })
+}
+
+fn completion_snapshot_for(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    document_id: &str,
+    observed_run_ids: &[String],
+) -> Result<CompletionSnapshot, IpcFailure> {
+    let document_id = parse_document_id(document_id)?;
+    let observed_run_ids = parse_observed_completion_runs(observed_run_ids)?;
+    let (project_identity, session_identity) = {
+        let mut session = lock_session(state)?;
+        let store = require_bound_store(&mut session, project_id, session_id)?;
+        (store.manifest().project_id, parse_command_id(session_id)?)
+    };
+
+    for _ in 0..COMPLETION_SNAPSHOT_CAPTURE_ATTEMPTS {
+        let routes_before = state
+            .generations
+            .active_routes_for_document(project_identity, session_identity, document_id)
+            .map_err(|error| IpcFailure::generation_registry(&error))?;
+        let projection = read_completion_store_projection(
+            state,
+            project_id,
+            session_id,
+            document_id,
+            &routes_before,
+            &observed_run_ids,
+        )?;
+        let routes_after = state
+            .generations
+            .active_routes_for_document(project_identity, session_identity, document_id)
+            .map_err(|error| IpcFailure::generation_registry(&error))?;
+        if routes_before != routes_after {
+            continue;
+        }
+        let Some(active_operations) =
+            completion_operation_snapshots(state, &routes_after, &projection.progress_by_run)?
+        else {
+            let current_routes = state
+                .generations
+                .active_routes_for_document(project_identity, session_identity, document_id)
+                .map_err(|registry_error| IpcFailure::generation_registry(&registry_error))?;
+            if current_routes != routes_after {
+                continue;
+            }
+            return Err(IpcFailure::new(
+                "generation_lifecycle_missing",
+                "an active generation family has no authoritative supervisor operation",
+                false,
+            ));
+        };
+        let active_run_ids = routes_after
+            .iter()
+            .map(|route| route.run_id)
+            .collect::<BTreeSet<_>>();
+        let mut durable_summaries = projection.page.branches;
+        let mut included_run_ids = durable_summaries
+            .iter()
+            .map(|summary| summary.run_id)
+            .collect::<BTreeSet<_>>();
+        for summary in projection.requested_summaries {
+            if included_run_ids.insert(summary.run_id) {
+                durable_summaries.push(summary);
+            }
+        }
+        let branches = durable_summaries
+            .into_iter()
+            .map(|summary| {
+                let active = active_run_ids.contains(&summary.run_id);
+                branch_summary_snapshot(summary, active)
+            })
+            .collect();
+        return Ok(CompletionSnapshot {
+            project_id: project_identity.to_string(),
+            session_id: session_identity.to_string(),
+            document_id: document_id.to_string(),
+            active_operations,
+            branches,
+            next_cursor: projection.page.next_cursor.map(BranchCursorSnapshot::from),
+            has_more: projection.page.has_more,
+        });
+    }
+    Err(IpcFailure::new(
+        "completion_snapshot_changed",
+        "generation routes changed while the completion snapshot was captured; retry the read",
+        true,
+    ))
+}
+
+#[tauri::command]
+async fn completion_snapshot(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    observed_run_ids: Vec<String>,
+    state: State<'_, PluginState>,
+) -> Result<CompletionSnapshot, IpcFailure> {
+    completion_snapshot_for(
+        &state,
+        &project_id,
+        &session_id,
+        &document_id,
+        &observed_run_ids,
+    )
+}
+
 #[tauri::command]
 async fn branch_page(
     project_id: String,
@@ -5377,6 +6498,7 @@ fn branch_snapshot(record: StoredBranchRecord, active: bool) -> BranchSnapshot {
     BranchSnapshot {
         run_id: record.run_id.to_string(),
         branch_id: record.branch_id.to_string(),
+        weave_command_id: record.weave_command_id.map(|id| id.to_string()),
         document_id: record.document_id.to_string(),
         candidate_id: record.candidate_id.map(|id| id.to_string()),
         source_revision_id: record.source_revision_id.to_string(),
@@ -5399,6 +6521,7 @@ fn branch_summary_snapshot(summary: StoredBranchSummary, active: bool) -> Branch
     BranchSummarySnapshot {
         run_id: summary.run_id.to_string(),
         branch_id: summary.branch_id.to_string(),
+        weave_command_id: summary.weave_command_id.map(|id| id.to_string()),
         document_id: summary.document_id.to_string(),
         candidate_id: summary.candidate_id.map(|id| id.to_string()),
         source_revision_id: summary.source_revision_id.to_string(),
@@ -5469,10 +6592,8 @@ fn branch_body_snapshot(
 }
 
 fn branch_status(status: StoredBranchStatus, active: bool) -> &'static str {
-    if active {
-        return "generating";
-    }
     match status {
+        StoredBranchStatus::Interrupted if active => "generating",
         StoredBranchStatus::Interrupted => "interrupted",
         StoredBranchStatus::Completed => "ready",
         StoredBranchStatus::Cancelled => "cancelled",
@@ -6129,6 +7250,7 @@ async fn weave_start<R: Runtime>(
             .map(|started| BranchSnapshot {
                 run_id: started.generation.run_id.to_string(),
                 branch_id: started.generation.branch_id.to_string(),
+                weave_command_id: Some(started.receipt.command_id.to_string()),
                 document_id: started.generation.document_id.to_string(),
                 candidate_id: None,
                 source_revision_id: started.generation.source_revision_id.to_string(),
@@ -6661,7 +7783,12 @@ fn persist_backend_event<R: Runtime>(
                 false,
             )
         })?;
-    emit_desktop_event(app, identity, LoomEvent::Generation(canonical))
+    // The renderer event is only a wakeup hint. Persistence plus the scoped
+    // completion snapshot own recoverable state, so a suspended or closing
+    // WebView must never turn an observer-delivery failure into cancellation
+    // of otherwise healthy inference.
+    let _ = emit_desktop_event(app, identity, LoomEvent::Generation(canonical));
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -7764,20 +8891,27 @@ fn snapshot_for(
     store: &ProjectStore,
     session_id: CommandId,
 ) -> Result<ProjectSnapshot, IpcFailure> {
+    store
+        .reconcile_document_lifecycle()
+        .map_err(IpcFailure::store)?;
     let documents = store
         .list_documents()
         .map_err(IpcFailure::store)?
         .into_iter()
-        .map(|summary| -> Result<DocumentSummary, IpcFailure> {
+        .map(|summary| -> Result<Option<DocumentSummary>, IpcFailure> {
+            let title = summary
+                .display_title
+                .clone()
+                .unwrap_or_else(|| title_for_path(&summary.relative_path));
             let (active_blob_id, word_count, externally_modified) =
                 if summary.active_revision_id.is_some() {
                     let reconciliation = store
                         .reconciliation_snapshot(&summary.relative_path)
                         .map_err(IpcFailure::store)?;
-                    let word_count = reconciliation
-                        .visible
-                        .as_ref()
-                        .map_or(0, |visible| count_words(&visible.text));
+                    let Some(visible) = reconciliation.visible.as_ref() else {
+                        return Ok(None);
+                    };
+                    let word_count = count_words(&visible.text);
                     (
                         Some(reconciliation.active_blob_id.to_string()),
                         word_count,
@@ -7786,18 +8920,21 @@ fn snapshot_for(
                 } else {
                     (None, 0, false)
                 };
-            Ok(DocumentSummary {
+            Ok(Some(DocumentSummary {
                 document_id: summary.document_id.to_string(),
-                title: title_for_path(&summary.relative_path),
+                title,
                 relative_path: summary.relative_path,
                 kind: summary.kind,
                 revision_id: summary.active_revision_id.map(|id| id.to_string()),
                 active_blob_id,
                 word_count,
                 externally_modified,
-            })
+            }))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     let root = store
         .root()
         .to_str()
@@ -7820,13 +8957,18 @@ fn snapshot_for(
     })
 }
 
-fn open_document_from(document: LoadedDocument, draft: Option<TransientDraft>) -> OpenDocument {
+fn open_document_from(
+    document: LoadedDocument,
+    draft: Option<TransientDraft>,
+    display_title: Option<String>,
+) -> OpenDocument {
     let word_count = count_words(&document.text);
+    let title = display_title.unwrap_or_else(|| title_for_path(&document.relative_path));
     OpenDocument {
         visible_blob_id: document.blob_id.to_string(),
         summary: DocumentSummary {
             document_id: document.document_id.to_string(),
-            title: title_for_path(&document.relative_path),
+            title,
             relative_path: document.relative_path,
             kind: document.kind,
             revision_id: Some(document.revision_id.to_string()),
@@ -8094,11 +9236,28 @@ impl From<ExternalReconciliationOutcome> for Receipt {
 mod tests {
     use super::*;
     use std::cell::Cell;
+    use std::io::Cursor;
 
     use loom_backend_llama::{
         CapabilitySupport, NativeEvidenceCapabilities, VerifiedCapabilitySet,
     };
     use loom_types::ModelEnvironmentId;
+
+    fn png_attachment_fixture(seed: u8) -> Vec<u8> {
+        let image = image::RgbaImage::from_fn(2, 2, |x, y| {
+            image::Rgba([
+                seed.wrapping_add(u8::try_from(x).unwrap_or(u8::MAX)),
+                seed.wrapping_add(u8::try_from(y).unwrap_or(u8::MAX)),
+                seed,
+                u8::MAX,
+            ])
+        });
+        let mut encoded = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode real PNG fixture");
+        encoded.into_inner()
+    }
 
     #[derive(Debug, Default)]
     struct RecordingCancellation {
@@ -9022,6 +10181,31 @@ mod tests {
     }
 
     #[test]
+    fn catalog_candidate_requires_the_embedded_digest_before_admission() {
+        let expectation = catalog_writer_expectation("google.gemma-4-12b-it-qat-q4_0")
+            .expect("embedded catalog identity");
+        assert_eq!(expectation.profile_id, "google.gemma-4-12b-it-qat-q4_0");
+        assert_eq!(expectation.model_file_bytes, 6_975_879_296);
+        assert_eq!(
+            expectation.model_sha256.to_string(),
+            "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b"
+        );
+        assert_eq!(
+            catalog_writer_expectation("unknown.catalog-model")
+                .expect_err("unknown catalog identity must fail before path admission")
+                .code,
+            "unknown_catalog_model"
+        );
+
+        let path = Path::new("/tmp/catalog-writer.gguf");
+        let mut substituted = test_descriptor(path, &expectation, "substituted-catalog-model");
+        substituted.model_sha256 = BlobId::digest(b"same-size-substitution").to_string();
+        let error = validate_policy_model_descriptor(&substituted, path, &expectation)
+            .expect_err("catalog admission must reject a substituted digest");
+        assert_eq!(error.code, "policy_model_native_identity_mismatch");
+    }
+
+    #[test]
     fn pre_native_policy_failure_restores_the_previous_model() {
         let state = PluginState::default();
         let staged_path = PathBuf::from("/tmp/new-writer.gguf");
@@ -9373,6 +10557,297 @@ mod tests {
     }
 
     #[test]
+    fn new_document_never_reuses_a_tombstoned_historical_path() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("historical manuscript".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let historical = store
+            .read_document(INITIAL_DOCUMENT)
+            .expect("historical document");
+        store
+            .delete_document_file_idempotent(
+                CommandId::new(),
+                historical.document_id,
+                historical.revision_id,
+                historical.blob_id,
+            )
+            .expect("delete initial document");
+
+        let created = create_untitled_document(&mut store).expect("new document");
+
+        assert_eq!(created, "manuscript/Untitled-2.md");
+        assert!(
+            store
+                .document_path_is_reserved(INITIAL_DOCUMENT)
+                .expect("reserved path")
+        );
+        assert_eq!(
+            store.read_document(&created).expect("new document").text,
+            ""
+        );
+    }
+
+    struct DocumentActionFixture {
+        _temporary: tempfile::TempDir,
+        root: PathBuf,
+        store: ProjectStore,
+        identity: DocumentActionIdentity,
+    }
+
+    fn document_action_fixture() -> DocumentActionFixture {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("exact manuscript\n".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        DocumentActionFixture {
+            _temporary: temporary,
+            root,
+            store,
+            identity: DocumentActionIdentity {
+                document: document.document_id,
+                revision: document.revision_id,
+                blob: document.blob_id,
+            },
+        }
+    }
+
+    #[test]
+    fn rename_action_moves_the_manuscript_and_preserves_identity() {
+        let mut fixture = document_action_fixture();
+
+        let renamed =
+            rename_registered_document(&mut fixture.store, fixture.identity, "  A Better Name  ")
+                .expect("rename document");
+
+        assert_eq!(renamed.title, "A Better Name");
+        assert_eq!(renamed.relative_path, "manuscript/A Better Name.md");
+        assert_eq!(
+            renamed.revision_id,
+            Some(fixture.identity.revision.to_string())
+        );
+        assert_eq!(
+            renamed.active_blob_id,
+            Some(fixture.identity.blob.to_string())
+        );
+        assert_eq!(renamed.word_count, 2);
+        assert!(!fixture.root.join(INITIAL_DOCUMENT).exists());
+        assert!(fixture.root.join("manuscript/A Better Name.md").is_file());
+
+        let snapshot = snapshot_for(&fixture.store, CommandId::new()).expect("project snapshot");
+        assert_eq!(snapshot.documents.len(), 1);
+        assert_eq!(snapshot.documents[0].title, "A Better Name");
+        let loaded = fixture
+            .store
+            .read_document("manuscript/A Better Name.md")
+            .expect("reopen renamed document");
+        let display_title = fixture
+            .store
+            .registered_document(loaded.document_id)
+            .expect("read renamed registration")
+            .expect("renamed document remains registered")
+            .display_title;
+        let opened = open_document_from(loaded, None, display_title);
+        assert_eq!(opened.summary.title, "A Better Name");
+    }
+
+    #[test]
+    fn delete_action_returns_an_authoritative_snapshot_and_replays_exactly() {
+        let mut fixture = document_action_fixture();
+        let session_id = CommandId::new();
+        let command_id = CommandId::new();
+
+        let deleted = delete_registered_document(
+            &mut fixture.store,
+            session_id,
+            command_id,
+            fixture.identity,
+        )
+        .expect("delete exact document");
+
+        assert_eq!(deleted.session_id, session_id.to_string());
+        assert!(deleted.documents.is_empty());
+        assert!(!fixture.root.join(INITIAL_DOCUMENT).exists());
+        assert!(
+            fixture
+                .store
+                .registered_document(fixture.identity.document)
+                .expect("query immutable registration")
+                .is_some()
+        );
+
+        let replayed = delete_registered_document(
+            &mut fixture.store,
+            session_id,
+            command_id,
+            fixture.identity,
+        )
+        .expect("replay exact deletion");
+        assert!(replayed.documents.is_empty());
+    }
+
+    #[test]
+    fn rename_action_rejects_invalid_titles_without_mutating_the_fallback_name() {
+        let mut fixture = document_action_fixture();
+
+        let failure = rename_registered_document(&mut fixture.store, fixture.identity, "\n")
+            .expect_err("blank title must fail");
+
+        assert_eq!(failure.code, "invalid_document_title");
+        let snapshot = snapshot_for(&fixture.store, CommandId::new()).expect("project snapshot");
+        assert_eq!(
+            snapshot.documents[0].title,
+            title_for_path(INITIAL_DOCUMENT)
+        );
+    }
+
+    #[test]
+    fn rename_action_rejects_a_stale_source_revision() {
+        let mut fixture = document_action_fixture();
+        fixture
+            .store
+            .save_document(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("newer manuscript\n".to_owned()),
+                "newer edit",
+            )
+            .expect("advance source revision");
+
+        let failure =
+            rename_registered_document(&mut fixture.store, fixture.identity, "Stale Rename")
+                .expect_err("stale rename must fail");
+
+        assert_eq!(failure.code, "stale_document_action");
+        let snapshot = snapshot_for(&fixture.store, CommandId::new()).expect("project snapshot");
+        assert_eq!(
+            snapshot.documents[0].title,
+            title_for_path(INITIAL_DOCUMENT)
+        );
+    }
+
+    fn replace_visible_document_with_regular_file(root: &Path) {
+        let visible = root.join(INITIAL_DOCUMENT);
+        std::fs::rename(&visible, root.join("manuscript/original.md"))
+            .expect("retain opened original");
+        std::fs::write(&visible, "exact manuscript\n").expect("install same-byte replacement");
+    }
+
+    #[cfg(unix)]
+    fn replace_visible_document_with_symlink(root: &Path) {
+        use std::os::unix::fs::symlink;
+
+        let visible = root.join(INITIAL_DOCUMENT);
+        let outside = root
+            .parent()
+            .expect("project parent")
+            .join("outside-manuscript.md");
+        std::fs::write(&outside, "exact manuscript\n").expect("outside manuscript");
+        std::fs::rename(&visible, root.join("manuscript/original.md"))
+            .expect("retain opened original");
+        symlink(&outside, &visible).expect("install final-component symlink");
+    }
+
+    #[test]
+    fn open_action_refuses_a_same_byte_final_component_replacement() {
+        let fixture = document_action_fixture();
+        let authority = resolve_document_action_file(&fixture.store, fixture.identity)
+            .expect("capture document descriptor");
+        replace_visible_document_with_regular_file(&fixture.root);
+
+        let error = finish_document_open(authority).expect_err("replacement must fail closed");
+
+        assert_eq!(error.code, "document_path_changed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_action_refuses_a_final_component_symlink_after_descriptor_capture() {
+        let fixture = document_action_fixture();
+        let authority = resolve_document_action_file(&fixture.store, fixture.identity)
+            .expect("capture document descriptor");
+        replace_visible_document_with_symlink(&fixture.root);
+
+        let error = finish_document_open(authority).expect_err("symlink must fail closed");
+
+        assert_eq!(error.code, "symbolic_link_refused");
+    }
+
+    #[test]
+    fn export_action_refuses_a_same_byte_final_component_replacement() {
+        let mut fixture = document_action_fixture();
+        let mut authority = resolve_document_action_file(&fixture.store, fixture.identity)
+            .expect("capture document descriptor");
+        replace_visible_document_with_regular_file(&fixture.root);
+        let destination = fixture.root.join("replacement-export.md");
+
+        let error = fixture
+            .store
+            .export_document_file(&mut authority, &destination)
+            .expect_err("replacement must fail closed");
+
+        assert_eq!(IpcFailure::store(error).code, "document_path_changed");
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn export_action_refuses_a_final_component_symlink_after_descriptor_capture() {
+        let mut fixture = document_action_fixture();
+        let mut authority = resolve_document_action_file(&fixture.store, fixture.identity)
+            .expect("capture document descriptor");
+        replace_visible_document_with_symlink(&fixture.root);
+        let destination = fixture.root.join("symlink-export.md");
+
+        let error = fixture
+            .store
+            .export_document_file(&mut authority, &destination)
+            .expect_err("symlink must fail closed");
+
+        assert_eq!(IpcFailure::store(error).code, "symbolic_link_refused");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn reveal_action_refuses_a_same_byte_final_component_replacement() {
+        let fixture = document_action_fixture();
+        let mut authority = resolve_document_action_file(&fixture.store, fixture.identity)
+            .expect("capture document descriptor");
+        replace_visible_document_with_regular_file(&fixture.root);
+
+        let error = validated_document_reveal_path(&mut authority)
+            .expect_err("replacement must fail closed");
+
+        assert_eq!(error.code, "document_reveal_path_changed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reveal_action_refuses_a_final_component_symlink_after_descriptor_capture() {
+        let fixture = document_action_fixture();
+        let mut authority = resolve_document_action_file(&fixture.store, fixture.identity)
+            .expect("capture document descriptor");
+        replace_visible_document_with_symlink(&fixture.root);
+
+        let error =
+            validated_document_reveal_path(&mut authority).expect_err("symlink must fail closed");
+
+        assert_eq!(error.code, "document_reveal_path_refused");
+    }
+
+    #[test]
     fn export_copy_is_document_bound_and_refuses_uncheckpointed_visible_bytes() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -9385,15 +10860,15 @@ mod tests {
             )
             .expect("initial document");
         let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let identity = DocumentActionIdentity {
+            document: document.document_id,
+            revision: document.revision_id,
+            blob: document.blob_id,
+        };
         let destination = temporary.path().join("copy.md");
 
-        let receipt = export_registered_document(
-            &mut store,
-            &document.document_id.to_string(),
-            INITIAL_DOCUMENT,
-            &destination,
-        )
-        .expect("export copy");
+        let receipt =
+            export_registered_document(&mut store, identity, &destination).expect("export copy");
         assert_eq!(receipt.command_kind, "export");
         assert_eq!(
             std::fs::read_to_string(&destination).expect("exported bytes"),
@@ -9403,25 +10878,209 @@ mod tests {
         let wrong_destination = temporary.path().join("wrong.md");
         let wrong_identity = export_registered_document(
             &mut store,
-            &DocumentId::new().to_string(),
-            INITIAL_DOCUMENT,
+            DocumentActionIdentity {
+                document: DocumentId::new(),
+                ..identity
+            },
             &wrong_destination,
         )
         .expect_err("foreign document identity");
-        assert_eq!(wrong_identity.code, "document_identity_mismatch");
+        assert_eq!(wrong_identity.code, "document_not_found");
         assert!(!wrong_destination.exists());
+
+        let stale_revision_destination = temporary.path().join("stale-revision.md");
+        let stale_revision = export_registered_document(
+            &mut store,
+            DocumentActionIdentity {
+                revision: RevisionId::new(),
+                ..identity
+            },
+            &stale_revision_destination,
+        )
+        .expect_err("stale captured revision");
+        assert_eq!(stale_revision.code, "stale_document_action");
+        assert!(!stale_revision_destination.exists());
+
+        let stale_blob_destination = temporary.path().join("stale-blob.md");
+        let stale_blob = export_registered_document(
+            &mut store,
+            DocumentActionIdentity {
+                blob: BlobId::digest(b"other bytes"),
+                ..identity
+            },
+            &stale_blob_destination,
+        )
+        .expect_err("stale captured blob");
+        assert_eq!(stale_blob.code, "stale_document_action");
+        assert!(!stale_blob_destination.exists());
 
         std::fs::write(root.join(INITIAL_DOCUMENT), "external edit\n").expect("external edit");
         let stale_destination = temporary.path().join("stale.md");
-        let stale = export_registered_document(
-            &mut store,
-            &document.document_id.to_string(),
-            INITIAL_DOCUMENT,
-            &stale_destination,
-        )
-        .expect_err("uncheckpointed visible bytes");
+        let stale = export_registered_document(&mut store, identity, &stale_destination)
+            .expect_err("uncheckpointed visible bytes");
         assert_eq!(stale.code, "external_file_change");
         assert!(!stale_destination.exists());
+    }
+
+    #[test]
+    fn document_action_resolves_only_the_explicit_captured_document_id() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                "manuscript/first.md",
+                DocumentContent::Prose("first document\n".to_owned()),
+                "first",
+            )
+            .expect("first document");
+        store
+            .create_document_if_absent(
+                "manuscript/second.md",
+                DocumentContent::Prose("second document\n".to_owned()),
+                "second",
+            )
+            .expect("second document");
+        let captured = store
+            .read_document("manuscript/first.md")
+            .expect("captured first document");
+        let other = store
+            .read_document("manuscript/second.md")
+            .expect("other document");
+        assert_ne!(captured.document_id, other.document_id);
+        let authority = resolve_document_action_file(
+            &store,
+            DocumentActionIdentity {
+                document: captured.document_id,
+                revision: captured.revision_id,
+                blob: captured.blob_id,
+            },
+        )
+        .expect("resolve captured document");
+        let resolved = finish_document_open(authority).expect("finish captured document open");
+
+        assert_eq!(resolved.document_id, captured.document_id);
+        assert_eq!(resolved.relative_path, "manuscript/first.md");
+        assert_eq!(resolved.text, "first document\n");
+    }
+
+    #[test]
+    fn reveal_path_is_store_derived_contained_and_bound_to_external_bytes() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("exact manuscript\n".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let identity = DocumentActionIdentity {
+            document: document.document_id,
+            revision: document.revision_id,
+            blob: document.blob_id,
+        };
+        let mut authority =
+            resolve_document_action_file(&store, identity).expect("resolve reveal authority");
+        let path = validated_document_reveal_path(&mut authority).expect("validated reveal path");
+        assert_eq!(path, store.root().join(INITIAL_DOCUMENT));
+
+        std::fs::write(root.join(INITIAL_DOCUMENT), "external edit\n").expect("external edit");
+        let reveal_external_error =
+            validated_document_reveal_path(&mut authority).expect_err("external reveal bytes");
+        assert_eq!(reveal_external_error.code, "external_file_change");
+        let external_error =
+            resolve_document_action_file(&store, identity).expect_err("external bytes");
+        assert_eq!(external_error.code, "external_file_change");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reveal_path_refuses_a_symbolic_document_target() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("exact manuscript\n".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let identity = DocumentActionIdentity {
+            document: document.document_id,
+            revision: document.revision_id,
+            blob: document.blob_id,
+        };
+        let mut authority =
+            resolve_document_action_file(&store, identity).expect("resolve reveal authority");
+        let outside = temporary.path().join("outside.md");
+        std::fs::write(&outside, "exact manuscript\n").expect("outside file");
+        let visible = root.join(INITIAL_DOCUMENT);
+        std::fs::remove_file(&visible).expect("remove captured visible file");
+        symlink(&outside, &visible).expect("symbolic document replacement");
+
+        let error =
+            validated_document_reveal_path(&mut authority).expect_err("symbolic reveal target");
+        assert_eq!(error.code, "document_reveal_path_refused");
+    }
+
+    #[test]
+    fn export_dialog_reservation_revalidates_the_captured_identity_before_writing() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("captured manuscript\n".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let identity = DocumentActionIdentity {
+            document: document.document_id,
+            revision: document.revision_id,
+            blob: document.blob_id,
+        };
+        let project_id = store.manifest().project_id.to_string();
+        let session_id = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+        let reservation =
+            reserve_document_export(&state, project_id, session_id.to_string(), identity)
+                .expect("reserve export dialog");
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session
+                .store
+                .as_mut()
+                .expect("bound store")
+                .save_document(
+                    INITIAL_DOCUMENT,
+                    DocumentContent::Prose("new active manuscript\n".to_owned()),
+                    "edit while export dialog is open",
+                )
+                .expect("new active revision");
+        }
+        let destination = temporary.path().join("stale-export.md");
+
+        let error = reservation
+            .export(&destination)
+            .expect_err("captured revision changed while dialog was open");
+
+        assert_eq!(error.code, "stale_document_action");
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -9436,11 +11095,12 @@ mod tests {
                 "initial manuscript",
             )
             .expect("initial document");
-        let document_id = store
-            .read_document(INITIAL_DOCUMENT)
-            .expect("document")
-            .document_id
-            .to_string();
+        let document = store.read_document(INITIAL_DOCUMENT).expect("document");
+        let identity = DocumentActionIdentity {
+            document: document.document_id,
+            revision: document.revision_id,
+            blob: document.blob_id,
+        };
         let project_id = store.manifest().project_id.to_string();
         let session_id = CommandId::new();
         let state = Arc::new(PluginState::default());
@@ -9450,14 +11110,9 @@ mod tests {
             session.store = Some(store);
             session.active_session_id = Some(session_id);
         }
-        let reservation = reserve_document_export(
-            &state,
-            project_id,
-            session_id.to_string(),
-            document_id,
-            INITIAL_DOCUMENT.to_owned(),
-        )
-        .expect("reserve export dialog");
+        let reservation =
+            reserve_document_export(&state, project_id, session_id.to_string(), identity)
+                .expect("reserve export dialog");
         assert!(!record_application_exit_request(&state));
 
         let (sent, received) = std::sync::mpsc::channel();
@@ -9763,6 +11418,7 @@ mod tests {
         let record = StoredBranchRecord {
             run_id: GenerationRunId::new(),
             branch_id: BranchId::new(),
+            weave_command_id: Some(CommandId::new()),
             document_id: DocumentId::new(),
             source_revision_id: RevisionId::new(),
             target_range: ByteRange::new(7, 7).expect("target range"),
@@ -9779,6 +11435,16 @@ mod tests {
         };
         let interrupted = branch_snapshot(record.clone(), false);
         assert_eq!(interrupted.status, "interrupted");
+        assert_eq!(
+            interrupted.weave_command_id.as_deref(),
+            Some(
+                record
+                    .weave_command_id
+                    .expect("weave command")
+                    .to_string()
+                    .as_str()
+            )
+        );
         let live = branch_snapshot(record, true);
         assert_eq!(live.status, "generating");
     }
@@ -9932,6 +11598,28 @@ mod tests {
     }
 
     #[test]
+    fn default_project_reopen_does_not_recreate_initial_after_rename() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let mut first = open_or_initialize_default_project(&root).expect("create default project");
+        let mut authority = first
+            .open_document_file(INITIAL_DOCUMENT)
+            .expect("open initial document");
+        first
+            .rename_document(&mut authority, "Renamed")
+            .expect("rename initial document");
+        drop(first);
+
+        let reopened = open_or_initialize_default_project(&root).expect("reopen renamed project");
+        let documents = reopened.list_documents().expect("active catalogue");
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].relative_path, "manuscript/Renamed.md");
+        assert!(!root.join(INITIAL_DOCUMENT).exists());
+        assert!(root.join("manuscript/Renamed.md").is_file());
+    }
+
+    #[test]
     fn default_project_repairs_interruption_after_manifest_before_document() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -10035,6 +11723,44 @@ mod tests {
         assert!(!root.join(INITIAL_DOCUMENT).exists());
     }
 
+    #[test]
+    fn default_project_reopens_after_explicit_initial_document_deletion_without_resurrection() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let mut store = open_or_initialize_default_project(&root).expect("create default project");
+        let project_id = store.manifest().project_id;
+        let initial = store
+            .read_document(INITIAL_DOCUMENT)
+            .expect("read initial document");
+        store
+            .delete_document_file_idempotent(
+                CommandId::new(),
+                initial.document_id,
+                initial.revision_id,
+                initial.blob_id,
+            )
+            .expect("explicitly delete initial document");
+        drop(store);
+
+        let reopened = open_or_initialize_default_project(&root)
+            .expect("reopen explicitly empty default project");
+
+        assert_eq!(reopened.manifest().project_id, project_id);
+        assert!(
+            reopened
+                .list_documents()
+                .expect("active catalogue")
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .registered_document(initial.document_id)
+                .expect("historical registration")
+                .is_some()
+        );
+        assert!(!root.join(INITIAL_DOCUMENT).exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn default_project_refuses_visible_symlink_before_creating_sidecar() {
@@ -10058,6 +11784,279 @@ mod tests {
             std::fs::read(&outside).expect("outside target survives"),
             outside_bytes
         );
+    }
+
+    fn append_completion_partial_text_fixture(
+        store: &mut ProjectStore,
+        document_id: DocumentId,
+        run_id: GenerationRunId,
+    ) -> u64 {
+        for text in [" world", " grows"] {
+            store
+                .append_generation_event(
+                    run_id,
+                    GenerationEventKind::TextDelta {
+                        text: text.to_owned(),
+                    },
+                )
+                .expect("persist partial text");
+        }
+        store
+            .generation_progress_text(document_id, run_id)
+            .expect("replay fixture partial text")
+            .last_text_delta_sequence
+            .expect("fixture has partial text")
+    }
+
+    fn assert_completion_partial_text(
+        branch: &CompletionOperationBranchSnapshot,
+        run_id: GenerationRunId,
+        branch_id: BranchId,
+        expected_sequence: u64,
+    ) {
+        assert_eq!(branch.run_id, run_id.to_string());
+        assert_eq!(branch.branch_id, branch_id.to_string());
+        let partial = branch
+            .partial_text
+            .as_ref()
+            .expect("active branch exposes durable partial text");
+        assert_eq!(partial.sequence, expected_sequence.to_string());
+        assert_eq!(partial.text, " world grows");
+        assert_eq!(partial.utf8_byte_len, partial.text.len().to_string());
+    }
+
+    fn assert_active_failed_completion(snapshot: &CompletionSnapshot, error: &str) {
+        assert_eq!(snapshot.active_operations.len(), 1);
+        assert_eq!(snapshot.branches[0].status, "failed");
+        assert_eq!(snapshot.branches[0].error.as_deref(), Some(error));
+    }
+
+    #[test]
+    fn completion_snapshot_joins_scoped_supervisor_and_durable_terminal_facts() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Completion Snapshot Novel");
+        let mut store =
+            initialize_project(&root, "Completion Snapshot Novel".to_owned()).expect("initialize");
+        let project_id = store.manifest().project_id;
+        let session_id = CommandId::new();
+        let (run_id, branch_id, document_id) = start_persisted_test_generation(&mut store);
+        let last_text_delta_sequence =
+            append_completion_partial_text_fixture(&mut store, document_id, run_id);
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+        let identity = GenerationFamilyIdentity {
+            request_id: "completion-snapshot-active".to_owned(),
+            project_id,
+            session_id,
+            document_id,
+        };
+        state
+            .generations
+            .register(loom_host::GenerationFamilyRegistration {
+                identity: identity.clone(),
+                branches: vec![(run_id, branch_id)],
+                cancellation: Arc::new(RecordingCancellation::default()),
+            })
+            .expect("register active family");
+        let lifecycle =
+            start_test_generation_lifecycle(&state.generation_lifecycle, &identity.request_id);
+        state
+            .generation_lifecycle
+            .publish_progress(&lifecycle, u64::MAX)
+            .expect("publish bounded supervisor progress");
+        state
+            .generation_lifecycle
+            .request_cancel(lifecycle.identity())
+            .expect("request supervisor cancellation");
+
+        let active = completion_snapshot_for(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            &document_id.to_string(),
+            &[],
+        )
+        .expect("capture active completion snapshot");
+        assert_eq!(active.project_id, project_id.to_string());
+        assert_eq!(active.session_id, session_id.to_string());
+        assert_eq!(active.document_id, document_id.to_string());
+        assert_eq!(active.active_operations.len(), 1);
+        let operation = &active.active_operations[0];
+        assert_eq!(operation.request_id, identity.request_id);
+        assert_eq!(operation.phase, "running");
+        assert!(operation.cancellation_requested);
+        assert_eq!(operation.progress_sequences, vec![u64::MAX.to_string()]);
+        assert_eq!(operation.branches.len(), 1);
+        assert_completion_partial_text(
+            &operation.branches[0],
+            run_id,
+            branch_id,
+            last_text_delta_sequence,
+        );
+        assert_eq!(active.branches.len(), 1);
+        assert_eq!(active.branches[0].status, "generating");
+
+        terminalize_open_runs(
+            &state,
+            &identity,
+            &[(run_id, branch_id)],
+            "fixture terminal failure",
+        )
+        .expect("persist authoritative terminal without releasing route");
+        let terminal = completion_snapshot_for(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            &document_id.to_string(),
+            &[run_id.to_string()],
+        )
+        .expect("capture durable terminal completion snapshot");
+        assert_active_failed_completion(&terminal, "fixture terminal failure");
+
+        release_family_after_terminal_persistence(
+            &state,
+            &identity,
+            &[(run_id, branch_id)],
+            GenerationTerminalClass::Failed,
+        )
+        .expect("release terminal family after its durable write");
+        let recovered = completion_snapshot_for(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            &document_id.to_string(),
+            &[run_id.to_string()],
+        )
+        .expect("recover the formerly active run by observed identity");
+        assert!(recovered.active_operations.is_empty());
+        assert_eq!(recovered.branches[0].status, "failed");
+    }
+
+    #[test]
+    fn completion_snapshot_rejects_stale_session_and_foreign_document_scope() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Scoped Completion Snapshot Novel");
+        let store = initialize_project(&root, "Scoped Completion Snapshot Novel".to_owned())
+            .expect("initialize");
+        let project_id = store.manifest().project_id;
+        let document_id = store
+            .list_documents()
+            .expect("list documents")
+            .first()
+            .expect("initial document")
+            .document_id;
+        let session_id = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+
+        let stale_session_error = completion_snapshot_for(
+            &state,
+            &project_id.to_string(),
+            &CommandId::new().to_string(),
+            &document_id.to_string(),
+            &[],
+        )
+        .expect_err("stale renderer session must fail");
+        assert_eq!(stale_session_error.code, "stale_project_session");
+
+        let foreign_document = completion_snapshot_for(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            &DocumentId::new().to_string(),
+            &[],
+        )
+        .expect_err("foreign document identity must fail");
+        assert_eq!(foreign_document.code, "document_not_found");
+    }
+
+    #[test]
+    fn completion_snapshot_recovers_one_observed_terminal_beyond_the_first_page() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Paged Completion Snapshot Novel");
+        let mut store = initialize_project(&root, "Paged Completion Snapshot Novel".to_owned())
+            .expect("initialize");
+        let project_id = store.manifest().project_id;
+        let session_id = CommandId::new();
+        let mut runs = Vec::with_capacity(COMPLETION_SNAPSHOT_BRANCH_LIMIT + 1);
+        let mut expected_document_id = None;
+        let mut first_branch_id = None;
+        for index in 0..=COMPLETION_SNAPSHOT_BRANCH_LIMIT {
+            let (run_id, branch_id, document_id) = start_persisted_test_generation(&mut store);
+            assert!(expected_document_id.is_none_or(|expected| expected == document_id));
+            expected_document_id = Some(document_id);
+            if first_branch_id.is_none() {
+                first_branch_id = Some(branch_id);
+            }
+            let error = format!("terminal failure {index}");
+            store
+                .finish_generation(run_id, GenerationTerminalStatus::Failed, Some(error))
+                .expect("persist terminal generation");
+            runs.push(run_id);
+        }
+        let document_id = expected_document_id.expect("one exact document");
+        let observed_run_id = runs[0];
+        let observed_branch_id = first_branch_id.expect("first branch identity");
+        let observed_run_id_text = observed_run_id.to_string();
+        let first_page = store
+            .branch_page(document_id, None, COMPLETION_SNAPSHOT_BRANCH_LIMIT)
+            .expect("read bounded first page");
+        assert!(first_page.has_more);
+        assert!(
+            first_page
+                .branches
+                .iter()
+                .all(|branch| branch.run_id != observed_run_id)
+        );
+        let expected_cursor = first_page.next_cursor.expect("first-page cursor");
+
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+        let snapshot = completion_snapshot_for(
+            &state,
+            &project_id.to_string(),
+            &session_id.to_string(),
+            &document_id.to_string(),
+            std::slice::from_ref(&observed_run_id_text),
+        )
+        .expect("recover observed terminal beyond first page");
+
+        assert!(snapshot.active_operations.is_empty());
+        assert!(snapshot.has_more);
+        assert_eq!(
+            snapshot.branches.len(),
+            COMPLETION_SNAPSHOT_BRANCH_LIMIT + 1
+        );
+        let snapshot_cursor = snapshot.next_cursor.expect("snapshot cursor");
+        assert_eq!(
+            snapshot_cursor.sequence,
+            expected_cursor.sequence.to_string()
+        );
+        assert_eq!(snapshot_cursor.run_id, expected_cursor.run_id.to_string());
+        let observed = snapshot
+            .branches
+            .iter()
+            .filter(|branch| branch.run_id == observed_run_id_text)
+            .collect::<Vec<_>>();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].branch_id, observed_branch_id.to_string());
+        assert_eq!(observed[0].status, "failed");
+        assert_eq!(observed[0].error.as_deref(), Some("terminal failure 0"));
     }
 
     #[test]
@@ -10316,6 +12315,7 @@ mod tests {
         let session_id = CommandId::new();
         let mut session = Session {
             phase: SessionPhase::Open,
+            document_filesystem_watcher: None,
             store: Some(store),
             active_session_id: Some(session_id),
             agency: AgencyGate::default(),
@@ -10333,6 +12333,343 @@ mod tests {
         )
         .expect_err("foreign project must fail");
         assert_eq!(foreign.code, "project_identity_mismatch");
+    }
+
+    #[test]
+    fn attachment_ingest_requires_exact_session_and_returns_only_bounded_paths() {
+        use base64::Engine as _;
+
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Attachment Novel");
+        let store = initialize_project(&root, "Attachment Novel".to_owned()).expect("initialize");
+        let project_id = store.manifest().project_id.to_string();
+        let session_id = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+        let png = png_attachment_fixture(7);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+
+        let stale_failure = ingest_image_attachment_for_session(
+            &state,
+            &project_id,
+            &CommandId::new().to_string(),
+            "image/png",
+            &encoded,
+        )
+        .expect_err("stale session must fail before storage");
+        assert_eq!(stale_failure.code, "stale_project_session");
+        assert_eq!(
+            std::fs::read_dir(root.join("assets"))
+                .expect("asset directory")
+                .count(),
+            0
+        );
+
+        let first = ingest_image_attachment_for_session(
+            &state,
+            &project_id,
+            &session_id.to_string(),
+            "image/png",
+            &encoded,
+        )
+        .expect("first ingest");
+        let second = ingest_image_attachment_for_session(
+            &state,
+            &project_id,
+            &session_id.to_string(),
+            "image/png",
+            &encoded,
+        )
+        .expect("idempotent ingest");
+        assert_eq!(first, second);
+        assert!(first.relative_path.starts_with("assets/"));
+        assert!(first.markdown_path.starts_with("../assets/"));
+        assert!(!first.relative_path.starts_with('/'));
+        assert!(
+            !first
+                .markdown_path
+                .contains(&root.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            std::fs::read(root.join(&first.relative_path)).expect("image"),
+            png
+        );
+
+        let foreign = ingest_image_attachment_for_session(
+            &state,
+            &ProjectId::new().to_string(),
+            &session_id.to_string(),
+            "image/png",
+            &encoded,
+        )
+        .expect_err("foreign project must fail");
+        assert_eq!(foreign.code, "project_identity_mismatch");
+    }
+
+    #[test]
+    fn asset_read_releases_session_lock_and_revalidates_authority() {
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root = temporary.path().join("Asset Read Authority");
+        let store =
+            initialize_project(&root, "Asset Read Authority".to_owned()).expect("initialize");
+        let project_id = store.manifest().project_id;
+        let expected_root = store.root().to_path_buf();
+        let session_id = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store);
+            session.active_session_id = Some(session_id);
+        }
+        let request = LoomAssetRequest {
+            project_id,
+            session_id,
+            file_name: format!("{}.png", "a".repeat(64)),
+        };
+
+        let asset =
+            read_authorized_loom_asset_with(&state, &request, |observed_root, file_name| {
+                let session = state
+                    .session
+                    .try_lock()
+                    .expect("asset reader must not hold the session lock");
+                assert_eq!(session.phase, SessionPhase::Open);
+                assert_eq!(observed_root, expected_root);
+                assert_eq!(file_name, request.file_name);
+                drop(session);
+                Ok(LoadedImageAsset {
+                    bytes: vec![1, 2, 3],
+                    media_type: "image/png",
+                })
+            })
+            .expect("unchanged authority returns the loaded asset");
+        assert_eq!(asset.bytes, vec![1, 2, 3]);
+
+        let revoked = read_authorized_loom_asset_with(&state, &request, |_, _| {
+            let mut session = state
+                .session
+                .try_lock()
+                .expect("asset reader must be able to revoke session authority");
+            session.active_session_id = Some(CommandId::new());
+            drop(session);
+            Ok(LoadedImageAsset {
+                bytes: vec![4, 5, 6],
+                media_type: "image/png",
+            })
+        });
+        assert_eq!(revoked, Err(LoomAssetReadFailure::NotFound));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn asset_protocol_authority_is_exact_across_close_switch_and_reopen() {
+        use base64::Engine as _;
+
+        fn request(uri: &str, method: http::Method) -> http::Request<Vec<u8>> {
+            http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Vec::new())
+                .expect("asset protocol request")
+        }
+
+        let temporary = tempfile::tempdir().expect("temporary parent");
+        let root_a = temporary.path().join("Project A");
+        let store_a = initialize_project(&root_a, "Project A".to_owned()).expect("project A");
+        let project_a = store_a.manifest().project_id;
+        let session_a = CommandId::new();
+        let state = PluginState::default();
+        {
+            let mut session = state.session.lock().expect("session lock");
+            session.phase = SessionPhase::Open;
+            session.store = Some(store_a);
+            session.active_session_id = Some(session_a);
+        }
+
+        let png = png_attachment_fixture(9);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+        let stored = ingest_image_attachment_for_session(
+            &state,
+            &project_a.to_string(),
+            &session_a.to_string(),
+            "image/png",
+            &encoded,
+        )
+        .expect("store project A image");
+        let file_name = Path::new(&stored.relative_path)
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .expect("asset file name");
+        let token_a = loom_asset_token(project_a, session_a, file_name).expect("asset token");
+        let mac_uri_a = format!("loom-asset://localhost/{token_a}");
+        let windows_uri_a = format!("http://loom-asset.localhost/{token_a}");
+
+        let first =
+            loom_asset_protocol_response(&state, "main", &request(&mac_uri_a, http::Method::GET));
+        assert_eq!(first.status(), http::StatusCode::OK);
+        assert_eq!(first.body(), &png);
+        assert_eq!(first.headers()[http::header::CONTENT_TYPE], "image/png");
+        assert_eq!(
+            first.headers()[http::header::CONTENT_LENGTH],
+            png.len().to_string()
+        );
+        assert_eq!(first.headers()[http::header::CACHE_CONTROL], "no-store");
+        assert_eq!(first.headers()["x-content-type-options"], "nosniff");
+
+        let windows_head = loom_asset_protocol_response(
+            &state,
+            "main",
+            &request(&windows_uri_a, http::Method::HEAD),
+        );
+        assert_eq!(windows_head.status(), http::StatusCode::OK);
+        assert!(windows_head.body().is_empty());
+        assert_eq!(
+            windows_head.headers()[http::header::CONTENT_LENGTH],
+            png.len().to_string()
+        );
+
+        assert_eq!(
+            loom_asset_protocol_response(
+                &state,
+                "auxiliary",
+                &request(&mac_uri_a, http::Method::GET),
+            )
+            .status(),
+            http::StatusCode::FORBIDDEN
+        );
+        let ranged = http::Request::builder()
+            .method(http::Method::GET)
+            .uri(&mac_uri_a)
+            .header(http::header::RANGE, "bytes=0-1")
+            .body(Vec::new())
+            .expect("range request");
+        assert_eq!(
+            loom_asset_protocol_response(&state, "main", &ranged).status(),
+            http::StatusCode::RANGE_NOT_SATISFIABLE
+        );
+        assert_eq!(
+            loom_asset_protocol_response(&state, "main", &request(&mac_uri_a, http::Method::POST),)
+                .status(),
+            http::StatusCode::METHOD_NOT_ALLOWED
+        );
+
+        close_project_with_wait(
+            &state,
+            project_a.to_string(),
+            session_a.to_string(),
+            CommandId::new(),
+            Duration::ZERO,
+        )
+        .expect("close project A");
+        assert_eq!(
+            loom_asset_protocol_response(&state, "main", &request(&mac_uri_a, http::Method::GET),)
+                .status(),
+            http::StatusCode::NOT_FOUND
+        );
+
+        let root_b = temporary.path().join("Project B");
+        let store_b = initialize_project(&root_b, "Project B".to_owned()).expect("project B");
+        let project_b = store_b.manifest().project_id;
+        let snapshot_b = reserve_project_choice(&state)
+            .expect("reserve project B open")
+            .finish_without_document_filesystem_watcher(Ok(store_b))
+            .expect("open project B");
+        let session_b = snapshot_b
+            .session_id
+            .parse::<CommandId>()
+            .expect("project B session");
+        assert_eq!(
+            loom_asset_protocol_response(&state, "main", &request(&mac_uri_a, http::Method::GET),)
+                .status(),
+            http::StatusCode::NOT_FOUND,
+            "switching projects must not accumulate project A authority"
+        );
+        close_project_with_wait(
+            &state,
+            project_b.to_string(),
+            session_b.to_string(),
+            CommandId::new(),
+            Duration::ZERO,
+        )
+        .expect("close project B");
+
+        // A fresh plugin state models process relaunch: no prior filesystem
+        // scope or in-memory admission can help this read succeed.
+        let relaunched_state = PluginState::default();
+        let reopened_a = ProjectStore::open(&root_a).expect("reopen project A from disk");
+        let snapshot_a2 = reserve_project_choice(&relaunched_state)
+            .expect("reserve project A reopen")
+            .finish_without_document_filesystem_watcher(Ok(reopened_a))
+            .expect("reopen project A");
+        let session_a2 = snapshot_a2
+            .session_id
+            .parse::<CommandId>()
+            .expect("new project A session");
+        assert_ne!(session_a2, session_a);
+        assert_eq!(
+            loom_asset_protocol_response(
+                &relaunched_state,
+                "main",
+                &request(&mac_uri_a, http::Method::GET),
+            )
+            .status(),
+            http::StatusCode::NOT_FOUND,
+            "the old project A session token stays revoked after reopen"
+        );
+        let token_a2 = loom_asset_token(project_a, session_a2, file_name).expect("reopen token");
+        let reopened_response = loom_asset_protocol_response(
+            &relaunched_state,
+            "main",
+            &request(
+                &format!("loom-asset://localhost/{token_a2}"),
+                http::Method::GET,
+            ),
+        );
+        assert_eq!(reopened_response.status(), http::StatusCode::OK);
+        assert_eq!(reopened_response.body(), &png);
+    }
+
+    #[test]
+    fn asset_protocol_parser_rejects_noncanonical_tokens_origins_and_paths() {
+        let project_id = ProjectId::new();
+        let session_id = CommandId::new();
+        let file_name = format!("{}.png", "a".repeat(64));
+        let token = loom_asset_token(project_id, session_id, &file_name).expect("canonical token");
+        let mac_uri = format!("loom-asset://localhost/{token}")
+            .parse::<http::Uri>()
+            .expect("mac URI");
+        let windows_uri = format!("http://loom-asset.localhost/{token}")
+            .parse::<http::Uri>()
+            .expect("Windows URI");
+        assert_eq!(
+            parse_loom_asset_uri(&mac_uri),
+            parse_loom_asset_uri(&windows_uri)
+        );
+        for rejected in [
+            format!("https://loom-asset.localhost/{token}"),
+            format!("loom-asset://not-localhost/{token}"),
+            format!("loom-asset://localhost/{token}?cache=1"),
+            format!("loom-asset://localhost/{token}/extra"),
+            format!("loom-asset://localhost/%25{token}"),
+            format!("loom-asset://localhost/{project_id}/{session_id}/{file_name}"),
+            format!("loom-asset://localhost/v1-{project_id}-{session_id}-../{file_name}"),
+            format!("loom-asset://localhost/V1-{project_id}-{session_id}-{file_name}"),
+            format!(
+                "loom-asset://localhost/v1-{}-{session_id}-{file_name}",
+                project_id.to_string().to_ascii_lowercase()
+            ),
+        ] {
+            let uri = rejected
+                .parse::<http::Uri>()
+                .expect("syntactically valid URI");
+            assert_eq!(parse_loom_asset_uri(&uri), None, "accepted {rejected}");
+        }
     }
 
     #[test]
@@ -10354,7 +12691,7 @@ mod tests {
     }
 
     #[test]
-    fn project_summary_keeps_active_identity_across_external_change_and_deletion() {
+    fn project_summary_keeps_active_identity_across_external_change_and_omits_deletion() {
         let fixture = ReconciliationFixture::new("one two\n");
         fixture.set_external("one two three\n");
 
@@ -10382,13 +12719,7 @@ mod tests {
         std::fs::remove_file(fixture.store.root().join(INITIAL_DOCUMENT))
             .expect("delete visible document");
         let deleted = snapshot_for(&fixture.store, CommandId::new()).expect("deleted snapshot");
-        let summary = &deleted.documents[0];
-        assert_eq!(
-            summary.active_blob_id.as_deref(),
-            Some(fixture.base.blob_id.to_string().as_str())
-        );
-        assert_eq!(summary.word_count, 0);
-        assert!(summary.externally_modified);
+        assert!(deleted.documents.is_empty());
     }
 
     #[test]

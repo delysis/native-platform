@@ -1,8 +1,8 @@
 # Mom Llama product contract
 
 This repository owns one product: Mom Llama. Reusable llama.cpp internals live
-in `delysis/llama-native-kit`; routing/protocol/provider modules live in
-`delysis/free-token-energy`; local STT/TTS lives in
+in `delysis/llama-native-kit`; the separate FTE product owns
+routing/protocol/provider modules; local STT/TTS lives in
 `delysis/speech-native-kit`; content-first attachment inspection and planning
 lives in `delysis/attachment-native-kit`.
 
@@ -20,6 +20,7 @@ lives in `delysis/attachment-native-kit`.
 
 - Use safe, idiomatic Rust. Keep authority narrow and typed.
 - Normal local inference is in-process through the pinned native-kit crates.
+- Mom does not compose FTE, its Tauri plugin, hosted providers, or loopback.
 - Rust owns state, validation, persistence, policy, inference and receipts.
 - The webview owns transient presentation only.
 - Product operations are CLI-exercisable before the GUI enables them.

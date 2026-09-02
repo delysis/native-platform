@@ -9,7 +9,9 @@ Every package must declare exactly one package group from the root catalogue.
 Portable CI must not depend on credentials, external networks, installed
 models, platform inventories, or real hardware. Tests needing those authorities
 belong in the appropriate diagnostic or real-hardware group and must state what
-they do not establish.
+they do not establish. Every `#[ignore]` test must also have an exact entry in
+`ci/ignored-tests.json`; listing or passing an ignored test never promotes the
+operational claim prohibited by that entry.
 
 The historical migration receipts and commit maps are inert provenance. Do not
 rewrite them as part of ordinary product work or add new source through them.

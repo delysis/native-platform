@@ -1184,6 +1184,11 @@ impl Drop for RequestLease {
 }
 
 impl RequestLease {
+    #[must_use]
+    pub(crate) fn sequence(&self) -> u64 {
+        self.entry.reservation_nonce
+    }
+
     pub(crate) fn queued(&self) -> NativeResult<()> {
         self.registry.queue(self)
     }

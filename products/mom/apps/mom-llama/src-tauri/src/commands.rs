@@ -1,7 +1,8 @@
 use llama_native_types::NativeDevice;
 use mom_llama_runtime::{
-    ChatSendInput, ChatSendOptions, ConversationExportFormat, EngineCheckOptions, KvCachePolicy,
-    PathSelection, PathSelectionKind, config::SettingsUpdate,
+    AttachmentPreviewAnchor, ChatDispatchOutput, ChatSendInput, ChatSendOptions,
+    ComposerAutocompleteAnchor, ComposerAutocompleteInput, ConversationExportFormat,
+    EngineCheckOptions, KvCachePolicy, PathSelection, PathSelectionKind, config::SettingsUpdate,
 };
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 use rfd::AsyncFileDialog;
@@ -13,8 +14,9 @@ use tauri::{Emitter, State, Window};
 
 use crate::app_runtime::{AppRuntimeHandle, AppWorkLease};
 use crate::command_registry::command_spec;
-
-const MAX_ATTACHMENT_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
+use crate::information::{
+    AlexandriaRightsDecision, CitationAnchor, ManagedCitationAnchor, ManagedRemovalPreview,
+};
 
 #[tauri::command]
 pub fn mom_llama_render_app(runtime: State<'_, AppRuntimeHandle>) -> Result<Response, String> {
@@ -100,6 +102,225 @@ pub async fn mom_llama_pick_file(
 }
 
 #[tauri::command]
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+pub async fn mom_llama_information_pick_alexandria(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_pick_alexandria"))?;
+    let information = runtime.information();
+    let path = tokio::select! {
+        file = AsyncFileDialog::new()
+            .add_filter("Alexandria SQLite database", &["db", "sqlite", "sqlite3"])
+            .pick_file() => file.map(|file| file.path().to_path_buf()),
+        () = lease.cancelled() => None,
+    };
+    let terminal = if lease.cancellation_requested() {
+        crate::operation_supervisor::TerminalClass::Cancelled
+    } else {
+        crate::operation_supervisor::TerminalClass::Completed
+    };
+    lease.finish(terminal)?;
+    let path = path.ok_or_else(|| "No Alexandria database was selected.".to_string())?;
+    let grant = information.issue_alexandria_path_grant(path)?;
+    to_value(grant).map_err(to_error)
+}
+
+#[tauri::command]
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+pub async fn mom_llama_information_pick_alexandria(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_pick_alexandria"))?;
+    lease.finish(crate::operation_supervisor::TerminalClass::Failed)?;
+    Err("The native Alexandria picker is unavailable on this platform.".to_string())
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_register_alexandria(
+    runtime: State<'_, AppRuntimeHandle>,
+    grant_id: String,
+    decision: AlexandriaRightsDecision,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_register_alexandria"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || {
+        information.register_alexandria(&grant_id, decision)
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn mom_llama_information_libraries(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_information_libraries"))?;
+    to_value(runtime.information().libraries()?).map_err(to_error)
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_search(
+    runtime: State<'_, AppRuntimeHandle>,
+    installation_id: String,
+    text: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_search"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || {
+        information.search_local(&installation_id, &text)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_open_citation(
+    runtime: State<'_, AppRuntimeHandle>,
+    citation: CitationAnchor,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_open_citation"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || information.open_citation(&citation)).await
+}
+
+#[tauri::command]
+pub fn mom_llama_information_grant_model_context(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation_id: String,
+    installation_id: String,
+    confirmed: bool,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_information_grant_model_context"))?;
+    to_value(runtime.information().grant_model_context(
+        &conversation_id,
+        &installation_id,
+        confirmed,
+    )?)
+    .map_err(to_error)
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_chat_send(
+    runtime: State<'_, AppRuntimeHandle>,
+    window: Window,
+    conversation_id: String,
+    grant_id: String,
+    query: String,
+    message: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_chat_send"))?;
+    let information = runtime.information();
+    let operations = runtime.operation_scope();
+    let events = window.clone();
+    blocking_command(lease, move || {
+        let message = information
+            .model_context_message(&conversation_id, &grant_id, &query, &message)
+            .map_err(anyhow::Error::msg)?;
+        mom_llama_runtime::chat_send_stream_in_scope(
+            &operations,
+            ChatSendInput {
+                conversation_id,
+                message,
+            },
+            ChatSendOptions::default(),
+            move |event| {
+                events
+                    .emit("mom_llama_chat_stream", &event)
+                    .map_err(anyhow::Error::new)?;
+                Ok(())
+            },
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_attachment_library_preview(
+    runtime: State<'_, AppRuntimeHandle>,
+    anchor: AttachmentPreviewAnchor,
+    title: String,
+    confirmed_private_use: bool,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_attachment_library_preview"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || {
+        information.preview_attachment(anchor, title, confirmed_private_use)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_attachment_library_commit(
+    runtime: State<'_, AppRuntimeHandle>,
+    preview_id: String,
+    impact_sha256: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_attachment_library_commit"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || {
+        information.commit_attachment(&preview_id, &impact_sha256)
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn mom_llama_information_managed_attachments(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_information_managed_attachments"))?;
+    to_value(runtime.information().managed_attachments()?).map_err(to_error)
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_search_managed_attachment(
+    runtime: State<'_, AppRuntimeHandle>,
+    materialization_id: String,
+    text: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec(
+        "mom_llama_information_search_managed_attachment",
+    ))?;
+    let information = runtime.information();
+    blocking_value(lease, move || {
+        information.search_managed_attachment(&materialization_id, &text)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_open_managed_citation(
+    runtime: State<'_, AppRuntimeHandle>,
+    citation: ManagedCitationAnchor,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_open_managed_citation"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || information.open_managed_citation(&citation)).await
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_managed_removal_preview(
+    runtime: State<'_, AppRuntimeHandle>,
+    materialization_id: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec(
+        "mom_llama_information_managed_removal_preview",
+    ))?;
+    let information = runtime.information();
+    blocking_value(lease, move || {
+        information.preview_managed_removal(&materialization_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_information_managed_removal_commit(
+    runtime: State<'_, AppRuntimeHandle>,
+    preview: ManagedRemovalPreview,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_information_managed_removal_commit"))?;
+    let information = runtime.information();
+    blocking_value(lease, move || information.commit_managed_removal(&preview)).await
+}
+
+#[tauri::command]
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 pub async fn mom_llama_pick_file(
     runtime: State<'_, AppRuntimeHandle>,
@@ -146,17 +367,15 @@ pub fn mom_llama_engine_configure(
     max_parallel_sequences: Option<u32>,
     memory_budget_mib: Option<u64>,
 ) -> Result<Value, String> {
-    let lease = runtime.admit(command_spec("mom_llama_engine_configure"))?;
-    let value = command_value(mom_llama_runtime::configure_engine(
+    let _lease = runtime.admit(command_spec("mom_llama_engine_configure"))?;
+    command_value(mom_llama_runtime::configure_engine(
         PathBuf::from(model_path),
         device.as_deref().map(native_device_from_str),
         context_tokens,
         batch_tokens,
         max_parallel_sequences,
         memory_budget_mib.map(mib_to_bytes),
-    ))?;
-    runtime.refresh_native_model(&lease)?;
-    Ok(value)
+    ))
 }
 
 #[tauri::command]
@@ -166,14 +385,29 @@ pub fn mom_llama_model_list(runtime: State<'_, AppRuntimeHandle>) -> Result<Valu
 }
 
 #[tauri::command]
-pub fn mom_llama_model_select(
+pub async fn mom_llama_model_select(
     runtime: State<'_, AppRuntimeHandle>,
     model_path: String,
+    conversation: Option<String>,
 ) -> Result<Value, String> {
+    let conversation = conversation.filter(|value| !value.trim().is_empty());
     let lease = runtime.admit(command_spec("mom_llama_model_select"))?;
-    let value = command_value(mom_llama_runtime::model_select(PathBuf::from(model_path)))?;
-    runtime.refresh_native_model(&lease)?;
-    Ok(value)
+    let default_intent = conversation
+        .is_none()
+        .then(mom_llama_runtime::begin_model_selection)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    blocking_command(lease, move || match conversation.as_deref() {
+        Some(conversation) => mom_llama_runtime::conversation_model_select_and_load(
+            conversation,
+            PathBuf::from(model_path),
+        ),
+        None => mom_llama_runtime::model_select_with_intent(
+            PathBuf::from(model_path),
+            default_intent.expect("default model selection always has an intent"),
+        ),
+    })
+    .await
 }
 
 #[tauri::command]
@@ -184,9 +418,11 @@ pub async fn mom_llama_chat_send(
     message: String,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_chat_send"))?;
+    let operations = runtime.operation_scope();
     let events = window.clone();
     blocking_command(lease, move || {
-        mom_llama_runtime::chat_send_stream(
+        mom_llama_runtime::chat_send_stream_in_scope(
+            &operations,
             ChatSendInput {
                 conversation_id: conversation,
                 message,
@@ -204,6 +440,82 @@ pub async fn mom_llama_chat_send(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn mom_llama_composer_autocomplete(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    draft: String,
+    active_leaf_message_id: Option<String>,
+    execution_profile_version: u64,
+    selection_start_utf16: u32,
+    selection_end_utf16: u32,
+    attachment_ids: Option<Vec<String>>,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_composer_autocomplete"))?;
+    let request_id = lease
+        .native_request_id()
+        .ok_or_else(|| "speculative autocomplete has no native request identity".to_string())?
+        .to_string();
+    let cancellation = lease
+        .cancellation_control()
+        .ok_or_else(|| "speculative autocomplete has no cancellation control".to_string())?;
+    lease
+        .run_blocking(move || {
+            let result = mom_llama_runtime::composer_autocomplete_supervised(
+                ComposerAutocompleteInput {
+                    conversation_id: conversation,
+                    draft,
+                    active_leaf_message_id,
+                    execution_profile_version,
+                    selection_start_utf16,
+                    selection_end_utf16,
+                    attachment_ids: attachment_ids.unwrap_or_default(),
+                },
+                request_id,
+                || cancellation.load(std::sync::atomic::Ordering::Acquire),
+            )
+            .map_err(to_error)?;
+            to_value(result).map_err(to_error)
+        })
+        .await
+}
+
+#[tauri::command]
+pub fn mom_llama_composer_autocomplete_cancel(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_composer_autocomplete_cancel"))?;
+    let result = mom_llama_runtime::CommandResult::passed(
+        "mom_llama.composer_autocomplete_cancel",
+        "host_integrated",
+        mom_llama_runtime::ComposerAutocompleteCancelOutput {
+            cancellation_requested_for: runtime.cancel_speculative()?,
+        },
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    );
+    to_value(result).map_err(to_error)
+}
+
+#[tauri::command]
+pub async fn mom_llama_composer_autocomplete_accept(
+    runtime: State<'_, AppRuntimeHandle>,
+    anchor: ComposerAutocompleteAnchor,
+    suffix: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_composer_autocomplete_accept"))?;
+    lease
+        .run_blocking(move || {
+            let result = mom_llama_runtime::composer_autocomplete_accept(anchor, suffix)
+                .map_err(to_error)?;
+            to_value(result).map_err(to_error)
+        })
+        .await
+}
+
+#[tauri::command]
 pub async fn mom_llama_chat_dispatch(
     runtime: State<'_, AppRuntimeHandle>,
     window: Window,
@@ -211,36 +523,12 @@ pub async fn mom_llama_chat_dispatch(
     message: String,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_chat_dispatch"))?;
+    let operations = runtime.operation_scope();
+    let runtime = runtime.inner().clone();
     let events = window.clone();
     blocking_command(lease, move || {
-        mom_llama_runtime::chat_dispatch_stream(
-            mom_llama_runtime::MentionDispatchInput {
-                conversation_id: conversation,
-                message,
-            },
-            ChatSendOptions::default(),
-            Some(move |event| {
-                events
-                    .emit("mom_llama_chat_dispatch_stream", &event)
-                    .map_err(anyhow::Error::new)?;
-                Ok(())
-            }),
-        )
-    })
-    .await
-}
-
-#[tauri::command]
-pub async fn mom_llama_mention_dispatch(
-    runtime: State<'_, AppRuntimeHandle>,
-    window: Window,
-    conversation: String,
-    message: String,
-) -> Result<Value, String> {
-    let lease = runtime.admit(command_spec("mom_llama_mention_dispatch"))?;
-    let events = window.clone();
-    blocking_command(lease, move || {
-        let mut result = mom_llama_runtime::chat_dispatch_stream(
+        let result = mom_llama_runtime::chat_dispatch_stream_in_scope(
+            &operations,
             mom_llama_runtime::MentionDispatchInput {
                 conversation_id: conversation,
                 message,
@@ -253,11 +541,58 @@ pub async fn mom_llama_mention_dispatch(
                 Ok(())
             }),
         )?;
+        observe_dispatch_approvals(&runtime, &result)?;
+        Ok(result)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_mention_dispatch(
+    runtime: State<'_, AppRuntimeHandle>,
+    window: Window,
+    conversation: String,
+    message: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_mention_dispatch"))?;
+    let operations = runtime.operation_scope();
+    let runtime = runtime.inner().clone();
+    let events = window.clone();
+    blocking_command(lease, move || {
+        let mut result = mom_llama_runtime::chat_dispatch_stream_in_scope(
+            &operations,
+            mom_llama_runtime::MentionDispatchInput {
+                conversation_id: conversation,
+                message,
+            },
+            ChatSendOptions::default(),
+            Some(move |event| {
+                events
+                    .emit("mom_llama_chat_dispatch_stream", &event)
+                    .map_err(anyhow::Error::new)?;
+                Ok(())
+            }),
+        )?;
+        observe_dispatch_approvals(&runtime, &result)?;
         result.command = "mom_llama.mention_dispatch".to_string();
         result.receipt.command = "mom_llama.mention_dispatch".to_string();
         Ok(result)
     })
     .await
+}
+
+fn observe_dispatch_approvals(
+    runtime: &AppRuntimeHandle,
+    result: &mom_llama_runtime::CommandResult<ChatDispatchOutput>,
+) -> anyhow::Result<()> {
+    if let Some(ChatDispatchOutput::Mention { invocation, .. }) = result.result.as_ref()
+        && !invocation.tool_approvals.is_empty()
+    {
+        runtime
+            .observe_persona_tool_approval_invocation(&invocation.id)
+            .map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -280,7 +615,8 @@ pub fn mom_llama_mention_cancel(
     target: Option<String>,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_mention_cancel"))?;
-    command_value(mom_llama_runtime::mention_cancel(
+    command_value(mom_llama_runtime::mention_cancel_in_scope(
+        &runtime.operation_scope(),
         &invocation,
         target.as_deref(),
     ))
@@ -294,6 +630,39 @@ pub async fn mom_llama_mention_synthesize(
     blocking_command(
         runtime.admit(command_spec("mom_llama_mention_synthesize"))?,
         move || mom_llama_runtime::mention_synthesize(&invocation),
+    )
+    .await
+}
+
+#[tauri::command]
+pub fn mom_llama_mention_tool_approval_list(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_mention_tool_approval_list"))?;
+    command_value(mom_llama_runtime::mention_tool_approval_list(&conversation))
+}
+
+#[tauri::command]
+pub async fn mom_llama_mention_tool_approval_decide(
+    runtime: State<'_, AppRuntimeHandle>,
+    invocation: String,
+    approval: String,
+    decision: mom_llama_runtime::MentionToolApprovalDecision,
+) -> Result<Value, String> {
+    let recovery = runtime.persona_tool_approval_recovery()?;
+    let operations = runtime.operation_scope();
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_mention_tool_approval_decide"))?,
+        move || {
+            mom_llama_runtime::mention_tool_approval_decide_with_recovery_in_scope(
+                &operations,
+                &invocation,
+                &approval,
+                decision,
+                &recovery,
+            )
+        },
     )
     .await
 }
@@ -351,12 +720,27 @@ pub async fn mom_llama_persona_update(
 }
 
 #[tauri::command]
-pub fn mom_llama_persona_delete(
+pub fn mom_llama_persona_removal_preview(
     runtime: State<'_, AppRuntimeHandle>,
     persona: String,
 ) -> Result<Value, String> {
-    let _lease = runtime.admit(command_spec("mom_llama_persona_delete"))?;
-    command_value(mom_llama_runtime::persona_delete(&persona))
+    let _lease = runtime.admit(command_spec("mom_llama_persona_removal_preview"))?;
+    command_value(mom_llama_runtime::persona_removal_preview_in_scope(
+        &runtime.operation_scope(),
+        &persona,
+    ))
+}
+
+#[tauri::command]
+pub fn mom_llama_persona_remove_from_library(
+    runtime: State<'_, AppRuntimeHandle>,
+    input: mom_llama_runtime::PersonaRemovalCommitInput,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_persona_remove_from_library"))?;
+    command_value(mom_llama_runtime::persona_remove_from_library_in_scope(
+        &runtime.operation_scope(),
+        input,
+    ))
 }
 
 #[tauri::command]
@@ -417,7 +801,10 @@ pub fn mom_llama_chat_cancel(
     conversation: String,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_chat_cancel"))?;
-    command_value(mom_llama_runtime::chat_cancel(&conversation))
+    command_value(mom_llama_runtime::chat_cancel_in_scope(
+        &runtime.operation_scope(),
+        &conversation,
+    ))
 }
 
 #[tauri::command]
@@ -426,7 +813,10 @@ pub fn mom_llama_chat_skip_reasoning(
     conversation: String,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_chat_skip_reasoning"))?;
-    command_value(mom_llama_runtime::chat_skip_reasoning(&conversation))
+    command_value(mom_llama_runtime::chat_skip_reasoning_in_scope(
+        &runtime.operation_scope(),
+        &conversation,
+    ))
 }
 
 #[tauri::command]
@@ -434,10 +824,16 @@ pub async fn mom_llama_chat_regenerate(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
 ) -> Result<Value, String> {
-    blocking_command(
-        runtime.admit(command_spec("mom_llama_chat_regenerate"))?,
-        move || mom_llama_runtime::chat_regenerate(&conversation, ChatSendOptions::default()),
-    )
+    blocking_command(runtime.admit(command_spec("mom_llama_chat_regenerate"))?, {
+        let operations = runtime.operation_scope();
+        move || {
+            mom_llama_runtime::chat_regenerate_in_scope(
+                &operations,
+                &conversation,
+                ChatSendOptions::default(),
+            )
+        }
+    })
     .await
 }
 
@@ -446,10 +842,16 @@ pub async fn mom_llama_chat_continue(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
 ) -> Result<Value, String> {
-    blocking_command(
-        runtime.admit(command_spec("mom_llama_chat_continue"))?,
-        move || mom_llama_runtime::chat_continue(&conversation, ChatSendOptions::default()),
-    )
+    blocking_command(runtime.admit(command_spec("mom_llama_chat_continue"))?, {
+        let operations = runtime.operation_scope();
+        move || {
+            mom_llama_runtime::chat_continue_in_scope(
+                &operations,
+                &conversation,
+                ChatSendOptions::default(),
+            )
+        }
+    })
     .await
 }
 
@@ -637,6 +1039,25 @@ pub fn mom_llama_message_copy(
 }
 
 #[tauri::command]
+pub async fn mom_llama_speech_read_aloud(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    message: String,
+    operation: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_speech_read_aloud"))?;
+    let speech = runtime.speech();
+    let result = speech
+        .read_aloud(&conversation, &message, &operation)
+        .await
+        .map_err(to_error)?;
+    let terminal = speech_terminal(&result);
+    let value = command_value(Ok(result));
+    lease.finish(terminal)?;
+    value
+}
+
+#[tauri::command]
 pub fn mom_llama_message_branches(
     runtime: State<'_, AppRuntimeHandle>,
     conversation: String,
@@ -714,7 +1135,29 @@ pub async fn mom_llama_attachment_preview(
 ) -> Result<Value, String> {
     blocking_command(
         runtime.admit(command_spec("mom_llama_attachment_preview"))?,
-        move || mom_llama_runtime::attachment_preview(&attachment, false),
+        move || mom_llama_runtime::attachment_preview(&attachment),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_attachment_preview_content(
+    runtime: State<'_, AppRuntimeHandle>,
+    attachment: String,
+    root_sha256: String,
+    artifact: String,
+    policy_fingerprint: String,
+) -> Result<Value, String> {
+    blocking_command(
+        runtime.admit(command_spec("mom_llama_attachment_preview_content"))?,
+        move || {
+            mom_llama_runtime::attachment_preview_content(&AttachmentPreviewAnchor {
+                attachment_id: attachment,
+                root_sha256,
+                artifact_id: artifact,
+                policy_fingerprint,
+            })
+        },
     )
     .await
 }
@@ -723,44 +1166,98 @@ pub async fn mom_llama_attachment_preview(
 pub async fn mom_llama_attachment_preview_bytes(
     runtime: State<'_, AppRuntimeHandle>,
     attachment: String,
+    root_sha256: String,
+    artifact: String,
+    policy_fingerprint: String,
 ) -> Result<Response, String> {
     blocking_response(
         runtime.admit(command_spec("mom_llama_attachment_preview_bytes"))?,
-        move || attachment_preview_response(&attachment),
+        move || {
+            attachment_preview_response(&AttachmentPreviewAnchor {
+                attachment_id: attachment,
+                root_sha256,
+                artifact_id: artifact,
+                policy_fingerprint,
+            })
+        },
     )
     .await
 }
 
-fn attachment_preview_response(attachment: &str) -> Result<Response, String> {
-    let preview = mom_llama_runtime::attachment_preview(attachment, false).map_err(to_error)?;
-    let metadata = preview.result.ok_or_else(|| {
-        preview
-            .blocker
-            .map(|blocker| format!("{}: {}", blocker.code, blocker.message))
-            .unwrap_or_else(|| {
-                "attachment_preview_unavailable: Preview metadata is unavailable.".to_string()
-            })
-    })?;
-    ensure_attachment_preview_size(&metadata.attachment.file_name, metadata.attachment.bytes)?;
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn mom_llama_speech_transcribe_attachment(
+    runtime: State<'_, AppRuntimeHandle>,
+    conversation: String,
+    attachment: String,
+    root_sha256: String,
+    artifact: String,
+    policy_fingerprint: String,
+    operation: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_speech_transcribe_attachment"))?;
+    let speech = runtime.speech();
+    let result = speech
+        .transcribe_attachment(
+            &conversation,
+            &AttachmentPreviewAnchor {
+                attachment_id: attachment,
+                root_sha256,
+                artifact_id: artifact,
+                policy_fingerprint,
+            },
+            &operation,
+        )
+        .await
+        .map_err(to_error)?;
+    let terminal = speech_terminal(&result);
+    let value = command_value(Ok(result));
+    lease.finish(terminal)?;
+    value
+}
 
-    let bytes = mom_llama_runtime::attachments::attachment_bytes(attachment)
+#[tauri::command]
+pub async fn mom_llama_speech_audio(
+    runtime: State<'_, AppRuntimeHandle>,
+    playback: String,
+    message: String,
+    text_sha256: String,
+    backend_descriptor_sha256: String,
+) -> Result<Response, String> {
+    let lease = runtime.admit(command_spec("mom_llama_speech_audio"))?;
+    let speech = runtime.speech();
+    blocking_response(lease, move || {
+        speech
+            .playback_bytes(
+                &playback,
+                &message,
+                &text_sha256,
+                &backend_descriptor_sha256,
+            )
+            .map(Response::new)
+    })
+    .await
+}
+
+#[tauri::command]
+pub fn mom_llama_speech_stop(
+    runtime: State<'_, AppRuntimeHandle>,
+    operation: Option<String>,
+    playback: Option<String>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_speech_stop"))?;
+    command_value(
+        runtime
+            .speech()
+            .stop(operation.as_deref(), playback.as_deref()),
+    )
+}
+
+fn attachment_preview_response(anchor: &AttachmentPreviewAnchor) -> Result<Response, String> {
+    let media = mom_llama_runtime::attachment_preview_media(anchor)
         .map_err(to_error)?
-        .ok_or_else(|| {
-            "attachment_content_missing: The attachment metadata exists, but its content is unavailable."
-                .to_string()
-        })?;
-    let loaded_bytes = u64::try_from(bytes.len()).map_err(|_| {
-        "attachment_preview_too_large: Attachment size does not fit in u64.".to_string()
-    })?;
-    ensure_attachment_preview_size(&metadata.attachment.file_name, loaded_bytes)?;
-    if loaded_bytes != metadata.attachment.bytes {
-        return Err(format!(
-            "attachment_content_size_mismatch: Attachment `{}` declares {} bytes but loaded {} bytes.",
-            metadata.attachment.file_name, metadata.attachment.bytes, loaded_bytes
-        ));
-    }
-
-    Ok(Response::new(bytes))
+        .map_err(|blocker| format!("{}: {}", blocker.code, blocker.message))?;
+    Ok(Response::new(media.bytes))
 }
 
 #[tauri::command]
@@ -771,10 +1268,8 @@ pub fn mom_llama_settings_get(runtime: State<'_, AppRuntimeHandle>) -> Result<Va
 
 #[tauri::command]
 pub fn mom_llama_settings_reset(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
-    let lease = runtime.admit(command_spec("mom_llama_settings_reset"))?;
-    let value = command_value(mom_llama_runtime::settings_reset())?;
-    runtime.refresh_native_model(&lease)?;
-    Ok(value)
+    let _lease = runtime.admit(command_spec("mom_llama_settings_reset"))?;
+    command_value(mom_llama_runtime::settings_reset())
 }
 
 #[tauri::command]
@@ -782,8 +1277,8 @@ pub fn mom_llama_settings_update(
     runtime: State<'_, AppRuntimeHandle>,
     input: SettingsUpdateInput,
 ) -> Result<Value, String> {
-    let lease = runtime.admit(command_spec("mom_llama_settings_update"))?;
-    let value = command_value(mom_llama_runtime::settings_update(SettingsUpdate {
+    let _lease = runtime.admit(command_spec("mom_llama_settings_update"))?;
+    command_value(mom_llama_runtime::settings_update(SettingsUpdate {
         model_path: path_setting_patch(input.model_path),
         mmproj_path: path_setting_patch(input.mmproj_path),
         native_device: input.device.as_deref().map(native_device_from_str),
@@ -796,9 +1291,7 @@ pub fn mom_llama_settings_update(
         max_tokens: input.max_tokens,
         kv_cache_policy: input.kv_cache_policy.as_deref().map(kv_policy_from_str),
         upstream_settings: input.upstream_settings.and_then(value_to_settings_map),
-    }))?;
-    runtime.refresh_native_model(&lease)?;
-    Ok(value)
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -958,9 +1451,10 @@ pub async fn mom_llama_mcp_list_tools(
     runtime: State<'_, AppRuntimeHandle>,
     server: String,
 ) -> Result<Value, String> {
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mcp_list_tools"))?,
-        move || mom_llama_runtime::mcp_list_tools(&server),
+        move || mom_llama_runtime::mcp_list_tools_in_scope(&operations, &server),
     )
     .await
 }
@@ -972,9 +1466,10 @@ pub async fn mom_llama_mcp_call_tool(
     tool: String,
     arguments: Value,
 ) -> Result<Value, String> {
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mcp_call_tool"))?,
-        move || mom_llama_runtime::mcp_call_tool(&server, &tool, arguments),
+        move || mom_llama_runtime::mcp_call_tool_in_scope(&operations, &server, &tool, arguments),
     )
     .await
 }
@@ -984,9 +1479,10 @@ pub async fn mom_llama_mcp_list_resources(
     runtime: State<'_, AppRuntimeHandle>,
     server: String,
 ) -> Result<Value, String> {
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mcp_list_resources"))?,
-        move || mom_llama_runtime::mcp_list_resources(&server),
+        move || mom_llama_runtime::mcp_list_resources_in_scope(&operations, &server),
     )
     .await
 }
@@ -997,9 +1493,10 @@ pub async fn mom_llama_mcp_read_resource(
     server: String,
     uri: String,
 ) -> Result<Value, String> {
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mcp_read_resource"))?,
-        move || mom_llama_runtime::mcp_read_resource(&server, &uri),
+        move || mom_llama_runtime::mcp_read_resource_in_scope(&operations, &server, &uri),
     )
     .await
 }
@@ -1009,9 +1506,10 @@ pub async fn mom_llama_mcp_list_prompts(
     runtime: State<'_, AppRuntimeHandle>,
     server: String,
 ) -> Result<Value, String> {
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mcp_list_prompts"))?,
-        move || mom_llama_runtime::mcp_list_prompts(&server),
+        move || mom_llama_runtime::mcp_list_prompts_in_scope(&operations, &server),
     )
     .await
 }
@@ -1023,9 +1521,12 @@ pub async fn mom_llama_mcp_get_prompt(
     prompt: String,
     arguments: Value,
 ) -> Result<Value, String> {
+    let operations = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mcp_get_prompt"))?,
-        move || mom_llama_runtime::mcp_get_prompt(&server, &prompt, arguments),
+        move || {
+            mom_llama_runtime::mcp_get_prompt_in_scope(&operations, &server, &prompt, arguments)
+        },
     )
     .await
 }
@@ -1041,7 +1542,8 @@ pub fn mom_llama_tool_loop_prepare(
     max_turns: Option<u32>,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_tool_loop_prepare"))?;
-    command_value(mom_llama_runtime::tool_loop_prepare(
+    command_value(mom_llama_runtime::tool_loop_prepare_in_scope(
+        &runtime.operation_scope(),
         &conversation,
         prompt,
         server,
@@ -1070,9 +1572,11 @@ pub async fn mom_llama_tool_loop_run(
     input: ToolLoopCommandInput,
 ) -> Result<Value, String> {
     let lease = runtime.admit(command_spec("mom_llama_tool_loop_run"))?;
+    let operations = runtime.operation_scope();
     let events = window.clone();
     blocking_command(lease, move || {
-        mom_llama_runtime::tool_loop_run_stream(
+        mom_llama_runtime::tool_loop_run_stream_in_scope(
+            &operations,
             mom_llama_runtime::ToolLoopRunInput {
                 conversation_id: input.conversation,
                 prompt: input.prompt,
@@ -1099,7 +1603,10 @@ pub fn mom_llama_tool_loop_cancel(
     conversation: String,
 ) -> Result<Value, String> {
     let _lease = runtime.admit(command_spec("mom_llama_tool_loop_cancel"))?;
-    command_value(mom_llama_runtime::tool_loop_cancel(&conversation))
+    command_value(mom_llama_runtime::tool_loop_cancel_in_scope(
+        &runtime.operation_scope(),
+        &conversation,
+    ))
 }
 
 #[tauri::command]
@@ -1184,7 +1691,10 @@ fn value_to_settings_map(value: Value) -> Option<std::collections::BTreeMap<Stri
 }
 
 fn path_setting_patch(value: Option<String>) -> Option<Option<PathBuf>> {
-    value.map(|value| (!value.is_empty()).then(|| PathBuf::from(value)))
+    value.map(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| PathBuf::from(value))
+    })
 }
 
 fn native_device_from_str(value: &str) -> NativeDevice {
@@ -1199,15 +1709,6 @@ fn mib_to_bytes(value: u64) -> u64 {
     value.saturating_mul(1024 * 1024)
 }
 
-fn ensure_attachment_preview_size(file_name: &str, bytes: u64) -> Result<(), String> {
-    if bytes <= MAX_ATTACHMENT_PREVIEW_BYTES {
-        return Ok(());
-    }
-    Err(format!(
-        "attachment_preview_too_large: Attachment `{file_name}` is {bytes} bytes; inline previews are limited to {MAX_ATTACHMENT_PREVIEW_BYTES} bytes."
-    ))
-}
-
 fn markup_response(result: anyhow::Result<String>) -> Result<Response, String> {
     result
         .map(|markup| Response::new(markup.into_bytes()))
@@ -1218,6 +1719,16 @@ fn command_value<T: serde::Serialize>(result: anyhow::Result<T>) -> Result<Value
     let result = result.map_err(to_error)?;
     mom_llama_runtime::persist_command_receipt(&result).map_err(to_error)?;
     to_value(result).map_err(to_error)
+}
+
+fn speech_terminal<T: serde::Serialize>(
+    result: &mom_llama_runtime::CommandResult<T>,
+) -> crate::operation_supervisor::TerminalClass {
+    match result.blocker.as_ref().map(|blocker| blocker.code.as_str()) {
+        Some("speech_cancelled") => crate::operation_supervisor::TerminalClass::Cancelled,
+        Some(_) => crate::operation_supervisor::TerminalClass::Failed,
+        None => crate::operation_supervisor::TerminalClass::Completed,
+    }
 }
 
 async fn blocking_command<T, F>(lease: AppWorkLease, operation: F) -> Result<Value, String>
@@ -1242,6 +1753,19 @@ where
     lease.run_blocking(operation).await
 }
 
+async fn blocking_value<T, F>(lease: AppWorkLease, operation: F) -> Result<Value, String>
+where
+    T: serde::Serialize + Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    lease
+        .run_blocking(move || {
+            let value = operation()?;
+            to_value(value).map_err(to_error)
+        })
+        .await
+}
+
 fn to_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
@@ -1256,7 +1780,7 @@ fn kv_policy_from_str(value: &str) -> KvCachePolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_ATTACHMENT_PREVIEW_BYTES, ensure_attachment_preview_size, path_setting_patch};
+    use super::path_setting_patch;
     use std::path::PathBuf;
 
     fn command_body<'a>(source: &'a str, name: &str) -> &'a str {
@@ -1270,20 +1794,10 @@ mod tests {
     }
 
     #[test]
-    fn attachment_preview_cap_is_checked_at_the_exact_boundary() {
-        assert!(ensure_attachment_preview_size("within.png", MAX_ATTACHMENT_PREVIEW_BYTES).is_ok());
-        let error = ensure_attachment_preview_size(
-            "too-large.png",
-            MAX_ATTACHMENT_PREVIEW_BYTES.saturating_add(1),
-        )
-        .expect_err("a preview over the hard byte ceiling must fail closed");
-        assert!(error.starts_with("attachment_preview_too_large:"));
-    }
-
-    #[test]
     fn path_setting_patch_distinguishes_omitted_clear_and_replace() {
         assert_eq!(path_setting_patch(None), None);
         assert_eq!(path_setting_patch(Some(String::new())), Some(None));
+        assert_eq!(path_setting_patch(Some("   ".to_string())), Some(None));
         assert_eq!(
             path_setting_patch(Some("/models/local.gguf".to_string())),
             Some(Some(PathBuf::from("/models/local.gguf")))
@@ -1298,6 +1812,7 @@ mod tests {
             "mom_llama_attachment_import_paste",
             "mom_llama_attachment_import",
             "mom_llama_attachment_preview",
+            "mom_llama_attachment_preview_content",
             "mom_llama_persona_update",
             "mom_llama_kv_cache_save",
             "mom_llama_kv_cache_restore",
@@ -1308,6 +1823,7 @@ mod tests {
             "mom_llama_mcp_read_resource",
             "mom_llama_mcp_list_prompts",
             "mom_llama_mcp_get_prompt",
+            "mom_llama_model_select",
             "mom_llama_model_slot_load",
             "mom_llama_model_slot_unload",
         ] {
@@ -1318,8 +1834,42 @@ mod tests {
         }
         assert!(
             command_body(source, "mom_llama_attachment_preview_bytes")
-                .contains("blocking_response("),
+                .contains("blocking_response(")
+                && command_body(source, "mom_llama_attachment_preview_bytes")
+                    .contains("AttachmentPreviewAnchor")
+                && command_body(source, "mom_llama_attachment_preview_bytes")
+                    .contains("root_sha256")
+                && command_body(source, "mom_llama_attachment_preview_bytes")
+                    .contains("policy_fingerprint"),
             "raw attachment previews must read and decrypt outside the async dispatch thread"
+        );
+        assert!(
+            command_body(source, "mom_llama_speech_audio").contains("blocking_response("),
+            "bounded complete WAV cloning must stay off the async dispatch thread"
+        );
+    }
+
+    #[test]
+    fn speech_ipc_is_path_free_and_rebinds_exact_authority() {
+        let source = include_str!("commands.rs");
+        let read_aloud = command_body(source, "mom_llama_speech_read_aloud");
+        assert!(
+            read_aloud.contains("&conversation")
+                && read_aloud.contains("&message")
+                && read_aloud.contains("&operation")
+                && !read_aloud.contains("PathBuf")
+                && !read_aloud.contains("path:"),
+            "Read Aloud IPC must accept only opaque operation and message identity"
+        );
+        let transcribe = command_body(source, "mom_llama_speech_transcribe_attachment");
+        assert!(
+            transcribe.contains("AttachmentPreviewAnchor")
+                && transcribe.contains("root_sha256")
+                && transcribe.contains("artifact_id: artifact")
+                && transcribe.contains("policy_fingerprint")
+                && !transcribe.contains("PathBuf")
+                && !transcribe.contains("path:"),
+            "transcription IPC must re-present exact Attachment authority without a path"
         );
     }
 }

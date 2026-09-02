@@ -1,11 +1,13 @@
 //! Embedded, network-free Parakeet speech recognition.
 //!
-//! The backend loads one Parakeet Realtime EOU ONNX model from the shared
-//! Hugging Face cache and creates independent decoder state per request. Model
-//! weights are never copied into application storage. The first implementation
+//! The backend accepts one exact Parakeet Realtime EOU ONNX manifest, copies
+//! verified candidates out of mutable caches into private content-addressed
+//! application storage, and creates independent decoder state per request. It
 //! intentionally advertises only what the 120M model proves: English PCM/WAV
 //! transcription with partial streaming results, without timestamps,
 //! diarization, translation, or hotword biasing.
+
+mod model_artifact;
 
 use async_trait::async_trait;
 use parakeet_rs::{ParakeetEOU, ParakeetEOUHandle};
@@ -23,16 +25,20 @@ use speech_native_types::{
 };
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 pub const PARAKEET_BACKEND_ID: &str = "parakeet-rs.eou-120m";
 pub const PARAKEET_MODEL_ID: &str = "parakeet-realtime-eou-120m-v1-onnx";
 pub const PARAKEET_HF_REPOSITORY: &str = "altunenes/parakeet-rs";
 pub const PARAKEET_HF_SUBDIRECTORY: &str = "realtime_eou_120m-v1-onnx";
+pub const PARAKEET_HF_REVISION: &str = model_artifact::MODEL_SOURCE_REVISION;
+pub const PARAKEET_MODEL_CONTENT_SHA256: &str = model_artifact::MODEL_CONTENT_SHA256;
+pub const PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID: &str =
+    "parakeet-rs-manifest-bound-deferred-loader";
 
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 const MODEL_CHUNK_SAMPLES: usize = 2_560;
@@ -41,18 +47,24 @@ const MAX_AUDIO_MS: u64 = 2 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct ParakeetBackendConfig {
+    /// Optional source candidate. Its bytes remain untrusted until copied and
+    /// verified against the checked-in model manifest.
     pub model_dir: Option<PathBuf>,
+    /// Optional injected root for private, content-addressed managed models.
+    /// Platform data storage is used when this is omitted.
+    pub managed_model_root: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 pub struct ParakeetSpeechBackend {
-    descriptor: SpeechBackendDescriptor,
-    model: Option<Arc<ParakeetEOUHandle>>,
     state: Arc<BackendState>,
 }
 
 struct BackendState {
     data: Mutex<BackendStateData>,
+    model_changed: Condvar,
+    model_config: ParakeetBackendConfig,
+    model_loader: Arc<dyn ParakeetModelLoader>,
     tasks: Arc<TaskSupervisor>,
     changed: Notify,
 }
@@ -68,7 +80,71 @@ struct BackendStateData {
     phase: BackendPhase,
     next_nonce: u64,
     active: HashMap<SpeechRequestId, ActiveParakeetOperation>,
+    model: ParakeetModelState,
     shutdown_result: Option<Result<(), SpeechError>>,
+}
+
+enum ParakeetModelState {
+    Deferred(SpeechBackendDescriptor),
+    Loading(SpeechBackendDescriptor),
+    Ready {
+        descriptor: SpeechBackendDescriptor,
+        model: Arc<ParakeetEOUHandle>,
+        initialization_ms: u64,
+    },
+    Unavailable(SpeechBackendDescriptor),
+}
+
+struct ModelAcquisition {
+    model: Arc<ParakeetEOUHandle>,
+    initialization_ms: u64,
+}
+
+enum ModelLoadOutcome {
+    Ready(Arc<ParakeetEOUHandle>),
+    Unavailable(SpeechBackendDescriptor),
+}
+
+trait ParakeetModelLoader: Send + Sync {
+    fn load(&self, config: &ParakeetBackendConfig) -> ModelLoadOutcome;
+}
+
+struct ExactParakeetModelLoader;
+
+impl ParakeetModelLoader for ExactParakeetModelLoader {
+    fn load(&self, config: &ParakeetBackendConfig) -> ModelLoadOutcome {
+        let model_dir = match model_artifact::prepare_model_dir(
+            config.model_dir.as_deref(),
+            config.managed_model_root.as_deref(),
+        ) {
+            Ok(Some(model_dir)) => model_dir,
+            Ok(None) => {
+                return ModelLoadOutcome::Unavailable(asset_required_descriptor());
+            }
+            Err(error) => {
+                return ModelLoadOutcome::Unavailable(unavailable_descriptor(format!(
+                    "Parakeet model admission failed: {error}"
+                )));
+            }
+        };
+        let loaded = model_artifact::verify_production_model_dir(&model_dir)
+            .map_err(|error| error.to_string())
+            .and_then(|()| {
+                ParakeetEOUHandle::from_pretrained(&model_dir, None)
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|handle| {
+                model_artifact::verify_production_model_dir(&model_dir)
+                    .map_err(|error| error.to_string())?;
+                Ok(handle)
+            });
+        match loaded {
+            Ok(handle) => ModelLoadOutcome::Ready(Arc::new(handle)),
+            Err(error) => ModelLoadOutcome::Unavailable(unavailable_descriptor(format!(
+                "Parakeet model loading failed: {error}"
+            ))),
+        }
+    }
 }
 
 struct ActiveParakeetOperation {
@@ -88,8 +164,144 @@ struct StreamAudioSink {
 }
 
 struct StreamControl {
-    sender: Mutex<Option<mpsc::Sender<AudioChunk>>>,
-    finished: AtomicBool,
+    pushes: mpsc::Sender<StreamPush>,
+    finishes: mpsc::Sender<oneshot::Sender<Result<(), SpeechError>>>,
+    cancel: watch::Sender<bool>,
+    phase: watch::Receiver<StreamPhase>,
+}
+
+struct StreamPush {
+    chunk: AudioChunk,
+    reply: oneshot::Sender<Result<(), SpeechError>>,
+}
+
+struct StreamDurationBudget {
+    format: PcmFormat,
+    accepted_frames: u64,
+    next_sequence: u64,
+    max_frames: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StreamAcceptance {
+    accepted_frames: u64,
+    next_sequence: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamPhase {
+    Running,
+    FinishCommitted,
+    Terminal,
+}
+
+enum PendingStreamActorAction {
+    Cancel,
+    Finish(Option<oneshot::Sender<Result<(), SpeechError>>>),
+    Capacity,
+    DownstreamClosed,
+}
+
+enum IdleStreamActorAction {
+    Cancel,
+    Finish(Option<oneshot::Sender<Result<(), SpeechError>>>),
+    DownstreamClosed,
+    Push(Option<StreamPush>),
+}
+
+impl StreamDurationBudget {
+    fn new(format: PcmFormat, request_id: &SpeechRequestId) -> Result<Self, SpeechError> {
+        let max_frames = u64::from(format.sample_rate_hz)
+            .checked_mul(MAX_AUDIO_MS)
+            .map(|sample_milliseconds| sample_milliseconds / 1_000)
+            .ok_or_else(|| {
+                backend_error(
+                    request_id,
+                    "audio_stream_geometry_overflow",
+                    SpeechErrorClass::InvalidRequest,
+                    false,
+                    "Audio stream duration geometry exceeds this platform",
+                )
+            })?;
+        Ok(Self {
+            format,
+            accepted_frames: 0,
+            next_sequence: 0,
+            max_frames,
+        })
+    }
+
+    fn checked_acceptance(
+        &self,
+        chunk: &AudioChunk,
+        request_id: &SpeechRequestId,
+    ) -> Result<StreamAcceptance, SpeechError> {
+        chunk.validate(request_id)?;
+        if chunk.format != self.format {
+            return Err(backend_error(
+                request_id,
+                "audio_stream_format_changed",
+                SpeechErrorClass::InvalidRequest,
+                false,
+                "A transcription stream must keep one PCM format",
+            ));
+        }
+        if chunk.sequence != self.next_sequence || chunk.sample_offset != self.accepted_frames {
+            return Err(backend_error(
+                request_id,
+                "audio_stream_order_invalid",
+                SpeechErrorClass::InvalidRequest,
+                false,
+                "Audio chunks must arrive in contiguous sequence and sample order",
+            ));
+        }
+        let frames =
+            u64::try_from(chunk.data.len() / self.format.bytes_per_frame()).map_err(|_| {
+                backend_error(
+                    request_id,
+                    "audio_stream_geometry_overflow",
+                    SpeechErrorClass::InvalidRequest,
+                    false,
+                    "Audio stream frame geometry exceeds this platform",
+                )
+            })?;
+        let accepted_frames = self.accepted_frames.checked_add(frames).ok_or_else(|| {
+            backend_error(
+                request_id,
+                "audio_stream_geometry_overflow",
+                SpeechErrorClass::InvalidRequest,
+                false,
+                "Audio stream cumulative frame geometry overflowed",
+            )
+        })?;
+        if accepted_frames > self.max_frames {
+            return Err(backend_error(
+                request_id,
+                "parakeet_audio_too_long",
+                SpeechErrorClass::InvalidRequest,
+                false,
+                "Streaming audio exceeds the embedded Parakeet duration limit",
+            ));
+        }
+        let next_sequence = self.next_sequence.checked_add(1).ok_or_else(|| {
+            backend_error(
+                request_id,
+                "audio_stream_geometry_overflow",
+                SpeechErrorClass::InvalidRequest,
+                false,
+                "Audio stream chunk sequence overflowed",
+            )
+        })?;
+        Ok(StreamAcceptance {
+            accepted_frames,
+            next_sequence,
+        })
+    }
+
+    fn commit(&mut self, accepted: StreamAcceptance) {
+        self.accepted_frames = accepted.accepted_frames;
+        self.next_sequence = accepted.next_sequence;
+    }
 }
 
 struct BackendOperationLease {
@@ -98,22 +310,121 @@ struct BackendOperationLease {
     nonce: u64,
 }
 
+struct ModelLoadPublication {
+    state: Arc<BackendState>,
+    published: bool,
+}
+
 impl Default for BackendState {
     fn default() -> Self {
+        Self::unavailable(asset_required_descriptor())
+    }
+}
+
+impl BackendState {
+    fn deferred(
+        model_config: ParakeetBackendConfig,
+        model_loader: Arc<dyn ParakeetModelLoader>,
+    ) -> Self {
+        Self::new(
+            model_config,
+            model_loader,
+            ParakeetModelState::Deferred(shape_admitted_deferred_descriptor()),
+        )
+    }
+
+    fn unavailable(descriptor: SpeechBackendDescriptor) -> Self {
+        Self::new(
+            ParakeetBackendConfig::default(),
+            Arc::new(ExactParakeetModelLoader),
+            ParakeetModelState::Unavailable(descriptor),
+        )
+    }
+
+    fn new(
+        model_config: ParakeetBackendConfig,
+        model_loader: Arc<dyn ParakeetModelLoader>,
+        model: ParakeetModelState,
+    ) -> Self {
         Self {
             data: Mutex::new(BackendStateData {
                 phase: BackendPhase::Running,
                 next_nonce: 0,
                 active: HashMap::new(),
+                model,
                 shutdown_result: None,
             }),
+            model_changed: Condvar::new(),
+            model_config,
+            model_loader,
             tasks: Arc::new(TaskSupervisor::default()),
             changed: Notify::new(),
         }
     }
-}
 
-impl BackendState {
+    fn descriptor(&self) -> SpeechBackendDescriptor {
+        let Ok(data) = self.data.lock() else {
+            return unavailable_descriptor("Parakeet model state is unavailable".to_owned());
+        };
+        match &data.model {
+            ParakeetModelState::Deferred(descriptor)
+            | ParakeetModelState::Loading(descriptor)
+            | ParakeetModelState::Ready { descriptor, .. } => descriptor.clone(),
+            ParakeetModelState::Unavailable(descriptor) => descriptor.clone(),
+        }
+    }
+
+    fn acquire_model(
+        self: &Arc<Self>,
+        request_id: &SpeechRequestId,
+        cancelled: &AtomicBool,
+    ) -> Result<ModelAcquisition, SpeechError> {
+        let mut observed_initialization = false;
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(cancelled_error(request_id));
+            }
+            let mut data = self.data.lock().map_err(|_| state_error())?;
+            if data.phase != BackendPhase::Running {
+                return Err(shutting_down_error(request_id));
+            }
+            match &data.model {
+                ParakeetModelState::Ready {
+                    model,
+                    initialization_ms,
+                    ..
+                } => {
+                    return Ok(ModelAcquisition {
+                        model: Arc::clone(model),
+                        initialization_ms: if observed_initialization {
+                            *initialization_ms
+                        } else {
+                            0
+                        },
+                    });
+                }
+                ParakeetModelState::Unavailable(descriptor) => {
+                    return Err(model_unavailable_error(request_id, descriptor));
+                }
+                ParakeetModelState::Loading(_) => {
+                    observed_initialization = true;
+                    data = self.model_changed.wait(data).map_err(|_| state_error())?;
+                    drop(data);
+                }
+                ParakeetModelState::Deferred(descriptor) => {
+                    let descriptor = descriptor.clone();
+                    data.model = ParakeetModelState::Loading(descriptor);
+                    observed_initialization = true;
+                    drop(data);
+                    let started = Instant::now();
+                    let publication = ModelLoadPublication::new(Arc::clone(self));
+                    let outcome = self.model_loader.load(&self.model_config);
+                    publication.publish(outcome, elapsed_ms(started));
+                }
+            }
+        }
+    }
+
     fn spawn_operation(
         self: &Arc<Self>,
         request_id: SpeechRequestId,
@@ -171,49 +482,93 @@ impl BackendState {
                 nonce,
             },
         );
+        self.changed.notify_waiters();
         Ok(())
     }
 }
 
-impl ParakeetSpeechBackend {
-    /// Discover and load the model from an explicit path or the standard
-    /// Hugging Face cache. Missing weights produce a registered but ineligible
-    /// backend so status can explain the exact remediation.
-    pub async fn discover(config: ParakeetBackendConfig) -> Self {
-        let model_dir = config.model_dir.or_else(discover_eou_model_dir);
-        let Some(model_dir) = model_dir else {
-            return Self::unavailable(asset_required_descriptor());
-        };
-        if !model_dir_is_complete(&model_dir) {
-            return Self::unavailable(asset_required_descriptor());
+impl ModelLoadPublication {
+    fn new(state: Arc<BackendState>) -> Self {
+        Self {
+            state,
+            published: false,
         }
+    }
 
-        let started = Instant::now();
-        let loaded = tokio::task::spawn_blocking(move || {
-            ParakeetEOUHandle::from_pretrained(model_dir, None)
-        })
-        .await;
-        let _initialization_ms = elapsed_ms(started);
-        match loaded {
-            Ok(Ok(handle)) => Self {
+    fn publish(mut self, outcome: ModelLoadOutcome, initialization_ms: u64) {
+        self.publish_state(match outcome {
+            ModelLoadOutcome::Ready(model) => ParakeetModelState::Ready {
                 descriptor: ready_descriptor(),
-                model: Some(Arc::new(handle)),
-                state: Arc::new(BackendState::default()),
+                model,
+                initialization_ms,
             },
-            Ok(Err(error)) => Self::unavailable(unavailable_descriptor(format!(
-                "Parakeet model loading failed: {error}"
-            ))),
-            Err(error) => Self::unavailable(unavailable_descriptor(format!(
-                "Parakeet model task failed: {error}"
-            ))),
+            ModelLoadOutcome::Unavailable(descriptor) => {
+                ParakeetModelState::Unavailable(descriptor)
+            }
+        });
+    }
+
+    fn publish_state(&mut self, model: ParakeetModelState) {
+        if let Ok(mut data) = self.state.data.lock()
+            && matches!(&data.model, ParakeetModelState::Loading(_))
+        {
+            data.model = model;
+        }
+        self.published = true;
+        self.state.model_changed.notify_all();
+        self.state.changed.notify_waiters();
+    }
+}
+
+impl Drop for ModelLoadPublication {
+    fn drop(&mut self) {
+        if !self.published {
+            self.publish_state(ParakeetModelState::Unavailable(unavailable_descriptor(
+                "Parakeet model loader panicked before publishing a verified result".to_owned(),
+            )));
+        }
+    }
+}
+
+impl ParakeetSpeechBackend {
+    /// Register the exact manifest-bound loader without reading model bytes.
+    /// The first transcription performs managed admission, verification,
+    /// session construction, and post-load verification under the backend's
+    /// joined operation supervisor.
+    pub async fn discover(config: ParakeetBackendConfig) -> Self {
+        match model_artifact::probe_model_source(
+            config.model_dir.as_deref(),
+            config.managed_model_root.as_deref(),
+        ) {
+            Ok(true) => {}
+            Ok(false) => return Self::unavailable(asset_required_descriptor()),
+            Err(error) => {
+                return Self::unavailable(unavailable_descriptor(format!(
+                    "Parakeet model shape admission failed: {error}"
+                )));
+            }
+        }
+        Self {
+            state: Arc::new(BackendState::deferred(
+                config,
+                Arc::new(ExactParakeetModelLoader),
+            )),
         }
     }
 
     fn unavailable(descriptor: SpeechBackendDescriptor) -> Self {
         Self {
-            descriptor,
-            model: None,
-            state: Arc::new(BackendState::default()),
+            state: Arc::new(BackendState::unavailable(descriptor)),
+        }
+    }
+
+    #[cfg(test)]
+    fn deferred_with_loader(loader: Arc<dyn ParakeetModelLoader>) -> Self {
+        Self {
+            state: Arc::new(BackendState::deferred(
+                ParakeetBackendConfig::default(),
+                loader,
+            )),
         }
     }
 }
@@ -221,11 +576,11 @@ impl ParakeetSpeechBackend {
 #[async_trait]
 impl SpeechBackend for ParakeetSpeechBackend {
     fn descriptor(&self) -> SpeechBackendDescriptor {
-        self.descriptor.clone()
+        self.state.descriptor()
     }
 
     fn readiness(&self) -> SpeechBackendReadiness {
-        self.descriptor.readiness.clone()
+        self.descriptor().readiness
     }
 
     async fn transcribe(
@@ -233,27 +588,17 @@ impl SpeechBackend for ParakeetSpeechBackend {
         request: TranscriptionRequest,
     ) -> Result<TranscriptionTicket, SpeechError> {
         validate_request(&request)?;
-        let model = self.model.clone().ok_or_else(|| {
-            backend_error(
-                &request.context.request_id,
-                "parakeet_model_unavailable",
-                SpeechErrorClass::AssetMissing,
-                true,
-                "The Parakeet EOU model is not loaded from the Hugging Face cache",
-            )
-        })?;
         let request_id = request.context.request_id.clone();
         let (event_sender, event_receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
         let (final_sender, final_receiver) = oneshot::channel();
+        let (model_ready_sender, model_ready_receiver) = oneshot::channel();
 
         let (audio_receiver, audio_sink, stream_control) = match &request.input {
             TranscriptionInput::Complete { .. } => (None, None, None),
             TranscriptionInput::Stream { format, .. } => {
-                let (sender, receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
-                let control = Arc::new(StreamControl {
-                    sender: Mutex::new(Some(sender)),
-                    finished: AtomicBool::new(false),
-                });
+                let (audio_sender, receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
+                let control =
+                    spawn_stream_actor(&self.state, request_id.clone(), *format, audio_sender)?;
                 let sink: Arc<dyn TranscriptionAudioSink> = Arc::new(StreamAudioSink {
                     request_id: request_id.clone(),
                     format: *format,
@@ -264,21 +609,65 @@ impl SpeechBackend for ParakeetSpeechBackend {
         };
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_cancelled = Arc::clone(&cancelled);
-        self.state.spawn_operation(
+        let worker_state = Arc::clone(&self.state);
+        let worker_request_id = request_id.clone();
+        if let Err(error) = self.state.spawn_operation(
             request_id.clone(),
             Arc::clone(&cancelled),
-            stream_control,
+            stream_control.clone(),
             move || {
+                let acquisition =
+                    worker_state.acquire_model(&worker_request_id, worker_cancelled.as_ref());
+                let acquisition = match acquisition {
+                    Ok(acquisition) => acquisition,
+                    Err(error) => {
+                        let _ = model_ready_sender.send(Err(error));
+                        return;
+                    }
+                };
+                if model_ready_sender
+                    .send(Ok(acquisition.initialization_ms))
+                    .is_err()
+                {
+                    return;
+                }
                 run_transcription(
                     request,
-                    model,
+                    acquisition.model,
                     audio_receiver,
                     worker_cancelled,
                     &event_sender,
                     final_sender,
+                    acquisition.initialization_ms,
                 );
             },
-        )?;
+        ) {
+            if let Some(stream) = &stream_control {
+                stream.cancel();
+            }
+            return Err(error);
+        }
+        match model_ready_receiver.await {
+            Ok(Ok(_initialization_ms)) => {}
+            Ok(Err(error)) => {
+                if let Some(stream) = &stream_control {
+                    stream.cancel();
+                }
+                return Err(error);
+            }
+            Err(_) => {
+                if let Some(stream) = &stream_control {
+                    stream.cancel();
+                }
+                return Err(backend_error(
+                    &request_id,
+                    "parakeet_model_loader_stopped",
+                    SpeechErrorClass::Internal,
+                    true,
+                    "The supervised Parakeet model loader stopped before publishing a result",
+                ));
+            }
+        }
 
         Ok(TranscriptionTicket::new(
             request_id,
@@ -314,6 +703,7 @@ impl SpeechBackend for ParakeetSpeechBackend {
                     for operation in data.active.values() {
                         cancel_operation(operation);
                     }
+                    self.state.model_changed.notify_all();
                     true
                 }
                 BackendPhase::Quiescing => false,
@@ -326,6 +716,7 @@ impl SpeechBackend for ParakeetSpeechBackend {
             }
         };
         if start {
+            self.state.changed.notify_waiters();
             spawn_backend_shutdown(Arc::clone(&self.state));
         }
         wait_for_backend_shutdown(&self.state).await
@@ -341,14 +732,8 @@ impl SpeechCancellation for BackendCancellation {
 #[async_trait]
 impl TranscriptionAudioSink for StreamAudioSink {
     async fn push(&self, chunk: AudioChunk) -> Result<(), SpeechError> {
-        if self.control.finished.load(Ordering::Acquire) {
-            return Err(backend_error(
-                &self.request_id,
-                "audio_stream_finished",
-                SpeechErrorClass::InvalidRequest,
-                false,
-                "Audio cannot be pushed after the stream has finished",
-            ));
+        if *self.control.phase.borrow() != StreamPhase::Running {
+            return Err(stream_finished_error(&self.request_id));
         }
         chunk.validate(&self.request_id)?;
         if chunk.format != self.format {
@@ -360,33 +745,277 @@ impl TranscriptionAudioSink for StreamAudioSink {
                 "A transcription stream must keep one PCM format",
             ));
         }
-        let sender = self
+        let (reply, response) = oneshot::channel();
+        if self
             .control
-            .sender
-            .lock()
-            .map_err(|_| stream_closed_error(&self.request_id))?
-            .clone()
-            .ok_or_else(|| stream_closed_error(&self.request_id))?;
-        sender
-            .send(chunk)
+            .pushes
+            .send(StreamPush { chunk, reply })
             .await
-            .map_err(|_| stream_closed_error(&self.request_id))?;
-        if self.control.finished.load(Ordering::Acquire) {
-            return Err(stream_closed_error(&self.request_id));
+            .is_err()
+        {
+            return Err(if *self.control.phase.borrow() == StreamPhase::Running {
+                stream_closed_error(&self.request_id)
+            } else {
+                stream_finished_error(&self.request_id)
+            });
         }
-        Ok(())
+        response
+            .await
+            .unwrap_or_else(|_| Err(stream_closed_error(&self.request_id)))
     }
 
     async fn finish(&self) -> Result<(), SpeechError> {
-        if self.control.finished.swap(true, Ordering::AcqRel) {
+        if *self.control.phase.borrow() != StreamPhase::Running {
             return Ok(());
         }
-        self.control
-            .sender
-            .lock()
-            .map_err(|_| stream_closed_error(&self.request_id))?
-            .take();
-        Ok(())
+        let (reply, response) = oneshot::channel();
+        if self.control.finishes.send(reply).await.is_err() {
+            return if *self.control.phase.borrow() != StreamPhase::Running {
+                Ok(())
+            } else {
+                Err(stream_closed_error(&self.request_id))
+            };
+        }
+        response
+            .await
+            .unwrap_or_else(|_| Err(stream_closed_error(&self.request_id)))
+    }
+}
+
+impl StreamControl {
+    fn cancel(&self) {
+        let _ = self.cancel.send(true);
+    }
+}
+
+fn spawn_stream_actor(
+    state: &BackendState,
+    request_id: SpeechRequestId,
+    format: PcmFormat,
+    audio_sender: mpsc::Sender<AudioChunk>,
+) -> Result<Arc<StreamControl>, SpeechError> {
+    let duration = StreamDurationBudget::new(format, &request_id)?;
+    spawn_stream_actor_with_budget(state, request_id, duration, audio_sender)
+}
+
+fn spawn_stream_actor_with_budget(
+    state: &BackendState,
+    request_id: SpeechRequestId,
+    duration: StreamDurationBudget,
+    audio_sender: mpsc::Sender<AudioChunk>,
+) -> Result<Arc<StreamControl>, SpeechError> {
+    let (pushes, push_receiver) = mpsc::channel(DEFAULT_SPEECH_EVENT_CAPACITY);
+    let (finishes, finish_receiver) = mpsc::channel(1);
+    let (cancel, cancel_receiver) = watch::channel(false);
+    let (phase_sender, phase) = watch::channel(StreamPhase::Running);
+    let actor_request_id = request_id.clone();
+    state
+        .tasks
+        .spawn(format!("parakeet-stream:{request_id}"), async move {
+            run_stream_actor(
+                actor_request_id,
+                duration,
+                push_receiver,
+                finish_receiver,
+                cancel_receiver,
+                phase_sender,
+                audio_sender,
+            )
+            .await;
+            Ok(())
+        })
+        .map_err(|error| task_supervisor_error(&request_id, error))?;
+    Ok(Arc::new(StreamControl {
+        pushes,
+        finishes,
+        cancel,
+        phase,
+    }))
+}
+
+async fn run_stream_actor(
+    request_id: SpeechRequestId,
+    mut duration: StreamDurationBudget,
+    mut pushes: mpsc::Receiver<StreamPush>,
+    mut finishes: mpsc::Receiver<oneshot::Sender<Result<(), SpeechError>>>,
+    mut cancel: watch::Receiver<bool>,
+    phase: watch::Sender<StreamPhase>,
+    audio_sender: mpsc::Sender<AudioChunk>,
+) {
+    let mut pending = None;
+    loop {
+        if pending.is_some() {
+            match next_pending_stream_actor_action(&mut cancel, &mut finishes, &audio_sender).await
+            {
+                PendingStreamActorAction::Cancel | PendingStreamActorAction::DownstreamClosed => {
+                    drop(audio_sender);
+                    close_stream_actor(
+                        &request_id,
+                        pending.take(),
+                        &mut pushes,
+                        &mut finishes,
+                        &phase,
+                        StreamPhase::Terminal,
+                        None,
+                    );
+                    return;
+                }
+                PendingStreamActorAction::Finish(finish) => {
+                    drop(audio_sender);
+                    close_stream_actor(
+                        &request_id,
+                        pending.take(),
+                        &mut pushes,
+                        &mut finishes,
+                        &phase,
+                        StreamPhase::FinishCommitted,
+                        finish,
+                    );
+                    return;
+                }
+                PendingStreamActorAction::Capacity => {
+                    if let Some(push) = pending.take() {
+                        let StreamPush { chunk, reply } = push;
+                        let accepted = match duration.checked_acceptance(&chunk, &request_id) {
+                            Ok(accepted) => accepted,
+                            Err(error) => {
+                                let _ = reply.send(Err(error));
+                                continue;
+                            }
+                        };
+                        match audio_sender.try_send(chunk) {
+                            Ok(()) => {
+                                duration.commit(accepted);
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(mpsc::error::TrySendError::Full(chunk)) => {
+                                pending = Some(StreamPush { chunk, reply });
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_chunk)) => {
+                                let _ = reply.send(Err(stream_closed_error(&request_id)));
+                                drop(audio_sender);
+                                close_stream_actor(
+                                    &request_id,
+                                    None,
+                                    &mut pushes,
+                                    &mut finishes,
+                                    &phase,
+                                    StreamPhase::Terminal,
+                                    None,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        match next_idle_stream_actor_action(&mut cancel, &mut pushes, &mut finishes, &audio_sender)
+            .await
+        {
+            IdleStreamActorAction::Cancel | IdleStreamActorAction::DownstreamClosed => {
+                drop(audio_sender);
+                close_stream_actor(
+                    &request_id,
+                    None,
+                    &mut pushes,
+                    &mut finishes,
+                    &phase,
+                    StreamPhase::Terminal,
+                    None,
+                );
+                return;
+            }
+            IdleStreamActorAction::Finish(finish) => {
+                drop(audio_sender);
+                close_stream_actor(
+                    &request_id,
+                    None,
+                    &mut pushes,
+                    &mut finishes,
+                    &phase,
+                    StreamPhase::FinishCommitted,
+                    finish,
+                );
+                return;
+            }
+            IdleStreamActorAction::Push(push) => {
+                let Some(push) = push else {
+                    return;
+                };
+                pending = Some(push);
+            }
+        }
+    }
+}
+
+async fn next_pending_stream_actor_action(
+    cancel: &mut watch::Receiver<bool>,
+    finishes: &mut mpsc::Receiver<oneshot::Sender<Result<(), SpeechError>>>,
+    audio_sender: &mpsc::Sender<AudioChunk>,
+) -> PendingStreamActorAction {
+    tokio::select! {
+        biased;
+        changed = cancel.changed() => {
+            let _ = changed;
+            PendingStreamActorAction::Cancel
+        }
+        finish = finishes.recv() => PendingStreamActorAction::Finish(finish),
+        permit = audio_sender.reserve() => {
+            match permit {
+                Ok(permit) => {
+                    drop(permit);
+                    PendingStreamActorAction::Capacity
+                }
+                Err(_) => PendingStreamActorAction::DownstreamClosed,
+            }
+        }
+    }
+}
+
+async fn next_idle_stream_actor_action(
+    cancel: &mut watch::Receiver<bool>,
+    pushes: &mut mpsc::Receiver<StreamPush>,
+    finishes: &mut mpsc::Receiver<oneshot::Sender<Result<(), SpeechError>>>,
+    audio_sender: &mpsc::Sender<AudioChunk>,
+) -> IdleStreamActorAction {
+    tokio::select! {
+        biased;
+        changed = cancel.changed() => {
+            let _ = changed;
+            IdleStreamActorAction::Cancel
+        }
+        finish = finishes.recv() => IdleStreamActorAction::Finish(finish),
+        () = audio_sender.closed() => IdleStreamActorAction::DownstreamClosed,
+        push = pushes.recv() => IdleStreamActorAction::Push(push),
+    }
+}
+
+fn close_stream_actor(
+    request_id: &SpeechRequestId,
+    pending: Option<StreamPush>,
+    pushes: &mut mpsc::Receiver<StreamPush>,
+    finishes: &mut mpsc::Receiver<oneshot::Sender<Result<(), SpeechError>>>,
+    phase: &watch::Sender<StreamPhase>,
+    terminal_phase: StreamPhase,
+    committed_finish: Option<oneshot::Sender<Result<(), SpeechError>>>,
+) {
+    pushes.close();
+    finishes.close();
+    phase.send_replace(terminal_phase);
+    if let Some(push) = pending {
+        let _ = push.reply.send(Err(stream_finished_error(request_id)));
+    }
+    while let Ok(push) = pushes.try_recv() {
+        let _ = push.reply.send(Err(stream_finished_error(request_id)));
+    }
+    while let Ok(finish) = finishes.try_recv() {
+        let _ = finish.send(Ok(()));
+    }
+    if let Some(finish) = committed_finish {
+        let _ = finish.send(Ok(()));
     }
 }
 
@@ -394,19 +1023,22 @@ fn cancel_request(state: &BackendState, request_id: &SpeechRequestId) -> usize {
     let Ok(data) = state.data.lock() else {
         return 0;
     };
-    data.active.get(request_id).map_or(0, |operation| {
+    let cancelled = data.active.get(request_id).map_or(0, |operation| {
         cancel_operation(operation);
         1
-    })
+    });
+    drop(data);
+    if cancelled != 0 {
+        state.model_changed.notify_all();
+        state.changed.notify_waiters();
+    }
+    cancelled
 }
 
 fn cancel_operation(operation: &ActiveParakeetOperation) {
     operation.cancelled.store(true, Ordering::Release);
     if let Some(stream) = &operation.stream {
-        stream.finished.store(true, Ordering::Release);
-        if let Ok(mut sender) = stream.sender.lock() {
-            sender.take();
-        }
+        stream.cancel();
     }
 }
 
@@ -509,6 +1141,54 @@ fn state_error() -> SpeechError {
         true,
         "Parakeet request state is unavailable",
     )
+}
+
+fn shutting_down_error(request_id: &SpeechRequestId) -> SpeechError {
+    backend_error(
+        request_id,
+        "parakeet_shutting_down",
+        SpeechErrorClass::Unavailable,
+        true,
+        "The embedded Parakeet backend is shutting down",
+    )
+}
+
+fn model_unavailable_error(
+    request_id: &SpeechRequestId,
+    descriptor: &SpeechBackendDescriptor,
+) -> SpeechError {
+    match &descriptor.readiness {
+        SpeechBackendReadiness::AssetInstallRequired { .. } => backend_error(
+            request_id,
+            "parakeet_model_asset_required",
+            SpeechErrorClass::AssetMissing,
+            true,
+            "The exact manifest-bound Parakeet model is not installed in managed storage",
+        ),
+        SpeechBackendReadiness::Unavailable { reason }
+        | SpeechBackendReadiness::NotConfigured { reason }
+        | SpeechBackendReadiness::Unknown { reason } => backend_error(
+            request_id,
+            "parakeet_model_unavailable",
+            SpeechErrorClass::Unavailable,
+            true,
+            reason,
+        ),
+        SpeechBackendReadiness::PermissionRequired { .. } => backend_error(
+            request_id,
+            "parakeet_model_permission_required",
+            SpeechErrorClass::Permission,
+            true,
+            "The exact Parakeet model cannot be admitted without local file permission",
+        ),
+        SpeechBackendReadiness::Ready => backend_error(
+            request_id,
+            "parakeet_model_state_invalid",
+            SpeechErrorClass::Internal,
+            false,
+            "Parakeet reported a ready descriptor without a verified model handle",
+        ),
+    }
 }
 
 fn task_supervisor_error(request_id: &SpeechRequestId, error: TaskSupervisorError) -> SpeechError {
@@ -614,6 +1294,7 @@ fn run_transcription(
     cancelled: Arc<AtomicBool>,
     event_sender: &mpsc::Sender<TranscriptionEvent>,
     final_sender: oneshot::Sender<Result<TranscriptionResponse, SpeechError>>,
+    model_load_ms: u64,
 ) {
     let request_id = request.context.request_id.clone();
     let route = resolved_route();
@@ -669,7 +1350,15 @@ fn run_transcription(
             true,
             "The streaming transcription input channel is unavailable",
         )),
-    };
+    }
+    .map(|mut response| {
+        response.usage.model_load_ms = Some(model_load_ms);
+        response.usage.total_ms = response
+            .usage
+            .total_ms
+            .map(|total_ms| total_ms.saturating_add(model_load_ms));
+        response
+    });
 
     match result {
         Ok(response) if cancelled.load(Ordering::Acquire) => {
@@ -934,8 +1623,8 @@ fn build_response(
         segments,
         usage: SpeechUsage {
             input_audio_ms: Some(input_audio_ms),
-            // The handle was resident before request admission. The one-time
-            // application initialization cost is not charged to every request.
+            // The worker overwrites this with the exact single-flight load
+            // duration for callers that observed first-use initialization.
             model_load_ms: Some(0),
             time_to_first_result_ms: first_result_ms,
             total_ms: Some(elapsed_ms(started_at)),
@@ -1153,63 +1842,12 @@ impl StreamingNormalizer {
     }
 }
 
-/// Resolve the EOU model without copying it out of Hugging Face's cache.
+/// Resolve and install the exact EOU model into content-addressed managed
+/// storage. Mutable cache references are discovery hints only; returned bytes
+/// have passed the checked-in revision/file/length/SHA-256 manifest.
 #[must_use]
 pub fn discover_eou_model_dir() -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os("SPEECH_NATIVE_PARAKEET_MODEL_DIR")
-        .or_else(|| std::env::var_os("FTE_PARAKEET_MODEL_DIR"))
-    {
-        let explicit = PathBuf::from(explicit);
-        if model_dir_is_complete(&explicit) {
-            return Some(explicit);
-        }
-    }
-    huggingface_cache_roots()
-        .into_iter()
-        .find_map(|root| discover_in_hf_root(&root))
-}
-
-fn huggingface_cache_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Some(root) = std::env::var_os("HUGGINGFACE_HUB_CACHE") {
-        roots.push(PathBuf::from(root));
-    }
-    if let Some(home) = std::env::var_os("HF_HOME") {
-        roots.push(PathBuf::from(home).join("hub"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        roots.push(PathBuf::from(home).join(".cache/huggingface/hub"));
-    }
-    roots.sort();
-    roots.dedup();
-    roots
-}
-
-fn discover_in_hf_root(root: &Path) -> Option<PathBuf> {
-    let repository = root.join("models--altunenes--parakeet-rs");
-    if let Ok(reference) = std::fs::read_to_string(repository.join("refs/main")) {
-        let candidate = repository
-            .join("snapshots")
-            .join(reference.trim())
-            .join(PARAKEET_HF_SUBDIRECTORY);
-        if model_dir_is_complete(&candidate) {
-            return Some(candidate);
-        }
-    }
-    let mut snapshots = std::fs::read_dir(repository.join("snapshots"))
-        .ok()?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join(PARAKEET_HF_SUBDIRECTORY))
-        .filter(|candidate| model_dir_is_complete(candidate))
-        .collect::<Vec<_>>();
-    snapshots.sort();
-    snapshots.pop()
-}
-
-fn model_dir_is_complete(path: &Path) -> bool {
-    ["encoder.onnx", "decoder_joint.onnx", "tokenizer.json"]
-        .iter()
-        .all(|file| path.join(file).is_file())
+    model_artifact::discover_default_model_dir()
 }
 
 fn ready_descriptor() -> SpeechBackendDescriptor {
@@ -1222,10 +1860,32 @@ fn ready_descriptor() -> SpeechBackendDescriptor {
             kind: EvidenceKind::RuntimeApi,
             outcome: EvidenceOutcome::Confirmed,
             observed_at_unix_ms: unix_time_ms(),
-            detail: "Parakeet EOU ONNX sessions and tokenizer loaded from the Hugging Face cache"
-                .to_string(),
+            detail: format!(
+                "Parakeet EOU ONNX sessions and tokenizer loaded from verified managed bytes at \
+                 altunenes/parakeet-rs@{PARAKEET_HF_REVISION}"
+            ),
         }],
         true,
+    )
+}
+
+fn shape_admitted_deferred_descriptor() -> SpeechBackendDescriptor {
+    descriptor(
+        SpeechBackendReadiness::Ready,
+        CapabilityAvailability::DeferredLoad,
+        vec![CapabilityEvidence {
+            source_id: PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID.to_owned(),
+            source_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            kind: EvidenceKind::SystemInventory,
+            outcome: EvidenceOutcome::Inconclusive,
+            observed_at_unix_ms: unix_time_ms(),
+            detail: format!(
+                "A metadata-shape-admitted source is present. A joined, single-flight runtime \
+                 loader will verify the exact Parakeet manifest at \
+                 altunenes/parakeet-rs@{PARAKEET_HF_REVISION} before first inference"
+            ),
+        }],
+        false,
     )
 }
 
@@ -1236,7 +1896,7 @@ fn asset_required_descriptor() -> SpeechBackendDescriptor {
                 id: "hf.altunenes.parakeet-rs.realtime-eou-120m-v1-onnx".to_string(),
                 display_name: "Parakeet Realtime EOU 120M ONNX".to_string(),
                 bytes: Some(MODEL_ASSET_BYTES),
-                managed_by: AssetManager::HuggingFaceCache,
+                managed_by: AssetManager::Application,
             }],
         },
         CapabilityAvailability::AssetInstallRequired,
@@ -1286,7 +1946,7 @@ fn descriptor(
             languages: vec!["en".to_string()],
             limits: SpeechCapabilityLimits {
                 max_audio_ms: Some(MAX_AUDIO_MS),
-                max_concurrent_requests: Some(4),
+                max_concurrent_requests: Some(1),
                 ..SpeechCapabilityLimits::default()
             },
             evidence,
@@ -1298,7 +1958,7 @@ fn descriptor(
             languages: vec!["en".to_string()],
             resident,
             estimated_memory_bytes: Some(700_000_000),
-            content_hash: None,
+            content_hash: Some(PARAKEET_MODEL_CONTENT_SHA256.to_owned()),
         }],
         voices: Vec::new(),
     }
@@ -1368,6 +2028,16 @@ fn stream_closed_error(request_id: &SpeechRequestId) -> SpeechError {
     )
 }
 
+fn stream_finished_error(request_id: &SpeechRequestId) -> SpeechError {
+    backend_error(
+        request_id,
+        "audio_stream_finished",
+        SpeechErrorClass::InvalidRequest,
+        false,
+        "Audio cannot be pushed after the stream has finished",
+    )
+}
+
 fn invalid_audio_error(request_id: &SpeechRequestId, detail: String) -> SpeechError {
     backend_error(
         request_id,
@@ -1410,6 +2080,167 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use speech_native_types::{SpeechDeadlinePolicy, SpeechRequestContext, SpeechRoutingPolicy};
+    use std::sync::atomic::AtomicUsize;
+
+    struct BarrierUnavailableLoader {
+        calls: AtomicUsize,
+        started: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    struct BarrierPanickingLoader {
+        calls: AtomicUsize,
+        started: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl BarrierUnavailableLoader {
+        fn new() -> (
+            Arc<Self>,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::SyncSender<()>,
+        ) {
+            let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
+            let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+            (
+                Arc::new(Self {
+                    calls: AtomicUsize::new(0),
+                    started: Mutex::new(Some(started_sender)),
+                    release: Mutex::new(release_receiver),
+                }),
+                started_receiver,
+                release_sender,
+            )
+        }
+    }
+
+    impl ParakeetModelLoader for BarrierUnavailableLoader {
+        fn load(&self, _config: &ParakeetBackendConfig) -> ModelLoadOutcome {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if let Some(started) = self.started.lock().expect("lock start barrier").take() {
+                started.send(()).expect("publish model-load start");
+            }
+            self.release
+                .lock()
+                .expect("lock release barrier")
+                .recv()
+                .expect("release model loader");
+            ModelLoadOutcome::Unavailable(unavailable_descriptor(
+                "fixture model is unavailable after the deterministic barrier".to_owned(),
+            ))
+        }
+    }
+
+    impl BarrierPanickingLoader {
+        fn new() -> (
+            Arc<Self>,
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::SyncSender<()>,
+        ) {
+            let (started_sender, started_receiver) = std::sync::mpsc::sync_channel(1);
+            let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(1);
+            (
+                Arc::new(Self {
+                    calls: AtomicUsize::new(0),
+                    started: Mutex::new(Some(started_sender)),
+                    release: Mutex::new(release_receiver),
+                }),
+                started_receiver,
+                release_sender,
+            )
+        }
+    }
+
+    impl ParakeetModelLoader for BarrierPanickingLoader {
+        fn load(&self, _config: &ParakeetBackendConfig) -> ModelLoadOutcome {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            if let Some(started) = self.started.lock().expect("lock start barrier").take() {
+                started.send(()).expect("publish model-load start");
+            }
+            self.release
+                .lock()
+                .expect("lock release barrier")
+                .recv()
+                .expect("release model loader");
+            panic!("fixture model loader panic after deterministic release")
+        }
+    }
+
+    fn temporary_model_root(label: &str) -> PathBuf {
+        static NEXT_ROOT: AtomicUsize = AtomicUsize::new(1);
+        std::env::temp_dir().join(format!(
+            "parakeet-{label}-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn fixture_pcm_format() -> PcmFormat {
+        PcmFormat {
+            sample_rate_hz: TARGET_SAMPLE_RATE,
+            channels: 1,
+            sample_format: PcmSampleFormat::I16Le,
+            interleaved: true,
+        }
+    }
+
+    fn complete_pcm_request(data: Vec<u8>) -> TranscriptionRequest {
+        complete_pcm_request_with_id("parakeet-characterization", data)
+    }
+
+    fn complete_pcm_request_with_id(id: &str, data: Vec<u8>) -> TranscriptionRequest {
+        TranscriptionRequest {
+            context: SpeechRequestContext {
+                request_id: SpeechRequestId(id.to_owned()),
+                client_id: "test".to_owned(),
+                route: SpeechRouteSelector::ExactBackend {
+                    backend_id: PARAKEET_BACKEND_ID.to_owned(),
+                    model_id: Some(PARAKEET_MODEL_ID.to_owned()),
+                    voice_id: None,
+                },
+                routing: SpeechRoutingPolicy::default(),
+                deadline: SpeechDeadlinePolicy::default(),
+            },
+            input: TranscriptionInput::Complete {
+                audio: AudioInput::Pcm {
+                    format: fixture_pcm_format(),
+                    data,
+                },
+            },
+            language: Some("en".to_owned()),
+            task: TranscriptionTask::Transcribe,
+            timestamps: TimestampGranularity::None,
+            diarization: DiarizationPolicy::Disabled,
+            partial_results: false,
+            punctuation: true,
+            hotwords: Vec::new(),
+        }
+    }
+
+    async fn wait_for_active_count(state: &BackendState, expected: usize) {
+        loop {
+            let changed = state.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if state.data.lock().expect("lock backend state").active.len() == expected {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    async fn wait_for_phase(state: &BackendState, expected: BackendPhase) {
+        loop {
+            let changed = state.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if state.data.lock().expect("lock backend state").phase == expected {
+                return;
+            }
+            changed.await;
+        }
+    }
 
     #[test]
     fn i24_sign_extension_is_correct() {
@@ -1431,26 +2262,372 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_model_directory_never_looks_ready() {
-        let path = std::env::temp_dir().join(format!(
-            "fte-parakeet-missing-{}-{}",
-            std::process::id(),
-            unix_time_ms()
-        ));
-        std::fs::create_dir_all(&path).expect("create fixture directory");
-        assert!(!model_dir_is_complete(&path));
-        std::fs::remove_dir_all(path).expect("remove fixture directory");
+    fn every_descriptor_binds_the_exact_model_content_hash() {
+        for descriptor in [
+            shape_admitted_deferred_descriptor(),
+            ready_descriptor(),
+            asset_required_descriptor(),
+            unavailable_descriptor("fixture unavailable".to_owned()),
+        ] {
+            descriptor
+                .validate()
+                .expect("Parakeet descriptor state must remain schema-valid");
+            assert_eq!(
+                descriptor.models[0].content_hash.as_deref(),
+                Some(PARAKEET_MODEL_CONTENT_SHA256)
+            );
+        }
     }
 
     #[test]
-    fn asset_blocker_is_hugging_face_cache_managed() {
+    fn duration_limit_is_currently_a_post_decode_finalization_check() {
+        let request = complete_pcm_request(vec![0, 0]);
+        validate_request(&request).expect("request validation does not enforce duration");
+        let TranscriptionInput::Complete { audio } = &request.input else {
+            panic!("fixture is complete audio");
+        };
+        assert_eq!(
+            decode_complete(audio, &request.context.request_id)
+                .expect("decode occurs before duration rejection")
+                .len(),
+            1
+        );
+
+        let error = build_response(
+            &request,
+            String::new(),
+            MAX_AUDIO_MS + 1,
+            Instant::now(),
+            None,
+            resolved_route(),
+        )
+        .expect_err("duration is rejected only while building the final response");
+        assert_eq!(error.code, "parakeet_audio_too_long");
+    }
+
+    #[test]
+    fn asset_blocker_requires_application_managed_verified_storage() {
         let descriptor = asset_required_descriptor();
         assert!(matches!(
-            descriptor.readiness,
+            &descriptor.readiness,
             SpeechBackendReadiness::AssetInstallRequired { .. }
         ));
+        let SpeechBackendReadiness::AssetInstallRequired { assets } = descriptor.readiness else {
+            panic!("asset blocker must retain exact asset facts");
+        };
+        assert_eq!(assets[0].managed_by, AssetManager::Application);
         assert!(!descriptor.capabilities[0].eligible_for_local_only());
         assert!(!descriptor.models[0].resident);
+    }
+
+    #[test]
+    fn every_initial_parakeet_descriptor_advertises_one_request() {
+        for descriptor in [
+            shape_admitted_deferred_descriptor(),
+            ready_descriptor(),
+            asset_required_descriptor(),
+            unavailable_descriptor("fixture unavailable".to_owned()),
+        ] {
+            assert_eq!(
+                descriptor.capabilities[0].limits.max_concurrent_requests,
+                Some(1)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_reports_missing_assets_without_starting_a_model_load() {
+        let root = temporary_model_root("missing-shape");
+        let impossible_model = root.join("candidate");
+        let backend = ParakeetSpeechBackend::discover(ParakeetBackendConfig {
+            model_dir: Some(impossible_model),
+            managed_model_root: Some(root.join("managed")),
+        })
+        .await;
+
+        let descriptor = backend.descriptor();
+        assert!(matches!(
+            &descriptor.readiness,
+            SpeechBackendReadiness::AssetInstallRequired { .. }
+        ));
+        assert!(!descriptor.models[0].resident);
+        backend
+            .shutdown()
+            .await
+            .expect("missing-asset backend shuts down without loading");
+    }
+
+    #[tokio::test]
+    async fn discovery_admits_only_bounded_shape_and_defers_byte_verification() {
+        let root = temporary_model_root("deferred-shape");
+        let candidate = root.join("candidate");
+        let managed = root.join("managed");
+        std::fs::create_dir_all(&candidate).expect("create sparse model candidate");
+        for (name, bytes) in [
+            ("encoder.onnx", 459_341_289),
+            ("decoder_joint.onnx", 21_347_639),
+            ("tokenizer.json", 20_053),
+        ] {
+            let file = std::fs::File::create(candidate.join(name)).expect("create sparse artifact");
+            file.set_len(bytes).expect("set exact manifest length");
+        }
+        let backend = ParakeetSpeechBackend::discover(ParakeetBackendConfig {
+            model_dir: Some(candidate),
+            managed_model_root: Some(managed),
+        })
+        .await;
+
+        let descriptor = backend.descriptor();
+        assert_eq!(descriptor.readiness, SpeechBackendReadiness::Ready);
+        assert!(!descriptor.models[0].resident);
+        assert_eq!(
+            descriptor.capabilities[0].availability,
+            CapabilityAvailability::DeferredLoad
+        );
+        assert!(descriptor.capabilities[0].deferred_load_admissible());
+        assert!(descriptor.capabilities[0].evidence.iter().any(|evidence| {
+            evidence.source_id == PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID
+                && evidence.kind == EvidenceKind::SystemInventory
+                && evidence.outcome == EvidenceOutcome::Inconclusive
+                && !evidence.proves_runtime()
+        }));
+        backend
+            .shutdown()
+            .await
+            .expect("shape-admitted backend shuts down without loading bytes");
+        std::fs::remove_dir_all(root).expect("remove sparse model candidate");
+    }
+
+    #[tokio::test]
+    async fn discovery_reports_malformed_candidate_shape_as_unavailable() {
+        let root = temporary_model_root("malformed-shape");
+        let candidate = root.join("candidate");
+        std::fs::create_dir_all(&candidate).expect("create malformed candidate");
+        std::fs::write(candidate.join("encoder.onnx"), b"wrong length")
+            .expect("write malformed artifact");
+        let backend = ParakeetSpeechBackend::discover(ParakeetBackendConfig {
+            model_dir: Some(candidate),
+            managed_model_root: Some(root.join("managed")),
+        })
+        .await;
+
+        assert!(matches!(
+            &backend.descriptor().readiness,
+            SpeechBackendReadiness::Unavailable { .. }
+        ));
+        backend
+            .shutdown()
+            .await
+            .expect("malformed-shape backend shuts down without loading");
+        std::fs::remove_dir_all(root).expect("remove malformed candidate");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_first_transcriptions_share_one_model_load() {
+        let (loader, started, release) = BarrierUnavailableLoader::new();
+        let backend = ParakeetSpeechBackend::deferred_with_loader(loader.clone());
+        let first_backend = backend.clone();
+        let first = tokio::spawn(async move {
+            first_backend
+                .transcribe(complete_pcm_request_with_id("lazy-first-a", vec![0, 0]))
+                .await
+        });
+        started
+            .recv()
+            .expect("first request reaches loader barrier");
+
+        let second_backend = backend.clone();
+        let second = tokio::spawn(async move {
+            second_backend
+                .transcribe(complete_pcm_request_with_id("lazy-first-b", vec![0, 0]))
+                .await
+        });
+        wait_for_active_count(&backend.state, 2).await;
+        assert_eq!(loader.calls.load(Ordering::Acquire), 1);
+
+        release.send(()).expect("release exact model load");
+        for request in [first, second] {
+            let error = request
+                .await
+                .expect("transcription task joins")
+                .err()
+                .expect("fixture loader publishes one shared failure");
+            assert_eq!(error.code, "parakeet_model_unavailable");
+        }
+        assert_eq!(loader.calls.load(Ordering::Acquire), 1);
+        backend
+            .shutdown()
+            .await
+            .expect("failed lazy load remains join-safe");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicking_first_load_wakes_waiters_and_is_reported_at_shutdown() {
+        let (loader, started, release) = BarrierPanickingLoader::new();
+        let backend = ParakeetSpeechBackend::deferred_with_loader(loader.clone());
+        let first_backend = backend.clone();
+        let first = tokio::spawn(async move {
+            first_backend
+                .transcribe(complete_pcm_request_with_id("lazy-panic-a", vec![0, 0]))
+                .await
+        });
+        started.recv().expect("first request reaches panic barrier");
+
+        let second_backend = backend.clone();
+        let second = tokio::spawn(async move {
+            second_backend
+                .transcribe(complete_pcm_request_with_id("lazy-panic-b", vec![0, 0]))
+                .await
+        });
+        wait_for_active_count(&backend.state, 2).await;
+        release.send(()).expect("release panicking model loader");
+
+        let mut error_codes = Vec::new();
+        for request in [first, second] {
+            error_codes.push(
+                request
+                    .await
+                    .expect("transcription caller remains isolated from worker panic")
+                    .err()
+                    .expect("panicking load cannot return a ticket")
+                    .code,
+            );
+        }
+        error_codes.sort();
+        assert_eq!(
+            error_codes,
+            [
+                "parakeet_model_loader_stopped".to_owned(),
+                "parakeet_model_unavailable".to_owned(),
+            ]
+        );
+        assert_eq!(loader.calls.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            backend.descriptor().readiness,
+            SpeechBackendReadiness::Unavailable { .. }
+        ));
+
+        let shutdown_error = backend
+            .shutdown()
+            .await
+            .expect_err("supervised loader panic must remain shutdown evidence");
+        assert_eq!(shutdown_error.code, "parakeet_worker_failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abandoned_first_dispatch_drains_after_loader_release() {
+        let (loader, started, release) = BarrierUnavailableLoader::new();
+        let backend = ParakeetSpeechBackend::deferred_with_loader(loader);
+        let request_backend = backend.clone();
+        let request = tokio::spawn(async move {
+            request_backend
+                .transcribe(complete_pcm_request_with_id(
+                    "lazy-abandoned-dispatch",
+                    vec![0, 0],
+                ))
+                .await
+        });
+        started.recv().expect("request reaches loader barrier");
+        request.abort();
+        let join_error = request
+            .await
+            .err()
+            .expect("aborted dispatch caller must stop");
+        assert!(join_error.is_cancelled());
+        assert_eq!(
+            backend
+                .state
+                .tasks
+                .snapshot()
+                .expect("read supervised abandoned loader")
+                .active,
+            1
+        );
+
+        let shutdown_backend = backend.clone();
+        let shutdown = tokio::spawn(async move { shutdown_backend.shutdown().await });
+        wait_for_phase(&backend.state, BackendPhase::Quiescing).await;
+        assert!(!shutdown.is_finished());
+        release
+            .send(())
+            .expect("release abandoned non-preemptible loader");
+        shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect("abandoned dispatch loader drains without inference");
+        assert!(
+            backend
+                .state
+                .data
+                .lock()
+                .expect("lock drained backend")
+                .active
+                .is_empty()
+        );
+        assert_eq!(
+            backend
+                .state
+                .tasks
+                .snapshot()
+                .expect("read drained supervisor")
+                .active,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_suppresses_inference_and_shutdown_joins_model_load() {
+        let (loader, started, release) = BarrierUnavailableLoader::new();
+        let backend = ParakeetSpeechBackend::deferred_with_loader(loader);
+        let request_id = SpeechRequestId("lazy-cancel-before-inference".to_owned());
+        let request_backend = backend.clone();
+        let request = tokio::spawn({
+            let request_id = request_id.clone();
+            async move {
+                request_backend
+                    .transcribe(complete_pcm_request_with_id(&request_id.0, vec![0, 0]))
+                    .await
+            }
+        });
+        started.recv().expect("request reaches loader barrier");
+        assert_eq!(backend.cancel(&request_id), 1);
+
+        let shutdown_backend = backend.clone();
+        let shutdown = tokio::spawn(async move { shutdown_backend.shutdown().await });
+        wait_for_phase(&backend.state, BackendPhase::Quiescing).await;
+        assert!(!shutdown.is_finished());
+        assert_eq!(
+            backend
+                .state
+                .tasks
+                .snapshot()
+                .expect("read supervised loader state")
+                .active,
+            1
+        );
+
+        release
+            .send(())
+            .expect("release non-preemptible model load");
+        let error = request
+            .await
+            .expect("request task joins")
+            .err()
+            .expect("cancelled request never reaches inference");
+        assert_eq!(error.class, SpeechErrorClass::Cancelled);
+        shutdown
+            .await
+            .expect("shutdown task joins")
+            .expect("shutdown joins the released model loader");
+        assert_eq!(
+            backend
+                .state
+                .tasks
+                .snapshot()
+                .expect("read terminal supervised state")
+                .active,
+            0
+        );
     }
 
     #[tokio::test]
@@ -1553,19 +2730,14 @@ mod tests {
     #[tokio::test]
     async fn stream_sink_rejects_push_after_finish() {
         let request_id = SpeechRequestId("finished-stream".to_string());
+        let state = BackendState::default();
         let (sender, _receiver) = mpsc::channel(1);
+        let control = spawn_stream_actor(&state, request_id.clone(), fixture_pcm_format(), sender)
+            .expect("spawn stream actor");
         let sink = StreamAudioSink {
             request_id: request_id.clone(),
-            format: PcmFormat {
-                sample_rate_hz: 16_000,
-                channels: 1,
-                sample_format: PcmSampleFormat::I16Le,
-                interleaved: true,
-            },
-            control: Arc::new(StreamControl {
-                sender: Mutex::new(Some(sender)),
-                finished: AtomicBool::new(false),
-            }),
+            format: fixture_pcm_format(),
+            control,
         };
         sink.finish().await.expect("finish stream");
         let error = sink
@@ -1579,16 +2751,177 @@ mod tests {
             .await
             .expect_err("push after finish must fail");
         assert_eq!(error.code, "audio_stream_finished");
+        state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("stream actor joins");
+    }
+
+    #[tokio::test]
+    async fn acknowledged_finish_rejects_a_blocked_push_without_delivery() {
+        let request_id = SpeechRequestId("finish-push-race".to_owned());
+        let state = BackendState::default();
+        let (sender, mut receiver) = mpsc::channel(1);
+        let control = spawn_stream_actor(&state, request_id.clone(), fixture_pcm_format(), sender)
+            .expect("spawn stream actor");
+        let sink = StreamAudioSink {
+            request_id: request_id.clone(),
+            format: fixture_pcm_format(),
+            control,
+        };
+        let chunk = |sequence| AudioChunk {
+            sequence,
+            sample_offset: sequence,
+            format: sink.format,
+            data: vec![0, 0],
+            end_of_stream: false,
+        };
+        sink.push(chunk(0)).await.expect("fill bounded channel");
+
+        let waiting_push = sink.push(chunk(1));
+        tokio::pin!(waiting_push);
+        tokio::select! {
+            biased;
+            result = &mut waiting_push => panic!("second push unexpectedly completed: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), sink.finish())
+            .await
+            .expect("finish overtakes the blocked push")
+            .expect("finish is acknowledged");
+
+        assert_eq!(
+            receiver.recv().await.expect("receive first chunk").sequence,
+            0
+        );
+        let error = waiting_push
+            .await
+            .expect_err("waiting push is rejected by committed finish");
+        assert_eq!(error.code, "audio_stream_finished");
+        assert!(
+            receiver.recv().await.is_none(),
+            "no chunk may cross the acknowledged finish boundary"
+        );
+        state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("stream actor joins");
+    }
+
+    #[tokio::test]
+    async fn stream_actor_rejects_audio_beyond_its_cumulative_frame_budget() {
+        let request_id = SpeechRequestId("stream-duration-budget".to_owned());
+        let state = BackendState::default();
+        let format = fixture_pcm_format();
+        let duration = StreamDurationBudget {
+            format,
+            accepted_frames: 0,
+            next_sequence: 0,
+            max_frames: 1,
+        };
+        let (sender, mut receiver) = mpsc::channel(2);
+        let control = spawn_stream_actor_with_budget(&state, request_id.clone(), duration, sender)
+            .expect("spawn bounded stream actor");
+        let sink = StreamAudioSink {
+            request_id: request_id.clone(),
+            format,
+            control,
+        };
+
+        sink.push(AudioChunk {
+            sequence: 0,
+            sample_offset: 0,
+            format,
+            data: vec![0, 0],
+            end_of_stream: false,
+        })
+        .await
+        .expect("the exact duration boundary is accepted");
+        assert_eq!(
+            receiver
+                .recv()
+                .await
+                .expect("receive exact-boundary chunk")
+                .sequence,
+            0
+        );
+
+        let error = sink
+            .push(AudioChunk {
+                sequence: 1,
+                sample_offset: 1,
+                format,
+                data: vec![0, 0],
+                end_of_stream: false,
+            })
+            .await
+            .expect_err("one frame beyond the cumulative budget must fail");
+        assert_eq!(error.code, "parakeet_audio_too_long");
+        assert_eq!(error.class, SpeechErrorClass::InvalidRequest);
+        assert!(
+            receiver.try_recv().is_err(),
+            "rejected audio never reaches inference"
+        );
+
+        sink.push(AudioChunk {
+            sequence: 1,
+            sample_offset: 1,
+            format,
+            data: Vec::new(),
+            end_of_stream: true,
+        })
+        .await
+        .expect("rejection does not consume cumulative frame or sequence state");
+        assert!(
+            receiver
+                .recv()
+                .await
+                .expect("receive zero-frame end marker")
+                .end_of_stream
+        );
+        sink.finish().await.expect("finish bounded stream");
+        state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("stream actor joins");
+    }
+
+    #[test]
+    fn stream_duration_budget_rejects_cumulative_geometry_overflow() {
+        let request_id = SpeechRequestId("stream-duration-overflow".to_owned());
+        let format = fixture_pcm_format();
+        let budget = StreamDurationBudget {
+            format,
+            accepted_frames: u64::MAX,
+            next_sequence: 0,
+            max_frames: u64::MAX,
+        };
+        let error = budget
+            .checked_acceptance(
+                &AudioChunk {
+                    sequence: 0,
+                    sample_offset: u64::MAX,
+                    format,
+                    data: vec![0, 0],
+                    end_of_stream: false,
+                },
+                &request_id,
+            )
+            .expect_err("cumulative frame overflow must fail closed");
+        assert_eq!(error.code, "audio_stream_geometry_overflow");
+        assert_eq!(error.class, SpeechErrorClass::InvalidRequest);
     }
 
     #[tokio::test]
     async fn cancellation_closes_the_stream_input_sink() {
         let request_id = SpeechRequestId("cancelled-stream".to_string());
+        let state = BackendState::default();
         let (sender, _receiver) = mpsc::channel(1);
-        let control = Arc::new(StreamControl {
-            sender: Mutex::new(Some(sender)),
-            finished: AtomicBool::new(false),
-        });
+        let control = spawn_stream_actor(&state, request_id.clone(), fixture_pcm_format(), sender)
+            .expect("spawn stream actor");
         let sink = StreamAudioSink {
             request_id: request_id.clone(),
             format: PcmFormat {
@@ -1615,6 +2948,11 @@ mod tests {
             .await
             .expect_err("cancelled stream must reject input");
         assert_eq!(error.code, "audio_stream_finished");
+        state
+            .tasks
+            .wait_for_idle()
+            .await
+            .expect("stream actor joins");
     }
 
     #[tokio::test]

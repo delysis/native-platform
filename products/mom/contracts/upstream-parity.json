@@ -95,8 +95,12 @@
     {
       "id": "composer_drafts",
       "classification": "p0_implemented",
-      "commands": ["mom_llama.draft_get", "mom_llama.draft_update", "mom_llama.draft_clear"],
-      "evidence": ["encrypted per-conversation draft persistence"]
+      "commands": ["mom_llama.draft_get", "mom_llama.draft_update", "mom_llama.draft_clear", "mom_llama.composer_autocomplete", "mom_llama.composer_autocomplete_cancel", "mom_llama.composer_autocomplete_accept"],
+      "evidence": [
+        "encrypted per-conversation draft persistence",
+        "resident-only bounded continuation prediction over the exact draft and conversation template",
+        "Right Arrow acceptance performs one normal draft edit while Enter and Tab retain their composer semantics"
+      ]
     },
     {
       "id": "jsonl_zip_legacy_settings_import_export",
@@ -107,7 +111,12 @@
       "id": "native_model_load_unload_slots",
       "classification": "p0_implemented",
       "commands": ["mom_llama.model_slot_list", "mom_llama.model_slot_load", "mom_llama.model_slot_unload"],
-      "evidence": ["owner-thread registry", "bounded resident memory budget", "no inference process or network authority"]
+      "evidence": [
+        "owner-thread registry",
+        "bounded resident memory budget",
+        "no inference process or network authority",
+        "resident-slot commands are backend-only and do not authorize a developer control panel in the ordinary chat UI"
+      ]
     },
     {
       "id": "model_metadata_search_progress",
@@ -169,14 +178,20 @@
       "evidence": [
         "scripts/prove-native-cache-restart.sh",
         "receipts/003-native-cache-restart-proof.json",
-        "real GGUF save and fresh-process encrypted restore returned prompt_smoke_verified with zero memory entries"
+        "real GGUF save and fresh-process encrypted restore returned prompt_smoke_verified with zero memory entries",
+        "cache commands and policy remain backend-only; no cache inspector, tier status, or cache-policy control is part of the ordinary UI"
       ]
     },
     {
       "id": "mcp_stdio",
       "classification": "p0_implemented",
       "commands": ["mom_llama.mcp_status", "mom_llama.mcp_configure", "mom_llama.mcp_list_servers", "mom_llama.mcp_list_tools", "mom_llama.mcp_call_tool", "mom_llama.mcp_list_resources", "mom_llama.mcp_read_resource", "mom_llama.mcp_list_prompts", "mom_llama.mcp_get_prompt"],
-      "evidence": ["disabled-by-default absolute-path stdio adapter", "bounded timeout and receipt test"]
+      "evidence": [
+        "disabled-by-default macOS/Linux absolute-path stdio adapter",
+        "configured MCP executables are disclosed as external unsandboxed processes with OS-account file, secret, and network authority",
+        "Persona review stages content-addressed executable bytes and detects pre/post-spawn pathname drift without claiming atomic inode-bound exec or dynamic dependency identity",
+        "bounded timeout and receipt test"
+      ]
     },
     {
       "id": "remote_mcp_transports",
@@ -249,7 +264,7 @@
     {
       "id": "cors_proxy",
       "classification": "rejected_for_constraint_violation",
-      "reason": "The native app exposes no general network proxy."
+      "reason": "The native app exposes no general network proxy; explicitly configured external MCP processes retain their OS-account network authority."
     },
     {
       "id": "sveltekit_runtime",
@@ -275,7 +290,10 @@
       "id": "mom_skills",
       "classification": "p0_implemented",
       "commands": ["mom_llama.skill_create", "mom_llama.skill_list", "mom_llama.skill_update", "mom_llama.skill_apply"],
-      "evidence": ["encrypted persistent prompt presets and cache policy"]
+      "evidence": [
+        "encrypted persistent prompt presets and cache policy",
+        "legacy Skill commands remain backend-only and do not authorize a Skills editor or navigation surface"
+      ]
     },
     {
       "id": "chat_native_personas_and_groups",
@@ -283,13 +301,17 @@
       "commands": [
         "mom_llama.persona_freeze",
         "mom_llama.persona_update",
+        "mom_llama.persona_removal_preview",
+        "mom_llama.persona_remove_from_library",
         "mom_llama.persona_instantiate",
         "mom_llama.persona_group_create",
         "mom_llama.persona_group_update",
         "mom_llama.mention_candidates",
         "mom_llama.chat_dispatch",
         "mom_llama.mention_cancel",
-        "mom_llama.mention_synthesize"
+        "mom_llama.mention_synthesize",
+        "mom_llama.mention_tool_approval_list",
+        "mom_llama.mention_tool_approval_decide"
       ],
       "evidence": [
         "Personas are encrypted versioned conversation templates with immutable profile and transcript hashes.",
@@ -297,7 +319,9 @@
         "Ordered groups expand to at most four unique Personas and generate concurrently through bounded resident model slots.",
         "Attributed responses are written only to the host chat; source chats and Persona templates are unchanged.",
         "Per-target cancellation preserves completed peers, and explicit synthesis requires two real terminal responses.",
+        "Ask-bound Persona tools use five-minute, one-use approval over the exact frozen turn, Persona version and snapshot, arguments, call hash, and model fingerprint; approve or deny resumes without target resolution.",
         "The ordinary composer provides Lucide-backed @handle autocomplete; Persona and group editing live in Settings.",
+        "Remove from Library uses an exact Persona ID, version, and impact SHA-256; one atomic tombstone transaction removes discoverability, group membership, draft-only state, and Persona-owned caches while retaining frozen history and invocations.",
         "The previous four-card Consult dashboard is absent from rendered desktop and compact native views.",
         "Real GGUF tests prove exact-version prefix reuse, fingerprint mismatch fallback, four-Persona dispatch, independent cancellation, source isolation, and attributed synthesis."
       ]

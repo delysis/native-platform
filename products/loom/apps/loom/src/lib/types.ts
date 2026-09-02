@@ -136,6 +136,49 @@ export interface ModelPolicyProfile {
   rank: number;
 }
 
+export interface CuratedModelLicense {
+  spdx_id: string;
+  name: string;
+  url: string;
+}
+
+export interface CuratedModelMemoryFit {
+  weight_bytes: number;
+  recommended_system_memory_bytes: number;
+  description: string;
+}
+
+export interface CuratedModelCompatibility {
+  local_only: true;
+  hosted_fallback: false;
+  prompt_mode: 'raw_completion';
+  native_inspection_required: true;
+  legacy_local_file_name: string;
+  legacy_local_file_bytes: number;
+}
+
+export interface CuratedModelCatalogEntry {
+  catalog_id: string;
+  display_name: string;
+  publisher: string;
+  repository: string;
+  revision: string;
+  artifact_name: string;
+  download_url: string;
+  expected_sha256: string;
+  expected_bytes: number;
+  max_bytes: number;
+  context_tokens: number;
+  license: CuratedModelLicense;
+  memory_fit: CuratedModelMemoryFit;
+  compatibility: CuratedModelCompatibility;
+}
+
+export interface CuratedModelCatalogSnapshot {
+  schema_version: 1;
+  entries: CuratedModelCatalogEntry[];
+}
+
 export interface ModelUnloadOutcome {
   model_id: string | null;
   resident_slot_released: boolean;
@@ -191,6 +234,7 @@ export interface ModelDownloadSnapshot {
 export interface BranchCard {
   run_id: string;
   branch_id: string;
+  weave_command_id: string | null;
   document_id: string;
   candidate_id: string | null;
   source_revision_id: string;
@@ -221,6 +265,59 @@ export interface BranchPage {
   branches: BranchSummary[];
   next_cursor: BranchPageCursor | null;
   has_more: boolean;
+}
+
+export type CompletionOperationPhase =
+  | 'reserved'
+  | 'queued'
+  | 'running'
+  | 'terminal'
+  | 'released';
+
+export type CompletionTerminalClass = 'completed' | 'cancelled' | 'failed';
+
+export interface CompletionTerminalSnapshot {
+  operation_id: string;
+  attempt_id: string;
+  /** Decimal u64, preserved as text across the JavaScript boundary. */
+  sequence: string;
+  class: CompletionTerminalClass;
+}
+
+export interface CompletionPartialTextSnapshot {
+  /** Cumulative UTF-8 completion prefix owned by the scoped native snapshot. */
+  text: string;
+  /** Decimal u64 sequence of the last text-delta included in `text`. */
+  sequence: string;
+  /** Decimal u64 byte length of `text` after UTF-8 encoding. */
+  utf8_byte_len: string;
+}
+
+export interface CompletionOperationBranchSnapshot {
+  run_id: string;
+  branch_id: string;
+  partial_text: CompletionPartialTextSnapshot | null;
+}
+
+export interface CompletionOperationSnapshot {
+  request_id: string;
+  attempt_id: string;
+  /** Decimal u64, preserved as text across the JavaScript boundary. */
+  operation_sequence: string;
+  phase: CompletionOperationPhase;
+  cancellation_requested: boolean;
+  authoritative_terminal: CompletionTerminalSnapshot | null;
+  final_projection: CompletionTerminalSnapshot | null;
+  /** Decimal u64 values, preserved as text across the JavaScript boundary. */
+  progress_sequences: string[];
+  branches: CompletionOperationBranchSnapshot[];
+}
+
+export interface CompletionSnapshot extends BranchPage {
+  project_id: string;
+  session_id: string;
+  document_id: string;
+  active_operations: CompletionOperationSnapshot[];
 }
 
 export interface BranchBody {

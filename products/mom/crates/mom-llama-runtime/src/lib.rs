@@ -1,5 +1,6 @@
 pub mod attachments;
 pub mod chat;
+pub mod composer;
 pub mod config;
 pub mod consult;
 pub mod conversation_store;
@@ -9,6 +10,7 @@ pub mod mcp;
 pub mod mentions;
 pub mod models;
 pub mod native_runtime;
+mod operation_scope;
 pub mod path_selection;
 mod persona_library;
 pub mod personas;
@@ -20,13 +22,25 @@ pub mod tool_loop;
 pub mod upstream_status;
 
 pub use attachments::{
-    AttachmentImportOutput, AttachmentKind, AttachmentPreview, AttachmentRecord, AttachmentState,
-    attachment_import, attachment_import_pasted_text, attachment_list, attachment_preview,
+    AttachmentImportOutput, AttachmentKind, AttachmentLibraryInput, AttachmentPreviewAnchor,
+    AttachmentPreviewArtifact, AttachmentPreviewCatalog, AttachmentPreviewContent,
+    AttachmentPreviewKind, AttachmentPreviewMedia, AttachmentPreviewNotice, AttachmentPreviewState,
+    AttachmentPreviewTextSection, AttachmentPreviewTextStats, AttachmentPreviewTransform,
+    AttachmentRecord, AttachmentState, AttachmentTranscriptionInput, attachment_import,
+    attachment_import_pasted_text, attachment_library_input, attachment_list, attachment_preview,
+    attachment_preview_content, attachment_preview_media, attachment_transcription_input,
 };
 pub use chat::{
     ChatCancelOutput, ChatRequestState, ChatSendInput, ChatSendOptions, ChatSendOutput,
-    ChatSkipReasoningOutput, ChatStreamEvent, chat_cancel, chat_continue, chat_regenerate,
-    chat_send, chat_send_stream, chat_skip_reasoning,
+    ChatSkipReasoningOutput, ChatStreamEvent, chat_cancel, chat_cancel_in_scope, chat_continue,
+    chat_continue_in_scope, chat_regenerate, chat_regenerate_in_scope, chat_send,
+    chat_send_in_scope, chat_send_stream, chat_send_stream_in_scope, chat_skip_reasoning,
+    chat_skip_reasoning_in_scope,
+};
+pub use composer::{
+    ComposerAutocompleteAcceptOutput, ComposerAutocompleteAnchor, ComposerAutocompleteCancelOutput,
+    ComposerAutocompleteInput, ComposerAutocompleteOutput, composer_autocomplete_accept,
+    composer_autocomplete_supervised,
 };
 pub use config::{
     GenerationDefaults, KvCachePolicy, Settings, configure_engine, settings_get, settings_reset,
@@ -54,27 +68,43 @@ pub use kv_cache::{kv_cache_clear, kv_cache_restore, kv_cache_save, kv_cache_sta
 pub use mcp::{
     McpCallToolOutput, McpGetPromptOutput, McpPrompt, McpPromptArgument, McpReadResourceOutput,
     McpResource, McpResourceContent, McpServerConfig, McpStatus, McpTool, mcp_call_tool,
-    mcp_configure, mcp_get_prompt, mcp_list_prompts, mcp_list_resources, mcp_list_servers,
-    mcp_list_tools, mcp_read_resource, mcp_status,
+    mcp_call_tool_in_scope, mcp_configure, mcp_get_prompt, mcp_get_prompt_in_scope,
+    mcp_list_prompts, mcp_list_prompts_in_scope, mcp_list_resources, mcp_list_resources_in_scope,
+    mcp_list_servers, mcp_list_tools, mcp_list_tools_in_scope, mcp_read_resource,
+    mcp_read_resource_in_scope, mcp_status,
 };
 pub use mentions::{
     ChatDispatchOutput, ChatDispatchStreamEvent, MentionCancelOutput, MentionCandidate,
     MentionDispatchInput, MentionInvocation, MentionInvocationState, MentionStreamEvent,
     MentionSynthesisOutput, MentionTargetKind, MentionTargetResult, MentionTargetSnapshot,
-    chat_dispatch, chat_dispatch_stream, mention_cancel, mention_candidates, mention_dispatch,
-    mention_synthesize,
+    MentionToolApproval, MentionToolApprovalDecision, MentionToolApprovalResolution,
+    MentionToolApprovalState, MentionToolEffectOutcome, PersonaToolApprovalRecovery, chat_dispatch,
+    chat_dispatch_in_scope, chat_dispatch_stream, chat_dispatch_stream_in_scope, mention_cancel,
+    mention_cancel_in_scope, mention_candidates, mention_dispatch, mention_dispatch_in_scope,
+    mention_synthesize, mention_tool_approval_decide, mention_tool_approval_decide_in_scope,
+    mention_tool_approval_decide_with_recovery,
+    mention_tool_approval_decide_with_recovery_in_scope, mention_tool_approval_list,
+    reconcile_persona_tool_approvals, reconcile_persona_tool_approvals_command,
 };
-pub use models::{hugging_face_hub_cache_dir, model_list, model_select};
+pub use models::{
+    ModelSelectionIntent, begin_model_selection, conversation_model_select_and_load,
+    discover_projector_for_model, hugging_face_hub_cache_dir, model_list, model_select,
+    model_select_with_intent,
+};
 pub use native_runtime::{
-    ProductShutdownError, gateway_native_configuration, gateway_native_host_and_model,
-    gateway_native_model_configuration, resident_model_for_profile, resident_status,
+    ProductShutdownError, resident_model_for_profile, resident_status,
     shutdown_product_runtime_for_process_exit, unload_resident_model,
 };
+pub use operation_scope::OperationScope;
 pub use path_selection::{PathSelection, PathSelectionKind, path_select};
 pub use personas::{
-    PersonaFreezeInput, PersonaGroup, PersonaHistoryMode, PersonaUpdateInput, PersonaVersion,
-    persona_delete, persona_freeze, persona_get, persona_group_create, persona_group_delete,
-    persona_group_list, persona_group_update, persona_instantiate, persona_list, persona_update,
+    PersonaFreezeInput, PersonaGroup, PersonaHistoryMode, PersonaRemovalAttachmentImpact,
+    PersonaRemovalCacheImpact, PersonaRemovalCommitInput, PersonaRemovalDraftImpact,
+    PersonaRemovalGroupImpact, PersonaRemovalHistoryImpact, PersonaRemovalImpact,
+    PersonaRemovalOutput, PersonaUpdateInput, PersonaVersion, persona_freeze, persona_get,
+    persona_group_create, persona_group_delete, persona_group_list, persona_group_update,
+    persona_instantiate, persona_list, persona_removal_preview, persona_removal_preview_in_scope,
+    persona_remove_from_library, persona_remove_from_library_in_scope, persona_update,
     persona_versions,
 };
 pub use receipts::{Blocker, CommandReceipt, CommandResult, persist_command_receipt};
@@ -85,22 +115,12 @@ pub use server::{
 pub use tool_loop::{
     ActiveToolLoop, ToolLoopApproval, ToolLoopCancelOutput, ToolLoopOutput, ToolLoopRunInput,
     ToolLoopState, ToolLoopStep, ToolLoopStreamEvent, ToolPermission, ToolPermissionPolicy,
-    tool_loop_cancel, tool_loop_prepare, tool_loop_run, tool_loop_run_stream, tool_loop_status,
-    tool_permission_list, tool_permission_revoke, tool_permission_set,
+    tool_loop_cancel, tool_loop_cancel_in_scope, tool_loop_prepare, tool_loop_prepare_in_scope,
+    tool_loop_run, tool_loop_run_in_scope, tool_loop_run_stream, tool_loop_run_stream_in_scope,
+    tool_loop_status, tool_permission_list, tool_permission_revoke, tool_permission_set,
 };
 pub const RESULT_SCHEMA: &str = "mom_llama.command_result.v1";
 pub const RECEIPT_SCHEMA: &str = "mom_llama.command_receipt.v1";
-const GATEWAY_RESPONSE_NAMESPACE_PREFIX: &str = "fte.response.v1:";
-
-/// Requests cancellation from every product operation registry without
-/// waiting for completion. The application composition root calls this after
-/// closing admission and before it drains services and application leases.
-pub fn request_product_cancellation() -> usize {
-    mcp::request_all_mcp_cancellation();
-    chat::request_all_chat_cancellation()
-        .saturating_add(mentions::request_all_mention_cancellation())
-        .saturating_add(tool_loop::request_all_tool_loop_cancellation())
-}
 
 /// Allows an explicit startup retry to ask the OS credential store again after
 /// a denied or cancelled first attempt. Successfully cached installation keys
@@ -114,39 +134,4 @@ pub fn now_ms() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or_default()
-}
-
-/// Encrypted product-store adapter for embedded gateway response state.
-pub fn gateway_document_get(namespace: &str) -> anyhow::Result<Option<Vec<u8>>> {
-    validate_gateway_document_namespace(namespace)?;
-    store::RuntimeStore::current()?.get_bytes(namespace)
-}
-
-/// Encrypted product-store adapter for embedded gateway response state.
-pub fn gateway_document_put(namespace: &str, value: &[u8]) -> anyhow::Result<()> {
-    validate_gateway_document_namespace(namespace)?;
-    store::RuntimeStore::current()?.put_bytes(namespace, value)
-}
-
-/// Encrypted product-store adapter for embedded gateway response state.
-pub fn gateway_document_delete(namespace: &str) -> anyhow::Result<bool> {
-    validate_gateway_document_namespace(namespace)?;
-    store::RuntimeStore::current()?.delete(namespace)
-}
-
-fn validate_gateway_document_namespace(namespace: &str) -> anyhow::Result<()> {
-    let Some(response_id) = namespace.strip_prefix(GATEWAY_RESPONSE_NAMESPACE_PREFIX) else {
-        anyhow::bail!(
-            "gateway documents must use the `{GATEWAY_RESPONSE_NAMESPACE_PREFIX}` namespace"
-        );
-    };
-    if response_id.is_empty()
-        || response_id.len() > 256
-        || !response_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-    {
-        anyhow::bail!("gateway response IDs must be non-empty safe ASCII identifiers");
-    }
-    Ok(())
 }

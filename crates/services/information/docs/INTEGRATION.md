@@ -1,5 +1,8 @@
 # Product integration
 
+<!-- current-service-surface: information -->
+<!-- retired-edge-parent: 5390edfcfb6b8412ae45f1e51d44644be3f7e8e3 -->
+
 Applications depend on the host or leaf crates they actually need. Until an
 authorized remote exists, sibling native applications should use explicit
 workspace-relative paths; a future Git dependency must pin an exact revision.
@@ -27,6 +30,41 @@ returns `EvidenceSet`; it does not manufacture prose or merge source text with
 system instructions. Backend-native query syntax should not be exposed to a
 model unless the app grants that capability deliberately.
 
+## Managed-document boundary
+
+Trusted native integrations may call the host's narrow
+`materialize_documents`, `search_managed_documents`,
+`plan_managed_documents_removal`, and `remove_managed_documents` methods. The
+caller supplies typed content and identities, never an output database path.
+Materialization does not read the source URI: a source-specific adapter must
+already have verified and bounded the inert text and must retain exact artifact
+and record lineage in the contract.
+
+For Attachment canonical text,
+`information-native-attachment-bridge::materialize_attachment_text` accepts an
+in-memory `AttachmentBundle`, its exact `AttachmentReceipt`, and a path-free
+`AttachmentTextMaterializationRequest`. The request carries caller-confirmed
+rights and the complete root/graph/artifact/processor/policy/text/title binding.
+All mismatches and rights denials fail before the managed store is invoked.
+Activation uses the same verified staging path as other managed documents, and
+the resulting citation lineage remains reopenable without the original bundle
+or source bytes. This service API does not provide an app command, picker, or
+library UI.
+
+For Kiwix, `materialize_zim_documents` accepts a native-only
+`ZimMaterializationRequest` containing one already-authorized local archive
+path plus its expected size/SHA-256 and catalogue identities. The host invokes
+the bounded OpenZIM producer and then the same atomic managed-document staging
+path. The path type is not serializable and this method is not part of the
+model tool or renderer IPC surface. OPDS/Metalink discovery and acquisition
+remain separate; conversion never performs network fallback.
+
+Managed search is local-UI-only. It does not appear in the model tool surface,
+and the default use policy leaves model context unknown/fail-closed while
+forbidding export and redistribution. A product that later grants a specific
+conversation access must do so through a separate exact capability rather than
+changing this storage default.
+
 ## Loom
 
 Global library payloads stay outside `.loom` projects. A Loom branch records the
@@ -34,24 +72,23 @@ resource ID, release ID, representation ID, source locator, selected excerpt,
 and excerpt hash. `.loom/indexes/` is appropriate only for project-local
 overlays and disposable caches.
 
-## Tauri authority
+## Product edge authority
 
-The default permission set grants status only. Separate permission sets grant
-catalogue inspection/planning, visible local-UI query/read, exact-target
-model-context query, external registration, mounting, acquisition, and removal
-planning. Local-UI commands force `local_ui`; only the typed model tool path can
-request `model_context`.
+The current executable integration boundary is
+`crates/services/information/crates/information-native-host`; products call its
+narrow native methods and keep paths outside renderer contracts. There is no
+current `crates/services/information/crates/tauri-plugin-information-native`
+crate, command registry, or permission set. Its last-present implementation is
+historical at exact parent
+[`5390edfcfb6b8412ae45f1e51d44644be3f7e8e3`](https://github.com/delysis/native-platform/tree/5390edfcfb6b8412ae45f1e51d44644be3f7e8e3/crates/services/information/crates/tauri-plugin-information-native).
 
-The external-registration command accepts an opaque, app-owned native picker
-grant, never a raw path from webview IPC. The embedding app supplies the grant
-resolver and is responsible for caller binding, expiry, and replay prevention
-while resolving the token to an authorized absolute path. Mounting is a
-separate permission and can rebind any of the four compiled SQLite profiles at
-startup without granting registration or query authority. Webview mount IPC
-cannot opt a private Community Archive into model context; that policy remains
-a trusted host-startup decision.
+A future product-specific edge must receive opaque, app-owned picker or target
+grants rather than renderer paths; bind caller, expiry, and replay; separate
+mount, local-UI query, and model-context authority; and expose only commands
+needed by that named vertical. Historical generic plugin permissions are not a
+current contract or a template to re-enable wholesale.
 
-Acquisition authority is also constrained inside the host: `file:` roots and
+Acquisition authority remains constrained inside the host: `file:` roots and
 private-network destinations require explicit grants. File pickers, user
 confirmation, app-data paths and Windows DACL setup, background scheduling,
 progress UI, cancellation, and display of license/disk impact remain product

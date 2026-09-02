@@ -1,5 +1,5 @@
 import { defaultMarkdownParser, defaultMarkdownSerializer } from 'prosemirror-markdown';
-import { AllSelection, EditorState, TextSelection } from 'prosemirror-state';
+import { AllSelection, EditorState, Selection, TextSelection } from 'prosemirror-state';
 import { describe, expect, it } from 'vitest';
 import { applyVisualFormat, visualFormatState, type VisualFormatAction } from './visualFormatting';
 import { parseVisualMarkdown } from './markdownSafety';
@@ -95,6 +95,59 @@ describe('Markdown-safe visual formatting', () => {
     ['blockquote', '> Words'],
     ['bullet_list', '* Words'],
     ['ordered_list', '1. Words']
+  ] as const)('maps browser Select All inside the visible text when applying %s', (
+    action,
+    expected
+  ) => {
+    const doc = defaultMarkdownParser.parse('Words');
+    let state = EditorState.create({ doc, selection: new AllSelection(doc) });
+    expect(applyVisualFormat(state, action, '', (transaction) => {
+      state = state.apply(transaction);
+    })).toBe(true);
+
+    expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(expected);
+    expect(state.selection).toBeInstanceOf(TextSelection);
+    expect({ from: state.selection.from, to: state.selection.to }).toEqual({
+      from: Selection.atStart(state.doc).from,
+      to: Selection.atEnd(state.doc).to
+    });
+  });
+
+  it.each([
+    ['---'],
+    ['---\n\nWords'],
+    ['Words\n\n---']
+  ] as const)('handles leaf block boundaries without inventing an invalid text endpoint: %s', (
+    markdown
+  ) => {
+    const doc = defaultMarkdownParser.parse(markdown);
+    let state = EditorState.create({ doc, selection: new AllSelection(doc) });
+    expect(applyVisualFormat(state, 'blockquote', '', (transaction) => {
+      state = state.apply(transaction);
+    })).toBe(true);
+    expect(state.selection).toBeInstanceOf(AllSelection);
+  });
+
+  it.each([
+    ['---\n\nWords'],
+    ['Words\n\n---']
+  ] as const)('retains leaf blocks in the next Select All quote toggle: %s', (markdown) => {
+    const doc = defaultMarkdownParser.parse(markdown);
+    const original = defaultMarkdownSerializer.serialize(doc);
+    let state = EditorState.create({ doc, selection: new AllSelection(doc) });
+    expect(applyVisualFormat(state, 'blockquote', '', (transaction) => {
+      state = state.apply(transaction);
+    })).toBe(true);
+    expect(applyVisualFormat(state, 'blockquote', '', (transaction) => {
+      state = state.apply(transaction);
+    })).toBe(true);
+    expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(original);
+  });
+
+  it.each([
+    ['blockquote', '> Words'],
+    ['bullet_list', '* Words'],
+    ['ordered_list', '1. Words']
   ] as const)('toggles %s back out across the command-mapped selection', (action, expected) => {
     let state = formatted('Words', action);
     expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(expected);
@@ -115,6 +168,11 @@ describe('Markdown-safe visual formatting', () => {
       state = state.apply(transaction);
     })).toBe(true);
     expect(defaultMarkdownSerializer.serialize(state.doc)).toBe('Words');
+    expect(state.selection).toBeInstanceOf(TextSelection);
+    expect({ from: state.selection.from, to: state.selection.to }).toEqual({
+      from: Selection.atStart(state.doc).from,
+      to: Selection.atEnd(state.doc).to
+    });
   });
 
   it.each([
@@ -134,6 +192,11 @@ describe('Markdown-safe visual formatting', () => {
       state = state.apply(transaction);
     })).toBe(true);
     expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(expected);
+    expect(state.selection).toBeInstanceOf(TextSelection);
+    expect({ from: state.selection.from, to: state.selection.to }).toEqual({
+      from: Selection.atStart(state.doc).from,
+      to: Selection.atEnd(state.doc).to
+    });
   });
 
   it.each([
@@ -151,6 +214,11 @@ describe('Markdown-safe visual formatting', () => {
       state = state.apply(transaction);
     })).toBe(true);
     expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(expected);
+    expect(state.selection).toBeInstanceOf(TextSelection);
+    expect({ from: state.selection.from, to: state.selection.to }).toEqual({
+      from: Selection.atStart(state.doc).from,
+      to: Selection.atEnd(state.doc).to
+    });
   });
 
   it('rejects unsafe or selection-free links', () => {

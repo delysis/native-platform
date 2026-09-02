@@ -6,6 +6,12 @@ pub enum CommandClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionClass {
+    Foreground,
+    Speculative,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandSpec {
     pub name: &'static str,
     pub class: CommandClass,
@@ -15,6 +21,7 @@ pub struct CommandSpec {
     pub uses_native: bool,
     pub allowed_during_quiesce: bool,
     pub permission: &'static str,
+    pub admission: AdmissionClass,
 }
 
 const fn read(name: &'static str, writes_receipt: bool, uses_native: bool) -> CommandSpec {
@@ -27,6 +34,7 @@ const fn read(name: &'static str, writes_receipt: bool, uses_native: bool) -> Co
         uses_native,
         allowed_during_quiesce: false,
         permission: "default",
+        admission: AdmissionClass::Foreground,
     }
 }
 
@@ -40,6 +48,7 @@ const fn mutation(name: &'static str, mutates_store: bool, uses_native: bool) ->
         uses_native,
         allowed_during_quiesce: false,
         permission: "default",
+        admission: AdmissionClass::Foreground,
     }
 }
 
@@ -53,6 +62,21 @@ const fn long(name: &'static str, mutates_store: bool, uses_native: bool) -> Com
         uses_native,
         allowed_during_quiesce: false,
         permission: "default",
+        admission: AdmissionClass::Foreground,
+    }
+}
+
+const fn speculative(name: &'static str, uses_native: bool) -> CommandSpec {
+    CommandSpec {
+        name,
+        class: CommandClass::LongOperation,
+        mutates_store: false,
+        starts_operation: true,
+        uses_gateway: false,
+        uses_native,
+        allowed_during_quiesce: false,
+        permission: "default",
+        admission: AdmissionClass::Speculative,
     }
 }
 
@@ -62,21 +86,49 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     read("mom_llama_render_sidebar_fragment", false, false),
     read("mom_llama_render_settings_fragment", false, true),
     long("mom_llama_pick_file", true, false),
+    long("mom_llama_information_pick_alexandria", false, false),
+    long("mom_llama_information_register_alexandria", true, false),
+    read("mom_llama_information_libraries", false, false),
+    long("mom_llama_information_search", false, false),
+    long("mom_llama_information_open_citation", false, false),
+    mutation("mom_llama_information_grant_model_context", false, false),
+    long("mom_llama_information_chat_send", true, true),
+    long("mom_llama_attachment_library_preview", false, false),
+    long("mom_llama_attachment_library_commit", true, false),
+    read("mom_llama_information_managed_attachments", false, false),
+    long(
+        "mom_llama_information_search_managed_attachment",
+        false,
+        false,
+    ),
+    long("mom_llama_information_open_managed_citation", false, false),
+    long(
+        "mom_llama_information_managed_removal_preview",
+        false,
+        false,
+    ),
+    long("mom_llama_information_managed_removal_commit", true, false),
     long("mom_llama_engine_check", true, true),
     mutation("mom_llama_engine_configure", true, true),
     read("mom_llama_model_list", true, false),
-    mutation("mom_llama_model_select", true, true),
+    long("mom_llama_model_select", true, true),
     long("mom_llama_chat_send", true, true),
+    speculative("mom_llama_composer_autocomplete", true),
+    mutation("mom_llama_composer_autocomplete_cancel", false, true),
+    long("mom_llama_composer_autocomplete_accept", true, true),
     long("mom_llama_chat_dispatch", true, true),
     long("mom_llama_mention_dispatch", true, true),
     read("mom_llama_mention_candidates", true, false),
     mutation("mom_llama_mention_cancel", true, true),
     long("mom_llama_mention_synthesize", true, true),
+    read("mom_llama_mention_tool_approval_list", true, false),
+    long("mom_llama_mention_tool_approval_decide", true, true),
     mutation("mom_llama_persona_freeze", true, false),
     read("mom_llama_persona_list", true, false),
     read("mom_llama_persona_get", true, false),
     long("mom_llama_persona_update", true, true),
-    mutation("mom_llama_persona_delete", true, false),
+    read("mom_llama_persona_removal_preview", true, false),
+    mutation("mom_llama_persona_remove_from_library", true, true),
     mutation("mom_llama_persona_instantiate", true, false),
     read("mom_llama_persona_group_list", true, false),
     mutation("mom_llama_persona_group_create", true, false),
@@ -101,6 +153,7 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     read("mom_llama_conversation_export", true, false),
     mutation("mom_llama_conversation_import", true, false),
     read("mom_llama_message_copy", true, false),
+    long("mom_llama_speech_read_aloud", true, true),
     mutation("mom_llama_message_edit", true, false),
     mutation("mom_llama_message_delete", true, false),
     read("mom_llama_message_branches", true, false),
@@ -110,7 +163,11 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     long("mom_llama_attachment_import", true, false),
     read("mom_llama_attachment_list", true, false),
     long("mom_llama_attachment_preview", true, false),
+    long("mom_llama_attachment_preview_content", true, false),
     long("mom_llama_attachment_preview_bytes", false, false),
+    long("mom_llama_speech_transcribe_attachment", true, true),
+    long("mom_llama_speech_audio", false, true),
+    mutation("mom_llama_speech_stop", true, true),
     read("mom_llama_settings_get", true, false),
     mutation("mom_llama_settings_reset", true, true),
     mutation("mom_llama_settings_update", true, true),
@@ -204,6 +261,14 @@ mod tests {
             .as_array()
             .expect("command contracts array")
         {
+            if command["surface"].as_str() == Some("lifecycle") {
+                assert_eq!(
+                    command["tauri_command"].as_str(),
+                    Some("lifecycle_only"),
+                    "lifecycle commands must not be exposed through Tauri"
+                );
+                continue;
+            }
             let tauri_command = command["tauri_command"]
                 .as_str()
                 .expect("contract Tauri command");
@@ -236,11 +301,17 @@ mod tests {
             "mom_llama_engine_configure",
             "mom_llama_model_select",
             "mom_llama_chat_send",
+            "mom_llama_information_chat_send",
+            "mom_llama_composer_autocomplete",
+            "mom_llama_composer_autocomplete_cancel",
+            "mom_llama_composer_autocomplete_accept",
             "mom_llama_chat_dispatch",
             "mom_llama_mention_dispatch",
             "mom_llama_mention_cancel",
             "mom_llama_mention_synthesize",
+            "mom_llama_mention_tool_approval_decide",
             "mom_llama_persona_update",
+            "mom_llama_persona_remove_from_library",
             "mom_llama_chat_cancel",
             "mom_llama_chat_skip_reasoning",
             "mom_llama_chat_regenerate",
@@ -255,6 +326,10 @@ mod tests {
             "mom_llama_model_slot_list",
             "mom_llama_model_slot_load",
             "mom_llama_model_slot_unload",
+            "mom_llama_speech_read_aloud",
+            "mom_llama_speech_transcribe_attachment",
+            "mom_llama_speech_audio",
+            "mom_llama_speech_stop",
         ]);
         let command_source = include_str!("commands.rs");
 
@@ -280,7 +355,11 @@ mod tests {
             {
                 let expected_store_mutation = body.contains("command_value(")
                     || body.contains("blocking_command(")
-                    || body.contains("picker_blocked(");
+                    || body.contains("picker_blocked(")
+                    || body.contains("composer_autocomplete_accept(")
+                    || body.contains("register_alexandria(")
+                    || body.contains("commit_attachment(")
+                    || body.contains("commit_managed_removal(");
                 assert_eq!(
                     spec.mutates_store, expected_store_mutation,
                     "{} implementation {} store authority",
@@ -355,18 +434,22 @@ pub async fn sample(runtime: Runtime) {
             for (implementation, body) in command_bodies(source, spec.name).into_iter().enumerate()
             {
                 assert!(
-                    body.contains(&format!("admit(command_spec(\"{}\"))", spec.name)),
+                    command_admission_offset(body, spec.name).is_some(),
                     "{} implementation {} must atomically acquire its classified app lease",
                     spec.name,
                     implementation
                 );
                 let starts_long_work = body.contains("blocking_command(")
+                    || body.contains("blocking_value(")
                     || body.contains("blocking_response(")
+                    || body.contains(".run_blocking(")
                     || body.contains("AsyncFileDialog::");
                 if starts_long_work {
                     assert!(
                         body.contains("blocking_command(")
+                            || body.contains("blocking_value(")
                             || body.contains("blocking_response(")
+                            || body.contains(".run_blocking(")
                             || body.contains("lease.cancellation")
                             || body.contains("lease.cancelled()"),
                         "{} implementation {} must carry an application cancellation control",
@@ -404,11 +487,29 @@ pub async fn sample(runtime: Runtime) {
         let Some((_, executable)) = body.split_once('{') else {
             return false;
         };
-        let admission = format!("admit(command_spec(\"{name}\"))");
-        let Some(admission_offset) = executable.find(&admission) else {
+        let executable = source_without_whitespace(executable);
+        let Some(admission_offset) = command_admission_offset(&executable, name) else {
             return false;
         };
-        effect_offsets(executable).all(|effect_offset| admission_offset < effect_offset)
+        effect_offsets(&executable).all(|effect_offset| admission_offset < effect_offset)
+    }
+
+    fn command_admission_offset(source: &str, name: &str) -> Option<usize> {
+        let compact = source_without_whitespace(source);
+        [
+            format!("admit(command_spec(\"{name}\"))"),
+            format!("admit(command_spec(\"{name}\",))"),
+        ]
+        .into_iter()
+        .filter_map(|admission| compact.find(&admission))
+        .min()
+    }
+
+    fn source_without_whitespace(source: &str) -> String {
+        source
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
     }
 
     fn effect_offsets(body: &str) -> impl Iterator<Item = usize> + '_ {

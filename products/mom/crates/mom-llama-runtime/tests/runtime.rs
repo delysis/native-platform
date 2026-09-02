@@ -1,14 +1,6 @@
 use anyhow::{Result, anyhow};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use fte_backend_llama::{BACKEND_ID, LlamaNativeBackend};
-use fte_router::{Gateway, GatewayDefaults};
-use fte_types::{
-    CacheMode, CacheOutcome, CachePolicy, ContentBlock, DeadlinePolicy, GatewayRequest,
-    GatewayResponse, GenerationInput, InputItem, MessageRole as GatewayMessageRole, ModelSelector,
-    RequestId, ResponseFormat, RoutingPolicy, SamplingOptions, StoragePolicy, StreamPolicy,
-    TerminalStatus, ToolPolicy,
-};
 use llama_native_types::{
     CompletionPrompt, GenerationInput as NativeGenerationInput,
     GenerationRequest as NativeGenerationRequest, GenerationState, SamplingConfig,
@@ -16,17 +8,18 @@ use llama_native_types::{
 };
 use mom_llama_runtime::config::{SettingsUpdate, set_data_dir_override_for_tests};
 use mom_llama_runtime::{
-    ChatDispatchOutput, ChatSendInput, ChatSendOptions, ConsultPanel, ConsultPersona,
-    ConsultStartInput, ConsultStartOptions, Conversation, ConversationExecutionProfile,
-    ConversationKind, EngineCheckOptions, KvCachePolicy, MentionDispatchInput, Message,
-    MessageAttribution, MessageRole, MessageSpeakerKind, PersonaFreezeInput, PersonaHistoryMode,
+    AttachmentPreviewAnchor, AttachmentPreviewCatalog, ChatDispatchOutput, ChatSendInput,
+    ChatSendOptions, ChatSendOutput, ConsultPanel, ConsultPersona, ConsultStartInput,
+    ConsultStartOptions, Conversation, ConversationExecutionProfile, ConversationKind,
+    EngineCheckOptions, KvCachePolicy, MentionDispatchInput, Message, MessageAttribution,
+    MessageRole, MessageSpeakerKind, PersonaFreezeInput, PersonaHistoryMode,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
+use std::sync::{Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
@@ -36,6 +29,19 @@ const VALID_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\
     \x00\x00\x00\x09pHYs\x00\x00\x00\x01\x00\x00\x00\x01\x00\x4f\x25\xc4\xd6\
     \x00\x00\x00\x10IDAT\x78\x9c\x63\xfc\xc3\x00\x02\x2c\x0c\x58\x28\x00\x1b\x74\x01\x0a\x5f\x82\xdc\x5d\
     \x00\x00\x00\x00IEND\xae\x42\x60\x82";
+
+fn primary_preview_anchor(catalog: &AttachmentPreviewCatalog) -> Result<AttachmentPreviewAnchor> {
+    let artifact = catalog
+        .primary
+        .as_ref()
+        .ok_or_else(|| anyhow!("canonical preview has no primary artifact"))?;
+    Ok(AttachmentPreviewAnchor {
+        attachment_id: catalog.attachment_id.clone(),
+        root_sha256: catalog.root_sha256.clone(),
+        artifact_id: artifact.artifact_id.clone(),
+        policy_fingerprint: catalog.policy_fingerprint.clone(),
+    })
+}
 
 type EncryptedDocumentSnapshot = BTreeMap<String, (Vec<u8>, Vec<u8>, i64)>;
 
@@ -234,14 +240,29 @@ fn settings_paths_can_be_replaced_and_explicitly_cleared() -> Result<()> {
     })?
     .result
     .ok_or_else(|| anyhow!("replacement settings missing"))?;
-    assert_eq!(replaced.model_path, Some(model));
-    assert_eq!(replaced.mmproj_path, Some(mmproj));
+    assert_eq!(replaced.model_path, Some(model.clone()));
+    assert_eq!(replaced.mmproj_path, Some(mmproj.clone()));
 
     let unchanged = mom_llama_runtime::settings_update(SettingsUpdate::default())?
         .result
         .ok_or_else(|| anyhow!("unchanged settings missing"))?;
     assert_eq!(unchanged.model_path, replaced.model_path);
     assert_eq!(unchanged.mmproj_path, replaced.mmproj_path);
+
+    let next_model = PathBuf::from("/models/next.gguf");
+    let model_changed = mom_llama_runtime::settings_update(SettingsUpdate {
+        model_path: Some(Some(next_model.clone())),
+        ..SettingsUpdate::default()
+    })?
+    .result
+    .ok_or_else(|| anyhow!("model-only settings missing"))?;
+    assert_eq!(model_changed.model_path, Some(next_model));
+    assert_eq!(model_changed.mmproj_path, None);
+    assert_eq!(
+        model_changed.upstream_settings.get("mmprojPath"),
+        Some(&json!("")),
+        "a model-only patch must never retain the previous model's projector"
+    );
 
     let cleared = mom_llama_runtime::settings_update(SettingsUpdate {
         model_path: Some(None),
@@ -750,35 +771,6 @@ fn malformed_legacy_panel_blocks_without_advancing_migration() -> Result<()> {
             .any(|persona| persona.title == "Duplicate lens"),
         "the failed attempt must not advance the migration marker"
     );
-    Ok(())
-}
-
-#[test]
-fn gateway_document_adapter_is_confined_to_fte_response_namespaces() -> Result<()> {
-    let session = TestSession::new("gateway-document-namespace")?;
-    for namespace in [
-        "consult-panels.v1",
-        "persona-groups.v1",
-        "fte.response.v1:",
-        "fte.response.v1:../consult-panels.v1",
-    ] {
-        assert!(mom_llama_runtime::gateway_document_get(namespace).is_err());
-        assert!(mom_llama_runtime::gateway_document_put(namespace, b"blocked").is_err());
-        assert!(mom_llama_runtime::gateway_document_delete(namespace).is_err());
-    }
-    assert!(
-        !session.path().join("runtime.sqlite3").exists(),
-        "invalid gateway namespaces must be rejected before product storage opens"
-    );
-
-    let namespace = "fte.response.v1:request_01.test";
-    mom_llama_runtime::gateway_document_put(namespace, b"response")?;
-    assert_eq!(
-        mom_llama_runtime::gateway_document_get(namespace)?,
-        Some(b"response".to_vec())
-    );
-    assert!(mom_llama_runtime::gateway_document_delete(namespace)?);
-    assert_eq!(mom_llama_runtime::gateway_document_get(namespace)?, None);
     Ok(())
 }
 
@@ -1600,6 +1592,20 @@ fn product_runtime_rejects_network_process_and_copied_native_authority() -> Resu
         );
     }
     let runtime_workspace_manifest = fs::read_to_string(runtime_manifest.join("Cargo.toml"))?;
+    let app_manifest = fs::read_to_string(
+        product_root
+            .join("apps")
+            .join("mom-llama")
+            .join("src-tauri")
+            .join("Cargo.toml"),
+    )?;
+    for retired_composition in ["fte-", "tauri-plugin-free-token-energy"] {
+        assert!(
+            !runtime_workspace_manifest.contains(retired_composition)
+                && !app_manifest.contains(retired_composition),
+            "Mom must not compose the retired FTE dependency `{retired_composition}`"
+        );
+    }
     for retired_source in [
         "github.com/delysis/mom-llama",
         "github.com/delysis/llama-native-kit",
@@ -2197,15 +2203,18 @@ fn attachment_payload_is_encrypted_and_multimodal_is_honestly_blocked() -> Resul
             .windows(payload.len())
             .any(|window| window == payload)
     );
-    let metadata_only = mom_llama_runtime::attachment_preview(&output.attachment.id, false)?
+    let catalog = mom_llama_runtime::attachment_preview(&output.attachment.id)?
         .result
-        .ok_or_else(|| anyhow!("attachment metadata preview missing"))?;
-    assert_eq!(metadata_only.attachment.sha256, output.attachment.sha256);
-    assert!(metadata_only.bytes.is_none());
-    let hydrated = mom_llama_runtime::attachment_preview(&output.attachment.id, true)?
-        .result
-        .ok_or_else(|| anyhow!("attachment payload preview missing"))?;
-    assert_eq!(hydrated.bytes.as_deref(), Some(payload));
+        .ok_or_else(|| anyhow!("attachment preview catalog missing"))?;
+    assert_eq!(catalog.root_sha256, output.attachment.sha256);
+    let media = mom_llama_runtime::attachment_preview_media(&primary_preview_anchor(&catalog)?)?
+        .map_err(|blocker| anyhow!("{}: {}", blocker.code, blocker.message))?;
+    assert_eq!(media.bytes.as_slice(), payload);
+    mom_llama_runtime::draft_update(
+        Some(&conversation.id),
+        "Describe the image.".to_string(),
+        vec![output.attachment.id.clone()],
+    )?;
     let chat = mom_llama_runtime::chat_send(
         ChatSendInput {
             conversation_id: conversation.id.clone(),
@@ -2255,6 +2264,11 @@ fn long_paste_becomes_an_encrypted_text_attachment_without_a_plaintext_file() ->
         .result
         .ok_or_else(|| anyhow!("pasted attachment draft missing"))?;
     assert_eq!(draft.attachment_ids, vec![output.attachment.id.clone()]);
+    mom_llama_runtime::draft_update(
+        Some(&conversation.id),
+        "Summarize this attachment.".to_string(),
+        vec![output.attachment.id.clone()],
+    )?;
     let sent = mom_llama_runtime::chat_send(
         ChatSendInput {
             conversation_id: conversation.id.clone(),
@@ -2487,16 +2501,24 @@ fn configure_mcp_fixture(session: &TestSession) -> Result<()> {
                     "properties":{"value":{"type":"string"}}
                 }
             }],
-            "content": [{"type":"text","text":"fixture tool result"}]
         }
     });
     let body = serde_json::to_string(&response)?;
+    let initialize = serde_json::to_string(&json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fixture", "version": "1"}
+        }
+    }))?;
     let executable = session.path().join("mcp-fixture");
     std::fs::write(
         &executable,
         format!(
-            "#!/bin/sh\ncat >/dev/null\nprintf 'Content-Length: {}\\r\\n\\r\\n{}'\n",
-            body.len(),
+            "#!/bin/sh\nIFS= read -r initialize\nprintf '%s\\n' '{}'\nIFS= read -r initialized\nIFS= read -r request\nprintf '%s\\n' '{}'\n",
+            initialize.replace('\'', "'\\''"),
             body.replace('\'', "'\\''")
         ),
     )?;
@@ -2538,99 +2560,24 @@ fn initialize_product_runtime() -> Result<mom_llama_runtime::native_runtime::Pro
     mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(&settings)
 }
 
-async fn product_gateway_cache_request(
-    stable_system: &str,
-    user_message: &str,
-    cache_mode: CacheMode,
-    owner_version: &str,
-) -> Result<GatewayResponse> {
-    let (host, model) = mom_llama_runtime::gateway_native_host_and_model()?;
-    let model_id = model.model_id.clone();
-    let backend = Arc::new(LlamaNativeBackend::new(host));
-    backend.configure_model(model)?;
-    let gateway = Gateway::new(GatewayDefaults {
-        catalog_version: "mom-llama-real-cache-proof-v1".to_string(),
-    });
-    gateway.register_backend(backend)?;
-    let request = GatewayRequest {
-        request_id: RequestId::new(),
-        client_id: "mom-llama-real-cache-proof".to_string(),
-        model: ModelSelector::ExactRoute {
-            backend_id: BACKEND_ID.to_string(),
-            model_id,
+fn product_chat_cache_request(conversation_id: &str, user_message: &str) -> Result<ChatSendOutput> {
+    let result = mom_llama_runtime::chat_send(
+        ChatSendInput {
+            conversation_id: conversation_id.to_owned(),
+            message: user_message.to_owned(),
         },
-        input: GenerationInput::Chat {
-            items: vec![
-                InputItem::Message {
-                    id: None,
-                    role: GatewayMessageRole::System,
-                    content: vec![ContentBlock::Text {
-                        text: stable_system.to_string(),
-                    }],
-                },
-                InputItem::Message {
-                    id: None,
-                    role: GatewayMessageRole::User,
-                    content: vec![ContentBlock::Text {
-                        text: user_message.to_string(),
-                    }],
-                },
-            ],
-        },
-        sampling: SamplingOptions {
-            max_output_tokens: Some(8),
-            temperature: Some(0.0),
-            seed: Some(7),
-            ..SamplingOptions::default()
-        },
-        response_format: ResponseFormat::default(),
-        tools: Vec::new(),
-        tool_policy: ToolPolicy::default(),
-        cache: CachePolicy {
-            mode: cache_mode,
-            stable_prefix_items: Some(1),
-            owner_namespace: Some("mom-llama-integrated-cache-proof".to_string()),
-            owner_version: Some(owner_version.to_string()),
-            ..CachePolicy::default()
-        },
-        routing: RoutingPolicy::default(),
-        storage: StoragePolicy::default(),
-        deadline: DeadlinePolicy {
-            total_ms: Some(180_000),
-            ..DeadlinePolicy::default()
-        },
-        stream: StreamPolicy::default(),
-        provider_extensions: BTreeMap::new(),
-    };
-    Ok(gateway.execute(request).await?.final_response().await?)
+        ChatSendOptions::default(),
+    )?;
+    assert!(result.receipt.real_engine_invoked);
+    result
+        .result
+        .ok_or_else(|| anyhow!("real product chat request did not return an output"))
 }
 
-fn assert_gateway_cache_outcome(
-    stage: &str,
-    response: &GatewayResponse,
-    expected: CacheOutcome,
-) -> Result<()> {
-    assert_eq!(response.status, TerminalStatus::Completed);
-    assert!(response.usage.real_local_inference);
-    assert!(!response.output.is_empty());
-    assert_eq!(
-        response
-            .usage
-            .cache
-            .as_ref()
-            .ok_or_else(|| anyhow!("gateway cache receipt missing"))?
-            .outcome,
-        expected,
-        "unexpected cache outcome at `{stage}`"
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "current_thread")]
+#[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
-async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_corruption()
--> Result<()> {
-    let Some(session) = configured_real_session("real-product-gateway-cache")? else {
+fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Result<()> {
+    let Some(session) = configured_real_session("real-product-native-chat-cache")? else {
         return Ok(());
     };
     mom_llama_runtime::settings_update(SettingsUpdate {
@@ -2639,175 +2586,49 @@ async fn real_product_gateway_cache_hierarchy_survives_clear_restart_off_and_cor
         ..SettingsUpdate::default()
     })?;
     let _native_owner = initialize_product_runtime()?;
-    let stable_system = format!(
-        "This is an immutable local persona prefix used only for cache verification. {}",
-        "Keep the complete prior statement in context and answer the next user briefly. "
-            .repeat(32)
-    );
+    let conversation = mom_llama_runtime::conversation_new(Some("Native cache proof".to_owned()))?
+        .result
+        .ok_or_else(|| anyhow!("cache proof conversation missing"))?;
 
-    let cold = product_gateway_cache_request(
-        &stable_system,
-        "Return the word cold.",
-        CacheMode::Persistent,
-        "v1",
-    )
-    .await?;
-    assert_gateway_cache_outcome("cold", &cold, CacheOutcome::Miss)?;
-    let warm = product_gateway_cache_request(
-        &stable_system,
-        "Return the word warm.",
-        CacheMode::Persistent,
-        "v1",
-    )
-    .await?;
-    assert_gateway_cache_outcome("warm", &warm, CacheOutcome::Hit)?;
+    let cold = product_chat_cache_request(&conversation.id, "Return the word cold.")?;
+    assert!(
+        !cold.cache_reused,
+        "the first direct chat request must be cold"
+    );
+    let warm = product_chat_cache_request(&conversation.id, "Return the word warm.")?;
+    assert!(
+        warm.cache_reused,
+        "the second direct chat request must reuse its prefix"
+    );
 
     let cleared = mom_llama_runtime::kv_cache_clear()?;
     assert_eq!(cleared.readiness, "contracted");
     assert!(cleared.blocker.is_none());
-    let after_clear = product_gateway_cache_request(
-        &stable_system,
-        "Return the words after clear.",
-        CacheMode::Persistent,
-        "v1",
-    )
-    .await?;
-    assert_gateway_cache_outcome("after_clear", &after_clear, CacheOutcome::Miss)?;
-
-    let settings = mom_llama_runtime::settings_get()?
-        .result
-        .ok_or_else(|| anyhow!("cache proof settings missing"))?;
-    mom_llama_runtime::settings_update(SettingsUpdate {
-        resident_memory_budget_bytes: Some(
-            settings
-                .resident_memory_budget_bytes
-                .saturating_add(1024 * 1024),
-        ),
-        ..SettingsUpdate::default()
-    })?;
-    let restored = product_gateway_cache_request(
-        &stable_system,
-        "Return the words after persistent restore.",
-        CacheMode::Persistent,
-        "v1",
-    )
-    .await?;
-    assert_gateway_cache_outcome("restored", &restored, CacheOutcome::Hit)?;
+    let after_clear =
+        product_chat_cache_request(&conversation.id, "Return the words after clear.")?;
+    assert!(
+        !after_clear.cache_reused,
+        "explicit clear must force a cold request"
+    );
+    let warm_after_clear =
+        product_chat_cache_request(&conversation.id, "Return the words after warmup.")?;
+    assert!(warm_after_clear.cache_reused);
 
     mom_llama_runtime::kv_cache_clear()?;
     mom_llama_runtime::settings_update(SettingsUpdate {
         kv_cache_policy: Some(KvCachePolicy::None),
         ..SettingsUpdate::default()
     })?;
-    let off_first = product_gateway_cache_request(
-        &stable_system,
-        "Caching is off, first request.",
-        CacheMode::Persistent,
-        "v1",
-    )
-    .await?;
-    let off_second = product_gateway_cache_request(
-        &stable_system,
-        "Caching is off, second request.",
-        CacheMode::Persistent,
-        "v1",
-    )
-    .await?;
-    assert_gateway_cache_outcome("off_first", &off_first, CacheOutcome::Miss)?;
-    assert_gateway_cache_outcome("off_second", &off_second, CacheOutcome::Miss)?;
+    let off_first = product_chat_cache_request(&conversation.id, "Caching is off, first request.")?;
+    let off_second =
+        product_chat_cache_request(&conversation.id, "Caching is off, second request.")?;
+    assert!(!off_first.cache_reused);
+    assert!(!off_second.cache_reused);
     assert!(
         !encrypted_document_snapshot(session.path())?
             .contains_key("native-host-prefix-cache.mom-llama"),
-        "the Off policy must not write the shared FTE/native prefix document"
+        "the Off policy must not write the product Native prefix document"
     );
-
-    mom_llama_runtime::settings_update(SettingsUpdate {
-        kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
-        ..SettingsUpdate::default()
-    })?;
-    let before_corruption = product_gateway_cache_request(
-        &stable_system,
-        "Checkpoint a prefix before corruption.",
-        CacheMode::Persistent,
-        "v1",
-    )
-    .await?;
-    assert_gateway_cache_outcome("before_corruption", &before_corruption, CacheOutcome::Miss)?;
-    let connection = rusqlite::Connection::open(session.path().join("runtime.sqlite3"))?;
-    assert_eq!(
-        connection.execute(
-            "UPDATE encrypted_documents SET ciphertext = X'00'
-             WHERE namespace = 'native-host-prefix-cache.mom-llama'",
-            [],
-        )?,
-        1
-    );
-    let settings = mom_llama_runtime::settings_get()?
-        .result
-        .ok_or_else(|| anyhow!("cache proof settings missing after re-enable"))?;
-    mom_llama_runtime::settings_update(SettingsUpdate {
-        resident_memory_budget_bytes: Some(
-            settings
-                .resident_memory_budget_bytes
-                .saturating_add(1024 * 1024),
-        ),
-        ..SettingsUpdate::default()
-    })?;
-    let corruption_fallback = product_gateway_cache_request(
-        &stable_system,
-        "Generate normally after quarantining corrupt cache bytes.",
-        CacheMode::Persistent,
-        "v1",
-    )
-    .await?;
-    assert_gateway_cache_outcome(
-        "corruption_fallback",
-        &corruption_fallback,
-        CacheOutcome::Miss,
-    )?;
-    let documents = encrypted_document_snapshot(session.path())?;
-    assert!(
-        documents
-            .keys()
-            .any(|namespace| namespace.starts_with("quarantine.disposable-cache."))
-    );
-    assert!(documents.contains_key("native-host-prefix-cache.mom-llama"));
-
-    let warm_after_quarantine = product_gateway_cache_request(
-        &stable_system,
-        "Verify the replacement cache is warm.",
-        CacheMode::Persistent,
-        "v1",
-    )
-    .await?;
-    assert_gateway_cache_outcome(
-        "warm_after_quarantine",
-        &warm_after_quarantine,
-        CacheOutcome::Hit,
-    )?;
-    let settings = mom_llama_runtime::settings_get()?
-        .result
-        .ok_or_else(|| anyhow!("cache proof settings missing before fingerprint change"))?;
-    mom_llama_runtime::settings_update(SettingsUpdate {
-        // Use a configuration field whose effective value is not capped by a
-        // small model's advertised context window. SmolLM2 clamps an oversized
-        // context request back to 8K, which correctly preserves the fingerprint
-        // and would make this a false invalidation test.
-        batch_tokens: Some(settings.batch_tokens.saturating_add(1)),
-        ..SettingsUpdate::default()
-    })?;
-    assert!(
-        mom_llama_runtime::unload_resident_model(),
-        "the prior fingerprint's resident worker should be unloadable without clearing cache state"
-    );
-    let fingerprint_miss = product_gateway_cache_request(
-        &stable_system,
-        "Generate normally after changing the model batch fingerprint.",
-        CacheMode::Persistent,
-        "v1",
-    )
-    .await?;
-    assert_gateway_cache_outcome("fingerprint_miss", &fingerprint_miss, CacheOutcome::Miss)?;
     Ok(())
 }
 
@@ -3046,10 +2867,13 @@ fn real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_byt
             .as_ref()
             .is_some_and(|fingerprint| { fingerprint.multimodal_projector_sha256.is_some() })
     );
-    let preview = mom_llama_runtime::attachment_preview(&attachment.id, true)?
+    let preview_catalog = mom_llama_runtime::attachment_preview(&attachment.id)?
         .result
-        .ok_or_else(|| anyhow!("decrypted multimodal preview missing"))?;
-    assert_eq!(preview.bytes.as_deref(), Some(image_bytes.as_slice()));
+        .ok_or_else(|| anyhow!("multimodal preview catalog missing"))?;
+    let preview =
+        mom_llama_runtime::attachment_preview_media(&primary_preview_anchor(&preview_catalog)?)?
+            .map_err(|blocker| anyhow!("{}: {}", blocker.code, blocker.message))?;
+    assert_eq!(preview.bytes.as_slice(), image_bytes.as_slice());
     let sqlite = std::fs::read(session.path().join("runtime.sqlite3"))?;
     assert!(
         !sqlite
@@ -3091,10 +2915,13 @@ fn real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_byt
     assert!(audio_result.result.as_ref().is_some_and(|output| {
         !output.assistant_text.trim().is_empty() && output.completion_tokens > 0
     }));
-    let audio_preview = mom_llama_runtime::attachment_preview(&audio_attachment.id, true)?
+    let audio_catalog = mom_llama_runtime::attachment_preview(&audio_attachment.id)?
         .result
-        .ok_or_else(|| anyhow!("decrypted multimodal audio preview missing"))?;
-    assert_eq!(audio_preview.bytes.as_deref(), Some(audio_bytes.as_slice()));
+        .ok_or_else(|| anyhow!("multimodal audio preview catalog missing"))?;
+    let audio_preview =
+        mom_llama_runtime::attachment_preview_media(&primary_preview_anchor(&audio_catalog)?)?
+            .map_err(|blocker| anyhow!("{}: {}", blocker.code, blocker.message))?;
+    assert_eq!(audio_preview.bytes.as_slice(), audio_bytes.as_slice());
     let sqlite = std::fs::read(session.path().join("runtime.sqlite3"))?;
     assert!(
         !sqlite
@@ -3404,7 +3231,8 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
         max_tokens: Some(64),
         ..SettingsUpdate::default()
     })?;
-    let _native_owner = initialize_product_runtime()?;
+    let native_owner = initialize_product_runtime()?;
+    let operation_scope = mom_llama_runtime::OperationScope::for_native_host(&native_owner.host());
     let source = mom_llama_runtime::conversation_new(Some("Group source".to_string()))?
         .result
         .ok_or_else(|| anyhow!("group source missing"))?;
@@ -3451,8 +3279,10 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
         .ok_or_else(|| anyhow!("group host missing"))?;
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let host_id = host.id.clone();
+    let dispatch_scope = operation_scope.clone();
     let handle = std::thread::spawn(move || {
-        mom_llama_runtime::chat_dispatch_stream(
+        mom_llama_runtime::chat_dispatch_stream_in_scope(
+            &dispatch_scope,
             MentionDispatchInput {
                 conversation_id: host_id,
                 message: format!("@{} offer four concise views", group.mention_handle),
@@ -3471,7 +3301,11 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
     let invocation_id = started_rx
         .recv_timeout(Duration::from_mins(2))
         .map_err(|error| anyhow!("persona group did not start streaming: {error}"))?;
-    let cancelled = mom_llama_runtime::mention_cancel(&invocation_id, Some(&cancelled_persona_id))?;
+    let cancelled = mom_llama_runtime::mention_cancel_in_scope(
+        &operation_scope,
+        &invocation_id,
+        Some(&cancelled_persona_id),
+    )?;
     assert_eq!(
         cancelled
             .result
@@ -3661,14 +3495,16 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
         max_tokens: Some(512),
         ..SettingsUpdate::default()
     })?;
-    let _native_owner = initialize_product_runtime()?;
+    let native_owner = initialize_product_runtime()?;
+    let operation_scope = mom_llama_runtime::OperationScope::for_native_host(&native_owner.host());
     configure_mcp_fixture(&session)?;
     let conversation_id = "real-tool-loop-cancel";
     let prompt =
         "Use the tool result, then write a very long detailed response with many paragraphs."
             .to_string();
     let arguments = json!({"value":"ready"});
-    let prepared = mom_llama_runtime::tool_loop_prepare(
+    let prepared = mom_llama_runtime::tool_loop_prepare_in_scope(
+        &operation_scope,
         conversation_id,
         prompt.clone(),
         "fixture".to_string(),
@@ -3682,8 +3518,10 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
         .ok_or_else(|| anyhow!("tool loop approval missing"))?;
     let prompt_for_worker = prompt.clone();
     let arguments_for_worker = arguments.clone();
+    let worker_scope = operation_scope.clone();
     let worker = std::thread::spawn(move || {
-        mom_llama_runtime::tool_loop_run(
+        mom_llama_runtime::tool_loop_run_in_scope(
+            &worker_scope,
             conversation_id,
             prompt_for_worker,
             "fixture".to_string(),
@@ -3722,7 +3560,8 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
     };
     assert!(active.current_model_request_id.is_some());
 
-    let cancelled = mom_llama_runtime::tool_loop_cancel(conversation_id)?;
+    let cancelled =
+        mom_llama_runtime::tool_loop_cancel_in_scope(&operation_scope, conversation_id)?;
     assert_eq!(cancelled.status, "contracted");
     assert_eq!(
         cancelled

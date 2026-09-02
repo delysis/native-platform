@@ -674,6 +674,32 @@ pub(crate) fn validate_active_in_transaction(
     document_id: DocumentId,
     expected: ActiveRevision,
 ) -> Result<()> {
+    let explicitly_deleted = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM document_deletions WHERE document_id = ?1
+         )",
+        [document_id.to_string()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if explicitly_deleted {
+        return Err(StoreError::DocumentExplicitlyDeleted(document_id));
+    }
+    let lifecycle_in_progress = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM document_rename_operations
+             WHERE document_id = ?1 AND state IN ('prepared', 'captured')
+             UNION ALL
+             SELECT 1 FROM document_delete_operations
+             WHERE document_id = ?1 AND state IN ('prepared', 'captured')
+         )",
+        [document_id.to_string()],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if lifecycle_in_progress {
+        return Err(StoreError::DocumentLifecycleUncertain(format!(
+            "document {document_id} has an unfinished native lifecycle operation"
+        )));
+    }
     let row: (String, String, String) = transaction.query_row(
         "SELECT r.revision_id, r.artifact_id, a.blob_id
          FROM revisions r JOIN artifacts a ON a.artifact_id = r.artifact_id

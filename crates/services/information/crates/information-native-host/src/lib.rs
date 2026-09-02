@@ -19,6 +19,9 @@ use information_native_backend_scripture::{
     SCRIPTURE_PROFILE_NAME, ScriptureBackend, ScriptureBackendConfig,
 };
 use information_native_backend_sqlite::{AlexandriaBackend, AlexandriaBackendConfig};
+use information_native_backend_zim::{
+    ZimError, ZimMaterializationRequest, ZimProductionReport, produce_managed_documents,
+};
 use information_native_catalog::{
     CatalogError, CatalogIndex, CatalogRepresentationMatch, CatalogSearchQuery, PlanRequest,
 };
@@ -27,16 +30,20 @@ use information_native_retrieval::{
     ResourceBackend, RetrievalRouter,
 };
 use information_native_store::{
-    ExternalRegistrationRequest, ManagedStore, PreparedInstall, RegisteredInstallation,
-    RemovalPlan, StoreError, StoreSnapshot, TransferSummary,
+    ActiveManagedDocumentsProjection, ActiveManagedMaterialization, ExternalRegistrationRequest,
+    ManagedStore, PreparedInstall, RegisteredInstallation, RemovalPlan, StoreError, StoreSnapshot,
+    TransferSummary,
 };
 use information_native_types::{
     AcquisitionAttempt, AcquisitionRedirect, AcquisitionTransport, AgentToolDefinition,
     ArtifactAcquisition, ArtifactId, ArtifactRole, CatalogAuthority, ErrorClass, EvidenceSet,
     ExternalAccessMode, ExternalRegistration, FormatKind, InformationCatalog, InformationError,
     InformationQuery, InstallPlan, InstallReceipt, InstallationId, InstallationState,
-    PlannedArtifact, ReleaseId, RepresentationFormat, RepresentationId, ResourceId, ResourceRecord,
-    RetrievalPurpose, RightsStatement, SourceIdentity, UsePolicy,
+    ManagedDocumentsReceipt, ManagedDocumentsRemovalPlan, ManagedDocumentsRemovalReceipt,
+    ManagedDocumentsRemovalRequest, ManagedDocumentsSearchRequest, ManagedDocumentsSearchResult,
+    ManagedDocumentsV1, ManagedMaterializationId, PlannedArtifact, ReleaseId, RepresentationFormat,
+    RepresentationId, ResourceId, ResourceRecord, RetrievalPurpose, RightsStatement,
+    SourceIdentity, UsePolicy,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -57,6 +64,8 @@ pub enum HostError {
     Acquire(#[from] AcquireError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Zim(#[from] ZimError),
     #[error(transparent)]
     Information(#[from] InformationError),
     #[error("information backend registry is unavailable")]
@@ -79,6 +88,7 @@ impl HostError {
             ),
             Self::Acquire(error) => acquisition_information_error(error),
             Self::Store(error) => store_information_error(error),
+            Self::Zim(error) => zim_information_error(error),
             Self::BackendRegistryUnavailable => InformationError::new(
                 ErrorClass::ResourceBusy,
                 "information_backend_registry_unavailable",
@@ -122,6 +132,15 @@ pub struct CatalogHit {
     pub record: ResourceRecord,
     pub relevance: u32,
     pub matching_representations: Vec<CatalogRepresentationMatch>,
+}
+
+/// Receipt for the exact managed bytes activated by one native OpenZIM
+/// conversion. It exposes no source or caller-selected output path; the store
+/// receipt retains only its Information-derived managed relative path.
+#[derive(Debug, Clone, Serialize)]
+pub struct MaterializedZimDocuments {
+    pub receipt: ManagedDocumentsReceipt,
+    pub production: ZimProductionReport,
 }
 
 /// Safe policy knobs for binding one durable installation into the retrieval
@@ -904,6 +923,81 @@ impl InformationHost {
         Ok(self.store.plan_removal(installation_id)?)
     }
 
+    /// Materialize a strict source-neutral document set inside Information's
+    /// managed root. Product and renderer code never receives a database path.
+    pub fn materialize_documents(
+        &self,
+        materialization: &ManagedDocumentsV1,
+    ) -> Result<ManagedDocumentsReceipt, HostError> {
+        Ok(self.store.materialize_documents(materialization)?)
+    }
+
+    /// Parse one acquisition-bound local ZIM archive into inert source-neutral
+    /// documents, then atomically activate Information's managed SQLite/FTS5
+    /// representation. The source archive remains read-only and separate.
+    pub fn materialize_zim_documents(
+        &self,
+        request: &ZimMaterializationRequest,
+    ) -> Result<MaterializedZimDocuments, HostError> {
+        let produced = produce_managed_documents(request)?;
+        let receipt = self.store.materialize_documents(&produced.documents)?;
+        Ok(MaterializedZimDocuments {
+            receipt,
+            production: produced.report,
+        })
+    }
+
+    /// Search one exact immutable managed-document representation for local UI
+    /// use. Model-context and export grants remain separate policy decisions.
+    pub fn search_managed_documents(
+        &self,
+        request: &ManagedDocumentsSearchRequest,
+    ) -> Result<ManagedDocumentsSearchResult, HostError> {
+        Ok(self.store.search_managed_documents(request)?)
+    }
+
+    /// Return a caller-bounded, path-free discoverability projection of active
+    /// receipt identities. Exact actions must use `active_managed_document`.
+    pub fn list_active_managed_documents(
+        &self,
+        max_entries: usize,
+    ) -> Result<ActiveManagedDocumentsProjection, HostError> {
+        Ok(self.store.list_active_managed_documents(max_entries)?)
+    }
+
+    pub fn active_managed_document(
+        &self,
+        materialization_id: &ManagedMaterializationId,
+    ) -> Result<ActiveManagedMaterialization, HostError> {
+        Ok(self.store.active_managed_document(materialization_id)?)
+    }
+
+    pub fn project_active_managed_document(
+        &self,
+        materialization_id: &ManagedMaterializationId,
+        max_manifest_bytes: u64,
+    ) -> Result<ActiveManagedMaterialization, HostError> {
+        Ok(self
+            .store
+            .project_active_managed_document(materialization_id, max_manifest_bytes)?)
+    }
+
+    pub fn plan_managed_documents_removal(
+        &self,
+        materialization_id: &ManagedMaterializationId,
+    ) -> Result<ManagedDocumentsRemovalPlan, HostError> {
+        Ok(self
+            .store
+            .plan_managed_documents_removal(materialization_id)?)
+    }
+
+    pub fn remove_managed_documents(
+        &self,
+        request: &ManagedDocumentsRemovalRequest,
+    ) -> Result<ManagedDocumentsRemovalReceipt, HostError> {
+        Ok(self.store.remove_managed_documents(request)?)
+    }
+
     pub fn execute_tool(
         &self,
         call: InformationToolCall,
@@ -1287,7 +1381,9 @@ fn store_information_error(error: &StoreError) -> InformationError {
             "information_store_conflict",
             false,
         ),
-        StoreError::InstallationNotFound(_) | StoreError::StageNotFound(_) => {
+        StoreError::InstallationNotFound(_)
+        | StoreError::StageNotFound(_)
+        | StoreError::ManagedDocumentsNotFound(_) => {
             (ErrorClass::NotFound, "information_store_not_found", false)
         }
         StoreError::Contract(_)
@@ -1310,9 +1406,20 @@ fn store_information_error(error: &StoreError) -> InformationError {
         | StoreError::ArtifactSizeMismatch { .. }
         | StoreError::ArtifactDigestMismatch { .. }
         | StoreError::SourceChanged(_)
-        | StoreError::RegistryCorrupt(_) => (
+        | StoreError::RegistryCorrupt(_)
+        | StoreError::ManagedDocumentsIdentityMismatch => (
             ErrorClass::Integrity,
             "information_store_integrity_failure",
+            false,
+        ),
+        StoreError::ManagedDocumentsConflict(_) => (
+            ErrorClass::ResourceBusy,
+            "information_managed_documents_conflict",
+            false,
+        ),
+        StoreError::ManagedDocumentsSqlite { .. } => (
+            ErrorClass::Backend,
+            "information_managed_documents_database_failure",
             false,
         ),
         StoreError::CommittedDurabilityUnknown { .. } => (
@@ -1328,6 +1435,46 @@ fn store_information_error(error: &StoreError) -> InformationError {
         ),
     };
     InformationError::new(class, code, error.to_string()).retryable(retryable)
+}
+
+fn zim_information_error(error: &ZimError) -> InformationError {
+    let (class, code) = match error {
+        ZimError::UnsupportedVersion(_)
+        | ZimError::UnsupportedCompression(_)
+        | ZimError::SplitArchiveUnsupported => {
+            (ErrorClass::Unsupported, "information_zim_unsupported")
+        }
+        ZimError::Io { .. } => (ErrorClass::Io, "information_zim_io_failure"),
+        ZimError::InvalidLimits | ZimError::InvalidRequest(_) | ZimError::InvalidExpectedSha256 => {
+            (ErrorClass::InvalidInput, "information_zim_invalid_input")
+        }
+        ZimError::Contract(_) => (ErrorClass::InvalidInput, "information_zim_contract_failure"),
+        ZimError::ArchiveLimitExceeded
+        | ZimError::CountLimit(_)
+        | ZimError::ClusterLimitExceeded
+        | ZimError::ArticleLimitExceeded => {
+            (ErrorClass::ResourceBusy, "information_zim_limit_exceeded")
+        }
+        ZimError::SymlinkArchive
+        | ZimError::NotARegularFile
+        | ZimError::ArchiveSizeMismatch { .. }
+        | ZimError::ArchiveHashMismatch
+        | ZimError::ArchiveChanged
+        | ZimError::Truncated(_)
+        | ZimError::InvalidMagic
+        | ZimError::InvalidHeader(_)
+        | ZimError::IntegerOverflow
+        | ZimError::OutOfBounds(_)
+        | ZimError::OverlappingRegions
+        | ZimError::InvalidMimeList
+        | ZimError::InvalidDirectoryEntry { .. }
+        | ZimError::InvalidCluster { .. }
+        | ZimError::InvalidArticleUtf8
+        | ZimError::MalformedHtml
+        | ZimError::NoMaterializableArticles
+        | ZimError::Zstd(_) => (ErrorClass::Integrity, "information_zim_integrity_failure"),
+    };
+    InformationError::new(class, code, error.to_string())
 }
 
 fn staged_downloaded_bytes(prepared: &PreparedInstall) -> Result<u64, HostError> {
@@ -1463,6 +1610,7 @@ fn network_attempted_for_failure(
         )
         | HostError::Catalog(_)
         | HostError::Store(_)
+        | HostError::Zim(_)
         | HostError::Information(_)
         | HostError::BackendRegistryUnavailable
         | HostError::MissingArtifactTarget(_)

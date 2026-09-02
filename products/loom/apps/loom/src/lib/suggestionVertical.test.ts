@@ -78,6 +78,7 @@ describe('W1 model-free suggestion vertical', () => {
     const branches: BranchCard[] = fixture.candidate_family.map((candidate, index) => ({
       run_id: `w1-run-${index}`,
       branch_id: `w1-branch-${index}`,
+      weave_command_id: '01K00000000000000000000001',
       document_id: 'w1-document',
       candidate_id: `w1-candidate-${index}`,
       source_revision_id: 'w1-source-revision',

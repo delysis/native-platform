@@ -572,11 +572,37 @@ pub struct TranscriptionResponse {
 pub struct SynthesisResponse {
     pub request_id: SpeechRequestId,
     pub route: SpeechResolvedRoute,
-    pub audio: Vec<u8>,
-    pub format: AudioOutputFormat,
+    pub output: SynthesisOutput,
     pub duration_ms: Option<u64>,
     pub alignments: Vec<SpeechAlignment>,
     pub usage: SpeechUsage,
+}
+
+/// The authoritative disposition of synthesized audio.
+///
+/// A complete response owns the returned bytes. A streamed response records
+/// that the bytes were already delivered through [`SynthesisEvent::Audio`]
+/// and never represents that state with an empty compatibility buffer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SynthesisOutput {
+    Complete {
+        audio: Vec<u8>,
+        format: AudioOutputFormat,
+    },
+    Streamed {
+        format: AudioOutputFormat,
+        emitted_bytes: u64,
+    },
+}
+
+impl SynthesisOutput {
+    #[must_use]
+    pub const fn format(&self) -> &AudioOutputFormat {
+        match self {
+            Self::Complete { format, .. } | Self::Streamed { format, .. } => format,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -918,6 +944,11 @@ impl SpeechCapability {
         {
             return Err(CapabilityValidationError::EvidenceSourceEmpty);
         }
+        if self.availability == CapabilityAvailability::DeferredLoad
+            && !self.deferred_load_admissible()
+        {
+            return Err(CapabilityValidationError::DeferredLoadInvalid);
+        }
         Ok(())
     }
 
@@ -929,6 +960,21 @@ impl SpeechCapability {
         self.availability == CapabilityAvailability::Available
             && self.network == NetworkBehavior::Never
             && self.evidence.iter().any(CapabilityEvidence::proves_runtime)
+    }
+
+    /// A deferred load is dispatchable only through an exact route. It names
+    /// one local model and proves only that a bounded inventory admission ran;
+    /// it is deliberately not runtime capability evidence.
+    #[must_use]
+    pub fn deferred_load_admissible(&self) -> bool {
+        self.availability == CapabilityAvailability::DeferredLoad
+            && self.network == NetworkBehavior::Never
+            && self.model_id.as_deref().is_some_and(valid_identifier)
+            && !self.evidence.is_empty()
+            && self.evidence.iter().all(|evidence| {
+                evidence.kind == EvidenceKind::SystemInventory
+                    && evidence.outcome == EvidenceOutcome::Inconclusive
+            })
     }
 }
 
@@ -1017,7 +1063,6 @@ pub enum AudioOutputKind {
     Wav,
     Mp3,
     OggOpus,
-    DirectPlayback,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1032,6 +1077,9 @@ pub struct SpeechCapabilityLimits {
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityAvailability {
     Available,
+    /// The backend can accept an exact model-bound dispatch, but must complete
+    /// its joined local loader before publishing runtime capability evidence.
+    DeferredLoad,
     AssetInstallRequired,
     PermissionRequired,
     Unavailable,
@@ -1191,6 +1239,10 @@ pub enum CapabilityValidationError {
     LanguageEmpty,
     #[error("capability evidence must name its source")]
     EvidenceSourceEmpty,
+    #[error(
+        "a deferred-load capability must bind one never-network model and carry only inconclusive system-inventory evidence"
+    )]
+    DeferredLoadInvalid,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1540,6 +1592,34 @@ mod tests {
     }
 
     #[test]
+    fn deferred_load_is_inventory_only_and_never_runtime_eligible() {
+        let mut deferred = capability(EvidenceKind::SystemInventory, NetworkBehavior::Never);
+        deferred.model_id = Some("parakeet.exact-model".to_owned());
+        deferred.availability = CapabilityAvailability::DeferredLoad;
+        deferred.evidence[0].outcome = EvidenceOutcome::Inconclusive;
+
+        deferred.validate().expect("valid deferred-load shape");
+        assert!(deferred.deferred_load_admissible());
+        assert!(!deferred.eligible_for_local_only());
+        assert!(!deferred.evidence[0].proves_runtime());
+
+        deferred.evidence[0].kind = EvidenceKind::RuntimeApi;
+        deferred.evidence[0].outcome = EvidenceOutcome::Confirmed;
+        assert_eq!(
+            deferred.validate(),
+            Err(CapabilityValidationError::DeferredLoadInvalid)
+        );
+
+        deferred.evidence[0].kind = EvidenceKind::SystemInventory;
+        deferred.evidence[0].outcome = EvidenceOutcome::Inconclusive;
+        deferred.model_id = Some(String::new());
+        assert_eq!(
+            deferred.validate(),
+            Err(CapabilityValidationError::DeferredLoadInvalid)
+        );
+    }
+
+    #[test]
     fn empty_audio_fails_before_backend_execution() {
         let request = TranscriptionRequest {
             context: context(),
@@ -1582,6 +1662,35 @@ mod tests {
             request.context.routing.privacy,
             SpeechPrivacyPolicy::LocalOnly
         );
+    }
+
+    #[test]
+    fn synthesis_output_distinguishes_complete_bytes_from_stream_delivery() {
+        let complete = SynthesisOutput::Complete {
+            audio: b"RIFFfixtureWAVE".to_vec(),
+            format: AudioOutputFormat::Wav,
+        };
+        let streamed = SynthesisOutput::Streamed {
+            format: AudioOutputFormat::Pcm {
+                format: PcmFormat {
+                    sample_rate_hz: 24_000,
+                    channels: 1,
+                    sample_format: PcmSampleFormat::I16Le,
+                    interleaved: true,
+                },
+            },
+            emitted_bytes: 4_096,
+        };
+
+        let complete_json = serde_json::to_value(&complete).expect("serialize complete output");
+        let streamed_json = serde_json::to_value(&streamed).expect("serialize streamed output");
+        assert_eq!(complete_json["kind"], "complete");
+        assert!(complete_json.get("audio").is_some());
+        assert_eq!(streamed_json["kind"], "streamed");
+        assert_eq!(streamed_json["emitted_bytes"], 4_096);
+        assert!(streamed_json.get("audio").is_none());
+        assert!(matches!(complete.format(), &AudioOutputFormat::Wav));
+        assert!(matches!(streamed.format(), &AudioOutputFormat::Pcm { .. }));
     }
 
     #[test]

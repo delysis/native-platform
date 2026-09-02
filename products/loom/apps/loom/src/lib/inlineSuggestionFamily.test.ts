@@ -12,10 +12,14 @@ import {
 } from './completionSession';
 import type { BranchCard, ModelCapabilitySummary, OpenDocument } from './types';
 
+const FAMILY_ONE = '01K00000000000000000000001';
+const FAMILY_TWO = '01K00000000000000000000002';
+
 function state(manuscriptText: string): InlineSuggestionState {
   const branch: BranchCard = {
     run_id: 'run-1',
     branch_id: 'branch-1',
+    weave_command_id: FAMILY_ONE,
     document_id: 'document-1',
     candidate_id: null,
     source_revision_id: 'revision-1',
@@ -70,9 +74,15 @@ function state(manuscriptText: string): InlineSuggestionState {
     tested_profile: null
   };
   return {
-    branches: [branch],
+    branches: Array.from({ length: 4 }, (_, index) => ({
+      ...branch,
+      run_id: `run-${index + 1}`,
+      branch_id: `branch-${index + 1}`,
+      seed: String(index + 1)
+    })),
     verifiedBodyByRun: {},
     liveTextByRun: { 'run-1': 'world continues' },
+    liveTextSequenceByRun: { 'run-1': '7' },
     currentModel,
     document,
     suggestionsEnabled: true,
@@ -89,10 +99,36 @@ describe('inline suggestion family', () => {
     expect(inlineSuggestionFamily(5, 'visual', state('hello'))).toMatchObject([{
       runId: 'run-1',
       targetByte: 5,
+      presentationKey: 'stream:run-1:7:prose-prefix:16',
       text: ' world continues',
       insertsOnAccept: true
     }]);
     expect(inlineSuggestionFamily(5, 'visual', state(''))).toEqual([]);
+  });
+
+  it('keys equal-byte-length live replacements by text-delta sequence', () => {
+    const selection = state('hello');
+    selection.liveTextByRun['run-1'] = 'cats arrive';
+    selection.liveTextSequenceByRun!['run-1'] = '41';
+    const first = inlineSuggestionFamily(5, 'visual', selection)[0];
+    selection.liveTextByRun['run-1'] = 'dogs arrive';
+    selection.liveTextSequenceByRun!['run-1'] = '42';
+    const second = inlineSuggestionFamily(5, 'visual', selection)[0];
+
+    expect(first).toMatchObject({
+      text: ' cats arrive',
+      presentationKey: 'stream:run-1:41:prose-prefix:12'
+    });
+    expect(second).toMatchObject({
+      text: ' dogs arrive',
+      presentationKey: 'stream:run-1:42:prose-prefix:12'
+    });
+  });
+
+  it('fails closed when live text has no validated sequence partner', () => {
+    const selection = state('hello');
+    selection.liveTextSequenceByRun = {};
+    expect(inlineSuggestionFamily(5, 'visual', selection)).toEqual([]);
   });
 
   it('projects multiline model output to one structurally faithful visual text block', () => {
@@ -117,6 +153,81 @@ describe('inline suggestion family', () => {
       '\n\nA new paragraph.',
       null
     )).toBeNull();
+  });
+
+  it('surfaces only the exact live authoritative four-run family', () => {
+    const selection = state('hello');
+    const branches = Array.from({ length: 8 }, (_, index): BranchCard => ({
+      ...selection.branches[0],
+      run_id: `run-${index + 1}`,
+      branch_id: `branch-${index + 1}`,
+      weave_command_id: index < 4 ? FAMILY_ONE : FAMILY_TWO,
+      created_at_unix_ms: index + 1
+    }));
+    selection.branches = [
+      branches[0],
+      branches[4],
+      branches[1],
+      branches[5],
+      branches[2],
+      branches[6],
+      branches[3],
+      branches[7]
+    ];
+    selection.liveTextByRun = Object.fromEntries(
+      branches.map((branch) => [branch.run_id, `choice ${branch.run_id}`])
+    );
+    selection.liveTextSequenceByRun = Object.fromEntries(
+      branches.map((branch, index) => [branch.run_id, String(index + 1)])
+    );
+    selection.authoritativeFamilyId = FAMILY_TWO;
+
+    expect(inlineSuggestionFamily(5, 'visual', selection).map(({ runId }) => runId))
+      .toEqual(['run-5', 'run-6', 'run-7', 'run-8']);
+  });
+
+  it('fails closed on an incomplete or repeated live-family identity', () => {
+    const selection = state('hello');
+    selection.authoritativeFamilyId = FAMILY_ONE;
+    selection.branches[3] = { ...selection.branches[3], run_id: 'run-1' };
+    expect(inlineSuggestionFamily(5, 'visual', selection)).toEqual([]);
+    selection.branches = selection.branches.slice(0, 3);
+    expect(inlineSuggestionFamily(5, 'source', selection)).toEqual([]);
+  });
+
+  it('recovers the newest complete durable family by weave identity, not time or adjacency', () => {
+    const selection = state('hello');
+    const branches = Array.from({ length: 9 }, (_, index): BranchCard => ({
+      ...selection.branches[0],
+      run_id: `run-${index + 1}`,
+      branch_id: `branch-${index + 1}`,
+      weave_command_id: index < 4 ? FAMILY_ONE : FAMILY_TWO,
+      created_at_unix_ms: index < 4 ? 9_000 + index : index
+    }));
+    selection.branches = [
+      branches[4],
+      branches[0],
+      branches[5],
+      branches[1],
+      branches[8],
+      branches[2],
+      branches[6],
+      branches[3],
+      branches[7]
+    ];
+    selection.liveTextByRun = Object.fromEntries(
+      branches.map((branch) => [branch.run_id, `choice ${branch.run_id}`])
+    );
+    selection.liveTextSequenceByRun = Object.fromEntries(
+      branches.map((branch, index) => [branch.run_id, String(index + 1)])
+    );
+
+    expect(inlineSuggestionFamily(5, 'source', selection).map(({ runId }) => runId))
+      .toEqual(['run-1', 'run-2', 'run-3', 'run-4']);
+
+    selection.branches = selection.branches.filter((branch) => branch.run_id !== 'run-9');
+    expect(inlineSuggestionFamily(5, 'source', selection).map(({ runId }) => runId))
+      .toEqual(['run-5', 'run-6', 'run-7', 'run-8']);
   });
 
   it('preserves the frozen continuation and editor-owned separator after one word', () => {

@@ -221,7 +221,7 @@ fn build_file_menu<R: Runtime>(
     let export_copy = MenuItem::with_id(
         app,
         tauri_plugin_loom::FILE_EXPORT_COPY_MENU_ID,
-        "Export Copy…",
+        "Export Text…",
         true,
         Some(FILE_EXPORT_COPY_ACCELERATOR),
     )?;
@@ -324,7 +324,7 @@ mod tests {
                 "missing native file menu item {menu_id}"
             );
         }
-        for label in ["New Document", "Open Project…", "Save", "Export Copy…"] {
+        for label in ["New Document", "Open Project…", "Save", "Export Text…"] {
             assert!(
                 source.contains(label),
                 "missing native file menu label {label}"
