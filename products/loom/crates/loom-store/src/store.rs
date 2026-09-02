@@ -3587,11 +3587,13 @@ fn document_path_conflicts_in(
 }
 
 fn document_path_for_title(relative_path: &str, title: &str) -> Result<String> {
-    let path = Path::new(relative_path);
-    let parent = path
-        .parent()
-        .ok_or_else(|| StoreError::UnsafeRelativePath(relative_path.to_owned()))?;
-    let extension = path.extension().and_then(std::ffi::OsStr::to_str);
+    let relative_path = normalize_document_path(Path::new(relative_path))?;
+    let (parent, source_file_name) = relative_path
+        .rsplit_once('/')
+        .ok_or_else(|| StoreError::UnsafeRelativePath(relative_path.clone()))?;
+    let extension = Path::new(source_file_name)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str);
     let portable_forbidden = ['/', '\\', '<', '>', ':', '"', '|', '?', '*'];
     let reserved_stem = title
         .split('.')
@@ -3625,7 +3627,7 @@ fn document_path_for_title(relative_path: &str, title: &str) -> Result<String> {
         file_name.push('.');
         file_name.push_str(extension);
     }
-    normalize_document_path(&parent.join(file_name))
+    normalize_document_path(Path::new(&format!("{parent}/{file_name}")))
 }
 
 fn validate_stored_document_display_title(stored: Option<String>) -> Result<Option<String>> {
@@ -4294,6 +4296,42 @@ mod tests {
     }
 
     #[test]
+    fn document_title_codec_is_portable_and_rejects_invalid_input() {
+        let target =
+            document_path_for_title("manuscript/chapters/Untitled.md", "A Portable Manuscript")
+                .expect("construct target path");
+
+        assert_eq!(target, "manuscript/chapters/A Portable Manuscript.md");
+        assert!(!target.contains('\\'));
+        for invalid in ["../escape", "CON", "trailing.", "bad:name"] {
+            assert!(matches!(
+                document_path_for_title("manuscript/Untitled.md", invalid),
+                Err(StoreError::InvalidDocumentFileName { .. })
+            ));
+        }
+        for invalid in ["   ".to_owned(), "line\nbreak".to_owned(), "é".repeat(129)] {
+            assert!(matches!(
+                normalize_document_display_title(&invalid),
+                Err(StoreError::InvalidDocumentTitle {
+                    max_bytes: MAX_DOCUMENT_TITLE_BYTES
+                })
+            ));
+        }
+        assert_eq!(
+            document_path_reservation_key("manuscript/Café.md"),
+            document_path_reservation_key("MANUSCRIPT/Cafe\u{301}.md")
+        );
+    }
+
+    // These positive state-machine tests mirror `ensure_document_lifecycle_supported`;
+    // unsupported targets retain the explicit fail-closed test below.
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
+    #[test]
     fn document_rename_moves_the_visible_file_and_preserves_identity() {
         let (directory, mut store) = new_store();
         let root = store.root().to_path_buf();
@@ -4402,6 +4440,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn committed_rename_releases_the_old_path_for_a_new_document() {
         let (_directory, mut store) = new_store();
@@ -4435,6 +4479,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn document_display_title_rejects_blank_control_and_overlong_utf8_without_mutation() {
         let (_directory, mut store) = new_store();
@@ -4483,6 +4533,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn document_rename_rejects_portable_name_violations_and_collisions_without_mutation() {
         let (_directory, mut store) = new_store();
@@ -4528,6 +4584,12 @@ mod tests {
         assert_eq!(unchanged.blob_id, source.blob_id);
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn document_delete_moves_exact_file_to_command_recovery_and_replays() {
         let (_directory, mut store) = new_store();
@@ -4596,6 +4658,12 @@ mod tests {
         ));
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn rename_capture_race_restores_the_replacement_without_unlinking_it() {
         let (_directory, mut store) = new_store();
@@ -4646,6 +4714,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn rename_collision_with_an_existing_same_inode_never_consumes_either_name() {
         let (_directory, mut store) = new_store();
@@ -4681,6 +4755,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn case_only_rename_uses_capture_before_no_clobber_install() {
         let (_directory, mut store) = new_store();
@@ -4713,6 +4793,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn prepared_rename_capture_recovers_the_old_path_after_reopen() {
         let (directory, mut store) = new_store();
@@ -4817,6 +4903,12 @@ mod tests {
         drop(directory);
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn prepared_rename_with_corrupt_private_capture_stays_live() {
         let (_directory, mut store) = new_store();
@@ -4868,6 +4960,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn prepared_rename_recovery_preserves_a_recreated_source_and_private_original() {
         let (directory, mut store) = new_store();
@@ -4925,6 +5023,12 @@ mod tests {
         drop(directory);
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn prepared_rename_recovery_does_not_confuse_same_blob_recreation_with_inode_restore() {
         let (directory, mut store) = new_store();
@@ -4997,6 +5101,12 @@ mod tests {
         drop(directory);
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn captured_rename_anchor_never_consumes_a_same_content_target_replacement() {
         let (directory, mut store) = new_store();
@@ -5063,6 +5173,12 @@ mod tests {
         drop(directory);
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn same_session_action_resolution_recovers_a_prepared_target_before_retry() {
         let (_directory, mut store) = new_store();
@@ -5111,6 +5227,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn post_target_precommit_failure_is_retryable_in_the_same_session() {
         let (_directory, mut store) = new_store();
@@ -5162,6 +5284,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn rename_to_a_tombstoned_historical_path_fails_before_capture() {
         let (_directory, mut store) = new_store();
@@ -5258,6 +5386,12 @@ mod tests {
         ));
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn save_checkpoint_and_import_cannot_bypass_portable_path_reservations() {
         let (directory, mut store) = new_store();
@@ -5359,6 +5493,12 @@ mod tests {
         ));
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn delete_capture_race_restores_replacement_and_does_not_tombstone() {
         let (_directory, mut store) = new_store();
@@ -5399,6 +5539,12 @@ mod tests {
         assert_eq!(store.list_documents().expect("active catalogue").len(), 1);
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn aborted_pre_capture_delete_reuses_the_exact_command_safely() {
         let (_directory, mut store) = new_store();
@@ -5447,6 +5593,12 @@ mod tests {
         assert!(store.list_documents().expect("active documents").is_empty());
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn aborted_delete_command_does_not_follow_a_later_rename() {
         let (_directory, mut store) = new_store();
@@ -5541,6 +5693,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn pending_outbox_blocks_namespace_changes_until_recovery() {
         let (_directory, mut store) = new_store();
@@ -5620,6 +5778,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn tombstoned_outbox_is_terminally_suppressed_without_visible_resurrection() {
         let (_directory, mut store) = new_store();
@@ -5658,6 +5822,12 @@ mod tests {
         assert!(!store.root.join("manuscript/001.md").exists());
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn corrupt_delete_recovery_evidence_stays_live() {
         let (_directory, mut store) = new_store();
@@ -5716,6 +5886,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn same_session_save_reconciles_a_captured_delete_without_resurrection() {
         let (_directory, mut store) = new_store();
@@ -5812,6 +5988,12 @@ mod tests {
         ));
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn draft_admission_reconciles_a_live_captured_delete_before_mutation() {
         let (_directory, mut store) = new_store();
@@ -5903,6 +6085,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn delete_uncertainty_replays_after_reopen_and_tombstone_survives_recovery_loss() {
         let (directory, mut store) = new_store();
