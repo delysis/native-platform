@@ -81,6 +81,16 @@ function macSmokeFixture(t, weightPath = null, weightContents = "fixture model b
 node -e 'const fs=require("fs"),crypto=require("crypto"),p=process.argv[1]; console.log(crypto.createHash("sha256").update(fs.readFileSync(p)).digest("hex")+"  "+p)' "$3"
 `,
   );
+  writeExecutable(
+    path.join(fakeTools, "stat"),
+    `#!/bin/sh
+if [ "$#" -ne 3 ] || [ "$1" != "-Lf" ] || [ "$2" != "%d:%i" ]; then
+  printf 'unsupported fake stat invocation\n' >&2
+  exit 2
+fi
+node -e 'const fs=require("fs"),s=fs.statSync(process.argv[1],{bigint:true}); process.stdout.write(String(s.dev)+":"+String(s.ino)+"\\n")' "$3"
+`,
+  );
 
   const validReceipt = {
     schema: "delysis.macos-release-receipt.v1",
