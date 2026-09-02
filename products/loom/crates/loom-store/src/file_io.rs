@@ -53,8 +53,8 @@ struct FileIdentity {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg(windows)]
 struct FileIdentity {
-    volume: Option<u32>,
-    index: Option<u64>,
+    volume: u64,
+    index: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,24 +77,10 @@ pub(crate) struct BoundedNoFollowFile {
 
 impl BoundedNoFollowFile {
     pub(crate) fn open(path: &Path, max_bytes: u64) -> Result<Self> {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        options.custom_flags(libc::O_NOFOLLOW);
-        #[cfg(windows)]
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-
-        let file = match options.open(path) {
-            Ok(file) => file,
-            #[cfg(unix)]
-            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-                return Err(StoreError::SymbolicLink(path.to_path_buf()));
-            }
-            Err(error) => return Err(error.into()),
-        };
+        let file = open_no_follow(path)?;
         let metadata = file.metadata()?;
         validate_bounded_regular_file(path, &metadata, max_bytes)?;
-        let identity = file_identity(&metadata);
+        let identity = descriptor_identity(&file, &metadata)?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -106,7 +92,7 @@ impl BoundedNoFollowFile {
     pub(crate) fn read(&mut self) -> Result<Vec<u8>> {
         let metadata = self.file.metadata()?;
         validate_bounded_regular_file(&self.path, &metadata, self.max_bytes)?;
-        if file_identity(&metadata) != self.identity {
+        if descriptor_identity(&self.file, &metadata)? != self.identity {
             return Err(StoreError::VisibleFileIdentityChanged(self.path.clone()));
         }
 
@@ -128,15 +114,14 @@ impl BoundedNoFollowFile {
     /// Confirms that the original store-derived path still names the opened
     /// regular file without following a final-component symbolic link.
     pub(crate) fn ensure_path_binding(&self) -> Result<()> {
-        let metadata = match fs::symlink_metadata(&self.path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let matches = match path_matches_identity(&self.path, self.max_bytes, self.identity) {
+            Ok(matches) => matches,
+            Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(StoreError::VisibleFileIdentityChanged(self.path.clone()));
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error),
         };
-        validate_bounded_regular_file(&self.path, &metadata, self.max_bytes)?;
-        if file_identity(&metadata) != self.identity {
+        if !matches {
             return Err(StoreError::VisibleFileIdentityChanged(self.path.clone()));
         }
         Ok(())
@@ -158,13 +143,11 @@ impl BoundedNoFollowFile {
     /// Reports whether `path` still names the exact regular file held by this
     /// descriptor without following a final-component symbolic link.
     pub(crate) fn path_has_identity(&self, path: &Path) -> Result<bool> {
-        let metadata = match fs::symlink_metadata(path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
-        };
-        validate_bounded_regular_file(path, &metadata, self.max_bytes)?;
-        Ok(file_identity(&metadata) == self.identity)
+        match path_matches_identity(path, self.max_bytes, self.identity) {
+            Ok(matches) => Ok(matches),
+            Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Resolves the current native path from the retained descriptor rather
@@ -210,6 +193,24 @@ impl BoundedNoFollowFile {
     }
 }
 
+fn open_no_follow(path: &Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+
+    match options.open(path) {
+        Ok(file) => Ok(file),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            Err(StoreError::SymbolicLink(path.to_path_buf()))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn validate_bounded_regular_file(
     path: &Path,
     metadata: &fs::Metadata,
@@ -218,12 +219,6 @@ fn validate_bounded_regular_file(
     #[cfg(windows)]
     if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(StoreError::SymbolicLink(path.to_path_buf()));
-    }
-    #[cfg(windows)]
-    if metadata.volume_serial_number().is_none() || metadata.file_index().is_none() {
-        return Err(
-            std::io::Error::other("the filesystem did not report a stable file identity").into(),
-        );
     }
     if metadata.file_type().is_symlink() {
         return Err(StoreError::SymbolicLink(path.to_path_buf()));
@@ -240,28 +235,49 @@ fn validate_bounded_regular_file(
     Ok(())
 }
 
-#[cfg(unix)]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    }
+#[cfg(not(windows))]
+// This platform-specific helper intentionally shares the fallible signature of
+// the Windows descriptor query so callers remain fail-closed on every target.
+#[allow(clippy::unnecessary_wraps)]
+fn descriptor_identity(_file: &File, metadata: &fs::Metadata) -> Result<FileIdentity> {
+    Ok(metadata_identity(metadata))
 }
 
 #[cfg(windows)]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    FileIdentity {
-        volume: metadata.volume_serial_number(),
-        index: metadata.file_index(),
-    }
+fn descriptor_identity(file: &File, _metadata: &fs::Metadata) -> Result<FileIdentity> {
+    let information = winx::winapi_util::file::information(file)?;
+    Ok(FileIdentity {
+        volume: information.volume_serial_number(),
+        index: information.file_index(),
+    })
 }
 
-#[cfg(not(any(unix, windows)))]
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    FileIdentity {
+#[cfg(windows)]
+fn path_matches_identity(path: &Path, max_bytes: u64, expected: FileIdentity) -> Result<bool> {
+    let current = BoundedNoFollowFile::open(path, max_bytes)?;
+    Ok(current.identity == expected)
+}
+
+#[cfg(not(windows))]
+fn path_matches_identity(path: &Path, max_bytes: u64, expected: FileIdentity) -> Result<bool> {
+    let metadata = fs::symlink_metadata(path)?;
+    validate_bounded_regular_file(path, &metadata, max_bytes)?;
+    Ok(metadata_identity(&metadata) == expected)
+}
+
+#[cfg(not(windows))]
+fn metadata_identity(metadata: &fs::Metadata) -> FileIdentity {
+    #[cfg(unix)]
+    let identity = FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    };
+    #[cfg(not(any(unix, windows)))]
+    let identity = FileIdentity {
         length: metadata.len(),
         modified: metadata.modified().ok(),
-    }
+    };
+    identity
 }
 
 /// Reads a regular file through one descriptor without following a
