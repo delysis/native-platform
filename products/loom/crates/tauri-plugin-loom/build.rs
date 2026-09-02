@@ -7,6 +7,7 @@ const COMMANDS: &[&str] = &[
     "project_recover",
     "document_create",
     "document_rename",
+    "document_delete",
     "attachment_ingest",
     "document_open",
     "document_checkpoint",

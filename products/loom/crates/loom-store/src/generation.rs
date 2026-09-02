@@ -4325,6 +4325,80 @@ mod tests {
     }
 
     #[test]
+    fn tombstoned_document_rejects_stale_candidate_promotion_after_path_recreation() {
+        let mut fixture = Fixture::new();
+        let start = fixture.start(fixture.writer_environment);
+        let terminal = fixture.finish(start.generation.run_id, "must not promote");
+        fixture
+            .store
+            .delete_document_file_idempotent(
+                CommandId::new(),
+                fixture.loaded.document_id,
+                fixture.loaded.revision_id,
+                fixture.loaded.blob_id,
+            )
+            .expect("delete active document");
+        let visible_path = fixture.store.root.join("manuscript/001.md");
+        fs::write(&visible_path, fixture.loaded.text.as_bytes())
+            .expect("recreate historical path with exact old bytes");
+        let counts_before = fixture
+            .store
+            .counts()
+            .expect("counts before stale promotion");
+        let outbox_before: i64 = fixture
+            .store
+            .connection
+            .query_row("SELECT COUNT(*) FROM visible_file_outbox", [], |row| {
+                row.get(0)
+            })
+            .expect("outbox count before stale promotion");
+
+        let failure = fixture
+            .store
+            .accept_diagnostic_candidate_with_command(
+                CommandId::new(),
+                PromoteCandidateCommand {
+                    candidate_id: terminal.candidate.candidate_id,
+                    expected_source_revision_id: fixture.loaded.revision_id,
+                    expected_visible_blob_id: fixture.loaded.blob_id,
+                },
+            )
+            .expect_err("tombstone is immutable mutation authority");
+        assert!(matches!(
+            failure,
+            StoreError::DocumentExplicitlyDeleted(id) if id == fixture.loaded.document_id
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .counts()
+                .expect("counts after stale promotion"),
+            counts_before
+        );
+        assert_eq!(
+            fixture
+                .store
+                .connection
+                .query_row("SELECT COUNT(*) FROM visible_file_outbox", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("outbox count after stale promotion"),
+            outbox_before
+        );
+        assert_eq!(
+            fs::read_to_string(visible_path).expect("recreated bytes remain unmanaged"),
+            fixture.loaded.text
+        );
+        assert!(
+            fixture
+                .store
+                .list_documents()
+                .expect("active documents")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn caller_declared_live_inference_cannot_promote_legacy_prose() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -4758,6 +4832,9 @@ mod tests {
             .connection
             .execute_batch(
                 "DROP TABLE generation_weave_commands;
+                 DROP TABLE document_delete_operations;
+                 DROP TABLE document_rename_operations;
+                 DROP TABLE document_deletions;
                  DROP TRIGGER command_requests_are_immutable_delete;
                  DROP TRIGGER generation_run_index_are_immutable_update;",
             )
@@ -4889,6 +4966,9 @@ mod tests {
             .connection
             .execute_batch(
                 "DROP TABLE generation_weave_commands;
+                 DROP TABLE document_delete_operations;
+                 DROP TABLE document_rename_operations;
+                 DROP TABLE document_deletions;
                  PRAGMA user_version = 12;",
             )
             .expect("restore the historical version-twelve shape");

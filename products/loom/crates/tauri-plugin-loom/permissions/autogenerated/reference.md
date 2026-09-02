@@ -12,6 +12,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-project-recover`
 - `allow-document-create`
 - `allow-document-rename`
+- `allow-document-delete`
 - `allow-attachment-ingest`
 - `allow-document-open`
 - `allow-document-checkpoint`
@@ -418,6 +419,32 @@ Enables the document_create command without any pre-configured scope.
 <td>
 
 Denies the document_create command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-delete`
+
+</td>
+<td>
+
+Enables the document_delete command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-delete`
+
+</td>
+<td>
+
+Denies the document_delete command without any pre-configured scope.
 
 </td>
 </tr>

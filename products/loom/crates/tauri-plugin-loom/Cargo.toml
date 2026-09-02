@@ -16,6 +16,7 @@ loom-backend-llama = { path = "../loom-backend-llama" }
 loom-host = { path = "../loom-host", features = ["tauri-native-focus"] }
 loom-store = { path = "../loom-store" }
 loom-types = { path = "../loom-types" }
+notify.workspace = true
 same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true

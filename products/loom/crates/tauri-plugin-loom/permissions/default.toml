@@ -11,6 +11,7 @@ permissions = [
   "allow-project-recover",
   "allow-document-create",
   "allow-document-rename",
+  "allow-document-delete",
   "allow-attachment-ingest",
   "allow-document-open",
   "allow-document-checkpoint",

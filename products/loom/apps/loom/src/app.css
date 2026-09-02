@@ -104,23 +104,30 @@ button:disabled { cursor: default; opacity: .45; }
 
 .workspace-grid { min-height: 0; flex: 1; display: grid; grid-template-columns: 0 minmax(0, 1fr); overflow: hidden; }
 .workspace-grid.outline-open { grid-template-columns: clamp(220px, 25vw, 300px) minmax(0, 1fr); }
-.workspace-grid.single-document .outline-panel { display: none; }
 .outline-panel { min-width: 0; display: none; grid-column: 1; flex-direction: column; overflow: hidden; border-right: 1px solid var(--line); background: #f1f0ee; }
 .outline-panel.open { display: flex; }
 .bare-button { font-size: 18px; }
 .search-field { display: flex; align-items: center; gap: 7px; margin: 10px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: rgb(255 255 255 / 48%); }
 .search-field input { min-width: 0; width: 100%; padding: 8px 0; border: 0; outline: 0; background: transparent; font-size: 13px; }
 .document-list { flex: 1; overflow: auto; padding: 2px 8px; }
+.document-row-group { width: 100%; display: grid; grid-template-columns: minmax(0, 1fr) 32px; align-items: center; border-radius: 8px; }
+.document-row-group:hover { background: rgb(255 255 255 / 45%); }
+.document-row-group.active { background: var(--paper); box-shadow: 0 1px 5px rgb(52 46 38 / 8%); }
 .document-row { width: 100%; display: flex; align-items: flex-start; gap: 9px; padding: 9px; border: 0; border-radius: 8px; text-align: left; background: transparent; }
 button.document-row { cursor: pointer; }
 button.document-row:hover { background: rgb(255 255 255 / 45%); }
+.document-row-group > button.document-row:hover { background: transparent; }
 .document-row.active { background: var(--paper); box-shadow: 0 1px 5px rgb(52 46 38 / 8%); }
 .document-row.editing { align-items: center; }
+.document-row-actions { width: 28px; height: 30px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 7px; color: var(--muted); background: transparent; cursor: pointer; font-size: 10px; letter-spacing: -1px; }
+.document-row-actions:hover, .document-row-actions:focus-visible { outline: none; color: var(--ink); background: var(--paper-deep); }
+.document-row-actions:disabled { color: var(--quiet); cursor: default; opacity: .55; }
 .document-context-menu { position: fixed; z-index: 60; width: min(220px, calc(100vw - 16px)); padding: 6px; border: 1px solid var(--line); border-radius: 9px; color: var(--ink); background: var(--paper); box-shadow: var(--shadow); }
 .document-context-menu button { width: 100%; min-height: 34px; display: block; padding: 7px 9px; border: 0; border-radius: 6px; color: inherit; background: transparent; cursor: pointer; font: inherit; font-size: 12px; text-align: left; }
 .document-context-menu button:hover,
 .document-context-menu button:focus-visible { outline: none; background: var(--paper-deep); }
 .document-context-menu button:disabled { color: var(--quiet); cursor: default; }
+.document-context-menu .document-delete-menu-item { margin-top: 5px; border-top: 1px solid var(--line); border-radius: 0 0 6px 6px; color: var(--danger); }
 .document-glyph { width: 18px; padding-top: 1px; color: var(--moss); font-family: Georgia, serif; font-size: 16px; text-align: center; }
 .document-label { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .document-label strong { overflow: hidden; font-size: 13px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
@@ -180,6 +187,13 @@ button.document-row:hover { background: rgb(255 255 255 / 45%); }
 .primary-button:hover { background: #304c3a; }
 .secondary-button { border: 1px solid var(--line); background: white; }
 .secondary-button:hover { border-color: #bdb6aa; background: #fdfcf9; }
+.danger-button { min-height: 36px; padding: 7px 13px; border: 1px solid color-mix(in srgb, var(--danger) 82%, black); border-radius: 8px; color: white; background: var(--danger); cursor: pointer; }
+.danger-button:hover { background: color-mix(in srgb, var(--danger) 86%, black); }
+.document-delete-backdrop { position: fixed; z-index: 70; inset: 0; display: grid; place-items: center; padding: 24px; background: rgb(30 31 28 / 42%); backdrop-filter: blur(4px); }
+.document-delete-dialog { width: min(430px, 100%); display: grid; gap: 12px; padding: 22px; border: 1px solid var(--line); border-radius: 13px; outline: 0; background: var(--paper); box-shadow: 0 24px 70px rgb(25 24 21 / 28%); }
+.document-delete-dialog h2 { margin: 0; font: 500 25px/1.2 Iowan Old Style, Palatino, Georgia, serif; }
+.document-delete-dialog p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+.document-delete-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
 .dialog-close { width: 32px; height: 32px; flex: 0 0 auto; border: 0; border-radius: 7px; color: var(--muted); background: transparent; cursor: pointer; font-size: 22px; }
 .dialog-close:hover { color: var(--ink); background: var(--paper-deep); }
 .primary-button.compact, .secondary-button.compact, .bare-button.compact { min-height: 29px; padding: 4px 8px; font-size: 11px; }
@@ -353,6 +367,7 @@ button.document-row:hover { background: rgb(255 255 255 / 45%); }
   .reconciliation-workspace > .reconciliation-actions { width: calc(100% - 28px); }
   .conflict-list dl { grid-template-columns: 1fr; }
   .model-manager-backdrop { padding: 0; }
+  .document-delete-backdrop { padding: 14px; }
   .model-manager { max-height: 100dvh; border-radius: 0; }
   .model-manager-header { padding: 10px 12px 10px 16px; }
   .model-manager-body { max-height: calc(100dvh - 54px); }
@@ -419,6 +434,8 @@ button.document-row:hover { background: rgb(255 255 255 / 45%); }
 :root[data-theme="dark"] .outline-panel { background: #262726; }
 :root[data-theme="dark"] .source-pane { background: #252722; }
 :root[data-theme="dark"] .secondary-button,
+:root[data-theme="dark"] .document-delete-dialog,
+:root[data-theme="dark"] .document-row-group.active,
 :root[data-theme="dark"] .document-row.active,
 :root[data-theme="dark"] .project-card,
 :root[data-theme="dark"] .project-card input,
@@ -427,7 +444,9 @@ button.document-row:hover { background: rgb(255 255 255 / 45%); }
 :root[data-theme="dark"] .download-error { color: #ffd7d5; background: #603532; }
 :root[data-theme="dark"] .search-field { background: rgb(255 255 255 / 4%); }
 :root[data-theme="dark"] .secondary-button:hover,
-:root[data-theme="dark"] button.document-row:hover { color: var(--ink); background: #373a35; }
+:root[data-theme="dark"] button.document-row:hover,
+:root[data-theme="dark"] .document-row-group:hover { color: var(--ink); background: #373a35; }
+:root[data-theme="dark"] .document-row-group > button.document-row:hover { background: transparent; }
 :root[data-theme="dark"] .welcome { background: var(--paper); }
 
 @media (prefers-contrast: more) {

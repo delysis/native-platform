@@ -146,6 +146,27 @@ impl BoundedNoFollowFile {
         &self.path
     }
 
+    pub(crate) fn sync_all(&self) -> Result<()> {
+        self.file.sync_all()?;
+        Ok(())
+    }
+
+    pub(crate) fn same_identity(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+
+    /// Reports whether `path` still names the exact regular file held by this
+    /// descriptor without following a final-component symbolic link.
+    pub(crate) fn path_has_identity(&self, path: &Path) -> Result<bool> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        validate_bounded_regular_file(path, &metadata, self.max_bytes)?;
+        Ok(file_identity(&metadata) == self.identity)
+    }
+
     /// Resolves the current native path from the retained descriptor rather
     /// than reopening the store path. Reveal uses this path only while the
     /// descriptor remains alive and path-bound.
@@ -339,6 +360,150 @@ pub(crate) fn hard_link_if_absent(source: &Path, destination: &Path) -> Result<b
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+// This cross-platform capability probe intentionally has the same fallible
+// signature as the fail-closed implementation on unsupported targets.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) const fn ensure_document_lifecycle_supported() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+)))]
+pub(crate) const fn ensure_document_lifecycle_supported() -> Result<()> {
+    Err(StoreError::UnsupportedDocumentLifecyclePlatform)
+}
+
+/// Atomically moves the pathname currently at `source` only when
+/// `destination` is absent. Callers must validate the captured file after the
+/// move: the source may have been atomically replaced immediately before this
+/// boundary, but that replacement is retained at the private destination and
+/// is never unlinked.
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+pub(crate) fn rename_if_absent(source: &Path, destination: &Path) -> Result<bool> {
+    use rustix::fs::{RenameFlags, renameat_with};
+
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| StoreError::CorruptDatabase("rename source has no parent".into()))?;
+    let source_name = source
+        .file_name()
+        .ok_or_else(|| StoreError::CorruptDatabase("rename source has no file name".into()))?;
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| StoreError::CorruptDatabase("rename target has no parent".into()))?;
+    let destination_name = destination
+        .file_name()
+        .ok_or_else(|| StoreError::CorruptDatabase("rename target has no file name".into()))?;
+    let source_directory = open_directory_no_follow(source_parent)?;
+    let destination_directory = open_directory_no_follow(destination_parent)?;
+
+    match renameat_with(
+        &source_directory,
+        source_name,
+        &destination_directory,
+        destination_name,
+        RenameFlags::NOREPLACE,
+    ) {
+        Ok(()) => {
+            rustix::fs::fsync(&source_directory).map_err(std::io::Error::from)?;
+            rustix::fs::fsync(&destination_directory).map_err(std::io::Error::from)?;
+            Ok(true)
+        }
+        Err(error) if error == rustix::io::Errno::EXIST => Ok(false),
+        Err(error) => Err(std::io::Error::from(error).into()),
+    }
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+pub(crate) fn sync_rename_parents(source: &Path, destination: &Path) -> Result<()> {
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| StoreError::CorruptDatabase("rename source has no parent".into()))?;
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| StoreError::CorruptDatabase("rename target has no parent".into()))?;
+    let source_directory = open_directory_no_follow(source_parent)?;
+    let destination_directory = open_directory_no_follow(destination_parent)?;
+    rustix::fs::fsync(&source_directory).map_err(std::io::Error::from)?;
+    rustix::fs::fsync(&destination_directory).map_err(std::io::Error::from)?;
+    Ok(())
+}
+
+#[cfg(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+))]
+fn open_directory_no_follow(path: &Path) -> Result<rustix::fd::OwnedFd> {
+    use std::path::Component;
+
+    use rustix::fs::{CWD, Mode, OFlags, open, openat};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut components = path.components();
+    let mut directory = match components.next() {
+        Some(Component::RootDir) => open("/", flags, Mode::empty()),
+        Some(Component::Normal(component)) => openat(CWD, component, flags, Mode::empty()),
+        _ => {
+            return Err(StoreError::CorruptDatabase(
+                "lifecycle directory path is not anchored".into(),
+            ));
+        }
+    }
+    .map_err(std::io::Error::from)?;
+    for component in components {
+        let Component::Normal(component) = component else {
+            return Err(StoreError::CorruptDatabase(
+                "lifecycle directory path is not canonical".into(),
+            ));
+        };
+        directory =
+            openat(&directory, component, flags, Mode::empty()).map_err(std::io::Error::from)?;
+    }
+    Ok(directory)
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+)))]
+pub(crate) fn rename_if_absent(_source: &Path, _destination: &Path) -> Result<bool> {
+    Err(StoreError::UnsupportedDocumentLifecyclePlatform)
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    target_os = "redox"
+)))]
+pub(crate) fn sync_rename_parents(_source: &Path, _destination: &Path) -> Result<()> {
+    Err(StoreError::UnsupportedDocumentLifecyclePlatform)
 }
 
 fn create_durable_sibling(path: &Path, bytes: &[u8]) -> Result<PathBuf> {

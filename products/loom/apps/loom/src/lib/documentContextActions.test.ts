@@ -1,16 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import {
   MAX_DOCUMENT_TITLE_BYTES,
+  applyDocumentRenameProjection,
   boundedDocumentTitleInput,
   captureDocumentTarget,
   capturedDocumentBelongsToSession,
   capturedDocumentIdentityIsCurrent,
   clampDocumentMenuPoint,
   createDocumentRenameCompositionGuard,
+  documentDeleteMenuIndex,
   documentMenuKeyAction,
   documentRevealLabel,
   isDocumentContextTriggerKey,
-  refreshDocumentRenameTarget
+  refreshDocumentDeleteTarget,
+  refreshDocumentRenameTarget,
+  visibleDocumentActionsMenuPoint
 } from './documentContextActions';
 import type { DocumentSummary, ProjectSnapshot } from './types';
 
@@ -137,6 +141,95 @@ describe('captured document context target', () => {
       async () => true,
       () => liveProject
     )).toBeNull();
+  });
+
+  it('recaptures deletion authority only after the current manuscript is flushed', async () => {
+    let liveProject = project();
+    const captured = captureDocumentTarget(liveProject, liveProject.documents[0])!;
+    const refreshed = await refreshDocumentDeleteTarget(
+      captured,
+      captured.documentId,
+      async () => {
+        liveProject = project(document({
+          revision_id: 'revision-after-flush',
+          active_blob_id: 'c'.repeat(64)
+        }));
+        return true;
+      },
+      () => liveProject
+    );
+
+    expect(refreshed).toMatchObject({
+      documentId: captured.documentId,
+      expectedRevisionId: 'revision-after-flush',
+      expectedBlobId: 'c'.repeat(64)
+    });
+  });
+
+  it('retries an uncertain deletion with the exact captured target even if a hint omitted its row', async () => {
+    const liveProject = project();
+    const captured = captureDocumentTarget(liveProject, liveProject.documents[0])!;
+    const hintedProject = { ...liveProject, documents: [] };
+    let flushes = 0;
+
+    const retried = await refreshDocumentDeleteTarget(
+      captured,
+      captured.documentId,
+      async () => {
+        flushes += 1;
+        return false;
+      },
+      () => hintedProject,
+      true
+    );
+
+    expect(retried).toBe(captured);
+    expect(flushes).toBe(0);
+  });
+
+  it('projects a same-title legacy rename when native repairs its relative path', () => {
+    const legacy = document({
+      title: 'Visible title',
+      relative_path: 'manuscript/Untitled-7.md'
+    });
+    const liveProject = project(legacy);
+    const open = {
+      summary: legacy,
+      visible_blob_id: legacy.active_blob_id!,
+      text: 'Exact text',
+      transient_draft: null
+    };
+    const repaired = {
+      ...legacy,
+      relative_path: 'manuscript/Visible-title.md'
+    };
+
+    expect(applyDocumentRenameProjection(liveProject, open, repaired)).toMatchObject({
+      project: {
+        documents: [{
+          title: 'Visible title',
+          relative_path: 'manuscript/Visible-title.md'
+        }]
+      },
+      document: {
+        summary: {
+          title: 'Visible title',
+          relative_path: 'manuscript/Visible-title.md'
+        }
+      }
+    });
+  });
+
+  it('anchors the visible row actions menu beside its sibling button', () => {
+    expect(visibleDocumentActionsMenuPoint({ right: 280, bottom: 96 })).toEqual({
+      x: 272,
+      y: 96
+    });
+  });
+
+  it('keeps delete last when the optional reveal action is present', () => {
+    expect(documentDeleteMenuIndex(false)).toBe(3);
+    expect(documentDeleteMenuIndex(true)).toBe(4);
   });
 });
 

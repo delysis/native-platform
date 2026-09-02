@@ -3,7 +3,7 @@ use rusqlite::{Connection, Transaction};
 use crate::{Result, StoreError};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
-pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 13;
+pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 14;
 
 pub(crate) fn configure(connection: &Connection) -> Result<()> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -80,6 +80,10 @@ const MIGRATIONS: &[(u32, &str)] = &[
         13,
         include_str!("../migrations/0013_generation_weave_commands.sql"),
     ),
+    (
+        14,
+        include_str!("../migrations/0014_document_lifecycle.sql"),
+    ),
 ];
 
 fn apply_migration(transaction: &Transaction<'_>, version: u32, sql: &str) -> Result<()> {
@@ -114,6 +118,61 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("read version");
         assert_eq!(version, CURRENT_STORE_SCHEMA_VERSION + 1);
+    }
+
+    #[test]
+    fn version_fourteen_adds_durable_document_lifecycle_authority() {
+        let mut connection = Connection::open_in_memory().expect("in-memory SQLite");
+        configure(&connection).expect("configure SQLite");
+        migrate(&mut connection).expect("migrate current schema");
+
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .expect("current store schema");
+        assert_eq!(version, 14);
+        for table in [
+            "document_deletions",
+            "document_delete_operations",
+            "document_rename_operations",
+        ] {
+            let strict: i64 = connection
+                .query_row(
+                    "SELECT strict FROM pragma_table_list WHERE name = ?1",
+                    [table],
+                    |row| row.get(0),
+                )
+                .expect("lifecycle table");
+            assert_eq!(strict, 1, "{table} must be STRICT");
+        }
+        for trigger in [
+            "document_deletions_are_immutable_update",
+            "document_deletions_are_immutable_delete",
+            "document_delete_operations_validate_insert",
+            "document_delete_operations_state_machine",
+            "document_delete_operations_are_immutable_delete",
+            "document_rename_operations_validate_insert",
+            "document_rename_operations_state_machine",
+            "document_rename_operations_are_immutable_delete",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                    [trigger],
+                    |row| row.get(0),
+                )
+                .expect("lifecycle trigger");
+            assert_eq!(count, 1, "missing {trigger}");
+        }
+        let delete_operation_sql: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'document_delete_operations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("delete operation schema SQL");
+        assert!(delete_operation_sql.contains("length(CAST(recovery_file_name AS BLOB))"));
+        assert!(delete_operation_sql.contains("recovery_file_name NOT GLOB '*[/\\\\]*'"));
     }
 
     #[test]

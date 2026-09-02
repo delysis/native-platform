@@ -1,6 +1,6 @@
-import type { DocumentKind, DocumentSummary, ProjectSnapshot } from './types';
+import type { DocumentKind, DocumentSummary, OpenDocument, ProjectSnapshot } from './types';
 
-export type DocumentContextAction = 'open' | 'rename' | 'export_text' | 'reveal';
+export type DocumentContextAction = 'open' | 'rename' | 'export_text' | 'delete' | 'reveal';
 export const MAX_DOCUMENT_TITLE_BYTES = 256;
 
 /**
@@ -25,6 +25,34 @@ export interface CapturedDocumentTarget {
 export interface MenuPoint {
   readonly x: number;
   readonly y: number;
+}
+
+export function visibleDocumentActionsMenuPoint(
+  bounds: Pick<DOMRect, 'right' | 'bottom'>
+): MenuPoint {
+  return { x: bounds.right - 8, y: bounds.bottom };
+}
+
+export function documentDeleteMenuIndex(revealAvailable: boolean): number {
+  return revealAvailable ? 4 : 3;
+}
+
+export function applyDocumentRenameProjection(
+  project: ProjectSnapshot,
+  currentDocument: OpenDocument | null,
+  renamed: DocumentSummary
+): { project: ProjectSnapshot; document: OpenDocument | null } {
+  return {
+    project: {
+      ...project,
+      documents: project.documents.map((candidate) =>
+        candidate.document_id === renamed.document_id ? renamed : candidate
+      )
+    },
+    document: currentDocument?.summary.document_id === renamed.document_id
+      ? { ...currentDocument, summary: renamed }
+      : currentDocument
+  };
 }
 
 export interface DocumentRenameCompositionGuard {
@@ -157,6 +185,25 @@ export async function refreshDocumentRenameTarget(
     (candidate) => candidate.document_id === target.documentId
   );
   return summary ? captureDocumentTarget(project, summary) : null;
+}
+
+/** Prepare the same source-bound identity for a destructive delete command. */
+export async function refreshDocumentDeleteTarget(
+  target: CapturedDocumentTarget,
+  currentDocumentId: string | null,
+  flushCurrentDocument: () => Promise<boolean>,
+  currentProject: () => ProjectSnapshot | null,
+  retryExactCapturedTarget = false
+): Promise<CapturedDocumentTarget | null> {
+  if (retryExactCapturedTarget) {
+    return capturedDocumentBelongsToSession(target, currentProject()) ? target : null;
+  }
+  return refreshDocumentRenameTarget(
+    target,
+    currentDocumentId,
+    flushCurrentDocument,
+    currentProject
+  );
 }
 
 /** Match the native store's UTF-8 byte ceiling without splitting a code point. */

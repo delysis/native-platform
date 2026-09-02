@@ -101,10 +101,34 @@ describe('App ghost reactivity wiring', () => {
     );
     expect(focus).toContain("if (mode === 'visual') visualEditor?.refreshGhostPresentation()");
     expect(focus).toContain('resumeCompletionObservation()');
+    expect(focus).toContain('scheduleProjectFilesystemRefresh()');
+    expect(source).toContain('function refreshProjectFilesystemState()');
+    expect(source).toContain('const refreshed = await currentProjectSession()');
     expect(recovery).toContain('installGenerationEventListener()');
     expect(recovery).toContain('window.clearTimeout(branchPollTimer)');
     expect(recovery).toContain('branchPollAttempt = 0');
     expect(recovery).toContain('scheduleBranchRefresh()');
+  });
+
+  it('uses native filesystem events only as exact-session coalesced refresh wakeups', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const install = source.slice(
+      source.indexOf('async function installDocumentFilesystemHintListener'),
+      source.indexOf('function scheduleProjectFilesystemRefresh')
+    );
+    const schedule = source.slice(
+      source.indexOf('function scheduleProjectFilesystemRefresh'),
+      source.indexOf('async function settleMissingDocumentRecoveryBoundary')
+    );
+
+    expect(source).toContain('void installDocumentFilesystemHintListener()');
+    expect(source).toContain('unlistenDocumentFilesystemHints?.()');
+    expect(install).toContain('routeDocumentFilesystemHint(');
+    expect(install).toContain('scheduleProjectFilesystemRefresh');
+    expect(install).not.toContain('refreshProjectFilesystemState(');
+    expect(schedule).toContain('window.clearTimeout(projectFilesystemRefreshTimer)');
+    expect(schedule).toContain('window.setTimeout(() =>');
+    expect(schedule).toContain('void refreshProjectFilesystemState()');
   });
 
   it('keeps suggestion review and implementation evidence out of the quiet titlebar', () => {
@@ -238,6 +262,9 @@ describe('App ghost reactivity wiring', () => {
     );
 
     expect(openProject).toContain('await selectDocument(first)');
+    expect(openProject).toContain('scheduleProjectFilesystemRefresh(0)');
+    expect(openProject.indexOf('scheduleProjectFilesystemRefresh(0)'))
+      .toBeGreaterThan(openProject.indexOf('await selectDocument(first)'));
     expect(openProject).not.toContain('getBuildModelPolicy');
     expect(openProject).not.toContain('setSuggestionsPolicy');
     expect(background).toContain('await restoreCompletionAutomation(captured)');
@@ -409,6 +436,10 @@ describe('App ghost reactivity wiring', () => {
       source.indexOf('async function commitDocumentRename'),
       source.indexOf('function handleDocumentRenameKeydown')
     );
+    const visibleActions = source.slice(
+      source.indexOf('function handleVisibleDocumentActions'),
+      source.indexOf('function beginDocumentContextLongPress')
+    );
     const readonly = source.slice(
       source.indexOf('$: editorReadonly ='),
       source.indexOf('$: reconciliationResolutionLocked')
@@ -422,6 +453,18 @@ describe('App ghost reactivity wiring', () => {
     expect(sidebar).toContain('>Open</button>');
     expect(sidebar).toContain('>Rename…</button>');
     expect(sidebar).toContain('>Export Text…</button>');
+    expect(sidebar).toContain('>Delete Manuscript…</button>');
+    expect(sidebar.indexOf('{documentContextRevealLabel}</button>'))
+      .toBeLessThan(sidebar.indexOf('>Delete Manuscript…</button>'));
+    expect(sidebar).toContain('documentDeleteMenuIndex(Boolean(documentContextRevealLabel))');
+    expect(sidebar).toContain('class="document-row-actions"');
+    expect(sidebar).toContain('aria-label={`Actions for ${candidate.title}`}');
+    expect(sidebar).toContain('on:click={(event) => handleVisibleDocumentActions(event, candidate)}');
+    expect(visibleActions).toContain('captureDocumentContextTarget(summary)');
+    expect(visibleActions).toContain('openDocumentContextMenu(');
+    expect(visibleActions).toContain('visibleDocumentActionsMenuPoint(');
+    expect(source).toContain('{#if project.documents.length > 0}');
+    expect(source).not.toContain('class:single-document=');
     expect(sidebar).toContain('{documentContextRevealLabel}</button>');
     expect(action).toContain('const target = documentContextTarget;');
     expect(action).toContain('closeDocumentContextMenu(false);');
@@ -444,8 +487,157 @@ describe('App ghost reactivity wiring', () => {
     expect(readonly).toContain('renameDocumentEditorLocked');
     expect(commitRename).toContain('capturedDocumentIdentityIsCurrent(target, project)');
     expect(commitRename).toContain('renameDocumentComposition.active');
+    expect(commitRename).toContain('applyDocumentRenameProjection(project, document, renamed)');
+    expect(commitRename).not.toContain('title === target.title');
     expect(source).toContain('boundedDocumentTitleInput(input.value)');
     expect(action).toContain("case 'rename':");
+    expect(action).toContain("case 'delete':");
+    expect(action).toContain('openDocumentDeleteConfirmation(target, trigger)');
+    expect(source).toContain('role="alertdialog"');
+    expect(source).toContain('aria-modal="true"');
+    expect(source).toContain('deleteDocumentCommandId = newUlid()');
+    expect(source).toContain('refreshDocumentDeleteTarget(');
+    expect(source).toContain('await deleteDocument(');
+    expect(source).toContain('documentRefreshDecision(');
+  });
+
+  it('treats a deleted visible file as an authoritative outline refresh', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const navigation = source.slice(
+      source.indexOf('async function selectCapturedDocument'),
+      source.indexOf('function updateText')
+    );
+    const refresh = source.slice(
+      source.indexOf('async function refreshProjectFilesystemState'),
+      source.indexOf('function resumeCompletionObservation')
+    );
+    const missing = source.slice(
+      source.indexOf('async function reconcileMissingCurrentDocument'),
+      source.indexOf('async function refreshProjectFilesystemState')
+    );
+
+    expect(navigation).toContain("normalizeFailure(error).code === 'external_file_deleted'");
+    expect(navigation).toContain('scheduleProjectFilesystemRefresh(0)');
+    expect(refresh).toContain('documentRefreshDecision(');
+    expect(refresh).toContain('applyGuardedProjectFilesystemRefresh(');
+    expect(refresh).toContain('captureProjectFilesystemRefreshBoundary(');
+    expect(refresh).toContain('await reconcileMissingCurrentDocument(');
+    expect(missing).toContain('await settleMissingDocumentRecoveryBoundary(');
+    expect(missing).toContain("boundary.kind !== 'ready'");
+    expect(missing).toContain('detachDocumentForReconciliation()');
+    expect(missing).toContain('await selectDocument(settledDecision.successor, true)');
+    expect(refresh).toContain("failure.code === 'external_file_deleted'");
+    expect(refresh).toContain('failureIsDefiniteContention(failure)');
+    expect(refresh).toContain('scheduleProjectFilesystemRefresh(retryDelayMilliseconds)');
+    expect(refresh).not.toContain("recordLocalFailure('filesystem_error'");
+  });
+
+  it('keeps normal watcher refreshes editable and locks only the missing-document boundary', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const readonly = source.slice(
+      source.indexOf('$: editorReadonly ='),
+      source.indexOf('$: reconciliationResolutionLocked')
+    );
+    const missingBoundary = source.slice(
+      source.indexOf('async function reconcileMissingCurrentDocument'),
+      source.indexOf('async function refreshProjectFilesystemState')
+    );
+    const refresh = source.slice(
+      source.indexOf('async function refreshProjectFilesystemState'),
+      source.indexOf('function resumeCompletionObservation')
+    );
+
+    expect(readonly).toContain('missingDocumentBoundaryInFlight');
+    expect(readonly).toContain('missingDocumentCapturePending !== null');
+    expect(readonly).not.toContain('projectFilesystemRefreshInFlight');
+    expect(refresh).toContain('projectFilesystemRefreshInFlight = true');
+    expect(missingBoundary).toContain('missingDocumentBoundaryInFlight = true');
+    expect(missingBoundary).toContain('finally');
+    expect(missingBoundary).toContain('missingDocumentBoundaryInFlight = false');
+  });
+
+  it('retains and locks a second missing manuscript until the earlier recovery is copied', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const reconcile = source.slice(
+      source.indexOf('async function reconcileMissingCurrentDocument'),
+      source.indexOf('async function refreshProjectFilesystemState')
+    );
+    const refresh = source.slice(
+      source.indexOf('async function refreshProjectFilesystemState'),
+      source.indexOf('function resumeCompletionObservation')
+    );
+    const missingBranch = refresh.slice(
+      refresh.indexOf('if (decision.currentDisappeared)'),
+      refresh.indexOf('const current = decision.current')
+    );
+    const blockedBranch = reconcile.slice(
+      reconcile.indexOf("if (admission.kind === 'wait_for_recovery_copy')"),
+      reconcile.indexOf('missingDocumentBoundaryInFlight = true')
+    );
+    const applicationClose = source.slice(
+      source.indexOf('const applicationCloseCoordinator'),
+      source.indexOf('const modelDownloadPollBaseMs')
+    );
+    const projectClose = source.slice(
+      source.indexOf('async function performCloseProject'),
+      source.indexOf('const closing = project')
+    );
+    const openProject = source.slice(
+      source.indexOf('async function finishOpeningProject'),
+      source.indexOf('async function selectDocument')
+    );
+    const openDocument = source.slice(
+      source.indexOf('async function selectCapturedDocument'),
+      source.indexOf('function updateText')
+    );
+    const copy = source.slice(
+      source.indexOf('async function copyMissingDocumentRecoveryText'),
+      source.indexOf('function clearMissingDocumentCapturePending')
+    );
+
+    expect(missingBranch).toContain('await reconcileMissingCurrentDocument(');
+    expect(missingBranch).not.toContain('project = refreshed');
+    expect(reconcile).toContain('missingDocumentCapturePending = admission.pending');
+    expect(blockedBranch).toContain('projectFilesystemRefreshQueued = false');
+    expect(blockedBranch).not.toContain('scheduleProjectFilesystemRefresh');
+    expect(blockedBranch).not.toContain('project =');
+    expect(applicationClose).toContain('if (missingDocumentCapturePending)');
+    expect(projectClose).toContain('missingDocumentRecoveryRequiresCopy(');
+    expect(projectClose).toContain('if (missingDocumentCapturePending && !retryingPreparedClose)');
+    expect(openProject).toContain("'missing_document_recovery_not_durable'");
+    expect(openProject).toContain('if (!unsafeRecovery)');
+    expect(openDocument).toContain('openedDocumentSubsumesMissingRecovery(');
+    expect(openDocument).not.toContain(
+      'if (missingDocumentRecovery?.documentId === opened.summary.document_id)'
+    );
+    expect(copy).toContain('missingDocumentRecovery !== recovery');
+    expect(copy).toContain('project.session_id !== recovery.sessionId');
+    expect(copy).toContain('scheduleProjectFilesystemRefresh(0)');
+  });
+
+  it('keeps an uncertain delete target frozen and retryable across watcher hints', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const refresh = source.slice(
+      source.indexOf('async function refreshProjectFilesystemState'),
+      source.indexOf('function resumeCompletionObservation')
+    );
+    const confirmDelete = source.slice(
+      source.indexOf('async function confirmDocumentDelete'),
+      source.indexOf('function handleDocumentContextMenuKeydown')
+    );
+    const uncertainGuard = refresh.slice(
+      refresh.indexOf('if (deleteDocumentUncertain)'),
+      refresh.indexOf('if (reconciliation)')
+    );
+
+    expect(uncertainGuard).toContain('projectFilesystemRefreshQueued = false');
+    expect(uncertainGuard).toContain('return;');
+    expect(uncertainGuard).not.toContain('scheduleProjectFilesystemRefresh');
+    expect(refresh.indexOf('if (deleteDocumentUncertain)'))
+      .toBeLessThan(refresh.indexOf('const guarded = await applyGuardedProjectFilesystemRefresh('));
+    expect(confirmDelete).toContain('const retryingUncertainDelete = deleteDocumentUncertain');
+    expect(confirmDelete).toContain('!retryingUncertainDelete && !flushEditors()');
+    expect(confirmDelete).toContain('retryingUncertainDelete\n      );');
   });
 
   it('does not let a handled rename or menu key escape into global Shuttle controls', () => {

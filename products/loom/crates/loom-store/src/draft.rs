@@ -60,6 +60,7 @@ impl ProjectStore {
         expected_version: u64,
         content: DocumentContent,
     ) -> Result<TransientDraftWriteOutcome> {
+        self.reconcile_document_lifecycle()?;
         let relative_path = normalize_document_path(relative_path.as_ref())?;
         let document = self
             .document_by_path(&relative_path)?
@@ -176,6 +177,7 @@ impl ProjectStore {
         &self,
         relative_path: impl AsRef<Path>,
     ) -> Result<Option<TransientDraft>> {
+        self.reconcile_document_lifecycle()?;
         let relative_path = normalize_document_path(relative_path.as_ref())?;
         let row: Option<LoadedDraftRecord> = self
             .connection
@@ -233,6 +235,7 @@ impl ProjectStore {
         relative_path: impl AsRef<Path>,
         expected_version: u64,
     ) -> Result<bool> {
+        self.reconcile_document_lifecycle()?;
         let relative_path = normalize_document_path(relative_path.as_ref())?;
         let document = self
             .document_by_path(&relative_path)?

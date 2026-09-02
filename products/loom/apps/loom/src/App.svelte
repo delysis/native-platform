@@ -5,6 +5,7 @@
   import LoomEditor from './lib/LoomEditor.svelte';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
+  import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
     applicationClosePending,
@@ -18,6 +19,7 @@
     closeProject as closeProjectSession,
     createDocument,
     currentProjectSession,
+    deleteDocument,
     exportDocumentCopy,
     getBranch,
     getBranchBody,
@@ -29,6 +31,7 @@
     ingestImageAttachment,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
+    listenForDocumentFilesystemHints,
     listenForFileCommands,
     listenForGenerationEvents,
     listenForModelDownloadEvents,
@@ -188,21 +191,39 @@
   } from './lib/completionAccessibility';
   import { observeNativeFullscreen } from './lib/nativeFullscreen';
   import {
+    applyDocumentRenameProjection,
     boundedDocumentTitleInput,
     captureDocumentTarget,
     capturedDocumentBelongsToSession,
     capturedDocumentIdentityIsCurrent,
     clampDocumentMenuPoint,
     createDocumentRenameCompositionGuard,
+    documentDeleteMenuIndex,
     documentMenuKeyAction,
     documentRevealLabel,
     isDocumentContextTriggerKey,
+    refreshDocumentDeleteTarget,
     refreshDocumentRenameTarget,
     releaseDocumentRenameAndRestoreFocus,
+    visibleDocumentActionsMenuPoint,
     type CapturedDocumentTarget,
     type DocumentContextAction,
     type MenuPoint
   } from './lib/documentContextActions';
+  import {
+    applyGuardedProjectFilesystemRefresh,
+    beginMissingDocumentCaptureBoundary,
+    captureProjectFilesystemRefreshBoundary,
+    documentBoundaryNeedsRecovery,
+    documentRefreshDecision,
+    missingDocumentJournalIsDurable,
+    missingDocumentRecoveryRequiresCopy,
+    openedDocumentSubsumesMissingRecovery,
+    projectFilesystemRefreshBoundaryDisposition,
+    type MissingDocumentCaptureIdentity,
+    type ProjectFilesystemRefreshBoundaryState
+  } from './lib/documentLifecycle';
+  import { routeDocumentFilesystemHint } from './lib/documentFilesystemHint';
   import {
     completionGenerationIsArmed,
     type CompletionGenerationTrigger
@@ -360,6 +381,7 @@
     selectionEmpty: true
   };
   let unlistenFileCommands: (() => void) | undefined;
+  let unlistenDocumentFilesystemHints: (() => void) | undefined;
   let fileCommandInFlight = false;
   let renamingDocumentId: string | null = null;
   let renameDocumentTitle = '';
@@ -369,6 +391,22 @@
   let renameDocumentInFlight = false;
   let renameDocumentEditorLocked = false;
   const renameDocumentComposition = createDocumentRenameCompositionGuard();
+  let deleteDocumentTarget: CapturedDocumentTarget | null = null;
+  let deleteDocumentTrigger: HTMLElement | null = null;
+  let deleteDocumentCommandId: string | null = null;
+  let deleteDocumentDialog: HTMLDivElement | undefined;
+  let deleteDocumentCancelButton: HTMLButtonElement | undefined;
+  let deleteDocumentInFlight = false;
+  let deleteDocumentUncertain = false;
+  let deleteDocumentEditorLocked = false;
+  let projectFilesystemRefreshTimer: number | undefined;
+  let projectFilesystemRefreshInFlight = false;
+  let missingDocumentBoundaryInFlight = false;
+  let missingDocumentCapturePending: MissingDocumentCaptureIdentity | null = null;
+  let projectFilesystemRefreshQueued = false;
+  let projectFilesystemRefreshSerial = 0;
+  let missingDocumentRecovery: MissingDocumentRecovery | null = null;
+  let missingDocumentCopyState: 'idle' | 'copied' | 'failed' = 'idle';
   let appliedNativeTitle = '';
   let suggestionsEnabled = false;
   let suggestionsChanging = false;
@@ -564,6 +602,33 @@
     sessionId: string;
   }
 
+  interface MissingDocumentRecovery {
+    projectId: string;
+    sessionId: string;
+    documentId: string;
+    relativePath: string;
+    title: string;
+    text: string;
+    hadUnsavedText: boolean;
+    journalDurable: boolean;
+    sourceRevisionId: string | null;
+    visibleBlobId: string;
+    draftVersion: string;
+    draftWasUncertain: boolean;
+    saveWasUncertain: boolean;
+  }
+
+  type MissingDocumentRecoveryBoundaryResult =
+    | { readonly kind: 'ready'; readonly project: ProjectSnapshot }
+    | {
+        readonly kind: 'deferred';
+        readonly reason:
+          | 'live_document_changed'
+          | 'editor_not_flushable'
+          | 'workspace_changed'
+          | 'document_reappeared';
+      };
+
   interface PromotionCapture {
     commandId: string;
     restoreSerial: number;
@@ -639,8 +704,29 @@
       applicationClosePhase = 'closing';
       clearDocumentContextLongPress();
       closeDocumentContextMenu(false);
+      closeDocumentDeleteConfirmation(false);
       clearPreferredWriterRequest();
       cancelSuggestionTimer();
+      if (
+        missingDocumentRecovery &&
+        !missingDocumentRecovery.journalDurable &&
+        missingDocumentCopyState !== 'copied'
+      ) {
+        recordLocalFailure(
+          'missing_document_recovery_not_durable',
+          'Copy the preserved missing-document text before closing Loom; its draft durability is not confirmed.'
+        );
+        announce(errorMessage);
+        return false;
+      }
+      if (missingDocumentCapturePending) {
+        recordLocalFailure(
+          'missing_document_capture_pending',
+          'Wait for Loom to preserve the newly missing manuscript before closing.'
+        );
+        announce(errorMessage);
+        return false;
+      }
       if (compositionActive) {
         recordLocalFailure(
           'composition_active',
@@ -1041,7 +1127,7 @@
   $: showVisual = mode === 'visual';
   $: showSource = mode === 'source';
   $: exactTextSurface = document?.summary.kind === 'verse';
-  $: editorReadonly = transition !== 'idle' || renameDocumentEditorLocked || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
+  $: editorReadonly = transition !== 'idle' || renameDocumentEditorLocked || deleteDocumentEditorLocked || missingDocumentBoundaryInFlight || missingDocumentCapturePending !== null || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
   $: reconciliationResolutionLocked = reconciliationApplying || pendingReconciliationApply !== null;
   $: reconciliationResolutionIsExact = Boolean(
     reconciliation && (
@@ -1104,6 +1190,7 @@
       componentMounted = false;
       startupHeldForApplicationClose = false;
       workspaceRestoreSerial += 1;
+      projectFilesystemRefreshSerial += 1;
       modelRefreshSerial += 1;
       modelLoadSerial += 1;
       clearPreferredWriterRequest();
@@ -1129,6 +1216,10 @@
       stopNativeFullscreenObservation = undefined;
       if (saveTimer !== undefined) window.clearTimeout(saveTimer);
       if (sourceProjectionTimer !== undefined) window.clearTimeout(sourceProjectionTimer);
+      if (projectFilesystemRefreshTimer !== undefined) {
+        window.clearTimeout(projectFilesystemRefreshTimer);
+        projectFilesystemRefreshTimer = undefined;
+      }
       if (draftTimer !== undefined) window.clearTimeout(draftTimer);
       if (branchRefreshTimer !== undefined) window.clearTimeout(branchRefreshTimer);
       if (branchPollTimer !== undefined) window.clearTimeout(branchPollTimer);
@@ -1151,6 +1242,7 @@
       weaveStatusPollTimers.clear();
       unlistenWindowFocus?.();
       unlistenFileCommands?.();
+      unlistenDocumentFilesystemHints?.();
     };
   });
 
@@ -1160,6 +1252,7 @@
       desktopWorkspaceStarted = true;
       void installWindowFocusHandler();
       void installFileCommandListener();
+      void installDocumentFilesystemHintListener();
       void installGenerationEventListener();
       void restoreDesktopWorkspace();
       return;
@@ -1500,6 +1593,7 @@
         windowFocused = focused;
         if (focused) {
           resumeCompletionObservation();
+          scheduleProjectFilesystemRefresh();
           // A hidden WKWebView may stay DOM-focused and emit neither browser
           // focus nor visibilitychange on native resume. Rebuild the exact
           // cached visual decoration from the native window focus edge.
@@ -1524,6 +1618,439 @@
   function handleRendererResume(): void {
     if (window.document.visibilityState === 'hidden') return;
     resumeCompletionObservation();
+    scheduleProjectFilesystemRefresh();
+  }
+
+  async function installDocumentFilesystemHintListener(): Promise<void> {
+    try {
+      const unlisten = await listenForDocumentFilesystemHints((hint) => {
+        routeDocumentFilesystemHint(hint, project, scheduleProjectFilesystemRefresh);
+      });
+      if (!componentMounted) {
+        unlisten();
+        return;
+      }
+      unlistenDocumentFilesystemHints?.();
+      unlistenDocumentFilesystemHints = unlisten;
+    } catch (error) {
+      if (componentMounted) recordFailure(error);
+    }
+  }
+
+  function scheduleProjectFilesystemRefresh(delayMilliseconds = 80): void {
+    if (!componentMounted || !desktop || window.document.visibilityState === 'hidden') return;
+    projectFilesystemRefreshQueued = true;
+    if (projectFilesystemRefreshTimer !== undefined) {
+      window.clearTimeout(projectFilesystemRefreshTimer);
+    }
+    projectFilesystemRefreshTimer = window.setTimeout(() => {
+      projectFilesystemRefreshTimer = undefined;
+      void refreshProjectFilesystemState();
+    }, Math.max(0, delayMilliseconds));
+  }
+
+  function currentProjectFilesystemRefreshBoundary(): ProjectFilesystemRefreshBoundaryState {
+    return {
+      projectToken: project,
+      documentId: document?.summary.document_id ?? null,
+      documentEpoch,
+      editVersion,
+      navigationSerial,
+      lifecycleIdle: Boolean(
+        applicationClosePhase === 'running' &&
+        transition === 'idle' &&
+        !compositionActive &&
+        !renamingDocumentId &&
+        !renameDocumentInFlight &&
+        !deleteDocumentInFlight &&
+        !fileCommandInFlight &&
+        !documentContextActionInFlight
+      )
+    };
+  }
+
+  async function settleMissingDocumentRecoveryBoundary(
+    boundProject: ProjectSnapshot,
+    missingDocumentId: string
+  ): Promise<MissingDocumentRecoveryBoundaryResult> {
+    if (!document || document.summary.document_id !== missingDocumentId) {
+      return { kind: 'deferred', reason: 'live_document_changed' };
+    }
+    if (!flushEditors()) {
+      projectFilesystemRefreshQueued = true;
+      return { kind: 'deferred', reason: 'editor_not_flushable' };
+    }
+    if (saveTimer !== undefined) {
+      window.clearTimeout(saveTimer);
+      saveTimer = undefined;
+    }
+
+    const saveWasUncertain = uncertainSave !== null || saveState === 'uncertain';
+    const draftWasUncertain = uncertainDraft !== null;
+    const hadUnsavedText = documentBoundaryNeedsRecovery({
+      sourceDirty,
+      editVersion,
+      savedVersion,
+      saveState,
+      saveInFlight: saveInFlight !== null,
+      draftInFlight: draftInFlight !== null,
+      uncertainSave: uncertainSave !== null,
+      uncertainDraft: uncertainDraft !== null
+    });
+
+    if (saveInFlight) await saveInFlight;
+    if (draftInFlight) await draftInFlight;
+    if (
+      !componentMounted ||
+      project?.project_id !== boundProject.project_id ||
+      project.session_id !== boundProject.session_id ||
+      document?.summary.document_id !== missingDocumentId
+    ) return {
+      kind: 'deferred',
+      reason: document?.summary.document_id === missingDocumentId
+        ? 'workspace_changed'
+        : 'live_document_changed'
+    };
+
+    // A save that was already admitted may have restored the visible file.
+    // Recheck native authority before classifying the document as missing.
+    const rechecked = await currentProjectSession();
+    if (
+      rechecked.project_id !== boundProject.project_id ||
+      rechecked.session_id !== boundProject.session_id
+    ) return { kind: 'deferred', reason: 'workspace_changed' };
+    if (rechecked.documents.some((candidate) => candidate.document_id === missingDocumentId)) {
+      project = rechecked;
+      clearFailure();
+      projectFilesystemRefreshQueued = true;
+      return { kind: 'deferred', reason: 'document_reappeared' };
+    }
+
+    const journalSettled = await flushDraftJournal();
+    if (
+      !componentMounted ||
+      project?.project_id !== boundProject.project_id ||
+      project.session_id !== boundProject.session_id ||
+      document?.summary.document_id !== missingDocumentId
+    ) return {
+      kind: 'deferred',
+      reason: document?.summary.document_id === missingDocumentId
+        ? 'workspace_changed'
+        : 'live_document_changed'
+    };
+    const latestText = documentText;
+    const latestEditVersion = editVersion;
+    const journalDurable = missingDocumentJournalIsDurable(
+      hadUnsavedText,
+      journalSettled,
+      uncertainDraft !== null,
+      draftSavedEditVersion,
+      latestEditVersion
+    );
+    missingDocumentRecovery = {
+      projectId: boundProject.project_id,
+      sessionId: boundProject.session_id,
+      documentId: missingDocumentId,
+      relativePath: document.summary.relative_path,
+      title: document.summary.title,
+      text: latestText,
+      hadUnsavedText,
+      journalDurable,
+      sourceRevisionId: document.summary.revision_id,
+      visibleBlobId: document.visible_blob_id,
+      draftVersion,
+      draftWasUncertain: draftWasUncertain || uncertainDraft !== null,
+      saveWasUncertain: saveWasUncertain || uncertainSave !== null
+    };
+    missingDocumentCopyState = 'idle';
+    clearFailure();
+    return { kind: 'ready', project: rechecked };
+  }
+
+  async function copyMissingDocumentRecoveryText(): Promise<void> {
+    const recovery = missingDocumentRecovery;
+    if (!recovery) return;
+    try {
+      await window.navigator.clipboard.writeText(recovery.text);
+      if (
+        missingDocumentRecovery !== recovery ||
+        project?.project_id !== recovery.projectId ||
+        project.session_id !== recovery.sessionId
+      ) return;
+      missingDocumentCopyState = 'copied';
+      announce('Preserved manuscript text copied');
+      scheduleProjectFilesystemRefresh(0);
+    } catch {
+      if (
+        missingDocumentRecovery !== recovery ||
+        project?.project_id !== recovery.projectId ||
+        project.session_id !== recovery.sessionId
+      ) return;
+      missingDocumentCopyState = 'failed';
+      announce('Select and copy the preserved manuscript text manually');
+    }
+  }
+
+  function clearMissingDocumentCapturePending(
+    capture: MissingDocumentCaptureIdentity
+  ): void {
+    if (missingDocumentCapturePending === capture) {
+      missingDocumentCapturePending = null;
+    }
+  }
+
+  function clearReappearedMissingDocumentCapture(
+    projectId: string,
+    sessionId: string,
+    documentId: string
+  ): void {
+    if (
+      missingDocumentCapturePending?.projectId === projectId &&
+      missingDocumentCapturePending.sessionId === sessionId &&
+      missingDocumentCapturePending.documentId === documentId
+    ) missingDocumentCapturePending = null;
+  }
+
+  async function reconcileMissingCurrentDocument(
+    boundProject: ProjectSnapshot,
+    previousDocuments: readonly DocumentSummary[],
+    currentDocumentId: string
+  ): Promise<void> {
+    const liveDocument = document;
+    if (!liveDocument || liveDocument.summary.document_id !== currentDocumentId) {
+      projectFilesystemRefreshQueued = true;
+      return;
+    }
+    const admission = beginMissingDocumentCaptureBoundary(
+      missingDocumentRecovery && {
+        documentId: missingDocumentRecovery.documentId,
+        journalDurable: missingDocumentRecovery.journalDurable,
+        copied: missingDocumentCopyState === 'copied'
+      },
+      {
+        projectId: boundProject.project_id,
+        sessionId: boundProject.session_id,
+        documentId: currentDocumentId,
+        revisionId: liveDocument.summary.revision_id,
+        blobId: liveDocument.visible_blob_id
+      },
+      missingDocumentCapturePending
+    );
+    missingDocumentCapturePending = admission.pending;
+    if (admission.kind === 'wait_for_recovery_copy') {
+      // Retain the row and mounted editor until the earlier recovery is safe.
+      // Copy success or a later native wakeup retries; do not timer-spin here.
+      projectFilesystemRefreshQueued = false;
+      announce('Copy the earlier preserved manuscript before Loom captures another missing file');
+      return;
+    }
+
+    missingDocumentBoundaryInFlight = true;
+    try {
+      const boundary = await settleMissingDocumentRecoveryBoundary(boundProject, currentDocumentId);
+      if (boundary.kind !== 'ready') {
+        if (boundary.reason !== 'editor_not_flushable') {
+          clearMissingDocumentCapturePending(admission.pending);
+        }
+        projectFilesystemRefreshQueued = true;
+        return;
+      }
+      const settledProject = boundary.project;
+      project = settledProject;
+      const settledDecision = documentRefreshDecision(
+        previousDocuments,
+        settledProject.documents,
+        currentDocumentId
+      );
+      closeDocumentContextMenu(false);
+      if (renamingDocumentId === currentDocumentId) cancelDocumentRename(false);
+      if (deleteDocumentTarget?.documentId === currentDocumentId) {
+        closeDocumentDeleteConfirmation(false);
+      }
+      cancelSuggestionTimer();
+      clearCompletionSession();
+      detachDocumentForReconciliation();
+      clearMissingDocumentCapturePending(admission.pending);
+      clearReconciliationState();
+      saveState = 'clean';
+      saveMessage = settledProject.documents.length === 0
+        ? 'Recovery text preserved'
+        : 'All changes saved';
+      if (settledProject.documents.length === 0) outlineOpen = false;
+      clearFailure();
+      announce('A manuscript deleted outside Loom was removed from the outline; its editor text remains available for recovery');
+      await tick();
+      if (settledDecision.successor) await selectDocument(settledDecision.successor, true);
+    } finally {
+      missingDocumentBoundaryInFlight = false;
+    }
+  }
+
+  async function refreshProjectFilesystemState(): Promise<void> {
+    if (projectFilesystemRefreshInFlight) {
+      projectFilesystemRefreshQueued = true;
+      return;
+    }
+    if (
+      !componentMounted ||
+      !desktop ||
+      !project ||
+      applicationClosePhase !== 'running'
+    ) return;
+    if (deleteDocumentUncertain) {
+      // The identical delete retry is the only authority that can classify
+      // this result. A watcher hint must not evict its frozen target or spin.
+      projectFilesystemRefreshQueued = false;
+      return;
+    }
+    if (reconciliation) {
+      scheduleProjectFilesystemRefresh(240);
+      return;
+    }
+    if (
+      transition !== 'idle' ||
+      compositionActive ||
+      renamingDocumentId ||
+      deleteDocumentInFlight
+    ) {
+      scheduleProjectFilesystemRefresh(180);
+      return;
+    }
+    if (fileCommandInFlight) {
+      scheduleProjectFilesystemRefresh(160);
+      return;
+    }
+
+    const boundProject = project;
+    const previousDocuments = boundProject.documents;
+    const currentDocumentId = document?.summary.document_id ?? null;
+    const restoreSerial = workspaceRestoreSerial;
+    const refreshSerial = ++projectFilesystemRefreshSerial;
+    const refreshBoundary = captureProjectFilesystemRefreshBoundary(
+      currentProjectFilesystemRefreshBoundary()
+    );
+    let retryDelayMilliseconds = 100;
+    projectFilesystemRefreshQueued = false;
+    projectFilesystemRefreshInFlight = true;
+    try {
+      const guarded = await applyGuardedProjectFilesystemRefresh(
+        refreshBoundary,
+        currentProjectSession,
+        currentProjectFilesystemRefreshBoundary,
+        async (refreshed) => {
+          if (
+            refreshSerial !== projectFilesystemRefreshSerial ||
+            !componentMounted ||
+            workspaceRestoreSerial !== restoreSerial ||
+            project?.project_id !== boundProject.project_id ||
+            project.session_id !== boundProject.session_id ||
+            refreshed.project_id !== boundProject.project_id ||
+            refreshed.session_id !== boundProject.session_id
+          ) return;
+
+          const decision = documentRefreshDecision(
+            previousDocuments,
+            refreshed.documents,
+            currentDocumentId
+          );
+          if (!currentDocumentId || !document) {
+            project = refreshed;
+            missingDocumentCapturePending = null;
+            return;
+          }
+
+          if (decision.currentDisappeared) {
+            await reconcileMissingCurrentDocument(
+              boundProject,
+              previousDocuments,
+              currentDocumentId
+            );
+            return;
+          }
+
+          const current = decision.current;
+          if (!current) return;
+          clearReappearedMissingDocumentCapture(
+            refreshed.project_id,
+            refreshed.session_id,
+            currentDocumentId
+          );
+          project = refreshed;
+          if (current.externally_modified) {
+            const previewBoundary = captureProjectFilesystemRefreshBoundary(
+              currentProjectFilesystemRefreshBoundary()
+            );
+            const preview = await requestReconciliationPreview(current, documentText, {
+              projectId: refreshed.project_id,
+              sessionId: refreshed.session_id,
+              restoreSerial
+            });
+            const previewDisposition = projectFilesystemRefreshBoundaryDisposition(
+              previewBoundary,
+              currentProjectFilesystemRefreshBoundary()
+            );
+            if (previewDisposition.kind === 'retry') {
+              retryDelayMilliseconds = 180;
+              projectFilesystemRefreshQueued = !deleteDocumentUncertain;
+              return;
+            }
+            if (
+              refreshSerial === projectFilesystemRefreshSerial &&
+              project?.project_id === refreshed.project_id &&
+              project.session_id === refreshed.session_id
+            ) activateReconciliation(preview);
+            return;
+          }
+
+          const liveCurrent = document?.summary.document_id === currentDocumentId
+            ? document.summary
+            : null;
+          if (
+            !liveCurrent ||
+            current.revision_id !== liveCurrent.revision_id ||
+            current.active_blob_id !== liveCurrent.active_blob_id
+          ) {
+            cancelSuggestionTimer();
+            clearCompletionSession();
+            detachDocumentForReconciliation();
+            clearReconciliationState();
+            await tick();
+            await selectDocument(current, true);
+            return;
+          }
+          document = { ...document, summary: current };
+          if (
+            lastFailure?.code === 'external_file_deleted' ||
+            lastFailure?.code === 'filesystem_error'
+          ) clearFailure();
+        }
+      );
+      if (guarded.kind === 'retry') {
+        retryDelayMilliseconds = guarded.reason === 'lifecycle_busy' ? 180 : 100;
+        projectFilesystemRefreshQueued = !deleteDocumentUncertain;
+        return;
+      }
+    } catch (error) {
+      const failure = normalizeFailure(error);
+      if (
+        failure.code === 'external_file_deleted' ||
+        failureIsDefiniteContention(failure)
+      ) {
+        retryDelayMilliseconds = 240;
+        projectFilesystemRefreshQueued = true;
+        return;
+      }
+      if (
+        componentMounted &&
+        project?.project_id === boundProject.project_id &&
+        project.session_id === boundProject.session_id
+      ) recordFailure(failure);
+    } finally {
+      projectFilesystemRefreshInFlight = false;
+      if (projectFilesystemRefreshQueued) {
+        scheduleProjectFilesystemRefresh(retryDelayMilliseconds);
+      }
+    }
   }
 
   function resumeCompletionObservation(): void {
@@ -2801,6 +3328,7 @@
     ) return;
     closeFormatMenu(false);
     closeDocumentContextMenu(false);
+    closeDocumentDeleteConfirmation(false);
     documentContextTarget = target;
     documentContextTrigger = trigger;
     documentContextPoint = point;
@@ -2847,6 +3375,22 @@
       x: bounds.left + 12,
       y: bounds.top + Math.min(bounds.height, 28)
     });
+  }
+
+  function handleVisibleDocumentActions(
+    event: MouseEvent,
+    summary: DocumentSummary
+  ): void {
+    event.preventDefault();
+    event.stopPropagation();
+    const target = captureDocumentContextTarget(summary);
+    if (!target) return;
+    const trigger = event.currentTarget as HTMLButtonElement;
+    openDocumentContextMenu(
+      target,
+      trigger,
+      visibleDocumentActionsMenuPoint(trigger.getBoundingClientRect())
+    );
   }
 
   function beginDocumentContextLongPress(
@@ -3045,10 +3589,6 @@
       return;
     }
     const title = renameDocumentTitle.trim();
-    if (title === target.title) {
-      cancelDocumentRename(refocus);
-      return;
-    }
     renameDocumentInFlight = true;
     fileCommandInFlight = true;
     let restoreFailedRenameFocus = false;
@@ -3069,15 +3609,9 @@
         renamed.revision_id !== target.expectedRevisionId ||
         renamed.active_blob_id !== target.expectedBlobId
       ) throw new Error('The rename receipt did not match the captured manuscript.');
-      project = {
-        ...project,
-        documents: project.documents.map((candidate) =>
-          candidate.document_id === renamed.document_id ? renamed : candidate
-        )
-      };
-      if (document?.summary.document_id === renamed.document_id) {
-        document = { ...document, summary: renamed };
-      }
+      const projection = applyDocumentRenameProjection(project, document, renamed);
+      project = projection.project;
+      document = projection.document;
       cancelDocumentRename(refocus);
       announce(`Renamed manuscript to ${renamed.title}`);
     } catch (error) {
@@ -3120,6 +3654,180 @@
     if (event.key === 'Enter') {
       event.preventDefault();
       void commitDocumentRename(true);
+    }
+  }
+
+  function openDocumentDeleteConfirmation(
+    target: CapturedDocumentTarget,
+    trigger: HTMLElement | null
+  ): void {
+    if (
+      deleteDocumentInFlight ||
+      fileCommandInFlight ||
+      editorReadonly ||
+      !capturedDocumentBelongsToSession(target, project)
+    ) return;
+    closeDocumentContextMenu(false);
+    deleteDocumentTarget = target;
+    deleteDocumentTrigger = trigger;
+    deleteDocumentCommandId = newUlid();
+    deleteDocumentUncertain = false;
+    void tick().then(() => {
+      if (deleteDocumentTarget === target) {
+        (deleteDocumentCancelButton ?? deleteDocumentDialog)?.focus();
+      }
+    });
+  }
+
+  function closeDocumentDeleteConfirmation(refocus = true): void {
+    if (deleteDocumentUncertain) return;
+    const trigger = deleteDocumentTrigger;
+    deleteDocumentTarget = null;
+    deleteDocumentTrigger = null;
+    deleteDocumentCommandId = null;
+    deleteDocumentUncertain = false;
+    deleteDocumentEditorLocked = false;
+    if (!refocus) return;
+    void tick().then(() => {
+      if (focusConnectedControl(trigger)) return;
+      if (focusConnectedControl(outlineToggle)) return;
+      focusCurrentWritingSurfaceAtEnd();
+    });
+  }
+
+  function handleDocumentDeleteDialogKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Escape' && !deleteDocumentInFlight && !deleteDocumentUncertain) {
+      event.preventDefault();
+      event.stopPropagation();
+      closeDocumentDeleteConfirmation();
+      return;
+    }
+    trapFocusWithin(event, deleteDocumentDialog);
+  }
+
+  async function confirmDocumentDelete(): Promise<void> {
+    const initialTarget = deleteDocumentTarget;
+    const commandId = deleteDocumentCommandId;
+    if (
+      !initialTarget ||
+      !commandId ||
+      deleteDocumentInFlight ||
+      !capturedDocumentBelongsToSession(initialTarget, project)
+    ) return;
+    if (compositionActive) {
+      announce('Finish composing text before deleting a manuscript');
+      return;
+    }
+
+    deleteDocumentInFlight = true;
+    deleteDocumentEditorLocked = true;
+    fileCommandInFlight = true;
+    let committed:
+      | {
+          deletedWasCurrent: boolean;
+          successor: DocumentSummary | null;
+          title: string;
+        }
+      | null = null;
+    try {
+      const retryingUncertainDelete = deleteDocumentUncertain;
+      const targetIsCurrent = document?.summary.document_id === initialTarget.documentId;
+      if (targetIsCurrent && !retryingUncertainDelete && !flushEditors()) return;
+      const prepared = await refreshDocumentDeleteTarget(
+        initialTarget,
+        document?.summary.document_id ?? null,
+        flushCurrentDocument,
+        () => project,
+        retryingUncertainDelete
+      );
+      if (!prepared || !project) {
+        announce('The manuscript changed before deletion could be authorized');
+        return;
+      }
+      deleteDocumentTarget = prepared;
+      const previousDocuments = project.documents;
+      const currentDocumentId = document?.summary.document_id ?? null;
+      const refreshed = await deleteDocument(
+        prepared.projectId,
+        prepared.sessionId,
+        prepared.documentId,
+        prepared.expectedRevisionId,
+        prepared.expectedBlobId,
+        commandId
+      );
+      if (
+        !project ||
+        refreshed.project_id !== prepared.projectId ||
+        refreshed.session_id !== prepared.sessionId ||
+        refreshed.documents.some((candidate) => candidate.document_id === prepared.documentId)
+      ) throw new Error('The desktop did not return the authoritative project after deletion.');
+
+      const decision = documentRefreshDecision(
+        previousDocuments,
+        refreshed.documents,
+        currentDocumentId
+      );
+      const deletedWasCurrent = currentDocumentId === prepared.documentId;
+      project = refreshed;
+      if (deletedWasCurrent) {
+        cancelSuggestionTimer();
+        clearCompletionSession();
+        detachDocumentForReconciliation();
+        clearReconciliationState();
+        saveState = 'clean';
+        saveMessage = refreshed.documents.length === 0 ? 'Project is ready' : 'All changes saved';
+        if (refreshed.documents.length === 0) outlineOpen = false;
+      } else if (document && decision.current) {
+        document = { ...document, summary: decision.current };
+      }
+      clearFailure();
+      committed = {
+        deletedWasCurrent,
+        successor: deletedWasCurrent ? decision.successor : null,
+        title: prepared.title
+      };
+    } catch (error) {
+      const failure = normalizeFailure(error);
+      if (
+        failure.code === 'external_file_deleted' ||
+        failure.code === 'document_not_found' ||
+        failure.code === 'stale_document_action'
+      ) {
+        deleteDocumentUncertain = false;
+        announce(`${initialTarget.title} changed outside Loom; refreshing the outline`);
+        closeDocumentDeleteConfirmation(false);
+        scheduleProjectFilesystemRefresh(0);
+      } else {
+        deleteDocumentUncertain = captureForIdempotentRetry(commandId, failure) !== null;
+        recordDocumentContextFailure(deleteDocumentTarget ?? initialTarget, failure);
+        if (deleteDocumentUncertain) {
+          announce('Deletion result is uncertain; check the identical command before continuing');
+        }
+      }
+    } finally {
+      fileCommandInFlight = false;
+      deleteDocumentInFlight = false;
+      deleteDocumentEditorLocked = deleteDocumentUncertain;
+    }
+
+    if (!committed) return;
+    const returnFocus = deleteDocumentTrigger;
+    deleteDocumentUncertain = false;
+    closeDocumentDeleteConfirmation(false);
+    announce(`Deleted ${committed.title}`);
+    if (!committed.deletedWasCurrent) {
+      await tick();
+      if (!focusConnectedControl(returnFocus)) focusConnectedControl(outlineToggle);
+      return;
+    }
+    await tick();
+    if (committed.successor) {
+      await selectDocument(committed.successor, true);
+    } else {
+      const newDocumentButton = window.document.querySelector<HTMLButtonElement>(
+        '.new-document-button:not([disabled])'
+      );
+      focusConnectedControl(newDocumentButton);
     }
   }
 
@@ -3226,6 +3934,10 @@
           break;
         case 'rename':
           await beginDocumentRename(target, trigger);
+          restoreTrigger = false;
+          break;
+        case 'delete':
+          openDocumentDeleteConfirmation(target, trigger);
           restoreTrigger = false;
           break;
         case 'export_text': {
@@ -4146,6 +4858,39 @@
     };
     if (!workspaceRestoreIsCurrent(captured)) return false;
     closeDocumentContextMenu(false);
+    closeDocumentDeleteConfirmation(false);
+    if (missingDocumentCapturePending) {
+      recordLocalFailure(
+        'missing_document_capture_pending',
+        'Loom refused to replace the workspace while a missing manuscript still needs preservation.'
+      );
+      return false;
+    }
+    const unsafeRecovery = missingDocumentRecoveryRequiresCopy(
+      missingDocumentRecovery && {
+        documentId: missingDocumentRecovery.documentId,
+        journalDurable: missingDocumentRecovery.journalDurable,
+        copied: missingDocumentCopyState === 'copied'
+      }
+    );
+    if (
+      unsafeRecovery &&
+      missingDocumentRecovery &&
+      (
+        missingDocumentRecovery.projectId !== opened.project_id ||
+        missingDocumentRecovery.sessionId !== opened.session_id
+      )
+    ) {
+      recordLocalFailure(
+        'missing_document_recovery_not_durable',
+        'Loom refused to replace the workspace before its preserved manuscript text was copied.'
+      );
+      return false;
+    }
+    if (!unsafeRecovery) {
+      missingDocumentRecovery = null;
+      missingDocumentCopyState = 'idle';
+    }
     outlineOpen = false;
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
@@ -4199,6 +4944,10 @@
       saveState = 'clean';
       saveMessage = 'Project is ready';
     }
+    if (!workspaceRestoreIsCurrent(captured)) return false;
+    // Close the listener/snapshot handoff gap: a watcher hint emitted before
+    // this project became current was correctly ignored, so pull once now.
+    scheduleProjectFilesystemRefresh(0);
     return true;
   }
 
@@ -4369,6 +5118,22 @@
       );
       const effectiveText = draftIsCurrent && draft ? draft.text : opened.text;
       document = { ...opened, text: effectiveText };
+      if (
+        missingDocumentRecovery &&
+        openedDocumentSubsumesMissingRecovery(
+          {
+            documentId: missingDocumentRecovery.documentId,
+            text: missingDocumentRecovery.text,
+            journalDurable: missingDocumentRecovery.journalDurable,
+            copied: missingDocumentCopyState === 'copied'
+          },
+          opened.summary.document_id,
+          effectiveText
+        )
+      ) {
+        missingDocumentRecovery = null;
+        missingDocumentCopyState = 'idle';
+      }
       documentText = effectiveText;
       setSourceDocument(effectiveText, opened.summary.kind);
       editVersion = draftIsCurrent ? 1 : 0;
@@ -4408,6 +5173,12 @@
         applicationClosePhase !== 'running' ||
         !projectRestoreScopeIsCurrent(project, workspaceRestoreSerial, source)
       ) return;
+      if (normalizeFailure(error).code === 'external_file_deleted') {
+        clearFailure();
+        announce(`${target.title} was deleted outside Loom; refreshing the outline`);
+        scheduleProjectFilesystemRefresh(0);
+        return;
+      }
       let reportedError = error;
       if (normalizeFailure(error).code === 'external_file_change') {
         try {
@@ -6782,6 +7553,24 @@
   async function performCloseProject(): Promise<ProjectCloseOutcome> {
     if (!project) return { status: 'closed' };
     const retryingPreparedClose = transition === 'closing' && pendingCloseCommandId !== null;
+    if (
+      missingDocumentRecoveryRequiresCopy(
+        missingDocumentRecovery && {
+          documentId: missingDocumentRecovery.documentId,
+          journalDurable: missingDocumentRecovery.journalDurable,
+          copied: missingDocumentCopyState === 'copied'
+        }
+      ) &&
+      !retryingPreparedClose
+    ) {
+      announce('Copy the preserved missing-document text before closing the project');
+      return { status: 'resume' };
+    }
+    if (missingDocumentCapturePending && !retryingPreparedClose) {
+      announce('Wait for Loom to preserve the newly missing manuscript before closing the project');
+      scheduleProjectFilesystemRefresh(0);
+      return { status: 'resume' };
+    }
     if (compositionActive && !retryingPreparedClose) {
       announce('Finish composing text before closing the project');
       return { status: 'resume' };
@@ -6977,7 +7766,7 @@
       aria-label="Writing controls"
     >
       <div class="canvas-controls-left" data-no-window-drag>
-        {#if project.documents.length > 1}
+        {#if project.documents.length > 0}
           <button
             bind:this={outlineToggle}
             class="titlebar-button outline-toggle"
@@ -7090,7 +7879,7 @@
   {/if}
 
   {#if project}
-    <div class:single-document={project.documents.length === 1} class:outline-open={outlineOpen} class="workspace-grid">
+    <div class:outline-open={outlineOpen} class="workspace-grid">
       <aside
         id="project-outline"
         class:open={outlineOpen}
@@ -7125,28 +7914,42 @@
                 </span>
               </div>
             {:else}
-            <button
-              class="document-row"
-              data-document-row={candidate.document_id}
+            <div
+              class="document-row-group"
               class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}
-              type="button"
-              disabled={editorReadonly}
-              aria-haspopup="menu"
-              aria-expanded={documentContextTarget?.documentId === candidate.document_id}
-              on:click={(event) => handleDocumentRowClick(event, candidate)}
-              on:contextmenu={(event) => handleDocumentContextPointer(event, candidate)}
-              on:keydown={(event) => handleDocumentContextKey(event, candidate)}
-              on:pointerdown={(event) => beginDocumentContextLongPress(event, candidate)}
-              on:pointermove={updateDocumentContextLongPress}
-              on:pointerup={finishDocumentContextLongPress}
-              on:pointercancel={finishDocumentContextLongPress}
             >
-              <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
-              <span class="document-label">
-                <strong data-document-title>{candidate.title}</strong>
-                <small>{candidate.word_count.toLocaleString()} {candidate.word_count === 1 ? 'word' : 'words'}</small>
-              </span>
-            </button>
+              <button
+                class="document-row"
+                data-document-row={candidate.document_id}
+                type="button"
+                disabled={editorReadonly}
+                aria-haspopup="menu"
+                aria-expanded={documentContextTarget?.documentId === candidate.document_id}
+                on:click={(event) => handleDocumentRowClick(event, candidate)}
+                on:contextmenu={(event) => handleDocumentContextPointer(event, candidate)}
+                on:keydown={(event) => handleDocumentContextKey(event, candidate)}
+                on:pointerdown={(event) => beginDocumentContextLongPress(event, candidate)}
+                on:pointermove={updateDocumentContextLongPress}
+                on:pointerup={finishDocumentContextLongPress}
+                on:pointercancel={finishDocumentContextLongPress}
+              >
+                <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
+                <span class="document-label">
+                  <strong data-document-title>{candidate.title}</strong>
+                  <small>{candidate.word_count.toLocaleString()} {candidate.word_count === 1 ? 'word' : 'words'}</small>
+                </span>
+              </button>
+              <button
+                class="document-row-actions"
+                type="button"
+                aria-label={`Actions for ${candidate.title}`}
+                aria-haspopup="menu"
+                aria-expanded={documentContextTarget?.documentId === candidate.document_id}
+                title={`Actions for ${candidate.title}`}
+                disabled={editorReadonly || fileCommandInFlight || documentContextActionInFlight}
+                on:click={(event) => handleVisibleDocumentActions(event, candidate)}
+              ><span aria-hidden="true">•••</span></button>
+            </div>
             {/if}
           {:else}
             <p class="empty-copy">No notes.</p>
@@ -7197,11 +8000,33 @@
                 on:click={() => void runDocumentContextAction('reveal')}
               >{documentContextRevealLabel}</button>
             {/if}
+            <button
+              class="document-delete-menu-item"
+              type="button"
+              role="menuitem"
+              tabindex={documentContextFocusIndex === documentDeleteMenuIndex(Boolean(documentContextRevealLabel)) ? 0 : -1}
+              disabled={editorReadonly || fileCommandInFlight || documentContextActionInFlight}
+              on:focus={() => documentContextFocusIndex = documentDeleteMenuIndex(Boolean(documentContextRevealLabel))}
+              on:click={() => void runDocumentContextAction('delete')}
+            >Delete Manuscript…</button>
           </div>
         {/if}
       </aside>
 
       <main id="manuscript" class="manuscript-area" tabindex="-1">
+        {#if missingDocumentRecovery}
+          <MissingDocumentRecoveryNotice
+            title={missingDocumentRecovery.title}
+            relativePath={missingDocumentRecovery.relativePath}
+            text={missingDocumentRecovery.text}
+            hadUnsavedText={missingDocumentRecovery.hadUnsavedText}
+            journalDurable={missingDocumentRecovery.journalDurable}
+            draftWasUncertain={missingDocumentRecovery.draftWasUncertain}
+            saveWasUncertain={missingDocumentRecovery.saveWasUncertain}
+            copyState={missingDocumentCopyState}
+            onCopy={() => void copyMissingDocumentRecoveryText()}
+          />
+        {/if}
         {#if reconciliation}
           <section class="reconciliation-workspace" aria-labelledby="reconciliation-title">
             <header class="document-header">
@@ -7448,6 +8273,55 @@
         </div>
       </section>
     </main>
+  {/if}
+
+  {#if deleteDocumentTarget}
+    <div
+      class="document-delete-backdrop"
+      role="presentation"
+      on:click={(event) => {
+        if (
+          event.target === event.currentTarget &&
+          !deleteDocumentInFlight &&
+          !deleteDocumentUncertain
+        ) {
+          closeDocumentDeleteConfirmation();
+        }
+      }}
+    >
+      <div
+        bind:this={deleteDocumentDialog}
+        class="document-delete-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="document-delete-title"
+        aria-describedby="document-delete-description"
+        aria-busy={deleteDocumentInFlight}
+        tabindex="-1"
+        on:keydown={handleDocumentDeleteDialogKeydown}
+      >
+        <h2 id="document-delete-title">Delete “{deleteDocumentTarget.title}”?</h2>
+        <p id="document-delete-description">
+          This deletes the manuscript file and removes it from this project. Other manuscripts are not affected.
+          {#if deleteDocumentUncertain} The first result was interrupted, so Loom will check the identical deletion command without issuing a new one.{/if}
+        </p>
+        <div class="document-delete-actions">
+          <button
+            bind:this={deleteDocumentCancelButton}
+            class="secondary-button"
+            type="button"
+            disabled={deleteDocumentInFlight || deleteDocumentUncertain}
+            on:click={() => closeDocumentDeleteConfirmation()}
+          >Cancel</button>
+          <button
+            class="danger-button"
+            type="button"
+            disabled={deleteDocumentInFlight}
+            on:click={() => void confirmDocumentDelete()}
+          >{deleteDocumentInFlight ? 'Checking…' : deleteDocumentUncertain ? 'Check Deletion' : 'Delete Manuscript'}</button>
+        </div>
+      </div>
+    </div>
   {/if}
 
   {#if modelManagerOpen}

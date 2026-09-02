@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod attachments;
+mod document_watcher;
 mod model_catalog;
 mod model_download;
 
@@ -58,6 +59,7 @@ use crate::attachments::{
     AttachmentStoreError, LoadedImageAsset, StoredImageAsset, is_canonical_image_asset_file_name,
     read_image_asset, store_image_asset,
 };
+use crate::document_watcher::DocumentFilesystemWatcher;
 use crate::model_catalog::{ModelCatalogSnapshot, catalog_model_identity, embedded_model_catalog};
 use crate::model_download::{
     ModelDownloadRegistry, ModelDownloadRegistryError, ModelDownloadSnapshot, ModelDownloadSpec,
@@ -160,6 +162,7 @@ enum SessionPhase {
 #[derive(Debug, Default)]
 struct Session {
     phase: SessionPhase,
+    document_filesystem_watcher: Option<DocumentFilesystemWatcher>,
     store: Option<ProjectStore>,
     active_session_id: Option<CommandId>,
     agency: AgencyGate,
@@ -347,6 +350,14 @@ impl Drop for PluginState {
         self.close_requested.store(true, Ordering::Release);
         self.exit_authorized.store(false, Ordering::Release);
         let _ = self.foreground_commands.revoke_all();
+        let session = self
+            .session
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Stop filesystem callbacks before tearing down any session-owned
+        // native authority that those callbacks can wake in the renderer.
+        let document_filesystem_watcher = session.document_filesystem_watcher.take();
+        drop(document_filesystem_watcher);
         if let Ok(phase) = self.application.get_mut() {
             *phase = ApplicationPhase::Closing;
         }
@@ -1790,6 +1801,7 @@ impl Builder {
                 project_recover,
                 document_create,
                 document_rename,
+                document_delete,
                 attachment_ingest,
                 document_open,
                 document_checkpoint,
@@ -1967,6 +1979,7 @@ impl IpcFailure {
             StoreError::UnsupportedSchema { .. } => "unsupported_project_schema",
             StoreError::InvalidProjectName { .. } => "invalid_project_name",
             StoreError::InvalidDocumentTitle { .. } => "invalid_document_title",
+            StoreError::InvalidDocumentFileName { .. } => "invalid_document_file_name",
             StoreError::ReasonTooLong { .. } => "checkpoint_reason_too_long",
             StoreError::DocumentTooLarge { .. } => "document_too_large",
             StoreError::DocumentKindMismatch { .. } => "document_kind_mismatch",
@@ -1976,6 +1989,11 @@ impl IpcFailure {
             StoreError::UncheckpointedVisibleChange(_) => "external_file_change",
             StoreError::VisibleFileIdentityChanged(_) => "document_path_changed",
             StoreError::DocumentFileAuthorityMismatch => "stale_document_action",
+            StoreError::DocumentExplicitlyDeleted(_) => "document_explicitly_deleted",
+            StoreError::DocumentHasTransientDraft(_) => "document_has_transient_draft",
+            StoreError::DocumentHasPendingOutbox(_) => "document_has_pending_projection",
+            StoreError::DocumentLifecycleUncertain(_) => "document_lifecycle_uncertain",
+            StoreError::UnsupportedDocumentLifecyclePlatform => "document_lifecycle_unsupported",
             StoreError::ExternalVisibleFileDeleted(_) => "external_file_deleted",
             StoreError::ExternalVisibleBlobMismatch { .. } => "external_file_conflict",
             StoreError::ExternalVisibleInvalidUtf8(_) => "external_file_invalid_utf8",
@@ -2027,7 +2045,10 @@ impl IpcFailure {
                 "transient_draft_identity_mismatch"
             }
         };
-        let retryable = matches!(error, StoreError::ProjectAlreadyOpen(_));
+        let retryable = matches!(
+            error,
+            StoreError::ProjectAlreadyOpen(_) | StoreError::DocumentLifecycleUncertain(_)
+        );
         Self::new(code, error.to_string(), retryable)
     }
 
@@ -2466,14 +2487,15 @@ struct DesktopLoomEvent {
 /// first launch. The folder is still an ordinary Loom project; this command
 /// merely removes file-management ceremony from the default authoring path.
 #[tauri::command]
-async fn project_open_default(
+async fn project_open_default<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
     ensure_application_running(&state, "a project session")?;
     let choice = reserve_project_choice(&state)?;
     let result =
         default_project_path(&state).and_then(|path| open_or_initialize_default_project(&path));
-    choice.finish(result)
+    choice.finish(&app, result)
 }
 
 fn default_project_path(state: &PluginState) -> Result<PathBuf, IpcFailure> {
@@ -2499,7 +2521,7 @@ async fn project_choose_create<R: Runtime>(
     ensure_application_running(&state, "a project session")?;
     let choice = reserve_project_choice(&state)?;
     let result = choose_project_folder(&app).and_then(|path| initialize_project(&path, title));
-    choice.finish(result)
+    choice.finish(&app, result)
 }
 
 fn reserve_project_choice(state: &PluginState) -> Result<ProjectChoiceReservation<'_>, IpcFailure> {
@@ -2528,12 +2550,44 @@ struct ProjectChoiceReservation<'a> {
 }
 
 impl ProjectChoiceReservation<'_> {
-    fn finish(
+    fn finish<R: Runtime>(
+        self,
+        app: &AppHandle<R>,
+        result: Result<ProjectStore, IpcFailure>,
+    ) -> Result<ProjectSnapshot, IpcFailure> {
+        self.finish_with_document_filesystem_watcher(result, |store, session_id| {
+            DocumentFilesystemWatcher::start(
+                app,
+                store.root(),
+                store.manifest().project_id.to_string(),
+                session_id.to_string(),
+            )
+            .map(Some)
+            .map_err(|_| {
+                IpcFailure::new(
+                    "document_filesystem_watcher_unavailable",
+                    "Loom could not observe manuscript filesystem changes for this project",
+                    true,
+                )
+            })
+        })
+    }
+
+    fn finish_with_document_filesystem_watcher(
         mut self,
         result: Result<ProjectStore, IpcFailure>,
+        start_watcher: impl FnOnce(
+            &ProjectStore,
+            CommandId,
+        ) -> Result<Option<DocumentFilesystemWatcher>, IpcFailure>,
     ) -> Result<ProjectSnapshot, IpcFailure> {
         let store = result?;
         let session_id = CommandId::new();
+        let document_filesystem_watcher = start_watcher(&store, session_id)?;
+        // Establish observation before reading the handoff snapshot. The
+        // renderer performs one coalesced refresh after attaching it, closing
+        // the small interval in which correctly scoped early hints are still
+        // rejected because no renderer session is attached yet.
         let snapshot = snapshot_for(&store, session_id)?;
         let mut session = lock_session_internal(self.state)?;
         if session.phase != SessionPhase::Choosing {
@@ -2543,6 +2597,7 @@ impl ProjectChoiceReservation<'_> {
                 false,
             ));
         }
+        session.document_filesystem_watcher = document_filesystem_watcher;
         session.store = Some(store);
         session.active_session_id = Some(session_id);
         session.agency = AgencyGate::default();
@@ -2550,6 +2605,14 @@ impl ProjectChoiceReservation<'_> {
         drop(session);
         self.committed = true;
         Ok(snapshot)
+    }
+
+    #[cfg(test)]
+    fn finish_without_document_filesystem_watcher(
+        self,
+        result: Result<ProjectStore, IpcFailure>,
+    ) -> Result<ProjectSnapshot, IpcFailure> {
+        self.finish_with_document_filesystem_watcher(result, |_store, _session_id| Ok(None))
     }
 }
 
@@ -2706,11 +2769,11 @@ fn validate_default_document_candidate(path: &Path) -> Result<(), IpcFailure> {
 
 fn ensure_default_document(store: &mut ProjectStore) -> Result<(), IpcFailure> {
     if store
-        .list_documents()
+        .has_registered_documents()
         .map_err(IpcFailure::store)?
-        .iter()
-        .any(|document| document.relative_path == INITIAL_DOCUMENT)
     {
+        // Initialization is one-shot. A renamed document stays renamed, and a
+        // catalogue containing only tombstones is intentionally empty.
         return Ok(());
     }
 
@@ -2769,7 +2832,7 @@ async fn project_choose_open<R: Runtime>(
         store.record_open().map_err(IpcFailure::store)?;
         Ok(store)
     });
-    choice.finish(result)
+    choice.finish(&app, result)
 }
 
 #[tauri::command]
@@ -2897,11 +2960,17 @@ fn close_project_with_wait(
         session_id,
         closed_at_unix_ms: now_unix_ms(),
     };
+    let document_filesystem_watcher = session.document_filesystem_watcher.take();
     session.store = None;
     session.active_session_id = None;
     session.agency = AgencyGate::default();
     session.phase = SessionPhase::Closed;
     session.last_close = Some(receipt.clone());
+    drop(session);
+    // The callback carries the closed session identity, so even an event
+    // already queued by the backend is rejected by the renderer. Drop the OS
+    // watcher outside the session mutex in case backend shutdown blocks.
+    drop(document_filesystem_watcher);
     Ok(receipt)
 }
 
@@ -3048,6 +3117,38 @@ async fn document_rename(
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
     rename_registered_document(store, identity, &title)
+}
+
+#[tauri::command]
+async fn document_delete(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    expected_revision_id: String,
+    expected_blob_id: String,
+    command_id: String,
+    state: State<'_, PluginState>,
+) -> Result<ProjectSnapshot, IpcFailure> {
+    let _application_admission = lock_application_admission(&state, "a document deletion")?;
+    let identity =
+        parse_document_action_identity(&document_id, &expected_revision_id, &expected_blob_id)?;
+    let command_id = command_id.parse::<CommandId>().map_err(|_| {
+        IpcFailure::new(
+            "invalid_command_id",
+            "the document deletion command ID is invalid",
+            false,
+        )
+    })?;
+    let mut session = lock_session(&state)?;
+    let active_session_id = session.active_session_id.ok_or_else(|| {
+        IpcFailure::new(
+            "corrupt_project_session",
+            "the live project session is missing its session ID",
+            false,
+        )
+    })?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    delete_registered_document(store, active_session_id, command_id, identity)
 }
 
 #[tauri::command]
@@ -3287,20 +3388,15 @@ fn empty_loom_asset_response_with_header(
 }
 
 fn create_untitled_document(store: &mut ProjectStore) -> Result<String, IpcFailure> {
-    let registered_paths = store
-        .list_documents()
-        .map_err(IpcFailure::store)?
-        .into_iter()
-        .map(|document| document.relative_path)
-        .collect::<BTreeSet<_>>();
-
     for ordinal in 1..=MAX_UNTITLED_DOCUMENT_CANDIDATES {
         let relative_path = if ordinal == 1 {
             INITIAL_DOCUMENT.to_owned()
         } else {
             format!("manuscript/Untitled-{ordinal}.md")
         };
-        if registered_paths.contains(&relative_path)
+        if store
+            .document_path_is_reserved(&relative_path)
+            .map_err(IpcFailure::store)?
             || !document_path_is_absent(store.root(), &relative_path)?
         {
             continue;
@@ -3496,6 +3592,9 @@ fn resolve_document_action_file(
     store: &ProjectStore,
     identity: DocumentActionIdentity,
 ) -> Result<DocumentFileAuthority, IpcFailure> {
+    store
+        .reconcile_document_lifecycle()
+        .map_err(IpcFailure::store)?;
     let relative_path = registered_document_action_path(store, identity)?;
     let authority = store
         .open_document_file(&relative_path)
@@ -3521,7 +3620,7 @@ fn rename_registered_document(
 ) -> Result<DocumentSummary, IpcFailure> {
     let mut authority = resolve_document_action_file(store, identity)?;
     let renamed = store
-        .set_document_display_title(&mut authority, title)
+        .rename_document(&mut authority, title)
         .map_err(IpcFailure::store)?;
     Ok(DocumentSummary {
         document_id: renamed.document_id.to_string(),
@@ -3534,6 +3633,29 @@ fn rename_registered_document(
         active_blob_id: Some(identity.blob.to_string()),
         word_count: count_words(&authority.document().text),
         externally_modified: false,
+    })
+}
+
+fn delete_registered_document(
+    store: &mut ProjectStore,
+    session_id: CommandId,
+    command_id: CommandId,
+    identity: DocumentActionIdentity,
+) -> Result<ProjectSnapshot, IpcFailure> {
+    store
+        .delete_document_file_idempotent(
+            command_id,
+            identity.document,
+            identity.revision,
+            identity.blob,
+        )
+        .map_err(IpcFailure::store)?;
+    snapshot_for(store, session_id).map_err(|mut failure| {
+        // The immutable deletion receipt may already be committed. Retaining
+        // the exact command ID lets the renderer replay and recover the
+        // authoritative snapshot without issuing a second deletion.
+        failure.retryable = true;
+        failure
     })
 }
 
@@ -8769,11 +8891,14 @@ fn snapshot_for(
     store: &ProjectStore,
     session_id: CommandId,
 ) -> Result<ProjectSnapshot, IpcFailure> {
+    store
+        .reconcile_document_lifecycle()
+        .map_err(IpcFailure::store)?;
     let documents = store
         .list_documents()
         .map_err(IpcFailure::store)?
         .into_iter()
-        .map(|summary| -> Result<DocumentSummary, IpcFailure> {
+        .map(|summary| -> Result<Option<DocumentSummary>, IpcFailure> {
             let title = summary
                 .display_title
                 .clone()
@@ -8783,10 +8908,10 @@ fn snapshot_for(
                     let reconciliation = store
                         .reconciliation_snapshot(&summary.relative_path)
                         .map_err(IpcFailure::store)?;
-                    let word_count = reconciliation
-                        .visible
-                        .as_ref()
-                        .map_or(0, |visible| count_words(&visible.text));
+                    let Some(visible) = reconciliation.visible.as_ref() else {
+                        return Ok(None);
+                    };
+                    let word_count = count_words(&visible.text);
                     (
                         Some(reconciliation.active_blob_id.to_string()),
                         word_count,
@@ -8795,7 +8920,7 @@ fn snapshot_for(
                 } else {
                     (None, 0, false)
                 };
-            Ok(DocumentSummary {
+            Ok(Some(DocumentSummary {
                 document_id: summary.document_id.to_string(),
                 title,
                 relative_path: summary.relative_path,
@@ -8804,9 +8929,12 @@ fn snapshot_for(
                 active_blob_id,
                 word_count,
                 externally_modified,
-            })
+            }))
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     let root = store
         .root()
         .to_str()
@@ -10428,6 +10556,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn new_document_never_reuses_a_tombstoned_historical_path() {
+        let temporary = tempfile::tempdir().expect("temporary project parent");
+        let root = temporary.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("historical manuscript".to_owned()),
+                "initial manuscript",
+            )
+            .expect("initial document");
+        let historical = store
+            .read_document(INITIAL_DOCUMENT)
+            .expect("historical document");
+        store
+            .delete_document_file_idempotent(
+                CommandId::new(),
+                historical.document_id,
+                historical.revision_id,
+                historical.blob_id,
+            )
+            .expect("delete initial document");
+
+        let created = create_untitled_document(&mut store).expect("new document");
+
+        assert_eq!(created, "manuscript/Untitled-2.md");
+        assert!(
+            store
+                .document_path_is_reserved(INITIAL_DOCUMENT)
+                .expect("reserved path")
+        );
+        assert_eq!(
+            store.read_document(&created).expect("new document").text,
+            ""
+        );
+    }
+
     struct DocumentActionFixture {
         _temporary: tempfile::TempDir,
         root: PathBuf,
@@ -10460,7 +10626,7 @@ mod tests {
     }
 
     #[test]
-    fn rename_action_persists_a_display_title_without_changing_manuscript_path() {
+    fn rename_action_moves_the_manuscript_and_preserves_identity() {
         let mut fixture = document_action_fixture();
 
         let renamed =
@@ -10468,7 +10634,7 @@ mod tests {
                 .expect("rename document");
 
         assert_eq!(renamed.title, "A Better Name");
-        assert_eq!(renamed.relative_path, INITIAL_DOCUMENT);
+        assert_eq!(renamed.relative_path, "manuscript/A Better Name.md");
         assert_eq!(
             renamed.revision_id,
             Some(fixture.identity.revision.to_string())
@@ -10478,15 +10644,15 @@ mod tests {
             Some(fixture.identity.blob.to_string())
         );
         assert_eq!(renamed.word_count, 2);
-        assert!(fixture.root.join(INITIAL_DOCUMENT).is_file());
-        assert!(!fixture.root.join("manuscript/A Better Name.md").exists());
+        assert!(!fixture.root.join(INITIAL_DOCUMENT).exists());
+        assert!(fixture.root.join("manuscript/A Better Name.md").is_file());
 
         let snapshot = snapshot_for(&fixture.store, CommandId::new()).expect("project snapshot");
         assert_eq!(snapshot.documents.len(), 1);
         assert_eq!(snapshot.documents[0].title, "A Better Name");
         let loaded = fixture
             .store
-            .read_document(INITIAL_DOCUMENT)
+            .read_document("manuscript/A Better Name.md")
             .expect("reopen renamed document");
         let display_title = fixture
             .store
@@ -10496,6 +10662,41 @@ mod tests {
             .display_title;
         let opened = open_document_from(loaded, None, display_title);
         assert_eq!(opened.summary.title, "A Better Name");
+    }
+
+    #[test]
+    fn delete_action_returns_an_authoritative_snapshot_and_replays_exactly() {
+        let mut fixture = document_action_fixture();
+        let session_id = CommandId::new();
+        let command_id = CommandId::new();
+
+        let deleted = delete_registered_document(
+            &mut fixture.store,
+            session_id,
+            command_id,
+            fixture.identity,
+        )
+        .expect("delete exact document");
+
+        assert_eq!(deleted.session_id, session_id.to_string());
+        assert!(deleted.documents.is_empty());
+        assert!(!fixture.root.join(INITIAL_DOCUMENT).exists());
+        assert!(
+            fixture
+                .store
+                .registered_document(fixture.identity.document)
+                .expect("query immutable registration")
+                .is_some()
+        );
+
+        let replayed = delete_registered_document(
+            &mut fixture.store,
+            session_id,
+            command_id,
+            fixture.identity,
+        )
+        .expect("replay exact deletion");
+        assert!(replayed.documents.is_empty());
     }
 
     #[test]
@@ -11397,6 +11598,28 @@ mod tests {
     }
 
     #[test]
+    fn default_project_reopen_does_not_recreate_initial_after_rename() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let mut first = open_or_initialize_default_project(&root).expect("create default project");
+        let mut authority = first
+            .open_document_file(INITIAL_DOCUMENT)
+            .expect("open initial document");
+        first
+            .rename_document(&mut authority, "Renamed")
+            .expect("rename initial document");
+        drop(first);
+
+        let reopened = open_or_initialize_default_project(&root).expect("reopen renamed project");
+        let documents = reopened.list_documents().expect("active catalogue");
+
+        assert_eq!(documents.len(), 1);
+        assert_eq!(documents[0].relative_path, "manuscript/Renamed.md");
+        assert!(!root.join(INITIAL_DOCUMENT).exists());
+        assert!(root.join("manuscript/Renamed.md").is_file());
+    }
+
+    #[test]
     fn default_project_repairs_interruption_after_manifest_before_document() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -11496,6 +11719,44 @@ mod tests {
                 .expect("list registered document")
                 .iter()
                 .any(|document| document.relative_path == INITIAL_DOCUMENT)
+        );
+        assert!(!root.join(INITIAL_DOCUMENT).exists());
+    }
+
+    #[test]
+    fn default_project_reopens_after_explicit_initial_document_deletion_without_resurrection() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let mut store = open_or_initialize_default_project(&root).expect("create default project");
+        let project_id = store.manifest().project_id;
+        let initial = store
+            .read_document(INITIAL_DOCUMENT)
+            .expect("read initial document");
+        store
+            .delete_document_file_idempotent(
+                CommandId::new(),
+                initial.document_id,
+                initial.revision_id,
+                initial.blob_id,
+            )
+            .expect("explicitly delete initial document");
+        drop(store);
+
+        let reopened = open_or_initialize_default_project(&root)
+            .expect("reopen explicitly empty default project");
+
+        assert_eq!(reopened.manifest().project_id, project_id);
+        assert!(
+            reopened
+                .list_documents()
+                .expect("active catalogue")
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .registered_document(initial.document_id)
+                .expect("historical registration")
+                .is_some()
         );
         assert!(!root.join(INITIAL_DOCUMENT).exists());
     }
@@ -12054,6 +12315,7 @@ mod tests {
         let session_id = CommandId::new();
         let mut session = Session {
             phase: SessionPhase::Open,
+            document_filesystem_watcher: None,
             store: Some(store),
             active_session_id: Some(session_id),
             agency: AgencyGate::default(),
@@ -12316,7 +12578,7 @@ mod tests {
         let project_b = store_b.manifest().project_id;
         let snapshot_b = reserve_project_choice(&state)
             .expect("reserve project B open")
-            .finish(Ok(store_b))
+            .finish_without_document_filesystem_watcher(Ok(store_b))
             .expect("open project B");
         let session_b = snapshot_b
             .session_id
@@ -12343,7 +12605,7 @@ mod tests {
         let reopened_a = ProjectStore::open(&root_a).expect("reopen project A from disk");
         let snapshot_a2 = reserve_project_choice(&relaunched_state)
             .expect("reserve project A reopen")
-            .finish(Ok(reopened_a))
+            .finish_without_document_filesystem_watcher(Ok(reopened_a))
             .expect("reopen project A");
         let session_a2 = snapshot_a2
             .session_id
@@ -12429,7 +12691,7 @@ mod tests {
     }
 
     #[test]
-    fn project_summary_keeps_active_identity_across_external_change_and_deletion() {
+    fn project_summary_keeps_active_identity_across_external_change_and_omits_deletion() {
         let fixture = ReconciliationFixture::new("one two\n");
         fixture.set_external("one two three\n");
 
@@ -12457,13 +12719,7 @@ mod tests {
         std::fs::remove_file(fixture.store.root().join(INITIAL_DOCUMENT))
             .expect("delete visible document");
         let deleted = snapshot_for(&fixture.store, CommandId::new()).expect("deleted snapshot");
-        let summary = &deleted.documents[0];
-        assert_eq!(
-            summary.active_blob_id.as_deref(),
-            Some(fixture.base.blob_id.to_string().as_str())
-        );
-        assert_eq!(summary.word_count, 0);
-        assert!(summary.externally_modified);
+        assert!(deleted.documents.is_empty());
     }
 
     #[test]

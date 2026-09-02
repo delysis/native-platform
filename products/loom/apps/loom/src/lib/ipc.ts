@@ -27,6 +27,9 @@ import type {
 } from './types';
 import { decodeBuildModelPolicy } from './buildModelPolicy';
 import type { ImageAttachmentReceipt } from './attachments';
+import type { DocumentFilesystemHint } from './documentFilesystemHint';
+
+export type { DocumentFilesystemHint } from './documentFilesystemHint';
 
 const PREFIX = 'plugin:loom|';
 
@@ -146,6 +149,24 @@ export function renameDocument(
     expectedRevisionId,
     expectedBlobId,
     title
+  });
+}
+
+export function deleteDocument(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  expectedRevisionId: string,
+  expectedBlobId: string,
+  commandId: string
+): Promise<ProjectSnapshot> {
+  return call('document_delete', {
+    projectId,
+    sessionId,
+    documentId,
+    expectedRevisionId,
+    expectedBlobId,
+    commandId
   });
 }
 
@@ -547,6 +568,21 @@ export function listenForGenerationEvents(
     });
   }
   return listen<DesktopGenerationEnvelope>('loom://generation', ({ payload }) => handler(payload));
+}
+
+export function listenForDocumentFilesystemHints(
+  handler: (event: DocumentFilesystemHint) => void
+): Promise<UnlistenFn> {
+  if (!isDesktopRuntime()) {
+    return Promise.reject({
+      code: 'desktop_runtime_required',
+      message: 'Document filesystem hints require the Loom desktop runtime.'
+    });
+  }
+  return listen<DocumentFilesystemHint>(
+    'loom://document-filesystem-hint',
+    ({ payload }) => handler(payload)
+  );
 }
 
 export function listenForApplicationCloseRequests(
