@@ -9,6 +9,8 @@ use crate::conversation_store::{
     active_path_messages, load_db, strip_reserved_attribution_prefix, upsert_conversation,
 };
 use crate::kv_cache::ensure_persona_prefix;
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+use crate::mcp::mcp_platform_blocker;
 use crate::mcp::{
     McpCallToolOutput, McpServerConfig, McpTool, cached_persona_mcp_tool_contract,
     exact_mcp_server_config_sha256, load_mcp_db, mcp_call_tool_supervised_with_config,
@@ -30,6 +32,7 @@ use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use crate::tool_loop::{ToolPermissionPolicy, tool_permission_policy, validate_tool_arguments};
 use anyhow::{Result, anyhow};
 use crossbeam_channel::TryRecvError;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use fs2::FileExt;
 use llama_native_engine::{ControlledGenerationSubmission, NativeModelHandle};
 use llama_native_types::{
@@ -44,7 +47,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::fs::{File, OpenOptions};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -490,11 +495,17 @@ pub struct MentionToolApprovalResolution {
     pub remaining_approvals: Vec<MentionToolApproval>,
 }
 
+// The live-generation witness relies on Unix advisory locks: recovery must be
+// able to open and read the locked inode without acquiring it. Unsupported
+// platforms never construct this authority; their persisted state is handled
+// by the terminal recovery branch below.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 struct PersonaToolResumeLease {
     file: File,
     lease_id: String,
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl PersonaToolResumeLease {
     fn acquire(
         data_dir: &Path,
@@ -534,12 +545,14 @@ impl PersonaToolResumeLease {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 impl Drop for PersonaToolResumeLease {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn persona_tool_resume_lease_path(
     data_dir: &Path,
     invocation_id: &str,
@@ -553,6 +566,7 @@ fn persona_tool_resume_lease_path(
         .join(format!("persona-tool-{:x}.lock", digest.finalize()))
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn persona_tool_resume_lease_is_live(
     data_dir: &Path,
     invocation_id: &str,
@@ -581,6 +595,30 @@ fn persona_tool_resume_lease_is_live(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn resume_lease_is_live_for_recovery(
+    data_dir: &Path,
+    invocation_id: &str,
+    approval_id: &str,
+    expected_lease_id: &str,
+) -> Result<bool> {
+    persona_tool_resume_lease_is_live(data_dir, invocation_id, approval_id, expected_lease_id)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn resume_lease_is_live_for_recovery(
+    data_dir: &Path,
+    invocation_id: &str,
+    approval_id: &str,
+    expected_lease_id: &str,
+) -> Result<bool> {
+    let _ = (data_dir, invocation_id, approval_id, expected_lease_id);
+    // External-process execution cannot be live under this platform's
+    // authority. A persisted Resuming record is therefore an interrupted
+    // unknown-effect state and must be terminalized without touching a lock.
+    Ok(false)
 }
 
 pub fn mention_candidates(
@@ -941,15 +979,23 @@ pub fn mention_tool_approval_decide_in_scope(
     approval_id: &str,
     decision: MentionToolApprovalDecision,
 ) -> Result<CommandResult<MentionToolApprovalResolution>> {
-    let settings = resolve_settings()?;
-    let recovery = PersonaToolApprovalRecovery::bind(&settings.data_dir)?;
-    mention_tool_approval_decide_with_recovery_in_scope(
-        scope,
-        invocation_id,
-        approval_id,
-        decision,
-        &recovery,
-    )
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (scope, invocation_id, approval_id, decision);
+        Ok(unsupported_persona_tool_approval_decision())
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let settings = resolve_settings()?;
+        let recovery = PersonaToolApprovalRecovery::bind(&settings.data_dir)?;
+        mention_tool_approval_decide_with_recovery_in_scope(
+            scope,
+            invocation_id,
+            approval_id,
+            decision,
+            &recovery,
+        )
+    }
 }
 
 pub fn mention_tool_approval_decide_with_recovery(
@@ -969,6 +1015,42 @@ pub fn mention_tool_approval_decide_with_recovery(
 }
 
 pub fn mention_tool_approval_decide_with_recovery_in_scope(
+    scope: &OperationScope,
+    invocation_id: &str,
+    approval_id: &str,
+    decision: MentionToolApprovalDecision,
+    recovery: &PersonaToolApprovalRecovery,
+) -> Result<CommandResult<MentionToolApprovalResolution>> {
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (scope, invocation_id, approval_id, decision, recovery);
+        Ok(unsupported_persona_tool_approval_decision())
+    }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        mention_tool_approval_decide_supported_in_scope(
+            scope,
+            invocation_id,
+            approval_id,
+            decision,
+            recovery,
+        )
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn unsupported_persona_tool_approval_decision() -> CommandResult<MentionToolApprovalResolution> {
+    let blocker = mcp_platform_blocker()
+        .expect("an unsupported platform must provide its typed MCP authority blocker");
+    CommandResult::blocked(
+        "mom_llama.mention_tool_approval_decide",
+        "blocked_platform_unsupported",
+        blocker,
+    )
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn mention_tool_approval_decide_supported_in_scope(
     scope: &OperationScope,
     invocation_id: &str,
     approval_id: &str,
@@ -2448,7 +2530,7 @@ fn reconcile_persona_tool_approval_set(
                 .as_deref()
                 .filter(|lease_id| !lease_id.is_empty());
             let lease_is_live = match lease_identity {
-                Some(lease_id) => persona_tool_resume_lease_is_live(
+                Some(lease_id) => resume_lease_is_live_for_recovery(
                     data_dir,
                     &approval.invocation_id,
                     &approval.approval_id,
@@ -5286,13 +5368,10 @@ const fn candidate_rank(kind: MentionTargetKind) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use super::{
         ACTIVE_APPROVALS_NAMESPACE, INVOCATIONS_NAMESPACE, MentionInvocationDb,
-        MentionToolEffectOutcome, PersonaToolApprovalRecovery, PersonaToolResumeLease,
-        claim_stored_persona_tool_approval, persona_tool_resume_lease_is_live,
-        project_visible_tool_approvals, upsert_invocation_with_continuations,
-        write_active_approval_index,
+        MentionToolEffectOutcome, PersonaToolApprovalRecovery,
+        upsert_invocation_with_continuations, write_active_approval_index,
     };
     use super::{
         ApprovalDeadlineTracker, BoundMentionTool, FrozenMentionToolContinuation,
@@ -5308,6 +5387,11 @@ mod tests {
         unregister_exact_mentions, validate_resolved_mention_tools,
     };
     #[cfg(any(target_os = "macos", target_os = "linux"))]
+    use super::{
+        PersonaToolResumeLease, claim_stored_persona_tool_approval,
+        persona_tool_resume_lease_is_live, project_visible_tool_approvals,
+    };
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::conversation_store::{CONVERSATIONS_NAMESPACE, Message, MessageRole};
     use crate::conversation_store::{
         Conversation, ConversationDb, ConversationExecutionProfile, ConversationKind,
@@ -5315,7 +5399,6 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::mcp::exact_mcp_server_config_sha256;
     use crate::mcp::{McpServerConfig, McpTool};
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     use crate::store::RuntimeStore;
     use crate::tool_loop::ToolPermissionPolicy;
     use llama_native_types::{
@@ -5327,10 +5410,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     struct RemoveTestDir(PathBuf);
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
     impl Drop for RemoveTestDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
@@ -5517,6 +5598,141 @@ mod tests {
                 resume_lease_id: None,
             }],
         }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn unsupported_platform_blocks_approval_before_store_or_lease_authority() {
+        let direct = super::mention_tool_approval_decide(
+            "missing-invocation",
+            "missing-approval",
+            MentionToolApprovalDecision::Approve,
+        )
+        .expect("typed unsupported approval result");
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "mom-persona-unsupported-decision-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&data_dir).expect("temporary unsupported decision directory");
+        let _remove_data_dir = RemoveTestDir(data_dir.clone());
+        let recovery = PersonaToolApprovalRecovery::bind(&data_dir)
+            .expect("bind unsupported-platform recovery authority");
+        let scoped = super::mention_tool_approval_decide_with_recovery_in_scope(
+            &crate::operation_scope::OperationScope::detached(),
+            "missing-invocation",
+            "missing-approval",
+            MentionToolApprovalDecision::Approve,
+            &recovery,
+        )
+        .expect("typed scoped unsupported approval result");
+
+        for result in [&direct, &scoped] {
+            assert_eq!(result.status, "blocked");
+            assert_eq!(result.readiness, "blocked_platform_unsupported");
+            assert_eq!(
+                result.blocker.as_ref().map(|blocker| blocker.code.as_str()),
+                Some("mcp_platform_unsupported")
+            );
+            assert!(result.result.is_none());
+            assert_eq!(result.receipt.readiness, result.readiness);
+        }
+        assert!(
+            !data_dir.join("operation-leases").exists(),
+            "an unsupported approval command must not create lease authority"
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn unsupported_platform_recovery_terminalizes_without_lease_io() -> anyhow::Result<()> {
+        let data_dir = std::env::temp_dir().join(format!(
+            "mom-persona-unsupported-recovery-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&data_dir)?;
+        let _remove_data_dir = RemoveTestDir(data_dir.clone());
+        let lease_io_trap = data_dir.join("operation-leases");
+        std::fs::write(&lease_io_trap, b"unsupported-platform-no-lease-io")?;
+        let store = RuntimeStore::open(&data_dir)?;
+        let mut stored = frozen_approval_record(u128::from(u64::MAX));
+
+        let mut resuming_approval = stored.tool_approvals[0].clone();
+        resuming_approval.id = "resuming-approval".to_string();
+        resuming_approval.state = MentionToolApprovalState::Resuming;
+        resuming_approval.decision = Some(MentionToolApprovalDecision::Approve);
+        resuming_approval.consumed_at_ms = Some(20);
+        stored.tool_approvals.push(resuming_approval);
+        let mut resuming_continuation = stored.frozen_tool_continuations[0].clone();
+        resuming_continuation.approval_id = "resuming-approval".to_string();
+        resuming_continuation.resume_lease_id = Some("unsupported-platform-lease".to_string());
+        stored.frozen_tool_continuations.push(resuming_continuation);
+
+        let invocation = stored.invocation.clone();
+        let continuations = stored.frozen_tool_continuations.clone();
+        store.mutate_documents(
+            INVOCATIONS_NAMESPACE,
+            MentionInvocationDb::default,
+            |db, documents| {
+                upsert_invocation_with_continuations(db, &invocation, continuations)?;
+                write_active_approval_index(db, documents)
+            },
+        )?;
+        drop(store);
+
+        let recovery = PersonaToolApprovalRecovery::bind(&data_dir)?;
+        recovery.reconcile()?;
+        // A second sweep proves the terminal projection cannot reacquire or
+        // retry the interrupted external effect.
+        recovery.reconcile()?;
+        drop(recovery);
+        assert_eq!(
+            std::fs::read(&lease_io_trap)?,
+            b"unsupported-platform-no-lease-io",
+            "unsupported recovery must not probe or mutate process-lease storage"
+        );
+
+        let reopened = RuntimeStore::open(&data_dir)?;
+        let terminal_db = reopened
+            .get::<MentionInvocationDb>(INVOCATIONS_NAMESPACE)?
+            .expect("terminalized invocation database");
+        let terminal = terminal_db
+            .invocations
+            .iter()
+            .find(|candidate| candidate.id == "invocation")
+            .expect("terminalized invocation");
+        let expired = terminal
+            .tool_approvals
+            .iter()
+            .find(|approval| approval.id == "approval")
+            .expect("expired pending approval");
+        assert_eq!(expired.state, MentionToolApprovalState::Expired);
+        assert!(expired.consumed_at_ms.is_some());
+        assert_eq!(expired.effect_receipt_id, None);
+        assert_eq!(expired.effect_outcome, None);
+
+        let interrupted = terminal
+            .tool_approvals
+            .iter()
+            .find(|approval| approval.id == "resuming-approval")
+            .expect("terminalized resuming approval");
+        assert_eq!(interrupted.state, MentionToolApprovalState::Failed);
+        assert_eq!(
+            interrupted.effect_outcome,
+            Some(MentionToolEffectOutcome::Unknown)
+        );
+        assert!(interrupted.effect_receipt_id.is_some());
+        assert!(terminal.frozen_tool_continuations.is_empty());
+        assert_eq!(terminal.state, MentionInvocationState::Failed);
+        assert!(
+            reopened
+                .get::<super::ActivePersonaToolApprovalIndex>(ACTIVE_APPROVALS_NAMESPACE)?
+                .expect("terminal active approval index")
+                .approvals
+                .is_empty(),
+            "terminal unsupported-platform approvals must never be retried"
+        );
+        Ok(())
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
