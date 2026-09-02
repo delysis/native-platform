@@ -1166,14 +1166,18 @@ fn digest_equal(left: &str, right: &str) -> bool {
 }
 
 fn sync_regular_file(path: &Path, operation: &'static str) -> Result<(), StoreError> {
-    let file = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|error| StoreError::Io {
-            operation,
-            path: path.to_path_buf(),
-            source: error,
-        })?;
+    let mut options = OpenOptions::new();
+    // Windows FlushFileBuffers requires a write-capable handle. Unix fsync
+    // accepts the read-only handle this staging-file boundary historically used.
+    #[cfg(windows)]
+    options.write(true);
+    #[cfg(not(windows))]
+    options.read(true);
+    let file = options.open(path).map_err(|error| StoreError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source: error,
+    })?;
     file.sync_all().map_err(|error| StoreError::Io {
         operation,
         path: path.to_path_buf(),
@@ -1424,6 +1428,20 @@ mod tests {
             read_json_bounded::<serde_json::Value>(&path, "projection fixture", 64),
             Err(StoreError::UnsafePath { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn managed_file_sync_uses_a_flush_capable_handle_without_changing_bytes()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = tempdir()?;
+        let path = temporary.path().join("managed-file.bin");
+        let expected = b"durable managed bytes";
+        fs::write(&path, expected)?;
+
+        sync_regular_file(&path, "sync managed file fixture")?;
+
+        assert_eq!(fs::read(path)?, expected);
         Ok(())
     }
 
