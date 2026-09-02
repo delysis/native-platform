@@ -2977,8 +2977,7 @@ fn multimodal_readiness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{lock_data_dir_override_for_tests, set_data_dir_override_for_tests};
-    use std::sync::MutexGuard;
+    use crate::config::set_data_dir_override_for_tests;
 
     const VALID_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\
         \x00\x00\x00\x0dIHDR\x00\x00\x00\x02\x00\x00\x00\x04\x08\x02\x00\x00\x00\x2b\x8d\x79\x6e\
@@ -2991,23 +2990,18 @@ mod tests {
     const STRUCTURALLY_VALID_MP4: &[u8] = b"\0\0\0\x10ftypisom\0\0\0\0\0\0\0\x08mdat";
 
     struct TestDataDir {
-        _guard: MutexGuard<'static, ()>,
         path: PathBuf,
     }
 
     impl TestDataDir {
         fn new(label: &str) -> Self {
-            let guard = lock_data_dir_override_for_tests();
             let path = std::env::temp_dir().join(format!(
                 "mom-llama-attachment-unit-{label}-{}",
                 Uuid::new_v4().simple()
             ));
             std::fs::create_dir_all(&path).expect("create attachment test data dir");
             set_data_dir_override_for_tests(Some(path.clone()));
-            Self {
-                _guard: guard,
-                path,
-            }
+            Self { path }
         }
     }
 

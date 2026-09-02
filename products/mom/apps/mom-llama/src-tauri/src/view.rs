@@ -4297,9 +4297,6 @@ mod tests {
 
     #[test]
     fn rendered_app_controls_have_contract_metadata() -> Result<()> {
-        let _guard = crate::APP_DATA_DIR_TEST_LOCK
-            .lock()
-            .expect("lock app data-dir test state");
         let data_dir = tempfile::tempdir()?;
         mom_llama_runtime::config::set_data_dir_override_for_tests(Some(
             data_dir.path().to_path_buf(),
@@ -4818,9 +4815,6 @@ mod tests {
 
     #[test]
     fn corrupt_product_storage_never_projects_an_empty_default_chat() {
-        let _guard = crate::APP_DATA_DIR_TEST_LOCK
-            .lock()
-            .expect("lock app data-dir test state");
         let data_dir = std::env::temp_dir().join(format!(
             "mom-llama-corrupt-view-test-{}-{}",
             std::process::id(),
@@ -5595,9 +5589,8 @@ mod tests {
         assert_interactive_tags_have_metadata(&html, "button");
 
         // This markup contract does not need storage. Calling the live Persona
-        // projection here races the separate render test's process-global data
-        // directory override and can both contaminate that fixture and inspect
-        // the developer's real store.
+        // projection would make it depend on mutable ambient product state and
+        // could inspect the developer's real store.
         let personas = StoreProjection {
             value: Vec::new(),
             blocker: None,

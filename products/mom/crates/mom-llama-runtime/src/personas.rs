@@ -2395,7 +2395,7 @@ mod tests {
         persona_remove_from_library, persona_remove_from_library_inner, reconcile_builtin_personas,
         repair_dangling_group_members, repair_legacy_handles, slug, validate_available_handle,
     };
-    use crate::config::{lock_data_dir_override_for_tests, set_data_dir_override_for_tests};
+    use crate::config::set_data_dir_override_for_tests;
     use crate::consult::ConsultPersona;
     use crate::conversation_store::{
         CONVERSATIONS_NAMESPACE, Conversation, ConversationDb, ConversationExecutionProfile,
@@ -2406,28 +2406,23 @@ mod tests {
     use crate::store::RuntimeStore;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
-    use std::sync::{Arc, Barrier, MutexGuard};
+    use std::sync::{Arc, Barrier};
     use std::thread;
     use uuid::Uuid;
 
     struct TestDataDir {
-        _guard: MutexGuard<'static, ()>,
         path: PathBuf,
     }
 
     impl TestDataDir {
         fn new(label: &str) -> Self {
-            let guard = lock_data_dir_override_for_tests();
             let path = std::env::temp_dir().join(format!(
                 "mom-llama-persona-removal-{label}-{}",
                 Uuid::new_v4().simple()
             ));
             std::fs::create_dir_all(&path).expect("create Persona removal test data dir");
             set_data_dir_override_for_tests(Some(path.clone()));
-            Self {
-                _guard: guard,
-                path,
-            }
+            Self { path }
         }
     }
 
@@ -3078,7 +3073,7 @@ mod tests {
 
     #[test]
     fn instantiate_rechecks_exact_persona_authority_in_its_write_transaction() {
-        let _session = TestDataDir::new("instantiate-removal-race");
+        let session = TestDataDir::new("instantiate-removal-race");
         let (_, persona, _) = seed_removal_fixture();
         let impact = persona_removal_preview(&persona.id)
             .expect("preview removal")
@@ -3087,13 +3082,17 @@ mod tests {
         let before_admission = Arc::new(Barrier::new(2));
         let release_admission = Arc::new(Barrier::new(2));
         let worker_persona_id = persona.id.clone();
+        let worker_data_dir = session.path.clone();
         let worker_before = Arc::clone(&before_admission);
         let worker_release = Arc::clone(&release_admission);
         let worker = thread::spawn(move || {
-            persona_instantiate_inner(&worker_persona_id, None, || {
+            set_data_dir_override_for_tests(Some(worker_data_dir));
+            let result = persona_instantiate_inner(&worker_persona_id, None, || {
                 worker_before.wait();
                 worker_release.wait();
-            })
+            });
+            set_data_dir_override_for_tests(None);
+            result
         });
 
         before_admission.wait();

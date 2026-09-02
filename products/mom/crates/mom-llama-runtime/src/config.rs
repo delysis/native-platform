@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 const SETTINGS_FILE: &str = "settings.json";
@@ -1116,11 +1116,7 @@ pub fn settings_reset() -> Result<CommandResult<Settings>> {
 }
 
 pub fn resolve_data_dir() -> PathBuf {
-    if let Some(path) = data_dir_override()
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-    {
+    if let Some(path) = data_dir_override() {
         return path;
     }
     if let Ok(path) = std::env::var("LLAMA_NATIVE_KIT_DATA_DIR")
@@ -1158,29 +1154,24 @@ pub(crate) fn insecure_development_store_enabled() -> bool {
 }
 
 pub fn set_data_dir_override_for_tests(path: Option<PathBuf>) {
-    if let Ok(mut guard) = data_dir_override().lock() {
-        *guard = path;
-    }
+    DATA_DIR_OVERRIDE.with(|override_path| *override_path.borrow_mut() = path);
 }
 
-#[cfg(test)]
-pub(crate) fn lock_data_dir_override_for_tests() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+std::thread_local! {
+    // A test override belongs to the test thread that installed it. Making it
+    // process-global lets unrelated parallel tests open and mutate the same
+    // SQLite fixture while its owning test is using it.
+    static DATA_DIR_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
 
-fn data_dir_override() -> &'static Mutex<Option<PathBuf>> {
-    static DATA_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-    DATA_DIR_OVERRIDE.get_or_init(|| Mutex::new(None))
+fn data_dir_override() -> Option<PathBuf> {
+    DATA_DIR_OVERRIDE.with(|override_path| override_path.borrow().clone())
 }
 
 pub(crate) fn data_dir_override_is_set() -> bool {
-    data_dir_override()
-        .lock()
-        .map(|guard| guard.is_some())
-        .unwrap_or(false)
+    DATA_DIR_OVERRIDE.with(|override_path| override_path.borrow().is_some())
 }
 
 pub fn write_json_atomic<T>(path: &Path, value: &T) -> Result<()>
@@ -1210,6 +1201,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_dir_override_does_not_leak_into_parallel_tests() {
+        let override_path = std::env::temp_dir().join(format!(
+            "mom-llama-config-thread-override-{}",
+            uuid::Uuid::new_v4()
+        ));
+        set_data_dir_override_for_tests(Some(override_path.clone()));
+
+        let parallel_data_dir = std::thread::spawn(resolve_data_dir).join();
+        set_data_dir_override_for_tests(None);
+        let parallel_data_dir = parallel_data_dir.expect("parallel data-dir lookup");
+        assert_ne!(parallel_data_dir, override_path);
+    }
 
     #[test]
     fn exact_upstream_setting_registry_is_complete_and_distinct_from_extensions() {

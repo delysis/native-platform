@@ -19,9 +19,6 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 const APPLICATION_QUIT_MENU_ID: &str = "mom-llama.application.quit";
 const APPLICATION_QUIT_ACCELERATOR: &str = "CmdOrCtrl+Q";
 
-#[cfg(test)]
-pub(crate) static APP_DATA_DIR_TEST_LOCK: Mutex<()> = Mutex::new(());
-
 #[derive(Clone)]
 struct StartupController {
     state: Arc<Mutex<StartupState>>,
