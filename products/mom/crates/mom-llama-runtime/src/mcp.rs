@@ -2594,7 +2594,7 @@ fn validate_mcp_command(command: &Path) -> Option<Blocker> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn mcp_platform_blocker() -> Option<Blocker> {
+pub(crate) fn mcp_platform_blocker() -> Option<Blocker> {
     Some(Blocker::new(
         "mcp_platform_unsupported",
         "Joined MCP process supervision is not available on this platform.",
@@ -2606,7 +2606,7 @@ fn mcp_platform_blocker() -> Option<Blocker> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-const fn mcp_platform_blocker() -> Option<Blocker> {
+pub(crate) const fn mcp_platform_blocker() -> Option<Blocker> {
     None
 }
 

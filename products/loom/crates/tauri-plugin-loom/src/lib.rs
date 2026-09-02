@@ -10556,6 +10556,15 @@ mod tests {
         );
     }
 
+    // These positive lifecycle tests must mirror loom-store's
+    // `ensure_document_lifecycle_supported` capability boundary. Unsupported
+    // targets exercise the typed IPC failure contract below instead.
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn new_document_never_reuses_a_tombstoned_historical_path() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
@@ -10625,6 +10634,12 @@ mod tests {
         }
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn rename_action_moves_the_manuscript_and_preserves_identity() {
         let mut fixture = document_action_fixture();
@@ -10664,6 +10679,12 @@ mod tests {
         assert_eq!(opened.summary.title, "A Better Name");
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn delete_action_returns_an_authoritative_snapshot_and_replays_exactly() {
         let mut fixture = document_action_fixture();
@@ -10697,6 +10718,68 @@ mod tests {
         )
         .expect("replay exact deletion");
         assert!(replayed.documents.is_empty());
+    }
+
+    #[cfg(not(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    )))]
+    #[test]
+    fn unsupported_lifecycle_platform_returns_typed_ipc_failures_without_mutation() {
+        let mut fixture = document_action_fixture();
+        let source_before = fixture
+            .store
+            .read_document(INITIAL_DOCUMENT)
+            .expect("read source before unsupported actions");
+        let registered_before = fixture
+            .store
+            .registered_document(fixture.identity.document)
+            .expect("read registration before unsupported actions")
+            .expect("source remains registered");
+
+        let rename_failure =
+            rename_registered_document(&mut fixture.store, fixture.identity, "A Better Name")
+                .expect_err("unsupported rename must fail closed");
+        assert_eq!(rename_failure.code, "document_lifecycle_unsupported");
+        assert!(!rename_failure.retryable);
+
+        let delete_failure = delete_registered_document(
+            &mut fixture.store,
+            CommandId::new(),
+            CommandId::new(),
+            fixture.identity,
+        )
+        .expect_err("unsupported delete must fail closed");
+        assert_eq!(delete_failure.code, "document_lifecycle_unsupported");
+        assert!(!delete_failure.retryable);
+
+        let source_after = fixture
+            .store
+            .read_document(INITIAL_DOCUMENT)
+            .expect("read source after unsupported actions");
+        let registered_after = fixture
+            .store
+            .registered_document(fixture.identity.document)
+            .expect("read registration after unsupported actions")
+            .expect("source remains registered");
+        assert_eq!(source_after, source_before);
+        assert_eq!(registered_after, registered_before);
+        assert_eq!(
+            std::fs::read(fixture.root.join(INITIAL_DOCUMENT))
+                .expect("read unchanged visible source"),
+            b"exact manuscript\n"
+        );
+        assert!(!fixture.root.join("manuscript/A Better Name.md").exists());
+        assert_eq!(
+            fixture
+                .store
+                .list_documents()
+                .expect("active catalogue after unsupported actions")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -11597,6 +11680,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn default_project_reopen_does_not_recreate_initial_after_rename() {
         let temporary = tempfile::tempdir().expect("temporary app data");
@@ -11723,6 +11812,12 @@ mod tests {
         assert!(!root.join(INITIAL_DOCUMENT).exists());
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn default_project_reopens_after_explicit_initial_document_deletion_without_resurrection() {
         let temporary = tempfile::tempdir().expect("temporary app data");

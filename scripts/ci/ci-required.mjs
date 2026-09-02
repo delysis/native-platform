@@ -20,9 +20,12 @@ const knownJobs = [
   "gateway-linux",
   "attachment-linux",
   "information-linux",
+  "information-windows",
   "speech-linux",
   "mom-linux",
+  "mom-windows",
   "loom-linux",
+  "loom-windows",
   "frontend",
   "platform-macos",
   "ignored-tests",
@@ -63,6 +66,30 @@ if (plan.flags?.frontend_loom === true) {
   }
 }
 
+if (plan.flags?.information === true || plan.flags?.full === true) {
+  for (const job of ["information-linux", "information-windows"]) {
+    if (!plan.jobs.includes(job)) failures.push(`Information plan omitted ${job}`);
+  }
+}
+
+if (
+  plan.presence?.mom === true &&
+  (plan.flags?.mom === true || plan.flags?.full === true)
+) {
+  for (const job of ["mom-linux", "mom-windows"]) {
+    if (!plan.jobs.includes(job)) failures.push(`Mom plan omitted ${job}`);
+  }
+}
+
+if (
+  plan.presence?.loom === true &&
+  (plan.flags?.loom === true || plan.flags?.full === true)
+) {
+  for (const job of ["loom-linux", "loom-windows"]) {
+    if (!plan.jobs.includes(job)) failures.push(`Loom plan omitted ${job}`);
+  }
+}
+
 if (plan.flags?.full === true) {
   const fullJobs = [
     "policy",
@@ -71,6 +98,7 @@ if (plan.flags?.full === true) {
     "gateway-linux",
     "attachment-linux",
     "information-linux",
+    "information-windows",
     "speech-linux",
     "frontend",
     "platform-macos",
@@ -78,8 +106,8 @@ if (plan.flags?.full === true) {
     "dependency-graph",
     "fuzz-build",
   ];
-  if (plan.presence?.mom === true) fullJobs.push("mom-linux");
-  if (plan.presence?.loom === true) fullJobs.push("loom-linux");
+  if (plan.presence?.mom === true) fullJobs.push("mom-linux", "mom-windows");
+  if (plan.presence?.loom === true) fullJobs.push("loom-linux", "loom-windows");
   for (const job of fullJobs) {
     if (!plan.jobs.includes(job)) failures.push(`full plan omitted ${job}`);
   }

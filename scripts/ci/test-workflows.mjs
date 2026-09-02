@@ -648,9 +648,12 @@ test("PR workflow exposes every targeted partition and future product guards", (
     "gateway-linux",
     "attachment-linux",
     "information-linux",
+    "information-windows",
     "speech-linux",
     "mom-linux",
+    "mom-windows",
     "loom-linux",
+    "loom-windows",
     "frontend",
     "platform-macos",
     "ignored-tests",
@@ -667,6 +670,56 @@ test("PR workflow exposes every targeted partition and future product guards", (
   assert.doesNotMatch(source, /platform_windows/);
 });
 
+test("Information changes run their portable tests on Windows before merge", () => {
+  const source = read(prPath);
+  const windows = source.match(
+    /^  information-windows:[\s\S]*?(?=^  speech-linux:)/m,
+  )?.[0];
+  assert.ok(windows, "information-windows job block is missing");
+  assert.match(
+    windows,
+    /if: \$\{\{ needs\.plan\.outputs\.information == 'true' \|\| needs\.plan\.outputs\.full == 'true' \}\}/,
+  );
+  assert.match(windows, /runs-on: windows-latest/);
+  assert.match(windows, /git config --global core\.longpaths true/);
+  assert.match(
+    windows,
+    /node scripts\/ci\/cargo-group\.mjs test service-information/,
+  );
+  const required = source.match(/^  ci-required:[\s\S]*$/m)?.[0];
+  assert.match(required, /^\s{6}- information-windows$/m);
+});
+
+test("Mom changes run their product tests on Windows before merge", () => {
+  const source = read(prPath);
+  const windows = source.match(/^  mom-windows:[\s\S]*?(?=^  loom-linux:)/m)?.[0];
+  assert.ok(windows, "mom-windows job block is missing");
+  assert.match(
+    windows,
+    /if: \$\{\{ needs\.plan\.outputs\.mom_present == 'true' && \(needs\.plan\.outputs\.mom == 'true' \|\| needs\.plan\.outputs\.full == 'true'\) \}\}/,
+  );
+  assert.match(windows, /runs-on: windows-latest/);
+  assert.match(windows, /git config --global core\.longpaths true/);
+  assert.match(windows, /node scripts\/ci\/cargo-group\.mjs test product-mom/);
+  const required = source.match(/^  ci-required:[\s\S]*$/m)?.[0];
+  assert.match(required, /^\s{6}- mom-windows$/m);
+});
+
+test("Loom changes run their product tests on Windows before merge", () => {
+  const source = read(prPath);
+  const windows = source.match(/^  loom-windows:[\s\S]*?(?=^  frontend:)/m)?.[0];
+  assert.ok(windows, "loom-windows job block is missing");
+  assert.match(
+    windows,
+    /if: \$\{\{ needs\.plan\.outputs\.loom_present == 'true' && \(needs\.plan\.outputs\.loom == 'true' \|\| needs\.plan\.outputs\.full == 'true'\) \}\}/,
+  );
+  assert.match(windows, /runs-on: windows-latest/);
+  assert.match(windows, /git config --global core\.longpaths true/);
+  assert.match(windows, /node scripts\/ci\/cargo-group\.mjs test product-loom/);
+  const required = source.match(/^  ci-required:[\s\S]*$/m)?.[0];
+  assert.match(required, /^\s{6}- loom-windows$/m);
+});
+
 test("root workspace tests can inspect the retained migration evidence", () => {
   const rootLinux = read(prPath).match(/^  root-linux:[\s\S]*?(?=^  native-linux:)/m)?.[0];
   assert.ok(rootLinux, "root-linux job block is missing");
@@ -677,8 +730,8 @@ test("long Linux lanes parallelize test and Clippy without dropping either", () 
   const source = read(prPath);
   const blocks = [
     source.match(/^  root-linux:[\s\S]*?(?=^  native-linux:)/m)?.[0],
-    source.match(/^  mom-linux:[\s\S]*?(?=^  loom-linux:)/m)?.[0],
-    source.match(/^  loom-linux:[\s\S]*?(?=^  frontend:)/m)?.[0],
+    source.match(/^  mom-linux:[\s\S]*?(?=^  mom-windows:)/m)?.[0],
+    source.match(/^  loom-linux:[\s\S]*?(?=^  loom-windows:)/m)?.[0],
   ];
   for (const block of blocks) {
     assert.ok(block, "parallel Linux job block is missing");
@@ -799,8 +852,8 @@ test("Mom and Loom Linux coverage provisions desktop build dependencies", () => 
   const pr = read(prPath);
   const full = read(fullPath);
   const blocks = [
-    pr.match(/^  mom-linux:[\s\S]*?(?=^  loom-linux:)/m)?.[0],
-    pr.match(/^  loom-linux:[\s\S]*?(?=^  frontend:)/m)?.[0],
+    pr.match(/^  mom-linux:[\s\S]*?(?=^  mom-windows:)/m)?.[0],
+    pr.match(/^  loom-linux:[\s\S]*?(?=^  loom-windows:)/m)?.[0],
     full.match(/^  mom:[\s\S]*?(?=^  loom:)/m)?.[0],
     full.match(/^  loom:[\s\S]*?(?=^  frontend:)/m)?.[0],
   ];
@@ -835,12 +888,27 @@ test("full workflow covers main, nightly, dispatch, products, policy, and fuzz",
   assert.match(source, /^\s{4}if: always\(\)$/m);
 });
 
-test("Windows remains full CI plus the exact ignored-inventory PR matrix only", () => {
+test("Windows PR coverage is limited to selected portability and inventory gates", () => {
   const pr = read(prPath);
   const full = read(fullPath);
   const ignored = pr.match(/^  ignored-tests:[\s\S]*?(?=^  fuzz-build:)/m)?.[0];
+  const information = pr.match(
+    /^  information-windows:[\s\S]*?(?=^  speech-linux:)/m,
+  )?.[0];
+  const mom = pr.match(/^  mom-windows:[\s\S]*?(?=^  loom-linux:)/m)?.[0];
+  const loom = pr.match(/^  loom-windows:[\s\S]*?(?=^  frontend:)/m)?.[0];
   assert.match(ignored, /windows-latest/);
-  assert.doesNotMatch(pr.replace(ignored, ""), /windows-latest/);
+  assert.match(information, /windows-latest/);
+  assert.match(mom, /windows-latest/);
+  assert.match(loom, /windows-latest/);
+  assert.doesNotMatch(
+    pr
+      .replace(ignored, "")
+      .replace(information, "")
+      .replace(mom, "")
+      .replace(loom, ""),
+    /windows-latest/,
+  );
   assert.match(full, /windows-latest/);
   assert.match(full, /ci-full-/);
 });

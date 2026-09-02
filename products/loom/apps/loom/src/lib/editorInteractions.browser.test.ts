@@ -954,6 +954,9 @@ describe('real WebKit editor interactions', () => {
     document.body.append(outside);
     await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
     const editor = editorLocator.element();
+    const visualSelectionWitness = () => JSON.parse(
+      page.getByRole('status', { name: 'Visual Selection Witness' }).element().textContent ?? '{}'
+    );
     const initialGhost = editor.querySelector('.loom-visual-ghost');
     expect(initialGhost).not.toBeNull();
 
@@ -966,6 +969,25 @@ describe('real WebKit editor interactions', () => {
     expect(lifecycleRefreshedGhost).not.toBeNull();
     expect(lifecycleRefreshedGhost).not.toBe(initialGhost);
     editor.focus();
+    await expect.poll(() => {
+      const selection = document.getSelection();
+      const witness = visualSelectionWitness();
+      return {
+        active: document.activeElement === editor,
+        collapsed: selection?.isCollapsed ?? false,
+        anchorInside: Boolean(selection?.anchorNode && editor.contains(selection.anchorNode)),
+        available: witness.available,
+        caretAtEnd: witness.caretAtEnd,
+        caretByteOffset: witness.caretByteOffset
+      };
+    }).toEqual({
+      active: true,
+      collapsed: true,
+      anchorInside: true,
+      available: true,
+      caretAtEnd: true,
+      caretByteOffset: 5
+    });
     await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
     await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
       .toHaveTextContent('0');
@@ -976,6 +998,11 @@ describe('real WebKit editor interactions', () => {
     await expect.poll(() => editor.querySelector('.loom-visual-ghost')).toBeNull();
     await expect.element(page.getByRole('status', { name: 'Completion Context' }))
       .toHaveTextContent('none');
+    await expect.poll(visualSelectionWitness).toMatchObject({
+      available: true,
+      caretAtEnd: false,
+      caretByteOffset: 4
+    });
     outside.focus();
     window.dispatchEvent(new Event('focus'));
     document.dispatchEvent(new Event('visibilitychange'));

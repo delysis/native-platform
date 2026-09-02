@@ -472,10 +472,16 @@ function jobsFor(selectedFlags) {
   if (selectedFlags.native || selectedFlags.full) selected.push("native-linux");
   if (selectedFlags.gateway || selectedFlags.full) selected.push("gateway-linux");
   if (selectedFlags.attachment || selectedFlags.full) selected.push("attachment-linux");
-  if (selectedFlags.information || selectedFlags.full) selected.push("information-linux");
+  if (selectedFlags.information || selectedFlags.full) {
+    selected.push("information-linux", "information-windows");
+  }
   if (selectedFlags.speech || selectedFlags.full) selected.push("speech-linux");
-  if (presence.mom && (selectedFlags.mom || selectedFlags.full)) selected.push("mom-linux");
-  if (presence.loom && (selectedFlags.loom || selectedFlags.full)) selected.push("loom-linux");
+  if (presence.mom && (selectedFlags.mom || selectedFlags.full)) {
+    selected.push("mom-linux", "mom-windows");
+  }
+  if (presence.loom && (selectedFlags.loom || selectedFlags.full)) {
+    selected.push("loom-linux", "loom-windows");
+  }
   if (
     selectedFlags.frontend_fte ||
     selectedFlags.frontend_mom ||

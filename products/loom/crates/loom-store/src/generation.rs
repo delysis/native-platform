@@ -4324,6 +4324,12 @@ mod tests {
         );
     }
 
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "redox"
+    ))]
     #[test]
     fn tombstoned_document_rejects_stale_candidate_promotion_after_path_recreation() {
         let mut fixture = Fixture::new();
