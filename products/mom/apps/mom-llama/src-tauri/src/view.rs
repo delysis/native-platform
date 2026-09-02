@@ -4472,7 +4472,7 @@ mod tests {
             !html.contains("conversation-search-prompt"),
             "search must not fall back to prompt-only behavior"
         );
-        for section in [
+        const ALWAYS_VISIBLE_SETTINGS_SECTIONS: &[&str] = &[
             "general",
             "display",
             "personas",
@@ -4480,16 +4480,35 @@ mod tests {
             "library",
             "sampling",
             "penalties",
-            "agentic",
-            "tools",
-            "mcp",
             "import-export",
             "developer",
-        ] {
+        ];
+        const PROCESS_BACKED_SETTINGS_SECTIONS: &[&str] = &["agentic", "tools", "mcp"];
+        for section in SETTINGS_SECTIONS {
             assert!(
-                html.contains(&format!(r#"data-section="{section}""#)),
-                "missing settings section {section}"
+                ALWAYS_VISIBLE_SETTINGS_SECTIONS.contains(&section.slug)
+                    || PROCESS_BACKED_SETTINGS_SECTIONS.contains(&section.slug),
+                "settings section {} must declare its platform surface contract",
+                section.slug
             );
+        }
+        let assert_settings_section = |section: &str, expected: bool| {
+            assert_eq!(
+                html.contains(&format!(r#"data-section="{section}""#)),
+                expected,
+                "settings tab {section} must match the supported platform surface"
+            );
+            assert_eq!(
+                html.contains(&format!(r#"data-section-panel="{section}""#)),
+                expected,
+                "settings panel {section} must match the supported platform surface"
+            );
+        };
+        for section in ALWAYS_VISIBLE_SETTINGS_SECTIONS {
+            assert_settings_section(section, true);
+        }
+        for section in PROCESS_BACKED_SETTINGS_SECTIONS {
+            assert_settings_section(section, mcp_process_ui_supported());
         }
         assert!(
             html.contains(r#"data-section-panel="personas""#)
@@ -4499,7 +4518,11 @@ mod tests {
             "persona definitions and group patterns must live in their Settings sections"
         );
         assert!(html.contains("lucide-search"));
-        assert!(html.contains("mcp-logo"));
+        assert_eq!(
+            html.contains("mcp-logo"),
+            mcp_process_ui_supported(),
+            "the MCP logo must appear exactly when the MCP settings surface is supported"
+        );
         let js = include_str!("../../ui/coop-hx.js");
         assert!(
             js.contains("invokeMarkup") && js.contains("Uint8Array.from(response)"),
