@@ -1421,16 +1421,17 @@ mod tests {
     #[test]
     fn path_grants_are_opaque_single_use_and_expire() {
         let information = MomInformation::empty_for_tests();
+        let expected_path = std::env::temp_dir().join("alexandria.db");
         let first = information
-            .issue_path_grant_at(PathBuf::from("/tmp/alexandria.db"), 100)
+            .issue_path_grant_at(expected_path.clone(), 100)
             .expect("grant");
         let encoded = serde_json::to_string(&first).expect("serialize grant");
-        assert!(!encoded.contains("/tmp"));
+        assert!(!encoded.contains("alexandria.db"));
         assert_eq!(
             information
                 .consume_path_grant(&first.grant_id, 101)
                 .expect("first use"),
-            PathBuf::from("/tmp/alexandria.db")
+            expected_path
         );
         assert!(
             information
@@ -1439,13 +1440,29 @@ mod tests {
         );
 
         let stale = information
-            .issue_path_grant_at(PathBuf::from("/tmp/stale.db"), 200)
+            .issue_path_grant_at(std::env::temp_dir().join("stale.db"), 200)
             .expect("stale grant");
         assert!(
             information
                 .consume_path_grant(&stale.grant_id, 200 + PATH_GRANT_TTL_MS)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn path_grants_reject_relative_picker_results() {
+        let information = MomInformation::empty_for_tests();
+        let relative_path = PathBuf::from("alexandria.db");
+
+        let error = information
+            .issue_path_grant_at(relative_path, 100)
+            .expect_err("relative picker result must be rejected");
+
+        assert_eq!(
+            error,
+            "The native picker did not return an absolute database file."
+        );
+        assert!(information.grants.lock().expect("grants").paths.is_empty());
     }
 
     #[test]
@@ -1474,8 +1491,9 @@ mod tests {
     #[test]
     fn denied_rights_never_consume_a_native_path_grant() {
         let information = MomInformation::empty_for_tests();
+        let expected_path = std::env::temp_dir().join("alexandria.db");
         let grant = information
-            .issue_path_grant_at(PathBuf::from("/tmp/alexandria.db"), now_unix_ms())
+            .issue_path_grant_at(expected_path.clone(), now_unix_ms())
             .expect("grant");
         let denied = information.register_alexandria(
             &grant.grant_id,
@@ -1492,6 +1510,12 @@ mod tests {
                 .expect("grants")
                 .paths
                 .contains_key(&grant.grant_id)
+        );
+        assert_eq!(
+            information
+                .consume_path_grant(&grant.grant_id, now_unix_ms())
+                .expect("denied rights must preserve the exact path grant"),
+            expected_path
         );
     }
 

@@ -4395,11 +4395,12 @@ mod tests {
             ),
             "machine-readable command receipts must not be announced as raw JSON"
         );
-        assert!(
+        assert_eq!(
             html.contains(
                 r#"id="tool-approval-modal" class="modal-backdrop is-hidden" hidden aria-hidden="true""#
             ),
-            "tool authority must stay behind an explicit hidden approval dialog"
+            mcp_process_ui_supported(),
+            "tool authority must stay behind an explicit hidden approval dialog on supported platforms and remain absent elsewhere"
         );
         assert!(!html.contains(r#"id="consult-view""#));
         assert!(!html.contains(r#"id="persona-view""#));
