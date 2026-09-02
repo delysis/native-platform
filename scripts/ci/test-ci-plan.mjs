@@ -202,6 +202,8 @@ test("Information changes select Information", () => {
   );
   assert.equal(result.flags.information, true);
   assert.equal(result.flags.full, false);
+  assert.ok(result.jobs.includes("information-linux"));
+  assert.ok(result.jobs.includes("information-windows"));
 });
 
 test("Speech Apple changes select Speech and platform coverage", () => {
@@ -228,6 +230,7 @@ test("contract-family changes include metadata consumers while the Mom overlay s
     });
     assert.equal(result.flags.mom, true, contractPath);
     assert.ok(result.jobs.includes("mom-linux"), contractPath);
+    assert.ok(result.jobs.includes("mom-windows"), contractPath);
     assert.equal(result.conservative_overlays.mom_contracts.applied, true);
     assert.deepEqual(result.conservative_overlays.mom_contracts.paths, [contractPath]);
     assert.equal(result.conservative_overlays.mom_contracts.applied_to_selection, false);
@@ -259,6 +262,7 @@ test("an unexplained legacy reduction forces full instead of narrowing generated
   );
   assert.equal(result.flags.full, true);
   assert.ok(result.dependency_shadow.missing_from_generated.includes("job:mom-linux"));
+  assert.ok(result.dependency_shadow.missing_from_generated.includes("job:mom-windows"));
   assert.ok(result.dependency_shadow.final_surface.includes("flag:full"));
 });
 
@@ -268,7 +272,10 @@ test("an explicit non-graph evidence rule can authorize a reviewed legacy reduct
   });
   assert.equal(result.flags.full, false);
   assert.deepEqual(result.jobs, ["policy"]);
-  assert.deepEqual(result.dependency_shadow.missing_from_generated, ["job:mom-linux"]);
+  assert.deepEqual(result.dependency_shadow.missing_from_generated, [
+    "job:mom-linux",
+    "job:mom-windows",
+  ]);
   assert.deepEqual(result.dependency_shadow.reduction_evidence, [
     {
       path: "products/mom/docs/PRODUCT.md",
@@ -289,6 +296,7 @@ test("Mom native source selects its product and macOS parity without root duplic
   assert.deepEqual(result.jobs, [
     "policy",
     "mom-linux",
+    "mom-windows",
     "platform-macos",
     "ignored-tests",
   ]);
@@ -315,6 +323,7 @@ test("the PR 22 Mom diff has the focused product, frontend, and macOS plan", () 
   assert.deepEqual(result.jobs, [
     "policy",
     "mom-linux",
+    "mom-windows",
     "frontend",
     "platform-macos",
     "ignored-tests",
@@ -396,7 +405,7 @@ test("product package scripts select their owned frontend checks", () => {
     present: ["products/mom/Cargo.toml"],
   }).result;
   assert.equal(mom.flags.frontend_mom, true);
-  assert.deepEqual(mom.jobs, ["policy", "mom-linux", "frontend"]);
+  assert.deepEqual(mom.jobs, ["policy", "mom-linux", "mom-windows", "frontend"]);
 
   const fte = fixture("products/fte/package.json").result;
   assert.equal(fte.flags.frontend_fte, true);
@@ -416,6 +425,7 @@ test("Mom dependency metadata remains conservative", () => {
     "policy",
     "root-linux",
     "mom-linux",
+    "mom-windows",
     "platform-macos",
     "ignored-tests",
     "dependency-graph",
@@ -433,6 +443,7 @@ test("Loom Svelte source selects the frontend and required macOS WebKit lane", (
   assert.equal(result.flags.platform_macos, true);
   assert.equal(result.flags.full, false);
   assert.ok(result.jobs.includes("loom-linux"));
+  assert.ok(result.jobs.includes("loom-windows"));
   assert.ok(result.jobs.includes("frontend"));
   assert.ok(result.jobs.includes("platform-macos"));
   assert.deepEqual(result.macos_matrix, ["release", "loom"]);
@@ -464,7 +475,9 @@ test("root Cargo metadata forces the complete present graph", () => {
   assert.equal(result.flags.full, true);
   assert.equal(result.flags.dependency_graph, true);
   assert.ok(result.jobs.includes("mom-linux"));
+  assert.ok(result.jobs.includes("mom-windows"));
   assert.ok(result.jobs.includes("loom-linux"));
+  assert.ok(result.jobs.includes("loom-windows"));
   assert.ok(result.jobs.includes("platform-macos"));
   assert.ok(!result.jobs.includes("platform-windows"));
   assert.deepEqual(result.macos_matrix, [
@@ -525,6 +538,7 @@ test("metadata unavailability forces the unchanged complete job and macOS matric
     "gateway-linux",
     "attachment-linux",
     "information-linux",
+    "information-windows",
     "speech-linux",
     "frontend",
     "platform-macos",

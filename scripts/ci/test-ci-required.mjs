@@ -39,14 +39,16 @@ test("a focused Mom plan accepts skipped root and requires its selected lanes", 
   const momPlan = {
     ...docsPlan,
     risk: "behavior",
+    flags: { full: false, mom: true },
     presence: { mom: true, loom: false },
-    jobs: ["policy", "mom-linux", "frontend", "platform-macos"],
+    jobs: ["policy", "mom-linux", "mom-windows", "frontend", "platform-macos"],
   };
   const needs = {
     plan: { result: "success" },
     policy: { result: "success" },
     "root-linux": { result: "skipped" },
     "mom-linux": { result: "success" },
+    "mom-windows": { result: "success" },
     frontend: { result: "success" },
     "platform-macos": { result: "success" },
   };
@@ -55,19 +57,45 @@ test("a focused Mom plan accepts skipped root and requires its selected lanes", 
   assert.notEqual(run(momPlan, needs).status, 0);
 });
 
+test("a Mom plan cannot omit or skip its Windows product gate", () => {
+  const momPlan = {
+    ...docsPlan,
+    risk: "behavior",
+    flags: { full: false, mom: true },
+    presence: { mom: true, loom: false },
+    jobs: ["policy", "mom-linux", "mom-windows"],
+  };
+  const needs = {
+    plan: { result: "success" },
+    policy: { result: "success" },
+    "mom-linux": { result: "success" },
+    "mom-windows": { result: "success" },
+  };
+  assert.equal(run(momPlan, needs).status, 0);
+
+  const skippedWindows = structuredClone(needs);
+  skippedWindows["mom-windows"].result = "skipped";
+  assert.notEqual(run(momPlan, skippedWindows).status, 0);
+
+  const omittedWindows = structuredClone(momPlan);
+  omittedWindows.jobs = omittedWindows.jobs.filter((job) => job !== "mom-windows");
+  assert.notEqual(run(omittedWindows, needs).status, 0);
+});
+
 test("a Loom frontend plan cannot omit or skip its macOS WebKit gate", () => {
   const loomPlan = {
     ...docsPlan,
     risk: "behavior",
-    flags: { full: false, frontend_loom: true },
+    flags: { full: false, loom: true, frontend_loom: true },
     presence: { mom: false, loom: true },
-    jobs: ["policy", "loom-linux", "frontend", "platform-macos"],
+    jobs: ["policy", "loom-linux", "loom-windows", "frontend", "platform-macos"],
     macos_matrix: ["release", "loom"],
   };
   const needs = {
     plan: { result: "success" },
     policy: { result: "success" },
     "loom-linux": { result: "success" },
+    "loom-windows": { result: "success" },
     frontend: { result: "success" },
     "platform-macos": { result: "success" },
   };
@@ -84,6 +112,57 @@ test("a Loom frontend plan cannot omit or skip its macOS WebKit gate", () => {
   const omittedMatrixEntry = structuredClone(loomPlan);
   omittedMatrixEntry.macos_matrix = ["release"];
   assert.notEqual(run(omittedMatrixEntry, needs).status, 0);
+});
+
+test("a Loom plan cannot omit or skip its Windows product gate", () => {
+  const loomPlan = {
+    ...docsPlan,
+    risk: "behavior",
+    flags: { full: false, loom: true },
+    presence: { mom: false, loom: true },
+    jobs: ["policy", "loom-linux", "loom-windows"],
+  };
+  const needs = {
+    plan: { result: "success" },
+    policy: { result: "success" },
+    "loom-linux": { result: "success" },
+    "loom-windows": { result: "success" },
+  };
+  assert.equal(run(loomPlan, needs).status, 0);
+
+  const skippedWindows = structuredClone(needs);
+  skippedWindows["loom-windows"].result = "skipped";
+  assert.notEqual(run(loomPlan, skippedWindows).status, 0);
+
+  const omittedWindows = structuredClone(loomPlan);
+  omittedWindows.jobs = omittedWindows.jobs.filter((job) => job !== "loom-windows");
+  assert.notEqual(run(omittedWindows, needs).status, 0);
+});
+
+test("an Information plan cannot omit or skip its Windows portability gate", () => {
+  const informationPlan = {
+    ...docsPlan,
+    risk: "behavior",
+    flags: { full: false, information: true },
+    jobs: ["policy", "information-linux", "information-windows"],
+  };
+  const needs = {
+    plan: { result: "success" },
+    policy: { result: "success" },
+    "information-linux": { result: "success" },
+    "information-windows": { result: "success" },
+  };
+  assert.equal(run(informationPlan, needs).status, 0);
+
+  const skippedWindows = structuredClone(needs);
+  skippedWindows["information-windows"].result = "skipped";
+  assert.notEqual(run(informationPlan, skippedWindows).status, 0);
+
+  const omittedWindows = structuredClone(informationPlan);
+  omittedWindows.jobs = omittedWindows.jobs.filter(
+    (job) => job !== "information-windows",
+  );
+  assert.notEqual(run(omittedWindows, needs).status, 0);
 });
 
 test("matrix-backed job IDs are consumed as one fail-closed aggregate result", () => {
