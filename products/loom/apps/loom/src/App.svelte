@@ -8,12 +8,14 @@
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
+    addDocumentContexts,
     applicationClosePending,
     cancelGeneration,
     cancelModelDownload,
     checkpointDocument,
     clearTransientDraft,
     applyDocumentReconciliation,
+    chooseAttachments,
     chooseAndOpenProject,
     chooseModel,
     closeProject as closeProjectSession,
@@ -25,10 +27,12 @@
     getBranchBody,
     getBranchPage,
     getCompletionSnapshot,
+    getDocumentContextText,
     getBuildModelPolicy,
     getModelDownloadStatus,
     getWeaveStatus,
     ingestImageAttachment,
+    importAttachmentPaths,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
     listenForDocumentFilesystemHints,
@@ -39,6 +43,7 @@
     loadModel,
     loadPolicyModelCandidate,
     listCuratedModels,
+    listDocumentContext,
     listModels,
     listModelDownloads,
     openDefaultProject,
@@ -47,9 +52,11 @@
     promoteCandidate,
     recoverProject,
     renameDocument,
+    removeDocumentContext,
     revealDocument,
     requestApplicationClose,
     setFocusMode,
+    setDocumentContextText,
     setSuggestions as setSuggestionsPolicy,
     startWeave,
     startModelDownload,
@@ -141,7 +148,7 @@
     type AppearancePreference
   } from './lib/appearance';
   import {
-    catalogDownloadRequest,
+    catalogDownloadRequests,
     isVerifiedCatalogWriter,
     legacyLocalCatalogMatch,
     validateCuratedModelCatalog
@@ -281,6 +288,7 @@
   } from './lib/weaveSafety';
   import {
     isEphemeralAcceptanceModelPath,
+    isOfficialGemma4CatalogHint,
     isVerifiedPolicyWriter,
     isUsableSuggestionWriter,
     looksLikeVisionAdapter,
@@ -295,6 +303,7 @@
     BranchSummary,
     BuildModelPolicySummary,
     CommandReceipt,
+    ContextAttachment,
     CuratedModelCatalogEntry,
     DesktopGenerationEnvelope,
     DocumentKind,
@@ -327,6 +336,24 @@
   let opening = false;
   let search = '';
   let outlineOpen = false;
+  let contextPaneOpen = false;
+  let contextPaneElement: HTMLDivElement | undefined;
+  let contextToggleElement: HTMLButtonElement | undefined;
+  let contextAttachments: ContextAttachment[] = [];
+  let contextText = '';
+  let contextEditorMode: EditorMode = 'visual';
+  let persistedContextText = '';
+  let contextTextSaveState: 'clean' | 'dirty' | 'saving' | 'error' = 'clean';
+  let contextTextSaveTimer: number | undefined;
+  let contextTextSaveQueue: Promise<void> = Promise.resolve();
+  let contextCompositionActive = false;
+  let contextVisualEditor: { flushPending: () => boolean } | null = null;
+  let contextAttachmentBusy = false;
+  let contextDropActive = false;
+  let contextDocumentId = '';
+  let contextRefreshSerial = 0;
+  let contextEpoch = 0;
+  let unlistenNativeAttachmentDrop: (() => void) | undefined;
   let outlineToggle: HTMLButtonElement | undefined;
   const documentContextLongPressMilliseconds = 550;
   const documentContextLongPressSlop = 10;
@@ -354,6 +381,7 @@
   let curatedModels: CuratedModelCatalogEntry[] = [];
   let curatedModelsLoading = false;
   let curatedModelsError = '';
+  let curatedModelsRefreshPromise: Promise<void> | null = null;
   let selectedModelPath = '';
   let compatibleWriterModels: ModelCapabilitySummary[] = [];
   let otherLocalModels: ModelCapabilitySummary[] = [];
@@ -512,11 +540,13 @@
     refreshGhostPresentation: () => boolean;
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
+    insertAttachmentMarkdown: (markdown: string, clientX?: number, clientY?: number) => boolean;
   } | null = null;
   let sourceEditor: {
     focusAtDocumentEnd: () => boolean;
     focusCurrentSelection: () => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
+    insertAttachmentMarkdown: (markdown: string) => boolean;
   } | null = null;
   let componentMounted = false;
   let nativeFullscreen = false;
@@ -832,12 +862,12 @@
   );
   $: visualGhostTargetByte = mode === 'visual' ? visualSelectionByte : null;
   $: completionContextKey = project && document
-    ? completionSessionContextKey(
+    ? `${completionSessionContextKey(
         project.session_id,
         document.summary.document_id,
         documentEpoch,
         mode
-      )
+      )}:context-${contextEpoch}`
     : '';
   $: visualGhostSurfaceKey = project && document
     ? `${project.session_id}:${document.summary.document_id}:${document.summary.revision_id}:${document.visible_blob_id}:${documentEpoch}:visual`
@@ -1138,6 +1168,365 @@
     )
   );
 
+  $: if ((document?.summary.document_id ?? '') !== contextDocumentId) {
+    contextDocumentId = document?.summary.document_id ?? '';
+    contextAttachments = [];
+    contextText = '';
+    persistedContextText = '';
+    contextTextSaveState = 'clean';
+    contextCompositionActive = false;
+    contextVisualEditor = null;
+    contextEpoch += 1;
+    if (desktop && project && document) void refreshDocumentContext();
+  }
+
+  async function refreshDocumentContext(): Promise<void> {
+    if (!desktop || !project || !document) return;
+    const serial = ++contextRefreshSerial;
+    const captured = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id
+    };
+    try {
+      const [attachments, text] = await Promise.all([
+        listDocumentContext(captured.projectId, captured.sessionId, captured.documentId),
+        getDocumentContextText(captured.projectId, captured.sessionId, captured.documentId)
+      ]);
+      if (
+        serial === contextRefreshSerial &&
+        project?.project_id === captured.projectId &&
+        project.session_id === captured.sessionId &&
+        document?.summary.document_id === captured.documentId
+      ) {
+        contextAttachments = attachments;
+        if (contextTextSaveState === 'clean') {
+          contextText = text;
+          persistedContextText = text;
+        }
+      }
+    } catch (error) {
+      if (serial === contextRefreshSerial) recordFailure(error);
+    }
+  }
+
+  function attachmentContextChanged(attachments: ContextAttachment[]): void {
+    contextAttachments = attachments;
+    contextEpoch += 1;
+    invalidateCompletionForCaretNavigation();
+    if (completionAutomationEnabled()) scheduleAutomaticSuggestions(editVersion, 0);
+  }
+
+  function scheduleContextTextSave(delay = 300): void {
+    if (!project || !document) return;
+    if (contextTextSaveTimer !== undefined) window.clearTimeout(contextTextSaveTimer);
+    const captured = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id,
+      text: contextText
+    };
+    contextTextSaveTimer = window.setTimeout(() => {
+      contextTextSaveTimer = undefined;
+      void enqueueContextTextPersistence(captured);
+    }, delay);
+  }
+
+  async function persistContextText(captured: {
+    projectId: string;
+    sessionId: string;
+    documentId: string;
+    text: string;
+  }): Promise<boolean> {
+    if (
+      captured.text === persistedContextText &&
+      captured.documentId === contextDocumentId
+    ) {
+      contextTextSaveState = 'clean';
+      return true;
+    }
+    if (captured.documentId === contextDocumentId) contextTextSaveState = 'saving';
+    try {
+      const saved = await setDocumentContextText(
+        captured.projectId,
+        captured.sessionId,
+        captured.documentId,
+        captured.text
+      );
+      if (
+        project?.project_id === captured.projectId &&
+        project.session_id === captured.sessionId &&
+        document?.summary.document_id === captured.documentId
+      ) {
+        persistedContextText = saved;
+        if (contextText === saved) {
+          contextTextSaveState = 'clean';
+          contextEpoch += 1;
+          if (completionAutomationEnabled()) scheduleAutomaticSuggestions(editVersion, 0);
+        } else {
+          // A newer edit (including reverting an in-flight save) must be sent
+          // after the now-authoritative reply. Never label stale backend text
+          // clean merely because it matched the value before this request.
+          contextTextSaveState = 'dirty';
+          scheduleContextTextSave(0);
+        }
+      }
+      return true;
+    } catch (error) {
+      if (captured.documentId === contextDocumentId) contextTextSaveState = 'error';
+      recordFailure(error);
+      return false;
+    }
+  }
+
+  function enqueueContextTextPersistence(captured: {
+    projectId: string;
+    sessionId: string;
+    documentId: string;
+    text: string;
+  }): Promise<boolean> {
+    const persistence = contextTextSaveQueue.then(() => persistContextText(captured));
+    contextTextSaveQueue = persistence.then(() => undefined, () => undefined);
+    return persistence;
+  }
+
+  function updateContextText(value: string): void {
+    if (value.length > 65_536) {
+      announce('Completion context is limited to 65,536 characters');
+      return;
+    }
+    contextText = value;
+    contextTextSaveState = value === persistedContextText ? 'clean' : 'dirty';
+    invalidateCompletionForCaretNavigation();
+    if (contextTextSaveState === 'dirty') {
+      scheduleContextTextSave();
+    } else if (contextTextSaveTimer !== undefined) {
+      window.clearTimeout(contextTextSaveTimer);
+      contextTextSaveTimer = undefined;
+    }
+  }
+
+  function flushContextText(): void {
+    if (contextTextSaveState !== 'dirty') return;
+    scheduleContextTextSave(0);
+  }
+
+  function flushContextEditorProjection(): boolean {
+    if (contextCompositionActive || !(contextVisualEditor?.flushPending() ?? true)) {
+      announce('Finish composing context before leaving it');
+      return false;
+    }
+    flushContextText();
+    return true;
+  }
+
+  async function persistCurrentContextText(): Promise<boolean> {
+    if (!project || !document || !flushContextEditorProjection()) return false;
+    while (true) {
+      if (contextTextSaveTimer !== undefined) {
+        window.clearTimeout(contextTextSaveTimer);
+        contextTextSaveTimer = undefined;
+      }
+      await contextTextSaveQueue;
+      if (contextTextSaveState === 'error') return false;
+      if (contextTextSaveState !== 'dirty') return true;
+      if (!await enqueueContextTextPersistence({
+        projectId: project.project_id,
+        sessionId: project.session_id,
+        documentId: document.summary.document_id,
+        text: contextText
+      })) return false;
+    }
+  }
+
+  function closeContextPane(): boolean {
+    if (!flushContextEditorProjection()) return false;
+    contextPaneOpen = false;
+    contextToggleElement?.focus();
+    return true;
+  }
+
+  function setContextEditorMode(next: EditorMode): void {
+    if (next === contextEditorMode || !flushContextEditorProjection()) return;
+    contextEditorMode = next;
+  }
+
+  async function adoptAuthoritativeContext(
+    attachments: ContextAttachment[],
+    projectId: string,
+    sessionId: string,
+    documentId: string
+  ): Promise<boolean> {
+    const text = await getDocumentContextText(projectId, sessionId, documentId);
+    if (
+      project?.project_id !== projectId ||
+      project.session_id !== sessionId ||
+      document?.summary.document_id !== documentId
+    ) return false;
+    if (contextTextSaveTimer !== undefined) {
+      window.clearTimeout(contextTextSaveTimer);
+      contextTextSaveTimer = undefined;
+    }
+    contextText = text;
+    persistedContextText = text;
+    contextTextSaveState = 'clean';
+    attachmentContextChanged(attachments);
+    return true;
+  }
+
+  async function addContextAttachmentsFromPicker(): Promise<void> {
+    if (!project || !document || contextAttachmentBusy) return;
+    const captured = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id
+    };
+    contextAttachmentBusy = true;
+    try {
+      if (!await persistCurrentContextText()) return;
+      if (
+        project?.project_id !== captured.projectId ||
+        project.session_id !== captured.sessionId ||
+        document?.summary.document_id !== captured.documentId
+      ) return;
+      const imported = await chooseAttachments(captured.projectId, captured.sessionId);
+      const attachments = imported.length === 0
+        ? contextAttachments
+        : await addDocumentContexts(
+          captured.projectId,
+          captured.sessionId,
+          captured.documentId,
+          imported.map((item) => item.id)
+        );
+      if (imported.length > 0) {
+        await adoptAuthoritativeContext(
+          attachments,
+          captured.projectId,
+          captured.sessionId,
+          captured.documentId
+        );
+      }
+      if (imported.length > 0) announce(`${imported.length} context attachment${imported.length === 1 ? '' : 's'} ready`);
+    } catch (error) {
+      recordFailure(error);
+      announce('Loom could not add that context attachment');
+    } finally {
+      contextAttachmentBusy = false;
+    }
+  }
+
+  async function removeContextAttachment(attachmentId: string): Promise<void> {
+    if (!project || !document || contextAttachmentBusy) return;
+    const captured = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id
+    };
+    contextAttachmentBusy = true;
+    try {
+      if (!await persistCurrentContextText()) return;
+      if (
+        project?.project_id !== captured.projectId ||
+        project.session_id !== captured.sessionId ||
+        document?.summary.document_id !== captured.documentId
+      ) return;
+      const attachments = await removeDocumentContext(
+        captured.projectId,
+        captured.sessionId,
+        captured.documentId,
+        attachmentId
+      );
+      await adoptAuthoritativeContext(
+        attachments,
+        captured.projectId,
+        captured.sessionId,
+        captured.documentId
+      );
+      announce('Context attachment removed');
+    } catch (error) {
+      recordFailure(error);
+    } finally {
+      contextAttachmentBusy = false;
+    }
+  }
+
+  function nativeDropPoint(position: { x: number; y: number }): { x: number; y: number } {
+    const scale = window.devicePixelRatio || 1;
+    return { x: position.x / scale, y: position.y / scale };
+  }
+
+  function nativeAttachmentDropScope(point: { x: number; y: number }): 'context' | 'inline' | null {
+    const target = window.document.elementFromPoint(point.x, point.y);
+    if (target?.closest('[data-attachment-drop="context"]')) return 'context';
+    if (target?.closest('[data-attachment-drop="inline"]')) return 'inline';
+    return null;
+  }
+
+  async function importNativeAttachmentDrop(
+    paths: string[],
+    point: { x: number; y: number },
+    scope: 'context' | 'inline'
+  ): Promise<void> {
+    if (!project || !document || contextAttachmentBusy || paths.length === 0) return;
+    const captured = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id
+    };
+    contextAttachmentBusy = true;
+    try {
+      if (scope === 'context' && !await persistCurrentContextText()) return;
+      if (
+        project?.project_id !== captured.projectId ||
+        project.session_id !== captured.sessionId ||
+        document?.summary.document_id !== captured.documentId
+      ) return;
+      const imported = await importAttachmentPaths(captured.projectId, captured.sessionId, paths);
+      if (scope === 'context') {
+        const attachments = await addDocumentContexts(
+            captured.projectId,
+            captured.sessionId,
+            captured.documentId,
+            imported.map((item) => item.id)
+          );
+        await adoptAuthoritativeContext(
+          attachments,
+          captured.projectId,
+          captured.sessionId,
+          captured.documentId
+        );
+      } else {
+        const markdown = imported.map((item) => item.inline_markdown).join('\n\n');
+        const inserted = mode === 'visual'
+          ? visualEditor?.insertAttachmentMarkdown(markdown, point.x, point.y)
+          : sourceEditor?.insertAttachmentMarkdown(markdown);
+        if (!inserted) throw new Error('The attachment was stored, but the current editor could not insert its card.');
+      }
+      announce(`${imported.length} attachment${imported.length === 1 ? '' : 's'} added`);
+    } catch (error) {
+      recordFailure(error);
+      announce('Loom could not attach those files');
+    } finally {
+      contextAttachmentBusy = false;
+      contextDropActive = false;
+    }
+  }
+
+  async function installNativeAttachmentDrop(): Promise<void> {
+    unlistenNativeAttachmentDrop = await getCurrentWindow().onDragDropEvent(({ payload }) => {
+      if (payload.type === 'leave') {
+        contextDropActive = false;
+        return;
+      }
+      const point = nativeDropPoint(payload.position);
+      const scope = nativeAttachmentDropScope(point);
+      contextDropActive = scope === 'context';
+      if (payload.type === 'drop' && scope) {
+        void importNativeAttachmentDrop(payload.paths, point, scope);
+      }
+    });
+  }
+
   onMount(() => {
     componentMounted = true;
     appearance = loadAppearancePreference(window);
@@ -1149,6 +1538,7 @@
     appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
     if (desktop) void refreshCuratedModels();
+    if (desktop) void installNativeAttachmentDrop();
     documentContextRevealLabel = desktop
       ? documentRevealLabel(window.navigator.platform, window.navigator.userAgent)
       : null;
@@ -1214,7 +1604,10 @@
       closeDocumentContextMenu(false);
       stopNativeFullscreenObservation?.();
       stopNativeFullscreenObservation = undefined;
+      unlistenNativeAttachmentDrop?.();
+      unlistenNativeAttachmentDrop = undefined;
       if (saveTimer !== undefined) window.clearTimeout(saveTimer);
+      if (contextTextSaveTimer !== undefined) window.clearTimeout(contextTextSaveTimer);
       if (sourceProjectionTimer !== undefined) window.clearTimeout(sourceProjectionTimer);
       if (projectFilesystemRefreshTimer !== undefined) {
         window.clearTimeout(projectFilesystemRefreshTimer);
@@ -2218,8 +2611,12 @@
     await refreshCurrentModelsAndEnsureWriter();
     const downloaded = models.find((model) => model.model_path === snapshot.target_path);
     if (downloaded) {
-      selectedModelPath = downloaded.model_path;
-      announce(`${snapshot.display_name} passed checksum and GGUF verification and is ready to inspect`);
+      if (looksLikeVisionAdapter(downloaded)) {
+        announce(`${snapshot.display_name} passed checksum and is ready beside Gemma 4`);
+      } else {
+        selectedModelPath = downloaded.model_path;
+        announce(`${snapshot.display_name} passed checksum and GGUF verification and is ready to inspect`);
+      }
     } else {
       modelDownloadError = 'The verified file was installed, but model discovery did not return it yet.';
       announce('Model download verified; discovery needs another refresh');
@@ -2323,38 +2720,60 @@
     return models.find((model) => isVerifiedCatalogWriter(entry, model));
   }
 
-  function catalogDownload(
-    entry: CuratedModelCatalogEntry
-  ): ModelDownloadSnapshot | undefined {
-    return modelDownloads.find((download) =>
-      download.expected_sha256 === entry.expected_sha256 &&
-      download.display_name.toLocaleLowerCase('en-US') ===
-        entry.artifact_name.toLocaleLowerCase('en-US')
+  function localCatalogProjector(entry: CuratedModelCatalogEntry): boolean {
+    return models.some((model) =>
+      model.local &&
+      model.header_verified &&
+      !model.loaded &&
+      model.display_name.toLocaleLowerCase('en-US') ===
+        entry.projector.artifact_name.toLocaleLowerCase('en-US') &&
+      model.file_bytes === entry.projector.expected_bytes
     );
   }
 
+  function catalogDownload(
+    entry: CuratedModelCatalogEntry
+  ): ModelDownloadSnapshot | undefined {
+    const identities = new Set(catalogDownloadRequests(entry).map((request) => request.sha256));
+    return modelDownloads.find((download) =>
+      identities.has(download.expected_sha256) && !modelDownloadIsTerminal(download)
+    ) ?? modelDownloads.find((download) => identities.has(download.expected_sha256));
+  }
+
   async function beginCatalogModelDownload(entry: CuratedModelCatalogEntry): Promise<void> {
+    const requests = catalogDownloadRequests(entry);
     if (
       pendingModelDownload ||
       modelDownloadStarting ||
-      modelDownloads.some((download) =>
-        download.expected_sha256 === entry.expected_sha256 &&
+      modelDownloads.some((download) => requests.some((request) =>
+        download.expected_sha256 === request.sha256 &&
         !modelDownloadIsTerminal(download)
-      )
+      ))
     ) return;
+    modelDownloadStarting = true;
+    modelDownloadError = '';
     try {
-      const request = catalogDownloadRequest(entry);
-      updateModelDownloadUrl(request.url);
-      modelDownloadFileName = request.fileName;
-      modelDownloadSha256 = request.sha256;
-      modelDownloadExpectedBytes = String(request.expectedBytes);
-      modelDownloadMaximumGiB = String(request.maxBytes / 1024 ** 3);
-      pendingModelDownload = { commandId: newUlid(), ...request };
-      await beginOrRetryModelDownload();
+      await ensureModelDownloadEventListener();
+      for (const request of requests) {
+        const commandId = newUlid();
+        const snapshot = await startModelDownload({
+          commandId,
+          url: request.url,
+          fileName: request.fileName,
+          expectedSha256: request.sha256,
+          expectedBytes: request.expectedBytes,
+          maxBytes: request.maxBytes
+        });
+        applyModelDownloadSnapshot(snapshot, false);
+      }
+      announce('Verified Gemma 4 model and multimodal projector downloads started');
     } catch (error) {
       modelDownloadError = error instanceof Error
         ? error.message
         : 'The curated model entry could not be downloaded safely.';
+    } finally {
+      modelDownloadStarting = false;
+      scheduleModelDownloadPoll();
     }
   }
 
@@ -3227,16 +3646,25 @@
   }
 
   async function refreshCuratedModels(): Promise<void> {
-    if (!desktop || curatedModelsLoading) return;
-    curatedModelsLoading = true;
-    curatedModelsError = '';
+    if (!desktop) return;
+    if (curatedModelsRefreshPromise) return curatedModelsRefreshPromise;
+    const refresh = (async () => {
+      curatedModelsLoading = true;
+      curatedModelsError = '';
+      try {
+        curatedModels = validateCuratedModelCatalog(await listCuratedModels());
+      } catch (error) {
+        curatedModels = [];
+        curatedModelsError = normalizeFailure(error).message;
+      } finally {
+        curatedModelsLoading = false;
+      }
+    })();
+    curatedModelsRefreshPromise = refresh;
     try {
-      curatedModels = validateCuratedModelCatalog(await listCuratedModels());
-    } catch (error) {
-      curatedModels = [];
-      curatedModelsError = normalizeFailure(error).message;
+      await refresh;
     } finally {
-      curatedModelsLoading = false;
+      if (curatedModelsRefreshPromise === refresh) curatedModelsRefreshPromise = null;
     }
   }
 
@@ -4312,6 +4740,11 @@
     if (currentModel) return true;
     if (!document || transition !== 'idle' || modelLoading || modelUnloading) return false;
     if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+    // Existing local Gemma files must never race the embedded catalog and be
+    // admitted as a generic text-only model before the pinned projector is
+    // known. All callers share the same in-flight catalog read.
+    if (curatedModels.length === 0) await refreshCuratedModels();
+    if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
     const rememberedPath = loadLastLocalModelPath();
     const candidates = startupWriterCandidates(models, rememberedPath);
     for (const candidate of candidates) {
@@ -4320,9 +4753,18 @@
       const loadSerial = ++modelLoadSerial;
       modelLoading = true;
       try {
+        const discovered = models.find((model) => model.model_path === candidate.modelPath);
+        const catalogEntry = discovered
+          ? curatedModels.find((entry) => legacyLocalCatalogMatch(entry, discovered)) ?? null
+          : null;
+        if (discovered && isOfficialGemma4CatalogHint(discovered) && !catalogEntry) {
+          continue;
+        }
         const loaded = candidate.profileId
           ? await loadPolicyModelCandidate(candidate.profileId, candidate.modelPath)
-          : await loadModel(candidate.modelPath);
+          : catalogEntry
+            ? await loadCatalogModelCandidate(catalogEntry.catalog_id, candidate.modelPath)
+            : await loadModel(candidate.modelPath);
         if (
           !componentMounted ||
           !applicationAllowsModelPreparation(applicationClosePhase) ||
@@ -4331,7 +4773,9 @@
         ) return false;
         if (candidate.profileId
           ? !isVerifiedPolicyWriter(loaded, candidate.profileId)
-          : !isUsableSuggestionWriter(loaded)) {
+          : catalogEntry
+            ? !isVerifiedCatalogWriter(catalogEntry, loaded)
+            : !isUsableSuggestionWriter(loaded)) {
           if (candidate.remembered && !candidate.profileId) {
             forgetLastLocalModelPath(candidate.modelPath);
           }
@@ -6474,6 +6918,11 @@
       closeFormatMenu();
       return;
     }
+    if (event.key === 'Escape' && contextPaneOpen) {
+      event.preventDefault();
+      closeContextPane();
+      return;
+    }
     if (event.key === 'Escape' && shuttleEnabled) {
       event.preventDefault();
       void setShuttleEnabled(false);
@@ -6498,6 +6947,14 @@
   }
 
   function handleGlobalPointerdown(event: PointerEvent): void {
+    if (
+      contextPaneOpen &&
+      event.target instanceof Node &&
+      !contextPaneElement?.contains(event.target) &&
+      !contextToggleElement?.contains(event.target)
+    ) {
+      closeContextPane();
+    }
     if (
       documentContextTarget &&
       event.target instanceof Node &&
@@ -7811,7 +8268,7 @@
         on:mousedown={startTitlebarDrag}
       ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
       <div class="canvas-controls-right" data-no-window-drag>
-        {#if document && mode === 'visual' && canUseVisual}
+        {#if document && mode === 'visual' && canUseVisual && !contextPaneOpen}
           <VisualFormatMenu
             bind:this={formatMenu}
             editor={visualEditor}
@@ -7822,6 +8279,25 @@
                 : `${action.replaceAll('_', ' ')} could not be applied at this selection`);
             }}
           />
+        {/if}
+        {#if document}
+          <button
+            bind:this={contextToggleElement}
+            class:active={contextPaneOpen}
+            class="titlebar-button context-toggle"
+            type="button"
+            aria-label={contextPaneOpen ? 'Close completion context' : 'Open completion context'}
+            aria-controls="completion-context-pane"
+            aria-expanded={contextPaneOpen}
+            title="Completion context"
+            on:click={() => {
+              if (contextPaneOpen) closeContextPane();
+              else {
+                contextPaneOpen = true;
+                void refreshDocumentContext();
+              }
+            }}
+          ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="2.25" y="2.25" width="13.5" height="13.5" rx="2.4"/><path d="M2.75 7h12.5"/></svg></button>
         {/if}
         <button
           class:active={suggestionsEnabled && Boolean(currentModel)}
@@ -8014,6 +8490,113 @@
       </aside>
 
       <main id="manuscript" class="manuscript-area" tabindex="-1">
+        {#if document && contextPaneOpen}
+          <div
+            bind:this={contextPaneElement}
+            id="completion-context-pane"
+            class:drop-active={contextDropActive}
+            class="completion-context-pane"
+            data-attachment-drop="context"
+            aria-label="Completion context"
+            role="dialog"
+          >
+            <div class="completion-context-heading">
+              <div>
+                <strong>Context</strong>
+                <span>Private guidance for this document’s autocomplete.</span>
+              </div>
+              <div class="context-heading-actions">
+                <div class="context-mode-toggle" aria-label="Context editor view">
+                  <button
+                    class:active={contextEditorMode === 'visual'}
+                    type="button"
+                    aria-label="Visual context editor"
+                    aria-pressed={contextEditorMode === 'visual'}
+                    disabled={!canUseVisualMarkdown(contextText, contextEditorMode === 'visual')}
+                    on:click={() => setContextEditorMode('visual')}
+                  ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="2.5" y="2.5" width="13" height="13" rx="2.25"/><path d="M8 3v12"/></svg></button>
+                  <button
+                    class:active={contextEditorMode === 'source'}
+                    type="button"
+                    aria-label="Markdown context editor"
+                    aria-pressed={contextEditorMode === 'source'}
+                    on:click={() => setContextEditorMode('source')}
+                  ><span aria-hidden="true">MD</span></button>
+                </div>
+                <button
+                  class="attachment-remove context-close"
+                  type="button"
+                  aria-label="Close completion context"
+                  on:click={closeContextPane}
+                >×</button>
+              </div>
+            </div>
+            <div class="context-composer">
+              <div class="context-editor-surface" on:focusout={flushContextEditorProjection}>
+                {#if contextEditorMode === 'visual' && canUseVisualMarkdown(contextText, true)}
+                  <LoomEditor
+                    bind:this={contextVisualEditor}
+                    value={contextText}
+                    label="Steering context"
+                    readonly={editorReadonly || contextAttachmentBusy}
+                    surfaceKey={`context:${contextDocumentId}`}
+                    acceptImageAttachments={false}
+                    onChange={updateContextText}
+                    onCompositionChange={(active) => contextCompositionActive = active}
+                    onGhostPresentationRejected={() => {}}
+                  />
+                {:else}
+                  <textarea
+                    aria-label="Steering context Markdown"
+                    placeholder="Paste notes, Markdown, or attach reference files…"
+                    value={contextText}
+                    maxlength={65536}
+                    spellcheck="true"
+                    disabled={editorReadonly || contextAttachmentBusy}
+                    on:input={(event) => updateContextText(event.currentTarget.value)}
+                    on:compositionstart={() => contextCompositionActive = true}
+                    on:compositionend={() => contextCompositionActive = false}
+                  ></textarea>
+                {/if}
+              </div>
+              <div class="context-composer-actions">
+                <button
+                  class="context-attach-button"
+                  type="button"
+                  aria-label="Attach files to completion context"
+                  title="Attach files"
+                  disabled={contextAttachmentBusy || editorReadonly}
+                  on:click={() => void addContextAttachmentsFromPicker()}
+                ><svg aria-hidden="true" viewBox="0 0 18 18"><circle cx="9" cy="9" r="6.25"/><path d="M9 5.75v6.5M5.75 9h6.5"/></svg></button>
+                <span class:error={contextTextSaveState === 'error'}>
+                  {contextTextSaveState === 'saving' ? 'Saving…' : contextTextSaveState === 'dirty' ? 'Unsaved' : contextTextSaveState === 'error' ? 'Couldn’t save' : 'Saved locally'}
+                </span>
+              </div>
+            </div>
+            {#if contextAttachments.length > 0}
+              <div class="completion-context-items">
+                {#each contextAttachments as attachment (attachment.id)}
+                  <article class="completion-context-card" title={attachment.warnings.join('\n')}>
+                    <span class="attachment-glyph" aria-hidden="true">{attachment.media_kinds.includes('image') ? '▧' : attachment.media_kinds.includes('audio') ? '◖' : '¶'}</span>
+                    <span class="completion-context-card-copy">
+                      <strong>{attachment.file_name}</strong>
+                      <small>{attachment.detected_format} · {formatByteCount(attachment.byte_count)}{attachment.coverage_complete ? '' : ' · excerpted'}</small>
+                    </span>
+                    <button
+                      class="attachment-remove"
+                      type="button"
+                      aria-label={`Remove ${attachment.file_name} from completion context`}
+                      disabled={contextAttachmentBusy}
+                      on:click={() => void removeContextAttachment(attachment.id)}
+                    >×</button>
+                  </article>
+                {/each}
+              </div>
+            {:else}
+              <p>Drop EPUB, spreadsheet, Markdown, DOCX, PDF, image, or audio files here.</p>
+            {/if}
+          </div>
+        {/if}
         {#if missingDocumentRecovery}
           <MissingDocumentRecoveryNotice
             title={missingDocumentRecovery.title}
@@ -8126,7 +8709,7 @@
             </div>
           {/if}
 
-          <section class="editor-stage" aria-label="Writing surface">
+          <section class="editor-stage" data-attachment-drop="inline" aria-label="Writing surface">
             {#if showVisual}
               <div class="editor-pane visual-pane" aria-label="Visual editor pane">
                 {#if exactTextSurface}
@@ -8395,6 +8978,7 @@
             {:else}
               {#each curatedModels as entry (entry.catalog_id)}
                 {@const installed = localCatalogModel(entry)}
+                {@const projectorInstalled = localCatalogProjector(entry)}
                 {@const resident = loadedCatalogModel(entry)}
                 {@const transfer = catalogDownload(entry)}
                 <article class="curated-model-card">
@@ -8402,7 +8986,7 @@
                     <strong>{entry.display_name}</strong>
                     <span>{entry.publisher} · {formatByteCount(entry.expected_bytes)} · {entry.context_tokens.toLocaleString()} token context</span>
                     <span>{formatByteCount(entry.memory_fit.recommended_system_memory_bytes)} or more system memory recommended</span>
-                    <span>Local only · {entry.license.name} · native inspection required before use</span>
+                    <span>Local only · text, image, and audio · {entry.license.name} · native inspection required before use</span>
                     <details class="model-technical">
                       <summary>Pinned artifact details</summary>
                       <dl class="model-evidence">
@@ -8410,6 +8994,8 @@
                         <div><dt>Revision</dt><dd><code>{entry.revision}</code></dd></div>
                         <div><dt>File</dt><dd><code>{entry.artifact_name}</code></dd></div>
                         <div><dt>SHA-256</dt><dd><code>{entry.expected_sha256}</code></dd></div>
+                        <div><dt>Projector</dt><dd><code>{entry.projector.artifact_name}</code></dd></div>
+                        <div><dt>Projector SHA-256</dt><dd><code>{entry.projector.expected_sha256}</code></dd></div>
                         <div><dt>License</dt><dd>{entry.license.spdx_id}</dd></div>
                         <div><dt>License source</dt><dd><code>{entry.license.url}</code></dd></div>
                       </dl>
@@ -8418,14 +9004,14 @@
                   <div class="curated-model-action">
                     {#if resident}
                       <button class="secondary-button compact" type="button" disabled>In use</button>
-                    {:else if installed}
+                    {:else if installed && projectorInstalled}
                       <button
                         class="primary-button compact"
                         type="button"
                         on:click={() => void useCatalogSuggestionWriter(entry, installed)}
                         disabled={!desktop || modelLoading || modelChoosing || modelUnloading}
                       >{modelLoading && selectedModelPath === installed.model_path ? 'Verifying…' : 'Verify local copy'}</button>
-                    {:else if transfer?.status.status === 'completed'}
+                    {:else if transfer?.status.status === 'completed' && projectorInstalled}
                       <button class="secondary-button compact" type="button" on:click={() => void refreshCurrentModelsAndEnsureWriter()}>Refresh installed copy</button>
                     {:else}
                       <button

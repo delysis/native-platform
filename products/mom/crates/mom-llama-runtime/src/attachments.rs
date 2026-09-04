@@ -567,7 +567,7 @@ fn canonicalize_and_stage(
     store.put_documents_atomically(documents)?;
     let settings = resolve_settings()?;
     let (multimodal_ready, multimodal_blocker) =
-        multimodal_readiness(&settings, manifest_contains_native_media(&manifest));
+        multimodal_readiness(&settings, manifest_contains_mom_native_media(&manifest));
     Ok(CommandResult::passed(
         command,
         "contracted",
@@ -875,10 +875,10 @@ pub fn attachment_transcription_input(
             "Initial local transcription accepts only a canonical WAV audio artifact.".to_string(),
         )));
     }
-    // Audio artifacts intentionally remain HeaderOrStructureOnly until an
-    // explicit transform decodes them. This complete-input STT call is that
-    // transform; direct multimodal model admission still requires the stronger
-    // PayloadDecoded grade elsewhere.
+    // Generic attachment inspection may completely decode WAV samples, but
+    // Mom's product policy remains transcription-first. The validation grade
+    // proves the retained source bytes; it does not grant direct-model audio
+    // authority here.
     if let Err(problem) = media_preview_admission(*family, &blob.media_type, blob.byte_len) {
         return Ok(Err(preview_blocker(&problem.code, problem.message)));
     }
@@ -2633,13 +2633,18 @@ fn resolve_attachment_set(
             else {
                 continue;
             };
-            if !validation.grade.permits_direct_media() {
-                return Ok(Err(media_transform_blocker(record, *family)));
-            }
             let kind = match family {
-                MediaFamily::Image => MediaKind::Image,
-                MediaFamily::Audio => MediaKind::Audio,
+                MediaFamily::Image => {
+                    if !validation.grade.permits_direct_media() {
+                        return Ok(Err(media_transform_blocker(record, *family)));
+                    }
+                    MediaKind::Image
+                }
+                MediaFamily::Audio => return Ok(Err(media_transform_blocker(record, *family))),
                 MediaFamily::Video => {
+                    if !validation.grade.permits_direct_media() {
+                        return Ok(Err(media_transform_blocker(record, *family)));
+                    }
                     contains_video = true;
                     continue;
                 }
@@ -2754,8 +2759,7 @@ fn context_blocker(code: &str, message: String) -> AttachmentContextBlocker {
             "Remove the image from this draft.".to_string(),
         ],
         "attachment_audio_transcription_required" => vec![
-            "Configure a transcription pipeline or a decoder-backed direct-audio pipeline."
-                .to_string(),
+            "Configure Mom's explicit audio transcription pipeline.".to_string(),
             "Remove the audio from this draft.".to_string(),
         ],
         "attachment_video_pipeline_required" => vec![
@@ -2801,7 +2805,7 @@ fn media_transform_blocker(
         ),
         MediaFamily::Audio => (
             "attachment_audio_transcription_required",
-            "a complete bounded audio decode or transcription transform",
+            "an explicit transcription transform; decoded source audio is not sent directly by Mom",
         ),
         MediaFamily::Video => (
             "attachment_video_pipeline_required",
@@ -2915,12 +2919,12 @@ fn object_storage_uri(object_id: &ObjectId) -> String {
     format!("encrypted://{}", object_namespace(object_id))
 }
 
-fn manifest_contains_native_media(manifest: &AttachmentManifest) -> bool {
+fn manifest_contains_mom_native_media(manifest: &AttachmentManifest) -> bool {
     manifest.artifacts.iter().any(|artifact| {
         matches!(
             &artifact.payload,
             ArtifactPayload::Media {
-                family: MediaFamily::Image | MediaFamily::Audio,
+                family: MediaFamily::Image,
                 validation,
                 ..
             } if validation.grade.permits_direct_media()
@@ -2930,9 +2934,9 @@ fn manifest_contains_native_media(manifest: &AttachmentManifest) -> bool {
 
 fn multimodal_readiness(
     settings: &crate::config::Settings,
-    contains_native_media: bool,
+    contains_direct_image: bool,
 ) -> (bool, Option<Blocker>) {
-    if !contains_native_media {
+    if !contains_direct_image {
         return (false, None);
     }
     if let Some(mmproj_path) = settings.mmproj_path.as_ref()
@@ -2965,7 +2969,7 @@ fn multimodal_readiness(
         false,
         Some(Blocker::new(
             "mmproj_path_missing",
-            "This image or audio attachment needs a vision-capable model.",
+            "This image attachment needs a vision-capable model.",
             vec![
                 "Choose or reselect a model and Mom will pair its vision support automatically."
                     .to_string(),
@@ -4402,7 +4406,7 @@ mod tests {
                 }
             }
             assert!(changed, "fixture must contain a canonical media artifact");
-            assert!(!manifest_contains_native_media(&manifest));
+            assert!(!manifest_contains_mom_native_media(&manifest));
             store
                 .put(namespace, &manifest)
                 .expect("write downgraded manifest");
@@ -4465,7 +4469,7 @@ mod tests {
         assert_eq!(input.bytes_sha256, input.blob_object_id);
         assert!(matches!(
             input.validation,
-            BlobValidationGrade::HeaderOrStructureOnly
+            BlobValidationGrade::PayloadDecoded
         ));
 
         let wrong_conversation = attachment_transcription_input("other", &anchor)

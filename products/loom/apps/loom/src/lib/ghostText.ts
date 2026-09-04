@@ -29,6 +29,7 @@ export interface GhostTextPresentation {
   hidden?: boolean;
   unconsumeText?: string;
   fanVisible?: boolean;
+  fanPinned?: boolean;
   /** Internal render identity; callers should normally omit this. */
   renderEpoch?: number;
 }
@@ -45,6 +46,7 @@ export interface GhostTextPlan {
   hidden: boolean;
   unconsumeText: string;
   fanVisible: boolean;
+  fanPinned: boolean;
   /**
    * Ephemeral DOM identity used only to rebuild an otherwise identical
    * widget after WebKit resumes from a hidden/suspended window.
@@ -67,6 +69,7 @@ export interface GhostTextHandlers {
   unconsume?: (candidateId: string, presentationKey: string, text: string) => boolean;
   cycle?: (offset: number) => void;
   modifier?: (held: boolean) => void;
+  pin?: (pinned: boolean) => void;
   dismiss: (candidateId: string, presentationKey: string) => void;
   visible: (
     presentationKey: string,
@@ -85,7 +88,8 @@ export interface GhostClientRect {
 type GhostTextMeta =
   | { kind: 'set'; presentation: GhostTextPresentation }
   | { kind: 'clear' }
-  | { kind: 'fan'; visible: boolean };
+  | { kind: 'fan'; visible: boolean }
+  | { kind: 'pin'; pinned: boolean };
 
 export const ghostTextPluginKey = new PluginKey<GhostTextPresentation | null>('loom-ghost-text');
 export const VISUAL_TAB_INDENT = '\t';
@@ -158,7 +162,8 @@ export function planGhostText(
     alternatives: presentation.alternatives ?? [],
     hidden: Boolean(presentation.hidden),
     unconsumeText: presentation.unconsumeText ?? '',
-    fanVisible: Boolean(presentation.fanVisible),
+    fanVisible: Boolean(presentation.fanVisible || presentation.fanPinned),
+    fanPinned: Boolean(presentation.fanPinned),
     renderEpoch: Number.isSafeInteger(presentation.renderEpoch)
       ? presentation.renderEpoch ?? 0
       : 0
@@ -529,7 +534,12 @@ export function visibleGhostWidgetPresentationKey(view: EditorView): string {
   return ghostWidgetPresentationKeyInViewport(view, false);
 }
 
-function ghostWidget(plan: GhostTextPlan, domIds: CompletionPopupDomIds): HTMLElement {
+function ghostWidget(
+  plan: GhostTextPlan,
+  domIds: CompletionPopupDomIds,
+  view: EditorView,
+  handlers: GhostTextHandlers
+): HTMLElement {
   const container = document.createElement('span');
   container.className = 'loom-ghost-widget';
   container.contentEditable = 'false';
@@ -538,7 +548,7 @@ function ghostWidget(plan: GhostTextPlan, domIds: CompletionPopupDomIds): HTMLEl
 
   const widget = document.createElement('span');
   widget.className = 'loom-visual-ghost';
-  widget.classList.toggle('ghost-text-hidden', plan.hidden || plan.fanVisible);
+  widget.classList.toggle('ghost-text-hidden', plan.hidden);
   widget.setAttribute(GHOST_PRESENTATION_ATTRIBUTE, plan.presentationKey);
   widget.setAttribute('aria-hidden', 'true');
   widget.contentEditable = 'false';
@@ -548,6 +558,36 @@ function ghostWidget(plan: GhostTextPlan, domIds: CompletionPopupDomIds): HTMLEl
   container.append(widget);
 
   if (plan.alternatives.length > 1) {
+    const selectedIndex = Math.max(0, plan.alternatives.findIndex(
+      (alternative) => alternative.presentationKey === plan.presentationKey
+    ));
+    const trigger = document.createElement('button');
+    trigger.className = 'loom-completion-lens-trigger';
+    trigger.classList.toggle('pinned', plan.fanPinned);
+    trigger.dataset.presentationKey = plan.presentationKey;
+    trigger.type = 'button';
+    trigger.tabIndex = -1;
+    trigger.textContent = `${selectedIndex + 1}/${plan.alternatives.length}`;
+    trigger.setAttribute(
+      'aria-label',
+      plan.fanPinned ? 'Unpin completion alternatives' : 'Pin completion alternatives'
+    );
+    trigger.setAttribute('aria-expanded', plan.fanVisible ? 'true' : 'false');
+    trigger.setAttribute('aria-controls', domIds.listboxId);
+    trigger.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+    });
+    trigger.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const pinned = !currentGhostTextPlan(view.state)?.fanPinned;
+      setGhostFanPinned(view, pinned);
+      handlers.pin?.(pinned);
+      view.focus();
+    });
+    container.append(trigger);
+
     const fan = document.createElement('span');
     fan.className = 'loom-ghost-fan';
     fan.id = domIds.listboxId;
@@ -574,17 +614,83 @@ function ghostWidget(plan: GhostTextPlan, domIds: CompletionPopupDomIds): HTMLEl
       const text = document.createElement('span');
       text.textContent = alternative.text;
       row.append(number, text);
+      row.addEventListener('pointerdown', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      });
+      row.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const current = currentGhostTextPlan(view.state);
+        const currentIndex = current?.alternatives.findIndex(
+          (item) => item.presentationKey === current.presentationKey
+        ) ?? -1;
+        if (currentIndex >= 0 && index !== currentIndex) handlers.cycle?.(index - currentIndex);
+        setGhostFanPinned(view, true);
+        handlers.pin?.(true);
+        view.focus();
+      });
       fan.append(row);
     });
     const hint = document.createElement('span');
     hint.className = 'loom-ghost-fan-hint';
     hint.setAttribute('aria-hidden', 'true');
-    hint.textContent = '↑↓ choose  ·  Return insert  ·  → next word';
+    hint.textContent = '↑↓ choose  ·  Tab insert  ·  click counter to pin';
     fan.append(hint);
     container.append(fan);
   }
   container.classList.toggle('fan-visible', plan.fanVisible);
   return container;
+}
+
+/** Patch a reused widget in place so streamed deltas do not tear down the lens. */
+function synchronizeGhostWidgetDom(
+  view: EditorView,
+  plan: GhostTextPlan,
+  domIds: CompletionPopupDomIds
+): void {
+  const container = view.dom.querySelector<HTMLElement>('.loom-ghost-widget');
+  const widget = container?.querySelector<HTMLElement>('.loom-visual-ghost');
+  if (!container || !widget) return;
+  widget.textContent = plan.text;
+  widget.classList.toggle('ghost-text-hidden', plan.hidden);
+  widget.setAttribute(GHOST_PRESENTATION_ATTRIBUTE, plan.presentationKey);
+  container.classList.toggle('fan-visible', plan.fanVisible);
+
+  const selectedIndex = Math.max(0, plan.alternatives.findIndex(
+    (alternative) => alternative.presentationKey === plan.presentationKey
+  ));
+  const trigger = container.querySelector<HTMLElement>('.loom-completion-lens-trigger');
+  if (trigger) {
+    trigger.dataset.presentationKey = plan.presentationKey;
+    trigger.textContent = `${selectedIndex + 1}/${plan.alternatives.length}`;
+    trigger.classList.toggle('pinned', plan.fanPinned);
+    trigger.setAttribute('aria-expanded', plan.fanVisible ? 'true' : 'false');
+    trigger.setAttribute(
+      'aria-label',
+      plan.fanPinned ? 'Unpin completion alternatives' : 'Pin completion alternatives'
+    );
+  }
+  const fan = container.querySelector<HTMLElement>('.loom-ghost-fan');
+  if (!fan) return;
+  fan.dataset.presentationKey = plan.presentationKey;
+  const rows = Array.from(fan.querySelectorAll<HTMLElement>('.loom-ghost-fan-row'));
+  rows.forEach((row, index) => {
+    const alternative = plan.alternatives[index];
+    if (!alternative) return;
+    const selected = index === selectedIndex;
+    row.classList.toggle('active', selected);
+    setCompletionOptionAccessibility(
+      row,
+      index + 1,
+      plan.alternatives.length,
+      alternative.text,
+      selected
+    );
+    row.id = domIds.optionId(index);
+    const text = row.lastElementChild;
+    if (text) text.textContent = alternative.text;
+  });
 }
 
 export function setGhostFanVisible(view: EditorView, visible: boolean): void {
@@ -593,6 +699,15 @@ export function setGhostFanVisible(view: EditorView, visible: boolean): void {
   if (!current || Boolean(current.fanVisible) === visible) return;
   view.dispatch(view.state.tr
     .setMeta(ghostTextPluginKey, { kind: 'fan', visible } satisfies GhostTextMeta)
+    .setMeta('addToHistory', false));
+}
+
+export function setGhostFanPinned(view: EditorView, pinned: boolean): void {
+  if (view.isDestroyed) return;
+  const current = ghostTextPluginKey.getState(view.state);
+  if (!current || Boolean(current.fanPinned) === pinned) return;
+  view.dispatch(view.state.tr
+    .setMeta(ghostTextPluginKey, { kind: 'pin', pinned } satisfies GhostTextMeta)
     .setMeta('addToHistory', false));
 }
 
@@ -608,6 +723,26 @@ function alternativesMatch(
       item.presentationKey === other.presentationKey &&
       item.runId === other.runId &&
       item.text === other.text;
+  });
+}
+
+/**
+ * Streaming replaces presentation keys and text as bytes arrive, but the
+ * ordered generation runs still identify the same alternatives family. A
+ * writer's explicit pin belongs to that family, not to one transient frame.
+ */
+function alternativeFamiliesMatch(
+  left: readonly SuggestionAlternative[] | undefined,
+  right: readonly SuggestionAlternative[] | undefined
+): boolean {
+  const leftItems = left ?? [];
+  const rightItems = right ?? [];
+  return leftItems.length > 1 && leftItems.length === rightItems.length && leftItems.every((item, index) => {
+    const other = rightItems[index];
+    if (!other) return false;
+    return item.runId && other.runId
+      ? item.runId === other.runId
+      : item.candidateId === other.candidateId;
   });
 }
 
@@ -639,6 +774,7 @@ export function setGhostText(
     Boolean(current?.insertsOnAccept) === Boolean(presentation?.insertsOnAccept) &&
     Boolean(current?.hidden) === Boolean(presentation?.hidden) &&
     Boolean(current?.fanVisible) === Boolean(presentation?.fanVisible) &&
+    Boolean(current?.fanPinned) === Boolean(presentation?.fanPinned) &&
     (current?.unconsumeText ?? '') === (presentation?.unconsumeText ?? '') &&
     alternativesMatch(current?.alternatives, presentation?.alternatives)
   ) return;
@@ -652,11 +788,18 @@ export function setGhostText(
     // update to that state so a 1→4 streamed family opens while Option is held,
     // and a consumed 4→1 family cannot leave its inline remainder hidden.
     fanVisible: Boolean(presentation.fanVisible),
+    fanPinned: Boolean(presentation.fanPinned || (
+      current?.fanPinned &&
+      current.surfaceKey === presentation.surfaceKey &&
+      alternativeFamiliesMatch(current.alternatives, presentation.alternatives)
+    )),
     // WebKit can discard or stop exposing an unchanged contenteditable
     // decoration while a native window is hidden. A lifecycle refresh must
     // therefore create a new widget DOM identity without changing completion
     // authority or manuscript state.
-    renderEpoch: forceRender ? (current?.renderEpoch ?? 0) + 1 : 0
+    renderEpoch: forceRender
+      ? (current?.renderEpoch ?? 0) + 1
+      : current?.renderEpoch ?? 0
   };
   view.dispatch(view.state.tr
     .setMeta(ghostTextPluginKey, { kind: 'set', presentation: next } satisfies GhostTextMeta)
@@ -675,6 +818,7 @@ export function createGhostTextPlugin(
         const meta = transactionMeta(transaction);
         if (meta?.kind === 'set') return meta.presentation;
         if (meta?.kind === 'fan') return current ? { ...current, fanVisible: meta.visible } : current;
+        if (meta?.kind === 'pin') return current ? { ...current, fanPinned: meta.pinned } : current;
         if (meta?.kind === 'clear' || transaction.docChanged) return null;
         // WebKit and ProseMirror may explicitly reassert the current selection
         // while restoring focus after an idle period. That transaction is not
@@ -689,21 +833,23 @@ export function createGhostTextPlugin(
         const plan = currentGhostTextPlan(state);
         if (!plan) return null;
         return DecorationSet.create(state.doc, [
-          Decoration.widget(plan.position, () => ghostWidget(plan, domIds), {
+          Decoration.widget(plan.position, (widgetView) => ghostWidget(
+            plan,
+            domIds,
+            widgetView,
+            handlers
+          ), {
             // ProseMirror reuses widget DOM when this key is unchanged. Fan,
             // hidden, and streamed-alternative changes are render identity,
             // not merely plugin metadata; include them so stale pixels cannot
             // survive Option-up or rollback.
             key: JSON.stringify([
-              plan.presentationKey,
+              plan.surfaceKey,
+              plan.anchorByteOffset,
               plan.renderEpoch,
-              plan.hidden,
-              plan.fanVisible,
               plan.alternatives.map((item) => [
                 item.candidateId,
-                item.presentationKey,
-                item.runId ?? '',
-                item.text
+                item.runId ?? ''
               ])
             ]),
             side: 1,
@@ -757,6 +903,19 @@ export function createGhostTextPlugin(
         if (
           plan &&
           exactAnchorVisible &&
+          plan.fanPinned &&
+          !event.altKey &&
+          !event.metaKey &&
+          !event.ctrlKey &&
+          (event.key === 'ArrowUp' || event.key === 'ArrowDown')
+        ) {
+          event.preventDefault();
+          handlers.cycle?.(event.key === 'ArrowDown' ? 1 : -1);
+          return true;
+        }
+        if (
+          plan &&
+          exactAnchorVisible &&
           event.altKey &&
           !event.metaKey &&
           !event.ctrlKey &&
@@ -798,7 +957,8 @@ export function createGhostTextPlugin(
                   alternatives: plan.alternatives,
                   hidden: plan.hidden,
                   unconsumeText: '',
-                  fanVisible: plan.fanVisible
+                  fanVisible: plan.fanVisible,
+                  fanPinned: plan.fanPinned
                 }
               } satisfies GhostTextMeta));
             return true;
@@ -808,7 +968,7 @@ export function createGhostTextPlugin(
           plan &&
           plan.fanVisible &&
           exactAnchorVisible &&
-          event.altKey &&
+          (event.altKey || plan.fanPinned) &&
           !event.metaKey &&
           !event.ctrlKey &&
           (event.key === 'Enter' || event.key === 'Tab')
@@ -839,6 +999,20 @@ export function createGhostTextPlugin(
             'option_word'
           )) return false;
           view.dispatch(view.state.tr.insertText(word));
+          return true;
+        }
+        if (
+          plan &&
+          plan.fanVisible &&
+          event.key === 'Escape' &&
+          !event.metaKey &&
+          !event.ctrlKey &&
+          !event.altKey
+        ) {
+          setGhostFanVisible(view, false);
+          setGhostFanPinned(view, false);
+          handlers.modifier?.(false);
+          handlers.pin?.(false);
           return true;
         }
         if (plan && event.key === 'Escape' && !event.metaKey && !event.ctrlKey && !event.altKey) {
@@ -937,11 +1111,16 @@ export function createGhostTextPlugin(
         editorView.dom.setAttribute('aria-activedescendant', activeOptionId);
       };
 
+      const synchronizeWidget = (): void => {
+        const plan = currentGhostTextPlan(editorView.state);
+        if (plan) synchronizeGhostWidgetDom(editorView, plan, domIds);
+      };
+
       const placeFan = (): void => {
         placementFrame = undefined;
         if (editorView.isDestroyed) return;
         const plan = currentGhostTextPlan(editorView.state);
-        if (!plan?.fanVisible) return;
+        if (!plan) return;
         if (
           ghostWidgetPresentationKeyInViewport(editorView, true) !== plan.presentationKey
         ) {
@@ -951,14 +1130,33 @@ export function createGhostTextPlugin(
           // attached to an unrelated visible edge.
           handlers.modifier?.(false);
           setGhostFanVisible(editorView, false);
+          setGhostFanPinned(editorView, false);
+          handlers.pin?.(false);
           return;
         }
-        const fan = Array.from(
-          editorView.dom.querySelectorAll<HTMLElement>('.loom-ghost-fan')
-        ).find((candidate) => candidate.dataset.presentationKey === plan.presentationKey);
-        if (!fan?.isConnected) return;
         try {
           const caret = editorView.coordsAtPos(plan.position);
+          const trigger = Array.from(
+            editorView.dom.querySelectorAll<HTMLElement>('.loom-completion-lens-trigger')
+          ).find((candidate) => candidate.dataset.presentationKey === plan.presentationKey);
+          if (trigger?.isConnected) {
+            const surface = editorView.dom.getBoundingClientRect();
+            const triggerWidth = Math.max(trigger.offsetWidth, 34);
+            const triggerHeight = Math.max(trigger.offsetHeight, 22);
+            trigger.style.left = `${Math.max(
+              12,
+              Math.min(window.innerWidth - triggerWidth - 12, surface.right - triggerWidth - 18)
+            )}px`;
+            trigger.style.top = `${Math.max(
+              12,
+              Math.min(window.innerHeight - triggerHeight - 12, caret.top)
+            )}px`;
+          }
+          if (!plan.fanVisible) return;
+          const fan = Array.from(
+            editorView.dom.querySelectorAll<HTMLElement>('.loom-ghost-fan')
+          ).find((candidate) => candidate.dataset.presentationKey === plan.presentationKey);
+          if (!fan?.isConnected) return;
           fan.style.maxHeight = '';
           placeCompletionPopup(fan, {
             ...caret,
@@ -976,10 +1174,12 @@ export function createGhostTextPlugin(
 
       window.addEventListener('resize', requestPlacement);
       window.addEventListener('scroll', requestPlacement, true);
+      synchronizeWidget();
       synchronizeFanAccessibility();
       requestPlacement();
       return {
         update() {
+          synchronizeWidget();
           synchronizeFanAccessibility();
           requestPlacement();
         },

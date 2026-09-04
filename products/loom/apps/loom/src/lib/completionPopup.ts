@@ -67,9 +67,12 @@ export function completionPopupPlacement(
   const unclampedTop = side === 'below'
     ? anchor.bottom + CARET_GAP
     : anchor.top - CARET_GAP - maxHeight;
+  // Alternatives are a completion lens, not a caret-covering menu. Dock the
+  // rail to the trailing viewport gutter while retaining the caret's vertical
+  // relationship and the existing narrow-window clamp.
   const maximumLeft = Math.max(VIEWPORT_MARGIN, viewportWidth - VIEWPORT_MARGIN - popup.width);
   return {
-    left: Math.min(Math.max(anchor.left, VIEWPORT_MARGIN), maximumLeft),
+    left: maximumLeft,
     top: Math.min(
       Math.max(unclampedTop, VIEWPORT_MARGIN),
       viewportHeight - VIEWPORT_MARGIN - maxHeight

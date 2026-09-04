@@ -122,6 +122,7 @@ export interface ModelCapabilitySummary {
   context_tokens: number | null;
   model_sha256: string | null;
   projector_present: boolean | null;
+  projector_sha256: string | null;
   media_kinds: Array<'image' | 'audio'>;
   /** Size-only build-policy hint. It is never evidence that the file matches. */
   policy_candidate: ModelPolicyProfile | null;
@@ -151,10 +152,18 @@ export interface CuratedModelMemoryFit {
 export interface CuratedModelCompatibility {
   local_only: true;
   hosted_fallback: false;
-  prompt_mode: 'raw_completion';
+  prompt_mode: 'chat_completion';
   native_inspection_required: true;
   legacy_local_file_name: string;
   legacy_local_file_bytes: number;
+}
+
+export interface CuratedModelArtifact {
+  artifact_name: string;
+  download_url: string;
+  expected_sha256: string;
+  expected_bytes: number;
+  max_bytes: number;
 }
 
 export interface CuratedModelCatalogEntry {
@@ -168,6 +177,7 @@ export interface CuratedModelCatalogEntry {
   expected_sha256: string;
   expected_bytes: number;
   max_bytes: number;
+  projector: CuratedModelArtifact;
   context_tokens: number;
   license: CuratedModelLicense;
   memory_fit: CuratedModelMemoryFit;
@@ -175,7 +185,7 @@ export interface CuratedModelCatalogEntry {
 }
 
 export interface CuratedModelCatalogSnapshot {
-  schema_version: 1;
+  schema_version: 2;
   entries: CuratedModelCatalogEntry[];
 }
 
@@ -397,6 +407,18 @@ export interface LoomFailure {
   code: string;
   message: string;
   retryable?: boolean;
+}
+
+export interface ContextAttachment {
+  id: string;
+  file_name: string;
+  byte_count: number;
+  detected_format: string;
+  coverage_complete: boolean;
+  text_bytes: number;
+  media_kinds: Array<'image' | 'audio'>;
+  warnings: string[];
+  inline_markdown: string;
 }
 
 export interface MergeByteRange {

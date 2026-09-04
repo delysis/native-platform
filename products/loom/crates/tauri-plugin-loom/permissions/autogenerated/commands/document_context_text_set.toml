@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-document-context-text-set"
+description = "Enables the document_context_text_set command without any pre-configured scope."
+commands.allow = ["document_context_text_set"]
+
+[[permission]]
+identifier = "deny-document-context-text-set"
+description = "Denies the document_context_text_set command without any pre-configured scope."
+commands.deny = ["document_context_text_set"]

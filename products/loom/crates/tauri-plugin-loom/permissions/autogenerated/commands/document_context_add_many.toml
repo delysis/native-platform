@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-document-context-add-many"
+description = "Enables the document_context_add_many command without any pre-configured scope."
+commands.allow = ["document_context_add_many"]
+
+[[permission]]
+identifier = "deny-document-context-add-many"
+description = "Denies the document_context_add_many command without any pre-configured scope."
+commands.deny = ["document_context_add_many"]

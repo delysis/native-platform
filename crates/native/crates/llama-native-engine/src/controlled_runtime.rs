@@ -1170,6 +1170,7 @@ fn as_exact_legacy_request(request: &ControlledGenerationBatchRequest) -> Genera
     GenerationBatchRequest {
         request_id: request.request_id().to_string(),
         model_id: request.control().writer().fingerprint().model_id.clone(),
+        media: Vec::new(),
         cases: request
             .cases()
             .iter()
@@ -1227,7 +1228,10 @@ fn execute_disabled_baseline(
             cancellations,
             reasoning_forces: &reasoning,
         },
-        tracking,
+        BatchSequenceState {
+            tracking,
+            resident: None,
+        },
     )?;
     join_baseline_runtime_trace(&execution, &runtime_sample_trace, &mut runtime_ledger)?;
     let outputs = request
@@ -1664,6 +1668,7 @@ fn execute_active_controls(
                     supplied_prefix_tokens: 0,
                     restored_prefix_tokens: 0,
                     batch_shared_prefix_tokens: layout.conditional_shared_prefix,
+                    resident_prefix_tokens: 0,
                 },
             },
             real_engine_invoked: true,
@@ -4274,6 +4279,7 @@ mod tests {
             .generate_batch(GenerationBatchRequest {
                 request_id: "real-legacy-baseline".to_string(),
                 model_id: identity.fingerprint().model_id.clone(),
+                media: Vec::new(),
                 cases: vec![GenerationCase {
                     case_id: "case-0".to_string(),
                     input: GenerationInput::Completion {

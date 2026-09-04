@@ -3,6 +3,7 @@ import type { ModelCapabilitySummary } from './types';
 import {
   isEphemeralAcceptanceModelPath,
   automaticWriterForBuildPolicy,
+  isOfficialGemma4CatalogHint,
   isUsableSuggestionWriter,
   isVerifiedPolicyWriter,
   looksLikeVisionAdapter,
@@ -32,6 +33,7 @@ function model(overrides: Partial<ModelCapabilitySummary> = {}): ModelCapability
     context_tokens: null,
     model_sha256: null,
     projector_present: null,
+    projector_sha256: null,
     media_kinds: [],
     policy_candidate: { profile_id: 'writer-v1', rank: 0 },
     policy_verified: null,
@@ -120,6 +122,7 @@ describe('startupWriterCandidates', () => {
       { modelPath: gemma.model_path, profileId: null, policyRank: -1, remembered: false },
       { modelPath: policy.model_path, profileId: 'writer-v1', policyRank: 0, remembered: false }
     ]);
+    expect(isOfficialGemma4CatalogHint(gemma)).toBe(true);
   });
 
   it('quietly reopens an explicitly selected generic text model before policy discovery', () => {
@@ -277,18 +280,33 @@ describe('explicit local suggestion writers', () => {
     expect(suggestionWriter([generic], policy)?.model_id).toBe('generic');
   });
 
-  it('rejects adapters and media models from text suggestions', () => {
+  it('rejects standalone projectors and incomplete media contracts', () => {
     const adapter = model({ display_name: 'clip-mmproj.gguf' });
-    const vision = model({
+    const incomplete = model({
       loaded: true,
       completion: true,
       output_tokens: true,
       projector_present: true,
+      projector_sha256: '1'.repeat(64),
       media_kinds: ['image']
     });
     expect(looksLikeVisionAdapter(adapter)).toBe(true);
-    expect(isUsableSuggestionWriter(vision)).toBe(false);
-    expect(suggestionWriter([vision], policy)).toBeUndefined();
+    expect(isUsableSuggestionWriter(incomplete)).toBe(false);
+    expect(suggestionWriter([incomplete], policy)).toBeUndefined();
+  });
+
+  it('accepts a projector-bound model only with its full native Gemma image and audio contract', () => {
+    const multimodal = model({
+      loaded: true,
+      chat: true,
+      completion: true,
+      output_tokens: true,
+      projector_present: true,
+      projector_sha256: '1'.repeat(64),
+      media_kinds: ['image', 'audio']
+    });
+    expect(isUsableSuggestionWriter(multimodal)).toBe(true);
+    expect(suggestionWriter([multimodal], policy)?.model_id).toBe(multimodal.model_id);
   });
 });
 

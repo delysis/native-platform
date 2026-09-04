@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod attachments;
+mod context_attachments;
 mod document_watcher;
 mod model_catalog;
 mod model_download;
@@ -16,13 +17,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime};
 
 use loom_backend_llama::{
-    ContinuationCase, DownloadCancellation, DownloadControl, DownloadError,
-    ExactContinuationRequest, ExactContinuationResult, GgufDownloadRequest, GgufHeaderStatus,
-    JoinedLlamaGeneration, JoinedLlamaRuntime, LlamaBackend, LlamaBackendError,
+    ContinuationCase, ContinuationContextBinding, DownloadCancellation, DownloadControl,
+    DownloadError, ExactContinuationRequest, ExactContinuationResult, GgufDownloadRequest,
+    GgufHeaderStatus, JoinedLlamaGeneration, JoinedLlamaRuntime, LlamaBackend, LlamaBackendError,
     LlamaGenerationControl, LlamaGenerationHandle, LocalModelProfile, MAX_MODEL_DOWNLOAD_BYTES,
     ModelDiscoveryOptions, ModelRelease, NativeHostRuntime, ProcessExitJoinedLlamaRuntime,
-    SamplerKind, SamplingConfig, Sha256Digest, VerifiedModelDescriptor, discover_gguf_models,
-    download_gguf, model_environment_from_verified, validate_candidate_receipt_binding,
+    SamplerKind, SamplingConfig, Sha256Digest, VerifiedModelDescriptor,
+    continuation_context_binding, discover_gguf_models, download_gguf,
+    model_environment_from_verified, validate_candidate_receipt_binding,
     validate_gguf_download_request,
 };
 use loom_document::{DocumentContent, MergeError, MergeOutcome, three_way_merge};
@@ -51,6 +53,7 @@ use loom_types::{
 use same_file::Handle as FileIdentityHandle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use sysinfo::System;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
@@ -58,6 +61,12 @@ use tauri_plugin_dialog::DialogExt;
 use crate::attachments::{
     AttachmentStoreError, LoadedImageAsset, StoredImageAsset, is_canonical_image_asset_file_name,
     read_image_asset, store_image_asset,
+};
+use crate::context_attachments::{
+    ContextAttachmentError, StoredAttachment, add_document_context, add_document_contexts,
+    document_context as load_document_context, document_context_text as load_document_context_text,
+    import_path as import_context_attachment_path, remove_document_context,
+    resolve_for_generation_with_budget, set_document_context_text as persist_document_context_text,
 };
 use crate::document_watcher::DocumentFilesystemWatcher;
 use crate::model_catalog::{ModelCatalogSnapshot, catalog_model_identity, embedded_model_catalog};
@@ -469,6 +478,10 @@ mod automatic_writer_authority {
                 prompt_mode: writer.prompt_mode(),
                 model_sha256: writer.model_sha256(),
                 model_file_bytes: writer.model_file_bytes(),
+                projector_name: None,
+                projector_sha256: None,
+                projector_file_bytes: None,
+                maximum_context_tokens: None,
             };
             validate_policy_model_descriptor(
                 &loaded.descriptor,
@@ -504,15 +517,24 @@ mod automatic_writer_authority {
     impl VerifiedTextAutomaticWriter {
         fn bind(loaded: LoadedModel) -> Result<Self, IpcFailure> {
             let capabilities = &loaded.descriptor.capabilities;
-            if loaded.profile.projector_path.is_some()
-                || loaded.descriptor.projector_sha256.is_some()
-                || !capabilities.media.is_empty()
-            {
-                return Err(IpcFailure::new(
-                    "automatic_writer_media_unsupported",
-                    "writing suggestions require a text-only model without a vision, audio, or projector adapter",
-                    false,
-                ));
+            if loaded.descriptor.projector_sha256.is_some() || !capabilities.media.is_empty() {
+                let image = capabilities.media.iter().any(|capability| {
+                    capability.kind == loom_backend_llama::VerifiedMediaKind::Image
+                });
+                let audio = capabilities.media.iter().any(|capability| {
+                    capability.kind == loom_backend_llama::VerifiedMediaKind::Audio
+                });
+                if loaded.descriptor.projector_sha256.is_none()
+                    || !capabilities.chat.is_supported()
+                    || !image
+                    || !audio
+                {
+                    return Err(IpcFailure::new(
+                        "automatic_writer_media_unsupported",
+                        "a multimodal writing model requires one verified projector with exact chat, image, and audio support",
+                        false,
+                    ));
+                }
             }
             if !capabilities.completion_text.is_supported()
                 || !capabilities.generated_token_ids.is_supported()
@@ -644,6 +666,8 @@ mod automatic_writer_authority {
             self,
             request_id: String,
             exact_manuscript_prefix: String,
+            context_preamble: String,
+            media: Vec<llama_native_types::MediaInput>,
             prompt_recipe: PromptRecipe,
             cases: Vec<ContinuationCase>,
         ) -> AuthorizedWeaveRequest {
@@ -659,6 +683,8 @@ mod automatic_writer_authority {
                     request_id,
                     model,
                     exact_manuscript_prefix,
+                    context_preamble,
+                    media,
                     prompt_recipe,
                     cases,
                 },
@@ -688,6 +714,7 @@ use automatic_writer_authority::{AuthorizedWeaveModel, AutomaticSuggestionAuthor
 #[derive(Clone, Debug)]
 struct GenerationResultBinding {
     exact_prompt_blob_id: BlobId,
+    context_binding: ContinuationContextBinding,
     model_environment: ModelEnvironment,
     model: VerifiedModelDescriptor,
     generations: BTreeMap<GenerationRunId, GenerationStart>,
@@ -1710,6 +1737,10 @@ struct PolicyWriterExpectation {
     prompt_mode: PromptMode,
     model_sha256: BlobId,
     model_file_bytes: u64,
+    projector_name: Option<String>,
+    projector_sha256: Option<String>,
+    projector_file_bytes: Option<u64>,
+    maximum_context_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1803,6 +1834,14 @@ impl Builder {
                 document_rename,
                 document_delete,
                 attachment_ingest,
+                attachment_import_choose,
+                attachment_import_paths,
+                document_context_list,
+                document_context_add,
+                document_context_add_many,
+                document_context_remove,
+                document_context_text_get,
+                document_context_text_set,
                 document_open,
                 document_checkpoint,
                 document_export_choose,
@@ -1956,6 +1995,25 @@ impl IpcFailure {
             AttachmentStoreError::DirectoryDurability(_) | AttachmentStoreError::Io(_)
         );
         Self::new(code, error.to_string(), retryable)
+    }
+
+    fn context_attachment(error: &ContextAttachmentError) -> Self {
+        let code = match error {
+            ContextAttachmentError::UnsafeSource => "attachment_source_refused",
+            ContextAttachmentError::SourceSize => "attachment_size_refused",
+            ContextAttachmentError::Processing(_) => "attachment_processing_failed",
+            ContextAttachmentError::NoRepresentation => "attachment_no_model_representation",
+            ContextAttachmentError::ContextLimit => "attachment_context_limit",
+            ContextAttachmentError::ManualTextLimit => "attachment_context_text_limit",
+            ContextAttachmentError::ContextInvalid => "attachment_context_invalid",
+            ContextAttachmentError::Io(_) => "attachment_storage_failed",
+            ContextAttachmentError::Json(_) => "attachment_metadata_invalid",
+        };
+        Self::new(
+            code,
+            error.to_string(),
+            matches!(error, ContextAttachmentError::Io(_)),
+        )
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -2242,6 +2300,7 @@ pub struct ModelCapabilitySummary {
     context_tokens: Option<u32>,
     model_sha256: Option<String>,
     projector_present: Option<bool>,
+    projector_sha256: Option<String>,
     media_kinds: Vec<&'static str>,
     /// A size-only policy hint. It is emitted only for uninspected discoveries.
     policy_candidate: Option<PolicyProfileSummary>,
@@ -3160,6 +3219,180 @@ async fn attachment_ingest(
     state: State<'_, PluginState>,
 ) -> Result<StoredImageAsset, IpcFailure> {
     ingest_image_attachment_for_session(&state, &project_id, &session_id, &media_type, &encoded)
+}
+
+#[tauri::command]
+async fn attachment_import_paths(
+    project_id: String,
+    session_id: String,
+    paths: Vec<String>,
+    state: State<'_, PluginState>,
+) -> Result<Vec<StoredAttachment>, IpcFailure> {
+    import_context_attachment_paths_for_session(&state, &project_id, &session_id, paths)
+}
+
+#[tauri::command]
+async fn attachment_import_choose<R: Runtime>(
+    project_id: String,
+    session_id: String,
+    app: AppHandle<R>,
+    state: State<'_, PluginState>,
+) -> Result<Vec<StoredAttachment>, IpcFailure> {
+    let selected = app
+        .dialog()
+        .file()
+        .blocking_pick_files()
+        .unwrap_or_default();
+    let paths = selected
+        .into_iter()
+        .map(|selected| {
+            selected.into_path().map_err(|error| {
+                IpcFailure::new(
+                    "selected_attachment_unavailable",
+                    format!("the selected attachment is not a local filesystem path: {error}"),
+                    false,
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    import_context_attachment_paths_for_session(&state, &project_id, &session_id, paths)
+}
+
+fn import_context_attachment_paths_for_session(
+    state: &PluginState,
+    project_id: &str,
+    session_id: &str,
+    paths: Vec<String>,
+) -> Result<Vec<StoredAttachment>, IpcFailure> {
+    if paths.len() > 16 {
+        return Err(IpcFailure::new(
+            "attachment_transfer_limit",
+            "attach at most 16 files at once",
+            false,
+        ));
+    }
+    let _application_admission = lock_application_admission(state, "attachment import")?;
+    let mut session = lock_session(state)?;
+    let store = require_bound_store(&mut session, project_id, session_id)?;
+    paths
+        .into_iter()
+        .map(|path| import_context_attachment_path(store.root(), Path::new(&path)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| IpcFailure::context_attachment(&error))
+}
+
+#[tauri::command]
+async fn document_context_list(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    state: State<'_, PluginState>,
+) -> Result<Vec<StoredAttachment>, IpcFailure> {
+    let _ = document_id
+        .parse::<DocumentId>()
+        .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    load_document_context(store.root(), &document_id)
+        .map_err(|error| IpcFailure::context_attachment(&error))
+}
+
+#[tauri::command]
+async fn document_context_add(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    attachment_id: String,
+    state: State<'_, PluginState>,
+) -> Result<Vec<StoredAttachment>, IpcFailure> {
+    let _ = document_id
+        .parse::<DocumentId>()
+        .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
+    let _application_admission = lock_application_admission(&state, "document context update")?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    add_document_context(store.root(), &document_id, &attachment_id)
+        .map_err(|error| IpcFailure::context_attachment(&error))
+}
+
+#[tauri::command]
+async fn document_context_add_many(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    attachment_ids: Vec<String>,
+    state: State<'_, PluginState>,
+) -> Result<Vec<StoredAttachment>, IpcFailure> {
+    let _ = document_id
+        .parse::<DocumentId>()
+        .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
+    if attachment_ids.len() > 16 {
+        return Err(IpcFailure::new(
+            "attachment_transfer_limit",
+            "attach at most 16 files at once",
+            false,
+        ));
+    }
+    let _application_admission = lock_application_admission(&state, "document context update")?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    add_document_contexts(store.root(), &document_id, &attachment_ids)
+        .map_err(|error| IpcFailure::context_attachment(&error))
+}
+
+#[tauri::command]
+async fn document_context_remove(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    attachment_id: String,
+    state: State<'_, PluginState>,
+) -> Result<Vec<StoredAttachment>, IpcFailure> {
+    let _ = document_id
+        .parse::<DocumentId>()
+        .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
+    let _application_admission = lock_application_admission(&state, "document context update")?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    remove_document_context(store.root(), &document_id, &attachment_id)
+        .map_err(|error| IpcFailure::context_attachment(&error))
+}
+
+#[tauri::command]
+async fn document_context_text_get(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    state: State<'_, PluginState>,
+) -> Result<String, IpcFailure> {
+    let _ = document_id
+        .parse::<DocumentId>()
+        .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    load_document_context_text(store.root(), &document_id)
+        .map_err(|error| IpcFailure::context_attachment(&error))
+}
+
+#[tauri::command]
+async fn document_context_text_set(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    text: String,
+    state: State<'_, PluginState>,
+) -> Result<String, IpcFailure> {
+    let _ = document_id
+        .parse::<DocumentId>()
+        .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
+    let _application_admission = lock_application_admission(&state, "document context update")?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    persist_document_context_text(store.root(), &document_id, text)
+        .map_err(|error| IpcFailure::context_attachment(&error))
 }
 
 fn ingest_image_attachment_for_session(
@@ -4409,6 +4642,7 @@ async fn model_list(
                 context_tokens: None,
                 model_sha256: None,
                 projector_present: None,
+                projector_sha256: None,
                 media_kinds: Vec::new(),
                 policy_candidate: policy_candidate_summary(
                     &state.build_model_policy,
@@ -4667,6 +4901,9 @@ async fn model_load_exact_writer<R: Runtime>(
     })?
 }
 
+// Keep the path, artifact, projector, and residency checks in one ordered
+// admission boundary so no partially verified load plan can escape.
+#[allow(clippy::too_many_lines)]
 fn prepare_exact_model_load(
     expectation: PolicyWriterExpectation,
     model_path: &str,
@@ -4689,7 +4926,51 @@ fn prepare_exact_model_load(
             false,
         ));
     }
-
+    let mut profile = model_profile_for_current_memory(
+        canonical_path.clone(),
+        expectation.model_file_bytes,
+        expectation.projector_file_bytes.unwrap_or(0),
+        expectation.maximum_context_tokens,
+    );
+    if let (Some(projector_name), Some(projector_sha256), Some(projector_file_bytes)) = (
+        expectation.projector_name.as_deref(),
+        expectation.projector_sha256.as_deref(),
+        expectation.projector_file_bytes,
+    ) {
+        let projector_path = canonical_path
+            .parent()
+            .ok_or_else(|| {
+                IpcFailure::new(
+                    "catalog_projector_path_invalid",
+                    "the catalog model has no model-library parent directory",
+                    false,
+                )
+            })?
+            .join(projector_name)
+            .canonicalize()
+            .map_err(|_| {
+                IpcFailure::new(
+                    "catalog_projector_missing",
+                    "the exact Gemma 4 multimodal projector is not installed beside the model",
+                    false,
+                )
+            })?;
+        ensure_model_path_in_isolated_library(state, &projector_path)?;
+        ensure_regular_policy_path(&projector_path)?;
+        if std::fs::metadata(&projector_path)
+            .map_err(|error| policy_model_io_failure("inspect the catalog projector", &error))?
+            .len()
+            != projector_file_bytes
+        {
+            return Err(IpcFailure::new(
+                "catalog_projector_size_mismatch",
+                "the installed Gemma 4 projector does not match the pinned catalog size",
+                false,
+            ));
+        }
+        profile.projector_path = Some(projector_path);
+        profile.expected_mmproj_sha256 = Some(projector_sha256.to_owned());
+    }
     let _lifecycle = lock_model_lifecycle(state)?;
     let mut registry = lock_model_registry(state)?;
     match &*registry {
@@ -4733,7 +5014,7 @@ fn prepare_exact_model_load(
     };
     Ok(PolicyModelLoadPlan::Inspect {
         canonical_path: canonical_path.clone(),
-        profile: LocalModelProfile::for_gguf(canonical_path),
+        profile,
         expectation,
     })
 }
@@ -4764,6 +5045,10 @@ fn policy_writer_expectation(
         prompt_mode: writer.prompt_mode(),
         model_sha256: writer.model_sha256(),
         model_file_bytes: writer.model_file_bytes(),
+        projector_name: None,
+        projector_sha256: None,
+        projector_file_bytes: None,
+        maximum_context_tokens: None,
     })
 }
 
@@ -4789,6 +5074,10 @@ fn catalog_writer_expectation(catalog_id: &str) -> Result<PolicyWriterExpectatio
         prompt_mode: PromptMode::Completion,
         model_sha256,
         model_file_bytes: identity.model_file_bytes,
+        projector_name: Some(identity.projector_name.to_owned()),
+        projector_sha256: Some(identity.projector_sha256.to_owned()),
+        projector_file_bytes: Some(identity.projector_file_bytes),
+        maximum_context_tokens: Some(identity.context_tokens),
     })
 }
 
@@ -4966,6 +5255,35 @@ fn validate_policy_model_descriptor(
             false,
         ));
     }
+    match expectation.projector_sha256.as_deref() {
+        Some(expected) => {
+            let media = &descriptor.capabilities.media;
+            if descriptor.projector_sha256.as_deref() != Some(expected)
+                || !descriptor.capabilities.chat.is_supported()
+                || !media.iter().any(|capability| {
+                    capability.kind == loom_backend_llama::VerifiedMediaKind::Image
+                })
+                || !media.iter().any(|capability| {
+                    capability.kind == loom_backend_llama::VerifiedMediaKind::Audio
+                })
+            {
+                return Err(IpcFailure::new(
+                    "catalog_projector_identity_mismatch",
+                    "native inspection did not prove the pinned Gemma 4 image-and-audio projector",
+                    false,
+                ));
+            }
+        }
+        None => {
+            if descriptor.projector_sha256.is_some() || !descriptor.capabilities.media.is_empty() {
+                return Err(IpcFailure::new(
+                    "policy_model_unexpected_projector",
+                    "this text-only writer policy does not authorize a multimodal projector",
+                    false,
+                ));
+            }
+        }
+    }
     if expectation.role != ModelRole::Writer
         || expectation.prompt_mode != PromptMode::Completion
         || !descriptor.capabilities.completion_text.is_supported()
@@ -5099,8 +5417,31 @@ fn prepare_model_load(
     };
     Ok(ModelLoadPlan::Inspect {
         canonical_path: canonical,
-        profile: LocalModelProfile::for_gguf(discovered.resolved_path),
+        profile: model_profile_for_current_memory(
+            discovered.resolved_path,
+            discovered.file_bytes,
+            0,
+            None,
+        ),
     })
+}
+
+fn model_profile_for_current_memory(
+    model_path: PathBuf,
+    model_file_bytes: u64,
+    projector_file_bytes: u64,
+    maximum_context_tokens: Option<u32>,
+) -> LocalModelProfile {
+    let mut system = System::new();
+    system.refresh_memory();
+    LocalModelProfile::for_gguf_with_memory(
+        model_path,
+        model_file_bytes,
+        projector_file_bytes,
+        system.available_memory(),
+        system.total_memory(),
+        maximum_context_tokens,
+    )
 }
 
 fn resolve_model_inspection(
@@ -5963,6 +6304,7 @@ fn model_summary(
         context_tokens: Some(model.descriptor.context_tokens),
         model_sha256: Some(model.descriptor.model_sha256.clone()),
         projector_present: Some(model.descriptor.projector_sha256.is_some()),
+        projector_sha256: model.descriptor.projector_sha256.clone(),
         media_kinds: model
             .descriptor
             .capabilities
@@ -6968,6 +7310,8 @@ async fn weave_start<R: Runtime>(
     let (
         identity,
         exact_prefix,
+        context_preamble,
+        media,
         prompt_recipe,
         cases,
         queued_branches,
@@ -7024,13 +7368,6 @@ async fn weave_start<R: Runtime>(
                 false,
             ));
         }
-        if cursor == 0 {
-            return Err(IpcFailure::new(
-                "empty_completion_prefix",
-                "write or place the cursor after at least one manuscript character before weaving",
-                false,
-            ));
-        }
         let automatic_budget_reservation = match authorized_model.automatic_writer() {
             Some(writer) => Some(
                 state
@@ -7063,7 +7400,33 @@ async fn weave_start<R: Runtime>(
             ),
             None => None,
         };
-        let exact_prefix = loaded.text[..cursor].to_owned();
+        let source_prefix = &loaded.text[..cursor];
+        let attachment_context = resolve_for_generation_with_budget(
+            store.root(),
+            &document_id.to_string(),
+            source_prefix,
+            resident_context_tokens(loaded_model),
+            branch_count,
+            max_tokens,
+        )
+        .map_err(|error| IpcFailure::context_attachment(&error))?;
+        let exact_prefix = attachment_context.manuscript_prompt.clone();
+        if exact_prefix.is_empty()
+            && attachment_context.context_preamble.is_empty()
+            && attachment_context.media.is_empty()
+        {
+            return Err(IpcFailure::new(
+                "empty_completion_prefix",
+                "write manuscript text or add completion context before weaving",
+                false,
+            ));
+        }
+        if !attachment_context.media.is_empty() {
+            validate_media_against_resident_model(
+                &attachment_context.media,
+                &loaded_model.descriptor,
+            )?;
+        }
         let exact_prompt_blob_id = store
             .store_provenance_blob(exact_prefix.as_bytes())
             .map_err(IpcFailure::store)?;
@@ -7087,12 +7450,23 @@ async fn weave_start<R: Runtime>(
         let prompt_artifact = store
             .record_prompt_recipe(&prompt_recipe)
             .map_err(IpcFailure::store)?;
+        let retrieval_evidence_blob_id = {
+            let identity =
+                serde_json::to_vec(&attachment_context.retrieval_evidence).map_err(|error| {
+                    IpcFailure::new("attachment_context_encode_failed", error.to_string(), false)
+                })?;
+            Some(
+                store
+                    .store_provenance_blob(&identity)
+                    .map_err(IpcFailure::store)?,
+            )
+        };
         let context_artifact = store
             .record_context_recipe(&ContextRecipe {
                 source_revision_id,
                 ordered_source_artifact_ids: Vec::new(),
-                token_budget: u64::from(loaded_model.profile.context_tokens),
-                retrieval_evidence_blob_id: None,
+                token_budget: u64::from(resident_context_tokens(loaded_model)),
+                retrieval_evidence_blob_id,
             })
             .map_err(IpcFailure::store)?;
         let authority_artifact = store
@@ -7271,6 +7645,8 @@ async fn weave_start<R: Runtime>(
         (
             identity,
             exact_prefix,
+            attachment_context.context_preamble,
+            attachment_context.media,
             prompt_recipe,
             cases,
             queued_branches,
@@ -7280,8 +7656,11 @@ async fn weave_start<R: Runtime>(
         )
     };
     let exact_prompt_blob_id = BlobId::digest(exact_prefix.as_bytes());
+    let context_binding = continuation_context_binding(&context_preamble, &media)
+        .map_err(|error| IpcFailure::backend(&error))?;
     let result_binding = GenerationResultBinding {
         exact_prompt_blob_id,
+        context_binding,
         model_environment: model_environment.clone(),
         model: loaded_model.descriptor.clone(),
         generations: cases
@@ -7292,6 +7671,8 @@ async fn weave_start<R: Runtime>(
     let native_request = authorized_model.into_exact_continuation_request(
         request_id.clone(),
         exact_prefix,
+        context_preamble,
+        media,
         prompt_recipe,
         cases,
     );
@@ -7607,6 +7988,104 @@ fn loaded_model(state: &State<'_, PluginState>) -> Result<LoadedModel, IpcFailur
     loaded_model_for_state(state)
 }
 
+fn resident_context_tokens(model: &LoadedModel) -> u32 {
+    // The request profile records what Loom asked for before native load.  The
+    // descriptor records the context llama.cpp actually made resident after
+    // clamping to the model's trained limit, and is therefore authoritative
+    // for prompt packing and provenance.
+    model.descriptor.context_tokens
+}
+
+fn validate_media_against_resident_model(
+    media: &[llama_native_types::MediaInput],
+    descriptor: &VerifiedModelDescriptor,
+) -> Result<(), IpcFailure> {
+    for kind in [
+        loom_backend_llama::VerifiedMediaKind::Image,
+        loom_backend_llama::VerifiedMediaKind::Audio,
+    ] {
+        let matching = media
+            .iter()
+            .filter(|item| match item.kind {
+                llama_native_types::MediaKind::Image => {
+                    kind == loom_backend_llama::VerifiedMediaKind::Image
+                }
+                llama_native_types::MediaKind::Audio => {
+                    kind == loom_backend_llama::VerifiedMediaKind::Audio
+                }
+            })
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            continue;
+        }
+        let Some(capability) = descriptor
+            .capabilities
+            .media
+            .iter()
+            .find(|capability| capability.kind == kind)
+        else {
+            return Err(IpcFailure::new(
+                "attachment_model_capability_mismatch",
+                "the selected model/projector does not accept every attached image or audio item",
+                false,
+            ));
+        };
+        if let Some(accepted) = &capability.accepted_mime_types
+            && matching.iter().any(|item| {
+                !accepted
+                    .iter()
+                    .any(|mime| mime.eq_ignore_ascii_case(&item.mime))
+            })
+        {
+            return Err(IpcFailure::new(
+                "attachment_model_capability_mismatch",
+                "an attachment MIME type is outside the resident projector contract",
+                false,
+            ));
+        }
+        if let Some(limit) = capability.max_objects_per_request
+            && matching.len() > limit as usize
+        {
+            return Err(IpcFailure::new(
+                "attachment_model_limit_exceeded",
+                format!(
+                    "the resident projector accepts at most {limit} {kind:?} objects per request"
+                ),
+                false,
+            ));
+        }
+        if let Some(limit) = capability.max_bytes_per_object
+            && matching
+                .iter()
+                .any(|item| u64::try_from(item.bytes.len()).map_or(true, |bytes| bytes > limit))
+        {
+            return Err(IpcFailure::new(
+                "attachment_model_limit_exceeded",
+                format!(
+                    "a {kind:?} attachment exceeds the resident projector's {limit}-byte per-object limit"
+                ),
+                false,
+            ));
+        }
+        if let Some(limit) = capability.max_total_bytes_per_request {
+            let total = matching.iter().try_fold(0_u64, |total, item| {
+                let bytes = u64::try_from(item.bytes.len()).map_err(|_| ())?;
+                total.checked_add(bytes).ok_or(())
+            });
+            if total.map_or(true, |total| total > limit) {
+                return Err(IpcFailure::new(
+                    "attachment_model_limit_exceeded",
+                    format!(
+                        "{kind:?} attachments exceed the resident projector's {limit}-byte request limit"
+                    ),
+                    false,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn loaded_model_for_state(state: &PluginState) -> Result<LoadedModel, IpcFailure> {
     let registry = lock_model_registry(state)?;
     match &*registry {
@@ -7804,6 +8283,7 @@ fn persist_generation_result<R: Runtime>(
     if result.request_id != identity.request_id
         || result.exact_prompt_blob_id != binding.exact_prompt_blob_id
         || BlobId::digest(result.exact_manuscript_prefix.as_bytes()) != binding.exact_prompt_blob_id
+        || result.context_binding != binding.context_binding
         || result.model_environment != binding.model_environment
         || result.model != binding.model
         || rebuilt_environment != binding.model_environment
@@ -7851,6 +8331,7 @@ fn persist_generation_result<R: Runtime>(
             &candidate,
             &identity.request_id,
             binding.exact_prompt_blob_id,
+            &binding.context_binding,
             &binding.model,
             input_index,
         )
@@ -9776,6 +10257,10 @@ mod tests {
             prompt_mode: PromptMode::Completion,
             model_sha256: BlobId::digest(expected_bytes),
             model_file_bytes: u64::try_from(expected_bytes.len()).expect("fixture byte length"),
+            projector_name: None,
+            projector_sha256: None,
+            projector_file_bytes: None,
+            maximum_context_tokens: None,
         }
     }
 
@@ -10065,6 +10550,90 @@ mod tests {
                 .code,
             "automatic_writer_media_unsupported"
         );
+    }
+
+    #[test]
+    fn generic_automatic_authority_accepts_only_a_complete_multimodal_contract() {
+        let policy = BuildModelPolicy::writer_gemma4_base_v2();
+        let mut multimodal =
+            test_loaded_model(Path::new("/tmp/multimodal.gguf"), "multimodal-writer");
+        multimodal.profile.projector_path = Some(PathBuf::from("/tmp/adapter.mmproj"));
+        multimodal.descriptor.projector_sha256 = Some(BlobId::digest(b"projector").to_string());
+        multimodal.descriptor.capabilities.chat = CapabilitySupport::Supported;
+        for kind in [
+            loom_backend_llama::VerifiedMediaKind::Image,
+            loom_backend_llama::VerifiedMediaKind::Audio,
+        ] {
+            multimodal.descriptor.capabilities.media.push(
+                loom_backend_llama::VerifiedMediaCapability {
+                    kind,
+                    projector_required: true,
+                    accepted_mime_types: None,
+                    max_objects_per_request: None,
+                    max_bytes_per_object: None,
+                    max_total_bytes_per_request: None,
+                },
+            );
+        }
+        let authorized =
+            AuthorizedWeaveModel::bind(ValidatedWeavePolicy::AutomaticV2, multimodal, &policy)
+                .expect("complete multimodal writer contract");
+        assert_eq!(authorized.automatic_binding(), None);
+    }
+
+    #[test]
+    fn prompt_packing_uses_the_context_that_native_actually_made_resident() {
+        let mut loaded = test_loaded_model(Path::new("/tmp/context.gguf"), "context-model");
+        loaded.profile.context_tokens = 262_144;
+        loaded.descriptor.context_tokens = 32_768;
+
+        assert_eq!(resident_context_tokens(&loaded), 32_768);
+    }
+
+    #[test]
+    fn resident_projector_limits_are_enforced_before_native_submission() {
+        let mut loaded = test_loaded_model(Path::new("/tmp/media.gguf"), "media-model");
+        loaded
+            .descriptor
+            .capabilities
+            .media
+            .push(loom_backend_llama::VerifiedMediaCapability {
+                kind: loom_backend_llama::VerifiedMediaKind::Image,
+                projector_required: true,
+                accepted_mime_types: Some(vec!["image/png".to_owned()]),
+                max_objects_per_request: Some(1),
+                max_bytes_per_object: Some(4),
+                max_total_bytes_per_request: Some(4),
+            });
+        let image = llama_native_types::MediaInput {
+            id: "image:one".to_owned(),
+            kind: llama_native_types::MediaKind::Image,
+            mime: "image/png".to_owned(),
+            sha256: BlobId::digest(b"png!").to_string(),
+            bytes: b"png!".to_vec(),
+        };
+
+        validate_media_against_resident_model(std::slice::from_ref(&image), &loaded.descriptor)
+            .expect("one exact in-contract image");
+
+        let error = validate_media_against_resident_model(
+            &[image.clone(), image.clone()],
+            &loaded.descriptor,
+        )
+        .expect_err("object limit must be enforced");
+        assert_eq!(error.code, "attachment_model_limit_exceeded");
+
+        let mut wrong_mime = image.clone();
+        wrong_mime.mime = "image/jpeg".to_owned();
+        let error = validate_media_against_resident_model(&[wrong_mime], &loaded.descriptor)
+            .expect_err("MIME allow-list must be enforced");
+        assert_eq!(error.code, "attachment_model_capability_mismatch");
+
+        let mut oversized = image;
+        oversized.bytes.push(0);
+        let error = validate_media_against_resident_model(&[oversized], &loaded.descriptor)
+            .expect_err("per-object byte limit must be enforced");
+        assert_eq!(error.code, "attachment_model_limit_exceeded");
     }
 
     #[test]

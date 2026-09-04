@@ -56,6 +56,7 @@ describe('planGhostText', () => {
       hidden: false,
       unconsumeText: '',
       fanVisible: false,
+      fanPinned: false,
       renderEpoch: 0
     });
   });
@@ -168,6 +169,48 @@ describe('visual ghost widget', () => {
       fanVisible: false
     });
     expect(ghostTextPluginKey.getState(state)?.fanVisible).toBe(false);
+  });
+
+  it('keeps a pinned alternatives family open while its streamed text and keys advance', () => {
+    const plugin = createGhostTextPlugin({
+      accept: () => true, dismiss() {}, visible: () => true
+    });
+    let state = EditorState.create({
+      doc: defaultMarkdownParser.parse('A paragraph.'),
+      plugins: [plugin]
+    });
+    const view = {
+      get state() { return state; },
+      dispatch(transaction: Parameters<EditorState['apply']>[0]) { state = state.apply(transaction); }
+    } as unknown as EditorView;
+    const firstFrame = {
+      ...suggestion,
+      presentationKey: 'stream:run-a:1',
+      text: ' first',
+      alternatives: [
+        { candidateId: 'candidate-a-1', presentationKey: 'stream:run-a:1', text: ' first', runId: 'run-a' },
+        { candidateId: 'candidate-b-1', presentationKey: 'stream:run-b:1', text: ' second', runId: 'run-b' }
+      ]
+    };
+    setGhostText(view, firstFrame);
+    view.dispatch(state.tr.setMeta(ghostTextPluginKey, { kind: 'pin', pinned: true }));
+
+    setGhostText(view, {
+      ...firstFrame,
+      candidateId: 'candidate-a-2',
+      presentationKey: 'stream:run-a:2',
+      text: ' first grows',
+      alternatives: [
+        { candidateId: 'candidate-a-2', presentationKey: 'stream:run-a:2', text: ' first grows', runId: 'run-a' },
+        { candidateId: 'candidate-b-2', presentationKey: 'stream:run-b:2', text: ' second grows', runId: 'run-b' }
+      ]
+    });
+
+    expect(ghostTextPluginKey.getState(state)).toMatchObject({
+      fanPinned: true,
+      presentationKey: 'stream:run-a:2',
+      text: ' first grows'
+    });
   });
 
   it('dispatches only real fan transitions against a live editor view', () => {
@@ -335,7 +378,7 @@ describe('visual ghost widget', () => {
     expect(state.doc.textContent).toBe('A waits');
   });
 
-  it('chooses the highlighted alternative with Option-Return while the inline ghost is hidden', () => {
+  it('chooses the highlighted alternative with Option-Return while the inline ghost remains visible', () => {
     const inserted: string[] = [];
     const modifierStates: boolean[] = [];
     const plugin = createGhostTextPlugin({
@@ -368,7 +411,7 @@ describe('visual ghost widget', () => {
       defaultView: {
         getComputedStyle: (element: unknown) => ({
           display: 'inline',
-          visibility: element === widget ? 'hidden' : 'visible',
+          visibility: 'visible',
           opacity: '1',
           direction: 'ltr'
         })
@@ -404,6 +447,34 @@ describe('visual ghost widget', () => {
     expect(modifierStates).toEqual([true]);
     expect(inserted).toEqual([' for rain.']);
     expect(state.doc.textContent).toBe('A waits for rain.');
+  });
+
+  it('keeps an explicitly pinned lens open when transient Option state releases', () => {
+    const plugin = createGhostTextPlugin({
+      accept: () => true,
+      dismiss() {},
+      visible: () => true
+    });
+    const doc = defaultMarkdownParser.parse('A waits');
+    let state = EditorState.create({ doc, selection: Selection.atEnd(doc), plugins: [plugin] });
+    state = state.apply(state.tr.setMeta(ghostTextPluginKey, {
+      kind: 'set',
+      presentation: {
+        ...suggestion,
+        fanVisible: true,
+        alternatives: [
+          { candidateId: 'a', presentationKey: suggestion.presentationKey, text: ' for rain.' },
+          { candidateId: 'b', presentationKey: 'b:1', text: ' until dawn.' }
+        ]
+      }
+    }));
+    state = state.apply(state.tr.setMeta(ghostTextPluginKey, { kind: 'pin', pinned: true }));
+    state = state.apply(state.tr.setMeta(ghostTextPluginKey, { kind: 'fan', visible: false }));
+
+    expect(planGhostText(state, ghostTextPluginKey.getState(state) ?? null)).toMatchObject({
+      fanVisible: true,
+      fanPinned: true
+    });
   });
 });
 

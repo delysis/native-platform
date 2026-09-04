@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-document-context-add"
+description = "Enables the document_context_add command without any pre-configured scope."
+commands.allow = ["document_context_add"]
+
+[[permission]]
+identifier = "deny-document-context-add"
+description = "Denies the document_context_add command without any pre-configured scope."
+commands.deny = ["document_context_add"]

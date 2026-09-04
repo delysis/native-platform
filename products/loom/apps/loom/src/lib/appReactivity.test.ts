@@ -204,8 +204,10 @@ describe('App ghost reactivity wiring', () => {
     );
 
     expect(catalogLoad).toContain('validateCuratedModelCatalog(await listCuratedModels())');
-    expect(catalogDownload).toContain('catalogDownloadRequest(entry)');
-    expect(catalogDownload).toContain('pendingModelDownload = { commandId: newUlid(), ...request }');
+    expect(catalogDownload).toContain('const requests = catalogDownloadRequests(entry)');
+    expect(catalogDownload).toContain('for (const request of requests)');
+    expect(catalogDownload).toContain('const commandId = newUlid()');
+    expect(catalogDownload).toContain('expectedSha256: request.sha256');
     expect(catalogAdmission).toContain(
       'await loadCatalogModelCandidate(catalogEntry.catalog_id, selected.model_path)'
     );
@@ -227,6 +229,45 @@ describe('App ghost reactivity wiring', () => {
     expect(visual).toContain('attributes: editorAttributes(snapshot.label)');
     expect(markdown).toContain('aria-label={label}');
     expect(source).toContain('autofocus={true}');
+  });
+
+  it('flushes the embedded context editor before disruptive pane transitions', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const close = source.slice(
+      source.indexOf('function closeContextPane'),
+      source.indexOf('function setContextEditorMode')
+    );
+    const modeSwitch = source.slice(
+      source.indexOf('function setContextEditorMode'),
+      source.indexOf('async function adoptAuthoritativeContext')
+    );
+
+    expect(source).toContain('bind:this={contextVisualEditor}');
+    expect(source).toContain('acceptImageAttachments={false}');
+    expect(close).toContain('flushContextEditorProjection()');
+    expect(close).toContain('contextToggleElement?.focus()');
+    expect(modeSwitch).toContain('flushContextEditorProjection()');
+    expect(source).toContain("on:compositionstart={() => contextCompositionActive = true}");
+    expect(source).toContain("on:compositionend={() => contextCompositionActive = false}");
+    expect(source).toContain("{#if document && mode === 'visual' && canUseVisual && !contextPaneOpen}");
+  });
+
+  it('adopts backend-owned context Markdown after attachment mutations', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const add = source.slice(
+      source.indexOf('async function addContextAttachmentsFromPicker'),
+      source.indexOf('async function removeContextAttachment')
+    );
+    const remove = source.slice(
+      source.indexOf('async function removeContextAttachment'),
+      source.indexOf('function nativeDropPoint')
+    );
+
+    expect(add).toContain('await persistCurrentContextText()');
+    expect(add).toContain('await adoptAuthoritativeContext(');
+    expect(remove).toContain('await persistCurrentContextText()');
+    expect(remove).toContain('await adoptAuthoritativeContext(');
+    expect(source).not.toContain('appendContextAttachmentMarkers');
   });
 
   it('announces image success only from an editor insertion acknowledgement', () => {
@@ -400,6 +441,27 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('on:mousedown={startTitlebarDrag}');
     expect(source).toContain('getCurrentWindow().startDragging()');
     expect(source).toContain('<span class="titlebar-document-title">{nativeWindowTitle}</span>');
+  });
+
+  it('uses a text-first pop-down for saved completion context', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const styles = readFileSync(new URL('../app.css', import.meta.url), 'utf8');
+    const ipc = readFileSync(new URL('./ipc.ts', import.meta.url), 'utf8');
+
+    expect(source).toContain('label="Steering context"');
+    expect(source).toContain('aria-label="Steering context Markdown"');
+    expect(source).toContain('aria-label="Visual context editor"');
+    expect(source).toContain('aria-label="Markdown context editor"');
+    expect(source).toContain('on:input={(event) => updateContextText(event.currentTarget.value)}');
+    expect(source).toContain('await adoptAuthoritativeContext(');
+    expect(source).not.toContain('appendContextAttachmentMarkers');
+    expect(source).toContain('setDocumentContextText(');
+    expect(source).toContain('Attach files to completion context');
+    expect(source).toContain('<path d="M2.75 7h12.5"/>');
+    expect(source).not.toContain('M6.2 9.8 10.8 5');
+    expect(styles).toContain('.completion-context-pane { position: absolute;');
+    expect(ipc).toContain("call('document_context_text_get'");
+    expect(ipc).toContain("call('document_context_text_set'");
   });
 
   it('keeps the document sidebar nonmodal and persistent', () => {

@@ -2,6 +2,7 @@ export interface VisualCompletionAccessibilityWitness {
   available: boolean;
   optionHeld: boolean;
   fanVisible: boolean;
+  lensPinned: boolean;
   inlineHidden: boolean;
   selectedCandidateId: string;
   selectedPresentationKey: string;
@@ -27,6 +28,7 @@ export function unavailableVisualCompletionWitness(): VisualCompletionAccessibil
     available: false,
     optionHeld: false,
     fanVisible: false,
+    lensPinned: false,
     inlineHidden: true,
     selectedCandidateId: '',
     selectedPresentationKey: '',

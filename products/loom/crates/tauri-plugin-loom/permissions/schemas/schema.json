@@ -349,6 +349,30 @@
           "markdownDescription": "Denies the application_close_pending command without any pre-configured scope."
         },
         {
+          "description": "Enables the attachment_import_choose command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-attachment-import-choose",
+          "markdownDescription": "Enables the attachment_import_choose command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the attachment_import_choose command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-attachment-import-choose",
+          "markdownDescription": "Denies the attachment_import_choose command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the attachment_import_paths command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-attachment-import-paths",
+          "markdownDescription": "Enables the attachment_import_paths command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the attachment_import_paths command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-attachment-import-paths",
+          "markdownDescription": "Denies the attachment_import_paths command without any pre-configured scope."
+        },
+        {
           "description": "Enables the attachment_ingest command without any pre-configured scope.",
           "type": "string",
           "const": "allow-attachment-ingest",
@@ -455,6 +479,78 @@
           "type": "string",
           "const": "deny-document-checkpoint",
           "markdownDescription": "Denies the document_checkpoint command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the document_context_add command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-document-context-add",
+          "markdownDescription": "Enables the document_context_add command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the document_context_add command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-document-context-add",
+          "markdownDescription": "Denies the document_context_add command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the document_context_add_many command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-document-context-add-many",
+          "markdownDescription": "Enables the document_context_add_many command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the document_context_add_many command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-document-context-add-many",
+          "markdownDescription": "Denies the document_context_add_many command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the document_context_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-document-context-list",
+          "markdownDescription": "Enables the document_context_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the document_context_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-document-context-list",
+          "markdownDescription": "Denies the document_context_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the document_context_remove command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-document-context-remove",
+          "markdownDescription": "Enables the document_context_remove command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the document_context_remove command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-document-context-remove",
+          "markdownDescription": "Denies the document_context_remove command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the document_context_text_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-document-context-text-get",
+          "markdownDescription": "Enables the document_context_text_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the document_context_text_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-document-context-text-get",
+          "markdownDescription": "Denies the document_context_text_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the document_context_text_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-document-context-text-set",
+          "markdownDescription": "Enables the document_context_text_set command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the document_context_text_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-document-context-text-set",
+          "markdownDescription": "Denies the document_context_text_set command without any pre-configured scope."
         },
         {
           "description": "Enables the document_create command without any pre-configured scope.",
@@ -841,10 +937,10 @@
           "markdownDescription": "Denies the weave_status command without any pre-configured scope."
         },
         {
-          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
+          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
+          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
         }
       ]
     }
