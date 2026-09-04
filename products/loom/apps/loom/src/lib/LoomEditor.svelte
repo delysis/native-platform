@@ -459,6 +459,54 @@
     return true;
   }
 
+  export function insertTextAtSelection(text: string): boolean {
+    if (!view || readonly || composing || !text) return false;
+    view.dispatch(view.state.tr.insertText(
+      text,
+      view.state.selection.from,
+      view.state.selection.to
+    ));
+    projectDocument();
+    view.focus();
+    return true;
+  }
+
+  export function captureTextInsertionAnchor(): {
+    surfaceKey: string;
+    markdown: string;
+    from: number;
+    to: number;
+  } | null {
+    if (!view || readonly || composing) return null;
+    return {
+      surfaceKey,
+      markdown: lastEmitted,
+      from: view.state.selection.from,
+      to: view.state.selection.to
+    };
+  }
+
+  export function insertTextAtAnchor(
+    anchor: { surfaceKey: string; markdown: string; from: number; to: number },
+    text: string
+  ): boolean {
+    if (
+      !view ||
+      readonly ||
+      composing ||
+      !text ||
+      anchor.surfaceKey !== surfaceKey ||
+      anchor.markdown !== lastEmitted ||
+      anchor.from < 0 ||
+      anchor.to < anchor.from ||
+      anchor.to > view.state.doc.content.size
+    ) return false;
+    view.dispatch(view.state.tr.insertText(text, anchor.from, anchor.to));
+    projectDocument();
+    view.focus();
+    return true;
+  }
+
   /** Reassert the current immutable selection without treating it as navigation. */
   export function reconcileCurrentSelection(): boolean {
     if (!view || view.isDestroyed) return false;

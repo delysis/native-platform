@@ -29,3 +29,13 @@ permissions = [
   "allow-model-download-start",
   "allow-model-download-cancel",
 ]
+
+[[set]]
+identifier = "microphone-capture"
+description = "Start, stop, or cancel a user-requested local microphone recording and its local speech-recognition request."
+permissions = [
+  "allow-speech-input-record-start",
+  "allow-speech-input-record-stop",
+  "allow-speech-input-record-cancel",
+  "allow-speech-input-cancel",
+]

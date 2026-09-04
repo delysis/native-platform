@@ -286,6 +286,7 @@
     on:click={() => editor.reconcileCurrentSelection()}
   >Reconcile current selection</button>
   <button type="button" on:mousedown|preventDefault on:click={advanceShuttle}>Advance Shuttle</button>
+  <button type="button" on:mousedown|preventDefault on:click={() => editor.insertTextAtSelection(' dictated')}>Insert transcript</button>
   <button type="button" on:click={replaceManuscriptExternally}>Replace manuscript externally</button>
   <button type="button" on:click={() => formattingMenuConnected = false}>Disconnect formatting editor</button>
   <button type="button" on:click={() => formattingMenuMounted = false}>Destroy formatting menu</button>

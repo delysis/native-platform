@@ -1,10 +1,13 @@
 #![forbid(unsafe_code)]
 
 mod attachments;
+mod co_writer;
 mod context_attachments;
 mod document_watcher;
+mod microphone_capture;
 mod model_catalog;
 mod model_download;
+mod speech_input;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, Metadata};
@@ -62,11 +65,16 @@ use crate::attachments::{
     AttachmentStoreError, LoadedImageAsset, StoredImageAsset, is_canonical_image_asset_file_name,
     read_image_asset, store_image_asset,
 };
+use crate::co_writer::{
+    CoWriterError, CoWriterSummary, apply_to_document as apply_co_writer,
+    delete as delete_co_writer, list as list_co_writers, save_from_document as save_co_writer,
+};
 use crate::context_attachments::{
-    ContextAttachmentError, StoredAttachment, add_document_context, add_document_contexts,
-    document_context as load_document_context, document_context_text as load_document_context_text,
-    import_path as import_context_attachment_path, remove_document_context,
-    resolve_for_generation_with_budget, set_document_context_text as persist_document_context_text,
+    ContextAttachmentError, DocumentContextSnapshot, StoredAttachment,
+    add_document_context_snapshot, document_context_snapshot,
+    import_path as import_context_attachment_path, read_context_media,
+    remove_document_context_snapshot, resolve_for_generation_with_budget,
+    set_document_context_snapshot,
 };
 use crate::document_watcher::DocumentFilesystemWatcher;
 use crate::model_catalog::{ModelCatalogSnapshot, catalog_model_identity, embedded_model_catalog};
@@ -74,6 +82,11 @@ use crate::model_download::{
     ModelDownloadRegistry, ModelDownloadRegistryError, ModelDownloadSnapshot, ModelDownloadSpec,
     ModelLibraryError, ReservationOutcome, model_target_path, prepare_model_library,
 };
+use crate::speech_input::{
+    SpeechInputError, SpeechInputService, SpeechInputSnapshot, SpeechInputTarget,
+    SpeechRecordingSnapshot,
+};
+use speech_native_host::SpeechHostStatus;
 
 const INITIAL_DOCUMENT: &str = "manuscript/Untitled.md";
 const DEFAULT_PROJECT_DIRECTORY: &str = "writing";
@@ -94,6 +107,7 @@ pub const FILE_EXPORT_COPY_MENU_ID: &str = "loom.file.export-copy";
 pub const FILE_COMMAND_EVENT: &str = "loom://file-command";
 const LOOM_ASSET_SCHEME: &str = "loom-asset";
 const LOOM_ASSET_TOKEN_VERSION: &str = "v1";
+const LOOM_CONTEXT_MEDIA_TOKEN_VERSION: &str = "v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -306,6 +320,7 @@ pub struct PluginState {
     model_loads: Arc<ModelLoadRegistry>,
     downloads: Arc<ModelDownloadRegistry>,
     download_workers: DownloadWorkerRegistry,
+    speech_input: SpeechInputService,
     app_local_data_root: Option<PathBuf>,
     isolate_model_discovery: bool,
     build_model_policy: BuildModelPolicy,
@@ -347,6 +362,7 @@ impl PluginState {
             model_loads: Arc::new(ModelLoadRegistry::default()),
             downloads: Arc::new(ModelDownloadRegistry::default()),
             download_workers: DownloadWorkerRegistry::default(),
+            speech_input: SpeechInputService::new(app_local_data_root.clone()),
             app_local_data_root,
             isolate_model_discovery,
             build_model_policy,
@@ -374,6 +390,9 @@ impl Drop for PluginState {
             eprintln!("Loom could not quiesce generation lifecycle during plugin drop: {error}");
         }
         let _desktop_workers = self.join_desktop_workers_for_exit();
+        if let Err(error) = tauri::async_runtime::block_on(self.speech_input.shutdown()) {
+            eprintln!("Loom speech input did not stop during plugin drop: {error}");
+        }
         let _native_runtime = self.native_runtime.shutdown_for_process_exit();
         if let Err(error) = self.generation_lifecycle.close() {
             eprintln!("Loom generation lifecycle did not close during plugin drop: {error}");
@@ -383,6 +402,10 @@ impl Drop for PluginState {
 
 #[derive(Clone, Debug)]
 struct LoadedModel {
+    /// User-visible path that selected this model. This may be a Hugging Face
+    /// snapshot symlink; keep it separate from the canonical execution path so
+    /// sibling artifacts (notably the multimodal projector) remain discoverable.
+    selected_path: PathBuf,
     profile: LocalModelProfile,
     descriptor: VerifiedModelDescriptor,
 }
@@ -1715,6 +1738,7 @@ impl Drop for GenerationWorkerReservation<'_, '_> {
 enum ModelLoadPlan {
     Ready(ModelCapabilitySummary),
     Inspect {
+        selected_path: PathBuf,
         canonical_path: PathBuf,
         profile: LocalModelProfile,
     },
@@ -1723,6 +1747,7 @@ enum ModelLoadPlan {
 enum PolicyModelLoadPlan {
     Ready(ModelCapabilitySummary),
     Inspect {
+        selected_path: PathBuf,
         canonical_path: PathBuf,
         profile: LocalModelProfile,
         expectation: PolicyWriterExpectation,
@@ -1842,6 +1867,17 @@ impl Builder {
                 document_context_remove,
                 document_context_text_get,
                 document_context_text_set,
+                document_context_snapshot_set,
+                co_writer_list,
+                co_writer_save,
+                co_writer_apply,
+                co_writer_delete,
+                speech_input_capabilities,
+                speech_input_record_start,
+                speech_input_record_stop,
+                speech_input_record_cancel,
+                speech_input_status,
+                speech_input_cancel,
                 document_open,
                 document_checkpoint,
                 document_export_choose,
@@ -2005,6 +2041,7 @@ impl IpcFailure {
             ContextAttachmentError::NoRepresentation => "attachment_no_model_representation",
             ContextAttachmentError::ContextLimit => "attachment_context_limit",
             ContextAttachmentError::ManualTextLimit => "attachment_context_text_limit",
+            ContextAttachmentError::TextImportLimit => "attachment_text_import_limit",
             ContextAttachmentError::ContextInvalid => "attachment_context_invalid",
             ContextAttachmentError::Io(_) => "attachment_storage_failed",
             ContextAttachmentError::Json(_) => "attachment_metadata_invalid",
@@ -2013,6 +2050,47 @@ impl IpcFailure {
             code,
             error.to_string(),
             matches!(error, ContextAttachmentError::Io(_)),
+        )
+    }
+
+    fn co_writer(error: &CoWriterError) -> Self {
+        let code = match error {
+            CoWriterError::InvalidName => "co_writer_invalid_name",
+            CoWriterError::Empty => "co_writer_empty",
+            CoWriterError::Limit => "co_writer_limit",
+            CoWriterError::NotFound => "co_writer_not_found",
+            CoWriterError::Invalid => "co_writer_store_invalid",
+            CoWriterError::State => "co_writer_state_unavailable",
+            CoWriterError::Context(_) => "co_writer_context_failed",
+            CoWriterError::Io(_) => "co_writer_storage_failed",
+            CoWriterError::Json(_) => "co_writer_metadata_invalid",
+        };
+        Self::new(
+            code,
+            error.to_string(),
+            matches!(error, CoWriterError::Io(_) | CoWriterError::State),
+        )
+    }
+
+    fn speech_input(error: &SpeechInputError) -> Self {
+        let code = match error {
+            SpeechInputError::Host(_) => "speech_host_failed",
+            SpeechInputError::State => "speech_state_unavailable",
+            SpeechInputError::Capacity => "speech_session_limit",
+            SpeechInputError::NotFound => "speech_request_not_found",
+            SpeechInputError::Scope => "speech_request_scope_mismatch",
+            SpeechInputError::InvalidWav => "speech_invalid_wav",
+            SpeechInputError::Microphone(_) => "microphone_capture_failed",
+            SpeechInputError::RecordingNotFound => "microphone_recording_not_found",
+            SpeechInputError::RecordingScope => "microphone_recording_scope_mismatch",
+            SpeechInputError::Backend(_) => "speech_backend_failed",
+            SpeechInputError::Unavailable(_) => "speech_backend_unavailable",
+            SpeechInputError::Task(_) => "speech_worker_failed",
+        };
+        Self::new(
+            code,
+            error.to_string(),
+            matches!(error, SpeechInputError::Host(_) | SpeechInputError::Task(_)),
         )
     }
 
@@ -2978,6 +3056,8 @@ fn close_project_with_wait(
                 false,
             )
         })?;
+    tauri::async_runtime::block_on(state.speech_input.cancel_scope(&project_id, &session_id))
+        .map_err(|error| IpcFailure::speech_input(&error))?;
     cancel_and_drain_generation_session(
         state,
         typed_project_id,
@@ -3284,20 +3364,61 @@ fn import_context_attachment_paths_for_session(
         .map_err(|error| IpcFailure::context_attachment(&error))
 }
 
+fn bind_context_media_tokens(
+    mut snapshot: DocumentContextSnapshot,
+    project_id: &str,
+    session_id: &str,
+    document_id: &str,
+) -> Result<DocumentContextSnapshot, IpcFailure> {
+    let project_id = project_id
+        .parse::<ProjectId>()
+        .map_err(|_| IpcFailure::new("invalid_project_id", "the project ID is invalid", false))?;
+    let session_id = session_id.parse::<CommandId>().map_err(|_| {
+        IpcFailure::new(
+            "invalid_session_id",
+            "the project session ID is invalid",
+            false,
+        )
+    })?;
+    let document_id = document_id
+        .parse::<DocumentId>()
+        .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
+    for attachment in &mut snapshot.attachments {
+        for media in &mut attachment.media {
+            media.preview_token = loom_context_media_token(
+                project_id,
+                session_id,
+                document_id,
+                &attachment.id,
+                &media.sha256,
+            );
+            if media.preview_token.is_none() {
+                return Err(IpcFailure::new(
+                    "attachment_context_invalid",
+                    "the selected context media identity is invalid",
+                    false,
+                ));
+            }
+        }
+    }
+    Ok(snapshot)
+}
+
 #[tauri::command]
 async fn document_context_list(
     project_id: String,
     session_id: String,
     document_id: String,
     state: State<'_, PluginState>,
-) -> Result<Vec<StoredAttachment>, IpcFailure> {
+) -> Result<DocumentContextSnapshot, IpcFailure> {
     let _ = document_id
         .parse::<DocumentId>()
         .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    load_document_context(store.root(), &document_id)
-        .map_err(|error| IpcFailure::context_attachment(&error))
+    let snapshot = document_context_snapshot(store.root(), &document_id)
+        .map_err(|error| IpcFailure::context_attachment(&error))?;
+    bind_context_media_tokens(snapshot, &project_id, &session_id, &document_id)
 }
 
 #[tauri::command]
@@ -3307,15 +3428,16 @@ async fn document_context_add(
     document_id: String,
     attachment_id: String,
     state: State<'_, PluginState>,
-) -> Result<Vec<StoredAttachment>, IpcFailure> {
+) -> Result<DocumentContextSnapshot, IpcFailure> {
     let _ = document_id
         .parse::<DocumentId>()
         .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
     let _application_admission = lock_application_admission(&state, "document context update")?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    add_document_context(store.root(), &document_id, &attachment_id)
-        .map_err(|error| IpcFailure::context_attachment(&error))
+    let snapshot = add_document_context_snapshot(store.root(), &document_id, &[attachment_id])
+        .map_err(|error| IpcFailure::context_attachment(&error))?;
+    bind_context_media_tokens(snapshot, &project_id, &session_id, &document_id)
 }
 
 #[tauri::command]
@@ -3325,7 +3447,7 @@ async fn document_context_add_many(
     document_id: String,
     attachment_ids: Vec<String>,
     state: State<'_, PluginState>,
-) -> Result<Vec<StoredAttachment>, IpcFailure> {
+) -> Result<DocumentContextSnapshot, IpcFailure> {
     let _ = document_id
         .parse::<DocumentId>()
         .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
@@ -3339,8 +3461,9 @@ async fn document_context_add_many(
     let _application_admission = lock_application_admission(&state, "document context update")?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    add_document_contexts(store.root(), &document_id, &attachment_ids)
-        .map_err(|error| IpcFailure::context_attachment(&error))
+    let snapshot = add_document_context_snapshot(store.root(), &document_id, &attachment_ids)
+        .map_err(|error| IpcFailure::context_attachment(&error))?;
+    bind_context_media_tokens(snapshot, &project_id, &session_id, &document_id)
 }
 
 #[tauri::command]
@@ -3350,15 +3473,16 @@ async fn document_context_remove(
     document_id: String,
     attachment_id: String,
     state: State<'_, PluginState>,
-) -> Result<Vec<StoredAttachment>, IpcFailure> {
+) -> Result<DocumentContextSnapshot, IpcFailure> {
     let _ = document_id
         .parse::<DocumentId>()
         .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
     let _application_admission = lock_application_admission(&state, "document context update")?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    remove_document_context(store.root(), &document_id, &attachment_id)
-        .map_err(|error| IpcFailure::context_attachment(&error))
+    let snapshot = remove_document_context_snapshot(store.root(), &document_id, &attachment_id)
+        .map_err(|error| IpcFailure::context_attachment(&error))?;
+    bind_context_media_tokens(snapshot, &project_id, &session_id, &document_id)
 }
 
 #[tauri::command]
@@ -3373,7 +3497,8 @@ async fn document_context_text_get(
         .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    load_document_context_text(store.root(), &document_id)
+    document_context_snapshot(store.root(), &document_id)
+        .map(|snapshot| snapshot.markdown)
         .map_err(|error| IpcFailure::context_attachment(&error))
 }
 
@@ -3391,8 +3516,224 @@ async fn document_context_text_set(
     let _application_admission = lock_application_admission(&state, "document context update")?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    persist_document_context_text(store.root(), &document_id, text)
+    let attachment_ids = document_context_snapshot(store.root(), &document_id)
+        .map_err(|error| IpcFailure::context_attachment(&error))?
+        .attachments
+        .into_iter()
+        .map(|attachment| attachment.id)
+        .collect::<Vec<_>>();
+    set_document_context_snapshot(store.root(), &document_id, &text, &attachment_ids)
+        .map(|snapshot| snapshot.markdown)
         .map_err(|error| IpcFailure::context_attachment(&error))
+}
+
+#[tauri::command]
+async fn document_context_snapshot_set(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    markdown: String,
+    attachment_ids: Vec<String>,
+    state: State<'_, PluginState>,
+) -> Result<DocumentContextSnapshot, IpcFailure> {
+    let _ = document_id
+        .parse::<DocumentId>()
+        .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
+    let _application_admission = lock_application_admission(&state, "document context update")?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    let snapshot =
+        set_document_context_snapshot(store.root(), &document_id, &markdown, &attachment_ids)
+            .map_err(|error| IpcFailure::context_attachment(&error))?;
+    bind_context_media_tokens(snapshot, &project_id, &session_id, &document_id)
+}
+
+#[tauri::command]
+async fn co_writer_list(
+    project_id: String,
+    session_id: String,
+    state: State<'_, PluginState>,
+) -> Result<Vec<CoWriterSummary>, IpcFailure> {
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    list_co_writers(store.root()).map_err(|error| IpcFailure::co_writer(&error))
+}
+
+#[tauri::command]
+async fn co_writer_save(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    name: String,
+    state: State<'_, PluginState>,
+) -> Result<CoWriterSummary, IpcFailure> {
+    let _ = document_id
+        .parse::<DocumentId>()
+        .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
+    let _application_admission = lock_application_admission(&state, "co-writer update")?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    save_co_writer(store.root(), &document_id, &name, now_unix_ms())
+        .map_err(|error| IpcFailure::co_writer(&error))
+}
+
+#[tauri::command]
+async fn co_writer_apply(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    profile_id: String,
+    state: State<'_, PluginState>,
+) -> Result<DocumentContextSnapshot, IpcFailure> {
+    let _ = document_id
+        .parse::<DocumentId>()
+        .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
+    let _application_admission = lock_application_admission(&state, "co-writer selection")?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    let snapshot = apply_co_writer(store.root(), &document_id, &profile_id)
+        .map_err(|error| IpcFailure::co_writer(&error))?;
+    bind_context_media_tokens(snapshot, &project_id, &session_id, &document_id)
+}
+
+#[tauri::command]
+async fn co_writer_delete(
+    project_id: String,
+    session_id: String,
+    profile_id: String,
+    state: State<'_, PluginState>,
+) -> Result<Vec<CoWriterSummary>, IpcFailure> {
+    let _application_admission = lock_application_admission(&state, "co-writer update")?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    delete_co_writer(store.root(), &profile_id).map_err(|error| IpcFailure::co_writer(&error))
+}
+
+#[tauri::command]
+async fn speech_input_capabilities(
+    project_id: String,
+    session_id: String,
+    state: State<'_, PluginState>,
+) -> Result<SpeechHostStatus, IpcFailure> {
+    {
+        let mut session = lock_session(&state)?;
+        let _ = require_bound_store(&mut session, &project_id, &session_id)?;
+    }
+    state
+        .speech_input
+        .capability_status()
+        .await
+        .map_err(|error| IpcFailure::speech_input(&error))
+}
+
+#[tauri::command]
+async fn speech_input_record_start(
+    project_id: String,
+    session_id: String,
+    document_id: String,
+    target: SpeechInputTarget,
+    state: State<'_, PluginState>,
+) -> Result<SpeechRecordingSnapshot, IpcFailure> {
+    let _ = document_id
+        .parse::<DocumentId>()
+        .map_err(|_| IpcFailure::new("invalid_document_id", "the document ID is invalid", false))?;
+    {
+        let _application_admission = lock_application_admission(&state, "speech input")?;
+        let mut session = lock_session(&state)?;
+        let _ = require_bound_store(&mut session, &project_id, &session_id)?;
+    }
+    let recording = state
+        .speech_input
+        .record_start(project_id.clone(), session_id.clone(), document_id, target)
+        .await
+        .map_err(|error| IpcFailure::speech_input(&error))?;
+    let authority = (|| {
+        let _application_admission = lock_application_admission(&state, "speech input")?;
+        let mut session = lock_session(&state)?;
+        let _ = require_bound_store(&mut session, &project_id, &session_id)?;
+        Ok::<(), IpcFailure>(())
+    })();
+    if let Err(error) = authority {
+        let _ = state
+            .speech_input
+            .record_cancel(&project_id, &session_id, &recording.recording_id)
+            .await;
+        return Err(error);
+    }
+    Ok(recording)
+}
+
+#[tauri::command]
+async fn speech_input_record_stop(
+    project_id: String,
+    session_id: String,
+    recording_id: String,
+    state: State<'_, PluginState>,
+) -> Result<SpeechInputSnapshot, IpcFailure> {
+    {
+        let _application_admission = lock_application_admission(&state, "speech input")?;
+        let mut session = lock_session(&state)?;
+        let _ = require_bound_store(&mut session, &project_id, &session_id)?;
+    }
+    state
+        .speech_input
+        .record_stop(&project_id, &session_id, &recording_id)
+        .await
+        .map_err(|error| IpcFailure::speech_input(&error))
+}
+
+#[tauri::command]
+async fn speech_input_record_cancel(
+    project_id: String,
+    session_id: String,
+    recording_id: String,
+    state: State<'_, PluginState>,
+) -> Result<SpeechRecordingSnapshot, IpcFailure> {
+    {
+        let mut session = lock_session(&state)?;
+        let _ = require_bound_store(&mut session, &project_id, &session_id)?;
+    }
+    state
+        .speech_input
+        .record_cancel(&project_id, &session_id, &recording_id)
+        .await
+        .map_err(|error| IpcFailure::speech_input(&error))
+}
+
+#[tauri::command]
+async fn speech_input_status(
+    project_id: String,
+    session_id: String,
+    request_id: String,
+    state: State<'_, PluginState>,
+) -> Result<SpeechInputSnapshot, IpcFailure> {
+    {
+        let mut session = lock_session(&state)?;
+        let _ = require_bound_store(&mut session, &project_id, &session_id)?;
+    }
+    state
+        .speech_input
+        .status(&project_id, &session_id, &request_id)
+        .await
+        .map_err(|error| IpcFailure::speech_input(&error))
+}
+
+#[tauri::command]
+async fn speech_input_cancel(
+    project_id: String,
+    session_id: String,
+    request_id: String,
+    state: State<'_, PluginState>,
+) -> Result<SpeechInputSnapshot, IpcFailure> {
+    {
+        let mut session = lock_session(&state)?;
+        let _ = require_bound_store(&mut session, &project_id, &session_id)?;
+    }
+    state
+        .speech_input
+        .cancel(&project_id, &session_id, &request_id)
+        .await
+        .map_err(|error| IpcFailure::speech_input(&error))
 }
 
 fn ingest_image_attachment_for_session(
@@ -3423,6 +3764,21 @@ struct LoomAssetAuthority {
     project_root: PathBuf,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoomContextMediaRequest {
+    project_id: ProjectId,
+    session_id: CommandId,
+    document_id: DocumentId,
+    attachment_id: String,
+    media_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LoadedProtocolAsset {
+    bytes: Vec<u8>,
+    media_type: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LoomAssetReadFailure {
     NotFound,
@@ -3440,6 +3796,73 @@ fn loom_asset_token(
     Some(format!(
         "{LOOM_ASSET_TOKEN_VERSION}-{project_id}-{session_id}-{file_name}"
     ))
+}
+
+fn loom_context_media_token(
+    project_id: ProjectId,
+    session_id: CommandId,
+    document_id: DocumentId,
+    attachment_id: &str,
+    media_sha256: &str,
+) -> Option<String> {
+    let valid_digest = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !valid_digest(attachment_id) || !valid_digest(media_sha256) {
+        return None;
+    }
+    Some(format!(
+        "{LOOM_CONTEXT_MEDIA_TOKEN_VERSION}-{project_id}-{session_id}-{document_id}-{attachment_id}-{media_sha256}"
+    ))
+}
+
+fn parse_loom_context_media_uri(uri: &http::Uri) -> Option<LoomContextMediaRequest> {
+    let canonical_origin = matches!(
+        (
+            uri.scheme_str(),
+            uri.authority().map(http::uri::Authority::as_str)
+        ),
+        (Some(LOOM_ASSET_SCHEME), Some("localhost")) | (Some("http"), Some("loom-asset.localhost"))
+    );
+    if !canonical_origin || uri.query().is_some() {
+        return None;
+    }
+    let token = uri.path().strip_prefix('/')?;
+    if token.contains('/') || !token.is_ascii() || token.contains('%') {
+        return None;
+    }
+    let mut parts = token.split('-');
+    if parts.next()? != LOOM_CONTEXT_MEDIA_TOKEN_VERSION {
+        return None;
+    }
+    let project_id = parts.next()?.parse::<ProjectId>().ok()?;
+    let session_id = parts.next()?.parse::<CommandId>().ok()?;
+    let document_id = parts.next()?.parse::<DocumentId>().ok()?;
+    let attachment_id = parts.next()?.to_owned();
+    let media_sha256 = parts.next()?.to_owned();
+    if parts.next().is_some()
+        || loom_context_media_token(
+            project_id,
+            session_id,
+            document_id,
+            &attachment_id,
+            &media_sha256,
+        )
+        .as_deref()
+            != Some(token)
+    {
+        return None;
+    }
+    Some(LoomContextMediaRequest {
+        project_id,
+        session_id,
+        document_id,
+        attachment_id,
+        media_sha256,
+    })
 }
 
 fn parse_loom_asset_uri(uri: &http::Uri) -> Option<LoomAssetRequest> {
@@ -3482,8 +3905,13 @@ fn parse_loom_asset_uri(uri: &http::Uri) -> Option<LoomAssetRequest> {
 fn read_authorized_loom_asset(
     state: &PluginState,
     request: &LoomAssetRequest,
-) -> Result<LoadedImageAsset, LoomAssetReadFailure> {
-    read_authorized_loom_asset_with(state, request, read_image_asset)
+) -> Result<LoadedProtocolAsset, LoomAssetReadFailure> {
+    read_authorized_loom_asset_with(state, request, read_image_asset).map(|asset| {
+        LoadedProtocolAsset {
+            bytes: asset.bytes,
+            media_type: asset.media_type.to_owned(),
+        }
+    })
 }
 
 fn read_authorized_loom_asset_with(
@@ -3507,22 +3935,29 @@ fn capture_loom_asset_authority(
     state: &PluginState,
     request: &LoomAssetRequest,
 ) -> Result<LoomAssetAuthority, LoomAssetReadFailure> {
+    capture_loom_asset_authority_for(state, request.project_id, request.session_id)
+}
+
+fn capture_loom_asset_authority_for(
+    state: &PluginState,
+    project_id: ProjectId,
+    session_id: CommandId,
+) -> Result<LoomAssetAuthority, LoomAssetReadFailure> {
     let session = state
         .session
         .lock()
         .map_err(|_| LoomAssetReadFailure::Unavailable)?;
-    if session.phase != SessionPhase::Open || session.active_session_id != Some(request.session_id)
-    {
+    if session.phase != SessionPhase::Open || session.active_session_id != Some(session_id) {
         return Err(LoomAssetReadFailure::NotFound);
     }
     let store = session
         .store
         .as_ref()
-        .filter(|store| store.manifest().project_id == request.project_id)
+        .filter(|store| store.manifest().project_id == project_id)
         .ok_or(LoomAssetReadFailure::NotFound)?;
     Ok(LoomAssetAuthority {
-        project_id: request.project_id,
-        session_id: request.session_id,
+        project_id,
+        session_id,
         project_root: store.root().to_path_buf(),
     })
 }
@@ -3541,6 +3976,40 @@ fn loom_asset_authority_is_current(
             store.manifest().project_id == authority.project_id
                 && store.root() == authority.project_root
         }))
+}
+
+fn read_authorized_context_media(
+    state: &PluginState,
+    request: &LoomContextMediaRequest,
+) -> Result<LoadedProtocolAsset, LoomAssetReadFailure> {
+    let authority =
+        capture_loom_asset_authority_for(state, request.project_id, request.session_id)?;
+    let snapshot =
+        document_context_snapshot(&authority.project_root, &request.document_id.to_string())
+            .map_err(|_| LoomAssetReadFailure::NotFound)?;
+    let selected = snapshot.attachments.iter().any(|attachment| {
+        attachment.id == request.attachment_id
+            && attachment
+                .media
+                .iter()
+                .any(|media| media.sha256 == request.media_sha256)
+    });
+    if !selected {
+        return Err(LoomAssetReadFailure::NotFound);
+    }
+    let media = read_context_media(
+        &authority.project_root,
+        &request.attachment_id,
+        &request.media_sha256,
+    )
+    .map_err(|_| LoomAssetReadFailure::NotFound)?;
+    if !loom_asset_authority_is_current(state, &authority)? {
+        return Err(LoomAssetReadFailure::NotFound);
+    }
+    Ok(LoadedProtocolAsset {
+        bytes: media.bytes,
+        media_type: media.mime_type,
+    })
 }
 
 fn loom_asset_protocol_response(
@@ -3562,14 +4031,22 @@ fn loom_asset_protocol_response(
     if !request.body().is_empty() {
         return empty_loom_asset_response(http::StatusCode::BAD_REQUEST);
     }
-    if request.headers().contains_key(http::header::RANGE) {
-        return empty_loom_asset_response(http::StatusCode::RANGE_NOT_SATISFIABLE);
-    }
-    let Some(asset_request) = parse_loom_asset_uri(request.uri()) else {
+    let range = match request.headers().get(http::header::RANGE) {
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value),
+            Err(_) => return empty_loom_asset_response(http::StatusCode::RANGE_NOT_SATISFIABLE),
+        },
+        None => None,
+    };
+    let asset = if let Some(asset_request) = parse_loom_asset_uri(request.uri()) {
+        read_authorized_loom_asset(state, &asset_request)
+    } else if let Some(media_request) = parse_loom_context_media_uri(request.uri()) {
+        read_authorized_context_media(state, &media_request)
+    } else {
         return empty_loom_asset_response(http::StatusCode::BAD_REQUEST);
     };
-    match read_authorized_loom_asset(state, &asset_request) {
-        Ok(asset) => successful_loom_asset_response(asset, is_head),
+    match asset {
+        Ok(asset) => successful_loom_asset_response(asset, is_head, range),
         Err(LoomAssetReadFailure::NotFound) => {
             empty_loom_asset_response(http::StatusCode::NOT_FOUND)
         }
@@ -3580,19 +4057,75 @@ fn loom_asset_protocol_response(
 }
 
 fn successful_loom_asset_response(
-    asset: LoadedImageAsset,
+    asset: LoadedProtocolAsset,
     is_head: bool,
+    range: Option<&str>,
 ) -> http::Response<Vec<u8>> {
-    let content_length = asset.bytes.len();
-    let body = if is_head { Vec::new() } else { asset.bytes };
-    http::Response::builder()
-        .status(http::StatusCode::OK)
+    let total = asset.bytes.len();
+    let Some((start, end)) = range.map_or(Some((0, total.saturating_sub(1))), |value| {
+        parse_single_byte_range(value, total)
+    }) else {
+        return http::Response::builder()
+            .status(http::StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(http::header::CONTENT_LENGTH, "0")
+            .header(http::header::CONTENT_RANGE, format!("bytes */{total}"))
+            .header(http::header::ACCEPT_RANGES, "bytes")
+            .header(http::header::CACHE_CONTROL, "no-store")
+            .header("x-content-type-options", "nosniff")
+            .body(Vec::new())
+            .expect("static Loom range rejection headers are valid");
+    };
+    let ranged = range.is_some();
+    let content_length = if total == 0 { 0 } else { end - start + 1 };
+    let body = if is_head || total == 0 {
+        Vec::new()
+    } else {
+        asset.bytes[start..=end].to_vec()
+    };
+    let mut response = http::Response::builder()
+        .status(if ranged {
+            http::StatusCode::PARTIAL_CONTENT
+        } else {
+            http::StatusCode::OK
+        })
         .header(http::header::CONTENT_TYPE, asset.media_type)
         .header(http::header::CONTENT_LENGTH, content_length.to_string())
+        .header(http::header::ACCEPT_RANGES, "bytes")
         .header(http::header::CACHE_CONTROL, "no-store")
-        .header("x-content-type-options", "nosniff")
+        .header("x-content-type-options", "nosniff");
+    if ranged {
+        response = response.header(
+            http::header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{total}"),
+        );
+    }
+    response
         .body(body)
-        .expect("static Loom asset response headers are valid")
+        .unwrap_or_else(|_| empty_loom_asset_response(http::StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+fn parse_single_byte_range(value: &str, total: usize) -> Option<(usize, usize)> {
+    if total == 0 || value.contains(',') {
+        return None;
+    }
+    let value = value.strip_prefix("bytes=")?;
+    let (start, end) = value.split_once('-')?;
+    match (start.is_empty(), end.is_empty()) {
+        (false, false) => {
+            let start = start.parse::<usize>().ok()?;
+            let end = end.parse::<usize>().ok()?.min(total - 1);
+            (start <= end && start < total).then_some((start, end))
+        }
+        (false, true) => {
+            let start = start.parse::<usize>().ok()?;
+            (start < total).then_some((start, total - 1))
+        }
+        (true, false) => {
+            let suffix = end.parse::<usize>().ok()?;
+            (suffix > 0).then_some((total.saturating_sub(suffix.min(total)), total - 1))
+        }
+        (true, true) => None,
+    }
 }
 
 fn empty_loom_asset_response(status: http::StatusCode) -> http::Response<Vec<u8>> {
@@ -4610,7 +5143,7 @@ async fn model_list(
         .models
         .into_iter()
         .map(|model| {
-            let model_path = model.resolved_path.to_string_lossy().into_owned();
+            let model_path = model.selected_path.to_string_lossy().into_owned();
             let display_name = model
                 .selected_path
                 .file_name()
@@ -4713,13 +5246,13 @@ async fn model_choose<R: Runtime>(
             false,
         ));
     }
-    remember_user_model_path(&state, selected.resolved_path.clone())?;
-    let canonical_path = selected.resolved_path.to_string_lossy().into_owned();
+    remember_user_model_path(&state, selected.selected_path.clone())?;
+    let selected_path = selected.selected_path.to_string_lossy().into_owned();
     drop(application_admission);
     model_list(state)
         .await?
         .into_iter()
-        .find(|model| model.model_path == canonical_path)
+        .find(|model| model.model_path == selected_path)
         .map(Some)
         .ok_or_else(|| {
             IpcFailure::new(
@@ -4742,15 +5275,17 @@ async fn model_load<R: Runtime>(
         let plan = prepare_model_load(&model_path, &state)?;
         (model_load, plan)
     };
-    let (canonical_path, profile) = match plan {
+    let (selected_path, canonical_path, profile) = match plan {
         ModelLoadPlan::Ready(summary) => return Ok(summary),
         ModelLoadPlan::Inspect {
+            selected_path,
             canonical_path,
             profile,
-        } => (canonical_path, profile),
+        } => (selected_path, canonical_path, profile),
     };
     let worker_app = app.clone();
     let worker_path = canonical_path.clone();
+    let worker_selected_path = selected_path;
     let worker_profile = profile.clone();
     let cleanup_profile = profile;
     let backend = Arc::clone(&state.backend);
@@ -4766,6 +5301,7 @@ async fn model_load<R: Runtime>(
                 &worker_state,
                 &worker_path,
                 LoadedModel {
+                    selected_path: worker_selected_path,
                     profile: worker_profile,
                     descriptor,
                 },
@@ -4837,16 +5373,18 @@ async fn model_load_exact_writer<R: Runtime>(
         let plan = prepare_exact_model_load(expectation, &model_path, &state)?;
         (model_load, plan)
     };
-    let (canonical_path, profile, expectation) = match plan {
+    let (selected_path, canonical_path, profile, expectation) = match plan {
         PolicyModelLoadPlan::Ready(summary) => return Ok(summary),
         PolicyModelLoadPlan::Inspect {
+            selected_path,
             canonical_path,
             profile,
             expectation,
-        } => (canonical_path, profile, expectation),
+        } => (selected_path, canonical_path, profile, expectation),
     };
     let worker_app = app.clone();
     let worker_path = canonical_path.clone();
+    let worker_selected_path = selected_path;
     let worker_profile = profile.clone();
     let cleanup_profile = profile;
     let worker_expectation = expectation.clone();
@@ -4878,6 +5416,7 @@ async fn model_load_exact_writer<R: Runtime>(
                 &worker_state,
                 &worker_path,
                 LoadedModel {
+                    selected_path: worker_selected_path,
                     profile: worker_profile,
                     descriptor,
                 },
@@ -4918,7 +5457,21 @@ fn prepare_exact_model_load(
         )
     })?;
     ensure_model_path_in_isolated_library(state, &canonical_path)?;
-    let discovered = discover_strict_policy_candidate(&canonical_path)?;
+    // Exact identity is enforced against the canonical target below, but the
+    // selected path is intentionally retained. Hugging Face snapshots expose
+    // named GGUF symlinks whose canonical targets are extensionless blobs, and
+    // the matching projector lives beside the named snapshot entry.
+    let discovered = discover_strict_policy_candidate(&requested).or_else(|direct_error| {
+        discover_loadable_model(state, &canonical_path).map_err(|_| direct_error)
+    })?;
+    if discovered.resolved_path != canonical_path {
+        return Err(IpcFailure::new(
+            "policy_model_file_changed",
+            "the selected writing model changed while Loom resolved its local identity",
+            true,
+        ));
+    }
+    let selected_path = discovered.selected_path;
     if discovered.file_bytes != expectation.model_file_bytes {
         return Err(IpcFailure::new(
             "policy_model_size_mismatch",
@@ -4937,16 +5490,7 @@ fn prepare_exact_model_load(
         expectation.projector_sha256.as_deref(),
         expectation.projector_file_bytes,
     ) {
-        let projector_path = canonical_path
-            .parent()
-            .ok_or_else(|| {
-                IpcFailure::new(
-                    "catalog_projector_path_invalid",
-                    "the catalog model has no model-library parent directory",
-                    false,
-                )
-            })?
-            .join(projector_name)
+        let projector_path = sibling_catalog_artifact_path(&selected_path, projector_name)?
             .canonicalize()
             .map_err(|_| {
                 IpcFailure::new(
@@ -5013,10 +5557,27 @@ fn prepare_exact_model_load(
         previous,
     };
     Ok(PolicyModelLoadPlan::Inspect {
+        selected_path,
         canonical_path: canonical_path.clone(),
         profile,
         expectation,
     })
+}
+
+fn sibling_catalog_artifact_path(
+    selected_model_path: &Path,
+    artifact_name: &str,
+) -> Result<PathBuf, IpcFailure> {
+    selected_model_path
+        .parent()
+        .map(|parent| parent.join(artifact_name))
+        .ok_or_else(|| {
+            IpcFailure::new(
+                "catalog_projector_path_invalid",
+                "the catalog model has no model-library parent directory",
+                false,
+            )
+        })
 }
 
 fn policy_writer_expectation(
@@ -5372,6 +5933,7 @@ fn prepare_model_load(
     })?;
     ensure_model_path_in_isolated_library(state, &canonical)?;
     let discovered = discover_loadable_model(state, &canonical)?;
+    let selected_path = discovered.selected_path.clone();
     let _lifecycle = lock_model_lifecycle(state)?;
     let mut registry = lock_model_registry(state)?;
     match &*registry {
@@ -5416,6 +5978,7 @@ fn prepare_model_load(
         previous,
     };
     Ok(ModelLoadPlan::Inspect {
+        selected_path,
         canonical_path: canonical,
         profile: model_profile_for_current_memory(
             discovered.resolved_path,
@@ -6055,11 +6618,18 @@ fn discover_loadable_model(
 /// an open identity handle, unchanged path identity, native inspection, and
 /// the required raw-completion capabilities before committing residency.
 fn discover_strict_policy_candidate(
-    canonical: &Path,
+    selected_path: &Path,
 ) -> Result<loom_backend_llama::DiscoveredGguf, IpcFailure> {
+    let canonical = selected_path.canonicalize().map_err(|error| {
+        IpcFailure::new(
+            "policy_model_path_error",
+            format!("the policy model path cannot be opened: {error}"),
+            false,
+        )
+    })?;
     let report = discover_gguf_models(&ModelDiscoveryOptions {
         hugging_face_cache_roots: Vec::new(),
-        user_paths: vec![canonical.to_path_buf()],
+        user_paths: vec![selected_path.to_path_buf()],
         max_entries: 1,
         max_depth: 1,
     })
@@ -6297,7 +6867,7 @@ fn model_summary(
             .capabilities
             .log_probability_stages
             .is_empty(),
-        model_path: model.profile.model_path.to_string_lossy().into_owned(),
+        model_path: model.selected_path.to_string_lossy().into_owned(),
         file_bytes: model.descriptor.model_file_bytes,
         header_verified,
         architecture: model.descriptor.architecture.clone(),
@@ -9209,6 +9779,8 @@ fn application_close<R: Runtime>(
             true,
         )
     })?;
+    tauri::async_runtime::block_on(state.speech_input.shutdown())
+        .map_err(|error| IpcFailure::speech_input(&error))?;
     let desktop_workers = state.join_desktop_workers()?;
     let _model_lifecycle = lock_model_lifecycle(&state)?;
     let mut model_registry = lock_model_registry(&state)?;
@@ -10320,6 +10892,7 @@ mod tests {
     fn test_loaded_model(path: &Path, stable_model_id: &str) -> LoadedModel {
         let expectation = test_policy_expectation(stable_model_id.as_bytes());
         LoadedModel {
+            selected_path: path.to_path_buf(),
             profile: LocalModelProfile::for_gguf(path),
             descriptor: test_descriptor(path, &expectation, stable_model_id),
         }
@@ -10330,6 +10903,7 @@ mod tests {
         let expectation =
             policy_writer_expectation(policy, writer.profile_id()).expect("known writer policy");
         LoadedModel {
+            selected_path: path.to_path_buf(),
             profile: LocalModelProfile::for_gguf(path),
             descriptor: test_descriptor(path, &expectation, "policy-writer"),
         }
@@ -10438,6 +11012,57 @@ mod tests {
             .expect("strict policy path is independently rediscovered");
         assert_eq!(reopened.resolved_path, canonical);
         assert!(matches!(reopened.header, GgufHeaderStatus::Verified));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_policy_candidate_preserves_hugging_face_snapshot_alias() {
+        let temporary = tempfile::tempdir().expect("temporary model directory");
+        let blobs = temporary.path().join("blobs");
+        let snapshot = temporary.path().join("snapshots/revision");
+        std::fs::create_dir_all(&blobs).expect("create blobs directory");
+        std::fs::create_dir_all(&snapshot).expect("create snapshot directory");
+        let blob = blobs.join("extensionless-model-digest");
+        std::fs::write(&blob, b"GGUFsnapshot-symlink-fixture").expect("write model blob");
+        let alias = snapshot.join("writer.gguf");
+        std::os::unix::fs::symlink(&blob, &alias).expect("create snapshot symlink");
+
+        let reopened = discover_strict_policy_candidate(&alias)
+            .expect("strict policy discovery accepts the named snapshot alias");
+
+        assert_eq!(reopened.selected_path, alias);
+        assert_eq!(
+            reopened.resolved_path,
+            blob.canonicalize().expect("canonical blob")
+        );
+    }
+
+    #[test]
+    fn catalog_projector_is_resolved_beside_selected_alias_not_canonical_blob() {
+        let selected = Path::new("/cache/snapshots/revision/writer.gguf");
+        let canonical = Path::new("/cache/blobs/model-digest");
+
+        let projector = sibling_catalog_artifact_path(selected, "mmproj-writer-f16.gguf")
+            .expect("selected model has a parent");
+
+        assert_eq!(
+            projector,
+            Path::new("/cache/snapshots/revision/mmproj-writer-f16.gguf")
+        );
+        assert_ne!(projector.parent(), canonical.parent());
+    }
+
+    #[test]
+    fn loaded_model_summary_preserves_selected_alias_and_canonical_execution_path() {
+        let selected = Path::new("/cache/snapshots/revision/writer.gguf");
+        let canonical = Path::new("/cache/blobs/model-digest");
+        let mut loaded = test_loaded_model(canonical, "alias-preserved");
+        loaded.selected_path = selected.to_path_buf();
+
+        let summary = model_summary(&loaded, true, &BuildModelPolicy::none_v1());
+
+        assert_eq!(summary.model_path, selected.to_string_lossy());
+        assert_eq!(loaded.profile.model_path, canonical);
     }
 
     #[test]
@@ -13213,10 +13838,14 @@ mod tests {
             .header(http::header::RANGE, "bytes=0-1")
             .body(Vec::new())
             .expect("range request");
+        let ranged = loom_asset_protocol_response(&state, "main", &ranged);
+        assert_eq!(ranged.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(ranged.body(), &png[..2]);
         assert_eq!(
-            loom_asset_protocol_response(&state, "main", &ranged).status(),
-            http::StatusCode::RANGE_NOT_SATISFIABLE
+            ranged.headers()[http::header::CONTENT_RANGE],
+            format!("bytes 0-1/{}", png.len())
         );
+        assert_eq!(ranged.headers()[http::header::ACCEPT_RANGES], "bytes");
         assert_eq!(
             loom_asset_protocol_response(&state, "main", &request(&mac_uri_a, http::Method::POST),)
                 .status(),
@@ -13333,6 +13962,61 @@ mod tests {
                 .parse::<http::Uri>()
                 .expect("syntactically valid URI");
             assert_eq!(parse_loom_asset_uri(&uri), None, "accepted {rejected}");
+        }
+    }
+
+    #[test]
+    fn context_media_protocol_token_binds_every_authority_dimension() {
+        let project_id = ProjectId::new();
+        let session_id = CommandId::new();
+        let document_id = DocumentId::new();
+        let attachment_id = "a".repeat(64);
+        let media_sha256 = "b".repeat(64);
+        let token = loom_context_media_token(
+            project_id,
+            session_id,
+            document_id,
+            &attachment_id,
+            &media_sha256,
+        )
+        .expect("canonical context media token");
+        let uri = format!("loom-asset://localhost/{token}")
+            .parse::<http::Uri>()
+            .expect("context media URI");
+        assert_eq!(
+            parse_loom_context_media_uri(&uri),
+            Some(LoomContextMediaRequest {
+                project_id,
+                session_id,
+                document_id,
+                attachment_id: attachment_id.clone(),
+                media_sha256: media_sha256.clone(),
+            })
+        );
+        let tampered = format!(
+            "loom-asset://localhost/v2-{project_id}-{session_id}-{document_id}-{attachment_id}-{}",
+            "B".repeat(64)
+        )
+        .parse::<http::Uri>()
+        .expect("syntactically valid tampered URI");
+        assert_eq!(parse_loom_context_media_uri(&tampered), None);
+    }
+
+    #[test]
+    fn asset_protocol_accepts_only_one_satisfiable_byte_range() {
+        assert_eq!(parse_single_byte_range("bytes=2-4", 10), Some((2, 4)));
+        assert_eq!(parse_single_byte_range("bytes=8-", 10), Some((8, 9)));
+        assert_eq!(parse_single_byte_range("bytes=-3", 10), Some((7, 9)));
+        assert_eq!(parse_single_byte_range("bytes=2-99", 10), Some((2, 9)));
+        for invalid in [
+            "bytes=",
+            "bytes=-0",
+            "bytes=10-11",
+            "bytes=7-2",
+            "bytes=0-1,4-5",
+            "items=0-1",
+        ] {
+            assert_eq!(parse_single_byte_range(invalid, 10), None, "{invalid}");
         }
     }
 

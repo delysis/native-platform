@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-co-writer-apply"
+description = "Enables the co_writer_apply command without any pre-configured scope."
+commands.allow = ["co_writer_apply"]
+
+[[permission]]
+identifier = "deny-co-writer-apply"
+description = "Denies the co_writer_apply command without any pre-configured scope."
+commands.deny = ["co_writer_apply"]

@@ -8,7 +8,9 @@ import type {
   BuildModelPolicySummary,
   CommandReceipt,
   CompletionSnapshot,
+  CoWriterSummary,
   ContextAttachment,
+  DocumentContextSnapshot,
   CuratedModelCatalogSnapshot,
   DesktopGenerationEnvelope,
   DocumentKind,
@@ -21,6 +23,9 @@ import type {
   ProjectSnapshot,
   RecoveryReport,
   ReconciliationPreview,
+  SpeechInputSnapshot,
+  SpeechInputTarget,
+  SpeechRecordingSnapshot,
   LoomFailure,
   TransientDraftSnapshot,
   TransientDraftWriteReceipt,
@@ -204,7 +209,7 @@ export function listDocumentContext(
   projectId: string,
   sessionId: string,
   documentId: string
-): Promise<ContextAttachment[]> {
+): Promise<DocumentContextSnapshot> {
   return call('document_context_list', { projectId, sessionId, documentId });
 }
 
@@ -213,7 +218,7 @@ export function addDocumentContext(
   sessionId: string,
   documentId: string,
   attachmentId: string
-): Promise<ContextAttachment[]> {
+): Promise<DocumentContextSnapshot> {
   return call('document_context_add', { projectId, sessionId, documentId, attachmentId });
 }
 
@@ -222,7 +227,7 @@ export function addDocumentContexts(
   sessionId: string,
   documentId: string,
   attachmentIds: readonly string[]
-): Promise<ContextAttachment[]> {
+): Promise<DocumentContextSnapshot> {
   return call('document_context_add_many', {
     projectId,
     sessionId,
@@ -236,7 +241,7 @@ export function removeDocumentContext(
   sessionId: string,
   documentId: string,
   attachmentId: string
-): Promise<ContextAttachment[]> {
+): Promise<DocumentContextSnapshot> {
   return call('document_context_remove', { projectId, sessionId, documentId, attachmentId });
 }
 
@@ -255,6 +260,103 @@ export function setDocumentContextText(
   text: string
 ): Promise<string> {
   return call('document_context_text_set', { projectId, sessionId, documentId, text });
+}
+
+export function setDocumentContextSnapshot(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  markdown: string,
+  attachmentIds: readonly string[]
+): Promise<DocumentContextSnapshot> {
+  return call('document_context_snapshot_set', {
+    projectId,
+    sessionId,
+    documentId,
+    markdown,
+    attachmentIds: [...attachmentIds]
+  });
+}
+
+export function listCoWriters(
+  projectId: string,
+  sessionId: string
+): Promise<CoWriterSummary[]> {
+  return call('co_writer_list', { projectId, sessionId });
+}
+
+export function saveCoWriter(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  name: string
+): Promise<CoWriterSummary> {
+  return call('co_writer_save', { projectId, sessionId, documentId, name });
+}
+
+export function applyCoWriter(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  profileId: string
+): Promise<DocumentContextSnapshot> {
+  return call('co_writer_apply', { projectId, sessionId, documentId, profileId });
+}
+
+export function deleteCoWriter(
+  projectId: string,
+  sessionId: string,
+  profileId: string
+): Promise<CoWriterSummary[]> {
+  return call('co_writer_delete', { projectId, sessionId, profileId });
+}
+
+export function getSpeechInputCapabilities(
+  projectId: string,
+  sessionId: string
+): Promise<unknown> {
+  return call('speech_input_capabilities', { projectId, sessionId });
+}
+
+export function startSpeechRecording(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  target: SpeechInputTarget
+): Promise<SpeechRecordingSnapshot> {
+  return call('speech_input_record_start', { projectId, sessionId, documentId, target });
+}
+
+export function stopSpeechRecording(
+  projectId: string,
+  sessionId: string,
+  recordingId: string
+): Promise<SpeechInputSnapshot> {
+  return call('speech_input_record_stop', { projectId, sessionId, recordingId });
+}
+
+export function cancelSpeechRecording(
+  projectId: string,
+  sessionId: string,
+  recordingId: string
+): Promise<SpeechRecordingSnapshot> {
+  return call('speech_input_record_cancel', { projectId, sessionId, recordingId });
+}
+
+export function getSpeechInputStatus(
+  projectId: string,
+  sessionId: string,
+  requestId: string
+): Promise<SpeechInputSnapshot> {
+  return call('speech_input_status', { projectId, sessionId, requestId });
+}
+
+export function cancelSpeechInput(
+  projectId: string,
+  sessionId: string,
+  requestId: string
+): Promise<SpeechInputSnapshot> {
+  return call('speech_input_cancel', { projectId, sessionId, requestId });
 }
 
 export async function getBuildModelPolicy(): Promise<BuildModelPolicySummary> {

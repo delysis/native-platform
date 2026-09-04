@@ -9,8 +9,11 @@
   import {
     abortApplicationClose,
     addDocumentContexts,
+    applyCoWriter,
     applicationClosePending,
     cancelGeneration,
+    cancelSpeechInput,
+    cancelSpeechRecording,
     cancelModelDownload,
     checkpointDocument,
     clearTransientDraft,
@@ -22,14 +25,15 @@
     createDocument,
     currentProjectSession,
     deleteDocument,
+    deleteCoWriter,
     exportDocumentCopy,
     getBranch,
     getBranchBody,
     getBranchPage,
     getCompletionSnapshot,
-    getDocumentContextText,
     getBuildModelPolicy,
     getModelDownloadStatus,
+    getSpeechInputStatus,
     getWeaveStatus,
     ingestImageAttachment,
     importAttachmentPaths,
@@ -42,6 +46,7 @@
     loadCatalogModelCandidate,
     loadModel,
     loadPolicyModelCandidate,
+    listCoWriters,
     listCuratedModels,
     listDocumentContext,
     listModels,
@@ -55,11 +60,14 @@
     removeDocumentContext,
     revealDocument,
     requestApplicationClose,
+    saveCoWriter,
     setFocusMode,
-    setDocumentContextText,
+    setDocumentContextSnapshot,
     setSuggestions as setSuggestionsPolicy,
+    startSpeechRecording,
     startWeave,
     startModelDownload,
+    stopSpeechRecording,
     unloadModel,
     normalizeFailure,
     upsertTransientDraft
@@ -302,8 +310,11 @@
     BranchPageCursor,
     BranchSummary,
     BuildModelPolicySummary,
+    CoWriterSummary,
     CommandReceipt,
-    ContextAttachment,
+    ContextAttachmentPresentation,
+    ContextMediaPresentation,
+    ContextTextSourcePresentation,
     CuratedModelCatalogEntry,
     DesktopGenerationEnvelope,
     DocumentKind,
@@ -318,9 +329,30 @@
     ProjectSnapshot,
     ReconciliationPreview,
     SaveState,
+    SpeechInputSnapshot,
+    SpeechInputTarget,
+    SpeechRecordingSnapshot,
     TransientDraftSnapshot,
+    DocumentContextSnapshot,
     WeaveStarted
   } from './lib/types';
+
+  type VisualTextInsertionAnchor = {
+    surfaceKey: string;
+    markdown: string;
+    from: number;
+    to: number;
+  };
+  type SourceTextInsertionAnchor = {
+    surfaceKey: string;
+    value: string;
+    start: number;
+    end: number;
+  };
+  type SpeechInsertionAnchor =
+    | { kind: 'visual'; target: SpeechInputTarget; anchor: VisualTextInsertionAnchor }
+    | { kind: 'source'; target: 'manuscript'; anchor: SourceTextInsertionAnchor }
+    | { kind: 'context-source'; target: 'context'; value: string; start: number; end: number };
 
   let desktop = false;
   let buildModelPolicy: BuildModelPolicySummary | null = null;
@@ -339,20 +371,59 @@
   let contextPaneOpen = false;
   let contextPaneElement: HTMLDivElement | undefined;
   let contextToggleElement: HTMLButtonElement | undefined;
-  let contextAttachments: ContextAttachment[] = [];
+  let contextAttachments: ContextAttachmentPresentation[] = [];
+  let contextTextSources: ContextTextSourcePresentation[] = [];
   let contextText = '';
-  let contextEditorMode: EditorMode = 'visual';
   let persistedContextText = '';
   let contextTextSaveState: 'clean' | 'dirty' | 'saving' | 'error' = 'clean';
   let contextTextSaveTimer: number | undefined;
   let contextTextSaveQueue: Promise<void> = Promise.resolve();
   let contextCompositionActive = false;
-  let contextVisualEditor: { flushPending: () => boolean } | null = null;
+  let contextVisualEditor: {
+    flushPending: () => boolean;
+    focusAtDocumentEnd: () => boolean;
+    focusPreservingSelection: () => boolean;
+    captureFormattingSelection: (focusTransitionFrom?: EventTarget | null) => boolean;
+    clearFormattingSelection: () => void;
+    applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
+    formattingDiagnostic: () => string;
+    insertTextAtSelection: (text: string) => boolean;
+    captureTextInsertionAnchor: () => VisualTextInsertionAnchor | null;
+    insertTextAtAnchor: (anchor: VisualTextInsertionAnchor, text: string) => boolean;
+  } | null = null;
+  let contextSourceTextarea: HTMLTextAreaElement | undefined;
+  let contextFormatting: VisualFormatState = {
+    block: 'body',
+    bold: false,
+    italic: false,
+    blockquote: false,
+    bulletList: false,
+    orderedList: false,
+    linkHref: '',
+    selectionEmpty: true
+  };
   let contextAttachmentBusy = false;
   let contextDropActive = false;
   let contextDocumentId = '';
   let contextRefreshSerial = 0;
   let contextEpoch = 0;
+  let coWriterOpen = false;
+  let coWriterTrigger: HTMLButtonElement | undefined;
+  let coWriterPopover: HTMLDivElement | undefined;
+  let coWriters: CoWriterSummary[] = [];
+  let coWriterProjectId = '';
+  let coWriterName = '';
+  let coWriterBusy = false;
+  let coWriterOperationSerial = 0;
+  let coWriterError = '';
+  let speechRecording: SpeechRecordingSnapshot | null = null;
+  let speechInput: SpeechInputSnapshot | null = null;
+  let speechStarting = false;
+  let speechError = '';
+  let speechPollTimer: number | undefined;
+  let speechInsertionAnchor: SpeechInsertionAnchor | null = null;
+  let speechRecovery: { transcript: string; target: SpeechInputTarget } | null = null;
+  let speechProjectId = '';
   let unlistenNativeAttachmentDrop: (() => void) | undefined;
   let outlineToggle: HTMLButtonElement | undefined;
   const documentContextLongPressMilliseconds = 550;
@@ -386,6 +457,7 @@
   let compatibleWriterModels: ModelCapabilitySummary[] = [];
   let otherLocalModels: ModelCapabilitySummary[] = [];
   let modelSetupError = '';
+  let quietModelLoadFailure: LoomFailure | null = null;
   let modelLoading = false;
   let modelUnloading = false;
   let modelChoosing = false;
@@ -541,12 +613,18 @@
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
     insertAttachmentMarkdown: (markdown: string, clientX?: number, clientY?: number) => boolean;
+    insertTextAtSelection: (text: string) => boolean;
+    captureTextInsertionAnchor: () => VisualTextInsertionAnchor | null;
+    insertTextAtAnchor: (anchor: VisualTextInsertionAnchor, text: string) => boolean;
   } | null = null;
   let sourceEditor: {
     focusAtDocumentEnd: () => boolean;
     focusCurrentSelection: () => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
     insertAttachmentMarkdown: (markdown: string) => boolean;
+    insertTextAtSelection: (text: string) => boolean;
+    captureTextInsertionAnchor: () => SourceTextInsertionAnchor | null;
+    insertTextAtAnchor: (anchor: SourceTextInsertionAnchor, text: string) => boolean;
   } | null = null;
   let componentMounted = false;
   let nativeFullscreen = false;
@@ -1057,11 +1135,13 @@
     ? '…'
     : modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0
       ? 'Preparing'
-      : !suggestionsEnabled
-        ? 'Off'
-        : currentModel
-          ? 'Ready'
-          : 'Set up';
+      : suggestionsEnabled && quietModelLoadFailure
+        ? 'Needs attention'
+        : !suggestionsEnabled
+          ? 'Off'
+          : currentModel
+            ? 'Ready'
+            : 'Set up';
   $: nativeWindowTitle = document?.summary.title ?? project?.title ?? 'Loom';
   $: resolvedAppearance = resolveAppearance(appearance, systemDark);
   $: if (desktop) void syncNativeWindowTitle(nativeWindowTitle);
@@ -1171,13 +1251,49 @@
   $: if ((document?.summary.document_id ?? '') !== contextDocumentId) {
     contextDocumentId = document?.summary.document_id ?? '';
     contextAttachments = [];
+    contextTextSources = [];
     contextText = '';
     persistedContextText = '';
     contextTextSaveState = 'clean';
     contextCompositionActive = false;
     contextVisualEditor = null;
+    contextSourceTextarea = undefined;
+    speechInsertionAnchor = null;
+    speechRecovery = null;
+    contextFormatting = {
+      block: 'body',
+      bold: false,
+      italic: false,
+      blockquote: false,
+      bulletList: false,
+      orderedList: false,
+      linkHref: '',
+      selectionEmpty: true
+    };
     contextEpoch += 1;
     if (desktop && project && document) void refreshDocumentContext();
+  }
+
+  $: if ((project?.project_id ?? '') !== coWriterProjectId) {
+    coWriterProjectId = project?.project_id ?? '';
+    coWriters = [];
+    coWriterOpen = false;
+    coWriterName = '';
+    coWriterError = '';
+    speechInsertionAnchor = null;
+    speechRecovery = null;
+  }
+
+  $: if ((project?.project_id ?? '') !== speechProjectId) {
+    speechProjectId = project?.project_id ?? '';
+    if (speechPollTimer !== undefined) window.clearTimeout(speechPollTimer);
+    speechPollTimer = undefined;
+    speechRecording = null;
+    speechInput = null;
+    speechInsertionAnchor = null;
+    speechRecovery = null;
+    speechStarting = false;
+    speechError = '';
   }
 
   async function refreshDocumentContext(): Promise<void> {
@@ -1189,20 +1305,21 @@
       documentId: document.summary.document_id
     };
     try {
-      const [attachments, text] = await Promise.all([
-        listDocumentContext(captured.projectId, captured.sessionId, captured.documentId),
-        getDocumentContextText(captured.projectId, captured.sessionId, captured.documentId)
-      ]);
+      const snapshot = await listDocumentContext(
+        captured.projectId,
+        captured.sessionId,
+        captured.documentId
+      );
       if (
         serial === contextRefreshSerial &&
         project?.project_id === captured.projectId &&
         project.session_id === captured.sessionId &&
         document?.summary.document_id === captured.documentId
       ) {
-        contextAttachments = attachments;
+        updateContextPresentation(snapshot);
         if (contextTextSaveState === 'clean') {
-          contextText = text;
-          persistedContextText = text;
+          contextText = snapshot.markdown;
+          persistedContextText = snapshot.markdown;
         }
       }
     } catch (error) {
@@ -1210,11 +1327,421 @@
     }
   }
 
-  function attachmentContextChanged(attachments: ContextAttachment[]): void {
-    contextAttachments = attachments;
+  function updateContextPresentation(snapshot: DocumentContextSnapshot): void {
+    contextAttachments = snapshot.attachments;
+    contextTextSources = snapshot.text_sources;
     contextEpoch += 1;
     invalidateCompletionForCaretNavigation();
     if (completionAutomationEnabled()) scheduleAutomaticSuggestions(editVersion, 0);
+  }
+
+  function contextMediaUrl(media: ContextMediaPresentation): string | null {
+    return media.preview_token ? convertFileSrc(media.preview_token, 'loom-asset') : null;
+  }
+
+  async function refreshCoWriters(): Promise<void> {
+    if (!desktop || !project) return;
+    const captured = { projectId: project.project_id, sessionId: project.session_id };
+    const serial = ++coWriterOperationSerial;
+    coWriterBusy = true;
+    coWriterError = '';
+    try {
+      const summaries = await listCoWriters(captured.projectId, captured.sessionId);
+      if (
+        project?.project_id === captured.projectId &&
+        project.session_id === captured.sessionId &&
+        serial === coWriterOperationSerial
+      ) coWriters = summaries;
+    } catch (error) {
+      if (
+        serial === coWriterOperationSerial &&
+        project?.project_id === captured.projectId &&
+        project.session_id === captured.sessionId
+      ) coWriterError = normalizeFailure(error).message;
+    } finally {
+      if (serial === coWriterOperationSerial) coWriterBusy = false;
+    }
+  }
+
+  function toggleCoWriter(): void {
+    coWriterOpen = !coWriterOpen;
+    coWriterError = '';
+    if (coWriterOpen) void refreshCoWriters();
+  }
+
+  async function saveCurrentCoWriter(): Promise<void> {
+    if (!project || !document || coWriterBusy || !coWriterName.trim()) return;
+    const captured = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id
+    };
+    const serial = ++coWriterOperationSerial;
+    coWriterBusy = true;
+    coWriterError = '';
+    try {
+      if (!await persistCurrentContextText()) return;
+      if (
+        project?.project_id !== captured.projectId ||
+        project.session_id !== captured.sessionId ||
+        document?.summary.document_id !== captured.documentId
+      ) return;
+      const saved = await saveCoWriter(
+        captured.projectId,
+        captured.sessionId,
+        captured.documentId,
+        coWriterName
+      );
+      if (
+        serial !== coWriterOperationSerial ||
+        project?.project_id !== captured.projectId ||
+        project.session_id !== captured.sessionId ||
+        document?.summary.document_id !== captured.documentId
+      ) return;
+      coWriters = [saved, ...coWriters.filter((candidate) => candidate.id !== saved.id)];
+      coWriterName = '';
+      announce(`${saved.name} saved as a co-writer`);
+    } catch (error) {
+      if (serial === coWriterOperationSerial) coWriterError = normalizeFailure(error).message;
+    } finally {
+      if (serial === coWriterOperationSerial) coWriterBusy = false;
+    }
+  }
+
+  async function applySelectedCoWriter(profile: CoWriterSummary): Promise<void> {
+    if (!project || !document || coWriterBusy) return;
+    const captured = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id
+    };
+    const serial = ++coWriterOperationSerial;
+    coWriterBusy = true;
+    coWriterError = '';
+    try {
+      if (!await persistCurrentContextText()) return;
+      if (
+        project?.project_id !== captured.projectId ||
+        project.session_id !== captured.sessionId ||
+        document?.summary.document_id !== captured.documentId
+      ) return;
+      const snapshot = await applyCoWriter(
+        captured.projectId,
+        captured.sessionId,
+        captured.documentId,
+        profile.id
+      );
+      if (serial !== coWriterOperationSerial) return;
+      if (adoptAuthoritativeContext(
+        snapshot,
+        captured.projectId,
+        captured.sessionId,
+        captured.documentId
+      )) {
+        contextPaneOpen = true;
+        coWriterOpen = false;
+        announce(`${profile.name} is steering this manuscript`);
+        await tick();
+        focusContextEditorAtEnd();
+      }
+    } catch (error) {
+      if (serial === coWriterOperationSerial) coWriterError = normalizeFailure(error).message;
+    } finally {
+      if (serial === coWriterOperationSerial) coWriterBusy = false;
+    }
+  }
+
+  async function removeCoWriter(profile: CoWriterSummary): Promise<void> {
+    if (!project || coWriterBusy) return;
+    const captured = { projectId: project.project_id, sessionId: project.session_id };
+    const serial = ++coWriterOperationSerial;
+    coWriterBusy = true;
+    coWriterError = '';
+    try {
+      const summaries = await deleteCoWriter(captured.projectId, captured.sessionId, profile.id);
+      if (
+        serial !== coWriterOperationSerial ||
+        project?.project_id !== captured.projectId ||
+        project.session_id !== captured.sessionId
+      ) return;
+      coWriters = summaries;
+      announce(`${profile.name} removed from co-writers`);
+    } catch (error) {
+      if (serial === coWriterOperationSerial) coWriterError = normalizeFailure(error).message;
+    } finally {
+      if (serial === coWriterOperationSerial) coWriterBusy = false;
+    }
+  }
+
+  function speechInputActive(): boolean {
+    return Boolean(speechRecording || speechInput);
+  }
+
+  function speechTarget(): SpeechInputTarget {
+    return contextPaneOpen ? 'context' : 'manuscript';
+  }
+
+  function captureSpeechInsertionAnchor(target: SpeechInputTarget): SpeechInsertionAnchor | null {
+    if (target === 'context') {
+      if (mode === 'visual') {
+        const anchor = contextVisualEditor?.captureTextInsertionAnchor() ?? null;
+        return anchor ? { kind: 'visual', target, anchor } : null;
+      }
+      const textarea = contextSourceTextarea;
+      return textarea && !textarea.disabled
+        ? {
+            kind: 'context-source',
+            target,
+            value: textarea.value,
+            start: textarea.selectionStart,
+            end: textarea.selectionEnd
+          }
+        : null;
+    }
+    if (mode === 'visual') {
+      const anchor = visualEditor?.captureTextInsertionAnchor() ?? null;
+      return anchor ? { kind: 'visual', target, anchor } : null;
+    }
+    const anchor = sourceEditor?.captureTextInsertionAnchor() ?? null;
+    return anchor ? { kind: 'source', target, anchor } : null;
+  }
+
+  function insertSpeechTranscript(snapshot: SpeechInputSnapshot): boolean {
+    if (!snapshot.transcript) return false;
+    const insertion = speechInsertionAnchor;
+    if (!insertion || insertion.target !== snapshot.target) return false;
+    if (insertion.kind === 'visual') {
+      const editor = insertion.target === 'context' ? contextVisualEditor : visualEditor;
+      return editor?.insertTextAtAnchor(insertion.anchor, snapshot.transcript) ?? false;
+    }
+    if (insertion.kind === 'context-source') {
+      if (!contextPaneOpen || mode !== 'source') return false;
+      const textarea = contextSourceTextarea;
+      if (!textarea || textarea.disabled || textarea.value !== insertion.value) return false;
+      textarea.setRangeText(
+        snapshot.transcript,
+        insertion.start,
+        insertion.end,
+        'end'
+      );
+      updateContextText(textarea.value);
+      textarea.focus({ preventScroll: true });
+      return true;
+    }
+    return mode === 'source'
+      ? sourceEditor?.insertTextAtAnchor(insertion.anchor, snapshot.transcript) ?? false
+      : false;
+  }
+
+  function insertRecoveredSpeech(): void {
+    const recovery = speechRecovery;
+    if (!recovery) return;
+    const inserted = recovery.target === 'context'
+      ? mode === 'visual'
+        ? contextVisualEditor?.insertTextAtSelection(recovery.transcript) ?? false
+        : (() => {
+            const textarea = contextSourceTextarea;
+            if (!textarea || textarea.disabled) return false;
+            textarea.setRangeText(
+              recovery.transcript,
+              textarea.selectionStart,
+              textarea.selectionEnd,
+              'end'
+            );
+            updateContextText(textarea.value);
+            textarea.focus({ preventScroll: true });
+            return true;
+          })()
+      : mode === 'visual'
+        ? visualEditor?.insertTextAtSelection(recovery.transcript) ?? false
+        : sourceEditor?.insertTextAtSelection(recovery.transcript) ?? false;
+    if (inserted) {
+      speechRecovery = null;
+      speechError = '';
+      announce('Recovered dictation inserted at the current caret');
+    }
+  }
+
+  function scheduleSpeechStatusPoll(snapshot: SpeechInputSnapshot): void {
+    if (speechPollTimer !== undefined) window.clearTimeout(speechPollTimer);
+    speechPollTimer = window.setTimeout(() => {
+      speechPollTimer = undefined;
+      void pollSpeechStatus(snapshot);
+    }, 350);
+  }
+
+  async function acceptSpeechSnapshot(snapshot: SpeechInputSnapshot): Promise<void> {
+    if (speechInput?.request_id !== snapshot.request_id) return;
+    speechInput = snapshot;
+    if (snapshot.phase === 'transcribing' || snapshot.phase === 'cancel_requested') {
+      scheduleSpeechStatusPoll(snapshot);
+      return;
+    }
+    if (snapshot.phase === 'completed') {
+      const inScope =
+        project?.project_id === snapshot.project_id &&
+        project.session_id === snapshot.session_id &&
+        document?.summary.document_id === snapshot.document_id;
+      if (!inScope || !insertSpeechTranscript(snapshot)) {
+        speechRecovery = snapshot.transcript
+          ? { transcript: snapshot.transcript, target: snapshot.target }
+          : null;
+        speechError = snapshot.transcript
+          ? 'Dictation finished after its insertion point changed. The transcript is preserved for recovery.'
+          : 'Dictation finished without any text.';
+        announce(speechError);
+      } else {
+        speechRecovery = null;
+        speechError = '';
+        announce('Dictation inserted');
+      }
+    } else if (snapshot.phase === 'failed') {
+      speechError = snapshot.error_message ?? 'Local speech recognition failed.';
+      recordLocalFailure(snapshot.error_code ?? 'speech_input_failed', speechError);
+      announce('Dictation needs attention');
+    } else {
+      announce('Dictation cancelled');
+    }
+    speechInsertionAnchor = null;
+    speechInput = null;
+  }
+
+  async function pollSpeechStatus(expected: SpeechInputSnapshot): Promise<void> {
+    if (speechInput?.request_id !== expected.request_id) return;
+    try {
+      const snapshot = await getSpeechInputStatus(
+        expected.project_id,
+        expected.session_id,
+        expected.request_id
+      );
+      await acceptSpeechSnapshot(snapshot);
+    } catch (error) {
+      if (speechInput?.request_id !== expected.request_id) return;
+      speechError = normalizeFailure(error).message;
+      recordFailure(error);
+      speechInput = null;
+    }
+  }
+
+  async function beginSpeechRecording(): Promise<void> {
+    if (!desktop || !project || !document || speechStarting || speechInputActive()) return;
+    const captured = {
+      projectId: project.project_id,
+      sessionId: project.session_id,
+      documentId: document.summary.document_id,
+      target: speechTarget()
+    };
+    const insertionAnchor = captureSpeechInsertionAnchor(captured.target);
+    if (!insertionAnchor) {
+      speechError = 'Place the caret in an editable manuscript or context surface before dictating.';
+      announce(speechError);
+      return;
+    }
+    speechStarting = true;
+    speechError = '';
+    try {
+      const recording = await startSpeechRecording(
+        captured.projectId,
+        captured.sessionId,
+        captured.documentId,
+        captured.target
+      );
+      const inScope =
+        project?.project_id === captured.projectId &&
+        project.session_id === captured.sessionId &&
+        document?.summary.document_id === captured.documentId;
+      if (!inScope) {
+        await cancelSpeechRecording(
+          recording.project_id,
+          recording.session_id,
+          recording.recording_id
+        );
+        return;
+      }
+      speechRecording = recording;
+      speechInsertionAnchor = insertionAnchor;
+      announce(`Dictating into ${recording.target === 'context' ? 'context' : 'the manuscript'}`);
+    } catch (error) {
+      speechRecording = null;
+      speechInput = null;
+      speechInsertionAnchor = null;
+      speechError = normalizeFailure(error).message;
+      recordFailure(error);
+      announce('Loom could not start the microphone');
+    } finally {
+      speechStarting = false;
+    }
+  }
+
+  async function finishSpeechRecording(): Promise<void> {
+    const recording = speechRecording;
+    if (!recording || speechStarting) return;
+    speechStarting = true;
+    try {
+      const snapshot = await stopSpeechRecording(
+        recording.project_id,
+        recording.session_id,
+        recording.recording_id
+      );
+      speechRecording = null;
+      speechInput = snapshot;
+      await acceptSpeechSnapshot(snapshot);
+    } catch (error) {
+      try {
+        await cancelSpeechRecording(
+          recording.project_id,
+          recording.session_id,
+          recording.recording_id
+        );
+      } catch {
+        // Stop may already have consumed the native recording. Either way the
+        // backend owns no reusable client handle after this terminal failure.
+      }
+      speechRecording = null;
+      speechInput = null;
+      speechInsertionAnchor = null;
+      speechError = normalizeFailure(error).message;
+      recordFailure(error);
+      announce('Loom could not stop dictation cleanly');
+    } finally {
+      speechStarting = false;
+    }
+  }
+
+  async function cancelActiveSpeech(): Promise<void> {
+    if (speechStarting) return;
+    speechStarting = true;
+    try {
+      if (speechRecording) {
+        const recording = speechRecording;
+        await cancelSpeechRecording(
+          recording.project_id,
+          recording.session_id,
+          recording.recording_id
+        );
+        speechRecording = null;
+        speechInsertionAnchor = null;
+      } else if (speechInput) {
+        const snapshot = await cancelSpeechInput(
+          speechInput.project_id,
+          speechInput.session_id,
+          speechInput.request_id
+        );
+        await acceptSpeechSnapshot(snapshot);
+      }
+      announce('Dictation cancellation requested');
+    } catch (error) {
+      speechError = normalizeFailure(error).message;
+      recordFailure(error);
+    } finally {
+      speechStarting = false;
+    }
+  }
+
+  function toggleSpeechInput(): void {
+    if (speechRecording) void finishSpeechRecording();
+    else if (speechInput) void cancelActiveSpeech();
+    else void beginSpeechRecording();
   }
 
   function scheduleContextTextSave(delay = 300): void {
@@ -1224,7 +1751,8 @@
       projectId: project.project_id,
       sessionId: project.session_id,
       documentId: document.summary.document_id,
-      text: contextText
+      text: contextText,
+      attachmentIds: contextAttachments.map((attachment) => attachment.id)
     };
     contextTextSaveTimer = window.setTimeout(() => {
       contextTextSaveTimer = undefined;
@@ -1237,6 +1765,7 @@
     sessionId: string;
     documentId: string;
     text: string;
+    attachmentIds: string[];
   }): Promise<boolean> {
     if (
       captured.text === persistedContextText &&
@@ -1247,19 +1776,21 @@
     }
     if (captured.documentId === contextDocumentId) contextTextSaveState = 'saving';
     try {
-      const saved = await setDocumentContextText(
+      const snapshot = await setDocumentContextSnapshot(
         captured.projectId,
         captured.sessionId,
         captured.documentId,
-        captured.text
+        captured.text,
+        captured.attachmentIds
       );
       if (
         project?.project_id === captured.projectId &&
         project.session_id === captured.sessionId &&
         document?.summary.document_id === captured.documentId
       ) {
-        persistedContextText = saved;
-        if (contextText === saved) {
+        updateContextPresentation(snapshot);
+        persistedContextText = snapshot.markdown;
+        if (contextText === snapshot.markdown) {
           contextTextSaveState = 'clean';
           contextEpoch += 1;
           if (completionAutomationEnabled()) scheduleAutomaticSuggestions(editVersion, 0);
@@ -1284,6 +1815,7 @@
     sessionId: string;
     documentId: string;
     text: string;
+    attachmentIds: string[];
   }): Promise<boolean> {
     const persistence = contextTextSaveQueue.then(() => persistContextText(captured));
     contextTextSaveQueue = persistence.then(() => undefined, () => undefined);
@@ -1291,8 +1823,8 @@
   }
 
   function updateContextText(value: string): void {
-    if (value.length > 65_536) {
-      announce('Completion context is limited to 65,536 characters');
+    if (new TextEncoder().encode(value).byteLength > 256 * 1024) {
+      announce('Completion context is limited to 256 KiB of UTF-8 text');
       return;
     }
     contextText = value;
@@ -1334,30 +1866,41 @@
         projectId: project.project_id,
         sessionId: project.session_id,
         documentId: document.summary.document_id,
-        text: contextText
+        text: contextText,
+        attachmentIds: contextAttachments.map((attachment) => attachment.id)
       })) return false;
     }
   }
 
   function closeContextPane(): boolean {
+    if (
+      (speechRecording?.target === 'context' || speechInput?.target === 'context') &&
+      speechInputActive()
+    ) {
+      announce('Finish or cancel dictation before closing its context insertion point');
+      return false;
+    }
     if (!flushContextEditorProjection()) return false;
     contextPaneOpen = false;
     contextToggleElement?.focus();
     return true;
   }
 
-  function setContextEditorMode(next: EditorMode): void {
-    if (next === contextEditorMode || !flushContextEditorProjection()) return;
-    contextEditorMode = next;
+  function focusContextEditorAtEnd(): boolean {
+    if (mode === 'visual') return contextVisualEditor?.focusAtDocumentEnd() ?? false;
+    if (!contextSourceTextarea || editorReadonly) return false;
+    contextSourceTextarea.focus({ preventScroll: true });
+    const end = contextSourceTextarea.value.length;
+    contextSourceTextarea.setSelectionRange(end, end);
+    return window.document.activeElement === contextSourceTextarea;
   }
 
-  async function adoptAuthoritativeContext(
-    attachments: ContextAttachment[],
+  function adoptAuthoritativeContext(
+    snapshot: DocumentContextSnapshot,
     projectId: string,
     sessionId: string,
     documentId: string
-  ): Promise<boolean> {
-    const text = await getDocumentContextText(projectId, sessionId, documentId);
+  ): boolean {
     if (
       project?.project_id !== projectId ||
       project.session_id !== sessionId ||
@@ -1367,10 +1910,10 @@
       window.clearTimeout(contextTextSaveTimer);
       contextTextSaveTimer = undefined;
     }
-    contextText = text;
-    persistedContextText = text;
+    contextText = snapshot.markdown;
+    persistedContextText = snapshot.markdown;
     contextTextSaveState = 'clean';
-    attachmentContextChanged(attachments);
+    updateContextPresentation(snapshot);
     return true;
   }
 
@@ -1390,8 +1933,8 @@
         document?.summary.document_id !== captured.documentId
       ) return;
       const imported = await chooseAttachments(captured.projectId, captured.sessionId);
-      const attachments = imported.length === 0
-        ? contextAttachments
+      const snapshot = imported.length === 0
+        ? null
         : await addDocumentContexts(
           captured.projectId,
           captured.sessionId,
@@ -1399,8 +1942,8 @@
           imported.map((item) => item.id)
         );
       if (imported.length > 0) {
-        await adoptAuthoritativeContext(
-          attachments,
+        adoptAuthoritativeContext(
+          snapshot!,
           captured.projectId,
           captured.sessionId,
           captured.documentId
@@ -1430,14 +1973,14 @@
         project.session_id !== captured.sessionId ||
         document?.summary.document_id !== captured.documentId
       ) return;
-      const attachments = await removeDocumentContext(
+      const snapshot = await removeDocumentContext(
         captured.projectId,
         captured.sessionId,
         captured.documentId,
         attachmentId
       );
-      await adoptAuthoritativeContext(
-        attachments,
+      adoptAuthoritativeContext(
+        snapshot,
         captured.projectId,
         captured.sessionId,
         captured.documentId
@@ -1483,14 +2026,14 @@
       ) return;
       const imported = await importAttachmentPaths(captured.projectId, captured.sessionId, paths);
       if (scope === 'context') {
-        const attachments = await addDocumentContexts(
+        const snapshot = await addDocumentContexts(
             captured.projectId,
             captured.sessionId,
             captured.documentId,
             imported.map((item) => item.id)
           );
-        await adoptAuthoritativeContext(
-          attachments,
+        adoptAuthoritativeContext(
+          snapshot,
           captured.projectId,
           captured.sessionId,
           captured.documentId
@@ -1608,6 +2151,7 @@
       unlistenNativeAttachmentDrop = undefined;
       if (saveTimer !== undefined) window.clearTimeout(saveTimer);
       if (contextTextSaveTimer !== undefined) window.clearTimeout(contextTextSaveTimer);
+      if (speechPollTimer !== undefined) window.clearTimeout(speechPollTimer);
       if (sourceProjectionTimer !== undefined) window.clearTimeout(sourceProjectionTimer);
       if (projectFilesystemRefreshTimer !== undefined) {
         window.clearTimeout(projectFilesystemRefreshTimer);
@@ -3599,6 +4143,12 @@
     return refreshed;
   }
 
+  async function retryPreferredWriter(): Promise<void> {
+    quietModelLoadFailure = null;
+    if (modelSetupError.startsWith('Automatic writer setup failed.')) modelSetupError = '';
+    await refreshCurrentModelsAndEnsureWriter();
+  }
+
   function closeFormatMenu(refocus = true): void {
     formatMenu?.close(refocus);
   }
@@ -4719,6 +5269,8 @@
         .filter((model) => model.model_path !== loaded.model_path)
         .map((model) => ({ ...model, loaded: false }))
     ];
+    quietModelLoadFailure = null;
+    if (modelSetupError.startsWith('Automatic writer setup failed.')) modelSetupError = '';
     selectedModelPath = loaded.model_path;
     rememberLastLocalModelPath(loaded.model_path);
     if (!quiet) {
@@ -4740,6 +5292,7 @@
     if (currentModel) return true;
     if (!document || transition !== 'idle' || modelLoading || modelUnloading) return false;
     if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+    quietModelLoadFailure = null;
     // Existing local Gemma files must never race the embedded catalog and be
     // admitted as a generic text-only model before the pinned projector is
     // known. All callers share the same in-flight catalog read.
@@ -4747,6 +5300,7 @@
     if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
     const rememberedPath = loadLastLocalModelPath();
     const candidates = startupWriterCandidates(models, rememberedPath);
+    let terminalFailure: LoomFailure | null = null;
     for (const candidate of candidates) {
       if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
       if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
@@ -4791,6 +5345,7 @@
           (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
         ) return false;
         const failure = normalizeFailure(error);
+        terminalFailure = failure;
         if (candidate.remembered && (
           rememberedWriterPathIsInvalid(failure.code) ||
           (!candidate.profileId && ['model_path_error', 'model_header_unverified'].includes(failure.code))
@@ -4804,6 +5359,16 @@
           wakePreferredWriterEnsure();
         }
       }
+    }
+    if (
+      terminalFailure &&
+      componentMounted &&
+      applicationAllowsModelPreparation(applicationClosePhase) &&
+      (!expectedWorkspace || workspaceRestoreIsCurrent(expectedWorkspace))
+    ) {
+      quietModelLoadFailure = terminalFailure;
+      modelSetupError = `Automatic writer setup failed. ${terminalFailure.message}`;
+      announce('Suggestions need attention; open their menu for details');
     }
     return false;
   }
@@ -5769,6 +6334,7 @@
   }
 
   function flushEditors(): boolean {
+    if (contextPaneOpen && !flushContextEditorProjection()) return false;
     if (!(visualEditor?.flushPending() ?? true) || sourceComposing) return false;
     commitSourceDraft();
     return true;
@@ -6918,6 +7484,17 @@
       closeFormatMenu();
       return;
     }
+    if (event.key === 'Escape' && coWriterOpen) {
+      event.preventDefault();
+      coWriterOpen = false;
+      coWriterTrigger?.focus();
+      return;
+    }
+    if (event.key === 'Escape' && speechInputActive()) {
+      event.preventDefault();
+      void cancelActiveSpeech();
+      return;
+    }
     if (event.key === 'Escape' && contextPaneOpen) {
       event.preventDefault();
       closeContextPane();
@@ -6948,10 +7525,17 @@
 
   function handleGlobalPointerdown(event: PointerEvent): void {
     if (
+      coWriterOpen &&
+      event.target instanceof Node &&
+      !coWriterPopover?.contains(event.target) &&
+      !coWriterTrigger?.contains(event.target)
+    ) coWriterOpen = false;
+    if (
       contextPaneOpen &&
       event.target instanceof Node &&
       !contextPaneElement?.contains(event.target) &&
-      !contextToggleElement?.contains(event.target)
+      !contextToggleElement?.contains(event.target) &&
+      !(event.target instanceof Element && event.target.closest('.canvas-controls'))
     ) {
       closeContextPane();
     }
@@ -7898,6 +8482,10 @@
   }
 
   async function setMode(next: EditorMode): Promise<void> {
+    if (speechInputActive()) {
+      announce('Finish or cancel dictation before changing its insertion surface');
+      return;
+    }
     if (compositionActive) {
       announce('Finish composing text before changing editor modes');
       return;
@@ -7916,6 +8504,14 @@
       announce('Visual editor unavailable for this Markdown; your source text is unchanged');
       return;
     }
+    if (next === 'visual' && contextPaneOpen && !canUseVisualMarkdown(contextText, false)) {
+      recordLocalFailure(
+        'visual_context_markdown_not_exact',
+        'This context uses Markdown the visual editor cannot preserve exactly. Its source remains unchanged.'
+      );
+      announce('Visual editor unavailable for this context; its Markdown is unchanged');
+      return;
+    }
     invalidateCompletionForCaretNavigation();
     if (next === 'source' && document) setSourceDocument(documentText, document.summary.kind);
     if (document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')) {
@@ -7923,7 +8519,8 @@
     }
     mode = next;
     await tick();
-    focusCurrentWritingSurfaceAtEnd();
+    if (contextPaneOpen) focusContextEditorAtEnd();
+    else focusCurrentWritingSurfaceAtEnd();
     if (completionAutomationEnabled() && currentModel && document) {
       scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
     }
@@ -8268,11 +8865,11 @@
         on:mousedown={startTitlebarDrag}
       ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
       <div class="canvas-controls-right" data-no-window-drag>
-        {#if document && mode === 'visual' && canUseVisual && !contextPaneOpen}
+        {#if document && mode === 'visual' && canUseVisual && (!contextPaneOpen || canUseVisualMarkdown(contextText, true))}
           <VisualFormatMenu
             bind:this={formatMenu}
-            editor={visualEditor}
-            formatting={visualFormatting}
+            editor={contextPaneOpen ? contextVisualEditor : visualEditor}
+            formatting={contextPaneOpen ? contextFormatting : visualFormatting}
             onCommandResult={(action, applied) => {
               announce(applied
                 ? 'Formatting applied'
@@ -8281,6 +8878,67 @@
           />
         {/if}
         {#if document}
+          <div class="co-writer-control">
+            <button
+              bind:this={coWriterTrigger}
+              class:active={coWriterOpen}
+              class="titlebar-button co-writer-toggle"
+              type="button"
+              aria-label="Choose a co-writer"
+              aria-haspopup="dialog"
+              aria-expanded={coWriterOpen}
+              aria-controls="co-writer-popover"
+              title="Co-writer"
+              disabled={editorReadonly}
+              on:click={toggleCoWriter}
+            ><svg aria-hidden="true" viewBox="0 0 18 18"><circle cx="9" cy="6" r="2.35"/><path d="M4.7 14.5c.55-2.7 2-4.05 4.3-4.05s3.75 1.35 4.3 4.05"/></svg></button>
+            {#if coWriterOpen}
+              <div
+                bind:this={coWriterPopover}
+                id="co-writer-popover"
+                class="co-writer-popover"
+                role="dialog"
+                aria-label="Co-writers"
+              >
+                <header><strong>Co-writers</strong><span>Reusable completion context</span></header>
+                <form on:submit|preventDefault={() => void saveCurrentCoWriter()}>
+                  <input
+                    bind:value={coWriterName}
+                    aria-label="New co-writer name"
+                    placeholder="Name this context"
+                    maxlength="96"
+                    disabled={coWriterBusy}
+                  />
+                  <button type="submit" disabled={coWriterBusy || !coWriterName.trim()}>Save</button>
+                </form>
+                {#if coWriterError}<p class="co-writer-error" role="alert">{coWriterError}</p>{/if}
+                {#if coWriters.length > 0}
+                  <div class="co-writer-list">
+                    {#each coWriters as profile (profile.id)}
+                      <div class="co-writer-row">
+                        <button
+                          class="co-writer-apply"
+                          type="button"
+                          disabled={coWriterBusy}
+                          on:click={() => void applySelectedCoWriter(profile)}
+                        ><strong>{profile.name}</strong><small>{formatByteCount(profile.context_bytes)}{profile.attachment_count ? ` · ${profile.attachment_count} media` : ''}</small></button>
+                        <button
+                          class="co-writer-delete"
+                          type="button"
+                          aria-label={`Delete co-writer ${profile.name}`}
+                          title="Delete co-writer"
+                          disabled={coWriterBusy}
+                          on:click={() => void removeCoWriter(profile)}
+                        >×</button>
+                      </div>
+                    {/each}
+                  </div>
+                {:else if !coWriterBusy}
+                  <p class="co-writer-empty">Save the current context here to reuse it.</p>
+                {/if}
+              </div>
+            {/if}
+          </div>
           <button
             bind:this={contextToggleElement}
             class:active={contextPaneOpen}
@@ -8298,14 +8956,37 @@
               }
             }}
           ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="2.25" y="2.25" width="13.5" height="13.5" rx="2.4"/><path d="M2.75 7h12.5"/></svg></button>
+          <button
+            class:recording={Boolean(speechRecording)}
+            class:transcribing={Boolean(speechInput)}
+            class:needs-attention={Boolean(speechError) && !speechInputActive()}
+            class="titlebar-button microphone-toggle"
+            type="button"
+            aria-label={speechRecording
+              ? 'Stop dictation'
+              : speechInput
+                ? 'Cancel speech recognition'
+                : 'Start dictation'}
+            aria-describedby="speech-input-help"
+            aria-pressed={Boolean(speechRecording)}
+            title={speechError || (speechRecording
+              ? 'Stop dictation'
+              : speechInput
+                ? 'Recognizing locally — click to cancel'
+                : 'Dictate locally')}
+            disabled={!desktop || !document || speechStarting || (editorReadonly && !speechInputActive())}
+            on:click={toggleSpeechInput}
+          ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="6.4" y="2.5" width="5.2" height="8.3" rx="2.6"/><path d="M4.4 8.8a4.6 4.6 0 0 0 9.2 0M9 13.4v2.1M6.8 15.5h4.4"/></svg></button>
+          <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Uses the local microphone and local speech model')}</span>
         {/if}
         <button
           class:active={suggestionsEnabled && Boolean(currentModel)}
-          class:preparing={suggestionsEnabled && !currentModel}
+          class:preparing={suggestionsEnabled && !currentModel && !quietModelLoadFailure && (modelLoading || preferredWriterEnsureInFlight !== null || preferredWriterPending !== null)}
+          class:needs-attention={suggestionsEnabled && !currentModel && Boolean(quietModelLoadFailure)}
           class="titlebar-button suggestions-toggle"
           type="button"
           aria-label={suggestionsEnabled ? 'Turn autocomplete off' : 'Turn autocomplete on'}
-          aria-describedby="completion-lifecycle-help autocomplete-model-menu-help"
+          aria-describedby="completion-lifecycle-help autocomplete-model-menu-help autocomplete-model-failure-help"
           aria-haspopup="dialog"
           aria-keyshortcuts="Shift+F10"
           aria-pressed={suggestionsEnabled}
@@ -8324,9 +9005,11 @@
         </button>
         <span id="completion-lifecycle-help" class="sr-only">{completionLifecycleHelp}</span>
         <span id="autocomplete-model-menu-help" class="sr-only">Right-click, touch and hold, or press the Menu key or Shift F10 to open local writing model setup.</span>
+        <span id="autocomplete-model-failure-help" class="sr-only">{quietModelLoadFailure ? `Local model setup failed: ${quietModelLoadFailure.message}` : ''}</span>
         <button
           class:active={shuttleEnabled}
-          class:preparing={shuttleEnabled && !currentModel}
+          class:preparing={shuttleEnabled && !currentModel && !quietModelLoadFailure && (modelLoading || preferredWriterEnsureInFlight !== null || preferredWriterPending !== null)}
+          class:needs-attention={shuttleEnabled && !currentModel && Boolean(quietModelLoadFailure)}
           class="titlebar-button shuttle-toggle"
           type="button"
           aria-label={shuttleEnabled ? 'Turn Shuttle off' : 'Turn Shuttle on'}
@@ -8498,31 +9181,11 @@
             class="completion-context-pane"
             data-attachment-drop="context"
             aria-label="Completion context"
-            role="dialog"
+            role="region"
           >
             <div class="completion-context-heading">
-              <div>
-                <strong>Context</strong>
-                <span>Private guidance for this document’s autocomplete.</span>
-              </div>
+              <strong>Context</strong>
               <div class="context-heading-actions">
-                <div class="context-mode-toggle" aria-label="Context editor view">
-                  <button
-                    class:active={contextEditorMode === 'visual'}
-                    type="button"
-                    aria-label="Visual context editor"
-                    aria-pressed={contextEditorMode === 'visual'}
-                    disabled={!canUseVisualMarkdown(contextText, contextEditorMode === 'visual')}
-                    on:click={() => setContextEditorMode('visual')}
-                  ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="2.5" y="2.5" width="13" height="13" rx="2.25"/><path d="M8 3v12"/></svg></button>
-                  <button
-                    class:active={contextEditorMode === 'source'}
-                    type="button"
-                    aria-label="Markdown context editor"
-                    aria-pressed={contextEditorMode === 'source'}
-                    on:click={() => setContextEditorMode('source')}
-                  ><span aria-hidden="true">MD</span></button>
-                </div>
                 <button
                   class="attachment-remove context-close"
                   type="button"
@@ -8533,7 +9196,7 @@
             </div>
             <div class="context-composer">
               <div class="context-editor-surface" on:focusout={flushContextEditorProjection}>
-                {#if contextEditorMode === 'visual' && canUseVisualMarkdown(contextText, true)}
+                {#if mode === 'visual' && canUseVisualMarkdown(contextText, true)}
                   <LoomEditor
                     bind:this={contextVisualEditor}
                     value={contextText}
@@ -8543,14 +9206,15 @@
                     acceptImageAttachments={false}
                     onChange={updateContextText}
                     onCompositionChange={(active) => contextCompositionActive = active}
+                    onFormatStateChange={(state) => contextFormatting = state}
                     onGhostPresentationRejected={() => {}}
                   />
                 {:else}
                   <textarea
+                    bind:this={contextSourceTextarea}
                     aria-label="Steering context Markdown"
-                    placeholder="Paste notes, Markdown, or attach reference files…"
+                    placeholder="Write, paste, or drop context…"
                     value={contextText}
-                    maxlength={65536}
                     spellcheck="true"
                     disabled={editorReadonly || contextAttachmentBusy}
                     on:input={(event) => updateContextText(event.currentTarget.value)}
@@ -8573,27 +9237,51 @@
                 </span>
               </div>
             </div>
+            {#if contextTextSources.length > 0}
+              <p class="context-source-note" title={contextTextSources.map((source) => source.file_name).join('\n')}>
+                {contextTextSources.length} imported text {contextTextSources.length === 1 ? 'source is' : 'sources are'} editable above
+              </p>
+            {/if}
             {#if contextAttachments.length > 0}
               <div class="completion-context-items">
                 {#each contextAttachments as attachment (attachment.id)}
-                  <article class="completion-context-card" title={attachment.warnings.join('\n')}>
-                    <span class="attachment-glyph" aria-hidden="true">{attachment.media_kinds.includes('image') ? '▧' : attachment.media_kinds.includes('audio') ? '◖' : '¶'}</span>
-                    <span class="completion-context-card-copy">
-                      <strong>{attachment.file_name}</strong>
-                      <small>{attachment.detected_format} · {formatByteCount(attachment.byte_count)}{attachment.coverage_complete ? '' : ' · excerpted'}</small>
-                    </span>
-                    <button
-                      class="attachment-remove"
-                      type="button"
-                      aria-label={`Remove ${attachment.file_name} from completion context`}
-                      disabled={contextAttachmentBusy}
-                      on:click={() => void removeContextAttachment(attachment.id)}
-                    >×</button>
+                  <article class="completion-context-card media-card" title={attachment.warnings.join('\n')}>
+                    <div class="completion-context-card-heading">
+                      <span class="attachment-glyph" aria-hidden="true">{attachment.presentation_kind === 'image' ? '▧' : attachment.presentation_kind === 'audio' ? '◖' : '◫'}</span>
+                      <span class="completion-context-card-copy">
+                        <strong>{attachment.file_name}</strong>
+                        <small>{attachment.detected_format} · {formatByteCount(attachment.text_bytes + attachment.media.reduce((sum, media) => sum + media.byte_count, 0))}{attachment.coverage_complete ? '' : ' · excerpted'}</small>
+                      </span>
+                      <button
+                        class="attachment-remove"
+                        type="button"
+                        aria-label={`Remove ${attachment.file_name} from completion context`}
+                        disabled={contextAttachmentBusy}
+                        on:click={() => void removeContextAttachment(attachment.id)}
+                      >×</button>
+                    </div>
+                    {#each attachment.media as media (media.sha256)}
+                      {@const previewUrl = contextMediaUrl(media)}
+                      <div class="context-media-preview">
+                        {#if media.kind === 'image' && previewUrl}
+                          <img src={previewUrl} alt={attachment.file_name} />
+                        {:else if media.kind === 'audio' && previewUrl}
+                          {#if media.waveform_peaks && media.waveform_peaks.length > 0}
+                            <div class="audio-waveform" aria-hidden="true">
+                              {#each media.waveform_peaks as peak}
+                                <i style={`height:${Math.max(5, peak / 255 * 100)}%`}></i>
+                              {/each}
+                            </div>
+                          {/if}
+                          <audio src={previewUrl} controls preload="metadata" aria-label={`Play ${attachment.file_name}`}></audio>
+                        {:else}
+                          <small class="context-media-error" role="status">Preview unavailable</small>
+                        {/if}
+                      </div>
+                    {/each}
                   </article>
                 {/each}
               </div>
-            {:else}
-              <p>Drop EPUB, spreadsheet, Markdown, DOCX, PDF, image, or audio files here.</p>
             {/if}
           </div>
         {/if}
@@ -8948,6 +9636,7 @@
               <span
                 class:ready={Boolean(currentModel) && !modelLoading && !modelUnloading}
                 class:preparing={modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0}
+                class:failed={Boolean(quietModelLoadFailure) && !currentModel}
                 class="status-dot"
               ></span>
               <strong>
@@ -8955,10 +9644,19 @@
                   ? 'Preparing'
                   : currentModel
                     ? 'Ready'
-                    : 'Needs setup'}
+                    : quietModelLoadFailure
+                      ? 'Needs attention'
+                      : 'Needs setup'}
               </strong>
             </div>
           </section>
+
+          {#if quietModelLoadFailure && !currentModel}
+            <div class="model-setup-error quiet-load-failure" role="alert">
+              <span>{quietModelLoadFailure.message}</span>
+              <button class="secondary-button compact" type="button" on:click={() => void retryPreferredWriter()}>Retry local writer</button>
+            </div>
+          {/if}
 
           <section class="curated-model-catalog" aria-labelledby="curated-model-catalog-title">
             <div class="section-heading">
@@ -9260,6 +9958,13 @@
       {:else}
         <button type="button" on:click={clearFailure} aria-label="Dismiss error">×</button>
       {/if}
+    </div>
+  {/if}
+  {#if speechRecovery && project}
+    <div class="toast speech-recovery" role="alert">
+      <span>Dictation is preserved because its original insertion point changed.</span>
+      <button type="button" on:click={insertRecoveredSpeech}>Insert at current caret</button>
+      <button type="button" on:click={() => { speechRecovery = null; }} aria-label="Discard preserved dictation">×</button>
     </div>
   {/if}
   <div class="sr-only" aria-live="polite">{liveRegion}</div>

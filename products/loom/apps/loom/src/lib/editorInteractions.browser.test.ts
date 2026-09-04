@@ -133,6 +133,79 @@ describe('real WebKit editor interactions', () => {
     await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
   }
 
+  it('makes the full visual writing body an editable hit target', async () => {
+    render('');
+    const editorLocator = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await expect.element(editorLocator).toBeInTheDocument();
+    const editor = editorLocator.element();
+    const pane = editor.closest('.editor-pane');
+    expect(pane).not.toBeNull();
+    const editorRect = editor.getBoundingClientRect();
+    const paneRect = pane!.getBoundingClientRect();
+    expect(Math.abs(editorRect.left - paneRect.left)).toBeLessThanOrEqual(1);
+    expect(Math.abs(editorRect.right - paneRect.right)).toBeLessThanOrEqual(1);
+
+    await editorLocator.click({
+      position: { x: editorRect.width - 4, y: editorRect.height - 4 }
+    });
+    expect(document.activeElement).toBe(editor);
+    await userEvent.keyboard('Anywhere');
+    await expect.poll(serializedMarkdown).toBe('Anywhere');
+  });
+
+  it('makes the full Markdown writing body an editable hit target', async () => {
+    renderSource('', []);
+    const editorLocator = page.getByRole('textbox');
+    await expect.element(editorLocator).toBeInTheDocument();
+    const editor = editorLocator.element() as HTMLTextAreaElement;
+    const pane = editor.closest('.editor-pane');
+    expect(pane).not.toBeNull();
+    const editorRect = editor.getBoundingClientRect();
+    const paneRect = pane!.getBoundingClientRect();
+    expect(Math.abs(editorRect.left - paneRect.left)).toBeLessThanOrEqual(1);
+    expect(Math.abs(editorRect.right - paneRect.right)).toBeLessThanOrEqual(1);
+
+    await editorLocator.click({
+      position: { x: editorRect.width - 4, y: Math.max(1, editorRect.height - 4) }
+    });
+    expect(document.activeElement).toBe(editor);
+    await userEvent.keyboard('Anywhere');
+    await expect.element(page.getByRole('status', { name: 'Source Markdown' }))
+      .toHaveTextContent('Anywhere');
+  });
+
+  it('inserts dictated text at the preserved visual and Markdown carets', async () => {
+    render('hello world');
+    const visual = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await visual.click();
+    const visualElement = visual.element();
+    const visualText = visualElement.querySelector('p')?.firstChild;
+    expect(visualText).not.toBeNull();
+    const range = document.createRange();
+    range.setStart(visualText!, 0);
+    range.collapse(true);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    document.dispatchEvent(new Event('selectionchange'));
+    await paintTwice();
+    await page.getByRole('button', { name: 'Insert transcript' }).click();
+    await expect.poll(serializedMarkdown).toBe(' dictatedhello world');
+
+    if (mounted) await unmount(mounted);
+    mounted = null;
+    document.body.replaceChildren();
+    renderSource('hello world', []);
+    const source = page.getByRole('textbox');
+    await source.click();
+    (source.element() as HTMLTextAreaElement).setSelectionRange(0, 0);
+    source.element().dispatchEvent(new Event('select', { bubbles: true }));
+    await page.getByRole('button', { name: 'Insert transcript' }).click();
+    await expect.poll(
+      () => page.getByRole('status', { name: 'Source Markdown' }).element().textContent
+    ).toBe(' dictatedhello world');
+  });
+
   it('preserves a paused terminal separator for later typing and palette commands', async () => {
     const keyboard = userEvent.setup();
     render('Something');

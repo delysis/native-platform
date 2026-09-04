@@ -421,6 +421,84 @@ export interface ContextAttachment {
   inline_markdown: string;
 }
 
+export interface ContextMediaPresentation {
+  id: string;
+  kind: 'image' | 'audio';
+  mime_type: string;
+  sha256: string;
+  byte_count: number;
+  preview_token: string | null;
+  waveform_peaks: number[] | null;
+}
+
+export interface ContextAttachmentPresentation {
+  id: string;
+  file_name: string;
+  detected_format: string;
+  coverage_complete: boolean;
+  text_bytes: number;
+  presentation_kind: 'text' | 'image' | 'audio' | 'mixed';
+  media: ContextMediaPresentation[];
+  warnings: string[];
+}
+
+export interface ContextTextSourcePresentation {
+  attachment_id: string;
+  file_name: string;
+  source_sha256: string;
+  source_bytes: number;
+  inserted_sha256: string;
+  inserted_bytes: number;
+  complete_projection: boolean;
+}
+
+export interface DocumentContextSnapshot {
+  markdown: string;
+  attachments: ContextAttachmentPresentation[];
+  text_sources: ContextTextSourcePresentation[];
+}
+
+export interface CoWriterSummary {
+  id: string;
+  name: string;
+  source_document_id: string;
+  context_bytes: number;
+  attachment_count: number;
+  created_at_unix_ms: number;
+  updated_at_unix_ms: number;
+}
+
+export type SpeechInputTarget = 'manuscript' | 'context';
+export type SpeechInputPhase =
+  | 'transcribing'
+  | 'cancel_requested'
+  | 'completed'
+  | 'cancelled'
+  | 'failed';
+
+export interface SpeechInputSnapshot {
+  request_id: string;
+  project_id: string;
+  session_id: string;
+  document_id: string;
+  target: SpeechInputTarget;
+  phase: SpeechInputPhase;
+  transcript: string;
+  error_code: string | null;
+  error_message: string | null;
+}
+
+export type SpeechRecordingPhase = 'recording' | 'cancelled';
+
+export interface SpeechRecordingSnapshot {
+  recording_id: string;
+  project_id: string;
+  session_id: string;
+  document_id: string;
+  target: SpeechInputTarget;
+  phase: SpeechRecordingPhase;
+}
+
 export interface MergeByteRange {
   start: number;
   end: number;

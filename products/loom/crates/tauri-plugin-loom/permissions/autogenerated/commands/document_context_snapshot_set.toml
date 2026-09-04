@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-document-context-snapshot-set"
+description = "Enables the document_context_snapshot_set command without any pre-configured scope."
+commands.allow = ["document_context_snapshot_set"]
+
+[[permission]]
+identifier = "deny-document-context-snapshot-set"
+description = "Denies the document_context_snapshot_set command without any pre-configured scope."
+commands.deny = ["document_context_snapshot_set"]

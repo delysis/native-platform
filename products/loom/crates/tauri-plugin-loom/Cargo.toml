@@ -12,6 +12,9 @@ attachment-native-host.workspace = true
 attachment-native-types.workspace = true
 atomic-write-file.workspace = true
 base64.workspace = true
+cpal = "=0.16.0"
+crossbeam-channel.workspace = true
+hound.workspace = true
 http.workspace = true
 image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 loom-document = { path = "../loom-document" }
@@ -25,11 +28,15 @@ same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+speech-native-backend-parakeet.workspace = true
+speech-native-host.workspace = true
+speech-native-types.workspace = true
 sysinfo.workspace = true
 tauri = { version = "2.11.5", default-features = false }
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-opener = "2.5.4"
 thiserror.workspace = true
+tokio.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
