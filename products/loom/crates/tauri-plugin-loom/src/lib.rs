@@ -14050,6 +14050,78 @@ mod tests {
     }
 
     #[test]
+    fn inline_media_authority_requires_current_document_membership_and_session() {
+        use sha2::Digest as _;
+        let mut fixture = document_action_fixture();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native.png");
+        let attachment = import_context_attachment_path(&fixture.root, &source).expect("import");
+        fixture
+            .store
+            .save_document(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose(attachment.media_markdown.expect("image Markdown")),
+                "insert image",
+            )
+            .expect("save image");
+        let state = PluginState::default();
+        let request = LoomContextMediaRequest {
+            project_id: fixture.store.manifest().project_id,
+            session_id: CommandId::new(),
+            document_id: fixture.identity.document,
+            attachment_id: attachment.id,
+            media_sha256: format!(
+                "{:x}",
+                sha2::Sha256::digest(std::fs::read(&source).expect("fixture bytes"))
+            ),
+        };
+        {
+            let mut session = state.session.lock().expect("session");
+            session.phase = SessionPhase::Open;
+            session.active_session_id = Some(request.session_id);
+            session.store = Some(fixture.store);
+        }
+        assert_eq!(
+            read_authorized_context_media(&state, &request)
+                .expect("selected image")
+                .bytes,
+            std::fs::read(&source).expect("fixture bytes"),
+        );
+        let other_document = LoomContextMediaRequest {
+            document_id: DocumentId::new(),
+            ..request.clone()
+        };
+        assert!(matches!(
+            read_authorized_context_media(&state, &other_document),
+            Err(LoomAssetReadFailure::NotFound)
+        ));
+        let other_session = LoomContextMediaRequest {
+            session_id: CommandId::new(),
+            ..request.clone()
+        };
+        assert!(matches!(
+            read_authorized_context_media(&state, &other_session),
+            Err(LoomAssetReadFailure::NotFound)
+        ));
+        state
+            .session
+            .lock()
+            .expect("session")
+            .store
+            .as_mut()
+            .expect("store")
+            .save_document(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("image removed\n".to_owned()),
+                "remove image",
+            )
+            .expect("save removal");
+        assert!(matches!(
+            read_authorized_context_media(&state, &request),
+            Err(LoomAssetReadFailure::NotFound)
+        ));
+    }
+
+    #[test]
     fn context_media_protocol_token_binds_every_authority_dimension() {
         let project_id = ProjectId::new();
         let session_id = CommandId::new();
