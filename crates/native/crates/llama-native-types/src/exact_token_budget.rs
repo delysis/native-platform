@@ -287,6 +287,7 @@ mod tests {
         GenerationBatchRequest {
             request_id: "budget".to_string(),
             model_id: "model".to_string(),
+            media: Vec::new(),
             cases,
         }
     }

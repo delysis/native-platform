@@ -29,6 +29,7 @@
   export let completionFrames: readonly (readonly CompletionCandidate[])[] = [];
   export let autocomplete = true;
   export let shuttle = false;
+  export let acceptImageAttachments = true;
   export let onImageAttachments: (files: readonly File[]) => Promise<readonly string[]> =
     async () => [];
   export let onImageAttachmentsCommitted: (count: number) => void = () => {};
@@ -242,6 +243,7 @@
       ghostHidden={shuttle || !autocomplete}
       ghostUnconsumeText={unconsumeText}
       surfaceKey="browser:surface"
+      {acceptImageAttachments}
       {onImageAttachments}
       onImageAttachmentsCommitted={acknowledgeImageAttachments}
       {onImageAttachmentError}

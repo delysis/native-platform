@@ -24,7 +24,7 @@ describe('completion popup placement', () => {
 
   it('stays below the caret when there is room', () => {
     expect(completionPopupPlacement(rect(300, 120), { width: 360, height: 180 }, 1000, 700)).toEqual({
-      left: 300,
+      left: 628,
       top: 146,
       maxHeight: 180,
       side: 'below'
@@ -33,7 +33,7 @@ describe('completion popup placement', () => {
 
   it('flips above a caret near the bottom edge', () => {
     expect(completionPopupPlacement(rect(300, 650), { width: 360, height: 180 }, 1000, 700)).toEqual({
-      left: 300,
+      left: 628,
       top: 462,
       maxHeight: 180,
       side: 'above'

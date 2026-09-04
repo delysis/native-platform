@@ -2,6 +2,12 @@
   import { onDestroy, onMount, tick } from 'svelte';
   import { completionOptionAccessibleLabel } from './ghostText';
   import { allocateCompletionPopupDomIds, placeCompletionPopup } from './completionPopup';
+  import {
+    CLOSED_COMPLETION_LENS,
+    completionLensVisible,
+    reduceCompletionLens,
+    type CompletionLensState
+  } from './completionLens';
   import type { VerseNewlineKind } from './verseCodec';
   import {
     nextSuggestionWord,
@@ -87,7 +93,11 @@
   let ltrContent = true;
   let plan: SourceGhostPlan | null = null;
   let presentationAnchor: SourceGhostAnchor | null = null;
+  let completionLens: CompletionLensState = CLOSED_COMPLETION_LENS;
+  let optionHeld = false;
   let optionFanVisible = false;
+  let lensVisible = false;
+  let lensTrigger: HTMLButtonElement;
   let suggestionFan: HTMLDivElement;
   let fanPlacementFrame: number | undefined;
   let selectedFanOptionIndex = -1;
@@ -166,18 +176,31 @@
   function placeSourceFan(): void {
     fanPlacementFrame = undefined;
     if (
-      !optionFanVisible ||
       !plan ||
-      !ghostSpan?.isConnected ||
-      !suggestionFan?.isConnected
+      !ghostSpan?.isConnected
     ) return;
     if (!visibleSourceGhostPlan(plan, true)) {
       // Viewport clamping cannot supply the missing insertion witness. Close
       // the fixed fan when its mirrored caret has scrolled out of view.
-      setOptionFanVisible(false);
+      optionHeld = false;
+      completionLens = CLOSED_COMPLETION_LENS;
       return;
     }
     const ghostRect = ghostSpan.getClientRects().item(0) ?? ghostSpan.getBoundingClientRect();
+    if (lensTrigger?.isConnected) {
+      const surfaceRect = shell.getBoundingClientRect();
+      const triggerWidth = Math.max(lensTrigger.offsetWidth, 34);
+      const triggerHeight = Math.max(lensTrigger.offsetHeight, 22);
+      lensTrigger.style.left = `${Math.max(
+        12,
+        Math.min(window.innerWidth - triggerWidth - 12, surfaceRect.right - triggerWidth - 18)
+      )}px`;
+      lensTrigger.style.top = `${Math.max(
+        12,
+        Math.min(window.innerHeight - triggerHeight - 12, ghostRect.top)
+      )}px`;
+    }
+    if (!lensVisible || !suggestionFan?.isConnected) return;
     suggestionFan.style.maxHeight = '';
     placeCompletionPopup(suggestionFan, {
       left: ghostRect.left,
@@ -190,17 +213,34 @@
   }
 
   function requestFanPlacement(): void {
-    if (fanPlacementFrame !== undefined || !optionFanVisible) return;
+    if (fanPlacementFrame !== undefined) return;
     fanPlacementFrame = window.requestAnimationFrame(placeSourceFan);
   }
 
   function setOptionFanVisible(visible: boolean): void {
-    if (optionFanVisible === visible) {
-      if (visible) requestFanPlacement();
+    optionHeld = visible;
+    const next = reduceCompletionLens(completionLens, visible
+      ? { kind: 'option_down', alternativeCount: ghostAlternatives.length }
+      : { kind: 'release_option' });
+    if (completionLens === next) {
+      if (lensVisible) requestFanPlacement();
       return;
     }
-    optionFanVisible = visible;
-    if (visible) void tick().then(requestFanPlacement);
+    completionLens = next;
+    if (completionLensVisible(completionLens)) void tick().then(requestFanPlacement);
+  }
+
+  function setCompletionLensPinned(pinned: boolean): void {
+    if (completionLens.pinned === pinned) return;
+    completionLens = pinned
+      ? { ...completionLens, pinned: ghostAlternatives.length > 1 }
+      : { ...completionLens, pinned: false };
+    if (completionLensVisible(completionLens)) void tick().then(requestFanPlacement);
+    element?.focus({ preventScroll: true });
+  }
+
+  function toggleCompletionLensPin(): void {
+    setCompletionLensPinned(!completionLens.pinned);
   }
 
   function renderedGhostPresentationKey(
@@ -220,7 +260,7 @@
 
     const viewportStyle = getComputedStyle(viewport);
     const ghostStyle = getComputedStyle(ghostSpan);
-    const ignoreFanVisibility = allowFanHiddenGhost && optionFanVisible;
+    const ignoreFanVisibility = allowFanHiddenGhost && lensVisible;
     if (
       viewportStyle.display === 'none' ||
       viewportStyle.visibility === 'hidden' ||
@@ -489,8 +529,8 @@
 
   function handleKeydown(event: KeyboardEvent): void {
     const candidate = currentPlan();
-    const visible = visibleSourceGhostPlan(candidate, optionFanVisible);
-    if (optionFanVisible && !visible) setOptionFanVisible(false);
+    const visible = visibleSourceGhostPlan(candidate, lensVisible);
+    if (lensVisible && !visible) completionLens = CLOSED_COMPLETION_LENS;
     if (
       (event.key === 'Alt' || event.altKey) &&
       visible &&
@@ -498,6 +538,32 @@
     ) {
       setOptionFanVisible(true);
       if (event.key === 'Alt') return;
+    }
+    if (
+      visible &&
+      lensVisible &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      event.key === 'Escape'
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      completionLens = CLOSED_COMPLETION_LENS;
+      return;
+    }
+    if (
+      visible &&
+      completionLens.pinned &&
+      !event.metaKey &&
+      !event.ctrlKey &&
+      !event.altKey &&
+      (event.key === 'ArrowUp' || event.key === 'ArrowDown')
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      onGhostCycle(event.key === 'ArrowDown' ? 1 : -1);
+      return;
     }
     if (
       candidate &&
@@ -541,8 +607,8 @@
     }
     if (
       visible &&
-      optionFanVisible &&
-      event.altKey &&
+      lensVisible &&
+      (event.altKey || completionLens.pinned) &&
       (event.key === 'Enter' || event.key === 'Tab') &&
       insertVisibleGhostText(
         visible,
@@ -555,7 +621,7 @@
       suppressCurrentGhost();
       return;
     }
-    const action = sourceGhostKeyAction(event, Boolean(visible), optionFanVisible && Boolean(visible));
+    const action = sourceGhostKeyAction(event, Boolean(visible), lensVisible && Boolean(visible));
     if (!action) return;
     if ((action === 'cycle_next' || action === 'cycle_previous') && visible) {
       event.preventDefault();
@@ -710,6 +776,24 @@
     return focused;
   }
 
+  export function insertAttachmentMarkdown(markdown: string): boolean {
+    if (!element || readonly || composing || !markdown.trim()) return false;
+    const start = element.selectionStart;
+    const end = element.selectionEnd;
+    const before = value.slice(0, start);
+    const after = value.slice(end);
+    const prefix = before && !before.endsWith('\n') ? '\n\n' : '';
+    const suffix = after && !after.startsWith('\n') ? '\n\n' : '';
+    const inserted = `${prefix}${markdown}${suffix}`;
+    element.value = `${before}${inserted}${after}`;
+    const caret = start + inserted.length;
+    element.setSelectionRange(caret, caret);
+    onValueInput(element);
+    onSelectionChange(element);
+    element.focus();
+    return true;
+  }
+
   export function acceptGhostWord(requireVisible = true): boolean {
     const candidate = currentPlan();
     if (
@@ -755,15 +839,30 @@
     installPlan(currentPlan());
   }
 
-  $: selectedFanOptionIndex = plan && optionFanVisible && ghostAlternatives.length > 1
+  $: selectedFanOptionIndex = plan && ghostAlternatives.length > 1
     ? ghostAlternatives.findIndex(
         (alternative) => alternative.presentationKey === plan?.presentationKey
       )
     : -1;
-  $: controlledFanId = selectedFanOptionIndex >= 0
+  $: controlledFanId = lensVisible && selectedFanOptionIndex >= 0
     ? completionPopupDomIds.listboxId
     : undefined;
-  $: activeFanOptionId = selectedFanOptionIndex >= 0
+
+  $: lensVisible = completionLensVisible(completionLens);
+  $: optionFanVisible = completionLens.momentary;
+  $: if (ghostAlternatives.length < 2 && completionLens !== CLOSED_COMPLETION_LENS) {
+    completionLens = reduceCompletionLens(completionLens, {
+      kind: 'alternatives_changed',
+      alternativeCount: ghostAlternatives.length
+    });
+  }
+  $: if (ghostAlternatives.length > 1 && optionHeld && !completionLens.momentary) {
+    completionLens = reduceCompletionLens(completionLens, {
+      kind: 'option_down',
+      alternativeCount: ghostAlternatives.length
+    });
+  }
+  $: activeFanOptionId = lensVisible && selectedFanOptionIndex >= 0
     ? completionPopupDomIds.optionId(selectedFanOptionIndex)
     : undefined;
 
@@ -819,7 +918,7 @@
   <div class="source-ghost-viewport" aria-hidden="true" hidden={!plan} bind:this={viewport}>
     <div class="source-ghost-mirror" bind:this={mirror}>
       {#if plan}
-        <span>{plan.prefix}</span><span class:ghost-text-hidden={ghostHidden || optionFanVisible} class="loom-source-ghost-text" bind:this={ghostSpan}>{plan.text}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
+        <span>{plan.prefix}</span><span class:ghost-text-hidden={ghostHidden} class="loom-source-ghost-text" bind:this={ghostSpan}>{plan.text}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
       {/if}
     </div>
   </div>
@@ -848,7 +947,21 @@
     spellcheck="true"
     wrap={verse ? 'off' : 'soft'}
   ></textarea>
-  {#if plan && optionFanVisible && ghostAlternatives.length > 1}
+  {#if plan && ghostAlternatives.length > 1}
+    <button
+      bind:this={lensTrigger}
+      class="loom-completion-lens-trigger source-completion-lens-trigger"
+      class:pinned={completionLens.pinned}
+      type="button"
+      tabindex="-1"
+      aria-label={completionLens.pinned ? 'Unpin completion alternatives' : 'Pin completion alternatives'}
+      aria-expanded={lensVisible}
+      aria-controls={completionPopupDomIds.listboxId}
+      on:mousedown|preventDefault|stopPropagation
+      on:click|preventDefault|stopPropagation={toggleCompletionLensPin}
+    >{Math.max(1, selectedFanOptionIndex + 1)}/{ghostAlternatives.length}</button>
+  {/if}
+  {#if plan && lensVisible && ghostAlternatives.length > 1}
     <div
       class="source-suggestion-fan"
       bind:this={suggestionFan}
@@ -857,8 +970,10 @@
       aria-label="Completion suggestions"
       aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown Alt+Enter Alt+Tab"
     >
-      {#each ghostAlternatives as alternative, index (alternative.presentationKey)}
-        <div
+      {#each ghostAlternatives as alternative, index (alternative.runId ?? alternative.candidateId)}
+        <button
+          type="button"
+          tabindex="-1"
           class:active={alternative.presentationKey === plan.presentationKey}
           class="loom-ghost-fan-row"
           id={completionPopupDomIds.optionId(index)}
@@ -869,11 +984,17 @@
             ghostAlternatives.length,
             alternative.text
           )}
+          on:mousedown|preventDefault|stopPropagation
+          on:click|preventDefault|stopPropagation={() => {
+            const offset = index - selectedFanOptionIndex;
+            if (offset !== 0) onGhostCycle(offset);
+            setCompletionLensPinned(true);
+          }}
         >
           <span class="loom-ghost-fan-index">{index + 1}</span><span>{alternative.text}</span>
-        </div>
+        </button>
       {/each}
-      <div class="loom-ghost-fan-hint">↑↓ choose&nbsp; · &nbsp;Return insert&nbsp; · &nbsp;→ next word</div>
+      <div class="loom-ghost-fan-hint">↑↓ choose&nbsp; · &nbsp;Tab insert&nbsp; · &nbsp;click counter to pin</div>
     </div>
   {/if}
 </div>

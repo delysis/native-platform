@@ -12,6 +12,7 @@ publish = false
 attachment-native-types.workspace = true
 csv.workspace = true
 html-to-markdown-rs.workspace = true
+hound.workspace = true
 imagesize.workspace = true
 image = { version = "0.25.9", default-features = false, features = ["bmp", "jpeg", "png", "tiff"] }
 lopdf.workspace = true

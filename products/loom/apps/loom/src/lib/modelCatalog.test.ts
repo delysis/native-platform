@@ -6,6 +6,7 @@ import type {
 } from './types';
 import {
   catalogDownloadRequest,
+  catalogDownloadRequests,
   isVerifiedCatalogWriter,
   legacyLocalCatalogMatch,
   validateCuratedModelCatalog
@@ -22,6 +23,13 @@ const entry: CuratedModelCatalogEntry = {
   expected_sha256: '93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b',
   expected_bytes: 6_975_879_296,
   max_bytes: 6_975_879_296,
+  projector: {
+    artifact_name: 'mmproj-gemma-4-12b-it-qat-q4_0.gguf',
+    download_url: 'https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/29d097773436b69ff9feafd636ab4cf873786537/mmproj-gemma-4-12b-it-qat-q4_0.gguf?download=true',
+    expected_sha256: 'cb018338a7538a9814d994bfe54644c71eb7ed54e31eae2f721e45fd3c260da7',
+    expected_bytes: 175_115_616,
+    max_bytes: 175_115_616
+  },
   context_tokens: 262_144,
   license: {
     spdx_id: 'Apache-2.0',
@@ -36,7 +44,7 @@ const entry: CuratedModelCatalogEntry = {
   compatibility: {
     local_only: true,
     hosted_fallback: false,
-    prompt_mode: 'raw_completion',
+    prompt_mode: 'chat_completion',
     native_inspection_required: true,
     legacy_local_file_name: 'gemma-4-12b-it-qat-q4_0.gguf',
     legacy_local_file_bytes: 6_975_879_296
@@ -44,7 +52,7 @@ const entry: CuratedModelCatalogEntry = {
 };
 
 function catalog(overrides: Partial<CuratedModelCatalogSnapshot> = {}): CuratedModelCatalogSnapshot {
-  return { schema_version: 1, entries: [entry], ...overrides };
+  return { schema_version: 2, entries: [entry], ...overrides };
 }
 
 function localModel(overrides: Partial<ModelCapabilitySummary> = {}): ModelCapabilitySummary {
@@ -65,6 +73,7 @@ function localModel(overrides: Partial<ModelCapabilitySummary> = {}): ModelCapab
     context_tokens: null,
     model_sha256: null,
     projector_present: null,
+    projector_sha256: null,
     media_kinds: [],
     policy_candidate: null,
     policy_verified: null,
@@ -82,6 +91,13 @@ describe('curated model catalog', () => {
       sha256: entry.expected_sha256,
       expectedBytes: entry.expected_bytes,
       maxBytes: entry.expected_bytes
+    });
+    expect(catalogDownloadRequests(entry)[1]).toEqual({
+      url: entry.projector.download_url,
+      fileName: entry.projector.artifact_name,
+      sha256: entry.projector.expected_sha256,
+      expectedBytes: entry.projector.expected_bytes,
+      maxBytes: entry.projector.expected_bytes
     });
   });
 
@@ -118,8 +134,12 @@ describe('curated model catalog', () => {
     const verified = localModel({
       loaded: true,
       completion: true,
+      chat: true,
       output_tokens: true,
-      model_sha256: entry.expected_sha256
+      model_sha256: entry.expected_sha256,
+      projector_present: true,
+      projector_sha256: entry.projector.expected_sha256,
+      media_kinds: ['image', 'audio']
     });
     expect(isVerifiedCatalogWriter(entry, verified)).toBe(true);
     expect(isVerifiedCatalogWriter(entry, {
@@ -134,9 +154,13 @@ describe('curated model catalog', () => {
       ...verified,
       output_tokens: false
     })).toBe(false);
+    expect(isVerifiedCatalogWriter(entry, {
+      ...verified,
+      projector_sha256: '0'.repeat(64)
+    })).toBe(false);
   });
 
-  it('rejects any second curated identity in schema version one', () => {
+  it('rejects any second curated identity in schema version two', () => {
     expect(() => validateCuratedModelCatalog(catalog({ entries: [entry, entry] })))
       .toThrow('unsupported curated model catalog');
   });

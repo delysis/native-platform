@@ -255,7 +255,7 @@ describe('sourceGhostKeyAction', () => {
     expect(sourceGhostKeyAction(key({ key: 'ArrowUp', altKey: true }), true)).toBe('cycle_previous');
   });
 
-  it('keeps cycling while Option deliberately hides the inline ghost', () => {
+  it('keeps cycling while the Option lens is open', () => {
     expect(sourceGhostKeyAction(key({ key: 'ArrowDown', altKey: true }), false, true))
       .toBe('cycle_next');
     expect(sourceGhostKeyAction(key({ key: 'ArrowUp', altKey: true }), false, true))

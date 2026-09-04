@@ -36,12 +36,23 @@ pub(crate) fn probe_media(
         DetectedFormat::Avi => probe_avi(bytes),
         _ => Err("No structural media probe is available for this detected format."),
     }?;
-    if matches!(format, DetectedFormat::Png | DetectedFormat::Jpeg) {
-        decode_static_raster(format, bytes, max_image_pixels, &metadata)?;
+    if matches!(
+        format,
+        DetectedFormat::Png | DetectedFormat::Jpeg | DetectedFormat::Wav
+    ) {
+        if format == DetectedFormat::Wav {
+            decode_wav(bytes)?;
+        } else {
+            decode_static_raster(format, bytes, max_image_pixels, &metadata)?;
+        }
         return Ok(MediaProbe {
             metadata,
             grade: BlobValidationGrade::PayloadDecoded,
-            method: "bounded complete static-image decode",
+            method: if format == DetectedFormat::Wav {
+                "bounded complete WAV sample decode"
+            } else {
+                "bounded complete static-image decode"
+            },
         });
     }
     Ok(MediaProbe {
@@ -49,6 +60,28 @@ pub(crate) fn probe_media(
         grade: BlobValidationGrade::HeaderOrStructureOnly,
         method: "bounded header or container-structure probe",
     })
+}
+
+fn decode_wav(bytes: &[u8]) -> Result<(), &'static str> {
+    let mut reader = hound::WavReader::new(Cursor::new(bytes))
+        .map_err(|_| "The complete WAV payload failed bounded decoding.")?;
+    match reader.spec().sample_format {
+        hound::SampleFormat::Float => {
+            for sample in reader.samples::<f32>() {
+                let value =
+                    sample.map_err(|_| "The complete WAV payload failed bounded decoding.")?;
+                if !value.is_finite() {
+                    return Err("The WAV payload contains a non-finite sample.");
+                }
+            }
+        }
+        hound::SampleFormat::Int => {
+            for sample in reader.samples::<i32>() {
+                sample.map_err(|_| "The complete WAV payload failed bounded decoding.")?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn decode_static_raster(

@@ -8,6 +8,7 @@ import type {
   BuildModelPolicySummary,
   CommandReceipt,
   CompletionSnapshot,
+  ContextAttachment,
   CuratedModelCatalogSnapshot,
   DesktopGenerationEnvelope,
   DocumentKind,
@@ -182,6 +183,78 @@ export function ingestImageAttachment(
     mediaType,
     encoded: base64
   });
+}
+
+export function importAttachmentPaths(
+  projectId: string,
+  sessionId: string,
+  paths: readonly string[]
+): Promise<ContextAttachment[]> {
+  return call('attachment_import_paths', { projectId, sessionId, paths: [...paths] });
+}
+
+export function chooseAttachments(
+  projectId: string,
+  sessionId: string
+): Promise<ContextAttachment[]> {
+  return call('attachment_import_choose', { projectId, sessionId });
+}
+
+export function listDocumentContext(
+  projectId: string,
+  sessionId: string,
+  documentId: string
+): Promise<ContextAttachment[]> {
+  return call('document_context_list', { projectId, sessionId, documentId });
+}
+
+export function addDocumentContext(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  attachmentId: string
+): Promise<ContextAttachment[]> {
+  return call('document_context_add', { projectId, sessionId, documentId, attachmentId });
+}
+
+export function addDocumentContexts(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  attachmentIds: readonly string[]
+): Promise<ContextAttachment[]> {
+  return call('document_context_add_many', {
+    projectId,
+    sessionId,
+    documentId,
+    attachmentIds: [...attachmentIds]
+  });
+}
+
+export function removeDocumentContext(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  attachmentId: string
+): Promise<ContextAttachment[]> {
+  return call('document_context_remove', { projectId, sessionId, documentId, attachmentId });
+}
+
+export function getDocumentContextText(
+  projectId: string,
+  sessionId: string,
+  documentId: string
+): Promise<string> {
+  return call('document_context_text_get', { projectId, sessionId, documentId });
+}
+
+export function setDocumentContextText(
+  projectId: string,
+  sessionId: string,
+  documentId: string,
+  text: string
+): Promise<string> {
+  return call('document_context_text_set', { projectId, sessionId, documentId, text });
 }
 
 export async function getBuildModelPolicy(): Promise<BuildModelPolicySummary> {

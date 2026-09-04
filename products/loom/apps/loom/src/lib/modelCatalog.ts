@@ -12,8 +12,8 @@ function isPositiveSafeInteger(value: number): boolean {
   return Number.isSafeInteger(value) && value > 0;
 }
 
-function expectedDownloadUrl(entry: CuratedModelCatalogEntry): string {
-  return `https://huggingface.co/${entry.repository}/resolve/${entry.revision}/${entry.artifact_name}?download=true`;
+function expectedDownloadUrl(entry: CuratedModelCatalogEntry, artifactName: string): string {
+  return `https://huggingface.co/${entry.repository}/resolve/${entry.revision}/${artifactName}?download=true`;
 }
 
 function isVisionAdapter(model: ModelCapabilitySummary): boolean {
@@ -31,7 +31,7 @@ function validateEntry(entry: CuratedModelCatalogEntry): void {
     !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(entry.repository) ||
     !REVISION_PATTERN.test(entry.revision) ||
     !/^[^/\\]+\.gguf$/iu.test(entry.artifact_name) ||
-    entry.download_url !== expectedDownloadUrl(entry) ||
+    entry.download_url !== expectedDownloadUrl(entry, entry.artifact_name) ||
     !SHA256_PATTERN.test(entry.expected_sha256) ||
     !isPositiveSafeInteger(entry.expected_bytes) ||
     entry.max_bytes !== entry.expected_bytes ||
@@ -45,7 +45,13 @@ function validateEntry(entry: CuratedModelCatalogEntry): void {
     !entry.memory_fit.description.trim() ||
     entry.compatibility.local_only !== true ||
     entry.compatibility.hosted_fallback !== false ||
-    entry.compatibility.prompt_mode !== 'raw_completion' ||
+    !/^[^/\\]+\.gguf$/iu.test(entry.projector.artifact_name) ||
+    !/(^|[-_.])mmproj([-_.]|$)/iu.test(entry.projector.artifact_name) ||
+    entry.projector.download_url !== expectedDownloadUrl(entry, entry.projector.artifact_name) ||
+    !SHA256_PATTERN.test(entry.projector.expected_sha256) ||
+    !isPositiveSafeInteger(entry.projector.expected_bytes) ||
+    entry.projector.max_bytes !== entry.projector.expected_bytes ||
+    entry.compatibility.prompt_mode !== 'chat_completion' ||
     entry.compatibility.native_inspection_required !== true ||
     entry.compatibility.legacy_local_file_name !== entry.artifact_name ||
     entry.compatibility.legacy_local_file_bytes !== entry.expected_bytes
@@ -63,7 +69,7 @@ export function validateCuratedModelCatalog(
   snapshot: CuratedModelCatalogSnapshot
 ): CuratedModelCatalogEntry[] {
   if (
-    snapshot.schema_version !== 1 ||
+    snapshot.schema_version !== 2 ||
     snapshot.entries.length !== 1
   ) {
     throw new Error('The desktop returned an unsupported curated model catalog.');
@@ -107,7 +113,11 @@ export function isVerifiedCatalogWriter(
     model.file_bytes === entry.expected_bytes &&
     model.completion &&
     model.output_tokens &&
-    !isVisionAdapter(model);
+    model.chat &&
+    model.projector_present === true &&
+    model.projector_sha256 === entry.projector.expected_sha256 &&
+    model.media_kinds.includes('image') &&
+    model.media_kinds.includes('audio');
 }
 
 export function catalogDownloadRequest(entry: CuratedModelCatalogEntry): {
@@ -125,4 +135,20 @@ export function catalogDownloadRequest(entry: CuratedModelCatalogEntry): {
     expectedBytes: entry.expected_bytes,
     maxBytes: entry.max_bytes
   };
+}
+
+export function catalogDownloadRequests(
+  entry: CuratedModelCatalogEntry
+): ReturnType<typeof catalogDownloadRequest>[] {
+  validateEntry(entry);
+  return [
+    catalogDownloadRequest(entry),
+    {
+      url: entry.projector.download_url,
+      fileName: entry.projector.artifact_name,
+      sha256: entry.projector.expected_sha256,
+      expectedBytes: entry.projector.expected_bytes,
+      maxBytes: entry.projector.max_bytes
+    }
+  ];
 }

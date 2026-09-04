@@ -404,6 +404,7 @@ dependencies = [
  "attachment-native-inspect",
  "attachment-native-types",
  "csv",
+ "hound",
  "html-to-markdown-rs",
  "image",
  "imagesize",
@@ -6925,10 +6926,14 @@ dependencies = [
 name = "tauri-plugin-loom"
 version = "0.1.0"
 dependencies = [
+ "atomic-write-file",
+ "attachment-native-host",
+ "attachment-native-types",
  "base64 0.22.1",
  "http",
  "image",
  "libc",
+ "llama-native-types",
  "loom-backend-llama",
  "loom-document",
  "loom-host",
@@ -6939,6 +6944,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "sysinfo",
  "tauri",
  "tauri-plugin",
  "tauri-plugin-dialog",

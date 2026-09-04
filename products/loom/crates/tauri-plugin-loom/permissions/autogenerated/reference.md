@@ -14,6 +14,14 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-document-rename`
 - `allow-document-delete`
 - `allow-attachment-ingest`
+- `allow-attachment-import-choose`
+- `allow-attachment-import-paths`
+- `allow-document-context-list`
+- `allow-document-context-add`
+- `allow-document-context-add-many`
+- `allow-document-context-remove`
+- `allow-document-context-text-get`
+- `allow-document-context-text-set`
 - `allow-document-open`
 - `allow-document-checkpoint`
 - `allow-document-export-choose`
@@ -159,6 +167,58 @@ Enables the application_close_pending command without any pre-configured scope.
 <td>
 
 Denies the application_close_pending command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-attachment-import-choose`
+
+</td>
+<td>
+
+Enables the attachment_import_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-attachment-import-choose`
+
+</td>
+<td>
+
+Denies the attachment_import_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-attachment-import-paths`
+
+</td>
+<td>
+
+Enables the attachment_import_paths command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-attachment-import-paths`
+
+</td>
+<td>
+
+Denies the attachment_import_paths command without any pre-configured scope.
 
 </td>
 </tr>
@@ -393,6 +453,162 @@ Enables the document_checkpoint command without any pre-configured scope.
 <td>
 
 Denies the document_checkpoint command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-context-add`
+
+</td>
+<td>
+
+Enables the document_context_add command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-context-add`
+
+</td>
+<td>
+
+Denies the document_context_add command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-context-add-many`
+
+</td>
+<td>
+
+Enables the document_context_add_many command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-context-add-many`
+
+</td>
+<td>
+
+Denies the document_context_add_many command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-context-list`
+
+</td>
+<td>
+
+Enables the document_context_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-context-list`
+
+</td>
+<td>
+
+Denies the document_context_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-context-remove`
+
+</td>
+<td>
+
+Enables the document_context_remove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-context-remove`
+
+</td>
+<td>
+
+Denies the document_context_remove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-context-text-get`
+
+</td>
+<td>
+
+Enables the document_context_text_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-context-text-get`
+
+</td>
+<td>
+
+Denies the document_context_text_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-context-text-set`
+
+</td>
+<td>
+
+Enables the document_context_text_set command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-context-text-set`
+
+</td>
+<td>
+
+Denies the document_context_text_set command without any pre-configured scope.
 
 </td>
 </tr>

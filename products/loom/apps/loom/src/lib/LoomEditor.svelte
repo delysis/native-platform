@@ -16,6 +16,7 @@
     clearGhostText,
     createGhostTextPlugin,
     currentGhostTextPlan,
+    setGhostFanPinned,
     setGhostText,
     visualCaretBoundaryProof,
     visibleGhostWidgetPresentationKey,
@@ -23,6 +24,11 @@
     type VisualCaretBoundaryFailure,
     visualGhostTextIsFaithfulAtSelection
   } from './ghostText';
+  import {
+    CLOSED_COMPLETION_LENS,
+    reduceCompletionLens,
+    type CompletionLensState
+  } from './completionLens';
   import {
     nextVisualSuggestionWord,
     type CompletionInsertionAction,
@@ -70,6 +76,7 @@
     surfaceKey: string;
     suppressedKey: string;
     optionHeld: boolean;
+    lensPinned: boolean;
   }
 
   export let value = '';
@@ -85,6 +92,13 @@
   export let ghostHidden = false;
   export let ghostUnconsumeText = '';
   export let surfaceKey = '';
+  /**
+   * Claim browser image paste/drop events for the manuscript attachment flow.
+   * Embedders with a different drop authority (such as the completion-context
+   * pane's native path importer) must opt out so this editor does not swallow
+   * an event it cannot commit.
+   */
+  export let acceptImageAttachments = true;
   export let onImageAttachments: (files: readonly File[]) => Promise<readonly string[]> =
     async () => [];
   export let onImageAttachmentsCommitted: (count: number) => void = () => {};
@@ -137,6 +151,7 @@
   let reportedGhostPresentationKey = '';
   let reportedRejectedPresentationIdentity = '';
   let optionHeld = false;
+  let completionLens: CompletionLensState = CLOSED_COMPLETION_LENS;
   let visibilityFrame: number | undefined;
   let ghostSynchronizationFrame: number | undefined;
   let ghostSynchronizationRequiresRender = false;
@@ -166,6 +181,7 @@
       available: Boolean(view),
       optionHeld,
       fanVisible: Boolean(plan?.fanVisible),
+      lensPinned: completionLens.pinned,
       inlineHidden: Boolean(plan?.hidden),
       selectedCandidateId: plan?.candidateId ?? '',
       selectedPresentationKey: plan?.presentationKey ?? '',
@@ -249,7 +265,8 @@
       unconsumeText: ghostUnconsumeText,
       surfaceKey,
       suppressedKey: suppressedGhostKey,
-      optionHeld
+      optionHeld,
+      lensPinned: completionLens.pinned
     };
   }
 
@@ -314,7 +331,8 @@
       // Once a word is consumed the session is locked to one candidate. Do
       // not hide its cached remainder behind a now-empty alternatives fan
       // while Option is still held.
-      fanVisible: snapshot.optionHeld && snapshot.alternatives.length > 1
+      fanVisible: snapshot.optionHeld && snapshot.alternatives.length > 1,
+      fanPinned: snapshot.lensPinned && snapshot.alternatives.length > 1
     } : null;
     setGhostText(editorView, presentation, forceRender);
     reportCompletionAccessibility();
@@ -416,6 +434,29 @@
     view.focus();
     reportSelection(view.state);
     return view.hasFocus();
+  }
+
+  export function insertAttachmentMarkdown(
+    markdown: string,
+    clientX?: number,
+    clientY?: number
+  ): boolean {
+    if (!view || readonly || composing || !markdown.trim()) return false;
+    const position = clientX !== undefined && clientY !== undefined
+      ? view.posAtCoords({ left: clientX, top: clientY })
+      : null;
+    const selection = position
+      ? Selection.near(view.state.doc.resolve(position.pos))
+      : view.state.selection;
+    const attachmentDocument = parse(markdown);
+    view.dispatch(view.state.tr.replaceRange(
+      selection.from,
+      selection.to,
+      attachmentDocument.slice(0, attachmentDocument.content.size)
+    ));
+    projectDocument();
+    view.focus();
+    return true;
   }
 
   /** Reassert the current immutable selection without treating it as navigation. */
@@ -633,6 +674,7 @@
           unconsume: authorizeCompletionReversal,
           cycle: onGhostCycle,
           modifier: setOptionHeld,
+          pin: setLensPinned,
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
           visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>
             Boolean(view) &&
@@ -696,6 +738,11 @@
     const files = imageFilesFromTransfer(transfer);
     const ephemeralImage = transferContainsEphemeralImage(transfer);
     const claimedFileDrop = event instanceof DragEvent && transferMayContainImageFile(transfer);
+    // Returning true tells ProseMirror not to run its own drop/paste fallback;
+    // deliberately leave the DOM event untouched for the embedding pane.
+    if (!acceptImageAttachments) {
+      return files.length > 0 || ephemeralImage || claimedFileDrop;
+    }
     if (files.length === 0 && !ephemeralImage && !claimedFileDrop) return false;
     event.preventDefault();
     event.stopPropagation();
@@ -755,6 +802,7 @@
   function handleImageDragOver(event: DragEvent): boolean {
     const claimed = transferMayContainImageFile(event.dataTransfer) ||
       transferContainsEphemeralImage(event.dataTransfer);
+    if (!acceptImageAttachments) return claimed;
     if (claimed) event.preventDefault();
     return claimed;
   }
@@ -805,8 +853,19 @@
   }
 
   function setOptionHeld(held: boolean): void {
-    if (optionHeld === held) return;
-    optionHeld = held;
+    if (optionHeld !== held) optionHeld = held;
+    const next = reduceCompletionLens(completionLens, held
+      ? { kind: 'option_down', alternativeCount: ghostAlternatives.length }
+      : { kind: 'release_option' });
+    if (completionLens !== next) completionLens = next;
+  }
+
+  function setLensPinned(pinned: boolean): void {
+    if (completionLens.pinned === pinned) return;
+    completionLens = pinned
+      ? { ...completionLens, pinned: ghostAlternatives.length > 1 }
+      : { ...completionLens, pinned: false };
+    if (view) setGhostFanPinned(view, completionLens.pinned);
   }
 
   function editorHasExactFocus(): boolean {
@@ -1033,7 +1092,22 @@
       unconsumeText: ghostUnconsumeText,
       surfaceKey,
       suppressedKey: suppressedGhostKey,
-      optionHeld
+      optionHeld,
+      lensPinned: completionLens.pinned
+    });
+  }
+
+  $: if (ghostAlternatives.length < 2 && completionLens !== CLOSED_COMPLETION_LENS) {
+    completionLens = reduceCompletionLens(completionLens, {
+      kind: 'alternatives_changed',
+      alternativeCount: ghostAlternatives.length
+    });
+    if (view) setGhostFanPinned(view, false);
+  }
+  $: if (ghostAlternatives.length > 1 && optionHeld && !completionLens.momentary) {
+    completionLens = reduceCompletionLens(completionLens, {
+      kind: 'option_down',
+      alternativeCount: ghostAlternatives.length
     });
   }
 
@@ -1053,6 +1127,7 @@
       available: false,
       optionHeld: false,
       fanVisible: false,
+      lensPinned: false,
       inlineHidden: true,
       selectedCandidateId: '',
       selectedPresentationKey: '',

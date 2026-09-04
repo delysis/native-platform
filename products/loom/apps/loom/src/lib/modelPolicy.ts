@@ -48,7 +48,7 @@ export function isEphemeralAcceptanceModelPath(modelPath: string): boolean {
   return /\/delysis-loom-smoke\.[^/]+\/product\/models\/[^/]+$/u.test(normalized);
 }
 
-function isOfficialGemma4_12BQat(model: ModelCapabilitySummary): boolean {
+export function isOfficialGemma4CatalogHint(model: ModelCapabilitySummary): boolean {
   return model.local &&
     model.header_verified &&
     !model.loaded &&
@@ -107,7 +107,7 @@ export function orderedLocalTextModels(
 ): ModelCapabilitySummary[] {
   const priority = (model: ModelCapabilitySummary): [number, number, string] => {
     if (model.model_path === rememberedPath) return [0, 0, model.model_path];
-    if (isOfficialGemma4_12BQat(model)) return [1, 0, model.model_path];
+    if (isOfficialGemma4CatalogHint(model)) return [1, 0, model.model_path];
     if (model.policy_candidate) return [2, model.policy_candidate.rank, model.model_path];
     return [3, 0, model.model_path];
   };
@@ -136,7 +136,7 @@ export function startupWriterCandidates(
   rememberedPath: string | null
 ): StartupWriterCandidate[] {
   const policyCandidates = orderedLocalWriterCandidates(models);
-  const officialGemma = models.find(isOfficialGemma4_12BQat);
+  const officialGemma = models.find(isOfficialGemma4CatalogHint);
   const rememberedProfile = rememberedPath
     ? models.find((model) => model.model_path === rememberedPath)?.policy_candidate?.profile_id ?? null
     : null;
@@ -199,8 +199,9 @@ export function isVerifiedPolicyWriter(
 
 /**
  * A model explicitly loaded through the native runtime may power suggestions
- * once its descriptor proves text completion and generated-token output. Media
- * adapters stay out of this path; they are not standalone language models.
+ * once its descriptor proves text completion and generated-token output. A
+ * standalone text model remains valid; a projector-bound model additionally
+ * needs the exact chat plus image/audio capabilities used by context cards.
  */
 export function isUsableSuggestionWriter(
   model: ModelCapabilitySummary
@@ -209,9 +210,11 @@ export function isUsableSuggestionWriter(
     model.local &&
     model.header_verified &&
     model.completion &&
-    model.output_tokens &&
-    model.projector_present === false &&
-    model.media_kinds.length === 0;
+    model.output_tokens && (
+      (model.projector_present === false && model.media_kinds.length === 0) ||
+      (model.projector_present === true && model.chat &&
+        model.media_kinds.includes('image') && model.media_kinds.includes('audio'))
+    );
 }
 
 /**

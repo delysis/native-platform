@@ -32,7 +32,7 @@ these evidence levels by itself.
 | RAR | RAR 4/5 signatures | detected | deliberately unsupported in process; no audited decoder exposes the required memory/step limits |
 | Raster images | PNG, JPEG, GIF, WebP, BMP, TIFF, HEIF, AVIF | PNG/JPEG receive a bounded complete payload decode; the remaining formats receive a structural/dimension probe | only payload-decoded media may be direct; structure-only formats require an explicit transform or remain blocked even when the target names that media type |
 | Vector image | SVG | XML canonicalization; direct when target allows | active/external content is data only and never fetched or executed |
-| Audio | WAV, AIFF, CAF, FLAC, MP3, Opus/Vorbis/Speex/FLAC-in-Ogg, M4A | container/frame probe; direct when target allows, otherwise explicit transcription request | ambiguous Ogg remains generic; core does not decode or transcribe |
+| Audio | WAV, AIFF, CAF, FLAC, MP3, Opus/Vorbis/Speex/FLAC-in-Ogg, M4A | WAV receives a complete sample decode and may be direct; the remaining formats receive a container/frame probe | ambiguous Ogg remains generic; the core never transcribes, and structure-only formats need an explicit transform before direct use |
 | Video | MP4, QuickTime, Theora-in-Ogg, Matroska, WebM, AVI | container probe; direct when target allows, otherwise explicit frame/audio DAG | core does not demux, decode frames, or invoke codecs |
 | Executables | common executable signatures | detected and blocked | never canonicalized or offered as opaque content by the default policy |
 | Unknown binary | anything not proven above | explicit opaque or blocked result | policy-controlled; never treated as text or clean content |

@@ -1802,6 +1802,7 @@ impl From<StrictGenerationOutputWire> for GenerationOutput {
                     supplied_prefix_tokens: value.metrics.cache.supplied_prefix_tokens,
                     restored_prefix_tokens: value.metrics.cache.restored_prefix_tokens,
                     batch_shared_prefix_tokens: value.metrics.cache.batch_shared_prefix_tokens,
+                    resident_prefix_tokens: 0,
                 },
             },
             real_engine_invoked: value.real_engine_invoked,
@@ -4036,6 +4037,7 @@ mod tests {
         let legacy = crate::GenerationBatchRequest {
             request_id: "legacy".to_string(),
             model_id: "writer".to_string(),
+            media: Vec::new(),
             cases: vec![crate::GenerationCase {
                 case_id: "case".to_string(),
                 input: crate::GenerationInput::Completion {

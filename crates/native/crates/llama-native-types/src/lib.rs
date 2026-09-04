@@ -701,7 +701,7 @@ pub struct GenerationRequest {
     pub model_id: String,
     pub input: GenerationInput,
     pub sampling: SamplingConfig,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<MediaInput>,
     #[serde(default)]
     pub cached_prefix: Option<SequenceStateBlob>,
@@ -730,6 +730,11 @@ pub struct GenerationCase {
 pub struct GenerationBatchRequest {
     pub request_id: String,
     pub model_id: String,
+    /// Ordered media shared by every case in this exact batch. Media bytes
+    /// remain request-scoped so a product cannot accidentally bind different
+    /// evidence to sibling alternatives in one completion family.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<MediaInput>,
     pub cases: Vec<GenerationCase>,
 }
 
@@ -794,8 +799,9 @@ pub struct GenerationMetrics {
     pub completion_tokens: usize,
     /// Compatibility total for callers predating `cache`.
     ///
-    /// This is the number of prompt tokens whose KV work was reused either
-    /// from a supplied state or from token-exact sharing inside the batch.
+    /// This is the number of prompt tokens whose KV work was reused from a
+    /// supplied state, a prior successful family in the same resident worker,
+    /// or token-exact sharing inside this batch.
     pub shared_prefix_tokens: usize,
     #[serde(with = "serde_u128_as_u64")]
     pub duration_ms: u128,
@@ -816,6 +822,12 @@ pub struct GenerationCacheMetrics {
     pub restored_prefix_tokens: usize,
     /// Token-exact prefix tokens decoded once and copied within this batch.
     pub batch_shared_prefix_tokens: usize,
+    /// Token-exact prefix cells retained in this model worker from the prior
+    /// successful text family. These cells are never caller-supplied and are
+    /// invalidated by media, cache mutation, cancellation of sequence zero,
+    /// execution failure, or a different resident fingerprint.
+    #[serde(default)]
+    pub resident_prefix_tokens: usize,
 }
 
 /// The probability distribution to which an observation belongs.
@@ -3634,6 +3646,7 @@ mod tests {
         let request = GenerationBatchRequest {
             request_id: "family".to_string(),
             model_id: "model".to_string(),
+            media: Vec::new(),
             cases: vec![
                 GenerationCase {
                     case_id: "first".to_string(),

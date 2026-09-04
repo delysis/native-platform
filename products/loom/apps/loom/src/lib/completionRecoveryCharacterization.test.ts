@@ -123,6 +123,7 @@ function model(modelId = fixture.models.initial): ModelCapabilitySummary {
     context_tokens: 4096,
     model_sha256: null,
     projector_present: false,
+    projector_sha256: null,
     media_kinds: [],
     policy_candidate: null,
     policy_verified: null,

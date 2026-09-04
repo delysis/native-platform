@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 37,
+  "expected_test_count": 41,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -141,6 +141,16 @@
       "manifest_path": "products/mom/crates/mom-llama-runtime/Cargo.toml",
       "platforms": ["linux", "macos", "windows"],
       "harness": "libtest"
+    },
+    {
+      "package": "tauri-plugin-loom",
+      "selector": "lib",
+      "name": "tauri_plugin_loom",
+      "kinds": ["lib"],
+      "src_path": "products/loom/crates/tauri-plugin-loom/src/lib.rs",
+      "manifest_path": "products/loom/crates/tauri-plugin-loom/Cargo.toml",
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
     }
   ],
   "reviewed_build_scripts": [
@@ -172,7 +182,7 @@
     {
       "package": "tauri-plugin-loom",
       "src_path": "products/loom/crates/tauri-plugin-loom/build.rs",
-      "sha256": "12352931394fffd81f4de0b2a479e4ce03ac5f1ed37104787a5b2cee0d648e6b"
+      "sha256": "cbf935f557ddc54567bccead4df6309bf9ecf5539970d4ce015dd755b2c39013"
     },
     {
       "package": "mom-llama-app",
@@ -215,6 +225,32 @@
       "platforms": ["linux", "macos", "windows"]
     },
     {
+      "test_id": "tests::real_multimodal_batch_shares_image_and_audio_across_four_streams",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MULTIMODAL_MODEL_PATH, MOM_LLAMA_MM_PROJ_PATH, MOM_LLAMA_TEST_IMAGE_PATH, a real Gemma 4 GGUF, matching projector, and local image",
+      "required_environment": [
+        "MOM_LLAMA_MULTIMODAL_MODEL_PATH",
+        "MOM_LLAMA_MM_PROJ_PATH",
+        "MOM_LLAMA_TEST_IMAGE_PATH"
+      ],
+      "evidence_class": "real-multimodal-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, multimodal-model compatibility, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "tests::real_consecutive_text_families_reuse_worker_resident_prefix",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
       "test_id": "tests::real_per_token_embeddings_preserve_generation_context",
       "package": "llama-native-engine",
       "target": "lib",
@@ -234,6 +270,28 @@
       "required_environment": ["MOM_LLAMA_MODEL_PATH", "MOM_LLAMA_MODEL_SHA256"],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "context_attachments::tests::oversized_utf8_document_is_retained_as_an_explicit_partial_excerpt",
+      "package": "tauri-plugin-loom",
+      "target": "lib",
+      "source": "products/loom/crates/tauri-plugin-loom/src/context_attachments.rs",
+      "prerequisite": "allocates and canonicalizes a generated 65 MiB UTF-8 document",
+      "required_environment": [],
+      "evidence_class": "large-file-runtime",
+      "promotion_prohibition": "Passing this generated large-file test alone cannot promote product, packaged-app, arbitrary-document compatibility, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "context_attachments::tests::wild_format_exemplars_produce_safe_real_representations",
+      "package": "tauri-plugin-loom",
+      "target": "lib",
+      "source": "products/loom/crates/tauri-plugin-loom/src/context_attachments.rs",
+      "prerequisite": "requires LOOM_ATTACHMENT_EXEMPLAR_MANIFEST naming private local DOCX, EPUB, JPEG, Markdown, PDF, PNG, WAV, and XLSX exemplars",
+      "required_environment": ["LOOM_ATTACHMENT_EXEMPLAR_MANIFEST"],
+      "evidence_class": "private-local-format-exemplar-runtime",
+      "promotion_prohibition": "Passing this private local exemplar test alone cannot promote product, packaged-app, general format compatibility, corpus redistribution, or release readiness; exemplar paths and files remain outside the registry and repository.",
       "platforms": ["linux", "macos", "windows"]
     },
     {

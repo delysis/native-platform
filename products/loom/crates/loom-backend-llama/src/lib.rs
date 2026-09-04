@@ -25,7 +25,8 @@ pub use fit::{
 pub use model::{
     CapabilitySupport, LocalDevicePreference, LocalModelProfile, ModelInspectionError,
     ProbabilitySemantics, RuntimeModelInspection, VerifiedCapabilitySet, VerifiedMediaCapability,
-    VerifiedMediaKind, VerifiedModelDescriptor, is_gguf_path, verify_model_inspection,
+    VerifiedMediaKind, VerifiedModelDescriptor, adaptive_context_tokens, is_gguf_path,
+    verify_model_inspection,
 };
 pub use runtime::{
     BatchExecution, BatchRuntime, CompleteModelRelease, JoinedLlamaRuntime, ModelRelease,
@@ -33,10 +34,12 @@ pub use runtime::{
 };
 
 pub use adapter::{
-    CandidateProvenanceRecord, ContinuationCase, DEFAULT_EVENT_CAPACITY, ExactContinuationRequest,
+    CandidateProvenanceRecord, ContinuationCase, ContinuationContextBinding,
+    ContinuationMediaBinding, DEFAULT_EVENT_CAPACITY, ExactContinuationRequest,
     ExactContinuationResult, JoinedLlamaGeneration, LlamaBackend, LlamaBackendError,
     LlamaGenerationControl, LlamaGenerationHandle, MAX_EVENT_CAPACITY,
-    model_environment_from_verified, validate_candidate_receipt_binding,
+    continuation_context_binding, model_environment_from_verified,
+    validate_candidate_receipt_binding,
 };
 pub use llama_native_host::JoinedHostSlot;
 pub use llama_native_types::{NativeEvidenceCapabilities, SamplerKind, SamplingConfig};

@@ -21,6 +21,7 @@ function render(
     autocomplete?: boolean;
     shuttle?: boolean;
     completionFrames?: readonly (readonly CompletionCandidate[])[];
+    acceptImageAttachments?: boolean;
     onImageAttachments?: (files: readonly File[]) => Promise<readonly string[]>;
     onImageAttachmentsCommitted?: (count: number) => void;
     onImageAttachmentError?: (message: string) => void;
@@ -560,6 +561,25 @@ describe('real WebKit editor interactions', () => {
     expect(editor.querySelector('img')?.getAttribute('src')).toBe('asset://resolved-sketch');
   });
 
+  it('does not claim image transfer events when an embedding pane owns attachments', async () => {
+    let attachmentCalls = 0;
+    render('context note', [], {
+      acceptImageAttachments: false,
+      onImageAttachments: async () => {
+        attachmentCalls += 1;
+        return [];
+      }
+    });
+    const editorLocator = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await expect.element(editorLocator).toBeInTheDocument();
+    const editor = editorLocator.element();
+
+    expect(dispatchTransfer(editor, 'dragover', imageTransfer()).defaultPrevented).toBe(false);
+    expect(dispatchTransfer(editor, 'drop', imageTransfer()).defaultPrevented).toBe(false);
+    expect(dispatchTransfer(editor, 'paste', imageTransfer()).defaultPrevented).toBe(false);
+    expect(attachmentCalls).toBe(0);
+  });
+
   it('fails closed on generic or empty-MIME file drops before WebKit default handling', async () => {
     const errors: string[] = [];
     render('hello', [], { onImageAttachmentError: (message) => errors.push(message) });
@@ -1088,6 +1108,10 @@ describe('real WebKit editor interactions', () => {
     dispatchOptionDown(editor);
     const fan = page.getByRole('listbox', { name: 'Completion suggestions' });
     await expect.element(fan).toBeVisible();
+    const inlineGhost = document.querySelector<HTMLElement>('.loom-visual-ghost');
+    expect(inlineGhost).not.toBeNull();
+    expect(inlineGhost?.classList.contains('ghost-text-hidden')).toBe(false);
+    expect(inlineGhost?.getClientRects().length).toBeGreaterThan(0);
     const fanElement = fan.element();
     expect(fanElement.id).not.toBe('');
     await expect.poll(() => editor.getAttribute('aria-controls')).toBe(fanElement.id);
@@ -1138,6 +1162,27 @@ describe('real WebKit editor interactions', () => {
     await expect.poll(() => editor.getAttribute('aria-controls')).toBeNull();
     expect(editor.getAttribute('aria-activedescendant')).toBeNull();
     await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+  });
+
+  it('pins the completion lens without stealing the caret and cycles with plain arrows', async () => {
+    render('hello', fourChoiceCompletion());
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' }).element();
+    const trigger = page.getByRole('button', { name: 'Pin completion alternatives' });
+
+    await trigger.click();
+    await expect.poll(completionFanIsVisible).toBe(true);
+    expect(document.activeElement).toBe(editor);
+    dispatchKey(editor, 'keydown', 'ArrowDown', 'ArrowDown', false);
+    dispatchKey(editor, 'keyup', 'ArrowDown', 'ArrowDown', false);
+    await expect.poll(
+      () => document.querySelector<HTMLElement>('.loom-ghost-fan-row.active')?.textContent
+    ).toContain('there');
+
+    dispatchKey(editor, 'keydown', 'Escape', 'Escape', false);
+    dispatchKey(editor, 'keyup', 'Escape', 'Escape', false);
+    await expect.poll(completionFanIsVisible).toBe(false);
+    await expect.element(page.getByText(' there', { exact: true }).first()).toBeVisible();
   });
 
   it('restores the selected four-choice fan when held Option-Left reverses fan Return', async () => {
@@ -1207,7 +1252,7 @@ describe('real WebKit editor interactions', () => {
     await expect.poll(completionFanIsVisible).toBe(false);
   });
 
-  it('anchors the visual completion fan to the caret and repositions it after resize', async () => {
+  it('docks the visual completion lens in the trailing gutter and repositions it after resize', async () => {
     render('hello', fourChoiceCompletion());
     await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
     const editor = page.getByRole('textbox', { name: 'Manuscript editor' }).element();
@@ -1217,12 +1262,10 @@ describe('real WebKit editor interactions', () => {
     await expect.element(fanLocator).toBeVisible();
     const fan = fanLocator.element();
     await expect.poll(() => fan.dataset.side === 'above' || fan.dataset.side === 'below').toBe(true);
-    const anchor = document.querySelector<HTMLElement>('.loom-visual-ghost')
-      ?.getBoundingClientRect();
-    expect(anchor).toBeDefined();
     const initialLeft = Number.parseFloat(fan.style.left);
     expect(Number.isFinite(initialLeft)).toBe(true);
-    expect(Math.abs(initialLeft - (anchor?.left ?? initialLeft))).toBeLessThanOrEqual(1);
+    expect(Math.abs(initialLeft - (window.innerWidth - 12 - fan.getBoundingClientRect().width)))
+      .toBeLessThanOrEqual(1);
 
     fan.style.left = '-999px';
     window.dispatchEvent(new Event('resize'));
@@ -1433,7 +1476,7 @@ describe('real WebKit editor interactions', () => {
     await keyboard.cleanup();
   });
 
-  it('anchors the source completion fan and preserves its accessible options after scroll', async () => {
+  it('docks the source completion lens and preserves its accessible options after scroll', async () => {
     renderSource('hello', fourChoiceCompletion());
     const textarea = page.getByRole('textbox', { name: 'Markdown source editor' })
       .element() as HTMLTextAreaElement;
@@ -1470,12 +1513,10 @@ describe('real WebKit editor interactions', () => {
     expect(selectedDown?.id).not.toBe(initialActiveDescendant);
     expect(document.getElementById(textarea.getAttribute('aria-activedescendant') ?? ''))
       .toBe(selectedDown);
-    const anchor = document.querySelector<HTMLElement>('.loom-source-ghost-text')
-      ?.getClientRects().item(0);
-    expect(anchor).not.toBeNull();
     const initialLeft = Number.parseFloat(fan.style.left);
     expect(Number.isFinite(initialLeft)).toBe(true);
-    expect(Math.abs(initialLeft - (anchor?.left ?? initialLeft))).toBeLessThanOrEqual(1);
+    expect(Math.abs(initialLeft - (window.innerWidth - 12 - fan.getBoundingClientRect().width)))
+      .toBeLessThanOrEqual(1);
 
     fan.style.left = '-999px';
     window.dispatchEvent(new Event('scroll'));

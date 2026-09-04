@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-document-context-text-get"
+description = "Enables the document_context_text_get command without any pre-configured scope."
+commands.allow = ["document_context_text_get"]
+
+[[permission]]
+identifier = "deny-document-context-text-get"
+description = "Denies the document_context_text_get command without any pre-configured scope."
+commands.deny = ["document_context_text_get"]

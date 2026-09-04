@@ -10,6 +10,14 @@ use loom_types::{BlobId, ModelEnvironmentId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+// llama.cpp rejects contexts below 512 cells.  Do not impose a larger product
+// floor here: on a memory-starved machine, requesting an unaffordable 8K
+// context makes model load less reliable rather than more useful.
+const MINIMUM_CONTEXT_TOKENS: u32 = 512;
+const DEFAULT_MAXIMUM_CONTEXT_TOKENS: u32 = 262_144;
+const CONSERVATIVE_KV_BYTES_PER_TOKEN: u64 = 256 * 1024;
+const MINIMUM_SYSTEM_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalDevicePreference {
@@ -74,6 +82,30 @@ impl LocalModelProfile {
         }
     }
 
+    /// Selects a power-of-two context from currently available system memory.
+    /// Native inspection still clamps this request to the GGUF's trained
+    /// context. The deliberately conservative KV estimate prevents the old
+    /// fixed 8K default from wasting memory that is actually available.
+    #[must_use]
+    pub fn for_gguf_with_memory(
+        model_path: impl Into<PathBuf>,
+        model_file_bytes: u64,
+        projector_file_bytes: u64,
+        available_memory_bytes: u64,
+        total_memory_bytes: u64,
+        maximum_context_tokens: Option<u32>,
+    ) -> Self {
+        let mut profile = Self::for_gguf(model_path);
+        profile.context_tokens = adaptive_context_tokens(
+            model_file_bytes,
+            projector_file_bytes,
+            available_memory_bytes,
+            total_memory_bytes,
+            maximum_context_tokens.unwrap_or(DEFAULT_MAXIMUM_CONTEXT_TOKENS),
+        );
+        profile
+    }
+
     #[must_use]
     pub fn as_native_config(&self) -> NativeModelConfig {
         NativeModelConfig {
@@ -89,6 +121,28 @@ impl LocalModelProfile {
             gpu_layers: self.gpu_layers,
         }
     }
+}
+
+#[must_use]
+pub fn adaptive_context_tokens(
+    model_file_bytes: u64,
+    projector_file_bytes: u64,
+    available_memory_bytes: u64,
+    total_memory_bytes: u64,
+    maximum_context_tokens: u32,
+) -> u32 {
+    let maximum = maximum_context_tokens.max(MINIMUM_CONTEXT_TOKENS);
+    let runtime_without_kv = model_file_bytes
+        .saturating_add((model_file_bytes / 2).max(384 * 1024 * 1024))
+        .saturating_add(projector_file_bytes);
+    let system_headroom = (total_memory_bytes / 8).max(MINIMUM_SYSTEM_HEADROOM_BYTES);
+    let kv_budget = available_memory_bytes
+        .saturating_sub(runtime_without_kv)
+        .saturating_sub(system_headroom);
+    let affordable = (kv_budget / CONSERVATIVE_KV_BYTES_PER_TOKEN).min(u64::from(maximum));
+    let affordable = u32::try_from(affordable).unwrap_or(maximum);
+    let tier = 1_u32 << affordable.max(MINIMUM_CONTEXT_TOKENS).ilog2();
+    tier.clamp(MINIMUM_CONTEXT_TOKENS, maximum)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -534,4 +588,52 @@ pub fn is_gguf_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn context_selection_scales_in_power_of_two_tiers_and_respects_model_limit() {
+        let gib = 1024_u64 * 1024 * 1024;
+        assert_eq!(
+            adaptive_context_tokens(7 * gib, 0, 14 * gib, 16 * gib, 262_144),
+            4_096
+        );
+        assert_eq!(
+            adaptive_context_tokens(7 * gib, 0, 48 * gib, 64 * gib, 262_144),
+            65_536
+        );
+        assert_eq!(
+            adaptive_context_tokens(7 * gib, 0, 56 * gib, 64 * gib, 262_144),
+            131_072
+        );
+        assert_eq!(
+            adaptive_context_tokens(7 * gib, 0, 112 * gib, 128 * gib, 262_144),
+            262_144
+        );
+        assert_eq!(
+            adaptive_context_tokens(7 * gib, 0, 112 * gib, 128 * gib, 32_768),
+            32_768
+        );
+    }
+
+    #[test]
+    fn context_selection_does_not_force_eight_k_when_memory_cannot_afford_it() {
+        let gib = 1024_u64 * 1024 * 1024;
+        assert_eq!(
+            adaptive_context_tokens(7 * gib, 0, 8 * gib, 16 * gib, 262_144),
+            512
+        );
+    }
+
+    #[test]
+    fn context_selection_honors_a_trained_limit_below_eight_k() {
+        let gib = 1024_u64 * 1024 * 1024;
+        assert_eq!(
+            adaptive_context_tokens(gib, 0, 48 * gib, 64 * gib, 4_096),
+            4_096
+        );
+    }
 }
