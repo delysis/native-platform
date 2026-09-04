@@ -133,6 +133,20 @@ describe('real WebKit editor interactions', () => {
     await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
   }
 
+  it('renders native audio as a waveform and playback control instead of a paperclip', async () => {
+    const id = 'a'.repeat(64);
+    const sha = 'b'.repeat(64);
+    render(`![Audio: fixture.wav](loom-attachment:${id}/${sha} "loom-waveform:001080ff")`, [], {
+      resolveImageAssetUrl: () => null
+    });
+    await expect.element(page.getByRole('textbox', { name: 'Manuscript editor' })).toBeVisible();
+    const audio = document.querySelector('audio');
+    expect(audio).not.toBeNull();
+    expect(audio?.controls).toBe(true);
+    expect(document.querySelectorAll('.audio-waveform i')).toHaveLength(4);
+    expect(document.querySelector('.inline-audio-card')?.textContent).not.toContain('📎');
+  });
+
   it('makes the full visual writing body an editable hit target', async () => {
     render('');
     const editorLocator = page.getByRole('textbox', { name: 'Manuscript editor' });

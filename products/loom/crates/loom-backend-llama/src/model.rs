@@ -15,7 +15,10 @@ use thiserror::Error;
 // context makes model load less reliable rather than more useful.
 const MINIMUM_CONTEXT_TOKENS: u32 = 512;
 const DEFAULT_MAXIMUM_CONTEXT_TOKENS: u32 = 262_144;
-const CONSERVATIVE_KV_BYTES_PER_TOKEN: u64 = 256 * 1024;
+// Gemma 4 12B allocates both full-attention and SWA caches. The observed
+// f16 runtime uses 336 KiB per cell; reserve 384 KiB rather than undercounting
+// the SWA cache and consuming system headroom.
+const CONSERVATIVE_KV_BYTES_PER_TOKEN: u64 = 384 * 1024;
 const MINIMUM_SYSTEM_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -607,11 +610,11 @@ mod context_tests {
         );
         assert_eq!(
             adaptive_context_tokens(7 * gib, 0, 56 * gib, 64 * gib, 262_144),
-            131_072
+            65_536
         );
         assert_eq!(
             adaptive_context_tokens(7 * gib, 0, 112 * gib, 128 * gib, 262_144),
-            262_144
+            131_072
         );
         assert_eq!(
             adaptive_context_tokens(7 * gib, 0, 112 * gib, 128 * gib, 32_768),

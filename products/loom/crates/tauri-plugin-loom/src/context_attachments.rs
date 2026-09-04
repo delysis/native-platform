@@ -54,6 +54,10 @@ pub(crate) struct StoredAttachment {
     pub(crate) media_kinds: Vec<String>,
     pub(crate) warnings: Vec<String>,
     pub(crate) inline_markdown: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) editable_markdown: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) media_markdown: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -409,6 +413,8 @@ pub(crate) fn import_path(
             )
             .collect(),
         inline_markdown,
+        editable_markdown: None,
+        media_markdown: None,
     };
     let manifest = AttachmentManifest {
         schema: MANIFEST_SCHEMA.to_owned(),
@@ -425,10 +431,16 @@ pub(crate) fn import_path(
         {
             return Err(ContextAttachmentError::ContextInvalid);
         }
-        return Ok(existing.attachment);
+        let mut result = existing.attachment;
+        result.media_markdown = editor_media_markdown(&result, &existing.media);
+        result.editable_markdown = (!canonical_text.is_empty()).then_some(canonical_text);
+        return Ok(result);
     }
     write_manifest(project_root, &manifest)?;
-    Ok(attachment)
+    let mut result = attachment;
+    result.media_markdown = editor_media_markdown(&result, &manifest.media);
+    result.editable_markdown = (!canonical_text.is_empty()).then_some(canonical_text);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1579,7 +1591,10 @@ fn excerpt_chunk_ranges(text: &str) -> Vec<(usize, usize)> {
                 .map_or(text.len(), |(offset, _)| start + offset);
         }
         if end < text.len() {
-            let floor = start + (end - start) / 2;
+            let mut floor = start + (end - start) / 2;
+            while !text.is_char_boundary(floor) {
+                floor -= 1;
+            }
             if let Some(relative) = text[floor..end].rfind("\n\n") {
                 let paragraph_end = floor + relative + 2;
                 if paragraph_end > start {
@@ -1701,6 +1716,50 @@ fn inline_attachment_markdown(id: &str, file_name: &str) -> String {
     )
 }
 
+fn editor_media_markdown(attachment: &StoredAttachment, media: &[StoredMedia]) -> Option<String> {
+    if media.is_empty() {
+        return None;
+    }
+    let name = attachment
+        .file_name
+        .replace(['[', ']', '\\', '\n', '\r'], " ");
+    Some(
+        media
+            .iter()
+            .map(|item| {
+                let kind = if item.kind == MediaKind::Audio {
+                    "Audio"
+                } else {
+                    "Image"
+                };
+                let waveform = item
+                    .waveform_peaks
+                    .as_ref()
+                    .map_or_else(String::new, |peaks| {
+                        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+                        let mut hex = String::with_capacity(peaks.len() * 2);
+                        for peak in peaks {
+                            hex.push(char::from(DIGITS[usize::from(peak >> 4)]));
+                            hex.push(char::from(DIGITS[usize::from(peak & 15)]));
+                        }
+                        format!(" \"loom-waveform:{hex}\"")
+                    });
+                format!(
+                    "![{kind}: {name}](loom-attachment:{}/{}{waveform})",
+                    attachment.id, item.sha256
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
+}
+
+pub(crate) fn manuscript_selects_attachment(markdown: &str, id: &str) -> bool {
+    inline_attachment_ids(markdown)
+        .iter()
+        .any(|selected| selected == id)
+}
+
 fn inline_media_markdown(id: &str, file_name: &str) -> String {
     inline_markdown_with_scheme(id, file_name, "loom-media")
 }
@@ -1736,7 +1795,16 @@ fn inline_ids_with_scheme(markdown: &str, scheme: &str) -> Vec<String> {
     while let Some(start) = rest.find(&marker) {
         rest = &rest[start + marker.len()..];
         let Some(end) = rest.find(')') else { break };
-        let candidate = &rest[..end];
+        let address = rest[..end].split_whitespace().next().unwrap_or_default();
+        let candidate = if let Some((id, media)) = address.split_once('/') {
+            if !is_sha256(media) {
+                rest = &rest[end + 1..];
+                continue;
+            }
+            id
+        } else {
+            address
+        };
         if is_sha256(candidate) && !ids.iter().any(|id| id == candidate) {
             ids.push(candidate.to_owned());
         }
@@ -2094,6 +2162,75 @@ fn is_sha256(value: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn inline_media_keeps_native_bytes_and_editable_markdown_preview_identity() {
+        let project = tempfile::tempdir().expect("project");
+        for (extension, expected_kind) in [("png", MediaKind::Image), ("wav", MediaKind::Audio)] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(format!("native.{extension}"));
+            let attachment = import_path(project.path(), &path).expect(extension);
+            assert!(attachment.editable_markdown.is_none());
+            let markdown = attachment.media_markdown.expect("native preview Markdown");
+            assert!(markdown.starts_with("!["));
+            assert!(manuscript_selects_attachment(&markdown, &attachment.id));
+            let resolved =
+                resolve_for_generation_with_budget(project.path(), "doc", &markdown, 32768, 4, 128)
+                    .expect("native prompt");
+            assert_eq!(resolved.media.len(), 1);
+            assert_eq!(resolved.media[0].kind, expected_kind);
+            assert_eq!(
+                resolved.media[0].bytes,
+                fs::read(path).expect("source bytes")
+            );
+        }
+    }
+
+    #[test]
+    fn supported_document_files_return_editable_text_on_first_and_cached_import() {
+        let project = tempfile::tempdir().expect("project");
+        for extension in ["pdf", "docx", "epub", "md", "txt", "csv", "xlsx"] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(format!("editable.{extension}"));
+            for _ in 0..2 {
+                let attachment = import_path(project.path(), &path).expect(extension);
+                let markdown = attachment.editable_markdown.as_deref().expect(extension);
+                assert!(
+                    markdown.contains("Loom editable fixture"),
+                    "{extension}: {markdown}"
+                );
+                assert!(!markdown.contains("loom-attachment:"));
+                let snapshot =
+                    add_document_context_snapshot(project.path(), extension, &[attachment.id])
+                        .expect(extension);
+                assert!(snapshot.markdown.contains("Loom editable fixture"));
+                assert!(!snapshot.text_sources.is_empty());
+                assert!(snapshot.attachments.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn excerpt_chunks_preserve_every_utf8_boundary() {
+        for symbol in ["•", "é", "界", "🖋"] {
+            for offset in 0..8 {
+                let text = format!("{}{}", "a".repeat(offset), symbol.repeat(3000));
+                let ranges = excerpt_chunk_ranges(&text);
+                let rebuilt: String = ranges
+                    .iter()
+                    .map(|&(start, end)| &text[start..end])
+                    .collect();
+                assert_eq!(rebuilt, text);
+                assert!(
+                    ranges
+                        .iter()
+                        .all(|&(start, end)| end > start && end - start <= EXCERPT_CHUNK_BYTES)
+                );
+            }
+        }
+    }
 
     #[test]
     fn inline_references_are_ordered_unique_and_prefix_scoped() {

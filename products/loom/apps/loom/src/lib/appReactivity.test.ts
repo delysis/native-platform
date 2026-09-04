@@ -249,8 +249,8 @@ describe('App ghost reactivity wiring', () => {
     expect(close).toContain('contextToggleElement?.focus()');
     expect(modeSwitch).toContain('flushEditors()');
     expect(modeSwitch).toContain('if (contextPaneOpen) focusContextEditorAtEnd()');
-    expect(source).toContain("on:compositionstart={() => contextCompositionActive = true}");
-    expect(source).toContain("on:compositionend={() => contextCompositionActive = false}");
+    expect(source).toContain("onCompositionStart={() => contextCompositionActive = true}");
+    expect(source).toContain("onCompositionEnd={() => contextCompositionActive = false}");
     expect(source).toContain("editor={contextPaneOpen ? contextVisualEditor : visualEditor}");
   });
 
@@ -279,7 +279,7 @@ describe('App ghost reactivity wiring', () => {
       source.indexOf('function captureWeaveCursorByte')
     );
 
-    expect(outsidePointer).toContain("event.target.closest('.canvas-controls')");
+    expect(outsidePointer).not.toContain("closeContextPane()");
     expect(source).toContain('on:click={() => void setOutlineOpen(!outlineOpen)}');
     expect(source).not.toContain('outlineOpen = open;\n    contextPaneOpen = false;');
   });
@@ -463,11 +463,11 @@ describe('App ghost reactivity wiring', () => {
     const ipc = readFileSync(new URL('./ipc.ts', import.meta.url), 'utf8');
 
     expect(source).toContain('label="Steering context"');
-    expect(source).toContain('aria-label="Steering context Markdown"');
+    expect(source).toContain('label="Steering context Markdown"');
     expect(source).not.toContain('aria-label="Visual context editor"');
     expect(source).not.toContain('aria-label="Markdown context editor"');
     expect(source).toContain("{#if mode === 'visual' && canUseVisualMarkdown(contextText, true)}");
-    expect(source).toContain('on:input={(event) => updateContextText(event.currentTarget.value)}');
+    expect(source).toContain('onValueInput={(textarea) => updateContextText(textarea.value)}');
     expect(source).toContain('adoptAuthoritativeContext(');
     expect(source).not.toContain('appendContextAttachmentMarkers');
     expect(source).toContain('setDocumentContextSnapshot(');

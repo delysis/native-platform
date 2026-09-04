@@ -147,6 +147,8 @@
   } from './lib/applicationCloseCoordinator';
   import { ApplicationCloseRetryScheduler } from './lib/applicationCloseRetry';
   import { DetachedProjectCloseCoordinator } from './lib/detachedProjectClose';
+  import { editableImportMarkdown, normalizeImportedMarkdown } from './lib/importedMarkdown';
+  import { nativeDropPoint as convertNativeDropPoint, nativeDropScope } from './lib/nativeAttachmentDrop';
   import { suggestionsEnabledFromStoredPreference } from './lib/suggestionPreference';
   import {
     loadAppearancePreference,
@@ -510,6 +512,9 @@
   let appliedNativeTitle = '';
   let suggestionsEnabled = false;
   let suggestionsChanging = false;
+  let reportedGenerationFailureRun: string | null = null;
+  let contextPresentationFingerprint = '';
+  let requireExplicitCompletionFamily = false;
   let autocompleteModelMenuLongPressTimer: number | undefined;
   let autocompleteModelMenuLongPress: {
     pointerId: number;
@@ -613,6 +618,8 @@
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
     insertAttachmentMarkdown: (markdown: string, clientX?: number, clientY?: number) => boolean;
+    captureAttachmentAnchor: (x: number, y: number) => VisualTextInsertionAnchor | null;
+    insertMarkdownAtAnchor: (anchor: VisualTextInsertionAnchor, markdown: string) => boolean;
     insertTextAtSelection: (text: string) => boolean;
     captureTextInsertionAnchor: () => VisualTextInsertionAnchor | null;
     insertTextAtAnchor: (anchor: VisualTextInsertionAnchor, text: string) => boolean;
@@ -751,6 +758,7 @@
   }
 
   interface WeaveCapture {
+    contextEpoch: number;
     commandId: string;
     epoch: number;
     projectId: string;
@@ -966,6 +974,7 @@
   $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual', {
     branches,
     authoritativeFamilyId: authoritativeCompletionFamilyId,
+    requireExplicitFamily: requireExplicitCompletionFamily,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     liveTextByRun: liveBranchTextByRun,
     liveTextSequenceByRun: liveBranchTextSequenceByRun,
@@ -981,6 +990,7 @@
   $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source', {
     branches,
     authoritativeFamilyId: authoritativeCompletionFamilyId,
+    requireExplicitFamily: requireExplicitCompletionFamily,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     liveTextByRun: liveBranchTextByRun,
     liveTextSequenceByRun: liveBranchTextSequenceByRun,
@@ -1328,8 +1338,13 @@
   }
 
   function updateContextPresentation(snapshot: DocumentContextSnapshot): void {
+    const fingerprint = JSON.stringify([contextDocumentId, snapshot]);
     contextAttachments = snapshot.attachments;
     contextTextSources = snapshot.text_sources;
+    if (fingerprint === contextPresentationFingerprint) return;
+    contextPresentationFingerprint = fingerprint;
+    authoritativeCompletionFamilyId = null;
+    requireExplicitCompletionFamily = true;
     contextEpoch += 1;
     invalidateCompletionForCaretNavigation();
     if (completionAutomationEnabled()) scheduleAutomaticSuggestions(editVersion, 0);
@@ -1827,7 +1842,11 @@
       announce('Completion context is limited to 256 KiB of UTF-8 text');
       return;
     }
+    if (contextText === value) return;
     contextText = value;
+    authoritativeCompletionFamilyId = null;
+    requireExplicitCompletionFamily = true;
+    contextEpoch += 1;
     contextTextSaveState = value === persistedContextText ? 'clean' : 'dirty';
     invalidateCompletionForCaretNavigation();
     if (contextTextSaveState === 'dirty') {
@@ -1917,6 +1936,19 @@
     return true;
   }
 
+  async function normalizeImportedContext(previousText: string): Promise<void> {
+    // Source-mode author text is not part of import conversion. In visual mode
+    // the existing text already belongs to the admitted editor dialect.
+    if (!contextText.startsWith(previousText) || contextText === previousText) return;
+    const suffix = normalizeImportedMarkdown(contextText.slice(previousText.length).trimStart());
+    const combined = previousText ? `${previousText}\n\n${suffix}` : suffix;
+    const normalized = mode === 'visual' ? normalizeImportedMarkdown(combined) : combined;
+    if (normalized !== contextText) {
+      updateContextText(normalized);
+      await persistCurrentContextText();
+    }
+  }
+
   async function addContextAttachmentsFromPicker(): Promise<void> {
     if (!project || !document || contextAttachmentBusy) return;
     const captured = {
@@ -1932,6 +1964,7 @@
         project.session_id !== captured.sessionId ||
         document?.summary.document_id !== captured.documentId
       ) return;
+      const previousContextText = contextText;
       const imported = await chooseAttachments(captured.projectId, captured.sessionId);
       const snapshot = imported.length === 0
         ? null
@@ -1942,12 +1975,13 @@
           imported.map((item) => item.id)
         );
       if (imported.length > 0) {
-        adoptAuthoritativeContext(
+        if (!adoptAuthoritativeContext(
           snapshot!,
           captured.projectId,
           captured.sessionId,
           captured.documentId
-        );
+        )) return;
+        await normalizeImportedContext(previousContextText);
       }
       if (imported.length > 0) announce(`${imported.length} context attachment${imported.length === 1 ? '' : 's'} ready`);
     } catch (error) {
@@ -1994,15 +2028,12 @@
   }
 
   function nativeDropPoint(position: { x: number; y: number }): { x: number; y: number } {
-    const scale = window.devicePixelRatio || 1;
-    return { x: position.x / scale, y: position.y / scale };
+    return convertNativeDropPoint(position, window.navigator.platform, window.devicePixelRatio);
   }
 
   function nativeAttachmentDropScope(point: { x: number; y: number }): 'context' | 'inline' | null {
-    const target = window.document.elementFromPoint(point.x, point.y);
-    if (target?.closest('[data-attachment-drop="context"]')) return 'context';
-    if (target?.closest('[data-attachment-drop="inline"]')) return 'inline';
-    return null;
+    return nativeDropScope(point, Array.from(window.document.querySelectorAll<HTMLElement>('[data-attachment-drop]'))
+      .map(surface => ({ scope: surface.dataset.attachmentDrop as 'context' | 'inline', bounds: surface.getBoundingClientRect() })));
   }
 
   async function importNativeAttachmentDrop(
@@ -2014,8 +2045,12 @@
     const captured = {
       projectId: project.project_id,
       sessionId: project.session_id,
-      documentId: document.summary.document_id
+      documentId: document.summary.document_id,
+      markdown: documentText,
+      mode
     };
+    const visualAnchor = scope === 'inline' && mode === 'visual' ? visualEditor?.captureAttachmentAnchor(point.x, point.y) : null;
+    const sourceAnchor = scope === 'inline' && mode === 'source' ? sourceEditor?.captureTextInsertionAnchor() : null;
     contextAttachmentBusy = true;
     try {
       if (scope === 'context' && !await persistCurrentContextText()) return;
@@ -2024,7 +2059,13 @@
         project.session_id !== captured.sessionId ||
         document?.summary.document_id !== captured.documentId
       ) return;
+      const previousContextText = contextText;
       const imported = await importAttachmentPaths(captured.projectId, captured.sessionId, paths);
+      if (project?.project_id !== captured.projectId || project.session_id !== captured.sessionId ||
+          document?.summary.document_id !== captured.documentId || mode !== captured.mode ||
+          (scope === 'inline' && documentText !== captured.markdown)) {
+        throw new Error('The editor changed during import. The file is stored; drop it again at the intended location.');
+      }
       if (scope === 'context') {
         const snapshot = await addDocumentContexts(
             captured.projectId,
@@ -2032,17 +2073,22 @@
             captured.documentId,
             imported.map((item) => item.id)
           );
-        adoptAuthoritativeContext(
+        if (!adoptAuthoritativeContext(
           snapshot,
           captured.projectId,
           captured.sessionId,
           captured.documentId
-        );
+        )) return;
+        await normalizeImportedContext(previousContextText);
       } else {
-        const markdown = imported.map((item) => item.inline_markdown).join('\n\n');
+        const markdown = imported.map(editableImportMarkdown).join('\n\n');
+        const before = sourceAnchor?.value.slice(0, sourceAnchor.start) ?? '';
+        const after = sourceAnchor?.value.slice(sourceAnchor.end) ?? '';
+        const prefix = before && !before.endsWith('\n\n') ? (before.endsWith('\n') ? '\n' : '\n\n') : '';
+        const suffix = after && !after.startsWith('\n\n') ? (after.startsWith('\n') ? '\n' : '\n\n') : '';
         const inserted = mode === 'visual'
-          ? visualEditor?.insertAttachmentMarkdown(markdown, point.x, point.y)
-          : sourceEditor?.insertAttachmentMarkdown(markdown);
+          ? visualAnchor && visualEditor?.insertMarkdownAtAnchor(visualAnchor, markdown)
+          : sourceAnchor && sourceEditor?.insertTextAtAnchor(sourceAnchor, `${prefix}${markdown}${suffix}`);
         if (!inserted) throw new Error('The attachment was stored, but the current editor could not insert its card.');
       }
       announce(`${imported.length} attachment${imported.length === 1 ? '' : 's'} added`);
@@ -3727,6 +3773,13 @@
       branchBodyErrorByRun = hydration.bodyErrorByRun;
       branches = branches.map((branch) => hydratedByRun.get(branch.run_id) ?? branch);
       completionActiveRunIds = completionFacts.activeRunIds;
+      const failed = branches.find(branch => branch.status === 'failed' &&
+        branch.source_revision_id === document?.summary.revision_id && branch.error);
+      if (failed && failed.run_id !== reportedGenerationFailureRun) {
+        reportedGenerationFailureRun = failed.run_id;
+        recordLocalFailure('generation_runtime_failed', failed.error!);
+        announce('Suggestions failed. Open Suggestions to reload the local model.');
+      }
       reconcileBranchActionState();
       if (completionActiveRunIds.length > 0) scheduleActiveBranchPoll();
       return true;
@@ -6422,6 +6475,10 @@
 
   function resolveImageAssetUrl(markdownPath: string): string | null {
     if (!project) return null;
+    const media = /^loom-attachment:([a-f0-9]{64})\/([a-f0-9]{64})$/.exec(markdownPath);
+    if (media && document) {
+      return convertFileSrc(`v2-${project.project_id}-${project.session_id}-${document.summary.document_id}-${media[1]}-${media[2]}`, 'loom-asset');
+    }
     const token = projectAssetProtocolToken(
       project.project_id,
       project.session_id,
@@ -7531,15 +7588,6 @@
       !coWriterTrigger?.contains(event.target)
     ) coWriterOpen = false;
     if (
-      contextPaneOpen &&
-      event.target instanceof Node &&
-      !contextPaneElement?.contains(event.target) &&
-      !contextToggleElement?.contains(event.target) &&
-      !(event.target instanceof Element && event.target.closest('.canvas-controls'))
-    ) {
-      closeContextPane();
-    }
-    if (
       documentContextTarget &&
       event.target instanceof Node &&
       !documentContextMenu?.contains(event.target)
@@ -7621,6 +7669,7 @@
       document.summary.revision_id === captured.sourceRevisionId &&
       document.visible_blob_id === captured.visibleBlobId &&
       documentEpoch === captured.epoch &&
+      contextEpoch === captured.contextEpoch &&
       editVersion === captured.editVersion &&
       completionController.intentEpoch === captured.intentEpoch &&
       currentModel?.model_id === captured.modelId &&
@@ -7756,6 +7805,7 @@
     const sourceRevisionId = document.summary.revision_id;
     if (!sourceRevisionId) return false;
     const captured: WeaveCapture = {
+      contextEpoch,
       commandId: newUlid(),
       epoch: documentEpoch,
       projectId: project.project_id,
@@ -9210,17 +9260,16 @@
                     onGhostPresentationRejected={() => {}}
                   />
                 {:else}
-                  <textarea
-                    bind:this={contextSourceTextarea}
-                    aria-label="Steering context Markdown"
-                    placeholder="Write, paste, or drop context…"
+                  <SourceEditor
+                    bind:element={contextSourceTextarea}
+                    label="Steering context Markdown"
                     value={contextText}
-                    spellcheck="true"
-                    disabled={editorReadonly || contextAttachmentBusy}
-                    on:input={(event) => updateContextText(event.currentTarget.value)}
-                    on:compositionstart={() => contextCompositionActive = true}
-                    on:compositionend={() => contextCompositionActive = false}
-                  ></textarea>
+                    surfaceKey={`context:${contextDocumentId}`}
+                    readonly={editorReadonly || contextAttachmentBusy}
+                    onValueInput={(textarea) => updateContextText(textarea.value)}
+                    onCompositionStart={() => contextCompositionActive = true}
+                    onCompositionEnd={() => contextCompositionActive = false}
+                  />
                 {/if}
               </div>
               <div class="context-composer-actions">
@@ -9628,7 +9677,7 @@
                 on:change={(event) => void setSuggestionsEnabled(event.currentTarget.checked)}
               />
               <span>
-                <strong>Suggestions</strong>
+                <strong>Suggestions {suggestionsEnabled ? 'on' : 'off'}</strong>
               </span>
             </label>
 
@@ -9643,7 +9692,7 @@
                 {modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0
                   ? 'Preparing'
                   : currentModel
-                    ? 'Ready'
+                    ? 'Model ready'
                     : quietModelLoadFailure
                       ? 'Needs attention'
                       : 'Needs setup'}

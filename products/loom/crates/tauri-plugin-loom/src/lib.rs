@@ -3994,7 +3994,32 @@ fn read_authorized_context_media(
                 .iter()
                 .any(|media| media.sha256 == request.media_sha256)
     });
-    if !selected {
+    let selected_inline = if selected {
+        false
+    } else {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| LoomAssetReadFailure::Unavailable)?;
+        let store = session
+            .store
+            .as_ref()
+            .ok_or(LoomAssetReadFailure::NotFound)?;
+        if session.active_session_id != Some(request.session_id)
+            || store.manifest().project_id != request.project_id
+        {
+            return Err(LoomAssetReadFailure::NotFound);
+        }
+        let registered = store
+            .registered_document(request.document_id)
+            .map_err(|_| LoomAssetReadFailure::NotFound)?
+            .ok_or(LoomAssetReadFailure::NotFound)?;
+        let loaded = store
+            .read_document(&registered.relative_path)
+            .map_err(|_| LoomAssetReadFailure::NotFound)?;
+        context_attachments::manuscript_selects_attachment(&loaded.text, &request.attachment_id)
+    };
+    if !selected && !selected_inline {
         return Err(LoomAssetReadFailure::NotFound);
     }
     let media = read_context_media(
@@ -7810,8 +7835,39 @@ async fn weave_start<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<WeaveStarted, IpcFailure> {
-    ensure_application_running(&state, "a writing suggestion")?;
-    let command_id = parse_command_id(&command_id)?;
+    complete_ipc_setup(|| {
+        weave_start_inner(
+            project_id,
+            session_id,
+            &command_id,
+            &document_id,
+            &relative_path,
+            &source_revision_id,
+            &expected_visible_blob_id,
+            cursor_byte,
+            policy,
+            &app,
+            &state,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn weave_start_inner<R: Runtime>(
+    project_id: String,
+    session_id: String,
+    command_id: &str,
+    document_id: &str,
+    relative_path: &str,
+    source_revision_id: &str,
+    expected_visible_blob_id: &str,
+    cursor_byte: u64,
+    policy: WeavePolicySnapshot,
+    app: &AppHandle<R>,
+    state: &State<'_, PluginState>,
+) -> Result<WeaveStarted, IpcFailure> {
+    ensure_application_running(state, "a writing suggestion")?;
+    let command_id = parse_command_id(command_id)?;
     let document_id = document_id.parse::<DocumentId>().map_err(|_| {
         IpcFailure::new(
             "invalid_document_id",
@@ -7837,18 +7893,18 @@ async fn weave_start<R: Runtime>(
 
     // Serialize the loaded-model snapshot through native startup and family
     // registration. A switch cannot observe zero active branches in the gap.
-    let application_admission = lock_application_admission(&state, "a writing suggestion")?;
+    let application_admission = lock_application_admission(state, "a writing suggestion")?;
     // Replay is read-only recovery, so focus/automation policy does not hide
     // durable private evidence. It is checked while holding the same admission
     // boundary as new work: concurrent first calls cannot both miss the row,
     // and an exact replay never consumes automatic budget or reaches native.
     if let Some(replay) = replay_weave_if_recorded(
-        &state,
+        state,
         &project_id,
         &session_id,
         command_id,
         document_id,
-        &relative_path,
+        relative_path,
         source_revision_id,
         expected_visible_blob_id,
         cursor_byte,
@@ -7856,9 +7912,9 @@ async fn weave_start<R: Runtime>(
     )? {
         return Ok(replay);
     }
-    let _model_lifecycle = lock_model_lifecycle(&state)?;
+    let _model_lifecycle = lock_model_lifecycle(state)?;
     let authorized_model =
-        AuthorizedWeaveModel::bind(policy, loaded_model(&state)?, &state.build_model_policy)?;
+        AuthorizedWeaveModel::bind(policy, loaded_model(state)?, &state.build_model_policy)?;
     let branch_count = authorized_model.branch_count();
     let loaded_model = authorized_model.loaded();
     let max_cases = loaded_model
@@ -7889,7 +7945,7 @@ async fn weave_start<R: Runtime>(
         lifecycle_ticket,
         lifecycle_lease,
     ) = {
-        let mut session = lock_session(&state)?;
+        let mut session = lock_session(state)?;
         authorized_model.admit(&session.agency)?;
         let active_session_id = session.active_session_id.ok_or_else(|| {
             IpcFailure::new(
@@ -7900,7 +7956,7 @@ async fn weave_start<R: Runtime>(
         })?;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;
         let loaded = store
-            .read_document(&relative_path)
+            .read_document(relative_path)
             .map_err(IpcFailure::store)?;
         ensure_document_id(&loaded, &document_id.to_string())?;
         let ResolvedWeavePolicy {
@@ -7939,37 +7995,37 @@ async fn weave_start<R: Runtime>(
             ));
         }
         let automatic_budget_reservation = match authorized_model.automatic_writer() {
-            Some(writer) => Some(
-                state
-                    .automatic_budget
-                    .reserve(writer, AutomaticBudgetScope {
-                        project: store.manifest().project_id,
-                        session: active_session_id,
-                        document: document_id,
-                        source_revision: source_revision_id,
-                    })
-                    .map_err(|error| match error {
-                        AutomaticBudgetError::Exhausted => IpcFailure::new(
-                            "automatic_revision_budget_exhausted",
-                            format!(
-                                "this immutable manuscript revision has already used its {AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2} automatic families ({AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2} generated-token ceiling)",
-                            ),
-                            false,
+        Some(writer) => Some(
+            state
+                .automatic_budget
+                .reserve(writer, AutomaticBudgetScope {
+                    project: store.manifest().project_id,
+                    session: active_session_id,
+                    document: document_id,
+                    source_revision: source_revision_id,
+                })
+                .map_err(|error| match error {
+                    AutomaticBudgetError::Exhausted => IpcFailure::new(
+                        "automatic_revision_budget_exhausted",
+                        format!(
+                            "this immutable manuscript revision has already used its {AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2} automatic families ({AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2} generated-token ceiling)",
                         ),
-                        AutomaticBudgetError::Capacity => IpcFailure::new(
-                            "automatic_budget_capacity",
-                            "the bounded automatic-budget ledger is full; close and reopen the project before requesting more automatic work",
-                            false,
-                        ),
-                        AutomaticBudgetError::Poisoned => IpcFailure::new(
-                            "automatic_budget_state_invalid",
-                            "automatic generation is unavailable because its budget authority cannot be proven",
-                            false,
-                        ),
-                    })?,
-            ),
-            None => None,
-        };
+                        false,
+                    ),
+                    AutomaticBudgetError::Capacity => IpcFailure::new(
+                        "automatic_budget_capacity",
+                        "the bounded automatic-budget ledger is full; close and reopen the project before requesting more automatic work",
+                        false,
+                    ),
+                    AutomaticBudgetError::Poisoned => IpcFailure::new(
+                        "automatic_budget_state_invalid",
+                        "automatic generation is unavailable because its budget authority cannot be proven",
+                        false,
+                    ),
+                })?,
+        ),
+        None => None,
+    };
         let source_prefix = &loaded.text[..cursor];
         let attachment_context = resolve_for_generation_with_budget(
             store.root(),
@@ -8248,7 +8304,7 @@ async fn weave_start<R: Runtime>(
     );
     if let Err(error) = state.generation_lifecycle.start(&lifecycle_lease) {
         if let Err(cleanup) =
-            fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
+            fail_and_release_open_runs(state, &identity, &runs, &error.to_string(), app)
         {
             let _ = state
                 .generations
@@ -8265,7 +8321,7 @@ async fn weave_start<R: Runtime>(
         Ok(owner) => owner,
         Err(error) => {
             if let Err(persistence) =
-                fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
+                fail_and_release_open_runs(state, &identity, &runs, &error.to_string(), app)
             {
                 let _ = state
                     .generations
@@ -8286,7 +8342,7 @@ async fn weave_start<R: Runtime>(
             let _ = handle.cancel_branch(*branch_id);
         }
         if let Err(persistence) =
-            fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
+            fail_and_release_open_runs(state, &identity, &runs, &error.to_string(), app)
         {
             let _ = state
                 .generations
@@ -8305,7 +8361,7 @@ async fn weave_start<R: Runtime>(
                 let _ = handle.cancel_branch(*branch_id);
             }
             if let Err(persistence) =
-                fail_and_release_open_runs(&state, &identity, &runs, &error.message, &app)
+                fail_and_release_open_runs(state, &identity, &runs, &error.message, app)
             {
                 let _ = state
                     .generations
@@ -8340,7 +8396,7 @@ async fn weave_start<R: Runtime>(
                 let _ = handle.cancel_branch(*branch_id);
             }
             if let Err(persistence) =
-                fail_and_release_open_runs(&state, &identity, &runs, &error.to_string(), &app)
+                fail_and_release_open_runs(state, &identity, &runs, &error.to_string(), app)
             {
                 let _ = state
                     .generations
@@ -8370,7 +8426,7 @@ async fn weave_start<R: Runtime>(
             failure
         };
         if let Err(persistence) =
-            fail_and_release_open_runs(&state, &identity, &runs, &failure.message, &app)
+            fail_and_release_open_runs(state, &identity, &runs, &failure.message, app)
         {
             let _ = state
                 .generations
@@ -8394,6 +8450,20 @@ async fn weave_start<R: Runtime>(
         source_revision_id: source_revision_id.to_string(),
         exact_prompt_blob_id: exact_prompt_blob_id.to_string(),
         branches: queued_branches,
+    })
+}
+
+fn complete_ipc_setup<T>(
+    operation: impl FnOnce() -> Result<T, IpcFailure>,
+) -> Result<T, IpcFailure> {
+    // Resolve the IPC promise even if setup unwinds. Never clear poisoned locks
+    // or claim partially executed work is safe to retry.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or_else(|_| {
+        Err(IpcFailure::new(
+            "completion_setup_panicked",
+            "Completion setup failed unexpectedly. Restart Loom to recover the project session; your saved manuscript is unchanged.",
+            false,
+        ))
     })
 }
 
@@ -10404,6 +10474,20 @@ mod tests {
             .shutdown_joined()
             .expect("join empty native runtime");
         ApplicationShutdownProof::from_graceful(native_runtime, desktop_workers)
+    }
+
+    #[test]
+    fn panicking_completion_setup_returns_a_terminal_ipc_failure_without_clearing_poison() {
+        let session = Mutex::new(());
+        let result: Result<(), IpcFailure> = complete_ipc_setup(|| {
+            let _guard = session.lock().expect("fresh session");
+            panic!("injected setup failure");
+        });
+        assert_eq!(
+            result.expect_err("terminal response").code,
+            "completion_setup_panicked"
+        );
+        assert!(session.is_poisoned());
     }
 
     #[test]

@@ -1,0 +1,1 @@
+These small fixtures were authored for Loom regression tests. Documents contain only the original phrase "Loom editable fixture", a count, and Unicode samples. `native.png` is a solid red tile; `native.wav` is a one-second 440 Hz sine wave generated at 16 kHz, mono PCM16. No personal or third-party content is included.

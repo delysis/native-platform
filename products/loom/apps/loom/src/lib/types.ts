@@ -419,6 +419,8 @@ export interface ContextAttachment {
   media_kinds: Array<'image' | 'audio'>;
   warnings: string[];
   inline_markdown: string;
+  editable_markdown?: string | null;
+  media_markdown?: string | null;
 }
 
 export interface ContextMediaPresentation {
