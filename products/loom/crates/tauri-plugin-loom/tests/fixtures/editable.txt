@@ -1,0 +1,3 @@
+Loom editable fixture.
+
+Unicode: café • 界 🖋.

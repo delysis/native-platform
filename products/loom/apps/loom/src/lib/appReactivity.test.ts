@@ -182,6 +182,10 @@ describe('App ghost reactivity wiring', () => {
     expect(source).not.toContain('Set up private writing suggestions');
     expect(source).toContain('class="model-setup-callout"');
     expect(source).toContain('Private writing model');
+    expect(source).toContain('class:needs-attention={suggestionsEnabled && !currentModel && Boolean(quietModelLoadFailure)}');
+    expect(source).toContain("modelSetupError = `Automatic writer setup failed. ${terminalFailure.message}`");
+    expect(source).toContain('Retry local writer');
+    expect(source).not.toContain('class:preparing={suggestionsEnabled && !currentModel}');
   });
 
   it('keeps system-aware appearance persistence behind one direct toggle and binds curated downloads', () => {
@@ -235,21 +239,19 @@ describe('App ghost reactivity wiring', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const close = source.slice(
       source.indexOf('function closeContextPane'),
-      source.indexOf('function setContextEditorMode')
+      source.indexOf('function focusContextEditorAtEnd')
     );
-    const modeSwitch = source.slice(
-      source.indexOf('function setContextEditorMode'),
-      source.indexOf('async function adoptAuthoritativeContext')
-    );
+    const modeSwitch = source.slice(source.indexOf('async function setMode'));
 
     expect(source).toContain('bind:this={contextVisualEditor}');
     expect(source).toContain('acceptImageAttachments={false}');
     expect(close).toContain('flushContextEditorProjection()');
     expect(close).toContain('contextToggleElement?.focus()');
-    expect(modeSwitch).toContain('flushContextEditorProjection()');
-    expect(source).toContain("on:compositionstart={() => contextCompositionActive = true}");
-    expect(source).toContain("on:compositionend={() => contextCompositionActive = false}");
-    expect(source).toContain("{#if document && mode === 'visual' && canUseVisual && !contextPaneOpen}");
+    expect(modeSwitch).toContain('flushEditors()');
+    expect(modeSwitch).toContain('if (contextPaneOpen) focusContextEditorAtEnd()');
+    expect(source).toContain("onCompositionStart={() => contextCompositionActive = true}");
+    expect(source).toContain("onCompositionEnd={() => contextCompositionActive = false}");
+    expect(source).toContain("editor={contextPaneOpen ? contextVisualEditor : visualEditor}");
   });
 
   it('adopts backend-owned context Markdown after attachment mutations', () => {
@@ -264,10 +266,22 @@ describe('App ghost reactivity wiring', () => {
     );
 
     expect(add).toContain('await persistCurrentContextText()');
-    expect(add).toContain('await adoptAuthoritativeContext(');
+    expect(add).toContain('adoptAuthoritativeContext(');
     expect(remove).toContain('await persistCurrentContextText()');
-    expect(remove).toContain('await adoptAuthoritativeContext(');
+    expect(remove).toContain('adoptAuthoritativeContext(');
     expect(source).not.toContain('appendContextAttachmentMarkers');
+  });
+
+  it('keeps the context and outline controls independent', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const outsidePointer = source.slice(
+      source.indexOf('function handleGlobalPointerdown'),
+      source.indexOf('function captureWeaveCursorByte')
+    );
+
+    expect(outsidePointer).not.toContain("closeContextPane()");
+    expect(source).toContain('on:click={() => void setOutlineOpen(!outlineOpen)}');
+    expect(source).not.toContain('outlineOpen = open;\n    contextPaneOpen = false;');
   });
 
   it('announces image success only from an editor insertion acknowledgement', () => {
@@ -417,7 +431,7 @@ describe('App ghost reactivity wiring', () => {
     expect(start).toContain('retainsScheduledCompletion(completionLifecycle)');
     expect(start).not.toContain("saveState === 'dirty'");
     expect(source).toContain(
-      'aria-describedby="completion-lifecycle-help autocomplete-model-menu-help"'
+      'aria-describedby="completion-lifecycle-help autocomplete-model-menu-help autocomplete-model-failure-help"'
     );
     expect(source).toContain('{completionLifecycleHelp}</span>');
   });
@@ -449,19 +463,74 @@ describe('App ghost reactivity wiring', () => {
     const ipc = readFileSync(new URL('./ipc.ts', import.meta.url), 'utf8');
 
     expect(source).toContain('label="Steering context"');
-    expect(source).toContain('aria-label="Steering context Markdown"');
-    expect(source).toContain('aria-label="Visual context editor"');
-    expect(source).toContain('aria-label="Markdown context editor"');
-    expect(source).toContain('on:input={(event) => updateContextText(event.currentTarget.value)}');
-    expect(source).toContain('await adoptAuthoritativeContext(');
+    expect(source).toContain('label="Steering context Markdown"');
+    expect(source).not.toContain('aria-label="Visual context editor"');
+    expect(source).not.toContain('aria-label="Markdown context editor"');
+    expect(source).toContain("{#if mode === 'visual' && canUseVisualMarkdown(contextText, true)}");
+    expect(source).toContain('onValueInput={(textarea) => updateContextText(textarea.value)}');
+    expect(source).toContain('adoptAuthoritativeContext(');
     expect(source).not.toContain('appendContextAttachmentMarkers');
-    expect(source).toContain('setDocumentContextText(');
+    expect(source).toContain('setDocumentContextSnapshot(');
     expect(source).toContain('Attach files to completion context');
     expect(source).toContain('<path d="M2.75 7h12.5"/>');
     expect(source).not.toContain('M6.2 9.8 10.8 5');
     expect(styles).toContain('.completion-context-pane { position: absolute;');
-    expect(ipc).toContain("call('document_context_text_get'");
-    expect(ipc).toContain("call('document_context_text_set'");
+    expect(styles).toContain('padding-inline: max(var(--writing-gutter), calc((100% - 82ch) / 2));');
+    expect(styles).toContain('.context-editor-surface .loom-editor-shell, .context-editor-surface .editor-mount { height: 100%;');
+    expect(ipc).toContain("call('document_context_snapshot_set'");
+    expect(source).toContain('media.preview_token');
+  });
+
+  it('projects native context media through document-scoped asset tokens without duplicating imported text', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const styles = readFileSync(new URL('../app.css', import.meta.url), 'utf8');
+    const tauri = readFileSync(new URL('../../src-tauri/tauri.conf.json', import.meta.url), 'utf8');
+
+    expect(source).toContain('contextText = snapshot.markdown');
+    expect(source).toContain('contextTextSources = snapshot.text_sources');
+    expect(source).toContain("convertFileSrc(media.preview_token, 'loom-asset')");
+    expect(source).toContain('<audio src={previewUrl} controls preload="metadata"');
+    expect(source).toContain('media.waveform_peaks');
+    expect(source).toContain('<img src={previewUrl} alt={attachment.file_name} />');
+    expect(source).not.toContain('URL.createObjectURL');
+    expect(source).not.toContain('maxlength={65536}');
+    expect(styles).toContain('.context-media-preview audio');
+    expect(styles).toContain('.audio-waveform');
+    expect(tauri).toContain("img-src 'self' loom-asset: http://loom-asset.localhost data:");
+    expect(tauri).toContain("media-src 'self' loom-asset: http://loom-asset.localhost");
+  });
+
+  it('keeps the low-noise co-writer popover independent from completion context', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const ipc = readFileSync(new URL('./ipc.ts', import.meta.url), 'utf8');
+
+    expect(source).toContain('aria-label="Choose a co-writer"');
+    expect(source).toContain('Reusable completion context');
+    expect(source).toContain('contextPaneOpen = true;');
+    expect(source).not.toContain('contextPaneOpen = false;\n    coWriterOpen = true');
+    expect(ipc).toContain("call('co_writer_list'");
+    expect(ipc).toContain("call('co_writer_save'");
+    expect(ipc).toContain("call('co_writer_apply'");
+    expect(ipc).toContain("call('co_writer_delete'");
+  });
+
+  it('routes dictation through native capture and inserts only at the retained editor selection', () => {
+    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+    const ipc = readFileSync(new URL('./ipc.ts', import.meta.url), 'utf8');
+
+    expect(source).toContain('aria-label={speechRecording');
+    expect(source).toContain("return contextPaneOpen ? focusedSpeechTarget : 'manuscript'");
+    expect(source).toContain("rememberSpeechEditor(event, 'context')");
+    expect(source).toContain("rememberSpeechEditor(event, 'manuscript')");
+    expect(source).toContain('captureSpeechInsertionAnchor(captured.target)');
+    expect(source).toContain('editor?.insertTextAtAnchor(insertion.anchor, snapshot.transcript)');
+    expect(source).toContain('sourceEditor?.insertTextAtAnchor(insertion.anchor, snapshot.transcript)');
+    expect(source).toContain('Dictation is preserved because its original insertion point changed.');
+    expect(source).not.toContain('microphoneCapture');
+    expect(ipc).toContain("call('speech_input_record_start'");
+    expect(ipc).toContain("call('speech_input_record_stop'");
+    expect(ipc).toContain("call('speech_input_record_cancel'");
+    expect(ipc).not.toContain('wavBytes');
   });
 
   it('keeps the document sidebar nonmodal and persistent', () => {

@@ -2259,10 +2259,10 @@
           "markdownDescription": "Denies the save command without any pre-configured scope."
         },
         {
-          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
+          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
           "type": "string",
           "const": "loom:default",
-          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
+          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
         },
         {
           "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
@@ -2275,6 +2275,12 @@
           "type": "string",
           "const": "loom:manuscript-promotion",
           "markdownDescription": "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command.\n#### This permission set includes:\n\n- `allow-candidate-promote`"
+        },
+        {
+          "description": "Start, stop, or cancel a user-requested local microphone recording and its local speech-recognition request.\n#### This permission set includes:\n\n- `allow-speech-input-record-start`\n- `allow-speech-input-record-stop`\n- `allow-speech-input-record-cancel`\n- `allow-speech-input-cancel`",
+          "type": "string",
+          "const": "loom:microphone-capture",
+          "markdownDescription": "Start, stop, or cancel a user-requested local microphone recording and its local speech-recognition request.\n#### This permission set includes:\n\n- `allow-speech-input-record-start`\n- `allow-speech-input-record-stop`\n- `allow-speech-input-record-cancel`\n- `allow-speech-input-cancel`"
         },
         {
           "description": "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`",
@@ -2355,6 +2361,30 @@
           "markdownDescription": "Enables the candidate_promote command without any pre-configured scope."
         },
         {
+          "description": "Enables the co_writer_apply command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-co-writer-apply",
+          "markdownDescription": "Enables the co_writer_apply command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the co_writer_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-co-writer-delete",
+          "markdownDescription": "Enables the co_writer_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the co_writer_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-co-writer-list",
+          "markdownDescription": "Enables the co_writer_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the co_writer_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-co-writer-save",
+          "markdownDescription": "Enables the co_writer_save command without any pre-configured scope."
+        },
+        {
           "description": "Enables the completion_snapshot command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-completion-snapshot",
@@ -2389,6 +2419,12 @@
           "type": "string",
           "const": "loom:allow-document-context-remove",
           "markdownDescription": "Enables the document_context_remove command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the document_context_snapshot_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-document-context-snapshot-set",
+          "markdownDescription": "Enables the document_context_snapshot_set command without any pre-configured scope."
         },
         {
           "description": "Enables the document_context_text_get command without any pre-configured scope.",
@@ -2577,6 +2613,42 @@
           "markdownDescription": "Enables the project_recover command without any pre-configured scope."
         },
         {
+          "description": "Enables the speech_input_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-speech-input-cancel",
+          "markdownDescription": "Enables the speech_input_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the speech_input_capabilities command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-speech-input-capabilities",
+          "markdownDescription": "Enables the speech_input_capabilities command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the speech_input_record_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-speech-input-record-cancel",
+          "markdownDescription": "Enables the speech_input_record_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the speech_input_record_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-speech-input-record-start",
+          "markdownDescription": "Enables the speech_input_record_start command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the speech_input_record_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-speech-input-record-stop",
+          "markdownDescription": "Enables the speech_input_record_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the speech_input_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-speech-input-status",
+          "markdownDescription": "Enables the speech_input_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the suggestions_set command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-suggestions-set",
@@ -2667,6 +2739,30 @@
           "markdownDescription": "Denies the candidate_promote command without any pre-configured scope."
         },
         {
+          "description": "Denies the co_writer_apply command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-co-writer-apply",
+          "markdownDescription": "Denies the co_writer_apply command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the co_writer_delete command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-co-writer-delete",
+          "markdownDescription": "Denies the co_writer_delete command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the co_writer_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-co-writer-list",
+          "markdownDescription": "Denies the co_writer_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the co_writer_save command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-co-writer-save",
+          "markdownDescription": "Denies the co_writer_save command without any pre-configured scope."
+        },
+        {
           "description": "Denies the completion_snapshot command without any pre-configured scope.",
           "type": "string",
           "const": "loom:deny-completion-snapshot",
@@ -2701,6 +2797,12 @@
           "type": "string",
           "const": "loom:deny-document-context-remove",
           "markdownDescription": "Denies the document_context_remove command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the document_context_snapshot_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-document-context-snapshot-set",
+          "markdownDescription": "Denies the document_context_snapshot_set command without any pre-configured scope."
         },
         {
           "description": "Denies the document_context_text_get command without any pre-configured scope.",
@@ -2887,6 +2989,42 @@
           "type": "string",
           "const": "loom:deny-project-recover",
           "markdownDescription": "Denies the project_recover command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the speech_input_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-speech-input-cancel",
+          "markdownDescription": "Denies the speech_input_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the speech_input_capabilities command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-speech-input-capabilities",
+          "markdownDescription": "Denies the speech_input_capabilities command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the speech_input_record_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-speech-input-record-cancel",
+          "markdownDescription": "Denies the speech_input_record_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the speech_input_record_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-speech-input-record-start",
+          "markdownDescription": "Denies the speech_input_record_start command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the speech_input_record_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-speech-input-record-stop",
+          "markdownDescription": "Denies the speech_input_record_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the speech_input_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-speech-input-status",
+          "markdownDescription": "Denies the speech_input_status command without any pre-configured scope."
         },
         {
           "description": "Denies the suggestions_set command without any pre-configured scope.",

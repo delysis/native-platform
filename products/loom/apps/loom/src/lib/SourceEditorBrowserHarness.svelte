@@ -140,4 +140,5 @@
   <output aria-label="Source Rerender Serial">{rerenderSerial}</output>
   <output aria-label="Source Attachment Commit Witness">{attachmentCommitWitness}</output>
   <button type="button" on:mousedown|preventDefault on:click={() => rerenderSerial += 1}>Stable rerender</button>
+  <button type="button" on:mousedown|preventDefault on:click={() => editor.insertTextAtSelection(' dictated')}>Insert transcript</button>
 </main>

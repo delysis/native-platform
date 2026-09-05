@@ -794,6 +794,56 @@
     return true;
   }
 
+  export function insertTextAtSelection(text: string): boolean {
+    if (!element || readonly || composing || !text) return false;
+    element.setRangeText(text, element.selectionStart, element.selectionEnd, 'end');
+    observedValue = element.value;
+    readSelection(false, false);
+    onValueInput(element);
+    onSelectionChange(element);
+    element.focus();
+    return true;
+  }
+
+  export function captureTextInsertionAnchor(): {
+    surfaceKey: string;
+    value: string;
+    start: number;
+    end: number;
+  } | null {
+    if (!element || readonly || composing) return null;
+    return {
+      surfaceKey,
+      value: element.value,
+      start: element.selectionStart,
+      end: element.selectionEnd
+    };
+  }
+
+  export function insertTextAtAnchor(
+    anchor: { surfaceKey: string; value: string; start: number; end: number },
+    text: string
+  ): boolean {
+    if (
+      !element ||
+      readonly ||
+      composing ||
+      !text ||
+      anchor.surfaceKey !== surfaceKey ||
+      anchor.value !== element.value ||
+      anchor.start < 0 ||
+      anchor.end < anchor.start ||
+      anchor.end > element.value.length
+    ) return false;
+    element.setRangeText(text, anchor.start, anchor.end, 'end');
+    observedValue = element.value;
+    readSelection(false, false);
+    onValueInput(element);
+    onSelectionChange(element);
+    element.focus();
+    return true;
+  }
+
   export function acceptGhostWord(requireVisible = true): boolean {
     const candidate = currentPlan();
     if (

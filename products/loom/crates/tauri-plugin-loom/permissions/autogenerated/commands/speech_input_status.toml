@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-speech-input-status"
+description = "Enables the speech_input_status command without any pre-configured scope."
+commands.allow = ["speech_input_status"]
+
+[[permission]]
+identifier = "deny-speech-input-status"
+description = "Denies the speech_input_status command without any pre-configured scope."
+commands.deny = ["speech_input_status"]

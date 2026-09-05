@@ -7160,6 +7160,87 @@ mod tests {
     }
 
     #[test]
+    fn source_bound_checkpoint_accepts_large_contiguous_insertions_and_deletions() {
+        for position in [0, 8, 16] {
+            let mut fixture = Fixture::new();
+            let start = fixture.start(fixture.writer_environment);
+            let terminal = fixture.finish(start.generation.run_id, "upon a time");
+            let promoted = fixture
+                .store
+                .promote_legacy_candidate_for_test(PromoteCandidateCommand {
+                    candidate_id: terminal.candidate.candidate_id,
+                    expected_source_revision_id: fixture.loaded.revision_id,
+                    expected_visible_blob_id: fixture.loaded.blob_id,
+                })
+                .expect("generated source");
+            let original = "Once upon a time";
+            let provenance = fixture
+                .store
+                .revision_provenance(promoted.save.revision_id)
+                .expect("source provenance");
+            let insertion = "Imported café • 界 text.\n".repeat(8_000);
+            let edited = format!(
+                "{}{}{}",
+                &original[..position],
+                insertion,
+                &original[position..]
+            );
+            fixture
+                .store
+                .save_document_if_source(
+                    "manuscript/001.md",
+                    DocumentContent::Prose(edited.clone()),
+                    "large paste",
+                    promoted.save.revision_id,
+                    promoted.save.blob_id,
+                )
+                .expect("large contiguous insertion");
+            let saved = fixture
+                .store
+                .read_document("manuscript/001.md")
+                .expect("saved");
+            assert_eq!(saved.text, edited);
+            assert_eq!(
+                fixture
+                    .store
+                    .reconstruct_revision(saved.revision_id)
+                    .expect("reconstruct large paste"),
+                edited.as_bytes()
+            );
+            fixture
+                .store
+                .save_document_if_source(
+                    "manuscript/001.md",
+                    DocumentContent::Prose(original.to_owned()),
+                    "remove paste",
+                    saved.revision_id,
+                    saved.blob_id,
+                )
+                .expect("large contiguous deletion");
+            assert_eq!(
+                fixture
+                    .store
+                    .read_document("manuscript/001.md")
+                    .expect("restored")
+                    .text,
+                original
+            );
+            let restored = fixture
+                .store
+                .read_document("manuscript/001.md")
+                .expect("restored");
+            assert_eq!(
+                fixture
+                    .store
+                    .revision_provenance(restored.revision_id)
+                    .expect("restored provenance")
+                    .segments,
+                provenance.segments
+            );
+        }
+    }
+
+    #[test]
     fn source_bound_checkpoint_rejects_unbounded_diff_work() {
         let mut fixture = Fixture::new();
         let oversized_changed_window = "z".repeat(crate::MAX_EDIT_DIFF_WINDOW_BYTES + 1);

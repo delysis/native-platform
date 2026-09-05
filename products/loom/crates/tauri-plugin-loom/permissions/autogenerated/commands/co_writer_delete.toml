@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-co-writer-delete"
+description = "Enables the co_writer_delete command without any pre-configured scope."
+commands.allow = ["co_writer_delete"]
+
+[[permission]]
+identifier = "deny-co-writer-delete"
+description = "Denies the co_writer_delete command without any pre-configured scope."
+commands.deny = ["co_writer_delete"]

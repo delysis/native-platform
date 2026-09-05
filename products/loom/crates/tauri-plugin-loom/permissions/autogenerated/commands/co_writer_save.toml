@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-co-writer-save"
+description = "Enables the co_writer_save command without any pre-configured scope."
+commands.allow = ["co_writer_save"]
+
+[[permission]]
+identifier = "deny-co-writer-save"
+description = "Denies the co_writer_save command without any pre-configured scope."
+commands.deny = ["co_writer_save"]

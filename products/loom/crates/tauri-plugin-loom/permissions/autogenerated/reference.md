@@ -22,6 +22,13 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-document-context-remove`
 - `allow-document-context-text-get`
 - `allow-document-context-text-set`
+- `allow-document-context-snapshot-set`
+- `allow-co-writer-list`
+- `allow-co-writer-save`
+- `allow-co-writer-apply`
+- `allow-co-writer-delete`
+- `allow-speech-input-capabilities`
+- `allow-speech-input-status`
 - `allow-document-open`
 - `allow-document-checkpoint`
 - `allow-document-export-choose`
@@ -89,6 +96,19 @@ Promote an explicitly selected private candidate into the active manuscript thro
 <td>
 
 Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:microphone-capture`
+
+</td>
+<td>
+
+Start, stop, or cancel a user-requested local microphone recording and its local speech-recognition request.
 
 </td>
 </tr>
@@ -408,6 +428,110 @@ Denies the candidate_promote command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-co-writer-apply`
+
+</td>
+<td>
+
+Enables the co_writer_apply command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-co-writer-apply`
+
+</td>
+<td>
+
+Denies the co_writer_apply command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-co-writer-delete`
+
+</td>
+<td>
+
+Enables the co_writer_delete command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-co-writer-delete`
+
+</td>
+<td>
+
+Denies the co_writer_delete command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-co-writer-list`
+
+</td>
+<td>
+
+Enables the co_writer_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-co-writer-list`
+
+</td>
+<td>
+
+Denies the co_writer_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-co-writer-save`
+
+</td>
+<td>
+
+Enables the co_writer_save command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-co-writer-save`
+
+</td>
+<td>
+
+Denies the co_writer_save command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-completion-snapshot`
 
 </td>
@@ -557,6 +681,32 @@ Enables the document_context_remove command without any pre-configured scope.
 <td>
 
 Denies the document_context_remove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-context-snapshot-set`
+
+</td>
+<td>
+
+Enables the document_context_snapshot_set command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-context-snapshot-set`
+
+</td>
+<td>
+
+Denies the document_context_snapshot_set command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1363,6 +1513,162 @@ Enables the project_recover command without any pre-configured scope.
 <td>
 
 Denies the project_recover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-speech-input-cancel`
+
+</td>
+<td>
+
+Enables the speech_input_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-speech-input-cancel`
+
+</td>
+<td>
+
+Denies the speech_input_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-speech-input-capabilities`
+
+</td>
+<td>
+
+Enables the speech_input_capabilities command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-speech-input-capabilities`
+
+</td>
+<td>
+
+Denies the speech_input_capabilities command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-speech-input-record-cancel`
+
+</td>
+<td>
+
+Enables the speech_input_record_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-speech-input-record-cancel`
+
+</td>
+<td>
+
+Denies the speech_input_record_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-speech-input-record-start`
+
+</td>
+<td>
+
+Enables the speech_input_record_start command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-speech-input-record-start`
+
+</td>
+<td>
+
+Denies the speech_input_record_start command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-speech-input-record-stop`
+
+</td>
+<td>
+
+Enables the speech_input_record_stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-speech-input-record-stop`
+
+</td>
+<td>
+
+Denies the speech_input_record_stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-speech-input-status`
+
+</td>
+<td>
+
+Enables the speech_input_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-speech-input-status`
+
+</td>
+<td>
+
+Denies the speech_input_status command without any pre-configured scope.
 
 </td>
 </tr>

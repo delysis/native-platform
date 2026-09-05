@@ -459,6 +459,74 @@
     return true;
   }
 
+  export function insertTextAtSelection(text: string): boolean {
+    if (!view || readonly || composing || !text) return false;
+    view.dispatch(view.state.tr.insertText(
+      text,
+      view.state.selection.from,
+      view.state.selection.to
+    ));
+    projectDocument();
+    view.focus();
+    return true;
+  }
+
+  export function captureTextInsertionAnchor(): {
+    surfaceKey: string;
+    markdown: string;
+    from: number;
+    to: number;
+  } | null {
+    if (!view || readonly || composing) return null;
+    return {
+      surfaceKey,
+      markdown: lastEmitted,
+      from: view.state.selection.from,
+      to: view.state.selection.to
+    };
+  }
+
+  export function captureAttachmentAnchor(clientX: number, clientY: number) {
+    if (!view || readonly || composing) return null;
+    const position = view.posAtCoords({ left: clientX, top: clientY });
+    const selection = position ? Selection.near(view.state.doc.resolve(position.pos)) : view.state.selection;
+    return { surfaceKey, markdown: lastEmitted, from: selection.from, to: selection.to };
+  }
+
+  export function insertMarkdownAtAnchor(
+    anchor: { surfaceKey: string; markdown: string; from: number; to: number }, markdown: string
+  ): boolean {
+    if (!view || readonly || composing || anchor.surfaceKey !== surfaceKey ||
+        anchor.markdown !== lastEmitted || anchor.from < 0 || anchor.to < anchor.from ||
+        anchor.to > view.state.doc.content.size) return false;
+    const imported = parse(markdown);
+    view.dispatch(view.state.tr.replaceRange(anchor.from, anchor.to, imported.slice(0, imported.content.size)));
+    projectDocument();
+    view.focus();
+    return true;
+  }
+
+  export function insertTextAtAnchor(
+    anchor: { surfaceKey: string; markdown: string; from: number; to: number },
+    text: string
+  ): boolean {
+    if (
+      !view ||
+      readonly ||
+      composing ||
+      !text ||
+      anchor.surfaceKey !== surfaceKey ||
+      anchor.markdown !== lastEmitted ||
+      anchor.from < 0 ||
+      anchor.to < anchor.from ||
+      anchor.to > view.state.doc.content.size
+    ) return false;
+    view.dispatch(view.state.tr.insertText(text, anchor.from, anchor.to));
+    projectDocument();
+    view.focus();
+    return true;
+  }
+
   /** Reassert the current immutable selection without treating it as navigation. */
   export function reconcileCurrentSelection(): boolean {
     if (!view || view.isDestroyed) return false;
@@ -714,14 +782,49 @@
     return attributes;
   }
 
-  function imageNodeView(node: ProseMirrorNode): { dom: HTMLImageElement } {
-    const dom = document.createElement('img');
+  function imageNodeView(node: ProseMirrorNode): { dom: HTMLElement; destroy: () => void } {
     const markdownPath = typeof node.attrs.src === 'string' ? node.attrs.src : '';
-    const resolved = resolveImageAssetUrl(markdownPath);
-    if (resolved) dom.src = resolved;
-    if (typeof node.attrs.alt === 'string') dom.alt = node.attrs.alt;
-    if (typeof node.attrs.title === 'string' && node.attrs.title) dom.title = node.attrs.title;
-    return { dom };
+    const isAudio = markdownPath.startsWith('loom-attachment:') && String(node.attrs.alt).startsWith('Audio:');
+    const media = document.createElement(isAudio ? 'audio' : 'img');
+    const dom = isAudio ? document.createElement('span') : media;
+    if (media instanceof HTMLAudioElement) {
+      dom.className = 'inline-audio-card';
+      dom.contentEditable = 'false';
+      media.controls = true;
+      media.preload = 'metadata';
+      media.setAttribute('aria-label', node.attrs.alt || 'Play audio');
+      const title = typeof node.attrs.title === 'string' ? node.attrs.title : '';
+      if (/^loom-waveform:(?:[a-f0-9]{2}){1,256}$/.test(title)) {
+        const waveform = document.createElement('span');
+        waveform.className = 'audio-waveform';
+        waveform.setAttribute('aria-hidden', 'true');
+        for (const hex of title.slice('loom-waveform:'.length).match(/../g) ?? []) {
+          const bar = document.createElement('i');
+          bar.style.height = `${Math.max(5, parseInt(hex, 16) / 255 * 100)}%`;
+          waveform.append(bar);
+        }
+        dom.append(waveform);
+      }
+      dom.append(media);
+    } else {
+      media.alt = typeof node.attrs.alt === 'string' ? node.attrs.alt : '';
+      if (node.attrs.title) media.title = node.attrs.title;
+    }
+    let retry: number | undefined;
+    let attempts = 0;
+    const load = (): void => {
+      const resolved = resolveImageAssetUrl(markdownPath);
+      if (resolved) media.src = resolved;
+    };
+    // Newly inserted media becomes readable only after the document save proves
+    // membership. Keep that authority boundary and retry briefly after autosave.
+    media.onerror = () => {
+      if (markdownPath.startsWith('loom-attachment:') && attempts++ < 12) {
+        retry = window.setTimeout(load, 250);
+      }
+    };
+    load();
+    return { dom, destroy: () => { media.onerror = null; window.clearTimeout(retry); } };
   }
 
   function attachmentSelection(event: DragEvent | ClipboardEvent): Selection | null {

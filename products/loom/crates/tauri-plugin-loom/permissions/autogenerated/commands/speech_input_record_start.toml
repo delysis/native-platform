@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-speech-input-record-start"
+description = "Enables the speech_input_record_start command without any pre-configured scope."
+commands.allow = ["speech_input_record_start"]
+
+[[permission]]
+identifier = "deny-speech-input-record-start"
+description = "Denies the speech_input_record_start command without any pre-configured scope."
+commands.deny = ["speech_input_record_start"]

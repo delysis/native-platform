@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-speech-input-capabilities"
+description = "Enables the speech_input_capabilities command without any pre-configured scope."
+commands.allow = ["speech_input_capabilities"]
+
+[[permission]]
+identifier = "deny-speech-input-capabilities"
+description = "Denies the speech_input_capabilities command without any pre-configured scope."
+commands.deny = ["speech_input_capabilities"]

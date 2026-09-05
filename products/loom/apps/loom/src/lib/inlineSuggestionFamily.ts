@@ -22,6 +22,8 @@ export interface InlineSuggestionState {
   branches: BranchCard[];
   /** Exact live weave command authority. Null/absent derives the newest durable family. */
   authoritativeFamilyId?: string | null;
+  /** Context edits require a newly admitted family, not historical manuscript matches. */
+  requireExplicitFamily?: boolean;
   verifiedBodyByRun: Record<string, VerifiedBranchBody>;
   liveTextByRun: Record<string, string>;
   /** Missing sequence authority fails closed instead of using byte length as identity. */
@@ -63,6 +65,7 @@ export function authoritativeInlineFamilyId(
   targetByte: number,
   state: InlineSuggestionState
 ): string | null {
+  if (state.requireExplicitFamily && !state.authoritativeFamilyId) return null;
   const families = new Map<string, { count: number; runIds: Set<string> }>();
   for (const branch of state.branches) {
     if (!branch.weave_command_id || !branchBelongsToSuggestionScope(branch, targetByte, state)) {

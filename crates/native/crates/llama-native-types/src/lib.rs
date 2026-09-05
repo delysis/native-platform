@@ -603,6 +603,9 @@ pub enum ChatTemplateChoice {
     #[default]
     ModelDefault,
     Override(String),
+    /// Exact Gemma 4 turn protocol with an empty thought channel before generation.
+    /// Rendered natively because the pinned llama.cpp simple template API is not a Jinja engine.
+    Gemma4NonThinking,
 }
 
 /// The exact prompt semantics for one native generation request.

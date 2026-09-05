@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   inlineSuggestionFamily,
+  authoritativeInlineFamilyId,
   projectInlineCandidateText,
   type InlineSuggestionState
 } from './inlineSuggestionFamily';
@@ -185,6 +186,14 @@ describe('inline suggestion family', () => {
 
     expect(inlineSuggestionFamily(5, 'visual', selection).map(({ runId }) => runId))
       .toEqual(['run-5', 'run-6', 'run-7', 'run-8']);
+  });
+
+  it('requires a fresh explicit family after completion context changes', () => {
+    const selection = state('hello');
+    selection.requireExplicitFamily = true;
+    expect(inlineSuggestionFamily(5, 'visual', selection)).toEqual([]);
+    selection.authoritativeFamilyId = FAMILY_ONE;
+    expect(authoritativeInlineFamilyId(5, selection)).toBe(FAMILY_ONE);
   });
 
   it('fails closed on an incomplete or repeated live-family identity', () => {
