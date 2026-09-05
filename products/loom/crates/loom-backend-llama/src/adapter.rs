@@ -37,10 +37,6 @@ const _: () = assert!(DEFAULT_EVENT_CAPACITY > 0 && DEFAULT_EVENT_CAPACITY <= MA
 
 const WRITER_CHAT_INSTRUCTION: &str = "Write only the new prose that belongs after <cursor>. Never copy text from inside <manuscript>, and do not explain, label, quote, or describe your reasoning.\n\n<manuscript>\n";
 const WRITER_CHAT_CURSOR: &str = "\n</manuscript>\n<cursor>";
-// The official Gemma 4 template with `enable_thinking=false`, reduced to the
-// one-user-turn contract Loom actually sends. The native text and mtmd paths
-// add BOS themselves, so this override deliberately starts at the first turn.
-const GEMMA4_NON_THINKING_CHAT_TEMPLATE: &str = "{%- for message in messages -%}{{- '<|turn>' + message['role'] + '\n' + message['content'] + '<turn|>\n' -}}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<|turn>model\n<|channel>thought\n<channel|>' -}}{%- endif -%}";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ContinuationCase {
@@ -1807,9 +1803,9 @@ fn build_native_request(
                                     "{WRITER_CHAT_INSTRUCTION}{contextual_prefix}{WRITER_CHAT_CURSOR}"
                                 ),
                             }],
-                            template: ChatTemplateChoice::Override(
-                                GEMMA4_NON_THINKING_CHAT_TEMPLATE.to_owned(),
-                            ),
+                            // mtmd adds BOS and media markers; the native renderer owns
+                            // the same non-thinking turn protocol as the text path.
+                            template: ChatTemplateChoice::Gemma4NonThinking,
                         }
                     }
                 },
@@ -3024,15 +3020,7 @@ mod tests {
                 request.exact_manuscript_prefix
             )
         );
-        assert_eq!(
-            template,
-            &ChatTemplateChoice::Override(GEMMA4_NON_THINKING_CHAT_TEMPLATE.to_owned())
-        );
-        assert!(!GEMMA4_NON_THINKING_CHAT_TEMPLATE.contains("<|think|>"));
-        assert!(
-            GEMMA4_NON_THINKING_CHAT_TEMPLATE
-                .contains("'<|turn>model\n<|channel>thought\n<channel|>'")
-        );
+        assert_eq!(template, &ChatTemplateChoice::Gemma4NonThinking);
     }
 
     #[test]

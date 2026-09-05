@@ -5699,6 +5699,9 @@ fn apply_model_chat_template(
     choice: &ChatTemplateChoice,
 ) -> NativeResult<String> {
     let template = match choice {
+        ChatTemplateChoice::Gemma4NonThinking => {
+            return render_gemma4_non_thinking(&messages, add_assistant);
+        }
         ChatTemplateChoice::ModelDefault => model.chat_template(None).map_err(|error| {
             NativeError::new(
                 NativeErrorCode::ModelInvalid,
@@ -5755,6 +5758,34 @@ fn apply_model_chat_template(
                 })
         }
     }
+}
+
+fn render_gemma4_non_thinking(
+    messages: &[ChatMessage],
+    add_assistant: bool,
+) -> NativeResult<String> {
+    let mut rendered = String::new();
+    for message in messages {
+        if message.content.contains('\0') {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "chat message contains a NUL byte",
+            ));
+        }
+        let role = match message.role {
+            ChatRole::Assistant => "model",
+            _ => role_name(message.role),
+        };
+        rendered.push_str("<|turn>");
+        rendered.push_str(role);
+        rendered.push('\n');
+        rendered.push_str(&message.content);
+        rendered.push_str("<turn|>\n");
+    }
+    if add_assistant {
+        rendered.push_str("<|turn>model\n<|channel>thought\n<channel|>");
+    }
+    Ok(rendered)
 }
 
 fn fallback_chat_template_name<'a>(
@@ -6690,6 +6721,42 @@ mod tests {
     use crate::generation_admission::{AdmissionClock, SPECULATIVE_PREEMPTION_LIMIT};
     use llama_native_types::EmbeddingInput;
     use std::sync::{Barrier, Mutex, atomic::AtomicU64};
+
+    #[test]
+    fn gemma4_non_thinking_renderer_preserves_native_markers_and_roles() {
+        let messages = vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: format!("{}\nUnicode: café • 界", mtmd_default_marker()),
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "previous answer".to_owned(),
+            },
+        ];
+        let turns = format!(
+            "<|turn>user\n{}\nUnicode: café • 界<turn|>\n<|turn>model\nprevious answer<turn|>\n",
+            mtmd_default_marker()
+        );
+        assert_eq!(
+            render_gemma4_non_thinking(&messages, false).expect("turns"),
+            turns
+        );
+        assert_eq!(
+            render_gemma4_non_thinking(&messages, true).expect("generation"),
+            format!("{turns}<|turn>model\n<|channel>thought\n<channel|>")
+        );
+        assert!(
+            render_gemma4_non_thinking(
+                &[ChatMessage {
+                    role: ChatRole::User,
+                    content: "bad\0text".to_owned()
+                }],
+                true
+            )
+            .is_err()
+        );
+    }
 
     type TestSealFixture = (
         GenerationBatchRequest,
