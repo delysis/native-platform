@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use loom_backend_llama::{
     ContinuationCase, ContinuationContextBinding, DownloadCancellation, DownloadControl,
@@ -192,11 +192,9 @@ struct Session {
     last_close: Option<ProjectCloseReceipt>,
 }
 
-const AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2: u8 = 2;
-const MAX_TRACKED_AUTOMATIC_REVISION_BUDGETS_V2: usize = 16_384;
-const AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2: u32 = AUTOMATIC_WEAVE_BRANCH_COUNT_V2
-    * AUTOMATIC_WEAVE_MAX_TOKENS_V2
-    * AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2 as u32;
+const AUTOMATIC_FAMILY_BURST_LIMIT: u8 = 2;
+const AUTOMATIC_BUDGET_WINDOW: Duration = Duration::from_secs(5);
+const MAX_TRACKED_AUTOMATIC_SCOPES: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct AutomaticBudgetScope {
@@ -209,7 +207,13 @@ struct AutomaticBudgetScope {
 #[derive(Debug, Default)]
 struct AutomaticBudgetLedger {
     active_session: Option<(ProjectId, CommandId)>,
-    families_by_scope: BTreeMap<AutomaticBudgetScope, u8>,
+    families_by_scope: BTreeMap<AutomaticBudgetScope, AutomaticBudgetWindow>,
+}
+
+#[derive(Debug)]
+struct AutomaticBudgetWindow {
+    started: Instant,
+    spent: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,14 +232,24 @@ struct AutomaticBudgetAuthority {
 struct AutomaticBudgetReservation<'authority> {
     authority: &'authority AutomaticBudgetAuthority,
     scope: AutomaticBudgetScope,
+    window_started: Instant,
     committed: bool,
 }
 
 impl AutomaticBudgetAuthority {
     fn reserve(
         &self,
+        writer: &AutomaticSuggestionAuthority,
+        scope: AutomaticBudgetScope,
+    ) -> Result<AutomaticBudgetReservation<'_>, AutomaticBudgetError> {
+        self.reserve_at(writer, scope, Instant::now())
+    }
+
+    fn reserve_at(
+        &self,
         _writer: &AutomaticSuggestionAuthority,
         scope: AutomaticBudgetScope,
+        now: Instant,
     ) -> Result<AutomaticBudgetReservation<'_>, AutomaticBudgetError> {
         let mut ledger = self
             .ledger
@@ -254,34 +268,51 @@ impl AutomaticBudgetAuthority {
                 || candidate.source_revision == scope.source_revision
         });
         if !ledger.families_by_scope.contains_key(&scope)
-            && ledger.families_by_scope.len() >= MAX_TRACKED_AUTOMATIC_REVISION_BUDGETS_V2
+            && ledger.families_by_scope.len() >= MAX_TRACKED_AUTOMATIC_SCOPES
         {
             return Err(AutomaticBudgetError::Capacity);
         }
-        let spent = ledger.families_by_scope.entry(scope).or_default();
-        if *spent >= AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2 {
+        let window = ledger
+            .families_by_scope
+            .entry(scope)
+            .or_insert(AutomaticBudgetWindow {
+                started: now,
+                spent: 0,
+            });
+        if now.saturating_duration_since(window.started) >= AUTOMATIC_BUDGET_WINDOW {
+            *window = AutomaticBudgetWindow {
+                started: now,
+                spent: 0,
+            };
+        }
+        if window.spent >= AUTOMATIC_FAMILY_BURST_LIMIT {
             return Err(AutomaticBudgetError::Exhausted);
         }
-        *spent += 1;
+        window.spent += 1;
+        let window_started = window.started;
         drop(ledger);
         Ok(AutomaticBudgetReservation {
             authority: self,
             scope,
+            window_started,
             committed: false,
         })
     }
 
-    fn refund(&self, scope: AutomaticBudgetScope) {
+    fn refund(&self, scope: AutomaticBudgetScope, window_started: Instant) {
         let Ok(mut ledger) = self.ledger.lock() else {
             // Poisoning fails closed: never mint replacement authority when
             // the exact prior reservation state cannot be proven.
             return;
         };
-        let Some(spent) = ledger.families_by_scope.get_mut(&scope) else {
+        let Some(window) = ledger.families_by_scope.get_mut(&scope) else {
             return;
         };
-        *spent = spent.saturating_sub(1);
-        if *spent == 0 {
+        if window.started != window_started {
+            return;
+        }
+        window.spent = window.spent.saturating_sub(1);
+        if window.spent == 0 {
             ledger.families_by_scope.remove(&scope);
         }
     }
@@ -296,7 +327,7 @@ impl AutomaticBudgetReservation<'_> {
 impl Drop for AutomaticBudgetReservation<'_> {
     fn drop(&mut self) {
         if !self.committed {
-            self.authority.refund(self.scope);
+            self.authority.refund(self.scope, self.window_started);
         }
     }
 }
@@ -8006,11 +8037,9 @@ fn weave_start_inner<R: Runtime>(
                 })
                 .map_err(|error| match error {
                     AutomaticBudgetError::Exhausted => IpcFailure::new(
-                        "automatic_revision_budget_exhausted",
-                        format!(
-                            "this immutable manuscript revision has already used its {AUTOMATIC_FAMILY_BUDGET_PER_REVISION_V2} automatic families ({AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2} generated-token ceiling)",
-                        ),
-                        false,
+                        "automatic_generation_throttled",
+                        "automatic suggestions are briefly cooling down before the next batch",
+                        true,
                     ),
                     AutomaticBudgetError::Capacity => IpcFailure::new(
                         "automatic_budget_capacity",
@@ -12526,6 +12555,55 @@ mod tests {
     }
 
     #[test]
+    fn automatic_budget_renews_without_editing_and_stale_refunds_do_not_mint_slots() {
+        let authority = AutomaticBudgetAuthority::default();
+        let automatic = test_automatic_model_authority();
+        let writer = automatic.automatic_writer().expect("writer");
+        let scope = AutomaticBudgetScope {
+            project: ProjectId::new(),
+            session: CommandId::new(),
+            document: DocumentId::new(),
+            source_revision: RevisionId::new(),
+        };
+        let now = Instant::now();
+        let stale = authority.reserve_at(writer, scope, now).expect("pending");
+        authority
+            .reserve_at(writer, scope, now)
+            .expect("second")
+            .commit();
+        assert_eq!(
+            authority
+                .reserve_at(
+                    writer,
+                    scope,
+                    now + AUTOMATIC_BUDGET_WINDOW.saturating_sub(Duration::from_nanos(1))
+                )
+                .expect_err("burst limited"),
+            AutomaticBudgetError::Exhausted
+        );
+        let renewed = now + AUTOMATIC_BUDGET_WINDOW;
+        authority
+            .reserve_at(writer, scope, renewed)
+            .expect("same revision renews")
+            .commit();
+        authority
+            .reserve_at(writer, scope, renewed)
+            .expect("second renewed")
+            .commit();
+        drop(stale);
+        assert_eq!(
+            authority
+                .reserve_at(writer, scope, renewed)
+                .expect_err("old refund cannot alter new window"),
+            AutomaticBudgetError::Exhausted
+        );
+        authority
+            .reserve_at(writer, scope, renewed + AUTOMATIC_BUDGET_WINDOW)
+            .expect("continues after idle")
+            .commit();
+    }
+
+    #[test]
     fn automatic_budget_reservations_are_affine_and_revision_bounded() {
         let authority = AutomaticBudgetAuthority::default();
         let automatic = test_automatic_model_authority();
@@ -12552,7 +12630,7 @@ mod tests {
                 .expect_err("revision budget exhausted"),
             AutomaticBudgetError::Exhausted
         );
-        assert_eq!(AUTOMATIC_TOKEN_BUDGET_PER_REVISION_V2, 384);
+        assert_eq!(AUTOMATIC_FAMILY_BURST_LIMIT, 2);
     }
 
     #[test]
@@ -12628,7 +12706,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_budget_renews_only_for_new_authoritative_revision_or_session() {
+    fn automatic_budget_renews_for_new_authoritative_revision_or_session() {
         let authority = AutomaticBudgetAuthority::default();
         let automatic = test_automatic_model_authority();
         let writer = automatic

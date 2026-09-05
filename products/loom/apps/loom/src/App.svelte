@@ -7858,6 +7858,11 @@
       ) {
         const captureIsCurrent = weaveCaptureStillCurrent(captured);
         const failure = normalizeFailure(error);
+        if (captureIsCurrent && failure.code === 'automatic_generation_throttled') {
+          uncertainWeave = null;
+          scheduleAutomaticSuggestions(editVersion, 5_000, 'retry');
+          return true;
+        }
         if (captureIsCurrent && failureIsDefiniteContention(failure)) {
           uncertainWeave = null;
           scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'retry');
