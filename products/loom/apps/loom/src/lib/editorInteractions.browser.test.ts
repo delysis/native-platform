@@ -1075,6 +1075,7 @@ describe('real WebKit editor interactions', () => {
     const lifecycleRefreshedGhost = editor.querySelector('.loom-visual-ghost');
     expect(lifecycleRefreshedGhost).not.toBeNull();
     expect(lifecycleRefreshedGhost).not.toBe(initialGhost);
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
     editor.focus();
     await expect.poll(() => {
       const selection = document.getSelection();
