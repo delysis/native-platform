@@ -83,9 +83,9 @@ Continuous typing is durable without manufacturing a semantic revision on every 
 - Revision slices use UTF-8 byte ranges and may not split a code point.
 - Empty revisions have zero segments. Non-empty revisions must have at least one reconstructing segment.
 
-Source-bound human checkpoints run a deterministic Unicode-scalar Myers diff over the changed middle after stripping a common prefix and suffix. Every equal run retains the original artifact slices; inserted or replaced runs become a new `HumanContribution`. This preserves generated evidence through multiple disjoint edits, including generated text between two human changes.
+Source-bound human checkpoints first strip an exact common UTF-8 prefix and suffix. A contiguous insertion or deletion is planned directly in linear time, retaining the original artifact slices on both sides. Other edits run a deterministic Unicode-scalar Myers diff over the changed middle. Every equal run retains the original artifact slices; inserted or replaced runs become a new `HumanContribution`. This preserves generated evidence through multiple disjoint edits, including generated text between two human changes.
 
-Diffing is fail-closed and bounded:
+The ambiguous diff search is fail-closed and bounded. Contiguous insertions and deletions do not enter that search; the document byte limit and final segment limit still apply:
 
 - changed middle: at most 64 KiB combined UTF-8 bytes;
 - changed middle: at most 16,384 combined Unicode scalar values;

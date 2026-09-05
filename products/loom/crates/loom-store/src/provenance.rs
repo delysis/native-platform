@@ -779,6 +779,7 @@ pub(crate) fn build_utf8_edit_plan(
     old_bytes: &[u8],
     new_bytes: &[u8],
 ) -> Result<EditPlan> {
+    ensure_bounded_document(new_bytes)?;
     let old = std::str::from_utf8(old_bytes)
         .map_err(|_| StoreError::CorruptDatabase("source revision is not UTF-8".into()))?;
     let new = std::str::from_utf8(new_bytes)
@@ -789,6 +790,18 @@ pub(crate) fn build_utf8_edit_plan(
     let new_middle_end = new.len().saturating_sub(suffix_length);
     let old_middle = &old[prefix_end..old_middle_end];
     let new_middle = &new[prefix_end..new_middle_end];
+    // A contiguous insertion or deletion has no ambiguous alignment to search.
+    // Preserve the exact common edges and avoid allocating a character-level diff
+    // for a book-sized paste. Ambiguous replacements still use the bounded diff.
+    if old_middle.is_empty() || new_middle.is_empty() {
+        return build_contiguous_edit_plan(
+            source_segments,
+            prefix_end,
+            old_middle_end,
+            old.len(),
+            new_middle,
+        );
+    }
     ensure_edit_diff_budget(old_middle, new_middle)?;
 
     let old_characters: Vec<char> = old_middle.chars().collect();
@@ -796,16 +809,7 @@ pub(crate) fn build_utf8_edit_plan(
     let old_offsets = utf8_offsets(old_middle);
     let new_offsets = utf8_offsets(new_middle);
     let operations = capture_diff_slices(Algorithm::Myers, &old_characters, &new_characters);
-    let segment_visits = u64::try_from(source_segments.len())
-        .unwrap_or(u64::MAX)
-        .saturating_mul(u64::try_from(operations.len()).unwrap_or(u64::MAX));
-    if segment_visits > MAX_DIFF_SEGMENT_VISITS {
-        return Err(StoreError::EditDiffBudgetExceeded {
-            metric: "segment visits",
-            actual: segment_visits,
-            limit: MAX_DIFF_SEGMENT_VISITS,
-        });
-    }
+    ensure_edit_segment_visit_budget(source_segments.len(), operations.len())?;
 
     let mut plan = EditPlan {
         segments: Vec::new(),
@@ -880,6 +884,52 @@ pub(crate) fn build_utf8_edit_plan(
         ));
     }
     Ok(plan)
+}
+
+fn ensure_edit_segment_visit_budget(segment_count: usize, operation_count: usize) -> Result<()> {
+    let segment_visits = u64::try_from(segment_count)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(operation_count).unwrap_or(u64::MAX));
+    if segment_visits > MAX_DIFF_SEGMENT_VISITS {
+        return Err(StoreError::EditDiffBudgetExceeded {
+            metric: "segment visits",
+            actual: segment_visits,
+            limit: MAX_DIFF_SEGMENT_VISITS,
+        });
+    }
+    Ok(())
+}
+
+fn build_contiguous_edit_plan(
+    source_segments: &[StoredSegment],
+    prefix_end: usize,
+    old_middle_end: usize,
+    old_length: usize,
+    new_middle: &str,
+) -> Result<EditPlan> {
+    let mut segments: Vec<PlannedSegment> = slice_segments(source_segments, 0, prefix_end)?
+        .into_iter()
+        .map(PlannedSegment::Existing)
+        .collect();
+    if !new_middle.is_empty() {
+        segments.push(PlannedSegment::Human {
+            start: 0,
+            end: u64::try_from(new_middle.len()).map_err(|_| StoreError::DocumentTooLarge {
+                actual_bytes: u64::MAX,
+                max_bytes: MAX_DOCUMENT_BYTES,
+            })?,
+        });
+    }
+    segments.extend(
+        slice_segments(source_segments, old_middle_end, old_length)?
+            .into_iter()
+            .map(PlannedSegment::Existing),
+    );
+    ensure_revision_segment_budget(segments.len())?;
+    Ok(EditPlan {
+        segments,
+        human_bytes: new_middle.as_bytes().to_vec(),
+    })
 }
 
 fn common_utf8_edges(old: &str, new: &str) -> (usize, usize) {
