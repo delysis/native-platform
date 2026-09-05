@@ -519,7 +519,9 @@ describe('App ghost reactivity wiring', () => {
     const ipc = readFileSync(new URL('./ipc.ts', import.meta.url), 'utf8');
 
     expect(source).toContain('aria-label={speechRecording');
-    expect(source).toContain("return contextPaneOpen ? 'context' : 'manuscript'");
+    expect(source).toContain("return contextPaneOpen ? focusedSpeechTarget : 'manuscript'");
+    expect(source).toContain("rememberSpeechEditor(event, 'context')");
+    expect(source).toContain("rememberSpeechEditor(event, 'manuscript')");
     expect(source).toContain('captureSpeechInsertionAnchor(captured.target)');
     expect(source).toContain('editor?.insertTextAtAnchor(insertion.anchor, snapshot.transcript)');
     expect(source).toContain('sourceEditor?.insertTextAtAnchor(insertion.anchor, snapshot.transcript)');

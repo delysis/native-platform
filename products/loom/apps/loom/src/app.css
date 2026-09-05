@@ -43,7 +43,7 @@ button:disabled { cursor: default; opacity: .45; }
 .canvas-controls {
   --titlebar-leading-inset: 76px;
   position: relative;
-  z-index: 17;
+  z-index: 29;
   min-width: 0;
   height: 30px;
   flex: 0 0 30px;

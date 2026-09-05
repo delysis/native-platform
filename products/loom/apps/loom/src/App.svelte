@@ -371,6 +371,7 @@
   let search = '';
   let outlineOpen = false;
   let contextPaneOpen = false;
+  let focusedSpeechTarget: SpeechInputTarget = 'manuscript';
   let contextPaneElement: HTMLDivElement | undefined;
   let contextToggleElement: HTMLButtonElement | undefined;
   let contextAttachments: ContextAttachmentPresentation[] = [];
@@ -1493,7 +1494,13 @@
   }
 
   function speechTarget(): SpeechInputTarget {
-    return contextPaneOpen ? 'context' : 'manuscript';
+    return contextPaneOpen ? focusedSpeechTarget : 'manuscript';
+  }
+
+  function rememberSpeechEditor(event: FocusEvent, target: SpeechInputTarget): void {
+    if (event.target instanceof HTMLElement && event.target.closest('[contenteditable="true"], textarea')) {
+      focusedSpeechTarget = target;
+    }
   }
 
   function captureSpeechInsertionAnchor(target: SpeechInputTarget): SpeechInsertionAnchor | null {
@@ -9230,6 +9237,7 @@
             class:drop-active={contextDropActive}
             class="completion-context-pane"
             data-attachment-drop="context"
+            on:focusin={(event) => rememberSpeechEditor(event, 'context')}
             aria-label="Completion context"
             role="region"
           >
@@ -9446,7 +9454,7 @@
             </div>
           {/if}
 
-          <section class="editor-stage" data-attachment-drop="inline" aria-label="Writing surface">
+          <section class="editor-stage" data-attachment-drop="inline" aria-label="Writing surface" on:focusin={(event) => rememberSpeechEditor(event, 'manuscript')}>
             {#if showVisual}
               <div class="editor-pane visual-pane" aria-label="Visual editor pane">
                 {#if exactTextSurface}
