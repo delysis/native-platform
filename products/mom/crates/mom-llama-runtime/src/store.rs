@@ -32,6 +32,46 @@ const STORE_SCHEMA: &str = "CREATE TABLE encrypted_documents (
                 created_at INTEGER NOT NULL
             );";
 
+/// Build privately, then publish a complete database without replacing any
+/// existing path. The hard-link operation arbitrates independent processes as
+/// well as threads; readers never observe our empty initialization file.
+fn initialize_store(data_dir: &Path, destination: &Path) -> Result<()> {
+    struct Candidate(PathBuf);
+    impl Drop for Candidate {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let path = data_dir.join(format!(".runtime-init-{}.sqlite3", uuid::Uuid::new_v4()));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let candidate = Candidate(path);
+    {
+        let mut connection =
+            Connection::open_with_flags(&candidate.0, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        // Keep every committed byte in this one file before linking it.
+        connection.pragma_update(None, "journal_mode", "DELETE")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(STORE_SCHEMA)?;
+        transaction.pragma_update(None, "application_id", STORE_APPLICATION_ID)?;
+        transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+        validate_schema(&transaction)?;
+        transaction.commit()?;
+    }
+    match fs::hard_link(&candidate.0, destination) {
+        Ok(()) => {
+            #[cfg(unix)]
+            fs::File::open(data_dir)?.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
 /// Legacy v0 has the identical physical schema. Do not stamp it or rewrite
 /// encrypted records: older binaries and retained keys remain compatible.
 fn validate_schema(connection: &Connection) -> Result<()> {
@@ -164,27 +204,29 @@ impl RuntimeStore {
     }
 
     pub(crate) fn open_with_key(data_dir: &Path, key: [u8; 32]) -> Result<Self> {
+        Self::open_with_key_at_creation(data_dir, key, || {})
+    }
+
+    fn open_with_key_at_creation(
+        data_dir: &Path,
+        key: [u8; 32],
+        before_creation: impl FnOnce(),
+    ) -> Result<Self> {
         fs::create_dir_all(data_dir)?;
         let store = Self {
             path: data_dir.join(DATABASE_FILE),
             key,
         };
-        if store.path.exists() {
-            // Refusal must not switch journal mode, create tables, or stamp a
-            // foreign/future database. Legacy stores retain their identifiers.
-            let connection =
-                Connection::open_with_flags(&store.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-            validate_schema(&connection)?;
-        } else {
-            let mut connection = Connection::open(&store.path)?;
-            let transaction =
-                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            transaction.execute_batch(STORE_SCHEMA)?;
-            transaction.pragma_update(None, "application_id", STORE_APPLICATION_ID)?;
-            transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
-            validate_schema(&transaction)?;
-            transaction.commit()?;
+        if !store.path.exists() {
+            before_creation();
+            initialize_store(data_dir, &store.path)?;
         }
+        // Validate the published winner read-only, including a foreign database
+        // that appeared while our private candidate was being initialized.
+        let connection =
+            Connection::open_with_flags(&store.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        validate_schema(&connection)?;
+        drop(connection);
         // Validate again on the exact connection before applying write pragmas.
         let _connection = store.connection()?;
         Ok(store)
@@ -870,6 +912,68 @@ mod tests {
     use llama_native_cache::PrefixCacheValue;
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn concurrent_first_opens_publish_one_complete_store() -> Result<()> {
+        let dir = test_dir("concurrent-first-opens");
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|index| {
+                let dir = dir.clone();
+                let ready = std::sync::Arc::clone(&ready);
+                std::thread::spawn(move || -> Result<()> {
+                    let store = RuntimeStore::open_with_key_at_creation(&dir, [42; 32], || {
+                        ready.wait();
+                    })?;
+                    store.put(&format!("concurrent-{index}"), &index)?;
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("initializer thread")?;
+        }
+        let store = RuntimeStore::open_with_key(&dir, [42; 32])?;
+        for index in 0..2 {
+            assert_eq!(
+                store.get::<u32>(&format!("concurrent-{index}"))?,
+                Some(index)
+            );
+        }
+        assert!(fs::read_dir(&dir)?.all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".runtime-init-")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_foreign_creation_is_never_replaced_or_stamped() -> Result<()> {
+        let dir = test_dir("foreign-first-open-winner");
+        let path = dir.join(DATABASE_FILE);
+        let mut before = Vec::new();
+        let result = RuntimeStore::open_with_key_at_creation(&dir, [42; 32], || {
+            let connection = Connection::open(&path).expect("foreign creator");
+            connection.execute_batch("CREATE TABLE foreign_data(value TEXT); INSERT INTO foreign_data VALUES ('preserved');").expect("foreign schema");
+            drop(connection);
+            before = fs::read(&path).expect("foreign bytes");
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path)?, before);
+        assert!(!dir.join("runtime.sqlite3-wal").exists());
+        assert!(!dir.join("runtime.sqlite3-shm").exists());
+        assert!(fs::read_dir(&dir)?.all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".runtime-init-")
+        }));
+        Ok(())
+    }
 
     #[test]
     fn schema_preflight_accepts_exact_legacy_and_reopens_without_stamping() -> Result<()> {
