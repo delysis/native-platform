@@ -4,7 +4,9 @@ pub mod control_math;
 mod controlled_runtime;
 mod embedding_runtime;
 mod generation_admission;
+mod memory_estimate;
 mod operation_registry;
+pub use memory_estimate::{MemoryEstimateBasis, NativeMemoryEstimate, estimate_memory_reservation};
 mod state_buffer;
 
 pub use controlled_runtime::{
@@ -50,8 +52,8 @@ use llama_native_types::{
     NativeErrorCode, NativeEvidenceCapabilities, NativeModelConfig, NativeModelDescriptor,
     NativeTransport, PreparedPrompt, ProjectorRequirement, PromptForm, PromptInputCapabilities,
     PromptTokenPolicy, ResidentModelStatus, SamplerKind, SamplingConfig, SamplingParameter,
-    SequenceStateBlob, SharedPrefixBatchRequest, SpecialTokenPolicy, TokenizedPrompt,
-    exact_token_batch_cell_budget,
+    SequenceRestoreKind, SequenceStateBlob, SharedPrefixBatchRequest, SpecialTokenPolicy,
+    TokenizedPrompt, exact_token_batch_cell_budget,
 };
 use sha2::{Digest, Sha256};
 
@@ -1120,7 +1122,7 @@ enum WorkerCommand {
     Restore {
         state: SequenceStateBlob,
         destination_sequence_id: i32,
-        response: Sender<NativeResult<()>>,
+        response: Sender<NativeResult<SequenceRestoreKind>>,
     },
     PrefillPrefix {
         request: SharedPrefixBatchRequest,
@@ -1622,7 +1624,7 @@ impl NativeModelHandle {
         &self,
         state: SequenceStateBlob,
         destination_sequence_id: i32,
-    ) -> NativeResult<()> {
+    ) -> NativeResult<SequenceRestoreKind> {
         self.inner.ensure_accepting()?;
         let (response_tx, response_rx) = bounded(1);
         self.inner.send_command(
@@ -2451,6 +2453,7 @@ fn run_worker(
                                     reasoning_forces: &reasoning_forces,
                                 },
                                 BatchSequenceState {
+                                    fingerprint: &fingerprint,
                                     tracking: SequenceTracking {
                                         token_counts: &mut sequence_token_counts,
                                         token_ids: &mut sequence_token_ids,
@@ -2506,7 +2509,7 @@ fn run_worker(
                         token_piece_traces,
                     } = execution;
                     let authority = strict_precheck.and_then(|()| {
-                        if !sealable_batch {
+                        if !sealable_batch || outputs.iter().any(|output| output.metrics.cache.replayed_prefix_tokens != 0) {
                             return Err(NativeError::new(
                                 NativeErrorCode::UnsupportedParameter,
                                 "this generation path does not carry exact-token owner-worker authority",
@@ -2574,6 +2577,7 @@ fn run_worker(
                         reasoning_forces: &reasoning_forces,
                     },
                     BatchSequenceState {
+                        fingerprint: &fingerprint,
                         tracking: SequenceTracking {
                             token_counts: &mut sequence_token_counts,
                             token_ids: &mut sequence_token_ids,
@@ -2753,6 +2757,7 @@ fn run_worker(
                     .unwrap_or_default();
                 let _ = response.send(state_buffer::export_sequence(
                     &context,
+                    &fingerprint,
                     sequence_id,
                     token_count,
                     sequence_token_ids
@@ -2766,20 +2771,46 @@ fn run_worker(
                 destination_sequence_id,
                 response,
             } => {
-                resident_text_prefix.invalidate();
-                let token_count = state.token_count;
-                let result =
-                    state_buffer::import_sequence(&mut context, &state, destination_sequence_id);
-                if result.is_ok() {
-                    sequence_token_counts.insert(destination_sequence_id, token_count);
-                    sequence_token_ids.insert(destination_sequence_id, state.token_ids);
-                }
+                // Pure rejection preserves all prior sequence state. Once native
+                // mutation starts, failure cannot leave tracking or reuse
+                // authority describing a partially restored context.
+                let result = validate_saved_sequence(
+                    &state,
+                    destination_sequence_id,
+                    model.n_vocab(),
+                    &fingerprint,
+                )
+                .and_then(|()| {
+                    resident_text_prefix.invalidate();
+                    let result = restore_saved_sequence(
+                        &model,
+                        &mut context,
+                        &fingerprint,
+                        &state,
+                        destination_sequence_id,
+                    );
+                    if result.is_ok() {
+                        sequence_token_counts.insert(destination_sequence_id, state.token_count);
+                        sequence_token_ids.insert(destination_sequence_id, state.token_ids);
+                    } else {
+                        // Raw import and decode may fail after partial mutation.
+                        // Discard every sequence, including valid peer sequences,
+                        // rather than mint snapshots from uncertain KV contents.
+                        context.clear_kv_cache();
+                        state_buffer::forget_live_exports();
+                        sequence_token_counts.clear();
+                        sequence_token_ids.clear();
+                        resident_text_prefix.invalidate();
+                    }
+                    result
+                });
                 let _ = response.send(result);
             }
             WorkerCommand::PrefillPrefix { request, response } => {
                 resident_text_prefix.invalidate();
                 let result = prefill_shared_prefix(
                     &model,
+                    &fingerprint,
                     &mut context,
                     &request,
                     &mut sequence_token_counts,
@@ -3492,6 +3523,7 @@ fn generate_batch(
     state: BatchSequenceState<'_>,
 ) -> NativeResult<GeneratedBatchExecution> {
     let BatchSequenceState {
+        fingerprint,
         tracking,
         mut resident,
     } = state;
@@ -3547,40 +3579,6 @@ fn generate_batch(
         } else {
             0
         };
-    if let Some((_, cache)) = resident.as_mut() {
-        cache.invalidate();
-    }
-    if resident_prefix == 0 {
-        context.clear_kv_cache();
-    } else {
-        let crop_start = u32::try_from(resident_prefix).map_err(|_| {
-            NativeError::new(
-                NativeErrorCode::Internal,
-                "resident prefix length does not fit the native KV position API",
-            )
-        })?;
-        context
-            .clear_kv_cache_seq(Some(0), Some(crop_start), None)
-            .map_err(|error| {
-                native_decode_error("failed to crop the resident text KV prefix", error)
-            })?;
-        let prior_sequences = tracking.token_ids.keys().copied().collect::<Vec<_>>();
-        for sequence_id in prior_sequences.into_iter().filter(|id| *id != 0) {
-            let sequence_id = u32::try_from(sequence_id).map_err(|_| {
-                NativeError::new(
-                    NativeErrorCode::Internal,
-                    "tracked native sequence ID was negative",
-                )
-            })?;
-            context
-                .clear_kv_cache_seq(Some(sequence_id), None, None)
-                .map_err(|error| {
-                    native_decode_error("failed to clear a prior text KV sequence", error)
-                })?;
-        }
-    }
-    tracking.token_counts.clear();
-    tracking.token_ids.clear();
     let cached_states = request
         .branches
         .iter()
@@ -3597,6 +3595,7 @@ fn generate_batch(
         })
         .collect::<Vec<_>>();
     let mut prefix_lengths = vec![0_usize; request.branches.len()];
+    let mut replayed_prefix_lengths = vec![0_usize; request.branches.len()];
     let uncached_indices = cached_states
         .iter()
         .enumerate()
@@ -3623,7 +3622,7 @@ fn generate_batch(
                 ),
             ));
         }
-        state_buffer::import_sequence(context, state, index as i32)?;
+        validate_saved_sequence(state, index as i32, model.n_vocab(), fingerprint)?;
         prefix_lengths[index] = state.token_count;
     }
     let (shared_uncached_prefix, required_tokens) = if let Some(budget) = exact_cell_budget {
@@ -3683,6 +3682,50 @@ fn generate_batch(
                 context.n_ctx()
             ),
         ));
+    }
+    // All supplied prefixes and aggregate cell budgets have passed preflight.
+    // Only now may this request clear, restore or decode native state.
+    if let Some((_, cache)) = resident.as_mut() {
+        cache.invalidate();
+    }
+    if resident_prefix == 0 {
+        context.clear_kv_cache();
+    } else {
+        let crop_start = u32::try_from(resident_prefix).map_err(|_| {
+            NativeError::new(
+                NativeErrorCode::Internal,
+                "resident prefix length does not fit the native KV position API",
+            )
+        })?;
+        context
+            .clear_kv_cache_seq(Some(0), Some(crop_start), None)
+            .map_err(|error| {
+                native_decode_error("failed to crop the resident text KV prefix", error)
+            })?;
+        let prior_sequences = tracking.token_ids.keys().copied().collect::<Vec<_>>();
+        for sequence_id in prior_sequences.into_iter().filter(|id| *id != 0) {
+            let sequence_id = u32::try_from(sequence_id).map_err(|_| {
+                NativeError::new(
+                    NativeErrorCode::Internal,
+                    "tracked native sequence ID was negative",
+                )
+            })?;
+            context
+                .clear_kv_cache_seq(Some(sequence_id), None, None)
+                .map_err(|error| {
+                    native_decode_error("failed to clear a prior text KV sequence", error)
+                })?;
+        }
+    }
+    tracking.token_counts.clear();
+    tracking.token_ids.clear();
+    for (index, state) in cached_states.iter().enumerate() {
+        if let Some(state) = state {
+            let kind = restore_saved_sequence(model, context, fingerprint, state, index as i32)?;
+            if kind == SequenceRestoreKind::TokenReplay {
+                replayed_prefix_lengths[index] = state.token_count;
+            }
+        }
     }
     for (index, branch) in request.branches.iter().enumerate() {
         supervision.emit_state(request, branch, index, 0, GenerationState::Prefilling);
@@ -3958,14 +4001,19 @@ fn generate_batch(
             metrics: GenerationMetrics {
                 prompt_tokens: token_sets[branch.sequence_id as usize].len(),
                 completion_tokens,
-                shared_prefix_tokens: prefix_lengths[branch.sequence_id as usize],
+                shared_prefix_tokens: prefix_lengths[branch.sequence_id as usize]
+                    .saturating_sub(replayed_prefix_lengths[branch.sequence_id as usize]),
                 duration_ms,
                 first_token_ms: branch.first_token_ms,
                 tokens_per_second,
                 cache: if let Some(state) = cached_states[branch.sequence_id as usize] {
                     GenerationCacheMetrics {
                         supplied_prefix_tokens: state.token_count,
-                        restored_prefix_tokens: state.token_count,
+                        restored_prefix_tokens: state
+                            .token_count
+                            .saturating_sub(replayed_prefix_lengths[branch.sequence_id as usize]),
+                        replayed_prefix_tokens: replayed_prefix_lengths
+                            [branch.sequence_id as usize],
                         batch_shared_prefix_tokens: 0,
                         resident_prefix_tokens: 0,
                     }
@@ -4355,6 +4403,7 @@ fn generate_multimodal_batch(
                 cache: GenerationCacheMetrics {
                     supplied_prefix_tokens: 0,
                     restored_prefix_tokens: 0,
+                    replayed_prefix_tokens: 0,
                     batch_shared_prefix_tokens: prompt_tokens,
                     resident_prefix_tokens: 0,
                 },
@@ -4692,6 +4741,7 @@ where
             || output.metrics.shared_prefix_tokens != expected_shared_prefix
             || output.metrics.cache.supplied_prefix_tokens != 0
             || output.metrics.cache.restored_prefix_tokens != 0
+            || output.metrics.cache.replayed_prefix_tokens != 0
             || output.metrics.cache.batch_shared_prefix_tokens != expected_shared_prefix
         {
             return Err(generation_verification_error(
@@ -5014,8 +5064,95 @@ fn prepare_input(model: &LlamaModel, input: GenerationInput) -> NativeResult<Vec
     }
 }
 
+#[cfg(test)]
+static SAVED_PREFIX_REPLAY_DECODES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static FAIL_NEXT_REPLAY_AFTER_DECODE: AtomicBool = AtomicBool::new(false);
+
+fn restore_saved_sequence(
+    model: &LlamaModel,
+    context: &mut LlamaContext<'_>,
+    fingerprint: &ModelFingerprint,
+    state: &SequenceStateBlob,
+    destination_sequence_id: i32,
+) -> NativeResult<SequenceRestoreKind> {
+    validate_saved_sequence(state, destination_sequence_id, model.n_vocab(), fingerprint)?;
+    if state_buffer::import_sequence(context, fingerprint, state, destination_sequence_id)? {
+        return Ok(SequenceRestoreKind::NativeState);
+    }
+    // Serialized data is not native parser authority. Recompute a durable
+    // prefix through the ordinary checked token decode path instead.
+    let cleared = context
+        .clear_kv_cache_seq(Some(destination_sequence_id as u32), None, None)
+        .map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::CacheIncompatible,
+                format!("failed to clear saved sequence: {error}"),
+            )
+        })?;
+    let tokens = state
+        .token_ids
+        .iter()
+        .copied()
+        .map(LlamaToken)
+        .collect::<Vec<_>>();
+    replay_after_sequence_clear(cleared, || {
+        #[cfg(test)]
+        SAVED_PREFIX_REPLAY_DECODES.fetch_add(1, Ordering::SeqCst);
+        decode_tokens_chunked(context, &tokens, destination_sequence_id, 0, false)
+    })?;
+    #[cfg(test)]
+    if FAIL_NEXT_REPLAY_AFTER_DECODE.swap(false, Ordering::SeqCst) {
+        return Err(NativeError::new(
+            NativeErrorCode::DecodeFailed,
+            "injected replay decode failure",
+        ));
+    }
+    Ok(SequenceRestoreKind::TokenReplay)
+}
+
+fn replay_after_sequence_clear(
+    cleared: bool,
+    decode: impl FnOnce() -> NativeResult<()>,
+) -> NativeResult<()> {
+    if !cleared {
+        return Err(NativeError::new(
+            NativeErrorCode::CacheIncompatible,
+            "native context rejected sequence removal before replay",
+        ));
+    }
+    decode()
+}
+
+fn validate_saved_sequence(
+    state: &SequenceStateBlob,
+    destination: i32,
+    vocabulary_size: i32,
+    fingerprint: &ModelFingerprint,
+) -> NativeResult<()> {
+    if destination < 0
+        || destination as u32 >= fingerprint.max_sequences
+        || state.token_count == 0
+        || state.token_count != state.token_ids.len()
+        || state.token_count > fingerprint.context_tokens as usize
+        || state
+            .token_ids
+            .iter()
+            .any(|token| *token < 0 || *token >= vocabulary_size)
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::CacheIncompatible,
+            "saved sequence token metadata is outside the resident context",
+        ));
+    }
+    state_buffer::validate_binding(state, fingerprint)
+}
+
 fn prefill_shared_prefix(
     model: &LlamaModel,
+    fingerprint: &ModelFingerprint,
     context: &mut LlamaContext<'_>,
     request: &SharedPrefixBatchRequest,
     sequence_token_counts: &mut HashMap<i32, usize>,
@@ -5048,7 +5185,7 @@ fn prefill_shared_prefix(
     let token_ids = tokens.iter().map(|token| token.0).collect::<Vec<_>>();
     sequence_token_counts.insert(0, tokens.len());
     sequence_token_ids.insert(0, token_ids.clone());
-    state_buffer::export_sequence(context, 0, tokens.len(), token_ids)
+    state_buffer::export_sequence(context, fingerprint, 0, tokens.len(), token_ids)
 }
 
 fn generate_multimodal(
@@ -5273,6 +5410,7 @@ struct SequenceTracking<'a> {
 }
 
 struct BatchSequenceState<'a> {
+    fingerprint: &'a ModelFingerprint,
     tracking: SequenceTracking<'a>,
     resident: Option<(
         &'a ResidentTextPrefixBinding,
@@ -5363,6 +5501,7 @@ fn implicit_text_cache_metrics(
     GenerationCacheMetrics {
         supplied_prefix_tokens: 0,
         restored_prefix_tokens: 0,
+        replayed_prefix_tokens: 0,
         batch_shared_prefix_tokens: shared_prefix_tokens.saturating_sub(resident_prefix_tokens),
         resident_prefix_tokens,
     }
@@ -7678,6 +7817,7 @@ mod tests {
                         cache: GenerationCacheMetrics {
                             supplied_prefix_tokens: 0,
                             restored_prefix_tokens: 0,
+                            replayed_prefix_tokens: 0,
                             batch_shared_prefix_tokens: 2,
                             resident_prefix_tokens: 0,
                         },
@@ -9884,6 +10024,210 @@ mod tests {
             Some("gemma")
         );
         assert_eq!(fallback_chat_template_name("qwen2", "chatml"), None);
+    }
+
+    #[test]
+    fn rejected_sequence_removal_never_decodes_replay_tokens() {
+        let mut decoded = false;
+        let error = replay_after_sequence_clear(false, || {
+            decoded = true;
+            Ok(())
+        })
+        .expect_err("native removal rejection");
+        assert_eq!(error.code, NativeErrorCode::CacheIncompatible);
+        assert!(!decoded);
+        replay_after_sequence_clear(true, || {
+            decoded = true;
+            Ok(())
+        })
+        .expect("cleared sequence");
+        assert!(decoded);
+    }
+
+    #[test]
+    #[ignore = "requires MOM_LLAMA_MODEL_PATH and a real local GGUF"]
+    fn real_saved_prefix_restores_live_replays_durable_and_rejects_context_change()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model lock");
+        let mut config = NativeModelConfig::local(std::env::var("MOM_LLAMA_MODEL_PATH")?.into());
+        config.device = NativeDevice::Cpu;
+        config.context_tokens = 512;
+        config.batch_tokens = 128;
+        config.max_sequences = 2;
+        let owner = NativeModelOwner::load(config.clone())?;
+        let handle = owner.handle();
+        let prefix = handle.prefill_shared_prefix(SharedPrefixBatchRequest {
+            request_id: "saved-prefix-source".into(),
+            model_id: config.model_id.clone(),
+            common_messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: "Count one two three.".into(),
+            }],
+            branches: (0..2)
+                .map(|i| BranchRequest {
+                    branch_id: format!("branch-{i}"),
+                    label: "Branch".into(),
+                    instruction: "Continue.".into(),
+                    sampling: SamplingConfig {
+                        max_tokens: 1,
+                        ..SamplingConfig::default()
+                    },
+                    messages: Vec::new(),
+                    cached_prefix: None,
+                })
+                .collect(),
+            chat_template: ChatTemplateChoice::ModelDefault,
+            cached_prefix: None,
+        })?;
+        assert_eq!(
+            handle.restore_sequence(prefix.clone(), 0)?,
+            SequenceRestoreKind::NativeState
+        );
+        let mut altered = prefix.clone();
+        altered.bytes.push(0xff);
+        assert_eq!(
+            handle.restore_sequence(altered, 0)?,
+            SequenceRestoreKind::TokenReplay
+        );
+        let mut invalid = prefix.clone();
+        invalid.token_ids[0] = i32::MAX;
+        assert_eq!(
+            handle
+                .restore_sequence(invalid, 0)
+                .expect_err("invalid token")
+                .code,
+            NativeErrorCode::CacheIncompatible
+        );
+        let family = |id: &str, state: &SequenceStateBlob| {
+            let mut tokens = state.token_ids.clone();
+            tokens.push(42);
+            GenerationBatchRequest {
+                request_id: id.into(),
+                model_id: config.model_id.clone(),
+                media: Vec::new(),
+                cases: vec![GenerationCase {
+                    case_id: "case".into(),
+                    input: GenerationInput::Completion {
+                        prompts: vec![CompletionPrompt::Tokens { token_ids: tokens }],
+                    },
+                    sampling: SamplingConfig {
+                        seed: 11,
+                        temperature: 0.0,
+                        max_tokens: 1,
+                        ..SamplingConfig::default()
+                    },
+                    cached_prefix: Some(state.clone()),
+                }],
+            }
+        };
+        let mut late_invalid = family("late-invalid-prefix", &prefix);
+        late_invalid.cases[0]
+            .cached_prefix
+            .as_mut()
+            .expect("prefix")
+            .bytes
+            .push(0xff);
+        let mut second = late_invalid.cases[0].clone();
+        second.case_id = "late-invalid-case".into();
+        // Change only the fingerprint envelope: token preflight remains valid.
+        second.cached_prefix.as_mut().expect("prefix").bytes[16] ^= 1;
+        late_invalid.cases.push(second);
+        let before_decodes = SAVED_PREFIX_REPLAY_DECODES.load(Ordering::SeqCst);
+        let error = handle
+            .generate_batch(late_invalid)?
+            .wait()
+            .expect_err("late incompatible prefix");
+        assert_eq!(error.code, NativeErrorCode::CacheIncompatible);
+        assert_eq!(
+            SAVED_PREFIX_REPLAY_DECODES.load(Ordering::SeqCst),
+            before_decodes,
+            "an invalid later prefix must not cause an earlier prefix decode"
+        );
+        let live_output = handle
+            .generate_batch(family("live-state", &prefix))?
+            .wait()?;
+        assert_eq!(
+            live_output[0].metrics.cache.restored_prefix_tokens,
+            prefix.token_count
+        );
+        assert_eq!(live_output[0].metrics.cache.replayed_prefix_tokens, 0);
+        handle.restore_sequence(prefix.clone(), 0)?;
+        handle.restore_sequence(prefix.clone(), 1)?;
+        let mut preflight_invalid = prefix.clone();
+        preflight_invalid.token_ids[0] = i32::MAX;
+        handle
+            .restore_sequence(preflight_invalid, 0)
+            .expect_err("preflight invalid");
+        assert_eq!(handle.snapshot_sequence(0)?.token_ids, prefix.token_ids);
+        assert_eq!(handle.snapshot_sequence(1)?.token_ids, prefix.token_ids);
+        let mut decode_failure = prefix.clone();
+        *decode_failure.token_ids.last_mut().expect("tokens") = 42;
+        FAIL_NEXT_REPLAY_AFTER_DECODE.store(true, Ordering::SeqCst);
+        assert_eq!(
+            handle
+                .restore_sequence(decode_failure, 0)
+                .expect_err("decode failure")
+                .code,
+            NativeErrorCode::DecodeFailed
+        );
+        assert!(
+            handle.snapshot_sequence(0).is_err(),
+            "failed restore cannot mint stale sequence metadata"
+        );
+        assert!(
+            handle.snapshot_sequence(1).is_err(),
+            "uncertain native mutation invalidates the whole context"
+        );
+        assert_eq!(
+            handle.restore_sequence(prefix.clone(), 0)?,
+            SequenceRestoreKind::TokenReplay,
+            "failed mutation also retires old raw-import receipts"
+        );
+        assert_eq!(handle.snapshot_sequence(0)?.token_ids, prefix.token_ids);
+        let serialized = serde_json::to_vec(&prefix)?;
+        owner.shutdown_joined()?;
+        drop(handle);
+        let owner = NativeModelOwner::load(config.clone())?;
+        let handle = owner.handle();
+        let durable: SequenceStateBlob = serde_json::from_slice(&serialized)?;
+        assert_eq!(
+            handle.restore_sequence(durable.clone(), 0)?,
+            SequenceRestoreKind::TokenReplay
+        );
+        let durable_output = handle
+            .generate_batch(family("durable-state", &durable))?
+            .wait()?;
+        assert_eq!(durable_output[0].metrics.cache.restored_prefix_tokens, 0);
+        assert_eq!(
+            durable_output[0].metrics.cache.replayed_prefix_tokens,
+            durable.token_count
+        );
+        assert_eq!(durable_output[0].metrics.shared_prefix_tokens, 0);
+        assert_eq!(
+            durable_output[0].generated_token_ids,
+            live_output[0].generated_token_ids
+        );
+        handle.restore_sequence(durable.clone(), 0)?;
+        let replayed = handle.snapshot_sequence(0)?;
+        assert_eq!(replayed.token_ids, durable.token_ids);
+        assert_eq!(
+            handle.restore_sequence(replayed, 0)?,
+            SequenceRestoreKind::NativeState
+        );
+        owner.shutdown_joined()?;
+        drop(handle);
+        config.context_tokens = 1024;
+        let owner = NativeModelOwner::load(config)?;
+        assert_eq!(
+            owner
+                .handle()
+                .restore_sequence(durable, 0)
+                .expect_err("changed context")
+                .code,
+            NativeErrorCode::CacheIncompatible
+        );
+        owner.shutdown_joined()?;
+        Ok(())
     }
 
     #[test]
