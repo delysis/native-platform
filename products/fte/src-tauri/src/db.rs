@@ -458,17 +458,26 @@ mod tests {
 
     #[test]
     fn log_summaries_report_latest_status_and_real_aggregates() {
-        let db = Database::new(test_database_path("summaries")).unwrap();
-        db.log_request("provider", "model-a", 10, 100, 200).unwrap();
-        db.log_request("provider", "model-b", 20, 300, 503).unwrap();
+        let db = Database::new(test_database_path("summaries"))
+            .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
+        db.log_request("provider", "model-a", 10, 100, 200)
+            .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
+        db.log_request("provider", "model-b", 20, 300, 503)
+            .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
 
-        let global = db.get_global_log_summary().unwrap();
+        let global = db
+            .get_global_log_summary()
+            .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
         assert_eq!(global.total_tokens, 30);
         assert_eq!(global.avg_latency_ms, 200);
         assert_eq!(global.request_count, 2);
 
-        let providers = db.get_provider_log_summaries().unwrap();
-        let provider = providers.get("provider").unwrap();
+        let providers = db
+            .get_provider_log_summaries()
+            .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
+        let provider = providers
+            .get("provider")
+            .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
         assert_eq!(provider.total_tokens, 30);
         assert_eq!(provider.avg_latency_ms, 200);
         assert_eq!(provider.request_count, 2);
@@ -483,13 +492,18 @@ mod tests {
             expected_sha256: Some("a".repeat(64)),
         };
         {
-            let db = Database::new(path.clone()).unwrap();
-            db.save_local_model_configuration(&configuration).unwrap();
+            let db = Database::new(path.clone())
+                .expect("local_model_configuration_survives_database_reopen: expected success");
+            db.save_local_model_configuration(&configuration)
+                .expect("local_model_configuration_survives_database_reopen: expected success");
         }
 
-        let reopened = Database::new(path).unwrap();
+        let reopened = Database::new(path)
+            .expect("local_model_configuration_survives_database_reopen: expected success");
         assert_eq!(
-            reopened.get_local_model_configuration().unwrap(),
+            reopened
+                .get_local_model_configuration()
+                .expect("local_model_configuration_survives_database_reopen: expected success"),
             Some(configuration)
         );
     }
@@ -498,16 +512,16 @@ mod tests {
     fn fresh_database_is_versioned_and_reopens_only_as_the_current_schema() {
         let path = test_database_path("current-schema");
         {
-            let db = Database::new(path.clone()).unwrap();
-            let conn = db.connection().unwrap();
+            let db = Database::new(path.clone()).expect("fresh_database_is_versioned_and_reopens_only_as_the_current_schema: expected success");
+            let conn = db.connection().expect("fresh_database_is_versioned_and_reopens_only_as_the_current_schema: expected success");
             assert_eq!(
                 conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
-                    .unwrap(),
+                    .expect("fresh_database_is_versioned_and_reopens_only_as_the_current_schema: expected success"),
                 APPLICATION_ID
             );
             assert_eq!(
                 conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                    .unwrap(),
+                    .expect("fresh_database_is_versioned_and_reopens_only_as_the_current_schema: expected success"),
                 SCHEMA_VERSION
             );
         }
@@ -518,16 +532,16 @@ mod tests {
     fn synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation() {
         let path = test_database_path("prohibited-plaintext-sentinel");
         {
-            let conn = Connection::open(&path).unwrap();
+            let conn = Connection::open(&path).expect("synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation: expected success");
             conn.execute_batch(
                 "CREATE TABLE api_keys (
                     provider_id TEXT PRIMARY KEY,
                     key_value TEXT NOT NULL
                 );",
             )
-            .unwrap();
+            .expect("synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation: expected success");
         }
-        let before = std::fs::read(&path).unwrap();
+        let before = std::fs::read(&path).expect("synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation: expected success");
 
         let error = match Database::new(path.clone()) {
             Ok(_) => panic!("legacy schema must fail closed"),
@@ -536,18 +550,20 @@ mod tests {
 
         assert!(error.to_string().contains("unsupported legacy database"));
         assert!(error.to_string().contains("not imported"));
-        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(std::fs::read(path).expect("synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation: expected success"), before);
     }
 
     #[test]
     fn unversioned_populated_database_is_rejected_without_schema_adoption() {
         let path = test_database_path("unversioned-populated");
         {
-            let conn = Connection::open(&path).unwrap();
+            let conn = Connection::open(&path).expect("unversioned_populated_database_is_rejected_without_schema_adoption: expected success");
             conn.execute_batch("CREATE TABLE operator_data (value TEXT NOT NULL);")
-                .unwrap();
+                .expect("unversioned_populated_database_is_rejected_without_schema_adoption: expected success");
         }
-        let before = std::fs::read(&path).unwrap();
+        let before = std::fs::read(&path).expect(
+            "unversioned_populated_database_is_rejected_without_schema_adoption: expected success",
+        );
 
         let error = match Database::new(path.clone()) {
             Ok(_) => panic!("unversioned populated database must fail closed"),
@@ -556,7 +572,7 @@ mod tests {
 
         assert!(error.to_string().contains("unsupported database"));
         assert!(error.to_string().contains("not imported"));
-        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(std::fs::read(path).expect("unversioned_populated_database_is_rejected_without_schema_adoption: expected success"), before);
     }
 
     #[test]
@@ -571,8 +587,17 @@ mod tests {
         ] {
             let path = test_database_path(label);
             {
-                let db = Database::new(path.clone()).unwrap();
-                db.connection().unwrap().execute_batch(mutation).unwrap();
+                let db = Database::new(path.clone()).expect(
+                    "wrong_version_or_unexpected_schema_object_is_rejected: expected success",
+                );
+                db.connection()
+                    .expect(
+                        "wrong_version_or_unexpected_schema_object_is_rejected: expected success",
+                    )
+                    .execute_batch(mutation)
+                    .expect(
+                        "wrong_version_or_unexpected_schema_object_is_rejected: expected success",
+                    );
             }
 
             let error = match Database::new(path) {
@@ -587,9 +612,10 @@ mod tests {
     fn same_schema_names_with_wrong_definitions_are_rejected() {
         let path = test_database_path("same-names-wrong-definitions");
         {
-            let db = Database::new(path.clone()).unwrap();
+            let db = Database::new(path.clone())
+                .expect("same_schema_names_with_wrong_definitions_are_rejected: expected success");
             db.connection()
-                .unwrap()
+                .expect("same_schema_names_with_wrong_definitions_are_rejected: expected success")
                 .execute_batch(
                     "DROP INDEX idx_request_log_provider;
                      DROP TABLE request_log;
@@ -600,7 +626,7 @@ mod tests {
                      CREATE INDEX idx_request_log_provider
                          ON request_log (provider_id, id DESC);",
                 )
-                .unwrap();
+                .expect("same_schema_names_with_wrong_definitions_are_rejected: expected success");
         }
 
         let error = match Database::new(path) {
@@ -617,7 +643,7 @@ mod tests {
             TEST_DATABASE_ID.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("test_database_path: expected success")
                 .as_nanos()
         ))
     }

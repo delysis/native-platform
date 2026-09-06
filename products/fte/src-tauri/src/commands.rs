@@ -237,7 +237,9 @@ mod tests {
     #[test]
     fn legacy_task_hint_is_explicitly_rejected_instead_of_ignored() {
         assert!(reject_legacy_task_hint(None).is_ok());
-        let error = reject_legacy_task_hint(Some("coding".to_string())).unwrap_err();
+        let error = reject_legacy_task_hint(Some("coding".to_string())).expect_err(
+            "legacy_task_hint_is_explicitly_rejected_instead_of_ignored: expected rejection",
+        );
         assert!(error.contains("no equivalent typed evaluation signal"));
         assert!(reject_legacy_task_hint(Some(String::new())).is_err());
     }

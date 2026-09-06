@@ -659,14 +659,13 @@ impl GatewayRuntimeOwner {
         Ok(statuses)
     }
 
-    pub fn global_headroom_percent(&self) -> anyhow::Result<f64> {
+    pub fn global_headroom_percent(&self) -> anyhow::Result<Option<f64>> {
         Ok(self
             .provider_statuses()?
             .into_iter()
             .filter_map(|provider| provider.headroom)
             .reduce(f64::max)
-            .unwrap_or(0.0)
-            * 100.0)
+            .map(|headroom| headroom * 100.0))
     }
 }
 
@@ -1252,6 +1251,15 @@ mod tests {
     use crate::secrets::SecretStoreError;
     use std::sync::Mutex;
 
+    #[test]
+    fn dashboard_preserves_unknown_headroom() {
+        let runtime = GatewayRuntimeOwner::new().expect("gateway");
+        runtime
+            .bind_database(test_database("unknown-headroom"))
+            .expect("bind database");
+        assert_eq!(runtime.global_headroom_percent().expect("headroom"), None);
+    }
+
     #[derive(Default)]
     struct FakeCredentialStore {
         values: Mutex<BTreeMap<String, Vec<u8>>>,
@@ -1550,7 +1558,7 @@ mod tests {
                 .configure_local_model(&model_path, Some("a".repeat(64)))
                 .expect("configure local model");
             assert_eq!(
-                runtime.local_model_status().unwrap().state,
+                runtime.local_model_status().expect("local_model_configuration_restores_through_a_new_gateway_owner: expected success").state,
                 LocalModelState::Ready
             );
             assert!(runtime.shutdown_native_for_process_exit());
@@ -1575,7 +1583,7 @@ mod tests {
                 .iter()
                 .any(|model| model.id == LOCAL_MODEL_ID)
         );
-        assert!(reopened.get_local_model_configuration().unwrap().is_some());
+        assert!(reopened.get_local_model_configuration().expect("local_model_configuration_restores_through_a_new_gateway_owner: expected success").is_some());
         assert!(restarted.shutdown_native_for_process_exit());
         std::fs::remove_file(model_path).expect("remove GGUF fixture");
     }
@@ -1594,17 +1602,17 @@ mod tests {
             .expect("configure valid local model");
         let saved = database
             .get_local_model_configuration()
-            .unwrap()
+            .expect("invalid_replacement_does_not_overwrite_working_local_model_configuration: expected success")
             .expect("saved configuration");
 
         let missing_path = test_gguf_path("missing-replacement");
         assert!(runtime.configure_local_model(missing_path, None).is_err());
         assert_eq!(
-            database.get_local_model_configuration().unwrap(),
+            database.get_local_model_configuration().expect("invalid_replacement_does_not_overwrite_working_local_model_configuration: expected success"),
             Some(saved)
         );
         assert_eq!(
-            runtime.local_model_status().unwrap().state,
+            runtime.local_model_status().expect("invalid_replacement_does_not_overwrite_working_local_model_configuration: expected success").state,
             LocalModelState::Ready
         );
 
@@ -1640,7 +1648,7 @@ mod tests {
                 .any(|model| model.id == LOCAL_MODEL_ID)
         );
         assert_eq!(
-            database.get_local_model_configuration().unwrap(),
+            database.get_local_model_configuration().expect("missing_saved_model_restores_as_invalid_without_deleting_the_selection: expected success"),
             Some(saved)
         );
         assert!(runtime.shutdown_native_for_process_exit());
@@ -1662,7 +1670,7 @@ mod tests {
             .expect("configure first model");
         let first = database
             .get_local_model_configuration()
-            .unwrap()
+            .expect("native_configuration_failure_rolls_back_the_persisted_replacement: expected success")
             .expect("first persisted model");
         runtime.gateway.shutdown().await.expect("shutdown Gateway");
 
@@ -1672,11 +1680,11 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            database.get_local_model_configuration().unwrap(),
+            database.get_local_model_configuration().expect("native_configuration_failure_rolls_back_the_persisted_replacement: expected success"),
             Some(first)
         );
         assert_eq!(
-            runtime.local_model_status().unwrap().state,
+            runtime.local_model_status().expect("native_configuration_failure_rolls_back_the_persisted_replacement: expected success").state,
             LocalModelState::Ready
         );
         assert!(runtime.shutdown_native_for_process_exit());

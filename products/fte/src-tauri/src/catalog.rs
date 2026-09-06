@@ -323,7 +323,7 @@ mod tests {
             catalog
                 .iter()
                 .find(|entry| entry.provider_id == provider && entry.provider_model_id == model)
-                .unwrap()
+                .expect("provider_completion_matrix_is_explicit_in_the_catalog: expected success")
         };
 
         assert!(
@@ -367,7 +367,7 @@ mod tests {
             find("cerebras", "gpt-oss-120b")
                 .text_completions
                 .as_ref()
-                .unwrap()
+                .expect("provider_completion_matrix_is_explicit_in_the_catalog: expected success")
                 .prompt_semantics,
             PromptSemantics::DirectContinuation
         );
