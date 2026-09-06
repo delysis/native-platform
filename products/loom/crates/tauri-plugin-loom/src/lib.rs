@@ -2765,6 +2765,13 @@ impl ProjectChoiceReservation<'_> {
                 false,
             ));
         }
+        self.state
+            .speech_input
+            .bind_scope(
+                store.manifest().project_id.to_string(),
+                session_id.to_string(),
+            )
+            .map_err(|error| IpcFailure::speech_input(&error))?;
         session.document_filesystem_watcher = document_filesystem_watcher;
         session.store = Some(store);
         session.active_session_id = Some(session_id);

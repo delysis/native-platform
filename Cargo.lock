@@ -7057,6 +7057,7 @@ dependencies = [
 name = "tauri-plugin-loom"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "atomic-write-file",
  "attachment-native-host",
  "attachment-native-types",
