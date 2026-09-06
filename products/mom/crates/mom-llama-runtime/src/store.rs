@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, anyhow};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -14,6 +16,51 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 const DATABASE_FILE: &str = "runtime.sqlite3";
+const STORE_APPLICATION_ID: i64 = 0x4d4f4d31; // MOM1
+const STORE_SCHEMA_VERSION: i64 = 1;
+const STORE_SCHEMA: &str = "CREATE TABLE encrypted_documents (
+                namespace TEXT PRIMARY KEY NOT NULL,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE receipts (
+                receipt_id TEXT PRIMARY KEY NOT NULL,
+                command_id TEXT NOT NULL,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            );";
+
+/// Legacy v0 has the identical physical schema. Do not stamp it or rewrite
+/// encrypted records: older binaries and retained keys remain compatible.
+fn validate_schema(connection: &Connection) -> Result<()> {
+    let application_id: i64 =
+        connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !matches!(
+        (application_id, version),
+        (0, 0) | (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION)
+    ) {
+        return Err(anyhow!("unsupported Mom store identity or schema version"));
+    }
+    let mut statement = connection
+        .prepare("SELECT sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name")?;
+    let actual = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let normalize = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let expected = STORE_SCHEMA
+        .split(';')
+        .filter(|sql| !sql.trim().is_empty())
+        .map(normalize)
+        .collect::<Vec<_>>();
+    if actual.iter().map(|sql| normalize(sql)).collect::<Vec<_>>() != expected {
+        return Err(anyhow!("unsupported Mom store physical schema"));
+    }
+    Ok(())
+}
+
 const STORE_KEY_ENV: &str = "LLAMA_NATIVE_KIT_STORE_KEY_HEX";
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "com.delysis.llama-native-kit.mom-llama.store.v1";
@@ -122,22 +169,24 @@ impl RuntimeStore {
             path: data_dir.join(DATABASE_FILE),
             key,
         };
-        let connection = store.connection()?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS encrypted_documents (
-                namespace TEXT PRIMARY KEY NOT NULL,
-                nonce BLOB NOT NULL,
-                ciphertext BLOB NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS receipts (
-                receipt_id TEXT PRIMARY KEY NOT NULL,
-                command_id TEXT NOT NULL,
-                nonce BLOB NOT NULL,
-                ciphertext BLOB NOT NULL,
-                created_at INTEGER NOT NULL
-            );",
-        )?;
+        if store.path.exists() {
+            // Refusal must not switch journal mode, create tables, or stamp a
+            // foreign/future database. Legacy stores retain their identifiers.
+            let connection =
+                Connection::open_with_flags(&store.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            validate_schema(&connection)?;
+        } else {
+            let mut connection = Connection::open(&store.path)?;
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute_batch(STORE_SCHEMA)?;
+            transaction.pragma_update(None, "application_id", STORE_APPLICATION_ID)?;
+            transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+            validate_schema(&transaction)?;
+            transaction.commit()?;
+        }
+        // Validate again on the exact connection before applying write pragmas.
+        let _connection = store.connection()?;
         Ok(store)
     }
 
@@ -546,7 +595,9 @@ impl RuntimeStore {
     }
 
     fn connection(&self) -> Result<Connection> {
-        let connection = Connection::open(&self.path)?;
+        let connection =
+            Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        validate_schema(&connection)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
@@ -819,6 +870,96 @@ mod tests {
     use llama_native_cache::PrefixCacheValue;
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn schema_preflight_accepts_exact_legacy_and_reopens_without_stamping() -> Result<()> {
+        let dir = test_dir("exact-legacy-schema");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(DATABASE_FILE);
+        let connection = Connection::open(&path)?;
+        // Frozen original physical schema, independent of the current constant.
+        connection.execute_batch(
+            "CREATE TABLE encrypted_documents (
+                namespace TEXT PRIMARY KEY NOT NULL,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE receipts (
+                receipt_id TEXT PRIMARY KEY NOT NULL,
+                command_id TEXT NOT NULL,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            );",
+        )?;
+        drop(connection);
+        let store = RuntimeStore::open_with_key(&dir, [42; 32])?;
+        store.put("legacy-record", &serde_json::json!({"preserve": true}))?;
+        drop(store);
+        let reopened = RuntimeStore::open_with_key(&dir, [42; 32])?;
+        assert_eq!(
+            reopened.get::<serde_json::Value>("legacy-record")?,
+            Some(serde_json::json!({"preserve": true}))
+        );
+        let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        for pragma in ["application_id", "user_version"] {
+            let value: i64 = connection.pragma_query_value(None, pragma, |row| row.get(0))?;
+            assert_eq!(value, 0, "legacy identifiers must remain unchanged");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn schema_preflight_rejects_changed_identity_on_an_existing_store_handle() -> Result<()> {
+        let dir = test_dir("schema-reopen");
+        let store = RuntimeStore::open_with_key(&dir, [42; 32])?;
+        store.put("preserved", &"original")?;
+        let connection = Connection::open(store.path())?;
+        connection.pragma_update(None, "user_version", 99)?;
+        drop(connection);
+        let before = fs::read(store.path())?;
+        assert!(store.put("preserved", &"changed").is_err());
+        assert!(RuntimeStore::open_with_key(&dir, [42; 32]).is_err());
+        assert_eq!(fs::read(store.path())?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_preflight_rejects_foreign_future_and_partial_without_mutation() -> Result<()> {
+        for (label, sql) in [
+            ("foreign", "PRAGMA application_id=1234;"),
+            ("future", "PRAGMA user_version=99;"),
+            (
+                "partial",
+                "CREATE TABLE encrypted_documents(namespace TEXT);",
+            ),
+            ("extra", "CREATE TABLE alien(value TEXT);"),
+        ] {
+            let dir = test_dir(label);
+            fs::create_dir_all(&dir)?;
+            let path = dir.join(DATABASE_FILE);
+            let connection = Connection::open(&path)?;
+            if matches!(label, "foreign" | "future") {
+                connection.execute_batch(STORE_SCHEMA)?;
+            }
+            connection.execute_batch(sql)?;
+            drop(connection);
+            let before = fs::read(&path)?;
+            assert!(
+                RuntimeStore::open_with_key(&dir, [42; 32]).is_err(),
+                "{label}"
+            );
+            assert_eq!(
+                fs::read(&path)?,
+                before,
+                "rejected store was changed: {label}"
+            );
+            assert!(!dir.join("runtime.sqlite3-wal").exists());
+            assert!(!dir.join("runtime.sqlite3-shm").exists());
+        }
+        Ok(())
+    }
 
     #[test]
     fn unit_test_key_selection_does_not_depend_on_the_mutable_data_dir_override() {
@@ -1272,7 +1413,7 @@ mod tests {
         let connection = Connection::open(reopened.path())?;
         let user_version: i64 =
             connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        assert_eq!(user_version, 0);
+        assert_eq!(user_version, STORE_SCHEMA_VERSION);
         let encrypted_rows: i64 = connection.query_row(
             "SELECT COUNT(*) FROM encrypted_documents WHERE namespace = ?1",
             [CONVERSATIONS_NAMESPACE],

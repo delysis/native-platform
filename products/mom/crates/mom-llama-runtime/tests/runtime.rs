@@ -3593,3 +3593,44 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn blocked_dispatch_retains_captured_draft_after_selection_changes() -> Result<()> {
+    let _session = TestSession::new("dispatch-draft-ownership")?;
+    let a = mom_llama_runtime::conversation_new(Some("A".into()))?
+        .result
+        .ok_or_else(|| anyhow!("missing ownership fixture result"))?;
+    let b = mom_llama_runtime::conversation_new(Some("B".into()))?
+        .result
+        .ok_or_else(|| anyhow!("missing ownership fixture result"))?;
+    let message = "@missing-person please answer";
+    mom_llama_runtime::draft_update(Some(&a.id), message.into(), vec![])?;
+    mom_llama_runtime::draft_update(Some(&b.id), "precious B".into(), vec![])?;
+    mom_llama_runtime::conversation_select(&b.id)?;
+    let result = mom_llama_runtime::chat_dispatch(
+        MentionDispatchInput {
+            conversation_id: a.id.clone(),
+            message: message.into(),
+        },
+        ChatSendOptions {
+            fake_fixture: true,
+            ..ChatSendOptions::default()
+        },
+    )?;
+    assert_eq!(result.status, "blocked");
+    assert_eq!(
+        mom_llama_runtime::draft_get(Some(&a.id))?
+            .result
+            .ok_or_else(|| anyhow!("missing ownership fixture result"))?
+            .message,
+        message
+    );
+    assert_eq!(
+        mom_llama_runtime::draft_get(Some(&b.id))?
+            .result
+            .ok_or_else(|| anyhow!("missing ownership fixture result"))?
+            .message,
+        "precious B"
+    );
+    Ok(())
+}
