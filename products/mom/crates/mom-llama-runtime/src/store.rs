@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", test))]
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DATABASE_FILE: &str = "runtime.sqlite3";
 const STORE_APPLICATION_ID: i64 = 0x4d4f4d31; // MOM1
@@ -99,6 +99,28 @@ fn validate_schema(connection: &Connection) -> Result<()> {
         return Err(anyhow!("unsupported Mom store physical schema"));
     }
     Ok(())
+}
+
+// SQLite can decline to invoke the busy handler when changing journal mode
+// would deadlock with a competing reader/initializer. Drop the entire failed
+// connection before retrying, so no read lock survives into the next attempt.
+// Retry only SQLITE_BUSY; identity, corruption and I/O errors stay terminal.
+fn retry_store_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match operation() {
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::SqliteFailure(code, _))
+                        if code.code == rusqlite::ErrorCode::DatabaseBusy
+                ) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
 }
 
 const STORE_KEY_ENV: &str = "LLAMA_NATIVE_KIT_STORE_KEY_HEX";
@@ -225,6 +247,7 @@ impl RuntimeStore {
         // that appeared while our private candidate was being initialized.
         let connection =
             Connection::open_with_flags(&store.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
         validate_schema(&connection)?;
         drop(connection);
         // Validate again on the exact connection before applying write pragmas.
@@ -637,13 +660,18 @@ impl RuntimeStore {
     }
 
     fn connection(&self) -> Result<Connection> {
+        retry_store_busy(|| self.connection_once())
+    }
+
+    fn connection_once(&self) -> Result<Connection> {
         let connection =
             Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(Duration::from_millis(100))?;
         validate_schema(&connection)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
         Ok(connection)
     }
 
@@ -912,6 +940,36 @@ mod tests {
     use llama_native_cache::PrefixCacheValue;
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn journal_mode_contention_retries_after_releasing_the_failed_connection() -> Result<()> {
+        let dir = test_dir("journal-mode-contention");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(DATABASE_FILE);
+        initialize_store(&dir, &path)?;
+        let reader = Connection::open(&path)?;
+        reader.execute_batch("BEGIN; SELECT * FROM encrypted_documents;")?;
+        let store = RuntimeStore {
+            path,
+            key: [42; 32],
+        };
+        let (busy_tx, busy_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            retry_store_busy(|| {
+                let result = store.connection_once();
+                if result.is_err() {
+                    let _ = busy_tx.try_send(());
+                }
+                result
+            })
+        });
+        busy_rx.recv_timeout(Duration::from_secs(10))?;
+        reader.execute_batch("ROLLBACK")?;
+        let connection = worker.join().expect("journal mode worker")?;
+        let mode: String = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        assert_eq!(mode, "wal");
+        Ok(())
+    }
 
     #[test]
     fn concurrent_first_opens_publish_one_complete_store() -> Result<()> {

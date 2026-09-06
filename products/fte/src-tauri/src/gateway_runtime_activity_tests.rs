@@ -152,8 +152,9 @@ async fn desktop_and_authenticated_loopback_log_once_with_unknown_usage() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let (owner, database, _) = fixture();
     owner.chat(chat()).await.expect("desktop request");
-    let token_path =
+    let token_directory =
         std::env::temp_dir().join(format!("fte-activity-token-{}", RequestId::new().0));
+    let token_path = token_directory.join("token");
     let mut config = fte_loopback::LoopbackConfig::app_private(token_path.clone());
     config.edge_defaults = hosted_defaults();
     let server = fte_loopback::LoopbackServer::start(
@@ -205,6 +206,7 @@ async fn desktop_and_authenticated_loopback_log_once_with_unknown_usage() {
     assert!(!json.contains(token.trim()));
     server.shutdown().await;
     std::fs::remove_file(token_path).expect("remove token");
+    std::fs::remove_dir(token_directory).expect("remove token directory");
 }
 
 #[tokio::test]

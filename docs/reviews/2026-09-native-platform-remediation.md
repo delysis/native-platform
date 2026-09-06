@@ -53,3 +53,18 @@ Memory estimates are not hard RSS or Metal allocation limits. Historic v1 token
 zeros cannot retrospectively distinguish unknown usage. These local checks do
 not certify physical microphones, live hosted credentials, signed bundles, or
 cross-platform runtime behavior. Remote CI and promotion are separate evidence.
+
+## CI follow-up
+
+The first full CI run exposed a Mom WAL-transition lock race on Linux and a
+loopback fixture that incorrectly used shared `/tmp` as its token directory.
+Connection initialization now retries only SQLite busy errors for a bounded
+interval, dropping the failed connection and its locks before each retry.
+Ordinary store operations retain their existing busy timeout. The loopback
+fixture now uses a private child directory; production permission checks stay
+unchanged.
+
+The corrected combined source passes 1,603 workspace tests (43 ignored),
+including an explicitly coordinated WAL contention regression, and full
+all-target/all-feature Clippy. Earlier 1,602-test results remain scoped to the
+pre-follow-up source above. Remote verification must use the corrected head.
