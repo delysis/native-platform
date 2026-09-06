@@ -4637,8 +4637,9 @@ mod tests {
         );
         assert!(
             js.contains(r#""draft-attachment-remove": async (button)"#)
-                && js.contains("await persistDraftNow(message, attachmentIds)"),
-            "attachment removal and blocked sends must write an explicit attachment-id set"
+                && js.contains("await persistDraftNow(message, attachmentIds, conversation)")
+                && !js.contains("await persistDraftNow(message, attachmentIds)"),
+            "dispatch must persist its captured attachment set and conversation; failed-send recovery must not rewrite the newly selected draft"
         );
         let picker = include_str!("commands.rs");
         for extension in ["docx", "odt", "epub", "avif", "aiff", "webm", "zip", "7z"] {
