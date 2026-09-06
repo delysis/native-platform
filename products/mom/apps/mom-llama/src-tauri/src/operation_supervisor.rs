@@ -116,6 +116,8 @@ struct WorkerEntry {
 
 #[derive(Debug)]
 struct SupervisorState {
+    #[cfg(test)]
+    publication_barriers: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
     phase: LifecyclePhase,
     next_sequence: u64,
     progress_capacity: usize,
@@ -199,6 +201,8 @@ impl OperationSupervisor {
     pub fn with_config(next_sequence: u64, progress_capacity: usize) -> Self {
         Self(Arc::new(SupervisorInner {
             state: Mutex::new(SupervisorState {
+                #[cfg(test)]
+                publication_barriers: None,
                 phase: LifecyclePhase::Running,
                 next_sequence,
                 progress_capacity,
@@ -641,14 +645,21 @@ impl OperationSupervisor {
                     }
                     Ok(Err(_)) => thread_supervisor.terminal(&thread_lease, TerminalClass::Failed),
                     Err(_) => thread_supervisor.record_executor_panic(&thread_lease),
-                }
-                .and_then(|()| thread_supervisor.release(&thread_lease));
+                };
                 let result = match (result, published) {
                     (_, Err(error)) => Err(error.to_string()),
                     (Ok(result), Ok(())) => result,
                     (Err(_), Ok(())) => Err("Mom Llama's supervised worker panicked".to_owned()),
                 };
+                #[cfg(test)]
+                if let Some(barriers) =
+                    { thread_supervisor.lock_state().publication_barriers.clone() }
+                {
+                    barriers.0.wait();
+                    barriers.1.wait();
+                }
                 let _ = result_tx.send(result);
+                let _ = thread_supervisor.release(&thread_lease);
                 thread_supervisor.record_worker_exit(&thread_worker_id);
             })
             .map_err(|_| {
@@ -1090,4 +1101,62 @@ pub fn validate_worker_sets(outcome: &SupervisorShutdownOutcome) -> bool {
     expected.len() == outcome.expected_worker_ids.len()
         && joined.len() == outcome.joined_worker_ids.len()
         && expected == joined
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    fn public_identity_survives_until_final_send_even_when_consumer_drops() {
+        for panics in [false, true] {
+            let supervisor = OperationSupervisor::new();
+            let barriers = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+            supervisor.lock_state().publication_barriers = Some(Arc::clone(&barriers));
+            let reservation = supervisor.reserve("publication").expect("reserve");
+            let lease = reservation.lease.clone();
+            let (proceed, ready) = mpsc::sync_channel(0);
+            let task = supervisor
+                .spawn(reservation, move |lease| {
+                    ready.recv().expect("consumer dropped before execution");
+                    for n in 0..256 {
+                        lease
+                            .supervisor()
+                            .expect("owner")
+                            .publish_progress(lease, n)
+                            .expect("progress");
+                    }
+                    assert!(!panics, "controlled executor panic");
+                    Ok(())
+                })
+                .expect("spawn");
+            let worker = task.worker_id.clone();
+            drop(task);
+            proceed.send(()).expect("allow execution");
+            barriers.0.wait();
+            let duplicate = supervisor.reserve("publication");
+            barriers.1.wait();
+            assert!(matches!(
+                duplicate,
+                Err(SupervisorError::DuplicateOperation)
+            ));
+            let snapshot = supervisor
+                .wait_for_released(&lease, Duration::from_secs(5))
+                .expect("released");
+            assert_eq!(
+                snapshot.progress_projection.len(),
+                DEFAULT_PROGRESS_CAPACITY
+            );
+            assert_eq!(
+                snapshot.authoritative_terminal.expect("terminal").class,
+                if panics {
+                    TerminalClass::Failed
+                } else {
+                    TerminalClass::Cancelled
+                }
+            );
+            supervisor.reap_worker(&worker).expect("join");
+            assert!(supervisor.reserve("publication").is_ok());
+        }
+    }
 }

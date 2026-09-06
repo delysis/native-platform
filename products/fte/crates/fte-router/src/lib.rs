@@ -183,6 +183,24 @@ impl LifecycleControl {
         recorded.and(result)
     }
 
+    fn finish_request_for_publication(
+        &self,
+        lease: &operation_lifecycle::OperationLease,
+        terminal: operation_lifecycle::TerminalClass,
+    ) -> Result<(), GatewayError> {
+        let request_id = RequestId(lease.identity().operation_id);
+        let result = lease
+            .terminal_for_publication(terminal)
+            .map_err(|error| operation_registry_error(&request_id, error));
+        let recorded = result
+            .as_ref()
+            .err()
+            .map(|error| self.record_lifecycle_error(error.clone()))
+            .transpose();
+        self.changed.notify_waiters();
+        recorded.and(result)
+    }
+
     fn release_terminalized_request(
         &self,
         lease: &operation_lifecycle::OperationLease,
@@ -1128,7 +1146,15 @@ impl TicketLifecycleLease for AdmissionLease {
             }
             Err(_) => operation_lifecycle::TerminalClass::Failed,
         };
-        self.release_with_terminal(terminal)
+        let operation = self
+            .operation
+            .lock()
+            .map_err(|_| lifecycle_state_poisoned(&RequestId::new()))?;
+        let Some(operation) = operation.as_ref() else {
+            return Ok(());
+        };
+        self.lifecycle
+            .finish_request_for_publication(operation, terminal)
     }
 
     fn terminal(

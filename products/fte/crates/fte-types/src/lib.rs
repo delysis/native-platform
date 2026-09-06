@@ -818,14 +818,16 @@ pub trait TicketCancellation: Send + Sync {
     fn cancel(&self, target: CancelTarget) -> usize;
 }
 
-/// Executor-owned lifecycle authority retained until the backend publishes its
-/// authoritative result. Implementations must terminalize and release their
-/// production operation record from this callback; consumer ticket drops do
-/// not own release. A callback error replaces the backend result so lifecycle
-/// failure can never be reported to the consumer as successful completion.
+/// Executor-owned lifecycle authority retained through the final send attempt.
+/// Consumer drops request cancellation but never release this authority.
+/// Arbitration/preflight failures replace backend success; release failures
+/// after publication remain the owner's shutdown/accounting responsibility.
 pub trait TicketLifecycleLease: Send + Sync {
+    /// Validate normal executor completion and record its terminal, retaining identity.
     fn finish(&self, result: &Result<GatewayResponse, GatewayError>) -> Result<(), GatewayError>;
+    /// Record an early terminal while the executor may still be draining.
     fn terminal(&self, result: &Result<GatewayResponse, GatewayError>) -> Result<(), GatewayError>;
+    /// Release only after final publication and executor completion.
     fn release(&self) -> Result<(), GatewayError>;
 }
 
@@ -998,6 +1000,7 @@ impl GatewayTicket {
                 };
                 terminal_for_task.store(true, Ordering::Release);
                 let _ = final_tx.send(result);
+                let _ = release.release();
                 return;
             };
             let mut terminal_permit = Some(terminal_permit);
@@ -1015,6 +1018,7 @@ impl GatewayTicket {
                 };
                 terminal_for_task.store(true, Ordering::Release);
                 let _ = final_tx.send(result);
+                let _ = release.release();
                 return;
             };
             let mut gap_permit = Some(gap_permit);
@@ -1069,6 +1073,7 @@ impl GatewayTicket {
                                     };
                                     terminal_for_task.store(true, Ordering::Release);
                                     let _ = final_tx.send(result);
+                                    let _ = release.release();
                                 }
                                 return;
                             }
@@ -1120,6 +1125,7 @@ impl GatewayTicket {
                             terminal_for_task.store(true, Ordering::Release);
                         }
                         let _ = final_tx.send(result);
+                        let _ = release.release();
                         return;
                     }
                     () = sleep_until_optional(deadline), if deadline.is_some() => {
@@ -1440,7 +1446,6 @@ mod tests {
             _result: &Result<GatewayResponse, GatewayError>,
         ) -> Result<(), GatewayError> {
             self.terminals.fetch_add(1, Ordering::AcqRel);
-            self.releases.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
 
@@ -1456,6 +1461,78 @@ mod tests {
             self.releases.fetch_add(1, Ordering::AcqRel);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn final_is_published_before_lifecycle_release_with_dropped_event_consumer() {
+        type FinalReceiver = oneshot::Receiver<Result<GatewayResponse, GatewayError>>;
+        struct ObservedRelease {
+            receiver: Arc<std::sync::Mutex<Option<FinalReceiver>>>,
+            observed: Arc<AtomicBool>,
+        }
+        impl TicketLifecycleLease for ObservedRelease {
+            fn finish(
+                &self,
+                _: &Result<GatewayResponse, GatewayError>,
+            ) -> Result<(), GatewayError> {
+                Ok(())
+            }
+            fn terminal(
+                &self,
+                _: &Result<GatewayResponse, GatewayError>,
+            ) -> Result<(), GatewayError> {
+                Ok(())
+            }
+            fn release(&self) -> Result<(), GatewayError> {
+                let published = self
+                    .receiver
+                    .lock()
+                    .expect("receiver")
+                    .as_mut()
+                    .expect("installed final")
+                    .try_recv()
+                    .is_ok();
+                self.observed.store(published, Ordering::Release);
+                Ok(())
+            }
+        }
+        let request_id = RequestId::new();
+        let receiver = Arc::new(std::sync::Mutex::new(None));
+        let observed = Arc::new(AtomicBool::new(false));
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let (final_tx, final_rx) = oneshot::channel();
+        let mut ticket = GatewayTicket::new(
+            request_id.clone(),
+            event_rx,
+            final_rx,
+            Arc::new(NoopCancellation),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .with_admission_lease_and_deadlines(
+            Box::new(ObservedRelease {
+                receiver: Arc::clone(&receiver),
+                observed: Arc::clone(&observed),
+            }),
+            DeadlinePolicy::default(),
+            Duration::ZERO,
+            32,
+        );
+        *receiver.lock().expect("receiver") = ticket.final_response.take();
+        drop(ticket);
+        final_tx
+            .send(Err(GatewayError::unavailable(
+                &request_id,
+                "fixture",
+                "fixture final",
+            )))
+            .expect("backend final");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !observed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("release observes prior final send");
     }
 
     #[test]
