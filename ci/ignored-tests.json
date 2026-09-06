@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 41,
+  "expected_test_count": 43,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -211,6 +211,28 @@
       "required_environment": ["MOM_LLAMA_MODEL_PATH"],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this test alone cannot promote product, packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "memory_estimate::tests::real_model_metadata_drives_estimate_without_tensor_load",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/memory_estimate.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and a supported attention GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-metadata",
+      "promotion_prohibition": "Passing metadata inspection cannot promote measured allocation bounds, runtime, product, packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "tests::real_saved_prefix_restores_live_replays_durable_and_rejects_context_change",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and a real local GGUF",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this bounded CPU test alone cannot promote Metal, product, packaged-app, cross-platform, or release readiness.",
       "platforms": ["linux", "macos", "windows"]
     },
     {

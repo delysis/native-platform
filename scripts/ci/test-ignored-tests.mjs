@@ -508,14 +508,14 @@ test("noncanonical cfg_attr, macro, and public ignored tests fail closed", () =>
 test("all ignored tests carry exact target, platform, evidence, and non-promotion metadata", () => {
   const metadata = workspaceMetadata();
   const report = validateRegistry({ registry, metadata, repoRoot: root });
-  assert.equal(report.registry_count, 41);
+  assert.equal(report.registry_count, 43);
   assert.equal(report.cargo_target_count, 15);
   assert.equal(report.reviewed_build_script_count, 7);
   assert.equal(report.workspace_proc_macro_count, 0);
   assert.ok(report.guarded_source_count > 0);
   assert.ok(report.guarded_test_target_root_count > 0);
   assert.ok(registry.cargo_targets.every((target) => target.harness === "libtest"));
-  assert.deepEqual(report.platform_counts, { linux: 40, macos: 41, windows: 37 });
+  assert.deepEqual(report.platform_counts, { linux: 42, macos: 43, windows: 39 });
   assert.ok(report.evidence_classes.includes("real-model-runtime"));
   assert.ok(report.evidence_classes.includes("real-corpus-read-only"));
   assert.ok(report.evidence_classes.includes("real-platform-tts-runtime"));
@@ -623,12 +623,12 @@ test("reconciliation compares only the explicitly available current-platform sub
   const macos = expectedCargoInventory(registry, "macos");
   const linux = expectedCargoInventory(registry, "linux");
   const windows = expectedCargoInventory(registry, "windows");
-  assert.equal(macos.length, 41);
-  assert.equal(linux.length, 40);
-  assert.equal(windows.length, 37);
-  assert.equal(reconcileCargoInventory(registry, macos, "darwin").cargo_count, 41);
-  assert.equal(reconcileCargoInventory(registry, linux, "linux").cargo_count, 40);
-  assert.equal(reconcileCargoInventory(registry, windows, "win32").cargo_count, 37);
+  assert.equal(macos.length, 43);
+  assert.equal(linux.length, 42);
+  assert.equal(windows.length, 39);
+  assert.equal(reconcileCargoInventory(registry, macos, "darwin").cargo_count, 43);
+  assert.equal(reconcileCargoInventory(registry, linux, "linux").cargo_count, 42);
+  assert.equal(reconcileCargoInventory(registry, windows, "win32").cargo_count, 39);
 });
 
 test("reconciliation fails for missing available or present unavailable tests", () => {

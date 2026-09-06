@@ -58,8 +58,9 @@ desktop compatibility edge.
 ## Database identity and legacy rejection
 
 Fresh databases never create `api_keys` and are stamped with an FTE
-`application_id` plus schema version. Reopen accepts only that exact current
-identity and table set. A database with the plaintext `api_keys` table, any
+`application_id` plus schema version. Reopen accepts that exact current
+identity and table set, or the exact v1 schema for the bounded v2 usage upgrade
+described below. A database with the plaintext `api_keys` table, any
 unversioned populated database, a foreign application ID, an unsupported schema
 version, or an unexpected table is rejected before product schema mutation.
 
@@ -149,3 +150,10 @@ recorded. The exact evidence is preserved in
 No live hosted request has been performed because no supported provider
 credential is configured, and none is required by the revised phase-one
 contract. The launched evidence is not signed-release certification.
+
+## Subsequent activity-storage change (2026-09-06)
+
+The [current storage contract](../README.md#request-activity-storage) adds an
+exact-v1-to-v2 transactional upgrade, explicit unknown usage, and shared desktop/
+loopback activity recording. The earlier verification receipts above retain
+their original scope.

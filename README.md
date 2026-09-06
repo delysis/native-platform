@@ -12,8 +12,11 @@ source: it is the separately reviewed unsafe upstream boundary.
 
 ## Workspace
 
+The [current architecture index](docs/architecture/CURRENT-DECISIONS.md) records
+scope changes since the sealed ADR import.
+
 - Rust 1.92.0, edition 2024, resolver 3.
-- All 47 first-party packages are members of one root Cargo workspace.
+- All first-party packages are members of one root Cargo workspace; [the package groups](ci/package-groups.json) record the current inventory.
 - One root `Cargo.lock` resolves exact `rusqlite 0.39.0` and one
   `libsqlite3-sys 0.37.0` native link.
 - One pnpm 11.16.0 workspace and root `pnpm-lock.yaml` own the FTE, Mom, and

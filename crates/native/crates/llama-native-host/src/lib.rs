@@ -7,9 +7,12 @@
 //! handles.
 
 use llama_native_cache::{CacheFingerprint, CacheOwnerScope, MemoryPrefixCache, PrefixCacheValue};
-pub use llama_native_engine::SpeculativeAdmissionStatus;
 use llama_native_engine::{
     GenerationTicket, JoinedNativeModel, NativeModelHandle, NativeModelOwner,
+};
+pub use llama_native_engine::{
+    MemoryEstimateBasis, NativeMemoryEstimate, SpeculativeAdmissionStatus,
+    estimate_memory_reservation,
 };
 use llama_native_types::{
     GenerationBatchRequest, GenerationRequest, ModelFingerprint, NativeDevice, NativeError,
@@ -477,7 +480,8 @@ impl NativeHost {
             })?
             .map(|metadata| metadata.len())
             .unwrap_or_default();
-        let reserved_bytes = memory_reservation(model_bytes, projector_bytes);
+        let estimate = estimate_memory_reservation(&model, model_bytes, projector_bytes);
+        let reserved_bytes = estimate.total_bytes;
         {
             let state = self.state.lock().map_err(host_poisoned)?;
             let used = state
@@ -485,13 +489,18 @@ impl NativeHost {
                 .iter()
                 .filter(|(candidate, _)| **candidate != slot_id)
                 .map(|(_, entry)| entry.reserved_bytes)
-                .sum::<u64>();
-            if used.saturating_add(reserved_bytes) > self.config.memory_budget_bytes {
+                .fold(0_u64, u64::saturating_add);
+            if reserved_bytes == u64::MAX
+                || used
+                    .checked_add(reserved_bytes)
+                    .is_none_or(|total| total > self.config.memory_budget_bytes)
+            {
                 return Err(NativeError::new(
                     NativeErrorCode::MemoryBudgetExceeded,
                     format!(
-                        "loading the model would reserve {} bytes, above the {} byte host budget",
+                        "loading the model estimates {} bytes ({:?}), above the {} byte host budget",
                         used.saturating_add(reserved_bytes),
+                        estimate.basis,
                         self.config.memory_budget_bytes
                     ),
                 ));
@@ -1189,6 +1198,9 @@ fn validate_resident_digest_assertions(
     Ok(())
 }
 
+/// Legacy file-size-only estimate retained for callers comparing historical
+/// budgets. Admission uses `estimate_memory_reservation`, which includes the
+/// requested context and model metadata. Neither function is an RSS bound.
 #[must_use]
 pub const fn memory_reservation(model_bytes: u64, projector_bytes: u64) -> u64 {
     const MINIMUM_RUNTIME_RESERVE: u64 = 384 * 1024 * 1024;

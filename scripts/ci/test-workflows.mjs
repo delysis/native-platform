@@ -800,6 +800,15 @@ test("PR and full CI enforce current service documentation paths", () => {
   assert.match(fullRoot, /if: runner\.os == 'Linux'/);
 });
 
+test("full CI executes browser coverage and has no empty Information platform lane", () => {
+  const full = read(fullPath);
+  const loom = full.match(/^  loom:[\s\S]*?(?=^  frontend:)/m)?.[0];
+  assert.ok(loom, "full Loom job is missing");
+  assert.match(loom, /playwright install webkit/);
+  assert.match(loom, /pnpm --filter @delysis\/loom run test:browser/);
+  assert.doesNotMatch(full, /information-platform-linux/);
+});
+
 test("full frontend coverage remains unchanged", () => {
   const fullFrontend = read(fullPath).match(/^  frontend:[\s\S]*?(?=^  policy-and-graphs:)/m)?.[0];
   assert.ok(fullFrontend, "full frontend job block is missing");

@@ -84,7 +84,8 @@ mod tests {
     #[test]
     fn absent_acceptance_environment_preserves_normal_mode() {
         assert_eq!(
-            AcceptanceIsolation::from_value(None, &std::env::temp_dir()).unwrap(),
+            AcceptanceIsolation::from_value(None, &std::env::temp_dir())
+                .expect("absent_acceptance_environment_preserves_normal_mode: expected success"),
             None
         );
     }
@@ -98,10 +99,19 @@ mod tests {
         )
         .expect("valid acceptance directory")
         .expect("acceptance mode");
-        assert_eq!(isolation.root(), root.canonicalize().unwrap());
+        assert_eq!(
+            isolation.root(),
+            root.canonicalize().expect(
+                "existing_absolute_directory_owns_the_acceptance_database: expected success"
+            )
+        );
         assert_eq!(
             isolation.desktop_database(),
-            root.canonicalize().unwrap().join("gateway.db")
+            root.canonicalize()
+                .expect(
+                    "existing_absolute_directory_owns_the_acceptance_database: expected success"
+                )
+                .join("gateway.db")
         );
         std::fs::remove_dir(root).expect("remove acceptance test directory");
     }
@@ -112,7 +122,7 @@ mod tests {
             Some(OsString::from("relative")),
             &std::env::temp_dir(),
         )
-        .unwrap_err()
+        .expect_err("relative_and_missing_acceptance_directories_fail_closed: expected rejection")
         .to_string();
         assert!(relative.contains("absolute"));
 
@@ -123,7 +133,9 @@ mod tests {
         ));
         let error =
             AcceptanceIsolation::from_value(Some(missing.into_os_string()), &std::env::temp_dir())
-                .unwrap_err()
+                .expect_err(
+                    "relative_and_missing_acceptance_directories_fail_closed: expected rejection",
+                )
                 .to_string();
         assert!(error.contains("existing directory"));
     }
@@ -138,7 +150,7 @@ mod tests {
                 Some(configured.clone().into_os_string()),
                 &temporary_directory,
             )
-            .unwrap_err()
+            .expect_err("temp_root_and_directories_outside_the_supplied_temp_root_fail_closed: expected rejection")
             .to_string();
             assert!(error.contains("must be a child"));
         }
@@ -159,7 +171,7 @@ mod tests {
             Some(link.clone().into_os_string()),
             &std::env::temp_dir(),
         )
-        .unwrap_err()
+        .expect_err("symbolic_link_acceptance_directory_fails_closed: expected rejection")
         .to_string();
         assert!(error.contains("symbolic link"));
         std::fs::remove_file(link).expect("remove acceptance symlink");

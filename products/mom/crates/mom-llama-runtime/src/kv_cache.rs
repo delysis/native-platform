@@ -392,7 +392,7 @@ pub fn kv_cache_restore(cache_id: Option<String>) -> Result<CommandResult<KvCach
             ),
         ));
     };
-    handle
+    let restore_kind = handle
         .restore_sequence(value.sequence.clone(), 0)
         .map_err(|error| anyhow!(error))?;
     let restored = value.metadata.clone();
@@ -418,7 +418,15 @@ pub fn kv_cache_restore(cache_id: Option<String>) -> Result<CommandResult<KvCach
                 .display()
                 .to_string(),
         ],
-        Vec::new(),
+        vec![match restore_kind {
+            llama_native_types::SequenceRestoreKind::NativeState => {
+                "Restored native KV state from the live exporting worker.".to_string()
+            }
+            llama_native_types::SequenceRestoreKind::TokenReplay => {
+                "Recomputed the saved prefix from token IDs; no native KV cache hit was claimed."
+                    .to_string()
+            }
+        }],
         true,
         false,
     ))

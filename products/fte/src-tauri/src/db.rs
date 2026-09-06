@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 const MAX_REQUEST_LOG_ROWS: i64 = 10_000;
 const APPLICATION_ID: i64 = 0x4654_4531;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const CURRENT_SCHEMA_OBJECTS: [(&str, &str, &str); 4] = [
     (
         "index",
@@ -26,7 +26,7 @@ const CURRENT_SCHEMA_OBJECTS: [(&str, &str, &str); 4] = [
     (
         "table",
         "request_log",
-        "CREATE TABLE request_log (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, provider_id TEXT NOT NULL, model_id TEXT NOT NULL, tokens_used INTEGER NOT NULL CHECK(tokens_used >= 0), latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0), status_code INTEGER NOT NULL)",
+        "CREATE TABLE request_log (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, provider_id TEXT NOT NULL, model_id TEXT NOT NULL, tokens_used INTEGER CHECK(tokens_used >= 0), latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0), status_code INTEGER NOT NULL)",
     ),
 ];
 
@@ -35,7 +35,7 @@ pub struct LogEntry {
     pub timestamp: String,
     pub provider_id: String,
     pub model_id: String,
-    pub tokens_used: u64,
+    pub tokens_used: Option<u64>,
     pub latency_ms: u64,
     pub status_code: i32,
 }
@@ -43,6 +43,7 @@ pub struct LogEntry {
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct ProviderLogSummary {
     pub total_tokens: u64,
+    pub unknown_usage_requests: u64,
     pub avg_latency_ms: u64,
     pub request_count: u64,
     pub last_request_at: Option<String>,
@@ -52,6 +53,7 @@ pub struct ProviderLogSummary {
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct GlobalLogSummary {
     pub total_tokens: u64,
+    pub unknown_usage_requests: u64,
     pub avg_latency_ms: u64,
     pub request_count: u64,
 }
@@ -89,8 +91,10 @@ impl Database {
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
-        if state == DatabaseState::Fresh {
-            db.init_schema()?;
+        match state {
+            DatabaseState::Fresh => db.init_schema()?,
+            DatabaseState::VersionOne => db.upgrade_version_one(&db_path)?,
+            DatabaseState::Current => {}
         }
         Ok(db)
     }
@@ -99,6 +103,31 @@ impl Database {
         self.conn
             .lock()
             .map_err(|_| anyhow!("database lock was poisoned"))
+    }
+
+    fn upgrade_version_one(&self, path: &Path) -> Result<()> {
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        match classify_database(&tx, path)? {
+            DatabaseState::Current => return Ok(()),
+            DatabaseState::VersionOne => {}
+            DatabaseState::Fresh => {
+                anyhow::bail!("database identity changed before the v1 upgrade")
+            }
+        }
+        tx.execute_batch(
+            "ALTER TABLE request_log RENAME TO request_log_v1;
+            DROP INDEX idx_request_log_provider;",
+        )?;
+        tx.execute_batch(CURRENT_SCHEMA_OBJECTS[3].2)?;
+        tx.execute_batch(
+            "INSERT INTO request_log SELECT * FROM request_log_v1;
+            DROP TABLE request_log_v1;",
+        )?;
+        tx.execute_batch(CURRENT_SCHEMA_OBJECTS[0].2)?;
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -110,7 +139,7 @@ impl Database {
                 timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 provider_id TEXT NOT NULL,
                 model_id TEXT NOT NULL,
-                tokens_used INTEGER NOT NULL CHECK(tokens_used >= 0),
+                tokens_used INTEGER CHECK(tokens_used >= 0),
                 latency_ms INTEGER NOT NULL CHECK(latency_ms >= 0),
                 status_code INTEGER NOT NULL
             );
@@ -130,7 +159,7 @@ impl Database {
             );
 
             PRAGMA application_id = 0x46544531;
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 2;
             ",
         )?;
         Ok(())
@@ -227,7 +256,10 @@ impl Database {
                 timestamp: row.get(0)?,
                 provider_id: row.get(1)?,
                 model_id: row.get(2)?,
-                tokens_used: nonnegative_u64(row.get(3)?, 3)?,
+                tokens_used: row
+                    .get::<_, Option<i64>>(3)?
+                    .map(|value| nonnegative_u64(value, 3))
+                    .transpose()?,
                 latency_ms: nonnegative_u64(row.get(4)?, 4)?,
                 status_code: row.get(5)?,
             })
@@ -244,7 +276,8 @@ impl Database {
             SELECT
                 COALESCE(SUM(tokens_used), 0),
                 COALESCE(AVG(latency_ms), 0),
-                COUNT(*)
+                COUNT(*),
+                COUNT(*) - COUNT(tokens_used)
             FROM request_log
             ",
         )?;
@@ -255,6 +288,7 @@ impl Database {
                 total_tokens: nonnegative_u64(row.get(0)?, 0)?,
                 avg_latency_ms: avg_latency.max(0.0).round() as u64,
                 request_count: nonnegative_u64(row.get(2)?, 2)?,
+                unknown_usage_requests: nonnegative_u64(row.get(3)?, 3)?,
             })
         })
         .map_err(Into::into)
@@ -276,7 +310,8 @@ impl Database {
                     WHERE r2.provider_id = rl.provider_id
                     ORDER BY r2.id DESC
                     LIMIT 1
-                )
+                ),
+                COUNT(*) - COUNT(rl.tokens_used)
             FROM request_log rl
             GROUP BY rl.provider_id
             ",
@@ -292,6 +327,7 @@ impl Database {
                     request_count: nonnegative_u64(row.get(3)?, 3)?,
                     last_request_at: row.get(4)?,
                     last_status_code: row.get(5)?,
+                    unknown_usage_requests: nonnegative_u64(row.get(6)?, 6)?,
                 },
             ))
         })?;
@@ -306,12 +342,13 @@ impl Database {
         &self,
         provider: &str,
         model: &str,
-        tokens: u32,
+        tokens: impl Into<Option<u32>>,
         latency: u64,
         status: i32,
     ) -> Result<()> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
+        let tokens = tokens.into();
         let latency = i64::try_from(latency).unwrap_or(i64::MAX);
         tx.execute(
             "INSERT INTO request_log
@@ -337,6 +374,7 @@ impl Database {
 enum DatabaseState {
     Fresh,
     Current,
+    VersionOne,
 }
 
 fn classify_database(conn: &Connection, path: &Path) -> Result<DatabaseState> {
@@ -385,6 +423,25 @@ fn classify_database(conn: &Connection, path: &Path) -> Result<DatabaseState> {
         .into_iter()
         .map(|(kind, name, sql)| (kind, name, sql.map(|sql| normalize_schema_sql(&sql))))
         .collect::<BTreeSet<_>>();
+    let version_one_schema_objects = CURRENT_SCHEMA_OBJECTS
+        .into_iter()
+        .map(|(kind, name, sql)| {
+            (
+                kind.to_owned(),
+                name.to_owned(),
+                Some(normalize_schema_sql(&sql.replace(
+                    "tokens_used INTEGER CHECK",
+                    "tokens_used INTEGER NOT NULL CHECK",
+                ))),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if application_id == APPLICATION_ID
+        && schema_version == 1
+        && schema_objects == version_one_schema_objects
+    {
+        return Ok(DatabaseState::VersionOne);
+    }
     if application_id == APPLICATION_ID
         && schema_version == SCHEMA_VERSION
         && schema_objects == expected_schema_objects
@@ -457,18 +514,160 @@ mod tests {
     static TEST_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
     #[test]
-    fn log_summaries_report_latest_status_and_real_aggregates() {
-        let db = Database::new(test_database_path("summaries")).unwrap();
-        db.log_request("provider", "model-a", 10, 100, 200).unwrap();
-        db.log_request("provider", "model-b", 20, 300, 503).unwrap();
+    fn stale_v1_preflight_accepts_an_exact_upgrade_committed_by_another_opener() {
+        let path = test_database_path("two-upgraders");
+        let connection = Connection::open(&path).expect("first preflight connection");
+        for (_, _, sql) in CURRENT_SCHEMA_OBJECTS
+            .iter()
+            .filter(|(kind, _, _)| *kind == "table")
+        {
+            connection
+                .execute_batch(&sql.replace(
+                    "tokens_used INTEGER CHECK",
+                    "tokens_used INTEGER NOT NULL CHECK",
+                ))
+                .expect("v1 schema");
+        }
+        connection
+            .execute_batch(CURRENT_SCHEMA_OBJECTS[0].2)
+            .expect("index");
+        connection
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .expect("app identity");
+        connection
+            .pragma_update(None, "user_version", 1)
+            .expect("v1 identity");
+        connection
+            .execute_batch("INSERT INTO master_profile VALUES ('name', 'preserved');")
+            .expect("profile");
+        assert_eq!(
+            classify_database(&connection, &path).expect("initial preflight"),
+            DatabaseState::VersionOne
+        );
+        let stale_opener = Database {
+            conn: Arc::new(Mutex::new(connection)),
+        };
+        // The first opener is paused after classifying v1. Another opener wins
+        // the write transaction and completes the identical supported upgrade.
+        let winner = Database::new(path.clone()).expect("other opener upgrades");
+        stale_opener
+            .upgrade_version_one(&path)
+            .expect("already-upgraded exact identity is success");
+        assert_eq!(
+            classify_database(&winner.connection().expect("winner connection"), &path)
+                .expect("current schema"),
+            DatabaseState::Current
+        );
+        assert_eq!(
+            winner
+                .connection()
+                .expect("winner connection")
+                .query_row(
+                    "SELECT value FROM master_profile WHERE key='name'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .expect("profile retained"),
+            "preserved"
+        );
+        for (pragma, value) in [("user_version", 99), ("application_id", 42)] {
+            {
+                let conn = winner.connection().expect("winner connection");
+                conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                    .expect("restore supported version");
+                conn.pragma_update(None, pragma, value)
+                    .expect("concurrent identity change");
+            }
+            stale_opener
+                .upgrade_version_one(&path)
+                .expect_err("stale opener must not accept foreign/future identity");
+            let actual = winner
+                .connection()
+                .expect("winner connection")
+                .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0))
+                .expect("identity retained");
+            assert_eq!(actual, value);
+        }
+    }
 
-        let global = db.get_global_log_summary().unwrap();
+    #[test]
+    fn exact_version_one_upgrade_preserves_rows_and_allows_unknown_usage_on_reopen() {
+        let path = test_database_path("exact-v1-upgrade");
+        {
+            let conn = Connection::open(&path).expect("v1 connection");
+            // Construct only the exact supported prior application schema.
+            for (_, _, sql) in CURRENT_SCHEMA_OBJECTS
+                .iter()
+                .filter(|(kind, _, _)| *kind == "table")
+            {
+                conn.execute_batch(&sql.replace(
+                    "tokens_used INTEGER CHECK",
+                    "tokens_used INTEGER NOT NULL CHECK",
+                ))
+                .expect("v1 tables");
+            }
+            conn.execute_batch(CURRENT_SCHEMA_OBJECTS[0].2)
+                .expect("v1 index");
+            conn.pragma_update(None, "application_id", APPLICATION_ID)
+                .expect("app id");
+            conn.pragma_update(None, "user_version", 1)
+                .expect("version");
+            conn.execute_batch("INSERT INTO request_log (provider_id, model_id, tokens_used, latency_ms, status_code)
+                VALUES ('old', 'zero', 0, 3, 200), ('old', 'known', 7, 4, 200);
+                INSERT INTO master_profile VALUES ('name', 'preserved');").expect("v1 rows");
+        }
+        let database = Database::new(path.clone()).expect("upgrade exact v1");
+        let logs = database.get_recent_logs(10).expect("preserved logs");
+        assert_eq!(logs[0].tokens_used, Some(7));
+        assert_eq!(logs[1].tokens_used, Some(0));
+        database
+            .log_request("new", "unknown", None, 5, 499)
+            .expect("unknown usage");
+        drop(database);
+        let database = Database::new(path.clone()).expect("v2 reopen");
+        let logs = database.get_recent_logs(10).expect("reopened logs");
+        assert_eq!(logs.len(), 3);
+        assert_eq!(logs[0].tokens_used, None);
+        assert_eq!(logs[2].tokens_used, Some(0));
+        let conn = database.connection().expect("connection");
+        assert_eq!(
+            conn.query_row(
+                "SELECT value FROM master_profile WHERE key='name'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .expect("profile"),
+            "preserved"
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .expect("version"),
+            2
+        );
+    }
+
+    #[test]
+    fn log_summaries_report_latest_status_and_real_aggregates() {
+        let db = Database::new(test_database_path("summaries"))
+            .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
+        db.log_request("provider", "model-a", 10, 100, 200)
+            .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
+        db.log_request("provider", "model-b", 20, 300, 503)
+            .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
+
+        let global = db
+            .get_global_log_summary()
+            .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
         assert_eq!(global.total_tokens, 30);
         assert_eq!(global.avg_latency_ms, 200);
         assert_eq!(global.request_count, 2);
 
-        let providers = db.get_provider_log_summaries().unwrap();
-        let provider = providers.get("provider").unwrap();
+        let providers = db
+            .get_provider_log_summaries()
+            .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
+        let provider = providers
+            .get("provider")
+            .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
         assert_eq!(provider.total_tokens, 30);
         assert_eq!(provider.avg_latency_ms, 200);
         assert_eq!(provider.request_count, 2);
@@ -483,13 +682,18 @@ mod tests {
             expected_sha256: Some("a".repeat(64)),
         };
         {
-            let db = Database::new(path.clone()).unwrap();
-            db.save_local_model_configuration(&configuration).unwrap();
+            let db = Database::new(path.clone())
+                .expect("local_model_configuration_survives_database_reopen: expected success");
+            db.save_local_model_configuration(&configuration)
+                .expect("local_model_configuration_survives_database_reopen: expected success");
         }
 
-        let reopened = Database::new(path).unwrap();
+        let reopened = Database::new(path)
+            .expect("local_model_configuration_survives_database_reopen: expected success");
         assert_eq!(
-            reopened.get_local_model_configuration().unwrap(),
+            reopened
+                .get_local_model_configuration()
+                .expect("local_model_configuration_survives_database_reopen: expected success"),
             Some(configuration)
         );
     }
@@ -498,16 +702,16 @@ mod tests {
     fn fresh_database_is_versioned_and_reopens_only_as_the_current_schema() {
         let path = test_database_path("current-schema");
         {
-            let db = Database::new(path.clone()).unwrap();
-            let conn = db.connection().unwrap();
+            let db = Database::new(path.clone()).expect("fresh_database_is_versioned_and_reopens_only_as_the_current_schema: expected success");
+            let conn = db.connection().expect("fresh_database_is_versioned_and_reopens_only_as_the_current_schema: expected success");
             assert_eq!(
                 conn.query_row("PRAGMA application_id", [], |row| row.get::<_, i64>(0))
-                    .unwrap(),
+                    .expect("fresh_database_is_versioned_and_reopens_only_as_the_current_schema: expected success"),
                 APPLICATION_ID
             );
             assert_eq!(
                 conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                    .unwrap(),
+                    .expect("fresh_database_is_versioned_and_reopens_only_as_the_current_schema: expected success"),
                 SCHEMA_VERSION
             );
         }
@@ -518,16 +722,16 @@ mod tests {
     fn synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation() {
         let path = test_database_path("prohibited-plaintext-sentinel");
         {
-            let conn = Connection::open(&path).unwrap();
+            let conn = Connection::open(&path).expect("synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation: expected success");
             conn.execute_batch(
                 "CREATE TABLE api_keys (
                     provider_id TEXT PRIMARY KEY,
                     key_value TEXT NOT NULL
                 );",
             )
-            .unwrap();
+            .expect("synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation: expected success");
         }
-        let before = std::fs::read(&path).unwrap();
+        let before = std::fs::read(&path).expect("synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation: expected success");
 
         let error = match Database::new(path.clone()) {
             Ok(_) => panic!("legacy schema must fail closed"),
@@ -536,18 +740,20 @@ mod tests {
 
         assert!(error.to_string().contains("unsupported legacy database"));
         assert!(error.to_string().contains("not imported"));
-        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(std::fs::read(path).expect("synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation: expected success"), before);
     }
 
     #[test]
     fn unversioned_populated_database_is_rejected_without_schema_adoption() {
         let path = test_database_path("unversioned-populated");
         {
-            let conn = Connection::open(&path).unwrap();
+            let conn = Connection::open(&path).expect("unversioned_populated_database_is_rejected_without_schema_adoption: expected success");
             conn.execute_batch("CREATE TABLE operator_data (value TEXT NOT NULL);")
-                .unwrap();
+                .expect("unversioned_populated_database_is_rejected_without_schema_adoption: expected success");
         }
-        let before = std::fs::read(&path).unwrap();
+        let before = std::fs::read(&path).expect(
+            "unversioned_populated_database_is_rejected_without_schema_adoption: expected success",
+        );
 
         let error = match Database::new(path.clone()) {
             Ok(_) => panic!("unversioned populated database must fail closed"),
@@ -556,13 +762,13 @@ mod tests {
 
         assert!(error.to_string().contains("unsupported database"));
         assert!(error.to_string().contains("not imported"));
-        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert_eq!(std::fs::read(path).expect("unversioned_populated_database_is_rejected_without_schema_adoption: expected success"), before);
     }
 
     #[test]
     fn wrong_version_or_unexpected_schema_object_is_rejected() {
         for (label, mutation) in [
-            ("future-version", "PRAGMA user_version = 2;"),
+            ("future-version", "PRAGMA user_version = 3;"),
             ("unexpected-table", "CREATE TABLE unexpected(value TEXT);"),
             (
                 "unexpected-view",
@@ -571,8 +777,17 @@ mod tests {
         ] {
             let path = test_database_path(label);
             {
-                let db = Database::new(path.clone()).unwrap();
-                db.connection().unwrap().execute_batch(mutation).unwrap();
+                let db = Database::new(path.clone()).expect(
+                    "wrong_version_or_unexpected_schema_object_is_rejected: expected success",
+                );
+                db.connection()
+                    .expect(
+                        "wrong_version_or_unexpected_schema_object_is_rejected: expected success",
+                    )
+                    .execute_batch(mutation)
+                    .expect(
+                        "wrong_version_or_unexpected_schema_object_is_rejected: expected success",
+                    );
             }
 
             let error = match Database::new(path) {
@@ -587,9 +802,10 @@ mod tests {
     fn same_schema_names_with_wrong_definitions_are_rejected() {
         let path = test_database_path("same-names-wrong-definitions");
         {
-            let db = Database::new(path.clone()).unwrap();
+            let db = Database::new(path.clone())
+                .expect("same_schema_names_with_wrong_definitions_are_rejected: expected success");
             db.connection()
-                .unwrap()
+                .expect("same_schema_names_with_wrong_definitions_are_rejected: expected success")
                 .execute_batch(
                     "DROP INDEX idx_request_log_provider;
                      DROP TABLE request_log;
@@ -600,7 +816,7 @@ mod tests {
                      CREATE INDEX idx_request_log_provider
                          ON request_log (provider_id, id DESC);",
                 )
-                .unwrap();
+                .expect("same_schema_names_with_wrong_definitions_are_rejected: expected success");
         }
 
         let error = match Database::new(path) {
@@ -617,7 +833,7 @@ mod tests {
             TEST_DATABASE_ID.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .expect("test_database_path: expected success")
                 .as_nanos()
         ))
     }

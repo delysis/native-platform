@@ -9,6 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[lints]
+workspace = true
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
@@ -42,4 +45,5 @@ llama-native-types.workspace = true
 tauri-plugin-free-token-energy = { path = "../crates/tauri-plugin-free-token-energy", features = ["native-llama"] }
 
 [dev-dependencies]
+fte-loopback = { path = "../crates/fte-loopback" }
 async-trait = "0.1.92"

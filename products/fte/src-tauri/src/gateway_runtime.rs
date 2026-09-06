@@ -68,6 +68,7 @@ pub struct ProviderStatus {
     pub text_completion_model_count: usize,
     pub headroom: Option<f64>,
     pub total_tokens: u64,
+    pub unknown_usage_requests: u64,
     pub avg_latency_ms: u64,
     pub request_count: u64,
     pub last_request_at: Option<String>,
@@ -165,6 +166,40 @@ impl SecretResolver for StoreSecretResolver {
     }
 }
 
+struct DesktopActivityObserver {
+    database: Arc<RwLock<Option<Arc<Database>>>>,
+}
+
+impl fte_router::GatewayOutcomeObserver for DesktopActivityObserver {
+    fn observe(&self, outcome: &fte_router::GatewayOutcome) {
+        if let Ok(database) = self.database.read()
+            && let Some(database) = database.as_ref()
+        {
+            let _ = database.log_request(
+                outcome.provider.as_deref().unwrap_or("gateway"),
+                outcome.model.as_deref().unwrap_or("unresolved"),
+                outcome
+                    .tokens
+                    .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX)),
+                u64::try_from(outcome.elapsed.as_millis()).unwrap_or(u64::MAX),
+                i32::from(outcome.status),
+            );
+        }
+    }
+}
+
+struct PlaygroundRequest {
+    id: RequestId,
+    cancellation: Arc<fte_types::RequestCancellation>,
+    result: tokio::sync::watch::Receiver<Option<Result<serde_json::Value, String>>>,
+}
+
+impl PlaygroundRequest {
+    fn is_finished(&self) -> bool {
+        self.result.borrow().is_some() || self.result.has_changed().is_err()
+    }
+}
+
 pub struct GatewayRuntimeOwner {
     runtime_id: RequestId,
     gateway: Arc<Gateway>,
@@ -172,7 +207,8 @@ pub struct GatewayRuntimeOwner {
     native_backend: Arc<LlamaNativeBackend>,
     native_shutdown: Mutex<Option<llama_native_host::ProcessExitJoinedNativeHost>>,
     credential_store: Arc<dyn CredentialStore>,
-    database: RwLock<Option<Arc<Database>>>,
+    database: Arc<RwLock<Option<Arc<Database>>>>,
+    playground: Mutex<Option<PlaygroundRequest>>,
     local_model_configuration_lock: Mutex<()>,
     local_model_status: RwLock<LocalModelStatus>,
     catalog: Vec<ModelCatalogEntry>,
@@ -200,9 +236,15 @@ impl GatewayRuntimeOwner {
         credential_store: Arc<dyn CredentialStore>,
         runtime_id: RequestId,
     ) -> Result<Self, GatewayError> {
-        let gateway = Arc::new(Gateway::new(GatewayDefaults {
-            catalog_version: "free-token-energy-desktop-v2".to_string(),
-        }));
+        let database = Arc::new(RwLock::new(None));
+        let gateway = Arc::new(
+            Gateway::new(GatewayDefaults {
+                catalog_version: "free-token-energy-desktop-v2".to_string(),
+            })
+            .with_outcome_observer(Arc::new(DesktopActivityObserver {
+                database: Arc::clone(&database),
+            })),
+        );
         let secrets: Arc<dyn SecretResolver> =
             Arc::new(StoreSecretResolver::new(Arc::clone(&credential_store)));
         let catalog = default_model_catalog();
@@ -219,7 +261,8 @@ impl GatewayRuntimeOwner {
             native_backend,
             native_shutdown: Mutex::new(None),
             credential_store,
-            database: RwLock::new(None),
+            database,
+            playground: Mutex::new(None),
             local_model_configuration_lock: Mutex::new(()),
             local_model_status: RwLock::new(LocalModelStatus::not_configured()),
             catalog,
@@ -397,100 +440,148 @@ impl GatewayRuntimeOwner {
     }
 
     pub async fn chat(&self, request: serde_json::Value) -> anyhow::Result<serde_json::Value> {
-        let (requested_model, mut canonical) = canonical_chat_request(request, &self.catalog)?;
-        self.apply_route_policy(&requested_model, &mut canonical);
-        let started = std::time::Instant::now();
-        let result = self.gateway.execute(canonical).await;
-        let response = match result {
-            Ok(ticket) => ticket.final_response().await,
-            Err(error) => Err(error),
-        };
-        match response {
-            Ok(response) => {
-                self.log_gateway_result(
-                    &response.route.backend_id,
-                    &requested_model,
-                    response
-                        .usage
-                        .input_tokens
-                        .unwrap_or_default()
-                        .saturating_add(response.usage.output_tokens.unwrap_or_default()),
-                    started.elapsed(),
-                    200,
-                );
-                let mut json = openai_chat_json(&response);
-                json["model"] = serde_json::Value::String(requested_model);
-                Ok(json)
-            }
-            Err(error) => {
-                self.log_gateway_result(
-                    error.provider.as_deref().unwrap_or("gateway"),
-                    &requested_model,
-                    0,
-                    started.elapsed(),
-                    i32::from(error.http_status),
-                );
-                Err(error.into())
-            }
-        }
+        let (model, mut canonical) = canonical_chat_request(request, &self.catalog)?;
+        self.apply_route_policy(&model, &mut canonical);
+        self.execute_desktop(
+            model,
+            canonical,
+            false,
+            Arc::new(fte_types::RequestCancellation::default()),
+        )
+        .await
     }
 
     pub async fn complete(&self, request: serde_json::Value) -> anyhow::Result<serde_json::Value> {
-        let (requested_model, mut canonical) = canonical_completion_request(request)?;
-        self.apply_route_policy(&requested_model, &mut canonical);
-        let started = std::time::Instant::now();
-        let result = self.gateway.execute(canonical).await;
-        let response = match result {
-            Ok(ticket) => ticket.final_response().await,
-            Err(error) => Err(error),
-        };
-        match response {
-            Ok(response) => {
-                self.log_gateway_result(
-                    &response.route.backend_id,
-                    &requested_model,
-                    response
-                        .usage
-                        .input_tokens
-                        .unwrap_or_default()
-                        .saturating_add(response.usage.output_tokens.unwrap_or_default()),
-                    started.elapsed(),
-                    200,
-                );
-                let mut json = openai_completion_json(&response);
-                json["model"] = serde_json::Value::String(requested_model);
-                Ok(json)
-            }
-            Err(error) => {
-                self.log_gateway_result(
-                    error.provider.as_deref().unwrap_or("gateway"),
-                    &requested_model,
-                    0,
-                    started.elapsed(),
-                    i32::from(error.http_status),
-                );
-                Err(error.into())
-            }
-        }
+        let (model, mut canonical) = canonical_completion_request(request)?;
+        self.apply_route_policy(&model, &mut canonical);
+        self.execute_desktop(
+            model,
+            canonical,
+            true,
+            Arc::new(fte_types::RequestCancellation::default()),
+        )
+        .await
     }
 
-    fn log_gateway_result(
+    async fn execute_desktop(
         &self,
-        provider_id: &str,
-        model_id: &str,
-        tokens: u64,
-        elapsed: std::time::Duration,
-        status: i32,
-    ) {
-        if let Ok(database) = self.database() {
-            let _ = database.log_request(
-                provider_id,
-                model_id,
-                u32::try_from(tokens).unwrap_or(u32::MAX),
-                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-                status,
+        model: String,
+        request: fte_types::GatewayRequest,
+        completion: bool,
+        cancellation: Arc<fte_types::RequestCancellation>,
+    ) -> anyhow::Result<serde_json::Value> {
+        let response = self
+            .gateway
+            .execute_with_cancellation(request, cancellation)
+            .await?
+            .final_response()
+            .await?;
+        let mut json = if completion {
+            openai_completion_json(&response)
+        } else {
+            openai_chat_json(&response)
+        };
+        json["model"] = serde_json::Value::String(model);
+        Ok(json)
+    }
+
+    pub fn start_playground(
+        self: &Arc<Self>,
+        request: serde_json::Value,
+        mode: &str,
+    ) -> anyhow::Result<String> {
+        let completion = match mode {
+            "chat" => false,
+            "completion" => true,
+            _ => anyhow::bail!("unsupported playground mode"),
+        };
+        let (model, mut canonical) = if completion {
+            canonical_completion_request(request)?
+        } else {
+            canonical_chat_request(request, &self.catalog)?
+        };
+        self.apply_route_policy(&model, &mut canonical);
+        let id = canonical.request_id.clone();
+        let cancellation = Arc::new(fte_types::RequestCancellation::default());
+        let (send, result) = tokio::sync::watch::channel(None);
+        {
+            let mut pending = self
+                .playground
+                .lock()
+                .map_err(|_| anyhow::anyhow!("playground state unavailable"))?;
+            anyhow::ensure!(
+                pending.as_ref().is_none_or(|pending| pending.is_finished()),
+                "a playground request is still pending"
             );
+            *pending = Some(PlaygroundRequest {
+                id: id.clone(),
+                cancellation: Arc::clone(&cancellation),
+                result,
+            });
         }
+        let owner = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = owner
+                .execute_desktop(model, canonical, completion, cancellation)
+                .await
+                .map_err(|error| error.to_string());
+            send.send_replace(Some(result));
+        });
+        Ok(id.0)
+    }
+
+    pub fn cancel_playground(&self, id: &str) -> anyhow::Result<bool> {
+        let pending = self
+            .playground
+            .lock()
+            .map_err(|_| anyhow::anyhow!("playground state unavailable"))?;
+        let Some(pending) = pending.as_ref().filter(|pending| pending.id.0 == id) else {
+            return Ok(false);
+        };
+        if pending.is_finished() {
+            return Ok(false);
+        }
+        pending.cancellation.cancel();
+        Ok(true)
+    }
+
+    pub async fn wait_playground(&self, id: &str) -> Result<serde_json::Value, String> {
+        let mut result = {
+            let pending = self
+                .playground
+                .lock()
+                .map_err(|_| "playground state unavailable")?;
+            pending
+                .as_ref()
+                .filter(|pending| pending.id.0 == id)
+                .ok_or("playground request not found")?
+                .result
+                .clone()
+        };
+        let outcome = loop {
+            if let Some(result) = result.borrow().clone() {
+                break result;
+            }
+            if result.changed().await.is_err() {
+                break Err(GatewayError {
+                    code: "playground_worker_stopped".to_owned(),
+                    class: fte_types::ErrorClass::Internal,
+                    retryable: false,
+                    http_status: 500,
+                    request_id: RequestId(id.to_owned()),
+                    provider: None,
+                    safe_detail: "the playground worker stopped before returning a terminal result"
+                        .to_owned(),
+                }
+                .to_string());
+            }
+        };
+        if let Ok(mut pending) = self.playground.lock()
+            && pending.as_ref().is_some_and(|pending| pending.id.0 == id)
+        {
+            *pending = None;
+        }
+        outcome
     }
 
     fn apply_route_policy(&self, requested_model: &str, request: &mut fte_types::GatewayRequest) {
@@ -594,6 +685,7 @@ impl GatewayRuntimeOwner {
                         .count(),
                     headroom,
                     total_tokens: summary.total_tokens,
+                    unknown_usage_requests: summary.unknown_usage_requests,
                     avg_latency_ms: summary.avg_latency_ms,
                     request_count: summary.request_count,
                     last_request_at: summary.last_request_at,
@@ -649,6 +741,7 @@ impl GatewayRuntimeOwner {
                     .count(),
                 headroom: None,
                 total_tokens: summary.total_tokens,
+                unknown_usage_requests: summary.unknown_usage_requests,
                 avg_latency_ms: summary.avg_latency_ms,
                 request_count: summary.request_count,
                 last_request_at: summary.last_request_at,
@@ -659,14 +752,13 @@ impl GatewayRuntimeOwner {
         Ok(statuses)
     }
 
-    pub fn global_headroom_percent(&self) -> anyhow::Result<f64> {
+    pub fn global_headroom_percent(&self) -> anyhow::Result<Option<f64>> {
         Ok(self
             .provider_statuses()?
             .into_iter()
             .filter_map(|provider| provider.headroom)
             .reduce(f64::max)
-            .unwrap_or(0.0)
-            * 100.0)
+            .map(|headroom| headroom * 100.0))
     }
 }
 
@@ -1252,8 +1344,17 @@ mod tests {
     use crate::secrets::SecretStoreError;
     use std::sync::Mutex;
 
+    #[test]
+    fn dashboard_preserves_unknown_headroom() {
+        let runtime = GatewayRuntimeOwner::new().expect("gateway");
+        runtime
+            .bind_database(test_database("unknown-headroom"))
+            .expect("bind database");
+        assert_eq!(runtime.global_headroom_percent().expect("headroom"), None);
+    }
+
     #[derive(Default)]
-    struct FakeCredentialStore {
+    pub(super) struct FakeCredentialStore {
         values: Mutex<BTreeMap<String, Vec<u8>>>,
     }
 
@@ -1550,7 +1651,7 @@ mod tests {
                 .configure_local_model(&model_path, Some("a".repeat(64)))
                 .expect("configure local model");
             assert_eq!(
-                runtime.local_model_status().unwrap().state,
+                runtime.local_model_status().expect("local_model_configuration_restores_through_a_new_gateway_owner: expected success").state,
                 LocalModelState::Ready
             );
             assert!(runtime.shutdown_native_for_process_exit());
@@ -1575,7 +1676,7 @@ mod tests {
                 .iter()
                 .any(|model| model.id == LOCAL_MODEL_ID)
         );
-        assert!(reopened.get_local_model_configuration().unwrap().is_some());
+        assert!(reopened.get_local_model_configuration().expect("local_model_configuration_restores_through_a_new_gateway_owner: expected success").is_some());
         assert!(restarted.shutdown_native_for_process_exit());
         std::fs::remove_file(model_path).expect("remove GGUF fixture");
     }
@@ -1594,17 +1695,17 @@ mod tests {
             .expect("configure valid local model");
         let saved = database
             .get_local_model_configuration()
-            .unwrap()
+            .expect("invalid_replacement_does_not_overwrite_working_local_model_configuration: expected success")
             .expect("saved configuration");
 
         let missing_path = test_gguf_path("missing-replacement");
         assert!(runtime.configure_local_model(missing_path, None).is_err());
         assert_eq!(
-            database.get_local_model_configuration().unwrap(),
+            database.get_local_model_configuration().expect("invalid_replacement_does_not_overwrite_working_local_model_configuration: expected success"),
             Some(saved)
         );
         assert_eq!(
-            runtime.local_model_status().unwrap().state,
+            runtime.local_model_status().expect("invalid_replacement_does_not_overwrite_working_local_model_configuration: expected success").state,
             LocalModelState::Ready
         );
 
@@ -1640,7 +1741,7 @@ mod tests {
                 .any(|model| model.id == LOCAL_MODEL_ID)
         );
         assert_eq!(
-            database.get_local_model_configuration().unwrap(),
+            database.get_local_model_configuration().expect("missing_saved_model_restores_as_invalid_without_deleting_the_selection: expected success"),
             Some(saved)
         );
         assert!(runtime.shutdown_native_for_process_exit());
@@ -1662,7 +1763,7 @@ mod tests {
             .expect("configure first model");
         let first = database
             .get_local_model_configuration()
-            .unwrap()
+            .expect("native_configuration_failure_rolls_back_the_persisted_replacement: expected success")
             .expect("first persisted model");
         runtime.gateway.shutdown().await.expect("shutdown Gateway");
 
@@ -1672,11 +1773,11 @@ mod tests {
                 .is_err()
         );
         assert_eq!(
-            database.get_local_model_configuration().unwrap(),
+            database.get_local_model_configuration().expect("native_configuration_failure_rolls_back_the_persisted_replacement: expected success"),
             Some(first)
         );
         assert_eq!(
-            runtime.local_model_status().unwrap().state,
+            runtime.local_model_status().expect("native_configuration_failure_rolls_back_the_persisted_replacement: expected success").state,
             LocalModelState::Ready
         );
         assert!(runtime.shutdown_native_for_process_exit());
@@ -1909,7 +2010,7 @@ mod tests {
         }));
     }
 
-    fn test_database(label: &str) -> Arc<Database> {
+    pub(super) fn test_database(label: &str) -> Arc<Database> {
         Arc::new(Database::new(test_database_path(label)).expect("test database"))
     }
 
@@ -1950,3 +2051,7 @@ mod tests {
         std::fs::write(path, b"GGUF").expect("write minimal GGUF fixture");
     }
 }
+
+#[cfg(test)]
+#[path = "gateway_runtime_activity_tests.rs"]
+mod activity_tests;

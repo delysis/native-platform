@@ -261,6 +261,10 @@ async function refreshDashboard() {
     );
     setText('stat-latency', stats.request_count > 0 ? `${formatNumber(stats.avg_latency)} ms` : '—');
     setText('stat-tokens', formatNumber(stats.total_tokens));
+    const unknownUsage = Number(stats.unknown_usage_requests) || 0;
+    setText('stat-tokens-context', unknownUsage > 0
+      ? `Partial · ${formatNumber(unknownUsage)} requests without usage`
+      : 'Stored counts');
     setText('stat-requests', formatNumber(stats.request_count));
 
     healthList.replaceChildren();
@@ -340,7 +344,7 @@ async function refreshLogs() {
         timestamp ? timestamp.toLocaleString() : String(log.timestamp),
         String(log.provider),
         String(log.model),
-        formatNumber(log.tokens),
+        log.tokens == null ? 'Unknown' : formatNumber(log.tokens),
         `${formatNumber(log.latency)} ms`,
         String(log.status),
       ];
@@ -593,7 +597,29 @@ function appendMessage(role, text, labelOverride = null) {
   history.scrollTop = history.scrollHeight;
 }
 
+let playgroundPending = null;
+
+async function stopPlayground() {
+  const pending = playgroundPending;
+  if (!pending || pending.cancelRequested) return;
+  pending.cancelRequested = true;
+  const button = document.getElementById('chat-send');
+  button.textContent = 'Stopping…';
+  button.disabled = true;
+  if (pending.id) {
+    try {
+      await invoke('playground_cancel', { requestId: pending.id });
+    } catch (error) {
+      appendMessage('error', errorMessage(error));
+      pending.cancelRequested = false;
+      button.disabled = false;
+      button.textContent = 'Stop';
+    }
+  }
+}
+
 async function sendMessage() {
+  if (playgroundPending) { await stopPlayground(); return; }
   const input = document.getElementById('chat-input');
   const sendButton = document.getElementById('chat-send');
   const mode = document.getElementById('playground-mode').value;
@@ -609,18 +635,30 @@ async function sendMessage() {
   }
   input.value = '';
   input.disabled = true;
-  sendButton.disabled = true;
-  sendButton.textContent = 'Routing…';
+  sendButton.disabled = false;
+  sendButton.textContent = 'Stop';
+  document.getElementById('playground-mode').disabled = true;
+  document.getElementById('chat-model').disabled = true;
+  const pending = { id: null, cancelRequested: false };
+  playgroundPending = pending;
 
+  const waitForRequest = async (req) => {
+    pending.id = await invoke('playground_start', { req, mode });
+    // Stop may precede the IPC start reply. Preserve that intent until the
+    // Rust-owned identity arrives; admission already owns the durable token.
+    if (pending.cancelRequested) {
+      pending.cancelRequested = false;
+      await stopPlayground();
+    }
+    return invoke('playground_wait', { requestId: pending.id });
+  };
   try {
     if (mode === 'completion') {
-      const response = await invoke('completion_request', {
-        req: {
+      const response = await waitForRequest({
           model: document.getElementById('chat-model').value,
           prompt: message,
           max_tokens: 256,
           stream: false,
-        },
       });
       const choices = response.choices || [];
       const content = choices.length > 1
@@ -628,12 +666,10 @@ async function sendMessage() {
         : choices[0]?.text || '(empty completion)';
       appendMessage('assistant', content, 'Continuation');
     } else {
-      const response = await invoke('chat_request', {
-        req: {
+      const response = await waitForRequest({
           model: document.getElementById('chat-model').value,
           messages: chatMessages,
           stream: false,
-        },
       });
       const responseMessage = response.choices?.[0]?.message;
       const content = contentToText(responseMessage?.content);
@@ -644,6 +680,9 @@ async function sendMessage() {
   } catch (error) {
     appendMessage('error', errorMessage(error));
   } finally {
+    playgroundPending = null;
+    document.getElementById('playground-mode').disabled = false;
+    document.getElementById('chat-model').disabled = false;
     input.disabled = false;
     sendButton.disabled = false;
     sendButton.textContent = 'Send request';

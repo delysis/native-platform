@@ -1961,6 +1961,7 @@
     stream.scrollTop = stream.scrollHeight;
   };
 
+  let activeDispatchConversation = null;
   const chatBusyLeases = new Set();
   let chatBusyLeaseSerial = 0;
 
@@ -2465,7 +2466,7 @@
       const result = await invoke("mom_llama_conversation_select", { conversation: button.dataset.conversation });
       report(result); await refreshConversationProjection();
     },
-    "chat-cancel": async () => report(await invoke("mom_llama_chat_cancel", { conversation: selectedConversation() })),
+    "chat-cancel": async () => report(await invoke("mom_llama_chat_cancel", { conversation: activeDispatchConversation || selectedConversation() })),
     "chat-skip-reasoning": async (button) => {
       const result = await invoke("mom_llama_chat_skip_reasoning", { conversation: selectedConversation() });
       report(result);
@@ -3203,7 +3204,8 @@
             chat().dataset.currentConversation = conversation;
             chat().dataset.conversationKind = "chat";
           }
-          await persistDraftNow(textarea?.value || message, attachmentIds, conversation);
+          activeDispatchConversation = conversation;
+          await persistDraftNow(message, attachmentIds, conversation);
           if (conversation !== sourceConversation) {
             await invoke("mom_llama_draft_update", {
               conversation: sourceConversation,
@@ -3211,15 +3213,18 @@
               attachmentIds: [],
             });
           }
-          if (textarea) textarea.value = "";
-          if (message) appendLiveMessage("user", message, `live-user-${Date.now()}`);
+          if (selectedConversation() === conversation) {
+            if (textarea) textarea.value = "";
+            if (message) appendLiveMessage("user", message, `live-user-${Date.now()}`);
+          }
           closeMentions();
           let result;
           try {
             result = await invoke("mom_llama_chat_dispatch", { conversation, message });
           } catch (error) {
-            if (textarea && !textarea.value) textarea.value = message;
-            await persistDraftNow(message, attachmentIds).catch(reportError);
+            // Rust retains the saved draft until commit. Recovery must never
+            // write through the renderer's possibly changed selection.
+            if (selectedConversation() === conversation && textarea && !textarea.value) textarea.value = message;
             await refreshChat().catch(reportError);
             throw error;
           }
@@ -3231,12 +3236,12 @@
           if (pendingApproval && mcpProcessUiSupported()) {
             openPersonaToolApproval(pendingApproval);
           }
-          if (result?.status === "blocked" && textarea && !textarea.value) {
+          if (result?.status === "blocked" && selectedConversation() === conversation && textarea && !textarea.value) {
             textarea.value = message;
-            await persistDraftNow(message, attachmentIds);
           }
           await refreshConversationProjection();
         } finally {
+          activeDispatchConversation = null;
           releaseChatBusy(dispatchLease);
         }
       }

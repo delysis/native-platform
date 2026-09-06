@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, anyhow};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -11,9 +13,116 @@ use std::fs;
 use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "macos", test))]
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DATABASE_FILE: &str = "runtime.sqlite3";
+const STORE_APPLICATION_ID: i64 = 0x4d4f4d31; // MOM1
+const STORE_SCHEMA_VERSION: i64 = 1;
+const STORE_SCHEMA: &str = "CREATE TABLE encrypted_documents (
+                namespace TEXT PRIMARY KEY NOT NULL,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE receipts (
+                receipt_id TEXT PRIMARY KEY NOT NULL,
+                command_id TEXT NOT NULL,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            );";
+
+/// Build privately, then publish a complete database without replacing any
+/// existing path. The hard-link operation arbitrates independent processes as
+/// well as threads; readers never observe our empty initialization file.
+fn initialize_store(data_dir: &Path, destination: &Path) -> Result<()> {
+    struct Candidate(PathBuf);
+    impl Drop for Candidate {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let path = data_dir.join(format!(".runtime-init-{}.sqlite3", uuid::Uuid::new_v4()));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let candidate = Candidate(path);
+    {
+        let mut connection =
+            Connection::open_with_flags(&candidate.0, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        // Keep every committed byte in this one file before linking it.
+        connection.pragma_update(None, "journal_mode", "DELETE")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(STORE_SCHEMA)?;
+        transaction.pragma_update(None, "application_id", STORE_APPLICATION_ID)?;
+        transaction.pragma_update(None, "user_version", STORE_SCHEMA_VERSION)?;
+        validate_schema(&transaction)?;
+        transaction.commit()?;
+    }
+    match fs::hard_link(&candidate.0, destination) {
+        Ok(()) => {
+            #[cfg(unix)]
+            fs::File::open(data_dir)?.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+/// Legacy v0 has the identical physical schema. Do not stamp it or rewrite
+/// encrypted records: older binaries and retained keys remain compatible.
+fn validate_schema(connection: &Connection) -> Result<()> {
+    let application_id: i64 =
+        connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !matches!(
+        (application_id, version),
+        (0, 0) | (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION)
+    ) {
+        return Err(anyhow!("unsupported Mom store identity or schema version"));
+    }
+    let mut statement = connection
+        .prepare("SELECT sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name")?;
+    let actual = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let normalize = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let expected = STORE_SCHEMA
+        .split(';')
+        .filter(|sql| !sql.trim().is_empty())
+        .map(normalize)
+        .collect::<Vec<_>>();
+    if actual.iter().map(|sql| normalize(sql)).collect::<Vec<_>>() != expected {
+        return Err(anyhow!("unsupported Mom store physical schema"));
+    }
+    Ok(())
+}
+
+// SQLite can decline to invoke the busy handler when changing journal mode
+// would deadlock with a competing reader/initializer. Drop the entire failed
+// connection before retrying, so no read lock survives into the next attempt.
+// Retry only SQLITE_BUSY; identity, corruption and I/O errors stay terminal.
+fn retry_store_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match operation() {
+            Err(error)
+                if matches!(
+                    error.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::SqliteFailure(code, _))
+                        if code.code == rusqlite::ErrorCode::DatabaseBusy
+                ) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
 const STORE_KEY_ENV: &str = "LLAMA_NATIVE_KIT_STORE_KEY_HEX";
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "com.delysis.llama-native-kit.mom-llama.store.v1";
@@ -117,27 +226,32 @@ impl RuntimeStore {
     }
 
     pub(crate) fn open_with_key(data_dir: &Path, key: [u8; 32]) -> Result<Self> {
+        Self::open_with_key_at_creation(data_dir, key, || {})
+    }
+
+    fn open_with_key_at_creation(
+        data_dir: &Path,
+        key: [u8; 32],
+        before_creation: impl FnOnce(),
+    ) -> Result<Self> {
         fs::create_dir_all(data_dir)?;
         let store = Self {
             path: data_dir.join(DATABASE_FILE),
             key,
         };
-        let connection = store.connection()?;
-        connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS encrypted_documents (
-                namespace TEXT PRIMARY KEY NOT NULL,
-                nonce BLOB NOT NULL,
-                ciphertext BLOB NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS receipts (
-                receipt_id TEXT PRIMARY KEY NOT NULL,
-                command_id TEXT NOT NULL,
-                nonce BLOB NOT NULL,
-                ciphertext BLOB NOT NULL,
-                created_at INTEGER NOT NULL
-            );",
-        )?;
+        if !store.path.exists() {
+            before_creation();
+            initialize_store(data_dir, &store.path)?;
+        }
+        // Validate the published winner read-only, including a foreign database
+        // that appeared while our private candidate was being initialized.
+        let connection =
+            Connection::open_with_flags(&store.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        validate_schema(&connection)?;
+        drop(connection);
+        // Validate again on the exact connection before applying write pragmas.
+        let _connection = store.connection()?;
         Ok(store)
     }
 
@@ -546,11 +660,18 @@ impl RuntimeStore {
     }
 
     fn connection(&self) -> Result<Connection> {
-        let connection = Connection::open(&self.path)?;
-        connection.busy_timeout(Duration::from_secs(5))?;
+        retry_store_busy(|| self.connection_once())
+    }
+
+    fn connection_once(&self) -> Result<Connection> {
+        let connection =
+            Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(Duration::from_millis(100))?;
+        validate_schema(&connection)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        connection.busy_timeout(Duration::from_secs(5))?;
         Ok(connection)
     }
 
@@ -819,6 +940,188 @@ mod tests {
     use llama_native_cache::PrefixCacheValue;
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn journal_mode_contention_retries_after_releasing_the_failed_connection() -> Result<()> {
+        let dir = test_dir("journal-mode-contention");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(DATABASE_FILE);
+        initialize_store(&dir, &path)?;
+        let reader = Connection::open(&path)?;
+        reader.execute_batch("BEGIN; SELECT * FROM encrypted_documents;")?;
+        let store = RuntimeStore {
+            path,
+            key: [42; 32],
+        };
+        let (busy_tx, busy_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            retry_store_busy(|| {
+                let result = store.connection_once();
+                if result.is_err() {
+                    let _ = busy_tx.try_send(());
+                }
+                result
+            })
+        });
+        busy_rx.recv_timeout(Duration::from_secs(10))?;
+        reader.execute_batch("ROLLBACK")?;
+        let connection = worker.join().expect("journal mode worker")?;
+        let mode: String = connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
+        assert_eq!(mode, "wal");
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_first_opens_publish_one_complete_store() -> Result<()> {
+        let dir = test_dir("concurrent-first-opens");
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|index| {
+                let dir = dir.clone();
+                let ready = std::sync::Arc::clone(&ready);
+                std::thread::spawn(move || -> Result<()> {
+                    let store = RuntimeStore::open_with_key_at_creation(&dir, [42; 32], || {
+                        ready.wait();
+                    })?;
+                    store.put(&format!("concurrent-{index}"), &index)?;
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("initializer thread")?;
+        }
+        let store = RuntimeStore::open_with_key(&dir, [42; 32])?;
+        for index in 0..2 {
+            assert_eq!(
+                store.get::<u32>(&format!("concurrent-{index}"))?,
+                Some(index)
+            );
+        }
+        assert!(fs::read_dir(&dir)?.all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".runtime-init-")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_foreign_creation_is_never_replaced_or_stamped() -> Result<()> {
+        let dir = test_dir("foreign-first-open-winner");
+        let path = dir.join(DATABASE_FILE);
+        let mut before = Vec::new();
+        let result = RuntimeStore::open_with_key_at_creation(&dir, [42; 32], || {
+            let connection = Connection::open(&path).expect("foreign creator");
+            connection.execute_batch("CREATE TABLE foreign_data(value TEXT); INSERT INTO foreign_data VALUES ('preserved');").expect("foreign schema");
+            drop(connection);
+            before = fs::read(&path).expect("foreign bytes");
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path)?, before);
+        assert!(!dir.join("runtime.sqlite3-wal").exists());
+        assert!(!dir.join("runtime.sqlite3-shm").exists());
+        assert!(fs::read_dir(&dir)?.all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".runtime-init-")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn schema_preflight_accepts_exact_legacy_and_reopens_without_stamping() -> Result<()> {
+        let dir = test_dir("exact-legacy-schema");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join(DATABASE_FILE);
+        let connection = Connection::open(&path)?;
+        // Frozen original physical schema, independent of the current constant.
+        connection.execute_batch(
+            "CREATE TABLE encrypted_documents (
+                namespace TEXT PRIMARY KEY NOT NULL,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE receipts (
+                receipt_id TEXT PRIMARY KEY NOT NULL,
+                command_id TEXT NOT NULL,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                created_at INTEGER NOT NULL
+            );",
+        )?;
+        drop(connection);
+        let store = RuntimeStore::open_with_key(&dir, [42; 32])?;
+        store.put("legacy-record", &serde_json::json!({"preserve": true}))?;
+        drop(store);
+        let reopened = RuntimeStore::open_with_key(&dir, [42; 32])?;
+        assert_eq!(
+            reopened.get::<serde_json::Value>("legacy-record")?,
+            Some(serde_json::json!({"preserve": true}))
+        );
+        let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        for pragma in ["application_id", "user_version"] {
+            let value: i64 = connection.pragma_query_value(None, pragma, |row| row.get(0))?;
+            assert_eq!(value, 0, "legacy identifiers must remain unchanged");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn schema_preflight_rejects_changed_identity_on_an_existing_store_handle() -> Result<()> {
+        let dir = test_dir("schema-reopen");
+        let store = RuntimeStore::open_with_key(&dir, [42; 32])?;
+        store.put("preserved", &"original")?;
+        let connection = Connection::open(store.path())?;
+        connection.pragma_update(None, "user_version", 99)?;
+        drop(connection);
+        let before = fs::read(store.path())?;
+        assert!(store.put("preserved", &"changed").is_err());
+        assert!(RuntimeStore::open_with_key(&dir, [42; 32]).is_err());
+        assert_eq!(fs::read(store.path())?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn schema_preflight_rejects_foreign_future_and_partial_without_mutation() -> Result<()> {
+        for (label, sql) in [
+            ("foreign", "PRAGMA application_id=1234;"),
+            ("future", "PRAGMA user_version=99;"),
+            (
+                "partial",
+                "CREATE TABLE encrypted_documents(namespace TEXT);",
+            ),
+            ("extra", "CREATE TABLE alien(value TEXT);"),
+        ] {
+            let dir = test_dir(label);
+            fs::create_dir_all(&dir)?;
+            let path = dir.join(DATABASE_FILE);
+            let connection = Connection::open(&path)?;
+            if matches!(label, "foreign" | "future") {
+                connection.execute_batch(STORE_SCHEMA)?;
+            }
+            connection.execute_batch(sql)?;
+            drop(connection);
+            let before = fs::read(&path)?;
+            assert!(
+                RuntimeStore::open_with_key(&dir, [42; 32]).is_err(),
+                "{label}"
+            );
+            assert_eq!(
+                fs::read(&path)?,
+                before,
+                "rejected store was changed: {label}"
+            );
+            assert!(!dir.join("runtime.sqlite3-wal").exists());
+            assert!(!dir.join("runtime.sqlite3-shm").exists());
+        }
+        Ok(())
+    }
 
     #[test]
     fn unit_test_key_selection_does_not_depend_on_the_mutable_data_dir_override() {
@@ -1272,7 +1575,7 @@ mod tests {
         let connection = Connection::open(reopened.path())?;
         let user_version: i64 =
             connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        assert_eq!(user_version, 0);
+        assert_eq!(user_version, STORE_SCHEMA_VERSION);
         let encrypted_rows: i64 = connection.query_row(
             "SELECT COUNT(*) FROM encrypted_documents WHERE namespace = ?1",
             [CONVERSATIONS_NAMESPACE],

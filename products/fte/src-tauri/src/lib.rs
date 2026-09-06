@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod acceptance;
 pub mod catalog;
 pub mod commands;
@@ -86,6 +88,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::playground_start,
+            commands::playground_wait,
+            commands::playground_cancel,
             commands::chat_request,
             commands::completion_request,
             commands::configure_local_model,

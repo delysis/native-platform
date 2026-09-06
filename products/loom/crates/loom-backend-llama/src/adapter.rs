@@ -2272,6 +2272,7 @@ mod tests {
                 cache: GenerationCacheMetrics {
                     supplied_prefix_tokens: 0,
                     restored_prefix_tokens: 0,
+                    replayed_prefix_tokens: 0,
                     batch_shared_prefix_tokens: 6,
                     resident_prefix_tokens: 0,
                 },

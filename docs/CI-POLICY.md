@@ -20,8 +20,7 @@ entry binds the exact Cargo test ID to a workspace package, source file, exact
 Cargo target identity, and explicit platform availability. Target records are
 validated against locked Cargo metadata by package, target name, target kinds,
 target source, and manifest. Entries also state their prerequisite and evidence
-class and explicitly record what that test cannot promote. The registry has 37
-tests: 37 are available on macOS, 36 on Linux, and 33 on Windows.
+class and explicitly record what that test cannot promote. The [registry](../ci/ignored-tests.json) is the current test inventory and records each test's supported platforms.
 
 The structural validator runs in ordinary policy CI. Ignored tests must use the
 canonical private `fn` or `async fn` form, an explicit `#[test]` or

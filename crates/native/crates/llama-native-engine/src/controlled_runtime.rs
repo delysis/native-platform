@@ -1229,6 +1229,7 @@ fn execute_disabled_baseline(
             reasoning_forces: &reasoning,
         },
         BatchSequenceState {
+            fingerprint: request.control().writer().fingerprint(),
             tracking,
             resident: None,
         },
@@ -1667,6 +1668,7 @@ fn execute_active_controls(
                 cache: GenerationCacheMetrics {
                     supplied_prefix_tokens: 0,
                     restored_prefix_tokens: 0,
+                    replayed_prefix_tokens: 0,
                     batch_shared_prefix_tokens: layout.conditional_shared_prefix,
                     resident_prefix_tokens: 0,
                 },
