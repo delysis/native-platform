@@ -78,6 +78,7 @@ const elementIds = [
   'stat-headroom',
   'stat-latency',
   'stat-tokens',
+  'stat-tokens-context',
   'stat-requests',
   'live-health-list',
   'onboarding-grid',
@@ -237,4 +238,64 @@ test('desktop setup reports saved-model failure and picker success without expos
     'choose_local_model',
     { expectedSha256: 'a'.repeat(64) },
   ]);
+});
+
+test('Playground Stop retains intent before start reply and enables another request after cancellation', async () => {
+  const elements = new Map([...elementIds, 'chat-history', 'chat-placeholder'].map((id) => [id, new FakeElement(id)]));
+  elements.get('playground-mode').value = 'chat';
+  elements.get('setting-port').value = '1337';
+  const calls = [];
+  let resolveStart;
+  let rejectResult;
+  let requests = 0;
+  const firstStart = new Promise((resolve) => { resolveStart = resolve; });
+  const firstResult = new Promise((_, reject) => { rejectResult = reject; });
+  const invoke = async (command, args) => {
+    calls.push([command, args]);
+    switch (command) {
+      case 'get_dashboard_stats': return { headroom: null, avg_latency: 0, total_tokens: 0, unknown_usage_requests: 2, request_count: 2 };
+      case 'get_providers': return [];
+      case 'get_models': return [{ id: 'auto', display_name: 'Auto', providers: [], supports_chat_completions: true, prompt_semantics: [] }];
+      case 'get_master_profile': return {};
+      case 'get_local_model_status': return { state: 'not_configured', detail: 'Not configured' };
+      case 'plugin:free-token-energy|loopback_status': return { enabled: false, addresses: [] };
+      case 'playground_start': requests += 1; return requests === 1 ? firstStart : 'request-two';
+      case 'playground_cancel': return true;
+      case 'playground_wait': return args.requestId === 'request-one' ? firstResult : { choices: [{ message: { role: 'assistant', content: 'finished' } }] };
+      default: throw new Error(`Unexpected command: ${command}`);
+    }
+  };
+  globalThis.window = { __TAURI__: { core: { invoke } } };
+  globalThis.document = {
+    body: new FakeElement('body'), createElement: () => new FakeElement(),
+    getElementById: (id) => elements.get(id), querySelector: () => null, querySelectorAll: () => [],
+  };
+  await import(`../src/main.js?stop-test=${Date.now()}`);
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+  await flush();
+  assert.equal(elements.get('stat-tokens-context').textContent, 'Partial · 2 requests without usage');
+  elements.get('chat-model').value = 'auto';
+  elements.get('chat-input').value = 'hello';
+  const submit = () => elements.get('chat-form').listeners.get('submit')({ preventDefault() {} });
+  submit();
+  assert.equal(elements.get('chat-send').textContent, 'Stop');
+  assert.equal(elements.get('chat-send').disabled, false);
+  submit();
+  assert.equal(elements.get('chat-send').textContent, 'Stopping…');
+  assert.equal(calls.filter(([command]) => command === 'playground_cancel').length, 0);
+  resolveStart('request-one');
+  await flush();
+  assert.deepEqual(calls.filter(([command]) => command === 'playground_cancel'), [['playground_cancel', { requestId: 'request-one' }]]);
+  rejectResult(new Error('request_cancelled: cancellation acknowledged'));
+  await flush();
+  assert.equal(elements.get('chat-send').textContent, 'Send request');
+  assert.equal(elements.get('chat-input').disabled, false);
+  assert.equal(elements.get('playground-mode').disabled, false);
+  assert.equal(elements.get('chat-history').children.filter((item) => item.className === 'chat-message chat-error').length, 1);
+  elements.get('chat-input').value = 'next';
+  submit();
+  await flush();
+  assert.equal(requests, 2);
+  assert.equal(elements.get('chat-send').textContent, 'Send request');
+  assert.equal(elements.get('chat-history').children.at(-1).children[1].textContent, 'finished');
 });

@@ -10,6 +10,7 @@ use fte_types::{
 };
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -371,8 +372,80 @@ impl LifecycleControl {
     }
 }
 
+/// Application-owned, metadata-only terminal observation. Implementations
+/// must not panic or retain model output, request prompts, or credentials.
+pub trait GatewayOutcomeObserver: Send + Sync {
+    fn observe(&self, outcome: &GatewayOutcome);
+}
+
+#[derive(Debug)]
+pub struct GatewayOutcome {
+    pub request_id: RequestId,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub tokens: Option<u64>,
+    pub elapsed: Duration,
+    pub status: u16,
+}
+
+fn observe_gateway_outcome(
+    observer: &Arc<dyn GatewayOutcomeObserver>,
+    request_id: RequestId,
+    selected: Option<ResolvedRoute>,
+    elapsed: Duration,
+    result: &Result<fte_types::GatewayResponse, GatewayError>,
+) {
+    let (provider, model, tokens, status) = match result {
+        Ok(response) => (
+            Some(response.route.backend_id.clone()),
+            Some(response.route.model_id.clone()),
+            response
+                .usage
+                .input_tokens
+                .zip(response.usage.output_tokens)
+                .map(|(input, output)| input.saturating_add(output)),
+            match response.status {
+                TerminalStatus::Completed => 200,
+                TerminalStatus::Cancelled => 499,
+                TerminalStatus::Failed => 500,
+            },
+        ),
+        Err(error) => (
+            selected
+                .as_ref()
+                .map(|route| route.backend_id.clone())
+                .or_else(|| error.provider.clone()),
+            selected.map(|route| route.model_id),
+            None,
+            error.http_status,
+        ),
+    };
+    let outcome = GatewayOutcome {
+        request_id,
+        provider,
+        model,
+        tokens,
+        elapsed,
+        status,
+    };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer.observe(&outcome)));
+}
+
+fn request_cancelled(request_id: &RequestId) -> GatewayError {
+    GatewayError {
+        code: "request_cancelled".into(),
+        class: ErrorClass::Cancelled,
+        retryable: false,
+        http_status: 499,
+        request_id: request_id.clone(),
+        provider: None,
+        safe_detail: "the request was cancelled before backend dispatch".into(),
+    }
+}
+
 pub struct Gateway {
     defaults: GatewayDefaults,
+    observer: Option<Arc<dyn GatewayOutcomeObserver>>,
     state: RwLock<GatewayState>,
     lifecycle: Arc<LifecycleControl>,
 }
@@ -391,9 +464,16 @@ impl Gateway {
     pub fn new(defaults: GatewayDefaults) -> Self {
         Self {
             defaults,
+            observer: None,
             state: RwLock::new(GatewayState::default()),
             lifecycle: Arc::new(LifecycleControl::default()),
         }
+    }
+
+    #[must_use]
+    pub fn with_outcome_observer(mut self, observer: Arc<dyn GatewayOutcomeObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     pub fn register_backend(&self, backend: Arc<dyn GatewayBackend>) -> Result<(), GatewayError> {
@@ -484,7 +564,45 @@ impl Gateway {
     }
 
     pub async fn execute(&self, request: GatewayRequest) -> Result<GatewayTicket, GatewayError> {
+        self.execute_with_cancellation(request, Arc::new(fte_types::RequestCancellation::default()))
+            .await
+    }
+
+    pub async fn execute_with_cancellation(
+        &self,
+        request: GatewayRequest,
+        cancellation: Arc<fte_types::RequestCancellation>,
+    ) -> Result<GatewayTicket, GatewayError> {
+        let started = Instant::now();
+        let request_id = request.request_id.clone();
+        let mut selected_route = None;
+        let result = self
+            .execute_inner(request, Arc::clone(&cancellation), &mut selected_route)
+            .await;
+        if let Err(error) = &result
+            && let Some(observer) = self.observer.as_ref()
+        {
+            observe_gateway_outcome(
+                observer,
+                request_id,
+                selected_route,
+                started.elapsed(),
+                &Err(error.clone()),
+            );
+        }
+        result
+    }
+
+    async fn execute_inner(
+        &self,
+        request: GatewayRequest,
+        cancellation: Arc<fte_types::RequestCancellation>,
+        selected_route: &mut Option<ResolvedRoute>,
+    ) -> Result<GatewayTicket, GatewayError> {
         let started_at = Instant::now();
+        if cancellation.is_cancelled() {
+            return Err(request_cancelled(&request.request_id));
+        }
         request.validate()?;
         let request_id = request.request_id.clone();
         self.lifecycle.ensure_running(&request_id)?;
@@ -501,10 +619,13 @@ impl Gateway {
             if attempt > 0 && !fallback_allowed {
                 break;
             }
-            let lease = match self
-                .admit(&request_id, &request, admission, started_at.elapsed())
-                .await
-            {
+            *selected_route = Some(route.clone());
+            let admission = tokio::select! {
+                biased;
+                () = cancellation.cancelled() => Err(request_cancelled(&request_id)),
+                result = self.admit(&request_id, &request, admission, started_at.elapsed()) => result,
+            };
+            let lease = match admission {
                 Ok(lease) => lease,
                 Err(error) if retryable_setup_failure(fallback_allowed, &error) => {
                     last_error = Some(error);
@@ -529,10 +650,35 @@ impl Gateway {
                     return Err(error);
                 }
             };
+            if cancellation.is_cancelled() {
+                let error = request_cancelled(&request_id);
+                lease.finish_error(&error)?;
+                return Err(error);
+            }
             let execution = backend.execute(BackendRequest {
                 request: request.clone(),
                 route,
             });
+            let execution = async {
+                let mut execution = std::pin::pin!(execution);
+                // Production backends register their cancellation owner before
+                // their first suspension. Poll once before servicing Stop so
+                // cancellation cannot disappear before backend registration.
+                let first =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(execution.as_mut().poll(cx)))
+                        .await;
+                if let std::task::Poll::Ready(result) = first {
+                    return result;
+                }
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        backend.cancel(&request_id, CancelTarget::Request);
+                        execution.await
+                    }
+                    result = &mut execution => result,
+                }
+            };
             let result = if let Some(startup_limit) = startup_limit {
                 match tokio::time::timeout(startup_limit, execution).await {
                     Ok(result) => result,
@@ -548,11 +694,30 @@ impl Gateway {
                         lease.finish_error(&error)?;
                         return Err(error);
                     }
-                    return Ok(ticket.with_admission_lease_and_deadlines(
+                    let observer = self.observer.clone().map(|observer| {
+                        let request_id = request_id.clone();
+                        let selected = selected_route.clone();
+                        Box::new(
+                            move |result: &Result<fte_types::GatewayResponse, GatewayError>| {
+                                observe_gateway_outcome(
+                                    &observer,
+                                    request_id,
+                                    selected,
+                                    started_at.elapsed(),
+                                    result,
+                                );
+                            },
+                        ) as fte_types::GatewayTerminalObserver
+                    });
+                    return Ok(ticket.with_admission_lease_deadlines_and_hooks(
                         Box::new(lease),
                         deadline,
                         started_at.elapsed(),
                         event_capacity,
+                        fte_types::GatewayExecutionHooks {
+                            cancellation: Some(Arc::clone(&cancellation)),
+                            observer,
+                        },
                     ));
                 }
                 Err(error) => {
@@ -2054,6 +2219,115 @@ mod tests {
                 .forget();
             Ok(())
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slow_observer_cannot_release_identity_before_public_final_publication() {
+        struct BlockingObserver {
+            entered: Mutex<Option<oneshot::Sender<()>>>,
+            release: Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl GatewayOutcomeObserver for BlockingObserver {
+            fn observe(&self, outcome: &GatewayOutcome) {
+                if outcome.status != 200 {
+                    return;
+                }
+                if let Some(entered) = self.entered.lock().expect("entry").take() {
+                    entered.send(()).expect("observer entry");
+                    self.release
+                        .lock()
+                        .expect("release gate")
+                        .recv_timeout(Duration::from_secs(5))
+                        .expect("observer release");
+                }
+            }
+        }
+        let (entered, entry) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let gateway = Gateway::new(GatewayDefaults::default()).with_outcome_observer(Arc::new(
+            BlockingObserver {
+                entered: Mutex::new(Some(entered)),
+                release: Mutex::new(released),
+            },
+        ));
+        let completion = Arc::new(Mutex::new(None));
+        gateway
+            .register_backend(Arc::new(DelayedFinalBackend {
+                completion: Arc::clone(&completion),
+                cancellations: Arc::new(AtomicUsize::new(0)),
+            }))
+            .expect("backend");
+        let request = request();
+        let ticket = gateway.execute(request.clone()).await.expect("admitted");
+        completion
+            .lock()
+            .expect("completion")
+            .take()
+            .expect("backend final")
+            .send(Ok(completed_response(
+                request.request_id.clone(),
+                "delayed-final",
+            )))
+            .expect("complete backend");
+        tokio::time::timeout(Duration::from_secs(5), entry)
+            .await
+            .expect("observer entered")
+            .expect("entry signal");
+        let mut final_result = std::pin::pin!(ticket.final_response());
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(final_result.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        assert_eq!(
+            gateway
+                .execute(request)
+                .await
+                .expect_err("identity stays reserved")
+                .code,
+            "request_already_active"
+        );
+        release.send(()).expect("unblock observer");
+        final_result.await.expect("public final");
+        wait_for_no_active(&gateway).await;
+    }
+
+    #[tokio::test]
+    async fn timeout_observer_runs_once_and_executor_stays_owned_until_backend_drain() {
+        #[derive(Default)]
+        struct Observed(Mutex<Vec<u16>>);
+        impl GatewayOutcomeObserver for Observed {
+            fn observe(&self, outcome: &GatewayOutcome) {
+                self.0.lock().expect("outcomes").push(outcome.status);
+            }
+        }
+        let observer = Arc::new(Observed::default());
+        let gateway =
+            Gateway::new(GatewayDefaults::default()).with_outcome_observer(observer.clone());
+        let completion = Arc::new(Mutex::new(None));
+        gateway
+            .register_backend(Arc::new(DelayedFinalBackend {
+                completion: Arc::clone(&completion),
+                cancellations: Arc::new(AtomicUsize::new(0)),
+            }))
+            .expect("backend");
+        let mut request = request();
+        request.deadline.total_ms = Some(10);
+        let id = request.request_id.clone();
+        let ticket = gateway.execute(request).await.expect("admitted");
+        let error = ticket.final_response().await.expect_err("deadline");
+        assert_eq!(error.class, ErrorClass::Timeout);
+        assert_eq!(*observer.0.lock().expect("outcomes"), vec![504]);
+        assert_eq!(gateway.status().active_requests, 1);
+        completion
+            .lock()
+            .expect("completion")
+            .take()
+            .expect("backend final")
+            .send(Ok(completed_response(id, "delayed-final")))
+            .expect("late final");
+        wait_for_no_active(&gateway).await;
+        assert_eq!(*observer.0.lock().expect("outcomes"), vec![504]);
     }
 
     #[tokio::test]

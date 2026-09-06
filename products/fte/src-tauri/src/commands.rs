@@ -5,6 +5,36 @@ use tauri::{AppHandle, State};
 use tauri_plugin_dialog::DialogExt;
 
 #[tauri::command]
+pub async fn playground_start(
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
+    req: serde_json::Value,
+    mode: String,
+) -> Result<String, String> {
+    runtime
+        .inner()
+        .start_playground(req, &mode)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn playground_cancel(
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
+    request_id: String,
+) -> Result<bool, String> {
+    runtime
+        .cancel_playground(&request_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn playground_wait(
+    runtime: State<'_, Arc<GatewayRuntimeOwner>>,
+    request_id: String,
+) -> Result<serde_json::Value, String> {
+    runtime.wait_playground(&request_id).await
+}
+
+#[tauri::command]
 pub async fn chat_request(
     runtime: State<'_, Arc<GatewayRuntimeOwner>>,
     req: serde_json::Value,
@@ -161,6 +191,7 @@ pub async fn get_dashboard_stats(
 
     Ok(serde_json::json!({
         "total_tokens": summary.total_tokens,
+        "unknown_usage_requests": summary.unknown_usage_requests,
         "avg_latency": summary.avg_latency_ms,
         "request_count": summary.request_count,
         "headroom": headroom,

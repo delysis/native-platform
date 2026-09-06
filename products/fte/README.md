@@ -166,3 +166,15 @@ cargo check --all-targets --all-features --manifest-path src-tauri/Cargo.toml
 Provider research notes and machine-readable policies are kept in
 `research/provider-gateways/`. Local cloned reference repositories under that
 directory are intentionally ignored rather than vendored.
+
+## Request activity storage
+
+Current request activity storage uses schema v2. The sole supported upgrade is
+the exact FTE v1 application ID and complete schema object set; it transactionally
+preserves existing IDs, rows and profile/model metadata while allowing new
+`tokens_used` values to be null when usage is unknown. Unversioned, foreign,
+future and altered schemas remain rejected before migration. Historical v1 zeros
+remain unchanged and can mean either zero or unavailable usage; the upgrade does
+not relabel them as measured zeros. Recorded token aggregates sum stored counts,
+not a claim that every request reported usage. Both desktop and authenticated
+loopback generation outcomes now enter the same metadata-only terminal observer.

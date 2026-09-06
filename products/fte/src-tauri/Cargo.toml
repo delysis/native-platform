@@ -45,4 +45,5 @@ llama-native-types.workspace = true
 tauri-plugin-free-token-energy = { path = "../crates/tauri-plugin-free-token-energy", features = ["native-llama"] }
 
 [dev-dependencies]
+fte-loopback = { path = "../crates/fte-loopback" }
 async-trait = "0.1.92"

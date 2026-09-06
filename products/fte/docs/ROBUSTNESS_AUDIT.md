@@ -75,3 +75,10 @@ evidence.
 
 Run one authorized hosted-provider chat and completion request when a revocable
 credential is already available, without weakening the fixture gates.
+
+## Subsequent activity-storage change (2026-09-06)
+
+The [current storage contract](../README.md#request-activity-storage) adds an
+exact-v1-to-v2 transactional upgrade, explicit unknown usage, and shared desktop/
+loopback activity recording. The earlier verification receipts above retain
+their original scope.

@@ -2118,6 +2118,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "fte-backend-llama",
+ "fte-loopback",
  "fte-protocols",
  "fte-providers",
  "fte-router",
