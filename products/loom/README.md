@@ -2,7 +2,7 @@
 
 Loom Native is an early, local-first desktop writing environment for prose and poetry. Active manuscripts remain ordinary UTF-8 files; a hidden `.loom/` sidecar holds revisions, provenance, transient crash-recovery drafts, branch records, and visible-file recovery state.
 
-This repository is an executable development foundation, not a finished release. Editing, storage, model inspection, private local suggestions, and the headless native fiction-research kernel work today. The desktop ingests bounded project images and has a separate completion-context path: text-bearing files are canonicalized locally, while fully decoded PNG, JPEG, and WAV payloads are retained byte-for-byte for direct Gemma 4 image/audio input. The exact quiet desktop has completed a real Gemma 4 E2B base Q8 Metal suggestion, caret-ghost acceptance, durable promotion, loaded-model quit, and immediate-relaunch exercise. There are no signed installers, hosted-provider or speech adapters, or release-certified platform backends.
+This repository is an executable development foundation, not a finished release. Editing, storage, model inspection, and private local suggestions are implemented; the former research engine is archived. The desktop ingests bounded project images and has a separate completion-context path: text-bearing files are canonicalized locally, while fully decoded PNG, JPEG, and WAV payloads are retained byte-for-byte for direct Gemma 4 image/audio input. The exact quiet desktop has completed a real Gemma 4 E2B base Q8 Metal suggestion, caret-ghost acceptance, durable promotion, loaded-model quit, and immediate-relaunch exercise. There are no signed installers, hosted-provider adapters, or release-certified platform backends. Local dictation uses the sibling Speech service; its lifecycle is separate from native image/audio completion context.
 
 See [Implementation status](docs/implementation-status.md) for the exact verified/deferred boundary and live migration number. [Project format v1](docs/format-v1.md) records the format rationale.
 
@@ -28,13 +28,13 @@ See [Implementation status](docs/implementation-status.md) for the exact verifie
 - A safe-Rust, headless fiction-research stack with bounded pack/manifests, exact prompt and source evidence, verified writer admission, assemblies and projections, immutable research storage, hard gates and pairwise evaluation, frozen trials, resumable campaigns, sealed benchmarks, QD archives, deterministic learned heads, and a diagnostic-only frontier-critic adapter. It is not yet a complete product campaign UI or a set of empirically qualified frozen profiles.
 - A JSON-emitting CLI for project initialization, open, import, checkpoint, recovery, export, read-only reconciliation preview, and identity-bound reconciliation apply.
 
-## Pinned native dependency
+## Native dependency
 
-The inference, evaluation, and trial crates pin their `llama-native-kit` dependencies to exact successor commit `f7a69316c64d857b99bd847dd44cd852fc5b4ca4`. The pin adds move-only polling and exact ordinary-generation token-piece traces to the prior product-neutral controlled-generation, embedding, executor-lease, build-identity, artifact-verification, residency, and joined-shutdown contracts. At this receipt's cutoff the successor commit exists only in the local native-kit repository, so ordinary remote Cargo resolution cannot build this tree until the commit is published. Changing the pin requires complete consumer compatibility and real-GGUF revalidation.
+Loom uses root-workspace path dependencies in `crates/native`. The root `Cargo.lock` pins external native dependencies; there is no unpublished sibling-repository commit required to resolve the current workspace. Native changes require consumer compatibility checks and separately identified real-model evidence.
 
 ## Build and test
 
-The workspace declares Rust 1.88 as its minimum version. The full workspace check passed locally with Rust 1.88, and CI runs the same minimum-version check on Linux alongside current-toolchain Rust jobs on Linux, macOS, and Windows. Node.js and pnpm are also required. From the repository root:
+The root workspace pins Rust 1.92.0. Node.js and pnpm are also required. From the monorepo root:
 
 ```sh
 pnpm install --frozen-lockfile
@@ -62,7 +62,7 @@ Run a frontend-only preview, which has no native IPC:
 pnpm --filter @delysis/loom dev
 ```
 
-Run the macOS development desktop app after the pinned native dependency has been fetched or is available in Cargo's cache:
+Run the macOS development desktop app after locked dependencies have been fetched or are available in Cargo's cache:
 
 ```sh
 pnpm --filter @delysis/loom tauri dev
@@ -135,7 +135,7 @@ Visible files are authoritative for the active manuscript. `.loom/` is authorita
 - Project-relative path traversal and document symlinks are refused. External file changes are not overwritten silently.
 - Newly created Unix sidecar directories/files request owner-only `0700`/`0600` modes while visible manuscript and pre-existing user permissions are preserved.
 - Test fixtures are labeled as fixtures; the llama adapter rejects fixture output presented as live inference.
-- `.gitleaks.toml` and a SHA-pinned GitHub security workflow define full-history secret scanning plus pull-request dependency review. No remote run is claimed here, and the workflow covers this repository rather than historical family repositories.
+- Root workflows are `ci-pr.yml`, `ci-full.yml`, and `release-macos.yml`. They enforce the configured policy, tests, and dependency-graph checks; this repository does not currently run a separate secret-scanning or dependency-review workflow. `.gitleaks.toml` is configuration, not evidence that a scan ran.
 - General backups, signed update delivery, and platform hardening remain release work.
 
 ## License

@@ -120,22 +120,6 @@ jobs:
       - if: runner.os == 'Linux'
         run: node scripts/ci/cargo-group.mjs clippy service-information
 
-  information-platform-linux:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with:
-          fetch-depth: 0
-      - run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            libasound2-dev libayatana-appindicator3-dev libglib2.0-dev libgtk-3-dev \
-            librsvg2-dev libwebkit2gtk-4.1-dev patchelf pkg-config
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
-        with:
-          toolchain: "1.92.0"
-          components: clippy
-
   speech:
     strategy:
       fail-fast: false
@@ -232,10 +216,13 @@ jobs:
           corepack enable
           corepack prepare pnpm@11.16.0 --activate
           pnpm install --frozen-lockfile
+          pnpm --filter @delysis/loom exec playwright install webkit
       - run: node scripts/ci/cargo-group.mjs fmt product-loom
       - run: node scripts/ci/cargo-group.mjs test product-loom
       - if: runner.os == 'Linux'
         run: node scripts/ci/cargo-group.mjs clippy product-loom
+      - if: runner.os == 'macOS'
+        run: pnpm --filter @delysis/loom run test:browser
       - if: runner.os == 'macOS'
         run: pnpm --filter @delysis/loom exec tauri build --debug
 
@@ -294,7 +281,6 @@ jobs:
       - root
       - attachment
       - information-portable
-      - information-platform-linux
       - speech
       - mom
       - loom
