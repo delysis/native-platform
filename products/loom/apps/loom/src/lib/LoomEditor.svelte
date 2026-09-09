@@ -276,10 +276,18 @@
   ): void {
     const editorView = view;
     if (!editorView || editorView.isDestroyed) return;
-    editorView.setProps({
-      editable: () => !snapshot.readonly,
-      attributes: editorAttributes(snapshot.label)
-    });
+    const attributes = editorAttributes(snapshot.label);
+    const previous = typeof editorView.props.attributes === 'function'
+      ? undefined : editorView.props.attributes;
+    if (
+      editorView.editable === snapshot.readonly ||
+      Object.keys(attributes).length !== Object.keys(previous ?? {}).length ||
+      Object.entries(attributes).some(([key, value]) => previous?.[key] !== value)
+    ) {
+      // A redundant setProps can restore stale ProseMirror selection before
+      // WebKit reports the default caret movement from the preceding key.
+      editorView.setProps({ editable: () => !snapshot.readonly, attributes });
+    }
     const anchorByteOffset = snapshot.anchorByteOffset;
     const provenAnchorByteOffset = anchorByteOffset ?? -1;
     const exactAnchor = anchorByteOffset !== null &&

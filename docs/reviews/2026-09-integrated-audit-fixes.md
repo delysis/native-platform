@@ -30,8 +30,14 @@ qualification is unfinished; it is not a declaration that the audit is complete.
 - F5: Mom callers receive an explicit runtime-owned operation scope. The global
   host lookup and duplicate ambient-call wrappers are removed. A production
   owner constructs its host, binds configuration, cancels its scope on drop,
-  and joins its workers. Independently owned runtimes cannot discover each
+  and joins its workers. Native-host access does not recursively lock the
+  operation registry during Persona admission. Independently owned runtimes cannot discover each
   other's host through ambient state.
+- Native empty-output receipts now report an engine invocation when inference
+  actually ran, even when it produced no visible text.
+- Loom skips redundant editor property updates so WebKit default caret movement
+  cannot be overwritten by stale ProseMirror selection. Native modifier-key
+  rollback and refocus scenarios verify the resulting caret and document state.
 - F7: the production native worker supervisor invalidates Ready/active state on
   unwind, including poisoned status locks, and preserves the failed join.
 - NP-008/F20: Information publication/removal errors retain exact committed
@@ -91,34 +97,37 @@ storage failure. The independent valid ZIM archive also failed before repair.
 
 With the complete Rust 1.92 toolchain on PATH:
 
-- FTE loopback 12, protocols 12, store 2; Information host 6 and store 27;
-  Mom runtime library 177 passed, none ignored. These precede the latest Mom
-  scope/catalog refactor.
-- Loom's current-schema library run passed 122 tests, none ignored. This precedes
-  the additional platform guards and damaged-project-open regression.
+- Consolidated workspace execution passed 1,590 tests in 63 harnesses, with 43
+  fixture-dependent tests ignored. This includes the inherited lifecycle,
+  redirect, Speech, FTE, Information, and current Mom/Loom store regressions.
+  A final run after the empty-output receipt correction is in progress.
+- Strict workspace/all-target Clippy passed after all current Rust repairs.
 - The wrapper's real CPU capacity test passed for zero, one, and undersized
   buffers with canaries, then exact export/restore: 1 passed, none ignored.
 - Native saved-prefix live/durable restoration and context rejection passed;
   strict pre-cancelled batch handling passed: two exact tests, none ignored.
   These are native-boundary results, not packaged product acceptance.
-- The consolidated Mom/runtime/CLI/desktop check reached product callers after
-  rebuilding the native feature variant. It found one missing scope in the
-  desktop cache-clear callback, now repaired. The workspace all-target test run
-  is the next compilation and execution gate.
+- The first real Mom product-cache execution reached native CPU inference but
+  returned empty text. Its receipt incorrectly denied that invocation. That
+  production bug is repaired; the bounded cache fixture now uses a smaller
+  context and disables reasoning parsing. Its rerun is pending.
 
 Other observed checks:
 
-- Simplified metadata/planner checks: 37 passed, none skipped.
-- Workflow checks before the helper-file rename: 41 passed.
+- Full WebKit interaction suite: 74 passed after the caret repair; Svelte check
+  reports zero errors and warnings. A source-string assertion tied to the old
+  spelling of the editor update was removed; real browser behavior is tested.
+- Simplified metadata/planner checks: 37 passed. Consolidated workflow/planner,
+  ignored-registry, and backup checks passed without skips.
 - Mom architecture and contracts passed (102 commands, 99 affordances, 46 effects,
   36 parity rows, 58 upstream settings, zero blockers).
 - Current-document paths and ignored-test source registry validation passed.
 - Root/fuzz cargo-deny checks and JavaScript advisory scan passed after repairs.
-  Optimized GLib runtime execution and bounded fuzz execution still need results.
+  Optimized GLib runtime execution and bounded fuzz execution need CI results.
 
 Earlier Rust 1.95 results and a disk-full Rust 1.92 attempt are not substituted
-for current qualification. Future commands select the entire 1.92 toolchain on
-PATH and reuse the active shared target directory.
+for current qualification. Commands select the entire 1.92 toolchain on PATH
+and reuse the active shared target directory.
 
 ## External wrapper
 

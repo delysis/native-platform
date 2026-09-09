@@ -474,10 +474,10 @@ pub fn resident_model_for_slot(
             "The requested resident model slot is outside the configured bound.",
         ));
     }
-    if requested_model_path.is_none() {
-        if let Some(handle) = with_host(scope, settings, |host| Ok(host.handle(slot_id)))? {
-            return Ok(handle);
-        }
+    if requested_model_path.is_none()
+        && let Some(handle) = with_host(scope, settings, |host| Ok(host.handle(slot_id)))?
+    {
+        return Ok(handle);
     }
     let Some(model_path) = requested_model_path else {
         return Err(ValidationBlocker {

@@ -27,7 +27,7 @@ test("Persona data is projected once per Rust render path", () => {
     ["render_sidebar_fragment", "\npub fn render_settings_fragment"],
     ["render_settings_fragment", "\nstruct AppProjection"],
   ]) {
-    const body = between(view, `pub fn ${renderer}()`, end);
+    const body = between(view, `pub fn ${renderer}(`, end);
     assert.ok(body.includes("let personas = persona_projection();"), `${renderer} must project Personas once`);
   }
 

@@ -72,16 +72,13 @@ fn initialize_store(data_dir: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Legacy v0 has the identical physical schema. Do not stamp it or rewrite
-/// encrypted records: older binaries and retained keys remain compatible.
+/// Accept only this build's store identity and schema. Incompatible stores
+/// remain untouched; unreleased formats have no implicit upgrade path.
 fn validate_schema(connection: &Connection) -> Result<()> {
     let application_id: i64 =
         connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-    if !matches!(
-        (application_id, version),
-        (0, 0) | (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION)
-    ) {
+    if (application_id, version) != (STORE_APPLICATION_ID, STORE_SCHEMA_VERSION) {
         return Err(anyhow!("unsupported Mom store identity or schema version"));
     }
     let mut statement = connection
@@ -1049,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_preflight_accepts_exact_legacy_and_reopens_without_stamping() -> Result<()> {
+    fn schema_preflight_refuses_unversioned_encrypted_schema_without_mutation() -> Result<()> {
         let dir = test_dir("exact-legacy-schema");
         fs::create_dir_all(&dir)?;
         let path = dir.join(DATABASE_FILE);
@@ -1071,19 +1068,10 @@ mod tests {
             );",
         )?;
         drop(connection);
-        let store = RuntimeStore::open_with_key(&dir, [42; 32])?;
-        store.put("legacy-record", &serde_json::json!({"preserve": true}))?;
-        drop(store);
-        let reopened = RuntimeStore::open_with_key(&dir, [42; 32])?;
-        assert_eq!(
-            reopened.get::<serde_json::Value>("legacy-record")?,
-            Some(serde_json::json!({"preserve": true}))
-        );
-        let connection = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        for pragma in ["application_id", "user_version"] {
-            let value: i64 = connection.pragma_query_value(None, pragma, |row| row.get(0))?;
-            assert_eq!(value, 0, "legacy identifiers must remain unchanged");
-        }
+        let before = fs::read(&path)?;
+        assert!(RuntimeStore::open_with_key(&dir, [42; 32]).is_err());
+        assert_eq!(fs::read(&path)?, before);
+        assert!(!path.with_extension("sqlite3-wal").exists());
         Ok(())
     }
 

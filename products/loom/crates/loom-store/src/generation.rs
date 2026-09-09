@@ -4756,13 +4756,36 @@ mod tests {
         assert_eq!(reopened_page.branches.len(), 4);
         assert_family_authority(&reopened_page, &first_family, first_command_id);
         assert_family_authority(&reopened_page, &second_family, second_command_id);
+    }
+
+    fn assert_family_authority(
+        page: &StoredBranchPage,
+        family: &GenerationFamilyStarted,
+        command_id: CommandId,
+    ) {
+        for generation in &family.generations {
+            let summary = page
+                .branches
+                .iter()
+                .find(|branch| branch.run_id == generation.generation.run_id)
+                .expect("family branch summary");
+            assert_eq!(summary.weave_command_id, Some(command_id));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn branch_query_uses_run_keyed_weave_index() {
+        let fixture = Fixture::new();
+        let document_id = fixture.loaded.document_id;
         let explain_sql = format!(
             "EXPLAIN QUERY PLAN {BRANCH_SUMMARY_SELECT}
              WHERE gr.document_id = ?1
              ORDER BY gri.sequence DESC, gr.run_id DESC
              LIMIT ?2"
         );
-        let mut statement = reopened
+        let mut statement = fixture
+            .store
             .connection
             .prepare(&explain_sql)
             .expect("prepare branch query plan");
@@ -4785,21 +4808,6 @@ mod tests {
                 .all(|detail| !detail.contains("command_receipts") && !detail.contains("json_each")),
             "branch query must not scan receipt JSON: {details:?}"
         );
-    }
-
-    fn assert_family_authority(
-        page: &StoredBranchPage,
-        family: &GenerationFamilyStarted,
-        command_id: CommandId,
-    ) {
-        for generation in &family.generations {
-            let summary = page
-                .branches
-                .iter()
-                .find(|branch| branch.run_id == generation.generation.run_id)
-                .expect("family branch summary");
-            assert_eq!(summary.weave_command_id, Some(command_id));
-        }
     }
 
     #[test]

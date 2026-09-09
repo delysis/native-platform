@@ -181,8 +181,9 @@ fn attributed_history_fixture(id: &str) -> Conversation {
 
 #[test]
 fn engine_check_blocks_without_model_configuration() -> Result<()> {
-    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("missing-model")?;
+    let owner = initialize_product_runtime()?;
+    let scope = owner.operation_scope();
     let result = mom_llama_runtime::engine_check(&scope, EngineCheckOptions::default())?;
     assert_eq!(result.status, "blocked");
     assert_eq!(result.readiness, "blocked_missing_model");
@@ -2255,7 +2256,7 @@ fn product_chat_cache_request(
     user_message: &str,
 ) -> Result<ChatSendOutput> {
     let result = mom_llama_runtime::chat_send_in_scope(
-        &scope,
+        scope,
         ChatSendInput {
             conversation_id: conversation_id.to_owned(),
             message: user_message.to_owned(),
@@ -2263,9 +2264,13 @@ fn product_chat_cache_request(
         ChatSendOptions::default(),
     )?;
     assert!(result.receipt.real_engine_invoked);
-    result
-        .result
-        .ok_or_else(|| anyhow!("real product chat request did not return an output"))
+    result.result.ok_or_else(|| {
+        anyhow!(
+            "real product chat returned {}: {:?}",
+            result.readiness,
+            result.blocker
+        )
+    })
 }
 
 #[test]
@@ -2273,7 +2278,14 @@ fn product_chat_cache_request(
 fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Result<()> {
     let session = configured_real_session("real-product-native-chat-cache")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
-        max_tokens: Some(8),
+        max_tokens: Some(32),
+        context_tokens: Some(2048),
+        batch_tokens: Some(128),
+        max_parallel_sequences: Some(1),
+        upstream_settings: Some(BTreeMap::from([(
+            "disableReasoningParsing".to_string(),
+            json!(true),
+        )])),
         kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
         ..SettingsUpdate::default()
     })?;

@@ -230,7 +230,6 @@ describe('App ghost reactivity wiring', () => {
     expect(visual).not.toContain('Start writing');
     expect(markdown).not.toContain('Start writing');
     expect(visual).toContain("'aria-label': currentLabel");
-    expect(visual).toContain('attributes: editorAttributes(snapshot.label)');
     expect(markdown).toContain('aria-label={label}');
     expect(source).toContain('autofocus={true}');
   });

@@ -21,7 +21,7 @@ struct Entry {
 
 pub fn run(root: &Path, args: &[String]) -> Result<()> {
     ensure!(
-        args.len() >= 4 && args.len() % 2 == 0,
+        args.len() >= 4 && args.len().is_multiple_of(2),
         "usage: cargo run -p xtask -- model-check MODEL SHA256 PACKAGE TEST_ID [PACKAGE TEST_ID ...]"
     );
     let model = PathBuf::from(&args[0])

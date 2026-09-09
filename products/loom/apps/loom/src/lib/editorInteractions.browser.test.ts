@@ -1133,11 +1133,16 @@ describe('real WebKit editor interactions', () => {
     await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
       .toHaveTextContent('hello');
     await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    const witness = () => JSON.parse(
+      page.getByRole('status', { name: 'Visual Selection Witness' }).element().textContent ?? '{}'
+    );
+    await expect.poll(witness).toMatchObject({ available: true, caretByteOffset: 5 });
     await keyboard.keyboard('{ArrowLeft}{/Alt}');
     await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
       .toHaveTextContent('hello');
-    await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
-      .toHaveTextContent('1');
+    await expect.poll(witness).toMatchObject({ available: true, caretByteOffset: 0 });
+    await expect.element(page.getByRole('status', { name: 'Completion Context' }))
+      .toHaveTextContent('none');
     await keyboard.cleanup();
   });
 

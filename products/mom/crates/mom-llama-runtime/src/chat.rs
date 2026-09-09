@@ -1034,7 +1034,7 @@ fn empty_native_response_result(
         Blocker::new(code, message, actions),
         Vec::new(),
         Vec::new(),
-        emitted_reasoning && !fake_fixture,
+        !fake_fixture,
         fake_fixture,
     )
 }
@@ -1618,7 +1618,7 @@ mod tests {
         assert!(!reasoning_only.receipt.fake_fixture);
 
         let empty = empty_native_response_result(None, false);
-        assert!(!empty.receipt.real_engine_invoked);
+        assert!(empty.receipt.real_engine_invoked);
 
         let fixture = empty_native_response_result(Some("fixture reasoning"), true);
         assert!(!fixture.receipt.real_engine_invoked);

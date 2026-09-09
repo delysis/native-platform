@@ -72,7 +72,7 @@ test("ordinary model selection stays visible while internal engine and resident 
   const modelSelect = commands.find((candidate) => candidate.command_id === "mom_llama.model_select");
   assert.ok(modelSelect.cli.includes("[--conversation <id>]"));
   assert.ok(cli.includes("conversation_model_select_and_load"));
-  assert.ok(cli.includes("None => mom_llama_runtime::model_select(model_path)?"));
+  assert.ok(cli.includes("None => mom_llama_runtime::model_select(&operation_scope, model_path)?"));
 });
 
 test("model choice is a scoped searchable picker with automatic projector pairing", () => {
