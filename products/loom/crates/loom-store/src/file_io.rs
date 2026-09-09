@@ -304,6 +304,7 @@ enum FilePolicy {
 }
 
 fn atomic_replace_with_policy(path: &Path, bytes: &[u8], policy: FilePolicy) -> Result<()> {
+    crate::paths::ensure_private_storage_supported()?;
     reject_symlink_target(path)?;
     let options = AtomicWriteFile::options();
     #[cfg(unix)]
@@ -330,6 +331,7 @@ fn atomic_replace_with_policy(path: &Path, bytes: &[u8], policy: FilePolicy) -> 
 /// file's permissions unchanged. `SQLite` can then open the file without using
 /// its process-umask-derived creation mode.
 pub(crate) fn create_private_file_if_absent(path: &Path) -> Result<()> {
+    crate::paths::ensure_private_storage_supported()?;
     reject_symlink_target(path)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -565,15 +567,8 @@ pub(crate) fn sync_parent(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn sync_parent(path: &Path) -> Result<()> {
-    // Rust does not expose a portable directory-flush primitive on Windows.
-    // Still validate the parent at the durability boundary so disappearance or
-    // replacement is reported instead of silently treating the boundary as
-    // infallible.
-    if let Some(parent) = path.parent() {
-        fs::metadata(parent)?;
-    }
-    Ok(())
+pub(crate) fn sync_parent(_path: &Path) -> Result<()> {
+    Err(StoreError::UnsupportedStoragePlatform)
 }
 
 #[cfg(all(test, unix))]
@@ -616,5 +611,39 @@ mod tests {
             .expect("set deliberate existing permissions");
         create_private_file_if_absent(&path).expect("accept existing private file");
         assert_eq!(mode(&path), 0o640);
+    }
+}
+
+#[cfg(all(test, not(unix)))]
+mod unsupported_tests {
+    use super::*;
+
+    #[test]
+    fn private_writes_and_directory_sync_are_explicitly_unsupported() {
+        let directory = tempfile::tempdir().expect("temporary root");
+        let path = directory.path().join("state");
+        assert!(matches!(
+            create_private_file_if_absent(&path),
+            Err(StoreError::UnsupportedStoragePlatform)
+        ));
+        assert!(matches!(
+            atomic_replace_private(&path, b"new"),
+            Err(StoreError::UnsupportedStoragePlatform)
+        ));
+        assert!(matches!(
+            crate::paths::ensure_private_directory(&path),
+            Err(StoreError::UnsupportedStoragePlatform)
+        ));
+        assert!(!path.exists());
+        fs::write(&path, b"preserve").expect("existing file");
+        assert!(matches!(
+            atomic_replace_private(&path, b"new"),
+            Err(StoreError::UnsupportedStoragePlatform)
+        ));
+        assert!(matches!(
+            sync_parent(&path),
+            Err(StoreError::UnsupportedStoragePlatform)
+        ));
+        assert_eq!(fs::read(&path).expect("unchanged file"), b"preserve");
     }
 }

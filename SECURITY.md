@@ -8,7 +8,7 @@ or model artifacts.
 The workspace contains native inference, hosted-provider, desktop, and sibling
 service runtimes. First-party Rust is safe by default, with a documented
 exception for the native engine's state-buffer module. Its unsafe calls require
-explicit export/import safety arguments; native execution also uses reviewed
+explicit import safety arguments; native execution also uses reviewed
 external FFI-bearing dependencies. Never commit secrets. Hosted-provider and operating-system
 credential tests must be opt-in and must not run in portable CI.
 
@@ -24,9 +24,10 @@ Automatic migration from Mom's legacy plaintext JSON files is retired. Opening
 a store with those files present reports the exact residual path and refuses
 to proceed; the application does not claim to have encrypted or deleted them.
 The reusable FTE response store similarly rejects unversioned and unsupported
-schemas without migrating them. These are pre-release formats.
+schemas without migrating them. Loom accepts its current schema directly and no
+longer installs research tables or replays old migrations. These are pre-release formats.
 
-Information managed storage and FTE private database/token storage currently
+Loom project storage, Information managed storage, and FTE private database/token storage currently
 require Unix permission and directory-synchronization support. Other platforms
 receive an unsupported result before existing state is read or new state is
 created. Portable protocol and in-memory database operations remain available.

@@ -373,13 +373,15 @@ struct AttachmentResolution<'a> {
 }
 
 pub fn attachment_import(
+    scope: &crate::OperationScope,
     conversation_id: &str,
     path: &Path,
 ) -> Result<CommandResult<AttachmentImportOutput>> {
-    attachment_import_with_identity(conversation_id, path, None)
+    attachment_import_with_identity(scope, conversation_id, path, None)
 }
 
 fn attachment_import_with_identity(
+    scope: &crate::OperationScope,
     conversation_id: &str,
     path: &Path,
     attachment_id: Option<&str>,
@@ -430,6 +432,7 @@ fn attachment_import_with_identity(
         }
     };
     canonicalize_and_stage(
+        scope,
         conversation_id,
         path.display().to_string(),
         provided,
@@ -440,6 +443,7 @@ fn attachment_import_with_identity(
 }
 
 pub fn attachment_import_pasted_text(
+    scope: &crate::OperationScope,
     conversation_id: &str,
     text: String,
 ) -> Result<CommandResult<AttachmentImportOutput>> {
@@ -476,6 +480,7 @@ pub fn attachment_import_pasted_text(
         text.into_bytes(),
     );
     canonicalize_and_stage(
+        scope,
         conversation_id,
         "pasted-text".to_string(),
         provided,
@@ -486,6 +491,7 @@ pub fn attachment_import_pasted_text(
 }
 
 fn canonicalize_and_stage(
+    scope: &crate::OperationScope,
     conversation_id: &str,
     source_path: String,
     provided: ProvidedAttachment,
@@ -565,8 +571,11 @@ fn canonicalize_and_stage(
     }
     store.put_documents_atomically(documents)?;
     let settings = resolve_settings()?;
-    let (multimodal_ready, multimodal_blocker) =
-        multimodal_readiness(&settings, manifest_contains_mom_native_media(&manifest));
+    let (multimodal_ready, multimodal_blocker) = multimodal_readiness(
+        scope,
+        &settings,
+        manifest_contains_mom_native_media(&manifest),
+    );
     Ok(CommandResult::passed(
         command,
         "contracted",
@@ -2928,6 +2937,7 @@ fn manifest_contains_mom_native_media(manifest: &AttachmentManifest) -> bool {
 }
 
 fn multimodal_readiness(
+    scope: &crate::OperationScope,
     settings: &crate::config::Settings,
     contains_direct_image: bool,
 ) -> (bool, Option<Blocker>) {
@@ -2941,7 +2951,7 @@ fn multimodal_readiness(
             .and_then(|value| value.to_str())
             .is_some_and(|value| value.eq_ignore_ascii_case("gguf"))
     {
-        let verified = crate::native_runtime::resident_status()
+        let verified = crate::native_runtime::resident_status(scope)
             .and_then(|status| status.fingerprint)
             .and_then(|fingerprint| fingerprint.multimodal_projector_sha256)
             .is_some();
@@ -3040,7 +3050,8 @@ mod tests {
     }
 
     fn stage_text(conversation_id: &str, text: &str) -> AttachmentRecord {
-        attachment_import_pasted_text(conversation_id, text.to_string())
+        let scope = crate::OperationScope::detached();
+        attachment_import_pasted_text(&scope, conversation_id, text.to_string())
             .expect("stage text attachment")
             .result
             .expect("attachment result")
@@ -3061,6 +3072,7 @@ mod tests {
     }
 
     fn send_staged_attachment(conversation_id: &str) -> Conversation {
+        let scope = crate::OperationScope::detached();
         let draft = crate::conversation_store::draft_get(Some(conversation_id))
             .expect("load staged attachment draft")
             .result
@@ -3071,7 +3083,8 @@ mod tests {
             draft.attachment_ids,
         )
         .expect("bind exact sent text to staged attachment draft");
-        crate::chat::chat_send(
+        crate::chat::chat_send_in_scope(
+            &scope,
             crate::chat::ChatSendInput {
                 conversation_id: conversation_id.to_string(),
                 message: "Use the attached material.".to_string(),
@@ -3163,9 +3176,10 @@ mod tests {
 
     #[test]
     fn canonical_text_preview_is_path_free_exact_and_stale_after_removal() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("canonical-preview");
         let hostile = "<script>window.evil = true</script>\n# inert markdown";
-        let attachment = attachment_import_pasted_text("chat", hostile.to_string())
+        let attachment = attachment_import_pasted_text(&scope, "chat", hostile.to_string())
             .expect("stage hostile text")
             .result
             .expect("hostile text result")
@@ -3313,6 +3327,7 @@ mod tests {
 
     #[test]
     fn exact_media_preview_adds_bounded_native_video_without_transform_execution() {
+        let scope = crate::OperationScope::detached();
         let session = TestDataDir::new("media-preview");
         for (name, bytes, kind) in [
             ("image.png", VALID_PNG, AttachmentPreviewKind::Image),
@@ -3324,7 +3339,7 @@ mod tests {
         ] {
             let path = session.path.join(name);
             std::fs::write(&path, bytes).expect("write media preview fixture");
-            let attachment = attachment_import("chat", &path)
+            let attachment = attachment_import(&scope, "chat", &path)
                 .expect("import media preview fixture")
                 .result
                 .expect("media import result")
@@ -3527,8 +3542,9 @@ mod tests {
 
     #[test]
     fn duplicate_attachment_references_cannot_bypass_the_active_count_limit() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("duplicate-reference-budget");
-        let attachment = attachment_import_pasted_text("chat", "bounded notes".to_string())
+        let attachment = attachment_import_pasted_text(&scope, "chat", "bounded notes".to_string())
             .expect("stage text")
             .result
             .expect("text import result")
@@ -3547,12 +3563,14 @@ mod tests {
 
     #[test]
     fn every_stored_policy_fingerprint_must_match_the_current_host_policy() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("policy-fingerprint");
-        let attachment = attachment_import_pasted_text("chat", "policy-bound notes".to_string())
-            .expect("stage text")
-            .result
-            .expect("text import result")
-            .attachment;
+        let attachment =
+            attachment_import_pasted_text(&scope, "chat", "policy-bound notes".to_string())
+                .expect("stage text")
+                .result
+                .expect("text import result")
+                .attachment;
         let namespace = attachment
             .manifest_namespace
             .as_deref()
@@ -3592,17 +3610,19 @@ mod tests {
 
     #[test]
     fn staged_canonical_text_and_current_turn_media_are_exact() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("current-turn");
-        let text = attachment_import_pasted_text("chat", "private garden notes".to_string())
-            .expect("stage text")
-            .result
-            .expect("text import result");
+        let text =
+            attachment_import_pasted_text(&scope, "chat", "private garden notes".to_string())
+                .expect("stage text")
+                .result
+                .expect("text import result");
         let image_path = resolve_settings()
             .expect("settings")
             .data_dir
             .join("image.png");
         std::fs::write(&image_path, VALID_PNG).expect("write image fixture");
-        let image = attachment_import("chat", &image_path)
+        let image = attachment_import(&scope, "chat", &image_path)
             .expect("stage image")
             .result
             .expect("image import result");
@@ -3634,18 +3654,23 @@ mod tests {
 
     #[test]
     fn inactive_branch_attachment_never_enters_the_active_prompt() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("inactive-branch");
-        let active = attachment_import_pasted_text("chat", "active branch secret".to_string())
-            .expect("stage active")
-            .result
-            .expect("active result")
-            .attachment;
-        let inactive =
-            attachment_import_pasted_text("chat", "inactive branch must not leak".to_string())
-                .expect("stage inactive")
+        let active =
+            attachment_import_pasted_text(&scope, "chat", "active branch secret".to_string())
+                .expect("stage active")
                 .result
-                .expect("inactive result")
+                .expect("active result")
                 .attachment;
+        let inactive = attachment_import_pasted_text(
+            &scope,
+            "chat",
+            "inactive branch must not leak".to_string(),
+        )
+        .expect("stage inactive")
+        .result
+        .expect("inactive result")
+        .attachment;
         let mut db = load_attachment_db().expect("load attachments");
         for record in &mut db.attachments {
             if record.id == active.id {
@@ -3683,12 +3708,14 @@ mod tests {
 
     #[test]
     fn forked_persona_attachment_snapshot_is_independent_and_content_addressed() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("attachment-snapshot");
-        let source = attachment_import_pasted_text("source", "stable source notes".to_string())
-            .expect("stage source")
-            .result
-            .expect("source result")
-            .attachment;
+        let source =
+            attachment_import_pasted_text(&scope, "source", "stable source notes".to_string())
+                .expect("stage source")
+                .result
+                .expect("source result")
+                .attachment;
         let mut db = load_attachment_db().expect("load source attachment");
         let source_record = db
             .attachments
@@ -3874,6 +3901,7 @@ mod tests {
 
     #[test]
     fn removing_a_persona_preserves_supporting_snapshot_records() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("persona-snapshot-gc");
         let source = new_conversation("Persona source");
         let source_attachment = stage_text(&source.id, "persona source notes");
@@ -3907,15 +3935,18 @@ mod tests {
             .find(|record| record.id == snapshot_id)
             .expect("persona snapshot record");
 
-        let impact = crate::personas::persona_removal_preview(&persona.id)
+        let impact = crate::personas::persona_removal_preview_in_scope(&scope, &persona.id)
             .expect("preview Persona removal")
             .result
             .expect("Persona removal impact");
-        crate::personas::persona_remove_from_library(crate::personas::PersonaRemovalCommitInput {
-            persona_id: persona.id.clone(),
-            persona_version: impact.persona_version,
-            impact_sha256: impact.impact_sha256,
-        })
+        crate::personas::persona_remove_from_library_in_scope(
+            &scope,
+            crate::personas::PersonaRemovalCommitInput {
+                persona_id: persona.id.clone(),
+                persona_version: impact.persona_version,
+                impact_sha256: impact.impact_sha256,
+            },
+        )
         .expect("remove Persona from library");
         let db = load_attachment_db().expect("attachment db after Persona removal");
         assert!(
@@ -4356,13 +4387,14 @@ mod tests {
 
     #[test]
     fn structure_only_media_never_enters_native_inputs() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("structure-only-media");
         let image_path = resolve_settings()
             .expect("settings")
             .data_dir
             .join("image.png");
         std::fs::write(&image_path, VALID_PNG).expect("write image fixture");
-        let record = attachment_import("chat", &image_path)
+        let record = attachment_import(&scope, "chat", &image_path)
             .expect("stage image")
             .result
             .expect("image import result")
@@ -4414,13 +4446,14 @@ mod tests {
 
     #[test]
     fn structurally_valid_audio_requires_transcription_before_native_input() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("structure-only-audio");
         let audio_path = resolve_settings()
             .expect("settings")
             .data_dir
             .join("sample.wav");
         std::fs::write(&audio_path, STRUCTURALLY_VALID_WAV).expect("write audio fixture");
-        let imported = attachment_import("chat", &audio_path)
+        let imported = attachment_import(&scope, "chat", &audio_path)
             .expect("stage audio")
             .result
             .expect("audio import result");
@@ -4439,13 +4472,14 @@ mod tests {
 
     #[test]
     fn transcription_input_rebinds_exact_audio_authority_and_rejects_stale_targets() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("speech-audio-authority");
         let audio_path = resolve_settings()
             .expect("settings")
             .data_dir
             .join("sample.wav");
         std::fs::write(&audio_path, STRUCTURALLY_VALID_WAV).expect("write audio fixture");
-        let attachment = attachment_import("chat", &audio_path)
+        let attachment = attachment_import(&scope, "chat", &audio_path)
             .expect("stage audio")
             .result
             .expect("audio import result")
@@ -4484,13 +4518,14 @@ mod tests {
 
     #[test]
     fn content_address_mismatch_fails_closed_before_native_media() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("content-mismatch");
         let image_path = resolve_settings()
             .expect("settings")
             .data_dir
             .join("image.png");
         std::fs::write(&image_path, VALID_PNG).expect("write image fixture");
-        let record = attachment_import("chat", &image_path)
+        let record = attachment_import(&scope, "chat", &image_path)
             .expect("stage image")
             .result
             .expect("image import result")

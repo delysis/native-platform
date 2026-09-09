@@ -1139,27 +1139,6 @@ impl ProjectStore {
                 created_at_ms,
             ],
         )?;
-        transaction.execute(
-            "INSERT INTO research_legacy_candidates(candidate_id, discovered_at_ms)
-             VALUES (?1, ?2)",
-            params![candidate_id.to_string(), created_at_ms.max(1)],
-        )?;
-        transaction.execute(
-            "INSERT INTO research_legacy_candidate_review_events(
-                candidate_id, sequence, disposition, assembly_id, reason, created_at_ms
-             ) VALUES (?1, 0, 'pending', NULL, NULL, ?2)",
-            params![candidate_id.to_string(), created_at_ms.max(1)],
-        )?;
-        transaction.execute(
-            "INSERT INTO research_legacy_candidate_review_events(
-                candidate_id, sequence, disposition, assembly_id, reason, created_at_ms
-             ) VALUES (?1, 1, 'quarantined', NULL, ?2, ?3)",
-            params![
-                candidate_id.to_string(),
-                "diagnostic finalization has no verifier-owned exact replay lease",
-                created_at_ms.max(1),
-            ],
-        )?;
         let ready_event = GenerationEvent {
             event_id: GenerationEventId::new(),
             run_id,
@@ -4275,6 +4254,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn private_generation_and_keep_do_not_mutate_active_manuscript() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -4331,6 +4311,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn tombstoned_document_rejects_stale_candidate_promotion_after_path_recreation() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -4405,6 +4386,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn caller_declared_live_inference_cannot_promote_legacy_prose() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -4419,19 +4401,6 @@ mod tests {
             fixture.store.promote_candidate(command),
             Err(StoreError::LegacyCandidateNotAdmitted)
         ));
-        let disposition: String = fixture
-            .store
-            .connection
-            .query_row(
-                "SELECT disposition
-                 FROM research_legacy_candidate_review_events
-                 WHERE candidate_id = ?1
-                 ORDER BY sequence DESC LIMIT 1",
-                [terminal.candidate.candidate_id.to_string()],
-                |row| row.get(0),
-            )
-            .expect("legacy quarantine disposition");
-        assert_eq!(disposition, "quarantined");
         assert_eq!(
             fixture
                 .store
@@ -4443,6 +4412,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn model_environment_recording_is_content_idempotent_and_rejects_identity_reuse() {
         let directory = tempdir().expect("temporary project");
         let root = directory.path().join("Novel");
@@ -4484,6 +4454,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn recipes_validate_and_preserve_ordered_artifact_references() {
         let mut fixture = Fixture::new();
         let prompt_input_count: i64 = fixture
@@ -4535,6 +4506,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn duplicate_outputs_share_blob_but_keep_distinct_occurrences() {
         let mut fixture = Fixture::new();
         let first_start = fixture.start(fixture.writer_environment);
@@ -4554,6 +4526,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generation_family_rejects_empty_and_duplicate_identities_without_writes() {
         let mut fixture = Fixture::new();
         assert!(matches!(
@@ -4603,6 +4576,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn invalid_later_family_run_rolls_back_the_whole_sql_family() {
         let mut fixture = Fixture::new();
         let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
@@ -4646,6 +4620,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generation_family_commits_all_runs_under_one_shared_receipt() {
         let mut fixture = Fixture::new();
         let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
@@ -4691,6 +4666,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn branch_reads_keep_distinct_weave_families_and_ignore_cancellation_receipts() {
         let mut fixture = Fixture::new();
         let document_id = fixture.loaded.document_id;
@@ -4780,150 +4756,13 @@ mod tests {
         assert_eq!(reopened_page.branches.len(), 4);
         assert_family_authority(&reopened_page, &first_family, first_command_id);
         assert_family_authority(&reopened_page, &second_family, second_command_id);
-    }
-
-    fn assert_family_authority(
-        page: &StoredBranchPage,
-        family: &GenerationFamilyStarted,
-        command_id: CommandId,
-    ) {
-        for generation in &family.generations {
-            let summary = page
-                .branches
-                .iter()
-                .find(|branch| branch.run_id == generation.generation.run_id)
-                .expect("family branch summary");
-            assert_eq!(summary.weave_command_id, Some(command_id));
-        }
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn weave_command_migration_backfills_modern_and_legacy_receipts_once() {
-        let mut fixture = Fixture::new();
-        let document_id = fixture.loaded.document_id;
-        let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
-        let target = ByteRange { start: end, end };
-        let first_command_id = CommandId::new();
-        let first_family = fixture
-            .store
-            .start_generation_family_with_command(
-                first_command_id,
-                vec![fixture.generation_start(fixture.writer_environment, target, 81)],
-            )
-            .expect("start historical first family");
-        let second_command_id = CommandId::new();
-        let second_family = fixture
-            .store
-            .start_generation_family_with_command(
-                second_command_id,
-                vec![
-                    fixture.generation_start(fixture.writer_environment, target, 83),
-                    fixture.generation_start(fixture.writer_environment, target, 84),
-                ],
-            )
-            .expect("start historical second family");
-        fixture
-            .store
-            .request_cancel_generation_with_command(
-                CommandId::new(),
-                CancelGenerationCommand {
-                    run_id: first_family.generations[0].generation.run_id,
-                },
-            )
-            .expect("record historical cancellation");
-
-        fixture
-            .store
-            .connection
-            .execute_batch(
-                "DROP TABLE generation_weave_commands;
-                 DROP TABLE document_delete_operations;
-                 DROP TABLE document_rename_operations;
-                 DROP TABLE document_deletions;
-                 DROP TRIGGER command_requests_are_immutable_delete;
-                 DROP TRIGGER generation_run_index_are_immutable_update;",
-            )
-            .expect("open a legacy receipt-only fixture");
-        fixture
-            .store
-            .connection
-            .execute(
-                "DELETE FROM command_requests WHERE command_id = ?1",
-                [first_command_id.to_string()],
-            )
-            .expect("remove the request absent from pre-family stores");
-        fixture
-            .store
-            .connection
-            .execute(
-                "UPDATE generation_run_index
-                 SET seed_decimal = NULL
-                 WHERE run_id = ?1",
-                [first_family.generations[0].generation.run_id.to_string()],
-            )
-            .expect("mark the run as migration-0006 legacy evidence");
-        fixture
-            .store
-            .connection
-            .execute_batch(
-                "CREATE TRIGGER command_requests_are_immutable_delete
-                 BEFORE DELETE ON command_requests BEGIN
-                     SELECT RAISE(ABORT, 'command requests are immutable');
-                 END;
-                 CREATE TRIGGER generation_run_index_are_immutable_update
-                 BEFORE UPDATE ON generation_run_index BEGIN
-                     SELECT RAISE(ABORT, 'generation run index entries are immutable');
-                 END;
-                 PRAGMA user_version = 12;",
-            )
-            .expect("restore a version-twelve store with one legacy receipt-only family");
-        let legacy_request_count: i64 = fixture
-            .store
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM command_requests WHERE command_id = ?1",
-                [first_command_id.to_string()],
-                |row| row.get(0),
-            )
-            .expect("count legacy command request");
-        assert_eq!(legacy_request_count, 0);
-        crate::schema::migrate(&mut fixture.store.connection)
-            .expect("backfill indexed weave commands");
-
-        let page = fixture
-            .store
-            .branch_page(document_id, None, MAX_BRANCH_PAGE_SIZE)
-            .expect("read migrated families");
-        for generation in &first_family.generations {
-            assert_eq!(
-                page.branches
-                    .iter()
-                    .find(|branch| branch.run_id == generation.generation.run_id)
-                    .expect("migrated first-family branch")
-                    .weave_command_id,
-                Some(first_command_id)
-            );
-        }
-        for generation in &second_family.generations {
-            assert_eq!(
-                page.branches
-                    .iter()
-                    .find(|branch| branch.run_id == generation.generation.run_id)
-                    .expect("migrated second-family branch")
-                    .weave_command_id,
-                Some(second_command_id)
-            );
-        }
-
         let explain_sql = format!(
             "EXPLAIN QUERY PLAN {BRANCH_SUMMARY_SELECT}
              WHERE gr.document_id = ?1
              ORDER BY gri.sequence DESC, gr.run_id DESC
              LIMIT ?2"
         );
-        let mut statement = fixture
-            .store
+        let mut statement = reopened
             .connection
             .prepare(&explain_sql)
             .expect("prepare branch query plan");
@@ -4948,270 +4787,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn weave_migration_preserves_old_families_above_the_current_product_cap() {
-        const ABOVE_CURRENT_PRODUCT_CAP: u64 = 65;
-
-        let mut fixture = Fixture::new();
-        let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
-        let target = ByteRange { start: end, end };
-        fixture
-            .store
-            .connection
-            .execute_batch("DROP TRIGGER generation_weave_commands_validate_insert;")
-            .expect("remove the post-v12 insert guard while building a v12 fixture");
-        let historical_starts = (0..ABOVE_CURRENT_PRODUCT_CAP)
-            .map(|seed| fixture.generation_start(fixture.writer_environment, target, 1_000 + seed))
-            .collect();
-        fixture
-            .store
-            .start_generation_family_with_command(CommandId::new(), historical_starts)
-            .expect("the pre-v13 store API accepted this bounded family");
-        fixture
-            .store
-            .connection
-            .execute_batch(
-                "DROP TABLE generation_weave_commands;
-                 DROP TABLE document_delete_operations;
-                 DROP TABLE document_rename_operations;
-                 DROP TABLE document_deletions;
-                 PRAGMA user_version = 12;",
-            )
-            .expect("restore the historical version-twelve shape");
-
-        crate::schema::migrate(&mut fixture.store.connection)
-            .expect("v13 preserves a valid historical family up to the hard 4096 ceiling");
-        let migrated_count: i64 = fixture
-            .store
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM generation_weave_commands",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count migrated weave authority");
-        assert_eq!(
-            migrated_count,
-            i64::try_from(ABOVE_CURRENT_PRODUCT_CAP).expect("test bound fits the SQL count domain")
-        );
-
-        let current_command_id = CommandId::new();
-        let current_starts = (0..ABOVE_CURRENT_PRODUCT_CAP)
-            .map(|seed| fixture.generation_start(fixture.writer_environment, target, 2_000 + seed))
-            .collect();
-        assert!(
-            fixture
-                .store
-                .start_generation_family_with_command(current_command_id, current_starts)
-                .is_err(),
-            "the post-migration insert trigger must enforce the shipped 64-branch cap"
-        );
-        let rejected_receipt_count: i64 = fixture
-            .store
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM command_receipts WHERE command_id = ?1",
-                [current_command_id.to_string()],
-                |row| row.get(0),
-            )
-            .expect("count rejected command receipt");
-        assert_eq!(rejected_receipt_count, 0, "the rejection must be atomic");
-    }
-
-    #[test]
-    fn weave_command_migration_fails_closed_on_duplicate_or_mismatched_authority() {
-        for corruption in ["duplicate", "mismatch"] {
-            let mut fixture = Fixture::new();
-            let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
-            let target = ByteRange { start: end, end };
-            let family = fixture
-                .store
-                .start_generation_family_with_command(
-                    CommandId::new(),
-                    vec![fixture.generation_start(fixture.writer_environment, target, 91)],
-                )
-                .expect("start historical family");
-            let artifact_id = match corruption {
-                "duplicate" => family.generations[0].run_artifact_id,
-                "mismatch" => ArtifactId::new(),
-                _ => unreachable!(),
-            };
-            let command_id = CommandId::new();
-            let mut receipt = family.receipt.clone();
-            receipt.command_id = command_id;
-            receipt.resulting_artifact_ids = vec![artifact_id];
-            receipt.resulting_operation_ids.clear();
-            fixture
-                .store
-                .connection
-                .execute(
-                    "INSERT INTO command_receipts(
-                         command_id, command_kind, receipt_json, completed_at_ms
-                     ) VALUES (?1, 'weave', ?2, ?3)",
-                    params![
-                        command_id.to_string(),
-                        serde_json::to_string(&receipt).expect("serialize synthetic receipt"),
-                        receipt.completed_at_ms,
-                    ],
-                )
-                .expect("insert synthetic weave receipt");
-            fixture
-                .store
-                .connection
-                .execute(
-                    "INSERT INTO command_requests(
-                         command_id, request_fingerprint, command_kind, created_at_ms
-                     ) VALUES (?1, ?2, 'weave', ?3)",
-                    params![
-                        command_id.to_string(),
-                        fixture.loaded.blob_id.to_string(),
-                        receipt.started_at_ms,
-                    ],
-                )
-                .expect("insert synthetic weave request");
-            fixture
-                .store
-                .connection
-                .execute_batch(
-                    "DROP TABLE generation_weave_commands;
-                     PRAGMA user_version = 12;",
-                )
-                .expect("restore corrupt version-twelve shape");
-
-            assert!(
-                crate::schema::migrate(&mut fixture.store.connection).is_err(),
-                "{corruption} weave authority must abort migration"
-            );
-            let version: u32 = fixture
-                .store
-                .connection
-                .query_row("PRAGMA user_version", [], |row| row.get(0))
-                .expect("read version after rejected migration");
-            assert_eq!(version, 12, "failed migration must roll back completely");
+    fn assert_family_authority(
+        page: &StoredBranchPage,
+        family: &GenerationFamilyStarted,
+        command_id: CommandId,
+    ) {
+        for generation in &family.generations {
+            let summary = page
+                .branches
+                .iter()
+                .find(|branch| branch.run_id == generation.generation.run_id)
+                .expect("family branch summary");
+            assert_eq!(summary.weave_command_id, Some(command_id));
         }
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
-    fn weave_command_migration_rejects_malformed_version_twelve_receipts() {
-        for corruption in [
-            "invalid_json",
-            "row_command_kind",
-            "embedded_command_id",
-            "embedded_command_kind",
-            "source_revision",
-            "artifact_scalar",
-            "artifact_empty",
-            "operation_empty",
-            "operation_not_authoritative",
-            "revision_nonempty",
-        ] {
-            let mut fixture = Fixture::new();
-            let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
-            let target = ByteRange { start: end, end };
-            let family = fixture
-                .store
-                .start_generation_family_with_command(
-                    CommandId::new(),
-                    vec![fixture.generation_start(fixture.writer_environment, target, 92)],
-                )
-                .expect("start historical family");
-            let command_id = family.receipt.command_id;
-            let mut receipt_json =
-                serde_json::to_value(&family.receipt).expect("serialize historical receipt");
-            let row_command_kind = if corruption == "row_command_kind" {
-                "cancel_generation"
-            } else {
-                "weave"
-            };
-            let serialized_receipt = if corruption == "invalid_json" {
-                "{".to_owned()
-            } else {
-                let receipt = receipt_json
-                    .as_object_mut()
-                    .expect("receipt serializes as an object");
-                match corruption {
-                    "row_command_kind" => {}
-                    "embedded_command_id" => {
-                        receipt.insert(
-                            "command_id".into(),
-                            serde_json::Value::String(CommandId::new().to_string()),
-                        );
-                    }
-                    "embedded_command_kind" => {
-                        receipt.insert("command".into(), json!("cancel_generation"));
-                    }
-                    "source_revision" => {
-                        receipt.insert("source_revision_id".into(), json!("not-the-source"));
-                    }
-                    "artifact_scalar" => {
-                        receipt.insert(
-                            "resulting_artifact_ids".into(),
-                            json!(family.generations[0].run_artifact_id),
-                        );
-                    }
-                    "artifact_empty" => {
-                        receipt.insert("resulting_artifact_ids".into(), json!([]));
-                    }
-                    "operation_empty" => {
-                        receipt.insert("resulting_operation_ids".into(), json!([]));
-                    }
-                    "operation_not_authoritative" => {
-                        receipt.insert(
-                            "resulting_operation_ids".into(),
-                            json!([OperationId::new()]),
-                        );
-                    }
-                    "revision_nonempty" => {
-                        receipt.insert("resulting_revision_ids".into(), json!(["unexpected"]));
-                    }
-                    _ => unreachable!(),
-                }
-                serde_json::to_string(&receipt_json).expect("serialize corrupted receipt")
-            };
-
-            fixture
-                .store
-                .connection
-                .execute_batch("DROP TRIGGER command_receipts_are_immutable_update;")
-                .expect("open malformed v12 receipt fixture");
-            fixture
-                .store
-                .connection
-                .execute(
-                    "UPDATE command_receipts
-                     SET command_kind = ?2, receipt_json = ?3
-                     WHERE command_id = ?1",
-                    params![command_id.to_string(), row_command_kind, serialized_receipt,],
-                )
-                .expect("write malformed v12 receipt");
-            fixture
-                .store
-                .connection
-                .execute_batch(
-                    "CREATE TRIGGER command_receipts_are_immutable_update
-                     BEFORE UPDATE ON command_receipts BEGIN
-                         SELECT RAISE(ABORT, 'command receipts are immutable');
-                     END;
-                     DROP TABLE generation_weave_commands;
-                     PRAGMA user_version = 12;",
-                )
-                .expect("restore malformed version-twelve shape");
-
-            assert!(
-                crate::schema::migrate(&mut fixture.store.connection).is_err(),
-                "{corruption} receipt authority must abort migration"
-            );
-            let version: u32 = fixture
-                .store
-                .connection
-                .query_row("PRAGMA user_version", [], |row| row.get(0))
-                .expect("read version after rejected migration");
-            assert_eq!(version, 12, "failed migration must roll back completely");
-        }
-    }
-
-    #[test]
+    #[cfg(unix)]
     fn generation_family_exact_retry_replays_identities_and_rejects_command_reuse() {
         let mut fixture = Fixture::new();
         let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
@@ -5257,6 +4849,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generation_family_preflight_returns_none_for_an_unknown_command_without_writes() {
         let fixture = Fixture::new();
         let before = fixture.store.counts().expect("counts before preflight");
@@ -5274,6 +4867,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generation_family_preflight_reconstructs_existing_weave_without_writes() {
         let mut fixture = Fixture::new();
         let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
@@ -5318,6 +4912,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generation_family_preflight_rejects_a_non_weave_command_id() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -5339,6 +4934,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn cancel_exact_retry_survives_terminal_and_rejects_command_reuse() {
         let mut fixture = Fixture::new();
         let first = fixture.start(fixture.writer_environment);
@@ -5392,6 +4988,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn keep_exact_retry_replays_selection_and_rejects_command_reuse() {
         let mut fixture = Fixture::new();
         let first_start = fixture.start(fixture.writer_environment);
@@ -5439,6 +5036,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn promotion_exact_retry_returns_committed_identity_and_rejects_command_reuse() {
         let mut fixture = Fixture::new();
         let first_start = fixture.start(fixture.writer_environment);
@@ -5495,6 +5093,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    #[cfg(unix)]
     fn exact_boundary_suggestion_promotion_survives_store_reopen() {
         let spec: W1SuggestionFixture = serde_json::from_str(include_str!(
             "../../../fixtures/compat/suggestion-promotion-v1.json"
@@ -5634,6 +5233,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn promotion_returns_committed_identity_with_pending_conflict_then_replays_to_applied() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -5679,6 +5279,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn promotion_wraps_postcommit_projection_error_as_pending_retry() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -5726,6 +5327,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn interrupted_generation_recovery_is_explicit_atomic_and_idempotent() {
         let mut fixture = Fixture::new();
         let end = u64::try_from(fixture.loaded.text.len()).expect("document length");
@@ -5807,6 +5409,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn bounded_branch_page_and_exact_records_rebuild_durable_state() {
         let mut fixture = Fixture::new();
         let completed_start = fixture.start(fixture.writer_environment);
@@ -5883,6 +5486,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    #[cfg(unix)]
     fn completion_recovery_fixture_survives_autosave_and_store_reopen() {
         let specification: CompletionRecoveryFixture = serde_json::from_str(include_str!(
             "../../../fixtures/compat/completion-recovery-v1.json"
@@ -6118,6 +5722,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn branch_cursor_is_stable_across_newer_insertions_and_bound_to_its_run() {
         let mut fixture = Fixture::new();
         for seed in 10..15 {
@@ -6179,6 +5784,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generation_progress_replays_durable_unicode_deltas_without_mutating_manuscript() {
         let mut fixture = Fixture::new();
         let source_text = fixture.loaded.text.clone();
@@ -6251,6 +5857,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generation_text_delta_accepts_exact_utf8_bound_and_rejects_larger_events() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -6283,6 +5890,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generation_progress_text_budget_is_enforced_before_append() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -6384,6 +5992,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generation_progress_event_budget_is_enforced_before_append() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -6470,6 +6079,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn branch_body_checks_indexed_and_filesystem_lengths_before_allocating() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -6503,6 +6113,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn branch_page_truncates_error_metadata_and_rejects_unbounded_limits() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -6545,6 +6156,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn critic_candidate_cannot_be_promoted() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.critic_environment);
@@ -6568,6 +6180,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn generation_has_exactly_one_terminal_event() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -6602,6 +6215,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn completed_terminal_links_candidate_output_and_token_evidence() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -6631,6 +6245,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    #[cfg(unix)]
     fn every_non_candidate_terminal_preserves_partial_output_receipt_trace_and_timings() {
         let mut fixture = Fixture::new();
         let cases = [
@@ -6771,6 +6386,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn one_character_edit_preserves_unmodified_generated_slices() {
         let mut fixture = Fixture::new();
         let start = fixture.start(fixture.writer_environment);
@@ -6824,6 +6440,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn two_disjoint_edits_preserve_generated_text_between_them() {
         let mut fixture = Fixture::new();
         let start = fixture.start_at(fixture.writer_environment, ByteRange { start: 2, end: 2 });
@@ -6878,6 +6495,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn empty_revision_survives_delete_type_and_undo() {
         let mut fixture = Fixture::new();
         let deleted = fixture
@@ -6943,6 +6561,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn source_bound_save_rejects_external_edit_without_overwrite() {
         let mut fixture = Fixture::new();
         let visible = fixture.store.root.join("manuscript/001.md");
@@ -6962,6 +6581,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn idempotent_checkpoint_replays_and_rejects_fingerprint_reuse() {
         let mut fixture = Fixture::new();
         let command_id = CommandId::new();
@@ -7030,6 +6650,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn committed_checkpoint_returns_typed_pending_state_at_projection_boundary() {
         let mut fixture = Fixture::new();
         let command_id = CommandId::new();
@@ -7102,6 +6723,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn committed_checkpoint_wraps_projection_failure_as_retryable_state() {
         let mut fixture = Fixture::new();
         let command_id = CommandId::new();
@@ -7160,6 +6782,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn source_bound_checkpoint_accepts_large_contiguous_insertions_and_deletions() {
         for position in [0, 8, 16] {
             let mut fixture = Fixture::new();
@@ -7241,6 +6864,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn source_bound_checkpoint_rejects_unbounded_diff_work() {
         let mut fixture = Fixture::new();
         let oversized_changed_window = "z".repeat(crate::MAX_EDIT_DIFF_WINDOW_BYTES + 1);

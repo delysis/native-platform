@@ -3,7 +3,6 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SELECTION_SCHEMA = "native-platform.ci-reverse-closure.v2";
-export const SHADOW_SCHEMA = "native-platform.ci-legacy-equivalence.v2";
 const KNOWN_EFFECTS = new Set([
   "dependency_graph",
   "force_full",
@@ -147,11 +146,6 @@ function closureOf(start, reverse) {
   return [...closure].sort();
 }
 
-function difference(left, right) {
-  const rightSet = new Set(right);
-  return left.filter((value) => !rightSet.has(value));
-}
-
 function exceptionRecord(changedPath, exception) {
   return {
     path: changedPath,
@@ -159,7 +153,6 @@ function exceptionRecord(changedPath, exception) {
     rule: exception.path ?? exception.prefix,
     primary_groups: [...new Set(exception.primary_groups ?? [])].sort(),
     effects: [...new Set(exception.effects ?? [])].sort(),
-    authorizes_legacy_reduction: exception.authorizes_legacy_reduction === true,
     evidence: exception.evidence,
   };
 }
@@ -286,35 +279,6 @@ export function unavailableSelection(reason, packageGroups) {
   };
 }
 
-export function legacyEquivalenceReport({
-  legacySurface,
-  generatedSurface,
-  finalSurface,
-  reductionEvidence = [],
-  fallbackReasons = [],
-}) {
-  const legacy = [...new Set(legacySurface)].sort();
-  const generated = [...new Set(generatedSurface)].sort();
-  const final = [...new Set(finalSurface)].sort();
-  const missingFromGenerated = difference(legacy, generated);
-  const extraInGenerated = difference(generated, legacy);
-  return {
-    schema: SHADOW_SCHEMA,
-    mode: "legacy-shadow",
-    selection_applied: false,
-    legacy_surface: legacy,
-    generated_surface: generated,
-    final_surface: final,
-    missing_from_generated: missingFromGenerated,
-    extra_in_generated: extraInGenerated,
-    matches_legacy:
-      missingFromGenerated.length === 0 && extraInGenerated.length === 0,
-    generated_is_at_least_as_conservative: missingFromGenerated.length === 0,
-    reduction_evidence: reductionEvidence,
-    conservative_fallback_reasons: [...new Set(fallbackReasons)].sort(),
-  };
-}
-
 export function readCargoMetadata(repoRoot, metadataPath = process.env.CI_CARGO_METADATA_PATH) {
   if (metadataPath) {
     const resolved = path.resolve(repoRoot, metadataPath);
@@ -336,6 +300,3 @@ export function readCargoMetadata(repoRoot, metadataPath = process.env.CI_CARGO_
   return JSON.parse(result.stdout);
 }
 
-// Compatibility exports for consumers that imported the original shadow helper.
-export const computeReverseDependencyShadow = computeMetadataSelection;
-export const unavailableShadow = unavailableSelection;

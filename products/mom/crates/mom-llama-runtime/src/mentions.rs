@@ -696,14 +696,6 @@ pub fn mention_candidates(
     ))
 }
 
-pub fn chat_dispatch(
-    input: MentionDispatchInput,
-    options: ChatSendOptions,
-) -> Result<CommandResult<ChatDispatchOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    chat_dispatch_in_scope(&scope, input, options)
-}
-
 pub fn chat_dispatch_in_scope(
     scope: &OperationScope,
     input: MentionDispatchInput,
@@ -717,14 +709,6 @@ pub fn chat_dispatch_in_scope(
     )
 }
 
-pub fn mention_dispatch(
-    input: MentionDispatchInput,
-    options: ChatSendOptions,
-) -> Result<CommandResult<ChatDispatchOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    mention_dispatch_in_scope(&scope, input, options)
-}
-
 pub fn mention_dispatch_in_scope(
     scope: &OperationScope,
     input: MentionDispatchInput,
@@ -734,18 +718,6 @@ pub fn mention_dispatch_in_scope(
     result.command = "mom_llama.mention_dispatch".to_string();
     result.receipt.command = "mom_llama.mention_dispatch".to_string();
     Ok(result)
-}
-
-pub fn chat_dispatch_stream<F>(
-    input: MentionDispatchInput,
-    options: ChatSendOptions,
-    on_event: Option<F>,
-) -> Result<CommandResult<ChatDispatchOutput>>
-where
-    F: FnMut(ChatDispatchStreamEvent) -> Result<()>,
-{
-    let scope = OperationScope::for_current_product_host();
-    chat_dispatch_stream_in_scope(&scope, input, options, on_event)
 }
 
 pub fn chat_dispatch_stream_in_scope<F>(
@@ -861,14 +833,6 @@ where
     dispatch_mentions(scope, input, resolved, options, &mut on_event)
 }
 
-pub fn mention_cancel(
-    invocation_id: &str,
-    target_id: Option<&str>,
-) -> Result<CommandResult<MentionCancelOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    mention_cancel_in_scope(&scope, invocation_id, target_id)
-}
-
 pub fn mention_cancel_in_scope(
     scope: &OperationScope,
     invocation_id: &str,
@@ -964,15 +928,6 @@ fn project_visible_tool_approvals(
     approvals
 }
 
-pub fn mention_tool_approval_decide(
-    invocation_id: &str,
-    approval_id: &str,
-    decision: MentionToolApprovalDecision,
-) -> Result<CommandResult<MentionToolApprovalResolution>> {
-    let scope = OperationScope::for_current_product_host();
-    mention_tool_approval_decide_in_scope(&scope, invocation_id, approval_id, decision)
-}
-
 pub fn mention_tool_approval_decide_in_scope(
     scope: &OperationScope,
     invocation_id: &str,
@@ -996,22 +951,6 @@ pub fn mention_tool_approval_decide_in_scope(
             &recovery,
         )
     }
-}
-
-pub fn mention_tool_approval_decide_with_recovery(
-    invocation_id: &str,
-    approval_id: &str,
-    decision: MentionToolApprovalDecision,
-    recovery: &PersonaToolApprovalRecovery,
-) -> Result<CommandResult<MentionToolApprovalResolution>> {
-    let scope = OperationScope::for_current_product_host();
-    mention_tool_approval_decide_with_recovery_in_scope(
-        &scope,
-        invocation_id,
-        approval_id,
-        decision,
-        recovery,
-    )
 }
 
 pub fn mention_tool_approval_decide_with_recovery_in_scope(
@@ -1101,6 +1040,7 @@ fn mention_tool_approval_decide_supported_in_scope(
         ));
     }
     let model = match resident_model_for_frozen_config(
+        scope,
         &settings,
         &preflight.model_config,
         &preflight.model_fingerprint,
@@ -1911,8 +1851,9 @@ fn resume_persona_tool_approval(
     ) {
         return Err(cancelled_persona_tool_resume(None));
     }
-    let handle = resident_model_for_fingerprint(settings, &claim.continuation.model_fingerprint)
-        .map_err(|blocked| blocked.blocker)?;
+    let handle =
+        resident_model_for_fingerprint(scope, settings, &claim.continuation.model_fingerprint)
+            .map_err(|blocked| blocked.blocker)?;
     if mention_cancellation_requested(
         scope,
         &claim.approval.invocation_id,
@@ -2755,7 +2696,10 @@ fn finish_stored_mention_invocation(
     stored.updated_at = now_ms().to_string();
 }
 
-pub fn mention_synthesize(invocation_id: &str) -> Result<CommandResult<MentionSynthesisOutput>> {
+pub fn mention_synthesize(
+    scope: &crate::OperationScope,
+    invocation_id: &str,
+) -> Result<CommandResult<MentionSynthesisOutput>> {
     let store = RuntimeStore::current()?;
     let invocation = store
         .get::<MentionInvocationDb>(INVOCATIONS_NAMESPACE)?
@@ -2861,6 +2805,7 @@ pub fn mention_synthesize(invocation_id: &str) -> Result<CommandResult<MentionSy
         ));
     };
     let handle = match resident_model_for_profile(
+        scope,
         &settings,
         model_path,
         host.execution_profile.mmproj_path.as_deref(),
@@ -3295,7 +3240,7 @@ where
                 continue;
             }
         };
-        let handle = match resident_model_for_configuration(&settings, &model_config) {
+        let handle = match resident_model_for_configuration(scope, &settings, &model_config) {
             Ok(handle) => handle,
             Err(blocked) => {
                 invocation.results.push(blocked_target_result(
@@ -5604,7 +5549,9 @@ mod tests {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[test]
     fn unsupported_platform_blocks_approval_before_store_or_lease_authority() {
-        let direct = super::mention_tool_approval_decide(
+        let scope = crate::OperationScope::detached();
+        let direct = super::mention_tool_approval_decide_in_scope(
+            &scope,
             "missing-invocation",
             "missing-approval",
             MentionToolApprovalDecision::Approve,

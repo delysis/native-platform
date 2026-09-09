@@ -1543,12 +1543,12 @@ fn store_blocker(blocker: &Blocker) -> Markup {
     }
 }
 
-pub fn render_app() -> Result<String> {
+pub fn render_app(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
     let settings = mom_llama_runtime::settings_get()?;
-    let engine = mom_llama_runtime::engine_status()?;
+    let engine = mom_llama_runtime::engine_status(scope)?;
     let personas = persona_projection();
     let conversations = mom_llama_runtime::conversation_list()?;
-    let models = mom_llama_runtime::model_list()?;
+    let models = mom_llama_runtime::model_list(scope)?;
     let selected_conversation_id =
         mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
     let current_conversation_id =
@@ -1568,10 +1568,10 @@ pub fn render_app() -> Result<String> {
     .into_string())
 }
 
-pub fn render_chat_fragment() -> Result<String> {
+pub fn render_chat_fragment(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
     let settings = mom_llama_runtime::settings_get()?;
-    let engine = mom_llama_runtime::engine_status()?;
-    let models = mom_llama_runtime::model_list()?;
+    let engine = mom_llama_runtime::engine_status(scope)?;
+    let models = mom_llama_runtime::model_list(scope)?;
     let conversations = mom_llama_runtime::conversation_list()?;
     let selected = mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
     let active = active_conversation(&conversations, selected.as_deref());
@@ -1593,9 +1593,9 @@ pub fn render_sidebar_fragment() -> Result<String> {
     Ok(sidebar(&conversations, &personas, selected.as_deref()).into_string())
 }
 
-pub fn render_settings_fragment() -> Result<String> {
+pub fn render_settings_fragment(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
     let settings = mom_llama_runtime::settings_get()?;
-    let models = mom_llama_runtime::model_list()?;
+    let models = mom_llama_runtime::model_list(scope)?;
     let personas = persona_projection();
     let conversations = mom_llama_runtime::conversation_list()?;
     let selected = mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
@@ -4301,7 +4301,7 @@ mod tests {
         mom_llama_runtime::config::set_data_dir_override_for_tests(Some(
             data_dir.path().to_path_buf(),
         ));
-        let rendered = render_app();
+        let rendered = render_app(&mom_llama_runtime::OperationScope::detached());
         mom_llama_runtime::config::set_data_dir_override_for_tests(None);
         let html = rendered?;
         for forbidden in ["__sveltekit__", "React", "Vue", "fetch("] {
@@ -4849,7 +4849,7 @@ mod tests {
         std::fs::write(data_dir.join("runtime.sqlite3"), b"not a sqlite database")
             .expect("write corrupt store fixture");
         mom_llama_runtime::config::set_data_dir_override_for_tests(Some(data_dir.clone()));
-        let rendered = render_app();
+        let rendered = render_app(&mom_llama_runtime::OperationScope::detached());
         mom_llama_runtime::config::set_data_dir_override_for_tests(None);
         std::fs::remove_dir_all(data_dir).expect("remove corrupt store fixture");
         assert!(

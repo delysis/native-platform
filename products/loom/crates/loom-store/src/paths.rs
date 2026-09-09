@@ -46,7 +46,16 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
+    ensure_private_storage_supported()?;
     ensure_directory_with_policy(path, DirectoryPolicy::Private)
+}
+
+pub(crate) const fn ensure_private_storage_supported() -> Result<()> {
+    if cfg!(unix) {
+        Ok(())
+    } else {
+        Err(StoreError::UnsupportedStoragePlatform)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

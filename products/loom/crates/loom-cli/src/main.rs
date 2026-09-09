@@ -570,6 +570,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn preview_defaults_app_side_to_base_and_never_writes() {
         let fixture = Fixture::new("base\n");
         fs::write(fixture.visible_path(), "external\n").expect("write external edit");
@@ -614,6 +615,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn preview_reports_conflict_and_deleted_external_without_applying() {
         let fixture = Fixture::new("abc\n");
         fs::write(fixture.visible_path(), "ayc\n").expect("write external edit");
@@ -644,6 +646,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn apply_requires_exact_bindings_and_records_explicit_resolution() {
         let mut fixture = Fixture::new("base\n");
         fs::write(fixture.visible_path(), "external\n").expect("write external edit");
@@ -690,6 +693,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn prose_preview_and_apply_share_canonical_crlf_projection() {
         let mut fixture = Fixture::new("base\n");
         fs::write(fixture.visible_path(), "external\r\n").expect("write CRLF external edit");
@@ -735,6 +739,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn verse_preview_preserves_crlf_and_whitespace_exactly() {
         let fixture = Fixture::new_with_kind("first\r\n", DocumentKind::Verse);
         let external = "first\r\n\r\n  second  \r\n";
@@ -756,6 +761,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn flat_hybrid_preview_and_apply_fail_closed() {
         let mut fixture = Fixture::new_with_kind("hybrid\n", DocumentKind::Hybrid);
         fs::write(fixture.visible_path(), "external\n").expect("write hybrid external edit");
@@ -788,6 +794,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn apply_rejects_empty_reason_before_mutating() {
         let mut fixture = Fixture::new("base\n");
         fs::write(fixture.visible_path(), "external\n").expect("write external edit");

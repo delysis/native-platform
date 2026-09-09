@@ -64,7 +64,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: policy-linux
-      - run: node --test scripts/ci/test-ci-metadata-shadow.mjs scripts/ci/test-ci-plan.mjs scripts/ci/test-ci-required.mjs scripts/ci/test-ignored-tests.mjs scripts/ci/test-product-state-backup.mjs scripts/ci/test-workflows.mjs
+      - run: node --test scripts/ci/test-ci-metadata-selection.mjs scripts/ci/test-ci-plan.mjs scripts/ci/test-ci-required.mjs scripts/ci/test-ignored-tests.mjs scripts/ci/test-product-state-backup.mjs scripts/ci/test-workflows.mjs
       - run: node --test scripts/ci/test-current-docs.mjs
       - run: node scripts/ci/validate-current-docs.mjs
       - run: cargo run --locked -p xtask -- policy

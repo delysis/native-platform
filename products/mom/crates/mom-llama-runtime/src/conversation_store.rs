@@ -1134,10 +1134,11 @@ pub fn draft_clear(conversation_id: Option<&str>) -> Result<CommandResult<Conver
 }
 
 pub fn text_attachment_import(
+    scope: &crate::OperationScope,
     conversation_id: &str,
     path: &Path,
 ) -> Result<CommandResult<TextAttachmentImport>> {
-    let imported = crate::attachments::attachment_import(conversation_id, path)?;
+    let imported = crate::attachments::attachment_import(scope, conversation_id, path)?;
     if imported.status == "blocked" {
         return Ok(CommandResult::blocked(
             "mom_llama.attachment_import_text",

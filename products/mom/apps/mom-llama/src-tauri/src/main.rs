@@ -359,14 +359,13 @@ async fn mom_llama_runtime_initialize(
 
 fn main() {
     if std::env::args().any(|arg| arg == "--dump-html") {
-        match view::render_app() {
+        match view::render_app(&mom_llama_runtime::OperationScope::detached()) {
             Ok(html) => println!("{html}"),
             Err(error) => {
                 eprintln!("{error:#}");
                 std::process::exit(1);
             }
         }
-        mom_llama_runtime::unload_resident_model();
         return;
     }
 
@@ -375,7 +374,6 @@ fn main() {
             eprintln!("{error:#}");
             std::process::exit(1);
         }
-        mom_llama_runtime::unload_resident_model();
         return;
     }
 
@@ -812,7 +810,7 @@ fn build_runtime(
 }
 
 fn smoke() -> Result<()> {
-    let app_html = view::render_app()?;
+    let app_html = view::render_app(&mom_llama_runtime::OperationScope::detached())?;
     let smoke = smoke_receipt(app_html.len());
     println!("{}", serde_json::to_string_pretty(&smoke)?);
     Ok(())

@@ -974,12 +974,12 @@ fn run() -> Result<()> {
     let operation_scope = native_owner
         .as_ref()
         .map_or_else(mom_llama_runtime::OperationScope::detached, |owner| {
-            mom_llama_runtime::OperationScope::for_native_host(&owner.host())
+            owner.operation_scope()
         });
     match cli.command {
         Command::Engine { command } => match command {
             EngineCommand::Check { json } => print_result(
-                mom_llama_runtime::engine_check(EngineCheckOptions::default())?,
+                mom_llama_runtime::engine_check(&operation_scope, EngineCheckOptions::default())?,
                 json,
             ),
             EngineCommand::Configure {
@@ -1003,7 +1003,9 @@ fn run() -> Result<()> {
             ),
         },
         Command::Model { command } => match command {
-            ModelCommand::List { json } => print_result(mom_llama_runtime::model_list()?, json),
+            ModelCommand::List { json } => {
+                print_result(mom_llama_runtime::model_list(&operation_scope)?, json)
+            }
             ModelCommand::Select {
                 model_path,
                 conversation,
@@ -1014,24 +1016,29 @@ fn run() -> Result<()> {
                     .filter(|value| !value.trim().is_empty())
                 {
                     Some(conversation) => mom_llama_runtime::conversation_model_select_and_load(
+                        &operation_scope,
                         conversation,
                         model_path,
                     )?,
-                    None => mom_llama_runtime::model_select(model_path)?,
+                    None => mom_llama_runtime::model_select(&operation_scope, model_path)?,
                 },
                 json,
             ),
             ModelCommand::Status { json } => {
-                print_result(mom_llama_runtime::model_slot_list()?, json)
+                print_result(mom_llama_runtime::model_slot_list(&operation_scope)?, json)
             }
             ModelCommand::Load {
                 slot,
                 model_path,
                 json,
-            } => print_result(mom_llama_runtime::model_slot_load(slot, model_path)?, json),
-            ModelCommand::Unload { slot, json } => {
-                print_result(mom_llama_runtime::model_slot_unload(slot)?, json)
-            }
+            } => print_result(
+                mom_llama_runtime::model_slot_load(&operation_scope, slot, model_path)?,
+                json,
+            ),
+            ModelCommand::Unload { slot, json } => print_result(
+                mom_llama_runtime::model_slot_unload(&operation_scope, slot)?,
+                json,
+            ),
         },
         Command::Chat { command } => match command {
             ChatCommand::Send {
@@ -1180,7 +1187,10 @@ fn run() -> Result<()> {
                 print_result(mom_llama_runtime::persona_get(&persona)?, json)
             }
             PersonaCommand::Update { profile, json } => print_result(
-                mom_llama_runtime::persona_update(serde_json::from_value(profile)?)?,
+                mom_llama_runtime::persona_update(
+                    &operation_scope,
+                    serde_json::from_value(profile)?,
+                )?,
                 json,
             ),
             PersonaCommand::RemovalPreview { persona, json } => print_result(
@@ -1275,9 +1285,10 @@ fn run() -> Result<()> {
                 )?,
                 json,
             ),
-            MentionCommand::Synthesize { invocation, json } => {
-                print_result(mom_llama_runtime::mention_synthesize(&invocation)?, json)
-            }
+            MentionCommand::Synthesize { invocation, json } => print_result(
+                mom_llama_runtime::mention_synthesize(&operation_scope, &invocation)?,
+                json,
+            ),
             MentionCommand::ApprovalList { conversation, json } => print_result(
                 mom_llama_runtime::mention_tool_approval_list(&conversation)?,
                 json,
@@ -1354,7 +1365,7 @@ fn run() -> Result<()> {
                 path,
                 json,
             } => print_result(
-                mom_llama_runtime::attachment_import(&conversation, &path)?,
+                mom_llama_runtime::attachment_import(&operation_scope, &conversation, &path)?,
                 json,
             ),
             AttachmentCommand::ImportText {
@@ -1362,7 +1373,7 @@ fn run() -> Result<()> {
                 path,
                 json,
             } => print_result(
-                mom_llama_runtime::text_attachment_import(&conversation, &path)?,
+                mom_llama_runtime::text_attachment_import(&operation_scope, &conversation, &path)?,
                 json,
             ),
             AttachmentCommand::ImportPaste {
@@ -1370,7 +1381,11 @@ fn run() -> Result<()> {
                 text,
                 json,
             } => print_result(
-                mom_llama_runtime::attachment_import_pasted_text(&conversation, text)?,
+                mom_llama_runtime::attachment_import_pasted_text(
+                    &operation_scope,
+                    &conversation,
+                    text,
+                )?,
                 json,
             ),
             AttachmentCommand::List { conversation, json } => print_result(
@@ -1419,21 +1434,29 @@ fn run() -> Result<()> {
                 json,
             ),
             ServerCommand::Status { json } => {
-                print_result(mom_llama_runtime::server_status()?, json)
+                print_result(mom_llama_runtime::server_status(&operation_scope)?, json)
             }
-            ServerCommand::Start { json } => print_result(mom_llama_runtime::server_start()?, json),
-            ServerCommand::Stop { json } => print_result(mom_llama_runtime::server_stop()?, json),
+            ServerCommand::Start { json } => {
+                print_result(mom_llama_runtime::server_start(&operation_scope)?, json)
+            }
+            ServerCommand::Stop { json } => {
+                print_result(mom_llama_runtime::server_stop(&operation_scope)?, json)
+            }
             ServerCommand::Slots { json } => {
-                print_result(mom_llama_runtime::model_slot_list()?, json)
+                print_result(mom_llama_runtime::model_slot_list(&operation_scope)?, json)
             }
             ServerCommand::SlotLoad {
                 slot,
                 model_path,
                 json,
-            } => print_result(mom_llama_runtime::model_slot_load(slot, model_path)?, json),
-            ServerCommand::SlotUnload { slot, json } => {
-                print_result(mom_llama_runtime::model_slot_unload(slot)?, json)
-            }
+            } => print_result(
+                mom_llama_runtime::model_slot_load(&operation_scope, slot, model_path)?,
+                json,
+            ),
+            ServerCommand::SlotUnload { slot, json } => print_result(
+                mom_llama_runtime::model_slot_unload(&operation_scope, slot)?,
+                json,
+            ),
         },
         Command::Conversation { command } => match command {
             ConversationCommand::New { title, json } => {
@@ -1766,14 +1789,16 @@ fn run() -> Result<()> {
             KvCacheCommand::Status { json } => {
                 print_result(mom_llama_runtime::kv_cache_status()?, json)
             }
-            KvCacheCommand::Save { skill, json } => {
-                print_result(mom_llama_runtime::kv_cache_save(skill)?, json)
-            }
-            KvCacheCommand::Restore { cache, json } => {
-                print_result(mom_llama_runtime::kv_cache_restore(cache)?, json)
-            }
+            KvCacheCommand::Save { skill, json } => print_result(
+                mom_llama_runtime::kv_cache_save(&operation_scope, skill)?,
+                json,
+            ),
+            KvCacheCommand::Restore { cache, json } => print_result(
+                mom_llama_runtime::kv_cache_restore(&operation_scope, cache)?,
+                json,
+            ),
             KvCacheCommand::Clear { json } => {
-                print_result(mom_llama_runtime::kv_cache_clear()?, json)
+                print_result(mom_llama_runtime::kv_cache_clear(&operation_scope)?, json)
             }
         },
     }

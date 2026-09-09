@@ -20,16 +20,18 @@ use crate::information::{
 
 #[tauri::command]
 pub fn mom_llama_render_app(runtime: State<'_, AppRuntimeHandle>) -> Result<Response, String> {
+    let scope = runtime.operation_scope();
     let _lease = runtime.admit(command_spec("mom_llama_render_app"))?;
-    markup_response(crate::view::render_app())
+    markup_response(crate::view::render_app(&scope))
 }
 
 #[tauri::command]
 pub fn mom_llama_render_chat_fragment(
     runtime: State<'_, AppRuntimeHandle>,
 ) -> Result<Response, String> {
+    let scope = runtime.operation_scope();
     let _lease = runtime.admit(command_spec("mom_llama_render_chat_fragment"))?;
-    markup_response(crate::view::render_chat_fragment())
+    markup_response(crate::view::render_chat_fragment(&scope))
 }
 
 #[tauri::command]
@@ -44,8 +46,9 @@ pub fn mom_llama_render_sidebar_fragment(
 pub fn mom_llama_render_settings_fragment(
     runtime: State<'_, AppRuntimeHandle>,
 ) -> Result<Response, String> {
+    let scope = runtime.operation_scope();
     let _lease = runtime.admit(command_spec("mom_llama_render_settings_fragment"))?;
-    markup_response(crate::view::render_settings_fragment())
+    markup_response(crate::view::render_settings_fragment(&scope))
 }
 
 #[tauri::command]
@@ -350,9 +353,10 @@ fn picker_blocked(code: &str, message: String) -> Result<Value, String> {
 
 #[tauri::command]
 pub async fn mom_llama_engine_check(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_engine_check"))?,
-        move || mom_llama_runtime::engine_check(EngineCheckOptions::default()),
+        move || mom_llama_runtime::engine_check(&scope, EngineCheckOptions::default()),
     )
     .await
 }
@@ -380,8 +384,9 @@ pub fn mom_llama_engine_configure(
 
 #[tauri::command]
 pub fn mom_llama_model_list(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     let _lease = runtime.admit(command_spec("mom_llama_model_list"))?;
-    command_value(mom_llama_runtime::model_list())
+    command_value(mom_llama_runtime::model_list(&scope))
 }
 
 #[tauri::command]
@@ -390,6 +395,7 @@ pub async fn mom_llama_model_select(
     model_path: String,
     conversation: Option<String>,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     let conversation = conversation.filter(|value| !value.trim().is_empty());
     let lease = runtime.admit(command_spec("mom_llama_model_select"))?;
     let default_intent = conversation
@@ -399,10 +405,12 @@ pub async fn mom_llama_model_select(
         .map_err(|error| error.to_string())?;
     blocking_command(lease, move || match conversation.as_deref() {
         Some(conversation) => mom_llama_runtime::conversation_model_select_and_load(
+            &scope,
             conversation,
             PathBuf::from(model_path),
         ),
         None => mom_llama_runtime::model_select_with_intent(
+            &scope,
             PathBuf::from(model_path),
             default_intent.expect("default model selection always has an intent"),
         ),
@@ -451,6 +459,7 @@ pub async fn mom_llama_composer_autocomplete(
     selection_end_utf16: u32,
     attachment_ids: Option<Vec<String>>,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     let lease = runtime.admit(command_spec("mom_llama_composer_autocomplete"))?;
     let request_id = lease
         .native_request_id()
@@ -462,6 +471,7 @@ pub async fn mom_llama_composer_autocomplete(
     lease
         .run_blocking(move || {
             let result = mom_llama_runtime::composer_autocomplete_supervised(
+                &scope,
                 ComposerAutocompleteInput {
                     conversation_id: conversation,
                     draft,
@@ -505,10 +515,11 @@ pub async fn mom_llama_composer_autocomplete_accept(
     anchor: ComposerAutocompleteAnchor,
     suffix: String,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     let lease = runtime.admit(command_spec("mom_llama_composer_autocomplete_accept"))?;
     lease
         .run_blocking(move || {
-            let result = mom_llama_runtime::composer_autocomplete_accept(anchor, suffix)
+            let result = mom_llama_runtime::composer_autocomplete_accept(&scope, anchor, suffix)
                 .map_err(to_error)?;
             to_value(result).map_err(to_error)
         })
@@ -627,9 +638,10 @@ pub async fn mom_llama_mention_synthesize(
     runtime: State<'_, AppRuntimeHandle>,
     invocation: String,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_mention_synthesize"))?,
-        move || mom_llama_runtime::mention_synthesize(&invocation),
+        move || mom_llama_runtime::mention_synthesize(&scope, &invocation),
     )
     .await
 }
@@ -712,9 +724,10 @@ pub async fn mom_llama_persona_update(
     runtime: State<'_, AppRuntimeHandle>,
     profile: mom_llama_runtime::PersonaUpdateInput,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_persona_update"))?,
-        move || mom_llama_runtime::persona_update(profile),
+        move || mom_llama_runtime::persona_update(&scope, profile),
     )
     .await
 }
@@ -1086,9 +1099,12 @@ pub async fn mom_llama_attachment_import_text(
     conversation: String,
     path: String,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_attachment_import_text"))?,
-        move || mom_llama_runtime::text_attachment_import(&conversation, &PathBuf::from(path)),
+        move || {
+            mom_llama_runtime::text_attachment_import(&scope, &conversation, &PathBuf::from(path))
+        },
     )
     .await
 }
@@ -1099,9 +1115,10 @@ pub async fn mom_llama_attachment_import_paste(
     conversation: String,
     text: String,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_attachment_import_paste"))?,
-        move || mom_llama_runtime::attachment_import_pasted_text(&conversation, text),
+        move || mom_llama_runtime::attachment_import_pasted_text(&scope, &conversation, text),
     )
     .await
 }
@@ -1112,9 +1129,10 @@ pub async fn mom_llama_attachment_import(
     conversation: String,
     path: String,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_attachment_import"))?,
-        move || mom_llama_runtime::attachment_import(&conversation, &PathBuf::from(path)),
+        move || mom_llama_runtime::attachment_import(&scope, &conversation, &PathBuf::from(path)),
     )
     .await
 }
@@ -1387,9 +1405,10 @@ pub async fn mom_llama_kv_cache_save(
     runtime: State<'_, AppRuntimeHandle>,
     skill: Option<String>,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_kv_cache_save"))?,
-        move || mom_llama_runtime::kv_cache_save(skill),
+        move || mom_llama_runtime::kv_cache_save(&scope, skill),
     )
     .await
 }
@@ -1399,9 +1418,10 @@ pub async fn mom_llama_kv_cache_restore(
     runtime: State<'_, AppRuntimeHandle>,
     cache: Option<String>,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_kv_cache_restore"))?,
-        move || mom_llama_runtime::kv_cache_restore(cache),
+        move || mom_llama_runtime::kv_cache_restore(&scope, cache),
     )
     .await
 }
@@ -1410,9 +1430,10 @@ pub async fn mom_llama_kv_cache_restore(
 pub async fn mom_llama_kv_cache_clear(
     runtime: State<'_, AppRuntimeHandle>,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_kv_cache_clear"))?,
-        mom_llama_runtime::kv_cache_clear,
+        move || mom_llama_runtime::kv_cache_clear(&scope),
     )
     .await
 }
@@ -1654,8 +1675,9 @@ pub fn mom_llama_tool_permission_revoke(
 
 #[tauri::command]
 pub fn mom_llama_model_slot_list(runtime: State<'_, AppRuntimeHandle>) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     let _lease = runtime.admit(command_spec("mom_llama_model_slot_list"))?;
-    command_value(mom_llama_runtime::model_slot_list())
+    command_value(mom_llama_runtime::model_slot_list(&scope))
 }
 
 #[tauri::command]
@@ -1664,9 +1686,10 @@ pub async fn mom_llama_model_slot_load(
     slot: usize,
     model_path: String,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_model_slot_load"))?,
-        move || mom_llama_runtime::model_slot_load(slot, PathBuf::from(model_path)),
+        move || mom_llama_runtime::model_slot_load(&scope, slot, PathBuf::from(model_path)),
     )
     .await
 }
@@ -1676,9 +1699,10 @@ pub async fn mom_llama_model_slot_unload(
     runtime: State<'_, AppRuntimeHandle>,
     slot: usize,
 ) -> Result<Value, String> {
+    let scope = runtime.operation_scope();
     blocking_command(
         runtime.admit(command_spec("mom_llama_model_slot_unload"))?,
-        move || mom_llama_runtime::model_slot_unload(slot),
+        move || mom_llama_runtime::model_slot_unload(&scope, slot),
     )
     .await
 }

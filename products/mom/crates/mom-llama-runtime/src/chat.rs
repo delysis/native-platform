@@ -394,14 +394,6 @@ fn parse_reasoning_output(value: &str, enabled: bool) -> ParsedReasoning {
     parsed
 }
 
-pub fn chat_send(
-    input: ChatSendInput,
-    options: ChatSendOptions,
-) -> Result<CommandResult<ChatSendOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    chat_send_in_scope(&scope, input, options)
-}
-
 pub fn chat_send_in_scope(
     scope: &OperationScope,
     input: ChatSendInput,
@@ -416,18 +408,6 @@ pub fn chat_send_in_scope(
     )
 }
 
-pub fn chat_send_stream<F>(
-    input: ChatSendInput,
-    options: ChatSendOptions,
-    on_event: F,
-) -> Result<CommandResult<ChatSendOutput>>
-where
-    F: FnMut(ChatStreamEvent) -> Result<()>,
-{
-    let scope = OperationScope::for_current_product_host();
-    chat_send_stream_in_scope(&scope, input, options, on_event)
-}
-
 pub fn chat_send_stream_in_scope<F>(
     scope: &OperationScope,
     input: ChatSendInput,
@@ -438,14 +418,6 @@ where
     F: FnMut(ChatStreamEvent) -> Result<()>,
 {
     chat_send_supervised(scope, input, options, None, Some(on_event))
-}
-
-pub fn chat_regenerate(
-    conversation_id: &str,
-    options: ChatSendOptions,
-) -> Result<CommandResult<ChatSendOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    chat_regenerate_in_scope(&scope, conversation_id, options)
 }
 
 pub fn chat_regenerate_in_scope(
@@ -488,14 +460,6 @@ pub fn chat_regenerate_in_scope(
     )?;
     retag_chat_result(&mut result, "mom_llama.chat_regenerate");
     Ok(result)
-}
-
-pub fn chat_continue(
-    conversation_id: &str,
-    options: ChatSendOptions,
-) -> Result<CommandResult<ChatSendOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    chat_continue_in_scope(&scope, conversation_id, options)
 }
 
 pub fn chat_continue_in_scope(
@@ -724,6 +688,7 @@ where
             return Ok(chat_cancelled_result());
         }
         let handle = match resident_model_for_profile(
+            scope,
             &settings,
             &model_path,
             settings.mmproj_path.as_deref(),
@@ -1080,11 +1045,6 @@ fn user_turn_is_empty(message: &str, attachments: &ChatAttachmentContext) -> boo
         && attachments.media.is_empty()
 }
 
-pub fn chat_cancel(conversation_id: &str) -> Result<CommandResult<ChatCancelOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    chat_cancel_in_scope(&scope, conversation_id)
-}
-
 pub fn chat_cancel_in_scope(
     scope: &OperationScope,
     conversation_id: &str,
@@ -1146,13 +1106,6 @@ pub fn chat_cancel_in_scope(
         false,
         false,
     ))
-}
-
-pub fn chat_skip_reasoning(
-    conversation_id: &str,
-) -> Result<CommandResult<ChatSkipReasoningOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    chat_skip_reasoning_in_scope(&scope, conversation_id)
 }
 
 pub fn chat_skip_reasoning_in_scope(

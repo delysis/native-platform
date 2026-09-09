@@ -186,7 +186,10 @@ pub fn kv_cache_status() -> Result<CommandResult<KvCacheStatus>> {
     ))
 }
 
-pub fn kv_cache_save(skill_id: Option<String>) -> Result<CommandResult<KvCacheMetadata>> {
+pub fn kv_cache_save(
+    scope: &crate::OperationScope,
+    skill_id: Option<String>,
+) -> Result<CommandResult<KvCacheMetadata>> {
     let settings = resolve_settings()?;
     if !settings.kv_cache_policy.allows_prefix_reuse() {
         return Ok(CommandResult::blocked(
@@ -199,7 +202,7 @@ pub fn kv_cache_save(skill_id: Option<String>) -> Result<CommandResult<KvCacheMe
             ),
         ));
     }
-    let handle = match resident_model(&settings) {
+    let handle = match resident_model(scope, &settings) {
         Ok(handle) => handle,
         Err(blocked) => {
             return Ok(CommandResult::blocked(
@@ -261,7 +264,10 @@ pub fn kv_cache_save(skill_id: Option<String>) -> Result<CommandResult<KvCacheMe
     ))
 }
 
-pub fn kv_cache_restore(cache_id: Option<String>) -> Result<CommandResult<KvCacheMetadata>> {
+pub fn kv_cache_restore(
+    scope: &crate::OperationScope,
+    cache_id: Option<String>,
+) -> Result<CommandResult<KvCacheMetadata>> {
     let settings = resolve_settings()?;
     if !settings.kv_cache_policy.allows_prefix_reuse() {
         return Ok(CommandResult::blocked(
@@ -274,7 +280,7 @@ pub fn kv_cache_restore(cache_id: Option<String>) -> Result<CommandResult<KvCach
             ),
         ));
     }
-    let handle = match resident_model(&settings) {
+    let handle = match resident_model(scope, &settings) {
         Ok(handle) => handle,
         Err(blocked) => {
             return Ok(CommandResult::blocked(
@@ -432,9 +438,9 @@ pub fn kv_cache_restore(cache_id: Option<String>) -> Result<CommandResult<KvCach
     ))
 }
 
-pub fn kv_cache_clear() -> Result<CommandResult<KvCacheStatus>> {
+pub fn kv_cache_clear(scope: &crate::OperationScope) -> Result<CommandResult<KvCacheStatus>> {
     let settings = resolve_settings()?;
-    clear_native_prefix_cache(&settings)?;
+    clear_native_prefix_cache(scope, &settings)?;
     let store = RuntimeStore::open(&settings.data_dir)?;
     store.mutate_documents(
         KV_CACHE_NAMESPACE,

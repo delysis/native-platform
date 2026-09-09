@@ -544,7 +544,7 @@ test("PR workflow is always triggered and has one truthful aggregate", () => {
   assert.match(source, /node scripts\/ci\/ci-required\.mjs/);
   assert.match(
     source,
-    /node --test scripts\/ci\/test-ci-metadata-shadow\.mjs scripts\/ci\/test-ci-plan\.mjs scripts\/ci\/test-ci-required\.mjs scripts\/ci\/test-ignored-tests\.mjs scripts\/ci\/test-product-state-backup\.mjs scripts\/ci\/test-workflows\.mjs/,
+    /node --test scripts\/ci\/test-ci-metadata-selection\.mjs scripts\/ci\/test-ci-plan\.mjs scripts\/ci\/test-ci-required\.mjs scripts\/ci\/test-ignored-tests\.mjs scripts\/ci\/test-product-state-backup\.mjs scripts\/ci\/test-workflows\.mjs/,
   );
 });
 

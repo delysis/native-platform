@@ -22,7 +22,7 @@ pub struct EngineCheckOutput {
     pub backend: String,
 }
 
-pub fn engine_status() -> Result<CommandResult<EngineCheckOutput>> {
+pub fn engine_status(scope: &crate::OperationScope) -> Result<CommandResult<EngineCheckOutput>> {
     let settings = resolve_settings()?;
     if let Err(blocked) = validate_engine_and_model(&settings) {
         return Ok(CommandResult::blocked(
@@ -32,8 +32,10 @@ pub fn engine_status() -> Result<CommandResult<EngineCheckOutput>> {
         ));
     }
     let model_path = settings.model_path.as_ref().cloned().unwrap_or_default();
-    let slot = resident_slots().into_iter().find(|slot| slot.slot_id == 0);
-    let resident = resident_status().filter(|status| {
+    let slot = resident_slots(scope)
+        .into_iter()
+        .find(|slot| slot.slot_id == 0);
+    let resident = resident_status(scope).filter(|status| {
         let Some(slot) = slot.as_ref() else {
             return false;
         };
@@ -68,7 +70,10 @@ pub fn engine_status() -> Result<CommandResult<EngineCheckOutput>> {
     ))
 }
 
-pub fn engine_check(options: EngineCheckOptions) -> Result<CommandResult<EngineCheckOutput>> {
+pub fn engine_check(
+    scope: &crate::OperationScope,
+    options: EngineCheckOptions,
+) -> Result<CommandResult<EngineCheckOutput>> {
     let settings = resolve_settings()?;
     if options.fake_fixture {
         return Ok(CommandResult::passed(
@@ -93,7 +98,7 @@ pub fn engine_check(options: EngineCheckOptions) -> Result<CommandResult<EngineC
             true,
         ));
     }
-    let handle = match resident_model(&settings) {
+    let handle = match resident_model(scope, &settings) {
         Ok(handle) => handle,
         Err(blocked) => {
             return Ok(CommandResult::blocked(

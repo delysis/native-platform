@@ -1,6 +1,6 @@
 # Loom Native implementation status
 
-Status date: 2026-09-04.
+Status date: 2026-09-09.
 
 This document describes Loom's lean shipping surface after W9. Historical
 research engines, migration adapters, and candidate plans remain available in
@@ -21,12 +21,12 @@ open or create project
     -> quit and reopen without losing accepted work
 ```
 
-The current workspace retains seven Loom Rust packages:
+The current workspace contains these Loom components:
 
 - `loom-types`: durable identities and protocol-neutral writing DTOs;
 - `loom-document`: canonical text projection and bounded merge logic;
 - `loom-store`: content-addressed artifacts, SQLite history, drafts, outbox,
-  generation evidence, and forward-compatible migrations;
+  generation evidence, and strict current-schema identity;
 - `loom-host`: product admission, generation lifecycle, and cancellation;
 - `loom-backend-llama`: the in-process `llama-native-kit` adapter;
 - `loom-cli`: storage and reconciliation oracle;
@@ -54,14 +54,13 @@ The lean pass preserves these product contracts:
   caret-prefix scope, bounded canonical text, and exact PNG/JPEG/WAV media
   bindings for Gemma 4 without OCR or transcription;
 - literal Tab behavior when a suggestion cannot be accepted exactly;
-- cancellation and joined application shutdown;
-- compatibility opening for prior store schemas and the prior-v10 project
-  fixture.
+- cancellation and joined application shutdown.
 
-Research-era SQLite migrations 7-10 remain installed because an existing Loom
-project may already contain those tables. They preserve readable history; no
-default production code recreates the deleted research authority or schedules
-research work. Migration 11 records ordinary foreground writing commands.
+The unreleased store uses one current schema. Research tables and old upgrade
+paths are retired. Opening an incompatible database reports a failure without
+rewriting it; ordinary manuscript bytes remain available. Private project
+storage requires Unix permissions and directory synchronization. Other
+platforms return an explicit unsupported result before mutation.
 
 ## Completion recovery boundary
 

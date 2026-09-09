@@ -216,11 +216,10 @@ test("Speech Apple changes select Speech and platform coverage", () => {
   assert.deepEqual(result.macos_matrix, ["release", "speech"]);
 });
 
-test("contract-family changes include metadata consumers while the Mom overlay stays shadow-only", () => {
+test("contract-family changes select their actual metadata consumers", () => {
   const contractPaths = [
     "crates/native/crates/llama-native-types/src/lib.rs",
     "crates/services/attachment/crates/attachment-native-types/src/lib.rs",
-    "crates/services/information/crates/information-native-types/src/lib.rs",
     "crates/services/speech/crates/speech-native-types/src/lib.rs",
     "products/fte/crates/fte-types/src/lib.rs",
   ];
@@ -231,58 +230,38 @@ test("contract-family changes include metadata consumers while the Mom overlay s
     assert.equal(result.flags.mom, true, contractPath);
     assert.ok(result.jobs.includes("mom-linux"), contractPath);
     assert.ok(result.jobs.includes("mom-windows"), contractPath);
-    assert.equal(result.conservative_overlays.mom_contracts.applied, true);
-    assert.deepEqual(result.conservative_overlays.mom_contracts.paths, [contractPath]);
-    assert.equal(result.conservative_overlays.mom_contracts.applied_to_selection, false);
     assert.equal(result.dependency_selection.selection_applied, true);
     assert.equal(result.dependency_selection.metadata_status, "available");
-    assert.equal(result.dependency_shadow.selection_applied, false);
   }
 });
 
-test("contract-family documentation does not trigger the temporary Mom overlay", () => {
+test("service documentation does not select an unrelated product", () => {
   const { result } = fixture("crates/services/speech/docs/ARCHITECTURE.md", {
     present: ["products/mom/Cargo.toml"],
   });
   assert.equal(result.flags.speech, true);
   assert.equal(result.flags.mom, false);
-  assert.equal(result.conservative_overlays.mom_contracts.applied, false);
 });
 
-test("an unexplained legacy reduction forces full instead of narrowing generated selection", () => {
+test("an unrelated product is not selected without a dependency edge", () => {
   const { result } = fixture(
     "crates/services/information/crates/information-native-types/src/lib.rs",
     { present: ["products/mom/Cargo.toml"] },
   );
-  assert.equal(result.dependency_selection.fallback, "full");
-  assert.ok(
-    result.dependency_selection.fallback_reasons.includes(
-      "legacy_reduction_without_evidence",
-    ),
-  );
-  assert.equal(result.flags.full, true);
-  assert.ok(result.dependency_shadow.missing_from_generated.includes("job:mom-linux"));
-  assert.ok(result.dependency_shadow.missing_from_generated.includes("job:mom-windows"));
-  assert.ok(result.dependency_shadow.final_surface.includes("flag:full"));
+  assert.equal(result.flags.full, false);
+  assert.equal(result.flags.information, true);
+  assert.equal(result.flags.mom, false);
+  assert.ok(result.jobs.includes("information-linux"));
+  assert.ok(!result.jobs.includes("mom-linux"));
 });
 
-test("an explicit non-graph evidence rule can authorize a reviewed legacy reduction", () => {
+test("an explicit documentation rule selects policy only", () => {
   const { result } = fixture("products/mom/docs/PRODUCT.md", {
     present: ["products/mom/Cargo.toml"],
   });
   assert.equal(result.flags.full, false);
   assert.deepEqual(result.jobs, ["policy"]);
-  assert.deepEqual(result.dependency_shadow.missing_from_generated, [
-    "job:mom-linux",
-    "job:mom-windows",
-  ]);
-  assert.deepEqual(result.dependency_shadow.reduction_evidence, [
-    {
-      path: "products/mom/docs/PRODUCT.md",
-      rule: "products/mom/docs",
-      evidence: "Mom documentation is policy-only",
-    },
-  ]);
+  assert.equal(result.dependency_selection.file_classifications[0].rule, "products/mom/docs");
 });
 
 test("Mom native source selects its product and macOS parity without root duplication", () => {
@@ -548,7 +527,7 @@ test("metadata unavailability forces the unchanged complete job and macOS matric
   ]);
 });
 
-test("planner applies metadata reverse consumers and retains a legacy shadow report", () => {
+test("planner applies metadata reverse consumers", () => {
   const { result } = fixture(
     "crates/native/crates/llama-native-types/src/lib.rs",
     {
@@ -579,8 +558,6 @@ test("planner applies metadata reverse consumers and retains a legacy shadow rep
   assert.equal(result.flags.gateway, true);
   assert.equal(result.flags.mom, true);
   assert.equal(result.flags.loom, true);
-  assert.equal(result.dependency_shadow.mode, "legacy-shadow");
-  assert.equal(result.dependency_shadow.generated_is_at_least_as_conservative, true);
 });
 
 test("renaming runtime source into docs retains the source-side coverage", () => {

@@ -65,7 +65,7 @@ pub struct ModelInfo {
     pub size_bytes: Option<u64>,
 }
 
-pub fn model_list() -> Result<CommandResult<Vec<ModelInfo>>> {
+pub fn model_list(scope: &crate::OperationScope) -> Result<CommandResult<Vec<ModelInfo>>> {
     let settings = resolve_settings()?;
     let mut models = Vec::new();
     let mut seen = BTreeSet::new();
@@ -75,7 +75,7 @@ pub fn model_list() -> Result<CommandResult<Vec<ModelInfo>>> {
         // from the explicit cache root below.
         push_model(&mut models, &mut seen, path.clone(), true);
     }
-    let resident_paths = crate::native_runtime::resident_slots()
+    let resident_paths = crate::native_runtime::resident_slots(scope)
         .into_iter()
         .map(|slot| slot.model_path)
         .collect::<Vec<_>>();
@@ -216,14 +216,18 @@ fn is_model_gguf(path: &Path) -> bool {
     !name.starts_with("mmproj-") && !name.contains("-mtp.")
 }
 
-pub fn model_select(model_path: PathBuf) -> Result<CommandResult<crate::Settings>> {
+pub fn model_select(
+    scope: &crate::OperationScope,
+    model_path: PathBuf,
+) -> Result<CommandResult<crate::Settings>> {
     // Claim the intent before validation or loading. A later invocation must
     // supersede this one even when it chooses an invalid path.
     let selection = begin_model_selection()?;
-    model_select_with_intent(model_path, selection)
+    model_select_with_intent(scope, model_path, selection)
 }
 
 pub fn model_select_with_intent(
+    scope: &crate::OperationScope,
     model_path: PathBuf,
     selection: ModelSelectionIntent,
 ) -> Result<CommandResult<crate::Settings>> {
@@ -232,6 +236,7 @@ pub fn model_select_with_intent(
         Err(blocked) => return Ok(blocked_model_selection(blocked)),
     };
     if let Err(blocked) = crate::native_runtime::resident_model_for_profile(
+        scope,
         &prepared,
         prepared
             .model_path
@@ -260,6 +265,7 @@ pub fn model_select_with_intent(
 /// composer boundary: selecting a model in an old chat must not silently mutate
 /// only the default for future chats.
 pub fn conversation_model_select_and_load(
+    scope: &crate::OperationScope,
     conversation_id: &str,
     model_path: PathBuf,
 ) -> Result<CommandResult<crate::Settings>> {
@@ -302,6 +308,7 @@ pub fn conversation_model_select_and_load(
         }
     };
     if let Err(blocked) = crate::native_runtime::resident_model_for_profile(
+        scope,
         &settings,
         settings
             .model_path

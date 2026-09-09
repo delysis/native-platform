@@ -130,10 +130,7 @@ pub struct AppWorkLease {
 }
 
 trait NativeFinalizer: Send + Sync {
-    fn shutdown(
-        &self,
-        host: &Arc<NativeHost>,
-    ) -> Result<ProcessExitJoinedNativeHost, mom_llama_runtime::ProductShutdownError>;
+    fn shutdown(&self, host: &Arc<NativeHost>) -> Result<ProcessExitJoinedNativeHost, String>;
 }
 
 trait PersonaApprovalReconciler: Send + Sync {
@@ -379,11 +376,8 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 struct ProductNativeFinalizer;
 
 impl NativeFinalizer for ProductNativeFinalizer {
-    fn shutdown(
-        &self,
-        host: &Arc<NativeHost>,
-    ) -> Result<ProcessExitJoinedNativeHost, mom_llama_runtime::ProductShutdownError> {
-        mom_llama_runtime::shutdown_product_runtime_for_process_exit(host)
+    fn shutdown(&self, host: &Arc<NativeHost>) -> Result<ProcessExitJoinedNativeHost, String> {
+        Ok(host.shutdown_for_process_exit())
     }
 }
 
@@ -550,7 +544,7 @@ impl AppRuntimeHandle {
         let native_host = native_owner.host();
         let persona_approval_authority = persona_approval_recovery.clone();
         Self::with_operation_supervisor(AppRuntimeConstruction {
-            operation_scope: mom_llama_runtime::OperationScope::for_native_host(&native_host),
+            operation_scope: native_owner.operation_scope(),
             native_host,
             speech,
             information,
@@ -1032,26 +1026,20 @@ mod tests {
     }
 
     impl NativeFinalizer for RecordingFinalizer {
-        fn shutdown(
-            &self,
-            _host: &Arc<NativeHost>,
-        ) -> Result<ProcessExitJoinedNativeHost, mom_llama_runtime::ProductShutdownError> {
+        fn shutdown(&self, _host: &Arc<NativeHost>) -> Result<ProcessExitJoinedNativeHost, String> {
             self.called.store(true, Ordering::Release);
-            Err(mom_llama_runtime::ProductShutdownError::HostMissing)
+            Err("native host unavailable".to_string())
         }
     }
 
     impl NativeFinalizer for ReconciliationOrderingFinalizer {
-        fn shutdown(
-            &self,
-            _host: &Arc<NativeHost>,
-        ) -> Result<ProcessExitJoinedNativeHost, mom_llama_runtime::ProductShutdownError> {
+        fn shutdown(&self, _host: &Arc<NativeHost>) -> Result<ProcessExitJoinedNativeHost, String> {
             assert!(
                 self.reconciled.load(Ordering::Acquire),
                 "final Persona approval recovery must precede Native finalization"
             );
             self.called.store(true, Ordering::Release);
-            Err(mom_llama_runtime::ProductShutdownError::HostMissing)
+            Err("native host unavailable".to_string())
         }
     }
 

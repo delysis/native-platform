@@ -25,7 +25,7 @@ use crate::paths::{
     ensure_directory, ensure_document_parent, ensure_private_directory, inspect_document_path,
     normalize_document_path, reject_symlink_target,
 };
-use crate::schema::{CURRENT_SCHEMA_VERSION, configure, migrate};
+use crate::schema::{CURRENT_SCHEMA_VERSION, initialize_schema};
 use crate::{Result, StoreError};
 
 const PROJECT_FORMAT: &str = "loom-project";
@@ -73,50 +73,11 @@ impl fmt::Debug for ProjectStore {
 }
 
 impl ProjectStore {
-    fn quarantine_pending_legacy_candidates(&mut self) -> Result<()> {
-        let pending = {
-            let mut statement = self.connection.prepare(
-                "SELECT candidate_id
-                 FROM research_legacy_candidate_review_events
-                 WHERE sequence = 0 AND disposition = 'pending'
-                   AND NOT EXISTS (
-                       SELECT 1 FROM research_legacy_candidate_review_events terminal
-                       WHERE terminal.candidate_id = research_legacy_candidate_review_events.candidate_id
-                         AND terminal.sequence > 0
-                   )
-                 ORDER BY candidate_id",
-            )?;
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let created_at_ms = now_unix_ms().max(1);
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for candidate_id in pending {
-            transaction.execute(
-                "INSERT INTO research_legacy_candidate_review_events(
-                    candidate_id, sequence, disposition, assembly_id, reason, created_at_ms
-                 ) VALUES (?1, 1, 'quarantined', NULL, ?2, ?3)",
-                params![
-                    candidate_id,
-                    "legacy candidate predates verifier-owned exact replay; preserved as diagnostic evidence",
-                    created_at_ms,
-                ],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(())
-    }
-
     pub fn initialize(
         path: impl AsRef<Path>,
         name: impl Into<String>,
     ) -> Result<(Self, CommandReceipt)> {
+        crate::paths::ensure_private_storage_supported()?;
         let requested_root = path.as_ref();
         reject_root_symlink(requested_root)?;
         fs::create_dir_all(requested_root)?;
@@ -179,6 +140,7 @@ impl ProjectStore {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        crate::paths::ensure_private_storage_supported()?;
         let requested_root = path.as_ref();
         reject_root_symlink(requested_root)?;
         let root = requested_root.canonicalize()?;
@@ -207,7 +169,15 @@ impl ProjectStore {
         manifest: ProjectManifest,
         lease: Option<ProjectLease>,
     ) -> Result<Self> {
+        let initializing = lease.is_some();
         let loom_dir = root.join(".loom");
+        let database_path = loom_dir.join(DATABASE_FILE);
+        reject_symlink_target(&database_path)?;
+        if !initializing && !database_path.is_file() {
+            return Err(StoreError::CorruptDatabase(
+                "project database is missing".into(),
+            ));
+        }
         for directory in [
             loom_dir.clone(),
             loom_dir.join("blobs"),
@@ -221,12 +191,15 @@ impl ProjectStore {
             Some(lease) => lease,
             None => acquire_project_lease(&loom_dir, &root)?,
         };
-        let database_path = loom_dir.join(DATABASE_FILE);
-        create_private_file_if_absent(&database_path)?;
-        let mut connection = Connection::open(&database_path)?;
-        configure(&connection)?;
-        migrate(&mut connection)?;
-        let mut store = Self {
+        if initializing {
+            create_private_file_if_absent(&database_path)?;
+        }
+        let mut connection = Connection::open_with_flags(
+            &database_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        initialize_schema(&mut connection, initializing)?;
+        let store = Self {
             root,
             manifest,
             connection,
@@ -235,7 +208,6 @@ impl ProjectStore {
         store.recover_document_rename_operations()?;
         store.recover_document_delete_operations()?;
         store.cleanup_terminal_rename_anchors();
-        store.quarantine_pending_legacy_candidates()?;
         Ok(store)
     }
 
@@ -3754,75 +3726,54 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[derive(Deserialize)]
-    struct W1PriorStoreFixture {
-        schema_version: u32,
-        fixture_id: String,
-        prior_store_schema_version: u32,
-        current_store_schema_version: u32,
-        producer: W1PriorStoreProducer,
-        document: W1PriorStoreDocument,
-        identities: W1PriorStoreIdentities,
-        frozen_corpus: W1PriorStoreCorpus,
-        expected: W1PriorStoreExpected,
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_storage_rejects_initialize_and_open_without_mutation() {
+        let directory = tempdir().expect("temporary root");
+        let missing = directory.path().join("absent");
+        assert!(matches!(
+            ProjectStore::initialize(&missing, "Novel"),
+            Err(StoreError::UnsupportedStoragePlatform)
+        ));
+        assert!(!missing.exists());
+        let existing = directory.path().join("existing");
+        fs::create_dir(&existing).expect("existing root");
+        let manuscript = existing.join("manuscript.txt");
+        fs::write(&manuscript, b"irreplaceable prose").expect("manuscript");
+        assert!(matches!(
+            ProjectStore::open(&existing),
+            Err(StoreError::UnsupportedStoragePlatform)
+        ));
+        assert!(matches!(
+            ProjectStore::initialize(&existing, "Novel"),
+            Err(StoreError::UnsupportedStoragePlatform)
+        ));
+        assert_eq!(
+            fs::read(&manuscript).expect("preserved manuscript"),
+            b"irreplaceable prose"
+        );
+        assert_eq!(fs::read_dir(&existing).expect("unchanged root").count(), 1);
     }
 
-    #[derive(Deserialize)]
-    #[allow(clippy::struct_field_names)]
-    struct W1PriorStoreIdentities {
-        project_id: loom_types::ProjectId,
-        document_id: DocumentId,
-        artifact_id: ArtifactId,
-        operation_id: OperationId,
-        revision_id: RevisionId,
-    }
-
-    #[derive(Deserialize)]
-    struct W1PriorStoreCorpus {
-        project_manifest_sha256: BlobId,
-        project_manifest_byte_len: u64,
-        database_sha256: BlobId,
-        database_byte_len: u64,
-    }
-
-    #[derive(Deserialize)]
-    struct W1PriorStoreProducer {
-        source_commit: String,
-        migration_sha256: Vec<BlobId>,
-    }
-
-    #[derive(Deserialize)]
-    struct W1PriorStoreDocument {
-        relative_path: String,
-        text: String,
-        sha256: BlobId,
-    }
-
-    #[derive(Deserialize)]
-    struct W1PriorStoreExpected {
-        preserve_project_identity: bool,
-        preserve_revision_identity: bool,
-        preserve_visible_bytes: bool,
-        pending_outbox_count: u64,
-        revision_count: u64,
-        selection_count: u64,
-        added_table: String,
-    }
-
-    struct W1PriorStoreWitness {
-        project_id: loom_types::ProjectId,
-        revision_id: RevisionId,
-        counts: StoreCounts,
-    }
-
-    fn selection_count(store: &ProjectStore) -> u64 {
-        let count: i64 = store
-            .connection
-            .query_row("SELECT COUNT(*) FROM selection_events", [], |row| {
-                row.get(0)
-            })
-            .expect("read selection count");
-        u64::try_from(count).expect("selection count is nonnegative")
+    #[cfg(unix)]
+    #[test]
+    fn opening_a_damaged_project_never_recreates_its_database() {
+        let (_directory, store) = new_store();
+        let root = store.root().to_path_buf();
+        drop(store);
+        let database = root.join(".loom").join(DATABASE_FILE);
+        fs::remove_file(&database).expect("remove fixture database");
+        assert!(ProjectStore::open(&root).is_err());
+        assert!(
+            !database.exists(),
+            "opening must not create a replacement database"
+        );
+        fs::write(&database, []).expect("empty database fixture");
+        assert!(ProjectStore::open(&root).is_err());
+        assert_eq!(
+            fs::metadata(&database).expect("preserved empty file").len(),
+            0
+        );
     }
 
     fn new_store() -> (tempfile::TempDir, ProjectStore) {
@@ -3880,290 +3831,6 @@ mod tests {
         assert!(
             hard_link_if_absent(&capture_path, &anchor_path).expect("link rename ownership anchor")
         );
-    }
-
-    fn prior_v10_migrations() -> [&'static str; 10] {
-        [
-            include_str!("../migrations/0001_initial.sql"),
-            include_str!("../migrations/0002_generation_provenance.sql"),
-            include_str!("../migrations/0003_transient_drafts.sql"),
-            include_str!("../migrations/0004_draft_generations.sql"),
-            include_str!("../migrations/0005_generation_command_hardening.sql"),
-            include_str!("../migrations/0006_bounded_branch_index.sql"),
-            include_str!("../migrations/0007_research_admission.sql"),
-            include_str!("../migrations/0008_verified_inference_batches.sql"),
-            include_str!("../migrations/0009_research_execution_ledger.sql"),
-            include_str!("../migrations/0010_token_piece_evidence.sql"),
-        ]
-    }
-
-    fn write_frozen_prior_v10_project(root: &Path, spec: &W1PriorStoreFixture) {
-        const PROJECT_MANIFEST: &[u8] =
-            include_bytes!("../../../fixtures/compat/state/loom-prior-v10/.loom/project.json");
-        const DATABASE: &[u8] =
-            include_bytes!("../../../fixtures/compat/state/loom-prior-v10/.loom/loom.sqlite3");
-
-        assert_eq!(
-            BlobId::digest(PROJECT_MANIFEST),
-            spec.frozen_corpus.project_manifest_sha256
-        );
-        assert_eq!(
-            u64::try_from(PROJECT_MANIFEST.len()).expect("bounded manifest"),
-            spec.frozen_corpus.project_manifest_byte_len
-        );
-        assert_eq!(BlobId::digest(DATABASE), spec.frozen_corpus.database_sha256);
-        assert_eq!(
-            u64::try_from(DATABASE.len()).expect("bounded database"),
-            spec.frozen_corpus.database_byte_len
-        );
-
-        fs::create_dir_all(root).expect("create frozen project root");
-        for directory in [
-            root.join("manuscript"),
-            root.join("sources"),
-            root.join("assets"),
-        ] {
-            ensure_directory(&directory).expect("create frozen visible directory");
-        }
-        let loom_dir = root.join(".loom");
-        for directory in [
-            loom_dir.clone(),
-            loom_dir.join("blobs"),
-            loom_dir.join("blobs/sha256"),
-            loom_dir.join("blobs/sha256/83"),
-            loom_dir.join("indexes"),
-            loom_dir.join("backups"),
-        ] {
-            ensure_private_directory(&directory).expect("create frozen private directory");
-        }
-        atomic_replace_private(&loom_dir.join(MANIFEST_FILE), PROJECT_MANIFEST)
-            .expect("write frozen project manifest");
-        atomic_replace_private(&loom_dir.join(DATABASE_FILE), DATABASE)
-            .expect("write frozen v10 database");
-        atomic_replace(
-            &root.join(&spec.document.relative_path),
-            spec.document.text.as_bytes(),
-        )
-        .expect("write frozen visible manuscript");
-        let blob_hex = spec.document.sha256.to_hex();
-        atomic_replace_private(
-            &loom_dir
-                .join("blobs/sha256")
-                .join(&blob_hex[..2])
-                .join(&blob_hex[2..]),
-            spec.document.text.as_bytes(),
-        )
-        .expect("write frozen content blob");
-    }
-
-    /// Emits a v10 project using the exact accepted v10 migration bundle and a
-    /// deliberately small v10-compatible writer. It never initializes or
-    /// downgrades a current store, so migration 11 is absent by construction.
-    #[allow(clippy::too_many_lines)]
-    fn build_prior_v10_project(root: &Path, spec: &W1PriorStoreFixture) -> W1PriorStoreWitness {
-        assert_eq!(
-            spec.producer.source_commit,
-            "d0aca6ff4883ac51514fea5e5fb75ffbb3c8c264"
-        );
-        let migrations = prior_v10_migrations();
-        assert_eq!(spec.producer.migration_sha256.len(), migrations.len());
-        for (sql, expected) in migrations.iter().zip(&spec.producer.migration_sha256) {
-            assert_eq!(BlobId::digest(sql.as_bytes()), *expected);
-        }
-
-        fs::create_dir_all(root).expect("create prior project root");
-        for directory in [
-            root.join("manuscript"),
-            root.join("sources"),
-            root.join("assets"),
-        ] {
-            ensure_directory(&directory).expect("create prior visible directory");
-        }
-        let loom_dir = root.join(".loom");
-        for directory in [
-            loom_dir.clone(),
-            loom_dir.join("blobs"),
-            loom_dir.join("blobs/sha256"),
-            loom_dir.join("indexes"),
-            loom_dir.join("backups"),
-        ] {
-            ensure_private_directory(&directory).expect("create prior private directory");
-        }
-
-        let created_at_ms = 1_723_370_400_000_i64;
-        let project_id = spec.identities.project_id;
-        let manifest = ProjectManifest {
-            format: PROJECT_FORMAT.to_owned(),
-            schema_version: CURRENT_SCHEMA_VERSION,
-            project_id,
-            name: "Accepted v10 fixture".to_owned(),
-            created_at_ms,
-        };
-        atomic_replace_private(
-            &loom_dir.join(MANIFEST_FILE),
-            &serde_json::to_vec_pretty(&manifest).expect("serialize prior manifest"),
-        )
-        .expect("write prior manifest");
-
-        let document_bytes = spec.document.text.as_bytes();
-        atomic_replace(&root.join(&spec.document.relative_path), document_bytes)
-            .expect("write prior visible manuscript");
-        let blob_id = BlobId::digest(document_bytes);
-        assert_eq!(blob_id, spec.document.sha256);
-        let blob_hex = blob_id.to_hex();
-        let blob_parent = loom_dir.join("blobs/sha256").join(&blob_hex[..2]);
-        ensure_private_directory(&blob_parent).expect("create prior blob shard");
-        atomic_replace_private(&blob_parent.join(&blob_hex[2..]), document_bytes)
-            .expect("write prior content blob");
-
-        let database_path = loom_dir.join(DATABASE_FILE);
-        create_private_file_if_absent(&database_path).expect("create prior database");
-        let connection = Connection::open(&database_path).expect("open prior database");
-        configure(&connection).expect("configure prior database");
-        for (index, sql) in migrations.iter().enumerate() {
-            connection
-                .execute_batch(sql)
-                .expect("apply accepted v10 migration");
-            connection
-                .execute(
-                    "INSERT INTO schema_migrations(version, applied_at_ms) VALUES (?1, ?2)",
-                    params![
-                        i64::try_from(index + 1).expect("bounded migration"),
-                        created_at_ms
-                    ],
-                )
-                .expect("record accepted v10 migration");
-        }
-        connection
-            .pragma_update(
-                None,
-                "user_version",
-                i64::from(spec.prior_store_schema_version),
-            )
-            .expect("mark exact prior schema");
-
-        let document_id = spec.identities.document_id;
-        let artifact_id = spec.identities.artifact_id;
-        let operation_id = spec.identities.operation_id;
-        let revision_id = spec.identities.revision_id;
-        let byte_len = i64::try_from(document_bytes.len()).expect("bounded fixture document");
-        let transaction = connection
-            .unchecked_transaction()
-            .expect("begin prior writer transaction");
-        transaction
-            .execute(
-                "INSERT INTO blobs(blob_id, byte_len, media_type, created_at_ms) VALUES (?1, ?2, 'application/octet-stream', ?3)",
-                params![blob_id.to_string(), byte_len, created_at_ms],
-            )
-            .expect("write prior blob row");
-        transaction
-            .execute(
-                "INSERT INTO documents(document_id, relative_path, document_kind, created_at_ms) VALUES (?1, ?2, 'prose', ?3)",
-                params![document_id.to_string(), &spec.document.relative_path, created_at_ms],
-            )
-            .expect("write prior document row");
-        transaction
-            .execute(
-                "INSERT INTO artifacts(artifact_id, blob_id, artifact_kind, media_type, metadata_json, created_at_ms) VALUES (?1, ?2, 'human_contribution', 'text/markdown; charset=utf-8', ?3, ?4)",
-                params![
-                    artifact_id.to_string(),
-                    blob_id.to_string(),
-                    serde_json::to_string(&json!({
-                        "relative_path": &spec.document.relative_path,
-                        "reason": "accepted v10 fixture writer"
-                    }))
-                    .expect("prior artifact metadata"),
-                    created_at_ms
-                ],
-            )
-            .expect("write prior artifact row");
-        transaction
-            .execute(
-                "INSERT INTO operations(operation_id, operation_kind, metadata_json, created_at_ms) VALUES (?1, 'human_edit', ?2, ?3)",
-                params![
-                    operation_id.to_string(),
-                    serde_json::to_string(&json!({
-                        "relative_path": &spec.document.relative_path,
-                        "reason": "accepted v10 fixture writer"
-                    }))
-                    .expect("prior operation metadata"),
-                    created_at_ms
-                ],
-            )
-            .expect("write prior operation row");
-        transaction
-            .execute(
-                "INSERT INTO operation_outputs(operation_id, position, artifact_id) VALUES (?1, 0, ?2)",
-                params![operation_id.to_string(), artifact_id.to_string()],
-            )
-            .expect("write prior operation output");
-        transaction
-            .execute(
-                "INSERT INTO revisions(revision_id, document_id, parent_revision_id, artifact_id, reason, created_at_ms) VALUES (?1, ?2, NULL, ?3, 'accepted v10 fixture writer', ?4)",
-                params![
-                    revision_id.to_string(),
-                    document_id.to_string(),
-                    artifact_id.to_string(),
-                    created_at_ms
-                ],
-            )
-            .expect("write prior revision");
-        transaction
-            .execute(
-                "INSERT INTO revision_segments(revision_id, position, artifact_id, start_byte, end_byte, contribution_kind) VALUES (?1, 0, ?2, 0, ?3, 'human')",
-                params![revision_id.to_string(), artifact_id.to_string(), byte_len],
-            )
-            .expect("write prior revision segment");
-        transaction
-            .execute(
-                "INSERT INTO visible_file_outbox(revision_id, relative_path, target_blob_id, expected_visible_blob_id, state, created_at_ms, completed_at_ms) VALUES (?1, ?2, ?3, NULL, 'completed', ?4, ?4)",
-                params![
-                    revision_id.to_string(),
-                    &spec.document.relative_path,
-                    blob_id.to_string(),
-                    created_at_ms
-                ],
-            )
-            .expect("write completed prior outbox row");
-        transaction
-            .commit()
-            .expect("commit prior writer transaction");
-
-        let counts = StoreCounts {
-            blobs: 1,
-            artifacts: 1,
-            operations: 1,
-            revisions: 1,
-            receipts: 0,
-        };
-        assert_eq!(spec.expected.revision_count, counts.revisions);
-        let selection_count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM selection_events", [], |row| {
-                row.get(0)
-            })
-            .expect("read prior selection count");
-        assert_eq!(
-            u64::try_from(selection_count).expect("nonnegative selection count"),
-            spec.expected.selection_count
-        );
-        let prior_version: u32 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .expect("read prior schema version");
-        assert_eq!(prior_version, spec.prior_store_schema_version);
-        let absent_v11_table: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
-                [&spec.expected.added_table],
-                |row| row.get(0),
-            )
-            .expect("verify v11 table was never created");
-        assert_eq!(absent_v11_table, 0);
-        drop(connection);
-        W1PriorStoreWitness {
-            project_id,
-            revision_id,
-            counts,
-        }
     }
 
     #[cfg(unix)]
@@ -4227,6 +3894,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn registered_document_probe_is_exact_and_survives_reopen() {
         let (_directory, mut store) = new_store();
         let root = store.root().to_path_buf();
@@ -4332,6 +4000,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn document_rename_moves_the_visible_file_and_preserves_identity() {
         let (directory, mut store) = new_store();
         let root = store.root().to_path_buf();
@@ -4391,6 +4060,7 @@ mod tests {
         target_os = "redox"
     )))]
     #[test]
+    #[cfg(unix)]
     fn unsupported_lifecycle_platform_fails_before_durable_intent_or_capture() {
         let (_directory, mut store) = new_store();
         store
@@ -4447,6 +4117,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn committed_rename_releases_the_old_path_for_a_new_document() {
         let (_directory, mut store) = new_store();
         store
@@ -4486,6 +4157,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn document_display_title_rejects_blank_control_and_overlong_utf8_without_mutation() {
         let (_directory, mut store) = new_store();
         store
@@ -4540,6 +4212,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn document_rename_rejects_portable_name_violations_and_collisions_without_mutation() {
         let (_directory, mut store) = new_store();
         store
@@ -4591,6 +4264,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn document_delete_moves_exact_file_to_command_recovery_and_replays() {
         let (_directory, mut store) = new_store();
         store
@@ -4641,6 +4315,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn opening_a_missing_registered_document_reports_external_deletion() {
         let (_directory, mut store) = new_store();
         store
@@ -4665,6 +4340,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn rename_capture_race_restores_the_replacement_without_unlinking_it() {
         let (_directory, mut store) = new_store();
         store
@@ -4721,6 +4397,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn rename_collision_with_an_existing_same_inode_never_consumes_either_name() {
         let (_directory, mut store) = new_store();
         store
@@ -4762,6 +4439,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn case_only_rename_uses_capture_before_no_clobber_install() {
         let (_directory, mut store) = new_store();
         store
@@ -4800,6 +4478,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn prepared_rename_capture_recovers_the_old_path_after_reopen() {
         let (directory, mut store) = new_store();
         store
@@ -4858,6 +4537,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn prepared_before_capture_never_consumes_an_unrelated_same_blob_target() {
         let (directory, mut store) = new_store();
         store
@@ -4910,6 +4590,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn prepared_rename_with_corrupt_private_capture_stays_live() {
         let (_directory, mut store) = new_store();
         store
@@ -4967,6 +4648,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn prepared_rename_recovery_preserves_a_recreated_source_and_private_original() {
         let (directory, mut store) = new_store();
         store
@@ -5030,6 +4712,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn prepared_rename_recovery_does_not_confuse_same_blob_recreation_with_inode_restore() {
         let (directory, mut store) = new_store();
         store
@@ -5108,6 +4791,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn captured_rename_anchor_never_consumes_a_same_content_target_replacement() {
         let (directory, mut store) = new_store();
         store
@@ -5180,6 +4864,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn same_session_action_resolution_recovers_a_prepared_target_before_retry() {
         let (_directory, mut store) = new_store();
         store
@@ -5234,6 +4919,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn post_target_precommit_failure_is_retryable_in_the_same_session() {
         let (_directory, mut store) = new_store();
         store
@@ -5291,6 +4977,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn rename_to_a_tombstoned_historical_path_fails_before_capture() {
         let (_directory, mut store) = new_store();
         store
@@ -5346,6 +5033,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn active_and_unicode_normalized_path_aliases_are_reserved_portably() {
         let (_directory, mut store) = new_store();
         store
@@ -5393,6 +5081,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn save_checkpoint_and_import_cannot_bypass_portable_path_reservations() {
         let (directory, mut store) = new_store();
         store
@@ -5500,6 +5189,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn delete_capture_race_restores_replacement_and_does_not_tombstone() {
         let (_directory, mut store) = new_store();
         store
@@ -5546,6 +5236,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn aborted_pre_capture_delete_reuses_the_exact_command_safely() {
         let (_directory, mut store) = new_store();
         store
@@ -5600,6 +5291,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn aborted_delete_command_does_not_follow_a_later_rename() {
         let (_directory, mut store) = new_store();
         store
@@ -5644,6 +5336,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn delete_refuses_a_recoverable_transient_draft_before_intent() {
         let (_directory, mut store) = new_store();
         let saved = store
@@ -5700,6 +5393,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn pending_outbox_blocks_namespace_changes_until_recovery() {
         let (_directory, mut store) = new_store();
         let saved = store
@@ -5785,6 +5479,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn tombstoned_outbox_is_terminally_suppressed_without_visible_resurrection() {
         let (_directory, mut store) = new_store();
         let saved = store
@@ -5829,6 +5524,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn corrupt_delete_recovery_evidence_stays_live() {
         let (_directory, mut store) = new_store();
         store
@@ -5893,6 +5589,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn same_session_save_reconciles_a_captured_delete_without_resurrection() {
         let (_directory, mut store) = new_store();
         store
@@ -5945,6 +5642,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn delete_commit_error_with_failed_readback_remains_retryable_uncertainty() {
         let (_directory, mut store) = new_store();
         store
@@ -5995,6 +5693,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn draft_admission_reconciles_a_live_captured_delete_before_mutation() {
         let (_directory, mut store) = new_store();
         store
@@ -6092,6 +5791,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn delete_uncertainty_replays_after_reopen_and_tombstone_survives_recovery_loss() {
         let (directory, mut store) = new_store();
         store
@@ -6189,6 +5889,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn document_summary_reads_reject_noncanonical_stored_titles() {
         let (_directory, mut store) = new_store();
         store
@@ -6233,6 +5934,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn project_lease_rejects_concurrent_open_and_releases_on_drop() {
         let directory = tempdir().expect("temporary project root");
         let project = directory.path().join("Novel");
@@ -6361,6 +6063,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn identical_content_shares_blob_but_not_occurrence() {
         let (_directory, mut store) = new_store();
         let first = store
@@ -6390,6 +6093,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn sidecar_removal_leaves_manuscript_readable() {
         let (directory, mut store) = new_store();
         let root = store.root().to_path_buf();
@@ -6410,6 +6114,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn database_uses_required_durability_pragmas() {
         let (_directory, store) = new_store();
         let foreign_keys: i64 = store
@@ -6430,6 +6135,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn core_history_tables_are_strict() {
         let (_directory, store) = new_store();
         for table in [
@@ -6469,6 +6175,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn immutable_rows_reject_updates() {
         let (_directory, mut store) = new_store();
         let saved = store
@@ -6486,6 +6193,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn close_project_has_a_public_receipt() {
         let (_directory, mut store) = new_store();
         let receipt = store.record_close().expect("record close");
@@ -6499,6 +6207,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn recovery_refuses_to_overwrite_external_change() {
         let (_directory, mut store) = new_store();
         let saved = store
@@ -6558,6 +6267,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn recovery_finishes_crash_after_visible_replace() {
         let (_directory, mut store) = new_store();
         let saved = store
@@ -6583,6 +6293,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn outbox_boundary_race_preserves_external_bytes() {
         let (_directory, mut store) = new_store();
         let saved = store
@@ -6631,6 +6342,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn create_if_absent_refuses_file_appearing_at_projection_boundary() {
         let (_directory, mut store) = new_store();
         let result = store.create_document_if_absent_with_boundary(
@@ -6655,6 +6367,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn create_if_absent_supports_an_empty_zero_segment_revision() {
         let (_directory, mut store) = new_store();
         let created = store
@@ -6687,6 +6400,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn adopt_visible_document_preserves_exact_prose_bytes_and_human_import_provenance() {
         let (_directory, mut store) = new_store();
         let relative_path = "manuscript/Untitled.md";
@@ -6786,6 +6500,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn adopt_visible_document_boundary_conflict_never_clobbers_newer_bytes() {
         let (_directory, mut store) = new_store();
         let relative_path = "manuscript/Untitled.md";
@@ -6843,6 +6558,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn adopt_visible_document_interruption_recovers_committed_receipt_and_outbox() {
         let (directory, mut store) = new_store();
         let root = store.root.clone();
@@ -6891,6 +6607,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn adopt_visible_document_rejects_non_file_and_invalid_utf8_without_state() {
         let (_directory, mut store) = new_store();
         let counts_before = store.counts().expect("counts before invalid adoption");
@@ -7040,6 +6757,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn read_document_binds_visible_text_to_active_revision() {
         let (_directory, mut store) = new_store();
         let saved = store
@@ -7064,6 +6782,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reconciliation_snapshot_reads_base_and_external_text_without_writing() {
         let (_directory, mut store) = new_store();
         let saved = store
@@ -7107,121 +6826,6 @@ mod tests {
             .expect("mid-snapshot deletion is ordinary missing state");
         assert!(disappeared.visible.is_none());
         assert_eq!(disappeared.base_text, "base");
-    }
-
-    #[test]
-    fn prior_v10_producer_recreates_frozen_exact_corpus() {
-        let spec: W1PriorStoreFixture = serde_json::from_str(include_str!(
-            "../../../fixtures/compat/prior-store-v10-v1.json"
-        ))
-        .expect("parse W1 prior-store fixture");
-        let directory = tempdir().expect("temporary project root");
-        let root = directory.path().join("Prior");
-        let witness = build_prior_v10_project(&root, &spec);
-        assert_eq!(witness.project_id, spec.identities.project_id);
-        assert_eq!(witness.revision_id, spec.identities.revision_id);
-        assert_eq!(
-            fs::read(root.join(".loom/project.json")).expect("read produced manifest"),
-            include_bytes!("../../../fixtures/compat/state/loom-prior-v10/.loom/project.json")
-        );
-        assert_eq!(
-            fs::read(root.join(".loom/loom.sqlite3")).expect("read produced database"),
-            include_bytes!("../../../fixtures/compat/state/loom-prior-v10/.loom/loom.sqlite3")
-        );
-    }
-
-    #[test]
-    fn prior_v10_project_store_migrates_and_reopens_without_identity_drift() {
-        let spec: W1PriorStoreFixture = serde_json::from_str(include_str!(
-            "../../../fixtures/compat/prior-store-v10-v1.json"
-        ))
-        .expect("parse W1 prior-store fixture");
-        assert_eq!(spec.schema_version, 1);
-        assert_eq!(spec.fixture_id, "loom-prior-store-v10-v1");
-        assert_eq!(spec.prior_store_schema_version, 10);
-        assert_eq!(
-            spec.current_store_schema_version,
-            crate::CURRENT_STORE_SCHEMA_VERSION
-        );
-        assert!(spec.expected.preserve_project_identity);
-        assert!(spec.expected.preserve_revision_identity);
-        assert!(spec.expected.preserve_visible_bytes);
-        assert_eq!(
-            BlobId::digest(spec.document.text.as_bytes()),
-            spec.document.sha256
-        );
-
-        let directory = tempdir().expect("temporary project root");
-        let root = directory.path().join("Prior");
-        write_frozen_prior_v10_project(&root, &spec);
-        let prior = W1PriorStoreWitness {
-            project_id: spec.identities.project_id,
-            revision_id: spec.identities.revision_id,
-            counts: StoreCounts {
-                blobs: 1,
-                artifacts: 1,
-                operations: 1,
-                revisions: 1,
-                receipts: 0,
-            },
-        };
-
-        let reopened = ProjectStore::open(&root).expect("migrate and open prior project");
-        assert_eq!(reopened.manifest().project_id, prior.project_id);
-        let migrated = reopened
-            .read_document(&spec.document.relative_path)
-            .expect("read migrated document");
-        assert_eq!(migrated.revision_id, prior.revision_id);
-        assert_eq!(migrated.blob_id, spec.document.sha256);
-        assert_eq!(migrated.text, spec.document.text);
-        assert_eq!(
-            reopened
-                .registered_document(migrated.document_id)
-                .expect("read migrated document summary")
-                .expect("migrated document remains registered")
-                .display_title,
-            None
-        );
-        assert_eq!(reopened.counts().expect("migrated counts"), prior.counts);
-        assert_eq!(selection_count(&reopened), spec.expected.selection_count);
-        assert_eq!(
-            reopened.pending_outbox_count().expect("migrated outbox"),
-            spec.expected.pending_outbox_count
-        );
-        let migrated_version: u32 = reopened
-            .connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .expect("read migrated schema version");
-        assert_eq!(migrated_version, spec.current_store_schema_version);
-        let v11_table: i64 = reopened
-            .connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = ?1",
-                [&spec.expected.added_table],
-                |row| row.get(0),
-            )
-            .expect("verify v11 table");
-        assert_eq!(v11_table, 1);
-        drop(reopened);
-
-        let reopened_again = ProjectStore::open(&root).expect("reopen migrated project again");
-        assert_eq!(reopened_again.manifest().project_id, prior.project_id);
-        let stable = reopened_again
-            .read_document(&spec.document.relative_path)
-            .expect("read twice-reopened document");
-        assert_eq!(stable.revision_id, prior.revision_id);
-        assert_eq!(stable.blob_id, spec.document.sha256);
-        assert_eq!(stable.text, spec.document.text);
-        assert_eq!(
-            selection_count(&reopened_again),
-            spec.expected.selection_count
-        );
-        assert_eq!(
-            reopened_again
-                .pending_outbox_count()
-                .expect("twice-reopened outbox"),
-            spec.expected.pending_outbox_count
-        );
     }
 
     #[cfg(unix)]

@@ -10,8 +10,8 @@ boundary it actually exercises.
 The PR planner uses locked Cargo metadata and reverse dependencies to select
 changed packages and their consumers. Asset and platform rules live in
 `ci/ci-path-exceptions.json`; missing metadata or unknown paths select full
-coverage. The legacy `dependency_shadow` comparison remains a conservative
-fallback for PR selection. It is not runtime evidence.
+coverage. There is one selection algorithm; obsolete path overlays and shadow
+comparisons are retired. Selection is not runtime evidence.
 
 Normal tests require no model downloads, account credentials, or hosted-provider
 access. Opt-in tests are indexed in `ci/ignored-tests.json`. The registry binds
@@ -61,7 +61,7 @@ workspace member. External llama bindings use an exact Git revision. Historical
 migration receipts and seals do not gate ordinary changes.
 
 macOS remains the product-acceptance target. Linux and Windows checks establish
-only their executed capabilities. Unsupported private Information storage and
+only their executed capabilities. Unsupported private Information, Loom project, and
 FTE database/token storage return errors before reading or creating state;
 non-Unix tests assert that boundary, while portable protocol/schema tests remain
 enabled. No platform is certified by compiling it. Signing, OS credentials,

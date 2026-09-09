@@ -134,14 +134,12 @@
       "prefix": "docs",
       "kind": "documentation",
       "effects": [],
-      "authorizes_legacy_reduction": true,
       "evidence": "root documentation is policy-only"
     },
     {
       "prefix": "migration",
       "kind": "provenance",
       "effects": ["import"],
-      "authorizes_legacy_reduction": true,
       "evidence": "immutable migration provenance is policy-only"
     },
     {
@@ -155,42 +153,36 @@
       "prefix": "products/fte/docs",
       "kind": "documentation",
       "effects": [],
-      "authorizes_legacy_reduction": true,
       "evidence": "FTE documentation is policy-only"
     },
     {
       "prefix": "products/fte/receipts",
       "kind": "provenance",
       "effects": [],
-      "authorizes_legacy_reduction": true,
       "evidence": "historical FTE evidence is immutable policy input"
     },
     {
       "prefix": "products/fte/research",
       "kind": "research",
       "effects": [],
-      "authorizes_legacy_reduction": true,
       "evidence": "research records do not select product builds"
     },
     {
       "prefix": "products/mom/docs",
       "kind": "documentation",
       "effects": [],
-      "authorizes_legacy_reduction": true,
       "evidence": "Mom documentation is policy-only"
     },
     {
       "prefix": "products/mom/receipts",
       "kind": "provenance",
       "effects": [],
-      "authorizes_legacy_reduction": true,
       "evidence": "historical Mom evidence is immutable policy input"
     },
     {
       "prefix": "products/loom/docs",
       "kind": "documentation",
       "effects": [],
-      "authorizes_legacy_reduction": true,
       "evidence": "Loom documentation is policy-only"
     },
     {
@@ -203,28 +195,24 @@
       "path": "README.md",
       "kind": "documentation",
       "effects": [],
-      "authorizes_legacy_reduction": true,
       "evidence": "root documentation is policy-only"
     },
     {
       "path": "AGENTS.md",
       "kind": "documentation",
       "effects": [],
-      "authorizes_legacy_reduction": true,
       "evidence": "root contributor instruction is policy-only"
     },
     {
       "path": "CONTRIBUTING.md",
       "kind": "documentation",
       "effects": [],
-      "authorizes_legacy_reduction": true,
       "evidence": "root contributor documentation is policy-only"
     },
     {
       "path": "SECURITY.md",
       "kind": "documentation",
       "effects": [],
-      "authorizes_legacy_reduction": true,
       "evidence": "root security documentation is policy-only"
     },
     {

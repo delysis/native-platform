@@ -323,11 +323,6 @@ pub fn mcp_list_servers() -> Result<CommandResult<Vec<McpServerConfig>>> {
     ))
 }
 
-pub fn mcp_list_tools(server_name: &str) -> Result<CommandResult<Vec<McpTool>>> {
-    let scope = OperationScope::for_current_product_host();
-    mcp_list_tools_in_scope(&scope, server_name)
-}
-
 pub fn mcp_list_tools_in_scope(
     scope: &OperationScope,
     server_name: &str,
@@ -701,15 +696,6 @@ fn parse_mcp_tools(response: Value) -> Result<Vec<McpTool>> {
     Ok(tools)
 }
 
-pub fn mcp_call_tool(
-    server_name: &str,
-    tool_name: &str,
-    arguments: Value,
-) -> Result<CommandResult<McpCallToolOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    mcp_call_tool_in_scope(&scope, server_name, tool_name, arguments)
-}
-
 pub fn mcp_call_tool_in_scope(
     scope: &OperationScope,
     server_name: &str,
@@ -871,11 +857,6 @@ fn mcp_call_tool_with_server(
     ))
 }
 
-pub fn mcp_list_resources(server_name: &str) -> Result<CommandResult<Vec<McpResource>>> {
-    let scope = OperationScope::for_current_product_host();
-    mcp_list_resources_in_scope(&scope, server_name)
-}
-
 pub fn mcp_list_resources_in_scope(
     scope: &OperationScope,
     server_name: &str,
@@ -925,14 +906,6 @@ pub fn mcp_list_resources_in_scope(
         false,
         false,
     ))
-}
-
-pub fn mcp_read_resource(
-    server_name: &str,
-    uri: &str,
-) -> Result<CommandResult<McpReadResourceOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    mcp_read_resource_in_scope(&scope, server_name, uri)
 }
 
 pub fn mcp_read_resource_in_scope(
@@ -1002,11 +975,6 @@ pub fn mcp_read_resource_in_scope(
     ))
 }
 
-pub fn mcp_list_prompts(server_name: &str) -> Result<CommandResult<Vec<McpPrompt>>> {
-    let scope = OperationScope::for_current_product_host();
-    mcp_list_prompts_in_scope(&scope, server_name)
-}
-
 pub fn mcp_list_prompts_in_scope(
     scope: &OperationScope,
     server_name: &str,
@@ -1070,15 +1038,6 @@ pub fn mcp_list_prompts_in_scope(
         false,
         false,
     ))
-}
-
-pub fn mcp_get_prompt(
-    server_name: &str,
-    prompt_name: &str,
-    arguments: Value,
-) -> Result<CommandResult<McpGetPromptOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    mcp_get_prompt_in_scope(&scope, server_name, prompt_name, arguments)
 }
 
 pub fn mcp_get_prompt_in_scope(

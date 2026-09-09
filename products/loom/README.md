@@ -4,12 +4,17 @@ Loom Native is an early, local-first desktop writing environment for prose and p
 
 This repository is an executable development foundation, not a finished release. Editing, storage, model inspection, and private local suggestions are implemented; the former research engine is archived. The desktop ingests bounded project images and has a separate completion-context path: text-bearing files are canonicalized locally, while fully decoded PNG, JPEG, and WAV payloads are retained byte-for-byte for direct Gemma 4 image/audio input. The historical verification snapshot records a real Gemma 4 E2B base Q8 Metal suggestion, caret-ghost acceptance, durable promotion, loaded-model quit, and immediate-relaunch exercise; that receipt does not certify every later build. There are no signed installers, hosted-provider adapters, or release-certified platform backends. Local dictation uses the sibling Speech service; its lifecycle is separate from native image/audio completion context.
 
-See [Implementation status](docs/implementation-status.md) for the exact verified/deferred boundary and live migration number. [Project format v1](docs/format-v1.md) records the format rationale.
+See [Implementation status](docs/implementation-status.md) for the exact verified/deferred boundary and current schema policy. [Project format v1](docs/format-v1.md) records the format rationale.
+
+Project storage currently requires Unix private permissions and directory sync.
+Other platforms return `private_storage_unsupported` before creating or opening
+a project. The unreleased database accepts only its current schema; old stores
+are not silently migrated or erased.
 
 ## What works now
 
 - Open-folder projects with readable Markdown prose and exact-whitespace UTF-8 verse.
-- A `STRICT` SQLite sidecar with foreign keys, WAL, `synchronous=FULL`, immutable semantic records, SHA-256 content-addressed blobs, migrations, and a conflict-preserving visible-file outbox.
+- A `STRICT` SQLite sidecar with foreign keys, WAL, `synchronous=FULL`, immutable semantic records, SHA-256 content-addressed blobs, and a conflict-preserving visible-file outbox.
 - Source-revision- and source-blob-bound checkpoints with idempotent command IDs.
 - Typed visible-projection receipts: a semantic revision that committed before a projection race is reported as `pending_conflict` or `pending_retry`, never misrepresented as either a pre-commit refusal or a fully saved visible file.
 - Two-slot transient draft journaling with monotonic, non-reused versions and atomic checkpoint consumption; it does not manufacture semantic history for every keystroke.
@@ -25,7 +30,6 @@ See [Implementation status](docs/implementation-status.md) for the exact verifie
 - Desktop model choose/load/unload, bounded local GGUF discovery, native capability inspection, and conservative model-fit calculation. Model admission chooses a power-of-two context from currently available system memory using a deliberately high unknown-KV-cost estimate, retains system headroom, and lets native inspection clamp that request to the GGUF's trained limit. A GGUF header alone is never represented as proof that a model is loadable or completion-capable.
 - An explicit verified-download path with HTTPS-only transport, mandatory SHA-256, a hard byte ceiling, safe partial resume, cancellation/status recovery, cold hash and GGUF verification, and no-clobber installation.
 - Under the verified quiet-default build policy, idle autosave triggers local raw continuation from the exact Source or Visual caret unless the author has turned Suggestions off. The earlier build policy retains explicit per-project opt-in. Typing cancels stale work; unmodified Tab accepts ghost text only when it is bound to the current caret, immutable branch bytes, and a live visible editor presentation. Without that exact ghost, the same key inserts a literal tab and remains in the writing surface; Escape dismisses a visible ghost. Reviewable suggestions remain private and recoverable under Writing options, not in the quiet header. There is no manual generation or checkpoint button on the writing surface. Fixture-backed tests cover the command contracts, and the corrected exact-bundle UX receipt is preserved in [docs/audit-receipts/2026-08-11-r4-quiet-editor-ux.md](docs/audit-receipts/2026-08-11-r4-quiet-editor-ux.md).
-- A safe-Rust, headless fiction-research stack with bounded pack/manifests, exact prompt and source evidence, verified writer admission, assemblies and projections, immutable research storage, hard gates and pairwise evaluation, frozen trials, resumable campaigns, sealed benchmarks, QD archives, deterministic learned heads, and a diagnostic-only frontier-critic adapter. It is not yet a complete product campaign UI or a set of empirically qualified frozen profiles.
 - A JSON-emitting CLI for project initialization, open, import, checkpoint, recovery, export, read-only reconciliation preview, and identity-bound reconciliation apply.
 
 ## Native dependency
@@ -100,7 +104,7 @@ That test passed locally on CPU. A companion real-model test in the pinned nativ
 | --- | --- |
 | `crates/loom-types` | Versioned identities, artifacts, operations, generation DTOs, commands, events, capabilities, and receipts |
 | `crates/loom-document` | Prose/verse/hybrid projection, UTF-8 artifact slices, and bounded three-way text merge |
-| `crates/loom-store` | Project folders, migrations, blobs, revisions, drafts, outbox/reconciliation recovery, provenance, authority, idempotent generation families, bounded branches, and promotion |
+| `crates/loom-store` | Project folders, current schema, blobs, revisions, drafts, outbox/reconciliation recovery, provenance, authority, idempotent generation families, bounded branches, and promotion |
 | `crates/loom-host` | Opt-in agency/focus gates, cancellation token, and bounded job queues |
 | `crates/loom-backend-llama` | Direct local raw-completion adapter, GGUF discovery/inspection, verified downloader, capability mapping, and fit estimates |
 | `crates/tauri-plugin-loom` | Typed desktop IPC for direct default-project opening, editing/reconciliation, model lifecycle/downloads, immutable context attachments, opt-in automatic continuation, durable branches, cancellation/selection, focus mode, and safe close |

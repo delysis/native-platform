@@ -6,9 +6,8 @@ import path from "node:path";
 import test from "node:test";
 import {
   computeMetadataSelection,
-  legacyEquivalenceReport,
   unavailableSelection,
-} from "./ci-metadata-shadow.mjs";
+} from "./ci-metadata-selection.mjs";
 
 const repoRoot = "/workspace";
 
@@ -87,7 +86,6 @@ const pathExceptions = {
       prefix: "docs",
       kind: "documentation",
       effects: [],
-      authorizes_legacy_reduction: true,
       evidence: "fixture documentation policy",
     },
   ],
@@ -146,7 +144,6 @@ test("explicit non-graph asset, workflow, platform, and documentation classes st
   );
   assert.deepEqual(result.primary_groups, ["product"]);
   assert.deepEqual(result.effects, ["frontend_mom", "ignored_tests", "platform_macos"]);
-  assert.equal(result.file_classifications[1].authorizes_legacy_reduction, true);
 });
 
 test("unknown additions and deletions fail closed to the complete workspace", () => {
@@ -173,21 +170,6 @@ test("missing resolve evidence fails instead of silently dropping reverse edges"
     () => selection(["crates/types/src/lib.rs"], incomplete),
     /resolve\.nodes must be an array/,
   );
-});
-
-test("legacy equivalence records both reductions and conservative final fallback", () => {
-  const report = legacyEquivalenceReport({
-    legacySurface: ["job:policy", "job:mom-linux"],
-    generatedSurface: ["job:policy", "job:information-linux"],
-    finalSurface: ["job:policy", "job:mom-linux", "job:information-linux"],
-    fallbackReasons: ["legacy_reduction_without_evidence"],
-  });
-  assert.deepEqual(report.missing_from_generated, ["job:mom-linux"]);
-  assert.deepEqual(report.extra_in_generated, ["job:information-linux"]);
-  assert.equal(report.generated_is_at_least_as_conservative, false);
-  assert.deepEqual(report.conservative_fallback_reasons, [
-    "legacy_reduction_without_evidence",
-  ]);
 });
 
 test("every checked-in workspace package class is accepted by deterministic metadata", () => {

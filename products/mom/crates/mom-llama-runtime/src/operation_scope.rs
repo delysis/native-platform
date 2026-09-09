@@ -162,6 +162,7 @@ struct OperationRegistries {
 
 struct OperationScopeInner {
     native_host: Weak<NativeHost>,
+    native_key: Option<crate::native_runtime::ProductHostKey>,
     registries: Mutex<OperationRegistries>,
 }
 
@@ -176,24 +177,39 @@ pub struct OperationScope(Arc<OperationScopeInner>);
 impl OperationScope {
     #[must_use]
     pub fn for_native_host(host: &Arc<NativeHost>) -> Self {
-        Self::new(Arc::downgrade(host))
+        Self::new(Arc::downgrade(host), None)
     }
 
     #[must_use]
     pub fn detached() -> Self {
-        Self::new(Weak::new())
+        Self::new(Weak::new(), None)
     }
 
-    pub(crate) fn for_current_product_host() -> Self {
-        match crate::native_runtime::current_product_host() {
-            Some(host) => Self::for_native_host(&host),
-            None => Self::detached(),
+    pub(crate) fn for_product_host(
+        host: &Arc<NativeHost>,
+        key: crate::native_runtime::ProductHostKey,
+    ) -> Self {
+        Self::new(Arc::downgrade(host), Some(key))
+    }
+
+    pub(crate) fn matches_native_key(&self, key: &crate::native_runtime::ProductHostKey) -> bool {
+        self.0.native_key.as_ref().is_none_or(|bound| bound == key)
+    }
+
+    pub(crate) fn native_host(&self) -> Option<Arc<NativeHost>> {
+        if self.0.registries.lock().ok()?.quiescing {
+            return None;
         }
+        self.0.native_host.upgrade()
     }
 
-    fn new(native_host: Weak<NativeHost>) -> Self {
+    fn new(
+        native_host: Weak<NativeHost>,
+        native_key: Option<crate::native_runtime::ProductHostKey>,
+    ) -> Self {
         Self(Arc::new(OperationScopeInner {
             native_host,
+            native_key,
             registries: Mutex::new(OperationRegistries {
                 quiescing: false,
                 next_mcp_id: 0,

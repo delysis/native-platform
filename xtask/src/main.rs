@@ -1,6 +1,5 @@
 #![forbid(unsafe_code)]
 
-mod lean;
 mod model_check;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -25,8 +24,7 @@ fn main() -> Result<()> {
     match command.as_str() {
         "policy" => check_policy(&workspace_root()),
         "model-check" => model_check::run(&workspace_root(), &arguments.collect::<Vec<_>>()),
-        "lean" => lean::run(&workspace_root(), arguments.collect()),
-        _ => bail!("usage: cargo xtask <policy|lean|model-check>"),
+        _ => bail!("usage: cargo xtask <policy|model-check>"),
     }
 }
 

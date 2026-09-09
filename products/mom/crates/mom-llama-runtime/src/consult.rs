@@ -186,13 +186,20 @@ pub fn consult_panel_create(
 }
 
 pub fn consult_start(
+    scope: &crate::OperationScope,
     input: ConsultStartInput,
     options: ConsultStartOptions,
 ) -> Result<CommandResult<ConsultRun>> {
-    consult_start_stream(input, options, None::<fn(ConsultStreamEvent) -> Result<()>>)
+    consult_start_stream(
+        scope,
+        input,
+        options,
+        None::<fn(ConsultStreamEvent) -> Result<()>>,
+    )
 }
 
 pub fn consult_start_stream<F>(
+    scope: &crate::OperationScope,
     input: ConsultStartInput,
     options: ConsultStartOptions,
     mut on_event: Option<F>,
@@ -264,6 +271,7 @@ where
         }
     } else {
         let outputs = match run_native_consult(
+            scope,
             &settings,
             &panel,
             &run_id,
@@ -366,10 +374,11 @@ pub fn consult_status(run_id: &str) -> Result<CommandResult<ConsultRun>> {
 }
 
 pub fn consult_cancel(
+    scope: &crate::OperationScope,
     run_id: &str,
     seat_id: Option<&str>,
 ) -> Result<CommandResult<ConsultCancelOutput>> {
-    let cancelled = cancel_native_request(run_id, seat_id);
+    let cancelled = cancel_native_request(scope, run_id, seat_id);
     if cancelled == 0 {
         return Ok(CommandResult::blocked(
             "mom_llama.consult_cancel",
@@ -397,6 +406,7 @@ pub fn consult_cancel(
 }
 
 pub fn consult_synthesize(
+    scope: &crate::OperationScope,
     run_id: &str,
     selected_seat_ids: Vec<String>,
 ) -> Result<CommandResult<ConsultSynthesis>> {
@@ -424,7 +434,7 @@ pub fn consult_synthesize(
         ));
     }
     let settings = resolve_settings()?;
-    let handle = match resident_model(&settings) {
+    let handle = match resident_model(scope, &settings) {
         Ok(handle) => handle,
         Err(blocked) => {
             return Ok(CommandResult::blocked(
@@ -517,10 +527,6 @@ fn load_panels() -> Result<ConsultPanelDb> {
         .get::<ConsultPanelDb>(PANELS_NAMESPACE)?
         .unwrap_or_default();
     Ok(db)
-}
-
-pub(crate) fn stored_legacy_panels() -> Result<Vec<ConsultPanel>> {
-    Ok(load_panels()?.panels)
 }
 
 fn selected_panel(id: Option<&str>) -> Result<ConsultPanel> {
@@ -683,6 +689,7 @@ enum ConsultExecutionError {
 }
 
 fn run_native_consult<F>(
+    scope: &crate::OperationScope,
     settings: &crate::config::Settings,
     panel: &ConsultPanel,
     run_id: &str,
@@ -703,9 +710,9 @@ where
     let mut tickets = Vec::with_capacity(groups.len());
     for (slot_id, personas) in groups {
         let handle = if slot_id == 0 {
-            resident_model(settings)
+            resident_model(scope, settings)
         } else {
-            resident_model_for_slot(settings, slot_id, None)
+            resident_model_for_slot(scope, settings, slot_id, None)
         }
         .map_err(ConsultExecutionError::Blocked)?;
         let status = handle.status();

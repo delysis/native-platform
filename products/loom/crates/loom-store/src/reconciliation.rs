@@ -713,6 +713,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reconciliation_preserves_base_segments_and_records_explicit_import_merge() {
         let mut fixture = Fixture::new("abc");
         let initial_artifact_id = fixture.base.artifact_id;
@@ -804,6 +805,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn exact_retry_replays_one_revision_and_different_request_conflicts() {
         let mut fixture = Fixture::new("base");
         let external_blob_id = fixture.set_external("external");
@@ -858,6 +860,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn second_external_edit_at_projection_boundary_is_never_overwritten() {
         let mut fixture = Fixture::new("base");
         let external_blob_id = fixture.set_external("external one");
@@ -928,6 +931,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn committed_reconciliation_wraps_projection_failure_as_retryable_state() {
         let mut fixture = Fixture::new("base");
         let external_blob_id = fixture.set_external("external");
@@ -963,6 +967,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn visible_deletion_and_stale_external_hash_fail_closed_without_history() {
         let mut fixture = Fixture::new("base");
         let counts = fixture.store.counts().expect("initial counts");

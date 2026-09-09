@@ -1,6 +1,12 @@
 # Loom project format v1
 
-Status: initial versioned foundation. Project manifest schema version `1` is the stable on-disk compatibility boundary. The current branch reaches additive SQLite migration `14`; database migration numbers do not change the manifest version when they preserve the v1 contract. Migration 10 added immutable, content-addressed exact token-piece bytes and cumulative boundary vectors for verified native calls. Migration 11 adds receipts for ordinary foreground writing commands. Migration 12 adds an optional bounded display title to registered documents; legacy documents continue to derive their title from the ordinary manuscript filename. Migration 13 normalizes each generation run's immutable weave-command family identity for indexed completion-family recovery. Migration 14 adds durable rename and delete operation state machines plus immutable deletion tombstones. Native document rename changes both the display title and ordinary manuscript filename while retaining the same document/revision/blob identity.
+Status: unreleased current format. Project manifest version `1` identifies the
+container; SQLite store version `15` and its application/schema identity identify
+the current database. Old schemas are rejected before mutation. There is no
+migration chain. A single schema defines current writing, generation, revision,
+rename/delete recovery, and draft constraints. Research tables are retired.
+Project storage requires Unix private permissions and directory synchronization.
+
 
 ## Authority split
 
@@ -97,7 +103,7 @@ Larger ambiguous edits require a future validated editor changeset or smaller se
 
 ## Generation and authority
 
-Migration `2` adds immutable model environments, prompt/context recipes, authority policies, branches, generation runs/events/candidates/terminals, selection events, authorship attestations, and idempotent command requests.
+The current schema contains immutable model environments, prompt/context recipes, authority policies, branches, generation runs/events/candidates/terminals, selection events, authorship attestations, and idempotent command requests.
 
 - A generation run binds one source revision/blob, target byte range, model environment, exact prompt recipe, context recipe, authority policy, seed, and sampler description.
 - Prompt bytes and optional exact token IDs are immutable blob references. No hidden chat template is implied by a completion recipe.
@@ -105,46 +111,17 @@ Migration `2` adds immutable model environments, prompt/context recipes, authori
 - Raw event streams and optional backend/cache receipts are immutable references. `InferenceEvidenceKind` distinguishes live inference from fixtures, mocks, and historical receipts.
 - Events have a per-run sequence. SQLite admits at most one terminal event and rejects later events. Completed terminals require one candidate; failed terminals require an error; cancelled, pruned, and rejected terminals cannot name a candidate.
 - Generated spans refer to immutable output bytes and token traces. Editing a promoted span changes revision projection, never its original output or trace.
-- Automation, generation completion, and `KeepAlternative` do not mutate the active manuscript. Migration `7` seals the legacy raw-candidate promotion path; those candidates are diagnostic-only and `PromoteCandidate` now fails closed until assembly-first promotion supplies a verified projection and explicit authority.
+- Automation, generation completion, and `KeepAlternative` do not mutate the active manuscript. Caller-declared candidates cannot grant promotion authority; automatic suggestions require the current exact revision and explicit command.
 - Authority policies assign each environment exactly one writer or critic role. Critics may generate evidence for inspection but promotion is rejected unless the candidate's environment is a designated writer.
 - Promotion records an immutable `SelectionEvent` and `AuthorshipAttestation` tied to the human command receipt.
 
 The checked-in `generation-protocol-v1.json` golden fixture fixes the serialized model, recipe, command, trace, terminal, and promotion DTO shapes. It is protocol evidence only, never a claimed live inference receipt.
 
-Migration `7` adds the clean-port research admission foundation:
-
-- model-call declarations and exactly one append-only terminal;
-- exact output partitions, non-empty generated-span occurrences, flat assemblies, pinned projections, mixed-authorship records, and normalized operation graphs;
-- schema and adoption groundwork for audit-only admission records; downstream span, assembly, and projection methods require an opaque admitted-call token bound to the current `ProjectStore` open session before they can insert one;
-- canonical, internally fingerprinted promotion requests and append-only, actor-bound, single-use user-presence events tied to one command and strictly increasing host-session index;
-- immutable legacy review events. Pre-migration candidates and every new diagnostic legacy candidate receive a terminal quarantine record rather than implicit research eligibility.
-
-`LiveBaseWriterClaim` and related values are declarations, not credentials. The raw receipt/event-stream replay mint was test-only, and no production constructor for `AdmittedModelCall` exists. The W9 lean profile removed the research inference and orchestration code that could consume this schema. `loom-store` retains migrations 7-10 solely so existing projects remain forward-readable; persisted fixture, mock, critic, historical, literal, or caller-declared live records cannot become foreground writing authority. New writing activity uses the migration-11 foreground command path.
-
-Migration `8` makes verified batch adoption atomic and replayable:
-
-- one immutable batch header binds the exact non-empty UTF-8 prompt, completion/no-BOS semantics, ordered token IDs, compiled prompt fingerprint, model binding, native request ID, and expected case count;
-- every completed or cancelled branch occupies one contiguous request-order position and retains its independently verified terminal evidence;
-- cancelled partial output is diagnostic-only and never receives an admitted-call lease;
-- a final immutable seal is accepted only when every expected position is present and the completed/cancelled counts agree;
-- an all-cancelled batch may be retained as diagnostic evidence, but cannot mint assembly authority.
-
-Migration `9` adds the append-only autoresearch execution ledger:
-
-- immutable campaign and trial specifications, separate campaign and stage DAG dependencies, attempts, event chains, whole-trial and per-stage reservations and charges, and search decisions;
-- immutable story graphs and states, prompt masks, evidence-grounded backtranslation proposals and auditions, evaluation tasks and exact candidate evidence, quality-diversity archive snapshots, benchmark seals, qualification journals, and sealed results;
-- one process-local exclusive session lease for each frozen campaign or trial. A durable journal writer consumes and retains that lease and the operating-system project lock until the writer is dropped;
-- persist-before-reducer transitions. A failed SQLite append leaves the in-memory journal unchanged, while restart replay conservatively abandons an unstarted reservation or charges the full reservation for work that may have started;
-- exact, bounded journal replay from content-addressed canonical records. Replayed rows are diagnostic facts and cannot recreate a stage terminal, evaluator, archive, benchmark, or promotion lease;
-- separate diagnostic and qualification benchmark namespaces. A qualification result counts only the exact ordered members committed by its one sealed journal; diagnostic or failed alternative runs cannot contaminate that set;
-- exact candidate projections and candidate blobs on qualified evaluation rows. An occurrence identifier alone is never evidence that a quotation came from that candidate.
-
-Controller-token maxima may be zero for a controller-free treatment such as exact direct continuation. Writer-token, evaluation, and wall-time maxima for an executable trial remain nonzero. Stored zero controller use is an honest absence of controller inference, not an implicit free call.
-
-Blob installation may leave harmless content-addressed orphans if a process dies before the SQLite transaction commits. No semantic row or live authority is partially committed.
+Blob installation may leave harmless content-addressed orphans if a process dies
+before the SQLite transaction commits. Semantic records commit atomically.
 
 ## SQLite guarantees
 
 The connection enables foreign keys, WAL, `synchronous=FULL`, a finite busy timeout, and `trusted_schema=OFF`. Semantic history tables are `STRICT`; most occurrence tables are also `WITHOUT ROWID`. Triggers reject updates and deletes on immutable blobs, artifacts, operations, ordered edges, revisions, segment manifests, receipts, model/recipe/policy records, generation records, selections, attestations, and idempotency records.
 
-Migration `3` adds the deliberately mutable `transient_drafts` pointer table. Its revision/document relationship is trigger-validated. Mutability is limited to the current two-slot draft journal and is not available to semantic artifacts.
+The current schema includes the deliberately mutable `transient_drafts` pointer table. Its revision/document relationship is trigger-validated. Mutability is limited to the current two-slot draft journal and is not available to semantic artifacts.

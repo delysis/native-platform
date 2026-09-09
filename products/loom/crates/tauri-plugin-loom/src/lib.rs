@@ -2161,6 +2161,7 @@ impl IpcFailure {
             StoreError::DocumentHasPendingOutbox(_) => "document_has_pending_projection",
             StoreError::DocumentLifecycleUncertain(_) => "document_lifecycle_uncertain",
             StoreError::UnsupportedDocumentLifecyclePlatform => "document_lifecycle_unsupported",
+            StoreError::UnsupportedStoragePlatform => "private_storage_unsupported",
             StoreError::ExternalVisibleFileDeleted(_) => "external_file_deleted",
             StoreError::ExternalVisibleBlobMismatch { .. } => "external_file_conflict",
             StoreError::ExternalVisibleInvalidUtf8(_) => "external_file_invalid_utf8",
@@ -11836,6 +11837,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn new_document_skips_registered_and_unmanaged_visible_paths_without_overwriting() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -11880,6 +11882,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn new_document_never_reuses_a_tombstoned_historical_path() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -11955,6 +11958,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn rename_action_moves_the_manuscript_and_preserves_identity() {
         let mut fixture = document_action_fixture();
 
@@ -12000,6 +12004,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn delete_action_returns_an_authoritative_snapshot_and_replays_exactly() {
         let mut fixture = document_action_fixture();
         let session_id = CommandId::new();
@@ -12041,6 +12046,7 @@ mod tests {
         target_os = "redox"
     )))]
     #[test]
+    #[cfg(unix)]
     fn unsupported_lifecycle_platform_returns_typed_ipc_failures_without_mutation() {
         let mut fixture = document_action_fixture();
         let source_before = fixture
@@ -12097,6 +12103,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn rename_action_rejects_invalid_titles_without_mutating_the_fallback_name() {
         let mut fixture = document_action_fixture();
 
@@ -12112,6 +12119,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn rename_action_rejects_a_stale_source_revision() {
         let mut fixture = document_action_fixture();
         fixture
@@ -12158,6 +12166,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn open_action_refuses_a_same_byte_final_component_replacement() {
         let fixture = document_action_fixture();
         let authority = resolve_document_action_file(&fixture.store, fixture.identity)
@@ -12183,6 +12192,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn export_action_refuses_a_same_byte_final_component_replacement() {
         let mut fixture = document_action_fixture();
         let mut authority = resolve_document_action_file(&fixture.store, fixture.identity)
@@ -12218,6 +12228,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reveal_action_refuses_a_same_byte_final_component_replacement() {
         let fixture = document_action_fixture();
         let mut authority = resolve_document_action_file(&fixture.store, fixture.identity)
@@ -12245,6 +12256,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn export_copy_is_document_bound_and_refuses_uncheckpointed_visible_bytes() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -12320,6 +12332,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn document_action_resolves_only_the_explicit_captured_document_id() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -12362,6 +12375,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reveal_path_is_store_derived_contained_and_bound_to_external_bytes() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -12428,6 +12442,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn export_dialog_reservation_revalidates_the_captured_identity_before_writing() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -12481,6 +12496,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn export_dialog_reservation_blocks_application_close_until_released() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -12911,6 +12927,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn project_creation_refuses_existing_default_manuscript_without_touching_it() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Existing Novel");
@@ -13017,6 +13034,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn default_project_opens_directly_and_reuses_the_same_plain_text_workspace() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13050,6 +13068,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn default_project_reopen_does_not_recreate_initial_after_rename() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13072,6 +13091,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn default_project_repairs_interruption_after_manifest_before_document() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13098,6 +13118,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn default_project_adopts_exact_visible_bytes_when_sidecar_is_absent() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13125,6 +13146,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn default_project_recovers_after_complete_sidecar_loss_without_rewriting_text() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13154,6 +13176,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn default_project_never_recreates_a_registered_external_deletion() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13182,6 +13205,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn default_project_reopens_after_explicit_initial_document_deletion_without_resurrection() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13290,6 +13314,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn completion_snapshot_joins_scoped_supervisor_and_durable_terminal_facts() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Completion Snapshot Novel");
@@ -13396,6 +13421,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn completion_snapshot_rejects_stale_session_and_foreign_document_scope() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Scoped Completion Snapshot Novel");
@@ -13439,6 +13465,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn completion_snapshot_recovers_one_observed_terminal_beyond_the_first_page() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Paged Completion Snapshot Novel");
@@ -13518,6 +13545,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn close_cancels_active_family_waits_for_terminal_release_and_replays() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Closing Novel");
@@ -13619,6 +13647,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn close_timeout_is_bounded_and_leaves_session_revoked_for_exact_retry() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Slow Closing Novel");
@@ -13707,6 +13736,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn close_repairs_recorded_terminal_persistence_failure_before_releasing_store() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Persistence Repair Novel");
@@ -13765,6 +13795,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn project_commands_reject_stale_session_and_cross_project_identity() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Bound Novel");
@@ -13794,6 +13825,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn attachment_ingest_requires_exact_session_and_returns_only_bounded_paths() {
         use base64::Engine as _;
 
@@ -13870,6 +13902,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn asset_read_releases_session_lock_and_revalidates_authority() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Asset Read Authority");
@@ -13926,6 +13959,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    #[cfg(unix)]
     fn asset_protocol_authority_is_exact_across_close_switch_and_reopen() {
         use base64::Engine as _;
 
@@ -14135,6 +14169,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn inline_media_authority_requires_current_document_membership_and_session() {
         use sha2::Digest as _;
         let mut fixture = document_action_fixture();
@@ -14280,6 +14315,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn project_summary_keeps_active_identity_across_external_change_and_omits_deletion() {
         let fixture = ReconciliationFixture::new("one two\n");
         fixture.set_external("one two three\n");
@@ -14312,6 +14348,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reconciliation_preview_returns_exact_canonical_inputs_and_bound_hashes() {
         let fixture = ReconciliationFixture::new("alpha\nmiddle\nomega\n");
         let external_visible = "alpha\r\nmiddle\r\nOMEGA\r\n";
@@ -14369,6 +14406,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reconciliation_preview_rejects_deleted_hybrid_and_unbound_inputs() {
         let fixture = ReconciliationFixture::new("bound base\n");
         fixture.set_external("bound external\n");
@@ -14436,6 +14474,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn preview_uses_current_draft_and_reports_conflicts_without_writing() {
         let mut fixture = ReconciliationFixture::new("dawn over water\n");
         let draft = fixture
@@ -14486,6 +14525,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn preview_rejects_a_draft_from_an_old_active_revision() {
         let mut fixture = ReconciliationFixture::new("first base\n");
         fixture
@@ -14520,6 +14560,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reconciliation_apply_is_replay_safe_and_never_clears_the_draft() {
         let mut fixture = ReconciliationFixture::new("base manuscript\n");
         let draft = fixture

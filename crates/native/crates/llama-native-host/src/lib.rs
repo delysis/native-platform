@@ -1211,22 +1211,6 @@ fn validate_resident_digest_assertions(
     Ok(())
 }
 
-/// Legacy file-size-only estimate retained for callers comparing historical
-/// budgets. Admission uses `estimate_memory_reservation`, which includes the
-/// requested context and model metadata. Neither function is an RSS bound.
-#[must_use]
-pub const fn memory_reservation(model_bytes: u64, projector_bytes: u64) -> u64 {
-    const MINIMUM_RUNTIME_RESERVE: u64 = 384 * 1024 * 1024;
-    let runtime = if model_bytes / 2 > MINIMUM_RUNTIME_RESERVE {
-        model_bytes / 2
-    } else {
-        MINIMUM_RUNTIME_RESERVE
-    };
-    model_bytes
-        .saturating_add(projector_bytes)
-        .saturating_add(runtime)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1871,16 +1855,6 @@ mod tests {
         assert!(debug.contains("slot_id: 3"));
         assert!(!debug.contains("HOST_PATH_SENTINEL"));
         assert!(!debug.contains("RESIDENT_PATH_SENTINEL"));
-    }
-
-    #[test]
-    fn memory_reservation_is_bounded_and_includes_projector() {
-        let mib = 1024 * 1024;
-        assert_eq!(memory_reservation(100 * mib, 0), 484 * mib);
-        assert_eq!(
-            memory_reservation(4 * 1024 * mib, 500 * mib),
-            6 * 1024 * mib + 500 * mib
-        );
     }
 
     #[test]

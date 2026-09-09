@@ -1,10 +1,7 @@
 # Mom Llama product contract
 
-This repository owns one product: Mom Llama. Reusable llama.cpp internals live
-in `delysis/llama-native-kit`; the separate FTE product owns
-routing/protocol/provider modules; local STT/TTS lives in
-`delysis/speech-native-kit`; content-first attachment inspection and planning
-lives in `delysis/attachment-native-kit`.
+This subtree owns Mom Llama. Shared native, Speech, Information, and Attachment
+crates live under the monorepo `crates/` tree. FTE remains a separate product.
 
 ## Product hierarchy
 
@@ -31,8 +28,8 @@ lives in `delysis/attachment-native-kit`.
 - Do not add native engine crates, attachment parsers, provider implementations,
   speech backends or loopback servers here. Consume their typed public
   boundaries.
-- Preserve current data/Keychain/Tauri identifiers until a tested additive
-  migration verifies read-back and rollback.
+- Keep user data and credentials intact. These products are unreleased; remove
+  unused compatibility paths and reject incompatible stores instead of inventing migrations.
 
 ## Native UI discipline
 

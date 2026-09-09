@@ -55,17 +55,16 @@ node scripts/ci/cargo-group.mjs clippy product-mom
 workspace, lockfile, and release changes. It does not run the guarded
 ignored-test inventory listing; when the planner selects `ignored-tests`, run
 `node scripts/ci/validate-ignored-tests.mjs --cargo-list` separately.
-`cargo xtask lean verify` is an explicit historical W8/W9 census check, not
-part of ordinary policy.
+Historical W8/W9 census commands are retired; Git retains their implementation
+and original receipts.
 
 PR selection derives changed packages and local reverse consumers from locked
 Cargo metadata. `dependency_selection` is applied; unknown or unavailable
 metadata forces the full plan. `ci/ci-path-exceptions.json` contains only
-evidenced non-Cargo asset, platform, workspace, and workflow rules. The former
-path planner remains under `dependency_shadow` as an observational equivalence
-report, and any unexplained reduction against it also forces full coverage.
+evidenced non-Cargo asset, platform, workspace, and workflow rules. One planner
+selects the actual dependency closure; the former path overlay is retired.
 
-Lifecycle, migration, and SQLite identity checks live with the product or
+Lifecycle, storage, and SQLite identity checks live with the product or
 service that owns the behavior. Product UI, real-model, and loaded-model
 shutdown evidence remain explicit acceptance gates and are not inferred from
 compilation.

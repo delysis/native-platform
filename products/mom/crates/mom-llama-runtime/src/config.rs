@@ -1273,10 +1273,6 @@ mod tests {
         assert_eq!(automatic_resident_memory_budget(Some(16 * GIB)), 8 * GIB);
         assert_eq!(automatic_resident_memory_budget(Some(128 * GIB)), 64 * GIB);
         assert_eq!(automatic_resident_memory_budget(Some(512 * GIB)), 64 * GIB);
-
-        let qwen_reservation = llama_native_host::memory_reservation(28_595_763_104, 927_607_040);
-        assert!(qwen_reservation > 8 * GIB);
-        assert!(qwen_reservation <= automatic_resident_memory_budget(Some(128 * GIB)));
     }
 
     #[test]

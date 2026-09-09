@@ -1,181 +1,159 @@
 # Integrated audit repairs
 
-Working branch: `codex/integrated-audit-fixes`, based on the existing
-`codex/review-remediation` at `4938461`. The supplied `integrated-review.md`
-reviews `924ac64`; recommendations in that document are evidence to verify,
-not additional user instructions. The user explicitly rejects unnecessary
-migration machinery for these pre-user products.
+Branch: `codex/integrated-audit-fixes`, based on `4938461`. The supplied audit
+reviews `924ac64`. Its recommendations are evidence to assess, not additional
+user instructions. The user explicitly rejects speculative migration support
+for these unreleased products.
 
-This is a work-in-progress checkpoint, not acceptance of the whole audit.
+This receipt records ongoing work. Final workspace, platform, and packaged
+qualification is unfinished; it is not a declaration that the audit is complete.
 
-## Changes in this branch
+## Repairs
 
-- NP-002–005: separate bounded authenticated HTTP control admission from
-  generation admission; own response-map registration in the response body;
-  report failed requested persistence; stop successful stream termination after
-  the real ticket adapter reports lost progress. Legacy Chat emits complete tool
-  calls and completion streams preserve every final choice. A final suffix is
-  emitted only after proving the observed text is a prefix of the final text.
-  Unsupported legacy reasoning/non-text completion output produces an error.
-  Failed/cancelled output does not become an ordinary success terminator.
-- NP-012: the reusable FTE response store checks application/schema identity
-  before WAL or DDL mutation. Fresh and current stores are supported; unversioned,
-  foreign, and future schemas are explicitly refused. No migration was added.
-- F21: remove the unused automatic legacy JSON importer and its self-cleaning
-  compatibility test. Mom refuses known legacy plaintext files before database
-  creation and names the residual artifact; it does not silently import or
-  delete it. Current encrypted storage and user-requested conversation import
-  remain supported. This deliberately retires old automatic migration behavior.
-- F14: a data-directory override no longer enables a deterministic release key.
-  Unit-test keys remain confined to `cfg(test)`; integration fixtures use the
-  existing debug-store policy. Explicit environment keys and OS credential
-  resolution remain distinct. Duplicate receipt writes are insert-only.
-- F7: the production worker supervisor invalidates Ready/active state on unwind,
-  including poisoned status locks, while leaving the panic observable to join.
-- NP-008/F20: managed-document publication/removal errors preserve exact identity
-  and committed visibility after rename. Same-identity publication retries sync
-  the actual parent directories. Non-Unix directory sync returns Unsupported
-  rather than success. macOS requires write permission for cross-parent directory
-  rename, so directory hardening stays after rename with committed-error handling.
-- NP-011: ZIM title ordering uses the path for an empty stored title. Independent
-  valid and reversed title-table fixtures exercise the actual archive reader.
+- NP-002–005: FTE separates bounded authenticated control admission from
+  generation admission; response bodies own response-map registration. Requested
+  persistence failures and lost progress cannot produce successful completion.
+  Legacy Chat preserves tool calls; completion preserves every final choice and
+  emits a final suffix only when observed text is its prefix. Unrepresentable
+  output produces an error. Cancellation does not become a success terminator.
+- NP-012/F22: FTE and Loom inspect database identity before WAL/schema mutation.
+  Fresh/current formats are supported; incompatible formats are refused. Loom
+  has one current schema, with writing constraints, indexes, and triggers intact;
+  the fourteen-step migration chain and retired research tables are removed.
+  Opening a damaged project cannot create a replacement database. Existing
+  incompatible data is preserved; no speculative migration or backup framework
+  was introduced.
+- F21/F14: Mom no longer automatically imports plaintext legacy JSON. Known
+  residual artifacts are refused before key/database creation. Explicit import
+  remains supported. A data-directory override cannot enable a deterministic
+  release key. Wrong keys do not rotate themselves; receipt insertion is unique.
+- F5: Mom callers receive an explicit runtime-owned operation scope. The global
+  host lookup and duplicate ambient-call wrappers are removed. A production
+  owner constructs its host, binds configuration, cancels its scope on drop,
+  and joins its workers. Independently owned runtimes cannot discover each
+  other's host through ambient state.
+- F7: the production native worker supervisor invalidates Ready/active state on
+  unwind, including poisoned status locks, and preserves the failed join.
+- NP-008/F20: Information publication/removal errors retain exact committed
+  identity after rename. Same-identity retries sync the actual parent directories.
+  Unsupported synchronization cannot return success.
+- F15: Information, FTE, and Loom refuse unsupported private-storage capabilities
+  before mutation. Actual storage tests are Unix-scoped; portable logic remains
+  enabled and explicit non-Unix no-mutation regressions cover refusal.
+- NP-009: persistent cache metadata and encrypted entries are separate. Restoring
+  an entry reads that payload once. Owner generations are revalidated at live
+  promotion; corrupt metadata clears its family atomically. Updating one entry
+  preserves unrelated ciphertext.
+- NP-011: ZIM title ordering uses the path for an empty title, with independent
+  valid and reversed title-table fixtures.
+- F13: MCP configuration records executable SHA-256; every spawn checks it.
+  A replaced/missing executable requires reconfiguration. Managed Persona tools
+  retain native/no-argument restrictions. Scripts/interpreter inputs are not
+  represented as immutable or sandboxed. A replaced-script regression checks
+  that no marker process effect occurs.
+- F18: the pinned llama.cpp wrapper takes a destination slice and passes its real
+  length. Native export no longer needs an unsafe call. State import remains the
+  documented narrow unsafe boundary.
+- F17: Vitest/browser packages were updated to 4.1.11, chacha20 to 0.10.2, and the
+  GTK-compatible GLib 0.18.5 has a documented two-line upstream security backport.
+  Seven maintenance-only notices have scoped reasons and a 2026-12-09 review
+  date. No runtime vulnerability is waived. ort-sys already verifies the hash of
+  its downloaded archive; no redundant downloader was added.
 
-## Verification so far
+## Simpler development process
 
-The three initial HTTP regressions failed against the pre-repair adapter
-(control returned 429, dropped body leaked identity, storage failure emitted
-`response.completed`). The independent valid ZIM archive failed before the fix.
+Full CI executes one workspace matrix, doctests, and Linux Clippy. macOS adds
+browser interaction and packaging; frontend commands do not repeat Rust builds.
+The fuzz lane executes bounded inputs and retains crashes. A hash-pinned CPU
+model lane runs exact registered tests and rejects zero execution. Advisory
+checks scan the actual root and fuzz locks.
 
-Selected runs passed on **Rust 1.95**, including FTE loopback (12), FTE store
-(2), Information store (27), Information host (6), Mom runtime unit (175 before
-the cache change, 176 afterward), Mom runtime integration (39 passed, 13 opt-in
-tests ignored), and native host (19 passed, 3 ignored after the cache change).
-Native engine and ZIM library suites also passed in the combined selected run.
-Although later commands used Cargo 1.92, that Cargo still found Homebrew rustc
-through PATH. The compiler identity correction is material: these results are
-not Rust 1.92 qualification.
+PR selection uses Cargo's resolved and declared local dependency edges plus
+explicit non-Cargo rules. Unknown paths or unavailable metadata select full
+coverage. The old path planner, Mom overlay, and shadow comparison are removed.
+The obsolete W8/W9 `xtask lean` census is retired. Git retains its history.
 
-A subsequent full workspace build explicitly set RUSTC and RUSTDOC to the Rust
-1.92 toolchain. It reached the desktop link/archive phase but exhausted disk;
-it did not reach test execution. An earlier real-model invocation also stopped at link. Subsequent
-Rust 1.92 native model executions passed as recorded below. Further verification
-must select the entire toolchain on PATH; explicit rustc/rustdoc alone does not
-prevent Cargo from discovering a Homebrew cargo-clippy/driver.
+Mom's Consult-to-Persona migration and repair machinery is removed. Current
+builtin catalog updates still preserve user edits. The unused file-size-only
+native memory estimator and tests of its obsolete formula are removed;
+admission uses the configuration-sensitive estimator.
 
-Portable changed-package Clippy passed on Rust 1.95. Broad Clippy, final model
-runner, final cancellation projection, and Rust 1.92 checks remain unfinished.
-The workflow tests now pass (41 tests), including after the full-CI
-consolidation. Registry validation and current-document path validation pass.
+Current contributor, product, security, and architecture documentation now
+states these boundaries. Dated ADRs and receipts remain historical. The W9
+correction names the actual orphan `manifest_tests.rs`, not the incorrectly
+attributed `research_admission.rs`; no historical evidence was silently resealed.
 
-The model lane selects two existing CPU tests from the ignored-test registry,
-checks the actual fixture digest, exact test listing, and a nonzero execution
-result. The immutable Hugging Face revision was resolved live and its LFS
-SHA-256 matches the local 484,220,320-byte fixture. This is runner/workflow source,
-not a claim that CI has executed. Full CI also selects doctests and rejects
-unexpected skipped mandatory jobs. Unused static/C ABI library outputs were
-removed from the desktop FTE/Loom manifests to avoid producing large archives
-that no desktop build consumes; packaging still needs final validation.
+## Verification recorded so far
 
-Only build files created by this task were removed automatically (birth time
-checked against the task start), reclaiming about 4.4 GB before the explicit
-Rust 1.92 build. That build filled the available space again.
-An approval request is pending for the old 6.3 GiB
-`/Users/george/.codex/worktrees/native-platform-w1/target` build cache. No source,
-models, archives, or older build directories have been deleted.
+Before the HTTP repairs, real adapter regressions observed control HTTP 429,
+a leaked response identity after body drop, and `response.completed` following
+storage failure. The independent valid ZIM archive also failed before repair.
 
-## Remaining audit work
+With the complete Rust 1.92 toolchain on PATH:
 
-- Finish FTE cancellation/failure wire controls and final combined verification.
-  Assess remaining protocol projection limitations against actual callers.
-- NP-009 implementation now uses metadata plus exact encrypted entries, with
-  one payload read per restored entry. Owner leases/generation-race tests and
-  unchanged-unrelated-ciphertext tests passed on Rust 1.95. Corrupt metadata
-  removes its payload family in the same transaction; clear deletes the whole
-  family atomically. Reverify on Rust 1.92 and with the real product cache path.
-- F5: remove Mom ambient host resolution by passing owner handles/scopes through
-  actual callers. Its global currently holds a weak host; do not invent a second
-  strong-owner problem.
-- F18: the wrapper is repaired and the product pin updated, with real CPU
-  checks passed below. Remaining broad workspace/CI verification still applies.
-- F13: configured digest enforcement and real spawn-boundary regressions are
-  implemented; the latest Mom source still needs compilation and execution.
-- F15: Information and FTE now refuse unsupported private storage before
-  mutation. Portable tests stay enabled; Unix storage tests are scoped and
-  explicit non-Unix no-mutation tests are added. These latest edits are not yet
-  compiled. Loom still has non-Unix private-file/directory and parent-sync
-  behavior to resolve; do not claim F15 complete.
-- F1/F2/NP-013: selected, hash-pinned real-model execution; doctests; bounded fuzz
-  execution; correct required-job aggregation; simplify redundant listing/shadow
-  machinery without dropping meaningful coverage. Browser lane exists in base.
-- F17: actual root/fuzz Rust advisory/license/source scans and JavaScript scan
-  passed after fixes; workflow and GLib optimized runtime execution remain to
-  qualify. No scan exception covers a runtime vulnerability.
-- F3/F4/F6/F8–12/F16/F19/F22/NP-001/006/007/010/014: refresh inherited repairs,
-  distinguish resolved behavior, remaining qualification, and historical prose.
-  F22's proposed future migration is not a requirement to add pre-user machinery.
-- Review receipt metadata/re-key/rollback supplements according to actual use;
-  do not invent an anti-rollback guarantee.
-- Reconcile current product/security/CI/architecture docs, add precise historical
-  W9 correction, then full workspace checks and separately scoped real-model and
-  packaged journeys. No completion or promotion claim yet.
+- FTE loopback 12, protocols 12, store 2; Information host 6 and store 27;
+  Mom runtime library 177 passed, none ignored. These precede the latest Mom
+  scope/catalog refactor.
+- Loom's current-schema library run passed 122 tests, none ignored. This precedes
+  the additional platform guards and damaged-project-open regression.
+- The wrapper's real CPU capacity test passed for zero, one, and undersized
+  buffers with canaries, then exact export/restore: 1 passed, none ignored.
+- Native saved-prefix live/durable restoration and context rejection passed;
+  strict pre-cancelled batch handling passed: two exact tests, none ignored.
+  These are native-boundary results, not packaged product acceptance.
+- The consolidated Mom/runtime/CLI/desktop check reached product callers after
+  rebuilding the native feature variant. It found one missing scope in the
+  desktop cache-clear callback, now repaired. The workspace all-target test run
+  is the next compilation and execution gate.
 
-## Later verification and source checkpoint
+Other observed checks:
 
-- External wrapper commit `eb0e47b57c2fba97ed13e8fe5e949d11798232cb` is pushed
-  on `delysis/llama-cpp-rs` branch `codex/state-buffer-capacity`; it is not merged.
-  Worktree: `/Users/george/.codex/worktrees/llama-cpp-rs-state-capacity`.
-  The method now accepts `&mut [u8]`, passes its real capacity, and is safe to
-  call. Its opaque export uses that method too. A real Qwen CPU test exercised
-  capacities 0, 1, and required-size-minus-one with canaries, followed by exact
-  export/restore. Rust 1.92: 1 passed, 0 ignored. Formatting/diff checks passed.
-  An extra strict Clippy attempt encountered 109 warnings promoted to errors in
-  existing external-wrapper code; no strict external Clippy pass is claimed.
-- The native-platform manifest, lock, build identity, exported revision, and
-  policy allowlist now pin that exact wrapper commit. The model-check runner
-  passed BOTH registered CPU tests under rustc 1.92: saved-prefix live restore,
-  durable replay, context rejection; and strict pre-cancelled batch handling.
-  Each execution reported 1 passed, 0 failed, 0 ignored. This is native-boundary
-  evidence, not packaged product acceptance or the real Mom cache path.
-- Full CI no longer repeats the full workspace in Attachment, Information,
-  Speech, Mom, and Loom jobs. One matrix owns all-target and doctest execution;
-  macOS adds browser interaction and desktop packaging. Frontend commands no
-  longer recursively trigger FTE Rust builds. Fuzz now executes bounded inputs
-  and uploads crashes. The fuzz lock was stale (missing hound); it is repaired.
-- Live dependency scans found the Vitest 4.1.10 advisory, GLib 0.18.5 iterator
-  unsoundness, and yanked chacha20 0.10.1. Vitest/browser packages are 4.1.11,
-  chacha20 is 0.10.2, and GLib is a documented two-line upstream security
-  backport. Root and fuzz cargo-deny checks passed; pnpm reported zero known
-  vulnerabilities afterward. Seven maintenance-only Rust notices have scoped
-  reasons and a 2026-12-09 review date. The optimized GLib iterator tests are
-  configured for Linux CI and have not run in this task.
-- ort-sys 2.0.0-rc.13 already verifies its bundled target-specific archive hash
-  before publishing the extracted ONNX Runtime 1.28.0 cache. Existing local
-  hash-named cache directories are trusted. No unsupported claim of an
-  unauthenticated fresh download, and no redundant downloader was added.
-- MCP configuration now records the executable digest; every spawn compares
-  it before process creation. Missing/changed identity requires reconfiguration.
-  Managed Persona staging retains its additional native/no-argument constraints.
-  Ordinary script/interpreter inputs are not misrepresented as immutable or
-  sandboxed. A regression replaces the configured script and checks that no
-  marker process effect occurs; it has not run yet.
-- W9 attribution was checked with `git ls-tree` at the recorded checkpoint.
-  The actual research-classified survivor was an orphaned `manifest_tests.rs`,
-  not the claimed `research_admission.rs`. An explicit correction preserves
-  the original historical claim; no census or acceptance rerun is implied.
+- Simplified metadata/planner checks: 37 passed, none skipped.
+- Workflow checks before the helper-file rename: 41 passed.
+- Mom architecture and contracts passed (102 commands, 99 affordances, 46 effects,
+  36 parity rows, 58 upstream settings, zero blockers).
+- Current-document paths and ignored-test source registry validation passed.
+- Root/fuzz cargo-deny checks and JavaScript advisory scan passed after repairs.
+  Optimized GLib runtime execution and bounded fuzz execution still need results.
 
-The later selected Rust 1.92 run (FTE, Information, Mom libraries) exhausted
-space while compiling dependency feature variants, before any tests executed.
-It also caused a rustc/libc++ failure while disk was full. This is not a pass
-and does not establish a source defect. Further builds are paused pending
-usable space. Only this task's obsolete native build directories, superseded native
-archives, and obsolete test executables were removed automatically; older caches remain
-untouched. The approval request for the exact 6.3 GiB W1 target is still pending.
+Earlier Rust 1.95 results and a disk-full Rust 1.92 attempt are not substituted
+for current qualification. Future commands select the entire 1.92 toolchain on
+PATH and reuse the active shared target directory.
 
-Remaining high-value work: Mom ambient host removal (F5); Loom platform privacy
-and durability (remaining F15); latest MCP/FTE/Information compilation and tests;
-real Mom cache exercise; inherited finding refresh; documentation reconciliation;
-then one final workspace gate and scoped packaged/platform qualification. The
-main native-platform changes are a work-in-progress checkpoint; this audit is not
-complete. The external wrapper is under draft review in PR #11:
-https://github.com/delysis/llama-cpp-rs/pull/11. Its CI was still running at the
-last check; no remote qualification result is claimed.
+## External wrapper
+
+Native-platform pins source commit `eb0e47b57c2fba97ed13e8fe5e949d11798232cb`.
+Draft PR: https://github.com/delysis/llama-cpp-rs/pull/11.
+
+The fork also retires upstream registry publication: it is consumed by immutable
+Git revision and must not accidentally package against the unrelated registry
+sys crate. Both crates are unpublished and upstream release-publication workflows
+are removed in `3cea96c5d09c1d9cdc0db418ea27d3f1e200465b`. Main's source pin need
+not change for workflow metadata.
+
+CI run 34394817229 passed Linux wrapper tests, Windows/macOS builds, and workflow
+policy. CUDA was still running at the last observation. The preceding source
+run passed CUDA but failed the obsolete registry dry-run publication path;
+that failure is distinct from the repaired state-buffer behavior.
+
+## Local cache maintenance
+
+The user's September 9 instruction supersedes per-cache approval. The preference
+is saved. A dependency-free safe Rust helper checks Cargo identity, a fourteen-day
+age threshold, active builds, Cargo locks, symlinks, and open files. It only prunes
+reproducible Cargo output subdirectories; model fixtures and source stay intact.
+A real filesystem regression passed. A daily 04:00 automation runs the helper
+quietly, notifying only on a failure requiring intervention.
+
+The automatic sweep removed 228,332,165,314 bytes, in addition to the obsolete W1
+and W9 targets. Available space was approximately 193 GiB after resumed builds.
+The disk blocker and old approval request are resolved.
+
+## Remaining qualification
+
+Finish current workspace tests/doctests/Clippy and the final workflow checks;
+exercise the actual Mom persistent cache path with the local model; qualify
+Linux/Windows capability behavior, optimized GLib, and bounded fuzz in CI.
+Keep browser and packaged interaction, OS credentials, native quit/join, and
+reopen evidence separate from compilation and fixture execution. Recheck inherited
+lifecycle, redirect, and Speech regressions in the consolidated workspace run.

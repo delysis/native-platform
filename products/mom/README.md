@@ -5,21 +5,12 @@ Mom Llama is the canonical native, local-first chat product in the
 product runtime, CLI, command/effect contracts, evidence receipts and
 Tauri/Maud interface.
 
-It does **not** contain a copied llama.cpp engine or a generic provider gateway:
-
-- [`delysis/llama-native-kit`](https://github.com/delysis/llama-native-kit)
-  owns the in-process GGUF runtime.
-- [`delysis/free-token-energy`](https://github.com/delysis/free-token-energy)
-  remains a separate product for protocol routing, hosted providers and
-  optional loopback compatibility; Mom does not compose it.
-- [`delysis/speech-native-kit`](https://github.com/delysis/speech-native-kit)
-  owns local STT/TTS contracts, routing, backends and optional Tauri IPC.
-- [`delysis/attachment-native-kit`](https://github.com/delysis/attachment-native-kit)
-  owns content-first recursive inspection, canonical attachment artifacts,
-  provenance and capability-aware media/transform planning.
-- [`delysis/capability-system-compiler`](https://github.com/delysis/capability-system-compiler)
-  owns Loom compilation/specification and may test this CLI as a black box; it
-  does not own another Mom Llama implementation.
+Mom composes the shared [native runtime](../../crates/native),
+[Speech](../../crates/services/speech), and
+[Attachment](../../crates/services/attachment) crates through their typed public
+APIs. [FTE](../fte) is a separate product; Mom has no provider gateway or loopback.
+The product owner passes one explicit operation scope through CLI and desktop
+operations, and dropping it joins its native workers.
 
 See [`docs/MODULE_BOUNDARIES.md`](docs/MODULE_BOUNDARIES.md) for the complete
 dependency graph and the exact present status of speech.
@@ -72,10 +63,9 @@ absolute and all selected model/projector files are still validated at runtime.
 When no compile default is supplied, Mom embeds no developer model path and does
 not fall back to the build directory.
 
-The extraction deliberately retains the existing Tauri identifier, data paths,
-environment variables and Keychain service. That preserves current local data
-and avoids new credential prompts. Renaming those compatibility identifiers is
-a separate additive migration, not part of repository cleanup.
+Mom uses the current Tauri identifier, data paths, environment variables, and
+Keychain service. These are the product configuration, not a second compatibility
+layer. Unused migration paths are retired; incompatible data is refused intact.
 
 Debug builds use the prompt-free development store unless
 `LLAMA_NATIVE_KIT_SECURE_STORAGE=1` is set. Release builds retain the existing

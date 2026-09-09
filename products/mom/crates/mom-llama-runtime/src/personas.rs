@@ -1,5 +1,5 @@
 use crate::config::{resolve_settings, upstream_setting_string};
-use crate::consult::{ConsultPanel, ConsultPersona, stored_legacy_panels};
+use crate::consult::ConsultPersona;
 use crate::conversation_store::{
     CONVERSATIONS_NAMESPACE, ChatTemplatePolicy, Conversation, ConversationDb,
     ConversationExecutionProfile, ConversationKind, DRAFTS_NAMESPACE, DraftDb, Message,
@@ -8,7 +8,7 @@ use crate::conversation_store::{
 use crate::native_runtime::resident_model_for_profile;
 use crate::now_ms;
 use crate::operation_scope::OperationScope;
-use crate::persona_library::{LIBRARY_REVISION, builtin_panels, builtin_personas};
+use crate::persona_library::{LIBRARY_REVISION, builtin_personas};
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use anyhow::Result;
@@ -30,7 +30,6 @@ const PERSONA_REMOVAL_SCHEMA: &str = "mom_llama.persona_removal_impact.v1";
 const PERSONA_CACHE_AUTHORITY_LOCK_FILE: &str = "persona-cache-authority.lock";
 const MAX_GROUP_MEMBERS: usize = 4;
 pub(crate) const MAX_PERSONA_TOOL_BINDINGS: usize = 8;
-const PERSONA_STATE_MIGRATION_VERSION: u32 = 4;
 
 static PERSONA_CACHE_AUTHORITY: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -114,21 +113,9 @@ pub struct PersonaGroup {
 struct PersonaGroupDb {
     groups: Vec<PersonaGroup>,
     #[serde(default)]
-    legacy_consult_migrated: bool,
-    #[serde(default)]
-    migration_version: u32,
-    #[serde(default)]
     catalog_revision: Option<String>,
     #[serde(default)]
     builtin_persona_provenance: Vec<BuiltinPersonaProvenance>,
-}
-
-impl PersonaGroupDb {
-    fn legacy_consult_migration_is_current(&self) -> bool {
-        self.legacy_consult_migrated
-            && self.migration_version >= PERSONA_STATE_MIGRATION_VERSION
-            && self.catalog_revision.as_deref() == Some(LIBRARY_REVISION)
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -244,8 +231,6 @@ struct PersonaRemovalRecord {
     removed_at: String,
     #[serde(default)]
     persona_snapshot: Option<Conversation>,
-    #[serde(default)]
-    migration_tombstone: bool,
 }
 
 enum PersonaRemovalAttempt {
@@ -261,7 +246,7 @@ enum PersonaRemovalAttempt {
 }
 
 pub fn persona_freeze(input: PersonaFreezeInput) -> Result<CommandResult<Conversation>> {
-    migrate_legacy_consult()?;
+    ensure_builtin_catalog()?;
     let mut db = load_db()?;
     let Some(source) = db
         .conversations
@@ -367,7 +352,7 @@ pub fn persona_freeze(input: PersonaFreezeInput) -> Result<CommandResult<Convers
 }
 
 pub fn persona_list() -> Result<CommandResult<Vec<Conversation>>> {
-    migrate_legacy_consult()?;
+    ensure_builtin_catalog()?;
     let db = load_db()?;
     let personas = db
         .conversations
@@ -386,7 +371,7 @@ pub fn persona_list() -> Result<CommandResult<Vec<Conversation>>> {
 }
 
 pub fn persona_get(persona_id: &str) -> Result<CommandResult<Conversation>> {
-    migrate_legacy_consult()?;
+    ensure_builtin_catalog()?;
     let db = load_db()?;
     let Some(persona) = db.conversations.into_iter().find(|conversation| {
         conversation.id == persona_id && conversation.kind == ConversationKind::PersonaTemplate
@@ -408,7 +393,10 @@ pub fn persona_get(persona_id: &str) -> Result<CommandResult<Conversation>> {
     ))
 }
 
-pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Conversation>> {
+pub fn persona_update(
+    scope: &crate::OperationScope,
+    input: PersonaUpdateInput,
+) -> Result<CommandResult<Conversation>> {
     let PersonaUpdateInput {
         persona_id,
         name,
@@ -458,7 +446,7 @@ pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Convers
             ));
         }
     };
-    migrate_legacy_consult()?;
+    ensure_builtin_catalog()?;
     if let ChatTemplatePolicy::FrozenSource(template) = &chat_template {
         if template.trim().is_empty() {
             return Ok(CommandResult::blocked(
@@ -483,8 +471,12 @@ pub fn persona_update(input: PersonaUpdateInput) -> Result<CommandResult<Convers
                 ),
             ));
         };
-        let model = match resident_model_for_profile(&settings, model_path, mmproj_path.as_deref())
-        {
+        let model = match resident_model_for_profile(
+            scope,
+            &settings,
+            model_path,
+            mmproj_path.as_deref(),
+        ) {
             Ok(model) => model,
             Err(blocked) => {
                 return Ok(CommandResult::blocked(
@@ -689,17 +681,12 @@ fn sha256_json(value: &impl Serialize) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
 }
 
-pub fn persona_removal_preview(persona_id: &str) -> Result<CommandResult<PersonaRemovalImpact>> {
-    let scope = OperationScope::for_current_product_host();
-    persona_removal_preview_in_scope(&scope, persona_id)
-}
-
 pub fn persona_removal_preview_in_scope(
     scope: &OperationScope,
     persona_id: &str,
 ) -> Result<CommandResult<PersonaRemovalImpact>> {
     const COMMAND: &str = "mom_llama.persona_removal_preview";
-    migrate_legacy_consult()?;
+    ensure_builtin_catalog()?;
     let store = RuntimeStore::current()?;
     let impact =
         crate::mentions::with_persona_invocation_registry(scope, persona_id, |live_ids| {
@@ -725,27 +712,11 @@ pub fn persona_removal_preview_in_scope(
     ))
 }
 
-pub fn persona_remove_from_library(
-    input: PersonaRemovalCommitInput,
-) -> Result<CommandResult<PersonaRemovalOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    persona_remove_from_library_in_scope(&scope, input)
-}
-
 pub fn persona_remove_from_library_in_scope(
     scope: &OperationScope,
     input: PersonaRemovalCommitInput,
 ) -> Result<CommandResult<PersonaRemovalOutput>> {
     persona_remove_from_library_inner_in_scope(scope, input, false)
-}
-
-#[cfg(test)]
-fn persona_remove_from_library_inner(
-    input: PersonaRemovalCommitInput,
-    inject_failure_after_mutations: bool,
-) -> Result<CommandResult<PersonaRemovalOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    persona_remove_from_library_inner_in_scope(&scope, input, inject_failure_after_mutations)
 }
 
 fn persona_remove_from_library_inner_in_scope(
@@ -768,7 +739,7 @@ fn persona_remove_from_library_inner_in_scope(
             ),
         ));
     }
-    migrate_legacy_consult()?;
+    ensure_builtin_catalog()?;
     let store = RuntimeStore::current()?;
     crate::mentions::with_persona_invocation_registry(scope, &input.persona_id, |live_ids| {
         // The registry lock is held across the authoritative transaction. A
@@ -914,7 +885,6 @@ fn persona_remove_from_library_inner_in_scope(
                     impact: Some(impact.clone()),
                     removed_at: removed_at.clone(),
                     persona_snapshot: Some(persona_snapshot),
-                    migration_tombstone: false,
                 });
                 if inject_failure_after_mutations {
                     anyhow::bail!("injected Persona removal transaction failure");
@@ -934,7 +904,7 @@ fn persona_remove_from_library_inner_in_scope(
         };
         let post_memory = crate::kv_cache::invalidate_persona_memory_cache(&input.persona_id)?;
         let post_native =
-            crate::native_runtime::invalidate_loaded_native_cache_owner(&input.persona_id)?;
+            crate::native_runtime::invalidate_loaded_native_cache_owner(scope, &input.persona_id)?;
         Ok(CommandResult::passed(
             COMMAND,
             "contracted",
@@ -1307,7 +1277,7 @@ fn persona_instantiate_inner(
     title: Option<String>,
     before_admission: impl FnOnce(),
 ) -> Result<CommandResult<Conversation>> {
-    migrate_legacy_consult()?;
+    ensure_builtin_catalog()?;
     let store = RuntimeStore::current()?;
     let _attachments = crate::attachments::lock_attachment_lifecycle()?;
     let _ = crate::attachments::load_attachment_db()?;
@@ -1421,7 +1391,7 @@ fn persona_instantiate_inner(
 }
 
 pub fn persona_group_list() -> Result<CommandResult<Vec<PersonaGroup>>> {
-    migrate_legacy_consult()?;
+    ensure_builtin_catalog()?;
     Ok(CommandResult::passed(
         "mom_llama.persona_group_list",
         "contracted",
@@ -1463,7 +1433,7 @@ pub fn persona_group_update(
 }
 
 pub fn persona_group_delete(group_id: &str) -> Result<CommandResult<PersonaGroup>> {
-    migrate_legacy_consult()?;
+    ensure_builtin_catalog()?;
     let store = RuntimeStore::current()?;
     let mut removed = None;
     store.mutate(GROUPS_NAMESPACE, PersonaGroupDb::default, |db| {
@@ -1495,7 +1465,7 @@ pub fn persona_group_delete(group_id: &str) -> Result<CommandResult<PersonaGroup
 }
 
 pub(crate) fn conversation_and_group_handles() -> Result<(Vec<Conversation>, Vec<PersonaGroup>)> {
-    migrate_legacy_consult()?;
+    ensure_builtin_catalog()?;
     let db = load_db()?;
     Ok((db.conversations, load_group_db()?.groups))
 }
@@ -1507,7 +1477,7 @@ fn write_group(
     persona_ids: Vec<String>,
     command: &str,
 ) -> Result<CommandResult<PersonaGroup>> {
-    migrate_legacy_consult()?;
+    ensure_builtin_catalog()?;
     let persona_ids = persona_ids
         .into_iter()
         .filter(|id| !id.trim().is_empty())
@@ -1601,315 +1571,28 @@ fn write_group(
     ))
 }
 
-fn migrate_legacy_consult() -> Result<()> {
+fn ensure_builtin_catalog() -> Result<()> {
     let mut groups = load_group_db()?;
-    if groups.legacy_consult_migration_is_current() {
+    if groups.catalog_revision.as_deref() == Some(LIBRARY_REVISION) {
         return Ok(());
     }
-
     let mut conversations = load_db()?;
-    repair_legacy_handles(&mut conversations, &mut groups);
-
     let settings = resolve_settings()?;
-    let catalog = builtin_personas();
-    let catalog_versions = reconcile_builtin_personas(
+    let versions = reconcile_builtin_personas(
         &mut conversations,
         &mut groups,
-        catalog,
+        builtin_personas(),
         LIBRARY_REVISION,
-        settings.model_path.clone(),
-        settings.mmproj_path.clone(),
+        settings.model_path,
+        settings.mmproj_path,
     )?;
-
-    // Migration reads the persisted legacy document directly. The display
-    // list intentionally overlays current built-ins and cannot be a lossless
-    // recovery source when a stored user panel collides with a built-in ID.
-    let current_builtin_panels = builtin_panels();
-    let mut migrated_legacy_persona_ids = BTreeSet::new();
-    for panel in stored_legacy_panels()? {
-        if current_builtin_panels
-            .iter()
-            .any(|built_in| built_in == &panel)
-        {
-            continue;
-        }
-        validate_legacy_panel(&panel)?;
-        let mut persona_ids = Vec::new();
-        let mut distinct_persona_ids = BTreeSet::new();
-        for (index, legacy) in panel.personas.iter().enumerate() {
-            let id = resolve_legacy_persona_id(&conversations, &panel, index, legacy)?;
-            if !distinct_persona_ids.insert(id.clone()) {
-                anyhow::bail!(
-                    "legacy Consult panel `{}` contains duplicate Persona content",
-                    panel.id
-                );
-            }
-            if !conversations
-                .conversations
-                .iter()
-                .any(|conversation| conversation.id == id)
-            {
-                let now = now_ms().to_string();
-                let handle = unique_handle(&conversations, &groups.groups, &legacy.label);
-                conversations.conversations.push(Conversation {
-                    id: id.clone(),
-                    title: legacy.label.clone(),
-                    created_at: now.clone(),
-                    updated_at: now,
-                    kind: ConversationKind::PersonaTemplate,
-                    execution_profile: ConversationExecutionProfile {
-                        mention_handle: handle,
-                        model_path: settings.model_path.clone(),
-                        mmproj_path: settings.mmproj_path.clone(),
-                        system_message: Some(legacy.perspective_prompt.clone()),
-                        ..ConversationExecutionProfile::default()
-                    },
-                    selected_model_path: settings.model_path.clone(),
-                    source_conversation_id: None,
-                    source_message_id: None,
-                    branch_root_message_id: None,
-                    active_leaf_message_id: None,
-                    current_skill_ids: Vec::new(),
-                    messages: Vec::new(),
-                });
-            }
-            migrated_legacy_persona_ids.insert(id.clone());
-            persona_ids.push(id);
-        }
-        let group_id = resolve_legacy_group_id(
-            &groups.groups,
-            &panel,
-            &persona_ids,
-            &current_builtin_panels,
-        )?;
-        if !groups.groups.iter().any(|group| group.id == group_id) {
-            let now = now_ms().to_string();
-            let handle = unique_handle(&conversations, &groups.groups, &panel.name);
-            groups.groups.push(PersonaGroup {
-                id: group_id,
-                name: panel.name.clone(),
-                mention_handle: handle,
-                persona_ids,
-                created_at: now.clone(),
-                updated_at: now,
-            });
-        }
-    }
-    repair_legacy_handles(&mut conversations, &mut groups);
-    let dangling_persona_ids = repair_dangling_group_members(&conversations, &mut groups);
-    groups.legacy_consult_migrated = true;
-    groups.migration_version = PERSONA_STATE_MIGRATION_VERSION;
-    groups.catalog_revision = Some(LIBRARY_REVISION.to_string());
     save_db(&conversations)?;
-    let legacy_versions = conversations
-        .conversations
-        .iter()
-        .filter(|persona| migrated_legacy_persona_ids.contains(&persona.id))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut recorded_version_ids = BTreeSet::new();
-    for persona in catalog_versions.into_iter().chain(legacy_versions) {
-        if !recorded_version_ids.insert(persona.id.clone()) {
-            continue;
-        }
+    for persona in versions {
         record_persona_version(&persona)?;
     }
-    persist_persona_removal_migration(&conversations, &groups, &dangling_persona_ids)?;
+    groups.catalog_revision = Some(LIBRARY_REVISION.to_string());
+    RuntimeStore::current()?.put(GROUPS_NAMESPACE, &groups)?;
     Ok(())
-}
-
-fn repair_dangling_group_members(
-    conversations: &ConversationDb,
-    groups: &mut PersonaGroupDb,
-) -> Vec<String> {
-    let valid_persona_ids = conversations
-        .conversations
-        .iter()
-        .filter(|conversation| conversation.kind == ConversationKind::PersonaTemplate)
-        .map(|conversation| conversation.id.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut removed_persona_ids = Vec::new();
-    for group in &mut groups.groups {
-        let before = group.persona_ids.len();
-        let mut retained = Vec::with_capacity(group.persona_ids.len());
-        for id in group.persona_ids.drain(..) {
-            if valid_persona_ids.contains(id.as_str()) {
-                retained.push(id);
-            } else {
-                removed_persona_ids.push(id);
-            }
-        }
-        if retained.len() != before {
-            group.updated_at = now_ms().to_string();
-        }
-        group.persona_ids = retained;
-    }
-    groups.groups.retain(|group| !group.persona_ids.is_empty());
-    removed_persona_ids.sort();
-    removed_persona_ids.dedup();
-    removed_persona_ids
-}
-
-fn persist_persona_removal_migration(
-    conversations: &ConversationDb,
-    groups: &PersonaGroupDb,
-    dangling_persona_ids: &[String],
-) -> Result<()> {
-    let present = conversations
-        .conversations
-        .iter()
-        .filter(|conversation| conversation.kind == ConversationKind::PersonaTemplate)
-        .map(|conversation| conversation.id.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut absent_persona_ids = groups
-        .builtin_persona_provenance
-        .iter()
-        .filter(|provenance| {
-            provenance.observed_persona_sha256 == "deleted"
-                && !present.contains(provenance.persona_id.as_str())
-        })
-        .map(|provenance| provenance.persona_id.clone())
-        .chain(dangling_persona_ids.iter().cloned())
-        .collect::<Vec<_>>();
-    absent_persona_ids.sort();
-    absent_persona_ids.dedup();
-    let store = RuntimeStore::current()?;
-    let _cache_authority = acquire_persona_cache_authority_guard(&store)?;
-    store.mutate_documents(
-        PERSONA_REMOVALS_NAMESPACE,
-        PersonaRemovalLedger::default,
-        |ledger, documents| {
-            for persona_id in &absent_persona_ids {
-                if !persona_is_tombstoned(ledger, persona_id) {
-                    let removed_at = now_ms().to_string();
-                    ledger.removals.push(PersonaRemovalRecord {
-                        persona_id: persona_id.clone(),
-                        persona_version: None,
-                        impact_sha256: sha256_json(&("persona_removal_migration.v1", persona_id))?,
-                        impact: None,
-                        removed_at,
-                        persona_snapshot: None,
-                        migration_tombstone: true,
-                    });
-                }
-                crate::kv_cache::remove_persona_cache_from_documents(documents, persona_id)?;
-                crate::native_runtime::remove_persona_native_cache_from_documents(
-                    documents, persona_id,
-                )?;
-            }
-            documents.put_bytes(GROUPS_NAMESPACE, &serde_json::to_vec(groups)?)?;
-            Ok(())
-        },
-    )?;
-    for persona_id in absent_persona_ids {
-        crate::kv_cache::invalidate_persona_memory_cache(&persona_id)?;
-        crate::native_runtime::invalidate_loaded_native_cache_owner(&persona_id)?;
-    }
-    Ok(())
-}
-
-fn validate_legacy_panel(panel: &ConsultPanel) -> Result<()> {
-    if panel.name.trim().is_empty() {
-        anyhow::bail!("legacy Consult panel `{}` has an empty name", panel.id);
-    }
-    if panel.personas.is_empty() || panel.personas.len() > MAX_GROUP_MEMBERS {
-        anyhow::bail!(
-            "legacy Consult panel `{}` must contain one to four Personas",
-            panel.id
-        );
-    }
-    if panel.personas.iter().any(|persona| {
-        persona.label.trim().is_empty() || persona.perspective_prompt.trim().is_empty()
-    }) {
-        anyhow::bail!(
-            "legacy Consult panel `{}` contains an incomplete Persona",
-            panel.id
-        );
-    }
-    Ok(())
-}
-
-fn resolve_legacy_persona_id(
-    conversations: &ConversationDb,
-    panel: &ConsultPanel,
-    index: usize,
-    legacy: &ConsultPersona,
-) -> Result<String> {
-    let legacy_id = legacy.id.trim();
-    if !legacy_id.is_empty() {
-        let candidate = format!("persona-{legacy_id}");
-        match conversations
-            .conversations
-            .iter()
-            .find(|conversation| conversation.id == candidate)
-        {
-            None => return Ok(candidate),
-            Some(conversation) if legacy_persona_matches(conversation, legacy) => {
-                return Ok(candidate);
-            }
-            Some(_) => {}
-        }
-    }
-
-    let digest = sha256_json(&(panel.id.as_str(), index, legacy))?;
-    let candidate = format!("persona-legacy-{digest}");
-    match conversations
-        .conversations
-        .iter()
-        .find(|conversation| conversation.id == candidate)
-    {
-        None => Ok(candidate),
-        Some(conversation) if legacy_persona_matches(conversation, legacy) => Ok(candidate),
-        Some(_) => anyhow::bail!(
-            "legacy Persona identity collision for panel `{}` seat {}",
-            panel.id,
-            index + 1
-        ),
-    }
-}
-
-fn legacy_persona_matches(conversation: &Conversation, legacy: &ConsultPersona) -> bool {
-    conversation.kind == ConversationKind::PersonaTemplate
-        && conversation.title == legacy.label
-        && conversation.execution_profile.system_message.as_deref()
-            == Some(legacy.perspective_prompt.as_str())
-}
-
-fn resolve_legacy_group_id(
-    groups: &[PersonaGroup],
-    panel: &ConsultPanel,
-    persona_ids: &[String],
-    current_builtin_panels: &[ConsultPanel],
-) -> Result<String> {
-    let panel_id = panel.id.trim();
-    let reserved_builtin_id = panel_id.starts_with("builtin-")
-        || current_builtin_panels
-            .iter()
-            .any(|built_in| built_in.id == panel_id);
-    if !panel_id.is_empty() && !reserved_builtin_id {
-        let candidate = format!("group-{panel_id}");
-        match groups.iter().find(|group| group.id == candidate) {
-            None => return Ok(candidate),
-            Some(group) if legacy_group_matches(group, panel, persona_ids) => return Ok(candidate),
-            Some(_) => {}
-        }
-    }
-
-    let digest = sha256_json(panel)?;
-    let candidate = format!("group-legacy-{digest}");
-    match groups.iter().find(|group| group.id == candidate) {
-        None => Ok(candidate),
-        Some(group) if legacy_group_matches(group, panel, persona_ids) => Ok(candidate),
-        Some(_) => anyhow::bail!("legacy Consult group identity collision for `{}`", panel.id),
-    }
-}
-
-fn legacy_group_matches(
-    group: &PersonaGroup,
-    panel: &ConsultPanel,
-    persona_ids: &[String],
-) -> bool {
-    group.name == panel.name && group.persona_ids == persona_ids
 }
 
 fn reconcile_builtin_personas(
@@ -1946,13 +1629,6 @@ fn reconcile_builtin_personas(
                     BuiltinPersonaOwnership::CatalogManaged
                 }
                 Some(_) => BuiltinPersonaOwnership::UserModified,
-                None if is_pristine_legacy_builtin(
-                    &conversations.conversations[index],
-                    &source,
-                ) =>
-                {
-                    BuiltinPersonaOwnership::CatalogManaged
-                }
                 None => BuiltinPersonaOwnership::UserModified,
             };
 
@@ -2090,109 +1766,10 @@ fn builtin_persona_content_sha256(persona: &Conversation) -> Result<String> {
     ))
 }
 
-fn is_pristine_legacy_builtin(persona: &Conversation, source: &ConsultPersona) -> bool {
-    persona.kind == ConversationKind::PersonaTemplate
-        && persona.title == source.label
-        && normalize_handle(&persona.execution_profile.mention_handle)
-            == source.id.replace('_', "-")
-        && persona.execution_profile.system_message.as_deref()
-            == Some(source.perspective_prompt.as_str())
-        && persona.execution_profile.sampling.is_none()
-        && persona.execution_profile.chat_template == ChatTemplatePolicy::ModelDefault
-        && persona.execution_profile.tool_bindings.is_empty()
-        && persona.execution_profile.source_history_tokens == 4096
-        && persona.execution_profile.host_context_tokens == 2048
-        && persona.execution_profile.version == 1
-        && persona.selected_model_path == persona.execution_profile.model_path
-        && persona.source_conversation_id.is_none()
-        && persona.source_message_id.is_none()
-        && persona.branch_root_message_id.is_none()
-        && persona.active_leaf_message_id.is_none()
-        && persona.current_skill_ids.is_empty()
-        && persona.messages.is_empty()
-}
-
 fn load_group_db() -> Result<PersonaGroupDb> {
     Ok(RuntimeStore::current()?
         .get(GROUPS_NAMESPACE)?
         .unwrap_or_default())
-}
-
-#[derive(Debug, Clone, Copy)]
-enum LegacyHandleOwner {
-    Conversation(usize),
-    Group(usize),
-}
-
-fn repair_legacy_handles(db: &mut ConversationDb, groups: &mut PersonaGroupDb) -> bool {
-    let mut owners = db
-        .conversations
-        .iter()
-        .enumerate()
-        .map(|(index, conversation)| {
-            (
-                conversation.created_at.clone(),
-                0_u8,
-                conversation.id.clone(),
-                LegacyHandleOwner::Conversation(index),
-            )
-        })
-        .chain(groups.groups.iter().enumerate().map(|(index, group)| {
-            (
-                group.created_at.clone(),
-                1_u8,
-                group.id.clone(),
-                LegacyHandleOwner::Group(index),
-            )
-        }))
-        .collect::<Vec<_>>();
-    owners.sort_by(|left, right| (&left.0, left.1, &left.2).cmp(&(&right.0, right.1, &right.2)));
-
-    let mut used = BTreeSet::new();
-    let mut changed = false;
-    for (_, _, _, owner) in owners {
-        let (stored, label) = match owner {
-            LegacyHandleOwner::Conversation(index) => (
-                db.conversations[index]
-                    .execution_profile
-                    .mention_handle
-                    .clone(),
-                db.conversations[index].title.clone(),
-            ),
-            LegacyHandleOwner::Group(index) => (
-                groups.groups[index].mention_handle.clone(),
-                groups.groups[index].name.clone(),
-            ),
-        };
-        let normalized = normalize_handle(&stored);
-        let base = if valid_normalized_handle(&normalized) {
-            normalized
-        } else {
-            slug(&label)
-        };
-        let migrated = unique_from_used(&mut used, &base);
-        if stored != migrated {
-            match owner {
-                LegacyHandleOwner::Conversation(index) => {
-                    db.conversations[index].execution_profile.mention_handle = migrated;
-                }
-                LegacyHandleOwner::Group(index) => {
-                    groups.groups[index].mention_handle = migrated;
-                }
-            }
-            changed = true;
-        }
-    }
-
-    for conversation in &mut db.conversations {
-        if conversation.execution_profile.model_path.is_none()
-            && conversation.selected_model_path.is_some()
-        {
-            conversation.execution_profile.model_path = conversation.selected_model_path.clone();
-            changed = true;
-        }
-    }
-    changed
 }
 
 fn validate_available_handle(
@@ -2388,12 +1965,12 @@ where
 mod tests {
     use super::{
         BuiltinPersonaOwnership, GROUPS_NAMESPACE, MAX_PERSONA_TOOL_BINDINGS,
-        PERSONA_REMOVALS_NAMESPACE, PERSONA_STATE_MIGRATION_VERSION, PERSONA_VERSIONS_NAMESPACE,
-        PersonaGroupDb, PersonaRemovalCommitInput, PersonaRemovalLedger, PersonaVersion,
-        PersonaVersionDb, builtin_persona_content_sha256, normalize_handle, normalize_tools,
-        persona_instantiate, persona_instantiate_inner, persona_removal_preview,
-        persona_remove_from_library, persona_remove_from_library_inner, reconcile_builtin_personas,
-        repair_dangling_group_members, repair_legacy_handles, slug, validate_available_handle,
+        PERSONA_REMOVALS_NAMESPACE, PERSONA_VERSIONS_NAMESPACE, PersonaGroupDb,
+        PersonaRemovalCommitInput, PersonaRemovalLedger, PersonaVersion, PersonaVersionDb,
+        builtin_persona_content_sha256, normalize_handle, normalize_tools, persona_instantiate,
+        persona_instantiate_inner, persona_removal_preview_in_scope,
+        persona_remove_from_library_in_scope, persona_remove_from_library_inner_in_scope,
+        reconcile_builtin_personas, slug, validate_available_handle,
     };
     use crate::config::set_data_dir_override_for_tests;
     use crate::consult::ConsultPersona;
@@ -2488,8 +2065,7 @@ mod tests {
                 created_at: "1".to_string(),
                 updated_at: "1".to_string(),
             }],
-            legacy_consult_migrated: true,
-            migration_version: PERSONA_STATE_MIGRATION_VERSION,
+
             catalog_revision: Some(LIBRARY_REVISION.to_string()),
             builtin_persona_provenance: Vec::new(),
         };
@@ -2613,48 +2189,6 @@ mod tests {
                 .message
                 .contains(&MAX_PERSONA_TOOL_BINDINGS.to_string())
         );
-    }
-
-    #[test]
-    fn legacy_handle_collisions_are_repaired_in_stable_owner_order() {
-        let mut conversations = ConversationDb {
-            conversations: vec![
-                legacy_conversation("newer", "Newer owner", "2", "SHARED"),
-                legacy_conversation("older", "Older owner", "1", "shared"),
-                legacy_conversation("invalid", "Careful Guide", "3", "not valid!"),
-            ],
-            selected_conversation_id: Some("newer".to_string()),
-        };
-        let mut groups = PersonaGroupDb {
-            groups: vec![super::PersonaGroup {
-                id: "group".to_string(),
-                name: "Shared group".to_string(),
-                mention_handle: "Shared".to_string(),
-                persona_ids: Vec::new(),
-                created_at: "4".to_string(),
-                updated_at: "4".to_string(),
-            }],
-            ..PersonaGroupDb::default()
-        };
-
-        assert!(repair_legacy_handles(&mut conversations, &mut groups));
-        let handle = |id: &str| {
-            conversations
-                .conversations
-                .iter()
-                .find(|conversation| conversation.id == id)
-                .expect("legacy conversation")
-                .execution_profile
-                .mention_handle
-                .clone()
-        };
-        assert_eq!(handle("older"), "shared");
-        assert_eq!(handle("newer"), "shared-2");
-        assert_eq!(handle("invalid"), "careful-guide");
-        assert_eq!(groups.groups[0].mention_handle, "shared-3");
-        let after = (conversations.clone(), groups.clone());
-        assert!(!repair_legacy_handles(&mut conversations, &mut groups));
-        assert_eq!((conversations, groups), after);
     }
 
     #[test]
@@ -2882,13 +2416,14 @@ mod tests {
 
     #[test]
     fn removal_commit_is_exact_idempotent_and_preserves_history() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("commit");
         let (store, persona, stale_conversations) = seed_removal_fixture();
         let stale_drafts = store
             .get::<DraftDb>(DRAFTS_NAMESPACE)
             .expect("read stale drafts")
             .expect("stale draft document");
-        let impact = persona_removal_preview(&persona.id)
+        let impact = persona_removal_preview_in_scope(&scope, &persona.id)
             .expect("preview removal")
             .result
             .expect("removal impact");
@@ -2915,7 +2450,7 @@ mod tests {
             impact_sha256: impact.impact_sha256.clone(),
         };
 
-        let first = persona_remove_from_library(input.clone())
+        let first = persona_remove_from_library_in_scope(&scope, input.clone())
             .expect("commit removal")
             .result
             .expect("removal output");
@@ -3033,20 +2568,23 @@ mod tests {
             "persona_group_member_invalid"
         );
 
-        let update = super::persona_update(super::PersonaUpdateInput {
-            persona_id: persona.id.clone(),
-            name: "Removed Persona".to_string(),
-            mention_handle: "removed-persona".to_string(),
-            model_path: None,
-            mmproj_path: None,
-            auto_discover_mmproj: false,
-            system_message: None,
-            sampling: None,
-            chat_template: crate::conversation_store::ChatTemplatePolicy::ModelDefault,
-            tool_bindings: Vec::new(),
-            source_history_tokens: 4096,
-            host_context_tokens: 2048,
-        })
+        let update = super::persona_update(
+            &scope,
+            super::PersonaUpdateInput {
+                persona_id: persona.id.clone(),
+                name: "Removed Persona".to_string(),
+                mention_handle: "removed-persona".to_string(),
+                model_path: None,
+                mmproj_path: None,
+                auto_discover_mmproj: false,
+                system_message: None,
+                sampling: None,
+                chat_template: crate::conversation_store::ChatTemplatePolicy::ModelDefault,
+                tool_bindings: Vec::new(),
+                source_history_tokens: 4096,
+                host_context_tokens: 2048,
+            },
+        )
         .expect("stale Persona update returns a typed blocker");
         assert_eq!(
             update.blocker.expect("stale Persona update blocker").code,
@@ -3063,7 +2601,7 @@ mod tests {
             "a removed Persona cannot acquire a post-removal version"
         );
 
-        let repeated = persona_remove_from_library(input)
+        let repeated = persona_remove_from_library_in_scope(&scope, input)
             .expect("repeat exact removal")
             .result
             .expect("idempotent removal output");
@@ -3073,9 +2611,10 @@ mod tests {
 
     #[test]
     fn instantiate_rechecks_exact_persona_authority_in_its_write_transaction() {
+        let scope = crate::OperationScope::detached();
         let session = TestDataDir::new("instantiate-removal-race");
         let (_, persona, _) = seed_removal_fixture();
-        let impact = persona_removal_preview(&persona.id)
+        let impact = persona_removal_preview_in_scope(&scope, &persona.id)
             .expect("preview removal")
             .result
             .expect("removal impact");
@@ -3096,11 +2635,14 @@ mod tests {
         });
 
         before_admission.wait();
-        persona_remove_from_library(PersonaRemovalCommitInput {
-            persona_id: persona.id.clone(),
-            persona_version: impact.persona_version,
-            impact_sha256: impact.impact_sha256,
-        })
+        persona_remove_from_library_in_scope(
+            &scope,
+            PersonaRemovalCommitInput {
+                persona_id: persona.id.clone(),
+                persona_version: impact.persona_version,
+                impact_sha256: impact.impact_sha256,
+            },
+        )
         .expect("commit removal while instantiation is pre-admission")
         .result
         .expect("removal output");
@@ -3131,9 +2673,10 @@ mod tests {
 
     #[test]
     fn removal_hash_revalidates_every_mutable_impact_fact() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("hash-cas");
         let (store, persona, _) = seed_removal_fixture();
-        let impact = persona_removal_preview(&persona.id)
+        let impact = persona_removal_preview_in_scope(&scope, &persona.id)
             .expect("preview removal")
             .result
             .expect("removal impact");
@@ -3144,11 +2687,14 @@ mod tests {
             })
             .expect("change exact impact");
 
-        let blocked = persona_remove_from_library(PersonaRemovalCommitInput {
-            persona_id: persona.id.clone(),
-            persona_version: impact.persona_version,
-            impact_sha256: impact.impact_sha256,
-        })
+        let blocked = persona_remove_from_library_in_scope(
+            &scope,
+            PersonaRemovalCommitInput {
+                persona_id: persona.id.clone(),
+                persona_version: impact.persona_version,
+                impact_sha256: impact.impact_sha256,
+            },
+        )
         .expect("stale commit returns typed blocker");
         assert_eq!(
             blocked.blocker.expect("impact blocker").code,
@@ -3173,6 +2719,7 @@ mod tests {
 
     #[test]
     fn removal_transaction_rolls_back_every_document_on_fault() {
+        let scope = crate::OperationScope::detached();
         let _session = TestDataDir::new("fault-rollback");
         let (store, persona, before_conversations) = seed_removal_fixture();
         let before_groups = store
@@ -3183,13 +2730,14 @@ mod tests {
             .get::<DraftDb>(DRAFTS_NAMESPACE)
             .expect("read drafts")
             .expect("drafts");
-        let impact = persona_removal_preview(&persona.id)
+        let impact = persona_removal_preview_in_scope(&scope, &persona.id)
             .expect("preview removal")
             .result
             .expect("removal impact");
 
         assert!(
-            persona_remove_from_library_inner(
+            persona_remove_from_library_inner_in_scope(
+                &scope,
                 PersonaRemovalCommitInput {
                     persona_id: persona.id,
                     persona_version: impact.persona_version,
@@ -3226,42 +2774,5 @@ mod tests {
                 .expect("read ledger")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn migration_repairs_dangling_group_persona_ids() {
-        let persona = removal_persona("present");
-        let conversations = ConversationDb {
-            conversations: vec![persona],
-            selected_conversation_id: None,
-        };
-        let mut groups = PersonaGroupDb {
-            groups: vec![
-                super::PersonaGroup {
-                    id: "mixed".to_string(),
-                    name: "Mixed".to_string(),
-                    mention_handle: "mixed".to_string(),
-                    persona_ids: vec!["missing".to_string(), "present".to_string()],
-                    created_at: "1".to_string(),
-                    updated_at: "1".to_string(),
-                },
-                super::PersonaGroup {
-                    id: "empty-after-repair".to_string(),
-                    name: "Missing".to_string(),
-                    mention_handle: "missing".to_string(),
-                    persona_ids: vec!["missing-two".to_string()],
-                    created_at: "1".to_string(),
-                    updated_at: "1".to_string(),
-                },
-            ],
-            ..PersonaGroupDb::default()
-        };
-
-        assert_eq!(
-            repair_dangling_group_members(&conversations, &mut groups),
-            vec!["missing".to_string(), "missing-two".to_string()]
-        );
-        assert_eq!(groups.groups.len(), 1);
-        assert_eq!(groups.groups[0].persona_ids, vec!["present".to_string()]);
     }
 }

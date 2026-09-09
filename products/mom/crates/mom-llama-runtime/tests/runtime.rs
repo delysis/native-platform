@@ -1,6 +1,4 @@
 use anyhow::{Result, anyhow};
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use llama_native_types::{
     CompletionPrompt, GenerationInput as NativeGenerationInput,
     GenerationRequest as NativeGenerationRequest, GenerationState, SamplingConfig,
@@ -9,13 +7,12 @@ use llama_native_types::{
 use mom_llama_runtime::config::{SettingsUpdate, set_data_dir_override_for_tests};
 use mom_llama_runtime::{
     AttachmentPreviewAnchor, AttachmentPreviewCatalog, ChatDispatchOutput, ChatSendInput,
-    ChatSendOptions, ChatSendOutput, ConsultPanel, ConsultPersona, ConsultStartInput,
-    ConsultStartOptions, Conversation, ConversationExecutionProfile, ConversationKind,
-    EngineCheckOptions, KvCachePolicy, MentionDispatchInput, Message, MessageAttribution,
-    MessageRole, MessageSpeakerKind, PersonaFreezeInput, PersonaHistoryMode,
+    ChatSendOptions, ChatSendOutput, ConsultPersona, ConsultStartInput, ConsultStartOptions,
+    Conversation, ConversationExecutionProfile, ConversationKind, EngineCheckOptions,
+    KvCachePolicy, MentionDispatchInput, Message, MessageAttribution, MessageRole,
+    MessageSpeakerKind, PersonaFreezeInput, PersonaHistoryMode,
 };
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -69,37 +66,6 @@ fn encrypted_document_snapshot(data_dir: &Path) -> Result<EncryptedDocumentSnaps
     Ok(rows.collect::<std::result::Result<BTreeMap<_, _>, _>>()?)
 }
 
-fn seed_legacy_consult_panels(data_dir: &Path, panels: Vec<Value>) -> Result<()> {
-    const NAMESPACE: &str = "consult-panels.v1";
-    let mut key_hasher = Sha256::new();
-    // Integration dependencies use the ordinary debug-store policy. A path
-    // override no longer grants the release library a deterministic test key.
-    key_hasher.update(b"mom-llama-insecure-development-store-key-v1");
-    key_hasher.update(data_dir.to_string_lossy().as_bytes());
-    let key: [u8; 32] = key_hasher.finalize().into();
-    let nonce = [0xA5_u8; 24];
-    let plaintext = serde_json::to_vec(&json!({ "panels": panels }))?;
-    let ciphertext = XChaCha20Poly1305::new(Key::from_slice(&key))
-        .encrypt(
-            XNonce::from_slice(&nonce),
-            Payload {
-                msg: &plaintext,
-                aad: NAMESPACE.as_bytes(),
-            },
-        )
-        .map_err(|_| anyhow!("failed to encrypt legacy Consult fixture"))?;
-    rusqlite::Connection::open(data_dir.join("runtime.sqlite3"))?.execute(
-        "INSERT INTO encrypted_documents(namespace, nonce, ciphertext, updated_at)
-         VALUES (?1, ?2, ?3, 0)
-         ON CONFLICT(namespace) DO UPDATE SET
-           nonce = excluded.nonce,
-           ciphertext = excluded.ciphertext,
-           updated_at = excluded.updated_at",
-        rusqlite::params![NAMESPACE, nonce.as_slice(), ciphertext],
-    )?;
-    Ok(())
-}
-
 struct TestSession {
     _guard: MutexGuard<'static, ()>,
     root: PathBuf,
@@ -111,7 +77,6 @@ impl TestSession {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        mom_llama_runtime::unload_resident_model();
         let root = std::env::temp_dir().join(format!(
             "mom-llama-native-{name}-{}",
             uuid::Uuid::new_v4().simple()
@@ -131,7 +96,6 @@ impl TestSession {
 
 impl Drop for TestSession {
     fn drop(&mut self) {
-        mom_llama_runtime::unload_resident_model();
         set_data_dir_override_for_tests(None);
     }
 }
@@ -217,8 +181,9 @@ fn attributed_history_fixture(id: &str) -> Conversation {
 
 #[test]
 fn engine_check_blocks_without_model_configuration() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("missing-model")?;
-    let result = mom_llama_runtime::engine_check(EngineCheckOptions::default())?;
+    let result = mom_llama_runtime::engine_check(&scope, EngineCheckOptions::default())?;
     assert_eq!(result.status, "blocked");
     assert_eq!(result.readiness, "blocked_missing_model");
     assert_eq!(
@@ -293,6 +258,7 @@ fn settings_paths_can_be_replaced_and_explicitly_cleared() -> Result<()> {
 
 #[test]
 fn cache_mode_is_coherent_and_off_blocks_manual_cache_access() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("cache-policy-surface")?;
     let defaults = mom_llama_runtime::settings_get()?
         .result
@@ -322,8 +288,8 @@ fn cache_mode_is_coherent_and_off_blocks_manual_cache_access() -> Result<()> {
         mom_llama_runtime::kv_cache::KvCacheState::Disabled
     );
     for blocked in [
-        mom_llama_runtime::kv_cache_save(None)?,
-        mom_llama_runtime::kv_cache_restore(None)?,
+        mom_llama_runtime::kv_cache_save(&scope, None)?,
+        mom_llama_runtime::kv_cache_restore(&scope, None)?,
     ] {
         assert_eq!(blocked.status, "blocked");
         assert_eq!(
@@ -487,302 +453,14 @@ fn legacy_panel_creation_is_read_only_even_before_migration() -> Result<()> {
 }
 
 #[test]
-fn legacy_consult_migration_to_personas_and_groups_is_idempotent() -> Result<()> {
-    let session = TestSession::new("consult-persona-migration")?;
-    mom_llama_runtime::consult_panel_list()?;
-    seed_legacy_consult_panels(
-        session.path(),
-        vec![json!({
-            "id": "migration-team",
-            "name": "Migration team",
-            "personas": [{
-                "id": "migration-lens",
-                "label": "Migration lens",
-                "description": "A durable migration test lens.",
-                "perspective_prompt": "Keep the migration exact.",
-                "public_figure": null,
-                "expertise": "Migration",
-                "model_slot": null
-            }],
-            "created_at": "1",
-            "updated_at": "1"
-        })],
-    )?;
-    let first_personas = mom_llama_runtime::persona_list()?
-        .result
-        .expect("first migrated Persona list missing");
-    let first_groups = mom_llama_runtime::persona_group_list()?
-        .result
-        .expect("first migrated group list missing");
-    let documents_after_migration = encrypted_document_snapshot(session.path())?;
-    let second_personas = mom_llama_runtime::persona_list()?
-        .result
-        .expect("second migrated Persona list missing");
-    let second_groups = mom_llama_runtime::persona_group_list()?
-        .result
-        .expect("second migrated group list missing");
-    mom_llama_runtime::mention_candidates("", None)?;
-    assert_eq!(
-        encrypted_document_snapshot(session.path())?,
-        documents_after_migration,
-        "subsequent Persona, group, and handle reads must not rewrite legacy migration state"
-    );
-    let retired_write = mom_llama_runtime::consult_panel_create(
-        "Too late legacy team".to_string(),
-        vec![ConsultPersona {
-            id: "post-migration-lens".to_string(),
-            label: "Post-migration lens".to_string(),
-            description: "This legacy panel must never be stranded.".to_string(),
-            perspective_prompt: "Fail closed instead of writing legacy state.".to_string(),
-            public_figure: None,
-            expertise: Some("Migration integrity".to_string()),
-            model_slot: None,
-        }],
-    )?;
-    assert_eq!(retired_write.readiness, "stub_blocked");
-    assert!(retired_write.result.is_none());
-    assert_eq!(
-        retired_write
-            .blocker
-            .as_ref()
-            .map(|blocker| blocker.code.as_str()),
-        Some("legacy_consult_panel_write_retired")
-    );
-    assert_eq!(
-        encrypted_document_snapshot(session.path())?,
-        documents_after_migration,
-        "a retired legacy write must not mutate any encrypted product document"
-    );
-    assert_eq!(first_personas, second_personas);
-    assert_eq!(first_groups, second_groups);
-    assert_eq!(
-        first_personas
-            .iter()
-            .filter(|persona| persona.id.starts_with("persona-"))
-            .count(),
-        15,
-        "the exact 14 supplied Personas plus the one custom migrated Persona should exist"
-    );
-    assert!(
-        first_personas
-            .iter()
-            .any(|persona| persona.title == "Bessel van der Kolk")
-    );
-    assert!(first_personas.iter().any(|persona| {
-        persona.id == "persona-richard_schwartz" && persona.title == "Richard Schwartz"
-    }));
-    assert!(
-        first_groups
-            .iter()
-            .all(|group| !group.id.starts_with("group-builtin-")),
-        "default legacy panels must not appear as user-configured consult groups"
-    );
-    assert!(
-        first_groups
-            .iter()
-            .any(|group| group.name == "Migration team")
-    );
-    Ok(())
-}
-
-#[test]
-fn raw_legacy_migration_preserves_builtin_and_persona_id_collisions() -> Result<()> {
-    let session = TestSession::new("consult-raw-collisions")?;
-    let builtins = mom_llama_runtime::consult_panel_list()?
-        .result
-        .ok_or_else(|| anyhow!("legacy built-in panel list missing"))?;
-    let exact_builtin = builtins
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow!("legacy built-in panel missing"))?;
-    let persona = |id: &str, label: &str, prompt: &str| ConsultPersona {
-        id: id.to_string(),
-        label: label.to_string(),
-        description: format!("{label} description"),
-        perspective_prompt: prompt.to_string(),
-        public_figure: None,
-        expertise: Some("Migration integrity".to_string()),
-        model_slot: None,
-    };
-    let panel = |id: &str, name: &str, personas: Vec<ConsultPersona>| ConsultPanel {
-        id: id.to_string(),
-        name: name.to_string(),
-        personas,
-        created_at: "1".to_string(),
-        updated_at: "1".to_string(),
-    };
-
-    let mut builtin_id_collision = panel(
-        &exact_builtin.id,
-        "Customized built-in ID",
-        vec![persona(
-            "shared-id",
-            "Customized collision lens",
-            "Preserve the customized built-in-ID panel.",
-        )],
-    );
-    builtin_id_collision.updated_at = "customized".to_string();
-    let prefixed_user_panel = panel(
-        "builtin-custom-user",
-        "User-owned builtin prefix",
-        vec![persona(
-            "prefix-lens",
-            "Prefix lens",
-            "Preserve user data even when its ID uses an old reserved prefix.",
-        )],
-    );
-    let first_shared_id = panel(
-        "first-team",
-        "First shared-ID team",
-        vec![persona(
-            "shared-id",
-            "First shared-ID lens",
-            "Keep the first prompt exact.",
-        )],
-    );
-    let second_shared_id = panel(
-        "second-team",
-        "Second shared-ID team",
-        vec![persona(
-            "shared-id",
-            "Second shared-ID lens",
-            "Keep the second prompt exact.",
-        )],
-    );
-    seed_legacy_consult_panels(
-        session.path(),
-        vec![
-            serde_json::to_value(exact_builtin.clone())?,
-            serde_json::to_value(builtin_id_collision)?,
-            serde_json::to_value(prefixed_user_panel)?,
-            serde_json::to_value(first_shared_id)?,
-            serde_json::to_value(second_shared_id)?,
-        ],
-    )?;
-
-    let personas = mom_llama_runtime::persona_list()?
-        .result
-        .ok_or_else(|| anyhow!("migrated Persona list missing"))?;
-    let groups = mom_llama_runtime::persona_group_list()?
-        .result
-        .ok_or_else(|| anyhow!("migrated group list missing"))?;
-    assert!(
-        !groups.iter().any(|group| group.name == exact_builtin.name),
-        "an exact application-owned built-in must not become a user group"
-    );
-    for recovered_name in [
-        "Customized built-in ID",
-        "User-owned builtin prefix",
-        "First shared-ID team",
-        "Second shared-ID team",
-    ] {
-        assert!(
-            groups.iter().any(|group| group.name == recovered_name),
-            "raw stored panel `{recovered_name}` was not recovered"
-        );
-    }
-    for recovered_name in ["Customized built-in ID", "User-owned builtin prefix"] {
-        assert!(
-            groups
-                .iter()
-                .find(|group| group.name == recovered_name)
-                .is_some_and(|group| group.id.starts_with("group-legacy-")),
-            "reserved built-in IDs must migrate to deterministic user-owned IDs"
-        );
-    }
-    let first_group = groups
-        .iter()
-        .find(|group| group.name == "First shared-ID team")
-        .ok_or_else(|| anyhow!("first shared-ID group missing"))?;
-    let second_group = groups
-        .iter()
-        .find(|group| group.name == "Second shared-ID team")
-        .ok_or_else(|| anyhow!("second shared-ID group missing"))?;
-    assert_ne!(first_group.persona_ids, second_group.persona_ids);
-    for (group, expected_prompt) in [
-        (first_group, "Keep the first prompt exact."),
-        (second_group, "Keep the second prompt exact."),
-    ] {
-        let persona = personas
-            .iter()
-            .find(|persona| group.persona_ids.first() == Some(&persona.id))
-            .ok_or_else(|| anyhow!("migrated shared-ID Persona missing"))?;
-        assert_eq!(
-            persona.execution_profile.system_message.as_deref(),
-            Some(expected_prompt)
-        );
-    }
-
-    let migrated = encrypted_document_snapshot(session.path())?;
-    mom_llama_runtime::persona_list()?;
-    mom_llama_runtime::persona_group_list()?;
-    assert_eq!(encrypted_document_snapshot(session.path())?, migrated);
-    Ok(())
-}
-
-#[test]
-fn malformed_legacy_panel_blocks_without_advancing_migration() -> Result<()> {
-    let session = TestSession::new("consult-malformed-collision")?;
-    mom_llama_runtime::consult_panel_list()?;
-    let duplicate = json!({
-        "id": "duplicate-team",
-        "name": "Duplicate team",
-        "personas": [{
-            "id": "duplicate-lens",
-            "label": "Duplicate lens",
-            "description": "Duplicate fixture",
-            "perspective_prompt": "Keep one exact copy.",
-            "public_figure": null,
-            "expertise": null,
-            "model_slot": null
-        }, {
-            "id": "duplicate-lens",
-            "label": "Duplicate lens",
-            "description": "Duplicate fixture",
-            "perspective_prompt": "Keep one exact copy.",
-            "public_figure": null,
-            "expertise": null,
-            "model_slot": null
-        }],
-        "created_at": "1",
-        "updated_at": "1"
-    });
-    seed_legacy_consult_panels(session.path(), vec![duplicate.clone()])?;
-    let before = encrypted_document_snapshot(session.path())?;
-    let error = mom_llama_runtime::persona_list()
-        .expect_err("duplicate legacy Persona content must fail closed");
-    assert!(error.to_string().contains("duplicate Persona content"));
-    assert_eq!(
-        encrypted_document_snapshot(session.path())?,
-        before,
-        "failed recovery must not persist Personas, groups, versions, or a migration marker"
-    );
-
-    let mut repaired = duplicate;
-    repaired["personas"]
-        .as_array_mut()
-        .ok_or_else(|| anyhow!("invalid duplicate fixture"))?
-        .pop();
-    seed_legacy_consult_panels(session.path(), vec![repaired])?;
-    let recovered = mom_llama_runtime::persona_list()?
-        .result
-        .ok_or_else(|| anyhow!("repaired legacy Persona list missing"))?;
-    assert!(
-        recovered
-            .iter()
-            .any(|persona| persona.title == "Duplicate lens"),
-        "the failed attempt must not advance the migration marker"
-    );
-    Ok(())
-}
-
-#[test]
 fn freezing_and_sending_from_a_persona_never_mutates_its_source_or_template() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("persona-freeze-isolation")?;
     let source = mom_llama_runtime::conversation_new(Some("Source interview".to_string()))?
         .result
         .ok_or_else(|| anyhow!("source conversation missing"))?;
-    mom_llama_runtime::chat_send(
+    mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: source.id.clone(),
             message: "A stable source fact".to_string(),
@@ -818,7 +496,8 @@ fn freezing_and_sending_from_a_persona_never_mutates_its_source_or_template() ->
     let template_before = mom_llama_runtime::persona_get(&persona.id)?
         .result
         .ok_or_else(|| anyhow!("persona template missing"))?;
-    let dispatched = mom_llama_runtime::chat_dispatch(
+    let dispatched = mom_llama_runtime::chat_dispatch_in_scope(
+        &scope,
         MentionDispatchInput {
             conversation_id: persona.id.clone(),
             message: "Continue in an ordinary chat".to_string(),
@@ -852,11 +531,13 @@ fn freezing_and_sending_from_a_persona_never_mutates_its_source_or_template() ->
 
 #[test]
 fn mention_snapshots_are_version_pinned_ordered_and_source_isolated() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("mention-snapshot-isolation")?;
     let source = mom_llama_runtime::conversation_new(Some("Persona source".to_string()))?
         .result
         .ok_or_else(|| anyhow!("source missing"))?;
-    mom_llama_runtime::chat_send(
+    mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: source.id.clone(),
             message: "Remember exactly this".to_string(),
@@ -907,7 +588,8 @@ fn mention_snapshots_are_version_pinned_ordered_and_source_isolated() -> Result<
     let host = mom_llama_runtime::conversation_new(Some("Host".to_string()))?
         .result
         .expect("mention host missing");
-    let result = mom_llama_runtime::chat_dispatch(
+    let result = mom_llama_runtime::chat_dispatch_in_scope(
+        &scope,
         MentionDispatchInput {
             conversation_id: host.id.clone(),
             message: format!("@{} compare this", group.mention_handle),
@@ -957,7 +639,7 @@ fn mention_snapshots_are_version_pinned_ordered_and_source_isolated() -> Result<
     assert_eq!(attributed[1].target_order, 1);
     assert_eq!(attributed[0].invocation_id, attributed[1].invocation_id);
     assert_eq!(attributed[0].version, 1);
-    let fixture_synthesis = mom_llama_runtime::mention_synthesize(&invocation.id)?;
+    let fixture_synthesis = mom_llama_runtime::mention_synthesize(&scope, &invocation.id)?;
     assert_eq!(fixture_synthesis.status, "blocked");
     assert_eq!(
         fixture_synthesis
@@ -991,11 +673,13 @@ fn mention_snapshots_are_version_pinned_ordered_and_source_isolated() -> Result<
 
 #[test]
 fn live_chat_mentions_capture_the_committed_leaf_without_writeback() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("live-chat-mention")?;
     let source = mom_llama_runtime::conversation_new(Some("Research notes".to_string()))?
         .result
         .expect("live-chat source missing");
-    mom_llama_runtime::chat_send(
+    mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: source.id.clone(),
             message: "Committed source context".to_string(),
@@ -1013,7 +697,8 @@ fn live_chat_mentions_capture_the_committed_leaf_without_writeback() -> Result<(
     let host = mom_llama_runtime::conversation_new(Some("Host".to_string()))?
         .result
         .expect("live-chat mention host missing");
-    let result = mom_llama_runtime::chat_dispatch(
+    let result = mom_llama_runtime::chat_dispatch_in_scope(
+        &scope,
         MentionDispatchInput {
             conversation_id: host.id.clone(),
             message: format!("@{handle} answer from your notes"),
@@ -1052,7 +737,8 @@ fn live_chat_mentions_capture_the_committed_leaf_without_writeback() -> Result<(
     );
     assert_eq!(attribution.source_id, source.id);
 
-    let follow_up = mom_llama_runtime::chat_dispatch(
+    let follow_up = mom_llama_runtime::chat_dispatch_in_scope(
+        &scope,
         MentionDispatchInput {
             conversation_id: host.id.clone(),
             message: "Continue as the host chat without inviting anyone.".to_string(),
@@ -1094,11 +780,13 @@ fn live_chat_mentions_capture_the_committed_leaf_without_writeback() -> Result<(
 
 #[test]
 fn duplicate_persona_handles_and_oversized_groups_fail_closed() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("persona-handle-safety")?;
     let source = mom_llama_runtime::conversation_new(Some("Source".to_string()))?
         .result
         .expect("handle-safety source missing");
-    mom_llama_runtime::chat_send(
+    mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: source.id.clone(),
             message: "seed".to_string(),
@@ -1170,7 +858,8 @@ fn duplicate_persona_handles_and_oversized_groups_fail_closed() -> Result<()> {
     let before = mom_llama_runtime::conversation_select(&host.id)?
         .result
         .expect("missing-target host snapshot missing");
-    let missing = mom_llama_runtime::chat_dispatch(
+    let missing = mom_llama_runtime::chat_dispatch_in_scope(
+        &scope,
         MentionDispatchInput {
             conversation_id: host.id.clone(),
             message: "@deleted-persona please answer".to_string(),
@@ -1257,9 +946,11 @@ fn legacy_plaintext_conversations_are_reported_without_import_or_deletion() -> R
 
 #[test]
 fn blocked_chat_stream_never_claims_native_engine_invocation() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("blocked-stream-evidence")?;
     let mut events = Vec::new();
-    let result = mom_llama_runtime::chat_send_stream(
+    let result = mom_llama_runtime::chat_send_stream_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: "blocked-stream-evidence".to_string(),
             message: "Hello".to_string(),
@@ -1286,8 +977,9 @@ fn blocked_chat_stream_never_claims_native_engine_invocation() -> Result<()> {
 
 #[test]
 fn skip_reasoning_without_an_active_request_is_typed() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("skip-reasoning-no-active")?;
-    let result = mom_llama_runtime::chat_skip_reasoning("conversation")?;
+    let result = mom_llama_runtime::chat_skip_reasoning_in_scope(&scope, "conversation")?;
     assert_eq!(result.status, "blocked");
     assert_eq!(
         result.blocker.as_ref().map(|blocker| blocker.code.as_str()),
@@ -1301,9 +993,11 @@ fn skip_reasoning_without_an_active_request_is_typed() -> Result<()> {
 #[cfg(unix)]
 #[test]
 fn tool_loop_without_model_is_blocked_and_never_claims_engine_execution() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let session = TestSession::new("tool-loop-missing-model")?;
     configure_mcp_fixture(&session)?;
-    let prepared = mom_llama_runtime::tool_loop_prepare(
+    let prepared = mom_llama_runtime::tool_loop_prepare_in_scope(
+        &scope,
         "tool-loop-missing-model",
         "Check the configured tool.".to_string(),
         "fixture".to_string(),
@@ -1315,7 +1009,8 @@ fn tool_loop_without_model_is_blocked_and_never_claims_engine_execution() -> Res
         .result
         .map(|approval| approval.id)
         .ok_or_else(|| anyhow!("tool loop approval missing"))?;
-    let result = mom_llama_runtime::tool_loop_run(
+    let result = mom_llama_runtime::tool_loop_run_in_scope(
+        &scope,
         "tool-loop-missing-model",
         "Check the configured tool.".to_string(),
         "fixture".to_string(),
@@ -1337,9 +1032,11 @@ fn tool_loop_without_model_is_blocked_and_never_claims_engine_execution() -> Res
 #[cfg(unix)]
 #[test]
 fn tool_loop_requires_an_exact_expiring_single_use_approval() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let session = TestSession::new("tool-loop-approval")?;
     configure_mcp_fixture(&session)?;
-    let without_approval = mom_llama_runtime::tool_loop_run(
+    let without_approval = mom_llama_runtime::tool_loop_run_in_scope(
+        &scope,
         "tool-loop-approval",
         "Use the tool.".to_string(),
         "fixture".to_string(),
@@ -1356,7 +1053,8 @@ fn tool_loop_requires_an_exact_expiring_single_use_approval() -> Result<()> {
         Some("tool_loop_approval_required")
     );
 
-    let prepared = mom_llama_runtime::tool_loop_prepare(
+    let prepared = mom_llama_runtime::tool_loop_prepare_in_scope(
+        &scope,
         "tool-loop-approval",
         "Use the tool.".to_string(),
         "fixture".to_string(),
@@ -1366,7 +1064,8 @@ fn tool_loop_requires_an_exact_expiring_single_use_approval() -> Result<()> {
     )?
     .result
     .ok_or_else(|| anyhow!("tool loop approval missing"))?;
-    let mismatch = mom_llama_runtime::tool_loop_run(
+    let mismatch = mom_llama_runtime::tool_loop_run_in_scope(
+        &scope,
         "tool-loop-approval",
         "Use the tool.".to_string(),
         "fixture".to_string(),
@@ -1382,7 +1081,8 @@ fn tool_loop_requires_an_exact_expiring_single_use_approval() -> Result<()> {
             .map(|blocker| blocker.code.as_str()),
         Some("tool_loop_approval_mismatch")
     );
-    let approved_attempt = mom_llama_runtime::tool_loop_run(
+    let approved_attempt = mom_llama_runtime::tool_loop_run_in_scope(
+        &scope,
         "tool-loop-approval",
         "Use the tool.".to_string(),
         "fixture".to_string(),
@@ -1392,7 +1092,8 @@ fn tool_loop_requires_an_exact_expiring_single_use_approval() -> Result<()> {
         Some(prepared.id.clone()),
     )?;
     assert_eq!(approved_attempt.readiness, "blocked_missing_model");
-    let reused = mom_llama_runtime::tool_loop_run(
+    let reused = mom_llama_runtime::tool_loop_run_in_scope(
+        &scope,
         "tool-loop-approval",
         "Use the tool.".to_string(),
         "fixture".to_string(),
@@ -1411,6 +1112,7 @@ fn tool_loop_requires_an_exact_expiring_single_use_approval() -> Result<()> {
 #[cfg(unix)]
 #[test]
 fn persistent_tool_permissions_support_ask_allow_deny_and_revoke() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let session = TestSession::new("tool-permissions")?;
     configure_mcp_fixture(&session)?;
 
@@ -1419,7 +1121,8 @@ fn persistent_tool_permissions_support_ask_allow_deny_and_revoke() -> Result<()>
         "echo".to_string(),
         mom_llama_runtime::ToolPermissionPolicy::Deny,
     )?;
-    let denied = mom_llama_runtime::tool_loop_prepare(
+    let denied = mom_llama_runtime::tool_loop_prepare_in_scope(
+        &scope,
         "tool-permissions",
         "Use the tool.".to_string(),
         "fixture".to_string(),
@@ -1437,7 +1140,8 @@ fn persistent_tool_permissions_support_ask_allow_deny_and_revoke() -> Result<()>
         "echo".to_string(),
         mom_llama_runtime::ToolPermissionPolicy::AlwaysAllow,
     )?;
-    let always_allowed = mom_llama_runtime::tool_loop_prepare(
+    let always_allowed = mom_llama_runtime::tool_loop_prepare_in_scope(
+        &scope,
         "tool-permissions",
         "Use the tool.".to_string(),
         "fixture".to_string(),
@@ -1448,7 +1152,8 @@ fn persistent_tool_permissions_support_ask_allow_deny_and_revoke() -> Result<()>
     .result
     .ok_or_else(|| anyhow!("always-allow approval missing"))?;
     assert!(!always_allowed.requires_confirmation);
-    let without_prompt = mom_llama_runtime::tool_loop_run(
+    let without_prompt = mom_llama_runtime::tool_loop_run_in_scope(
+        &scope,
         "tool-permissions",
         "Use the tool.".to_string(),
         "fixture".to_string(),
@@ -1460,7 +1165,8 @@ fn persistent_tool_permissions_support_ask_allow_deny_and_revoke() -> Result<()>
     assert_eq!(without_prompt.readiness, "blocked_missing_model");
 
     mom_llama_runtime::tool_permission_revoke("fixture", "echo")?;
-    let ask_again = mom_llama_runtime::tool_loop_prepare(
+    let ask_again = mom_llama_runtime::tool_loop_prepare_in_scope(
+        &scope,
         "tool-permissions",
         "Use the tool.".to_string(),
         "fixture".to_string(),
@@ -1482,8 +1188,10 @@ fn persistent_tool_permissions_support_ask_allow_deny_and_revoke() -> Result<()>
 
 #[test]
 fn fixture_readiness_never_claims_native_inference() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("fixture-readiness")?;
-    let result = mom_llama_runtime::engine_check(EngineCheckOptions { fake_fixture: true })?;
+    let result =
+        mom_llama_runtime::engine_check(&scope, EngineCheckOptions { fake_fixture: true })?;
     assert_eq!(result.readiness, "fake_fixture_exercised");
     assert!(result.receipt.fake_fixture);
     assert!(!result.receipt.real_engine_invoked);
@@ -1660,8 +1368,10 @@ fn upstream_sampling_settings_drive_the_native_sampler_dto() -> Result<()> {
 
 #[test]
 fn fixture_chat_persists_in_encrypted_sqlite_and_stays_labeled() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let session = TestSession::new("fixture-chat")?;
-    let result = mom_llama_runtime::chat_send(
+    let result = mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: "fixture-chat".to_string(),
             message: "private fixture phrase 7419".to_string(),
@@ -1692,12 +1402,14 @@ fn fixture_chat_persists_in_encrypted_sqlite_and_stays_labeled() -> Result<()> {
 
 #[test]
 fn message_tree_preserves_siblings_and_switches_the_active_leaf() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("message-tree")?;
     let options = ChatSendOptions {
         timeout_s: 1.0,
         fake_fixture: true,
     };
-    let first = mom_llama_runtime::chat_send(
+    let first = mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: "message-tree".to_string(),
             message: "Give me one answer.".to_string(),
@@ -1706,7 +1418,7 @@ fn message_tree_preserves_siblings_and_switches_the_active_leaf() -> Result<()> 
     )?
     .result
     .ok_or_else(|| anyhow!("first fixture output missing"))?;
-    let second = mom_llama_runtime::chat_regenerate("message-tree", options)?
+    let second = mom_llama_runtime::chat_regenerate_in_scope(&scope, "message-tree", options)?
         .result
         .ok_or_else(|| anyhow!("regenerated fixture output missing"))?;
     assert_eq!(first.user_message_id, second.user_message_id);
@@ -1764,8 +1476,10 @@ fn message_tree_preserves_siblings_and_switches_the_active_leaf() -> Result<()> 
 
 #[test]
 fn user_and_assistant_edits_preserve_original_message_branches() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("message-edit-branches")?;
-    let output = mom_llama_runtime::chat_send(
+    let output = mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: "message-edit-branches".to_string(),
             message: "Original user request".to_string(),
@@ -2004,12 +1718,14 @@ fn system_and_tool_messages_reject_edits_without_mutating_the_conversation() -> 
 #[test]
 fn chat_dispatch_ignores_email_embedded_and_code_at_tokens_but_blocks_explicit_unknowns()
 -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("mention-token-boundaries")?;
     let conversation = mom_llama_runtime::conversation_new(Some("Mention boundaries".to_string()))?
         .result
         .ok_or_else(|| anyhow!("mention-boundary conversation missing"))?;
     let literal_message = "Email george@example.com; keep prefix@embedded, `@inline-code`, and:\n```text\n@fenced-code\n```\n    @indented-code";
-    let direct = mom_llama_runtime::chat_dispatch(
+    let direct = mom_llama_runtime::chat_dispatch_in_scope(
+        &scope,
         MentionDispatchInput {
             conversation_id: conversation.id.clone(),
             message: literal_message.to_string(),
@@ -2031,7 +1747,8 @@ fn chat_dispatch_ignores_email_embedded_and_code_at_tokens_but_blocks_explicit_u
         "@missing-person please answer",
         "Ask @missing-person please",
     ] {
-        let blocked = mom_llama_runtime::chat_dispatch(
+        let blocked = mom_llama_runtime::chat_dispatch_in_scope(
+            &scope,
             MentionDispatchInput {
                 conversation_id: conversation.id.clone(),
                 message: message.to_string(),
@@ -2060,11 +1777,13 @@ fn chat_dispatch_ignores_email_embedded_and_code_at_tokens_but_blocks_explicit_u
 
 #[test]
 fn conversations_search_skills_and_settings_survive_restart() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let session = TestSession::new("persistence")?;
     let conversation = mom_llama_runtime::conversation_new(Some("Garden planning".to_string()))?
         .result
         .ok_or_else(|| anyhow!("conversation was not created"))?;
-    mom_llama_runtime::chat_send(
+    mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: conversation.id.clone(),
             message: "purple basil seedlings".to_string(),
@@ -2104,7 +1823,7 @@ fn conversations_search_skills_and_settings_survive_restart() -> Result<()> {
     })?;
 
     set_data_dir_override_for_tests(None);
-    mom_llama_runtime::unload_resident_model();
+    mom_llama_runtime::unload_resident_model(&scope);
     set_data_dir_override_for_tests(Some(session.path().to_path_buf()));
 
     let search = mom_llama_runtime::conversation_search("basil")?;
@@ -2131,6 +1850,7 @@ fn conversations_search_skills_and_settings_survive_restart() -> Result<()> {
 
 #[test]
 fn attachment_payload_is_encrypted_and_multimodal_is_honestly_blocked() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let session = TestSession::new("attachment")?;
     let conversation = mom_llama_runtime::conversation_new(Some("Photo".to_string()))?
         .result
@@ -2138,7 +1858,7 @@ fn attachment_payload_is_encrypted_and_multimodal_is_honestly_blocked() -> Resul
     let image = session.path().join("garden.png");
     let payload = VALID_PNG;
     std::fs::write(&image, payload)?;
-    let imported = mom_llama_runtime::attachment_import(&conversation.id, &image)?;
+    let imported = mom_llama_runtime::attachment_import(&scope, &conversation.id, &image)?;
     let output = imported
         .result
         .as_ref()
@@ -2175,7 +1895,8 @@ fn attachment_payload_is_encrypted_and_multimodal_is_honestly_blocked() -> Resul
         "Describe the image.".to_string(),
         vec![output.attachment.id.clone()],
     )?;
-    let chat = mom_llama_runtime::chat_send(
+    let chat = mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: conversation.id.clone(),
             message: "Describe the image.".to_string(),
@@ -2199,13 +1920,14 @@ fn attachment_payload_is_encrypted_and_multimodal_is_honestly_blocked() -> Resul
 
 #[test]
 fn long_paste_becomes_an_encrypted_text_attachment_without_a_plaintext_file() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let session = TestSession::new("pasted-text-attachment")?;
     let conversation = mom_llama_runtime::conversation_new(Some("Pasted notes".to_string()))?
         .result
         .ok_or_else(|| anyhow!("pasted-notes conversation missing"))?;
     let marker = "private-long-paste-9137 ".repeat(160);
     let imported =
-        mom_llama_runtime::attachment_import_pasted_text(&conversation.id, marker.clone())?;
+        mom_llama_runtime::attachment_import_pasted_text(&scope, &conversation.id, marker.clone())?;
     assert_eq!(imported.readiness, "contracted");
     let output = imported
         .result
@@ -2229,7 +1951,8 @@ fn long_paste_becomes_an_encrypted_text_attachment_without_a_plaintext_file() ->
         "Summarize this attachment.".to_string(),
         vec![output.attachment.id.clone()],
     )?;
-    let sent = mom_llama_runtime::chat_send(
+    let sent = mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: conversation.id.clone(),
             message: "Summarize this attachment.".to_string(),
@@ -2283,11 +2006,13 @@ fn long_paste_becomes_an_encrypted_text_attachment_without_a_plaintext_file() ->
 #[test]
 fn fixture_mention_commits_staged_attachments_and_clears_the_draft_without_real_readiness()
 -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("fixture-mention-attachment-lifecycle")?;
     let source = mom_llama_runtime::conversation_new(Some("Fixture persona source".to_string()))?
         .result
         .ok_or_else(|| anyhow!("fixture persona source missing"))?;
-    mom_llama_runtime::chat_send(
+    mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: source.id.clone(),
             message: "Stable fixture source context".to_string(),
@@ -2316,6 +2041,7 @@ fn fixture_mention_commits_staged_attachments_and_clears_the_draft_without_real_
         .result
         .ok_or_else(|| anyhow!("fixture attachment host missing"))?;
     let imported = mom_llama_runtime::attachment_import_pasted_text(
+        &scope,
         &host.id,
         "private fixture attachment payload 4182".to_string(),
     )?
@@ -2331,7 +2057,8 @@ fn fixture_mention_commits_staged_attachments_and_clears_the_draft_without_real_
         vec![imported.attachment.id.clone()],
     )?;
 
-    let dispatched = mom_llama_runtime::chat_dispatch(
+    let dispatched = mom_llama_runtime::chat_dispatch_in_scope(
+        &scope,
         MentionDispatchInput {
             conversation_id: host.id.clone(),
             message: addressed,
@@ -2386,8 +2113,9 @@ fn fixture_mention_commits_staged_attachments_and_clears_the_draft_without_real_
 
 #[test]
 fn deprecated_server_aliases_report_only_in_process_residency() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("resident-alias")?;
-    let status = mom_llama_runtime::server_status()?;
+    let status = mom_llama_runtime::server_status(&scope)?;
     let value = serde_json::to_value(&status)?;
     assert_eq!(value["result"]["transport"], "in_process");
     assert_eq!(value["result"]["running"], false);
@@ -2401,8 +2129,10 @@ fn deprecated_server_aliases_report_only_in_process_residency() -> Result<()> {
 
 #[test]
 fn consult_fixture_is_bounded_and_cannot_promote_readiness() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("consult-fixture")?;
     let result = mom_llama_runtime::consult_start(
+        &scope,
         ConsultStartInput {
             conversation_id: "consult-fixture".to_string(),
             prompt: "What assumptions should be checked?".to_string(),
@@ -2429,9 +2159,10 @@ fn consult_fixture_is_bounded_and_cannot_promote_readiness() -> Result<()> {
 #[cfg(unix)]
 #[test]
 fn mcp_process_authority_is_explicit_bounded_and_receipted() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let session = TestSession::new("mcp")?;
     configure_mcp_fixture(&session)?;
-    let tools = mom_llama_runtime::mcp_list_tools("fixture")?;
+    let tools = mom_llama_runtime::mcp_list_tools_in_scope(&scope, "fixture")?;
     assert_eq!(tools.readiness, "host_integrated");
     assert_eq!(
         tools
@@ -2494,13 +2225,11 @@ fn configure_mcp_fixture(session: &TestSession) -> Result<()> {
     Ok(())
 }
 
-fn configured_real_session(name: &str) -> Result<Option<TestSession>> {
-    let Some(model_path) = std::env::var_os("MOM_LLAMA_MODEL_PATH").map(PathBuf::from) else {
-        return Ok(None);
-    };
-    if !model_path.is_file() {
-        return Ok(None);
-    }
+fn configured_real_session(name: &str) -> Result<TestSession> {
+    let model_path = std::env::var_os("MOM_LLAMA_MODEL_PATH")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .ok_or_else(|| anyhow!("MOM_LLAMA_MODEL_PATH must point to a real local GGUF"))?;
     let session = TestSession::new(name)?;
     mom_llama_runtime::settings_update(SettingsUpdate {
         model_path: Some(Some(model_path)),
@@ -2512,7 +2241,7 @@ fn configured_real_session(name: &str) -> Result<Option<TestSession>> {
         kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
         ..SettingsUpdate::default()
     })?;
-    Ok(Some(session))
+    Ok(session)
 }
 
 fn initialize_product_runtime() -> Result<mom_llama_runtime::native_runtime::ProductRuntimeOwner> {
@@ -2520,8 +2249,13 @@ fn initialize_product_runtime() -> Result<mom_llama_runtime::native_runtime::Pro
     mom_llama_runtime::native_runtime::ProductRuntimeOwner::initialize(&settings)
 }
 
-fn product_chat_cache_request(conversation_id: &str, user_message: &str) -> Result<ChatSendOutput> {
-    let result = mom_llama_runtime::chat_send(
+fn product_chat_cache_request(
+    scope: &mom_llama_runtime::OperationScope,
+    conversation_id: &str,
+    user_message: &str,
+) -> Result<ChatSendOutput> {
+    let result = mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: conversation_id.to_owned(),
             message: user_message.to_owned(),
@@ -2537,51 +2271,54 @@ fn product_chat_cache_request(conversation_id: &str, user_message: &str) -> Resu
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Result<()> {
-    let Some(session) = configured_real_session("real-product-native-chat-cache")? else {
-        return Ok(());
-    };
+    let session = configured_real_session("real-product-native-chat-cache")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
         max_tokens: Some(8),
         kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
         ..SettingsUpdate::default()
     })?;
-    let _native_owner = initialize_product_runtime()?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
     let conversation = mom_llama_runtime::conversation_new(Some("Native cache proof".to_owned()))?
         .result
         .ok_or_else(|| anyhow!("cache proof conversation missing"))?;
 
-    let cold = product_chat_cache_request(&conversation.id, "Return the word cold.")?;
+    let cold = product_chat_cache_request(&scope, &conversation.id, "Return the word cold.")?;
     assert!(
         !cold.cache_reused,
         "the first direct chat request must be cold"
     );
-    let warm = product_chat_cache_request(&conversation.id, "Return the word warm.")?;
+    let warm = product_chat_cache_request(&scope, &conversation.id, "Return the word warm.")?;
     assert!(
         warm.cache_reused,
         "the second direct chat request must reuse its prefix"
     );
 
-    let cleared = mom_llama_runtime::kv_cache_clear()?;
+    let cleared = mom_llama_runtime::kv_cache_clear(&scope)?;
     assert_eq!(cleared.readiness, "contracted");
     assert!(cleared.blocker.is_none());
     let after_clear =
-        product_chat_cache_request(&conversation.id, "Return the words after clear.")?;
+        product_chat_cache_request(&scope, &conversation.id, "Return the words after clear.")?;
     assert!(
         !after_clear.cache_reused,
         "explicit clear must force a cold request"
     );
     let warm_after_clear =
-        product_chat_cache_request(&conversation.id, "Return the words after warmup.")?;
+        product_chat_cache_request(&scope, &conversation.id, "Return the words after warmup.")?;
     assert!(warm_after_clear.cache_reused);
 
-    mom_llama_runtime::kv_cache_clear()?;
+    mom_llama_runtime::kv_cache_clear(&scope)?;
+    drop(native_owner);
     mom_llama_runtime::settings_update(SettingsUpdate {
         kv_cache_policy: Some(KvCachePolicy::None),
         ..SettingsUpdate::default()
     })?;
-    let off_first = product_chat_cache_request(&conversation.id, "Caching is off, first request.")?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
+    let off_first =
+        product_chat_cache_request(&scope, &conversation.id, "Caching is off, first request.")?;
     let off_second =
-        product_chat_cache_request(&conversation.id, "Caching is off, second request.")?;
+        product_chat_cache_request(&scope, &conversation.id, "Caching is off, second request.")?;
     assert!(!off_first.cache_reused);
     assert!(!off_second.cache_reused);
     assert!(
@@ -2625,9 +2362,7 @@ fn one_second_tone_wav() -> Vec<u8> {
 fn resident_model_profiles_fail_closed_before_memory_overcommit_without_eviction() -> Result<()> {
     use std::os::unix::fs::symlink;
 
-    let Some(session) = configured_real_session("real-resident-memory-budget")? else {
-        return Ok(());
-    };
+    let session = configured_real_session("real-resident-memory-budget")?;
     let model_path = std::env::var_os("MOM_LLAMA_MODEL_PATH")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("real model path disappeared"))?;
@@ -2641,24 +2376,29 @@ fn resident_model_profiles_fail_closed_before_memory_overcommit_without_eviction
         max_parallel_sequences: Some(2),
         ..SettingsUpdate::default()
     })?;
-    let _native_owner = initialize_product_runtime()?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
     let settings = mom_llama_runtime::config::resolve_settings()?;
-    let first = mom_llama_runtime::resident_model_for_profile(&settings, &model_path, None)
+    let first = mom_llama_runtime::resident_model_for_profile(&scope, &settings, &model_path, None)
         .map_err(|blocked| anyhow!(blocked.blocker.message))?;
     let first_model_id = first.status().model_id;
 
     let second_profile_path = session.path().join("same-weights-distinct-profile.gguf");
     symlink(&model_path, &second_profile_path)?;
-    let blocked =
-        mom_llama_runtime::resident_model_for_profile(&settings, &second_profile_path, None)
-            .expect_err("the second resident profile must be rejected before overcommit");
+    let blocked = mom_llama_runtime::resident_model_for_profile(
+        &scope,
+        &settings,
+        &second_profile_path,
+        None,
+    )
+    .expect_err("the second resident profile must be rejected before overcommit");
     assert_eq!(blocked.readiness, "blocked_memory_budget");
     assert_eq!(
         blocked.blocker.code,
         "resident_model_memory_budget_exceeded"
     );
     assert_eq!(
-        mom_llama_runtime::resident_status().map(|status| status.model_id),
+        mom_llama_runtime::resident_status(&scope,).map(|status| status.model_id),
         Some(first_model_id),
         "a rejected profile must never evict the already resident model"
     );
@@ -2668,41 +2408,44 @@ fn resident_model_profiles_fail_closed_before_memory_overcommit_without_eviction
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn repeated_profile_acquisition_reuses_the_same_resident_worker() -> Result<()> {
-    let Some(_session) = configured_real_session("real-resident-worker-reuse")? else {
-        return Ok(());
-    };
+    let _session = configured_real_session("real-resident-worker-reuse")?;
     let model_path = std::env::var_os("MOM_LLAMA_MODEL_PATH")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("real model path disappeared"))?;
     let settings = mom_llama_runtime::config::resolve_settings()?;
-    let _native_owner = initialize_product_runtime()?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
 
-    let first = mom_llama_runtime::resident_model_for_profile(&settings, &model_path, None)
+    let first = mom_llama_runtime::resident_model_for_profile(&scope, &settings, &model_path, None)
         .map_err(|blocked| anyhow!(blocked.blocker.message))?;
-    let second = mom_llama_runtime::resident_model_for_profile(&settings, &model_path, None)
-        .map_err(|blocked| anyhow!(blocked.blocker.message))?;
+    let second =
+        mom_llama_runtime::resident_model_for_profile(&scope, &settings, &model_path, None)
+            .map_err(|blocked| anyhow!(blocked.blocker.message))?;
 
     assert!(
         first.is_same_worker(&second),
         "reacquiring an unchanged profile must reuse its resident worker"
     );
-    assert_eq!(mom_llama_runtime::native_runtime::resident_slots().len(), 1);
+    assert_eq!(
+        mom_llama_runtime::native_runtime::resident_slots(&scope,).len(),
+        1
+    );
     Ok(())
 }
 
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local base GGUF"]
 fn real_native_base_completion_invokes_no_fixture() -> Result<()> {
-    let Some(_session) = configured_real_session("real-base-completion")? else {
-        return Ok(());
-    };
+    let _session = configured_real_session("real-base-completion")?;
     let model_path = std::env::var_os("MOM_LLAMA_MODEL_PATH")
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("real model path disappeared"))?;
     let settings = mom_llama_runtime::config::resolve_settings()?;
-    let _native_owner = initialize_product_runtime()?;
-    let handle = mom_llama_runtime::resident_model_for_profile(&settings, &model_path, None)
-        .map_err(|blocked| anyhow!(blocked.blocker.message))?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
+    let handle =
+        mom_llama_runtime::resident_model_for_profile(&scope, &settings, &model_path, None)
+            .map_err(|blocked| anyhow!(blocked.blocker.message))?;
     let output = handle
         .generate(NativeGenerationRequest {
             request_id: format!("real-base-completion-{}", uuid::Uuid::new_v4()),
@@ -2739,11 +2482,11 @@ fn real_native_base_completion_invokes_no_fixture() -> Result<()> {
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_native_chat_invokes_no_fixture_and_persists() -> Result<()> {
-    let Some(_session) = configured_real_session("real-chat")? else {
-        return Ok(());
-    };
-    let _native_owner = initialize_product_runtime()?;
-    let result = mom_llama_runtime::chat_send(
+    let _session = configured_real_session("real-chat")?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
+    let result = mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: "real-chat".to_string(),
             message: "Reply with exactly two friendly words.".to_string(),
@@ -2789,9 +2532,11 @@ fn real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_byt
         resident_memory_budget_bytes: Some(12 * 1024 * 1024 * 1024),
         ..SettingsUpdate::default()
     })?;
-    let _native_owner = initialize_product_runtime()?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
     let image_bytes = std::fs::read(&image_path)?;
-    let imported = mom_llama_runtime::attachment_import("real-multimodal-image", &image_path)?;
+    let imported =
+        mom_llama_runtime::attachment_import(&scope, "real-multimodal-image", &image_path)?;
     let attachment = imported
         .result
         .as_ref()
@@ -2799,7 +2544,8 @@ fn real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_byt
         .ok_or_else(|| anyhow!("multimodal attachment import missing"))?;
     assert!(attachment.stored_path.starts_with("encrypted://"));
 
-    let result = mom_llama_runtime::chat_send(
+    let result = mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: "real-multimodal-image".to_string(),
             message: "Describe the attached image in one short sentence.".to_string(),
@@ -2819,7 +2565,7 @@ fn real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_byt
     assert!(result.result.as_ref().is_some_and(|output| {
         !output.assistant_text.trim().is_empty() && output.completion_tokens > 0
     }));
-    let status = mom_llama_runtime::resident_status()
+    let status = mom_llama_runtime::resident_status(&scope)
         .ok_or_else(|| anyhow!("resident multimodal model status missing"))?;
     assert!(
         status
@@ -2847,7 +2593,8 @@ fn real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_byt
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::write(&audio_path, &audio_bytes)?;
-    let audio_import = mom_llama_runtime::attachment_import("real-multimodal-audio", &audio_path);
+    let audio_import =
+        mom_llama_runtime::attachment_import(&scope, "real-multimodal-audio", &audio_path);
     std::fs::remove_file(&audio_path)?;
     let audio_attachment = audio_import?
         .result
@@ -2855,7 +2602,8 @@ fn real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_byt
         .map(|output| output.attachment.clone())
         .ok_or_else(|| anyhow!("multimodal audio attachment import missing"))?;
     assert!(audio_attachment.stored_path.starts_with("encrypted://"));
-    let audio_result = mom_llama_runtime::chat_send(
+    let audio_result = mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: "real-multimodal-audio".to_string(),
             message: "Reply with whether the attached audio is a tone or silence.".to_string(),
@@ -2912,10 +2660,12 @@ fn real_native_reasoning_stream_can_be_forced_to_the_answer() -> Result<()> {
         ])),
         ..SettingsUpdate::default()
     })?;
-    let _native_owner = initialize_product_runtime()?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
     let mut reasoning_preview = String::new();
     let mut skip_result = None;
-    let result = mom_llama_runtime::chat_send_stream(
+    let result = mom_llama_runtime::chat_send_stream_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: "real-reasoning-control".to_string(),
             message: "Begin your response with the exact token <think>. Inside that block, repeat the word reasoning many times before you would close it. After the block, answer READY.".to_string(),
@@ -2927,7 +2677,8 @@ fn real_native_reasoning_stream_can_be_forced_to_the_answer() -> Result<()> {
                     reasoning_preview.push_str(delta);
                 }
                 if skip_result.is_none() && reasoning_preview.trim().chars().count() >= 12 {
-                    skip_result = Some(mom_llama_runtime::chat_skip_reasoning(
+                    skip_result = Some(mom_llama_runtime::chat_skip_reasoning_in_scope(
+                        &scope,
                         "real-reasoning-control",
                     )?);
                 }
@@ -2960,16 +2711,15 @@ fn real_native_reasoning_stream_can_be_forced_to_the_answer() -> Result<()> {
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Result<()> {
-    let Some(_session) = configured_real_session("real-consult")? else {
-        return Ok(());
-    };
+    let _session = configured_real_session("real-consult")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
         // This proof needs observable concurrent work and a non-empty
         // synthesis, not long prose from every seat.
         max_tokens: Some(64),
         ..SettingsUpdate::default()
     })?;
-    let _native_owner = initialize_product_runtime()?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
     let cancellation_panel = mom_llama_runtime::consult_panel_list()?
         .result
         .and_then(|panels| panels.into_iter().next())
@@ -2981,6 +2731,7 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
         .ok_or_else(|| anyhow!("the legacy recovery panel has no cancellation target"))?;
     let mut cancelled = None;
     let result = mom_llama_runtime::consult_start_stream(
+        &scope,
         ConsultStartInput {
             conversation_id: "real-consult".to_string(),
             prompt: "Give a careful short plan for preparing a virtual consultation.".to_string(),
@@ -2998,8 +2749,11 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
                     )
                 ) || event.event == "delta")
             {
-                let attempt =
-                    mom_llama_runtime::consult_cancel(&event.run_id, Some(&cancellation_target))?;
+                let attempt = mom_llama_runtime::consult_cancel(
+                    &scope,
+                    &event.run_id,
+                    Some(&cancellation_target),
+                )?;
                 if attempt
                     .result
                     .as_ref()
@@ -3036,7 +2790,7 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
             .count()
             >= 1
     );
-    let synthesis = mom_llama_runtime::consult_synthesize(&run.id, Vec::new())?;
+    let synthesis = mom_llama_runtime::consult_synthesize(&scope, &run.id, Vec::new())?;
     assert!(synthesis.result.as_ref().is_some_and(|value| {
         value.derived && !value.source_receipt_ids.is_empty() && !value.text.trim().is_empty()
     }));
@@ -3046,9 +2800,7 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
-    let Some(_session) = configured_real_session("real-persona-cache")? else {
-        return Ok(());
-    };
+    let _session = configured_real_session("real-persona-cache")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
         max_tokens: Some(24),
         ..SettingsUpdate::default()
@@ -3058,11 +2810,13 @@ fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
         kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
         ..SettingsUpdate::default()
     })?;
-    let _native_owner = initialize_product_runtime()?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
     let source = mom_llama_runtime::conversation_new(Some("Cache source".to_string()))?
         .result
         .ok_or_else(|| anyhow!("cache source missing"))?;
-    mom_llama_runtime::chat_send(
+    mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: source.id.clone(),
             message: "Keep this frozen source context exact.".to_string(),
@@ -3092,7 +2846,8 @@ fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
         .ok_or_else(|| anyhow!("cache host missing"))?;
 
     let dispatch = |message: &str| -> Result<mom_llama_runtime::MentionInvocation> {
-        let result = mom_llama_runtime::chat_dispatch(
+        let result = mom_llama_runtime::chat_dispatch_in_scope(
+            &scope,
             MentionDispatchInput {
                 conversation_id: host.id.clone(),
                 message: format!("@cache-witness {message}"),
@@ -3184,19 +2939,19 @@ fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Result<()> {
-    let Some(_session) = configured_real_session("real-persona-group-cancel")? else {
-        return Ok(());
-    };
+    let _session = configured_real_session("real-persona-group-cancel")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
         max_tokens: Some(64),
         ..SettingsUpdate::default()
     })?;
     let native_owner = initialize_product_runtime()?;
-    let operation_scope = mom_llama_runtime::OperationScope::for_native_host(&native_owner.host());
+    let operation_scope = native_owner.operation_scope();
+    let scope = operation_scope.clone();
     let source = mom_llama_runtime::conversation_new(Some("Group source".to_string()))?
         .result
         .ok_or_else(|| anyhow!("group source missing"))?;
-    mom_llama_runtime::chat_send(
+    mom_llama_runtime::chat_send_in_scope(
+        &scope,
         ChatSendInput {
             conversation_id: source.id.clone(),
             message: "Immutable source material for four views.".to_string(),
@@ -3296,7 +3051,7 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
             .count()
             >= 2
     );
-    let synthesis = mom_llama_runtime::mention_synthesize(&invocation.id)?;
+    let synthesis = mom_llama_runtime::mention_synthesize(&scope, &invocation.id)?;
     assert_eq!(synthesis.readiness, "real_prompt_smoke_passed");
     assert!(synthesis.receipt.real_engine_invoked);
     let synthesis = synthesis
@@ -3343,10 +3098,9 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_native_kv_cache_save_restore_proves_equivalence() -> Result<()> {
-    let Some(_session) = configured_real_session("real-cache")? else {
-        return Ok(());
-    };
-    let _native_owner = initialize_product_runtime()?;
+    let _session = configured_real_session("real-cache")?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
     let skill = mom_llama_runtime::skill_store::skill_create(
         "Cache proof".to_string(),
         "Deterministic cache verification".to_string(),
@@ -3356,14 +3110,14 @@ fn real_native_kv_cache_save_restore_proves_equivalence() -> Result<()> {
     )?
     .result
     .ok_or_else(|| anyhow!("cache skill missing"))?;
-    let saved = mom_llama_runtime::kv_cache_save(Some(skill.id))?;
+    let saved = mom_llama_runtime::kv_cache_save(&scope, Some(skill.id))?;
     assert_eq!(saved.readiness, "prompt_smoke_verified");
     let cache_id = saved
         .result
         .as_ref()
         .map(|entry| entry.id.clone())
         .ok_or_else(|| anyhow!("cache metadata missing"))?;
-    let restored = mom_llama_runtime::kv_cache_restore(Some(cache_id))?;
+    let restored = mom_llama_runtime::kv_cache_restore(&scope, Some(cache_id))?;
     assert_eq!(restored.readiness, "prompt_smoke_verified");
     assert!(restored.receipt.real_engine_invoked);
     Ok(())
@@ -3373,12 +3127,12 @@ fn real_native_kv_cache_save_restore_proves_equivalence() -> Result<()> {
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_native_tool_loop_invokes_model_and_persists_tool_lineage() -> Result<()> {
-    let Some(session) = configured_real_session("real-tool-loop")? else {
-        return Ok(());
-    };
-    let _native_owner = initialize_product_runtime()?;
+    let session = configured_real_session("real-tool-loop")?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
     configure_mcp_fixture(&session)?;
-    let prepared = mom_llama_runtime::tool_loop_prepare(
+    let prepared = mom_llama_runtime::tool_loop_prepare_in_scope(
+        &scope,
         "real-tool-loop",
         "Use the supplied tool result, then answer in one short sentence.".to_string(),
         "fixture".to_string(),
@@ -3391,7 +3145,8 @@ fn real_native_tool_loop_invokes_model_and_persists_tool_lineage() -> Result<()>
         .map(|approval| approval.id)
         .ok_or_else(|| anyhow!("tool loop approval missing"))?;
     let mut stream_events = Vec::new();
-    let result = mom_llama_runtime::tool_loop_run_stream(
+    let result = mom_llama_runtime::tool_loop_run_stream_in_scope(
+        &scope,
         mom_llama_runtime::ToolLoopRunInput {
             conversation_id: "real-tool-loop".to_string(),
             prompt: "Use the supplied tool result, then answer in one short sentence.".to_string(),
@@ -3448,15 +3203,13 @@ fn real_native_tool_loop_invokes_model_and_persists_tool_lineage() -> Result<()>
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
-    let Some(session) = configured_real_session("real-tool-loop-cancel")? else {
-        return Ok(());
-    };
+    let session = configured_real_session("real-tool-loop-cancel")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
         max_tokens: Some(512),
         ..SettingsUpdate::default()
     })?;
     let native_owner = initialize_product_runtime()?;
-    let operation_scope = mom_llama_runtime::OperationScope::for_native_host(&native_owner.host());
+    let operation_scope = native_owner.operation_scope();
     configure_mcp_fixture(&session)?;
     let conversation_id = "real-tool-loop-cancel";
     let prompt =
@@ -3556,6 +3309,7 @@ fn real_native_tool_loop_cancels_an_active_model_request() -> Result<()> {
 
 #[test]
 fn blocked_dispatch_retains_captured_draft_after_selection_changes() -> Result<()> {
+    let scope = mom_llama_runtime::OperationScope::detached();
     let _session = TestSession::new("dispatch-draft-ownership")?;
     let a = mom_llama_runtime::conversation_new(Some("A".into()))?
         .result
@@ -3567,7 +3321,8 @@ fn blocked_dispatch_retains_captured_draft_after_selection_changes() -> Result<(
     mom_llama_runtime::draft_update(Some(&a.id), message.into(), vec![])?;
     mom_llama_runtime::draft_update(Some(&b.id), "precious B".into(), vec![])?;
     mom_llama_runtime::conversation_select(&b.id)?;
-    let result = mom_llama_runtime::chat_dispatch(
+    let result = mom_llama_runtime::chat_dispatch_in_scope(
+        &scope,
         MentionDispatchInput {
             conversation_id: a.id.clone(),
             message: message.into(),

@@ -553,6 +553,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn thousands_of_drafts_use_two_slots_without_semantic_history() {
         let (_directory, mut store, source) = new_store();
         let counts = store.counts().expect("semantic counts");
@@ -585,6 +586,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn draft_retry_is_idempotent_and_stale_different_bytes_fail() {
         let (_directory, mut store, source) = new_store();
         let request = DocumentContent::Prose("newer".into());
@@ -612,6 +614,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn crash_before_database_commit_cannot_replace_active_draft() {
         let (_directory, mut store, source) = new_store();
         let first = store
@@ -648,6 +651,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn clear_removes_both_bounded_slots() {
         let (_directory, mut store, source) = new_store();
         let first = store
@@ -680,6 +684,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn cleared_versions_are_never_reused_or_vulnerable_to_aba_clear() {
         let (_directory, mut store, source) = new_store();
         let first = store
@@ -721,6 +726,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn first_write_after_clear_replays_exactly_after_lost_acknowledgement() {
         let (_directory, mut store, source) = new_store();
         let first = store
@@ -748,6 +754,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn checkpoint_atomically_consumes_exact_lost_ack_draft_and_replays() {
         let (_directory, mut store, source) = new_store();
         let text = "semantic checkpoint";
@@ -798,6 +805,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn checkpoint_refuses_mismatched_draft_without_consuming_or_saving() {
         let (_directory, mut store, source) = new_store();
         let current = store
