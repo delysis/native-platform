@@ -737,8 +737,17 @@ impl NativeModelOwner {
         let model_id = self.status().model_id;
         let worker_identity = Arc::clone(&self.inner.worker_identity);
         self.inner.begin_shutdown();
-        self.join_worker()?;
+        let join_result = self.join_worker();
         let lifecycle = self.inner.requests.shutdown();
+        // A failed join/state check cannot skip the remaining owned registry
+        // drain. Only certify authority after both cleanup paths completed.
+        join_result?;
+        if lifecycle.state_poisoned {
+            return Err(NativeError::new(
+                NativeErrorCode::Internal,
+                "native request registry is poisoned",
+            ));
+        }
         Ok(JoinedNativeModel {
             model_id,
             worker_identity,
@@ -5843,12 +5852,34 @@ fn apply_model_chat_template(
         ChatTemplateChoice::Gemma4NonThinking => {
             return render_gemma4_non_thinking(&messages, add_assistant);
         }
-        ChatTemplateChoice::ModelDefault => model.chat_template(None).map_err(|error| {
-            NativeError::new(
-                NativeErrorCode::ModelInvalid,
-                format!("model has no usable chat template: {error}"),
-            )
-        })?,
+        ChatTemplateChoice::ModelDefault => {
+            let template = model.chat_template(None).map_err(|error| {
+                NativeError::new(
+                    NativeErrorCode::ModelInvalid,
+                    format!("model has no usable chat template: {error}"),
+                )
+            })?;
+            if model
+                .meta_val_str("general.architecture")
+                .is_ok_and(|architecture| architecture == "gemma4")
+            {
+                // The pinned simple-template API does not execute Jinja and
+                // cannot represent Gemma 4 using its older `gemma` renderer.
+                // Google's embedded canonical template defaults thinking off.
+                let source = template.to_str().unwrap_or_default();
+                if !source.contains("enable_thinking | default(false)")
+                    || !source.contains("<|turn>")
+                    || !source.contains("<turn|>")
+                {
+                    return Err(NativeError::new(
+                        NativeErrorCode::ModelInvalid,
+                        "Gemma 4 requires a supported canonical embedded chat template or an explicit template choice",
+                    ));
+                }
+                return render_gemma4_non_thinking(&messages, add_assistant);
+            }
+            template
+        }
         ChatTemplateChoice::Override(template) => {
             LlamaChatTemplate::new(template).map_err(|error| {
                 NativeError::new(
@@ -5906,7 +5937,11 @@ fn render_gemma4_non_thinking(
     add_assistant: bool,
 ) -> NativeResult<String> {
     let mut rendered = String::new();
-    for message in messages {
+    // Text-only projection of the official Gemma 4 canonical template embedded
+    // in google/gemma-4-12B-it-qat-q4_0-gguf at 29d097773436b69ff9feafd636ab4cf873786537.
+    // Tokenization adds BOS. Structured tool turns need metadata ChatMessage
+    // does not carry, so they cannot be represented by this text boundary.
+    for (index, message) in messages.iter().enumerate() {
         if message.content.contains('\0') {
             return Err(NativeError::new(
                 NativeErrorCode::InvalidConfig,
@@ -5915,13 +5950,41 @@ fn render_gemma4_non_thinking(
         }
         let role = match message.role {
             ChatRole::Assistant => "model",
+            ChatRole::Tool => {
+                return Err(NativeError::new(
+                    NativeErrorCode::UnsupportedPromptForm,
+                    "Gemma 4 tool turns require structured tool-call metadata",
+                ));
+            }
             _ => role_name(message.role),
         };
-        rendered.push_str("<|turn>");
-        rendered.push_str(role);
-        rendered.push('\n');
-        rendered.push_str(&message.content);
-        rendered.push_str("<turn|>\n");
+        if message.role != ChatRole::Assistant
+            || index == 0
+            || messages[index - 1].role != ChatRole::Assistant
+        {
+            rendered.push_str("<|turn>");
+            rendered.push_str(role);
+            rendered.push('\n');
+        }
+        if message.role == ChatRole::Assistant {
+            // Canonical history excludes previous thought channels. This is
+            // input rendering, not filtering or repairing generated output.
+            let content = message
+                .content
+                .split("<channel|>")
+                .map(|part| part.split_once("<|channel>").map_or(part, |(text, _)| text))
+                .collect::<String>();
+            rendered.push_str(content.trim());
+        } else {
+            rendered.push_str(message.content.trim());
+        }
+        if message.role != ChatRole::Assistant
+            || messages
+                .get(index + 1)
+                .is_none_or(|next| next.role != ChatRole::Assistant)
+        {
+            rendered.push_str("<turn|>\n");
+        }
     }
     if add_assistant {
         rendered.push_str("<|turn>model\n<|channel>thought\n<channel|>");
@@ -5933,7 +5996,11 @@ fn fallback_chat_template_name<'a>(
     architecture: &str,
     embedded_template: &'a str,
 ) -> Option<&'a str> {
-    if architecture.starts_with("gemma") || embedded_template.contains("<start_of_turn>") {
+    if architecture == "gemma4" {
+        None
+    } else if matches!(architecture, "gemma" | "gemma2" | "gemma3")
+        || embedded_template.contains("<start_of_turn>")
+    {
         Some("gemma")
     } else {
         None
@@ -6919,6 +6986,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gemma4_canonical_history_joins_assistant_turns_and_omits_prior_thoughts() {
+        let messages = [
+            ChatMessage {
+                role: ChatRole::System,
+                content: " Be concise. ".into(),
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: " Hello. ".into(),
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "<|channel>thought\nold reasoning<channel|> Answer".into(),
+            },
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: ". ".into(),
+            },
+            ChatMessage {
+                role: ChatRole::User,
+                content: " Again. ".into(),
+            },
+        ];
+        assert_eq!(
+            render_gemma4_non_thinking(&messages, true).expect("canonical text history"),
+            "<|turn>system\nBe concise.<turn|>\n<|turn>user\nHello.<turn|>\n<|turn>model\nAnswer.<turn|>\n<|turn>user\nAgain.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>"
+        );
+        let error = render_gemma4_non_thinking(
+            &[ChatMessage {
+                role: ChatRole::Tool,
+                content: "result without tool-call identity".into(),
+            }],
+            true,
+        )
+        .expect_err("unstructured tool turns cannot be represented");
+        assert_eq!(error.code, NativeErrorCode::UnsupportedPromptForm);
+    }
+
     type TestSealFixture = (
         GenerationBatchRequest,
         ModelFingerprint,
@@ -7750,6 +7856,64 @@ mod tests {
             .shutdown_joined()
             .expect_err("a panicked worker must not yield joined evidence");
         assert_eq!(error.code, NativeErrorCode::WorkerStopped);
+    }
+
+    #[test]
+    fn poisoned_registry_drains_executor_and_cannot_mint_joined_owner_authority() {
+        let worker_id = "poisoned-registry-owner-test-worker".to_owned();
+        let requests = Arc::new(RequestRegistry::with_external_worker(worker_id.clone()));
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (_, lease) = requests
+            .reserve(
+                "poisoned-owner-request",
+                RequestClass::Embedding,
+                RequestControls::Embedding {
+                    cancellation: Arc::clone(&cancellation),
+                },
+            )
+            .expect("reserve actual executor lease");
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        let (command_tx, _command_rx) = bounded(COMMAND_CAPACITY);
+        let (speculative_tx, _speculative_rx) = bounded(SPECULATIVE_COMMAND_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = bounded(1);
+        let join = std::thread::spawn(move || {
+            shutdown_rx.recv().expect("shutdown signal");
+            assert!(cancellation.load(Ordering::Acquire));
+            drop(lease);
+            worker_completed.store(true, Ordering::Release);
+        });
+        let inner = Arc::new(NativeModelInner {
+            worker_identity: Arc::new(WorkerIdentity),
+            worker_id: worker_id.clone(),
+            command_tx,
+            speculative_tx,
+            shutdown_tx,
+            closing: AtomicBool::new(false),
+            admission: Arc::new(Mutex::new(())),
+            speculative_admission: Arc::new(SpeculativeAdmission::new(Arc::new(
+                SystemAdmissionClock::default(),
+            ))),
+            requests: Arc::clone(&requests),
+            status: Arc::new(RwLock::new(admission_test_status())),
+        });
+        requests.poison_state_for_test();
+        let owner = NativeModelOwner {
+            inner,
+            join: Some(join),
+        };
+        let result = owner.shutdown_joined();
+        assert!(
+            completed.load(Ordering::Acquire),
+            "owner must join its worker even when state is poisoned"
+        );
+        assert_eq!(requests.active_count(), 0);
+        assert_eq!(requests.retained_task_count(), 0);
+        let drained = requests.shutdown();
+        assert_eq!(drained.joined_worker_ids, vec![worker_id]);
+        let error = result.expect_err("poisoned state cannot certify joined authority");
+        assert_eq!(error.code, NativeErrorCode::Internal);
+        assert!(error.message.contains("poison"));
     }
 
     struct TestArtifactDirectory {
@@ -10063,7 +10227,8 @@ mod tests {
 
     #[test]
     fn gemma_family_uses_the_supported_named_template_when_embedded_jinja_is_too_new() {
-        assert_eq!(fallback_chat_template_name("gemma4", ""), Some("gemma"));
+        assert_eq!(fallback_chat_template_name("gemma4", ""), None);
+        assert_eq!(fallback_chat_template_name("gemma3", ""), Some("gemma"));
         assert_eq!(
             fallback_chat_template_name("unknown", "{{ '<start_of_turn>' }}"),
             Some("gemma")

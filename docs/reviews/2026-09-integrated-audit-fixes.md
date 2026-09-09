@@ -11,6 +11,16 @@ not a declaration that compilation or fixtures establish product acceptance.
 
 ## Repairs
 
+- F8: recovered supervisor state must not erase poison. The real Mom owner
+  regression retained its worker join but lost the operation fault; the real
+  native owner regression minted successful joined authority after registry
+  poison. Cleanup now drains the owned work and records the fault. Native owner
+  shutdown also drains registry work before propagating a prior join/state error.
+  Mom refuses new admission/worker starts after poison and releases a refused
+  reservation; existing workers still drain. Unused controlled-worker scaffolding
+  was removed instead of extending it. The final affected native suite passed
+  133 tests with nine model prerequisites ignored, Mom passed all 72 app tests,
+  and strict workspace/all-target Clippy plus formatting passed.
 - NP-007: the closure review found that Loom's speech-input owner still returned
   early after a microphone/host stop error or a failed task join. Two controlled
   regressions reproduced abandoned blocked followers through the real shutdown
@@ -128,6 +138,18 @@ states these boundaries. Dated ADRs and receipts remain historical. The W9
 correction names the actual orphan `manifest_tests.rs`, not the incorrectly
 attributed `research_admission.rs`; no historical evidence was silently resealed.
 
+Lifecycle finding qualifications remain explicit. F3's old universal-suite
+claim is superseded by `CURRENT-DECISIONS`; tests exercise actual owners with
+different scopes, not a universal acceptance matrix. F9's cancellation
+arbitration and F12's close-abort/resume are intentional behavior. For F10,
+executor drop requests cancellation while the actual Speech task supervisor
+retains monitor/backend-shutdown panic errors separately. F11's existing panic
+fixture covers its helper, not the full admission path. Source confirms the
+higher-level application/session poison mitigation; no additional observable
+admission leak was demonstrated. No stronger runtime proof is claimed for F11,
+and no generic conformance framework was introduced to satisfy a proposed test
+matrix.
+
 ## Verification recorded so far
 
 Before the HTTP repairs, real adapter regressions observed control HTTP 429,
@@ -243,7 +265,7 @@ The automatic sweep removed 228,332,165,314 bytes, in addition to the obsolete W
 and W9 targets. Available space was approximately 193 GiB after resumed builds.
 The disk blocker and old approval request are resolved.
 
-## Remaining qualification
+## Qualification checkpoints
 
 Full CI `34406935088` completed successfully at `6d49d14`: all eight jobs passed,
 including Windows, macOS, Linux, browser interactions, bounded fuzz execution,
@@ -271,7 +293,6 @@ OS Keychain resolver with the environment-key override unset and secure storage
 explicitly enabled for the debug executable. These checks establish the named
 runtime paths, not release-bundle UI acceptance.
 
-Qualify the later Swift extraction and Consult removal on the final CI revision.
 Run `34409139337` at `ceaf885` passed Linux, macOS, Windows, model integration,
 frontend, and fuzz, while its policy tests exposed two stale copied ignored-test counts.
 Those assertions now use source reconciliation and a small explicit platform
@@ -286,8 +307,8 @@ or distribution is implied by this receipt.
 
 ## September 9 product punch list
 
-Mom now uses a compact overlay titlebar for Settings and the sidebar toggle,
-retaining native window decorations and lowering the minimum to 640 by 480.
+The first Mom pass used a compact overlay titlebar for Settings and the sidebar
+toggle, retaining native decorations and lowering the minimum to 640 by 480.
 The one-line composer grows with its draft; the permanent shortcut row, fixed
 150-pixel composer floor, and 180-pixel transcript spacer are removed. The
 space-efficiency preference is recorded in the root and Mom instructions.
@@ -340,3 +361,34 @@ The closure review also corrected two FTE documents that still described the
 removed schema upgrade as current. Historical receipts retain their original
 scope. Native memory reservations remain explicitly heuristic; no measured
 supported-device envelope or hard process-memory limit is claimed.
+
+Native access briefly resumed. The old Mom process was observed idle with an
+empty draft, then quit normally: native and speech hosts joined, all six named
+workers joined, zero operations/tasks remained, and the drain completed in
+110 milliseconds. The new sidebar bundle launched against the same encrypted
+store, but normal Keychain access remained pending in SecurityAgent. Computer
+Use refuses that protected app; the user was asked to complete the prompt.
+The screen subsequently locked again. No key override or alternate store was
+used to turn this into a claimed successful reopen.
+
+The current FTE bundle started its authenticated loopback at port 18491 through
+Settings. The advertised `local/default` now routes to actual local Gemma
+inference and its completed response can be retrieved from the response store.
+However, its generated text exposed another true defect: the shared model-default
+chat renderer used old Gemma framing for Gemma 4. The same sentence with the
+official Gemma 4 framing through raw completion immediately produced a normal
+13-token answer. Successful HTTP transport is therefore not recorded as model
+acceptance. A separate live cancellation after the first text delta returned
+`cancelling`, then `response.incomplete`, with no `response.completed` event.
+
+The shared renderer now recognizes Gemma 4 before the pinned simple-template
+API can misclassify it. It requires the supported canonical embedded template
+and follows its default non-thinking text semantics, assistant history and turn
+markers; ordinary tokenization adds BOS once. Unstructured tool turns without
+required call metadata fail explicitly. Other model families and explicit
+template choices retain their own paths. The native renderer suite passed;
+the identical packaged FTE request still needs rerunning on the rebuilt bundle.
+
+Full CI `34412937976` passed all eight jobs at `f0c3ca8`. It qualifies the second
+Mom layout pass and the Loom speech drain repair, and predates the Gemma 4
+renderer and poison-evidence changes described above.

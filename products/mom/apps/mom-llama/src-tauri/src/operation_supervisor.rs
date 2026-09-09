@@ -62,6 +62,7 @@ pub struct OperationSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SupervisorShutdownOutcome {
     pub phase: LifecyclePhase,
+    pub state_poisoned: bool,
     pub active_operations: usize,
     pub retained_tasks: usize,
     pub expected_worker_ids: Vec<String>,
@@ -70,6 +71,8 @@ pub struct SupervisorShutdownOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum SupervisorError {
+    #[error("operation supervisor state is poisoned")]
+    StatePoisoned,
     #[error("operation admission is closed")]
     AdmissionClosed,
     #[error("an operation with this public ID is already active")]
@@ -170,17 +173,6 @@ pub struct SupervisedTask<T> {
     _ticket: OperationTicket,
 }
 
-#[derive(Clone)]
-pub struct ControlledOperation(Arc<ControlledOperationInner>);
-
-struct ControlledOperationInner {
-    lease: OperationLease,
-    _ticket: Mutex<Option<OperationTicket>>,
-    worker_id: String,
-    terminal: mpsc::SyncSender<TerminalClass>,
-    exit: mpsc::SyncSender<()>,
-}
-
 impl<T> SupervisedTask<T> {
     pub async fn wait(self) -> Result<T, String> {
         let result = self.result.await.map_err(|_| {
@@ -248,7 +240,7 @@ impl OperationSupervisor {
         if operation_id.is_empty() {
             return Err(SupervisorError::UnknownOperation);
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_admission_state()?;
         if state.phase != LifecyclePhase::Running {
             return Err(SupervisorError::AdmissionClosed);
         }
@@ -287,7 +279,7 @@ impl OperationSupervisor {
         if !Arc::ptr_eq(&owner, &self.0) {
             return Err(SupervisorError::StaleLease);
         }
-        let mut state = self.lock_state();
+        let mut state = self.lock_admission_state()?;
         if state.phase != LifecyclePhase::Running {
             return Err(SupervisorError::AdmissionClosed);
         }
@@ -609,6 +601,15 @@ impl OperationSupervisor {
         T: Send + 'static,
         F: FnOnce(&OperationLease) -> Result<T, String> + Send + 'static,
     {
+        if let Err(error) = self.lock_admission_state() {
+            // No worker owns this reservation yet. Consumer drop only requests
+            // cancellation, so refusal must release its executor identity here.
+            self.queue(&reservation.lease)?;
+            self.start(&reservation.lease)?;
+            self.terminal(&reservation.lease, TerminalClass::Failed)?;
+            self.release(&reservation.lease)?;
+            return Err(error);
+        }
         self.queue(&reservation.lease)?;
         self.start(&reservation.lease)?;
         let worker_id = format!(
@@ -686,197 +687,6 @@ impl OperationSupervisor {
         })
     }
 
-    pub fn spawn_controlled(
-        &self,
-        operation_id: &str,
-    ) -> Result<ControlledOperation, SupervisorError> {
-        let reservation = self.reserve(operation_id)?;
-        self.queue(&reservation.lease)?;
-        self.start(&reservation.lease)?;
-        let worker_id = format!(
-            "mom-operation-worker-{}",
-            reservation.lease.attempt.identity.sequence
-        );
-        let lease = reservation.lease;
-        let thread_lease = lease.clone();
-        let supervisor = self.clone();
-        let thread_worker_id = worker_id.clone();
-        let (start_tx, start_rx) = mpsc::sync_channel(0);
-        let (terminal_tx, terminal_rx) = mpsc::sync_channel(1);
-        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
-        let join = thread::Builder::new()
-            .name(worker_id.clone())
-            .spawn(move || {
-                if start_rx.recv().is_err() {
-                    return;
-                }
-                let Ok(class) = terminal_rx.recv() else {
-                    return;
-                };
-                let _ = supervisor
-                    .terminal(&thread_lease, class)
-                    .and_then(|()| supervisor.release(&thread_lease));
-                let _ = exit_rx.recv();
-                supervisor.record_worker_exit(&thread_worker_id);
-            })
-            .map_err(|_| SupervisorError::WorkerStart)?;
-        {
-            let mut state = self.lock_state();
-            state.expected_worker_ids.push(worker_id.clone());
-            state
-                .workers
-                .insert(worker_id.clone(), WorkerEntry { join: Some(join) });
-        }
-        start_tx
-            .send(())
-            .map_err(|_| SupervisorError::WorkerStart)?;
-        Ok(ControlledOperation(Arc::new(ControlledOperationInner {
-            lease,
-            _ticket: Mutex::new(Some(reservation.ticket)),
-            worker_id,
-            terminal: terminal_tx,
-            exit: exit_tx,
-        })))
-    }
-
-    pub fn spawn_panicking(
-        &self,
-        operation_id: &str,
-    ) -> Result<ControlledOperation, SupervisorError> {
-        let reservation = self.reserve(operation_id)?;
-        self.queue(&reservation.lease)?;
-        self.start(&reservation.lease)?;
-        let worker_id = format!(
-            "mom-operation-worker-{}",
-            reservation.lease.attempt.identity.sequence
-        );
-        let lease = reservation.lease;
-        let thread_lease = lease.clone();
-        let supervisor = self.clone();
-        let thread_worker_id = worker_id.clone();
-        let (start_tx, start_rx) = mpsc::sync_channel(0);
-        let (terminal_tx, _terminal_rx) = mpsc::sync_channel(1);
-        let (exit_tx, _exit_rx) = mpsc::sync_channel(1);
-        let join = thread::Builder::new()
-            .name(worker_id.clone())
-            .spawn(move || {
-                if start_rx.recv().is_err() {
-                    return;
-                }
-                let panicked = catch_unwind(AssertUnwindSafe(|| {
-                    panic!("controlled Mom operation panic")
-                }))
-                .is_err();
-                if panicked {
-                    let _ = supervisor
-                        .record_executor_panic(&thread_lease)
-                        .and_then(|()| supervisor.release(&thread_lease));
-                }
-                supervisor.record_worker_exit(&thread_worker_id);
-            })
-            .map_err(|_| SupervisorError::WorkerStart)?;
-        {
-            let mut state = self.lock_state();
-            state.expected_worker_ids.push(worker_id.clone());
-            state
-                .workers
-                .insert(worker_id.clone(), WorkerEntry { join: Some(join) });
-        }
-        start_tx
-            .send(())
-            .map_err(|_| SupervisorError::WorkerStart)?;
-        Ok(ControlledOperation(Arc::new(ControlledOperationInner {
-            lease,
-            _ticket: Mutex::new(Some(reservation.ticket)),
-            worker_id,
-            terminal: terminal_tx,
-            exit: exit_tx,
-        })))
-    }
-
-    pub fn request_controlled_terminal(
-        &self,
-        operation: &ControlledOperation,
-        class: TerminalClass,
-    ) -> Result<(), SupervisorError> {
-        operation
-            .0
-            .terminal
-            .try_send(class)
-            .map_err(|_| SupervisorError::InvalidTransition)
-    }
-
-    pub fn controlled_snapshot(
-        &self,
-        operation: &ControlledOperation,
-    ) -> Option<OperationSnapshot> {
-        self.snapshot(&operation.0.lease)
-    }
-
-    pub fn wait_controlled_released(
-        &self,
-        operation: &ControlledOperation,
-        timeout: Duration,
-    ) -> Result<OperationSnapshot, SupervisorError> {
-        self.wait_for_released(&operation.0.lease, timeout)
-    }
-
-    pub fn allow_controlled_exit(
-        &self,
-        operation: &ControlledOperation,
-    ) -> Result<(), SupervisorError> {
-        operation
-            .0
-            .exit
-            .try_send(())
-            .map_err(|_| SupervisorError::InvalidTransition)?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut state = self.lock_state();
-        while !state
-            .exited_worker_ids
-            .iter()
-            .any(|worker| worker == &operation.0.worker_id)
-        {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(SupervisorError::WorkerTimeout);
-            };
-            let (next, wait) = self
-                .0
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next;
-            if wait.timed_out()
-                && !state
-                    .exited_worker_ids
-                    .iter()
-                    .any(|worker| worker == &operation.0.worker_id)
-            {
-                return Err(SupervisorError::WorkerTimeout);
-            }
-        }
-        Ok(())
-    }
-
-    pub fn reap_controlled(&self, operation: &ControlledOperation) -> Result<(), SupervisorError> {
-        self.reap_worker(&operation.0.worker_id)
-    }
-
-    pub fn cancellation_requested_by_id(&self, operation_id: &str) -> bool {
-        self.lock_state()
-            .operations
-            .get(operation_id)
-            .is_some_and(|operation| operation.cancellation_requested)
-    }
-
-    pub fn publish_controlled_progress(
-        &self,
-        operation: &ControlledOperation,
-        sequence: u64,
-    ) -> Result<(), SupervisorError> {
-        self.publish_progress(&operation.0.lease, sequence)
-    }
-
     pub fn shutdown(&self) -> SupervisorShutdownOutcome {
         self.begin_quiesce();
         {
@@ -918,6 +728,8 @@ impl OperationSupervisor {
         state.phase = LifecyclePhase::Closed;
         let outcome = SupervisorShutdownOutcome {
             phase: LifecyclePhase::Closed,
+            // Poison recovery permits cleanup; it cannot certify clean state.
+            state_poisoned: self.0.state.is_poisoned(),
             active_operations: state.attempts.len(),
             retained_tasks: state.workers.len(),
             expected_worker_ids: state.expected_worker_ids.clone(),
@@ -1014,6 +826,26 @@ impl OperationSupervisor {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_admission_state(&self) -> Result<MutexGuard<'_, SupervisorState>, SupervisorError> {
+        self.0
+            .state
+            .lock()
+            .map_err(|_| SupervisorError::StatePoisoned)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_state_for_test(&self) {
+        let supervisor = self.clone();
+        assert!(
+            std::thread::spawn(move || {
+                let _state = supervisor.0.state.lock().expect("unpoisoned supervisor");
+                panic!("controlled Mom operation supervisor poison");
+            })
+            .join()
+            .is_err()
+        );
     }
 }
 

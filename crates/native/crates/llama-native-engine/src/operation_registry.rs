@@ -249,6 +249,7 @@ struct WorkerEntry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RegistryShutdownOutcome {
     pub(crate) phase: RequestRegistryPhase,
+    pub(crate) state_poisoned: bool,
     pub(crate) active_operations: usize,
     pub(crate) retained_tasks: usize,
     pub(crate) expected_workers: usize,
@@ -950,6 +951,7 @@ impl RequestRegistry {
         let joined_worker_ids = state.joined_worker_ids.clone();
         let outcome = RegistryShutdownOutcome {
             phase: RequestRegistryPhase::Closed,
+            state_poisoned: self.state.is_poisoned(),
             active_operations: state.attempts.len(),
             retained_tasks: state.workers.len(),
             expected_workers: expected_worker_ids.len(),
@@ -1021,7 +1023,13 @@ impl RequestRegistry {
         }
         state.phase = RegistryPhase::Closed;
         self.drained.notify_all();
-        Ok(())
+        // Draining remains mandatory after poison, but recovered cleanup state
+        // cannot grant successful joined-owner authority.
+        if self.state.is_poisoned() {
+            Err(registry_error("native request registry is poisoned"))
+        } else {
+            Ok(())
+        }
     }
 
     #[cfg(test)]
@@ -1133,6 +1141,19 @@ impl RequestRegistry {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_state_for_test(self: &Arc<Self>) {
+        let registry = Arc::clone(self);
+        assert!(
+            std::thread::spawn(move || {
+                let _state = registry.state.lock().expect("unpoisoned registry");
+                panic!("controlled native request registry poison");
+            })
+            .join()
+            .is_err()
+        );
     }
 }
 

@@ -814,6 +814,11 @@ impl AppRuntimeHandle {
                     )),
                 };
                 let mut operation_errors = Vec::new();
+                if supervisor.state_poisoned {
+                    operation_errors.push(
+                        "operation supervisor state was poisoned; owned workers were drained but state integrity is unproven".to_owned(),
+                    );
+                }
                 if !validate_worker_sets(&supervisor) {
                     operation_errors.push(
                         "operation worker join identities did not match admitted worker identities"
@@ -987,7 +992,9 @@ mod tests {
     };
     use crate::command_registry::command_spec;
     use crate::information::MomInformation;
-    use crate::operation_supervisor::OperationSupervisor;
+    use crate::operation_supervisor::{
+        LifecyclePhase as OperationLifecyclePhase, OperationSupervisor, SupervisorError,
+    };
     use llama_native_host::{NativeHost, NativeHostConfig, ProcessExitJoinedNativeHost};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1150,6 +1157,100 @@ mod tests {
         assert!(runtime.begin_quiesce());
         assert!(!runtime.begin_quiesce());
         assert!(runtime.admit(command).is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn poisoned_operation_supervisor_drains_workers_and_remains_a_shutdown_error() {
+        let native_called = Arc::new(AtomicBool::new(false));
+        let runtime = runtime_with_finalizer(Arc::clone(&native_called));
+        let supervisor = runtime.0.operation_supervisor.clone();
+        let reservation = supervisor.reserve("poison-drain").expect("reserve worker");
+        let worker_id = format!(
+            "mom-operation-worker-{}",
+            reservation.lease.identity().sequence
+        );
+        let (release, blocked) = std::sync::mpsc::sync_channel(0);
+        let task = supervisor
+            .spawn(reservation, move |_| {
+                blocked.recv().expect("release worker during shutdown");
+                Ok(())
+            })
+            .expect("spawn worker");
+        let operation = supervisor
+            .create_operation("pre-poison-operation")
+            .expect("operation");
+        let pending = supervisor
+            .reserve("pre-poison-reservation")
+            .expect("pending reservation");
+        supervisor.poison_state_for_test();
+        assert!(matches!(
+            supervisor.reserve("after-poison"),
+            Err(SupervisorError::StatePoisoned)
+        ));
+        assert!(matches!(
+            supervisor.start_attempt(&operation),
+            Err(SupervisorError::StatePoisoned)
+        ));
+        let rejected_worker_ran = Arc::new(AtomicBool::new(false));
+        let ran = Arc::clone(&rejected_worker_ran);
+        assert!(matches!(
+            supervisor.spawn(pending, move |_| {
+                ran.store(true, Ordering::Release);
+                Ok(())
+            }),
+            Err(SupervisorError::StatePoisoned)
+        ));
+        assert!(!rejected_worker_ran.load(Ordering::Acquire));
+        assert_eq!(
+            supervisor.active_count(),
+            1,
+            "only the already-running worker remains"
+        );
+        supervisor
+            .finish_operation(&operation)
+            .expect("cleanup still recovers poisoned state");
+        let worker_supervisor = supervisor.clone();
+        let finalizer_called = Arc::clone(&native_called);
+        let releaser = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while worker_supervisor.phase() == OperationLifecyclePhase::Running {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "shutdown did not quiesce"
+                );
+                std::thread::yield_now();
+            }
+            assert!(!finalizer_called.load(Ordering::Acquire));
+            release.send(()).expect("release active worker");
+        });
+        let error = runtime.shutdown().await.expect_err("faulted shutdown");
+        releaser.join().expect("release coordinator");
+        drop(task);
+        assert!(
+            native_called.load(Ordering::Acquire),
+            "native cleanup still runs"
+        );
+        assert_eq!(error.summary.active_operation_count, 0);
+        assert_eq!(error.summary.retained_operation_task_count, 0);
+        assert_eq!(error.summary.expected_operation_worker_count, 1);
+        assert_eq!(error.summary.joined_operation_worker_count, 1);
+        assert!(error.summary.joined_worker_ids.contains(&worker_id));
+        assert!(
+            error
+                .operation_error
+                .as_deref()
+                .is_some_and(|message| message.contains("poison")),
+            "supervisor poison was lost: {error:?}"
+        );
+        assert_eq!(
+            runtime
+                .shutdown()
+                .await
+                .expect_err("retained shutdown")
+                .operation_error,
+            error.operation_error
+        );
     }
 
     #[test]
