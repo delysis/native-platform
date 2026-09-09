@@ -1600,7 +1600,7 @@ pub fn render_settings_fragment(scope: &mom_llama_runtime::OperationScope) -> Re
     let conversations = mom_llama_runtime::conversation_list()?;
     let selected = mom_llama_runtime::conversation_store::load_db()?.selected_conversation_id;
     let active = active_conversation(&conversations, selected.as_deref());
-    Ok(settings_modal(&settings, &models, &personas, active.as_ref()).into_string())
+    Ok(settings_sidebar(&settings, &models, &personas, active.as_ref()).into_string())
 }
 
 struct AppProjection<'a> {
@@ -1645,11 +1645,11 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             (sidebar(conversations, personas, active.as_ref().map(|conversation| conversation.id.as_str())))
             header class="chrome" aria-label="Window toolbar" {
                 (button("layout.sidebar_toggle", Some("sidebar-toggle"), "icon-button sidebar-toggle", false))
-                div class="titlebar-drag-surface" { span { "Mom Llama" } }
+                div class="titlebar-drag-surface" {}
                 (button("settings.open", Some("settings-open"), "icon-button settings-toggle", false))
             }
             (chat_view_with_draft(settings, engine, models, active.as_ref(), Some(draft)))
-            (settings_modal(settings, models, personas, active.as_ref()))
+            (settings_sidebar(settings, models, personas, active.as_ref()))
             (persona_freeze_modal())
             (persona_context_menu())
             (persona_removal_modal())
@@ -1926,7 +1926,6 @@ fn sidebar(
     let persona_list = control("persona.list");
     html! {
         aside class="sidebar" aria-label="Sidebar" {
-            h2 { "llama.cpp" }
             nav class="sidebar-nav" aria-label="Main actions" {
                 (button("conversation.new", Some("conversation-new"), "nav-button", false))
                 (button("conversation.search", Some("conversation-search-open"), "nav-button", false))
@@ -2591,7 +2590,7 @@ fn message_button(key: &str, action: &str, message: &Message) -> Markup {
     }
 }
 
-fn settings_modal(
+fn settings_sidebar(
     settings: &CommandResult<Settings>,
     models: &CommandResult<Vec<ModelInfo>>,
     personas: &StoreProjection<Vec<Conversation>>,
@@ -2601,11 +2600,14 @@ fn settings_modal(
         .map(|conversation| conversation.id.as_str())
         .unwrap_or("default");
     html! {
-        div id="settings-modal" class="modal-backdrop is-hidden" hidden[true] aria-hidden="true"
+        aside id="settings-sidebar" class="settings-sidebar is-hidden" hidden[true] aria-hidden="true"
+            aria-label="Settings"
             data-current-conversation=(current_conversation_id) {
-            section class="settings-dialog" aria-label="Settings" {
-                div class="settings-sections" {
-                    h2 { "llama.cpp" }
+                header class="settings-heading" {
+                    h2 id="settings-section-title" { "General" }
+                    (button("settings.close", Some("settings-close"), "icon-button", false))
+                }
+                nav class="settings-sections" aria-label="Settings sections" {
                     @for section in SETTINGS_SECTIONS.iter().filter(|section| settings_section_visible(section)) {
                         button type="button"
                             class=(if section.slug == "general" { "section-tab active" } else { "section-tab" })
@@ -2615,6 +2617,7 @@ fn settings_modal(
                             data-cli="mom-llama settings get --json"
                             data-effect="mom_llama.effects.settings_store.v1"
                             data-action="settings-section"
+                            aria-pressed=(section.slug == "general")
                             data-section=(section.slug) {
                             (icon_markup(section.icon))
                             span { (section.title) }
@@ -2622,10 +2625,6 @@ fn settings_modal(
                     }
                 }
                 div class="settings-content" {
-                    div class="modal-title-row" {
-                        h2 id="settings-section-title" { "General" }
-                        (button("settings.close", Some("settings-close"), "icon-button", false))
-                    }
                     form id="settings-form" class="settings-form"
                         data-affordance="settings.update.form"
                         data-command="mom_llama.settings_update"
@@ -2656,7 +2655,6 @@ fn settings_modal(
                         (button("settings.update", Some("settings-retry"), "small-button settings-retry is-hidden", false))
                     }
                 }
-            }
         }
     }
 }
@@ -2672,10 +2670,6 @@ fn settings_panel(
         section class=(if section.slug == "general" { "settings-panel active" } else { "settings-panel" })
             data-section-panel=(section.slug)
             aria-label=(section.title) {
-            div class="settings-panel-heading" {
-                (icon_markup(section.icon))
-                h3 { (section.title) }
-            }
             @if let Some(blocker) = section.blocker {
                 p class="settings-blocker"
                     data-blocker-code=(format!("{}_blocked_native_profile", section.slug.replace('-', "_"))) {
@@ -2695,17 +2689,9 @@ fn settings_panel(
                         "settings-model-picker",
                     ))
                     p class="field-help" { "New chats capture this default. Existing chats use their saved conversation model when available." }
-                    @if let Some(cache) = mom_llama_runtime::hugging_face_hub_cache_dir() {
-                        p class="field-help model-cache-hint" {
-                            "Model discovery and the file picker use the shared Hugging Face cache at "
-                            code { (cache.display()) }
-                            "."
-                        }
-                    }
                     div class="button-strip" {
                         (button("model.list", Some("model-list"), "small-button", false))
                     }
-                    p class="field-help" { "Models and a sole matching vision projector load together, locally inside Mom." }
                 }
             }
             @if section.slug == "consult" {
@@ -3760,6 +3746,8 @@ fn button(key: &str, action: Option<&str>, class_name: &str, disabled: bool) -> 
         button type="button"
             class=(class_name)
             aria-label=(control.label)
+            aria-controls=[(key == "settings.open").then_some("settings-sidebar")]
+            aria-expanded=[(key == "settings.open").then_some("false")]
             data-affordance=(control.affordance)
             data-command=(control.command)
             data-tauri-command=(control.tauri_command)
@@ -4331,9 +4319,9 @@ mod tests {
         );
         assert!(
             html.contains(
-                r#"id="settings-modal" class="modal-backdrop is-hidden" hidden aria-hidden="true""#
+                r#"id="settings-sidebar" class="settings-sidebar is-hidden" hidden aria-hidden="true""#
             ),
-            "settings modal must be hidden until its Rust-owned command affordance opens it"
+            "settings sidebar must be hidden until its Rust-owned command affordance opens it"
         );
         assert!(html.contains("Current chat instructions"));
         assert!(html.contains(r#"data-chat-setting="system_message""#));

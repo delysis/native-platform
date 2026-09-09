@@ -12,8 +12,8 @@
       {
         "label": "main",
         "title": "Mom Llama",
-        "titleBarStyle": "Overlay",
-        "hiddenTitle": true,
+        "titleBarStyle": "Visible",
+        "decorations": true,
         "width": 1440,
         "height": 860,
         "minWidth": 640,

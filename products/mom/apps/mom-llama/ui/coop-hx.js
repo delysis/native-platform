@@ -45,14 +45,7 @@
   const initializeWindowChrome = async () => {
     const nativeWindow = tauri()?.window?.getCurrentWindow();
     if (!nativeWindow) return;
-    const root = document.documentElement;
-    root.dataset.nativePlatform = navigator.platform.startsWith("Mac") ? "macos" : "other";
-    const syncWindow = async () => {
-      root.classList.toggle("native-fullscreen", await nativeWindow.isFullscreen());
-      sizeComposer();
-    };
-    await syncWindow();
-    await nativeWindow.onResized(() => { void syncWindow().catch(reportError); });
+    await nativeWindow.onResized(sizeComposer);
   };
   const composerPolicy = globalThis.MomLlamaComposerKeyPolicy;
   let composerState = composerPolicy?.initialState?.() || { kind: "idle" };
@@ -708,8 +701,8 @@
     return replacement;
   };
   const refreshSettings = async (section = "general") => {
-    const wasOpen = !document.getElementById("settings-modal")?.hidden;
-    const modal = await swap("#settings-modal", "mom_llama_render_settings_fragment");
+    const wasOpen = !document.getElementById("settings-sidebar")?.hidden;
+    const modal = await swap("#settings-sidebar", "mom_llama_render_settings_fragment");
     refreshAutosaveStatus();
     if (wasOpen && modal) {
       modal.hidden = false;
@@ -722,6 +715,16 @@
 
   const refreshConversationProjection = async () => {
     await Promise.all([refreshChat(), refreshSidebar()]);
+    const settings = document.getElementById("settings-sidebar");
+    if (settings && settings.dataset.currentConversation !== selectedConversation()) {
+      const projection = parseFragment(await invokeMarkup("mom_llama_render_settings_fragment"));
+      const instructions = projection?.querySelector(".current-chat-settings");
+      if (instructions && settings === document.getElementById("settings-sidebar")
+        && projection.dataset.currentConversation === selectedConversation()) {
+        settings.querySelector(".current-chat-settings")?.replaceWith(instructions);
+        settings.dataset.currentConversation = projection.dataset.currentConversation;
+      }
+    }
   };
 
   const formField = (form, name) =>
@@ -864,7 +867,7 @@
   };
 
   const scheduleChatInstructionsAutosave = (field, delay = 650) => {
-    const modal = field.closest("#settings-modal");
+    const modal = field.closest("#settings-sidebar");
     const conversation = field.dataset.conversation || modal?.dataset.currentConversation || "default";
     const systemMessage = field.value.trim() || null;
     queueAutosave(`conversation:${conversation}`, {
@@ -876,20 +879,30 @@
   };
 
   const openSettings = (section = "general") => {
-    const modal = document.getElementById("settings-modal");
+    const modal = document.getElementById("settings-sidebar");
     if (!modal) return;
     modal.hidden = false;
     modal.classList.remove("is-hidden");
     modal.setAttribute("aria-hidden", "false");
+    shell()?.classList.add("settings-open");
+    document.querySelector('[data-action="settings-open"]')?.setAttribute("aria-expanded", "true");
     switchSettingsSection(section);
+    sizeComposer();
+    modal.querySelector(".section-tab.active")?.focus();
   };
 
   const closeSettings = () => {
-    const modal = document.getElementById("settings-modal");
+    const modal = document.getElementById("settings-sidebar");
     if (!modal) return;
+    const hadFocus = modal.contains(document.activeElement);
     modal.hidden = true;
     modal.classList.add("is-hidden");
     modal.setAttribute("aria-hidden", "true");
+    shell()?.classList.remove("settings-open");
+    const toggle = document.querySelector('[data-action="settings-open"]');
+    toggle?.setAttribute("aria-expanded", "false");
+    if (hadFocus) toggle?.focus();
+    sizeComposer();
   };
 
   const setModalVisibility = (id, visible) => {
@@ -1479,11 +1492,13 @@
 
   const switchSettingsSection = (section) => {
     const title = document.getElementById("settings-section-title");
-    const modal = document.getElementById("settings-modal");
+    const modal = document.getElementById("settings-sidebar");
     if (modal) modal.dataset.activeSection = section;
     document.querySelectorAll(".section-tab[data-section]").forEach((tab) => {
       const active = tab.dataset.section === section;
       tab.classList.toggle("active", active);
+      tab.setAttribute("aria-pressed", String(active));
+      if (active) tab.scrollIntoView({ block: "nearest", inline: "nearest" });
       if (active && title) title.textContent = tab.textContent.trim();
     });
     document.querySelectorAll("[data-section-panel]").forEach((panel) => {
@@ -2427,7 +2442,11 @@
         throw error;
       }
     },
-    "settings-open": async () => { await invoke("mom_llama_settings_get"); openSettings(); },
+    "settings-open": async () => {
+      await invoke("mom_llama_settings_get");
+      if (document.getElementById("settings-sidebar")?.hidden) openSettings();
+      else closeSettings();
+    },
     "settings-close": async () => { await invoke("mom_llama_settings_get"); closeSettings(); },
     "settings-section": async (button) => switchSettingsSection(button.dataset.section || "general"),
     "mention-insert": async (button) => {
@@ -3411,6 +3430,11 @@
     if (event.key === "Escape" && event.target.matches(".inline-message-editor")) {
       event.preventDefault();
       refreshChat().catch(reportError);
+      return;
+    }
+    if (event.key === "Escape" && event.target.closest("#settings-sidebar")) {
+      event.preventDefault();
+      closeSettings();
       return;
     }
     if (!event.target.matches("#chat-form textarea[name='message']")) return;

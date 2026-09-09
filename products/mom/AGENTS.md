@@ -36,6 +36,9 @@ crates live under the monorepo `crates/` tree. FTE remains a separate product.
 - Use screen space purposefully: compact adaptive layouts, integrated titlebar
   controls and native edge resizing, with comfortable hit targets. Help and
   secondary status must not reserve permanent empty space around the work.
+- Settings occupy a compact right sidebar while the conversation remains usable.
+  Hidden message actions reserve no layout space; avoid repeated headings,
+  decorative cards and fixed reading gutters that crowd the work.
 - Ordinary chat stays calm: no permanent dashboards, empty result-card grids,
   inline documentation rails or exposed settings on the conversation surface.
 - Use established component classes and existing Lucide/upstream llama.cpp

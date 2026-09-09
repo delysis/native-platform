@@ -6,7 +6,7 @@ user instructions. The user explicitly rejects speculative migration support
 for these unreleased products.
 
 This receipt records the implemented repairs and their observed qualification.
-The final cross-platform CI rerun and packaged acceptance remain separate. It is
+Cross-platform CI and packaged acceptance remain separate. It is
 not a declaration that compilation or fixtures establish product acceptance.
 
 ## Repairs
@@ -301,5 +301,30 @@ repair rather than relabeling the original run as green.
 The active isolated Mom session now uses Gemma and normal reasoning parsing.
 Messages and system prompts were compared and preserved in all fifteen
 conversations/Personas. The supported model-selection command loaded Gemma on
-Metal and returned `host_integrated`. Native UI layout/resizing, the rebuilt
-FTE API journey, and final cross-platform qualification remain to execute.
+Metal and returned `host_integrated`. Native UI layout/resizing and the rebuilt
+FTE API journey remain to execute. Full CI `34411484993` passed all eight jobs
+at `54136ce`, including all three desktop platforms. That revision predates the
+following second UI pass.
+
+The user rejected the first layout pass after actual use. Settings now occupies
+a compact right sidebar instead of a centered modal. Conversation content uses
+the remaining width; invisible message actions reserve no row height. Duplicate
+headings, oversized sidebar branding, fixed reading gutters, and extra composer
+form margins are removed. Switching conversations updates the sidebar's chat
+instructions without replacing unrelated settings edits. The normal AppKit
+titlebar replaces Overlay/hiddenTitle; the webview no longer reserves stoplight
+space or repeats the native title. This is the standard native fallback, not a
+claim that the reported missing-stoplight or resize-cursor cause is established.
+
+The affected Mom app harness passed all 71 tests. Focused WebKit geometry checks
+covered 640 by 480 and desktop layouts, and the actual conversation-refresh
+function preserved unrelated settings edits/focus and rejected a stale projection.
+The debug bundle built in 7.98 seconds and passed local ad-hoc signature checking.
+The Mac was locked before native interaction could resume; the user's existing
+Mom process and conversation were preserved. Native controls, edge cursors and
+resize behavior still require verification in the rebuilt running app.
+
+The closure review also corrected two FTE documents that still described the
+removed schema upgrade as current. Historical receipts retain their original
+scope. Native memory reservations remain explicitly heuristic; no measured
+supported-device envelope or hard process-memory limit is claimed.

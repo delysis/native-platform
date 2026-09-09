@@ -59,10 +59,10 @@ desktop compatibility edge.
 
 Fresh databases never create `api_keys` and are stamped with an FTE
 `application_id` plus schema version. Reopen accepts that exact current
-identity and table set, or the exact v1 schema for the bounded v2 usage upgrade
-described below. A database with the plaintext `api_keys` table, any
+identity and schema object set. A database with the plaintext `api_keys` table, any
 unversioned populated database, a foreign application ID, an unsupported schema
-version, or an unexpected table is rejected before product schema mutation.
+version, or an altered schema is rejected before journal or product schema
+mutation. Prior product schemas are preserved and refused; no upgrade runs.
 
 No independently produced prior `gateway.db` or `gateway-v2.db` corpus was
 available to authenticate. Backward compatibility was explicitly waived, so
@@ -153,7 +153,9 @@ contract. The launched evidence is not signed-release certification.
 
 ## Subsequent activity-storage change (2026-09-06)
 
-The [current storage contract](../README.md#request-activity-storage) adds an
-exact-v1-to-v2 transactional upgrade, explicit unknown usage, and shared desktop/
-loopback activity recording. The earlier verification receipts above retain
-their original scope.
+The September 6 activity-storage change introduced explicit unknown usage and
+shared desktop/loopback activity recording. Its v1-to-v2 upgrade was subsequently
+removed for the unreleased product. The [current storage contract](../README.md#request-activity-storage)
+accepts fresh or exact current schema-v2 stores and refuses incompatible stores
+without mutation. The earlier verification receipts above retain their original
+scope.

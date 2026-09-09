@@ -78,7 +78,9 @@ credential is already available, without weakening the fixture gates.
 
 ## Subsequent activity-storage change (2026-09-06)
 
-The [current storage contract](../README.md#request-activity-storage) adds an
-exact-v1-to-v2 transactional upgrade, explicit unknown usage, and shared desktop/
-loopback activity recording. The earlier verification receipts above retain
-their original scope.
+The September 6 activity-storage change introduced explicit unknown usage and
+shared desktop/loopback activity recording. Its v1-to-v2 upgrade was subsequently
+removed for the unreleased product. The [current storage contract](../README.md#request-activity-storage)
+accepts fresh or exact current schema-v2 stores and refuses incompatible stores
+without mutation. The earlier verification receipts above retain their original
+scope.
