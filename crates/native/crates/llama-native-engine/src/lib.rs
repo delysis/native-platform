@@ -68,7 +68,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 pub const LLAMA_CPP_BINDING_VERSION: &str = "0.1.154";
-pub const LLAMA_CPP_BINDING_REV: &str = "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391";
+pub const LLAMA_CPP_BINDING_REV: &str = "eb0e47b57c2fba97ed13e8fe5e949d11798232cb";
 pub const LLAMA_CPP_REV: &str = "5f55650a78f92aff4d48d671423e888fac0469ff";
 /// SHA-256 of a private, domain-separated build-input accumulator. The raw
 /// inputs are deliberately neither compiled into this crate nor exposed.
@@ -1200,13 +1200,15 @@ impl NativeModelHandle {
         let worker = thread::Builder::new()
             .name(worker_id.clone())
             .spawn(move || {
-                run_worker(
-                    config,
-                    worker_lanes,
-                    ready_tx,
-                    worker_status,
-                    owner_worker_identity,
-                );
+                supervise_worker(&worker_status, || {
+                    run_worker(
+                        config,
+                        worker_lanes,
+                        ready_tx,
+                        Arc::clone(&worker_status),
+                        owner_worker_identity,
+                    );
+                });
             })
             .map_err(|error| {
                 NativeError::new(
@@ -6839,6 +6841,26 @@ fn try_emit_terminal(event_tx: &Sender<GenerationEvent>, event: GenerationEvent)
     let _ = event_tx.try_send(event);
 }
 
+// A failed join and failed readiness are separate facts. Keep the panic intact
+// for the owner to join, while invalidating stale Ready/active status on unwind.
+fn supervise_worker(status: &RwLock<ResidentModelStatus>, run: impl FnOnce()) {
+    struct FailureGuard<'a>(&'a RwLock<ResidentModelStatus>);
+    impl Drop for FailureGuard<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let mut status = self
+                    .0
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                status.state = ModelRuntimeState::Failed;
+                status.active_sequences = 0;
+            }
+        }
+    }
+    let _guard = FailureGuard(status);
+    run();
+}
+
 fn set_status_state(
     status: &Arc<RwLock<ResidentModelStatus>>,
     state: ModelRuntimeState,
@@ -7026,6 +7048,29 @@ mod tests {
             command_rx,
             speculative_rx,
         )
+    }
+
+    #[test]
+    fn supervisory_unwind_invalidates_readiness_and_preserves_failed_join() {
+        let status = Arc::new(RwLock::new(admission_test_status()));
+        let worker_status = Arc::clone(&status);
+        let worker = std::thread::spawn(move || {
+            supervise_worker(&worker_status, || {
+                let mut current = worker_status.write().expect("status");
+                current.state = ModelRuntimeState::Ready;
+                current.active_sequences = 3;
+                panic!("injected worker failure while status is locked");
+            });
+        });
+        assert!(
+            worker.join().is_err(),
+            "supervision must not swallow the panic"
+        );
+        let status = status
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(status.state, ModelRuntimeState::Failed);
+        assert_eq!(status.active_sequences, 0);
     }
 
     fn admission_test_status() -> ResidentModelStatus {
@@ -8092,7 +8137,7 @@ mod tests {
     fn reported_binding_identity_matches_the_private_recipe_and_lock_pin() {
         assert_eq!(
             LLAMA_CPP_BINDING_REV,
-            "a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"
+            "eb0e47b57c2fba97ed13e8fe5e949d11798232cb"
         );
         assert_eq!(LLAMA_CPP_REV, "5f55650a78f92aff4d48d671423e888fac0469ff");
         let manifest = include_str!("../Cargo.toml");

@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use uuid::Uuid;
 
-const ATTACHMENTS_FILE: &str = "attachments.json";
 const ATTACHMENTS_NAMESPACE_V2: &str = "attachments.v2";
 const ATTACHMENTS_NAMESPACE: &str = "attachments.v3";
 const ATTACHMENT_DB_SCHEMA: &str = "mom_llama.attachments.v3";
@@ -2442,10 +2441,6 @@ pub fn load_attachment_db() -> Result<AttachmentDb> {
         }
         return Ok(db);
     }
-    store.import_json_once::<AttachmentDb>(
-        ATTACHMENTS_NAMESPACE_V2,
-        &settings.data_dir.join(ATTACHMENTS_FILE),
-    )?;
     let mut db = store
         .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE_V2)?
         .unwrap_or_default();

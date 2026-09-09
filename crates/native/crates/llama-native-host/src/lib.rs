@@ -6,7 +6,9 @@
 //! optional persistent cache storage, then route typed requests to its model
 //! handles.
 
-use llama_native_cache::{CacheFingerprint, CacheOwnerScope, MemoryPrefixCache, PrefixCacheValue};
+use llama_native_cache::{
+    CacheFingerprint, CacheOwnerScope, MemoryPrefixCache, PrefixCacheMetadata, PrefixCacheValue,
+};
 use llama_native_engine::{
     GenerationTicket, JoinedNativeModel, NativeModelHandle, NativeModelOwner,
 };
@@ -46,7 +48,22 @@ impl HostClock for SystemClock {
 /// product may inject an authenticated implementation; routers may inject a
 /// database-backed implementation; tests may inject an in-memory store.
 pub trait PrefixCacheStore: Send + Sync {
-    fn load(&self, namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError>;
+    fn list(&self, namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError>;
+    fn load_entry(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<PrefixCacheValue>, NativeError>;
+
+    fn load(&self, namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
+        let mut values = Vec::new();
+        for metadata in self.list(namespace)? {
+            if let Some(value) = self.load_entry(namespace, &metadata.id)? {
+                values.push(value);
+            }
+        }
+        Ok(values)
+    }
     fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError>;
     fn delete(&self, namespace: &str, id: &str) -> Result<(), NativeError>;
 
@@ -63,9 +80,9 @@ pub trait PrefixCacheStore: Send + Sync {
     }
 
     fn clear(&self, namespace: &str) -> Result<usize, NativeError> {
-        let values = self.load(namespace)?;
+        let values = self.list(namespace)?;
         for value in &values {
-            self.delete(namespace, &value.metadata.id)?;
+            self.delete(namespace, &value.id)?;
         }
         Ok(values.len())
     }
@@ -1021,20 +1038,20 @@ impl NativeHost {
         let Some(store) = &self.persistent_cache else {
             return Ok(0);
         };
-        let values = store.load(&self.config.cache_namespace)?;
+        let values = store.list(&self.config.cache_namespace)?;
         let mut restored = 0;
         for candidate in values {
             if !candidate.is_valid() {
                 continue;
             }
-            let owner_generation = candidate.metadata.owner_id.as_deref().map(|owner_id| {
+            let owner_generation = candidate.owner_id.as_deref().map(|owner_id| {
                 self.state
                     .lock()
                     .map(|state| cache_owner_generation(&state, owner_id))
                     .map_err(host_poisoned)
             });
             let owner_generation = owner_generation.transpose()?;
-            let promotion_lease = match candidate.metadata.owner_id.as_deref() {
+            let promotion_lease = match candidate.owner_id.as_deref() {
                 Some(owner_id) => {
                     let Some(lease) = store
                         .acquire_owner_promotion_lease(&self.config.cache_namespace, owner_id)?
@@ -1045,14 +1062,10 @@ impl NativeHost {
                 }
                 None => None,
             };
-            let Some(value) = store
-                .load(&self.config.cache_namespace)?
-                .into_iter()
-                .find(|value| value.metadata.id == candidate.metadata.id)
-            else {
+            let Some(value) = store.load_entry(&self.config.cache_namespace, &candidate.id)? else {
                 continue;
             };
-            if !value.is_valid() || value != candidate {
+            if !value.is_valid() || value.metadata != candidate {
                 continue;
             }
             if let Some(lease) = &promotion_lease {
@@ -1230,8 +1243,27 @@ mod tests {
     }
 
     impl PrefixCacheStore for TestPrefixStore {
-        fn load(&self, _namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
-            Ok(self.values.lock().expect("test store lock").clone())
+        fn list(&self, _namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
+            Ok(self
+                .values
+                .lock()
+                .expect("test store lock")
+                .iter()
+                .map(|value| value.metadata.clone())
+                .collect())
+        }
+        fn load_entry(
+            &self,
+            _namespace: &str,
+            id: &str,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            Ok(self
+                .values
+                .lock()
+                .expect("test store lock")
+                .iter()
+                .find(|value| value.metadata.id == id)
+                .cloned())
         }
 
         fn save(&self, _namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
@@ -1254,8 +1286,15 @@ mod tests {
     struct RejectingPrefixStore;
 
     impl PrefixCacheStore for RejectingPrefixStore {
-        fn load(&self, _namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
+        fn list(&self, _namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
             Ok(Vec::new())
+        }
+        fn load_entry(
+            &self,
+            _namespace: &str,
+            _id: &str,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            Ok(None)
         }
 
         fn save(&self, _namespace: &str, _value: &PrefixCacheValue) -> Result<(), NativeError> {
@@ -1277,8 +1316,27 @@ mod tests {
     }
 
     impl PrefixCacheStore for BlockingSavePrefixStore {
-        fn load(&self, _namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
-            Ok(self.values.lock().expect("test store lock").clone())
+        fn list(&self, _namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
+            Ok(self
+                .values
+                .lock()
+                .expect("test store lock")
+                .iter()
+                .map(|value| value.metadata.clone())
+                .collect())
+        }
+        fn load_entry(
+            &self,
+            _namespace: &str,
+            id: &str,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            Ok(self
+                .values
+                .lock()
+                .expect("test store lock")
+                .iter()
+                .find(|value| value.metadata.id == id)
+                .cloned())
         }
 
         fn save(&self, _namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
@@ -1308,13 +1366,33 @@ mod tests {
     }
 
     impl PrefixCacheStore for BlockingRestorePrefixStore {
-        fn load(&self, _namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
+        fn list(&self, _namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .values
+                .lock()
+                .expect("test store lock")
+                .iter()
+                .map(|value| value.metadata.clone())
+                .collect())
+        }
+        fn load_entry(
+            &self,
+            _namespace: &str,
+            id: &str,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
             let call = self.load_calls.fetch_add(1, Ordering::SeqCst);
             if call == 1 {
                 self.authoritative_reload.wait();
                 self.release_reload.wait();
             }
-            Ok(self.values.lock().expect("test store lock").clone())
+            Ok(self
+                .values
+                .lock()
+                .expect("test store lock")
+                .iter()
+                .find(|value| value.metadata.id == id)
+                .cloned())
         }
 
         fn save(&self, _namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
@@ -1332,6 +1410,59 @@ mod tests {
                 .retain(|candidate| candidate.metadata.id != id);
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct CountingPrefixStore {
+        inner: TestPrefixStore,
+        lists: AtomicUsize,
+        payload_bytes: AtomicUsize,
+    }
+    impl PrefixCacheStore for CountingPrefixStore {
+        fn list(&self, namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
+            self.lists.fetch_add(1, Ordering::Relaxed);
+            self.inner.list(namespace)
+        }
+        fn load_entry(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            let value = self.inner.load_entry(namespace, id)?;
+            if let Some(value) = &value {
+                self.payload_bytes
+                    .fetch_add(value.sequence.bytes.len(), Ordering::Relaxed);
+            }
+            Ok(value)
+        }
+        fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
+            self.inner.save(namespace, value)
+        }
+        fn delete(&self, namespace: &str, id: &str) -> Result<(), NativeError> {
+            self.inner.delete(namespace, id)
+        }
+    }
+
+    #[test]
+    fn restore_enumerates_once_and_reads_each_payload_once() {
+        let store = Arc::new(CountingPrefixStore::default());
+        let mut expected_bytes = 0;
+        for index in 0..16 {
+            let value = cache_value(&format!("entry-{index}"), index + 1);
+            expected_bytes += value.sequence.bytes.len();
+            store.save("test", &value).expect("save");
+        }
+        let host = NativeHost::with_dependencies(
+            NativeHostConfig {
+                cache_namespace: "test".into(),
+                ..Default::default()
+            },
+            Arc::new(SystemClock),
+            Some(store.clone()),
+        );
+        assert_eq!(host.restore_persistent_cache().expect("restore"), 16);
+        assert_eq!(store.lists.load(Ordering::Relaxed), 1);
+        assert_eq!(store.payload_bytes.load(Ordering::Relaxed), expected_bytes);
     }
 
     fn resident_test_config(expected_model_sha256: Option<&str>) -> NativeModelConfig {

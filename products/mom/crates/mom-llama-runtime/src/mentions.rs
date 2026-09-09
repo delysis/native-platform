@@ -5476,6 +5476,7 @@ mod tests {
         let arguments = json!({"query": "exact"});
         let arguments_sha256 = sha256_json_value(&arguments).expect("arguments hash");
         let frozen_server_config = McpServerConfig {
+            executable_sha256: None,
             name: "local".to_string(),
             command: std::env::current_exe().expect("test executable path"),
             args: Vec::new(),
@@ -6708,6 +6709,7 @@ mod tests {
         let tool = |policy| BoundMentionTool {
             server: "local".to_string(),
             server_config: McpServerConfig {
+                executable_sha256: None,
                 name: "local".to_string(),
                 command: std::env::current_exe().expect("test executable path"),
                 args: Vec::new(),
@@ -6837,6 +6839,7 @@ mod tests {
         let tools = vec![BoundMentionTool {
             server: "local".to_string(),
             server_config: McpServerConfig {
+                executable_sha256: None,
                 name: "local".to_string(),
                 command: std::env::current_exe().expect("test executable path"),
                 args: Vec::new(),
@@ -6879,6 +6882,7 @@ mod tests {
         let tool = |index: usize, payload_bytes: usize| BoundMentionTool {
             server: format!("server-{index}"),
             server_config: McpServerConfig {
+                executable_sha256: None,
                 name: format!("server-{index}"),
                 command: std::env::current_exe().expect("test executable path"),
                 args: Vec::new(),

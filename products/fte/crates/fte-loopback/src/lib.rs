@@ -76,12 +76,62 @@ struct AppState {
     token: Arc<RwLock<String>>,
     allowed_origins: Arc<BTreeSet<String>>,
     concurrency: Arc<Semaphore>,
-    active_responses: Arc<Mutex<HashMap<String, RequestId>>>,
+    control_concurrency: Arc<Semaphore>,
+    active_responses: Arc<Mutex<HashMap<String, ActiveResponse>>>,
     edge_defaults: EdgeDefaults,
     keep_alive: Duration,
     max_header_bytes: usize,
     stream_idle_timeout: Duration,
     stream_total_timeout: Duration,
+}
+
+struct ActiveResponse {
+    request_id: RequestId,
+    identity: Arc<()>,
+}
+
+// Lives inside the HTTP body; Drop runs even if the body is never polled again.
+struct ResponseRegistration {
+    active: Arc<Mutex<HashMap<String, ActiveResponse>>>,
+    response_id: String,
+    identity: Arc<()>,
+}
+
+impl ResponseRegistration {
+    fn register(
+        state: &AppState,
+        response_id: String,
+        request_id: RequestId,
+    ) -> Result<Self, GatewayError> {
+        let identity = Arc::new(());
+        state.active_responses.lock().map_err(lock_error)?.insert(
+            response_id.clone(),
+            ActiveResponse {
+                request_id,
+                identity: identity.clone(),
+            },
+        );
+        Ok(Self {
+            active: state.active_responses.clone(),
+            response_id,
+            identity,
+        })
+    }
+}
+
+impl Drop for ResponseRegistration {
+    fn drop(&mut self) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active
+            .get(&self.response_id)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.identity, &self.identity))
+        {
+            active.remove(&self.response_id);
+        }
+    }
 }
 
 pub struct LoopbackServer {
@@ -115,6 +165,7 @@ impl LoopbackServer {
             token: Arc::clone(&token),
             allowed_origins: Arc::new(config.allowed_origins),
             concurrency: Arc::new(Semaphore::new(config.max_concurrent_requests.max(1))),
+            control_concurrency: Arc::new(Semaphore::new(4)),
             active_responses: Arc::new(Mutex::new(HashMap::new())),
             edge_defaults: config.edge_defaults,
             keep_alive: config.stream_keep_alive,
@@ -280,7 +331,20 @@ async fn security_guard(
         )
         .into_response();
     }
-    let permit = match Arc::clone(&state.concurrency).try_acquire_owned() {
+    let generation = matches!(
+        request.uri().path(),
+        "/v1/completions"
+            | "/v1/chat/completions"
+            | "/v1/responses"
+            | "/v1/messages"
+            | "/v1/messages/count_tokens"
+    );
+    let capacity = if generation {
+        &state.concurrency
+    } else {
+        &state.control_concurrency
+    };
+    let permit = match Arc::clone(capacity).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
             return ApiError::simple(
@@ -435,7 +499,7 @@ async fn cancel_response(
             )
         })?
         .get(&id)
-        .cloned()
+        .map(|entry| entry.request_id.clone())
         .or_else(|| {
             state
                 .store
@@ -532,7 +596,15 @@ async fn await_response(
             break;
         }
     }
-    ticket.final_response().await
+    let response = ticket.final_response().await?;
+    if response.status != fte_types::TerminalStatus::Completed {
+        return Err(GatewayError::unavailable(
+            &response.request_id,
+            "generation_incomplete",
+            "Generation did not complete successfully",
+        ));
+    }
+    Ok(response)
 }
 
 #[derive(Clone, Copy)]
@@ -586,6 +658,89 @@ fn stream_timeout_payload(poll: &StreamPoll) -> Value {
     json!({"type":"gateway_error","code":code,"message":message})
 }
 
+fn stream_integrity_error(event: &GatewayEvent) -> Option<Value> {
+    match event {
+        GatewayEvent::Warning { code, message, .. } if code == "gateway_progress_truncated" => {
+            Some(json!({"code":code,"message":message}))
+        }
+        _ => None,
+    }
+}
+
+fn legacy_completion_chunks(
+    response: &GatewayResponse,
+    flavor: StreamFlavor,
+    emitted: &HashMap<usize, String>,
+) -> Result<Vec<Value>, &'static str> {
+    if response.status != fte_types::TerminalStatus::Completed {
+        return Err("Generation did not complete successfully");
+    }
+    if response
+        .output
+        .iter()
+        .any(|item| matches!(item, fte_types::OutputItem::Reasoning { .. }))
+    {
+        return Err("Reasoning output requires the Responses API");
+    }
+    if matches!(flavor, StreamFlavor::Completion)
+        && response
+            .output
+            .iter()
+            .any(|item| !matches!(item, fte_types::OutputItem::Message { .. }))
+    {
+        return Err("Non-text completion output requires the Responses API");
+    }
+    let mut value = match flavor {
+        StreamFlavor::Chat => openai_chat_json(response),
+        StreamFlavor::Completion => openai_completion_json(response),
+    };
+    let choices = value["choices"]
+        .as_array_mut()
+        .ok_or("Missing output choices")?;
+    if emitted.keys().any(|index| *index >= choices.len()) {
+        return Err("Streamed output has no corresponding final choice");
+    }
+    for (index, choice) in choices.iter_mut().enumerate() {
+        let final_text = match flavor {
+            StreamFlavor::Chat => choice["message"]["content"].as_str(),
+            StreamFlavor::Completion => choice["text"].as_str(),
+        }
+        .unwrap_or("");
+        let suffix = final_text
+            .strip_prefix(emitted.get(&index).map_or("", String::as_str))
+            .ok_or("Streamed text is not a prefix of the authoritative output")?
+            .to_string();
+        match flavor {
+            StreamFlavor::Chat => {
+                let mut delta = json!({"content":suffix});
+                if let Some(tools) = choice["message"]["tool_calls"].as_array() {
+                    delta["tool_calls"] = json!(
+                        tools
+                            .iter()
+                            .enumerate()
+                            .map(|(index, tool)| {
+                                let mut tool = tool.clone();
+                                tool["index"] = json!(index);
+                                tool
+                            })
+                            .collect::<Vec<_>>()
+                    );
+                }
+                choice
+                    .as_object_mut()
+                    .ok_or("Invalid choice")?
+                    .remove("message");
+                choice["delta"] = delta;
+            }
+            StreamFlavor::Completion => choice["text"] = json!(suffix),
+        }
+    }
+    if matches!(flavor, StreamFlavor::Chat) {
+        value["object"] = json!("chat.completion.chunk");
+    }
+    Ok(vec![value])
+}
+
 fn openai_stream_response(
     mut ticket: fte_types::GatewayTicket,
     flavor: StreamFlavor,
@@ -596,24 +751,35 @@ fn openai_stream_response(
     let total_timeout = state.stream_total_timeout;
     let event_stream = stream! {
         let started_at = Instant::now();
-        let mut active_response_id = None;
+        let mut _registration = None;
+        let mut emitted_text = HashMap::<usize, String>::new();
         loop {
             let poll = next_stream_event(&mut ticket.events, started_at, idle_timeout, total_timeout).await;
             let event = match poll {
                 StreamPoll::Event(event) => *event,
-                StreamPoll::Closed => break,
+                StreamPoll::Closed => {
+                    yield Ok::<Event, Infallible>(Event::default().event("error").data(json!({"error":stream_timeout_payload(&StreamPoll::Closed)}).to_string()));
+                    break;
+                },
                 StreamPoll::IdleTimeout | StreamPoll::TotalTimeout => {
                     yield Ok::<Event, Infallible>(Event::default().data(json!({"error":stream_timeout_payload(&poll)}).to_string()));
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
             };
+            if let Some(error) = stream_integrity_error(&event) {
+                yield Ok::<Event, Infallible>(Event::default().data(json!({"error":error}).to_string()));
+                break;
+            }
             match event {
                 GatewayEvent::ResponseCreated { response_id, request_id, .. } => {
-                    if let Ok(mut active) = state.active_responses.lock() {
-                        active.insert(response_id.clone(), request_id);
+                    match ResponseRegistration::register(&state, response_id.clone(), request_id) {
+                        Ok(registration) => _registration = Some(registration),
+                        Err(error) => {
+                            yield Ok::<Event, Infallible>(Event::default().data(json!({"error":error}).to_string()));
+                            break;
+                        }
                     }
-                    active_response_id = Some(response_id.clone());
                     if matches!(flavor, StreamFlavor::Chat) {
                         yield Ok::<Event, Infallible>(Event::default().data(json!({
                             "id":format!("chatcmpl_{response_id}"),
@@ -622,7 +788,13 @@ fn openai_stream_response(
                         }).to_string()));
                     }
                 }
-                GatewayEvent::TextDelta { delta, output_index, .. } => {
+                GatewayEvent::TextDelta { delta, output_index, content_index, .. } => {
+                    // Chat has one choice; later output items are flattened by
+                    // the final projector. Emit only its provable first prefix.
+                    if matches!(flavor, StreamFlavor::Chat) && (output_index != 0 || content_index != 0) {
+                        continue;
+                    }
+                    emitted_text.entry(output_index).or_default().push_str(&delta);
                     let value = match flavor {
                         StreamFlavor::Chat => json!({
                             "object":"chat.completion.chunk",
@@ -636,37 +808,34 @@ fn openai_stream_response(
                     yield Ok(Event::default().data(value.to_string()));
                 }
                 GatewayEvent::Completed { response, .. } => {
-                    let value = match flavor {
-                        StreamFlavor::Chat => json!({
-                            "id":format!("chatcmpl_{}",response.id),
-                            "object":"chat.completion.chunk",
-                            "model":response.model,
-                            "choices":[{"index":0,"delta":{},"finish_reason":"stop"}],
-                            "usage":response.usage,
-                        }),
-                        StreamFlavor::Completion => json!({
-                            "id":format!("cmpl_{}",response.id),
-                            "object":"text_completion",
-                            "model":response.model,
-                            "choices":[{"index":0,"text":"","finish_reason":"stop","logprobs":Value::Null}],
-                            "usage":response.usage,
-                        }),
+                    let final_chunks = match legacy_completion_chunks(&response, flavor, &emitted_text) {
+                        Ok(chunks) => chunks,
+                        Err(message) => {
+                            yield Ok(Event::default().data(json!({"error":{"code":"stream_projection_incomplete","message":message}}).to_string()));
+                            break;
+                        }
                     };
-                    yield Ok(Event::default().data(value.to_string()));
+                    for value in final_chunks {
+                        yield Ok(Event::default().data(value.to_string()));
+                    }
                     yield Ok(Event::default().data("[DONE]"));
                     break;
                 }
-                GatewayEvent::Cancelled { .. } | GatewayEvent::Failed { .. } => {
-                    yield Ok(Event::default().data("[DONE]"));
+                GatewayEvent::Cancelled { .. } => {
+                    yield Ok(Event::default().data(json!({"error":{"code":"cancelled","message":"Generation cancelled"}}).to_string()));
                     break;
                 }
-                _ => {}
+                GatewayEvent::Failed { error, .. } => {
+                    yield Ok(Event::default().data(json!({"error":{"code":error.code,"message":error.safe_detail}}).to_string()));
+                    break;
+                }
+                // Identity/content boundary events are carried by the final
+                // legacy projector. Tool arguments are emitted atomically there.
+                GatewayEvent::OutputItemAdded { .. } | GatewayEvent::ContentPartAdded { .. }
+                | GatewayEvent::ContentPartCompleted { .. } | GatewayEvent::OutputItemCompleted { .. }
+                | GatewayEvent::ReasoningSummaryDelta { .. } | GatewayEvent::FunctionArgumentsDelta { .. }
+                | GatewayEvent::UsageUpdated { .. } | GatewayEvent::Warning { .. } => {}
             }
-        }
-        if let Some(response_id) = active_response_id
-            && let Ok(mut active) = state.active_responses.lock()
-        {
-            active.remove(&response_id);
         }
     };
     Sse::new(event_stream)
@@ -685,29 +854,39 @@ fn openai_responses_stream(
     let event_stream = stream! {
         let mut encoder = OpenAiResponsesStreamEncoder::default();
         let started_at = Instant::now();
-        let mut active_response_id = None;
+        let mut _registration = None;
         loop {
             let poll = next_stream_event(&mut ticket.events, started_at, idle_timeout, total_timeout).await;
             let event = match poll {
                 StreamPoll::Event(event) => *event,
-                StreamPoll::Closed => break,
+                StreamPoll::Closed => {
+                    yield Ok::<Event, Infallible>(Event::default().event("error").data(json!({"error":stream_timeout_payload(&StreamPoll::Closed)}).to_string()));
+                    break;
+                },
                 StreamPoll::IdleTimeout | StreamPoll::TotalTimeout => {
                     let payload = stream_timeout_payload(&poll);
                     yield Ok::<Event, Infallible>(Event::default().event("error").data(payload.to_string()));
                     break;
                 }
             };
-            if let GatewayEvent::ResponseCreated { response_id, request_id, .. } = &event
-                && let Ok(mut active) = state.active_responses.lock()
-            {
-                active.insert(response_id.clone(), request_id.clone());
-                active_response_id = Some(response_id.clone());
+            if let Some(error) = stream_integrity_error(&event) {
+                yield Ok::<Event, Infallible>(Event::default().event("error").data(json!({"type":"error","error":error}).to_string()));
+                break;
             }
-            if let GatewayEvent::Completed { response, .. } = &event {
-                let _ = persist_response(&state, response, should_store);
-                if let Ok(mut active) = state.active_responses.lock() {
-                    active.remove(&response.id);
+            if let GatewayEvent::ResponseCreated { response_id, request_id, .. } = &event {
+                match ResponseRegistration::register(&state, response_id.clone(), request_id.clone()) {
+                    Ok(registration) => _registration = Some(registration),
+                    Err(error) => {
+                        yield Ok::<Event, Infallible>(Event::default().event("error").data(json!({"type":"error","code":error.code,"message":error.safe_detail}).to_string()));
+                        break;
+                    }
                 }
+            }
+            if let GatewayEvent::Completed { response, .. } = &event
+                && let Err(error) = persist_response(&state, response, should_store)
+            {
+                yield Ok::<Event, Infallible>(Event::default().event("error").data(json!({"type":"error","code":error.code,"message":error.safe_detail}).to_string()));
+                break;
             }
             if let Some(encoded) = encoder.encode(&event) {
                 yield Ok::<Event, Infallible>(Event::default().event(encoded.event).data(encoded.data.to_string()));
@@ -715,11 +894,6 @@ fn openai_responses_stream(
             if event.is_terminal() {
                 break;
             }
-        }
-        if let Some(response_id) = active_response_id
-            && let Ok(mut active) = state.active_responses.lock()
-        {
-            active.remove(&response_id);
         }
     };
     Sse::new(event_stream)
@@ -742,13 +916,20 @@ fn anthropic_stream(
             let poll = next_stream_event(&mut ticket.events, started_at, idle_timeout, total_timeout).await;
             let event = match poll {
                 StreamPoll::Event(event) => *event,
-                StreamPoll::Closed => break,
+                StreamPoll::Closed => {
+                    yield Ok::<Event, Infallible>(Event::default().event("error").data(json!({"error":stream_timeout_payload(&StreamPoll::Closed)}).to_string()));
+                    break;
+                },
                 StreamPoll::IdleTimeout | StreamPoll::TotalTimeout => {
                     let payload = stream_timeout_payload(&poll);
                     yield Ok::<Event, Infallible>(Event::default().event("error").data(json!({"type":"error","error":payload}).to_string()));
                     break;
                 }
             };
+            if let Some(error) = stream_integrity_error(&event) {
+                yield Ok::<Event, Infallible>(Event::default().event("error").data(json!({"type":"error","error":error}).to_string()));
+                break;
+            }
             for encoded in encoder.encode(&event) {
                 yield Ok::<Event, Infallible>(Event::default().event(encoded.event).data(encoded.data.to_string()));
             }
@@ -767,11 +948,17 @@ fn persist_response(
     response: &GatewayResponse,
     should_store: bool,
 ) -> Result<(), GatewayError> {
-    state
-        .gateway
-        .record_response_affinity(&response.id, &response.route)?;
     if should_store {
         state.store.put(response)?;
+    }
+    if let Err(error) = state
+        .gateway
+        .record_response_affinity(&response.id, &response.route)
+    {
+        if should_store {
+            state.store.delete(&response.id)?;
+        }
+        return Err(error);
     }
     Ok(())
 }
@@ -837,6 +1024,7 @@ fn origin_allowed(headers: &HeaderMap, allowlist: &BTreeSet<String>) -> bool {
 }
 
 fn load_or_create_token(path: &FilePath) -> Result<String, GatewayError> {
+    require_private_token_support()?;
     if let Ok(value) = fs::read_to_string(path) {
         verify_private_token_path(path)?;
         let value = value.trim().to_string();
@@ -908,8 +1096,8 @@ fn ensure_private_directory(path: &FilePath) -> Result<(), GatewayError> {
 }
 
 #[cfg(not(unix))]
-fn ensure_private_directory(path: &FilePath) -> Result<(), GatewayError> {
-    fs::create_dir_all(path).map_err(loopback_error)
+fn ensure_private_directory(_path: &FilePath) -> Result<(), GatewayError> {
+    require_private_token_support()
 }
 
 #[cfg(unix)]
@@ -931,7 +1119,7 @@ fn verify_private_token_path(path: &FilePath) -> Result<(), GatewayError> {
 
 #[cfg(not(unix))]
 fn verify_private_token_path(_path: &FilePath) -> Result<(), GatewayError> {
-    Ok(())
+    require_private_token_support()
 }
 
 #[cfg(unix)]
@@ -943,7 +1131,23 @@ fn sync_directory(path: &FilePath) -> Result<(), GatewayError> {
 
 #[cfg(not(unix))]
 fn sync_directory(_path: &FilePath) -> Result<(), GatewayError> {
-    Ok(())
+    require_private_token_support()
+}
+
+fn require_private_token_support() -> Result<(), GatewayError> {
+    if cfg!(unix) {
+        Ok(())
+    } else {
+        Err(GatewayError {
+            code: "loopback_private_storage_unsupported".into(),
+            class: fte_types::ErrorClass::Capability,
+            retryable: false,
+            http_status: 501,
+            request_id: RequestId::new(),
+            provider: None,
+            safe_detail: "private loopback token storage is unsupported on this platform".into(),
+        })
+    }
 }
 
 fn random_token() -> String {
@@ -1021,6 +1225,325 @@ mod tests {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{mpsc, oneshot};
+
+    fn regression_state(store: Arc<dyn ResponseStore>) -> AppState {
+        let gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
+        gateway
+            .register_backend(Arc::new(StreamingTestBackend))
+            .expect("backend");
+        AppState {
+            gateway,
+            store,
+            token: Arc::new(RwLock::new("test-token".into())),
+            allowed_origins: Arc::default(),
+            concurrency: Arc::new(Semaphore::new(1)),
+            control_concurrency: Arc::new(Semaphore::new(4)),
+            active_responses: Arc::default(),
+            edge_defaults: EdgeDefaults::default(),
+            keep_alive: Duration::from_secs(15),
+            max_header_bytes: 32768,
+            stream_idle_timeout: Duration::from_secs(2),
+            stream_total_timeout: Duration::from_secs(5),
+        }
+    }
+
+    fn http_request(path: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("host", "127.0.0.1")
+            .header("authorization", "Bearer test-token")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request")
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_token_storage_never_reads_or_creates_a_token() {
+        let root = std::env::temp_dir().join(format!("fte-unsupported-token-{}", random::<u64>()));
+        let path = root.join("token");
+        let error = load_or_create_token(&path).expect_err("unsupported token storage");
+        assert_eq!(error.code, "loopback_private_storage_unsupported");
+        assert!(!root.exists());
+        fs::create_dir(&root).expect("fixture directory");
+        fs::write(&path, b"existing token").expect("fixture token");
+        assert!(load_or_create_token(&path).is_err());
+        assert!(write_token_atomic(&path, &random_token()).is_err());
+        assert_eq!(fs::read(&path).expect("fixture read"), b"existing token");
+        fs::remove_file(&path).expect("remove fixture");
+        fs::remove_dir(&root).expect("remove directory");
+    }
+
+    #[tokio::test]
+    async fn audit_control_admission_survives_full_generation_capacity() {
+        use tower::ServiceExt;
+        let state = regression_state(Arc::new(SqliteStore::in_memory().expect("store")));
+        let _busy = state
+            .concurrency
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("permit");
+        let _registration =
+            ResponseRegistration::register(&state, "active".into(), RequestId::new())
+                .expect("register");
+        let app = router(state, 8192);
+        let denied = app
+            .clone()
+            .oneshot(http_request(
+                "/v1/responses",
+                json!({"model":"test-model","input":"hello"}),
+            ))
+            .await
+            .expect("generation");
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        let cancel = app
+            .clone()
+            .oneshot(http_request("/v1/responses/active/cancel", json!({})))
+            .await
+            .expect("cancel");
+        assert_eq!(cancel.status(), StatusCode::OK);
+        let mut unauthorized = http_request("/v1/responses/active/cancel", json!({}));
+        unauthorized.headers_mut().remove("authorization");
+        assert_eq!(
+            app.oneshot(unauthorized)
+                .await
+                .expect("unauthorized")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    struct FailingStore;
+    impl ResponseStore for FailingStore {
+        fn put(&self, _: &GatewayResponse) -> Result<(), GatewayError> {
+            Err(loopback_error("disk full"))
+        }
+        fn get(&self, _: &str) -> Result<Option<GatewayResponse>, GatewayError> {
+            Ok(None)
+        }
+        fn delete(&self, _: &str) -> Result<bool, GatewayError> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_stream_does_not_report_stored_success_after_write_failure() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        for streaming in [false, true] {
+            let app = router(regression_state(Arc::new(FailingStore)), 8192);
+            let response = app
+                .oneshot(http_request(
+                    "/v1/responses",
+                    json!({"model":"test-model","input":"hello","store":true,"stream":streaming}),
+                ))
+                .await
+                .expect("response");
+            let status = response.status();
+            let text = String::from_utf8(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("body")
+                    .to_bytes()
+                    .to_vec(),
+            )
+            .expect("utf8");
+            if streaming {
+                assert!(!text.contains("event: response.completed"), "{text}");
+                assert!(text.contains("event: error"), "{text}");
+            } else {
+                assert!(status.is_server_error(), "{text}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_dropping_http_body_releases_response_identity() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let state = regression_state(Arc::new(SqliteStore::in_memory().expect("store")));
+        let app = router(state.clone(), 8192);
+        let response = app
+            .oneshot(http_request(
+                "/v1/responses",
+                json!({"model":"test-model","input":"hello","stream":true}),
+            ))
+            .await
+            .expect("response");
+        let mut body = response.into_body();
+        body.frame().await.expect("created frame").expect("body");
+        assert_eq!(state.active_responses.lock().expect("active").len(), 1);
+        drop(body);
+        assert!(state.active_responses.lock().expect("active").is_empty());
+        assert_eq!(state.concurrency.available_permits(), 1);
+    }
+
+    fn scripted_response(output: Vec<OutputItem>) -> GatewayResponse {
+        GatewayResponse {
+            id: "scripted".into(),
+            request_id: RequestId::new(),
+            model: "test-model".into(),
+            route: fte_types::ResolvedRoute {
+                backend_id: "test-local".into(),
+                model_id: "test-model".into(),
+                display_name: "Test".into(),
+                location: BackendLocation::LocalEmbedded,
+                catalog_version: "test".into(),
+            },
+            output,
+            usage: GatewayUsage::default(),
+            status: TerminalStatus::Completed,
+            previous_response_id: None,
+        }
+    }
+
+    fn scripted_ticket(response: &GatewayResponse, progress: Vec<GatewayEvent>) -> GatewayTicket {
+        let (tx, rx) = mpsc::channel(progress.len() + 2);
+        for event in progress {
+            tx.try_send(event).expect("scripted event");
+        }
+        tx.try_send(GatewayEvent::Completed {
+            request_id: response.request_id.clone(),
+            response: Box::new(response.clone()),
+        })
+        .expect("terminal");
+        drop(tx);
+        let (final_tx, final_rx) = oneshot::channel();
+        final_tx.send(Ok(response.clone())).expect("final");
+        GatewayTicket::new(
+            response.request_id.clone(),
+            rx,
+            final_rx,
+            Arc::new(NoopCancellation),
+            Arc::new(AtomicBool::new(true)),
+        )
+    }
+
+    async fn response_body(response: Response) -> String {
+        use http_body_util::BodyExt;
+        String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+                .to_vec(),
+        )
+        .expect("utf8")
+    }
+
+    #[tokio::test]
+    async fn audit_slow_reader_reports_real_ticket_progress_loss_on_every_edge() {
+        for edge in 0..4 {
+            let response = scripted_response(vec![]);
+            let progress = (0..128)
+                .map(|_| GatewayEvent::TextDelta {
+                    request_id: response.request_id.clone(),
+                    output_index: 0,
+                    content_index: 0,
+                    delta: "x".into(),
+                })
+                .collect();
+            let ticket = scripted_ticket(&response, progress).with_deadlines(
+                fte_types::DeadlinePolicy {
+                    total_ms: Some(1000),
+                    ..Default::default()
+                },
+                Duration::ZERO,
+                32,
+            );
+            // Do not poll the HTTP body until the real bounded ticket adapter
+            // finishes forwarding. This deterministically exhausts its buffer.
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !ticket.events.is_closed() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("ticket finishes without a reader");
+            let state = regression_state(Arc::new(SqliteStore::in_memory().expect("store")));
+            let http = match edge {
+                0 => openai_stream_response(ticket, StreamFlavor::Chat, state),
+                1 => openai_stream_response(ticket, StreamFlavor::Completion, state),
+                2 => openai_responses_stream(ticket, state, false),
+                _ => anthropic_stream(ticket, state, 1),
+            };
+            let text = response_body(http).await;
+            assert!(text.contains("gateway_progress_truncated"), "{text}");
+            assert!(
+                !text.contains("response.completed")
+                    && !text.contains("message_stop")
+                    && !text.contains("\"finish_reason\":\"stop\""),
+                "{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_legacy_streams_preserve_tools_choices_and_reject_wrong_prefixes() {
+        let tool = OutputItem::FunctionCall {
+            id: "tool-1".into(),
+            call_id: "call-1".into(),
+            name: "lookup".into(),
+            arguments: json!({"query":"needle"}),
+        };
+        let response = scripted_response(vec![tool]);
+        let state = || regression_state(Arc::new(SqliteStore::in_memory().expect("store")));
+        let text = response_body(openai_stream_response(
+            scripted_ticket(&response, vec![]),
+            StreamFlavor::Chat,
+            state(),
+        ))
+        .await;
+        assert!(
+            text.contains("tool_calls") && text.contains("lookup") && text.contains("needle"),
+            "{text}"
+        );
+        let messages = ["first", "second"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| OutputItem::Message {
+                id: format!("m{index}"),
+                role: MessageRole::Assistant,
+                content: vec![ContentBlock::Text { text: text.into() }],
+            })
+            .collect();
+        let response = scripted_response(messages);
+        let text = response_body(openai_stream_response(
+            scripted_ticket(&response, vec![]),
+            StreamFlavor::Completion,
+            state(),
+        ))
+        .await;
+        let payload: Value = serde_json::from_str(
+            text.lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("data"),
+        )
+        .expect("json");
+        assert_eq!(payload["choices"][0]["text"], "first");
+        assert_eq!(payload["choices"][1]["text"], "second");
+        assert_eq!(payload["choices"][1]["index"], 1);
+        let wrong = GatewayEvent::TextDelta {
+            request_id: response.request_id.clone(),
+            output_index: 0,
+            content_index: 0,
+            delta: "wrong".into(),
+        };
+        let text = response_body(openai_stream_response(
+            scripted_ticket(&response, vec![wrong]),
+            StreamFlavor::Completion,
+            state(),
+        ))
+        .await;
+        assert!(text.contains("stream_projection_incomplete"), "{text}");
+        assert!(!text.contains("[DONE]"), "{text}");
+    }
 
     fn hosted_loopback_fixture() -> Value {
         serde_json::from_str(include_str!(
@@ -1317,6 +1840,7 @@ mod tests {
         assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn token_creation_and_rotation_are_private_atomic_replacements() {
         let directory =
@@ -1389,6 +1913,7 @@ mod tests {
         fs::remove_dir_all(directory).expect("remove shared directory");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn real_loopback_socket_enforces_security_stream_state_and_storage() {
         let fixture = hosted_loopback_fixture();
@@ -1459,11 +1984,12 @@ mod tests {
         assert_eq!(stream.status(), StatusCode::OK);
 
         let while_streaming = client
-            .get(format!("{base}/healthz"))
+            .post(format!("{base}/v1/responses"))
             .bearer_auth(&token)
+            .json(&fixture["loopback"]["requests"]["responses"])
             .send()
             .await
-            .expect("concurrent request");
+            .expect("concurrent generation request");
         let concurrent_status = while_streaming.status().as_u16();
         assert_eq!(
             u64::from(concurrent_status),
@@ -1627,6 +2153,7 @@ mod tests {
         let _ = fs::remove_file(database_path.with_extension("sqlite3-wal"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_aborts_a_listener_after_a_non_reading_sse_client_exhausts_grace() {
         let gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));

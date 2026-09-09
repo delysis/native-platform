@@ -72,7 +72,9 @@ fn encrypted_document_snapshot(data_dir: &Path) -> Result<EncryptedDocumentSnaps
 fn seed_legacy_consult_panels(data_dir: &Path, panels: Vec<Value>) -> Result<()> {
     const NAMESPACE: &str = "consult-panels.v1";
     let mut key_hasher = Sha256::new();
-    key_hasher.update(b"mom-llama-test-store-key-v1");
+    // Integration dependencies use the ordinary debug-store policy. A path
+    // override no longer grants the release library a deterministic test key.
+    key_hasher.update(b"mom-llama-insecure-development-store-key-v1");
     key_hasher.update(data_dir.to_string_lossy().as_bytes());
     let key: [u8; 32] = key_hasher.finalize().into();
     let nonce = [0xA5_u8; 24];
@@ -1243,55 +1245,13 @@ fn conversation_import_validates_or_safely_assigns_mention_handles() -> Result<(
 }
 
 #[test]
-fn persisted_legacy_handle_collisions_migrate_without_losing_conversation_data() -> Result<()> {
-    let session = TestSession::new("persisted-legacy-handle-collisions")?;
-    let mut older = attributed_history_fixture("legacy-older");
-    older.title = "Older saved chat".to_string();
-    older.created_at = "1".to_string();
-    older.updated_at = "1".to_string();
-    older.execution_profile.mention_handle = "Shared-Lens".to_string();
-    let older_messages = older.messages.clone();
-
-    let mut newer = attributed_history_fixture("legacy-newer");
-    newer.title = "Newer saved chat".to_string();
-    newer.created_at = "2".to_string();
-    newer.updated_at = "2".to_string();
-    newer.execution_profile.mention_handle = "shared-lens".to_string();
-    let newer_messages = newer.messages.clone();
-
-    let legacy = mom_llama_runtime::conversation_store::ConversationDb {
-        conversations: vec![newer, older],
-        selected_conversation_id: Some("legacy-newer".to_string()),
-    };
-    fs::write(
-        session.path().join("conversations.json"),
-        serde_json::to_vec_pretty(&legacy)?,
-    )?;
-
-    mom_llama_runtime::persona_list()?;
-    let conversations = mom_llama_runtime::conversation_list()?
-        .result
-        .ok_or_else(|| anyhow!("migrated conversations missing"))?;
-    let migrated_older = conversations
-        .iter()
-        .find(|conversation| conversation.id == "legacy-older")
-        .ok_or_else(|| anyhow!("older legacy conversation missing"))?;
-    let migrated_newer = conversations
-        .iter()
-        .find(|conversation| conversation.id == "legacy-newer")
-        .ok_or_else(|| anyhow!("newer legacy conversation missing"))?;
-    assert_eq!(
-        migrated_older.execution_profile.mention_handle,
-        "shared-lens"
-    );
-    assert_eq!(
-        migrated_newer.execution_profile.mention_handle,
-        "shared-lens-2"
-    );
-    assert_eq!(migrated_older.messages, older_messages);
-    assert_eq!(migrated_newer.messages, newer_messages);
-    assert_eq!(migrated_older.title, "Older saved chat");
-    assert_eq!(migrated_newer.title, "Newer saved chat");
+fn legacy_plaintext_conversations_are_reported_without_import_or_deletion() -> Result<()> {
+    let session = TestSession::new("legacy-plaintext-refused")?;
+    let path = session.path().join("conversations.json");
+    fs::write(&path, b"private legacy conversation")?;
+    let error = mom_llama_runtime::conversation_list().expect_err("legacy refused");
+    assert!(error.to_string().contains("conversations.json"));
+    assert_eq!(fs::read(path)?, b"private legacy conversation");
     Ok(())
 }
 

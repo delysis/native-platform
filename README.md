@@ -26,12 +26,22 @@ scope changes since the sealed ADR import.
 - `ci/ignored-tests.json` registers every opt-in test with its exact source,
   prerequisite, evidence class, and prohibition on automatic promotion.
 - The Attachment fuzz target is the only deliberately excluded auxiliary
-  Cargo workspace.
+  Cargo workspace. The externally sourced GLib security backport is excluded
+  from first-party workspace membership; see [its patch record](vendor/glib/PATCH.md).
 
 Check the live repository invariants with:
 
 ```text
 cargo run --locked -p xtask -- policy
+```
+
+When a system Cargo installation precedes rustup on PATH, select the whole
+toolchain before running these commands:
+
+```sh
+export PATH="$(dirname "$(rustup which --toolchain 1.92.0 cargo)"):$PATH"
+rustc --version
+cargo clippy --version
 ```
 
 Then test and lint only the affected package group during normal development:

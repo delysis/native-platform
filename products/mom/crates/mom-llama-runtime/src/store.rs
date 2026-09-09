@@ -220,6 +220,7 @@ impl RuntimeStore {
     }
 
     pub(crate) fn open(data_dir: &Path) -> Result<Self> {
+        reject_legacy_plaintext(data_dir)?;
         fs::create_dir_all(data_dir)?;
         let key = resolve_store_key(data_dir)?;
         Self::open_with_key(data_dir, key)
@@ -234,6 +235,7 @@ impl RuntimeStore {
         key: [u8; 32],
         before_creation: impl FnOnce(),
     ) -> Result<Self> {
+        reject_legacy_plaintext(data_dir)?;
         fs::create_dir_all(data_dir)?;
         let store = Self {
             path: data_dir.join(DATABASE_FILE),
@@ -288,6 +290,17 @@ impl RuntimeStore {
     where
         T: DeserializeOwned,
     {
+        self.get_disposable_cache_with_members(namespace, None)
+    }
+
+    pub(crate) fn get_disposable_cache_with_members<T>(
+        &self,
+        namespace: &str,
+        member_prefix: Option<&str>,
+    ) -> Result<Option<T>>
+    where
+        T: DeserializeOwned,
+    {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let encrypted = transaction
@@ -318,10 +331,28 @@ impl RuntimeStore {
                     "DELETE FROM encrypted_documents WHERE namespace = ?1",
                     [namespace],
                 )?;
+                if let Some(prefix) = member_prefix {
+                    transaction.execute("DELETE FROM encrypted_documents WHERE substr(namespace, 1, length(?1)) = ?1", [prefix])?;
+                }
                 transaction.commit()?;
                 Ok(None)
             }
         }
+    }
+
+    pub(crate) fn clear_cache_family(&self, namespace: &str, member_prefix: &str) -> Result<usize> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = transaction.execute(
+            "DELETE FROM encrypted_documents WHERE substr(namespace, 1, length(?1)) = ?1",
+            [member_prefix],
+        )?;
+        transaction.execute(
+            "DELETE FROM encrypted_documents WHERE namespace = ?1",
+            [namespace],
+        )?;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     pub(crate) fn put<T>(&self, namespace: &str, value: &T) -> Result<()>
@@ -406,13 +437,6 @@ impl RuntimeStore {
         }
         transaction.commit()?;
         Ok(())
-    }
-
-    pub(crate) fn delete(&self, namespace: &str) -> Result<bool> {
-        Ok(self.connection()?.execute(
-            "DELETE FROM encrypted_documents WHERE namespace = ?1",
-            [namespace],
-        )? > 0)
     }
 
     pub(crate) fn mutate<T, R>(
@@ -618,28 +642,6 @@ impl RuntimeStore {
         read(&snapshot)
     }
 
-    pub(crate) fn import_json_once<T>(&self, namespace: &str, legacy_path: &Path) -> Result<bool>
-    where
-        T: Serialize + DeserializeOwned,
-    {
-        if self.get::<T>(namespace)?.is_some() || !legacy_path.is_file() {
-            return Ok(false);
-        }
-        let raw = fs::read(legacy_path)?;
-        let value = serde_json::from_slice::<T>(&raw)
-            .with_context(|| format!("failed to import {}", legacy_path.display()))?;
-        self.put(namespace, &value)?;
-        let round_trip = self
-            .get::<T>(namespace)?
-            .ok_or_else(|| anyhow!("encrypted legacy import did not round-trip"))?;
-        let expected = serde_json::to_vec(&value)?;
-        let actual = serde_json::to_vec(&round_trip)?;
-        if expected != actual {
-            return Err(anyhow!("encrypted legacy import changed serialized data"));
-        }
-        Ok(true)
-    }
-
     pub(crate) fn write_receipt<T>(
         &self,
         receipt_id: &str,
@@ -652,7 +654,7 @@ impl RuntimeStore {
         let namespace = format!("receipt:{receipt_id}");
         let (nonce, ciphertext) = self.encrypt_json(&namespace, receipt)?;
         self.connection()?.execute(
-            "INSERT OR REPLACE INTO receipts(receipt_id, command_id, nonce, ciphertext, created_at)
+            "INSERT INTO receipts(receipt_id, command_id, nonce, ciphertext, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![receipt_id, command_id, nonce, ciphertext, timestamp_i64()],
         )?;
@@ -764,18 +766,36 @@ fn disposable_cache_quarantine_namespace(
     )
 }
 
+const LEGACY_PLAINTEXT_FILES: &[&str] = &[
+    "conversations.json",
+    "drafts.json",
+    "attachments.json",
+    "mcp-servers.json",
+    "skills.json",
+];
+
+fn reject_legacy_plaintext(data_dir: &Path) -> Result<()> {
+    for name in LEGACY_PLAINTEXT_FILES {
+        let path = data_dir.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => anyhow::bail!(
+                "Unsupported legacy plaintext store at {}. Move this file out of the product directory before opening the current encrypted store; automatic migration is not supported.",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn resolve_store_key(data_dir: &Path) -> Result<[u8; 32]> {
-    // Unit tests share one process and may exercise the public test data-dir
-    // override concurrently.  Store identity must follow the explicit path,
-    // not the instantaneous value of that unrelated process-global switch.
-    // `cfg!(test)` is immutable for this binary and keeps every unit-test open
-    // on the same deterministic key derivation.
-    let deterministic_test_store =
-        deterministic_test_store(crate::config::data_dir_override_is_set());
+    // Only this crate's unit-test binary may derive its fixture key. Changing
+    // a data directory never changes the credential policy of a release build.
     if let Some(key) = configured_store_key(
         data_dir,
         std::env::var(STORE_KEY_ENV).ok().as_deref(),
-        deterministic_test_store,
+        cfg!(test),
         crate::config::insecure_development_store_enabled(),
     )? {
         return Ok(key);
@@ -794,10 +814,6 @@ fn resolve_store_key(data_dir: &Path) -> Result<[u8; 32]> {
             "Set LLAMA_NATIVE_KIT_STORE_KEY_HEX on platforms without a supported OS credential store"
         ))
     }
-}
-
-const fn deterministic_test_store(data_dir_override_is_set: bool) -> bool {
-    cfg!(test) || data_dir_override_is_set
 }
 
 fn configured_store_key(
@@ -936,10 +952,9 @@ fn decode_hex_key(input: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation_store::{CONVERSATIONS_NAMESPACE, Conversation, ConversationDb};
+    use crate::conversation_store::{Conversation, ConversationDb};
     use llama_native_cache::PrefixCacheValue;
     use serde::{Deserialize, Serialize};
-    use std::collections::BTreeMap;
 
     #[test]
     fn journal_mode_contention_retries_after_releasing_the_failed_connection() -> Result<()> {
@@ -1123,26 +1138,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn unit_test_key_selection_does_not_depend_on_the_mutable_data_dir_override() {
-        assert!(deterministic_test_store(false));
-        assert!(deterministic_test_store(true));
-    }
-
     #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
     struct SecretDocument {
         values: Vec<String>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct W1PriorStoreFixture {
-        schema: String,
-        fixture_key_hex: String,
-        credential_scope: String,
-        physical_schema: String,
-        logical_versions: BTreeMap<String, String>,
-        import_namespace: String,
-        conversation: Conversation,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1154,14 +1152,6 @@ mod tests {
         authoritative_conversation: Conversation,
         tampered_ciphertext_hex: String,
         native_prefix_disposition: String,
-    }
-
-    struct RemovePlaintextOnDrop(PathBuf);
-
-    impl Drop for RemovePlaintextOnDrop {
-        fn drop(&mut self) {
-            let _ = fs::remove_file(&self.0);
-        }
     }
 
     fn test_dir(name: &str) -> PathBuf {
@@ -1483,110 +1473,39 @@ mod tests {
     }
 
     #[test]
-    fn prior_logical_store_import_cleans_plaintext_and_reopens_with_fixture_only_key() -> Result<()>
-    {
-        let fixture_bytes = include_bytes!("../fixtures/compat/prior-store-v1.json");
-        assert_eq!(
-            format!("{:x}", Sha256::digest(fixture_bytes)),
-            "7e44507f4ee444becf112ed1853e9cfb301618aadac19b1909a41cacf95c6ccf"
-        );
-        let fixture: W1PriorStoreFixture = serde_json::from_slice(fixture_bytes)?;
-        assert_eq!(
-            fixture.schema,
-            "mom_llama.w1.redacted_logical_store_import_fixture.v1"
-        );
-        assert_eq!(
-            fixture.credential_scope,
-            "deterministic_fixture_only_not_personal_keychain"
-        );
-        assert_eq!(
-            fixture.physical_schema,
-            "runtime.sqlite3/encrypted_documents.v1"
-        );
-        assert_eq!(fixture.import_namespace, CONVERSATIONS_NAMESPACE);
-        assert_eq!(
-            fixture
-                .logical_versions
-                .get("conversations")
-                .map(String::as_str),
-            Some(CONVERSATIONS_NAMESPACE)
-        );
-        assert_eq!(
-            fixture.logical_versions.get("drafts").map(String::as_str),
-            Some("drafts.v2")
-        );
-        assert_eq!(
-            fixture
-                .logical_versions
-                .get("attachments")
-                .map(String::as_str),
-            Some("mom_llama.attachments.v3")
-        );
-        assert_eq!(
-            fixture.logical_versions.get("personas").map(String::as_str),
-            Some("personas.v1")
-        );
+    fn legacy_plaintext_is_refused_before_database_creation() -> Result<()> {
+        for name in LEGACY_PLAINTEXT_FILES {
+            let dir = test_dir(name);
+            fs::create_dir_all(&dir)?;
+            let path = dir.join(name);
+            fs::write(&path, b"private legacy source")?;
+            let error = RuntimeStore::open_with_key(&dir, [7; 32])
+                .err()
+                .expect("legacy refused");
+            assert!(error.to_string().contains(name));
+            assert_eq!(fs::read(&path)?, b"private legacy source");
+            assert!(!dir.join(DATABASE_FILE).exists());
+            fs::remove_dir_all(dir)?;
+        }
+        Ok(())
+    }
 
-        let data_dir = test_dir("w1-prior-store");
-        fs::create_dir_all(&data_dir)?;
-        let legacy_path = data_dir.join("conversations.json");
-        let _plaintext_cleanup = RemovePlaintextOnDrop(legacy_path.clone());
-        let expected = ConversationDb {
-            conversations: vec![fixture.conversation],
-            selected_conversation_id: Some("mom-w1-prior-store".to_string()),
-        };
-        fs::write(&legacy_path, serde_json::to_vec_pretty(&expected)?)?;
-        let key = decode_hex_key(&fixture.fixture_key_hex)?;
-        let store = RuntimeStore::open_with_key(&data_dir, key)?;
-        assert!(store.import_json_once::<ConversationDb>(CONVERSATIONS_NAMESPACE, &legacy_path)?);
-        assert_eq!(
-            store.get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?,
-            Some(expected.clone())
-        );
+    #[test]
+    fn receipts_cannot_overwrite_an_existing_identity() -> Result<()> {
+        let dir = test_dir("receipt-insert-only");
+        let store = RuntimeStore::open_with_key(&dir, [7; 32])?;
+        store.write_receipt("same", "first", &"original")?;
         assert!(
-            !store.import_json_once::<ConversationDb>(CONVERSATIONS_NAMESPACE, &legacy_path)?,
-            "import must be idempotent once the encrypted document exists"
-        );
-        fs::remove_file(&legacy_path)?;
-        assert!(
-            !legacy_path.exists(),
-            "the plaintext import artifact must not remain beside the encrypted store"
-        );
-
-        drop(store);
-        let reopened = RuntimeStore::open_with_key(&data_dir, key)?;
-        assert_eq!(
-            reopened.get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?,
-            Some(expected.clone())
-        );
-        let wrong_key = RuntimeStore::open_with_key(&data_dir, [0x43; 32])?;
-        assert!(
-            wrong_key
-                .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)
+            store
+                .write_receipt("same", "second", &"replacement")
                 .is_err()
         );
-        let database = fs::read(reopened.path())?;
-        let redacted_content = expected.conversations[0].messages[0].content.as_bytes();
-        assert!(
-            !database
-                .windows(redacted_content.len())
-                .any(|window| window == redacted_content)
-        );
-        let connection = Connection::open(reopened.path())?;
-        let user_version: i64 =
-            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        assert_eq!(user_version, STORE_SCHEMA_VERSION);
-        let encrypted_rows: i64 = connection.query_row(
-            "SELECT COUNT(*) FROM encrypted_documents WHERE namespace = ?1",
-            [CONVERSATIONS_NAMESPACE],
+        let command: String = store.connection()?.query_row(
+            "SELECT command_id FROM receipts WHERE receipt_id = 'same'",
+            [],
             |row| row.get(0),
         )?;
-        assert_eq!(encrypted_rows, 1);
-
-        assert_eq!(
-            reopened.get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?,
-            Some(expected)
-        );
+        assert_eq!(command, "first");
         Ok(())
     }
 

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod lean;
+mod model_check;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -23,8 +24,9 @@ fn main() -> Result<()> {
     let command = arguments.next().unwrap_or_else(|| "policy".to_owned());
     match command.as_str() {
         "policy" => check_policy(&workspace_root()),
+        "model-check" => model_check::run(&workspace_root(), &arguments.collect::<Vec<_>>()),
         "lean" => lean::run(&workspace_root(), arguments.collect()),
-        _ => bail!("usage: cargo xtask <policy|lean>"),
+        _ => bail!("usage: cargo xtask <policy|lean|model-check>"),
     }
 }
 
@@ -51,9 +53,13 @@ fn check_workspace(root: &Path) -> Result<()> {
         cargo["workspace"]["exclude"]
             .as_array()
             .is_some_and(|exclude| {
-                exclude.len() == 1 && exclude[0].as_str() == Some("crates/services/attachment/fuzz")
+                exclude
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<BTreeSet<_>>()
+                    == BTreeSet::from(["crates/services/attachment/fuzz", "vendor/glib"])
             }),
-        "only the Attachment fuzz workspace may be excluded"
+        "only the Attachment fuzz workspace and the patched external GLib crate may be excluded"
     );
 
     let output = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
@@ -248,7 +254,7 @@ fn check_git_dependencies(value: &toml::Value, manifest: &Path) -> Result<()> {
                 );
                 ensure!(
                     table.get("rev").and_then(toml::Value::as_str)
-                        == Some("a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"),
+                        == Some("eb0e47b57c2fba97ed13e8fe5e949d11798232cb"),
                     "unsealed llama-cpp-rs dependency: {}",
                     manifest.display()
                 );

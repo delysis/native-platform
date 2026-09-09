@@ -1,91 +1,69 @@
 # CI policy
 
-The shell gate is authority-free and deterministic. It checks formatting,
-compilation, tests, strict Clippy, the pnpm lock, live workspace topology,
-package-group coverage, and the external Git allowlist. Historical migration
-receipts, seal hashes, and ADR snapshots remain readable provenance but do not
-gate ordinary changes. The shell gate does not contact product repositories,
-load models, use credentials, exercise real hardware, or establish a product
-claim.
+Use focused package tests while changing code, then one combined workspace gate
+when the patch settles. Formatting, source inspection, and a test listing do
+not establish runtime behavior. A fixture-backed test establishes only the
+boundary it actually exercises.
 
-Every future package belongs to exactly one declared package group. Portable,
-platform, and product checks may be required for ordinary pull requests.
-Research, diagnostic, and real-hardware jobs must be separately named and may
-not be treated as substitutes for operational acceptance.
+## Pull requests
 
-## Ignored-test registry
+The PR planner uses locked Cargo metadata and reverse dependencies to select
+changed packages and their consumers. Asset and platform rules live in
+`ci/ci-path-exceptions.json`; missing metadata or unknown paths select full
+coverage. The legacy `dependency_shadow` comparison remains a conservative
+fallback for PR selection. It is not runtime evidence.
 
-`ci/ignored-tests.json` is the machine-readable inventory of opt-in tests. Each
-entry binds the exact Cargo test ID to a workspace package, source file, exact
-Cargo target identity, and explicit platform availability. Target records are
-validated against locked Cargo metadata by package, target name, target kinds,
-target source, and manifest. Entries also state their prerequisite and evidence
-class and explicitly record what that test cannot promote. The [registry](../ci/ignored-tests.json) is the current test inventory and records each test's supported platforms.
+Normal tests require no model downloads, account credentials, or hosted-provider
+access. Opt-in tests are indexed in `ci/ignored-tests.json`. The registry binds
+package, exact target and test ID, prerequisites, and supported platforms.
+`validate-ignored-tests.mjs --cargo-list` reconciles compiled harness listings;
+listing establishes inventory only. The source/build-script guards constrain
+that listing operation, not trusted compiler or native-toolchain behavior.
 
-The structural validator runs in ordinary policy CI. Ignored tests must use the
-canonical private `fn` or `async fn` form, an explicit `#[test]` or
-`#[tokio::test(...)]`, and `#[ignore = "reason"]`. Conditional, public, and
-macro-generated ignore syntax is rejected. Comments and strings are tokenized
-as non-code, not counted as test declarations. Workspace manifests may not
-configure custom Cargo harnesses. Crate-level `no_main`, custom test framework,
-test-runner, generated harness-main, `include!`, and workspace proc-macro paths
-are rejected, including raw-identifier and conditional forms. Every workspace
-build script is bound to an explicitly reviewed SHA-256.
+## Full CI
 
-Every Cargo metadata target with `test = true` has its root guarded regardless
-of filename extension. The root must be an absolute regular nonsymlink file
-whose lexical and resolved paths remain inside both its workspace package and
-the repository; it is token-scanned and included in the pre/post-build source
-snapshot.
+`ci-full.yml` runs the workspace once on each of Linux, macOS, and Windows:
+all targets and doctests, with strict Clippy on Linux. This covers the products
+and services without rebuilding them in redundant product/group jobs. macOS
+also runs the WebKit browser suite and packages Loom and FTE using that job's
+existing Rust target directory. The separate frontend job runs only frontend
+commands; it does not recursively invoke product Rust build scripts.
 
-Every Rust source, Cargo manifest or lock, build script, proc-macro source,
-toolchain file, and Cargo configuration change selects exact reconciliation.
-The blocking pull-request job is a Linux, macOS, and Windows matrix, and full CI
-also reconciles on all three operating systems. Each lane builds test harnesses
-with locked `cargo test --no-run --message-format=json-render-diagnostics`
-through `rustup run 1.92.0`, independent of the ambient `cargo` on `PATH`.
-Compiler identity is recorded. The guard rejects override keys for Cargo,
-rustc, rustdoc, Rust compiler wrappers, `RUSTC_BOOTSTRAP`, Cargo build targets,
-target runners and linkers, Rustflags, Rustdoc flags, and the named loader
-variables below. It does not sandbox native-toolchain discovery: `PATH`, `CC`,
-`CXX`, `CMAKE`, and `LDFLAGS` remain trusted inputs. The guarded source set,
-manifests, build scripts, lock, toolchain, registry, and Cargo configuration are
-hashed before the build and must remain unchanged afterward.
+The `model-integration` job downloads one immutable Qwen3 0.6B CPU fixture and
+verifies its SHA-256. `cargo run --locked -p xtask -- model-check MODEL SHA256
+PACKAGE TEST_ID ...` lists the exact registered test and requires one executed
+passing test, with no ignored or filtered-zero substitute. The runner resolves
+Rust 1.92 rustc and rustdoc explicitly. Its selected saved-prefix and strict
+pre-cancellation checks do not establish Metal, other model families, operating
+system credentials, or a packaged user journey.
 
-Loader rejection covers ambient and Cargo-configured `LD_PRELOAD`, `LD_AUDIT`,
-`LD_LIBRARY_PATH`, and every `DYLD_*` variable. These checks run before Cargo
-metadata and again before compilation and guarded listing.
+The Attachment fuzz job executes `inspect` and `pipeline` with 60 seconds per
+target, a ten-second input timeout, and a 2 GiB memory limit. Crashing inputs are
+uploaded on failure. It uses the independent, locked fuzz workspace. A bounded
+fuzz run is not proof that arbitrary inputs are safe.
 
-Cargo test-profile artifacts must be regular nonsymlink files inside Cargo's
-metadata target directory. They are hashed, invoked from an empty temporary
-working directory with only `--ignored --list`, bounded by a 30-second timeout,
-hard-terminated on timeout, then hashed again. The resulting full test ID and
-real Cargo target tuple is reconciled against the expected current-platform
-subset. This gate records that
-Cargo requested rustc test mode and that the validator supplied list arguments;
-it does not claim cryptographic proof of stock libtest or that trusted compiler,
-build-script, proc-macro, linker, or loader code cannot misbehave. It never
-requests an ignored test body and cannot promote runtime or product evidence.
+Every job listed by `full-summary` must succeed. Failure, cancellation, or an
+unexpected skipped job fails the aggregate. Product absence is not an excuse
+to skip a declared workspace member.
 
-## Metadata reverse-dependency selection
+## Dependencies and platform qualification
 
-The PR plan derives changed workspace packages and their complete local reverse
-closure from locked Cargo metadata. Resolved edges are conservatively unioned
-with declared local path edges so optional and target-specific consumers cannot
-silently disappear. Only evidenced non-graph asset, platform, workspace, and
-workflow rules remain in `ci/ci-path-exceptions.json`. Unknown paths, incomplete
-metadata, and Cargo metadata failure force the complete plan.
+`dependencies.yml` runs daily and for relevant manifest, lock, policy, or vendor
+changes. Hash-pinned cargo-deny checks both Rust locks for advisories, licenses,
+and permitted sources; pnpm checks the actual JavaScript lock. Maintenance-only
+exceptions name their reason and review date in `deny.toml`. GLib's compatible
+security backport has a source/patch record in `vendor/glib/PATCH.md`; its real
+iterator tests run with optimization on Linux.
 
-`dependency_selection` records the applied graph, changed packages, closure,
-file classes, and fallback reasons. `dependency_shadow` retains the frozen
-legacy path planner as an observational equivalence report. If generated jobs,
-frontend sublanes, or macOS matrix entries are less conservative than that
-baseline without an explicit exception record, the applied plan becomes full.
-Required workflow job names and matrices are frozen by
-`ci/ci-workflow-snapshot.json`.
+There is one first-party Cargo workspace and root lock plus the independent
+Attachment fuzz workspace/lock. The external GLib patch is not a first-party
+workspace member. External llama bindings use an exact Git revision. Historical
+migration receipts and seals do not gate ordinary changes.
 
-There is one root Rust toolchain declaration, one Cargo workspace, one root
-Cargo lockfile, and one root pnpm workspace lockfile. CI uses locked dependency
-resolution, rejects first-party Git dependencies, and pins the one permitted
-external FFI dependency to its reviewed revision. It does not consult the
-migration ledger.
+macOS remains the product-acceptance target. Linux and Windows checks establish
+only their executed capabilities. Unsupported private Information storage and
+FTE database/token storage return errors before reading or creating state;
+non-Unix tests assert that boundary, while portable protocol/schema tests remain
+enabled. No platform is certified by compiling it. Signing, OS credentials,
+loaded-model shutdown, and visible packaged interactions require their own
+current evidence.

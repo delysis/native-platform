@@ -2,7 +2,7 @@ use crate::config::{KvCachePolicy, Settings};
 use crate::engine::{ValidationBlocker, validate_model_path};
 use crate::receipts::Blocker;
 use crate::store::{DocumentMutations, DocumentSnapshot};
-use llama_native_cache::PrefixCacheValue;
+use llama_native_cache::{PrefixCacheMetadata, PrefixCacheValue};
 use llama_native_engine::NativeModelHandle;
 use llama_native_host::{
     HostCachePolicy, NativeHost, NativeHostConfig, PrefixCachePromotionLease, PrefixCacheStore,
@@ -10,6 +10,7 @@ use llama_native_host::{
 };
 use llama_native_types::{NativeError, NativeErrorCode, NativeModelConfig, ResidentModelStatus};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -181,6 +182,14 @@ impl ProductPrefixCacheStore {
     fn document(namespace: &str) -> String {
         format!("native-host-prefix-cache.{namespace}")
     }
+
+    fn entry(namespace: &str, id: &str) -> String {
+        format!(
+            "{}.entry.{:x}",
+            Self::document(namespace),
+            Sha256::digest(id.as_bytes())
+        )
+    }
 }
 
 pub(crate) fn persona_native_cache_ids_from_snapshot(
@@ -188,7 +197,7 @@ pub(crate) fn persona_native_cache_ids_from_snapshot(
     owner_id: &str,
 ) -> anyhow::Result<Vec<String>> {
     let values = snapshot
-        .get::<Vec<PrefixCacheValue>>(&ProductPrefixCacheStore::document(
+        .get::<Vec<PrefixCacheMetadata>>(&ProductPrefixCacheStore::document(
             PRODUCT_PREFIX_CACHE_NAMESPACE,
         ))?
         .unwrap_or_default();
@@ -200,7 +209,7 @@ pub(crate) fn persona_native_cache_ids_from_documents(
     owner_id: &str,
 ) -> anyhow::Result<Vec<String>> {
     let values = documents
-        .get::<Vec<PrefixCacheValue>>(&ProductPrefixCacheStore::document(
+        .get::<Vec<PrefixCacheMetadata>>(&ProductPrefixCacheStore::document(
             PRODUCT_PREFIX_CACHE_NAMESPACE,
         ))?
         .unwrap_or_default();
@@ -213,19 +222,25 @@ pub(crate) fn remove_persona_native_cache_from_documents(
 ) -> anyhow::Result<Vec<String>> {
     let namespace = ProductPrefixCacheStore::document(PRODUCT_PREFIX_CACHE_NAMESPACE);
     let mut values = documents
-        .get::<Vec<PrefixCacheValue>>(&namespace)?
+        .get::<Vec<PrefixCacheMetadata>>(&namespace)?
         .unwrap_or_default();
     let removed = prefix_cache_ids_for_owner(&values, owner_id);
-    values.retain(|value| value.metadata.owner_id.as_deref() != Some(owner_id));
+    for id in &removed {
+        documents.delete(&ProductPrefixCacheStore::entry(
+            PRODUCT_PREFIX_CACHE_NAMESPACE,
+            id,
+        ));
+    }
+    values.retain(|value| value.owner_id.as_deref() != Some(owner_id));
     documents.put_bytes(&namespace, &serde_json::to_vec(&values)?)?;
     Ok(removed)
 }
 
-fn prefix_cache_ids_for_owner(values: &[PrefixCacheValue], owner_id: &str) -> Vec<String> {
+fn prefix_cache_ids_for_owner(values: &[PrefixCacheMetadata], owner_id: &str) -> Vec<String> {
     let mut ids = values
         .iter()
-        .filter(|value| value.metadata.owner_id.as_deref() == Some(owner_id))
-        .map(|value| value.metadata.id.clone())
+        .filter(|value| value.owner_id.as_deref() == Some(owner_id))
+        .map(|value| value.id.clone())
         .collect::<Vec<_>>();
     ids.sort();
     ids
@@ -250,45 +265,51 @@ pub(crate) fn invalidate_loaded_native_cache_owner(owner_id: &str) -> anyhow::Re
 }
 
 impl PrefixCacheStore for ProductPrefixCacheStore {
-    fn load(&self, namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
+    fn list(&self, namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
         self.store
-            .get_disposable_cache(&Self::document(namespace))
+            .get_disposable_cache_with_members(
+                &Self::document(namespace),
+                Some(&format!("{}.entry.", Self::document(namespace))),
+            )
             .map(|values| values.unwrap_or_default())
             .map_err(prefix_store_error)
     }
 
-    fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
-        let document = Self::document(namespace);
+    fn load_entry(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<PrefixCacheValue>, NativeError> {
         self.store
-            .mutate_documents(
-                &document,
-                Vec::<PrefixCacheValue>::new,
-                |values, documents| {
-                    if let Some(owner_id) = value.metadata.owner_id.as_deref()
-                        && crate::personas::persona_cache_owner_is_removed_from_documents(
-                            documents, owner_id,
-                        )?
-                    {
-                        anyhow::bail!(
-                            "refusing to restore cache authority for removed Persona owner {owner_id}"
-                        );
-                    }
-                    values.retain(|candidate| candidate.metadata.id != value.metadata.id);
-                    values.push(value.clone());
-                    values.sort_by_key(|candidate| candidate.metadata.last_used_at_ms);
-                    while values.len() > PERSISTENT_PREFIX_CACHE_MAX_ENTRIES
-                        || values
-                            .iter()
-                            .map(|candidate| candidate.metadata.state_bytes)
-                            .sum::<usize>()
-                            > PERSISTENT_PREFIX_CACHE_MAX_BYTES
-                    {
-                        values.remove(0);
-                    }
-                    Ok(())
-                },
-            )
+            .get_disposable_cache(&Self::entry(namespace, id))
             .map_err(prefix_store_error)
+    }
+
+    fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
+        if !value.is_valid() {
+            return Err(NativeError::new(
+                NativeErrorCode::CacheIncompatible,
+                "refusing an invalid persistent prefix",
+            ));
+        }
+        self.store.mutate_documents(&Self::document(namespace), Vec::<PrefixCacheMetadata>::new, |entries, documents| {
+            if let Some(owner_id) = value.metadata.owner_id.as_deref()
+                && crate::personas::persona_cache_owner_is_removed_from_documents(documents, owner_id)?
+            { anyhow::bail!("refusing to restore cache authority for removed Persona owner {owner_id}"); }
+            entries.retain(|entry| entry.id != value.metadata.id);
+            entries.push(value.metadata.clone());
+            entries.sort_by_key(|entry| entry.last_used_at_ms);
+            while entries.len() > PERSISTENT_PREFIX_CACHE_MAX_ENTRIES
+                || entries.iter().try_fold(0_usize, |total, entry| total.checked_add(entry.state_bytes))
+                    .is_none_or(|bytes| bytes > PERSISTENT_PREFIX_CACHE_MAX_BYTES) {
+                let removed = entries.remove(0);
+                documents.delete(&Self::entry(namespace, &removed.id));
+            }
+            if entries.iter().any(|entry| entry.id == value.metadata.id) {
+                documents.put_bytes(&Self::entry(namespace, &value.metadata.id), &serde_json::to_vec(value)?)?;
+            }
+            Ok(())
+        }).map_err(prefix_store_error)
     }
 
     fn acquire_owner_promotion_lease(
@@ -307,24 +328,26 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
     }
 
     fn delete(&self, namespace: &str, id: &str) -> Result<(), NativeError> {
-        let document = Self::document(namespace);
         self.store
-            .mutate(&document, Vec::<PrefixCacheValue>::new, |values| {
-                values.retain(|candidate| candidate.metadata.id != id);
-                Ok(())
-            })
+            .mutate_documents(
+                &Self::document(namespace),
+                Vec::<PrefixCacheMetadata>::new,
+                |entries, documents| {
+                    entries.retain(|entry| entry.id != id);
+                    documents.delete(&Self::entry(namespace, id));
+                    Ok(())
+                },
+            )
             .map_err(prefix_store_error)
     }
 
     fn clear(&self, namespace: &str) -> Result<usize, NativeError> {
-        let document = Self::document(namespace);
-        let entries = self
-            .store
-            .get_disposable_cache::<Vec<PrefixCacheValue>>(&document)
-            .map_err(prefix_store_error)?
-            .map_or(0, |values| values.len());
-        self.store.delete(&document).map_err(prefix_store_error)?;
-        Ok(entries)
+        self.store
+            .clear_cache_family(
+                &Self::document(namespace),
+                &format!("{}.entry.", Self::document(namespace)),
+            )
+            .map_err(prefix_store_error)
     }
 }
 
@@ -882,6 +905,61 @@ mod tests {
             memory_reservation(4 * 1024 * mib, 500 * mib),
             6 * 1024 * mib + 500 * mib
         );
+    }
+
+    #[test]
+    fn changing_one_prefix_keeps_other_encrypted_payload_bytes_unchanged() {
+        let dir =
+            std::env::temp_dir().join(format!("mom-prefix-entry-cost-{}", uuid::Uuid::new_v4()));
+        let store = crate::store::RuntimeStore::open_with_key(&dir, [19; 32]).expect("store");
+        let path = store.path().to_path_buf();
+        let cache = ProductPrefixCacheStore { store };
+        let mut first = cache_value();
+        let mut second = first.clone();
+        second.metadata.id = "second".into();
+        cache.save("cost", &first).expect("first");
+        cache.save("cost", &second).expect("second");
+        let snapshot = || {
+            let db = rusqlite::Connection::open(&path).expect("db");
+            let mut query = db
+                .prepare("SELECT namespace, ciphertext FROM encrypted_documents ORDER BY namespace")
+                .expect("query");
+            query
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .expect("rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("snapshot")
+        };
+        let before = snapshot();
+        assert_eq!(
+            before.len(),
+            3,
+            "one small index and two independently encrypted entries"
+        );
+        first.metadata.last_used_at_ms += 1;
+        cache.save("cost", &first).expect("update");
+        let after = snapshot();
+        assert_eq!(
+            before
+                .iter()
+                .zip(&after)
+                .filter(|(old, new)| old == new)
+                .count(),
+            1,
+            "the unrelated encrypted payload must not be rewritten"
+        );
+        assert_eq!(
+            cache.load_entry("cost", "second").expect("exact read"),
+            Some(second)
+        );
+        assert_eq!(cache.clear("cost").expect("clear"), 2);
+        assert!(
+            snapshot().is_empty(),
+            "clear atomically removes metadata and every payload"
+        );
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]

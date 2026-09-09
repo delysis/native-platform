@@ -9,7 +9,6 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use uuid::Uuid;
 
-const SKILLS_FILE: &str = "skills.json";
 pub(crate) const SKILLS_NAMESPACE: &str = "skills.v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -71,7 +70,6 @@ pub fn skill_create(
     };
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    store.import_json_once::<SkillDb>(SKILLS_NAMESPACE, &settings.data_dir.join(SKILLS_FILE))?;
     store.mutate(SKILLS_NAMESPACE, SkillDb::default, |db: &mut SkillDb| {
         db.skills.insert(0, skill.clone());
         Ok(())
@@ -109,7 +107,6 @@ pub fn skill_update(
     }
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    store.import_json_once::<SkillDb>(SKILLS_NAMESPACE, &settings.data_dir.join(SKILLS_FILE))?;
     let updated = store.mutate(SKILLS_NAMESPACE, SkillDb::default, |db: &mut SkillDb| {
         let Some(skill) = db.skills.iter_mut().find(|skill| skill.id == skill_id) else {
             return Ok(None);
@@ -213,7 +210,6 @@ pub fn skill_apply(
 pub fn load_skill_db() -> Result<SkillDb> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    store.import_json_once::<SkillDb>(SKILLS_NAMESPACE, &settings.data_dir.join(SKILLS_FILE))?;
     Ok(store.get(SKILLS_NAMESPACE)?.unwrap_or_default())
 }
 

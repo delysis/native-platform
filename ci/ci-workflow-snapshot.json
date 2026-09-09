@@ -24,8 +24,15 @@
       "fuzz-build",
       "ci-required"
     ],
-    "command_matrix": ["test", "clippy"],
-    "ignored_test_os_matrix": ["ubuntu-latest", "macos-latest", "windows-latest"],
+    "command_matrix": [
+      "test",
+      "clippy"
+    ],
+    "ignored_test_os_matrix": [
+      "ubuntu-latest",
+      "macos-latest",
+      "windows-latest"
+    ],
     "macos_component_superset": [
       "release",
       "root",
@@ -39,18 +46,17 @@
   "full": {
     "workflow_name": "ci-full",
     "job_ids": [
-      "inventory",
       "root",
-      "attachment",
-      "information-portable",
-      "speech",
-      "mom",
-      "loom",
       "frontend",
       "policy-and-graphs",
       "fuzz-build",
+      "model-integration",
       "full-summary"
     ],
-    "os_matrix": ["ubuntu-latest", "macos-latest", "windows-latest"]
+    "os_matrix": [
+      "ubuntu-latest",
+      "macos-latest",
+      "windows-latest"
+    ]
   }
 }

@@ -21,7 +21,6 @@ use std::time::{Duration, Instant};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use uuid::Uuid;
 
-const MCP_SERVERS_FILE: &str = "mcp-servers.json";
 const MCP_SERVERS_NAMESPACE: &str = "mcp-servers.v2";
 const MCP_TOOL_CATALOG_NAMESPACE: &str = "mcp-tool-catalog.v1";
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
@@ -52,6 +51,8 @@ const MANAGED_MCP_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct McpServerConfig {
     pub name: String,
     pub command: PathBuf,
+    #[serde(default)]
+    pub executable_sha256: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default = "default_true")]
@@ -268,10 +269,12 @@ pub fn mcp_configure(
             blocker,
         ));
     }
+    let (identity, _) = read_mcp_command_identity(&command, false)?;
     let mut db = load_mcp_db()?;
     let config = McpServerConfig {
         name: name.trim().to_string(),
-        command,
+        command: identity.canonical_path,
+        executable_sha256: Some(identity.sha256),
         args,
         enabled,
     };
@@ -1137,10 +1140,6 @@ pub fn mcp_get_prompt_in_scope(
 pub fn load_mcp_db() -> Result<McpServerDb> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    store.import_json_once::<McpServerDb>(
-        MCP_SERVERS_NAMESPACE,
-        &settings.data_dir.join(MCP_SERVERS_FILE),
-    )?;
     Ok(store.get(MCP_SERVERS_NAMESPACE)?.unwrap_or_default())
 }
 
@@ -1283,17 +1282,18 @@ impl McpStdioSession {
         server: &McpServerConfig,
         process_spawned: Option<&mut bool>,
     ) -> Result<Self> {
+        if let Some(blocker) = validate_mcp_command(&server.command) {
+            anyhow::bail!("{}", blocker.message);
+        }
         let managed_store_guard = managed_mcp_read_guard(&server.command)?;
-        let (expected_identity, executable_guard) = if managed_store_guard.is_some() {
-            let (identity, executable) = mcp_executable_identity_with_file(&server.command)?;
-            (Some(identity), Some(executable))
-        } else {
-            (None, None)
-        };
-        let command_path = expected_identity.as_ref().map_or_else(
-            || server.command.clone(),
-            |identity| identity.canonical_path.clone(),
-        );
+        let (expected_identity, executable_guard) =
+            read_mcp_command_identity(&server.command, managed_store_guard.is_some())?;
+        if server.executable_sha256.as_deref() != Some(expected_identity.sha256.as_str()) {
+            anyhow::bail!(
+                "MCP executable differs from its saved configuration or has no saved identity; review and configure it again"
+            );
+        }
+        let command_path = expected_identity.canonical_path.clone();
         let working_dir = command_path.parent().ok_or_else(|| {
             anyhow::anyhow!("MCP server command has no deterministic parent directory")
         })?;
@@ -1335,11 +1335,12 @@ impl McpStdioSession {
             let flags = OFlag::from_bits_truncate(current) | OFlag::O_NONBLOCK;
             fcntl(descriptor, FcntlArg::F_SETFL(flags))?;
         }
-        if let Some(expected_identity) = expected_identity.as_ref() {
-            let actual_identity = mcp_executable_identity(&server.command)?;
-            if &actual_identity != expected_identity {
+        {
+            let (actual_identity, _) =
+                read_mcp_command_identity(&server.command, managed_store_guard.is_some())?;
+            if actual_identity != expected_identity {
                 anyhow::bail!(
-                    "managed MCP pathname identity drifted across process spawn; the executed inode is not asserted"
+                    "MCP pathname identity drifted across process spawn; the executed inode is not asserted"
                 );
             }
         }
@@ -1349,7 +1350,7 @@ impl McpStdioSession {
             stdin: Some(stdin),
             stdout,
             _managed_store_guard: managed_store_guard,
-            _executable_guard: executable_guard,
+            _executable_guard: Some(executable_guard),
             pending: Vec::new(),
             responses: VecDeque::new(),
             stdout_closed: false,
@@ -2126,6 +2127,7 @@ fn stage_mcp_server_for_persona_locked(
     let frozen = McpServerConfig {
         name: config.name.clone(),
         command: managed_path,
+        executable_sha256: Some(source_identity.sha256.clone()),
         args: Vec::new(),
         enabled: true,
     };
@@ -2418,6 +2420,13 @@ fn mcp_executable_identity(command: &Path) -> Result<McpExecutableIdentity> {
 }
 
 fn mcp_executable_identity_with_file(command: &Path) -> Result<(McpExecutableIdentity, File)> {
+    read_mcp_command_identity(command, true)
+}
+
+fn read_mcp_command_identity(
+    command: &Path,
+    require_native: bool,
+) -> Result<(McpExecutableIdentity, File)> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     use std::os::unix::fs::MetadataExt;
 
@@ -2425,7 +2434,7 @@ fn mcp_executable_identity_with_file(command: &Path) -> Result<(McpExecutableIde
         anyhow::bail!("MCP command must be an absolute executable path");
     }
     let path_metadata = fs::symlink_metadata(command)?;
-    if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+    if require_native && (path_metadata.file_type().is_symlink() || !path_metadata.is_file()) {
         anyhow::bail!("MCP command must be a nonsymlink regular file");
     }
     let canonical_path = command.canonicalize()?;
@@ -2447,7 +2456,7 @@ fn mcp_executable_identity_with_file(command: &Path) -> Result<(McpExecutableIde
     let mut digest = Sha256::new();
     let mut magic = [0_u8; 4];
     executable.read_exact(&mut magic)?;
-    if !is_native_executable_magic(magic) {
+    if require_native && !is_native_executable_magic(magic) {
         anyhow::bail!(
             "Persona MCP approvals require a native executable for the current platform, not a script or interpreter input"
         );
@@ -2471,7 +2480,11 @@ fn mcp_executable_identity_with_file(command: &Path) -> Result<(McpExecutableIde
     if bytes != metadata.len() {
         anyhow::bail!("MCP command changed size while hashing");
     }
-    let current_path_metadata = fs::symlink_metadata(command)?;
+    let current_path_metadata = if require_native {
+        fs::symlink_metadata(command)?
+    } else {
+        fs::metadata(command)?
+    };
     if current_path_metadata.file_type().is_symlink() || !current_path_metadata.is_file() {
         anyhow::bail!("MCP command changed type while hashing");
     }
@@ -2590,6 +2603,17 @@ fn validate_mcp_command(command: &Path) -> Option<Blocker> {
             vec!["Choose an existing local executable.".to_string()],
         ));
     }
+    use std::os::unix::fs::PermissionsExt;
+    match fs::metadata(command) {
+        Ok(metadata) if metadata.permissions().mode() & 0o111 != 0 => {}
+        _ => {
+            return Some(Blocker::new(
+                "mcp_command_not_executable",
+                "MCP server command does not have executable permissions.",
+                vec!["Choose a local executable that you have reviewed.".to_string()],
+            ));
+        }
+    }
     None
 }
 
@@ -2677,9 +2701,50 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn replacing_a_configured_mcp_file_cannot_spawn_or_claim_an_unknown_effect() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("mom-mcp-drift-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).expect("fixture directory");
+        let command = directory.join("server");
+        std::fs::write(&command, b"#!/bin/sh\nexit 0\n").expect("fixture script");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture permissions");
+        let identity = super::read_mcp_command_identity(&command, false)
+            .expect("configured identity")
+            .0;
+        let mut server = McpServerConfig {
+            executable_sha256: Some(identity.sha256),
+            name: "drift".into(),
+            command: command.clone(),
+            args: Vec::new(),
+            enabled: true,
+        };
+        std::fs::write(&command, b"#!/bin/sh\ntouch executed\n").expect("replace executable");
+        let error =
+            execute_mcp_effect_request_supervised(&server, "lookup", json!({}), "unused", &|| {
+                false
+            })
+            .expect_err("changed executable");
+        assert!(!error.outcome_unknown());
+        assert!(
+            error
+                .to_string()
+                .contains("differs from its saved configuration")
+        );
+        assert!(!directory.join("executed").exists());
+        server.executable_sha256 = None;
+        assert!(super::McpStdioSession::spawn(&server).is_err());
+        assert!(!directory.join("executed").exists());
+        std::fs::remove_dir_all(directory).expect("fixture cleanup");
+    }
+
     #[test]
     fn cancellation_before_spawn_is_proven_before_effect() {
         let server = McpServerConfig {
+            executable_sha256: None,
             name: "missing".to_string(),
             command: PathBuf::from("/definitely/not/a/real/mcp/server"),
             args: Vec::new(),
@@ -2695,9 +2760,22 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn failed_os_spawn_remains_proven_before_external_process_authority() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("mom-mcp-exec-failure-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).expect("fixture directory");
+        let command = directory.join("server");
+        std::fs::write(&command, b"#!/definitely/not/a/real/interpreter\n")
+            .expect("fixture script");
+        std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o700))
+            .expect("fixture permissions");
+        let identity = super::read_mcp_command_identity(&command, false)
+            .expect("fixture identity")
+            .0;
         let server = McpServerConfig {
-            name: "missing".to_string(),
-            command: PathBuf::from("/definitely/not/a/real/mcp/server"),
+            executable_sha256: Some(identity.sha256),
+            name: "missing-interpreter".to_string(),
+            command,
             args: Vec::new(),
             enabled: true,
         };
@@ -2708,12 +2786,19 @@ mod tests {
             .expect_err("failed OS spawn must not cross the external-process boundary");
         assert!(!error.outcome_unknown());
         assert!(error.to_string().contains("failed to start MCP server"));
+        std::fs::remove_dir_all(directory).expect("fixture cleanup");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn successful_spawn_makes_initialize_failure_outcome_unknown() {
         let server = McpServerConfig {
+            executable_sha256: Some(
+                super::read_mcp_command_identity(std::path::Path::new("/bin/sh"), false)
+                    .expect("shell identity")
+                    .0
+                    .sha256,
+            ),
             name: "exits-during-initialize".to_string(),
             command: PathBuf::from("/bin/sh"),
             args: vec!["-c".to_string(), "exit 0".to_string()],
@@ -2962,6 +3047,7 @@ mod tests {
         std::fs::create_dir_all(&data_dir)?;
         let store = RuntimeStore::open_with_key(&data_dir, [62_u8; 32])?;
         let server = McpServerConfig {
+            executable_sha256: None,
             name: "reviewed".to_string(),
             command: std::env::current_exe()?,
             args: Vec::new(),
@@ -3032,6 +3118,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&data_dir).expect("temporary data directory");
         let configured = McpServerConfig {
+            executable_sha256: None,
             name: "exact-native".to_string(),
             command: std::env::current_exe().expect("test executable path"),
             args: Vec::new(),
@@ -3059,6 +3146,7 @@ mod tests {
             .expect("managed executable revalidation");
 
         let configured_with_argument = McpServerConfig {
+            executable_sha256: None,
             args: vec!["mutable-code-path".to_string()],
             ..configured.clone()
         };
@@ -3081,6 +3169,7 @@ mod tests {
         std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
             .expect("script permissions");
         let script_config = McpServerConfig {
+            executable_sha256: None,
             name: "script".to_string(),
             command: script_path,
             args: Vec::new(),
@@ -3097,6 +3186,7 @@ mod tests {
         std::os::unix::fs::symlink(&configured.command, &symlink_path)
             .expect("executable symlink fixture");
         let symlink_config = McpServerConfig {
+            executable_sha256: None,
             name: "symlink".to_string(),
             command: symlink_path,
             args: Vec::new(),
@@ -3128,6 +3218,12 @@ mod tests {
              {effect_response}"
         );
         McpServerConfig {
+            executable_sha256: Some(
+                super::read_mcp_command_identity(std::path::Path::new("/bin/sh"), false)
+                    .expect("shell identity")
+                    .0
+                    .sha256,
+            ),
             name: "standard".to_string(),
             command: PathBuf::from("/bin/sh"),
             args: vec!["-c".to_string(), script],
@@ -3147,6 +3243,7 @@ mod tests {
             server: server.to_string(),
             server_config_sha256: format!("configured-{server}"),
             frozen_server_config: McpServerConfig {
+                executable_sha256: None,
                 name: server.to_string(),
                 command: PathBuf::from(format!("/managed/{server}.bin")),
                 args: Vec::new(),

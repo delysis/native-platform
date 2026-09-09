@@ -415,3 +415,52 @@ fn exact_hash_and_split_archive_guards_fail_closed() -> Result<(), Box<dyn Error
     ));
     Ok(())
 }
+
+#[test]
+fn title_index_orders_empty_titles_by_their_path() -> Result<(), Box<dyn Error>> {
+    let entries = [
+        FixtureEntry {
+            namespace: b'C',
+            path: "Alpha",
+            title: "Bee",
+            mime_index: 1,
+            blob: b"first",
+        },
+        FixtureEntry {
+            namespace: b'C',
+            path: "Zoo",
+            title: "",
+            mime_index: 1,
+            blob: b"second",
+        },
+    ];
+    let temp = TempDir::new()?;
+    // Explicit independent order: effective titles are Bee, Zoo. The empty
+    // stored title must not sort before Bee. Neither order uses parser helpers.
+    for (name, indices, valid) in [("valid", [0_u32, 1], true), ("invalid", [1_u32, 0], false)] {
+        let mut bytes = build_fixture(&entries, FixtureCompression::None);
+        bytes.truncate(bytes.len() - 16);
+        let title_position = bytes.len() as u64;
+        for index in indices {
+            bytes.extend_from_slice(&index.to_le_bytes());
+        }
+        let checksum_position = bytes.len() as u64;
+        bytes.extend_from_slice(&[0; 16]);
+        write_u64(&mut bytes, 40, title_position);
+        write_u64(&mut bytes, 72, checksum_position);
+        let path = write_fixture(&temp, name, &bytes)?;
+        let result = produce_managed_documents(&request(&path, &bytes)?);
+        if valid {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(ZimError::InvalidHeader("title index is not ordered"))
+                ),
+                "{result:?}"
+            );
+        }
+    }
+    Ok(())
+}

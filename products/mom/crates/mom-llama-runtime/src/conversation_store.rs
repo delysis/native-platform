@@ -9,8 +9,6 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-const CONVERSATIONS_FILE: &str = "conversations.json";
-const DRAFTS_FILE: &str = "drafts.json";
 pub(crate) const CONVERSATIONS_NAMESPACE: &str = "conversations.v2";
 pub(crate) const DRAFTS_NAMESPACE: &str = "drafts.v2";
 const NEW_CHAT_DRAFT_KEY: &str = "__new_chat__";
@@ -1445,8 +1443,6 @@ fn descendant_ids(conversation: &Conversation, message_id: &str) -> HashSet<Stri
 pub fn load_db() -> Result<ConversationDb> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    let legacy_path = settings.data_dir.join(CONVERSATIONS_FILE);
-    store.import_json_once::<ConversationDb>(CONVERSATIONS_NAMESPACE, &legacy_path)?;
     let mut db = store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default();
     let repaired = repair_inline_attribution_prefixes(&mut db);
     let normalized = normalize_db_model_paths(&mut db);
@@ -1558,10 +1554,6 @@ pub fn get_or_create_conversation(id: &str) -> Result<(ConversationDb, Conversat
 pub fn upsert_conversation(db: ConversationDb, conversation: Conversation) -> Result<PathBuf> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    store.import_json_once::<ConversationDb>(
-        CONVERSATIONS_NAMESPACE,
-        &settings.data_dir.join(CONVERSATIONS_FILE),
-    )?;
     store.mutate_documents(
         CONVERSATIONS_NAMESPACE,
         || db,
@@ -1652,7 +1644,6 @@ fn snippet(content: &str, query: &str) -> String {
 pub(crate) fn load_drafts() -> Result<DraftDb> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    store.import_json_once::<DraftDb>(DRAFTS_NAMESPACE, &settings.data_dir.join(DRAFTS_FILE))?;
     Ok(store.get(DRAFTS_NAMESPACE)?.unwrap_or_default())
 }
 

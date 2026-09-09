@@ -70,6 +70,7 @@ pub struct Database {
 
 impl Database {
     pub fn new(db_path: PathBuf) -> Result<Self> {
+        require_private_storage_support()?;
         create_parent_if_missing(&db_path)?;
         let conn = Connection::open(&db_path)
             .with_context(|| format!("failed to open database at {}", db_path.display()))?;
@@ -96,6 +97,15 @@ impl Database {
             DatabaseState::VersionOne => db.upgrade_version_one(&db_path)?,
             DatabaseState::Current => {}
         }
+        Ok(db)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> Result<Self> {
+        let db = Self {
+            conn: Arc::new(Mutex::new(Connection::open_in_memory()?)),
+        };
+        db.init_schema()?;
         Ok(db)
     }
 
@@ -482,6 +492,18 @@ fn create_parent_if_missing(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn require_private_storage_support() -> Result<()> {
+    if cfg!(unix) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "private FTE database storage is unsupported on this platform",
+        )
+        .into())
+    }
+}
+
 #[cfg(unix)]
 fn harden_directory_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -491,7 +513,7 @@ fn harden_directory_permissions(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn harden_directory_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+    require_private_storage_support()
 }
 
 #[cfg(unix)]
@@ -503,7 +525,7 @@ fn harden_file_permissions(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn harden_file_permissions(_path: &Path) -> Result<()> {
-    Ok(())
+    require_private_storage_support()
 }
 
 #[cfg(test)]
@@ -511,8 +533,38 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[cfg(not(unix))]
+    #[test]
+    fn private_database_refuses_unsupported_platform_before_mutation() {
+        let root = test_database_path("unsupported");
+        let path = root.join("private.sqlite");
+        let error = match Database::new(path.clone()) {
+            Ok(_) => panic!("private database unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("typed unsupported")
+                .kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        assert!(!root.exists());
+        std::fs::create_dir(&root).expect("fixture directory");
+        std::fs::write(&path, b"existing state").expect("fixture state");
+        assert!(Database::new(path.clone()).is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("read fixture"),
+            b"existing state"
+        );
+        assert_eq!(std::fs::read_dir(&root).expect("directory").count(), 1);
+        std::fs::remove_file(&path).expect("remove fixture");
+        std::fs::remove_dir(&root).expect("remove directory");
+    }
+
     static TEST_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
+    #[cfg(unix)]
     #[test]
     fn stale_v1_preflight_accepts_an_exact_upgrade_committed_by_another_opener() {
         let path = test_database_path("two-upgraders");
@@ -590,6 +642,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn exact_version_one_upgrade_preserves_rows_and_allows_unknown_usage_on_reopen() {
         let path = test_database_path("exact-v1-upgrade");
@@ -648,7 +701,7 @@ mod tests {
 
     #[test]
     fn log_summaries_report_latest_status_and_real_aggregates() {
-        let db = Database::new(test_database_path("summaries"))
+        let db = Database::in_memory()
             .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
         db.log_request("provider", "model-a", 10, 100, 200)
             .expect("log_summaries_report_latest_status_and_real_aggregates: expected success");
@@ -674,6 +727,7 @@ mod tests {
         assert_eq!(provider.last_status_code, Some(503));
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_model_configuration_survives_database_reopen() {
         let path = test_database_path("local-model-reopen");
@@ -698,6 +752,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn fresh_database_is_versioned_and_reopens_only_as_the_current_schema() {
         let path = test_database_path("current-schema");
@@ -718,6 +773,7 @@ mod tests {
         Database::new(path).expect("exact current database reopens");
     }
 
+    #[cfg(unix)]
     #[test]
     fn synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation() {
         let path = test_database_path("prohibited-plaintext-sentinel");
@@ -743,6 +799,7 @@ mod tests {
         assert_eq!(std::fs::read(path).expect("synthetic_prohibited_plaintext_table_is_rejected_without_import_or_mutation: expected success"), before);
     }
 
+    #[cfg(unix)]
     #[test]
     fn unversioned_populated_database_is_rejected_without_schema_adoption() {
         let path = test_database_path("unversioned-populated");
@@ -765,6 +822,7 @@ mod tests {
         assert_eq!(std::fs::read(path).expect("unversioned_populated_database_is_rejected_without_schema_adoption: expected success"), before);
     }
 
+    #[cfg(unix)]
     #[test]
     fn wrong_version_or_unexpected_schema_object_is_rejected() {
         for (label, mutation) in [
@@ -798,6 +856,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn same_schema_names_with_wrong_definitions_are_rejected() {
         let path = test_database_path("same-names-wrong-definitions");

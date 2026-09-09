@@ -1638,6 +1638,7 @@ mod tests {
         assert!(runtime.shutdown_native_for_process_exit());
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_model_configuration_restores_through_a_new_gateway_owner() {
         let database_path = test_database_path("local-model-restart");
@@ -2010,8 +2011,8 @@ mod tests {
         }));
     }
 
-    pub(super) fn test_database(label: &str) -> Arc<Database> {
-        Arc::new(Database::new(test_database_path(label)).expect("test database"))
+    pub(super) fn test_database(_label: &str) -> Arc<Database> {
+        Arc::new(Database::in_memory().expect("test database"))
     }
 
     fn test_database_path(label: &str) -> PathBuf {

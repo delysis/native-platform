@@ -96,7 +96,7 @@
       "package": "free-token-energy",
       "selector": "lib",
       "name": "free_token_energy_lib",
-      "kinds": ["cdylib", "rlib", "staticlib"],
+      "kinds": ["rlib"],
       "src_path": "products/fte/src-tauri/src/lib.rs",
       "manifest_path": "products/fte/src-tauri/Cargo.toml",
       "platforms": ["linux", "macos", "windows"],
@@ -157,7 +157,7 @@
     {
       "package": "llama-native-engine",
       "src_path": "crates/native/crates/llama-native-engine/build.rs",
-      "sha256": "c28035ab5a321cbd583f2b62e0abc07f9c107aee0daec43bfd2b7b022ba345b3"
+      "sha256": "0089f0cac17064ed852d78b6c0502c285c2fb4242c483147e8836248154a9954"
     },
     {
       "package": "speech-native-platform",

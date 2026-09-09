@@ -119,9 +119,7 @@ pub(crate) fn export_sequence(
         return Err(incompatible("llama.cpp reported an empty sequence state"));
     }
     let mut bytes = vec![0_u8; size];
-    // SAFETY: the buffer has exactly the size reported for this worker-owned
-    // context and sequence. No state mutation occurs between size and export.
-    let written = unsafe { context.state_seq_get_data_ext(bytes.as_mut_ptr(), sequence_id, flags) };
+    let written = context.state_seq_get_data_ext(&mut bytes, sequence_id, flags);
     if written != size {
         return Err(incompatible("llama.cpp sequence export size changed"));
     }

@@ -1902,15 +1902,10 @@ impl AnthropicStreamEncoder {
                 });
                 self.terminal = true;
             }
-            GatewayEvent::Cancelled { usage, .. } => {
-                self.finish_content_blocks(&mut events);
+            GatewayEvent::Cancelled { .. } => {
                 events.push(SseEvent {
-                    event: "message_delta".to_string(),
-                    data: json!({"type":"message_delta","delta":{"stop_reason":"stop_sequence","stop_sequence":Value::Null},"usage":anthropic_usage(usage)}),
-                });
-                events.push(SseEvent {
-                    event: "message_stop".to_string(),
-                    data: json!({"type":"message_stop"}),
+                    event: "error".to_string(),
+                    data: json!({"type":"error","error":{"type":"api_error","message":"Generation cancelled","code":"cancelled"}}),
                 });
                 self.terminal = true;
             }

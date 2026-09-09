@@ -51,7 +51,7 @@ members = [
     "products/mom/crates/mom-llama-runtime",
     "xtask",
 ]
-exclude = ["crates/services/attachment/fuzz"]
+exclude = ["crates/services/attachment/fuzz", "vendor/glib"]
 resolver = "3"
 
 [workspace.package]
@@ -195,3 +195,7 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[patch.crates-io]
+# GTK3 still requires the 0.18 API. Backport the upstream VariantStrIter fix.
+glib = { path = "vendor/glib" }

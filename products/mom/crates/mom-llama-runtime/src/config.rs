@@ -1170,10 +1170,6 @@ fn data_dir_override() -> Option<PathBuf> {
     DATA_DIR_OVERRIDE.with(|override_path| override_path.borrow().clone())
 }
 
-pub(crate) fn data_dir_override_is_set() -> bool {
-    DATA_DIR_OVERRIDE.with(|override_path| override_path.borrow().is_some())
-}
-
 pub fn write_json_atomic<T>(path: &Path, value: &T) -> Result<()>
 where
     T: Serialize,

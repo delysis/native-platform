@@ -112,6 +112,7 @@ fn assert_no_publish(store: &ManagedStore) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn exact_materialization_is_idempotent_source_preserving_and_reopenable()
 -> Result<(), Box<dyn Error>> {
@@ -192,6 +193,7 @@ fn exact_materialization_is_idempotent_source_preserving_and_reopenable()
     Ok(())
 }
 
+#[cfg(unix)]
 #[test]
 fn every_bound_identity_and_rights_fact_fails_before_publication_when_wrong()
 -> Result<(), Box<dyn Error>> {

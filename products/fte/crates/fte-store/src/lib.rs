@@ -1,7 +1,7 @@
 //! Persistent gateway state and injected secret/cache-store boundaries.
 
 use fte_types::{GatewayError, GatewayResponse, RequestId};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -29,19 +29,51 @@ impl std::fmt::Debug for SqliteStore {
 
 impl SqliteStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, GatewayError> {
-        let connection = Connection::open(path).map_err(store_error)?;
-        connection
-            .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 CREATE TABLE IF NOT EXISTS gateway_responses (
+        let mut connection = Connection::open(path).map_err(store_error)?;
+        // Check identity under a write reservation before changing schema or WAL.
+        // Pre-release unversioned databases are deliberately unsupported.
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(store_error)?;
+        let application_id: i64 = transaction
+            .pragma_query_value(None, "application_id", |row| row.get(0))
+            .map_err(store_error)?;
+        let version: i64 = transaction
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .map_err(store_error)?;
+        let objects: i64 = transaction
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(store_error)?;
+        if application_id == 0 && version == 0 && objects == 0 {
+            transaction
+                .execute_batch(
+                    "CREATE TABLE gateway_responses (
                     id TEXT PRIMARY KEY NOT NULL,
                     request_id TEXT NOT NULL,
                     backend_id TEXT NOT NULL,
                     model_id TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
-                 );",
-            )
+                 );
+                 PRAGMA application_id = 1179927890;
+                 PRAGMA user_version = 1;",
+                )
+                .map_err(store_error)?;
+        } else if application_id != 1179927890 || version != 1 || objects != 1 {
+            return Err(store_error(
+                "unrecognized response store identity or schema version",
+            ));
+        }
+        // Preparing the real queries checks the required column contract before
+        // mutating connection settings, even for a marker-bearing damaged file.
+        transaction.prepare("SELECT id, request_id, backend_id, model_id, payload_json, created_at FROM gateway_responses").map_err(store_error)?;
+        transaction.commit().map_err(store_error)?;
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
             .map_err(store_error)?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -119,6 +151,35 @@ fn store_error(error: impl std::fmt::Display) -> GatewayError {
 mod tests {
     use super::*;
     use fte_types::{BackendLocation, GatewayUsage, ResolvedRoute, TerminalStatus};
+
+    #[test]
+    fn foreign_and_future_databases_are_refused_without_mutation() {
+        for (label, ddl) in [
+            (
+                "foreign",
+                "CREATE TABLE private(value TEXT); INSERT INTO private VALUES ('preserved');",
+            ),
+            (
+                "future",
+                "PRAGMA application_id = 1179927890; PRAGMA user_version = 2;",
+            ),
+            (
+                "unversioned",
+                "CREATE TABLE gateway_responses(id TEXT PRIMARY KEY);",
+            ),
+        ] {
+            let path = std::env::temp_dir()
+                .join(format!("fte-store-{label}-{}.sqlite", RequestId::new().0));
+            let connection = Connection::open(&path).expect("fixture");
+            connection.execute_batch(ddl).expect("schema");
+            drop(connection);
+            let before = std::fs::read(&path).expect("before");
+            assert!(SqliteStore::open(&path).is_err());
+            assert_eq!(std::fs::read(&path).expect("after"), before);
+            assert!(!std::path::PathBuf::from(format!("{}-wal", path.display())).exists());
+            std::fs::remove_file(path).expect("cleanup");
+        }
+    }
 
     #[test]
     fn responses_round_trip_and_delete_additively() {

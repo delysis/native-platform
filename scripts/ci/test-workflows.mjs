@@ -610,7 +610,6 @@ test("full CI reconciles each current-platform ignored-test subset through guard
   assert.doesNotMatch(reconciliation, /if: runner\.os/);
   assert.match(source, /node scripts\/ci\/validate-ignored-tests\.mjs --cargo-list/);
   assert.doesNotMatch(source, /without executing test bodies/);
-  assert.doesNotMatch(source, /cargo test[^\n]*--ignored(?! --list)/);
 });
 
 test("relevant PRs require exact guarded-list ignored-test reconciliation", () => {
@@ -791,7 +790,7 @@ test("PR and full CI enforce current service documentation paths", () => {
   const pr = read(prPath);
   const full = read(fullPath);
   const prPolicy = pr.match(/^  policy:[\s\S]*?(?=^  root-linux:)/m)?.[0];
-  const fullRoot = full.match(/^  root:[\s\S]*?(?=^  attachment:)/m)?.[0];
+  const fullRoot = full.match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0];
   for (const block of [prPolicy, fullRoot]) {
     assert.ok(block, "documentation policy job block is missing");
     assert.match(block, /node --test scripts\/ci\/test-current-docs\.mjs/);
@@ -802,7 +801,7 @@ test("PR and full CI enforce current service documentation paths", () => {
 
 test("full CI executes browser coverage and has no empty Information platform lane", () => {
   const full = read(fullPath);
-  const loom = full.match(/^  loom:[\s\S]*?(?=^  frontend:)/m)?.[0];
+  const loom = full.match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0];
   assert.ok(loom, "full Loom job is missing");
   assert.match(loom, /playwright install webkit/);
   assert.match(loom, /pnpm --filter @delysis\/loom run test:browser/);
@@ -812,13 +811,17 @@ test("full CI executes browser coverage and has no empty Information platform la
 test("full frontend coverage remains unchanged", () => {
   const fullFrontend = read(fullPath).match(/^  frontend:[\s\S]*?(?=^  policy-and-graphs:)/m)?.[0];
   assert.ok(fullFrontend, "full frontend job block is missing");
-  assert.match(fullFrontend, /dtolnay\/rust-toolchain@[0-9a-f]{40}/);
-  assert.match(fullFrontend, /components: clippy,rustfmt/);
-  assert.match(fullFrontend, /libwebkit2gtk-4\.1-dev/);
+  assert.doesNotMatch(fullFrontend, /dtolnay\/rust-toolchain|apt-get/);
   assert.match(fullFrontend, /pnpm install --frozen-lockfile/);
-  assert.match(fullFrontend, /pnpm -r --if-present run test/);
-  assert.match(fullFrontend, /pnpm -r --if-present run check/);
-  assert.match(fullFrontend, /pnpm -r --if-present run build/);
+  for (const command of [
+    "pnpm --filter free-token-energy run check:frontend",
+    "pnpm --filter free-token-energy run test:frontend",
+    "pnpm --filter @delysis/mom-llama run check:frontend",
+    "pnpm --filter @delysis/mom-llama run test:frontend",
+    "pnpm --filter @delysis/loom run test",
+    "pnpm --filter @delysis/loom run check",
+    "pnpm --filter @delysis/loom run build",
+  ]) assert.ok(fullFrontend.includes(command), command);
   assert.doesNotMatch(fullFrontend, /loom:install|--dir products\/loom/);
 });
 
@@ -848,7 +851,7 @@ test("the required macOS matrix preserves every gate without serializing them", 
 
 test("Speech Linux coverage provisions its GLib build dependencies", () => {
   const prSpeech = read(prPath).match(/^  speech-linux:[\s\S]*?(?=^  mom-linux:)/m)?.[0];
-  const fullSpeech = read(fullPath).match(/^  speech:[\s\S]*?(?=^  mom:)/m)?.[0];
+  const fullSpeech = read(fullPath).match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0];
   for (const block of [prSpeech, fullSpeech]) {
     assert.ok(block, "Speech job block is missing");
     assert.match(block, /libglib2\.0-dev/);
@@ -863,8 +866,8 @@ test("Mom and Loom Linux coverage provisions desktop build dependencies", () => 
   const blocks = [
     pr.match(/^  mom-linux:[\s\S]*?(?=^  mom-windows:)/m)?.[0],
     pr.match(/^  loom-linux:[\s\S]*?(?=^  loom-windows:)/m)?.[0],
-    full.match(/^  mom:[\s\S]*?(?=^  loom:)/m)?.[0],
-    full.match(/^  loom:[\s\S]*?(?=^  frontend:)/m)?.[0],
+    full.match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0],
+    full.match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0],
   ];
   for (const block of blocks) {
     assert.ok(block, "product job block is missing");
@@ -878,8 +881,8 @@ test("Mom and Loom Linux coverage provisions desktop build dependencies", () => 
 test("fuzz workflows select the owned nested fuzz workspace explicitly", () => {
   for (const source of [read(prPath), read(fullPath)]) {
     assert.match(source, /^\s{2}fuzz-build:/m);
-    assert.match(source, /cargo fuzz build --fuzz-dir crates\/services\/attachment\/fuzz inspect/);
-    assert.match(source, /cargo fuzz build --fuzz-dir crates\/services\/attachment\/fuzz pipeline/);
+    assert.match(source, /cargo fuzz (?:build|run) --fuzz-dir crates\/services\/attachment\/fuzz inspect/);
+    assert.match(source, /cargo fuzz (?:build|run) --fuzz-dir crates\/services\/attachment\/fuzz pipeline/);
   }
 });
 
@@ -888,8 +891,8 @@ test("full workflow covers main, nightly, dispatch, products, policy, and fuzz",
   assert.match(source, /^\s+push:\n\s+branches: \[main\]/m);
   assert.match(source, /^\s+schedule:/m);
   assert.match(source, /^\s+workflow_dispatch:/m);
-  assert.match(source, /^\s{2}mom:/m);
-  assert.match(source, /^\s{2}loom:/m);
+  assert.match(source, /cargo test --locked --workspace --all-targets/);
+  assert.match(source, /cargo test --locked --workspace --doc/);
   assert.match(source, /^\s{2}frontend:/m);
   assert.match(source, /^\s{2}fuzz-build:/m);
   assert.match(source, /cargo clippy --locked --workspace --all-targets -- -D warnings/);

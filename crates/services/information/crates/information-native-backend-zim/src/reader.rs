@@ -1034,7 +1034,12 @@ fn validate_title_index(indices: &[u32], entries: &[DirectoryEntry]) -> Result<(
                 "title index is not a permutation of entries",
             ));
         }
-        let current = (entry.namespace, entry.title.as_str(), entry.path.as_str());
+        let title = if entry.title.is_empty() {
+            entry.path.as_str()
+        } else {
+            entry.title.as_str()
+        };
+        let current = (entry.namespace, title, entry.path.as_str());
         if previous.is_some_and(|previous| previous > current) {
             return Err(ZimError::InvalidHeader("title index is not ordered"));
         }
