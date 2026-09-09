@@ -1982,6 +1982,7 @@ pub fn model_environment_from_verified(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use crossbeam_channel::RecvTimeoutError;
@@ -3706,7 +3707,25 @@ mod tests {
             request.cases.push(case);
         }
         request.cases.truncate(case_count);
-        request.model = LocalModelProfile::for_gguf(model_path);
+        let runtime = Arc::new(NativeHostRuntime::default());
+        let projector_path = std::env::var_os("LOOM_GGUF_MMPROJ_PATH").map(PathBuf::from);
+        let projector_bytes = projector_path
+            .as_ref()
+            .map(std::fs::metadata)
+            .transpose()?
+            .map_or(0, |metadata| metadata.len());
+        request.model = runtime.model_profile_for_current_memory(
+            PathBuf::from(model_path),
+            std::fs::metadata(model_path)?.len(),
+            projector_bytes,
+            None,
+        );
+        request.model.projector_path = projector_path;
+        request.model.expected_mmproj_sha256 = std::env::var("LOOM_GGUF_MMPROJ_SHA256").ok();
+        eprintln!(
+            "production writer context: {} cells",
+            request.model.context_tokens
+        );
         request.model.expected_model_sha256 = Some(expected_sha256.to_string());
         request.model.max_parallel_cases = u32::try_from(case_count)?;
         request.request_id = "real-raw-family".to_string();
@@ -3728,7 +3747,7 @@ mod tests {
             case.sampling.max_tokens = 48;
             case.generation.sampling = serde_json::to_value(&case.sampling)?;
         }
-        let backend = LlamaBackend::default();
+        let backend = LlamaBackend::with_default_native_runtime(runtime);
         let handle = backend.start_exact_continuation(request)?;
         Ok(handle.wait_timeout(Duration::from_mins(5))?)
     }

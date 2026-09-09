@@ -32,7 +32,6 @@ sha2.workspace = true
 speech-native-backend-parakeet.workspace = true
 speech-native-host.workspace = true
 speech-native-types.workspace = true
-sysinfo.workspace = true
 tauri = { version = "2.11.5", default-features = false }
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-opener = "2.5.4"

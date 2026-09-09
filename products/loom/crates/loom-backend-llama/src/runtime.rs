@@ -168,6 +168,7 @@ struct ResidencyLedger {
 #[derive(Debug)]
 pub struct NativeHostRuntime {
     host: NativeHost,
+    memory_budget_bytes: u64,
     residency: Mutex<ResidencyLedger>,
 }
 
@@ -175,9 +176,34 @@ impl NativeHostRuntime {
     #[must_use]
     pub fn new(config: NativeHostConfig) -> Self {
         Self {
+            memory_budget_bytes: config.memory_budget_bytes,
             host: NativeHost::new(config),
             residency: Mutex::new(ResidencyLedger::default()),
         }
+    }
+
+    /// Sizes a default model profile within this host's immutable admission
+    /// budget and current physical-memory headroom. Native admission still
+    /// checks its independent estimate and any already resident models.
+    #[must_use]
+    pub fn model_profile_for_current_memory(
+        &self,
+        model_path: PathBuf,
+        model_file_bytes: u64,
+        projector_file_bytes: u64,
+        maximum_context_tokens: Option<u32>,
+    ) -> LocalModelProfile {
+        let mut system = sysinfo::System::new();
+        system.refresh_memory();
+        LocalModelProfile::for_gguf_with_memory(
+            model_path,
+            model_file_bytes,
+            projector_file_bytes,
+            system.available_memory(),
+            system.total_memory(),
+            self.memory_budget_bytes,
+            maximum_context_tokens,
+        )
     }
 
     fn lock_residency(&self) -> Result<MutexGuard<'_, ResidencyLedger>, NativeError> {

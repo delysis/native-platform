@@ -56,7 +56,6 @@ use loom_types::{
 use same_file::Handle as FileIdentityHandle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use sysinfo::System;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
@@ -5543,7 +5542,7 @@ fn prepare_exact_model_load(
             false,
         ));
     }
-    let mut profile = model_profile_for_current_memory(
+    let mut profile = state.native_runtime.model_profile_for_current_memory(
         canonical_path.clone(),
         expectation.model_file_bytes,
         expectation.projector_file_bytes.unwrap_or(0),
@@ -6044,31 +6043,13 @@ fn prepare_model_load(
     Ok(ModelLoadPlan::Inspect {
         selected_path,
         canonical_path: canonical,
-        profile: model_profile_for_current_memory(
+        profile: state.native_runtime.model_profile_for_current_memory(
             discovered.resolved_path,
             discovered.file_bytes,
             0,
             None,
         ),
     })
-}
-
-fn model_profile_for_current_memory(
-    model_path: PathBuf,
-    model_file_bytes: u64,
-    projector_file_bytes: u64,
-    maximum_context_tokens: Option<u32>,
-) -> LocalModelProfile {
-    let mut system = System::new();
-    system.refresh_memory();
-    LocalModelProfile::for_gguf_with_memory(
-        model_path,
-        model_file_bytes,
-        projector_file_bytes,
-        system.available_memory(),
-        system.total_memory(),
-        maximum_context_tokens,
-    )
 }
 
 fn resolve_model_inspection(

@@ -387,8 +387,54 @@ and follows its default non-thinking text semantics, assistant history and turn
 markers; ordinary tokenization adds BOS once. Unstructured tool turns without
 required call metadata fail explicitly. Other model families and explicit
 template choices retain their own paths. The native renderer suite passed;
-the identical packaged FTE request still needs rerunning on the rebuilt bundle.
+the identical packaged FTE request subsequently passed on the rebuilt bundle.
+
+At `e576891`, packaged FTE returned “The small boat reached the shore just as
+the sun began to set.” through the ordinary `local/default` Responses route:
+14 output tokens, `response.completed`, and `real_local_inference: true`.
+Retrieving that response returned the same text and completed status. A fresh
+stream cancelled after its first text delta returned `cancelling`, followed by
+`response.incomplete` and no completed event. Evidence is retained in
+`/tmp/integrated-audit-fte-e576891-{stream.sse,retrieved.json,cancellation.json}`.
+The preceding loaded-model FTE process quit normally in 107 milliseconds:
+gateway drained, native host joined, eight of eight workers joined, and no
+retained tasks. Reopening the rebuilt bundle displayed its persisted activity.
+
+The current Mom bundle reopened the existing store as far as the normal
+Keychain unlock screen; its new “Mom Llama” bootstrap title identifies the
+updated assets. The protected prompt and then the locked Mac still prevent
+native sidebar, stoplight and resize acceptance. The user's store remains
+untouched. Source review also leaves titlebar integration explicitly open:
+`Visible` retains a separate 38-pixel web control row. The installed safe Tauri
+API supports integrated decorated Overlay mode, but repositioning native
+buttons is not evidence that the missing-control report has been repaired.
+No new unsafe native toolbar bridge was introduced to evade that boundary.
+Loom's isolated native run exposed a separate startup failure:
+the default Gemma configuration reserves 36,806,870,528 heuristic bytes against
+a 12,884,901,888-byte host budget. The context selector used available system
+RAM without considering that host limit, choosing 131,072 cells on this
+machine. A focused regression reproduced those exact numbers before repair.
+
+The selector now bounds available RAM minus system headroom by the immutable
+host budget before allocating model, projector, workspace and context. The
+desktop and existing real-model writer check call the same runtime method;
+system memory sampling moved with it instead of being duplicated. The cap
+and native admission estimator remain unchanged. The official model selects
+4,096 cells; native admission estimates 9,767,211,792 bytes, while the product's
+more conservative sizing accounts for 12,249,547,296 bytes. Both are below the
+12 GiB cap. Existing output allowances and typed over-budget refusals remain.
+
+All four focused context tests passed. The existing opt-in four-way writer
+acceptance then loaded the exact cached model and projector on Metal and
+produced four ordinary prose continuations, passing in 16.76 seconds. Logs:
+`/tmp/integrated-audit-loom-memory-{before,after}.log` and
+`/tmp/integrated-audit-loom-gemma-writer-after.log`. This is real backend
+generation evidence; the visible native writing interaction remains open.
 
 Full CI `34412937976` passed all eight jobs at `f0c3ca8`. It qualifies the second
 Mom layout pass and the Loom speech drain repair, and predates the Gemma 4
 renderer and poison-evidence changes described above.
+
+Full CI `34414775472` passed at `e576891`, including Linux, macOS, Windows,
+frontend, policy, model integration and fuzz. It predates the newly reproduced
+Loom context-sizing defect's repair.

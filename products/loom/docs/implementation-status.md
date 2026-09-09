@@ -109,9 +109,16 @@ the model context.
 The resident llama.cpp context is selected at model load rather than fixed at
 8,192 tokens. Loom samples currently available and total system memory, reserves
 the model, projector, conservative runtime overhead, and system headroom, then
-selects the largest safe power-of-two tier up to the model's known or native-
-clamped trained limit. Generation packing reserves all branches' output cells
-and transport overhead first. If the remaining conservative byte budget cannot
+selects a power-of-two tier bounded by the same native host's 12 GiB admission
+budget and the model's known or native-clamped trained limit. More system RAM
+alone cannot authorize a context above that host budget. With sufficient free
+RAM, the official Gemma 4 12B QAT model and projector select 4,096 shared context
+cells. This leaves 2,880 conservative prompt bytes after four automatic
+48-token branches and 1,024 scaffold cells; branches share the prompt rather
+than dividing the entire context by four. These are estimates, not an allocator
+limit; native admission independently checks its estimate and resident models.
+Generation packing reserves all branches' output cells and transport overhead
+first. If the remaining conservative byte budget cannot
 hold the manuscript, it preserves the opening and the live tail, inserts an
 explicit omitted-middle marker, and receipts the exact omitted byte range.
 Attachment relevance is recalculated only at coarse manuscript-growth epochs,

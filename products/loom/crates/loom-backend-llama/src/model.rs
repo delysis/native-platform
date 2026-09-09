@@ -85,7 +85,7 @@ impl LocalModelProfile {
         }
     }
 
-    /// Selects a power-of-two context from currently available system memory.
+    /// Selects a power-of-two context within system headroom and the host budget.
     /// Native inspection still clamps this request to the GGUF's trained
     /// context. The deliberately conservative KV estimate prevents the old
     /// fixed 8K default from wasting memory that is actually available.
@@ -96,6 +96,7 @@ impl LocalModelProfile {
         projector_file_bytes: u64,
         available_memory_bytes: u64,
         total_memory_bytes: u64,
+        host_memory_budget_bytes: u64,
         maximum_context_tokens: Option<u32>,
     ) -> Self {
         let mut profile = Self::for_gguf(model_path);
@@ -104,6 +105,7 @@ impl LocalModelProfile {
             projector_file_bytes,
             available_memory_bytes,
             total_memory_bytes,
+            host_memory_budget_bytes,
             maximum_context_tokens.unwrap_or(DEFAULT_MAXIMUM_CONTEXT_TOKENS),
         );
         profile
@@ -132,6 +134,7 @@ pub fn adaptive_context_tokens(
     projector_file_bytes: u64,
     available_memory_bytes: u64,
     total_memory_bytes: u64,
+    host_memory_budget_bytes: u64,
     maximum_context_tokens: u32,
 ) -> u32 {
     let maximum = maximum_context_tokens.max(MINIMUM_CONTEXT_TOKENS);
@@ -139,9 +142,12 @@ pub fn adaptive_context_tokens(
         .saturating_add((model_file_bytes / 2).max(384 * 1024 * 1024))
         .saturating_add(projector_file_bytes);
     let system_headroom = (total_memory_bytes / 8).max(MINIMUM_SYSTEM_HEADROOM_BYTES);
+    // Physical availability never grants permission to exceed the host's
+    // admission budget. System headroom belongs outside that host allocation.
     let kv_budget = available_memory_bytes
-        .saturating_sub(runtime_without_kv)
-        .saturating_sub(system_headroom);
+        .saturating_sub(system_headroom)
+        .min(host_memory_budget_bytes)
+        .saturating_sub(runtime_without_kv);
     let affordable = (kv_budget / CONSERVATIVE_KV_BYTES_PER_TOKEN).min(u64::from(maximum));
     let affordable = u32::try_from(affordable).unwrap_or(maximum);
     let tier = 1_u32 << affordable.max(MINIMUM_CONTEXT_TOKENS).ilog2();
@@ -598,26 +604,61 @@ mod context_tests {
     use super::*;
 
     #[test]
+    fn default_gemma_context_fits_host_budget_on_a_large_memory_machine() {
+        let gib = 1024_u64 * 1024 * 1024;
+        // Official Gemma 4 12B QAT model and projector artifact sizes.
+        let model_bytes = 6_975_879_296;
+        let projector_bytes = 175_115_616;
+        let host_budget = llama_native_host::NativeHostConfig::default().memory_budget_bytes;
+        let profile = LocalModelProfile::for_gguf_with_memory(
+            "unloaded-gemma4.gguf",
+            model_bytes,
+            projector_bytes,
+            90 * gib,
+            96 * gib,
+            host_budget,
+            Some(262_144),
+        );
+        let estimate = llama_native_engine::estimate_memory_reservation(
+            &profile.as_native_config(),
+            model_bytes,
+            projector_bytes,
+        );
+        assert_eq!(
+            estimate.basis,
+            llama_native_engine::MemoryEstimateBasis::ConfigurationHeuristic
+        );
+        assert!(
+            estimate.total_bytes <= host_budget,
+            "{} context cells reserve {} bytes above the {} byte host budget",
+            profile.context_tokens,
+            estimate.total_bytes,
+            host_budget,
+        );
+        assert_eq!(profile.context_tokens, 4_096);
+    }
+
+    #[test]
     fn context_selection_scales_in_power_of_two_tiers_and_respects_model_limit() {
         let gib = 1024_u64 * 1024 * 1024;
         assert_eq!(
-            adaptive_context_tokens(7 * gib, 0, 14 * gib, 16 * gib, 262_144),
+            adaptive_context_tokens(7 * gib, 0, 14 * gib, 16 * gib, u64::MAX, 262_144),
             4_096
         );
         assert_eq!(
-            adaptive_context_tokens(7 * gib, 0, 48 * gib, 64 * gib, 262_144),
+            adaptive_context_tokens(7 * gib, 0, 48 * gib, 64 * gib, u64::MAX, 262_144),
             65_536
         );
         assert_eq!(
-            adaptive_context_tokens(7 * gib, 0, 56 * gib, 64 * gib, 262_144),
+            adaptive_context_tokens(7 * gib, 0, 56 * gib, 64 * gib, u64::MAX, 262_144),
             65_536
         );
         assert_eq!(
-            adaptive_context_tokens(7 * gib, 0, 112 * gib, 128 * gib, 262_144),
+            adaptive_context_tokens(7 * gib, 0, 112 * gib, 128 * gib, u64::MAX, 262_144),
             131_072
         );
         assert_eq!(
-            adaptive_context_tokens(7 * gib, 0, 112 * gib, 128 * gib, 32_768),
+            adaptive_context_tokens(7 * gib, 0, 112 * gib, 128 * gib, u64::MAX, 32_768),
             32_768
         );
     }
@@ -626,7 +667,7 @@ mod context_tests {
     fn context_selection_does_not_force_eight_k_when_memory_cannot_afford_it() {
         let gib = 1024_u64 * 1024 * 1024;
         assert_eq!(
-            adaptive_context_tokens(7 * gib, 0, 8 * gib, 16 * gib, 262_144),
+            adaptive_context_tokens(7 * gib, 0, 8 * gib, 16 * gib, u64::MAX, 262_144),
             512
         );
     }
@@ -635,7 +676,7 @@ mod context_tests {
     fn context_selection_honors_a_trained_limit_below_eight_k() {
         let gib = 1024_u64 * 1024 * 1024;
         assert_eq!(
-            adaptive_context_tokens(gib, 0, 48 * gib, 64 * gib, 4_096),
+            adaptive_context_tokens(gib, 0, 48 * gib, 64 * gib, u64::MAX, 4_096),
             4_096
         );
     }
