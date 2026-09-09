@@ -2,7 +2,6 @@ pub mod attachments;
 pub mod chat;
 pub mod composer;
 pub mod config;
-pub mod consult;
 pub mod conversation_store;
 pub mod engine;
 pub mod kv_cache;
@@ -44,12 +43,6 @@ pub use composer::{
 pub use config::{
     GenerationDefaults, KvCachePolicy, Settings, configure_engine, settings_get, settings_reset,
     settings_update,
-};
-pub use consult::{
-    ConsultCancelOutput, ConsultPanel, ConsultPersona, ConsultRun, ConsultRunState,
-    ConsultSeatResult, ConsultStartInput, ConsultStartOptions, ConsultStreamEvent,
-    ConsultSynthesis, consult_cancel, consult_panel_create, consult_panel_list, consult_start,
-    consult_start_stream, consult_status, consult_synthesize,
 };
 pub use conversation_store::{
     ChatTemplatePolicy, Conversation, ConversationBranchSibling, ConversationExecutionProfile,

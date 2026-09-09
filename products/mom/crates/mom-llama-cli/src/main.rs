@@ -31,12 +31,6 @@ enum Command {
         #[command(subcommand)]
         command: ChatCommand,
     },
-    /// Hidden compatibility surface for verified migration and recovery only.
-    #[command(hide = true)]
-    Consult {
-        #[command(subcommand)]
-        command: ConsultCommand,
-    },
     Persona {
         #[command(subcommand)]
         command: PersonaCommand,
@@ -403,20 +397,6 @@ impl From<MentionToolApprovalDecisionArg> for mom_llama_runtime::MentionToolAppr
             MentionToolApprovalDecisionArg::Deny => Self::Deny,
         }
     }
-}
-
-#[derive(Debug, Subcommand)]
-enum ConsultCommand {
-    PanelList {
-        #[arg(long)]
-        json: bool,
-    },
-    Status {
-        #[arg(long)]
-        run: String,
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1308,14 +1288,6 @@ fn run() -> Result<()> {
                 json,
             ),
         },
-        Command::Consult { command } => match command {
-            ConsultCommand::PanelList { json } => {
-                print_result(mom_llama_runtime::consult_panel_list()?, json)
-            }
-            ConsultCommand::Status { run, json } => {
-                print_result(mom_llama_runtime::consult_status(&run)?, json)
-            }
-        },
         Command::Message { command } => match command {
             MessageCommand::Copy {
                 conversation,
@@ -1836,8 +1808,7 @@ fn command_uses_native(command: &Command) -> bool {
             ToolLoopCommand::Run { .. } | ToolLoopCommand::Cancel { .. }
         ),
         Command::KvCache { command } => !matches!(command, KvCacheCommand::Status { .. }),
-        Command::Consult { .. }
-        | Command::PersonaGroup { .. }
+        Command::PersonaGroup { .. }
         | Command::Message { .. }
         | Command::Attachment { .. }
         | Command::Path { .. }

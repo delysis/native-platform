@@ -290,7 +290,7 @@
     },
     {
       "effect_id": "mom_llama.effects.consult_read.v1",
-      "reads": ["encrypted_persona_groups", "encrypted_persona_versions", "legacy_consult_records"],
+      "reads": ["encrypted_persona_groups", "encrypted_persona_versions"],
       "writes": [],
       "network": [],
       "process": [],
@@ -343,14 +343,14 @@
     },
     {
       "effect_id": "mom_llama.effects.consult_cancel.v1",
-      "reads": ["active_mention_registry", "legacy_active_consult_registry"],
+      "reads": ["active_mention_registry"],
       "writes": ["target_cancellation_flag", "command_receipt"],
       "network": [],
       "process": [],
       "secrets": [],
       "model_calls": [],
       "persistence": ["encrypted_receipts"],
-      "memory": ["active_mention_registry", "legacy_active_consult_registry"],
+      "memory": ["active_mention_registry"],
       "external_apps": [],
       "destructive": "reversible"
     },
@@ -370,7 +370,7 @@
     {
       "effect_id": "mom_llama.effects.persona_removal_preview.v1",
       "reads": ["encrypted_persona_template", "encrypted_persona_versions", "encrypted_persona_groups", "encrypted_draft", "encrypted_attachment_index", "encrypted_prefix_cache_metadata", "encrypted_mention_invocations", "active_mention_registry", "encrypted_persona_removal_ledger"],
-      "writes": ["one_time_persona_migration_repair", "command_receipt"],
+      "writes": ["command_receipt"],
       "network": [],
       "process": [],
       "secrets": [],

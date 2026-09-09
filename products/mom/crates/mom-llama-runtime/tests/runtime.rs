@@ -7,10 +7,9 @@ use llama_native_types::{
 use mom_llama_runtime::config::{SettingsUpdate, set_data_dir_override_for_tests};
 use mom_llama_runtime::{
     AttachmentPreviewAnchor, AttachmentPreviewCatalog, ChatDispatchOutput, ChatSendInput,
-    ChatSendOptions, ChatSendOutput, ConsultPersona, ConsultStartInput, ConsultStartOptions,
-    Conversation, ConversationExecutionProfile, ConversationKind, EngineCheckOptions,
-    KvCachePolicy, MentionDispatchInput, Message, MessageAttribution, MessageRole,
-    MessageSpeakerKind, PersonaFreezeInput, PersonaHistoryMode,
+    ChatSendOptions, ChatSendOutput, Conversation, ConversationExecutionProfile, ConversationKind,
+    EngineCheckOptions, KvCachePolicy, MentionDispatchInput, Message, MessageAttribution,
+    MessageRole, MessageSpeakerKind, PersonaFreezeInput, PersonaHistoryMode,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -419,37 +418,6 @@ fn conversation_system_message_is_scoped_persistent_and_clearable() -> Result<()
         .result
         .ok_or_else(|| anyhow!("cleared conversation missing"))?;
     assert_eq!(cleared.execution_profile.system_message, None);
-    Ok(())
-}
-
-#[test]
-fn legacy_panel_creation_is_read_only_even_before_migration() -> Result<()> {
-    let session = TestSession::new("dream-team-create")?;
-    let rejected = mom_llama_runtime::consult_panel_create(
-        "Mom's favorites".to_string(),
-        vec![ConsultPersona {
-            id: String::new(),
-            label: "Compassionate author lens".to_string(),
-            description: "Reflects gently and names practical choices.".to_string(),
-            perspective_prompt: "Offer a warm reflection grounded in public writing.".to_string(),
-            public_figure: Some("Private Example Author 8642".to_string()),
-            expertise: Some("Compassion and practical reflection".to_string()),
-            model_slot: None,
-        }],
-    )?;
-    assert_eq!(rejected.readiness, "stub_blocked");
-    assert!(rejected.result.is_none());
-    assert_eq!(
-        rejected
-            .blocker
-            .as_ref()
-            .map(|blocker| blocker.code.as_str()),
-        Some("legacy_consult_panel_write_retired")
-    );
-    assert!(
-        !session.path().join("runtime.sqlite3").exists(),
-        "retired runtime writes must not initialize product storage"
-    );
     Ok(())
 }
 
@@ -2128,35 +2096,6 @@ fn deprecated_server_aliases_report_only_in_process_residency() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn consult_fixture_is_bounded_and_cannot_promote_readiness() -> Result<()> {
-    let scope = mom_llama_runtime::OperationScope::detached();
-    let _session = TestSession::new("consult-fixture")?;
-    let result = mom_llama_runtime::consult_start(
-        &scope,
-        ConsultStartInput {
-            conversation_id: "consult-fixture".to_string(),
-            prompt: "What assumptions should be checked?".to_string(),
-            panel_id: None,
-        },
-        ConsultStartOptions {
-            timeout_s: 1.0,
-            fake_fixture: true,
-        },
-    )?;
-    assert_eq!(result.readiness, "fake_fixture_exercised");
-    assert!(result.receipt.fake_fixture);
-    assert!(!result.receipt.real_engine_invoked);
-    assert_eq!(result.result.as_ref().map(|run| run.seats.len()), Some(4));
-    assert!(
-        result
-            .result
-            .as_ref()
-            .is_some_and(|run| !run.medical_authority)
-    );
-    Ok(())
-}
-
 #[cfg(unix)]
 #[test]
 fn mcp_process_authority_is_explicit_bounded_and_receipted() -> Result<()> {
@@ -2735,95 +2674,6 @@ fn real_native_reasoning_stream_can_be_forced_to_the_answer() -> Result<()> {
 
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
-fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Result<()> {
-    let _session = configured_real_session("real-consult")?;
-    mom_llama_runtime::settings_update(SettingsUpdate {
-        // This proof needs observable concurrent work and a non-empty
-        // synthesis, not long prose from every seat.
-        max_tokens: Some(64),
-        ..SettingsUpdate::default()
-    })?;
-    let native_owner = initialize_product_runtime()?;
-    let scope = native_owner.operation_scope();
-    let cancellation_panel = mom_llama_runtime::consult_panel_list()?
-        .result
-        .and_then(|panels| panels.into_iter().next())
-        .ok_or_else(|| anyhow!("the legacy recovery panel is unavailable"))?;
-    let cancellation_target = cancellation_panel
-        .personas
-        .last()
-        .map(|persona| persona.id.clone())
-        .ok_or_else(|| anyhow!("the legacy recovery panel has no cancellation target"))?;
-    let mut cancelled = None;
-    let result = mom_llama_runtime::consult_start_stream(
-        &scope,
-        ConsultStartInput {
-            conversation_id: "real-consult".to_string(),
-            prompt: "Give a careful short plan for preparing a virtual consultation.".to_string(),
-            panel_id: Some(cancellation_panel.id),
-        },
-        ConsultStartOptions::default(),
-        Some(|event: mom_llama_runtime::ConsultStreamEvent| {
-            if cancelled.is_none()
-                && event.seat_id == cancellation_target
-                && (matches!(
-                    event.state,
-                    Some(
-                        llama_native_types::GenerationState::Prefilling
-                            | llama_native_types::GenerationState::Generating
-                    )
-                ) || event.event == "delta")
-            {
-                let attempt = mom_llama_runtime::consult_cancel(
-                    &scope,
-                    &event.run_id,
-                    Some(&cancellation_target),
-                )?;
-                if attempt
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| result.cancelled_sequences == 1)
-                {
-                    cancelled = Some(attempt);
-                }
-            }
-            Ok(())
-        }),
-    )?;
-    let cancelled = cancelled.ok_or_else(|| {
-        anyhow!("legacy consult seat `{cancellation_target}` never became cancellable")
-    })?;
-    assert_eq!(
-        cancelled
-            .result
-            .as_ref()
-            .map(|result| result.cancelled_sequences),
-        Some(1)
-    );
-    let run = result
-        .result
-        .ok_or_else(|| anyhow!("consult result missing"))?;
-    assert_eq!(run.seats.len(), 4);
-    assert!(run.seats.iter().any(|seat| {
-        seat.seat_id == cancellation_target
-            && seat.state == llama_native_types::GenerationState::Cancelled
-    }));
-    assert!(
-        run.seats
-            .iter()
-            .filter(|seat| { seat.state == llama_native_types::GenerationState::Completed })
-            .count()
-            >= 1
-    );
-    let synthesis = mom_llama_runtime::consult_synthesize(&scope, &run.id, Vec::new())?;
-    assert!(synthesis.result.as_ref().is_some_and(|value| {
-        value.derived && !value.source_receipt_ids.is_empty() && !value.text.trim().is_empty()
-    }));
-    Ok(())
-}
-
-#[test]
-#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
     let _session = configured_real_session("real-persona-cache")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
@@ -2968,9 +2818,20 @@ fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF"]
 fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Result<()> {
-    let _session = configured_real_session("real-persona-group-cancel")?;
+    let session = configured_real_session("real-persona-group-cancel")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
         max_tokens: Some(64),
+        context_tokens: Some(2048),
+        batch_tokens: Some(128),
+        max_parallel_sequences: Some(4),
+        // This scenario verifies independent execution, cancellation, and
+        // source ownership; reasoning extraction has its own model scenarios.
+        upstream_settings: Some(BTreeMap::from([(
+            "disableReasoningParsing".to_string(),
+            json!(true),
+        )])),
         ..SettingsUpdate::default()
     })?;
     let native_owner = initialize_product_runtime()?;
@@ -3024,7 +2885,9 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let host_id = host.id.clone();
     let dispatch_scope = operation_scope.clone();
+    let dispatch_data_dir = session.path().to_path_buf();
     let handle = std::thread::spawn(move || {
+        set_data_dir_override_for_tests(Some(dispatch_data_dir));
         mom_llama_runtime::chat_dispatch_stream_in_scope(
             &dispatch_scope,
             MentionDispatchInput {
@@ -3042,9 +2905,20 @@ fn real_four_persona_group_cancels_one_target_without_touching_sources() -> Resu
             }),
         )
     });
-    let invocation_id = started_rx
-        .recv_timeout(Duration::from_mins(2))
-        .map_err(|error| anyhow!("persona group did not start streaming: {error}"))?;
+    let invocation_id = match started_rx.recv_timeout(Duration::from_mins(2)) {
+        Ok(id) => id,
+        Err(error) => {
+            operation_scope.request_cancellation();
+            let result = handle
+                .join()
+                .map_err(|_| anyhow!("persona group dispatch panicked"))??;
+            return Err(anyhow!(
+                "persona group did not start streaming: {error}; {}: {:?}",
+                result.readiness,
+                result.blocker
+            ));
+        }
+    };
     let cancelled = mom_llama_runtime::mention_cancel_in_scope(
         &operation_scope,
         &invocation_id,

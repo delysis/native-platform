@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 43,
+  "expected_test_count": 42,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -527,17 +527,6 @@
     },
     {
       "test_id": "real_four_persona_group_cancels_one_target_without_touching_sources",
-      "package": "mom-llama-runtime",
-      "target": "test:runtime",
-      "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",
-      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF",
-      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
-      "evidence_class": "real-product-model-runtime",
-      "promotion_prohibition": "Passing this runtime test cannot promote visible GUI, packaged-app, cross-platform, or release readiness.",
-      "platforms": ["linux", "macos", "windows"]
-    },
-    {
-      "test_id": "real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources",
       "package": "mom-llama-runtime",
       "target": "test:runtime",
       "source": "products/mom/crates/mom-llama-runtime/tests/runtime.rs",

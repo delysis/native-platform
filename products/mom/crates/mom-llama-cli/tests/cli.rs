@@ -331,69 +331,6 @@ fn path_selection_is_cli_exercisable_and_typed() -> Result<()> {
 }
 
 #[test]
-fn legacy_consult_cli_is_hidden_but_remains_available_for_recovery() -> Result<()> {
-    let root = data_dir("legacy-consult-recovery")?;
-    let help = cli(&root, &["--help"])?;
-    assert!(help.status.success());
-    let help = String::from_utf8(help.stdout)?;
-    assert!(
-        !help
-            .lines()
-            .any(|line| line.trim_start().starts_with("consult")),
-        "legacy Consult commands must not be advertised in the product CLI"
-    );
-
-    let recovered = json_output(&cli(&root, &["consult", "panel-list", "--json"])?)?;
-    assert_eq!(
-        recovered.get("command").and_then(Value::as_str),
-        Some("mom_llama.consult_panel_list")
-    );
-    assert_eq!(
-        recovered.get("readiness").and_then(Value::as_str),
-        Some("contracted")
-    );
-    Ok(())
-}
-
-#[test]
-fn legacy_consult_cli_rejects_every_mutating_subcommand() -> Result<()> {
-    let root = data_dir("legacy-consult-read-only")?;
-    let help = cli(&root, &["consult", "--help"])?;
-    assert!(help.status.success());
-    let help = String::from_utf8(help.stdout)?;
-    for retired in ["panel-create", "start", "cancel", "synthesize"] {
-        assert!(
-            !help.lines().any(|line| line.contains(retired)),
-            "retired mutating subcommand `{retired}` must not be parseable"
-        );
-    }
-
-    for args in [
-        &["consult", "panel-create"][..],
-        &["consult", "start"][..],
-        &["consult", "cancel"][..],
-        &["consult", "synthesize"][..],
-    ] {
-        let rejected = cli(&root, args)?;
-        assert!(
-            !rejected.status.success(),
-            "retired mutating command `{}` unexpectedly succeeded",
-            args.join(" ")
-        );
-        assert!(
-            String::from_utf8_lossy(&rejected.stderr).contains("unrecognized subcommand"),
-            "retired command `{}` did not fail during parsing",
-            args.join(" ")
-        );
-    }
-    assert!(
-        !root.join("runtime.sqlite3").exists(),
-        "rejected legacy writes must not initialize product storage"
-    );
-    Ok(())
-}
-
-#[test]
 fn attachment_and_mcp_are_exercisable_without_claiming_llama_inference() -> Result<()> {
     let root = data_dir("adapters")?;
     let image = root.join("photo.png");

@@ -224,8 +224,34 @@ The disk blocker and old approval request are resolved.
 
 ## Remaining qualification
 
-Complete final cross-platform CI for the FTE schema simplification, Mom Windows
-fixture scope, and Loom fixture correction. Keep packaged
+Full CI `34406935088` completed successfully at `6d49d14`: all eight jobs passed,
+including Windows, macOS, Linux, browser interactions, bounded fuzz execution,
+and the selected real-model scenarios. This qualifies the FTE schema
+simplification, Mom platform fixtures, and Loom cancellation fixture repair.
+
+The subsequent unused Consult engine and hidden CLI were removed; the current
+Persona catalog, mentions, and groups remain. Affected Mom checks passed 168
+library, 34 runtime integration, 71 app, and 11 CLI integration cases; thirteen
+prerequisite-dependent cases were skipped across those harnesses. Strict
+workspace/all-target Clippy passed. The ignored registry now contains 42 entries
+because the removed engine's integration case has no remaining implementation.
+
+The existing current four-Persona scenario passed with the hash-verified Qwen
+fixture on Metal in 10.88 seconds. It exercised targeted cancellation, real
+synthesis, attribution, and unchanged source conversations and Persona versions.
+Its dispatch worker now explicitly carries the thread-local fixture directory;
+previously it lost that binding and correctly hit the incompatible default-store
+rejection. Failure diagnostics now join the dispatch and expose its actual result.
+
+The FTE real OS credential test passed in 0.39 seconds, including create, replace,
+readback and deletion of a disposable Keychain entry. Two separate normal Mom
+CLI processes created and reopened the same encrypted conversation through the
+OS Keychain resolver with the environment-key override unset and secure storage
+explicitly enabled for the debug executable. These checks establish the named
+runtime paths, not release-bundle UI acceptance.
+
+Qualify the later Swift extraction and Consult removal on the final CI revision.
+Keep packaged
 interaction, OS credentials, native quit/join, and reopen
 evidence separate from compilation and controlled fixture execution. No merge
 or distribution is implied by this receipt.

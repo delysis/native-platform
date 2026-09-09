@@ -1,5 +1,4 @@
 use crate::config::{resolve_settings, upstream_setting_string};
-use crate::consult::ConsultPersona;
 use crate::conversation_store::{
     CONVERSATIONS_NAMESPACE, ChatTemplatePolicy, Conversation, ConversationDb,
     ConversationExecutionProfile, ConversationKind, DRAFTS_NAMESPACE, DraftDb, Message,
@@ -8,6 +7,7 @@ use crate::conversation_store::{
 use crate::native_runtime::resident_model_for_profile;
 use crate::now_ms;
 use crate::operation_scope::OperationScope;
+use crate::persona_library::BuiltinPersona;
 use crate::persona_library::{LIBRARY_REVISION, builtin_personas};
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
@@ -1598,7 +1598,7 @@ fn ensure_builtin_catalog() -> Result<()> {
 fn reconcile_builtin_personas(
     conversations: &mut ConversationDb,
     groups: &mut PersonaGroupDb,
-    catalog: Vec<ConsultPersona>,
+    catalog: Vec<BuiltinPersona>,
     catalog_revision: &str,
     default_model_path: Option<PathBuf>,
     default_mmproj_path: Option<PathBuf>,
@@ -1973,12 +1973,12 @@ mod tests {
         reconcile_builtin_personas, slug, validate_available_handle,
     };
     use crate::config::set_data_dir_override_for_tests;
-    use crate::consult::ConsultPersona;
     use crate::conversation_store::{
         CONVERSATIONS_NAMESPACE, Conversation, ConversationDb, ConversationExecutionProfile,
         ConversationKind, DRAFTS_NAMESPACE, DraftDb, DraftMessage, Message, MessageRole,
         ToolBinding, load_db, save_db,
     };
+    use crate::persona_library::BuiltinPersona;
     use crate::persona_library::LIBRARY_REVISION;
     use crate::store::RuntimeStore;
     use std::collections::BTreeSet;
@@ -2125,8 +2125,8 @@ mod tests {
         }
     }
 
-    fn catalog_persona(label: &str, prompt: &str) -> ConsultPersona {
-        ConsultPersona {
+    fn catalog_persona(label: &str, prompt: &str) -> BuiltinPersona {
+        BuiltinPersona {
             id: "careful_guide".to_string(),
             label: label.to_string(),
             description: "A deterministic catalog fixture.".to_string(),
