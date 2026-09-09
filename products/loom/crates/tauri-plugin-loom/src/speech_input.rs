@@ -17,7 +17,7 @@ use speech_native_types::{
 };
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 
 use crate::microphone_capture::{MicrophoneCaptureError, NativeMicrophoneCapture};
 
@@ -156,7 +156,7 @@ impl MicrophoneCapture for NativeMicrophoneCapture {
 pub(crate) struct SpeechInputService {
     host: OnceCell<Arc<SpeechHost>>,
     sessions: Arc<Mutex<BTreeMap<SpeechRequestId, Arc<AsyncMutex<SpeechInputSnapshot>>>>>,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
+    tasks: Mutex<SpeechInputTasks>,
     microphone: Arc<dyn MicrophoneCapture>,
     recording: Mutex<Option<ActiveRecording>>,
     recording_lifecycle: AsyncMutex<()>,
@@ -164,12 +164,18 @@ pub(crate) struct SpeechInputService {
     managed_model_root: Option<PathBuf>,
 }
 
+#[derive(Debug, Default)]
+struct SpeechInputTasks {
+    workers: JoinSet<()>,
+    failure: Option<String>,
+}
+
 impl SpeechInputService {
     pub(crate) fn new(app_local_data_root: Option<PathBuf>) -> Self {
         Self {
             host: OnceCell::new(),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
-            tasks: Mutex::new(Vec::new()),
+            tasks: Mutex::new(SpeechInputTasks::default()),
             microphone: Arc::new(NativeMicrophoneCapture::new()),
             recording: Mutex::new(None),
             recording_lifecycle: AsyncMutex::new(()),
@@ -351,17 +357,27 @@ impl SpeechInputService {
             }) {
                 return Err(SpeechInputError::Scope);
             }
+            let mut tasks = self.tasks.lock().map_err(|_| SpeechInputError::State)?;
+            while let Some(result) = tasks.workers.try_join_next() {
+                if let Err(error) = result {
+                    tasks.failure.get_or_insert_with(|| error.to_string());
+                }
+            }
+            if let Some(failure) = &tasks.failure {
+                return Err(SpeechInputError::Task(failure.clone()));
+            }
             let mut sessions = self.sessions.lock().map_err(|_| SpeechInputError::State)?;
             prune_terminal_sessions(&mut sessions);
             if sessions.len() >= MAX_INPUT_SESSIONS {
                 return Err(SpeechInputError::Capacity);
             }
             sessions.insert(request_id, Arc::clone(&session));
+            // Publish the session and its owned worker before scope revocation
+            // can begin shutdown and take the task set.
+            tasks
+                .workers
+                .spawn(run_transcription(host, request, session));
         }
-        let task = tokio::spawn(run_transcription(host, request, session));
-        let mut tasks = self.tasks.lock().map_err(|_| SpeechInputError::State)?;
-        tasks.retain(|task| !task.is_finished());
-        tasks.push(task);
         Ok(snapshot)
     }
 
@@ -500,30 +516,58 @@ impl SpeechInputService {
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), SpeechInputError> {
-        *self
-            .active_scope
-            .lock()
-            .map_err(|_| SpeechInputError::State)? = None;
+        let mut failure = None;
+        *self.active_scope.lock().unwrap_or_else(|poisoned| {
+            failure.get_or_insert(SpeechInputError::State);
+            poisoned.into_inner()
+        }) = None;
         let _lifecycle = self.recording_lifecycle.lock().await;
         let microphone = Arc::clone(&self.microphone);
-        tokio::task::spawn_blocking(move || microphone.shutdown())
+        if let Err(error) = tokio::task::spawn_blocking(move || microphone.shutdown())
             .await
-            .map_err(|error| SpeechInputError::Task(error.to_string()))??;
-        *self.recording.lock().map_err(|_| SpeechInputError::State)? = None;
-        if let Some(host) = self.host.get() {
-            host.shutdown().await?;
+            .map_err(|error| SpeechInputError::Task(error.to_string()))
+            .and_then(|result| result.map_err(SpeechInputError::from))
+        {
+            failure.get_or_insert(error);
         }
-        let tasks = self
-            .tasks
-            .lock()
-            .map_err(|_| SpeechInputError::State)?
-            .drain(..)
-            .collect::<Vec<_>>();
-        for task in tasks {
-            task.await
-                .map_err(|error| SpeechInputError::Task(error.to_string()))?;
+        *self.recording.lock().unwrap_or_else(|poisoned| {
+            failure.get_or_insert(SpeechInputError::State);
+            poisoned.into_inner()
+        }) = None;
+        if let Some(host) = self.host.get()
+            && let Err(error) = host.shutdown().await
+        {
+            failure.get_or_insert(error.into());
         }
-        Ok(())
+        let mut workers = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|poisoned| {
+                failure.get_or_insert(SpeechInputError::State);
+                poisoned.into_inner()
+            });
+            if let Some(error) = &tasks.failure {
+                failure.get_or_insert_with(|| SpeechInputError::Task(error.clone()));
+            }
+            std::mem::take(&mut tasks.workers)
+        };
+        let mut join_failure = None;
+        while let Some(result) = workers.join_next().await {
+            if let Err(error) = result {
+                let message = error.to_string();
+                failure.get_or_insert_with(|| SpeechInputError::Task(message.clone()));
+                join_failure.get_or_insert(message);
+            }
+        }
+        if let Some(error) = join_failure {
+            self.tasks
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    failure.get_or_insert(SpeechInputError::State);
+                    poisoned.into_inner()
+                })
+                .failure
+                .get_or_insert(error);
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     fn session(
@@ -774,6 +818,7 @@ mod tests {
     struct TestSpeechBackend {
         dispatches: std::sync::atomic::AtomicUsize,
         cancellations: std::sync::atomic::AtomicUsize,
+        shutdowns: std::sync::atomic::AtomicUsize,
         entered: tokio::sync::Notify,
         release: tokio::sync::Notify,
     }
@@ -850,6 +895,8 @@ mod tests {
             1
         }
         async fn shutdown(&self) -> Result<(), speech_native_types::SpeechError> {
+            self.shutdowns
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -1031,6 +1078,7 @@ mod tests {
     struct TestMicrophone {
         starts: std::sync::atomic::AtomicUsize,
         active: std::sync::atomic::AtomicBool,
+        fail_shutdown: std::sync::atomic::AtomicBool,
         entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
         release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
     }
@@ -1063,8 +1111,93 @@ mod tests {
         fn shutdown(&self) -> Result<(), MicrophoneCaptureError> {
             self.active
                 .store(false, std::sync::atomic::Ordering::SeqCst);
+            if self.fail_shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(MicrophoneCaptureError::Stream(
+                    "controlled microphone shutdown failure".into(),
+                ));
+            }
             Ok(())
         }
+    }
+
+    async fn assert_shutdown_drains_after_failure(microphone_fails: bool) {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+        let microphone = Arc::new(TestMicrophone::default());
+        microphone.fail_shutdown.store(microphone_fails, SeqCst);
+        let mut service = SpeechInputService::new(None);
+        service.microphone = microphone;
+        let (_, backend) = test_host(&service);
+        service
+            .bind_scope("project".into(), "session".into())
+            .expect("scope");
+
+        let first = service
+            .tasks
+            .lock()
+            .expect("tasks")
+            .workers
+            .spawn(async { panic!("controlled first speech task failure") });
+        while !first.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let (release, blocked) = tokio::sync::oneshot::channel::<()>();
+        let follower_completed = Arc::new(AtomicBool::new(false));
+        let completed = Arc::clone(&follower_completed);
+        service
+            .tasks
+            .lock()
+            .expect("tasks")
+            .workers
+            .spawn(async move {
+                let _ = blocked.await;
+                completed.store(true, SeqCst);
+            });
+
+        let mut shutdown = std::pin::pin!(service.shutdown());
+        // Drive real shutdown until it owns the retained handles. The follower
+        // cannot finish until explicitly released; an early error is a failure.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            poll_fn(|cx| match shutdown.as_mut().poll(cx) {
+                Poll::Ready(result) => {
+                    panic!("shutdown abandoned the blocked follower: {result:?}")
+                }
+                Poll::Pending if service.tasks.lock().expect("tasks").workers.is_empty() => {
+                    Poll::Ready(())
+                }
+                Poll::Pending => Poll::Pending,
+            }),
+        )
+        .await
+        .expect("shutdown reaches retained task drain");
+        assert_eq!(
+            backend.shutdowns.load(SeqCst),
+            1,
+            "host shutdown was attempted"
+        );
+        assert!(!follower_completed.load(SeqCst));
+        release.send(()).expect("release follower");
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), shutdown)
+            .await
+            .expect("all tasks joined")
+            .expect_err("failure remains observable");
+        assert!(follower_completed.load(SeqCst));
+        if microphone_fails {
+            assert!(matches!(error, SpeechInputError::Microphone(_)), "{error}");
+        } else {
+            assert!(matches!(error, SpeechInputError::Task(_)), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn microphone_shutdown_failure_still_drains_host_and_all_tasks() {
+        assert_shutdown_drains_after_failure(true).await;
+    }
+
+    #[tokio::test]
+    async fn panicked_speech_task_does_not_abandon_blocked_follower() {
+        assert_shutdown_drains_after_failure(false).await;
     }
 
     fn service_with_microphone(microphone: Arc<TestMicrophone>) -> Arc<SpeechInputService> {

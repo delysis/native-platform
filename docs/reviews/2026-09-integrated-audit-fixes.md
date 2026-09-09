@@ -11,6 +11,18 @@ not a declaration that compilation or fixtures establish product acceptance.
 
 ## Repairs
 
+- NP-007: the closure review found that Loom's speech-input owner still returned
+  early after a microphone/host stop error or a failed task join. Two controlled
+  regressions reproduced abandoned blocked followers through the real shutdown
+  method. Shutdown now attempts every phase and joins every retained worker
+  before returning its first error. Tokio's task set also observes completed
+  task failures instead of silently dropping their handles; session publication
+  and worker registration share the existing scope lock. Both regressions and
+  all eleven speech-input tests pass after the repair. The complete affected
+  plugin harness passed 172 tests with two prerequisite-dependent cases ignored;
+  strict workspace/all-target Clippy passed. Independent source review found no
+  blocking ownership or drain defect. This closes the remaining
+  owner path rather than substituting the earlier underlying-host drain proof.
 - Packaged FTE qualification found an additional protocol-edge mismatch:
   `/v1/models` advertised `local/default`, but submitting that exact ID returned
   HTTP 503 because the codec split it into backend `local` and model `default`.
