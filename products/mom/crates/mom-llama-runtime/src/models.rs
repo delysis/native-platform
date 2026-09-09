@@ -13,6 +13,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+pub use desktop_model_defaults::hugging_face_hub_cache_dir;
+
 const MAX_DISCOVERED_MODELS: usize = 512;
 const MAX_CACHE_SCAN_DEPTH: usize = 8;
 const MAX_PROJECTOR_SIBLINGS: usize = 256;
@@ -113,39 +115,6 @@ pub fn model_list(scope: &crate::OperationScope) -> Result<CommandResult<Vec<Mod
         false,
         false,
     ))
-}
-
-pub fn hugging_face_hub_cache_dir() -> Option<PathBuf> {
-    if let Some(path) =
-        nonempty_env_path("HF_HUB_CACHE").or_else(|| nonempty_env_path("HUGGINGFACE_HUB_CACHE"))
-    {
-        return Some(path);
-    }
-    if let Some(path) = nonempty_env_path("HF_HOME") {
-        return Some(path.join("hub"));
-    }
-    if let Some(path) = nonempty_env_path("XDG_CACHE_HOME") {
-        return Some(path.join("huggingface").join("hub"));
-    }
-    user_home_dir().map(|home| home.join(".cache").join("huggingface").join("hub"))
-}
-
-fn nonempty_env_path(key: &str) -> Option<PathBuf> {
-    std::env::var_os(key)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-fn user_home_dir() -> Option<PathBuf> {
-    nonempty_env_path("HOME")
-        .or_else(|| nonempty_env_path("USERPROFILE"))
-        .or_else(|| {
-            let drive = std::env::var_os("HOMEDRIVE").filter(|value| !value.is_empty())?;
-            let path = std::env::var_os("HOMEPATH").filter(|value| !value.is_empty())?;
-            let mut home = drive;
-            home.push(path);
-            Some(PathBuf::from(home))
-        })
 }
 
 fn collect_cached_models(directory: &Path, depth: usize, models: &mut Vec<PathBuf>) {

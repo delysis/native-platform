@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+desktop-model-defaults.workspace = true
 attachment-native-host.workspace = true
 attachment-native-types.workspace = true
 atomic-write-file.workspace = true

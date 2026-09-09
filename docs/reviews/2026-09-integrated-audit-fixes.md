@@ -11,6 +11,15 @@ not a declaration that compilation or fixtures establish product acceptance.
 
 ## Repairs
 
+- Packaged FTE qualification found an additional protocol-edge mismatch:
+  `/v1/models` advertised `local/default`, but submitting that exact ID returned
+  HTTP 503 because the codec split it into backend `local` and model `default`.
+  HTTP model IDs now remain opaque, including slashes. The actual HTTP router
+  regression failed with 503 before the repair and now accepts both one- and
+  multiple-slash IDs through the production codec and route selector. All 25
+  loopback/protocol tests and strict Clippy passed. An independent review found
+  no callers relying on the removed shorthand; canonical exact-route selection
+  remains available. Packaged requalification follows the pending UI/default work.
 - NP-002–005: FTE separates bounded authenticated control admission from
   generation admission; response bodies own response-map registration. Requested
   persistence failures and lost progress cannot produce successful completion.
@@ -251,7 +260,46 @@ explicitly enabled for the debug executable. These checks establish the named
 runtime paths, not release-bundle UI acceptance.
 
 Qualify the later Swift extraction and Consult removal on the final CI revision.
+Run `34409139337` at `ceaf885` passed Linux, macOS, Windows, model integration,
+frontend, and fuzz, while its policy tests exposed two stale copied ignored-test counts.
+Those assertions now use source reconciliation and a small explicit platform
+fixture; the complete 120-case policy test command passed locally. The subsequently found
+HTTP model-ID repair and the user's new UI/default-model punch list are not
+covered by that earlier revision.
+
 Keep packaged
 interaction, OS credentials, native quit/join, and reopen
 evidence separate from compilation and controlled fixture execution. No merge
 or distribution is implied by this receipt.
+
+## September 9 product punch list
+
+Mom now uses a compact overlay titlebar for Settings and the sidebar toggle,
+retaining native window decorations and lowering the minimum to 640 by 480.
+The one-line composer grows with its draft; the permanent shortcut row, fixed
+150-pixel composer floor, and 180-pixel transcript spacer are removed. The
+space-efficiency preference is recorded in the root and Mom instructions.
+
+A small std-only workspace crate owns the official Gemma 4 12B QAT Q4_0
+artifact identity and exact Hugging Face cache lookup. Fresh Mom/FTE setup
+uses that cached candidate while preserving explicit choices. Loom's catalog
+shares the identity; its existing policy already prefers the official 12B
+artifact. Normal model inspection and validation still apply. The local
+6,975,879,296-byte artifact matched SHA-256
+`93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b`.
+The hidden Mom server CLI shim and obsolete cache-policy spellings are removed;
+current model residency, MCP, and cache commands remain.
+
+The consolidated Rust run recorded 1,586 passes, 42 prerequisite-dependent
+ignores, and one obsolete assertion requiring the previous 760-pixel minimum.
+That assertion now verifies entry into the actual compact breakpoint; the
+affected app harness then passed all 71 tests. Strict workspace Clippy, the
+120-case policy command, ignored-source reconciliation, Mom architecture, and
+29 frontend tests passed. This records the failed invocation and its focused
+repair rather than relabeling the original run as green.
+
+The active isolated Mom session now uses Gemma and normal reasoning parsing.
+Messages and system prompts were compared and preserved in all fifteen
+conversations/Personas. The supported model-selection command loaded Gemma on
+Metal and returned `host_integrated`. Native UI layout/resizing, the rebuilt
+FTE API journey, and final cross-platform qualification remain to execute.

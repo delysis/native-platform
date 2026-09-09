@@ -180,6 +180,7 @@ fn check_package_groups(
             .map(String::as_str)
             .collect::<BTreeSet<_>>()
             == BTreeSet::from([
+                "desktop",
                 "native",
                 "gateway",
                 "service-attachment",
@@ -328,6 +329,7 @@ mod tests {
 
     fn package_groups() -> (PackageGroups, BTreeSet<String>) {
         let primary = [
+            "desktop",
             "native",
             "gateway",
             "service-attachment",

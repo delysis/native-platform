@@ -1229,7 +1229,7 @@ mod tests {
     fn regression_state(store: Arc<dyn ResponseStore>) -> AppState {
         let gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
         gateway
-            .register_backend(Arc::new(StreamingTestBackend))
+            .register_backend(Arc::new(StreamingTestBackend("test-model")))
             .expect("backend");
         AppState {
             gateway,
@@ -1256,6 +1256,42 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .expect("request")
+    }
+
+    #[tokio::test]
+    async fn advertised_namespaced_model_ids_round_trip_through_http_routing() {
+        use tower::ServiceExt;
+
+        for model_id in ["local/default", "organization/family/model"] {
+            let mut state = regression_state(Arc::new(SqliteStore::in_memory().expect("store")));
+            state.gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
+            state
+                .gateway
+                .register_backend(Arc::new(StreamingTestBackend(model_id)))
+                .expect("backend");
+            let app = router(state, 8192);
+            let mut request = http_request("/v1/models", Value::Null);
+            *request.method_mut() = axum::http::Method::GET;
+            let listed = app.clone().oneshot(request).await.expect("models");
+            assert_eq!(listed.status(), StatusCode::OK);
+            let listed: Value = serde_json::from_str(&response_body(listed).await).expect("JSON");
+            let advertised_id = &listed["data"][0]["id"];
+            assert_eq!(advertised_id, model_id);
+
+            let response = app
+                .oneshot(http_request(
+                    "/v1/responses",
+                    json!({"model": advertised_id, "input": "hello", "store": false}),
+                ))
+                .await
+                .expect("response");
+            let status = response.status();
+            let body = response_body(response).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let response: Value = serde_json::from_str(&body).expect("JSON");
+            assert_eq!(response["model"], model_id);
+            assert_eq!(response["status"], "completed");
+        }
     }
 
     #[cfg(not(unix))]
@@ -1560,7 +1596,7 @@ mod tests {
         }
     }
 
-    struct StreamingTestBackend;
+    struct StreamingTestBackend(&'static str);
 
     struct FloodingTestBackend;
 
@@ -1572,7 +1608,7 @@ mod tests {
                 display_name: "Test local".to_string(),
                 location: BackendLocation::LocalEmbedded,
                 models: vec![ModelDescriptor {
-                    id: "test-model".to_string(),
+                    id: self.0.to_string(),
                     aliases: Vec::new(),
                     display_name: "Test model".to_string(),
                     backend_id: "test-local".to_string(),
@@ -1705,7 +1741,7 @@ mod tests {
     #[async_trait]
     impl GatewayBackend for FloodingTestBackend {
         fn descriptor(&self) -> BackendDescriptor {
-            StreamingTestBackend.descriptor()
+            StreamingTestBackend("test-model").descriptor()
         }
 
         fn readiness(&self) -> BackendReadiness {
@@ -1922,7 +1958,7 @@ mod tests {
         assert_eq!(fixture["execution"]["credential_required"], false);
         let gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
         gateway
-            .register_backend(Arc::new(StreamingTestBackend))
+            .register_backend(Arc::new(StreamingTestBackend("test-model")))
             .expect("register backend");
         let token_directory =
             std::env::temp_dir().join(format!("fte-loopback-test-{}", random::<u64>()));
@@ -2098,7 +2134,7 @@ mod tests {
 
         let restarted_gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
         restarted_gateway
-            .register_backend(Arc::new(StreamingTestBackend))
+            .register_backend(Arc::new(StreamingTestBackend("test-model")))
             .expect("register backend after restart");
         let reopened_store = Arc::new(
             SqliteStore::open(&database_path).expect("reopen file-backed store after shutdown"),

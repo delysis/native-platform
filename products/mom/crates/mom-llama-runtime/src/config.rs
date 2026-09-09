@@ -566,13 +566,43 @@ pub(crate) fn settings_from_document(
     data_dir: PathBuf,
     stored: Option<Settings>,
 ) -> std::result::Result<Settings, ValidationBlocker> {
-    settings_from_document_with_model_sources(
+    let mut settings = settings_from_document_with_model_sources(
         data_dir,
         stored,
         runtime_model_override(),
         COMPILED_DEFAULT_MODEL_PATH,
         COMPILED_DEFAULT_MMPROJ_PATH,
-    )
+    )?;
+    // An isolated test store must not silently borrow the developer's model
+    // cache. Real-model fixtures supply an explicit model just like the CLI.
+    if settings.model_path.is_none() && data_dir_override().is_none() {
+        let cached = desktop_model_defaults::hugging_face_hub_cache_dir()
+            .and_then(|cache| desktop_model_defaults::cached_default_model(&cache));
+        apply_cached_default_model(&mut settings, cached);
+    }
+    Ok(settings)
+}
+
+fn apply_cached_default_model(
+    settings: &mut Settings,
+    cached: Option<desktop_model_defaults::CachedDefaultModel>,
+) {
+    if settings.model_path.is_none()
+        && let Some(cached) = cached
+    {
+        settings.model_path = Some(cached.model);
+        settings.mmproj_path = cached.projector;
+        settings.upstream_settings.insert(
+            "mmprojPath".to_string(),
+            json!(
+                settings
+                    .mmproj_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            ),
+        );
+    }
 }
 
 pub(crate) fn runtime_model_override() -> Option<PathBuf> {
@@ -1251,6 +1281,32 @@ mod tests {
         let settings = Settings::defaults_for_data_dir(std::env::temp_dir());
         assert_eq!(settings.default_max_tokens, DEFAULT_MAX_TOKENS);
         assert_eq!(settings.sampling_config().max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(
+            settings.upstream_settings.get("disableReasoningParsing"),
+            Some(&json!(false))
+        );
+    }
+
+    #[test]
+    fn cached_default_binds_its_projector_and_preserves_explicit_selection() {
+        let mut settings = Settings::defaults_for_data_dir(std::env::temp_dir());
+        let cached = desktop_model_defaults::CachedDefaultModel {
+            model: PathBuf::from("/cache/gemma.gguf"),
+            projector: Some(PathBuf::from("/cache/mmproj.gguf")),
+        };
+        apply_cached_default_model(&mut settings, Some(cached.clone()));
+        assert_eq!(settings.model_path.as_ref(), Some(&cached.model));
+        assert_eq!(settings.mmproj_path, cached.projector);
+        assert_eq!(
+            settings.upstream_settings.get("mmprojPath"),
+            Some(&json!("/cache/mmproj.gguf"))
+        );
+
+        settings.model_path = Some(PathBuf::from("/chosen/custom.gguf"));
+        settings.mmproj_path = None;
+        let selected = settings.clone();
+        apply_cached_default_model(&mut settings, Some(cached));
+        assert_eq!(settings, selected);
     }
 
     #[test]

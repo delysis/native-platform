@@ -21,7 +21,7 @@ for (const switchAt of ["persistence", "dispatch"]) {
         formValue: () => textarea.value, draftAttachmentIds: () => [],
         acquireChatBusy: () => "lease", releaseChatBusy() {},
         selectedConversation: () => selected, selectedConversationKind: () => "chat",
-        formField: () => textarea, closeMentions() {}, appendLiveMessage() {},
+        formField: () => textarea, closeMentions() {}, appendLiveMessage() {}, sizeComposer() {},
         report() {}, reportError() {}, releaseMentionInvocationBusy() {},
         refreshChat: async () => {}, refreshConversationProjection: async () => {},
         persistDraftNow: async (message, _, conversation = selected) => {

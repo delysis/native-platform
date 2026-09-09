@@ -137,6 +137,9 @@ try {
 
 function applyPrimaryGroup(group) {
   switch (group) {
+    case "desktop":
+      flags.root = true;
+      break;
     case "native":
       flags.native = true;
       flags.root = true;

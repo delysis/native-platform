@@ -113,7 +113,13 @@ streaming, cancellation, resident-model reuse, and fingerprinted prefix caches
 run in process. There is no `llama-cli`, `llama-server`, subprocess, or
 loopback hop between the router and local inference.
 
-In the desktop app, open **Providers** and choose a GGUF file. The sole
+Fresh desktop setup uses Google's Gemma 4 12B first-party QAT Q4_0 model when
+its pinned artifact is already in the Hugging Face cache. Startup registers the
+local candidate without downloading or loading weights; inference verifies the
+expected model digest. A saved selection always takes precedence, including
+when its file has become unavailable.
+
+To choose another model, open **Providers** and choose a GGUF file. The sole
 application-owned Gateway validates and registers the file, while SQLite keeps
 only its non-secret canonical path and optional expected SHA-256 for startup
 restoration. The webview receives the filename and readiness state, not the

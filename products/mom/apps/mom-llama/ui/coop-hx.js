@@ -36,6 +36,24 @@
     (chat() && chat().dataset.currentConversation) || "default";
   const selectedConversationKind = () =>
     (chat() && chat().dataset.conversationKind) || "chat";
+  const sizeComposer = () => {
+    const textarea = document.querySelector("#chat-form textarea[name='message']");
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${textarea.scrollHeight}px`;
+  };
+  const initializeWindowChrome = async () => {
+    const nativeWindow = tauri()?.window?.getCurrentWindow();
+    if (!nativeWindow) return;
+    const root = document.documentElement;
+    root.dataset.nativePlatform = navigator.platform.startsWith("Mac") ? "macos" : "other";
+    const syncWindow = async () => {
+      root.classList.toggle("native-fullscreen", await nativeWindow.isFullscreen());
+      sizeComposer();
+    };
+    await syncWindow();
+    await nativeWindow.onResized(() => { void syncWindow().catch(reportError); });
+  };
   const composerPolicy = globalThis.MomLlamaComposerKeyPolicy;
   let composerState = composerPolicy?.initialState?.() || { kind: "idle" };
   const transitionComposer = (event) => {
@@ -233,6 +251,7 @@
     }
     releaseAttachmentObjectUrls(current);
     current.replaceWith(replacement);
+    sizeComposer();
     return replacement;
   };
 
@@ -2382,6 +2401,7 @@
     "sidebar-toggle": async () => {
       await invoke("mom_llama_conversation_list");
       shell()?.classList.toggle("sidebar-open");
+      sizeComposer();
     },
     "sidebar-section-toggle": async (button) => {
       const section = button.dataset.sidebarSection;
@@ -3215,6 +3235,7 @@
           }
           if (selectedConversation() === conversation) {
             if (textarea) textarea.value = "";
+            sizeComposer();
             if (message) appendLiveMessage("user", message, `live-user-${Date.now()}`);
           }
           closeMentions();
@@ -3279,6 +3300,7 @@
         });
     }
     if (event.target.matches("#chat-form textarea[name='message']")) {
+      sizeComposer();
       if (autocompleteAccepting) return;
       if (event.isComposing || composerState.kind === "composing") return;
       const committedAutocomplete = event.target.dataset.autocompleteCommittedDraft;
@@ -3506,6 +3528,16 @@
     });
   };
 
+  document.addEventListener("mousedown", (event) => {
+    if (event.button !== 0) return;
+    const nativeWindow = tauri()?.window?.getCurrentWindow();
+    if (!nativeWindow) return;
+    if (event.target.closest?.(".titlebar-drag-surface")) {
+      event.preventDefault();
+      void nativeWindow.startDragging().catch(reportError);
+    }
+  });
+
   const boot = async () => {
     const status = document.getElementById("startup-status");
     const retry = document.getElementById("startup-retry");
@@ -3522,11 +3554,14 @@
         await invoke("mom_llama_runtime_initialize");
         const root = document.getElementById("app");
         root.innerHTML = await invokeMarkup("mom_llama_render_app");
+        sizeComposer();
+        await initializeWindowChrome();
         applyCustomCss(shell()?.dataset.customCss || "");
         await hydrateAttachmentPreviews(root);
         restoreChatViewport(null, chat());
         const alwaysShowSidebar = shell()?.dataset.alwaysShowSidebar === "true";
         if (window.innerWidth >= 1180 && alwaysShowSidebar) shell()?.classList.add("sidebar-open");
+        sizeComposer();
         await listen();
       } catch (error) {
         if (status) {

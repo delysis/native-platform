@@ -1643,8 +1643,9 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             data-native-core-only="true"
             data-mcp-process-ui-supported=(mcp_process_ui_supported()) {
             (sidebar(conversations, personas, active.as_ref().map(|conversation| conversation.id.as_str())))
-            header class="chrome" {
+            header class="chrome" aria-label="Window toolbar" {
                 (button("layout.sidebar_toggle", Some("sidebar-toggle"), "icon-button sidebar-toggle", false))
+                div class="titlebar-drag-surface" { span { "Mom Llama" } }
                 (button("settings.open", Some("settings-open"), "icon-button settings-toggle", false))
             }
             (chat_view_with_draft(settings, engine, models, active.as_ref(), Some(draft)))
@@ -2126,7 +2127,8 @@ fn composer(
                     span class="composer-ai-suffix" {}
                 }
                 textarea name="message"
-                    rows="2"
+                    rows="1"
+                    title="Enter to send; Shift + Enter for a new line"
                     aria-label="Message"
                     role="combobox"
                     aria-autocomplete="list"
@@ -2223,7 +2225,6 @@ fn composer(
             }
             output id="chat-events" class="stream-events" aria-live="polite" {}
         }
-        p class="keyboard-hint" { "Press " kbd { "Enter" } " to send, " kbd { "Shift + Enter" } " for new line" }
     }
 }
 
@@ -4721,11 +4722,11 @@ mod tests {
     #[test]
     fn compact_layout_is_reachable_at_the_native_window_minimum() -> Result<()> {
         let config: Value = serde_json::from_str(include_str!("../tauri.conf.json"))?;
-        assert_eq!(
+        assert!(
             config
                 .pointer("/app/windows/0/minWidth")
-                .and_then(Value::as_u64),
-            Some(760),
+                .and_then(Value::as_u64)
+                .is_some_and(|width| width <= 900),
             "the native minimum width must enter the 900px compact layout"
         );
         assert!(

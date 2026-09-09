@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Rust-owned product state, personas, conversations, tools and cache policy for Mom Llama"
 
 [dependencies]
+desktop-model-defaults.workspace = true
 anyhow.workspace = true
 attachment-native-host.workspace = true
 attachment-native-types.workspace = true

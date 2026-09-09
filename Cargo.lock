@@ -1671,6 +1671,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-model-defaults"
+version = "0.0.0"
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2117,6 +2121,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "desktop-model-defaults",
  "fte-backend-llama",
  "fte-loopback",
  "fte-protocols",
@@ -4353,6 +4358,7 @@ dependencies = [
  "attachment-native-types",
  "chacha20poly1305",
  "crossbeam-channel",
+ "desktop-model-defaults",
  "fs2",
  "getrandom 0.3.4",
  "llama-native-cache",
@@ -7063,6 +7069,7 @@ dependencies = [
  "base64 0.22.1",
  "cpal",
  "crossbeam-channel",
+ "desktop-model-defaults",
  "hound",
  "http",
  "image",

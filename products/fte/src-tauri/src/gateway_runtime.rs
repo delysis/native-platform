@@ -315,21 +315,32 @@ impl GatewayRuntimeOwner {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let database = self.database()?;
-        let Some(saved) = database.get_local_model_configuration()? else {
+        // A saved choice, including a missing or invalid file, always wins.
+        // Fresh setup reuses the official local cache without downloading or
+        // loading weights until a request actually selects the local route.
+        let configuration = database.get_local_model_configuration()?.or_else(|| {
+            let cache = desktop_model_defaults::hugging_face_hub_cache_dir()?;
+            let cached = desktop_model_defaults::cached_default_model(&cache)?;
+            Some(LocalModelConfiguration {
+                model_path: cached.model.to_str()?.to_owned(),
+                expected_sha256: Some(desktop_model_defaults::GEMMA_SHA256.to_owned()),
+            })
+        });
+        let Some(saved) = configuration else {
             let status = LocalModelStatus::not_configured();
             self.set_local_model_status(status.clone())?;
             return Ok(status);
         };
         let saved_path = PathBuf::from(&saved.model_path);
         match local_model_configuration(&saved_path, saved.expected_sha256) {
-            Ok((canonical_path, native_config, _)) => {
+            Ok((_, native_config, _)) => {
                 if let Err(error) = self.native_backend.configure_model(native_config) {
                     let error = anyhow::Error::from(error);
                     let status = LocalModelStatus::invalid(&saved_path, &error);
                     self.set_local_model_status(status.clone())?;
                     return Ok(status);
                 }
-                let status = LocalModelStatus::ready(&canonical_path);
+                let status = LocalModelStatus::ready(&saved_path);
                 self.set_local_model_status(status.clone())?;
                 Ok(status)
             }

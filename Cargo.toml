@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/desktop-model-defaults",
     "crates/native/crates/llama-native-cache",
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
@@ -63,6 +64,7 @@ repository = "https://github.com/delysis/native-platform"
 publish = false
 
 [workspace.dependencies]
+desktop-model-defaults = { path = "crates/desktop-model-defaults" }
 anyhow = "1.0.100"
 async-stream = "0.3.6"
 async-trait = "0.1.89"

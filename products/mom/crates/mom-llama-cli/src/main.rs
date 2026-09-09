@@ -55,11 +55,6 @@ enum Command {
         #[command(subcommand)]
         command: PathCommand,
     },
-    #[command(hide = true)]
-    Server {
-        #[command(subcommand)]
-        command: ServerCommand,
-    },
     Conversation {
         #[command(subcommand)]
         command: ConversationCommand,
@@ -597,50 +592,6 @@ enum AttachmentCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
-enum ServerCommand {
-    Configure {
-        #[arg(long)]
-        model_path: Option<PathBuf>,
-        #[arg(long)]
-        slots: Option<u32>,
-        #[arg(long)]
-        memory_budget_mib: Option<u64>,
-        #[arg(long)]
-        json: bool,
-    },
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
-    Start {
-        #[arg(long)]
-        json: bool,
-    },
-    Stop {
-        #[arg(long)]
-        json: bool,
-    },
-    Slots {
-        #[arg(long)]
-        json: bool,
-    },
-    SlotLoad {
-        #[arg(long)]
-        slot: usize,
-        #[arg(long)]
-        model_path: PathBuf,
-        #[arg(long)]
-        json: bool,
-    },
-    SlotUnload {
-        #[arg(long)]
-        slot: usize,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
 #[derive(Debug, Clone, ValueEnum)]
 enum ExportFormatArg {
     Json,
@@ -850,11 +801,8 @@ impl From<ToolPermissionPolicyArg> for mom_llama_runtime::ToolPermissionPolicy {
 
 #[derive(Debug, Clone, ValueEnum)]
 enum KvCachePolicyArg {
-    #[value(alias = "kv-cache-candidate")]
     Automatic,
-    #[value(alias = "prompt-prefix")]
     PrefixesOnly,
-    #[value(alias = "none")]
     Off,
 }
 
@@ -1391,45 +1339,6 @@ fn run() -> Result<()> {
                 json,
             ),
         },
-        Command::Server { command } => match command {
-            ServerCommand::Configure {
-                model_path,
-                slots,
-                memory_budget_mib,
-                json,
-            } => print_result(
-                mom_llama_runtime::server_configure(
-                    model_path,
-                    slots,
-                    memory_budget_mib.map(mib_to_bytes),
-                )?,
-                json,
-            ),
-            ServerCommand::Status { json } => {
-                print_result(mom_llama_runtime::server_status(&operation_scope)?, json)
-            }
-            ServerCommand::Start { json } => {
-                print_result(mom_llama_runtime::server_start(&operation_scope)?, json)
-            }
-            ServerCommand::Stop { json } => {
-                print_result(mom_llama_runtime::server_stop(&operation_scope)?, json)
-            }
-            ServerCommand::Slots { json } => {
-                print_result(mom_llama_runtime::model_slot_list(&operation_scope)?, json)
-            }
-            ServerCommand::SlotLoad {
-                slot,
-                model_path,
-                json,
-            } => print_result(
-                mom_llama_runtime::model_slot_load(&operation_scope, slot, model_path)?,
-                json,
-            ),
-            ServerCommand::SlotUnload { slot, json } => print_result(
-                mom_llama_runtime::model_slot_unload(&operation_scope, slot)?,
-                json,
-            ),
-        },
         Command::Conversation { command } => match command {
             ConversationCommand::New { title, json } => {
                 print_result(mom_llama_runtime::conversation_new(title)?, json)
@@ -1787,7 +1696,7 @@ fn command_requires_persona_approval_recovery(command: &Command) -> bool {
 
 fn command_uses_native(command: &Command) -> bool {
     match command {
-        Command::Engine { .. } | Command::Chat { .. } | Command::Server { .. } => true,
+        Command::Engine { .. } | Command::Chat { .. } => true,
         Command::Model { command } => matches!(
             command,
             ModelCommand::Select { .. }

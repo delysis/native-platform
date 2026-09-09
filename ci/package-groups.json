@@ -1,6 +1,9 @@
 {
   "schema_version": 1,
   "primary": {
+    "desktop": [
+      "desktop-model-defaults"
+    ],
     "native": [
       "llama-native-cache",
       "llama-native-engine",
@@ -72,6 +75,7 @@
   },
   "secondary": {
     "portable": [
+      "desktop-model-defaults",
       "attachment-native-document",
       "attachment-native-host",
       "attachment-native-inspect",

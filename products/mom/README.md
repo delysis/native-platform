@@ -47,8 +47,11 @@ products/mom/scripts/check-persona-product-ux.sh
 
 ## Run the app
 
-Choose a GGUF from the composer dropdown (or use its **Choose GGUF file…**
-action), then:
+Fresh setup selects Google's Gemma 4 12B instruction model, first-party QAT
+Q4_0, when its pinned artifact is already in the Hugging Face cache. The matching
+cached projector is paired automatically. Nothing is downloaded on startup.
+Choose another GGUF from the composer dropdown (or **Choose GGUF file…**) at any
+time. Run:
 
 ```sh
 cargo run --locked -p mom-llama-app
@@ -60,8 +63,10 @@ and, only when automatic same-directory pairing is not unique, optionally set
 `MOM_LLAMA_DEFAULT_MMPROJ_PATH`. A persisted user choice wins over the compiled
 default; the explicit runtime override wins over both. Compile defaults must be
 absolute and all selected model/projector files are still validated at runtime.
-When no compile default is supplied, Mom embeds no developer model path and does
-not fall back to the build directory.
+When none of those choices is set, Mom checks the shared pinned Gemma cache
+entry using `HF_HUB_CACHE`, `HUGGINGFACE_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME`,
+then the platform home cache. Mom embeds no developer model path and does not
+fall back to the build directory or an arbitrary smaller model.
 
 Mom uses the current Tauri identifier, data paths, environment variables, and
 Keychain service. These are the product configuration, not a second compatibility

@@ -26,6 +26,7 @@ crate-type = ["rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+desktop-model-defaults.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"

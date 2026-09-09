@@ -3,5 +3,9 @@
   "identifier": "default",
   "description": "Default Mom Llama window capability.",
   "windows": ["main"],
-  "permissions": ["core:default", "core:event:default"]
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:allow-start-dragging"
+  ]
 }
