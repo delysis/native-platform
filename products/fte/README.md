@@ -12,9 +12,9 @@ Messages blocks, and can route to
 an in-process llama.cpp host or hosted providers without changing caller
 shape. See [Gateway Module](docs/GATEWAY_MODULE.md).
 
-Local STT/TTS lives in the independent
-[`delysis/speech-native-kit`](https://github.com/delysis/speech-native-kit)
-repository. FTE may consume it through optional provider/protocol bridges, but
+Local STT/TTS lives in the shared
+[Speech service](../../crates/services/speech).
+FTE may consume it through optional provider/protocol bridges, but
 does not compile, install, or authorize speech by default. See
 [Module and Repository Map](docs/MODULE_MAP.md).
 
@@ -43,13 +43,12 @@ application does not invent benchmark, latency, usage, or quota data.
 
 ## Run locally
 
-Requirements: a current Rust toolchain, Node.js 22 or later, and the
-platform-specific Tauri prerequisites.
+Use the pinned Rust and pnpm versions and Tauri prerequisites described in the
+[workspace README](../../README.md). Run these commands from the repository root:
 
 ```sh
-npm ci
-npm test
-npm run dev
+pnpm install --frozen-lockfile
+pnpm --filter free-token-energy dev
 ```
 
 The authenticated loopback API is disabled until explicitly started. By
@@ -123,11 +122,8 @@ is never presented as a usable route.
 
 The real-GGUF integration test distinguishes actual in-process evidence from
 fixtures and proves both cold checkpoint creation and a second-request stable
-prefix hit. Release manifests pin the native kit by immutable Git revision.
-For coordinated local development, copy
-`.cargo/local-native-kit.toml.example` to `.cargo/local-native-kit.toml` and
-pass `--config .cargo/local-native-kit.toml` to Cargo; that override is ignored
-by Git.
+prefix hit. The native crates are workspace dependencies under `crates/native`;
+the root lockfile pins the external llama.cpp wrapper by immutable Git revision.
 
 ## Speech composition
 
@@ -153,15 +149,17 @@ injected OS credential-store resolver. Fresh databases never create plaintext
 credential storage. The database has an explicit application/schema identity;
 unversioned, foreign, and legacy plaintext stores are rejected before schema
 mutation and are never imported. Read
-[SECURITY.md](SECURITY.md) before using valuable credentials.
+[workspace security policy](../../SECURITY.md) for credential modes and platform
+limits. Private file storage and loopback-token creation refuse unsupported
+platforms before writing protected state.
 
 ## Development
 
-```sh
-npm run check
-npm run test:rust
-cargo check --all-targets --all-features --manifest-path src-tauri/Cargo.toml
-```
+Follow [the workspace contribution guide](../../CONTRIBUTING.md). The FTE
+desktop selection is `node scripts/ci/cargo-group.mjs test product-fte` (use
+`gateway` for the reusable gateway crates); frontend-only validation
+is `pnpm --filter free-token-energy test:frontend`. Full CI owns cross-platform
+workspace qualification, browser interaction, and packaging.
 
 Provider research notes and machine-readable policies are kept in
 `research/provider-gateways/`. Local cloned reference repositories under that
@@ -169,12 +167,10 @@ directory are intentionally ignored rather than vendored.
 
 ## Request activity storage
 
-Current request activity storage uses schema v2. The sole supported upgrade is
-the exact FTE v1 application ID and complete schema object set; it transactionally
-preserves existing IDs, rows and profile/model metadata while allowing new
-`tokens_used` values to be null when usage is unknown. Unversioned, foreign,
-future and altered schemas remain rejected before migration. Historical v1 zeros
-remain unchanged and can mean either zero or unavailable usage; the upgrade does
-not relabel them as measured zeros. Recorded token aggregates sum stored counts,
+Current request activity storage uses schema v2, with nullable `tokens_used`
+when usage is unknown. Fresh and exact current stores are supported; prior,
+unversioned, foreign, future, and altered schemas are rejected before schema or
+journal mutation. Incompatible databases are preserved without automatic
+conversion. Recorded token aggregates sum stored counts,
 not a claim that every request reported usage. Both desktop and authenticated
 loopback generation outcomes now enter the same metadata-only terminal observer.

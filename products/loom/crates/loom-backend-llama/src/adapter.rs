@@ -1996,6 +1996,7 @@ mod tests {
     use super::*;
     use crate::model::RuntimeModelInspection;
     use crate::runtime::CompleteModelRelease;
+    use std::time::Instant;
 
     #[derive(Debug)]
     struct FakeExecution {
@@ -2830,7 +2831,8 @@ mod tests {
             event_rx,
             result: Mutex::new(Some(outputs)),
             ready: AtomicBool::new(false),
-            complete_on_cancel: AtomicBool::new(false),
+            // Assertion failure must not deadlock the real owner's Drop/join.
+            complete_on_cancel: AtomicBool::new(true),
             panic_on_receive: AtomicBool::new(false),
             cancelled: Mutex::new(Vec::new()),
         });
@@ -2863,14 +2865,30 @@ mod tests {
                     },
                 })
                 .expect("send bounded native delta");
-            for _ in 0..chunks_per_delta {
-                delivered.push(
-                    handle
-                        .receive_event_timeout(Duration::from_millis(100))
-                        .expect("receive concurrently drained chunk")
-                        .expect("native delta must produce a chunk"),
-                );
+            // Coalescing and consumer scheduling determine chunk boundaries.
+            // Wait for the exact submitted bytes, not a presumed chunk count
+            // or a guarantee that every 100 ms polling interval has an event.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut received_bytes = 0;
+            while received_bytes < one_mibibyte.len() {
+                assert!(Instant::now() < deadline, "native delta delivery timed out");
+                let Some(event) = handle
+                    .receive_event_timeout(Duration::from_millis(100))
+                    .expect("receive concurrently drained chunk")
+                else {
+                    continue;
+                };
+                let LoomEvent::Generation(GenerationEvent {
+                    kind: GenerationEventKind::TextDelta { text },
+                    ..
+                }) = &event
+                else {
+                    panic!("unexpected event before native completion: {event:?}");
+                };
+                received_bytes += text.len();
+                delivered.push(event);
             }
+            assert_eq!(received_bytes, one_mibibyte.len());
         }
         event_tx
             .send(NativeEvent {

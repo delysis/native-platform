@@ -99,7 +99,7 @@ jobs:
       - if: ${{ matrix.command == 'test' }}
         run: cargo fmt --all -- --check
       - if: ${{ matrix.command == 'test' }}
-        run: cargo test --locked --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets --no-fail-fast
       - if: ${{ matrix.command == 'clippy' }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 

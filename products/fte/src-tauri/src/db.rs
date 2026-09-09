@@ -94,7 +94,6 @@ impl Database {
         };
         match state {
             DatabaseState::Fresh => db.init_schema()?,
-            DatabaseState::VersionOne => db.upgrade_version_one(&db_path)?,
             DatabaseState::Current => {}
         }
         Ok(db)
@@ -113,31 +112,6 @@ impl Database {
         self.conn
             .lock()
             .map_err(|_| anyhow!("database lock was poisoned"))
-    }
-
-    fn upgrade_version_one(&self, path: &Path) -> Result<()> {
-        let mut conn = self.connection()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        match classify_database(&tx, path)? {
-            DatabaseState::Current => return Ok(()),
-            DatabaseState::VersionOne => {}
-            DatabaseState::Fresh => {
-                anyhow::bail!("database identity changed before the v1 upgrade")
-            }
-        }
-        tx.execute_batch(
-            "ALTER TABLE request_log RENAME TO request_log_v1;
-            DROP INDEX idx_request_log_provider;",
-        )?;
-        tx.execute_batch(CURRENT_SCHEMA_OBJECTS[3].2)?;
-        tx.execute_batch(
-            "INSERT INTO request_log SELECT * FROM request_log_v1;
-            DROP TABLE request_log_v1;",
-        )?;
-        tx.execute_batch(CURRENT_SCHEMA_OBJECTS[0].2)?;
-        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        tx.commit()?;
-        Ok(())
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -384,7 +358,6 @@ impl Database {
 enum DatabaseState {
     Fresh,
     Current,
-    VersionOne,
 }
 
 fn classify_database(conn: &Connection, path: &Path) -> Result<DatabaseState> {
@@ -433,25 +406,6 @@ fn classify_database(conn: &Connection, path: &Path) -> Result<DatabaseState> {
         .into_iter()
         .map(|(kind, name, sql)| (kind, name, sql.map(|sql| normalize_schema_sql(&sql))))
         .collect::<BTreeSet<_>>();
-    let version_one_schema_objects = CURRENT_SCHEMA_OBJECTS
-        .into_iter()
-        .map(|(kind, name, sql)| {
-            (
-                kind.to_owned(),
-                name.to_owned(),
-                Some(normalize_schema_sql(&sql.replace(
-                    "tokens_used INTEGER CHECK",
-                    "tokens_used INTEGER NOT NULL CHECK",
-                ))),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    if application_id == APPLICATION_ID
-        && schema_version == 1
-        && schema_objects == version_one_schema_objects
-    {
-        return Ok(DatabaseState::VersionOne);
-    }
     if application_id == APPLICATION_ID
         && schema_version == SCHEMA_VERSION
         && schema_objects == expected_schema_objects
@@ -566,89 +520,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn stale_v1_preflight_accepts_an_exact_upgrade_committed_by_another_opener() {
-        let path = test_database_path("two-upgraders");
-        let connection = Connection::open(&path).expect("first preflight connection");
-        for (_, _, sql) in CURRENT_SCHEMA_OBJECTS
-            .iter()
-            .filter(|(kind, _, _)| *kind == "table")
-        {
-            connection
-                .execute_batch(&sql.replace(
-                    "tokens_used INTEGER CHECK",
-                    "tokens_used INTEGER NOT NULL CHECK",
-                ))
-                .expect("v1 schema");
-        }
-        connection
-            .execute_batch(CURRENT_SCHEMA_OBJECTS[0].2)
-            .expect("index");
-        connection
-            .pragma_update(None, "application_id", APPLICATION_ID)
-            .expect("app identity");
-        connection
-            .pragma_update(None, "user_version", 1)
-            .expect("v1 identity");
-        connection
-            .execute_batch("INSERT INTO master_profile VALUES ('name', 'preserved');")
-            .expect("profile");
-        assert_eq!(
-            classify_database(&connection, &path).expect("initial preflight"),
-            DatabaseState::VersionOne
-        );
-        let stale_opener = Database {
-            conn: Arc::new(Mutex::new(connection)),
-        };
-        // The first opener is paused after classifying v1. Another opener wins
-        // the write transaction and completes the identical supported upgrade.
-        let winner = Database::new(path.clone()).expect("other opener upgrades");
-        stale_opener
-            .upgrade_version_one(&path)
-            .expect("already-upgraded exact identity is success");
-        assert_eq!(
-            classify_database(&winner.connection().expect("winner connection"), &path)
-                .expect("current schema"),
-            DatabaseState::Current
-        );
-        assert_eq!(
-            winner
-                .connection()
-                .expect("winner connection")
-                .query_row(
-                    "SELECT value FROM master_profile WHERE key='name'",
-                    [],
-                    |row| row.get::<_, String>(0)
-                )
-                .expect("profile retained"),
-            "preserved"
-        );
-        for (pragma, value) in [("user_version", 99), ("application_id", 42)] {
-            {
-                let conn = winner.connection().expect("winner connection");
-                conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-                    .expect("restore supported version");
-                conn.pragma_update(None, pragma, value)
-                    .expect("concurrent identity change");
-            }
-            stale_opener
-                .upgrade_version_one(&path)
-                .expect_err("stale opener must not accept foreign/future identity");
-            let actual = winner
-                .connection()
-                .expect("winner connection")
-                .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0))
-                .expect("identity retained");
-            assert_eq!(actual, value);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn exact_version_one_upgrade_preserves_rows_and_allows_unknown_usage_on_reopen() {
-        let path = test_database_path("exact-v1-upgrade");
+    fn prior_schema_is_rejected_without_changing_the_database() {
+        let path = test_database_path("prior-schema");
         {
             let conn = Connection::open(&path).expect("v1 connection");
-            // Construct only the exact supported prior application schema.
+            // A recognized historical schema is still incompatible: no upgrade
+            // machinery is needed for an unreleased product.
             for (_, _, sql) in CURRENT_SCHEMA_OBJECTS
                 .iter()
                 .filter(|(kind, _, _)| *kind == "table")
@@ -669,34 +546,16 @@ mod tests {
                 VALUES ('old', 'zero', 0, 3, 200), ('old', 'known', 7, 4, 200);
                 INSERT INTO master_profile VALUES ('name', 'preserved');").expect("v1 rows");
         }
-        let database = Database::new(path.clone()).expect("upgrade exact v1");
-        let logs = database.get_recent_logs(10).expect("preserved logs");
-        assert_eq!(logs[0].tokens_used, Some(7));
-        assert_eq!(logs[1].tokens_used, Some(0));
-        database
-            .log_request("new", "unknown", None, 5, 499)
-            .expect("unknown usage");
-        drop(database);
-        let database = Database::new(path.clone()).expect("v2 reopen");
-        let logs = database.get_recent_logs(10).expect("reopened logs");
-        assert_eq!(logs.len(), 3);
-        assert_eq!(logs[0].tokens_used, None);
-        assert_eq!(logs[2].tokens_used, Some(0));
-        let conn = database.connection().expect("connection");
-        assert_eq!(
-            conn.query_row(
-                "SELECT value FROM master_profile WHERE key='name'",
-                [],
-                |row| row.get::<_, String>(0)
-            )
-            .expect("profile"),
-            "preserved"
-        );
-        assert_eq!(
-            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-                .expect("version"),
-            2
-        );
+        let before = std::fs::read(&path).expect("original database");
+        let error = match Database::new(path.clone()) {
+            Ok(_) => panic!("prior schema must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unsupported database"));
+        assert_eq!(std::fs::read(&path).expect("unchanged database"), before);
+        assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", path.display())).exists());
+        std::fs::remove_file(path).expect("remove fixture after assertions");
     }
 
     #[test]

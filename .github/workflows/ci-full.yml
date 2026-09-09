@@ -51,7 +51,7 @@ jobs:
           shared-key: full-root-${{ runner.os }}
           cache-on-failure: true
       - run: cargo fmt --all -- --check
-      - run: cargo test --locked --workspace --all-targets
+      - run: cargo test --locked --workspace --all-targets --no-fail-fast
       - run: cargo test --locked --workspace --doc
       - name: Reconcile ignored-test evidence registry with guarded list arguments
         run: node scripts/ci/validate-ignored-tests.mjs --cargo-list

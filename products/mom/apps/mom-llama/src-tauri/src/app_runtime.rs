@@ -994,6 +994,9 @@ mod tests {
     use std::time::Duration;
 
     fn runtime() -> AppRuntimeHandle {
+        // This composes the real Information private store. Tests using it run
+        // only where that storage capability is implemented; independent
+        // supervisor and approval-worker tests remain portable.
         runtime_with_finalizer(Arc::new(AtomicBool::new(false)))
     }
 
@@ -1100,6 +1103,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn final_persona_approval_recovery_waits_for_admitted_work_and_precedes_native_join() {
         let host = Arc::new(NativeHost::new(NativeHostConfig::default()));
         let reconciled = Arc::new(AtomicBool::new(false));
@@ -1138,6 +1142,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn quiesce_closes_admission_once() {
         let runtime = runtime();
         let command = command_spec("mom_llama_settings_update");
@@ -1148,6 +1153,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn cloned_handles_share_one_admission_gate() {
         let first = runtime();
         let second = first.clone();
@@ -1161,6 +1167,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn speculative_admission_is_single_flight_and_yields_to_foreground() {
         let runtime = runtime();
         let speculative = runtime
@@ -1195,6 +1202,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn explicit_speculative_cancel_is_runtime_local_and_idempotent() {
         let left = runtime();
         let right = runtime();
@@ -1212,6 +1220,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn two_runtime_characterization_keeps_injected_admission_and_cancel_seams_isolated() {
         let left = runtime();
         let right = runtime();
@@ -1249,6 +1258,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn quiesce_waits_for_every_previously_admitted_operation() {
         let runtime = runtime();
         let command = command_spec("mom_llama_settings_update");
@@ -1271,6 +1281,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn direct_native_operation_drains_before_final_join() {
         let finalizer_called = Arc::new(AtomicBool::new(false));
         let runtime = runtime_with_finalizer(Arc::clone(&finalizer_called));
@@ -1310,6 +1321,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn receipt_and_native_reads_drain_before_final_join() {
         let finalizer_called = Arc::new(AtomicBool::new(false));
         let runtime = runtime_with_finalizer(Arc::clone(&finalizer_called));
@@ -1339,6 +1351,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn cancellation_is_reswept_until_late_registered_work_drains() {
         let finalizer_called = Arc::new(AtomicBool::new(false));
         let runtime = runtime_with_finalizer(Arc::clone(&finalizer_called));
@@ -1361,6 +1374,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn repeated_quit_runs_one_shutdown() {
         let finalizer_called = Arc::new(AtomicBool::new(false));
         let runtime = runtime_with_finalizer(Arc::clone(&finalizer_called));
@@ -1421,21 +1435,25 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn model_select_vs_quit_has_one_winner() {
         command_vs_quit_has_one_winner("mom_llama_model_select");
     }
 
     #[test]
+    #[cfg(unix)]
     fn settings_update_vs_quit_has_one_winner() {
         command_vs_quit_has_one_winner("mom_llama_settings_update");
     }
 
     #[test]
+    #[cfg(unix)]
     fn receipt_writing_read_vs_quit_has_one_winner() {
         command_vs_quit_has_one_winner("mom_llama_conversation_list");
     }
 
     #[test]
+    #[cfg(unix)]
     fn native_read_vs_quit_has_one_winner() {
         command_vs_quit_has_one_winner("mom_llama_model_slot_list");
     }

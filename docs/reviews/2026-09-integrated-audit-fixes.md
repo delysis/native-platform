@@ -23,7 +23,8 @@ not a declaration that compilation or fixtures establish product acceptance.
   the fourteen-step migration chain and retired research tables are removed.
   Opening a damaged project cannot create a replacement database. Existing
   incompatible data is preserved; no speculative migration or backup framework
-  was introduced.
+  was introduced. The remaining FTE desktop v1-to-v2 upgrade is also removed;
+  a real prior-format file is rejected byte-for-byte without WAL/SHM creation.
 - F21/F14: Mom no longer automatically imports plaintext legacy JSON. Known
   residual artifacts are refused before key/database creation. Explicit import
   remains supported. A data-directory override cannot enable a deterministic
@@ -76,6 +77,8 @@ not a declaration that compilation or fixtures establish product acceptance.
 
 Full CI executes one workspace matrix, doctests, and Linux Clippy. macOS adds
 browser interaction and packaging; frontend commands do not repeat Rust builds.
+Workspace execution reports failures across all binaries in one run instead of
+stopping after the first failing package and requiring another discovery cycle.
 The fuzz lane executes bounded inputs and retains crashes. A hash-pinned CPU
 model lane runs exact registered tests and rejects zero execution. Advisory
 checks scan the actual root and fuzz locks.
@@ -145,6 +148,29 @@ Other observed checks:
   portable, while the real private-token case is Unix-only. macOS compiled and
   passed Rust tests, then reproduced the now-repaired native caret failure.
   These failures are preserved, not relabeled as a green full run.
+- CI `34403997871` at `34980c0` passed Linux tests/doctests/Clippy and the optimized
+  GLib iterator, all three exact CPU model scenarios, frontend, policy, and fuzz.
+  macOS passed Rust tests/doctests, all 74 WebKit cases, and Loom/FTE packaging.
+  Windows passed the corrected FTE boundary and subsequently exposed 23 Mom
+  tests whose setup opened unsupported Information private storage. Those
+  composed-store tests now run only on Unix; independent supervisor, approval
+  worker, serialization, and policy tests remain portable. A Windows product
+  boundary test asserts refusal preserves existing source and creates no store.
+- The next consolidated local run completed 63 harnesses with 1,544 passes and
+  38 ignored cases. One additional Loom adapter harness was terminated after
+  an assertion unwind hung in a fixture that never completed cancellation;
+  this is not recorded as a passing consolidated run. That fixture now honours
+  cancellation and verifies delivered bytes across variable chunk boundaries,
+  retrying empty polls within a bounded deadline. Overflow, contiguous sequence,
+  and failed-terminal assertions remain intact. The final focused case passed
+  in 2.61 seconds; its full adapter harness then passed 48 tests with five
+  fixture-dependent cases ignored in 3.26 seconds. Together with the completed
+  unaffected harnesses this records 1,592 passing cases and 43 ignored cases,
+  not a claim that the interrupted invocation itself passed.
+- The FTE current/prior/foreign schema checks passed eight cases after removing
+  the upgrade path. Workflow and current-document checks passed 45 cases.
+  Strict workspace/all-target Clippy passed after all final fixture and schema
+  edits, using the existing dependency cache.
 
 Earlier Rust 1.95 results and the disk-full Rust 1.92 attempt are not substituted
 for current qualification. Commands select the complete 1.92 toolchain on PATH
@@ -167,8 +193,8 @@ CI run 34394817229 passed Linux wrapper tests, Windows/macOS builds, workflow
 policy, and CUDA. The CUDA check took nearly its ninety-minute allowance because
 it built a multi-architecture binary. Commit `4c000bd5992da2a95beffe3b6777216f2a5fea67`
 pins Rust 1.92 and limits that compile check to representative CUDA architecture
-75 with a thirty-minute cap. This is compile coverage, not GPU runtime acceptance;
-its CI rerun is `34403567854`.
+75 with a thirty-minute cap. Run `34403567854` passed all five jobs; CUDA completed
+in 26 minutes 24 seconds. This is compile coverage, not GPU runtime acceptance.
 
 ## Local cache maintenance
 
@@ -176,8 +202,13 @@ The user's September 9 instruction supersedes per-cache approval. The preference
 is saved. A dependency-free safe Rust helper checks Cargo identity, a fourteen-day
 age threshold, active builds, Cargo locks, symlinks, and open files. It only prunes
 reproducible Cargo output subdirectories; model fixtures and source stay intact.
-A real filesystem regression passed. A daily 04:00 automation runs the helper
-quietly, notifying only on a failure requiring intervention.
+A real filesystem regression passed. The task automation currently follows audit
+CI every fifteen minutes; after completion it returns to daily 04:00 cleanup,
+quiet on successful cleanup or active-build deferral. It never broadens the
+helper's deletion paths or falls back to manual deletion. Research databases,
+including Alexandria, Community Archive, Encyclopedia, and MPC, were verified
+present after cleanup; the major Alexandria and Community Archive databases
+also opened successfully read-only.
 
 The automatic sweep removed 228,332,165,314 bytes, in addition to the obsolete W1
 and W9 targets. Available space was approximately 193 GiB after resumed builds.
@@ -185,8 +216,8 @@ The disk blocker and old approval request are resolved.
 
 ## Remaining qualification
 
-Complete the cross-platform CI run with the corrected
-GLib target, Windows fixture scope, native caret path, and registered Mom cache
-scenario. Keep packaged interaction, OS credentials, native quit/join, and reopen
+Complete final cross-platform CI for the FTE schema simplification, Mom Windows
+fixture scope, and Loom fixture correction. Keep packaged
+interaction, OS credentials, native quit/join, and reopen
 evidence separate from compilation and controlled fixture execution. No merge
 or distribution is implied by this receipt.

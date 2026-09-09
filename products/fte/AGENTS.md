@@ -40,9 +40,8 @@ provider, routing, streaming, and persistence components.
   request-log state, and the selected local-model path plus optional expected
   digest; provider credentials live in the OS credential store
 - the desktop database accepts only a fresh store or the exact current
-  application/schema identity, or upgrades the exact prior v1 identity to v2
-  transactionally to preserve unknown token usage; unversioned, foreign, future,
-  and plaintext credential stores fail closed before schema mutation
+  application/schema identity; prior, unversioned, foreign, future, and plaintext
+  credential stores fail closed before schema or journal mutation
 - model and provider presentation metadata lives in `src-tauri/src/catalog.rs`;
   protocol codecs, routing, hosted adapters, loopback, and native inference
   remain in their respective reusable workspace crates
@@ -65,22 +64,17 @@ their respective score. Missing observations use a neutral value.
 
 ## Required verification
 
-Before committing:
-
-```sh
-npm test
-cargo fmt --all --check
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-./scripts/check-module-boundaries.sh
-```
+Use the root `CONTRIBUTING.md` commands. Run focused checks while editing, then
+one affected-package and consumer gate; do not repeat the whole native build
+for each edit or invoke obsolete standalone-workspace commands.
 
 For native cache or adapter changes, also run the ignored real-GGUF proof with
 `MOM_LLAMA_MODEL_PATH`. A cache metadata round-trip is not sufficient: the
 proof must show a cold checkpoint, a later hit, and real in-process inference.
 
 When changing provider transforms or streams, add fixture-style regression
-tests. When changing SQLite schema or migrations, add a reopen/migration test.
+tests. When changing SQLite schema, verify current-store reopen and preservation
+of rejected incompatible stores. Do not add speculative upgrade paths.
 Never commit the cloned repositories beneath `research/provider-gateways/`.
 
 Local inference backends must not require placeholder credentials, masquerade
