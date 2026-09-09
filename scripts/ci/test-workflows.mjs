@@ -162,7 +162,11 @@ test("local macOS smoke can verify the exact emitted archive", () => {
 });
 
 test("Loom UI smoke cannot attach to an active editor or invent a model identity", () => {
-  const smoke = read(smokeScriptPath);
+  const support = path.join(root, "scripts/macos-smoke-support");
+  const smoke = [read(smokeScriptPath), ...fs.readdirSync(support)
+    .filter((name) => name.endsWith(".swift"))
+    .sort()
+    .map((name) => read(path.join(support, name)))].join("\n");
   assert.match(smoke, /running_exact_pids=\$\(exact_bundle_pid\)/);
   assert.match(smoke, /refusing to run macOS UI smoke while the exact application bundle is already running/);
   assert.match(smoke, /gemma-4-12B-it-qat-q4_0\.gguf/);
@@ -835,8 +839,10 @@ test("the required macOS matrix preserves every gate without serializing them", 
   assert.match(macos, /component: \$\{\{ fromJSON\(needs\.plan\.outputs\.macos_matrix\) \}\}/);
   assert.match(macos, /fail-fast: false/);
   assert.match(macos, /name: Release tooling shell syntax\n\s+if: \$\{\{ matrix\.component == 'release' \}\}\n\s+run: sh -n scripts\/release-macos\.sh scripts\/smoke-macos-app\.sh/);
-  assert.match(macos, /dtolnay\/rust-toolchain@[0-9a-f]{40}\n\s+if: \$\{\{ matrix\.component != 'release' \}\}/);
-  assert.match(macos, /Swatinem\/rust-cache@[0-9a-f]{40}\n\s+if: \$\{\{ matrix\.component != 'release' \}\}/);
+  assert.match(macos, /dtolnay\/rust-toolchain@[0-9a-f]{40}\n\s+with:/);
+  assert.match(macos, /name: Compile macOS smoke support\n\s+if: \$\{\{ matrix\.component == 'release' \}\}\n\s+run: cargo run --locked -p xtask -- macos-smoke-support/);
+  assert.match(read(fullPath), /name: Compile macOS smoke support\n\s+if: runner.os == 'macOS'\n\s+run: cargo run --locked -p xtask -- macos-smoke-support/);
+  assert.match(macos, /Swatinem\/rust-cache@[0-9a-f]{40}\n\s+with:/);
   assert.match(macos, /shared-key: platform-macos-\$\{\{ matrix\.component \}\}/);
   assert.doesNotMatch(macos, /save-if:/);
   assert.doesNotMatch(rootGraph, /needs\.plan\.outputs\.mom/);

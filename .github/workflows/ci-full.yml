@@ -51,6 +51,9 @@ jobs:
           shared-key: full-root-${{ runner.os }}
           cache-on-failure: true
       - run: cargo fmt --all -- --check
+      - name: Compile macOS smoke support
+        if: runner.os == 'macOS'
+        run: cargo run --locked -p xtask -- macos-smoke-support target/macos-smoke-support
       - run: cargo test --locked --workspace --all-targets --no-fail-fast
       - run: cargo test --locked --workspace --doc
       - name: Reconcile ignored-test evidence registry with guarded list arguments

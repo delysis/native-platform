@@ -252,6 +252,12 @@
       "evidence": "macOS product smoke has no Cargo owner"
     },
     {
+      "prefix": "scripts/macos-smoke-support",
+      "kind": "platform",
+      "effects": ["platform_macos", "release"],
+      "evidence": "compiled macOS smoke helpers have no Cargo owner"
+    },
+    {
       "path": "scripts/find-embedded-model.mjs",
       "kind": "platform",
       "effects": ["platform_macos", "release"],

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod macos_smoke_support;
 mod model_check;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -24,7 +25,10 @@ fn main() -> Result<()> {
     match command.as_str() {
         "policy" => check_policy(&workspace_root()),
         "model-check" => model_check::run(&workspace_root(), &arguments.collect::<Vec<_>>()),
-        _ => bail!("usage: cargo xtask <policy|model-check>"),
+        "macos-smoke-support" => {
+            macos_smoke_support::run(&workspace_root(), &arguments.collect::<Vec<_>>())
+        }
+        _ => bail!("usage: cargo xtask <policy|model-check|macos-smoke-support>"),
     }
 }
 

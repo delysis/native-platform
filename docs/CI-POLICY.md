@@ -28,6 +28,10 @@ and services without rebuilding them in redundant product/group jobs. macOS
 also runs the WebKit browser suite and packages Loom and FTE using that job's
 existing Rust target directory. The separate frontend job runs only frontend
 commands; it does not recursively invoke product Rust build scripts.
+The macOS job and selected release-tooling lane compile and link the platform
+programs in `scripts/macos-smoke-support` through `xtask macos-smoke-support`.
+The smoke runner reuses those compiled helpers throughout its isolated run;
+shell syntax checks are not substituted for checking the platform source.
 
 The `model-integration` job downloads one immutable Qwen3 0.6B CPU fixture and
 verifies its SHA-256. `cargo run --locked -p xtask -- model-check MODEL SHA256

@@ -88,6 +88,14 @@ explicit non-Cargo rules. Unknown paths or unavailable metadata select full
 coverage. The old path planner, Mom overlay, and shadow comparison are removed.
 The obsolete W8/W9 `xtask lean` census is retired. Git retains its history.
 
+The eighteen existing Swift programs are extracted unchanged from the macOS
+smoke shell into `scripts/macos-smoke-support`. A safe Rust xtask command compiles
+and links them; the shell builds them once and reuses them for both launch/use/
+quit cycles. Full macOS CI and the selected release-tooling lane execute that
+compiler gate. Local compilation passed all eighteen programs; the compiled
+bundle-inventory helper also executed successfully. This closes the former
+shell-syntax-only check without rewriting the platform implementation.
+
 Mom's Consult-to-Persona migration and repair machinery is removed. Current
 builtin catalog updates still preserve user edits. The unused file-size-only
 native memory estimator and tests of its obsolete formula are removed;
