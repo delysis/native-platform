@@ -504,3 +504,21 @@ the corrected binary-target invocation executed the 19 tests.
 
 Full CI `34416191301` passed at `8a6a155`, qualifying the Loom memory repair.
 It predates the final Mom settings and FTE cancellation-display cleanup above.
+
+The `359bb9f` Mom and FTE debug bundles built sequentially in 8.07 and 4.32
+seconds and passed strict ad-hoc signature verification. Mom executable hash:
+`2801d7a1da84e751adef41871b5a00c721c95d2a5a03ea579083faa5bde3cbeb`;
+FTE executable hash:
+`3a4d43ae51bd936c14170c9c125f48e9f805365d27b6676b5df7f6e9992c6fee`.
+The final Mom development-store run (PID 76160) restored the fixture conversation,
+showed the active-only right settings sidebar with the X close control, and
+closed that sidebar correctly. The preceding loaded-model fixture quit joined
+its operation worker, native slot and persona recovery worker in 110 ms with
+no retained work. The development run was then quit normally and the final
+bundle relaunched against the original encrypted `/tmp/mom-audit-bundle.R1ZWQT`
+store with secure storage enabled (PID 76226). It again reached the native
+Keychain wait; encrypted-store reopen remains unverified and requires the user.
+The final FTE run (PID 76262) showed the same five stored requests and 275 tokens,
+now with a ready local provider and neutral Cancelled rows in native Activity.
+Full CI `34418019361` is running for this production-code checkpoint. Later
+receipt-only commits do not require rebuilding these unchanged executables.
