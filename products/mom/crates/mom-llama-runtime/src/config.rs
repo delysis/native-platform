@@ -389,18 +389,8 @@ fn reconcile_resident_memory_budget(settings: &mut Settings, physical_memory: Op
         .upstream_settings
         .get(MEMORY_BUDGET_MODE_KEY)
         .and_then(Value::as_str);
-    let legacy_budget_mib = upstream_setting_i64(settings, "nativeMemoryBudgetMiB")
-        .and_then(|value| u64::try_from(value).ok());
     let mode = match declared_mode {
         Some("manual") => ResidentMemoryBudgetMode::Manual,
-        Some("auto") => ResidentMemoryBudgetMode::Auto,
-        _ if legacy_budget_mib.is_some_and(|value| value != 8192) => {
-            ResidentMemoryBudgetMode::Manual
-        }
-        // The historical default and an explicit 8192 MiB choice are
-        // indistinguishable in documents written before mode provenance. The
-        // migration treats that exact legacy value as auto; every subsequent
-        // explicit update records `manual` and is preserved exactly.
         _ => ResidentMemoryBudgetMode::Auto,
     };
     if mode == ResidentMemoryBudgetMode::Auto {
@@ -1298,35 +1288,11 @@ mod tests {
             Some(&json!("manual"))
         );
 
-        let mut legacy_non_default = Settings::defaults_for_data_dir(std::env::temp_dir());
-        legacy_non_default.resident_memory_budget_bytes = 12 * GIB;
-        legacy_non_default
-            .upstream_settings
-            .remove(MEMORY_BUDGET_MODE_KEY);
-        legacy_non_default
-            .upstream_settings
-            .insert("nativeMemoryBudgetMiB".to_string(), json!(12 * 1024));
-        reconcile_resident_memory_budget(&mut legacy_non_default, Some(128 * GIB));
-        assert_eq!(legacy_non_default.resident_memory_budget_bytes, 12 * GIB);
+        let mut automatic = Settings::defaults_for_data_dir(std::env::temp_dir());
+        reconcile_resident_memory_budget(&mut automatic, Some(128 * GIB));
+        assert_eq!(automatic.resident_memory_budget_bytes, 64 * GIB);
         assert_eq!(
-            legacy_non_default
-                .upstream_settings
-                .get(MEMORY_BUDGET_MODE_KEY),
-            Some(&json!("manual"))
-        );
-
-        let mut legacy_default = Settings::defaults_for_data_dir(std::env::temp_dir());
-        legacy_default.resident_memory_budget_bytes = 8 * GIB;
-        legacy_default
-            .upstream_settings
-            .remove(MEMORY_BUDGET_MODE_KEY);
-        legacy_default
-            .upstream_settings
-            .insert("nativeMemoryBudgetMiB".to_string(), json!(8192));
-        reconcile_resident_memory_budget(&mut legacy_default, Some(128 * GIB));
-        assert_eq!(legacy_default.resident_memory_budget_bytes, 64 * GIB);
-        assert_eq!(
-            legacy_default.upstream_settings.get(MEMORY_BUDGET_MODE_KEY),
+            automatic.upstream_settings.get(MEMORY_BUDGET_MODE_KEY),
             Some(&json!("auto"))
         );
     }

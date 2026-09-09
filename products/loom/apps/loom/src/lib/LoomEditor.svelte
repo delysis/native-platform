@@ -750,6 +750,7 @@
           unconsume: authorizeCompletionReversal,
           cycle: onGhostCycle,
           modifier: setOptionHeld,
+          navigate: onCaretNavigation,
           pin: setLensPinned,
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
           visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>

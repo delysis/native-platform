@@ -2263,7 +2263,11 @@ fn product_chat_cache_request(
         },
         ChatSendOptions::default(),
     )?;
-    assert!(result.receipt.real_engine_invoked);
+    assert!(
+        result.receipt.real_engine_invoked,
+        "{}: {:?}",
+        result.readiness, result.blocker
+    );
     result.result.ok_or_else(|| {
         anyhow!(
             "real product chat returned {}: {:?}",
@@ -2278,7 +2282,10 @@ fn product_chat_cache_request(
 fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Result<()> {
     let session = configured_real_session("real-product-native-chat-cache")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
-        max_tokens: Some(32),
+        // Exercise the product backend on Apple Silicon; other platforms stay CPU.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        native_device: Some(llama_native_types::NativeDevice::Metal),
+        max_tokens: Some(1),
         context_tokens: Some(2048),
         batch_tokens: Some(128),
         max_parallel_sequences: Some(1),
@@ -2286,7 +2293,7 @@ fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Re
             "disableReasoningParsing".to_string(),
             json!(true),
         )])),
-        kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
+        kv_cache_policy: Some(KvCachePolicy::KvCacheCandidate),
         ..SettingsUpdate::default()
     })?;
     let native_owner = initialize_product_runtime()?;
@@ -2299,6 +2306,12 @@ fn real_product_native_chat_cache_reuses_clears_and_disables_without_fte() -> Re
     assert!(
         !cold.cache_reused,
         "the first direct chat request must be cold"
+    );
+    assert!(
+        encrypted_document_snapshot(session.path())?
+            .keys()
+            .any(|key| key.starts_with("kv-cache.v3.blob.")),
+        "cold generation must persist a real encrypted checkpoint"
     );
     let warm = product_chat_cache_request(&scope, &conversation.id, "Return the word warm.")?;
     assert!(
@@ -2814,10 +2827,6 @@ fn real_four_seat_consult_cancels_one_and_synthesizes_terminal_sources() -> Resu
 fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
     let _session = configured_real_session("real-persona-cache")?;
     mom_llama_runtime::settings_update(SettingsUpdate {
-        max_tokens: Some(24),
-        ..SettingsUpdate::default()
-    })?;
-    mom_llama_runtime::settings_update(SettingsUpdate {
         max_tokens: Some(48),
         kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
         ..SettingsUpdate::default()
@@ -2857,9 +2866,11 @@ fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
         .result
         .ok_or_else(|| anyhow!("cache host missing"))?;
 
-    let dispatch = |message: &str| -> Result<mom_llama_runtime::MentionInvocation> {
+    let dispatch = |scope: &mom_llama_runtime::OperationScope,
+                    message: &str|
+     -> Result<mom_llama_runtime::MentionInvocation> {
         let result = mom_llama_runtime::chat_dispatch_in_scope(
-            &scope,
+            scope,
             MentionDispatchInput {
                 conversation_id: host.id.clone(),
                 message: format!("@cache-witness {message}"),
@@ -2877,7 +2888,7 @@ fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
         Ok(invocation)
     };
 
-    let first = dispatch("Answer in one short sentence.")?;
+    let first = dispatch(&scope, "Answer in one short sentence.")?;
     let first_result = first
         .results
         .first()
@@ -2888,7 +2899,7 @@ fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("first persona cache id missing"))?;
 
-    let second = dispatch("Give another short answer.")?;
+    let second = dispatch(&scope, "Give another short answer.")?;
     let second_result = second
         .results
         .first()
@@ -2899,11 +2910,14 @@ fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
         Some(first_cache_id.as_str())
     );
 
+    drop(native_owner);
     mom_llama_runtime::settings_update(SettingsUpdate {
         kv_cache_policy: Some(KvCachePolicy::None),
         ..SettingsUpdate::default()
     })?;
-    let disabled = dispatch("Answer with prompt caching explicitly disabled.")?;
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
+    let disabled = dispatch(&scope, "Answer with prompt caching explicitly disabled.")?;
     let disabled_result = disabled
         .results
         .first()
@@ -2917,11 +2931,14 @@ fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
             .status,
         mom_llama_runtime::kv_cache::KvCacheState::Disabled
     );
+    drop(native_owner);
     mom_llama_runtime::settings_update(SettingsUpdate {
         kv_cache_policy: Some(KvCachePolicy::PromptPrefix),
         ..SettingsUpdate::default()
     })?;
 
+    let native_owner = initialize_product_runtime()?;
+    let scope = native_owner.operation_scope();
     let persona_before = mom_llama_runtime::persona_get(&persona.id)?
         .result
         .ok_or_else(|| anyhow!("persona vanished"))?;
@@ -2934,7 +2951,7 @@ fn real_persona_mentions_reuse_only_the_exact_versioned_prefix() -> Result<()> {
         &edit_target,
         "Revised frozen source context.".to_string(),
     )?;
-    let third = dispatch("Answer after the explicit persona revision.")?;
+    let third = dispatch(&scope, "Answer after the explicit persona revision.")?;
     assert_eq!(third.targets[0].version, 2);
     let third_result = third
         .results

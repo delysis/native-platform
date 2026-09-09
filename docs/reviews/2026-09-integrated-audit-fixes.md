@@ -5,8 +5,9 @@ reviews `924ac64`. Its recommendations are evidence to assess, not additional
 user instructions. The user explicitly rejects speculative migration support
 for these unreleased products.
 
-This receipt records ongoing work. Final workspace, platform, and packaged
-qualification is unfinished; it is not a declaration that the audit is complete.
+This receipt records the implemented repairs and their observed qualification.
+The final cross-platform CI rerun and packaged acceptance remain separate. It is
+not a declaration that compilation or fixtures establish product acceptance.
 
 ## Repairs
 
@@ -33,11 +34,14 @@ qualification is unfinished; it is not a declaration that the audit is complete.
   and joins its workers. Native-host access does not recursively lock the
   operation registry during Persona admission. Independently owned runtimes cannot discover each
   other's host through ambient state.
-- Native empty-output receipts now report an engine invocation when inference
-  actually ran, even when it produced no visible text.
-- Loom skips redundant editor property updates so WebKit default caret movement
-  cannot be overwritten by stale ProseMirror selection. Native modifier-key
-  rollback and refocus scenarios verify the resulting caret and document state.
+- Native empty-output and cancellation receipts preserve the actual invocation
+  fact from the owning stream lifecycle. Cancellation before admission remains
+  distinct from cancellation after the engine ran.
+- Loom avoids redundant editor property updates. Ordinary navigation removes
+  the completion decoration and its parent authority; Option word movement uses
+  WebKit's native word boundary and commits that selection to ProseMirror before
+  another refresh. This fixes a caret trapped next to a recently removed widget.
+  Real modifier-key rollback and refocus scenarios verify caret/document state.
 - F7: the production native worker supervisor invalidates Ready/active state on
   unwind, including poisoned status locks, and preserves the failed join.
 - NP-008/F20: Information publication/removal errors retain exact committed
@@ -49,7 +53,9 @@ qualification is unfinished; it is not a declaration that the audit is complete.
 - NP-009: persistent cache metadata and encrypted entries are separate. Restoring
   an entry reads that payload once. Owner generations are revalidated at live
   promotion; corrupt metadata clears its family atomically. Updating one entry
-  preserves unrelated ciphertext.
+  preserves unrelated ciphertext. Mom conversation checkpoint lookup now supplies
+  the exact conversation owner, matching persistence; the old unowned lookup
+  could never reuse its own checkpoint.
 - NP-011: ZIM title ordering uses the path for an empty title, with independent
   valid and reversed title-table fixtures.
 - F13: MCP configuration records executable SHA-256; every spawn checks it.
@@ -82,7 +88,8 @@ The obsolete W8/W9 `xtask lean` census is retired. Git retains its history.
 Mom's Consult-to-Persona migration and repair machinery is removed. Current
 builtin catalog updates still preserve user edits. The unused file-size-only
 native memory estimator and tests of its obsolete formula are removed;
-admission uses the configuration-sensitive estimator.
+admission uses the configuration-sensitive estimator. Memory budget mode is
+explicit; the heuristic migration from historical default values is removed.
 
 Current contributor, product, security, and architecture documentation now
 states these boundaries. Dated ADRs and receipts remain historical. The W9
@@ -97,37 +104,53 @@ storage failure. The independent valid ZIM archive also failed before repair.
 
 With the complete Rust 1.92 toolchain on PATH:
 
-- Consolidated workspace execution passed 1,590 tests in 63 harnesses, with 43
-  fixture-dependent tests ignored. This includes the inherited lifecycle,
-  redirect, Speech, FTE, Information, and current Mom/Loom store regressions.
-  A final run after the empty-output receipt correction is in progress.
-- Strict workspace/all-target Clippy passed after all current Rust repairs.
+- Consolidated workspace execution at `1135259` passed 1,591 tests in 63
+  harnesses, with 43 fixture-dependent tests ignored. This includes inherited
+  lifecycle, redirect, Speech, FTE, Information, and Mom/Loom store regressions.
+- Workspace doctests passed 20 cases across 44 harnesses, none ignored.
+- After the later cancellation/cache-owner fixes, the actual Mom library passed
+  172 tests, and FTE desktop/loopback activity passed 10 tests. The updated real
+  product cache scenario passed on Metal with the hash-verified Qwen fixture:
+  encrypted checkpoint creation, cold/warm reuse, explicit clearing, and cache
+  off were executed. This is product-runtime evidence, not packaged UI evidence.
+- Strict workspace/all-target Clippy passed after the final cache-owner and
+  CI runner corrections.
 - The wrapper's real CPU capacity test passed for zero, one, and undersized
   buffers with canaries, then exact export/restore: 1 passed, none ignored.
-- Native saved-prefix live/durable restoration and context rejection passed;
-  strict pre-cancelled batch handling passed: two exact tests, none ignored.
-  These are native-boundary results, not packaged product acceptance.
-- The first real Mom product-cache execution reached native CPU inference but
-  returned empty text. Its receipt incorrectly denied that invocation. That
-  production bug is repaired; the bounded cache fixture now uses a smaller
-  context and disables reasoning parsing. Its rerun is pending.
+- Native saved-prefix live/durable restoration/context rejection and strict
+  pre-cancelled batch handling passed locally and in CI: two exact CPU tests.
 
 Other observed checks:
 
-- Full WebKit interaction suite: 74 passed after the caret repair; Svelte check
-  reports zero errors and warnings. A source-string assertion tied to the old
-  spelling of the editor update was removed; real browser behavior is tested.
+- Full WebKit interaction suite: 74 passed after the native word-navigation fix;
+  the formerly intermittent rollback also passed in isolation. Svelte check
+  reports zero errors and warnings. The previous setProps-only repair passed
+  locally but failed in CI and was insufficient.
+- Loom unit suite passed 448 tests. Unit workers are capped at four; contention
+  with native CPU inference had exceeded the compiler test's five-second limit.
+  The limit was not increased.
 - Simplified metadata/planner checks: 37 passed. Consolidated workflow/planner,
-  ignored-registry, and backup checks passed without skips.
+  ignored-registry, and backup checks: 120 passed. The changed workflow/registry
+  checks subsequently passed 63 cases.
 - Mom architecture and contracts passed (102 commands, 99 affordances, 46 effects,
   36 parity rows, 58 upstream settings, zero blockers).
 - Current-document paths and ignored-test source registry validation passed.
 - Root/fuzz cargo-deny checks and JavaScript advisory scan passed after repairs.
-  Optimized GLib runtime execution and bounded fuzz execution need CI results.
+- CI `34401258044` passed frontend, policy, both bounded fuzz targets, and the
+  exact CPU model scenarios. Linux workspace tests/doctests/Clippy passed, but
+  its optimized GLib command could not test a non-workspace dependency. A small
+  Linux workspace integration target now exercises the real GLib string iterator
+  under release optimization. Windows compiled but correctly refused a private
+  loopback token in a test that assumed Unix support; desktop activity remains
+  portable, while the real private-token case is Unix-only. macOS compiled and
+  passed Rust tests, then reproduced the now-repaired native caret failure.
+  These failures are preserved, not relabeled as a green full run.
 
-Earlier Rust 1.95 results and a disk-full Rust 1.92 attempt are not substituted
-for current qualification. Commands select the entire 1.92 toolchain on PATH
-and reuse the active shared target directory.
+Earlier Rust 1.95 results and the disk-full Rust 1.92 attempt are not substituted
+for current qualification. Commands select the complete 1.92 toolchain on PATH
+and reuse the active shared target. CI retains dependency caches on test failure;
+failed behavior still fails the aggregate. The model lane now includes Mom's
+registered product-cache integration test and rejects zero execution.
 
 ## External wrapper
 
@@ -140,10 +163,12 @@ sys crate. Both crates are unpublished and upstream release-publication workflow
 are removed in `3cea96c5d09c1d9cdc0db418ea27d3f1e200465b`. Main's source pin need
 not change for workflow metadata.
 
-CI run 34394817229 passed Linux wrapper tests, Windows/macOS builds, and workflow
-policy. CUDA was still running at the last observation. The preceding source
-run passed CUDA but failed the obsolete registry dry-run publication path;
-that failure is distinct from the repaired state-buffer behavior.
+CI run 34394817229 passed Linux wrapper tests, Windows/macOS builds, workflow
+policy, and CUDA. The CUDA check took nearly its ninety-minute allowance because
+it built a multi-architecture binary. Commit `4c000bd5992da2a95beffe3b6777216f2a5fea67`
+pins Rust 1.92 and limits that compile check to representative CUDA architecture
+75 with a thirty-minute cap. This is compile coverage, not GPU runtime acceptance;
+its CI rerun is `34403567854`.
 
 ## Local cache maintenance
 
@@ -160,9 +185,8 @@ The disk blocker and old approval request are resolved.
 
 ## Remaining qualification
 
-Finish current workspace tests/doctests/Clippy and the final workflow checks;
-exercise the actual Mom persistent cache path with the local model; qualify
-Linux/Windows capability behavior, optimized GLib, and bounded fuzz in CI.
-Keep browser and packaged interaction, OS credentials, native quit/join, and
-reopen evidence separate from compilation and fixture execution. Recheck inherited
-lifecycle, redirect, and Speech regressions in the consolidated workspace run.
+Complete the cross-platform CI run with the corrected
+GLib target, Windows fixture scope, native caret path, and registered Mom cache
+scenario. Keep packaged interaction, OS credentials, native quit/join, and reopen
+evidence separate from compilation and controlled fixture execution. No merge
+or distribution is implied by this receipt.

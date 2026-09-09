@@ -49,6 +49,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: full-root-${{ runner.os }}
+          cache-on-failure: true
       - run: cargo fmt --all -- --check
       - run: cargo test --locked --workspace --all-targets
       - run: cargo test --locked --workspace --doc
@@ -59,7 +60,7 @@ jobs:
 
       - name: Exercise the patched GLib iterator with optimization
         if: runner.os == 'Linux'
-        run: cargo test --locked --release -p glib@0.18.5 --lib variant_iter::tests
+        run: cargo test --locked --release -p xtask --test glib_iterator
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         if: runner.os == 'macOS'
         with:
@@ -135,6 +136,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: cpu-model-integration
+          cache-on-failure: true
       - name: Fetch immutable CPU fixture
         run: >-
           curl --fail --location --retry 3
@@ -146,6 +148,7 @@ jobs:
           9acfc1e001311f34b4252001b626f2e466d592a42065f66571bff3790d4e1b14
           llama-native-engine tests::real_saved_prefix_restores_live_replays_durable_and_rejects_context_change
           llama-native-engine tests::real_strict_batch_retains_a_pre_cancelled_case_under_exact_model_binding
+          mom-llama-runtime real_product_native_chat_cache_reuses_clears_and_disables_without_fte
 
   full-summary:
     if: always()

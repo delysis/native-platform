@@ -11,7 +11,7 @@ is mutable and passed by mutable reference. This backports
 RUSTSEC-2024-0429. GTK3 in the current Tauri dependency graph requires the 0.18
 API; replacing it with 0.20 would not satisfy that dependency.
 
-Existing `variant_iter` tests exercise the real GLib calls and must run with
-optimization enabled. Remove this patch when the GTK3 dependency is retired or
+The workspace `xtask/tests/glib_iterator.rs` regression exercises the real GLib
+string iterator with optimization enabled on Linux. Remove this patch when the GTK3 dependency is retired or
 a compatible fixed upstream release is available. Review by 2026-12-09.
 The original MIT license is retained.

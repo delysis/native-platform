@@ -8880,6 +8880,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "glib",
  "serde",
  "serde_json",
  "sha2 0.10.9",

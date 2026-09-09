@@ -7,7 +7,8 @@ use crate::conversation_store::{
     get_or_create_conversation, load_db, strip_reserved_attribution_prefix,
 };
 use crate::kv_cache::{
-    compatible_cached_prefix, ensure_persona_prefix, invalidate_cache, persist_session_checkpoint,
+    compatible_conversation_prefix, ensure_persona_prefix, invalidate_cache,
+    persist_session_checkpoint,
 };
 use crate::native_runtime::resident_model_for_profile;
 use crate::now_ms;
@@ -115,7 +116,7 @@ where
         self.operation.with_native_admission(admit)
     }
 
-    fn finish_cancelled(&mut self) -> Result<()> {
+    fn finish_cancelled(&mut self) -> Result<CommandResult<ChatSendOutput>> {
         self.operation.request_cancel();
         self.operation.arbitrate_terminal();
         mark_request_state(
@@ -126,7 +127,20 @@ where
         self.finish(
             "cancelled",
             Some("The local model request was cancelled.".to_string()),
-        )
+        )?;
+        Ok(CommandResult::blocked_with_evidence(
+            "mom_llama.chat_send",
+            "stub_blocked",
+            Blocker::new(
+                "chat_cancelled",
+                "The local model request was cancelled.",
+                vec!["Send the message again to retry.".to_string()],
+            ),
+            Vec::new(),
+            Vec::new(),
+            self.real_engine_invoked,
+            self.options.fake_fixture,
+        ))
     }
 
     fn finish(&mut self, event: &'static str, message: Option<String>) -> Result<()> {
@@ -657,8 +671,7 @@ where
         operation,
     );
     if stream.cancellation_requested() {
-        stream.finish_cancelled()?;
-        return Ok(chat_cancelled_result());
+        return stream.finish_cancelled();
     }
     let started = Instant::now();
     let model_path = settings.model_path.clone().unwrap_or_default();
@@ -684,8 +697,7 @@ where
         )
     } else {
         if stream.cancellation_requested() {
-            stream.finish_cancelled()?;
-            return Ok(chat_cancelled_result());
+            return stream.finish_cancelled();
         }
         let handle = match resident_model_for_profile(
             scope,
@@ -709,8 +721,7 @@ where
             ChatTemplatePolicy::ModelDefault
         );
         if stream.cancellation_requested() {
-            stream.finish_cancelled()?;
-            return Ok(chat_cancelled_result());
+            return stream.finish_cancelled();
         }
         let (cached_prefix, cache_was_preexisting) = if media.is_empty() && default_template {
             if let Some(owner_id) = skill_prompt.cache_owner_id.as_deref() {
@@ -734,7 +745,7 @@ where
                     cache.is_some_and(|cache| cache.reused),
                 )
             } else {
-                let cache = compatible_cached_prefix(&handle, &messages)?;
+                let cache = compatible_conversation_prefix(&handle, &messages, &conversation.id)?;
                 let reused = cache.is_some();
                 (cache, reused)
             }
@@ -767,8 +778,7 @@ where
         let Some(first_ticket) =
             stream.with_native_admission(|| handle.generate(build_request(first_prefix)))?
         else {
-            stream.finish_cancelled()?;
-            return Ok(chat_cancelled_result());
+            return stream.finish_cancelled();
         };
         stream.mark_engine_invoked();
         let first_ticket = first_ticket.map_err(|error| anyhow::anyhow!(error))?;
@@ -794,8 +804,7 @@ where
                 let Some(retry) =
                     stream.with_native_admission(|| handle.generate(build_request(None)))?
                 else {
-                    stream.finish_cancelled()?;
-                    return Ok(chat_cancelled_result());
+                    return stream.finish_cancelled();
                 };
                 let retry = retry.map_err(|error| anyhow::anyhow!(error))?;
                 (
@@ -826,8 +835,7 @@ where
             ));
         };
         if output.state == GenerationState::Cancelled {
-            stream.finish_cancelled()?;
-            return Ok(chat_cancelled_result());
+            return stream.finish_cancelled();
         }
         if media.is_empty()
             && default_template
@@ -848,8 +856,7 @@ where
         )
     };
     if stream.arbitrate_terminal() {
-        stream.finish_cancelled()?;
-        return Ok(chat_cancelled_result());
+        return stream.finish_cancelled();
     }
     if assistant_text.trim().is_empty() {
         mark_request_state(&settings.data_dir, &request_id, ChatRequestState::Failed)?;
@@ -992,18 +999,6 @@ fn apply_conversation_model_pair(
                 .unwrap_or_default(),
         ),
     );
-}
-
-fn chat_cancelled_result() -> CommandResult<ChatSendOutput> {
-    CommandResult::blocked(
-        "mom_llama.chat_send",
-        "stub_blocked",
-        Blocker::new(
-            "chat_cancelled",
-            "The local model request was cancelled.",
-            vec!["Send the message again to retry.".to_string()],
-        ),
-    )
 }
 
 fn empty_native_response_result(
@@ -1667,6 +1662,42 @@ mod tests {
         assert!(events[0].real_engine_invoked);
         let requests = load_active_requests(data_dir.path()).expect("load request registry");
         assert_eq!(requests.requests[0].state, ChatRequestState::Failed);
+    }
+
+    #[test]
+    fn cancelled_receipt_and_terminal_preserve_the_same_invocation_fact() {
+        for invoked in [false, true] {
+            let data_dir = TestDataDir::new("cancelled-invocation");
+            let scope = OperationScope::detached();
+            let mut events = Vec::new();
+            let mut callback = Some(|event| {
+                events.push(event);
+                Ok(())
+            });
+            let result = {
+                let mut stream = ChatStreamLifecycle::new(
+                    "request",
+                    "conversation",
+                    data_dir.path(),
+                    ChatSendOptions::default(),
+                    &mut callback,
+                    scope
+                        .register_chat("request", "conversation")
+                        .expect("register"),
+                );
+                if invoked {
+                    stream.mark_engine_invoked();
+                }
+                stream.finish_cancelled().expect("cancel")
+            };
+            assert!(result.result.is_none());
+            assert_eq!(result.blocker.expect("blocker").code, "chat_cancelled");
+            assert_eq!(result.receipt.real_engine_invoked, invoked);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].event, "cancelled");
+            assert_eq!(events[0].real_engine_invoked, invoked);
+            assert!(!scope.chat_request_is_active("request", "conversation"));
+        }
     }
 
     #[test]

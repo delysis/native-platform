@@ -59,10 +59,13 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
             .iter()
             .find(|entry| &entry.package == package && &entry.test_id == test_id)
             .with_context(|| format!("unregistered test: {package} {test_id}"))?;
-        ensure!(
-            entry.target == "lib",
-            "this CPU model lane supports library tests only"
-        );
+        let target_args = if entry.target == "lib" {
+            vec!["--lib"]
+        } else if let Some(name) = entry.target.strip_prefix("test:") {
+            vec!["--test", name]
+        } else {
+            anyhow::bail!("unsupported model test target: {}", entry.target);
+        };
         ensure!(
             entry.required_environment.iter().all(|name| matches!(
                 name.as_str(),
@@ -82,12 +85,9 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
                     "--locked",
                     "--package",
                     package,
-                    "--lib",
-                    test_id,
-                    "--",
-                    "--ignored",
-                    "--exact",
                 ])
+                .args(&target_args)
+                .args([test_id.as_str(), "--", "--ignored", "--exact"])
                 .env("RUSTC", &rustc)
                 .env("RUSTDOC", &rustdoc)
                 .env("MOM_LLAMA_MODEL_PATH", &model)

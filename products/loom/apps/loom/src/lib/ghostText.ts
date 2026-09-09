@@ -69,6 +69,7 @@ export interface GhostTextHandlers {
   unconsume?: (candidateId: string, presentationKey: string, text: string) => boolean;
   cycle?: (offset: number) => void;
   modifier?: (held: boolean) => void;
+  navigate?: () => void;
   pin?: (pinned: boolean) => void;
   dismiss: (candidateId: string, presentationKey: string) => void;
   visible: (
@@ -1056,6 +1057,31 @@ export function createGhostTextPlugin(
           // hand focus traversal to surrounding application chrome.
           view.dispatch(view.state.tr.insertText(VISUAL_TAB_INDENT));
           return true;
+        }
+        if (plan && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) {
+          // Native caret movement must see the manuscript, without an adjacent
+          // uneditable decoration or a parent refresh restoring that decoration.
+          clearGhostText(view);
+          handlers.navigate?.();
+          if (event.altKey && !event.metaKey && !event.ctrlKey &&
+              (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+            const selection = view.dom.ownerDocument.getSelection();
+            if (selection?.anchorNode && selection.focusNode &&
+                view.dom.contains(selection.anchorNode) && view.dom.contains(selection.focusNode)) {
+              // Let WebKit choose its native word boundary, then commit it to
+              // ProseMirror before another decoration update can restore the
+              // preceding caret. The default arrow path can stick beside a
+              // recently removed contenteditable=false widget.
+              selection.modify(event.shiftKey ? 'extend' : 'move',
+                event.key === 'ArrowLeft' ? 'left' : 'right', 'word');
+              const anchor = view.posAtDOM(selection.anchorNode, selection.anchorOffset);
+              const head = view.posAtDOM(selection.focusNode, selection.focusOffset);
+              view.dispatch(view.state.tr.setSelection(TextSelection.between(
+                view.state.doc.resolve(anchor), view.state.doc.resolve(head)
+              )).scrollIntoView());
+              return true;
+            }
+          }
         }
         return false;
       },

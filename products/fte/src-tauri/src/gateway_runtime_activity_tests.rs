@@ -148,10 +148,34 @@ async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
 }
 
 #[tokio::test]
-async fn desktop_and_authenticated_loopback_log_once_with_unknown_usage() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+async fn desktop_logs_once_with_unknown_usage_and_without_private_prompt() {
     let (owner, database, _) = fixture();
     owner.chat(chat()).await.expect("desktop request");
+    let logs = database.get_recent_logs(10).expect("logs");
+    assert_eq!(logs.len(), 1);
+    assert_eq!(logs[0].provider_id, "activity-fixture");
+    assert_eq!(logs[0].model_id, "activity-model");
+    assert!(logs[0].tokens_used.is_none());
+    assert_eq!(logs[0].status_code, 200);
+    assert_eq!(
+        database
+            .get_global_log_summary()
+            .expect("summary")
+            .request_count,
+        1
+    );
+    assert!(
+        !serde_json::to_string(&logs)
+            .expect("json")
+            .contains("private prompt")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn authenticated_loopback_logs_once_with_unknown_usage() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (owner, database, _) = fixture();
     let token_directory =
         std::env::temp_dir().join(format!("fte-activity-token-{}", RequestId::new().0));
     let token_path = token_directory.join("token");
@@ -189,7 +213,7 @@ async fn desktop_and_authenticated_loopback_log_once_with_unknown_usage() {
         String::from_utf8_lossy(&response)
     );
     let logs = database.get_recent_logs(10).expect("logs");
-    assert_eq!(logs.len(), 2);
+    assert_eq!(logs.len(), 1);
     assert!(logs.iter().all(|log| log.provider_id == "activity-fixture"
         && log.model_id == "activity-model"
         && log.tokens_used.is_none()
@@ -199,7 +223,7 @@ async fn desktop_and_authenticated_loopback_log_once_with_unknown_usage() {
             .get_global_log_summary()
             .expect("summary")
             .request_count,
-        2
+        1
     );
     let json = serde_json::to_string(&logs).expect("json");
     assert!(!json.contains("private prompt"));
