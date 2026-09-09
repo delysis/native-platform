@@ -438,3 +438,26 @@ renderer and poison-evidence changes described above.
 Full CI `34414775472` passed at `e576891`, including Linux, macOS, Windows,
 frontend, policy, model integration and fuzz. It predates the newly reproduced
 Loom context-sizing defect's repair.
+
+Native access subsequently resumed. The `8a6a155` Loom bundle (PID 70239,
+executable SHA-256 `3851c06b591a33f237570bf08e909e413e09557a6e422a8a3599a6dcaacddcfc`)
+loaded Gemma and displayed four completion alternatives in its actual editor.
+Option-Right accepted one word; Tab accepted the remaining visible continuation.
+Turning autocomplete off removed the ghost presentation while preserving the
+accepted manuscript. Normal Command-Q ended the process and deallocated Metal
+buffers. Reopening restored the exact accepted text and the off preference.
+The isolated manuscript hash is
+`06eaecf243cc10b0bd1e7b7ee24240e38dd04d7fb8f8d6b4fca838db735ed9be`.
+This qualifies that writing path, without claiming a separately instrumented
+per-worker shutdown receipt or live in-flight cancellation from an idle toggle.
+
+During the same native session, the system control indicator occupied the
+traffic-light location in both Mom's stock Visible titlebar and macOS Finder.
+Both exposed native close/minimize/zoom accessibility controls. An edge drag
+visibly resized Mom's window. These observations establish that retaining the
+extra web toolbar row does not solve the indicator seen during Computer Use.
+Mom now uses decorated Overlay with its native title retained, controls in one
+38-pixel row, a 76-pixel macOS windowed inset, and a 6-pixel inset in fullscreen
+or on other platforms. All 29 frontend tests and six WebKit geometry cases
+passed. The normal encrypted-store Keychain prompt still gates the actual
+sidebar and integrated-titlebar interaction; that acceptance remains open.

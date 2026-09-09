@@ -45,7 +45,15 @@
   const initializeWindowChrome = async () => {
     const nativeWindow = tauri()?.window?.getCurrentWindow();
     if (!nativeWindow) return;
-    await nativeWindow.onResized(sizeComposer);
+    const root = document.documentElement;
+    const macos = navigator.platform.startsWith("Mac");
+    if (macos) root.dataset.nativePlatform = "macos";
+    const syncChrome = async () => {
+      if (macos) root.classList.toggle("native-fullscreen", await nativeWindow.isFullscreen());
+      sizeComposer();
+    };
+    await syncChrome();
+    await nativeWindow.onResized(() => { void syncChrome().catch(reportError); });
   };
   const composerPolicy = globalThis.MomLlamaComposerKeyPolicy;
   let composerState = composerPolicy?.initialState?.() || { kind: "idle" };
