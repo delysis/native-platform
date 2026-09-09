@@ -1285,7 +1285,11 @@ fn provider_status(
         BackendReadiness::Unavailable { .. } => "unavailable",
         BackendReadiness::Ready if headroom.is_some_and(|value| value <= 0.0) => "quota_exhausted",
         BackendReadiness::Ready if summary.last_status_code == Some(429) => "quota_exhausted",
-        BackendReadiness::Ready if summary.last_status_code.is_some_and(|status| status >= 400) => {
+        BackendReadiness::Ready
+            if summary
+                .last_status_code
+                .is_some_and(|status| status >= 400 && status != 499) =>
+        {
             "upstream_error"
         }
         BackendReadiness::Ready => "ready",

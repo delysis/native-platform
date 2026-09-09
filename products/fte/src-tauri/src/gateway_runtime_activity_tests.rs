@@ -275,6 +275,30 @@ async fn playground_stop_reaches_registered_backend_during_setup() {
         database.get_recent_logs(10).expect("logs")[0].status_code,
         499
     );
+    let summaries = database
+        .get_provider_log_summaries()
+        .expect("provider activity");
+    let summary = summaries
+        .get("activity-fixture")
+        .expect("cancelled provider");
+    assert_eq!(
+        provider_status(&backend.readiness(), None, summary),
+        "ready"
+    );
+    assert_eq!(
+        provider_status(
+            &BackendReadiness::Unavailable {
+                reason: "offline".into(),
+            },
+            None,
+            summary
+        ),
+        "unavailable"
+    );
+    assert_eq!(
+        provider_status(&backend.readiness(), Some(0.0), summary),
+        "quota_exhausted"
+    );
 }
 
 #[tokio::test]

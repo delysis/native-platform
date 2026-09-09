@@ -461,3 +461,46 @@ Mom now uses decorated Overlay with its native title retained, controls in one
 or on other platforms. All 29 frontend tests and six WebKit geometry cases
 passed. The normal encrypted-store Keychain prompt still gates the actual
 sidebar and integrated-titlebar interaction; that acceptance remains open.
+
+The rebuilt `f54c539` Mom bundle was subsequently exercised in its supported
+empty development store, explicitly separate from the user's encrypted store.
+The fixture is recorded in
+`/tmp/integrated-audit-mom-layout-development-directory.txt`; no key override or
+user-data copy was used. Actual native screenshots show the integrated toolbar,
+native title and red/yellow/green controls, right settings sidebar, and compact
+composer. Corner dragging reached exactly 640 by 480 with usable 320-pixel chat
+and settings panes; dragging the right edge expanded the window to 1101 by 480.
+Gemma returned “Hello!” to the fixture prompt while settings remained open and
+its current-chat instructions updated correctly. This qualifies native layout
+and chat in the development fixture, not encrypted-store reopening.
+
+FTE's current renderer also completed normal native quit and reopen after the
+real request/cancellation checks: 93 milliseconds, gateway drained, native host
+joined, eight of eight workers joined, no retained tasks, and stored activity
+restored. Its Overview exposed a presentation defect: the latest recorded
+request was cancelled (`499`) but labelled “Last call failed”. Cancellation now
+leaves an otherwise ready provider ready, and Activity displays neutral
+“Cancelled”; actual unavailable/quota states and failures retain precedence.
+Ten lifecycle tests and three frontend tests passed.
+
+Native Mom settings review removed ten inactive upstream-only controls, their
+unused rendering machinery, defaults and write authority. The historical
+58-key parity ledger remains intact; the active contract now follows its 48
+implemented entries. Existing unconsumed stored values remain inert and
+unchanged. Working model, MCP, permission and attachment controls remain.
+The empty chat uses Mom branding, and the settings close button uses an X.
+
+A further completion check found `settings.json` omitted from the current-only
+store guard. Production `resolve_settings` still parsed and imported that file,
+including its legacy shape. The actual fixture demonstrated the import before
+repair. The file now joins the existing early plaintext rejection list, before
+credential lookup or database creation, and all legacy parser/conversion/import
+and migration-receipt code is removed. Thirteen config tests and the six-file
+store rejection check passed, including byte preservation and no database
+creation for the refused file. All 29 Mom frontend tests, contract checks,
+19 actual app-binary view tests, and strict workspace Clippy passed. The first
+library-only view-test filter selected zero tests and is not counted as evidence;
+the corrected binary-target invocation executed the 19 tests.
+
+Full CI `34416191301` passed at `8a6a155`, qualifying the Loom memory repair.
+It predates the final Mom settings and FTE cancellation-display cleanup above.

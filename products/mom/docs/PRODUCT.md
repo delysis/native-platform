@@ -76,6 +76,12 @@ and CLI capabilities; they do not authorize settings cards, dashboards or
 navigation in the ordinary UI. Model discovery and selection remain the single
 user-facing model setup path.
 
+Settings expose implemented native behavior. Superseded, unavailable and
+rejected upstream keys remain documented in the parity ledger without GUI
+controls, defaults or write authority. Unconsumed keys already present in an
+encrypted settings document remain inert; removing a control does not rewrite
+the user's store.
+
 ## Release meaning
 
 The app is not released until:

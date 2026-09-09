@@ -181,6 +181,11 @@ test('desktop setup reports saved-model failure and picker success without expos
         }];
       case 'get_master_profile':
         return {};
+      case 'get_recent_logs':
+        return [499, 503].map((status) => ({
+          timestamp: '2026-09-09 12:00:00', provider: 'Local llama.cpp',
+          model: 'local/default', tokens: 12, latency: 25, status,
+        }));
       case 'plugin:free-token-energy|loopback_status':
         return { enabled: false, addresses: [], token_path: null };
       case 'get_local_model_status':
@@ -238,6 +243,12 @@ test('desktop setup reports saved-model failure and picker success without expos
     'choose_local_model',
     { expectedSha256: 'a'.repeat(64) },
   ]);
+  await elements.get('refresh-logs').listeners.get('click')();
+  const [cancelled, failed] = elements.get('logs-body').children.map((row) => row.lastElementChild);
+  assert.equal(cancelled.textContent, 'Cancelled');
+  assert.equal(cancelled.className, 'log-status');
+  assert.equal(failed.textContent, '503');
+  assert.equal(failed.className, 'log-status error-copy');
 });
 
 test('Playground Stop retains intent before start reply and enables another request after cancellation', async () => {

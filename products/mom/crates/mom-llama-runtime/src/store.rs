@@ -764,6 +764,7 @@ fn disposable_cache_quarantine_namespace(
 }
 
 const LEGACY_PLAINTEXT_FILES: &[&str] = &[
+    "settings.json",
     "conversations.json",
     "drafts.json",
     "attachments.json",

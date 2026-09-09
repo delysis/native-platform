@@ -845,7 +845,6 @@ struct SettingsFieldSpec {
     kind: &'static str,
     help: &'static str,
     options: &'static [(&'static str, &'static str)],
-    blocker: Option<&'static str>,
 }
 
 fn settings_section_visible(section: &SettingsSectionSpec) -> bool {
@@ -939,16 +938,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "select",
         help: "Choose the color theme for the interface.",
         options: THEME_OPTIONS,
-        blocker: None,
-    },
-    SettingsFieldSpec {
-        section: "general",
-        key: "apiKey",
-        label: "API Key",
-        kind: "password",
-        help: "Saved locally for parity with upstream server API-key mode; native local llama.cpp does not require it.",
-        options: EMPTY_OPTIONS,
-        blocker: Some("Not used by the native local llama.cpp path."),
     },
     SettingsFieldSpec {
         section: "general",
@@ -957,7 +946,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "textarea",
         help: "Used by chats that do not have their own instructions.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "general",
@@ -966,7 +954,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Convert pasted text at or above this length into an encrypted local attachment. Use 0 to disable.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "general",
@@ -975,7 +962,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Use Enter to send messages and Shift + Enter for new lines.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "general",
@@ -984,7 +970,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Copy an attached text message as its plain text payload instead of its attachment wrapper.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "general",
@@ -993,18 +978,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Show Continue for assistant messages.",
         options: EMPTY_OPTIONS,
-        blocker: None,
-    },
-    SettingsFieldSpec {
-        section: "general",
-        key: "pdfAsImage",
-        label: "Parse PDF as image",
-        kind: "checkbox",
-        help: "Upstream multimodal preference.",
-        options: EMPTY_OPTIONS,
-        blocker: Some(
-            "PDF files are stored as local attachments; PDF-to-image decoding is not active.",
-        ),
     },
     SettingsFieldSpec {
         section: "general",
@@ -1013,38 +986,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Use the first non-empty prompt line for title generation.",
         options: EMPTY_OPTIONS,
-        blocker: None,
-    },
-    SettingsFieldSpec {
-        section: "general",
-        key: "titleGenerationUseLLM",
-        label: "Use LLM for title",
-        kind: "checkbox",
-        help: "Generate titles from the first exchange.",
-        options: EMPTY_OPTIONS,
-        blocker: Some(
-            "Native title generation uses the first user line; LLM title calls would require an extra explicit local model command.",
-        ),
-    },
-    SettingsFieldSpec {
-        section: "general",
-        key: "titleGenerationPrompt",
-        label: "LLM title prompt",
-        kind: "textarea",
-        help: "Template for upstream title generation.",
-        options: EMPTY_OPTIONS,
-        blocker: Some(
-            "The prompt is persisted, but automatic LLM title calls are disabled unless a separate local model command is added.",
-        ),
-    },
-    SettingsFieldSpec {
-        section: "general",
-        key: "maxImageMPixels",
-        label: "Maximum image resolution",
-        kind: "number",
-        help: "Resize images larger than this many megapixels.",
-        options: EMPTY_OPTIONS,
-        blocker: Some("Image files are stored and gated by mmprojPath; resizing is not active."),
     },
     SettingsFieldSpec {
         section: "display",
@@ -1053,7 +994,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Display generation statistics below assistant messages.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "display",
@@ -1062,7 +1002,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Display the persisted turn number and native token counts for each tool/model turn.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "display",
@@ -1071,7 +1010,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Keep an incomplete streamed reasoning section expanded.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "display",
@@ -1080,18 +1018,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Expand tool arguments and technical details in completed external-process tool cards.",
         options: EMPTY_OPTIONS,
-        blocker: None,
-    },
-    SettingsFieldSpec {
-        section: "general",
-        key: "autoMicOnEmpty",
-        label: "Show microphone on empty input",
-        kind: "checkbox",
-        help: "Show microphone affordance on empty input.",
-        options: EMPTY_OPTIONS,
-        blocker: Some(
-            "Microphone recording requires a native permissioned capture path; audio files can be attached through Attach file.",
-        ),
     },
     SettingsFieldSpec {
         section: "display",
@@ -1100,7 +1026,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Render user-authored messages as Markdown.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "display",
@@ -1109,7 +1034,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Render model reasoning as formatted Markdown instead of plain text.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "display",
@@ -1118,7 +1042,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Expand code blocks to full available height.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "display",
@@ -1127,7 +1050,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Disable automatic scrolling during generation.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "display",
@@ -1136,7 +1058,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Keep sidebar open on desktop layouts.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "display",
@@ -1145,7 +1066,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Display full raw model identifiers.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "display",
@@ -1154,7 +1074,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Show the quantization inferred from the selected local GGUF filename.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "display",
@@ -1163,7 +1082,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Show native capability tags such as local, multimodal, and reasoning.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "display",
@@ -1172,7 +1090,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Display the Mom Llama app version in the bottom-right corner.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "display",
@@ -1181,7 +1098,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Display the system message at the top of each conversation.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "sampling",
@@ -1190,7 +1106,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Temperature applied by the in-process llama.cpp sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "sampling",
@@ -1199,7 +1114,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Dynamic temperature range applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "sampling",
@@ -1208,7 +1122,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Dynamic temperature exponent applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "sampling",
@@ -1217,7 +1130,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Top-K filter applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "sampling",
@@ -1226,7 +1138,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Top-P filter applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "sampling",
@@ -1235,7 +1146,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Min-P filter applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "sampling",
@@ -1244,7 +1154,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "XTC probability applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "sampling",
@@ -1253,7 +1162,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "XTC threshold applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "sampling",
@@ -1262,7 +1170,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Typical-P filter applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "sampling",
@@ -1271,7 +1178,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Maximum completion tokens decoded by the native model worker.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "sampling",
@@ -1280,16 +1186,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "text",
         help: "Native sampler order, separated by spaces, commas, or semicolons.",
         options: EMPTY_OPTIONS,
-        blocker: None,
-    },
-    SettingsFieldSpec {
-        section: "sampling",
-        key: "backend_sampling",
-        label: "Backend sampling",
-        kind: "checkbox",
-        help: "Upstream server-side sampling preference.",
-        options: EMPTY_OPTIONS,
-        blocker: Some("Sampling is always owned by the in-process native model worker."),
     },
     SettingsFieldSpec {
         section: "penalties",
@@ -1298,7 +1194,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Token history considered by native repetition penalties.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "penalties",
@@ -1307,7 +1202,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Repetition penalty applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "penalties",
@@ -1316,7 +1210,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Presence penalty applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "penalties",
@@ -1325,7 +1218,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Frequency penalty applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "penalties",
@@ -1334,7 +1226,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "DRY multiplier applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "penalties",
@@ -1343,7 +1234,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "DRY exponential base applied by the in-process sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "penalties",
@@ -1352,7 +1242,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Allowed repeated sequence length for the native DRY sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "penalties",
@@ -1361,7 +1250,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Token history considered by the native DRY sampler.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "agentic",
@@ -1370,7 +1258,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Maximum bounded native model/tool turns (1 to 8).",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "mcp",
@@ -1379,18 +1266,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "MCP request timeout in seconds.",
         options: EMPTY_OPTIONS,
-        blocker: None,
-    },
-    SettingsFieldSpec {
-        section: "mcp",
-        key: "mcpServers",
-        label: "MCP servers",
-        kind: "textarea",
-        help: "Upstream MCP server JSON.",
-        options: EMPTY_OPTIONS,
-        blocker: Some(
-            "Executable MCP servers are configured through Configure MCP so absolute paths can be validated.",
-        ),
     },
     SettingsFieldSpec {
         section: "developer",
@@ -1399,7 +1274,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Keep model reasoning markers in the raw assistant output.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "developer",
@@ -1408,7 +1282,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Exclude reasoning blocks from future context.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "developer",
@@ -1417,29 +1290,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: "Expose raw output display mode.",
         options: EMPTY_OPTIONS,
-        blocker: None,
-    },
-    SettingsFieldSpec {
-        section: "developer",
-        key: "jsSandboxEnabled",
-        label: "JavaScript sandbox tool",
-        kind: "checkbox",
-        help: "Upstream browser JavaScript execution authority.",
-        options: EMPTY_OPTIONS,
-        blocker: Some(
-            "Rejected in the local native profile because the webview cannot execute model-authored code.",
-        ),
-    },
-    SettingsFieldSpec {
-        section: "developer",
-        key: "symbolicMathEnabled",
-        label: "Symbolic math",
-        kind: "checkbox",
-        help: "Upstream nerdamer support inside the JavaScript sandbox.",
-        options: EMPTY_OPTIONS,
-        blocker: Some(
-            "Rejected with the JavaScript sandbox; a bounded native math tool would require its own command contract.",
-        ),
     },
     SettingsFieldSpec {
         section: "developer",
@@ -1448,7 +1298,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "textarea",
         help: "Allowlisted native sampler overrides encoded as a JSON object.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "developer",
@@ -1457,7 +1306,6 @@ const SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "textarea",
         help: "Local CSS applied to this native app through a text-only style element.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
 ];
 
@@ -1469,7 +1317,6 @@ const NATIVE_SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "number",
         help: "Native-only limit for readable tool result previews.",
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
     SettingsFieldSpec {
         section: "mcp",
@@ -1478,7 +1325,6 @@ const NATIVE_SETTINGS_FIELDS: &[SettingsFieldSpec] = &[
         kind: "checkbox",
         help: MCP_PROCESS_AUTHORITY_WARNING,
         options: EMPTY_OPTIONS,
-        blocker: None,
     },
 ];
 
@@ -1794,7 +1640,7 @@ fn chat_view_with_draft(
                         h1 { (persona.title.clone()) }
                         p { "@" (persona.execution_profile.mention_handle.clone()) }
                     } @else {
-                        h1 { "llama.cpp" }
+                        h1 { "Mom Llama" }
                         p { "Type a message or upload files to get started" }
                     }
                 }
@@ -3474,7 +3320,6 @@ fn settings_field(field: &SettingsFieldSpec, settings: &CommandResult<Settings>)
                     input type="checkbox"
                         name=(field.key)
                         checked[checked]
-                        disabled[field.blocker.is_some()]
                         data-setting-key=(field.key)
                         data-setting-type="boolean"
                         data-affordance=(format!("settings.{}", field.key))
@@ -3485,7 +3330,6 @@ fn settings_field(field: &SettingsFieldSpec, settings: &CommandResult<Settings>)
                 }
                 "textarea" => {
                     textarea name=(field.key) rows="4"
-                        disabled[field.blocker.is_some()]
                         data-setting-key=(field.key)
                         data-setting-type="string"
                         data-affordance=(format!("settings.{}", field.key))
@@ -3498,7 +3342,6 @@ fn settings_field(field: &SettingsFieldSpec, settings: &CommandResult<Settings>)
                 }
                 "select" => {
                     select name=(field.key)
-                        disabled[field.blocker.is_some()]
                         data-setting-key=(field.key)
                         data-setting-type="string"
                         data-affordance=(format!("settings.{}", field.key))
@@ -3511,24 +3354,10 @@ fn settings_field(field: &SettingsFieldSpec, settings: &CommandResult<Settings>)
                         }
                     }
                 }
-                "password" => {
-                    input type="password"
-                        name=(field.key)
-                        value=(value)
-                        disabled[field.blocker.is_some()]
-                        data-setting-key=(field.key)
-                        data-setting-type="string"
-                        data-affordance=(format!("settings.{}", field.key))
-                        data-command="mom_llama.settings_update"
-                        data-tauri-command="mom_llama_settings_update"
-                        data-cli="mom-llama settings update --set key=value --json"
-                        data-effect="mom_llama.effects.settings_store.v1";
-                }
                 "number" => {
                     input type="number" step="any"
                         name=(field.key)
                         value=(value)
-                        disabled[field.blocker.is_some()]
                         data-setting-key=(field.key)
                         data-setting-type="number"
                         data-affordance=(format!("settings.{}", field.key))
@@ -3541,7 +3370,6 @@ fn settings_field(field: &SettingsFieldSpec, settings: &CommandResult<Settings>)
                     input type="text"
                         name=(field.key)
                         value=(value)
-                        disabled[field.blocker.is_some()]
                         data-setting-key=(field.key)
                         data-setting-type="string"
                         data-affordance=(format!("settings.{}", field.key))
@@ -3552,11 +3380,6 @@ fn settings_field(field: &SettingsFieldSpec, settings: &CommandResult<Settings>)
                 }
             }
             small class="field-help" { (field.help) }
-            @if let Some(blocker) = field.blocker {
-                small class="settings-blocker" data-blocker-code=(format!("{}_blocked_native_profile", field.key)) {
-                    (blocker)
-                }
-            }
         }
     }
 }
@@ -3780,9 +3603,8 @@ fn button_inner(control: &ControlSpec, class_name: &str) -> Markup {
 fn icon_for_affordance(affordance: &str) -> Option<&'static str> {
     match affordance {
         "layout.sidebar_toggle" => Some("panel-left"),
-        "settings.open" | "settings.close" | "settings.get" | "settings.section" => {
-            Some("settings")
-        }
+        "settings.close" => Some("x"),
+        "settings.open" | "settings.get" | "settings.section" => Some("settings"),
         "conversation.new" => Some("square-pen"),
         "conversation.search" => Some("search"),
         "conversation.search.close" => Some("x"),

@@ -340,25 +340,27 @@ async function refreshLogs() {
     for (const log of logs) {
       const row = document.createElement('tr');
       const timestamp = parseSqliteTimestamp(log.timestamp);
+      const status = Number(log.status);
       const cells = [
         timestamp ? timestamp.toLocaleString() : String(log.timestamp),
         String(log.provider),
         String(log.model),
         log.tokens == null ? 'Unknown' : formatNumber(log.tokens),
         `${formatNumber(log.latency)} ms`,
-        String(log.status),
+        status === 499 ? 'Cancelled' : String(log.status),
       ];
       for (const value of cells) {
         const cell = document.createElement('td');
         cell.textContent = value;
         row.append(cell);
       }
-      const status = Number(log.status);
-      row.lastElementChild.className = status >= 500
-        ? 'log-status error-copy'
-        : status >= 400
-          ? 'log-status warn-copy'
-          : 'log-status success-copy';
+      row.lastElementChild.className = status === 499
+        ? 'log-status'
+        : status >= 500
+          ? 'log-status error-copy'
+          : status >= 400
+            ? 'log-status warn-copy'
+            : 'log-status success-copy';
       body.append(row);
     }
   } catch (error) {

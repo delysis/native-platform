@@ -11,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
-const SETTINGS_FILE: &str = "settings.json";
 pub(crate) const SETTINGS_NAMESPACE: &str = "settings.v2";
 const DEFAULT_MAX_TOKENS: u32 = 512;
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -83,36 +82,6 @@ pub struct Settings {
     pub resident_memory_budget_bytes: u64,
     #[serde(default = "upstream_settings_defaults")]
     pub upstream_settings: BTreeMap<String, Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct LegacySettings {
-    engine_bin: Option<PathBuf>,
-    selected_model: Option<PathBuf>,
-    default_max_tokens: Option<u32>,
-    kv_cache_policy: Option<String>,
-}
-
-impl LegacySettings {
-    fn looks_like_legacy(&self) -> bool {
-        self.engine_bin.is_some() || self.selected_model.is_some()
-    }
-
-    fn into_settings(self, data_dir: PathBuf) -> Settings {
-        let mut settings = Settings::defaults_for_data_dir(data_dir);
-        settings.model_path = self.selected_model;
-        if let Some(max_tokens) = self.default_max_tokens {
-            settings.default_max_tokens = max_tokens;
-        }
-        let policy = match self.kv_cache_policy.as_deref() {
-            Some("none") => KvCachePolicy::None,
-            Some("prompt_prefix") => KvCachePolicy::PromptPrefix,
-            Some("kv_cache_candidate") => KvCachePolicy::KvCacheCandidate,
-            _ => KvCachePolicy::KvCacheCandidate,
-        };
-        set_cache_policy(&mut settings, policy);
-        settings
-    }
 }
 
 impl Settings {
@@ -201,21 +170,15 @@ fn default_kv_cache_policy() -> KvCachePolicy {
 
 pub const UPSTREAM_SETTING_KEYS: &[&str] = &[
     "theme",
-    "apiKey",
     "systemMessage",
     "pasteLongTextToFileLen",
     "copyTextAttachmentsAsPlainText",
     "sendOnEnter",
     "enableContinueGeneration",
-    "pdfAsImage",
     "titleGenerationUseFirstLine",
-    "titleGenerationUseLLM",
-    "titleGenerationPrompt",
-    "maxImageMPixels",
     "showMessageStats",
     "showAgenticTurnStats",
     "showThoughtInProgress",
-    "autoMicOnEmpty",
     "renderUserContentAsMarkdown",
     "disableAutoScroll",
     "alwaysShowSidebarOnDesktop",
@@ -237,7 +200,6 @@ pub const UPSTREAM_SETTING_KEYS: &[&str] = &[
     "typ_p",
     "max_tokens",
     "samplers",
-    "backend_sampling",
     "repeat_last_n",
     "repeat_penalty",
     "presence_penalty",
@@ -246,7 +208,6 @@ pub const UPSTREAM_SETTING_KEYS: &[&str] = &[
     "dry_base",
     "dry_allowed_length",
     "dry_penalty_last_n",
-    "mcpServers",
     "mcpRequestTimeoutSeconds",
     "agenticMaxTurns",
     "alwaysShowToolCallContent",
@@ -254,8 +215,6 @@ pub const UPSTREAM_SETTING_KEYS: &[&str] = &[
     "disableReasoningParsing",
     "excludeReasoningFromContext",
     "showRawOutputSwitch",
-    "jsSandboxEnabled",
-    "symbolicMathEnabled",
     "customJson",
     "customCss",
 ];
@@ -428,27 +387,16 @@ fn write_resident_memory_budget_projection(
 pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
     BTreeMap::from([
         ("theme".to_string(), json!("system")),
-        ("apiKey".to_string(), json!("")),
         ("systemMessage".to_string(), json!("")),
         ("pasteLongTextToFileLen".to_string(), json!(2500)),
         ("copyTextAttachmentsAsPlainText".to_string(), json!(false)),
         ("sendOnEnter".to_string(), json!(true)),
         ("enableContinueGeneration".to_string(), json!(false)),
-        ("pdfAsImage".to_string(), json!(false)),
         ("titleGenerationUseFirstLine".to_string(), json!(true)),
-        ("titleGenerationUseLLM".to_string(), json!(false)),
-        (
-            "titleGenerationPrompt".to_string(),
-            json!(
-                "Generate a concise conversation title from the first user and assistant exchange."
-            ),
-        ),
-        ("maxImageMPixels".to_string(), json!(0)),
         ("showMessageStats".to_string(), json!(false)),
         ("showAgenticTurnStats".to_string(), json!(false)),
         ("showThoughtInProgress".to_string(), json!(true)),
         ("alwaysShowToolCallContent".to_string(), json!(false)),
-        ("autoMicOnEmpty".to_string(), json!(false)),
         ("renderUserContentAsMarkdown".to_string(), json!(false)),
         ("fullHeightCodeBlocks".to_string(), json!(false)),
         ("disableAutoScroll".to_string(), json!(false)),
@@ -470,7 +418,6 @@ pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
         ("typ_p".to_string(), Value::Null),
         ("max_tokens".to_string(), json!(DEFAULT_MAX_TOKENS)),
         ("samplers".to_string(), json!("")),
-        ("backend_sampling".to_string(), json!(false)),
         ("repeat_last_n".to_string(), Value::Null),
         ("repeat_penalty".to_string(), Value::Null),
         ("presence_penalty".to_string(), Value::Null),
@@ -484,14 +431,10 @@ pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
         ("disableReasoningParsing".to_string(), json!(false)),
         ("excludeReasoningFromContext".to_string(), json!(false)),
         ("showRawOutputSwitch".to_string(), json!(false)),
-        ("jsSandboxEnabled".to_string(), json!(false)),
-        ("symbolicMathEnabled".to_string(), json!(false)),
         ("customJson".to_string(), json!("")),
         ("customCss".to_string(), json!("")),
         ("mcpRequestTimeoutSeconds".to_string(), json!(30)),
-        ("mcpServers".to_string(), json!("[]")),
-        // Native-only settings remain in the same encrypted map for backwards
-        // compatibility, but are not counted as upstream settings parity.
+        // Native settings share the encrypted map without counting as upstream parity.
         ("agenticMaxToolPreviewLines".to_string(), json!(25)),
         ("mcpNativeEnabled".to_string(), json!(false)),
         ("mmprojPath".to_string(), json!("")),
@@ -534,32 +477,9 @@ pub fn upstream_setting_string(settings: &Settings, key: &str) -> Option<String>
 
 pub fn resolve_settings() -> Result<Settings> {
     let data_dir = resolve_data_dir();
-    fs::create_dir_all(&data_dir)
-        .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
-    let path = data_dir.join(SETTINGS_FILE);
     let store = RuntimeStore::open(&data_dir)?;
-    let settings = if let Some(settings) = store.get::<Settings>(SETTINGS_NAMESPACE)? {
-        settings
-    } else if path.exists() {
-        let (migrated, legacy_engine_path) = read_settings_file(&path, data_dir.clone())?;
-        store.put(SETTINGS_NAMESPACE, &migrated)?;
-        let migration_id = format!("mom_llama.settings_migration:{}", crate::now_ms());
-        store.write_receipt(
-            &migration_id,
-            "mom_llama.settings_migrate",
-            &json!({
-                "schema": "mom_llama.settings_migration.v1",
-                "status": "migrated",
-                "source": path,
-                "native_backend": true,
-                "legacy_engine_path_ignored": legacy_engine_path,
-            }),
-        )?;
-        migrated
-    } else {
-        Settings::defaults_for_data_dir(data_dir.clone())
-    };
-    settings_from_document(data_dir, Some(settings)).map_err(anyhow::Error::new)
+    let settings = store.get::<Settings>(SETTINGS_NAMESPACE)?;
+    settings_from_document(data_dir, settings).map_err(anyhow::Error::new)
 }
 
 pub(crate) fn settings_from_document(
@@ -705,29 +625,6 @@ fn compiled_default_path(
             )],
         ),
     })
-}
-
-fn read_settings_file(path: &Path, data_dir: PathBuf) -> Result<(Settings, Option<PathBuf>)> {
-    let raw = fs::read_to_string(path)?;
-    let legacy_engine_path = serde_json::from_str::<Value>(&raw).ok().and_then(|value| {
-        value
-            .get("engine_path")
-            .or_else(|| value.get("engine_bin"))
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-    });
-    match serde_json::from_str::<Settings>(&raw) {
-        Ok(settings) => Ok((settings, legacy_engine_path)),
-        Err(settings_error) => {
-            if let Ok(legacy) = serde_json::from_str::<LegacySettings>(&raw)
-                && legacy.looks_like_legacy()
-            {
-                return Ok((legacy.into_settings(data_dir), legacy_engine_path));
-            }
-            Err(settings_error).with_context(|| format!("failed to parse {}", path.display()))
-        }
-    }
 }
 
 pub fn save_settings(settings: &Settings) -> Result<PathBuf> {
@@ -1219,6 +1116,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plaintext_settings_are_rejected_without_import_or_source_mutation() -> Result<()> {
+        let data_dir =
+            std::env::temp_dir().join(format!("mom-plaintext-settings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&data_dir)?;
+        let path = data_dir.join("settings.json");
+        let source = br#"{"engine_bin":"old-engine","selected_model":"private-model.gguf","default_max_tokens":73}"#;
+        fs::write(&path, source)?;
+        set_data_dir_override_for_tests(Some(data_dir.clone()));
+        let result = resolve_settings();
+        set_data_dir_override_for_tests(None);
+        let preserved_source = fs::read(&path)?;
+        let database_created = data_dir.join("runtime.sqlite3").exists();
+        fs::remove_dir_all(&data_dir)?;
+
+        let error = result.expect_err("plaintext settings must not be silently imported");
+        assert!(error.to_string().contains("settings.json"));
+        assert_eq!(preserved_source, source);
+        assert!(!database_created);
+        Ok(())
+    }
+
+    #[test]
     fn data_dir_override_does_not_leak_into_parallel_tests() {
         let override_path = std::env::temp_dir().join(format!(
             "mom-llama-config-thread-override-{}",
@@ -1233,9 +1152,9 @@ mod tests {
     }
 
     #[test]
-    fn exact_upstream_setting_registry_is_complete_and_distinct_from_extensions() {
+    fn supported_upstream_setting_registry_is_complete_and_distinct_from_extensions() {
         let defaults = upstream_settings_defaults();
-        assert_eq!(UPSTREAM_SETTING_KEYS.len(), 58);
+        assert_eq!(UPSTREAM_SETTING_KEYS.len(), 48);
         for key in UPSTREAM_SETTING_KEYS {
             assert!(
                 defaults.contains_key(*key),
@@ -1249,6 +1168,26 @@ mod tests {
                 "missing native extension {key}"
             );
         }
+    }
+
+    #[test]
+    fn inactive_settings_remain_in_existing_data_but_reject_new_writes() {
+        let data_dir = std::env::temp_dir();
+        let mut stored = Settings::defaults_for_data_dir(data_dir.clone());
+        assert!(!stored.upstream_settings.contains_key("apiKey"));
+        stored
+            .upstream_settings
+            .insert("apiKey".to_string(), json!("retained inert value"));
+        let resolved =
+            settings_from_document_with_model_sources(data_dir, Some(stored), None, None, None)
+                .expect("unconsumed stored fields do not require a migration");
+        assert_eq!(resolved.upstream_settings["apiKey"], "retained inert value");
+        let blocker = validate_settings_update(&BTreeMap::from([(
+            "apiKey".to_string(),
+            json!("new value"),
+        )]))
+        .expect("inactive settings are not writable product controls");
+        assert_eq!(blocker.code, "setting_key_unknown");
     }
 
     #[test]
