@@ -23,7 +23,6 @@ pub struct Builder {
     loopback: Option<LoopbackConfig>,
     default_loopback: bool,
     app_data_dir: Option<PathBuf>,
-    cleanup_on_exit: bool,
     #[cfg(feature = "native-llama")]
     native_backend: Option<Arc<fte_backend_llama::LlamaNativeBackend>>,
 }
@@ -44,7 +43,6 @@ impl Builder {
             loopback: None,
             default_loopback: false,
             app_data_dir: None,
-            cleanup_on_exit: true,
             #[cfg(feature = "native-llama")]
             native_backend: None,
         }
@@ -145,15 +143,6 @@ impl Builder {
         self
     }
 
-    /// Defers `RunEvent::Exit` cleanup to an embedding application that
-    /// drains the shared Gateway before requesting final process exit.
-    /// Plugin drop remains an idempotent fallback after that coordinated exit.
-    #[must_use]
-    pub fn with_application_managed_exit(mut self) -> Self {
-        self.cleanup_on_exit = false;
-        self
-    }
-
     pub fn register_backend(self, backend: Arc<dyn GatewayBackend>) -> Result<Self, GatewayError> {
         self.gateway.register_backend(backend)?;
         Ok(self)
@@ -165,7 +154,6 @@ impl Builder {
         let loopback_config = self.loopback;
         let default_loopback = self.default_loopback;
         let app_data_dir = self.app_data_dir;
-        let cleanup_on_exit = self.cleanup_on_exit;
         PluginBuilder::new("free-token-energy")
             .invoke_handler(tauri::generate_handler![
                 gateway_status,
@@ -206,8 +194,7 @@ impl Builder {
             // subsequently close its application-owned native host without a
             // gateway bridge or provider task still using it.
             .on_event(move |app, event| {
-                if cleanup_on_exit
-                    && matches!(event, RunEvent::Exit)
+                if matches!(event, RunEvent::Exit)
                     && let Some(state) = app.try_state::<PluginState>()
                 {
                     state.cleanup_blocking();
@@ -368,6 +355,7 @@ impl PluginState {
             Ok(mut loopback) => (loopback.take(), None),
             Err(poisoned) => (poisoned.into_inner().take(), Some(plugin_state_error())),
         };
+        let listener_count = server.as_ref().map_or(0, |server| server.addresses().len());
         let gateway = Arc::clone(&self.gateway);
         // `on_drop` may be reached through dynamic plugin removal from a
         // Tokio task. Calling `Handle::block_on` from that task panics, so the
@@ -402,6 +390,11 @@ impl PluginState {
             eprintln!(
                 "Free Token Energy cleanup failed ({}): {}",
                 cleanup_error.code, cleanup_error.safe_detail
+            );
+        }
+        if error.is_none() {
+            eprintln!(
+                "free-token-energy plugin cleanup: loopback_listeners_joined={listener_count} gateway_drained=true"
             );
         }
         self.cleanup.finish(error);
@@ -655,16 +648,6 @@ mod tests {
     }
 
     #[test]
-    fn application_managed_exit_disables_only_the_early_exit_hook() {
-        assert!(Builder::new().cleanup_on_exit);
-        assert!(
-            !Builder::new()
-                .with_application_managed_exit()
-                .cleanup_on_exit
-        );
-    }
-
-    #[test]
     fn cleanup_coordinator_is_idempotent_and_retains_safe_error() {
         let cleanup = CleanupCoordinator::default();
         assert!(cleanup.start_or_wait());
@@ -722,9 +705,45 @@ mod tests {
             cleanup: Arc::new(CleanupCoordinator::default()),
         };
 
+        // Private token storage is supported on Unix. Other platforms still
+        // exercise the synchronous cleanup boundary inside an async runtime.
+        #[cfg(unix)]
+        let (token_directory, addresses) = {
+            let token_directory =
+                std::env::temp_dir().join(format!("fte-plugin-cleanup-{}", RequestId::new().0));
+            let server = LoopbackServer::start(
+                Arc::clone(&state.gateway),
+                Arc::clone(&state.store),
+                LoopbackConfig::app_private(token_directory.join("token")),
+            )
+            .await
+            .expect("real loopback listeners");
+            let addresses = server.addresses().to_vec();
+            for address in &addresses {
+                drop(
+                    tokio::net::TcpStream::connect(address)
+                        .await
+                        .expect("live listener"),
+                );
+            }
+            *state.loopback.lock().expect("loopback state") = Some(server);
+            (token_directory, addresses)
+        };
+
+        state.cleanup_blocking();
         state.cleanup_blocking();
 
         assert_eq!(state.cleanup.status().phase, PluginCleanupPhase::Complete);
         assert!(state.cleanup.status().error.is_none());
+        assert!(state.loopback.lock().expect("loopback state").is_none());
+        #[cfg(unix)]
+        {
+            for address in addresses {
+                let listener = std::net::TcpListener::bind(address)
+                    .expect("cleanup released the actual listener socket");
+                drop(listener);
+            }
+            std::fs::remove_dir_all(token_directory).expect("remove fixture token directory");
+        }
     }
 }

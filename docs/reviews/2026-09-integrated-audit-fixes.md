@@ -536,3 +536,37 @@ goal turns. The goal is blocked on that user action, not marked complete. No
 credential override, original-store mutation or substitution of fixture evidence
 was used. The audit polling automation returns to daily deterministic cache
 maintenance while this user action is pending.
+
+### September 10 native follow-up
+
+The protected-store boundary is now verified. The unchanged Mom executable
+(`2801d7a1da84e751adef41871b5a00c721c95d2a5a03ea579083faa5bde3cbeb`)
+reopened the original encrypted `/tmp/mom-audit-bundle.R1ZWQT` store with secure
+storage enabled, PID 98321. Native accessibility showed the original four-message
+conversation, including both user prompts and replies, and the saved official
+Gemma model selection. The prior run also logged successful native/speech joins
+and persona recovery on quit. No fixture substitution or key override was used.
+
+The user's September 10 crash report revealed a separate FTE exit defect. Its
+binary UUID `41D9FE66-0B97-3A96-A35B-B61651BC255F` matches the final `359bb9f`
+executable above. AppleEvent Quit entered AppKit termination and reached
+`RunEvent::Exit` without `ExitRequested`; the application's unconditional final
+exit fallback called `std::process::abort`. The matching PID 76262 stderr records
+that exact branch. Previous Cmd+Q acceptance did not qualify this OS quit path.
+
+FTE now synchronously drains the same application-owned runtime at that final
+boundary, returning to AppKit only after the existing exact worker/native join
+check succeeds. Cmd+Q shares the drain/report policy. The unused plugin exit
+override and its mirror-only test are removed: the plugin's final event hook
+joins loopback listeners and Gateway work before the desktop joins its native
+host. Repeated/concurrent calls retain the existing owners and shutdown reports.
+No native bridge, extra runtime or replacement shutdown framework was added.
+
+The affected desktop library passed 49 tests (two prerequisite-dependent cases
+ignored); the plugin passed four. The new desktop regression invokes the actual
+final-exit function alongside requested shutdown. The existing async-runtime
+cleanup check now opens real listeners, cleans up twice and rebinds the same
+addresses on Unix; its portable cleanup assertions remain enabled elsewhere.
+Strict affected-package/all-target Clippy and formatting passed. Independent
+source review found no remaining event-ordering or ownership blocker. Native
+loaded-model OS-quit verification remains the next acceptance step.

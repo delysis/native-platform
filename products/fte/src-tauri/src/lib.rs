@@ -47,8 +47,7 @@ pub fn run() {
     let event_shutdown_started = Arc::clone(&shutdown_started);
     let mut plugin_builder = tauri_plugin_free_token_energy::Builder::new()
         .with_gateway(plugin_gateway)
-        .with_default_loopback()
-        .with_application_managed_exit();
+        .with_default_loopback();
     if let Some(isolation) = &acceptance {
         plugin_builder = plugin_builder.with_app_data_dir(isolation.root().to_path_buf());
     }
@@ -137,12 +136,14 @@ pub fn run() {
             if let tauri::RunEvent::Exit = event
                 && !event_exit_allowed.load(Ordering::Acquire)
             {
-                // Some OS-level termination paths cannot be delayed. A hard
-                // stop is preferable to joining a Metal worker from inside
-                // AppKit's synchronous terminate callback, which can deadlock
-                // process exit.
+                // AppKit's Dock/AppleEvent termination can bypass
+                // ExitRequested. Final exit cannot be deferred, so observe the
+                // same owner's complete drain before returning to AppKit.
+                if complete_final_exit(&event_gateway_runtime, &event_exit_allowed) {
+                    return;
+                }
                 eprintln!(
-                    "Free Token Energy aborts an uncoordinated final exit before Rust or Metal teardown"
+                    "Free Token Energy could not join every worker before final process exit"
                 );
                 std::process::abort();
             }
@@ -166,19 +167,7 @@ fn request_graceful_exit<R: Runtime>(
     let shutdown_started = Arc::clone(shutdown_started);
     let exit_allowed = Arc::clone(exit_allowed);
     tauri::async_runtime::spawn(async move {
-        let started_at = Instant::now();
-        let report = runtime.shutdown_with_report().await;
-        let gateway_drained = gateway_report_is_drained(&report.gateway);
-        eprintln!(
-            "free-token-energy shutdown: elapsed_ms={} gateway_drained={} native_host_joined={} expected_workers={} joined_workers={} retained_tasks={}",
-            started_at.elapsed().as_millis(),
-            gateway_drained,
-            report.native_host_joined,
-            report.gateway.expected_worker_ids.len(),
-            report.gateway.joined_worker_ids.len(),
-            report.gateway.retained_tasks,
-        );
-        if gateway_drained && report.native_host_joined {
+        if drain_runtime_for_exit(&runtime).await {
             exit_allowed.store(true, Ordering::Release);
             app_handle.exit(exit_code);
         } else {
@@ -186,6 +175,38 @@ fn request_graceful_exit<R: Runtime>(
             eprintln!("Free Token Energy remains open because shutdown did not join every worker");
         }
     });
+}
+
+fn complete_final_exit(
+    runtime: &gateway_runtime::GatewayRuntimeOwner,
+    exit_allowed: &AtomicBool,
+) -> bool {
+    eprintln!("free-token-energy final exit: joining the application-owned runtime");
+    if tauri::async_runtime::block_on(drain_runtime_for_exit(runtime)) {
+        exit_allowed.store(true, Ordering::Release);
+        true
+    } else {
+        false
+    }
+}
+
+async fn drain_runtime_for_exit(runtime: &gateway_runtime::GatewayRuntimeOwner) -> bool {
+    let started_at = Instant::now();
+    let report = runtime.shutdown_with_report().await;
+    let gateway_drained = gateway_report_is_drained(&report.gateway);
+    eprintln!(
+        "free-token-energy shutdown: elapsed_ms={} gateway_drained={} native_host_joined={} expected_workers={} joined_workers={} retained_tasks={}",
+        started_at.elapsed().as_millis(),
+        gateway_drained,
+        report.native_host_joined,
+        report.gateway.expected_worker_ids.len(),
+        report.gateway.joined_worker_ids.len(),
+        report.gateway.retained_tasks,
+    );
+    if let Err(error) = &report.gateway.result {
+        eprintln!("Free Token Energy gateway shutdown reported: {error}");
+    }
+    gateway_drained && report.native_host_joined
 }
 
 fn gateway_report_is_drained(report: &GatewayShutdownReport) -> bool {
@@ -338,5 +359,32 @@ mod tests {
             &["hosted", "llama-native"],
             1,
         )));
+    }
+
+    #[test]
+    fn final_exit_joins_the_actual_owner_alongside_requested_shutdown() {
+        let runtime = gateway_runtime::GatewayRuntimeOwner::new_with_store(Arc::new(
+            EphemeralCredentialStore::default(),
+        ))
+        .expect("application-owned Gateway and native host");
+        let exit_allowed = AtomicBool::new(false);
+        let rendezvous = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let requested = scope.spawn(|| {
+                rendezvous.wait();
+                tauri::async_runtime::block_on(drain_runtime_for_exit(&runtime))
+            });
+            rendezvous.wait();
+            assert!(complete_final_exit(&runtime, &exit_allowed));
+            assert!(requested.join().expect("requested shutdown caller"));
+        });
+        assert!(exit_allowed.load(Ordering::Acquire));
+        let report = tauri::async_runtime::block_on(runtime.shutdown_with_report());
+        assert!(gateway_report_is_drained(&report.gateway));
+        assert!(report.native_host_joined);
+        report
+            .gateway
+            .result
+            .expect("repeat drain preserves success");
     }
 }
