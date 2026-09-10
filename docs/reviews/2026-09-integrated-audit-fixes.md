@@ -520,5 +520,19 @@ store with secure storage enabled (PID 76226). It again reached the native
 Keychain wait; encrypted-store reopen remains unverified and requires the user.
 The final FTE run (PID 76262) showed the same five stored requests and 275 tokens,
 now with a ready local provider and neutral Cancelled rows in native Activity.
-Full CI `34418019361` is running for this production-code checkpoint. Later
-receipt-only commits do not require rebuilding these unchanged executables.
+Full CI `34418019361` completed successfully at production-code checkpoint
+`359bb9f82ee1bff5952596fc85ab00415ee3a4bd`: all eight jobs passed, including
+Linux, macOS, Windows, model integration, frontend, fuzz, policy and the aggregate
+gate. Its existing watcher exited successfully; no duplicate matrix or unchanged
+local rebuild was started. Later receipt-only commits do not require rebuilding
+these unchanged executables.
+
+The remaining acceptance boundary is reopening Mom's original encrypted store
+through normal OS credential access. The app was observed waiting for its
+Keychain unlock; the subsequent final check was prevented by the locked Mac.
+Computer Use cannot operate SecurityAgent. This requires the user to unlock the
+Mac and approve the normal Keychain prompt, and has persisted across multiple
+goal turns. The goal is blocked on that user action, not marked complete. No
+credential override, original-store mutation or substitution of fixture evidence
+was used. The audit polling automation returns to daily deterministic cache
+maintenance while this user action is pending.
