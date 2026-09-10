@@ -569,4 +569,44 @@ cleanup check now opens real listeners, cleans up twice and rebinds the same
 addresses on Unix; its portable cleanup assertions remain enabled elsewhere.
 Strict affected-package/all-target Clippy and formatting passed. Independent
 source review found no remaining event-ordering or ownership blocker. Native
-loaded-model OS-quit verification remains the next acceptance step.
+loaded-model OS-quit verification subsequently passed at `d88949f`:
+
+- The FTE debug bundle built in 4.83 seconds and passed strict ad-hoc signature
+  verification. Executable SHA-256:
+  `13043c04c58947bc9b0fad46ba760c5e2e9b8bcac4debf0a8c8d021717440910`.
+- PID 4926 served a real local Gemma response, then Activity Monitor's ordinary
+  Quit action exercised the final OS-exit path. The plugin joined both actual
+  loopback listeners, followed by the final-exit log, Metal deallocation, and
+  eight expected/eight joined gateway workers with zero retained tasks. The
+  native-host drain took 113 ms. The process disappeared and both listener
+  addresses rebound. Reopening preserved all six requests/302 tokens; API
+  retrieval returned the unchanged completed response
+  `resp_2b73600b-ac50-40dd-9e6e-2323b17dd8a4`.
+- PID 5296 then served a longer real Gemma stream. After output was observed,
+  ordinary OS Quit cancelled the active request: 1,588 output deltas, exactly
+  one `response.incomplete`, no `response.completed`. The plugin again joined
+  both listeners, Metal was freed, and eight/eight gateway workers joined with
+  zero retained tasks; native-host drain took 202 ms. This is active-generation
+  evidence, not an idle-toggle substitute. The process disappeared; the
+  listeners rebound with `SO_REUSEADDR` after the active TCP connection entered
+  normal TIME_WAIT (the initial plain bind was correctly refused by the kernel).
+- The only FTE crash report still present was the original PID 76262 report.
+  Final reopen PID 7019 displayed seven requests/1,938 tokens, a Ready local
+  provider, and the new request as Cancelled in native Activity. The isolated
+  credential fixture remains explicitly separate from hosted credential proof.
+
+Native logs and wire evidence are `/tmp/integrated-audit-fte-d88949f.stderr`,
+`/tmp/integrated-audit-fte-d88949f-reopen.stderr`,
+`/tmp/integrated-audit-fte-d88949f-generation.json`, and
+`/tmp/integrated-audit-fte-d88949f-active-quit.sse`. Full CI `34535642710`
+passed all eight jobs at production checkpoint
+`d88949fbd6be5b7e7ba70ac5120adb4fec636248`. Its logs confirm execution of both
+the actual-owner final-exit regression and async-runtime cleanup regression on
+Linux, macOS and Windows. The existing watcher exited successfully. The external
+wrapper PR 11 remains open/draft at `4c000bd5992da2a95beffe3b6777216f2a5fea67`,
+with all five checks passing.
+
+The original audit dispositions above, native UI/default work, protected-store
+reopen and reported OS-quit crash now have their recorded verification. No
+required audit work remains open. Daily deterministic cache maintenance remains
+in place. Receipt-only updates do not require rebuilding unchanged executables.
