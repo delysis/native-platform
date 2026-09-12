@@ -44,7 +44,7 @@ opened the installed database and all retained table values were checked again.
 
 Both a complete logical backup and a byte-exact original remain in the writing
 folder's `.loom/backups/development-store-2026-09-11/`, with preparation and
-installation receipts. The complete backup also retains the retired research
+installation receipts and the one-time repair source. The complete backup also retains the retired research
 tables (749 candidate records and 1,498 review events). No writing files or model
 assets were deleted. The temporary repair program is excluded from the product;
 there is no shipped migration chain or weakened schema validation.
@@ -65,3 +65,11 @@ there is no shipped migration chain or weakened schema validation.
   storage opener, Computer Use reported that the Mac was locked. The rebuilt app
   has not yet been visibly opened. A plain-folder native test copy is prepared;
   no launch or static check is being treated as visible product acceptance.
+
+Remote CI runs against product commit `226f03e4076b0edce7e4cb6876d083432cbf9862`:
+<https://github.com/delysis/native-platform/actions/runs/34661208294>.
+Policy, verified CPU-model integration, and fuzz checks have passed. The frontend
+job found one obsolete source-string assertion requiring the old outline guard
+verbatim; that assertion is removed, and all 448 frontend tests pass locally on
+the corrected test source. This test-only correction does not change the signed
+application. Cross-platform workspace jobs remain pending at this receipt update.

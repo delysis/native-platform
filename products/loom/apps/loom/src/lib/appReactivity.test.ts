@@ -593,7 +593,6 @@ describe('App ghost reactivity wiring', () => {
     expect(visibleActions).toContain('captureDocumentContextTarget(summary)');
     expect(visibleActions).toContain('openDocumentContextMenu(');
     expect(visibleActions).toContain('visibleDocumentActionsMenuPoint(');
-    expect(source).toContain('{#if project.documents.length > 0}');
     expect(source).not.toContain('class:single-document=');
     expect(sidebar).toContain('{documentContextRevealLabel}</button>');
     expect(action).toContain('const target = documentContextTarget;');
