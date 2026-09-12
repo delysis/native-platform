@@ -894,6 +894,7 @@
   $: unpresentableVisualGhostPresentationKeys = completionController.unpresentableVisualKeys;
   $: scheduledSuggestion = completionController.scheduled;
 
+  $: folderWarnings = project?.folder_warnings ?? [];
   $: visibleDocuments = project?.documents.filter((candidate) => {
     const query = search.trim().toLocaleLowerCase();
     return !query || candidate.title.toLocaleLowerCase().includes(query) || candidate.relative_path.toLocaleLowerCase().includes(query);
@@ -8913,16 +8914,19 @@
       aria-label="Writing controls"
     >
       <div class="canvas-controls-left" data-no-window-drag>
-        {#if project.documents.length > 0}
+        {#if project.documents.length > 0 || folderWarnings.length > 0}
           <button
             bind:this={outlineToggle}
             class="titlebar-button outline-toggle"
             type="button"
             aria-controls="project-outline"
             aria-expanded={outlineOpen}
-            aria-label={outlineOpen ? 'Close manuscript outline' : 'Open manuscript outline'}
+            aria-label={`${outlineOpen ? 'Close' : 'Open'} manuscript outline${folderWarnings.length ? `, ${folderWarnings.length} files not opened` : ''}`}
+            title={folderWarnings.length ? `${folderWarnings.length} files not opened — see folder details` : 'Manuscript outline'}
             on:click={() => void setOutlineOpen(!outlineOpen)}
-          ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 4h10M3 8h10M3 12h10" /></svg></button>
+          ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 4h10M3 8h10M3 12h10" /></svg>
+            {#if folderWarnings.length}<span class="folder-warning-dot" aria-hidden="true"></span>{/if}
+          </button>
         {/if}
         {#if transition === 'idle'}
           <button
@@ -9207,6 +9211,12 @@
             <p class="empty-copy">No notes.</p>
           {/each}
         </nav>
+        {#if folderWarnings.length > 0}
+          <details class="folder-warnings">
+            <summary>{folderWarnings.length} {folderWarnings.length === 1 ? 'file' : 'files'} not opened</summary>
+            <ul>{#each folderWarnings as warning}<li>{warning}</li>{/each}</ul>
+          </details>
+        {/if}
         {#if documentContextTarget}
           <div
             bind:this={documentContextMenu}

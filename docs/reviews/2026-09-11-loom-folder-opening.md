@@ -17,6 +17,10 @@ Discovery is bounded, skips hidden/generated directories and symlinks, and keeps
 existing document identities, revisions, and deletion tombstones. Filesystem hints
 discover new files and cover directory renames, including dotted directory names.
 Root-level files use the same source-bound save and no-clobber rename/delete paths.
+An unsupported text encoding or oversized unregistered file is left untouched
+and listed in compact folder details, without blocking readable writing or later
+filesystem refreshes. Replacing that file externally with supported UTF-8 lets
+the next refresh discover it normally.
 
 Folder selection validates and holds one candidate store while the current
 writing remains open. Cancellation, same-folder selection, and invalid targets
@@ -47,7 +51,7 @@ there is no shipped migration chain or weakened schema validation.
 
 ## Validation
 
-- Store: 126 unit tests and three active integration tests passed; one pre-existing
+- Store: 127 unit tests and three active integration tests passed; one pre-existing
   integration test remains explicitly ignored.
 - CLI: 10 tests passed.
 - Plugin: 176 tests passed; two pre-existing native tests remain explicitly ignored.
@@ -56,7 +60,7 @@ there is no shipped migration chain or weakened schema validation.
   policy, and current-doc validation passed.
 - The debug bundle built using the shared target and passed strict ad-hoc signature
   verification. Executable SHA-256:
-  `d3cb8ec4a20a376eb001f43dfda7673e064da335f8a5127275b0f749f7817a43`.
+  `65b3645eea0668177a0c0a20e49336ae4f9b9075320ae336b4f6bcc023d12708`.
 - Native interaction remains unverified: after the repaired store passed the real
   storage opener, Computer Use reported that the Mac was locked. The rebuilt app
   has not yet been visibly opened. A plain-folder native test copy is prepared;

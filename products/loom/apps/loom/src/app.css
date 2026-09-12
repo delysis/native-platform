@@ -173,6 +173,12 @@ button:disabled { cursor: default; opacity: .45; }
 .loom-prosemirror a[href^="loom-attachment:"] { display: inline-flex; align-items: center; max-width: 100%; margin: .2em 0; padding: .35em .65em; border: 1px solid color-mix(in srgb, var(--moss) 42%, var(--line)); border-radius: .65em; background: color-mix(in srgb, var(--moss-soft) 50%, var(--paper)); color: var(--ink); font-family: Inter, ui-sans-serif, sans-serif; font-size: .76em; line-height: 1.25; text-decoration: none; }
 .outline-panel { min-width: 0; display: none; grid-column: 1; flex-direction: column; overflow: hidden; border-right: 1px solid var(--line); background: #f1f0ee; }
 .outline-panel.open { display: flex; }
+.outline-toggle { position: relative; }
+.folder-warning-dot { position: absolute; top: 3px; right: 2px; width: 5px; height: 5px; border-radius: 50%; background: var(--danger); }
+.folder-warnings { flex: 0 1 auto; min-height: 30px; max-height: 35%; overflow: auto; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; line-height: 1.4; }
+.folder-warnings summary { padding: 8px 10px; cursor: pointer; }
+.folder-warnings ul { margin: 0; padding: 0 12px 10px 26px; overflow-wrap: anywhere; }
+.folder-warnings li + li { margin-top: 5px; }
 .bare-button { font-size: 18px; }
 .search-field { display: flex; align-items: center; gap: 7px; margin: 10px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--muted); background: rgb(255 255 255 / 48%); }
 .search-field input { min-width: 0; width: 100%; padding: 8px 0; border: 0; outline: 0; background: transparent; font-size: 13px; }

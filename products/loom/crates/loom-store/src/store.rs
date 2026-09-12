@@ -45,6 +45,7 @@ pub struct ProjectStore {
     pub(crate) root: PathBuf,
     pub(crate) manifest: ProjectManifest,
     pub(crate) connection: Connection,
+    pub(crate) folder_warnings: Vec<String>,
     _lease: ProjectLease,
 }
 
@@ -196,6 +197,7 @@ impl ProjectStore {
             root,
             manifest,
             connection,
+            folder_warnings: Vec::new(),
             _lease: lease,
         };
         store.recover_document_rename_operations()?;

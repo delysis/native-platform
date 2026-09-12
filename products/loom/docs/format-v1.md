@@ -49,6 +49,8 @@ Reopening and filesystem hints discover newly added files; existing registration
 including deletion tombstones, are retained. Discovery skips symbolic links,
 hidden directories, `node_modules`, and `target`, with a 50,000-entry and 64-level
 bound. Document authority excludes hidden paths and traversal outside the folder.
+Unsupported encoding and oversized unregistered files remain untouched and are
+listed in folder warnings without blocking readable documents.
 An unreadable existing sidecar is never replaced with an empty history store.
 
 New documents use `create_document_if_absent`. Both the database registration and visible path must be absent. Its outbox predecessor is strictly `NULL`; projection uses a no-clobber install, so a file appearing after preflight is preserved and reported as a conflict.

@@ -49,6 +49,7 @@ impl ProjectStore {
             .query_map([], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         let mut adopted = 0;
+        let mut warnings = Vec::new();
         for path in paths {
             let Some(relative) = path.to_str() else {
                 return Err(StoreError::NonUtf8Path(path));
@@ -56,14 +57,27 @@ impl ProjectStore {
             if registered.contains(relative) || self.document_path_is_reserved(relative)? {
                 continue;
             }
-            self.adopt_visible_document_if_absent(
+            match self.adopt_visible_document_if_absent(
                 relative,
                 DocumentKind::Prose,
                 "Open writing file",
-            )?;
-            adopted += 1;
+            ) {
+                Ok(_) => adopted += 1,
+                Err(StoreError::ExternalVisibleInvalidUtf8(_)) => {
+                    warnings.push(format!("{relative}: not UTF-8 text"));
+                }
+                Err(StoreError::DocumentTooLarge { .. }) => {
+                    warnings.push(format!("{relative}: exceeds the document size limit"));
+                }
+                Err(error) => return Err(error),
+            }
         }
+        self.folder_warnings = warnings;
         Ok(adopted)
+    }
+
+    pub fn folder_warnings(&self) -> &[String] {
+        &self.folder_warnings
     }
 }
 
@@ -188,5 +202,28 @@ mod tests {
         let mut store = ProjectStore::open_folder(root.path()).unwrap();
         assert_eq!(store.list_documents().unwrap().len(), 1);
         assert_eq!(store.discover_documents().unwrap(), 0);
+    }
+
+    #[test]
+    fn unsupported_text_does_not_block_open_or_refresh_of_readable_writing() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("Notes.md"), "Readable writing.").unwrap();
+        let invalid = [0xff, 0xfe, b'A', 0];
+        fs::write(root.path().join("Export.txt"), invalid).unwrap();
+        let mut store = ProjectStore::open_folder(root.path()).unwrap();
+        assert_eq!(store.list_documents().unwrap().len(), 1);
+        assert_eq!(store.folder_warnings(), ["Export.txt: not UTF-8 text"]);
+        assert_eq!(fs::read(root.path().join("Export.txt")).unwrap(), invalid);
+        fs::write(root.path().join("New.md"), "New writing.").unwrap();
+        assert_eq!(store.discover_documents().unwrap(), 1);
+        assert_eq!(store.list_documents().unwrap().len(), 2);
+        fs::write(
+            root.path().join("Export.txt"),
+            "Replaced externally with UTF-8.",
+        )
+        .unwrap();
+        assert_eq!(store.discover_documents().unwrap(), 1);
+        assert!(store.folder_warnings().is_empty());
+        assert_eq!(store.list_documents().unwrap().len(), 3);
     }
 }

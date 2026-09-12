@@ -2296,6 +2296,7 @@ pub struct ProjectSnapshot {
     root: String,
     schema_version: u32,
     documents: Vec<DocumentSummary>,
+    folder_warnings: Vec<String>,
     pending_recovery: u64,
 }
 
@@ -10184,6 +10185,7 @@ fn snapshot_for(
         root,
         schema_version: store.manifest().schema_version,
         documents,
+        folder_warnings: store.folder_warnings().to_vec(),
         pending_recovery: store.pending_outbox_count().map_err(IpcFailure::store)?,
     })
 }
