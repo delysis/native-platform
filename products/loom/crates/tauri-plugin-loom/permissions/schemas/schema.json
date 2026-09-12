@@ -895,30 +895,6 @@
           "markdownDescription": "Denies the model_unload command without any pre-configured scope."
         },
         {
-          "description": "Enables the project_choose_create command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-project-choose-create",
-          "markdownDescription": "Enables the project_choose_create command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the project_choose_create command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-project-choose-create",
-          "markdownDescription": "Denies the project_choose_create command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the project_choose_open command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-project-choose-open",
-          "markdownDescription": "Enables the project_choose_open command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the project_choose_open command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-project-choose-open",
-          "markdownDescription": "Denies the project_choose_open command without any pre-configured scope."
-        },
-        {
           "description": "Enables the project_close command without any pre-configured scope.",
           "type": "string",
           "const": "allow-project-close",
@@ -929,6 +905,18 @@
           "type": "string",
           "const": "deny-project-close",
           "markdownDescription": "Denies the project_close command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_commit_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-commit-open",
+          "markdownDescription": "Enables the project_commit_open command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_commit_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-commit-open",
+          "markdownDescription": "Denies the project_commit_open command without any pre-configured scope."
         },
         {
           "description": "Enables the project_current command without any pre-configured scope.",
@@ -943,6 +931,18 @@
           "markdownDescription": "Denies the project_current command without any pre-configured scope."
         },
         {
+          "description": "Enables the project_discard_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-discard-open",
+          "markdownDescription": "Enables the project_discard_open command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_discard_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-discard-open",
+          "markdownDescription": "Denies the project_discard_open command without any pre-configured scope."
+        },
+        {
           "description": "Enables the project_open_default command without any pre-configured scope.",
           "type": "string",
           "const": "allow-project-open-default",
@@ -953,6 +953,18 @@
           "type": "string",
           "const": "deny-project-open-default",
           "markdownDescription": "Denies the project_open_default command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_prepare_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-prepare-open",
+          "markdownDescription": "Enables the project_prepare_open command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_prepare_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-prepare-open",
+          "markdownDescription": "Denies the project_prepare_open command without any pre-configured scope."
         },
         {
           "description": "Enables the project_recover command without any pre-configured scope.",
@@ -1075,10 +1087,10 @@
           "markdownDescription": "Denies the weave_status command without any pre-configured scope."
         },
         {
-          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
+          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
+          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
         }
       ]
     }

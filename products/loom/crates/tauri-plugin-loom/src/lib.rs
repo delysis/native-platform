@@ -87,7 +87,7 @@ use crate::speech_input::{
 };
 use speech_native_host::SpeechHostStatus;
 
-const INITIAL_DOCUMENT: &str = "manuscript/Untitled.md";
+const INITIAL_DOCUMENT: &str = "Untitled.md";
 const DEFAULT_PROJECT_DIRECTORY: &str = "writing";
 const MAX_UNTITLED_DOCUMENT_CANDIDATES: u32 = 10_000;
 const PROJECT_CLOSE_GENERATION_WAIT: Duration = Duration::from_secs(3);
@@ -332,11 +332,19 @@ impl Drop for AutomaticBudgetReservation<'_> {
 }
 
 #[derive(Debug)]
+struct PreparedProject {
+    id: CommandId,
+    store: ProjectStore,
+}
+
+#[derive(Debug)]
 pub struct PluginState {
     close_requested: AtomicBool,
     exit_authorized: AtomicBool,
     application: Mutex<ApplicationPhase>,
     session: Mutex<Session>,
+    prepared_project: Mutex<Option<PreparedProject>>,
+    folder_picker_open: AtomicBool,
     native_runtime: Arc<NativeHostRuntime>,
     backend: Arc<LlamaBackend>,
     model: Mutex<ModelRegistry>,
@@ -379,6 +387,8 @@ impl PluginState {
             exit_authorized: AtomicBool::new(false),
             application: Mutex::new(ApplicationPhase::default()),
             session: Mutex::new(Session::default()),
+            prepared_project: Mutex::new(None),
+            folder_picker_open: AtomicBool::new(false),
             native_runtime,
             backend,
             model: Mutex::new(ModelRegistry::default()),
@@ -405,6 +415,10 @@ impl Drop for PluginState {
         self.close_requested.store(true, Ordering::Release);
         self.exit_authorized.store(false, Ordering::Release);
         let _ = self.foreground_commands.revoke_all();
+        self.prepared_project
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let session = self
             .session
             .get_mut()
@@ -1880,8 +1894,9 @@ impl Builder {
             })
             .invoke_handler(tauri::generate_handler![
                 project_open_default,
-                project_choose_create,
-                project_choose_open,
+                project_prepare_open,
+                project_commit_open,
+                project_discard_open,
                 project_close,
                 project_current,
                 project_recover,
@@ -2137,6 +2152,7 @@ impl IpcFailure {
             StoreError::UnsafeRelativePath(_) => "unsafe_relative_path",
             StoreError::SymbolicLink(_) => "symbolic_link_refused",
             StoreError::NotDirectory(_) => "not_a_directory",
+            StoreError::FolderTooLarge { .. } => "writing_folder_too_large",
             StoreError::NotRegularFile(_) => "not_a_regular_file",
             StoreError::AlreadyInitialized(_) => "project_already_initialized",
             StoreError::ProjectAlreadyOpen(_) => "project_already_open",
@@ -2680,16 +2696,143 @@ fn default_project_path(state: &PluginState) -> Result<PathBuf, IpcFailure> {
         })
 }
 
+/// Hold a validated candidate separately from the live writing session. The
+/// renderer closes that session only after the folder picker has succeeded.
 #[tauri::command]
-async fn project_choose_create<R: Runtime>(
-    title: String,
+async fn project_prepare_open<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, PluginState>,
+) -> Result<Option<String>, IpcFailure> {
+    let picker = reserve_folder_picker(&state)?;
+    let path = choose_project_folder(&app)?;
+    picker.finish(path)
+}
+
+struct FolderPickerReservation<'a> {
+    state: &'a PluginState,
+}
+
+fn reserve_folder_picker(state: &PluginState) -> Result<FolderPickerReservation<'_>, IpcFailure> {
+    let _admission = lock_application_admission(state, "a folder choice")?;
+    state
+        .folder_picker_open
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| {
+            IpcFailure::new(
+                "folder_picker_open",
+                "a folder chooser is already open",
+                true,
+            )
+        })?;
+    let picker = FolderPickerReservation { state };
+    // A fresh choice also releases any candidate left by a renderer reload.
+    lock_prepared_project(state)?.take();
+    // No mutex crosses the native dialog: AppKit must remain free to service
+    // quit/close events while the picker waits for its main-thread callbacks.
+    Ok(picker)
+}
+
+impl FolderPickerReservation<'_> {
+    fn finish(self, path: Option<PathBuf>) -> Result<Option<String>, IpcFailure> {
+        if path.is_none() {
+            return Ok(None);
+        }
+        // Shutdown may have started while the dialog was open. Re-establish
+        // native admission before acquiring a candidate's store lease.
+        let _admission = lock_application_admission(self.state, "a folder choice")?;
+        prepare_project_folder(self.state, path)
+    }
+}
+
+impl Drop for FolderPickerReservation<'_> {
+    fn drop(&mut self) {
+        self.state
+            .folder_picker_open
+            .store(false, Ordering::Release);
+    }
+}
+
+fn prepare_project_folder(
+    state: &PluginState,
+    path: Option<PathBuf>,
+) -> Result<Option<String>, IpcFailure> {
+    let Some(path) = path else { return Ok(None) };
+    let path = path
+        .canonicalize()
+        .map_err(|error| IpcFailure::new("selected_folder_unavailable", error.to_string(), true))?;
+    {
+        let session = lock_session(state)?;
+        if let Some(current) = &session.store
+            && current.root() == path
+        {
+            return Ok(None);
+        }
+    }
+    let mut store = ProjectStore::open_folder(&path).map_err(IpcFailure::store)?;
+    store
+        .recover_interrupted_generations()
+        .map_err(IpcFailure::store)?;
+    store.record_open().map_err(IpcFailure::store)?;
+    let id = CommandId::new();
+    // Surface an unreadable catalogue before asking the renderer to save and
+    // close the current writing. The commit reads a fresh handoff snapshot.
+    snapshot_for(&store, id)?;
+    *lock_prepared_project(state)? = Some(PreparedProject { id, store });
+    Ok(Some(id.to_string()))
+}
+
+fn lock_prepared_project(
+    state: &PluginState,
+) -> Result<MutexGuard<'_, Option<PreparedProject>>, IpcFailure> {
+    state.prepared_project.lock().map_err(|_| {
+        IpcFailure::new(
+            "prepared_project_poisoned",
+            "the folder choice entered an invalid state; restart Loom",
+            false,
+        )
+    })
+}
+
+fn take_prepared_project(state: &PluginState, id: CommandId) -> Result<ProjectStore, IpcFailure> {
+    let mut prepared = lock_prepared_project(state)?;
+    if prepared
+        .as_ref()
+        .is_some_and(|candidate| candidate.id == id)
+    {
+        return Ok(prepared.take().expect("matching prepared project").store);
+    }
+    Err(IpcFailure::new(
+        "prepared_project_expired",
+        "choose the folder again; this folder choice is no longer available",
+        true,
+    ))
+}
+
+#[tauri::command]
+async fn project_commit_open<R: Runtime>(
+    preparation_id: String,
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
-    ensure_application_running(&state, "a project session")?;
+    let id = parse_command_id(&preparation_id)?;
     let choice = reserve_project_choice(&state)?;
-    let result = choose_project_folder(&app).and_then(|path| initialize_project(&path, title));
-    choice.finish(&app, result)
+    choice.finish(&app, take_prepared_project(&state, id))
+}
+
+#[tauri::command]
+async fn project_discard_open(
+    preparation_id: String,
+    state: State<'_, PluginState>,
+) -> Result<(), IpcFailure> {
+    let id = parse_command_id(&preparation_id)?;
+    let mut prepared = lock_prepared_project(&state)?;
+    if prepared
+        .as_ref()
+        .is_some_and(|candidate| candidate.id == id)
+    {
+        prepared.take();
+    }
+    Ok(())
 }
 
 fn reserve_project_choice(state: &PluginState) -> Result<ProjectChoiceReservation<'_>, IpcFailure> {
@@ -2810,21 +2953,20 @@ impl Drop for ProjectChoiceReservation<'_> {
     }
 }
 
-fn choose_project_folder<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, IpcFailure> {
-    let selected = app.dialog().file().blocking_pick_folder().ok_or_else(|| {
-        IpcFailure::new(
-            "folder_selection_cancelled",
-            "no project folder was selected",
-            false,
-        )
-    })?;
-    selected.into_path().map_err(|error| {
-        IpcFailure::new(
-            "selected_folder_unavailable",
-            format!("the selected folder is not a local filesystem path: {error}"),
-            false,
-        )
-    })
+fn choose_project_folder<R: Runtime>(app: &AppHandle<R>) -> Result<Option<PathBuf>, IpcFailure> {
+    app.dialog()
+        .file()
+        .blocking_pick_folder()
+        .map(|selected| {
+            selected.into_path().map_err(|error| {
+                IpcFailure::new(
+                    "selected_folder_unavailable",
+                    format!("the selected folder is not a local filesystem path: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
 }
 
 fn choose_model_file<R: Runtime>(app: &AppHandle<R>) -> Result<Option<PathBuf>, IpcFailure> {
@@ -2844,67 +2986,23 @@ fn choose_model_file<R: Runtime>(app: &AppHandle<R>) -> Result<Option<PathBuf>, 
         .transpose()
 }
 
+#[cfg(test)]
 fn initialize_project(path: &Path, title: String) -> Result<ProjectStore, IpcFailure> {
-    let existing_initial = path.join(INITIAL_DOCUMENT);
-    match std::fs::symlink_metadata(&existing_initial) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(IpcFailure::new(
-                "initial_document_symlink",
-                "the default manuscript path is a symbolic link; import it explicitly instead",
-                false,
-            ));
-        }
-        Ok(metadata) if metadata.is_file() => {
-            return Err(IpcFailure::new(
-                "existing_manuscript_requires_import",
-                "the default manuscript file already exists; import the folder instead of creating an empty project",
-                false,
-            ));
-        }
-        Ok(_) => {
-            return Err(IpcFailure::new(
-                "initial_document_not_file",
-                "the default manuscript path already exists and is not a regular file",
-                false,
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(IpcFailure::new(
-                "initial_document_inspection_failed",
-                format!("could not inspect the default manuscript path: {error}"),
-                false,
-            ));
-        }
-    }
-    let (mut store, _receipt) = ProjectStore::initialize(path, title).map_err(IpcFailure::store)?;
-    store
-        .create_document_if_absent(
-            INITIAL_DOCUMENT,
-            DocumentContent::Prose(String::new()),
-            "initial manuscript",
-        )
-        .map_err(IpcFailure::store)?;
+    let (mut store, _) = ProjectStore::initialize(path, title).map_err(IpcFailure::store)?;
+    ensure_default_document(&mut store)?;
     Ok(store)
 }
 
 fn open_or_initialize_default_project(path: &Path) -> Result<ProjectStore, IpcFailure> {
-    let manifest = path.join(".loom/project.json");
-    let initialized = manifest.try_exists().map_err(|error| {
-        IpcFailure::new(
-            "default_project_inspection_failed",
-            format!("the local writing folder could not be inspected: {error}"),
-            true,
-        )
-    })?;
-    let mut store = if initialized {
-        ProjectStore::open(path).map_err(IpcFailure::store)?
-    } else {
+    if !path.join(".loom").try_exists().map_err(|error| {
+        IpcFailure::new("default_project_inspection_failed", error.to_string(), true)
+    })? {
         validate_default_document_candidate(path)?;
-        ProjectStore::initialize(path, "My Writing")
-            .map(|(store, _)| store)
-            .map_err(IpcFailure::store)?
-    };
+    }
+    std::fs::create_dir_all(path).map_err(|error| {
+        IpcFailure::new("default_project_creation_failed", error.to_string(), true)
+    })?;
+    let mut store = ProjectStore::open_folder(path).map_err(IpcFailure::store)?;
 
     // Settle an initialization/adoption transaction before deciding whether
     // the default document is absent. A registered document whose visible file
@@ -2990,24 +3088,6 @@ fn ensure_default_document(store: &mut ProjectStore) -> Result<(), IpcFailure> {
             true,
         )),
     }
-}
-
-#[tauri::command]
-async fn project_choose_open<R: Runtime>(
-    app: AppHandle<R>,
-    state: State<'_, PluginState>,
-) -> Result<ProjectSnapshot, IpcFailure> {
-    ensure_application_running(&state, "a project session")?;
-    let choice = reserve_project_choice(&state)?;
-    let result = choose_project_folder(&app).and_then(|path| {
-        let mut store = ProjectStore::open(path).map_err(IpcFailure::store)?;
-        store
-            .recover_interrupted_generations()
-            .map_err(IpcFailure::store)?;
-        store.record_open().map_err(IpcFailure::store)?;
-        Ok(store)
-    });
-    choice.finish(&app, result)
 }
 
 #[tauri::command]
@@ -3208,7 +3288,7 @@ fn cancel_and_drain_generation_session(
 
 #[tauri::command]
 async fn project_current(state: State<'_, PluginState>) -> Result<ProjectSnapshot, IpcFailure> {
-    let session = lock_session(&state)?;
+    let mut session = lock_session(&state)?;
     if session.phase == SessionPhase::Closed {
         return Err(IpcFailure::new(
             "project_not_open",
@@ -3230,13 +3310,17 @@ async fn project_current(state: State<'_, PluginState>) -> Result<ProjectSnapsho
             false,
         )
     })?;
-    let store = session.store.as_ref().ok_or_else(|| {
+    let store = session.store.as_mut().ok_or_else(|| {
         IpcFailure::new(
             "corrupt_project_session",
             "the live project session is missing its store",
             false,
         )
     })?;
+    store
+        .reconcile_document_lifecycle()
+        .map_err(IpcFailure::store)?;
+    store.discover_documents().map_err(IpcFailure::store)?;
     snapshot_for(store, session_id)
 }
 
@@ -4221,7 +4305,7 @@ fn create_untitled_document(store: &mut ProjectStore) -> Result<String, IpcFailu
         let relative_path = if ordinal == 1 {
             INITIAL_DOCUMENT.to_owned()
         } else {
-            format!("manuscript/Untitled-{ordinal}.md")
+            format!("Untitled-{ordinal}.md")
         };
         if store
             .document_path_is_reserved(&relative_path)
@@ -9583,6 +9667,11 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
     *phase = ApplicationPhase::Closing;
+    state
+        .prepared_project
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     if let Err(error) = state.generation_lifecycle.quiesce() {
         eprintln!("Loom could not quiesce generation lifecycle before runtime exit: {error}");
         return;
@@ -9838,6 +9927,7 @@ fn application_close<R: Runtime>(
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
     let close_attempt = begin_application_close(&state)?;
+    lock_prepared_project(&state)?.take();
     if state
         .generations
         .active_branch_count()
@@ -10659,6 +10749,155 @@ mod tests {
             ApplicationPhase::Closing
         );
         worker.join().expect("join close worker");
+    }
+
+    #[test]
+    fn pending_folder_picker_does_not_hold_shutdown_admission_or_open_a_store_after_quit() {
+        let state = PluginState::default();
+        let next = tempfile::tempdir().expect("next folder");
+        let picker = reserve_folder_picker(&state).expect("reserve picker");
+        assert!(
+            state.application.try_lock().is_ok(),
+            "dialog must not own application mutex"
+        );
+        assert!(
+            state.prepared_project.try_lock().is_ok(),
+            "dialog must not own candidate mutex"
+        );
+        assert!(
+            reserve_folder_picker(&state).is_err(),
+            "only one native picker may run"
+        );
+        assert!(!record_application_exit_request(&state));
+        assert_eq!(
+            picker
+                .finish(Some(next.path().into()))
+                .expect_err("quit revoked folder admission")
+                .code,
+            "application_quiescing"
+        );
+        assert!(
+            !next.path().join(".loom").exists(),
+            "no store was acquired after quit"
+        );
+        assert!(
+            !state.folder_picker_open.load(Ordering::Acquire),
+            "failure releases picker reservation"
+        );
+        let attempt = begin_application_close(&state).expect("shutdown can proceed");
+        drop(attempt);
+        abort_application_close(&state).expect("abort close intent");
+        let picker = reserve_folder_picker(&state).expect("new picker after close abort");
+        assert!(picker.finish(None).expect("quiet cancellation").is_none());
+        assert!(!state.folder_picker_open.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn folder_preparation_keeps_current_writing_on_cancel_same_folder_and_invalid_choice() {
+        let current = tempfile::tempdir().expect("current writing folder");
+        let state = PluginState::default();
+        let store = initialize_project(current.path(), "Current".into()).expect("current store");
+        let opened = reserve_project_choice(&state)
+            .expect("reserve")
+            .finish_without_document_filesystem_watcher(Ok(store))
+            .expect("attach current");
+        assert!(
+            prepare_project_folder(&state, None)
+                .expect("cancel")
+                .is_none()
+        );
+        assert!(
+            prepare_project_folder(&state, Some(current.path().into()))
+                .expect("same folder")
+                .is_none()
+        );
+        let invalid = current.path().join("Untitled.md");
+        assert_eq!(
+            prepare_project_folder(&state, Some(invalid))
+                .expect_err("file is not a folder")
+                .code,
+            "not_a_directory"
+        );
+        let session = state.session.lock().expect("session");
+        assert_eq!(session.phase, SessionPhase::Open);
+        assert_eq!(
+            session.active_session_id.expect("session ID").to_string(),
+            opened.session_id
+        );
+        assert_eq!(
+            session
+                .store
+                .as_ref()
+                .expect("live store")
+                .read_document(INITIAL_DOCUMENT)
+                .expect("writing remains readable")
+                .text,
+            ""
+        );
+        assert!(
+            state
+                .prepared_project
+                .lock()
+                .expect("prepared slot")
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prepared_folder_lease_survives_old_session_close_and_is_consumed_once() {
+        let current = tempfile::tempdir().expect("current folder");
+        let next = tempfile::tempdir().expect("next folder");
+        std::fs::write(next.path().join("Existing.md"), "Exact writing.\r\n")
+            .expect("existing manuscript");
+        let state = PluginState::default();
+        let store = initialize_project(current.path(), "Current".into()).expect("current store");
+        let opened = reserve_project_choice(&state)
+            .expect("reserve")
+            .finish_without_document_filesystem_watcher(Ok(store))
+            .expect("attach current");
+        let id = prepare_project_folder(&state, Some(next.path().into()))
+            .expect("prepare")
+            .expect("new folder")
+            .parse::<CommandId>()
+            .expect("preparation ID");
+        assert!(
+            reserve_project_choice(&state).is_err(),
+            "cannot commit over live writing"
+        );
+        assert!(matches!(
+            ProjectStore::open(next.path()),
+            Err(loom_store::StoreError::ProjectAlreadyOpen(_))
+        ));
+        assert!(
+            take_prepared_project(&state, CommandId::new()).is_err(),
+            "stale token cannot take candidate"
+        );
+        close_project_with_wait(
+            &state,
+            opened.project_id,
+            opened.session_id,
+            CommandId::new(),
+            Duration::ZERO,
+        )
+        .expect("close current once");
+        let choice = reserve_project_choice(&state).expect("reserve after close");
+        let store = take_prepared_project(&state, id).expect("take prepared store");
+        let next_snapshot = choice
+            .finish_without_document_filesystem_watcher(Ok(store))
+            .expect("attach next");
+        assert_eq!(next_snapshot.documents.len(), 1);
+        assert_eq!(next_snapshot.documents[0].relative_path, "Existing.md");
+        assert!(
+            take_prepared_project(&state, id).is_err(),
+            "one-shot preparation"
+        );
+        assert_eq!(
+            std::fs::read(next.path().join("Existing.md")).expect("unchanged bytes"),
+            b"Exact writing.\r\n"
+        );
+        drop(ProjectStore::open(current.path()).expect("old lease released"));
     }
 
     #[test]
@@ -11830,12 +12069,12 @@ mod tests {
                 "initial manuscript",
             )
             .expect("initial document");
-        let unmanaged = root.join("manuscript/Untitled-2.md");
+        let unmanaged = root.join("Untitled-2.md");
         std::fs::write(&unmanaged, "external manuscript").expect("unmanaged visible file");
 
         let created = create_untitled_document(&mut store).expect("new document");
 
-        assert_eq!(created, "manuscript/Untitled-3.md");
+        assert_eq!(created, "Untitled-3.md");
         assert_eq!(
             std::fs::read_to_string(root.join(INITIAL_DOCUMENT)).expect("first manuscript"),
             "first manuscript"
@@ -11889,7 +12128,7 @@ mod tests {
 
         let created = create_untitled_document(&mut store).expect("new document");
 
-        assert_eq!(created, "manuscript/Untitled-2.md");
+        assert_eq!(created, "Untitled-2.md");
         assert!(
             store
                 .document_path_is_reserved(INITIAL_DOCUMENT)
@@ -11948,7 +12187,7 @@ mod tests {
                 .expect("rename document");
 
         assert_eq!(renamed.title, "A Better Name");
-        assert_eq!(renamed.relative_path, "manuscript/A Better Name.md");
+        assert_eq!(renamed.relative_path, "A Better Name.md");
         assert_eq!(
             renamed.revision_id,
             Some(fixture.identity.revision.to_string())
@@ -11959,14 +12198,14 @@ mod tests {
         );
         assert_eq!(renamed.word_count, 2);
         assert!(!fixture.root.join(INITIAL_DOCUMENT).exists());
-        assert!(fixture.root.join("manuscript/A Better Name.md").is_file());
+        assert!(fixture.root.join("A Better Name.md").is_file());
 
         let snapshot = snapshot_for(&fixture.store, CommandId::new()).expect("project snapshot");
         assert_eq!(snapshot.documents.len(), 1);
         assert_eq!(snapshot.documents[0].title, "A Better Name");
         let loaded = fixture
             .store
-            .read_document("manuscript/A Better Name.md")
+            .read_document("A Better Name.md")
             .expect("reopen renamed document");
         let display_title = fixture
             .store
@@ -12072,7 +12311,7 @@ mod tests {
                 .expect("read unchanged visible source"),
             b"exact manuscript\n"
         );
-        assert!(!fixture.root.join("manuscript/A Better Name.md").exists());
+        assert!(!fixture.root.join("A Better Name.md").exists());
         assert_eq!(
             fixture
                 .store
@@ -12126,8 +12365,7 @@ mod tests {
 
     fn replace_visible_document_with_regular_file(root: &Path) {
         let visible = root.join(INITIAL_DOCUMENT);
-        std::fs::rename(&visible, root.join("manuscript/original.md"))
-            .expect("retain opened original");
+        std::fs::rename(&visible, root.join("original.md")).expect("retain opened original");
         std::fs::write(&visible, "exact manuscript\n").expect("install same-byte replacement");
     }
 
@@ -12141,8 +12379,7 @@ mod tests {
             .expect("project parent")
             .join("outside-manuscript.md");
         std::fs::write(&outside, "exact manuscript\n").expect("outside manuscript");
-        std::fs::rename(&visible, root.join("manuscript/original.md"))
-            .expect("retain opened original");
+        std::fs::rename(&visible, root.join("original.md")).expect("retain opened original");
         symlink(&outside, &visible).expect("install final-component symlink");
     }
 
@@ -12908,28 +13145,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
-    fn project_creation_refuses_existing_default_manuscript_without_touching_it() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
-        let root = temporary.path().join("Existing Novel");
-        let manuscript = root.join(INITIAL_DOCUMENT);
-        std::fs::create_dir_all(manuscript.parent().expect("manuscript parent"))
-            .expect("create manuscript parent");
-        let original = "Already written.\n\nStill here.\n";
-        std::fs::write(&manuscript, original).expect("write existing manuscript");
-
-        let error = initialize_project(&root, "Existing Novel".to_owned())
-            .expect_err("creation must refuse an ambiguous existing manuscript");
-
-        assert_eq!(error.code, "existing_manuscript_requires_import");
-        assert_eq!(
-            std::fs::read_to_string(&manuscript).expect("read visible manuscript"),
-            original
-        );
-        assert!(!root.join(".loom").exists());
-    }
-
-    #[test]
     fn app_local_override_routes_default_project_and_model_library() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join("isolated-app-local-data");
@@ -13066,9 +13281,9 @@ mod tests {
         let documents = reopened.list_documents().expect("active catalogue");
 
         assert_eq!(documents.len(), 1);
-        assert_eq!(documents[0].relative_path, "manuscript/Renamed.md");
+        assert_eq!(documents[0].relative_path, "Renamed.md");
         assert!(!root.join(INITIAL_DOCUMENT).exists());
-        assert!(root.join("manuscript/Renamed.md").is_file());
+        assert!(root.join("Renamed.md").is_file());
     }
 
     #[test]
@@ -13222,6 +13437,39 @@ mod tests {
                 .is_some()
         );
         assert!(!root.join(INITIAL_DOCUMENT).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_default_writing_ignores_unrelated_untitled_symlink() {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir().expect("writing folder");
+        let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let mut store = open_or_initialize_default_project(&root).expect("create writing");
+        let mut document = store
+            .open_document_file(INITIAL_DOCUMENT)
+            .expect("initial document");
+        store
+            .rename_document(&mut document, "Draft")
+            .expect("rename");
+        drop(document);
+        drop(store);
+        let outside = temporary.path().join("outside.md");
+        std::fs::write(&outside, "Unrelated writing").expect("outside writing");
+        symlink(&outside, root.join(INITIAL_DOCUMENT)).expect("unrelated symlink");
+        let reopened = open_or_initialize_default_project(&root).expect("open registered writing");
+        assert_eq!(reopened.list_documents().expect("documents").len(), 1);
+        assert_eq!(
+            reopened
+                .read_document("Draft.md")
+                .expect("registered draft")
+                .text,
+            ""
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside).expect("outside untouched"),
+            "Unrelated writing"
+        );
     }
 
     #[cfg(unix)]
@@ -13834,11 +14082,9 @@ mod tests {
         )
         .expect_err("stale session must fail before storage");
         assert_eq!(stale_failure.code, "stale_project_session");
-        assert_eq!(
-            std::fs::read_dir(root.join("assets"))
-                .expect("asset directory")
-                .count(),
-            0
+        assert!(
+            !root.join("assets").exists(),
+            "stale request must not create asset storage"
         );
 
         let first = ingest_image_attachment_for_session(

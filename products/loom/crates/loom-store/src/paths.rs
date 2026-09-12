@@ -29,13 +29,13 @@ pub(crate) fn normalize_document_path(path: &Path) -> Result<String> {
         let component = component
             .to_str()
             .ok_or_else(|| StoreError::NonUtf8Path(path.to_path_buf()))?;
-        if component == ".loom" {
+        if component.starts_with('.') {
             return Err(StoreError::UnsafeRelativePath(path.display().to_string()));
         }
         components.push(component.to_owned());
     }
 
-    if components.len() < 2 || components.first().map(String::as_str) != Some("manuscript") {
+    if components.is_empty() {
         return Err(StoreError::UnsafeRelativePath(path.display().to_string()));
     }
     Ok(components.join("/"))
@@ -162,14 +162,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn document_paths_are_confined_to_manuscript() {
+    fn document_paths_are_confined_to_visible_files_in_the_folder() {
         assert_eq!(
             normalize_document_path(Path::new("manuscript/poems/one.txt")).expect("valid path"),
             "manuscript/poems/one.txt"
         );
         assert!(normalize_document_path(Path::new("../secret")).is_err());
         assert!(normalize_document_path(Path::new(".loom/project.json")).is_err());
-        assert!(normalize_document_path(Path::new("assets/image.png")).is_err());
+        assert_eq!(
+            normalize_document_path(Path::new("Notes.md")).unwrap(),
+            "Notes.md"
+        );
+        assert!(normalize_document_path(Path::new("notes/.git/config")).is_err());
         assert!(normalize_document_path(Path::new("manuscript\\escape.md")).is_err());
     }
 

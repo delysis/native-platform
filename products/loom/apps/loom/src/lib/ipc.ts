@@ -120,16 +120,20 @@ async function call<T>(command: string, args: Record<string, unknown> = {}): Pro
   return enqueueSessionCommand(() => invokeWhenProjectSessionAdmitted<T>(command, args));
 }
 
-export function chooseAndCreateProject(title: string): Promise<ProjectSnapshot> {
-  return call('project_choose_create', { title });
-}
-
 export function openDefaultProject(): Promise<ProjectSnapshot> {
   return call('project_open_default');
 }
 
-export function chooseAndOpenProject(): Promise<ProjectSnapshot> {
-  return call('project_choose_open');
+export function prepareProjectOpen(): Promise<string | null> {
+  return call('project_prepare_open');
+}
+
+export function commitProjectOpen(preparationId: string): Promise<ProjectSnapshot> {
+  return call('project_commit_open', { preparationId });
+}
+
+export function discardProjectOpen(preparationId: string): Promise<void> {
+  return call('project_discard_open', { preparationId });
 }
 
 export function currentProjectSession(): Promise<ProjectSnapshot> {

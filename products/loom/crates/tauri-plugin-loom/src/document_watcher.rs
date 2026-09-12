@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Component, Path};
 
@@ -86,27 +85,20 @@ fn event_requires_hint(project_root: &Path, event: &notify::Result<Event>) -> bo
     event
         .paths
         .iter()
-        .any(|path| is_manuscript_path(project_root, path))
+        .any(|path| is_writing_path(project_root, path))
 }
 
-fn is_manuscript_path(project_root: &Path, event_path: &Path) -> bool {
+fn is_writing_path(project_root: &Path, event_path: &Path) -> bool {
     let relative = relative_event_path(project_root, event_path);
     let Some(relative) = relative else {
         return false;
     };
-    let mut components = relative.components();
-    let first_is_manuscript = matches!(
-        components.next(),
-        Some(Component::Normal(component)) if component == OsStr::new("manuscript")
-    );
-
-    first_is_manuscript
-        && components.all(|component| {
-            !matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
+    relative.components().all(|component| match component {
+        Component::Normal(name) => name.to_str().is_some_and(|name| {
+            !name.starts_with('.') && !matches!(name, "node_modules" | "target")
+        }),
+        _ => false,
+    })
 }
 
 fn relative_event_path<'a>(project_root: &Path, event_path: &'a Path) -> Option<&'a Path> {
@@ -205,11 +197,25 @@ mod tests {
     }
 
     #[test]
+    fn root_writing_and_folder_moves_require_a_hint() {
+        // A removed or renamed directory may itself have an extension.
+        for path in ["Notes.md", "Notes.TXT", "chapters", "drafts.v2"] {
+            assert!(event_requires_hint(
+                &project_root(),
+                &Ok(event(
+                    EventKind::Modify(ModifyKind::Any),
+                    [project_path(path)],
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn metadata_and_unrelated_paths_are_ignored() {
         let root = project_root();
         for path in [
             project_path(".loom/project.sqlite3"),
-            project_path("attachments/image.png"),
+            project_path("target/generated.md"),
             std::env::temp_dir().join("other-project/manuscript/chapter.md"),
         ] {
             assert!(!event_requires_hint(

@@ -172,6 +172,15 @@ fn store_image_asset_with_limits(
 
     let digest = format!("{:x}", Sha256::digest(&bytes));
     let file_name = format!("{digest}.{}", kind.extension);
+    require_ordinary_directory(project_root)?;
+    match fs::create_dir(project_root.join("assets")) {
+        Ok(()) => {
+            sync_asset_directory(project_root)
+                .map_err(AttachmentStoreError::DirectoryDurability)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
     let assets = verified_asset_directory(project_root)?;
     let destination = assets.join(&file_name);
 
@@ -786,7 +795,7 @@ mod tests {
 
     #[test]
     fn stores_reads_and_reuses_structurally_valid_supported_images() {
-        let root = prepared_project();
+        let root = tempfile::tempdir().expect("ordinary folder without an asset directory");
         for (format, media_type, seed) in [
             (ImageFormat::Png, "image/png", 1),
             (ImageFormat::Jpeg, "image/jpeg", 2),

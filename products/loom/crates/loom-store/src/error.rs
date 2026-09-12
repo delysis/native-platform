@@ -24,6 +24,14 @@ pub enum StoreError {
     SymbolicLink(PathBuf),
     #[error("path is not a directory: {0:?}")]
     NotDirectory(PathBuf),
+    #[error(
+        "folder discovery exceeds the {max_entries}-entry or {max_depth}-level limit at {path:?}"
+    )]
+    FolderTooLarge {
+        path: PathBuf,
+        max_entries: usize,
+        max_depth: usize,
+    },
     #[error("path is not a regular file: {0:?}")]
     NotRegularFile(PathBuf),
     #[error("project is already initialized at {0:?}")]

@@ -1,7 +1,8 @@
 const COMMANDS: &[&str] = &[
     "project_open_default",
-    "project_choose_create",
-    "project_choose_open",
+    "project_prepare_open",
+    "project_commit_open",
+    "project_discard_open",
     "project_close",
     "project_current",
     "project_recover",

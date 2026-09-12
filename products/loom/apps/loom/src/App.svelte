@@ -19,7 +19,9 @@
     clearTransientDraft,
     applyDocumentReconciliation,
     chooseAttachments,
-    chooseAndOpenProject,
+    prepareProjectOpen,
+    commitProjectOpen,
+    discardProjectOpen,
     chooseModel,
     closeProject as closeProjectSession,
     createDocument,
@@ -5780,13 +5782,27 @@
   }
 
   async function doOpenProject(): Promise<void> {
-    const restoreSerial = ++workspaceRestoreSerial;
-    modelRefreshSerial += 1;
+    if (fileCommandInFlight || opening || applicationClosePhase !== 'running') return;
     opening = true;
-    clearFailure();
+    fileCommandInFlight = true;
+    let preparationId: string | null = null;
+    let handoffStarted = false;
     try {
+      // The chooser and validation leave the current editor/session intact.
+      preparationId = await prepareProjectOpen();
+      if (!preparationId || !componentMounted || applicationClosePhase !== 'running') return;
+      clearFailure();
+      if (project) {
+        const outcome = await closeProject();
+        if (outcome.status !== 'closed') return;
+      }
+      if (!componentMounted || applicationClosePhase !== 'running') return;
+      const restoreSerial = ++workspaceRestoreSerial;
+      modelRefreshSerial += 1;
+      handoffStarted = true;
+      const selectedPreparation = preparationId;
       const opened = await attachWorkspaceProjectReply({
-        open: chooseAndOpenProject,
+        open: () => commitProjectOpen(selectedPreparation),
         mayAttach: () => Boolean(
           componentMounted &&
           applicationClosePhase === 'running' &&
@@ -5817,20 +5833,35 @@
         announce(`Opened ${opened.title}`);
       }
     } catch (error) {
-      if (!(await reattachNativeProject())) recordFailure(error);
+      // Only an uncertain commit needs native reattachment. Picker/validation
+      // failures must not replace the current editor or conceal the failure.
+      if (handoffStarted) await reattachNativeProject();
+      recordFailure(error);
     } finally {
+      if (preparationId) {
+        try {
+          await discardProjectOpen(preparationId);
+        } catch (error) {
+          recordFailure(error);
+        }
+      }
       opening = false;
+      fileCommandInFlight = false;
     }
   }
 
   async function openAnotherProject(): Promise<void> {
-    if (fileCommandInFlight || opening) return;
-    fileCommandInFlight = true;
+    await doOpenProject();
+  }
+
+  async function retryInitialProject(): Promise<void> {
+    if (opening || fileCommandInFlight || project || applicationClosePhase !== 'running') return;
+    opening = true;
+    clearFailure();
     try {
-      const outcome = await closeProject();
-      if (outcome.status === 'closed') await doOpenProject();
+      await restoreDesktopWorkspace();
     } finally {
-      fileCommandInFlight = false;
+      opening = false;
     }
   }
 
@@ -9600,8 +9631,13 @@
           </div>
         {/if}
         <div class="welcome-actions">
+          {#if errorMessage && desktop}
+            <button class="secondary-button" type="button" on:click={retryInitialProject} disabled={opening}>
+              Retry
+            </button>
+          {/if}
           <button class="secondary-button" type="button" on:click={doOpenProject} disabled={!desktop || opening}>
-            {opening ? 'Opening…' : 'Choose another folder…'}
+            {opening ? 'Opening…' : 'Open folder…'}
           </button>
         </div>
       </section>

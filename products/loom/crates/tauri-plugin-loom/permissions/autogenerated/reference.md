@@ -5,8 +5,9 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 #### This default permission set includes the following:
 
 - `allow-project-open-default`
-- `allow-project-choose-create`
-- `allow-project-choose-open`
+- `allow-project-prepare-open`
+- `allow-project-commit-open`
+- `allow-project-discard-open`
 - `allow-project-close`
 - `allow-project-current`
 - `allow-project-recover`
@@ -1364,58 +1365,6 @@ Denies the model_unload command without any pre-configured scope.
 <tr>
 <td>
 
-`loom:allow-project-choose-create`
-
-</td>
-<td>
-
-Enables the project_choose_create command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`loom:deny-project-choose-create`
-
-</td>
-<td>
-
-Denies the project_choose_create command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`loom:allow-project-choose-open`
-
-</td>
-<td>
-
-Enables the project_choose_open command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`loom:deny-project-choose-open`
-
-</td>
-<td>
-
-Denies the project_choose_open command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
 `loom:allow-project-close`
 
 </td>
@@ -1435,6 +1384,32 @@ Enables the project_close command without any pre-configured scope.
 <td>
 
 Denies the project_close command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-project-commit-open`
+
+</td>
+<td>
+
+Enables the project_commit_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-project-commit-open`
+
+</td>
+<td>
+
+Denies the project_commit_open command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1468,6 +1443,32 @@ Denies the project_current command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-project-discard-open`
+
+</td>
+<td>
+
+Enables the project_discard_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-project-discard-open`
+
+</td>
+<td>
+
+Denies the project_discard_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-project-open-default`
 
 </td>
@@ -1487,6 +1488,32 @@ Enables the project_open_default command without any pre-configured scope.
 <td>
 
 Denies the project_open_default command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-project-prepare-open`
+
+</td>
+<td>
+
+Enables the project_prepare_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-project-prepare-open`
+
+</td>
+<td>
+
+Denies the project_prepare_open command without any pre-configured scope.
 
 </td>
 </tr>

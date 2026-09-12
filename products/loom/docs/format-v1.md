@@ -10,7 +10,7 @@ Project storage requires Unix private permissions and directory synchronization.
 
 ## Authority split
 
-- `manuscript/**` is authoritative for the active, readable UTF-8 manuscript.
+- Ordinary `.md`, `.markdown`, and `.txt` files anywhere below the chosen folder are authoritative for active, readable UTF-8 writing. No `manuscript/` hierarchy is required.
 - `.loom/loom.sqlite3` is authoritative for revisions, causal occurrences, receipts, generation evidence, branch state, and pending visible-file projection.
 - `.loom/blobs/sha256/**` contains immutable payload bytes referenced by semantic history.
 - `.loom/drafts/**` contains at most two mutable crash-safe draft slots per document. Draft slots are explicitly not semantic history or immutable content-addressed artifacts.
@@ -43,6 +43,14 @@ This distinction is required: two branches producing identical bytes retain dist
 
 ## Concurrent create and save protocols
 
+Opening a folder creates only its private `.loom` sidecar when absent and registers
+existing writing files in place, preserving their exact bytes and relative paths.
+Reopening and filesystem hints discover newly added files; existing registrations,
+including deletion tombstones, are retained. Discovery skips symbolic links,
+hidden directories, `node_modules`, and `target`, with a 50,000-entry and 64-level
+bound. Document authority excludes hidden paths and traversal outside the folder.
+An unreadable existing sidecar is never replaced with an empty history store.
+
 New documents use `create_document_if_absent`. Both the database registration and visible path must be absent. Its outbox predecessor is strictly `NULL`; projection uses a no-clobber install, so a file appearing after preflight is preserved and reported as a conflict.
 
 Existing documents use `save_document_if_source` or `save_document_if_source_idempotent`. The caller supplies the exact source `RevisionId` and visible `BlobId` it edited. The store:
@@ -56,7 +64,8 @@ Existing documents use `save_document_if_source` or `save_document_if_source_ide
 
 The idempotent form is keyed by caller-owned `CommandId` and a canonical request fingerprint. An exact retry returns the original receipt, revision, and outbox result. Reusing the ID with different path, kind, bytes, reason, source revision, or source blob fails with `IdempotencyConflict`.
 
-The older convenience checkpoint/import APIs remain compatibility surfaces. Concurrent editor code must use the source-bound or create-if-absent APIs.
+Concurrent editor code uses the source-bound or create-if-absent APIs. File adoption
+records a human import without normalizing or replacing the visible bytes.
 
 ## Conflict-preserving outbox projection
 

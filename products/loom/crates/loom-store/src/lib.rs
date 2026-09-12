@@ -3,6 +3,7 @@
 mod draft;
 mod error;
 mod file_io;
+mod folder;
 mod generation;
 mod paths;
 mod provenance;

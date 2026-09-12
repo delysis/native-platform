@@ -22,7 +22,7 @@ use crate::file_io::{
     read_bounded, read_bounded_no_follow, rename_if_absent, sync_parent, sync_rename_parents,
 };
 use crate::paths::{
-    ensure_directory, ensure_document_parent, ensure_private_directory, inspect_document_path,
+    ensure_document_parent, ensure_private_directory, inspect_document_path,
     normalize_document_path, reject_symlink_target,
 };
 use crate::schema::{CURRENT_SCHEMA_VERSION, initialize_schema};
@@ -96,13 +96,6 @@ impl ProjectStore {
             return Err(StoreError::AlreadyInitialized(root));
         }
 
-        for directory in [
-            root.join("manuscript"),
-            root.join("sources"),
-            root.join("assets"),
-        ] {
-            ensure_directory(&directory)?;
-        }
         for directory in [
             loom_dir.clone(),
             loom_dir.join("blobs"),
@@ -3562,7 +3555,7 @@ fn document_path_for_title(relative_path: &str, title: &str) -> Result<String> {
     let relative_path = normalize_document_path(Path::new(relative_path))?;
     let (parent, source_file_name) = relative_path
         .rsplit_once('/')
-        .ok_or_else(|| StoreError::UnsafeRelativePath(relative_path.clone()))?;
+        .unwrap_or(("", &relative_path));
     let extension = Path::new(source_file_name)
         .extension()
         .and_then(std::ffi::OsStr::to_str);
@@ -3599,7 +3592,7 @@ fn document_path_for_title(relative_path: &str, title: &str) -> Result<String> {
         file_name.push('.');
         file_name.push_str(extension);
     }
-    normalize_document_path(Path::new(&format!("{parent}/{file_name}")))
+    normalize_document_path(&Path::new(parent).join(file_name))
 }
 
 fn validate_stored_document_display_title(stored: Option<String>) -> Result<Option<String>> {
@@ -3780,6 +3773,7 @@ mod tests {
         let directory = tempdir().expect("temporary project root");
         let project = directory.path().join("Novel");
         let (store, _) = ProjectStore::initialize(&project, "Novel").expect("initialize project");
+        fs::create_dir(project.join("manuscript")).expect("fixture manuscript directory");
         (directory, store)
     }
 

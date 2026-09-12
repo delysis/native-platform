@@ -4,8 +4,9 @@
 description = "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions."
 permissions = [
   "allow-project-open-default",
-  "allow-project-choose-create",
-  "allow-project-choose-open",
+  "allow-project-prepare-open",
+  "allow-project-commit-open",
+  "allow-project-discard-open",
   "allow-project-close",
   "allow-project-current",
   "allow-project-recover",
