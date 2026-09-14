@@ -6,6 +6,7 @@ use thiserror::Error;
 
 mod merge;
 pub mod neural_functions;
+pub mod revision_diff;
 
 pub use neural_functions::{
     DocumentReference, NeuralCommand, NeuralExpression, NeuralSyntaxError, document_references,
