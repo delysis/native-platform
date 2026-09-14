@@ -51,7 +51,7 @@ impl ProjectStore {
     /// Two alternating mutable slots bound storage to two full drafts per
     /// document, including every crash phase. `expected_version == 0` means
     /// the caller expects no draft. Retrying a committed write with the same
-    /// source, expected version, and canonical bytes replays its result.
+    /// source, expected version, and exact bytes replays its result.
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     pub fn upsert_transient_draft(
         &mut self,
@@ -550,6 +550,77 @@ mod tests {
             .read_document("manuscript/001.md")
             .expect("load source");
         (directory, store, source)
+    }
+
+    #[test]
+    fn prose_draft_and_checkpoint_preserve_exact_line_endings_after_reopen() {
+        let (directory, mut store, _) = new_store();
+        let path = "manuscript/001.md";
+        let root = directory.path().join("Novel");
+        let external = "# Quiet tablet\r\n\r\nCafé.\r\n";
+        fs::write(root.join(path), external).expect("external CRLF writing");
+        store
+            .import_external_changes_if_uncontested(path, "read external writing")
+            .expect("import external bytes")
+            .expect("external revision");
+        let source = store.read_document(path).expect("read external revision");
+        assert_eq!(source.text, external);
+        let edited = "# Quiet tablet\r\n\r\nCafé.\r\nPlay. β\rnext\n";
+        let content = DocumentContent::Prose(edited.into());
+        let draft = store
+            .upsert_transient_draft(path, source.revision_id, 0, content.clone())
+            .expect("save recoverable exact draft")
+            .draft;
+        assert_eq!(draft.text, edited);
+        assert_eq!(draft.blob_id, BlobId::digest(edited.as_bytes()));
+        assert_eq!(fs::read(root.join(path)).unwrap(), external.as_bytes());
+        drop(store);
+
+        let mut store = ProjectStore::open(&root).expect("reopen project");
+        let recovered = store
+            .load_transient_draft(path)
+            .expect("load draft")
+            .expect("retained draft");
+        assert_eq!(recovered, draft);
+        let command = loom_types::CommandId::new();
+        let checkpoint = store
+            .save_document_if_source_idempotent_consuming_draft(
+                command,
+                path,
+                content.clone(),
+                "save writing",
+                source.revision_id,
+                source.blob_id,
+                draft.version,
+            )
+            .expect("checkpoint exact draft");
+        assert_eq!(fs::read(root.join(path)).unwrap(), edited.as_bytes());
+        assert!(store.load_transient_draft(path).unwrap().is_none());
+        let replay = store
+            .save_document_if_source_idempotent_consuming_draft(
+                command,
+                path,
+                content,
+                "save writing",
+                source.revision_id,
+                source.blob_id,
+                draft.version,
+            )
+            .expect("replay exact checkpoint");
+        assert!(replay.replayed);
+        assert_eq!(replay.save.revision_id, checkpoint.save.revision_id);
+        drop(store);
+
+        let store = ProjectStore::open(&root).expect("reopen checkpoint");
+        let reopened = store.read_document(path).expect("read checkpoint");
+        assert_eq!(reopened.text, edited);
+        assert_eq!(reopened.blob_id, BlobId::digest(edited.as_bytes()));
+        assert_eq!(
+            store.read_blob(reopened.blob_id).unwrap(),
+            edited.as_bytes()
+        );
+        let start = edited.find("β").unwrap();
+        assert_eq!(&reopened.text[start..start + "β".len()], "β");
     }
 
     #[test]

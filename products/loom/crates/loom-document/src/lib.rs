@@ -33,7 +33,7 @@ impl DocumentContent {
                 kind: HybridBlockKind::Prose,
                 text: canonicalize_prose(&text),
             }]),
-            DocumentKind::Prose => Self::Prose(canonicalize_prose(&text)),
+            DocumentKind::Prose => Self::Prose(text),
             DocumentKind::Verse => Self::Verse(text),
         })
     }
@@ -49,7 +49,7 @@ impl DocumentContent {
     pub fn project_visible(&self) -> Result<VisibleProjection, DocumentError> {
         match self {
             Self::Prose(markdown) => Ok(VisibleProjection {
-                bytes: canonicalize_prose(markdown).into_bytes(),
+                bytes: markdown.as_bytes().to_vec(),
                 hybrid_blocks: Vec::new(),
             }),
             Self::Verse(text) => Ok(VisibleProjection {
@@ -194,11 +194,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prose_projection_canonicalizes_line_endings() {
-        let content = DocumentContent::Prose("one\r\ntwo\rthree\n".into());
+    fn prose_projection_preserves_authored_utf8_and_line_endings() {
+        let original = "# café\r\n\r\none\rtwo\n\u{301}\t";
+        let content =
+            DocumentContent::from_visible(DocumentKind::Prose, original.as_bytes().to_vec())
+                .expect("valid prose");
+        assert_eq!(content, DocumentContent::Prose(original.into()));
         assert_eq!(
             content.project_visible().expect("project prose").bytes,
-            b"one\ntwo\nthree\n"
+            original.as_bytes()
         );
     }
 

@@ -82,47 +82,26 @@ impl ProjectStore {
             // file changes again before import. No distinct writing is lost.
             self.clear_transient_draft(&snapshot.relative_path, draft.version)?;
         }
-        let exact_bytes = visible.text.into_bytes();
         let request = ExternalReconciliationRequest {
             relative_path: snapshot.relative_path,
             expected_active_revision_id: snapshot.active_revision_id,
             expected_base_blob_id: snapshot.active_blob_id,
             expected_visible_blob_id: visible.blob_id,
-            resolved_content: DocumentContent::from_visible(snapshot.kind, exact_bytes.clone())?,
+            resolved_content: DocumentContent::from_visible(
+                snapshot.kind,
+                visible.text.into_bytes(),
+            )?,
             reason: reason.into(),
         };
-        self.reconcile_external_with_projection(
-            CommandId::new(),
-            request,
-            Some(exact_bytes),
-            |_| Ok(()),
-        )
-        .map(Some)
+        self.reconcile_external_idempotent(CommandId::new(), request)
+            .map(Some)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn reconcile_external_with_boundary<F>(
         &mut self,
         command_id: CommandId,
         request: ExternalReconciliationRequest,
-        before_projection_boundary: F,
-    ) -> Result<ExternalReconciliationOutcome>
-    where
-        F: FnOnce(&Path) -> Result<()>,
-    {
-        self.reconcile_external_with_projection(
-            command_id,
-            request,
-            None,
-            before_projection_boundary,
-        )
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn reconcile_external_with_projection<F>(
-        &mut self,
-        command_id: CommandId,
-        request: ExternalReconciliationRequest,
-        exact_external_bytes: Option<Vec<u8>>,
         before_projection_boundary: F,
     ) -> Result<ExternalReconciliationOutcome>
     where
@@ -144,18 +123,8 @@ impl ProjectStore {
             });
         }
         let document_kind = resolved_content.kind();
-        let mut projection = resolved_content.project_visible()?;
+        let projection = resolved_content.project_visible()?;
         drop(resolved_content);
-        if let Some(bytes) = exact_external_bytes {
-            let actual = BlobId::digest(&bytes);
-            if actual != expected_visible_blob_id {
-                return Err(StoreError::ExternalVisibleBlobMismatch {
-                    expected: expected_visible_blob_id,
-                    actual,
-                });
-            }
-            projection.bytes = bytes;
-        }
         ensure_bounded_document(&projection.bytes)?;
         let request_fingerprint = reconciliation_fingerprint(
             &relative_path,

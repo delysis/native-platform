@@ -324,7 +324,7 @@ fn real_native_terminal_retains_raw_inference_without_changing_source() {
         let backend: serde_json::Value = serde_json::from_slice(&candidate.backend_receipt_bytes).expect("native backend receipt");
         assert_eq!(backend["input_contract"], "raw_completion");
         let output = store.read_document(output_path).expect("registered ordinary result document");
-        assert_eq!(output.text, loom_document::canonicalize_prose(&candidate.output_text));
+        assert_eq!(output.text, candidate.output_text);
         assert_eq!(Some(output.document_id.to_string()), completed.output_document_id);
         let provenance = store.revision_provenance(output.revision_id).expect("generated authorship");
         assert_eq!(provenance.segments.len(), 1);

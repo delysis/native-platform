@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn prose_preview_and_apply_share_canonical_crlf_projection() {
+    fn reconciliation_preview_and_apply_preserve_exact_prose_crlf_bytes() {
         let mut fixture = Fixture::new("base\n");
         fs::write(fixture.visible_path(), "external\r\n").expect("write CRLF external edit");
         let external_blob_id = BlobId::digest(b"external\r\n");
@@ -706,7 +706,7 @@ mod tests {
             ReconciliationPreviewOutcome::Merged {
                 ref content,
                 merged_blob_id,
-            } if content == "external\n" && merged_blob_id == BlobId::digest(b"external\n")
+            } if content == "external\r\n" && merged_blob_id == BlobId::digest(b"external\r\n")
         ));
 
         let resolved = fixture.root.join("resolved.txt");
@@ -720,21 +720,21 @@ mod tests {
             resolved,
             kind: CliDocumentKind::Prose,
             command_id: CommandId::new(),
-            reason: "accept canonicalized external prose".into(),
+            reason: "accept exact external prose".into(),
         };
         let applied =
             reconciliation_apply(&mut fixture.store, &arguments).expect("apply CRLF resolution");
         assert_eq!(
             applied.binding.resolved_blob_id,
-            BlobId::digest(b"external\n")
+            BlobId::digest(b"external\r\n")
         );
         assert_eq!(
             fixture
                 .store
                 .read_document("manuscript/001.md")
-                .expect("read canonical prose")
+                .expect("read exact prose")
                 .text,
-            "external\n"
+            "external\r\n"
         );
     }
 

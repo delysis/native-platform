@@ -14634,7 +14634,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn reconciliation_preview_returns_exact_canonical_inputs_and_bound_hashes() {
+    fn reconciliation_preview_returns_exact_authored_inputs_and_bound_hashes() {
         let fixture = ReconciliationFixture::new("alpha\nmiddle\nomega\n");
         let external_visible = "alpha\r\nmiddle\r\nOMEGA\r\n";
         let external_visible_blob_id = fixture.set_external(external_visible);
@@ -14656,7 +14656,7 @@ mod tests {
         assert_eq!(preview.base_text, "alpha\nmiddle\nomega\n");
         assert_eq!(preview.app_text, "ALPHA\nmiddle\nomega\n");
         assert_eq!(preview.external_visible_text, external_visible);
-        assert_eq!(preview.external_text, "alpha\nmiddle\nOMEGA\n");
+        assert_eq!(preview.external_text, external_visible);
         assert_eq!(
             preview.external_visible_blob_id,
             external_visible_blob_id.to_string()
@@ -14670,7 +14670,7 @@ mod tests {
         assert_eq!(
             preview.outcome,
             MergeOutcome::Merged {
-                content: "ALPHA\nmiddle\nOMEGA\n".to_owned()
+                content: "ALPHA\r\nmiddle\r\nOMEGA\r\n".to_owned()
             }
         );
         let serialized = serde_json::to_value(&preview).expect("serialize preview contract");
