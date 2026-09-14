@@ -591,6 +591,7 @@
   let suggestionInteraction: 'ghost' | 'loompad' = 'ghost';
   let loompadAccepting = false;
   $: loompadActive = suggestionsEnabled && suggestionInteraction === 'loompad';
+  $: ghostTextHidden = loompadActive || inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled });
   let suggestionsChanging = false;
   let reportedGenerationFailureRun: string | null = null;
   let contextPresentationFingerprint = '';
@@ -1192,10 +1193,7 @@
       : 0,
     autocomplete_enabled: suggestionsEnabled,
     shuttle_enabled: shuttleEnabled,
-    inline_hidden_requested: inlineGhostHidden({
-      autocomplete: suggestionsEnabled,
-      shuttle: shuttleEnabled
-    }),
+    inline_hidden_requested: ghostTextHidden,
     inline_visible_key: mode === 'visual'
       ? visibleVisualGhostPresentationKey
       : mode === 'source'
@@ -9891,7 +9889,7 @@
                       ghostAnchorByteOffset={ghostSuggestion?.targetByte ?? null}
                       ghostInsertsOnAccept={ghostSuggestion?.insertsOnAccept ?? false}
                       ghostAlternatives={ghostAlternatives}
-                      ghostHidden={loompadActive || inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled })}
+                      ghostHidden={ghostTextHidden}
                       {ghostUnconsumeText}
                       surfaceKey={visualGhostSurfaceKey}
                       onChange={updateText}
@@ -9951,7 +9949,7 @@
                   ghostPresentationKey={sourceGhostSuggestion?.presentationKey ?? ''}
                   ghostInsertsOnAccept={sourceGhostSuggestion?.insertsOnAccept ?? false}
                   ghostAlternatives={ghostAlternatives}
-                  ghostHidden={loompadActive || inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled })}
+                  ghostHidden={ghostTextHidden}
                   {ghostUnconsumeText}
                   onCompositionStart={beginSourceComposition}
                   onCompositionEnd={finishSourceComposition}
