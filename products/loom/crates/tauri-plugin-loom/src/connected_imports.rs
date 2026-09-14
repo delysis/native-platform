@@ -1,11 +1,14 @@
 //! Product-owned account grants, credential storage, and explicit sync.
+mod credentials;
+
 use super::{
     IpcFailure, PluginState, lock_application_admission, lock_session, require_bound_store,
 };
 use crate::context_attachments::{import_provided, record_import_origin};
 use attachment_native_host::ProvidedAttachment;
+use credentials::AccountStore;
 use information_native_acquire::google_import::{
-    self, GoogleCredentials, GoogleService, GoogleSession, ImportQuery, RemoteFile,
+    self, GoogleService, GoogleSession, ImportQuery, RemoteFile,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -55,44 +58,6 @@ impl ImportSource {
 fn failure(message: impl Into<String>) -> IpcFailure {
     IpcFailure::new("connected_import_failed", message, false)
 }
-fn keyring_failure(_: keyring::Error) -> IpcFailure {
-    failure(
-        "The system credential store is unavailable. No credential was written to a project file.",
-    )
-}
-
-fn entry(project_id: &str, service: GoogleService) -> Result<keyring::Entry, IpcFailure> {
-    let service_name = match service {
-        GoogleService::Gmail => "gmail",
-        GoogleService::Drive => "drive",
-    };
-    keyring::Entry::new(
-        "com.delysis.loom.connected-import",
-        &format!("{project_id}:{service_name}"),
-    )
-    .map_err(keyring_failure)
-}
-
-fn credentials(
-    project_id: &str,
-    service: GoogleService,
-) -> Result<Vec<GoogleCredentials>, IpcFailure> {
-    match entry(project_id, service)?.get_password() {
-        Ok(value) => {
-            let accounts: Vec<GoogleCredentials> = serde_json::from_str(&value).map_err(|_| {
-                failure("The stored account credential is invalid; disconnect and reconnect it.")
-            })?;
-            if accounts.len() > 8 || accounts.iter().any(|account| account.service != service) {
-                return Err(failure(
-                    "The stored account scope does not match this import.",
-                ));
-            }
-            Ok(accounts)
-        }
-        Err(keyring::Error::NoEntry) => Ok(Vec::new()),
-        Err(error) => Err(keyring_failure(error)),
-    }
-}
 
 fn validate_session(
     state: &PluginState,
@@ -113,7 +78,7 @@ pub(crate) async fn import_accounts(
     validate_session(&state, &project_id, &session_id)?;
     let mut result = Vec::new();
     for service in [GoogleService::Gmail, GoogleService::Drive] {
-        for account in credentials(&project_id, service)? {
+        for account in AccountStore::new(&project_id, service).list()? {
             result.push(AccountStatus {
                 service,
                 email: Some(account.account_email),
@@ -136,7 +101,6 @@ pub(crate) async fn import_account_connect(
         .try_lock()
         .map_err(|_| failure("Another account import is running."))?;
     validate_session(&state, &project_id, &session_id)?;
-    let credential_entry = entry(&project_id, service)?;
     let pending = google_import::begin_authorization(client_id, client_secret, service)
         .await
         .map_err(|e| failure(e.to_string()))?;
@@ -159,19 +123,7 @@ pub(crate) async fn import_account_connect(
     let _admission = lock_application_admission(&state, "saving an account authorization")?;
     require_bound_store(&mut *lock_session(&state)?, &project_id, &session_id)?;
     let email = credential.account_email.clone();
-    let mut accounts = credentials(&project_id, service)?;
-    accounts.retain(|account| account.account_email != email);
-    if accounts.len() >= 8 {
-        return Err(failure(
-            "Disconnect an account before adding another; this project supports eight accounts per service.",
-        ));
-    }
-    accounts.push(credential);
-    let encoded = serde_json::to_string(&accounts)
-        .map_err(|_| failure("The account credential could not be encoded."))?;
-    credential_entry
-        .set_password(&encoded)
-        .map_err(keyring_failure)?;
+    AccountStore::new(&project_id, service).save(&credential)?;
     Ok(AccountStatus {
         service,
         email: Some(email),
@@ -191,21 +143,7 @@ pub(crate) async fn import_account_disconnect(
     })?;
     let _admission = lock_application_admission(&state, "disconnecting an import account")?;
     require_bound_store(&mut *lock_session(&state)?, &project_id, &session_id)?;
-    let mut accounts = credentials(&project_id, service)?;
-    accounts.retain(|account| account.account_email != account_email);
-    let credential_entry = entry(&project_id, service)?;
-    if accounts.is_empty() {
-        match credential_entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(error) => Err(keyring_failure(error)),
-        }
-    } else {
-        let encoded = serde_json::to_string(&accounts)
-            .map_err(|_| failure("The account list could not be encoded."))?;
-        credential_entry
-            .set_password(&encoded)
-            .map_err(keyring_failure)
-    }
+    AccountStore::new(&project_id, service).disconnect(&account_email)
 }
 
 #[derive(Serialize)]
@@ -256,7 +194,8 @@ pub(crate) async fn import_account_sync(
             "Enter a Gmail search, such as newer_than:30d or label:Research.",
         ));
     }
-    let credential = credentials(&project_id, source.service())?
+    let credential = AccountStore::new(&project_id, source.service())
+        .list()?
         .into_iter()
         .find(|account| account.account_email == account_email)
         .ok_or_else(|| failure("Connect this account first."))?;

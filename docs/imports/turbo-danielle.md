@@ -49,7 +49,9 @@ consent-screen configuration, test-user enrollment, or verification for these
 read-only scopes. Each service requests only its own scope.
 
 Credentials are stored in the operating system's credential store, keyed by
-project identity and service. There is no project-file or environment-variable
+project identity, service, and one of eight account slots. Each account has its
+own entry so multiple accounts do not exceed Windows' per-entry password limit.
+There is no project-file or environment-variable
 fallback. Disconnect removes the selected account's local credential; existing
 imports remain. Google-side revocation is available in the account's connected
 apps settings. The browser's completion page only acknowledges receipt of the
