@@ -12,7 +12,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod history;
+mod snapshot;
 pub use history::{BranchIndex, HistoryError, HistoryNode};
+pub use snapshot::{
+    DocumentLineage, DocumentSelection, DocumentSnapshot, PartContent, RevisionLineage,
+    SnapshotError, SnapshotPart, SourceKind, SourceLineage, SourceReference,
+};
 
 pub const MAX_DOCUMENT_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_DOCUMENT_PARTS: usize = 65_536;
@@ -37,7 +42,13 @@ impl MessageRole {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    content = "role",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum PartKind {
     /// An exact source slice without a formatting or role assertion.
     Text,
@@ -134,6 +145,17 @@ impl<'a, Source, Metadata> Document<'a, Source, Metadata> {
         self.check_capacity(selected.len())?;
         let text = std::str::from_utf8(selected).map_err(|_| DocumentError::InvalidUtf8)?;
         self.push(source, range, Cow::Owned(text.to_owned()), kind, metadata)
+    }
+
+    fn push_owned_part(
+        &mut self,
+        source: Source,
+        range: Range<u64>,
+        text: String,
+        kind: PartKind,
+        metadata: Metadata,
+    ) -> Result<(), DocumentError> {
+        self.push(source, range, Cow::Owned(text), kind, metadata)
     }
 
     fn push(

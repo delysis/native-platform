@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod document_snapshot;
 mod draft;
 mod error;
 mod file_io;
@@ -11,6 +12,7 @@ mod reconciliation;
 mod schema;
 mod store;
 
+pub use document_snapshot::ImportedDocumentSnapshot;
 pub use draft::{TransientDraft, TransientDraftClaim, TransientDraftWriteOutcome};
 pub use error::{Result, StoreError};
 pub use generation::{

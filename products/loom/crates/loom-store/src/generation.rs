@@ -1405,10 +1405,19 @@ impl ProjectStore {
             target_blob_id,
             ArtifactKind::DocumentRevision,
             document_media_type(candidate.document_kind),
-            &json!({
-                "source_revision_id": candidate.source_revision_id,
-                "candidate_id": candidate.candidate_id,
-            }),
+            &crate::document_snapshot::seal(
+                json!({
+                    "source_revision_id": candidate.source_revision_id,
+                    "candidate_id": candidate.candidate_id,
+                }),
+                crate::document_snapshot::RevisionIdentity {
+                    document_id: candidate.document_id,
+                    revision_id,
+                    parent_revision_id: Some(candidate.source_revision_id),
+                    kind: candidate.document_kind,
+                },
+                &promoted_segments,
+            )?,
             created_at_ms,
         )?;
         insert_artifact(

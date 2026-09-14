@@ -335,9 +335,23 @@ impl ProjectStore {
     pub fn revision_document(
         &self,
         revision_id: RevisionId,
-    ) -> Result<workspace_document::Document<'static, ArtifactId, ContributionKind>> {
-        let segments = self.load_revision_segments(revision_id)?;
-        document_from_segments(self, &segments)
+    ) -> Result<
+        workspace_document::Document<
+            'static,
+            workspace_document::SourceReference,
+            ContributionKind,
+        >,
+    > {
+        let snapshot = crate::document_snapshot::load(self, revision_id)?;
+        snapshot.resolve(|source| {
+            let artifact_id = parse_id::<ArtifactId>(&source.occurrence_id, "source occurrence")?;
+            let blob_id: String = self.connection.query_row(
+                "SELECT blob_id FROM artifacts WHERE artifact_id = ?1",
+                [artifact_id.to_string()],
+                |row| row.get(0),
+            )?;
+            self.read_blob(parse_blob_id(&blob_id)?)
+        })
     }
 
     pub(crate) fn verify_visible_source(
@@ -461,12 +475,19 @@ impl ProjectStore {
                 write.created_at_ms,
             )?;
         }
-        let metadata = serde_json::to_string(&json!({
-            "workflow": write.workflow,
-            "relative_path": write.relative_path,
-            "reason": write.reason,
-            "source_revision_id": write.expected.revision_id,
-        }))?;
+        let metadata = serde_json::to_string(&crate::document_snapshot::seal(
+            json!({
+                "workflow": write.workflow, "relative_path": write.relative_path,
+                "reason": write.reason, "source_revision_id": write.expected.revision_id,
+            }),
+            crate::document_snapshot::RevisionIdentity {
+                document_id: write.document_id,
+                revision_id: write.revision_id,
+                parent_revision_id: Some(write.expected.revision_id),
+                kind: write.document_kind,
+            },
+            write.segments,
+        )?)?;
         transaction.execute(
             "INSERT INTO artifacts(artifact_id, blob_id, artifact_kind, media_type, metadata_json, created_at_ms)
              VALUES (?1, ?2, 'document_revision', ?3, ?4, ?5)",
@@ -573,6 +594,24 @@ impl ProjectStore {
     }
 
     pub(crate) fn load_revision_segments(
+        &self,
+        revision_id: RevisionId,
+    ) -> Result<Vec<StoredSegment>> {
+        crate::document_snapshot::load(self, revision_id)?
+            .parts()
+            .iter()
+            .map(|part| {
+                Ok(StoredSegment {
+                    artifact_id: parse_id(&part.source.occurrence_id, "source occurrence")?,
+                    start: part.source.start_byte,
+                    end: part.source.end_byte,
+                    contribution: part.metadata,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn load_revision_segment_index(
         &self,
         revision_id: RevisionId,
     ) -> Result<Vec<StoredSegment>> {

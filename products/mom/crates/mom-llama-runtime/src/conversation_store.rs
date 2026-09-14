@@ -231,6 +231,7 @@ impl<'de> Deserialize<'de> for ConversationDb {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationExportFormat {
+    Document,
     Json,
     Markdown,
 }
@@ -648,6 +649,10 @@ pub fn conversation_export(
         ));
     };
     let (format_name, content) = match format {
+        ConversationExportFormat::Document => (
+            "document".into(),
+            serde_json::to_string_pretty(&crate::conversation_snapshot::freeze(conversation)?)?,
+        ),
         ConversationExportFormat::Json => (
             "json".to_string(),
             serde_json::to_string_pretty(conversation)?,
@@ -1241,6 +1246,13 @@ impl HistoryNode for Message {
 /// No role is inferred from message text and no branch is silently repaired.
 pub fn conversation_document(conversation: &Conversation) -> Result<Document<'_, &str, &Message>> {
     let index = BranchIndex::new(&conversation.messages)?;
+    conversation_document_from_index(conversation, &index)
+}
+
+fn conversation_document_from_index<'a>(
+    conversation: &'a Conversation,
+    index: &BranchIndex<'a, Message>,
+) -> Result<Document<'a, &'a str, &'a Message>> {
     let head = conversation
         .active_leaf_message_id
         .as_ref()
@@ -1262,8 +1274,8 @@ pub fn conversation_document(conversation: &Conversation) -> Result<Document<'_,
 }
 
 pub fn active_path_messages(conversation: &Conversation) -> Result<Vec<Message>> {
-    let document = conversation_document(conversation)?;
     let index = BranchIndex::new(&conversation.messages)?;
+    let document = conversation_document_from_index(conversation, &index)?;
     let mut path = Vec::with_capacity(document.parts().len());
     for part in document.parts() {
         let mut message = (**part.metadata()).clone();
@@ -1785,6 +1797,43 @@ mod tests {
             current_skill_ids: Vec::new(),
             messages,
         }
+    }
+
+    #[test]
+    fn explicit_snapshot_export_preserves_private_metadata_without_changing_legacy_codec() {
+        let mut original = message("original", None, MessageRole::Assistant, "original answer");
+        original.receipt_id = Some("generated-receipt".into());
+        original.reasoning_content = Some("private reasoning".into());
+        let mut edited = message("edited", None, MessageRole::Assistant, "human revision");
+        edited.attachment_ids = vec!["attachment-occurrence".into()];
+        let conversation = conversation(vec![original, edited], "edited");
+        let db = ConversationDb {
+            conversations: vec![conversation.clone()],
+            selected_conversation_id: Some("host".into()),
+        };
+        let before = serde_json::to_value(&db).expect("conversation fixture");
+        let snapshot =
+            crate::conversation_snapshot::freeze(&conversation).expect("conversation fixture");
+        let value = serde_json::to_value(snapshot).expect("conversation fixture");
+        assert_eq!(value["selection"]["head"], "edited");
+        assert_eq!(
+            value["parts"][0]["metadata"]["receipt_id"],
+            "generated-receipt"
+        );
+        assert_eq!(
+            value["parts"][0]["metadata"]["reasoning_content"],
+            "private reasoning"
+        );
+        assert!(value["parts"][1]["metadata"]["receipt_id"].is_null());
+        assert_eq!(
+            value["parts"][1]["metadata"]["attachment_ids"][0],
+            "attachment-occurrence"
+        );
+        assert!(before["conversations"][0]["messages"].is_array());
+        assert_eq!(
+            before,
+            serde_json::to_value(db).expect("conversation fixture")
+        );
     }
 
     #[test]

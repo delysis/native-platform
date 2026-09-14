@@ -3,7 +3,9 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::{Result, StoreError};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
-pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 15;
+// Version 16 requires the shared document snapshot on every immutable revision.
+// Reject older stores before recovery or new writes can mix revision formats.
+pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 16;
 const APPLICATION_ID: u32 = 0x4c4f_4f4d;
 const SCHEMA: &str = include_str!("../schema.sql");
 
@@ -62,9 +64,9 @@ mod tests {
     fn incompatible_databases_are_rejected_without_mutation_or_wal_creation() {
         for setup in [
             "CREATE TABLE unrelated(value TEXT); INSERT INTO unrelated VALUES ('preserve');",
-            "PRAGMA user_version = 14; CREATE TABLE manuscript(text TEXT);",
-            "PRAGMA application_id = 1280266061; PRAGMA user_version = 16;",
-            "PRAGMA user_version = 15;",
+            "PRAGMA user_version = 15; CREATE TABLE manuscript(text TEXT);",
+            "PRAGMA application_id = 1280266061; PRAGMA user_version = 17;",
+            "PRAGMA user_version = 16;",
         ] {
             let directory = tempfile::tempdir().expect("temporary directory");
             let path = directory.path().join("store.sqlite3");

@@ -67,6 +67,16 @@ enum Command {
         #[arg(long, default_value = "human import")]
         reason: String,
     },
+    /// Import a self-contained snapshot, retaining all branches as source evidence.
+    /// The selected transcript is explicitly written to a readable manuscript.
+    ImportSnapshot {
+        project: PathBuf,
+        source: PathBuf,
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long, default_value = "explicit document snapshot import")]
+        reason: String,
+    },
     /// Export the latest checkpointed visible manuscript.
     Export {
         project: PathBuf,
@@ -265,6 +275,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mut store = ProjectStore::open(project)?;
             print_json(&store.import_file(source, to, kind.into(), reason)?)?;
+        }
+        Command::ImportSnapshot {
+            project,
+            source,
+            to,
+            reason,
+        } => {
+            let snapshot = read_bounded_utf8_file(&source)?;
+            let mut store = ProjectStore::open(project)?;
+            print_json(&store.import_document_snapshot_if_absent(to, &snapshot, reason)?)?;
         }
         Command::Export { project, file, to } => {
             let mut store = ProjectStore::open(project)?;

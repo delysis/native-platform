@@ -8,8 +8,8 @@ use std::sync::{Mutex, OnceLock};
 use fs4::TryLockError;
 use loom_document::DocumentContent;
 use loom_types::{
-    ArtifactId, BlobId, CommandId, CommandKind, CommandReceipt, DocumentId, DocumentKind,
-    OperationId, OperationKind, ProjectId, ProjectManifest, RevisionId, now_unix_ms,
+    ArtifactId, BlobId, CommandId, CommandKind, CommandReceipt, ContributionKind, DocumentId,
+    DocumentKind, OperationId, OperationKind, ProjectId, ProjectManifest, RevisionId, now_unix_ms,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
@@ -46,35 +46,48 @@ enum DocumentOrigin {
     Human,
     Generated { evidence_blob_id: BlobId },
     Derived { evidence_blob_id: BlobId },
+    DocumentSnapshot { evidence_blob_id: BlobId },
 }
 
 impl DocumentOrigin {
     const fn artifact_kind(self) -> &'static str {
         match self {
             Self::Human => "human_contribution",
-            Self::Generated { .. } | Self::Derived { .. } => "text_blob",
+            Self::Generated { .. } | Self::Derived { .. } | Self::DocumentSnapshot { .. } => {
+                "text_blob"
+            }
+        }
+    }
+
+    const fn contribution(self) -> ContributionKind {
+        match self {
+            Self::Human => ContributionKind::Human,
+            Self::Generated { .. } => ContributionKind::Generated,
+            Self::Derived { .. } | Self::DocumentSnapshot { .. } => ContributionKind::Source,
         }
     }
 
     const fn contribution_kind(self) -> &'static str {
-        match self {
-            Self::Human => "human",
-            Self::Generated { .. } => "generated",
-            Self::Derived { .. } => "source",
-        }
+        self.contribution().as_str()
     }
 
     const fn operation_kind(self) -> &'static str {
         match self {
-            Self::Human | Self::Derived { .. } => "import",
+            Self::Human | Self::Derived { .. } | Self::DocumentSnapshot { .. } => "import",
             Self::Generated { .. } => "generate",
         }
     }
 
     fn metadata(self, relative_path: &str, reason: &str) -> serde_json::Value {
         let mut metadata = json!({ "relative_path": relative_path, "reason": reason });
-        if let Self::Generated { evidence_blob_id } | Self::Derived { evidence_blob_id } = self {
+        if let Self::Generated { evidence_blob_id }
+        | Self::Derived { evidence_blob_id }
+        | Self::DocumentSnapshot { evidence_blob_id } = self
+        {
             metadata["evidence_blob_id"] = json!(evidence_blob_id);
+        }
+        if let Self::DocumentSnapshot { evidence_blob_id } = self {
+            metadata["source_document_snapshot_blob_id"] = json!(evidence_blob_id);
         }
         metadata
     }
@@ -338,6 +351,43 @@ impl ProjectStore {
         )
     }
 
+    /// Explicitly import a self-contained document as writing. The complete
+    /// snapshot, including inactive branches and private metadata, is retained
+    /// as immutable source evidence. Only the selected text becomes a visible
+    /// manuscript. Imported metadata never becomes execution or tool authority.
+    pub fn import_document_snapshot_if_absent(
+        &mut self,
+        relative_path: impl AsRef<Path>,
+        snapshot_json: &str,
+        reason: impl Into<String>,
+    ) -> Result<SaveOutcome> {
+        let snapshot = crate::document_snapshot::parse_import(snapshot_json)?;
+        let document = snapshot.resolve::<StoreError>(|_| {
+            Err(StoreError::CorruptDatabase(
+                "imported document must contain its source bytes".into(),
+            ))
+        })?;
+        let text = if document
+            .parts()
+            .iter()
+            .any(|part| matches!(part.kind(), workspace_document::PartKind::Message(_)))
+        {
+            document
+                .transcript()
+                .map_err(workspace_document::SnapshotError::from)?
+        } else {
+            document.text()
+        };
+        let evidence_blob_id = self.put_blob(snapshot_json.as_bytes())?;
+        self.create_document_if_absent_with_boundary(
+            relative_path,
+            DocumentContent::Prose(text),
+            reason,
+            DocumentOrigin::DocumentSnapshot { evidence_blob_id },
+            |_| Ok(()),
+        )
+    }
+
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     fn create_document_if_absent_with_boundary<F>(
         &mut self,
@@ -427,7 +477,9 @@ impl ProjectStore {
                 blob_id.to_string(),
                 origin.artifact_kind(),
                 media_type(document_kind),
-                serde_json::to_string(&origin.metadata(&relative_path, &reason))?,
+                serde_json::to_string(&crate::document_snapshot::seal(origin.metadata(&relative_path, &reason), crate::document_snapshot::RevisionIdentity {
+                    document_id, revision_id, parent_revision_id: None, kind: document_kind,
+                }, &crate::document_snapshot::single_segment(artifact_id, byte_len, origin.contribution()))?)?,
                 created_at_ms,
             ],
         )?;
@@ -618,13 +670,23 @@ impl ProjectStore {
                 created_at_ms
             ],
         )?;
-        let metadata = serde_json::to_string(&json!({
-            "workflow": "adopt_visible_document",
-            "source": "existing_visible_file",
-            "relative_path": relative_path,
-            "reason": reason,
-            "source_blob_id": blob_id,
-        }))?;
+        let metadata = serde_json::to_string(&crate::document_snapshot::seal(
+            json!({
+                "workflow": "adopt_visible_document", "source": "existing_visible_file",
+                "relative_path": relative_path, "reason": reason, "source_blob_id": blob_id,
+            }),
+            crate::document_snapshot::RevisionIdentity {
+                document_id,
+                revision_id,
+                parent_revision_id: None,
+                kind,
+            },
+            &crate::document_snapshot::single_segment(
+                artifact_id,
+                byte_len,
+                ContributionKind::Human,
+            ),
+        )?)?;
         transaction.execute(
             "INSERT INTO artifacts(artifact_id, blob_id, artifact_kind, media_type, metadata_json, created_at_ms)
              VALUES (?1, ?2, 'human_contribution', ?3, ?4, ?5)",
@@ -847,10 +909,22 @@ impl ProjectStore {
             )?;
         }
 
-        let artifact_metadata = serde_json::to_string(&json!({
-            "relative_path": relative_path,
-            "reason": &reason,
-        }))?;
+        let artifact_metadata = serde_json::to_string(&crate::document_snapshot::seal(
+            json!({
+                "relative_path": relative_path, "reason": &reason,
+            }),
+            crate::document_snapshot::RevisionIdentity {
+                document_id,
+                revision_id,
+                parent_revision_id: active.as_ref().map(|active| active.revision_id),
+                kind: content.kind(),
+            },
+            &crate::document_snapshot::single_segment(
+                artifact_id,
+                byte_len,
+                ContributionKind::Human,
+            ),
+        )?)?;
         transaction.execute(
             "INSERT INTO artifacts(artifact_id, blob_id, artifact_kind, media_type, metadata_json, created_at_ms) VALUES (?1, ?2, 'human_contribution', ?3, ?4, ?5)",
             params![
@@ -7067,7 +7141,7 @@ mod tests {
         assert_eq!(document.text(), updated);
         assert_eq!(document.parts().len(), provenance.segments.len());
         for (part, segment) in document.parts().iter().zip(&provenance.segments) {
-            assert_eq!(*part.source(), segment.artifact_id);
+            assert_eq!(part.source().occurrence_id, segment.artifact_id.to_string());
             assert_eq!(
                 part.source_range(),
                 segment.byte_range.start..segment.byte_range.end

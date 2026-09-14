@@ -8,6 +8,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("document snapshot failed: {0}")]
+    DocumentSnapshot(#[from] workspace_document::SnapshotError),
     #[error("I/O failure: {0}")]
     Io(#[from] std::io::Error),
     #[error("SQLite failure: {0}")]
