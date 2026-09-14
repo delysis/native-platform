@@ -1361,14 +1361,8 @@ impl NativeModelHandle {
         request: GenerationRequest,
         generation_admission: GenerationAdmissionClass,
     ) -> NativeResult<GenerationTicket> {
-        if matches!(&request.input, GenerationInput::Chat { .. }) && !request.media.is_empty() {
-            return self.generate_multimodal(request, generation_admission);
-        }
         if !request.media.is_empty() {
-            return Err(NativeError::new(
-                NativeErrorCode::UnsupportedMedia,
-                "media inputs require a chat generation request",
-            ));
+            return self.generate_multimodal(request, generation_admission);
         }
         let GenerationRequest {
             request_id,
@@ -4103,8 +4097,8 @@ fn generate_multimodal_batch(
     let chunks = multimodal
         .tokenize(
             MtmdInputText {
-                text: prompt.clone(),
-                add_special: true,
+                text: prompt.text.clone(),
+                add_special: prompt.add_special,
                 parse_special: true,
             },
             &bitmap_refs,
@@ -5233,8 +5227,8 @@ fn generate_multimodal(
     let chunks = multimodal
         .tokenize(
             MtmdInputText {
-                text: prompt,
-                add_special: true,
+                text: prompt.text,
+                add_special: prompt.add_special,
                 parse_special: true,
             },
             &bitmap_refs,
@@ -5685,10 +5679,16 @@ fn media_bitmap(
     Ok(bitmap)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RenderedMultimodalPrompt {
+    text: String,
+    add_special: bool,
+}
+
 fn render_multimodal_prompt(
     model: &LlamaModel,
     request: &GenerationRequest,
-) -> NativeResult<String> {
+) -> NativeResult<RenderedMultimodalPrompt> {
     render_multimodal_case_prompt(model, &request.media, &request.input)
 }
 
@@ -5696,11 +5696,14 @@ fn render_multimodal_case_prompt(
     model: &LlamaModel,
     media: &[MediaInput],
     input: &GenerationInput,
-) -> NativeResult<String> {
+) -> NativeResult<RenderedMultimodalPrompt> {
+    if let GenerationInput::Completion { prompts } = input {
+        return render_raw_multimodal_prompt(prompts, media.len());
+    }
     let GenerationInput::Chat { messages, template } = input else {
         return Err(NativeError::new(
             NativeErrorCode::UnsupportedPromptForm,
-            "multimodal generation requires chat input",
+            "multimodal generation requires chat or one text completion prompt",
         ));
     };
     let mut messages = messages.clone();
@@ -5721,7 +5724,44 @@ fn render_multimodal_case_prompt(
             content: markers,
         });
     }
-    render_messages_prompt_with_template(model, messages, true, template)
+    Ok(RenderedMultimodalPrompt {
+        text: render_messages_prompt_with_template(model, messages, true, template)?,
+        add_special: true,
+    })
+}
+
+/// Raw media prefix contract: one marker per payload in request order, then
+/// two newlines and the untouched text. No roles, instructions, or filenames.
+fn render_raw_multimodal_prompt(
+    prompts: &[CompletionPrompt],
+    media_count: usize,
+) -> NativeResult<RenderedMultimodalPrompt> {
+    let [
+        CompletionPrompt::Text {
+            text,
+            special_tokens,
+        },
+    ] = prompts
+    else {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedPromptForm,
+            "raw multimodal generation requires exactly one text prompt, not token IDs",
+        ));
+    };
+    let marker = mtmd_default_marker();
+    if text.contains(marker) {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            "raw media prompt contains a reserved media marker; payload markers are supplied in request order",
+        ));
+    }
+    let markers = std::iter::repeat_n(marker, media_count)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(RenderedMultimodalPrompt {
+        text: format!("{markers}\n\n{text}"),
+        add_special: *special_tokens == SpecialTokenPolicy::AddBosParseSpecial,
+    })
 }
 
 fn emit_generation_state(
@@ -6313,6 +6353,19 @@ fn validate_batch_request(
     Ok(())
 }
 
+fn validate_multimodal_input(input: &GenerationInput, media_count: usize) -> NativeResult<()> {
+    match input {
+        GenerationInput::Chat { messages, .. } if !messages.is_empty() => Ok(()),
+        GenerationInput::Completion { prompts } => {
+            render_raw_multimodal_prompt(prompts, media_count).map(|_| ())
+        }
+        _ => Err(NativeError::new(
+            NativeErrorCode::UnsupportedPromptForm,
+            "multimodal generation requires nonempty chat or one text completion prompt",
+        )),
+    }
+}
+
 fn validate_generation_request(
     request: &GenerationRequest,
     status: &ResidentModelStatus,
@@ -6323,14 +6376,17 @@ fn validate_generation_request(
             format!("model {} is not resident", request.model_id),
         ));
     }
-    let message_count = match &request.input {
-        GenerationInput::Chat { messages, .. } => messages.len(),
-        _ => 0,
-    };
-    if message_count == 0 || request.sampling.max_tokens == 0 {
+    validate_multimodal_input(&request.input, request.media.len())?;
+    if request.cached_prefix.is_some() {
+        return Err(NativeError::new(
+            NativeErrorCode::UnsupportedParameter,
+            "caller-supplied cached state is unavailable for multimodal generation",
+        ));
+    }
+    if request.sampling.max_tokens == 0 {
         return Err(NativeError::new(
             NativeErrorCode::InvalidConfig,
-            "multimodal generation requires messages and a positive token limit",
+            "multimodal generation requires a positive token limit",
         ));
     }
     if request.media.is_empty() {
@@ -6401,7 +6457,7 @@ fn validate_generation_batch_request(
                     CompletionPrompt::Text { text, .. } => text.is_empty(),
                     CompletionPrompt::Tokens { token_ids } => token_ids.is_empty(),
                 };
-                if empty {
+                if empty && request.media.is_empty() {
                     return Err(NativeError::new(
                         NativeErrorCode::InvalidConfig,
                         format!("generation case {index} has an empty completion prompt"),
@@ -6420,15 +6476,8 @@ fn validate_generation_batch_request(
         }
     }
     if !request.media.is_empty() {
-        if request
-            .cases
-            .iter()
-            .any(|case| !matches!(case.input, GenerationInput::Chat { .. }))
-        {
-            return Err(NativeError::new(
-                NativeErrorCode::UnsupportedPromptForm,
-                "multimodal batch generation requires chat input in every case",
-            ));
+        for case in &request.cases {
+            validate_multimodal_input(&case.input, request.media.len())?;
         }
         if request
             .cases
@@ -6952,6 +7001,60 @@ mod tests {
     use crate::generation_admission::{AdmissionClock, SPECULATIVE_PREEMPTION_LIMIT};
     use llama_native_types::EmbeddingInput;
     use std::sync::{Barrier, Mutex, atomic::AtomicU64};
+
+    #[test]
+    fn raw_media_prefix_preserves_text_and_bos_policy_without_chat_roles() {
+        let text = "  Sound: café • 界\n";
+        let marker = mtmd_default_marker();
+        for policy in [
+            SpecialTokenPolicy::NoBosParseSpecial,
+            SpecialTokenPolicy::AddBosParseSpecial,
+        ] {
+            let rendered = render_raw_multimodal_prompt(
+                &[CompletionPrompt::Text {
+                    text: text.to_owned(),
+                    special_tokens: policy,
+                }],
+                2,
+            )
+            .expect("raw media renders");
+            assert_eq!(rendered.text, format!("{marker}\n{marker}\n\n{text}"));
+            assert_eq!(
+                rendered.add_special,
+                policy == SpecialTokenPolicy::AddBosParseSpecial
+            );
+        }
+        let rendered = render_raw_multimodal_prompt(
+            &[CompletionPrompt::Text {
+                text: String::new(),
+                special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+            }],
+            1,
+        )
+        .expect("audio-only input is meaningful");
+        assert_eq!(rendered.text, format!("{marker}\n\n"));
+    }
+
+    #[test]
+    fn raw_media_rejects_ambiguous_markers_and_token_prompts() {
+        let error = render_raw_multimodal_prompt(
+            &[CompletionPrompt::Text {
+                text: format!("literal {} marker", mtmd_default_marker()),
+                special_tokens: SpecialTokenPolicy::NoBosParseSpecial,
+            }],
+            1,
+        )
+        .expect_err("caller cannot add a second unbound media slot");
+        assert_eq!(error.code, NativeErrorCode::InvalidConfig);
+        for prompts in [
+            vec![],
+            vec![CompletionPrompt::Tokens { token_ids: vec![1] }],
+        ] {
+            let error = render_raw_multimodal_prompt(&prompts, 1)
+                .expect_err("mtmd requires one text prompt");
+            assert_eq!(error.code, NativeErrorCode::UnsupportedPromptForm);
+        }
+    }
 
     #[test]
     fn gemma4_non_thinking_renderer_preserves_native_markers_and_roles() {

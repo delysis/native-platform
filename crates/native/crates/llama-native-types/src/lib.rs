@@ -704,6 +704,10 @@ pub struct GenerationRequest {
     pub model_id: String,
     pub input: GenerationInput,
     pub sampling: SamplingConfig,
+    /// For a text Completion, media are encoded in this order before the exact
+    /// text: one native media marker per item, separated by newlines, then two
+    /// newlines and the original text. No chat template is applied. The text
+    /// must not contain native media markers; token-ID prompts cannot carry media.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<MediaInput>,
     #[serde(default)]
@@ -735,7 +739,8 @@ pub struct GenerationBatchRequest {
     pub model_id: String,
     /// Ordered media shared by every case in this exact batch. Media bytes
     /// remain request-scoped so a product cannot accidentally bind different
-    /// evidence to sibling alternatives in one completion family.
+    /// evidence to sibling alternatives in one completion family. Text completion
+    /// cases use the same ordered marker prefix contract as `GenerationRequest`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<MediaInput>,
     pub cases: Vec<GenerationCase>,

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod attachments;
+mod audio_io;
 mod co_writer;
 mod context_attachments;
 mod document_bindings;
@@ -11,7 +12,10 @@ mod model_download;
 mod shader_preview;
 mod speech_input;
 mod terminal;
+mod terminal_media;
 mod terminal_receipts;
+mod workspace_preview;
+mod workspace_template;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, Metadata};
@@ -68,6 +72,7 @@ use crate::attachments::{
     AttachmentStoreError, LoadedImageAsset, StoredImageAsset, is_canonical_image_asset_file_name,
     read_image_asset, store_image_asset,
 };
+use crate::audio_io::{audio_record_start, audio_record_stop, audio_synthesize};
 use crate::co_writer::{
     CoWriterError, CoWriterSummary, apply_to_document as apply_co_writer,
     delete as delete_co_writer, list as list_co_writers, save_from_document as save_co_writer,
@@ -91,6 +96,7 @@ use crate::speech_input::{
     SpeechRecordingSnapshot,
 };
 use crate::terminal::{terminal_cancel, terminal_list, terminal_run};
+use crate::workspace_template::{workspace_template_enable, workspace_template_get};
 use speech_native_host::SpeechHostStatus;
 
 const INITIAL_DOCUMENT: &str = "Untitled.md";
@@ -364,7 +370,8 @@ pub struct PluginState {
     model_loads: Arc<ModelLoadRegistry>,
     downloads: Arc<ModelDownloadRegistry>,
     download_workers: DownloadWorkerRegistry,
-    speech_input: SpeechInputService,
+    speech_input: Arc<SpeechInputService>,
+    audio_capture: audio_io::CapturePersistence,
     app_local_data_root: Option<PathBuf>,
     isolate_model_discovery: bool,
     build_model_policy: BuildModelPolicy,
@@ -408,7 +415,8 @@ impl PluginState {
             model_loads: Arc::new(ModelLoadRegistry::default()),
             downloads: Arc::new(ModelDownloadRegistry::default()),
             download_workers: DownloadWorkerRegistry::default(),
-            speech_input: SpeechInputService::new(app_local_data_root.clone()),
+            speech_input: Arc::new(SpeechInputService::new(app_local_data_root.clone())),
+            audio_capture: audio_io::CapturePersistence::default(),
             app_local_data_root,
             isolate_model_discovery,
             build_model_policy,
@@ -1910,6 +1918,12 @@ impl Builder {
                 };
                 loom_asset_protocol_response(&state, context.webview_label(), &request)
             })
+            .register_uri_scheme_protocol(workspace_preview::SCHEME, |context, request| {
+                let Some(state) = context.app_handle().try_state::<PluginState>() else {
+                    return empty_loom_asset_response(http::StatusCode::SERVICE_UNAVAILABLE);
+                };
+                workspace_preview::response(&state, context.webview_label(), &request)
+            })
             .invoke_handler(tauri::generate_handler![
                 project_open_default,
                 project_prepare_open,
@@ -1919,6 +1933,11 @@ impl Builder {
                 project_current,
                 project_recover,
                 document_create,
+                workspace_template_get,
+                workspace_template_enable,
+                audio_record_start,
+                audio_record_stop,
+                audio_synthesize,
                 document_rename,
                 document_delete,
                 attachment_ingest,
@@ -3147,6 +3166,7 @@ fn close_project_with_wait(
     command_id: CommandId,
     generation_wait: Duration,
 ) -> Result<ProjectCloseReceipt, IpcFailure> {
+    let _audio = state.audio_capture.close_guard()?;
     let (typed_project_id, typed_session_id) = {
         let mut session = lock_session_internal(state)?;
         if session.phase == SessionPhase::Closed {
@@ -9959,6 +9979,7 @@ fn application_close<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
+    let _audio = state.audio_capture.close_guard()?;
     let close_attempt = begin_application_close(&state)?;
     lock_prepared_project(&state)?.take();
     if state

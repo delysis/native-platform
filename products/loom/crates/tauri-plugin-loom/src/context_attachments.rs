@@ -270,6 +270,33 @@ pub(crate) fn import_path(
         return Err(ContextAttachmentError::UnsafeSource);
     }
 
+    import_provided(project_root, file_name, metadata.len(), provided)
+}
+
+/// Retains an explicitly captured recording through the same direct-media
+/// pipeline as an imported WAV. Recognition is never part of this operation.
+pub(crate) fn import_recorded_wav(
+    project_root: &Path,
+    file_name: String,
+    wav: &[u8],
+) -> Result<StoredAttachment, ContextAttachmentError> {
+    let provided = ProvidedAttachment::read_bounded(
+        file_name.clone(),
+        Some("audio/wav".to_owned()),
+        &mut Cursor::new(wav),
+        MAX_ATTACHMENT_BYTES,
+    )
+    .map_err(|error| ContextAttachmentError::Processing(error.safe_message))?;
+    import_provided(project_root, file_name, wav.len() as u64, provided)
+}
+
+#[allow(clippy::too_many_lines)]
+fn import_provided(
+    project_root: &Path,
+    file_name: String,
+    byte_count: u64,
+    provided: ProvidedAttachment,
+) -> Result<StoredAttachment, ContextAttachmentError> {
     let mut host_config = AttachmentHostConfig {
         preparation: PreparationPolicy {
             // Gemma consumes decoded audio itself. Loom must never silently
@@ -389,7 +416,7 @@ pub(crate) fn import_path(
     let attachment = StoredAttachment {
         id: id.clone(),
         file_name,
-        byte_count: metadata.len(),
+        byte_count,
         detected_format,
         coverage_complete,
         text_bytes,
@@ -2811,6 +2838,21 @@ mod tests {
                 attachment.warnings
             );
         }
+    }
+
+    #[test]
+    fn captured_wav_survives_exactly_without_transcription_or_a_source_file() {
+        let project = tempfile::tempdir().expect("project fixture");
+        let wav = wav_fixture();
+        let audio = import_recorded_wav(project.path(), "Recording.wav".to_owned(), &wav)
+            .expect("retain capture");
+        assert_eq!(audio.media_kinds, ["audio"]);
+        assert_eq!(audio.text_bytes, 0);
+        let resolved = resolve_for_generation(project.path(), "document", &audio.inline_markdown)
+            .expect("direct native audio context");
+        assert!(resolved.context_preamble.is_empty());
+        assert_eq!(resolved.media.len(), 1);
+        assert_eq!(resolved.media[0].bytes, wav);
     }
 
     fn wav_fixture() -> Vec<u8> {

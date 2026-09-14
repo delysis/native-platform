@@ -18,12 +18,33 @@ pub(super) struct TerminalRun {
     run_id: String,
     status: String,
     expression: String,
+    #[serde(default)]
+    source_document_id: String,
+    #[serde(default)]
+    presentation: Option<TerminalPresentation>,
     title: String,
     output_document_id: Option<String>,
     output_relative_path: Option<String>,
     preview: String,
     error: Option<String>,
     created_at_ms: i64,
+}
+
+/// Display metadata is retained with the exact native input, never substituted
+/// for it. Pane identity groups history without granting execution authority.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TerminalPresentation {
+    pane_id: String,
+    input: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TerminalMediaEvidence {
+    id: String,
+    kind: llama_native_types::MediaKind,
+    mime: String,
+    bytes_blob_id: BlobId,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -33,6 +54,10 @@ struct RunReceipt {
     source_document_id: DocumentId,
     source_revision_id: RevisionId,
     input_blob_id: BlobId,
+    #[serde(default)]
+    context_references: Option<Vec<String>>,
+    #[serde(default)]
+    media: Vec<TerminalMediaEvidence>,
     model: Option<VerifiedModelDescriptor>,
     bindings: BTreeMap<String, String>,
     sources: Vec<crate::document_bindings::ResolvedDocument>,
@@ -163,6 +188,45 @@ fn function_names(expression: &NeuralExpression, names: &mut BTreeSet<String>) {
     }
 }
 
+fn validate_explicit_references(references: &[String]) -> Result<(), IpcFailure> {
+    if references.len() > 64
+        || references.iter().any(|name| {
+            name.trim().is_empty() || name.len() > 1024 || name.chars().any(char::is_control)
+        })
+    {
+        return Err(failure(
+            "Explicit context supports at most 64 document names of up to 1024 bytes each.",
+        ));
+    }
+    Ok(())
+}
+
+fn prompt_reference_names(
+    text: &str,
+    references: Option<&[String]>,
+    current_input: Option<&str>,
+) -> Result<BTreeSet<String>, IpcFailure> {
+    if let Some(references) = references {
+        validate_explicit_references(references)?;
+        let mut names = references.iter().cloned().collect::<BTreeSet<_>>();
+        if let Some(input) = current_input {
+            names.extend(
+                document_references(input)
+                    .map_err(io_failure)?
+                    .into_iter()
+                    .map(|reference| reference.name),
+            );
+        }
+        Ok(names)
+    } else {
+        Ok(document_references(text)
+            .map_err(io_failure)?
+            .into_iter()
+            .map(|reference| reference.name)
+            .collect())
+    }
+}
+
 fn bounded(value: String) -> Result<String, IpcFailure> {
     if value.len() > MAX_PROMPT_BYTES {
         Err(failure(
@@ -192,10 +256,13 @@ fn read_receipt(root: &Path, id: &str, finished: bool) -> Result<Option<RunRecei
     let Some(bytes) = crate::terminal_receipts::read(root, id, finished)? else {
         return Ok(None);
     };
-    let receipt: RunReceipt = serde_json::from_slice(&bytes).map_err(io_failure)?;
+    let mut receipt: RunReceipt = serde_json::from_slice(&bytes).map_err(io_failure)?;
     if receipt.run.run_id != id {
         return Err(failure("Function receipt identity differs from its name"));
     }
+    // The source has always been part of the immutable receipt. Expose it in
+    // the presentation DTO without rewriting any retained history.
+    receipt.run.source_document_id = receipt.source_document_id.to_string();
     Ok(Some(receipt))
 }
 
@@ -225,22 +292,40 @@ pub(super) async fn terminal_run<R: Runtime>(
     source_start_byte: u64,
     source_end_byte: u64,
     expression: String,
+    presentation: Option<TerminalPresentation>,
+    context_references: Option<Vec<String>>,
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<TerminalRun, IpcFailure> {
     let command_id = parse_command_id(&command_id)?;
-    let fingerprint = BlobId::digest(
-        &serde_json::to_vec(&(
-            &project_id,
-            &document_id,
-            &source_revision_id,
-            &expected_visible_blob_id,
-            source_start_byte,
-            source_end_byte,
-            &expression,
-        ))
-        .map_err(io_failure)?,
-    );
+    if let Some(presentation) = &presentation
+        && (!crate::workspace_template::valid_pane_id(&presentation.pane_id)
+            || presentation.input.len() > MAX_PROMPT_BYTES)
+    {
+        return Err(failure(
+            "Run presentation needs a valid pane name and input within 64 KiB.",
+        ));
+    }
+    let mut fingerprint_bytes = serde_json::to_vec(&(
+        &project_id,
+        &document_id,
+        &source_revision_id,
+        &expected_visible_blob_id,
+        source_start_byte,
+        source_end_byte,
+        &expression,
+    ))
+    .map_err(io_failure)?;
+    if let Some(presentation) = &presentation {
+        // An absent presentation keeps the existing request identity. A present
+        // one must match on replay just like every execution input.
+        fingerprint_bytes.extend(serde_json::to_vec(presentation).map_err(io_failure)?);
+    }
+    if let Some(references) = &context_references {
+        validate_explicit_references(references)?;
+        fingerprint_bytes.extend(serde_json::to_vec(references).map_err(io_failure)?);
+    }
+    let fingerprint = BlobId::digest(&fingerprint_bytes);
     let admission = lock_application_admission(&state, "an experiment")?;
     let model_guard = lock_model_lifecycle(&state)?;
     let mut session = lock_session(&state)?;
@@ -289,12 +374,21 @@ pub(super) async fn terminal_run<R: Runtime>(
     let mut calls = 0;
     match &command {
         NeuralCommand::Prompt(text) => {
-            for reference in document_references(text).map_err(io_failure)? {
-                names.insert(reference.name);
-            }
+            names = prompt_reference_names(
+                text,
+                context_references.as_deref(),
+                presentation
+                    .as_ref()
+                    .map(|presentation| presentation.input.as_str()),
+            )?;
             calls = 1;
         }
         NeuralCommand::Expression(expression) => {
+            if context_references.is_some() {
+                return Err(failure(
+                    "Explicit context belongs to a plain prompt, not a function expression.",
+                ));
+            }
             expression_names(expression, &mut names, &mut calls);
         }
     }
@@ -350,6 +444,37 @@ pub(super) async fn terminal_run<R: Runtime>(
         }
         bindings.insert(name, bounded(text)?);
     }
+    let media = if let Some(model) = &model {
+        let media = crate::terminal_media::resolve(
+            store,
+            &source,
+            &sources,
+            resident_context_tokens(model),
+        )?;
+        validate_media_against_resident_model(&media, &model.descriptor)?;
+        media
+    } else {
+        Vec::new()
+    };
+    let media_evidence = media
+        .iter()
+        .map(|item| {
+            let bytes_blob_id = store
+                .store_provenance_blob(&item.bytes)
+                .map_err(IpcFailure::store)?;
+            if bytes_blob_id.to_string() != item.sha256 {
+                return Err(failure(
+                    "The attached media changed before this experiment.",
+                ));
+            }
+            Ok(TerminalMediaEvidence {
+                id: item.id.clone(),
+                kind: item.kind,
+                mime: item.mime.clone(),
+                bytes_blob_id,
+            })
+        })
+        .collect::<Result<Vec<_>, IpcFailure>>()?;
     let input_blob_id = store
         .store_provenance_blob(input.as_bytes())
         .map_err(IpcFailure::store)?;
@@ -371,6 +496,8 @@ pub(super) async fn terminal_run<R: Runtime>(
             status: "running".into(),
             title,
             expression: entry,
+            source_document_id: document_id.to_string(),
+            presentation,
             output_document_id: None,
             output_relative_path: None,
             preview: String::new(),
@@ -381,6 +508,8 @@ pub(super) async fn terminal_run<R: Runtime>(
         source_document_id: document_id,
         source_revision_id: source.revision_id,
         input_blob_id,
+        context_references,
+        media: media_evidence,
         model: model.as_ref().map(|model| model.descriptor.clone()),
         bindings,
         sources,
@@ -463,6 +592,7 @@ pub(super) async fn terminal_run<R: Runtime>(
                 source: &source,
                 input,
                 receipt,
+                media,
                 step: 0,
             };
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -529,6 +659,7 @@ struct Evaluator<'a> {
     source: &'a LoadedDocument,
     input: String,
     receipt: RunReceipt,
+    media: Vec<llama_native_types::MediaInput>,
     step: u32,
 }
 
@@ -638,7 +769,8 @@ impl Evaluator<'_> {
             };
             let context_evidence = store
                 .store_provenance_blob(
-                    &serde_json::to_vec(&self.receipt.sources).map_err(io_failure)?,
+                    &serde_json::to_vec(&(&self.receipt.sources, &self.receipt.media))
+                        .map_err(io_failure)?,
                 )
                 .map_err(IpcFailure::store)?;
             let prompt_artifact = store
@@ -692,7 +824,7 @@ impl Evaluator<'_> {
                 model: model.profile.clone(),
                 exact_manuscript_prefix: prompt,
                 context_preamble: String::new(),
-                media: Vec::new(),
+                media: self.media.clone(),
                 prompt_recipe: recipe.clone(),
                 cases: vec![case],
             })
@@ -733,7 +865,7 @@ impl Evaluator<'_> {
             PromptMode::RawCompletion,
             &result.context_binding,
             &model.descriptor,
-            0,
+            self.media.len(),
         )
         .map_err(|error| IpcFailure::backend(&error))?;
         let evidence = self.with_store(|store| {
@@ -771,10 +903,7 @@ impl Evaluator<'_> {
         } else {
             title.trim()
         };
-        let path = format!(
-            "Runs/{}/{}/{title}.md",
-            self.receipt.run.run_id, self.step
-        );
+        let path = format!("Runs/{}/{}/{title}.md", self.receipt.run.run_id, self.step);
         let id = self.with_store(|store| {
             if self.step == 0 {
                 store

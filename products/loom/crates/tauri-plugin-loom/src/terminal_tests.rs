@@ -58,6 +58,15 @@ impl TerminalFixture {
     }
 
     fn run(&self, id: CommandId, expression: &str) -> Result<TerminalRun, IpcFailure> {
+        self.run_with_presentation(id, expression, None)
+    }
+
+    fn run_with_presentation(
+        &self,
+        id: CommandId,
+        expression: &str,
+        presentation: Option<TerminalPresentation>,
+    ) -> Result<TerminalRun, IpcFailure> {
         tauri::async_runtime::block_on(terminal_run(
             self.project_id.clone(),
             self.session_id.clone(),
@@ -68,6 +77,8 @@ impl TerminalFixture {
             0,
             0,
             expression.into(),
+            presentation,
+            None,
             self.app.handle().clone(),
             self.app.state::<PluginState>(),
         ))
@@ -322,4 +333,66 @@ fn real_native_terminal_retains_raw_inference_without_changing_source() {
     let unloaded = tauri::async_runtime::block_on(crate::model_unload(state))
         .expect("release the real native model");
     assert!(unloaded.resident_slot_released);
+}
+
+#[test]
+fn pane_presentation_is_retained_and_bound_to_replay_identity() {
+    let fixture = TerminalFixture::new();
+    let id = CommandId::new();
+    let presentation = TerminalPresentation {
+        pane_id: "chat".into(),
+        input: "A human-facing question".into(),
+    };
+    fixture
+        .run_with_presentation(id, "=\"Retained reply\"", Some(presentation.clone()))
+        .unwrap();
+    let completed = fixture.wait(id);
+    assert_eq!(
+        completed.source_document_id,
+        fixture.source.document_id.to_string()
+    );
+    assert_eq!(
+        completed.presentation.as_ref().unwrap().input,
+        presentation.input
+    );
+    fixture
+        .run_with_presentation(id, "=\"Retained reply\"", Some(presentation.clone()))
+        .unwrap();
+    let changed = TerminalPresentation {
+        pane_id: "other".into(),
+        ..presentation
+    };
+    assert!(
+        fixture
+            .run_with_presentation(id, "=\"Retained reply\"", Some(changed))
+            .is_err()
+    );
+    let listed = fixture
+        .list()
+        .into_iter()
+        .find(|run| run.run_id == id.to_string())
+        .unwrap();
+    assert_eq!(listed.presentation.unwrap().pane_id, "chat");
+}
+
+#[test]
+fn explicit_prompt_context_does_not_interpret_literal_history() {
+    let literal =
+        "User: What is @Missing?\nAssistant: A literal @mention.\nUser: Continue.\nAssistant:";
+    assert!(
+        prompt_reference_names(literal, Some(&[]), None)
+            .unwrap()
+            .is_empty()
+    );
+    let references = vec!["Draft".to_owned(), "Draft".to_owned()];
+    assert_eq!(
+        prompt_reference_names(literal, Some(&references), Some("Use @Voice")).unwrap(),
+        BTreeSet::from(["Draft".into(), "Voice".into()])
+    );
+    assert_eq!(
+        prompt_reference_names(literal, None, None).unwrap(),
+        BTreeSet::from(["Missing".into(), "mention".into()])
+    );
+    assert!(validate_explicit_references(&vec!["Draft".into(); 65]).is_err());
+    assert!(validate_explicit_references(&["x".repeat(1025)]).is_err());
 }

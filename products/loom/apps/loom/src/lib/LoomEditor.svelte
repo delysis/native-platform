@@ -47,7 +47,7 @@
     type VisualFormatAction,
     type VisualFormatState
   } from './visualFormatting';
-  import { visualMarkdownInputRules } from './visualInputRules';
+  import { visualMarkdownFenceEnter, visualMarkdownInputRules } from './visualInputRules';
   import { visualListKeymap } from './visualListEditing';
   import {
     STALE_IMAGE_ATTACHMENT_ERROR,
@@ -730,6 +730,7 @@
         history(),
         visualMarkdownInputRules(schema),
         keymap({
+          Enter: visualMarkdownFenceEnter,
           'Mod-z': undo,
           'Shift-Mod-z': redo,
           'Mod-y': redo,

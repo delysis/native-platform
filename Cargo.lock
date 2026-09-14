@@ -7165,6 +7165,7 @@ dependencies = [
  "sha2 0.10.9",
  "speech-native-backend-parakeet",
  "speech-native-host",
+ "speech-native-platform",
  "speech-native-types",
  "tauri",
  "tauri-plugin",
@@ -7173,6 +7174,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "toml 0.9.12+spec-1.1.0",
  "windows-sys 0.61.2",
 ]
 

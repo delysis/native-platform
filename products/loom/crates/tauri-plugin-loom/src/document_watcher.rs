@@ -93,12 +93,28 @@ fn is_writing_path(project_root: &Path, event_path: &Path) -> bool {
     let Some(relative) = relative else {
         return false;
     };
-    relative.components().all(|component| match component {
-        Component::Normal(name) => name.to_str().is_some_and(|name| {
-            !name.starts_with('.') && !matches!(name, "node_modules" | "target")
-        }),
-        _ => false,
-    })
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let hidden_markdown_leaf = components.peek().is_none()
+            && matches!(
+                Path::new(name)
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
+                Some("md" | "markdown")
+            );
+        if (name.starts_with('.') && !hidden_markdown_leaf)
+            || matches!(name, "node_modules" | "target")
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn relative_event_path<'a>(project_root: &Path, event_path: &'a Path) -> Option<&'a Path> {
@@ -199,7 +215,14 @@ mod tests {
     #[test]
     fn root_writing_and_folder_moves_require_a_hint() {
         // A removed or renamed directory may itself have an extension.
-        for path in ["Notes.md", "Notes.TXT", "chapters", "drafts.v2"] {
+        for path in [
+            "Notes.md",
+            "Notes.TXT",
+            "chapters",
+            "drafts.v2",
+            ".loom.md",
+            "templates/.chat.md",
+        ] {
             assert!(event_requires_hint(
                 &project_root(),
                 &Ok(event(
@@ -215,6 +238,8 @@ mod tests {
         let root = project_root();
         for path in [
             project_path(".loom/project.sqlite3"),
+            project_path(".hidden.md/prompt.md"),
+            project_path(".env"),
             project_path("target/generated.md"),
             std::env::temp_dir().join("other-project/manuscript/chapter.md"),
         ] {

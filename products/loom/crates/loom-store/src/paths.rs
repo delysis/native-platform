@@ -22,14 +22,24 @@ pub(crate) fn normalize_document_path(path: &Path) -> Result<String> {
     }
 
     let mut components = Vec::new();
-    for component in path.components() {
+    let mut path_components = path.components().peekable();
+    while let Some(component) = path_components.next() {
         let Component::Normal(component) = component else {
             return Err(StoreError::UnsafeRelativePath(path.display().to_string()));
         };
         let component = component
             .to_str()
             .ok_or_else(|| StoreError::NonUtf8Path(path.to_path_buf()))?;
-        if component.starts_with('.') {
+        // Dot-prefixed Markdown leaves are ordinary, explicitly opened writing
+        // (including .loom.md). Hidden directories remain outside this authority.
+        let hidden_markdown_leaf = path_components.peek().is_none()
+            && matches!(
+                Path::new(component)
+                    .extension()
+                    .and_then(|ext| ext.to_str()),
+                Some("md" | "markdown")
+            );
+        if component.starts_with('.') && !hidden_markdown_leaf {
             return Err(StoreError::UnsafeRelativePath(path.display().to_string()));
         }
         components.push(component.to_owned());
@@ -162,7 +172,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn document_paths_are_confined_to_visible_files_in_the_folder() {
+    fn document_paths_are_confined_to_ordinary_files_in_the_folder() {
         assert_eq!(
             normalize_document_path(Path::new("manuscript/poems/one.txt")).expect("valid path"),
             "manuscript/poems/one.txt"
@@ -174,6 +184,11 @@ mod tests {
             "Notes.md"
         );
         assert!(normalize_document_path(Path::new("notes/.git/config")).is_err());
+        assert!(normalize_document_path(Path::new(".hidden.md/notes.md")).is_err());
+        assert!(normalize_document_path(Path::new(".env")).is_err());
+        for path in [".loom.md", "templates/.voice.markdown"] {
+            assert_eq!(normalize_document_path(Path::new(path)).unwrap(), path);
+        }
         assert!(normalize_document_path(Path::new("manuscript\\escape.md")).is_err());
     }
 

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-workspace-template-enable"
+description = "Enables the workspace_template_enable command without any pre-configured scope."
+commands.allow = ["workspace_template_enable"]
+
+[[permission]]
+identifier = "deny-workspace-template-enable"
+description = "Denies the workspace_template_enable command without any pre-configured scope."
+commands.deny = ["workspace_template_enable"]

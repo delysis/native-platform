@@ -547,6 +547,8 @@ export interface ReconciliationPreview {
 }
 
 export interface TerminalRun {
+  source_document_id?: string;
+  presentation?: { pane_id: string; input: string } | null;
   run_id: string;
   title?: string;
   status: 'running' | 'completed' | 'cancelled' | 'failed';
@@ -559,6 +561,8 @@ export interface TerminalRun {
 }
 
 export interface TerminalRunRequest {
+  contextReferences?: string[];
+  presentation?: { pane_id: string; input: string };
   projectId: string;
   sessionId: string;
   commandId: string;

@@ -12,6 +12,8 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-project-current`
 - `allow-project-recover`
 - `allow-document-create`
+- `allow-workspace-template-get`
+- `allow-workspace-template-enable`
 - `allow-document-rename`
 - `allow-document-delete`
 - `allow-attachment-ingest`
@@ -267,6 +269,84 @@ Enables the attachment_ingest command without any pre-configured scope.
 <td>
 
 Denies the attachment_ingest command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-audio-record-start`
+
+</td>
+<td>
+
+Enables the audio_record_start command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-audio-record-start`
+
+</td>
+<td>
+
+Denies the audio_record_start command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-audio-record-stop`
+
+</td>
+<td>
+
+Enables the audio_record_stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-audio-record-stop`
+
+</td>
+<td>
+
+Denies the audio_record_stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-audio-synthesize`
+
+</td>
+<td>
+
+Enables the audio_synthesize command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-audio-synthesize`
+
+</td>
+<td>
+
+Denies the audio_synthesize command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1879,6 +1959,58 @@ Enables the weave_status command without any pre-configured scope.
 <td>
 
 Denies the weave_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-template-enable`
+
+</td>
+<td>
+
+Enables the workspace_template_enable command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-template-enable`
+
+</td>
+<td>
+
+Denies the workspace_template_enable command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-template-get`
+
+</td>
+<td>
+
+Enables the workspace_template_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-template-get`
+
+</td>
+<td>
+
+Denies the workspace_template_get command without any pre-configured scope.
 
 </td>
 </tr>

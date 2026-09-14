@@ -5,6 +5,11 @@
   import LoomEditor from './lib/LoomEditor.svelte';
   import TerminalPane from './lib/TerminalPane.svelte';
   import type { TerminalSourceRange } from './lib/terminalSelection';
+  import { workspaceRows } from './lib/workspaceTree';
+  import WorkspacePane from './lib/WorkspacePane.svelte';
+  import type { WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
+  import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
+  import { startAudioRecording, stopAudioRecording, synthesizeAudio, type AudioRecording } from './lib/ipc';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
@@ -158,8 +163,6 @@
   import { nativeDropPoint as convertNativeDropPoint, nativeDropScope } from './lib/nativeAttachmentDrop';
   import { suggestionsEnabledFromStoredPreference } from './lib/suggestionPreference';
   import {
-    loadAppearancePreference,
-    persistAppearancePreference,
     resolveAppearance,
     toggledAppearance,
     type AppearancePreference
@@ -378,12 +381,35 @@
   let lastFailure: LoomFailure | null = null;
   let opening = false;
   let search = '';
+  let workspaceTemplate: WorkspaceTemplateSnapshot | null = null;
+  let deferredWorkspaceTemplate: WorkspaceTemplateSnapshot | null = null;
+  let deferredTemplateSession = '';
+  $: if (deferredWorkspaceTemplate && !compositionActive) applyDeferredTemplate();
+  let templateKey = '';
+  let templateSerial = 0;
+  let paneSelection: Record<string, string> = {};
+  let paneEditors: Record<string, WorkspacePane> = {};
+  let paneBusy: Record<string, boolean> = {};
+  let paneComposing: Record<string, boolean> = {};
+  $: configuredPanes = workspaceTemplate?.enabled && !workspaceTemplate.error ? Object.entries(workspaceTemplate.config.panes) : [];
+  $: paneSlots = (['main', 'right', 'bottom'] as const).map(position => {
+    const choices = configuredPanes.filter(([, config]) => config.position === position && config.visible);
+    return { position, choices, selected: choices.find(([id]) => id === paneSelection[position]) ?? choices[0] };
+  });
+  $: mainPane = paneSlots.find(slot => slot.position === 'main')?.selected;
+  $: customMain = Boolean(mainPane && (mainPane[1].kind !== 'editor' || mainPane[1].document));
+  $: if (desktop && project) {
+    const key = `${project.project_id}/${project.session_id}/${project.documents.find(item => item.relative_path === '.loom.md')?.revision_id ?? ''}`;
+    if (key !== templateKey) { templateKey = key; void refreshWorkspaceTemplate(); }
+  } else { workspaceTemplate = null; deferredWorkspaceTemplate = null; templateKey = ''; }
   let outlineOpen = false;
+  let collapsedFolders = new Set<string>();
   let terminalOpen = false;
   let terminalEntry = '';
   let terminalRuns: TerminalRun[] = [];
   let terminalDispatching = false;
   let terminalCancelRequested = false;
+  let cancelledTerminalIds = new Set<string>();
   let terminalPendingRequest: TerminalRunRequest | null = null;
   let terminalError = '';
   let terminalSessionKey = '';
@@ -467,6 +493,12 @@
   } | null = null;
   let documentContextSuppressClickId: string | null = null;
   let documentContextSuppressClickTimer: number | undefined;
+  let retainedRecording: AudioRecording | null = null;
+  let spokenAudio: HTMLAudioElement | null = null;
+  let spokenAudioUrl: string | null = null;
+  let speechPlaybackSerial = 0;
+  let speechPlaybackScope = '';
+  $: if (speechPlaybackScope !== `${project?.session_id ?? ''}/${document?.summary.document_id ?? ''}`) { speechPlaybackScope = `${project?.session_id ?? ''}/${document?.summary.document_id ?? ''}`; stopReadAloud(); }
   let appearance: AppearancePreference = 'system';
   let systemDark = false;
   let appearanceMedia: MediaQueryList | null = null;
@@ -625,7 +657,8 @@
   let visualBoundaryDiagnostic: string | null = null;
   let visualMutationPending = false;
   let verseCodec: VerseEditorCodec | null = null;
-  let compositionActive = false;
+  let mainCompositionActive = false;
+  $: compositionActive = mainCompositionActive || Object.values(paneComposing).some(Boolean);
   let sourceComposing = false;
   let visualEditor: {
     captureTerminalSourceRange: () => TerminalSourceRange | null;
@@ -912,7 +945,7 @@
   $: unpresentableVisualGhostPresentationKeys = completionController.unpresentableVisualKeys;
   $: scheduledSuggestion = completionController.scheduled;
 
-  $: terminalBusy = terminalDispatching || terminalPendingRequest !== null || terminalRuns.some((run) => run.status === 'running');
+  $: terminalBusy = terminalDispatching || terminalPendingRequest !== null || terminalRuns.some((run) => run.status === 'running') || Object.values(paneBusy).some(Boolean);
   $: if (terminalSessionKey !== `${project?.project_id ?? ''}:${project?.session_id ?? ''}`) {
     terminalSessionKey = `${project?.project_id ?? ''}:${project?.session_id ?? ''}`;
     terminalRefreshSerial += 1;
@@ -921,6 +954,7 @@
     terminalError = '';
     terminalDispatching = false;
     terminalCancelRequested = false;
+    cancelledTerminalIds = new Set();
     terminalPendingRequest = null;
     terminalOpen = false;
     if (terminalPollTimer !== undefined) window.clearTimeout(terminalPollTimer);
@@ -929,10 +963,7 @@
   }
 
   $: folderWarnings = project?.folder_warnings ?? [];
-  $: visibleDocuments = project?.documents.filter((candidate) => {
-    const query = search.trim().toLocaleLowerCase();
-    return !query || candidate.title.toLocaleLowerCase().includes(query) || candidate.relative_path.toLocaleLowerCase().includes(query);
-  }) ?? [];
+  $: fileRows = workspaceRows(project?.documents ?? [], collapsedFolders, search);
   $: loadedModel = models.find((model) => model.loaded) ?? null;
   $: currentModel = suggestionWriter(models, buildModelPolicy);
   $: suggestionSetupNeeded = Boolean(
@@ -1690,21 +1721,10 @@
       documentId: document.summary.document_id,
       target: speechTarget()
     };
-    const insertionAnchor = captureSpeechInsertionAnchor(captured.target);
-    if (!insertionAnchor) {
-      speechError = 'Place the caret in an editable manuscript or context surface before dictating.';
-      announce(speechError);
-      return;
-    }
     speechStarting = true;
     speechError = '';
     try {
-      const recording = await startSpeechRecording(
-        captured.projectId,
-        captured.sessionId,
-        captured.documentId,
-        captured.target
-      );
+      const recording = await startAudioRecording(captured.projectId, captured.sessionId, captured.documentId);
       const inScope =
         project?.project_id === captured.projectId &&
         project.session_id === captured.sessionId &&
@@ -1718,8 +1738,8 @@
         return;
       }
       speechRecording = recording;
-      speechInsertionAnchor = insertionAnchor;
-      announce(`Dictating into ${recording.target === 'context' ? 'context' : 'the manuscript'}`);
+      speechInsertionAnchor = null;
+      announce('Recording audio locally');
     } catch (error) {
       speechRecording = null;
       speechInput = null;
@@ -1737,31 +1757,18 @@
     if (!recording || speechStarting) return;
     speechStarting = true;
     try {
-      const snapshot = await stopSpeechRecording(
-        recording.project_id,
-        recording.session_id,
-        recording.recording_id
-      );
+      const captured = retainedRecording ?? await stopAudioRecording(recording.project_id, recording.session_id, recording.recording_id);
+      retainedRecording = captured;
+      const snapshot = await addDocumentContexts(recording.project_id, recording.session_id, captured.document_id, [captured.attachment.id]);
+      adoptAuthoritativeContext(snapshot, recording.project_id, recording.session_id, captured.document_id);
       speechRecording = null;
-      speechInput = snapshot;
-      await acceptSpeechSnapshot(snapshot);
+      retainedRecording = null;
+      speechError = '';
+      announce(captured.activity.limit_reached ? 'Five minutes of audio retained and attached to this document' : captured.activity.signal_detected ? 'Audio retained and attached to this document' : 'Quiet recording retained and attached to this document');
     } catch (error) {
-      try {
-        await cancelSpeechRecording(
-          recording.project_id,
-          recording.session_id,
-          recording.recording_id
-        );
-      } catch {
-        // Stop may already have consumed the native recording. Either way the
-        // backend owns no reusable client handle after this terminal failure.
-      }
-      speechRecording = null;
-      speechInput = null;
-      speechInsertionAnchor = null;
-      speechError = normalizeFailure(error).message;
+      speechError = `${normalizeFailure(error).message} Click the microphone to retry saving this recording.`;
       recordFailure(error);
-      announce('Loom could not stop dictation cleanly');
+      announce(speechError);
     } finally {
       speechStarting = false;
     }
@@ -1771,6 +1778,11 @@
     if (speechStarting) return;
     speechStarting = true;
     try {
+      if (speechRecording && (retainedRecording || speechError)) {
+        speechStarting = false;
+        await finishSpeechRecording();
+        return;
+      }
       if (speechRecording) {
         const recording = speechRecording;
         await cancelSpeechRecording(
@@ -2162,7 +2174,7 @@
 
   onMount(() => {
     componentMounted = true;
-    appearance = loadAppearancePreference(window);
+    appearance = 'system';
     appearanceMedia = window.matchMedia('(prefers-color-scheme: dark)');
     systemDark = appearanceMedia.matches;
     const syncSystemAppearance = (event: MediaQueryListEvent): void => {
@@ -2223,6 +2235,7 @@
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
       window.removeEventListener('pageshow', handleRendererResume);
       window.document.removeEventListener('visibilitychange', handleRendererResume);
+      stopReadAloud();
       appearanceMedia?.removeEventListener('change', syncSystemAppearance);
       appearanceMedia = null;
       clearAutocompleteModelMenuLongPress();
@@ -2386,7 +2399,7 @@
     sourceDirty = false;
     verseCodec = null;
     visualEditor = null;
-    compositionActive = false;
+    mainCompositionActive = false;
     sourceComposing = false;
     branches = [];
     promotionArmedCandidateId = null;
@@ -4257,11 +4270,37 @@
     await tick();
   }
 
+  function stopReadAloud(): void {
+    speechPlaybackSerial++;
+    spokenAudio?.pause();
+    spokenAudio = null;
+    if (spokenAudioUrl) URL.revokeObjectURL(spokenAudioUrl);
+    spokenAudioUrl = null;
+  }
+
+  async function readAloud(): Promise<void> {
+    if (spokenAudio) { stopReadAloud(); return; }
+    if (!document) return;
+    const text = window.getSelection()?.toString().trim() || (sourceTextarea && sourceTextarea.selectionStart !== sourceTextarea.selectionEnd ? sourceTextarea.value.slice(sourceTextarea.selectionStart, sourceTextarea.selectionEnd) : documentText);
+    if (!text.trim()) return;
+    if (new TextEncoder().encode(text).length > 4096) { announce('Select a shorter passage to read aloud'); return; }
+    const serial = ++speechPlaybackSerial;
+    const scope = document.summary.document_id;
+    try {
+      const result = await synthesizeAudio(text);
+      if (serial !== speechPlaybackSerial || document?.summary.document_id !== scope) return;
+      spokenAudioUrl = URL.createObjectURL(new Blob([new Uint8Array(result.wav)], { type: 'audio/wav' }));
+      spokenAudio = new Audio(spokenAudioUrl);
+      spokenAudio.onended = stopReadAloud;
+      await spokenAudio.play();
+      announce('Reading aloud');
+    } catch (error) { if (serial === speechPlaybackSerial) { stopReadAloud(); recordFailure(error); } }
+  }
+
   function setAppearance(next: AppearancePreference): void {
     appearance = next;
-    const persisted = persistAppearancePreference(window, next);
     const label = next === 'system' ? 'Appearance follows the system' : `${next} appearance`;
-    announce(persisted ? label : `${label} for this session`);
+    announce(`${label} for this session`);
   }
 
   function toggleAppearance(): void {
@@ -6461,6 +6500,7 @@
   }
 
   function flushEditors(): boolean {
+    if (Object.values(paneEditors).some(pane => pane && !pane.flush())) return false;
     if (contextPaneOpen && !flushContextEditorProjection()) return false;
     if (!(visualEditor?.flushPending() ?? true) || sourceComposing) return false;
     commitSourceDraft();
@@ -6469,12 +6509,12 @@
 
   function beginSourceComposition(): void {
     sourceComposing = true;
-    compositionActive = true;
+    mainCompositionActive = true;
   }
 
   function finishSourceComposition(textarea: HTMLTextAreaElement): void {
     sourceComposing = false;
-    compositionActive = false;
+    mainCompositionActive = false;
     updateSourceSelection(textarea);
     updateFromSource(textarea.value);
     scheduleSourceProjection(0);
@@ -6677,7 +6717,7 @@
   }
 
   function setVisualComposition(active: boolean): void {
-    compositionActive = active;
+    mainCompositionActive = active;
     if (!active) scheduleSave();
   }
 
@@ -7587,7 +7627,7 @@
   }
 
   function terminalIsBusy(): boolean {
-    return terminalDispatching || terminalPendingRequest !== null || terminalRuns.some((run) => run.status === 'running');
+    return terminalDispatching || terminalPendingRequest !== null || terminalRuns.some((run) => run.status === 'running') || Object.values(paneBusy).some(Boolean);
   }
 
   function terminalScopeIsCurrent(projectId: string, sessionId: string): boolean {
@@ -7607,8 +7647,8 @@
       if (terminalPendingRequest && (!terminalDispatching || runs.some((run) => run.run_id === terminalPendingRequest?.commandId))) {
         terminalPendingRequest = null;
       }
-      if (terminalCancelRequested) {
-        for (const run of runs.filter((candidate) => candidate.status === 'running')) {
+      if (cancelledTerminalIds.size) {
+        for (const run of runs.filter((candidate) => candidate.status === 'running' && cancelledTerminalIds.has(candidate.run_id))) {
           await cancelTerminalRun(projectId, sessionId, run.run_id);
         }
       }
@@ -7677,7 +7717,7 @@
       const request: TerminalRunRequest = {
         ...scope, commandId: newUlid(), documentId, sourceRevisionId,
         expectedVisibleBlobId: document.visible_blob_id,
-        sourceStartByte: range.start, sourceEndByte: range.end, expression
+        sourceStartByte: range.start, sourceEndByte: range.end, expression, presentation: { pane_id: 'terminal', input: expression || new TextDecoder().decode(new TextEncoder().encode(documentText).slice(range.start, range.end)) }
       };
       terminalPendingRequest = request;
       const run = await runTerminal(request);
@@ -7708,6 +7748,7 @@
     try {
       const runIds = new Set(terminalRuns.filter((run) => run.status === 'running').map((run) => run.run_id));
       if (terminalPendingRequest) runIds.add(terminalPendingRequest.commandId);
+      cancelledTerminalIds = new Set([...cancelledTerminalIds, ...runIds]);
       for (const runId of runIds) await cancelTerminalRun(projectId, sessionId, runId);
       if (terminalScopeIsCurrent(projectId, sessionId)) await refreshTerminalRuns();
     } catch (error) {
@@ -7745,6 +7786,7 @@
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
     if (event.defaultPrevented) return;
+    if (event.key === 'Escape' && spokenAudio) { event.preventDefault(); stopReadAloud(); return; }
     if (event.key === 'Escape' && documentContextTarget) {
       event.preventDefault();
       closeDocumentContextMenu();
@@ -7782,6 +7824,15 @@
       return;
     }
     const modifier = event.metaKey || event.ctrlKey;
+    if (modifier && event.shiftKey && !event.altKey && !event.isComposing) {
+      const key = event.key.toLowerCase();
+      if (key === 'u') { event.preventDefault(); void readAloud(); return; }
+      if (event.code === 'Comma') { event.preventDefault(); void refreshWorkspaceTemplate(true); return; }
+      if (key === 'l') { event.preventDefault(); toggleAppearance(); return; }
+      if (key === 'm' && document) { event.preventDefault(); void setMode(mode === 'visual' ? 'source' : 'visual'); return; }
+      if (key === 'f' && formatMenu) { event.preventDefault(); formatMenu.toggleOpen(); return; }
+      if (key === 'j') { event.preventDefault(); void toggleShuttleFromTitlebar(); return; }
+    }
     if (modifier && event.key === 'Enter' && !event.altKey && !event.shiftKey && !event.isComposing) {
       const target = event.target;
       const inManuscript = target instanceof Element && Boolean(target.closest('.editor-stage'));
@@ -8890,6 +8941,12 @@
 
   async function performCloseProject(): Promise<ProjectCloseOutcome> {
     if (!project) return { status: 'closed' };
+    if (speechStarting) { announce('Finishing the microphone operation before closing'); return { status: 'resume' }; }
+    if (speechRecording) {
+      await finishSpeechRecording();
+      if (speechRecording) return { status: 'resume' };
+    }
+    stopReadAloud();
     const retryingPreparedClose = transition === 'closing' && pendingCloseCommandId !== null;
     if (
       missingDocumentRecoveryRequiresCopy(
@@ -9083,6 +9140,50 @@
     return { status: 'closed' };
   }
 
+  async function refreshWorkspaceTemplate(enable = false): Promise<void> {
+    if (!project) return;
+    const scope = { projectId: project.project_id, sessionId: project.session_id };
+    const serial = ++templateSerial;
+    try {
+      const snapshot = await (enable ? enableWorkspaceTemplate : getWorkspaceTemplate)(scope.projectId, scope.sessionId);
+      if (serial !== templateSerial || !terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return;
+      if (!flushEditors()) { deferredTemplateSession = scope.sessionId; deferredWorkspaceTemplate = snapshot; return; }
+      workspaceTemplate = snapshot;
+      if (enable && snapshot.document_id) {
+        await refreshProjectFilesystemState();
+        await openPaneDocument(snapshot.document_id);
+        outlineOpen = true;
+      }
+    } catch (error) { recordFailure(error); }
+  }
+
+  async function openPaneDocument(id: string): Promise<void> {
+    const candidate = project?.documents.find(item => item.document_id === id);
+    if (candidate) await selectDocument(candidate, true);
+  }
+
+  function applyDeferredTemplate(): void {
+    if (project?.session_id !== deferredTemplateSession) { deferredWorkspaceTemplate = null; return; }
+    if (!flushEditors()) return;
+    workspaceTemplate = deferredWorkspaceTemplate;
+    deferredWorkspaceTemplate = null;
+  }
+
+  function selectPane(position: string, id: string): void {
+    if (!flushEditors()) return;
+    paneSelection = { ...paneSelection, [position]: id };
+  }
+
+  async function preparePaneRun(): Promise<OpenDocument | null> {
+    if (!project || !document || editorReadonly || compositionActive || !flushEditors()) return null;
+    const expected = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id, epoch: documentEpoch, text: documentText };
+    const current = () => terminalScopeIsCurrent(expected.projectId, expected.sessionId) && document?.summary.document_id === expected.documentId && documentEpoch === expected.epoch && documentText === expected.text;
+    cancelSuggestionTimer();
+    await cancelActiveBranches();
+    if (!current() || !await flushCurrentDocument() || !current()) return null;
+    return document;
+  }
+
   function kindLabel(kind: DocumentKind): string {
     if (kind === 'verse') return 'Poem';
     if (kind === 'hybrid') return 'Hybrid';
@@ -9114,7 +9215,7 @@
             aria-label={`${outlineOpen ? 'Close' : 'Open'} manuscript outline${folderWarnings.length ? `, ${folderWarnings.length} files not opened` : ''}`}
             title={folderWarnings.length ? `${folderWarnings.length} files not opened — see folder details` : 'Manuscript outline'}
             on:click={() => void setOutlineOpen(!outlineOpen)}
-          ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 4h10M3 8h10M3 12h10" /></svg>
+          ><svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/><path d="M6 2.5v11"/></svg>
             {#if folderWarnings.length}<span class="folder-warning-dot" aria-hidden="true"></span>{/if}
           </button>
         {/if}
@@ -9128,23 +9229,7 @@
             on:click={() => void newDocument()}
           ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
         {/if}
-        {#if document?.summary.kind === 'prose'}
-          <button
-            class="titlebar-button mode-toggle"
-            type="button"
-            aria-label={mode === 'visual' ? 'Switch to Markdown editor' : 'Switch to visual editor'}
-            aria-pressed={mode === 'source'}
-            title={mode === 'visual' ? 'Markdown source' : 'Visual writing'}
-            disabled={editorReadonly}
-            on:click={() => void setMode(mode === 'visual' ? 'source' : 'visual')}
-          >
-            {#if mode === 'visual'}
-              <svg aria-hidden="true" viewBox="0 0 18 18"><path d="m5 13 1.2-3.6 6.6-6.6 2.4 2.4-6.6 6.6L5 13Z"/><path d="m6.2 9.4 2.4 2.4M4.4 14.3h9.2"/></svg>
-            {:else}
-              <span class="markdown-monogram" aria-hidden="true">MD</span>
-            {/if}
-          </button>
-        {/if}
+
       </div>
       <div
         class="titlebar-drag-surface"
@@ -9155,6 +9240,7 @@
         {#if document && mode === 'visual' && canUseVisual && (!contextPaneOpen || canUseVisualMarkdown(contextText, true))}
           <VisualFormatMenu
             bind:this={formatMenu}
+            hiddenTrigger
             editor={contextPaneOpen ? contextVisualEditor : visualEditor}
             formatting={contextPaneOpen ? contextFormatting : visualFormatting}
             onCommandResult={(action, applied) => {
@@ -9165,115 +9251,29 @@
           />
         {/if}
         {#if document}
-          <div class="co-writer-control">
-            <button
-              bind:this={coWriterTrigger}
-              class:active={coWriterOpen}
-              class="titlebar-button co-writer-toggle"
-              type="button"
-              aria-label="Choose a co-writer"
-              aria-haspopup="dialog"
-              aria-expanded={coWriterOpen}
-              aria-controls="co-writer-popover"
-              title="Co-writer"
-              disabled={editorReadonly}
-              on:click={toggleCoWriter}
-            ><svg aria-hidden="true" viewBox="0 0 18 18"><circle cx="9" cy="6" r="2.35"/><path d="M4.7 14.5c.55-2.7 2-4.05 4.3-4.05s3.75 1.35 4.3 4.05"/></svg></button>
-            {#if coWriterOpen}
-              <div
-                bind:this={coWriterPopover}
-                id="co-writer-popover"
-                class="co-writer-popover"
-                role="dialog"
-                aria-label="Co-writers"
-              >
-                <header><strong>Co-writers</strong><span>Reusable completion context</span></header>
-                <form on:submit|preventDefault={() => void saveCurrentCoWriter()}>
-                  <input
-                    bind:value={coWriterName}
-                    aria-label="New co-writer name"
-                    placeholder="Name this context"
-                    maxlength="96"
-                    disabled={coWriterBusy}
-                  />
-                  <button type="submit" disabled={coWriterBusy || !coWriterName.trim()}>Save</button>
-                </form>
-                {#if coWriterError}<p class="co-writer-error" role="alert">{coWriterError}</p>{/if}
-                {#if coWriters.length > 0}
-                  <div class="co-writer-list">
-                    {#each coWriters as profile (profile.id)}
-                      <div class="co-writer-row">
-                        <button
-                          class="co-writer-apply"
-                          type="button"
-                          disabled={coWriterBusy}
-                          on:click={() => void applySelectedCoWriter(profile)}
-                        ><strong>{profile.name}</strong><small>{formatByteCount(profile.context_bytes)}{profile.attachment_count ? ` · ${profile.attachment_count} media` : ''}</small></button>
-                        <button
-                          class="co-writer-delete"
-                          type="button"
-                          aria-label={`Delete co-writer ${profile.name}`}
-                          title="Delete co-writer"
-                          disabled={coWriterBusy}
-                          on:click={() => void removeCoWriter(profile)}
-                        >×</button>
-                      </div>
-                    {/each}
-                  </div>
-                {:else if !coWriterBusy}
-                  <p class="co-writer-empty">Save the current context here to reuse it.</p>
-                {/if}
-              </div>
-            {/if}
-          </div>
           <button
-            bind:this={contextToggleElement}
-            class:active={contextPaneOpen}
-            class="titlebar-button context-toggle"
-            type="button"
-            aria-label={contextPaneOpen ? 'Close completion context' : 'Open completion context'}
-            aria-controls="completion-context-pane"
-            aria-expanded={contextPaneOpen}
-            title="Completion context"
-            on:click={() => {
-              if (contextPaneOpen) closeContextPane();
-              else {
-                contextPaneOpen = true;
-                void refreshDocumentContext();
-              }
-            }}
-          ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="2.25" y="2.25" width="13.5" height="13.5" rx="2.4"/><path d="M2.75 7h12.5"/></svg></button>
-          <button
-            class:recording={Boolean(speechRecording)}
+            class:recording={Boolean(speechRecording) && !speechError}
             class:transcribing={Boolean(speechInput)}
-            class:needs-attention={Boolean(speechError) && !speechInputActive()}
+            class:needs-attention={Boolean(speechError)}
             class="titlebar-button microphone-toggle"
             type="button"
             aria-label={speechRecording
-              ? 'Stop dictation'
+              ? speechError ? 'Retry saving recording' : 'Stop recording'
               : speechInput
                 ? 'Cancel speech recognition'
-                : 'Start dictation'}
+                : 'Record audio'}
             aria-describedby="speech-input-help"
             aria-pressed={Boolean(speechRecording)}
             title={speechError || (speechRecording
-              ? 'Stop dictation'
+              ? 'Stop recording'
               : speechInput
                 ? 'Recognizing locally — click to cancel'
-                : 'Dictate locally')}
+                : 'Record audio for this document')}
             disabled={!desktop || !document || speechStarting || (editorReadonly && !speechInputActive())}
             on:click={toggleSpeechInput}
           ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="6.4" y="2.5" width="5.2" height="8.3" rx="2.6"/><path d="M4.4 8.8a4.6 4.6 0 0 0 9.2 0M9 13.4v2.1M6.8 15.5h4.4"/></svg></button>
-          <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Uses the local microphone and local speech model')}</span>
+          <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Audio stays on this device and is attached to this document')}</span>
         {/if}
-        <button
-          class="titlebar-button try-output-button"
-          type="button"
-          aria-label="Try selection or paragraph"
-          title="Try"
-          disabled={!document || !currentModel?.completion || terminalBusy || editorReadonly}
-          on:click={() => void runRetainedOutput('')}
-        ><svg aria-hidden="true" viewBox="0 0 18 18"><path d="m6 3 9 6-9 6Z"/></svg></button>
         <button
           class:active={suggestionsEnabled && Boolean(currentModel)}
           class:preparing={suggestionsEnabled && !currentModel && !quietModelLoadFailure && (modelLoading || preferredWriterEnsureInFlight !== null || preferredWriterPending !== null)}
@@ -9296,44 +9296,18 @@
           on:pointercancel={finishAutocompleteModelMenuLongPress}
           on:lostpointercapture={finishAutocompleteModelMenuLongPress}
         >
-          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="m9 2 .65 2.1L12 5l-2.35.9L9 8l-.65-2.1L6 5l2.35-.9L9 2ZM4.4 8.4l.45 1.45 1.55.55-1.55.55-.45 1.45-.45-1.45-1.55-.55 1.55-.55.45-1.45ZM12.4 9.2l.85 2.55 2.55.85-2.55.85L12.4 16l-.85-2.55L9 12.6l2.55-.85.85-2.55Z"/></svg>
+          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M3.5 15V8a5.5 5.5 0 0 1 11 0v7l-2.75-2-2.75 2-2.75-2-2.75 2Z"/><path d="M7 7v1M11 7v1"/></svg>
         </button>
         <span id="completion-lifecycle-help" class="sr-only">{completionLifecycleHelp}</span>
         <span id="autocomplete-model-menu-help" class="sr-only">Right-click, touch and hold, or press the Menu key or Shift F10 to open local writing model setup.</span>
         <span id="autocomplete-model-failure-help" class="sr-only">{quietModelLoadFailure ? `Local model setup failed: ${quietModelLoadFailure.message}` : ''}</span>
-        <button
-          class:active={shuttleEnabled}
-          class:preparing={shuttleEnabled && !currentModel && !quietModelLoadFailure && (modelLoading || preferredWriterEnsureInFlight !== null || preferredWriterPending !== null)}
-          class:needs-attention={shuttleEnabled && !currentModel && Boolean(quietModelLoadFailure)}
-          class="titlebar-button shuttle-toggle"
-          type="button"
-          aria-label={shuttleEnabled ? 'Turn Shuttle off' : 'Turn Shuttle on'}
-          aria-pressed={shuttleEnabled}
-          title={shuttleEnabled ? 'Shuttle: accepting one word every four idle seconds' : 'Shuttle: Off'}
-          disabled={!project || suggestionsChanging}
-          on:click={() => void toggleShuttleFromTitlebar()}
-        >
-          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M4 4.5 10.5 9 4 13.5v-9ZM13.5 4.5v9"/></svg>
-        </button>
-        <button
-          class="titlebar-button appearance-button"
-          type="button"
-          aria-label={`Use ${resolvedAppearance === 'dark' ? 'light' : 'dark'} appearance`}
-          title={`Appearance: ${appearance === 'system' ? `System (${resolvedAppearance})` : appearance}`}
-          on:click={toggleAppearance}
-        >
-          {#if resolvedAppearance === 'dark'}
-            <svg aria-hidden="true" viewBox="0 0 18 18"><circle cx="9" cy="9" r="3"/><path d="M9 1.8v1.4M9 14.8v1.4M1.8 9h1.4M14.8 9h1.4M3.9 3.9l1 1M13.1 13.1l1 1M14.1 3.9l-1 1M4.9 13.1l-1 1"/></svg>
-          {:else}
-            <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M14.7 11.7A6.4 6.4 0 0 1 6.3 3.3a6.4 6.4 0 1 0 8.4 8.4Z"/></svg>
-          {/if}
-        </button>
+
       </div>
     </div>
   {/if}
 
   {#if project}
-    <div class:outline-open={outlineOpen} class="workspace-grid">
+    <div class:outline-open={outlineOpen} class:has-right-pane={paneSlots.some(slot => slot.position === 'right' && slot.selected)} class="workspace-grid">
       <aside
         id="project-outline"
         class:open={outlineOpen}
@@ -9346,10 +9320,16 @@
           <input bind:value={search} type="search" placeholder="Find in project" />
         </label>
         <nav class="document-list" aria-label="Documents">
-          {#each visibleDocuments as candidate (candidate.document_id)}
+          {#each fileRows as row (row.path)}
+            {#if row.folder}
+              <button class="folder-row" type="button" style={`padding-left: ${8 + row.depth * 14}px`} aria-expanded={!collapsedFolders.has(row.path) || Boolean(search.trim())} on:click={() => { const next = new Set(collapsedFolders); if (next.has(row.path)) next.delete(row.path); else next.add(row.path); collapsedFolders = next; }}>
+                <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{row.title}</span>
+              </button>
+            {:else}
+            {@const candidate = row.document}
             {#if renamingDocumentId === candidate.document_id}
               <div class:active={candidate.document_id === document?.summary.document_id} class="document-row editing">
-                <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
+
                 <span class="document-label">
                   <input
                     bind:this={renameDocumentInput}
@@ -9364,12 +9344,14 @@
                     on:keydown={handleDocumentRenameKeydown}
                     on:blur={handleDocumentRenameBlur}
                   />
-                  <small>{candidate.word_count.toLocaleString()} {candidate.word_count === 1 ? 'word' : 'words'}</small>
+
                 </span>
               </div>
             {:else}
             <div
               class="document-row-group"
+              class:template-file={row.path.split('/').at(-1)?.startsWith('.')}
+              style={`padding-left: ${row.depth * 14}px`}
               class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}
             >
               <button
@@ -9387,10 +9369,10 @@
                 on:pointerup={finishDocumentContextLongPress}
                 on:pointercancel={finishDocumentContextLongPress}
               >
-                <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
+
                 <span class="document-label">
                   <strong data-document-title>{candidate.title}</strong>
-                  <small>{candidate.word_count.toLocaleString()} {candidate.word_count === 1 ? 'word' : 'words'}</small>
+
                 </span>
               </button>
               <button
@@ -9404,6 +9386,7 @@
                 on:click={(event) => handleVisibleDocumentActions(event, candidate)}
               ><span aria-hidden="true">•••</span></button>
             </div>
+            {/if}
             {/if}
           {:else}
             <p class="empty-copy">No notes.</p>
@@ -9473,7 +9456,7 @@
         {/if}
       </aside>
 
-      <main id="manuscript" class="manuscript-area" tabindex="-1">
+      <main id="manuscript" class="manuscript-area" tabindex="-1" class:workspace-main-hidden={customMain}>
         {#if document && contextPaneOpen}
           <div
             bind:this={contextPaneElement}
@@ -9825,10 +9808,27 @@
           </section>
         {/if}
       </main>
+      {#each paneSlots as slot (slot.position)}
+        {#if slot.selected && (slot.position !== 'main' || customMain)}
+          {@const selected = slot.selected}
+          <aside class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
+            <header class="workspace-pane-header">
+              <select aria-label="Pane" value={selected[0]} on:change={(event) => selectPane(slot.position, event.currentTarget.value)}>
+                {#each slot.choices as [id, config]}<option value={id}>{config.title ?? id}</option>{/each}
+              </select>
+            </header>
+            <WorkspacePane bind:this={paneEditors[slot.position]} paneId={selected[0]} config={selected[1]} modelLabel={currentModel?.display_name ?? 'Local model'} onModelSelect={openModelManager} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} onCompositionChange={(active) => paneComposing = { ...paneComposing, [slot.position]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [slot.position]: busy }} />
+          </aside>
+        {/if}
+      {/each}
+
     </div>
       <TerminalPane
         bind:open={terminalOpen}
         bind:entry={terminalEntry}
+        projectId={project.project_id}
+        sessionId={project.session_id}
+        documents={project.documents}
         runs={terminalRuns}
         busy={terminalBusy}
         disabled={applicationClosePhase !== 'running'}

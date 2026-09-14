@@ -39,8 +39,6 @@ pub(crate) enum MicrophoneCaptureError {
     Stream(String),
     #[error("audio arrived faster than Loom's bounded recorder could consume it")]
     QueueOverflow,
-    #[error("the recording exceeded Loom's five-minute limit")]
-    DurationLimit,
     #[error("the recording did not contain any audio")]
     Empty,
     #[error("the microphone controller is unavailable: {0}")]
@@ -417,9 +415,8 @@ fn finish(mut capture: Active) -> Result<Vec<u8>, MicrophoneCaptureError> {
     if capture.overflowed.load(Ordering::Acquire) {
         return Err(MicrophoneCaptureError::QueueOverflow);
     }
-    if capture.too_long {
-        return Err(MicrophoneCaptureError::DurationLimit);
-    }
+    // `push` already bounded this buffer. Retain that material when the limit
+    // is reached instead of throwing away five minutes of recording.
     encode_wav(&capture.samples)
 }
 

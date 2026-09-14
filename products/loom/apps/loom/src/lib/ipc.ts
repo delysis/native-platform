@@ -49,6 +49,7 @@ const PREFIX = 'plugin:loom|';
 const INDEPENDENT_COMMANDS = new Set([
   'application_close_abort',
   'application_close_pending',
+  'audio_synthesize',
   'build_model_policy_get',
   'shader_preview',
   'model_catalog_list',
@@ -323,6 +324,44 @@ export function getSpeechInputCapabilities(
   sessionId: string
 ): Promise<unknown> {
   return call('speech_input_capabilities', { projectId, sessionId });
+}
+
+export interface AudioActivity {
+  duration_ms: number;
+  signal_detected: boolean;
+  limit_reached: boolean;
+  segments: Array<{ start_ms: number; end_ms: number }>;
+}
+
+export interface AudioRecording {
+  recording_id: string;
+  document_id: string;
+  attachment: ContextAttachment;
+  activity: AudioActivity;
+}
+
+export interface AudioSpeech {
+  wav: number[];
+}
+
+export function startAudioRecording(
+  projectId: string,
+  sessionId: string,
+  documentId: string
+): Promise<SpeechRecordingSnapshot> {
+  return call('audio_record_start', { projectId, sessionId, documentId });
+}
+
+export function stopAudioRecording(
+  projectId: string,
+  sessionId: string,
+  recordingId: string
+): Promise<AudioRecording> {
+  return call('audio_record_stop', { projectId, sessionId, recordingId });
+}
+
+export function synthesizeAudio(text: string): Promise<AudioSpeech> {
+  return call('audio_synthesize', { text });
 }
 
 export function startSpeechRecording(
@@ -865,4 +904,11 @@ export function cancelTerminalRun(projectId: string, sessionId: string, runId: s
 
 export function compileShaderPreview(source: string): Promise<{ fragment: string }> {
   return call('shader_preview', { source });
+}
+
+export function getWorkspaceTemplate(projectId: string, sessionId: string): Promise<import('./workspaceTemplate').WorkspaceTemplateSnapshot> {
+  return call('workspace_template_get', { projectId, sessionId });
+}
+export function enableWorkspaceTemplate(projectId: string, sessionId: string): Promise<import('./workspaceTemplate').WorkspaceTemplateSnapshot> {
+  return call('workspace_template_enable', { projectId, sessionId });
 }

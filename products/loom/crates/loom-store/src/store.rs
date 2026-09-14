@@ -3658,8 +3658,7 @@ fn document_path_for_title(relative_path: &str, title: &str) -> Result<String> {
         });
     let file_name_bytes =
         title.len() + extension.map_or(0, |extension| extension.len().saturating_add(1));
-    if title.starts_with('.')
-        || title.ends_with('.')
+    if title.ends_with('.')
         || title.ends_with(' ')
         || title
             .chars()
@@ -4039,6 +4038,28 @@ mod tests {
                 .active_revision_id,
             Some(loaded.revision_id)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_markdown_can_be_named_as_a_hidden_template_without_rewriting_it() {
+        let (_directory, mut store) = new_store();
+        store
+            .create_document_if_absent(
+                "Template.md",
+                DocumentContent::Prose("My exact template\n".into()),
+                "author template",
+            )
+            .unwrap();
+        let source = store.read_document("Template.md").unwrap();
+        let mut authority = store.open_document_file("Template.md").unwrap();
+        let renamed = store.rename_document(&mut authority, ".chat").unwrap();
+        assert_eq!(renamed.relative_path, ".chat.md");
+        let after = store.read_document(".chat.md").unwrap();
+        assert_eq!(after.document_id, source.document_id);
+        assert_eq!(after.revision_id, source.revision_id);
+        assert_eq!(after.blob_id, source.blob_id);
+        assert_eq!(after.text, source.text);
     }
 
     #[test]

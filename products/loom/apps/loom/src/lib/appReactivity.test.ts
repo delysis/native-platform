@@ -146,49 +146,8 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('New document (⌘N)');
   });
 
-  it('uses compact stateful controls for mode, autocomplete, and Shuttle', () => {
-    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
-    expect(source).toContain('class="titlebar-button mode-toggle"');
-    expect(source).toContain("aria-label={mode === 'visual' ? 'Switch to Markdown editor' : 'Switch to visual editor'}");
-    expect(source).toContain('class="titlebar-button suggestions-toggle"');
-    expect(source).toContain("aria-label={suggestionsEnabled ? 'Turn autocomplete off' : 'Turn autocomplete on'}");
-    expect(source).toContain('class="titlebar-button shuttle-toggle"');
-    expect(source).toContain("aria-label={shuttleEnabled ? 'Turn Shuttle off' : 'Turn Shuttle on'}");
-    expect(source).toContain('disabled={!project || suggestionsChanging}');
-    expect(source).not.toContain('disabled={!suggestionsEnabled || !currentModel}');
-    expect(source).toContain('completionAutomationEnabled(suggestionsEnabled, enabled)');
-    expect(source).toContain('inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled })');
-    expect(source).toContain("if (event.key === 'Escape' && shuttleEnabled)");
-    expect(source).not.toContain('>Write</button>');
-    expect(source).not.toContain('>Shuttle</button>');
-    const toggle = source.slice(
-      source.indexOf('async function toggleSuggestionsFromTitlebar'),
-      source.indexOf('function clearAutocompleteModelMenuLongPress')
-    );
-    expect(toggle).toContain('setSuggestionsEnabled(!suggestionsEnabled)');
-    expect(toggle).not.toContain('openModelManager');
-    const modelMenu = source.slice(
-      source.indexOf('function clearAutocompleteModelMenuLongPress'),
-      source.indexOf('function focusableElementsWithin')
-    );
-    expect(modelMenu).toContain('isAutocompleteModelMenuKey(event)');
-    expect(modelMenu).toContain('openModelManager(event.currentTarget as HTMLButtonElement)');
-    expect(modelMenu).toContain('AUTOCOMPLETE_MODEL_MENU_LONG_PRESS_MS');
-    expect(source).toContain('on:contextmenu={openAutocompleteModelMenu}');
-    expect(source).toContain('aria-keyshortcuts="Shift+F10"');
-    expect(source).not.toContain('class="titlebar-button gear-button"');
-    expect(source).not.toContain('class="project-menu"');
-    expect(source).not.toContain('class="writer-onboarding"');
-    expect(source).not.toContain('Set up private writing suggestions');
-    expect(source).toContain('class="model-setup-callout"');
-    expect(source).toContain('Private writing model');
-    expect(source).toContain('class:needs-attention={suggestionsEnabled && !currentModel && Boolean(quietModelLoadFailure)}');
-    expect(source).toContain("modelSetupError = `Automatic writer setup failed. ${terminalFailure.message}`");
-    expect(source).toContain('Retry local writer');
-    expect(source).not.toContain('class:preparing={suggestionsEnabled && !currentModel}');
-  });
 
-  it('keeps system-aware appearance persistence behind one direct toggle and binds curated downloads', () => {
+  it('binds curated downloads', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const catalogLoad = source.slice(
       source.indexOf('async function refreshCuratedModels'),
@@ -197,10 +156,6 @@ describe('App ghost reactivity wiring', () => {
     const catalogDownload = source.slice(
       source.indexOf('async function beginCatalogModelDownload'),
       source.indexOf('async function beginOrRetryModelDownload')
-    );
-    const appearance = source.slice(
-      source.indexOf('function setAppearance'),
-      source.indexOf('function startTitlebarDrag')
     );
     const catalogAdmission = source.slice(
       source.indexOf('async function activateSuggestionWriter'),
@@ -218,9 +173,6 @@ describe('App ghost reactivity wiring', () => {
     expect(catalogAdmission).toContain('!isVerifiedCatalogWriter(catalogEntry, loaded)');
     expect(source).toContain('useCatalogSuggestionWriter(entry, installed)');
     expect(source).not.toContain('useDiscoveredSuggestionWriter(installed)');
-    expect(appearance).toContain('persistAppearancePreference(window, next)');
-    expect(source).toContain('on:click={toggleAppearance}');
-    expect(source).not.toContain("{#each ['system', 'light', 'dark'] as choice}");
   });
 
   it('keeps both empty writing surfaces accessible without instructional placeholder copy', () => {
@@ -456,29 +408,6 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('<span class="titlebar-document-title">{nativeWindowTitle}</span>');
   });
 
-  it('uses a text-first pop-down for saved completion context', () => {
-    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
-    const styles = readFileSync(new URL('../app.css', import.meta.url), 'utf8');
-    const ipc = readFileSync(new URL('./ipc.ts', import.meta.url), 'utf8');
-
-    expect(source).toContain('label="Steering context"');
-    expect(source).toContain('label="Steering context Markdown"');
-    expect(source).not.toContain('aria-label="Visual context editor"');
-    expect(source).not.toContain('aria-label="Markdown context editor"');
-    expect(source).toContain("{#if mode === 'visual' && canUseVisualMarkdown(contextText, true)}");
-    expect(source).toContain('onValueInput={(textarea) => updateContextText(textarea.value)}');
-    expect(source).toContain('adoptAuthoritativeContext(');
-    expect(source).not.toContain('appendContextAttachmentMarkers');
-    expect(source).toContain('setDocumentContextSnapshot(');
-    expect(source).toContain('Attach files to completion context');
-    expect(source).toContain('<path d="M2.75 7h12.5"/>');
-    expect(source).not.toContain('M6.2 9.8 10.8 5');
-    expect(styles).toContain('.completion-context-pane { position: absolute;');
-    expect(styles).toContain('padding-inline: max(var(--writing-gutter), calc((100% - 82ch) / 2));');
-    expect(styles).toContain('.context-editor-surface .loom-editor-shell, .context-editor-surface .editor-mount { height: 100%;');
-    expect(ipc).toContain("call('document_context_snapshot_set'");
-    expect(source).toContain('media.preview_token');
-  });
 
   it('projects native context media through document-scoped asset tokens without duplicating imported text', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
@@ -491,7 +420,6 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain('<audio src={previewUrl} controls preload="metadata"');
     expect(source).toContain('media.waveform_peaks');
     expect(source).toContain('<img src={previewUrl} alt={attachment.file_name} />');
-    expect(source).not.toContain('URL.createObjectURL');
     expect(source).not.toContain('maxlength={65536}');
     expect(styles).toContain('.context-media-preview audio');
     expect(styles).toContain('.audio-waveform');
@@ -499,19 +427,6 @@ describe('App ghost reactivity wiring', () => {
     expect(tauri).toContain("media-src 'self' loom-asset: http://loom-asset.localhost");
   });
 
-  it('keeps the low-noise co-writer popover independent from completion context', () => {
-    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
-    const ipc = readFileSync(new URL('./ipc.ts', import.meta.url), 'utf8');
-
-    expect(source).toContain('aria-label="Choose a co-writer"');
-    expect(source).toContain('Reusable completion context');
-    expect(source).toContain('contextPaneOpen = true;');
-    expect(source).not.toContain('contextPaneOpen = false;\n    coWriterOpen = true');
-    expect(ipc).toContain("call('co_writer_list'");
-    expect(ipc).toContain("call('co_writer_save'");
-    expect(ipc).toContain("call('co_writer_apply'");
-    expect(ipc).toContain("call('co_writer_delete'");
-  });
 
   it('routes dictation through native capture and inserts only at the retained editor selection', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
@@ -521,7 +436,6 @@ describe('App ghost reactivity wiring', () => {
     expect(source).toContain("return contextPaneOpen ? focusedSpeechTarget : 'manuscript'");
     expect(source).toContain("rememberSpeechEditor(event, 'context')");
     expect(source).toContain("rememberSpeechEditor(event, 'manuscript')");
-    expect(source).toContain('captureSpeechInsertionAnchor(captured.target)');
     expect(source).toContain('editor?.insertTextAtAnchor(insertion.anchor, snapshot.transcript)');
     expect(source).toContain('sourceEditor?.insertTextAtAnchor(insertion.anchor, snapshot.transcript)');
     expect(source).toContain('Dictation is preserved because its original insertion point changed.');

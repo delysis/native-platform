@@ -11,6 +11,8 @@ permissions = [
   "allow-project-current",
   "allow-project-recover",
   "allow-document-create",
+  "allow-workspace-template-get",
+  "allow-workspace-template-enable",
   "allow-document-rename",
   "allow-document-delete",
   "allow-attachment-ingest",

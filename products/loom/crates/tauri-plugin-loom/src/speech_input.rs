@@ -46,7 +46,14 @@ pub(crate) enum SpeechInputPhase {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum SpeechRecordingPhase {
     Recording,
+    Captured,
     Cancelled,
+}
+
+#[derive(Debug)]
+pub(crate) struct CapturedAudio {
+    pub(crate) recording: SpeechRecordingSnapshot,
+    pub(crate) wav: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -241,6 +248,23 @@ impl SpeechInputService {
             .await
     }
 
+    /// Explicit capture is independent of any transcription model. Callers
+    /// retain the WAV returned by `record_stop_capture` before choosing a route.
+    pub(crate) async fn record_start_capture(
+        &self,
+        project_id: String,
+        session_id: String,
+        document_id: String,
+    ) -> Result<SpeechRecordingSnapshot, SpeechInputError> {
+        self.record_start_ready(
+            project_id,
+            session_id,
+            document_id,
+            SpeechInputTarget::Context,
+        )
+        .await
+    }
+
     async fn record_start_ready(
         &self,
         project_id: String,
@@ -387,6 +411,25 @@ impl SpeechInputService {
         session_id: &str,
         recording_id: &str,
     ) -> Result<SpeechInputSnapshot, SpeechInputError> {
+        let captured = self
+            .record_stop_capture(project_id, session_id, recording_id)
+            .await?;
+        self.transcribe_wav(
+            captured.recording.project_id,
+            captured.recording.session_id,
+            captured.recording.document_id,
+            captured.recording.target,
+            captured.wav,
+        )
+        .await
+    }
+
+    pub(crate) async fn record_stop_capture(
+        &self,
+        project_id: &str,
+        session_id: &str,
+        recording_id: &str,
+    ) -> Result<CapturedAudio, SpeechInputError> {
         let _lifecycle = self.recording_lifecycle.lock().await;
         let recording = self
             .recording
@@ -401,14 +444,10 @@ impl SpeechInputService {
             .await
             .map_err(|error| SpeechInputError::Task(error.to_string()))?;
         *self.recording.lock().map_err(|_| SpeechInputError::State)? = None;
-        self.transcribe_wav(
-            recording.project_id,
-            recording.session_id,
-            recording.document_id,
-            recording.target,
-            wav?,
-        )
-        .await
+        Ok(CapturedAudio {
+            recording: recording.snapshot(SpeechRecordingPhase::Captured),
+            wav: wav?,
+        })
     }
 
     pub(crate) async fn record_cancel(
@@ -1208,6 +1247,31 @@ mod tests {
             .bind_scope("project".into(), "session".into())
             .expect("bind");
         Arc::new(service)
+    }
+
+    #[tokio::test]
+    async fn explicit_audio_capture_never_initializes_or_admits_transcription() {
+        let microphone = Arc::new(TestMicrophone::default());
+        let mut service = SpeechInputService::new(None);
+        service.microphone = microphone;
+        service
+            .bind_scope("project".into(), "session".into())
+            .expect("bind");
+        let service = Arc::new(service);
+        let recording = service
+            .record_start_capture("project".into(), "session".into(), "document".into())
+            .await
+            .expect("capture without STT");
+        let captured = service
+            .record_stop_capture("project", "session", &recording.recording_id)
+            .await
+            .expect("captured original WAV");
+        assert_eq!(captured.wav, wav_header());
+        assert_eq!(captured.recording.document_id, "document");
+        assert_eq!(captured.recording.phase, SpeechRecordingPhase::Captured);
+        assert!(service.host.get().is_none());
+        assert!(service.sessions.lock().expect("sessions").is_empty());
+        service.shutdown().await.expect("capture owner drains");
     }
 
     #[tokio::test]

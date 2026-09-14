@@ -1336,6 +1336,8 @@ struct OwnedBackendReceipt {
 enum WriterInputContract {
     #[default]
     RawCompletion,
+    /// Ordered native media markers precede the unchanged raw prompt, without roles.
+    RawCompletionWithMediaPrefix,
     InstructionChat,
     Gemma4NonThinkingChat,
 }
@@ -1676,10 +1678,10 @@ fn validate_request(
         ));
     }
     if request.prompt_recipe.mode == PromptMode::RawCompletion
-        && (!request.context_preamble.is_empty() || !request.media.is_empty())
+        && !request.context_preamble.is_empty()
     {
         return Err(LlamaBackendError::InvalidRequest(
-            "raw completion requires a self-contained text prompt without context preamble or media".to_string(),
+            "raw completion requires a self-contained text prompt without a hidden context preamble".to_string(),
         ));
     }
     if request.prompt_recipe.exact_prompt_blob_id != prompt_blob_id {
@@ -1690,11 +1692,6 @@ fn validate_request(
     if request.prompt_recipe.exact_prompt_token_ids.is_some() {
         return Err(LlamaBackendError::InvalidRequest(
             "text completion cannot accept an unverified predeclared token prompt".to_string(),
-        ));
-    }
-    if !request.media.is_empty() && !model.capabilities.chat.is_supported() {
-        return Err(LlamaBackendError::InvalidRequest(
-            "media attachments require a model with an exact native chat contract".to_string(),
         ));
     }
     let _ = continuation_context_binding(&request.context_preamble, &request.media)?;
@@ -1770,7 +1767,8 @@ fn build_native_request(
             .map(|case| GenerationCase {
                 case_id: case.generation.branch_id.to_string(),
                 input: match input_contract {
-                    WriterInputContract::RawCompletion => {
+                    WriterInputContract::RawCompletion
+                    | WriterInputContract::RawCompletionWithMediaPrefix => {
                         llama_native_types::GenerationInput::Completion {
                             prompts: vec![CompletionPrompt::Text {
                                 text: contextual_prefix.clone(),
@@ -1843,7 +1841,7 @@ fn writer_input_contract_for_mode(
     model: &VerifiedModelDescriptor,
 ) -> WriterInputContract {
     if mode == PromptMode::RawCompletion {
-        WriterInputContract::RawCompletion
+        raw_input_contract(has_media)
     } else {
         writer_input_contract_for_media(has_media, model)
     }
@@ -1854,10 +1852,18 @@ fn writer_input_contract_for_media(
     model: &VerifiedModelDescriptor,
 ) -> WriterInputContract {
     let contract = writer_input_contract(model);
-    if !has_media || contract == WriterInputContract::Gemma4NonThinkingChat {
-        contract
+    if contract == WriterInputContract::RawCompletion {
+        raw_input_contract(has_media)
     } else {
-        WriterInputContract::InstructionChat
+        contract
+    }
+}
+
+fn raw_input_contract(has_media: bool) -> WriterInputContract {
+    if has_media {
+        WriterInputContract::RawCompletionWithMediaPrefix
+    } else {
+        WriterInputContract::RawCompletion
     }
 }
 
@@ -3153,7 +3159,7 @@ mod tests {
     }
 
     #[test]
-    fn native_media_stays_byte_exact_and_forces_the_bound_chat_transport() {
+    fn instruction_model_media_stays_byte_exact_with_its_bound_chat_transport() {
         let mut request = request_with_two_cases();
         request.context_preamble = "Reference the attached sound and image.".to_owned();
         let bytes = b"native media fixture".to_vec();
@@ -3167,6 +3173,7 @@ mod tests {
         let mut model = verify_model_inspection(&request.model, model_inspection(&request.model))
             .expect("verified fixture model");
         model.capabilities.chat = crate::CapabilitySupport::Supported;
+        model.display_name = "fixture-instruct".to_owned();
 
         let native = build_native_request(&request, &model);
         assert_eq!(native.media, request.media);
@@ -3378,6 +3385,56 @@ mod tests {
             verify_model_inspection(&first_profile, mismatched),
             Err(ModelInspectionError::ModelPathMismatch)
         ));
+    }
+
+    #[test]
+    fn base_media_uses_raw_completion_and_binds_payload_order() {
+        let mut request = request_with_two_cases();
+        for (id, kind, mime) in [
+            ("voice", MediaKind::Audio, "audio/wav"),
+            ("picture", MediaKind::Image, "image/png"),
+        ] {
+            let bytes = id.as_bytes().to_vec();
+            request.media.push(MediaInput {
+                id: id.into(),
+                kind,
+                mime: mime.into(),
+                sha256: BlobId::digest(&bytes).to_string(),
+                bytes,
+            });
+        }
+        let mut model = verify_model_inspection(&request.model, model_inspection(&request.model))
+            .expect("verified base fixture");
+        model.capabilities.chat = crate::CapabilitySupport::Unsupported;
+        for mode in [PromptMode::Completion, PromptMode::RawCompletion] {
+            request.prompt_recipe.mode = mode;
+            validate_request(&request, &model, 64)
+                .expect("media needs a projector, not chat roles");
+            assert_eq!(
+                writer_input_contract_for_request(&request, &model),
+                WriterInputContract::RawCompletionWithMediaPrefix
+            );
+            let native = build_native_request(&request, &model);
+            assert_eq!(native.media, request.media);
+            for case in native.cases {
+                assert_eq!(
+                    case.input,
+                    llama_native_types::GenerationInput::Completion {
+                        prompts: vec![CompletionPrompt::Text {
+                            text: request.exact_manuscript_prefix.clone(),
+                            special_tokens: SpecialTokenPolicy::AddBosParseSpecial,
+                        }],
+                    }
+                );
+            }
+        }
+        let first = continuation_context_binding("", &request.media).expect("binding");
+        request.media.reverse();
+        let reversed = continuation_context_binding("", &request.media).expect("binding");
+        assert_ne!(
+            first, reversed,
+            "payload order is part of preserved provenance"
+        );
     }
 
     #[test]
