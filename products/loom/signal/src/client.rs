@@ -23,21 +23,30 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 type Client = Manager<SqliteStore, Registered>;
-type Output = mpsc::Sender<Response>;
+
+#[derive(Clone)]
+struct Output {
+    sender: mpsc::Sender<Response>,
+    stop: CancellationToken,
+}
 
 pub async fn run(
     vault: Vault,
     mut requests: mpsc::Receiver<Request>,
-    output: Output,
+    output: mpsc::Sender<Response>,
     stop: CancellationToken,
 ) -> Result<()> {
     retention::sweep(&vault.database).await?;
-    let mut manager = if vault.store.load_registration_data().await?.is_some() {
-        Some(Manager::load_registered(vault.store.clone()).await?)
-    } else {
-        None
+    let output = Output {
+        sender: output,
+        stop: stop.clone(),
     };
-    let (phase_tx, phase) = watch::channel(Phase::Unlinked);
+    let mut manager = registered_client(&vault.store).await?;
+    let (phase_tx, phase) = watch::channel(if manager.is_some() {
+        Phase::Connecting
+    } else {
+        Phase::Unlinked
+    });
     let mut receiver = manager.as_ref().map(|client| {
         start_receiver(
             client.clone(),
@@ -47,27 +56,54 @@ pub async fn run(
             stop.clone(),
         )
     });
-    let (linked_tx, mut linked_rx) = mpsc::channel::<Result<Client, ()>>(1);
-    let mut linking: Option<JoinHandle<()>> = None;
+    let mut linking: Option<JoinHandle<Result<Client, ()>>> = None;
     let mut expiry = tokio::time::interval(Duration::from_secs(10));
     let initial_phase = *phase.borrow();
     emit(&output, None, status(manager.as_ref(), initial_phase)).await;
-    loop {
+    // Every fallible exit from the session joins its owned tasks. In
+    // particular, a disk failure must not detach the message receiver.
+    let result: Result<()> = async {
+      loop {
         tokio::select! {
             biased;
             () = stop.cancelled() => break,
-            Some(linked) = linked_rx.recv() => {
+            linked = async {
+                match linking.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 linking = None;
+                // Provisioning may have committed registration before its
+                // final network step failed or timed out. That device remains
+                // ours and must be resumed instead of replaced by a new link.
+                let linked = match linked {
+                    Ok(Ok(client)) => Some(client),
+                    Ok(Err(())) | Err(_) => registered_client(&vault.store).await?,
+                };
                 match linked {
-                    Ok(client) => {
+                    Some(client) => {
+                        phase_tx.send_replace(Phase::Connecting);
                         receiver = Some(start_receiver(client.clone(), vault.database.clone(), output.clone(), phase_tx.clone(), stop.clone()));
                         manager = Some(client);
                     }
-                    Err(()) => {
+                    None => {
                         phase_tx.send_replace(Phase::Unlinked);
                         emit(&output, None, failure("link_failed", "Signal linking did not complete. You can try again.", true)).await;
                     }
                 }
+            }
+            _ = async {
+                match receiver.as_mut() {
+                    Some(task) => task.await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                receiver = None;
+                // Let the process supervisor reopen the same encrypted
+                // device after a receiver panic, rather than remain falsely
+                // connected with no task receiving messages.
+                anyhow::bail!("Signal receiver stopped unexpectedly");
             }
             _ = expiry.tick() => {
                 if retention::sweep(&vault.database).await? {
@@ -88,16 +124,16 @@ pub async fn run(
                     }
                     Command::CancelLink => {
                         if let Some(task) = linking.take() { task.abort(); let _ = task.await; }
-                        while linked_rx.try_recv().is_ok() {}
                         // Cancellation can race the durable registration commit.
                         // Recover that committed device instead of advertising a
                         // fresh link and accidentally replacing its credentials.
-                        if manager.is_none() && vault.store.load_registration_data().await?.is_some() {
-                            let client = Manager::load_registered(vault.store.clone()).await?;
-                            receiver = Some(start_receiver(client.clone(), vault.database.clone(), output.clone(), phase_tx.clone(), stop.clone()));
-                            manager = Some(client);
-                            phase_tx.send_replace(Phase::Connecting);
-                        } else if manager.is_none() { phase_tx.send_replace(Phase::Unlinked); }
+                        if manager.is_none() {
+                            manager = registered_client(&vault.store).await?;
+                            if let Some(client) = &manager {
+                                receiver = Some(start_receiver(client.clone(), vault.database.clone(), output.clone(), phase_tx.clone(), stop.clone()));
+                                phase_tx.send_replace(Phase::Connecting);
+                            } else { phase_tx.send_replace(Phase::Unlinked); }
+                        }
                         let observed = *phase.borrow();
                         emit(&output, Some(id), status(manager.as_ref(), observed)).await;
                     }
@@ -109,7 +145,6 @@ pub async fn run(
                         phase_tx.send_replace(Phase::Linking);
                         let store = vault.store.clone();
                         let output = output.clone();
-                        let linked = linked_tx.clone();
                         linking = Some(tokio::task::spawn_local(async move {
                             let (link_tx, link_rx) = oneshot::channel::<url::Url>();
                             let provision = async {
@@ -128,11 +163,10 @@ pub async fn run(
                                 }
                             };
                             let registration = Manager::link_secondary_device(store, SignalServers::Production, device_name, link_tx);
-                            let result = tokio::time::timeout(Duration::from_secs(180), async {
+                            tokio::time::timeout(Duration::from_secs(180), async {
                                 let (result, ()) = futures::future::join(registration, provision).await;
                                 result.map_err(|_| ())
-                            }).await.unwrap_or(Err(()));
-                            let _ = linked.send(result).await;
+                            }).await.unwrap_or(Err(()))
                         }));
                     }
                     command => {
@@ -143,7 +177,9 @@ pub async fn run(
                 }
             }
         }
-    }
+      }
+      Ok(())
+    }.await;
     stop.cancel();
     if let Some(task) = linking {
         task.abort();
@@ -152,9 +188,20 @@ pub async fn run(
     if let Some(task) = receiver.take() {
         let _ = task.await;
     }
-    emit(&output, None, Event::Stopped).await;
+    let _ = output.sender.try_send(Response {
+        id: None,
+        event: Event::Stopped,
+    });
     vault.database.close().await;
-    Ok(())
+    result
+}
+
+async fn registered_client(store: &SqliteStore) -> Result<Option<Client>> {
+    if store.load_registration_data().await?.is_some() {
+        Ok(Some(Manager::load_registered(store.clone()).await?))
+    } else {
+        Ok(None)
+    }
 }
 
 fn status(manager: Option<&Client>, phase: Phase) -> Event {
@@ -171,7 +218,13 @@ fn status(manager: Option<&Client>, phase: Phase) -> Event {
 }
 
 async fn emit(output: &Output, id: Option<String>, event: Event) {
-    let _ = output.send(Response { id, event }).await;
+    tokio::select! {
+        biased;
+        () = output.stop.cancelled() => (),
+        sent = output.sender.send(Response { id, event }) => {
+            if sent.is_err() { output.stop.cancel(); }
+        }
+    }
 }
 
 fn failure(code: &str, message: &str, retryable: bool) -> Event {
@@ -491,4 +544,36 @@ fn start_receiver(
             backoff = (backoff * 2).min(30);
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stopping_releases_a_receiver_blocked_by_the_full_outbox() {
+        let (sender, mut responses) = mpsc::channel(1);
+        let stop = CancellationToken::new();
+        let output = Output {
+            sender,
+            stop: stop.clone(),
+        };
+        emit(&output, None, Event::Stopped).await;
+        let blocked = tokio::spawn(async move { emit(&output, None, Event::Stopped).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "the full outbox applies backpressure"
+        );
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("cancellation releases the sender")
+            .expect("sender joined");
+        assert!(responses.recv().await.is_some());
+        assert!(
+            responses.recv().await.is_none(),
+            "no detached sender retains the outbox"
+        );
+    }
 }
