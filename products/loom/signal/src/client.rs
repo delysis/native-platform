@@ -188,10 +188,6 @@ pub async fn run(
     if let Some(task) = receiver.take() {
         let _ = task.await;
     }
-    let _ = output.sender.try_send(Response {
-        id: None,
-        event: Event::Stopped,
-    });
     vault.database.close().await;
     result
 }

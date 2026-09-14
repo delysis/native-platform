@@ -108,6 +108,13 @@ Workspace bookmarks use the same database, with versioned updates, exact retries
 tokens or group keys. The bundled frontend/native host and worker use IPC version 2;
 an older worker is rejected instead of partially serving newer requests.
 
+Shutdown is a terminal stdin command: the reader forwards it in order and does
+not schedule another blocking read. The worker reports Stopped after its Signal
+tasks and vault settle. The native supervisor closes stdin before awaiting the
+child, including an unsolicited stop after failure, so a pending OS read cannot
+keep the worker process alive. A real child-process test keeps the parent's pipe
+open to exercise this boundary.
+
 Disappearing-message expiry is recorded at first receipt, before receiving the
 next event. Later group settings cannot extend an already recorded expiry.
 Expired and view-once bodies are removed, including on startup after a crash.

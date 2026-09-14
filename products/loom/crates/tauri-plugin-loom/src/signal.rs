@@ -204,6 +204,7 @@ async fn process(
             _ = child.wait() => break,
             response = events_rx.recv() => {
                 let Some(response) = response else { break; };
+                if matches!(response.event, Event::Stopped) { break; }
                 if matches!(&response.event, Event::Status { status } if status.version != PROTOCOL_VERSION) {
                     (observer)(failure("signal_version_mismatch", "The bundled Signal worker has an incompatible protocol version.", false));
                     result = Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Signal protocol mismatch"));
@@ -238,8 +239,11 @@ async fn process(
             ),
         )
         .await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     }
+    // EOF releases Tokio's uncancellable stdin read after a worker failure.
+    // Close our pipe before waiting, including when Stopped came unsolicited.
+    drop(input);
+    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
     match child.try_wait() {
         Ok(Some(_)) => (),
         Ok(None) => {

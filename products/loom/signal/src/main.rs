@@ -9,7 +9,7 @@ mod retention;
 mod vault;
 mod workspaces;
 
-use loom_signal_protocol::{Event, Request, Response, read_frame, write_frame};
+use loom_signal_protocol::{Command, Event, Request, Response, read_frame, write_frame};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -27,6 +27,34 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
+async fn read_requests(requests: mpsc::Sender<Request>, stop: CancellationToken) {
+    let mut input = tokio::io::stdin();
+    loop {
+        let frame = tokio::select! {
+            () = stop.cancelled() => break,
+            frame = read_frame::<Request>(&mut input) => frame,
+        };
+        let Ok(Some(request)) = frame else {
+            break;
+        };
+        let shutdown = matches!(request.command, Command::Shutdown);
+        let sent = tokio::select! {
+            () = stop.cancelled() => break,
+            sent = requests.send(request) => sent,
+        };
+        if sent.is_err() {
+            break;
+        }
+        if shutdown {
+            // Tokio stdin uses an uncancellable blocking read. Do not start
+            // another read after forwarding the terminal command. The client
+            // processes it in order and owns cancellation of the session.
+            return;
+        }
+    }
+    stop.cancel();
+}
+
 async fn run() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1);
     anyhow::ensure!(
@@ -41,25 +69,7 @@ async fn run() -> anyhow::Result<()> {
     let stop = CancellationToken::new();
     let (requests_tx, requests) = mpsc::channel(32);
     let (responses, mut responses_rx) = mpsc::channel::<Response>(64);
-    let input_stop = stop.clone();
-    let reader = tokio::task::spawn_local(async move {
-        let mut input = tokio::io::stdin();
-        loop {
-            let frame = tokio::select! {
-                () = input_stop.cancelled() => break,
-                frame = read_frame::<Request>(&mut input) => frame,
-            };
-            match frame {
-                Ok(Some(request)) => {
-                    if requests_tx.send(request).await.is_err() {
-                        break;
-                    }
-                }
-                _ => break,
-            }
-        }
-        input_stop.cancel();
-    });
+    let reader = tokio::task::spawn_local(read_requests(requests_tx, stop.clone()));
     let output_stop = stop.clone();
     let mut writer = tokio::task::spawn_local(async move {
         let mut output = tokio::io::stdout();
@@ -84,6 +94,17 @@ async fn run() -> anyhow::Result<()> {
     stop.cancel();
     reader.abort();
     let _ = reader.await;
+    // Signal tasks have joined and the vault has closed before the parent is
+    // told to retire this process. On failure the parent closes stdin, also
+    // releasing any blocking read that was in flight when its task was aborted.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        responses.send(Response {
+            id: None,
+            event: Event::Stopped,
+        }),
+    )
+    .await;
     drop(responses);
     if tokio::time::timeout(std::time::Duration::from_secs(2), &mut writer)
         .await
@@ -93,4 +114,83 @@ async fn run() -> anyhow::Result<()> {
         let _ = writer.await;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::Write,
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn shutdown_releases_the_real_stdin_reader_without_parent_eof() {
+        const CHILD: &str = "LOOM_SIGNAL_STDIN_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let (sender, mut requests) = mpsc::channel(2);
+                let stop = CancellationToken::new();
+                read_requests(sender, stop.clone()).await;
+                assert!(matches!(
+                    requests.recv().await.unwrap().command,
+                    Command::Status
+                ));
+                assert!(matches!(
+                    requests.recv().await.unwrap().command,
+                    Command::Shutdown
+                ));
+                assert!(
+                    !stop.is_cancelled(),
+                    "the client owns the forwarded shutdown"
+                );
+            });
+            drop(runtime); // This hung while stdin scheduled one more read.
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::shutdown_releases_the_real_stdin_reader_without_parent_eof",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        for command in [Command::Status, Command::Shutdown] {
+            let bytes = serde_json::to_vec(&Request {
+                id: "test".into(),
+                command,
+            })
+            .unwrap();
+            input
+                .write_all(&(bytes.len() as u32).to_be_bytes())
+                .unwrap();
+            input.write_all(&bytes).unwrap();
+        }
+        input.flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("the worker waited for stdin EOF after its terminal command");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(input);
+    }
 }
