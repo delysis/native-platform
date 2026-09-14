@@ -48,6 +48,7 @@ members = [
     "products/loom/apps/loom/src-tauri",
     "products/loom/crates/loom-backend-llama",
     "products/loom/crates/loom-cli",
+    "products/loom/crates/loom-config",
     "products/loom/crates/loom-document",
     "products/loom/crates/loom-host",
     "products/loom/crates/loom-store",
@@ -73,6 +74,7 @@ publish = false
 desktop-context = { path = "crates/desktop-context" }
 desktop-speech = { path = "crates/desktop-speech" }
 operation-lifecycle = { path = "crates/operation-lifecycle" }
+loom-config = { path = "products/loom/crates/loom-config" }
 desktop-model-discovery = { path = "crates/desktop-model-discovery" }
 desktop-generation-policy = { path = "crates/desktop-generation-policy" }
 desktop-model-defaults = { path = "crates/desktop-model-defaults" }

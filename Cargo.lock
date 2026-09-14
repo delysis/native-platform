@@ -4101,6 +4101,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "loom-config"
+version = "0.1.0"
+dependencies = [
+ "desktop-generation-policy",
+ "llama-native-types",
+ "loom-document",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.20",
+ "toml 0.9.12+spec-1.1.0",
+]
+
+[[package]]
 name = "loom-document"
 version = "0.1.0"
 dependencies = [
@@ -7211,6 +7226,7 @@ dependencies = [
  "libc",
  "llama-native-types",
  "loom-backend-llama",
+ "loom-config",
  "loom-document",
  "loom-host",
  "loom-store",
