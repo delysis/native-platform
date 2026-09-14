@@ -270,6 +270,7 @@ jobs:
         with:
           cache-on-failure: true
           shared-key: mom-windows
+          cache-directories: ~/AppData/Local/ort.pyke.io/dfbin
       - run: node scripts/ci/cargo-group.mjs test product-mom
 
   loom-linux:
@@ -319,6 +320,7 @@ jobs:
         with:
           cache-on-failure: true
           shared-key: loom-windows
+          cache-directories: ~/AppData/Local/ort.pyke.io/dfbin
       - run: node scripts/ci/cargo-group.mjs test product-loom
 
       - name: Inspect Windows native loader failure
@@ -453,7 +455,7 @@ jobs:
         with:
           cache-on-failure: true
           shared-key: ignored-tests-${{ runner.os }}
-          cache-directories: ${{ runner.os == 'macOS' && '~/Library/Caches/ort.pyke.io/dfbin' || '' }}
+          cache-directories: ${{ runner.os == 'macOS' && '~/Library/Caches/ort.pyke.io/dfbin' || runner.os == 'Windows' && '~/AppData/Local/ort.pyke.io/dfbin' || '' }}
       - name: Reconcile exact ignored-test inventory with guarded list arguments
         run: node scripts/ci/validate-ignored-tests.mjs --cargo-list
       - name: Inspect Windows native loader failure

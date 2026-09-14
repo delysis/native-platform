@@ -8,6 +8,7 @@
 *.sh text eol=lf
 *.toml text eol=lf
 *.toml.in text eol=lf
+*.tsv text eol=lf
 *.rs.in text eol=lf
 *.yaml text eol=lf
 *.yml text eol=lf

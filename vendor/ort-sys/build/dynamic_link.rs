@@ -18,11 +18,6 @@ pub fn copy_dylibs(lib_dir: &Path, out_dir: &Path) {
 	let out_dir = out_dir.ancestors().nth(3).unwrap();
 	for out_dir in [out_dir.to_path_buf(), out_dir.join("examples"), out_dir.join("deps")] {
 		fs::create_dir_all(&out_dir).unwrap();
-		#[cfg(windows)]
-		let mut copy_fallback = false;
-		#[cfg(not(windows))]
-		let copy_fallback = false;
-
 		let lib_files = fs::read_dir(lib_dir).unwrap_or_else(|_| panic!("Failed to read contents of `{}` (does it exist?)", lib_dir.display()));
 		for lib_file in lib_files.filter(|e| {
 			e.as_ref().ok().is_some_and(|e| {
@@ -36,21 +31,18 @@ pub fn copy_dylibs(lib_dir: &Path, out_dir: &Path) {
 			if out_path.is_symlink() {
 				fs::remove_file(&out_path).unwrap();
 			}
+			// Windows build caches must contain the DLL bytes, not links into
+			// an external download cache that may be absent on the next runner.
+			#[cfg(windows)]
+			fs::copy(&lib_path, &out_path).unwrap();
+			#[cfg(unix)]
 			if !out_path.exists() {
-				#[cfg(windows)]
-				if std::os::windows::fs::symlink_file(&lib_path, &out_path).is_err() {
-					copy_fallback = true;
-					fs::copy(&lib_path, &out_path).unwrap();
-				}
-				#[cfg(unix)]
 				std::os::unix::fs::symlink(&lib_path, &out_path).unwrap();
 			}
-			if !copy_fallback {
-				println!("cargo:rerun-if-changed={}", out_path.to_str().unwrap());
-			}
+			println!("cargo:rerun-if-changed={}", out_path.to_str().unwrap());
 		}
 
-		// A copied DLL must reach examples and tests too: Windows searches their
-		// executable directory before system directories and PATH.
+		// Windows searches the executable directory before system directories
+		// and PATH, so every executable directory needs its matching DLLs.
 	}
 }

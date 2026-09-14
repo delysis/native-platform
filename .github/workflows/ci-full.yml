@@ -50,7 +50,7 @@ jobs:
         with:
           shared-key: full-root-${{ runner.os }}
           cache-on-failure: true
-          cache-directories: ${{ runner.os == 'macOS' && '~/Library/Caches/ort.pyke.io/dfbin' || '' }}
+          cache-directories: ${{ runner.os == 'macOS' && '~/Library/Caches/ort.pyke.io/dfbin' || runner.os == 'Windows' && '~/AppData/Local/ort.pyke.io/dfbin' || '' }}
       - run: cargo fmt --all -- --check
       - name: Compile macOS smoke support
         if: runner.os == 'macOS'
