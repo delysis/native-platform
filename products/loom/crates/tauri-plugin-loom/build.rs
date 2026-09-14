@@ -2,6 +2,7 @@ const COMMANDS: &[&str] = &[
     "project_open_default",
     "project_prepare_open",
     "project_prepare_open_path",
+    "project_drop_directories",
     "project_commit_open",
     "project_discard_open",
     "project_close",

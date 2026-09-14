@@ -67,6 +67,7 @@
     listModelDownloads,
     openDefaultProject,
     prepareProjectOpenPath,
+    projectDropDirectories,
     openDocument,
     importExternalDocument,
     previewDocumentReconciliation,
@@ -2182,6 +2183,25 @@
     }
   }
 
+  async function handleNativeDrop(paths: string[], point: { x: number; y: number }): Promise<void> {
+    if (fileCommandInFlight || opening || !paths.length) return;
+    const captured = { session: project?.session_id, document: document?.summary.document_id, markdown: documentText, mode };
+    try {
+      const directories = await projectDropDirectories(paths);
+      if (!componentMounted || applicationClosePhase !== 'running' || fileCommandInFlight || opening ||
+          project?.session_id !== captured.session || document?.summary.document_id !== captured.document ||
+          documentText !== captured.markdown || mode !== captured.mode) return;
+      if (directories.length) {
+        await openDroppedFolders(directories);
+      } else {
+        const scope = nativeAttachmentDropScope(point);
+        if (scope) await importNativeAttachmentDrop(paths, point, scope);
+      }
+    } catch (error) {
+      recordFailure(error);
+    }
+  }
+
   async function installNativeAttachmentDrop(): Promise<void> {
     unlistenNativeAttachmentDrop = await getCurrentWindow().onDragDropEvent(({ payload }) => {
       if (payload.type === 'leave') {
@@ -2193,16 +2213,14 @@
       const outline = outlineElement?.getBoundingClientRect();
       const inOutline = Boolean(outlineOpen && outline && point.x >= outline.left && point.x < outline.right && point.y >= outline.top && point.y < outline.bottom);
       workspaceDropActive = inOutline;
-      if (payload.type === 'drop' && (inOutline || !project)) {
+      if (payload.type === 'drop') {
         workspaceDropActive = false;
-        void openDroppedFolders(payload.paths);
+        contextDropActive = false;
+        void handleNativeDrop(payload.paths, point);
         return;
       }
       const scope = nativeAttachmentDropScope(point);
       contextDropActive = scope === 'context';
-      if (payload.type === 'drop' && scope) {
-        void importNativeAttachmentDrop(payload.paths, point, scope);
-      }
     });
   }
 

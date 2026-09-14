@@ -136,6 +136,10 @@ export function prepareProjectOpenPath(path: string): Promise<string | null> {
   return call('project_prepare_open_path', { path });
 }
 
+export function projectDropDirectories(paths: string[]): Promise<string[]> {
+  return call('project_drop_directories', { paths });
+}
+
 export function commitProjectOpen(preparationId: string): Promise<ProjectSnapshot> {
   return call('project_commit_open', { preparationId });
 }

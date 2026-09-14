@@ -1930,6 +1930,7 @@ impl Builder {
                 project_open_default,
                 project_prepare_open,
                 project_prepare_open_path,
+                project_drop_directories,
                 project_commit_open,
                 project_discard_open,
                 project_close,
@@ -2763,6 +2764,43 @@ async fn project_prepare_open_path(
     state: State<'_, PluginState>,
 ) -> Result<Option<String>, IpcFailure> {
     prepare_project_path(&state, &path)
+}
+
+/// Classify native drop hints without acquiring a store or reading file contents.
+/// The subsequent prepared-open boundary revalidates each selected directory.
+#[tauri::command]
+async fn project_drop_directories(paths: Vec<String>) -> Result<Vec<String>, IpcFailure> {
+    dropped_directories(paths)
+}
+
+fn dropped_directories(paths: Vec<String>) -> Result<Vec<String>, IpcFailure> {
+    if paths.len() > 32 {
+        return Err(IpcFailure::new(
+            "workspace_drop_limit",
+            "drop at most 32 paths at once",
+            false,
+        ));
+    }
+    // Validate the whole batch before filesystem access, including discarded files.
+    if paths
+        .iter()
+        .any(|path| path.len() > 32_768 || path.contains('\0') || !Path::new(path).is_absolute())
+    {
+        return Err(IpcFailure::new(
+            "selected_folder_unavailable",
+            "dropped paths must be absolute local paths",
+            false,
+        ));
+    }
+    let mut directories = Vec::new();
+    for path in paths {
+        if !directories.contains(&path)
+            && std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir())
+        {
+            directories.push(path);
+        }
+    }
+    Ok(directories)
 }
 
 fn prepare_project_path(state: &PluginState, path: &str) -> Result<Option<String>, IpcFailure> {
@@ -10923,6 +10961,47 @@ mod tests {
                 .expect("prepared slot")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn workspace_drop_classifies_directories_without_opening_or_changing_files() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("Writing");
+        let file = root.path().join("Notes.md");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&file, "Exact writing.\r\n").unwrap();
+        let folder = folder.to_str().unwrap().to_owned();
+        let paths = vec![
+            file.to_str().unwrap().to_owned(),
+            folder.clone(),
+            root.path().join("missing").to_str().unwrap().to_owned(),
+            folder.clone(),
+            root.path().to_str().unwrap().to_owned(),
+        ];
+        assert_eq!(
+            dropped_directories(paths).unwrap(),
+            vec![folder.clone(), root.path().to_str().unwrap().to_owned()]
+        );
+        assert!(std::fs::read_dir(&folder).unwrap().next().is_none());
+        assert_eq!(std::fs::read(&file).unwrap(), b"Exact writing.\r\n");
+        assert!(dropped_directories(vec![folder.clone(); 33]).is_err());
+        for invalid in [
+            "relative".to_owned(),
+            "/bad\0path".into(),
+            format!("/{}", "x".repeat(32_768)),
+        ] {
+            assert!(dropped_directories(vec![folder.clone(), invalid]).is_err());
+        }
+        #[cfg(unix)]
+        {
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(&folder, &alias).unwrap();
+            let alias = alias.to_str().unwrap().to_owned();
+            assert_eq!(
+                dropped_directories(vec![alias.clone()]).unwrap(),
+                vec![alias]
+            );
+        }
     }
 
     #[test]
