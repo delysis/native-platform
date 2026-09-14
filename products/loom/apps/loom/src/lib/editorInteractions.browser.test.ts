@@ -5,6 +5,7 @@ import '../app.css';
 import EditorBrowserHarness from './EditorBrowserHarness.svelte';
 import SourceEditorBrowserHarness from './SourceEditorBrowserHarness.svelte';
 import type { CompletionCandidate } from './completionSession';
+import type { VisualSelectionAccessibilityWitness } from './completionAccessibility';
 
 let mounted: ReturnType<typeof mount> | null = null;
 
@@ -26,6 +27,7 @@ function render(
     onImageAttachmentsCommitted?: (count: number) => void;
     onImageAttachmentError?: (message: string) => void;
     resolveImageAssetUrl?: (markdownPath: string) => string | null;
+    onSelectionWitness?: (witness: VisualSelectionAccessibilityWitness, markdown: string) => void;
   } = {}
 ): void {
   const target = document.createElement('div');
@@ -248,15 +250,21 @@ describe('real WebKit editor interactions', () => {
   });
 
   it('withdraws stale selection evidence until typed document state settles', async () => {
-    render('Something');
+    const transitions: { witness: VisualSelectionAccessibilityWitness; markdown: string }[] = [];
+    render('Something', [], { onSelectionWitness: (witness, markdown) => transitions.push({ witness, markdown }) });
     const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
     const witness = () => JSON.parse(
       page.getByRole('status', { name: 'Visual Selection Witness' }).element().textContent ?? '{}'
     );
     await editor.click();
-    await userEvent.keyboard('{Meta>}a{/Meta}Replacement');
+    await userEvent.keyboard('{Meta>}a{/Meta}');
+    await expect.poll(witness).toMatchObject({ available: true, allVisibleText: true });
+    transitions.length = 0;
+    await userEvent.keyboard('Replacement');
 
-    expect(witness()).toMatchObject({ available: false });
+    // WebKit may finish the projection before the keyboard promise resolves.
+    // Observe the actual callback order instead of racing the debounce timer.
+    expect(transitions[0]?.witness.available).toBe(false);
     await expect.poll(serializedMarkdown).toBe('Replacement');
     await expect.poll(witness).toMatchObject({
       available: true,
@@ -266,6 +274,13 @@ describe('real WebKit editor interactions', () => {
       caretByteOffset: 'Replacement'.length
     });
     expect(witness().epoch).toBeGreaterThan(0);
+    const renewed = transitions.filter(({ witness }) => witness.available);
+    expect(renewed.length).toBeGreaterThan(0);
+    for (const { witness, markdown } of renewed) {
+      expect(witness.caretAtEnd).toBe(true);
+      expect(witness.caretByteOffset).toBe(markdown.length);
+    }
+    expect(renewed.at(-1)?.markdown).toBe('Replacement');
   });
 
   it('wires every Aa formatting family to exact Markdown', async () => {

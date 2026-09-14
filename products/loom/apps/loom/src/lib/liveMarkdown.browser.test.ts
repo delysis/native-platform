@@ -47,8 +47,9 @@ describe('live Markdown typing', () => {
     await userEvent.keyboard('#### Detail{Enter}~~unimplemented~~');
     expect(document.querySelector('.ProseMirror h4')?.textContent).toBe('Detail');
     expect(document.querySelector('.ProseMirror p')?.textContent).toBe('~~unimplemented~~');
-    await expect.poll(markdown).toContain('unimplemented');
-    expect(parseVisualMarkdown(markdown()!).lastChild?.textContent).toBe('~~unimplemented~~');
+    // The editor DOM can lead the Svelte serialization projection by a tick.
+    // Wait for all authored delimiters, not an already-present word prefix.
+    await expect.poll(() => parseVisualMarkdown(markdown()!).lastChild?.textContent).toBe('~~unimplemented~~');
     expect(canRoundTripMarkdownExactly('| a | b |\n| - | - |\n| c | d |')).toBe(false);
   });
 });

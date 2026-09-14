@@ -17,7 +17,16 @@ runs:
       run: brew list protobuf >/dev/null 2>&1 || brew install protobuf
     - shell: pwsh
       if: runner.os == 'Windows'
-      run: choco install protoc --no-progress --yes
+      run: |
+        choco install protoc strawberryperl --no-progress --yes
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        # Git Bash's Perl cannot configure the MSVC OpenSSL build. Pin the
+        # native interpreter even when later Cargo commands run under Bash.
+        $signalPerl = Join-Path $env:SystemDrive 'Strawberry\perl\bin\perl.exe'
+        if (-not (Test-Path $signalPerl -PathType Leaf)) { throw 'Native Strawberry Perl is missing.' }
+        & $signalPerl -MLocale::Maketext::Simple -MIPC::Cmd -e 'print "$^O\n"'
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        "OPENSSL_SRC_PERL=$signalPerl" >> $env:GITHUB_ENV
     - shell: bash
       run: |
         cargo fmt --manifest-path products/loom/signal/Cargo.toml -- --check

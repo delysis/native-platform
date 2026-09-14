@@ -35,6 +35,7 @@
   export let onImageAttachmentsCommitted: (count: number) => void = () => {};
   export let onImageAttachmentError: (message: string) => void = () => {};
   export let resolveImageAssetUrl: (markdownPath: string) => string | null = () => null;
+  export let onSelectionWitness: (witness: VisualSelectionAccessibilityWitness, markdown: string) => void = () => {};
 
   let markdown = initialValue;
   let pendingMarkdown: string | null = null;
@@ -252,7 +253,10 @@
       onImmediateDocumentMutation={immediateMutation}
       onCaretNavigation={caretNavigation}
       onSelectionChange={selectionChanged}
-      onSelectionAccessibilityChange={(witness) => selectionAccessibility = witness}
+      onSelectionAccessibilityChange={(witness) => {
+        selectionAccessibility = witness;
+        onSelectionWitness(witness, markdown);
+      }}
       onGhostInsert={insert}
       onGhostUnconsume={unconsume}
       onGhostCycle={cycle}
