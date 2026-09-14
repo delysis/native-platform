@@ -3,10 +3,12 @@
 mod attachments;
 mod audio_io;
 mod co_writer;
+mod connected_imports;
 mod context_attachments;
 mod document_bindings;
 mod document_watcher;
 mod external_import;
+mod import_batch;
 mod microphone_capture;
 mod model_catalog;
 mod model_download;
@@ -2050,6 +2052,14 @@ impl Builder {
                 audio_synthesize,
                 document_rename,
                 document_delete,
+                import_batch::import_text_sources,
+                import_batch::attachment_import_batch_choose,
+                connected_imports::import_account_cancel,
+                connected_imports::import_source_url,
+                connected_imports::import_accounts,
+                connected_imports::import_account_connect,
+                connected_imports::import_account_disconnect,
+                connected_imports::import_account_sync,
                 attachment_ingest,
                 attachment_import_choose,
                 attachment_import_paths,

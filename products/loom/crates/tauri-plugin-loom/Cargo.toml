@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 desktop-model-defaults.workspace = true
+information-native-acquire.workspace = true
+keyring = "=4.1.6"
 attachment-native-host.workspace = true
 attachment-native-types.workspace = true
 atomic-write-file.workspace = true

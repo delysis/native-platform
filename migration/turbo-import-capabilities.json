@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "transition": "authorized_capability_port",
+  "authorization": "User: mine turbo-danielle (upstream if helpful) for all data import functionality, integrate into native-kit and Loom; follow-up explicitly includes connected-account syncing.",
+  "source_history_imported": false,
+  "production_source_copied": false,
+  "private_data_imported": false,
+  "source_inventory": "docs/imports/turbo-danielle.md",
+  "destination_base": "924ac64ef0a7512327406ec6490c5e017b5112a8",
+  "destinations": [
+    "crates/services/attachment",
+    "crates/services/information/crates/information-native-acquire",
+    "products/loom"
+  ],
+  "status": "implemented_locally_validated",
+  "validation_receipt": "docs/imports/turbo-danielle-validation.md",
+  "remaining_acceptance": [
+    "Live Google consent, credential write/refresh/disconnect, account downloads, and multi-account pagination require an actual configured Desktop OAuth client and account authorization."
+  ]
+}

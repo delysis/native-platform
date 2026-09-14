@@ -17,6 +17,7 @@
   import { startAudioRecording, stopAudioRecording, synthesizeAudio, type AudioRecording } from './lib/ipc';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
+  import ImportSources from './lib/ImportSources.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
@@ -2121,6 +2122,26 @@
     } finally {
       contextAttachmentBusy = false;
     }
+  }
+
+  async function useImportedSources(items: import('./lib/types').ContextAttachment[]): Promise<boolean> {
+    if (!project || !document || editorReadonly || contextAttachmentBusy || items.length === 0) return false;
+    const captured = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id };
+    contextAttachmentBusy = true;
+    try {
+      if (!await persistCurrentContextText()) return false;
+      if (
+        project?.project_id !== captured.projectId ||
+        project.session_id !== captured.sessionId ||
+        document?.summary.document_id !== captured.documentId ||
+        editorReadonly
+      ) return false;
+      const previousText = contextText;
+      const snapshot = await addDocumentContexts(captured.projectId, captured.sessionId, captured.documentId, [...new Set(items.map((item) => item.id))]);
+      if (!adoptAuthoritativeContext(snapshot, captured.projectId, captured.sessionId, captured.documentId)) return false;
+      await normalizeImportedContext(previousText);
+      return true;
+    } finally { contextAttachmentBusy = false; }
   }
 
   async function removeContextAttachment(attachmentId: string): Promise<void> {
@@ -9639,6 +9660,11 @@
             </div>
             {/if}
           {/each}
+          {#if desktop && document}
+            {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
+              <ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={document.summary.title} onUse={useImportedSources} />
+            {/key}
+          {/if}
         </nav>
         {#if folderWarnings.length > 0}
           <details class="folder-warnings">

@@ -229,7 +229,7 @@ pub(crate) enum ContextAttachmentError {
     SourceSize,
     #[error("attachment processing failed: {0}")]
     Processing(String),
-    #[error("the attachment produced no safe representation for Gemma 4")]
+    #[error("the attachment produced no safe text or media representation")]
     NoRepresentation,
     #[error("the document context already contains Loom's 32-attachment limit")]
     ContextLimit,
@@ -252,6 +252,15 @@ pub(crate) fn import_path(
     project_root: &Path,
     source_path: &Path,
 ) -> Result<StoredAttachment, ContextAttachmentError> {
+    import_path_bounded(project_root, source_path, MAX_ATTACHMENT_BYTES)
+}
+
+pub(crate) fn import_path_bounded(
+    project_root: &Path,
+    source_path: &Path,
+    max_bytes: u64,
+) -> Result<StoredAttachment, ContextAttachmentError> {
+    let max_bytes = max_bytes.min(MAX_ATTACHMENT_BYTES);
     let file_name = source_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -262,25 +271,44 @@ pub(crate) fn import_path(
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(ContextAttachmentError::UnsafeSource);
     }
-    if metadata.len() > MAX_ATTACHMENT_BYTES {
+    if metadata.len() == 0 || metadata.len() > max_bytes {
         return Err(ContextAttachmentError::SourceSize);
     }
-    let mut source = File::open(source_path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut source = options.open(source_path)?;
+    if !source.metadata()?.is_file() {
+        return Err(ContextAttachmentError::UnsafeSource);
+    }
     let identity = FileIdentityHandle::from_file(source.try_clone()?)?;
-    let provided = ProvidedAttachment::read_bounded(
-        file_name.clone(),
-        None,
-        &mut source,
-        MAX_ATTACHMENT_BYTES,
-    )
-    .map_err(|error| ContextAttachmentError::Processing(error.safe_message))?;
+    let provided =
+        ProvidedAttachment::read_bounded(file_name.clone(), None, &mut source, max_bytes)
+            .map_err(|error| ContextAttachmentError::Processing(error.safe_message))?;
     let visible = FileIdentityHandle::from_path(source_path)?;
     if visible != identity {
         return Err(ContextAttachmentError::UnsafeSource);
     }
 
-    let byte_count = provided.bytes.len() as u64;
-    import_provided(project_root, file_name, byte_count, provided)
+    let attachment = import_provided(project_root, provided)?;
+    record_import_origin(
+        project_root,
+        &serde_json::json!({
+            "schema": "loom.file-import.v1", "source_path": source_path,
+            "source_sha256": attachment.id, "source_bytes": attachment.byte_count,
+            "network_used": false, "human_reviewed": false,
+        }),
+    )?;
+    Ok(attachment)
 }
 
 /// Retains an explicitly captured recording through the same direct-media
@@ -291,22 +319,27 @@ pub(crate) fn import_recorded_wav(
     wav: &[u8],
 ) -> Result<StoredAttachment, ContextAttachmentError> {
     let provided = ProvidedAttachment::read_bounded(
-        file_name.clone(),
+        file_name,
         Some("audio/wav".to_owned()),
         &mut Cursor::new(wav),
         MAX_ATTACHMENT_BYTES,
     )
     .map_err(|error| ContextAttachmentError::Processing(error.safe_message))?;
-    import_provided(project_root, file_name, wav.len() as u64, provided)
+    import_provided(project_root, provided)
 }
 
+// Account downloads, folder imports, recordings, and native file grants share
+// one parser and persistence path. Callers provide bytes, never URLs to the parser.
 #[allow(clippy::too_many_lines)]
-fn import_provided(
+pub(crate) fn import_provided(
     project_root: &Path,
-    file_name: String,
-    byte_count: u64,
     provided: ProvidedAttachment,
 ) -> Result<StoredAttachment, ContextAttachmentError> {
+    let mut file_name = provided.display_name.clone();
+    let byte_count = provided.bytes.len() as u64;
+    if byte_count == 0 || byte_count > MAX_ATTACHMENT_BYTES {
+        return Err(ContextAttachmentError::SourceSize);
+    }
     let original = std::sync::Arc::clone(&provided.bytes);
     let mut host_config = AttachmentHostConfig {
         preparation: PreparationPolicy {
@@ -451,6 +484,7 @@ fn import_provided(
             "Original file retained. No supported text or native media was extracted; this file is not sent to the model.".to_owned(),
         );
     }
+
     let detected_format = prepared
         .bundle
         .graph
@@ -462,6 +496,14 @@ fn import_provided(
             || "unknown".to_owned(),
             |format| format!("{format:?}").to_ascii_lowercase(),
         );
+    if detected_format == "email"
+        && file_name.starts_with("Gmail message ")
+        && let Some(subject) = canonical_text
+            .lines()
+            .find_map(|line| line.strip_prefix("**Subject:** "))
+    {
+        file_name = format!("{}.eml", subject.chars().take(160).collect::<String>());
+    }
     let text_bytes = u64::try_from(canonical_text.len()).unwrap_or(u64::MAX);
     let canonical_text_sha256 = (!canonical_text.is_empty())
         .then(|| format!("{:x}", Sha256::digest(canonical_text.as_bytes())));
@@ -2063,6 +2105,20 @@ fn write_manifest(
     install_immutable(&path, &bytes)
 }
 
+/// Acquisition provenance is separate from the offline processing receipt.
+/// The receipt is immutable and contains no OAuth credential material.
+pub(crate) fn record_import_origin(
+    project_root: &Path,
+    origin: &impl Serialize,
+) -> Result<(), ContextAttachmentError> {
+    let bytes = serde_json::to_vec_pretty(origin)?;
+    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let path = attachment_root(project_root)?
+        .join("manifests")
+        .join(format!("source-{hash}.json"));
+    install_immutable(&path, &bytes)
+}
+
 fn read_manifest(
     project_root: &Path,
     id: &str,
@@ -2326,8 +2382,8 @@ mod tests {
     fn source_only_files_retain_originals_without_inventing_model_content() {
         let project = tempfile::tempdir().unwrap();
         let source = tempfile::tempdir().unwrap();
-        let bytes = b"{\\rtf1\\ansi Original rich text.}";
-        let path = source.path().join("Draft.rtf");
+        let bytes = b"\x00\xff\xfe\xfd\x80\x81\x82\x83";
+        let path = source.path().join("Archive.bin");
         fs::write(&path, bytes).unwrap();
         let attachment = import_path(project.path(), &path).unwrap();
         assert_eq!(attachment.text_bytes, 0);
