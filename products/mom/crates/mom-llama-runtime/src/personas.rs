@@ -411,6 +411,19 @@ pub fn persona_update(
         source_history_tokens,
         host_context_tokens,
     } = input;
+    if let Some(sampling) = &sampling
+        && let Err(error) = sampling.validate()
+    {
+        return Ok(CommandResult::blocked(
+            "mom_llama.persona_update",
+            "blocked_invalid_generation_profile",
+            Blocker::new(
+                "generation_profile_invalid",
+                error.to_string(),
+                vec!["Correct the Persona sampling settings.".into()],
+            ),
+        ));
+    }
     if auto_discover_mmproj {
         if let Some(model_path) = model_path.as_deref()
             && let Err(blocked) = crate::engine::validate_model_path(model_path)
@@ -2153,6 +2166,43 @@ mod tests {
             None,
         )
         .expect("catalog reconciliation must succeed")
+    }
+
+    #[test]
+    fn persona_sampling_is_validated_before_store_or_model_access() {
+        let directory =
+            std::env::temp_dir().join(format!("mom-invalid-persona-{}", uuid::Uuid::new_v4()));
+        crate::config::set_data_dir_override_for_tests(Some(directory.clone()));
+        let result = super::persona_update(
+            &crate::OperationScope::detached(),
+            super::PersonaUpdateInput {
+                persona_id: "absent".into(),
+                name: "Invalid".into(),
+                mention_handle: "invalid".into(),
+                model_path: None,
+                mmproj_path: None,
+                auto_discover_mmproj: false,
+                system_message: None,
+                sampling: Some(llama_native_types::SamplingConfig {
+                    top_p: 1.5,
+                    ..Default::default()
+                }),
+                chat_template: crate::conversation_store::ChatTemplatePolicy::ModelDefault,
+                tool_bindings: Vec::new(),
+                source_history_tokens: 4096,
+                host_context_tokens: 2048,
+            },
+        );
+        crate::config::set_data_dir_override_for_tests(None);
+        assert_eq!(
+            result
+                .expect("typed result")
+                .blocker
+                .expect("invalid profile")
+                .code,
+            "generation_profile_invalid"
+        );
+        assert!(!directory.exists());
     }
 
     #[test]

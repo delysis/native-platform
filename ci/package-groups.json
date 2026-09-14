@@ -3,6 +3,7 @@
   "primary": {
     "desktop": [
       "desktop-context",
+      "desktop-generation-policy",
       "desktop-model-defaults",
       "workspace-document"
     ],

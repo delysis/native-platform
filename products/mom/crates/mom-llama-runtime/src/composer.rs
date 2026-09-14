@@ -577,11 +577,8 @@ fn prepare_composer_generation(
             ChatTemplateChoice::Override(template.clone())
         }
     };
-    let mut sampling = conversation
-        .execution_profile
-        .sampling
-        .clone()
-        .unwrap_or_else(|| settings.sampling_config());
+    let mut sampling =
+        settings.sampling_for_profile(conversation.execution_profile.sampling.as_ref())?;
     sampling.max_tokens = MAX_COMPLETION_TOKENS;
     sampling.stop = vec!["\n".to_string(), "\r".to_string()];
     let input_sha256 = format!(

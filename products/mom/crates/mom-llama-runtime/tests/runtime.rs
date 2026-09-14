@@ -1314,7 +1314,7 @@ fn upstream_sampling_settings_drive_the_native_sampler_dto() -> Result<()> {
     let settings = updated
         .result
         .ok_or_else(|| anyhow!("settings update returned no result"))?;
-    let sampling = settings.sampling_config();
+    let sampling = settings.sampling_config()?;
     assert_eq!(sampling.temperature, 0.35);
     assert_eq!(sampling.dynamic_temperature_range, 0.2);
     assert_eq!(sampling.dynamic_temperature_exponent, 1.2);

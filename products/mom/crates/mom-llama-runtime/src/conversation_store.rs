@@ -335,7 +335,7 @@ pub fn conversation_new(title: Option<String>) -> Result<CommandResult<Conversat
             mention_handle,
             model_path: settings.model_path.clone(),
             mmproj_path: settings.mmproj_path.clone(),
-            sampling: Some(settings.sampling_config()),
+            sampling: Some(settings.sampling_config()?),
             ..ConversationExecutionProfile::default()
         },
         selected_model_path: settings.model_path,

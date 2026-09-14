@@ -2843,11 +2843,7 @@ pub fn mention_synthesize(
         .map_err(|error| anyhow!(error))?
         .token_ids
         .len();
-    let sampling = host
-        .execution_profile
-        .sampling
-        .clone()
-        .unwrap_or_else(|| settings.sampling_config());
+    let sampling = settings.sampling_for_profile(host.execution_profile.sampling.as_ref())?;
     if prompt_tokens.saturating_add(sampling.max_tokens as usize) > settings.context_tokens as usize
     {
         return Ok(CommandResult::blocked(
@@ -3211,6 +3207,14 @@ where
     let mut planned = Vec::new();
     for (order, target) in targets.iter().enumerate() {
         let snapshot = &snapshots[order];
+        if let Err(blocked) = settings.sampling_for_profile(snapshot.profile.sampling.as_ref()) {
+            invocation.results.push(blocked_target_result(
+                snapshot,
+                GenerationState::Failed,
+                &blocked.blocker.message,
+            ));
+            continue;
+        }
         let model_path = snapshot
             .profile
             .model_path
@@ -3348,20 +3352,18 @@ where
         let status = handle.status();
         let branches = targets
             .iter()
-            .map(|target| BranchRequest {
-                branch_id: target.snapshot.target_id.clone(),
-                label: target.snapshot.label.clone(),
-                instruction: String::new(),
-                sampling: target
-                    .snapshot
-                    .profile
-                    .sampling
-                    .clone()
-                    .unwrap_or_else(|| settings.sampling_config()),
-                messages: target.messages.clone(),
-                cached_prefix: target.cached_prefix.clone(),
+            .map(|target| {
+                Ok(BranchRequest {
+                    branch_id: target.snapshot.target_id.clone(),
+                    label: target.snapshot.label.clone(),
+                    instruction: String::new(),
+                    sampling: settings
+                        .sampling_for_profile(target.snapshot.profile.sampling.as_ref())?,
+                    messages: target.messages.clone(),
+                    cached_prefix: target.cached_prefix.clone(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let ticket = handle
             .generate_shared_prefix(SharedPrefixBatchRequest {
                 request_id: invocation_id.clone(),
@@ -4291,12 +4293,9 @@ fn run_persona_tool_decision(
             vec!["Review the target model and attached tool schemas.".to_string()],
         )
     })?;
-    let mut sampling = target
-        .snapshot
-        .profile
-        .sampling
-        .clone()
-        .unwrap_or_else(|| settings.sampling_config());
+    let mut sampling = settings
+        .sampling_for_profile(target.snapshot.profile.sampling.as_ref())
+        .map_err(|error| error.blocker)?;
     sampling.max_tokens = sampling
         .max_tokens
         .clamp(64, PERSONA_TOOL_DECISION_MAX_TOKENS);
@@ -4558,12 +4557,9 @@ fn prepare_persona_tool_approval(
         model_config: Some(frozen_model_config),
         model_fingerprint,
         chat_template: profile_chat_template(&target.snapshot.profile),
-        sampling: target
-            .snapshot
-            .profile
-            .sampling
-            .clone()
-            .unwrap_or_else(|| settings.sampling_config()),
+        sampling: settings
+            .sampling_for_profile(target.snapshot.profile.sampling.as_ref())
+            .map_err(|error| error.blocker)?,
         messages: target.messages.clone(),
         provisional_output,
         input_schema: binding.contract.input_schema.clone(),

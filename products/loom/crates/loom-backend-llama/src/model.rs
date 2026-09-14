@@ -2,43 +2,21 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use llama_native_types::{
-    CapabilityDeclarationStatus, ExactModelCapabilities, MediaKind, ModelFingerprint, NativeDevice,
-    NativeError, NativeErrorCode, NativeEvidenceCapabilities, NativeModelConfig,
-    NativeModelDescriptor, ProbabilityStage, ProjectorRequirement,
+    CapabilityDeclarationStatus, ExactModelCapabilities, MediaKind, ModelFingerprint, NativeError,
+    NativeErrorCode, NativeEvidenceCapabilities, NativeModelConfig, NativeModelDescriptor,
+    ProbabilityStage, ProjectorRequirement,
 };
 use loom_types::{BlobId, ModelEnvironmentId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-// llama.cpp rejects contexts below 512 cells.  Do not impose a larger product
-// floor here: on a memory-starved machine, requesting an unaffordable 8K
-// context makes model load less reliable rather than more useful.
-const MINIMUM_CONTEXT_TOKENS: u32 = 512;
-const DEFAULT_MAXIMUM_CONTEXT_TOKENS: u32 = 262_144;
-// Gemma 4 12B allocates both full-attention and SWA caches. The observed
-// f16 runtime uses 336 KiB per cell; reserve 384 KiB rather than undercounting
-// the SWA cache and consuming system headroom.
+use desktop_generation_policy::{
+    ContextMemoryBudget, ContextPlanError, DEFAULT_MAXIMUM_CONTEXT_TOKENS, ModelExecutionLimits,
+};
+// Retain Loom's model-family heuristic; this is not a universal KV formula.
 const CONSERVATIVE_KV_BYTES_PER_TOKEN: u64 = 384 * 1024;
-const MINIMUM_SYSTEM_HEADROOM_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LocalDevicePreference {
-    #[default]
-    Auto,
-    Cpu,
-    Metal,
-}
-
-impl From<LocalDevicePreference> for NativeDevice {
-    fn from(value: LocalDevicePreference) -> Self {
-        match value {
-            LocalDevicePreference::Auto => Self::Auto,
-            LocalDevicePreference::Cpu => Self::Cpu,
-            LocalDevicePreference::Metal => Self::Metal,
-        }
-    }
-}
+pub use llama_native_types::NativeDevice as LocalDevicePreference;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LocalModelProfile {
@@ -89,7 +67,6 @@ impl LocalModelProfile {
     /// Native inspection still clamps this request to the GGUF's trained
     /// context. The deliberately conservative KV estimate prevents the old
     /// fixed 8K default from wasting memory that is actually available.
-    #[must_use]
     pub fn for_gguf_with_memory(
         model_path: impl Into<PathBuf>,
         model_file_bytes: u64,
@@ -98,7 +75,7 @@ impl LocalModelProfile {
         total_memory_bytes: u64,
         host_memory_budget_bytes: u64,
         maximum_context_tokens: Option<u32>,
-    ) -> Self {
+    ) -> Result<Self, ContextPlanError> {
         let mut profile = Self::for_gguf(model_path);
         profile.context_tokens = adaptive_context_tokens(
             model_file_bytes,
@@ -107,28 +84,34 @@ impl LocalModelProfile {
             total_memory_bytes,
             host_memory_budget_bytes,
             maximum_context_tokens.unwrap_or(DEFAULT_MAXIMUM_CONTEXT_TOKENS),
-        );
-        profile
+        )?;
+        Ok(profile)
     }
 
-    #[must_use]
-    pub fn as_native_config(&self) -> NativeModelConfig {
-        NativeModelConfig {
+    pub fn as_native_config(&self) -> Result<NativeModelConfig, NativeError> {
+        let mut config = NativeModelConfig {
             model_id: self.model_id.clone(),
             model_path: self.model_path.clone(),
             expected_model_sha256: self.expected_model_sha256.clone(),
             mmproj_path: self.projector_path.clone(),
             expected_mmproj_sha256: self.expected_mmproj_sha256.clone(),
-            device: self.device.into(),
+            device: self.device,
             context_tokens: self.context_tokens,
             batch_tokens: self.batch_tokens,
             max_sequences: self.max_parallel_cases,
             gpu_layers: self.gpu_layers,
+        };
+        ModelExecutionLimits {
+            context_tokens: self.context_tokens,
+            batch_tokens: self.batch_tokens,
+            parallel_sequences: self.max_parallel_cases,
         }
+        .apply_to(&mut config)
+        .map_err(|error| NativeError::new(NativeErrorCode::InvalidConfig, error.to_string()))?;
+        Ok(config)
     }
 }
 
-#[must_use]
 pub fn adaptive_context_tokens(
     model_file_bytes: u64,
     projector_file_bytes: u64,
@@ -136,22 +119,17 @@ pub fn adaptive_context_tokens(
     total_memory_bytes: u64,
     host_memory_budget_bytes: u64,
     maximum_context_tokens: u32,
-) -> u32 {
-    let maximum = maximum_context_tokens.max(MINIMUM_CONTEXT_TOKENS);
-    let runtime_without_kv = model_file_bytes
-        .saturating_add((model_file_bytes / 2).max(384 * 1024 * 1024))
-        .saturating_add(projector_file_bytes);
-    let system_headroom = (total_memory_bytes / 8).max(MINIMUM_SYSTEM_HEADROOM_BYTES);
-    // Physical availability never grants permission to exceed the host's
-    // admission budget. System headroom belongs outside that host allocation.
-    let kv_budget = available_memory_bytes
-        .saturating_sub(system_headroom)
-        .min(host_memory_budget_bytes)
-        .saturating_sub(runtime_without_kv);
-    let affordable = (kv_budget / CONSERVATIVE_KV_BYTES_PER_TOKEN).min(u64::from(maximum));
-    let affordable = u32::try_from(affordable).unwrap_or(maximum);
-    let tier = 1_u32 << affordable.max(MINIMUM_CONTEXT_TOKENS).ilog2();
-    tier.clamp(MINIMUM_CONTEXT_TOKENS, maximum)
+) -> Result<u32, ContextPlanError> {
+    ContextMemoryBudget {
+        model_file_bytes,
+        projector_file_bytes,
+        available_memory_bytes,
+        total_memory_bytes,
+        host_memory_budget_bytes,
+        estimated_kv_bytes_per_token: CONSERVATIVE_KV_BYTES_PER_TOKEN,
+    }
+    .plan(maximum_context_tokens)
+    .map(|plan| plan.selected_tokens)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -618,9 +596,10 @@ mod context_tests {
             96 * gib,
             host_budget,
             Some(262_144),
-        );
+        )
+        .expect("fits host budget");
         let estimate = llama_native_engine::estimate_memory_reservation(
-            &profile.as_native_config(),
+            &profile.as_native_config().expect("valid limits"),
             model_bytes,
             projector_bytes,
         );
@@ -643,23 +622,23 @@ mod context_tests {
         let gib = 1024_u64 * 1024 * 1024;
         assert_eq!(
             adaptive_context_tokens(7 * gib, 0, 14 * gib, 16 * gib, u64::MAX, 262_144),
-            4_096
+            Ok(4_096)
         );
         assert_eq!(
             adaptive_context_tokens(7 * gib, 0, 48 * gib, 64 * gib, u64::MAX, 262_144),
-            65_536
+            Ok(65_536)
         );
         assert_eq!(
             adaptive_context_tokens(7 * gib, 0, 56 * gib, 64 * gib, u64::MAX, 262_144),
-            65_536
+            Ok(65_536)
         );
         assert_eq!(
             adaptive_context_tokens(7 * gib, 0, 112 * gib, 128 * gib, u64::MAX, 262_144),
-            131_072
+            Ok(131_072)
         );
         assert_eq!(
             adaptive_context_tokens(7 * gib, 0, 112 * gib, 128 * gib, u64::MAX, 32_768),
-            32_768
+            Ok(32_768)
         );
     }
 
@@ -668,7 +647,7 @@ mod context_tests {
         let gib = 1024_u64 * 1024 * 1024;
         assert_eq!(
             adaptive_context_tokens(7 * gib, 0, 8 * gib, 16 * gib, u64::MAX, 262_144),
-            512
+            Err(ContextPlanError::InsufficientEstimatedMemory)
         );
     }
 
@@ -677,7 +656,7 @@ mod context_tests {
         let gib = 1024_u64 * 1024 * 1024;
         assert_eq!(
             adaptive_context_tokens(gib, 0, 48 * gib, 64 * gib, u64::MAX, 4_096),
-            4_096
+            Ok(4_096)
         );
     }
 }

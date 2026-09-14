@@ -53,12 +53,12 @@ fn terminal_sampling(
     command_id: CommandId,
     step: u32,
     boundary: Option<TerminalTurnBoundary>,
-) -> SamplingConfig {
-    let mut sampling = sampling_for_weave_case(command_id, step, 512, 0.8, WeavePreset::ManualV2);
+) -> Result<SamplingConfig, IpcFailure> {
+    let mut sampling = sampling_for_weave_case(command_id, step, 512, 0.8, WeavePreset::ManualV2)?;
     if let Some(TerminalTurnBoundary::Chat) = boundary {
         sampling.stop = vec!["\nUser:".into(), "\nAssistant:".into()];
     }
-    sampling
+    Ok(sampling)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -825,7 +825,7 @@ impl Evaluator<'_> {
                 parse_command_id(&self.receipt.run.run_id)?,
                 self.step,
                 self.receipt.run.turn_boundary,
-            );
+            )?;
             let generation = GenerationStart {
                 run_id: GenerationRunId::new(),
                 branch_id: BranchId::new(),

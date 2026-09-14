@@ -536,7 +536,7 @@ impl TryFrom<ControlledGenerationCaseWire> for ControlledGenerationCase {
     }
 }
 
-fn validate_sampling(sampling: &SamplingConfig) -> Result<(), NativeError> {
+pub(crate) fn validate_sampling(sampling: &SamplingConfig) -> Result<(), NativeError> {
     let bounded = [
         ("temperature", sampling.temperature, 0.0, 100.0),
         (
@@ -570,23 +570,21 @@ fn validate_sampling(sampling: &SamplingConfig) -> Result<(), NativeError> {
     for (field, value, minimum, maximum) in bounded {
         if !value.is_finite() || value < minimum || value > maximum {
             return Err(invalid(format!(
-                "controlled sampling {field} must be finite and between {minimum} and {maximum}"
+                "sampling {field} must be finite and between {minimum} and {maximum}"
             )));
         }
     }
     if sampling.top_k < 0 || sampling.repeat_last_n < -1 || sampling.dry_penalty_last_n < -1 {
         return Err(invalid(
-            "controlled sampling integer windows must be non-negative or the documented -1 sentinel",
+            "sampling integer windows must be non-negative or the documented -1 sentinel",
         ));
     }
     if sampling.dry_allowed_length < 0 {
-        return Err(invalid(
-            "controlled sampling dry_allowed_length must be non-negative",
-        ));
+        return Err(invalid("sampling dry_allowed_length must be non-negative"));
     }
     if sampling.max_tokens == 0 || sampling.max_tokens > MAX_GENERATION_TOKENS_PER_CASE {
         return Err(invalid(format!(
-            "controlled sampling max_tokens must be between 1 and {MAX_GENERATION_TOKENS_PER_CASE}"
+            "sampling max_tokens must be between 1 and {MAX_GENERATION_TOKENS_PER_CASE}"
         )));
     }
     if sampling
@@ -595,29 +593,25 @@ fn validate_sampling(sampling: &SamplingConfig) -> Result<(), NativeError> {
         .enumerate()
         .any(|(index, kind)| sampling.sampler_order[..index].contains(kind))
     {
-        return Err(invalid(
-            "controlled sampling sampler_order cannot contain duplicates",
-        ));
+        return Err(invalid("sampling sampler_order cannot contain duplicates"));
     }
     if sampling.stop.len() > MAX_STOP_SEQUENCES {
         return Err(invalid(format!(
-            "controlled sampling cannot contain more than {MAX_STOP_SEQUENCES} stop sequences"
+            "sampling cannot contain more than {MAX_STOP_SEQUENCES} stop sequences"
         )));
     }
     let mut stop_bytes = 0usize;
     for stop in &sampling.stop {
         if stop.is_empty() {
-            return Err(invalid(
-                "controlled sampling stop sequences cannot be empty",
-            ));
+            return Err(invalid("sampling stop sequences cannot be empty"));
         }
         stop_bytes = stop_bytes
             .checked_add(stop.len())
-            .ok_or_else(|| invalid("controlled sampling stop bytes overflow"))?;
+            .ok_or_else(|| invalid("sampling stop bytes overflow"))?;
     }
     if stop_bytes > MAX_STOP_SEQUENCE_BYTES {
         return Err(invalid(format!(
-            "controlled sampling stop bytes cannot exceed {MAX_STOP_SEQUENCE_BYTES}"
+            "sampling stop bytes cannot exceed {MAX_STOP_SEQUENCE_BYTES}"
         )));
     }
     Ok(())

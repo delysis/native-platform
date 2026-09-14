@@ -28,16 +28,16 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
+use desktop_generation_policy::{GenerationTask, SamplingOverrides, resolve_sampling};
 use loom_backend_llama::{
     ContinuationCase, ContinuationContextBinding, DownloadCancellation, DownloadControl,
     DownloadError, ExactContinuationRequest, ExactContinuationResult, GgufDownloadRequest,
     GgufHeaderStatus, JoinedLlamaGeneration, JoinedLlamaRuntime, LlamaBackend, LlamaBackendError,
     LlamaGenerationControl, LlamaGenerationHandle, LocalModelProfile, MAX_MODEL_DOWNLOAD_BYTES,
     ModelDiscoveryOptions, ModelRelease, NativeHostRuntime, ProcessExitJoinedLlamaRuntime,
-    SamplerKind, SamplingConfig, Sha256Digest, VerifiedModelDescriptor,
-    continuation_context_binding, discover_gguf_models, download_gguf,
-    model_environment_from_verified, validate_candidate_receipt_binding,
-    validate_gguf_download_request,
+    SamplingConfig, Sha256Digest, VerifiedModelDescriptor, continuation_context_binding,
+    discover_gguf_models, download_gguf, model_environment_from_verified,
+    validate_candidate_receipt_binding, validate_gguf_download_request,
 };
 use loom_document::{DocumentContent, MergeError, MergeOutcome, three_way_merge};
 use loom_host::{
@@ -5672,12 +5672,15 @@ fn prepare_exact_model_load(
             false,
         ));
     }
-    let mut profile = state.native_runtime.model_profile_for_current_memory(
-        canonical_path.clone(),
-        expectation.model_file_bytes,
-        expectation.projector_file_bytes.unwrap_or(0),
-        expectation.maximum_context_tokens,
-    );
+    let mut profile = state
+        .native_runtime
+        .model_profile_for_current_memory(
+            canonical_path.clone(),
+            expectation.model_file_bytes,
+            expectation.projector_file_bytes.unwrap_or(0),
+            expectation.maximum_context_tokens,
+        )
+        .map_err(|error| IpcFailure::new("model_context_plan_failed", error.to_string(), true))?;
     if let (Some(projector_name), Some(projector_sha256), Some(projector_file_bytes)) = (
         expectation.projector_name.as_deref(),
         expectation.projector_sha256.as_deref(),
@@ -6157,6 +6160,10 @@ fn prepare_model_load(
         ModelRegistry::Loaded(_) | ModelRegistry::Empty => {}
     }
     ensure_no_active_generations(state, "switching local models")?;
+    let profile = state
+        .native_runtime
+        .model_profile_for_current_memory(discovered.resolved_path, discovered.file_bytes, 0, None)
+        .map_err(|error| IpcFailure::new("model_context_plan_failed", error.to_string(), true))?;
     let previous = match std::mem::take(&mut *registry) {
         ModelRegistry::Loaded(previous) => Some(previous),
         ModelRegistry::Empty => None,
@@ -6173,12 +6180,7 @@ fn prepare_model_load(
     Ok(ModelLoadPlan::Inspect {
         selected_path,
         canonical_path: canonical,
-        profile: state.native_runtime.model_profile_for_current_memory(
-            discovered.resolved_path,
-            discovered.file_bytes,
-            0,
-            None,
-        ),
+        profile,
     })
 }
 
@@ -7799,13 +7801,15 @@ fn replay_weave_if_recorded(
                             return false;
                         };
                         let (run_id, branch_id) = derive_weave_case_ids(command_id, case_index);
-                        let sampling = sampling_for_weave_case(
+                        let Ok(sampling) = sampling_for_weave_case(
                             command_id,
                             case_index,
                             resolved.max_tokens,
                             resolved.temperature,
                             resolved.preset,
-                        );
+                        ) else {
+                            return false;
+                        };
                         serde_json::from_value::<SamplingConfig>(
                             started.generation.sampling.clone(),
                         )
@@ -8268,7 +8272,7 @@ fn weave_start_inner<R: Runtime>(
         for index in 0..branch_count {
             let (run_id, branch_id) = derive_weave_case_ids(command_id, index);
             let sampling =
-                sampling_for_weave_case(command_id, index, max_tokens, temperature, preset);
+                sampling_for_weave_case(command_id, index, max_tokens, temperature, preset)?;
             let generation = GenerationStart {
                 run_id,
                 branch_id,
@@ -8735,50 +8739,22 @@ fn sampling_for_weave_case(
     max_tokens: u32,
     temperature: f32,
     preset: WeavePreset,
-) -> SamplingConfig {
-    let repetition_resistant_prose = preset == WeavePreset::AutomaticProseV2;
-    SamplingConfig {
-        seed: generation_seed(command_id, index, preset),
-        temperature,
-        dynamic_temperature_range: 0.0,
-        dynamic_temperature_exponent: 1.0,
-        top_k: 40,
-        top_p: 0.95,
-        min_p: if repetition_resistant_prose {
-            0.05
-        } else {
-            0.0
-        },
-        typical_p: 1.0,
-        xtc_probability: 0.0,
-        xtc_threshold: 0.1,
-        repeat_last_n: 64,
-        // Prompt penalties operate over the full rendered Gemma chat scaffold,
-        // not merely generated prose. Keep them neutral; the model and min-p
-        // filter provide diversity without distorting the first word.
-        repeat_penalty: 1.0,
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
-        // DRY consumes the rendered instruction/chat control tokens as history.
-        // On Gemma 4 this can suppress ordinary prose tokens before the first
-        // generated word and drive the sampler into numeric degeneration.
-        dry_multiplier: 0.0,
-        dry_base: 1.75,
-        dry_allowed_length: if repetition_resistant_prose { 4 } else { 2 },
-        dry_penalty_last_n: if repetition_resistant_prose { 256 } else { -1 },
-        sampler_order: vec![
-            SamplerKind::Penalties,
-            SamplerKind::Dry,
-            SamplerKind::TopK,
-            SamplerKind::TypicalP,
-            SamplerKind::TopP,
-            SamplerKind::MinP,
-            SamplerKind::Xtc,
-            SamplerKind::Temperature,
-        ],
-        max_tokens,
-        stop: Vec::new(),
-    }
+) -> Result<SamplingConfig, IpcFailure> {
+    let task = match preset {
+        WeavePreset::AutomaticProseV2 => GenerationTask::AutomaticProse,
+        WeavePreset::AutomaticVerseV2 => GenerationTask::AutomaticVerse,
+        WeavePreset::ManualV2 => GenerationTask::ManualWriting,
+    };
+    resolve_sampling(
+        task,
+        &[SamplingOverrides {
+            seed: Some(generation_seed(command_id, index, preset)),
+            temperature: Some(temperature),
+            max_tokens: Some(max_tokens),
+            ..SamplingOverrides::default()
+        }],
+    )
+    .map_err(|error| IpcFailure::new("generation_profile_invalid", error.to_string(), false))
 }
 
 fn loaded_model(state: &State<'_, PluginState>) -> Result<LoadedModel, IpcFailure> {
@@ -13051,9 +13027,12 @@ mod tests {
     fn automatic_sampling_is_typed_and_repetition_resistant() {
         let command_id = CommandId::new();
         let automatic =
-            sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::AutomaticProseV2);
-        let verse = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::AutomaticVerseV2);
-        let manual = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::ManualV2);
+            sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::AutomaticProseV2)
+                .expect("valid sampling");
+        let verse = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::AutomaticVerseV2)
+            .expect("valid sampling");
+        let manual = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::ManualV2)
+            .expect("valid sampling");
 
         assert_ne!(automatic.seed, verse.seed);
         assert_ne!(verse.seed, manual.seed);
@@ -13087,15 +13066,18 @@ mod tests {
             AUTOMATIC_WEAVE_MAX_TOKENS_V2,
             AUTOMATIC_WEAVE_TEMPERATURE_V2,
             WeavePreset::AutomaticProseV2,
-        );
+        )
+        .expect("valid sampling");
         let verse = sampling_for_weave_case(
             command_id,
             0,
             AUTOMATIC_WEAVE_MAX_TOKENS_V2,
             AUTOMATIC_WEAVE_TEMPERATURE_V2,
             WeavePreset::AutomaticVerseV2,
-        );
-        let manual = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::ManualV2);
+        )
+        .expect("valid sampling");
+        let manual = sampling_for_weave_case(command_id, 0, 48, 0.8, WeavePreset::ManualV2)
+            .expect("valid sampling");
         assert_eq!(
             prose.fingerprint().sha256_hex(),
             "3da7620eae64153b0c5785abcdffb094b3eef47677a4beec9ab71fe8c718f334"

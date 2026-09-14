@@ -3432,7 +3432,7 @@ mod tests {
         profile.projector_path = Some("fixture.mmproj".into());
         profile.expected_mmproj_sha256 = Some("66".repeat(32));
 
-        let native = profile.as_native_config();
+        let native = profile.as_native_config().expect("valid profile");
         assert_eq!(native.model_path, profile.model_path);
         assert_eq!(native.expected_model_sha256, profile.expected_model_sha256);
         assert_eq!(native.mmproj_path, profile.projector_path);
@@ -3915,7 +3915,7 @@ mod tests {
             std::fs::metadata(model_path)?.len(),
             projector_bytes,
             None,
-        );
+        )?;
         request.model.projector_path = projector_path;
         request.model.expected_mmproj_sha256 = std::env::var("LOOM_GGUF_MMPROJ_SHA256").ok();
         eprintln!(

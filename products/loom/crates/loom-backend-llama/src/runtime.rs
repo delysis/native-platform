@@ -185,14 +185,13 @@ impl NativeHostRuntime {
     /// Sizes a default model profile within this host's immutable admission
     /// budget and current physical-memory headroom. Native admission still
     /// checks its independent estimate and any already resident models.
-    #[must_use]
     pub fn model_profile_for_current_memory(
         &self,
         model_path: PathBuf,
         model_file_bytes: u64,
         projector_file_bytes: u64,
         maximum_context_tokens: Option<u32>,
-    ) -> LocalModelProfile {
+    ) -> Result<LocalModelProfile, NativeError> {
         let mut system = sysinfo::System::new();
         system.refresh_memory();
         LocalModelProfile::for_gguf_with_memory(
@@ -204,6 +203,7 @@ impl NativeHostRuntime {
             self.memory_budget_bytes,
             maximum_context_tokens,
         )
+        .map_err(|error| NativeError::new(NativeErrorCode::InvalidConfig, error.to_string()))
     }
 
     fn lock_residency(&self) -> Result<MutexGuard<'_, ResidencyLedger>, NativeError> {
@@ -223,7 +223,7 @@ impl NativeHostRuntime {
         profile: &LocalModelProfile,
     ) -> Result<NativeModelHandle, NativeError> {
         let mut residency = self.lock_residency()?;
-        let handle = self.host.acquire(profile.as_native_config())?;
+        let handle = self.host.acquire(profile.as_native_config()?)?;
         residency.model_paths.insert(profile.model_path.clone());
         Ok(handle)
     }
@@ -341,7 +341,7 @@ impl BatchRuntime for NativeHostRuntime {
         profile: &LocalModelProfile,
     ) -> Result<RuntimeModelInspection, NativeError> {
         let mut residency = self.lock_residency()?;
-        let handle = self.host.acquire(profile.as_native_config())?;
+        let handle = self.host.acquire(profile.as_native_config()?)?;
         residency.model_paths.insert(profile.model_path.clone());
         let status = handle.status();
         let live_model_path = status.model_path;
@@ -363,7 +363,7 @@ impl BatchRuntime for NativeHostRuntime {
         request: GenerationBatchRequest,
     ) -> Result<Arc<dyn BatchExecution>, NativeError> {
         let mut residency = self.lock_residency()?;
-        let handle = self.host.acquire(profile.as_native_config())?;
+        let handle = self.host.acquire(profile.as_native_config()?)?;
         residency.model_paths.insert(profile.model_path.clone());
         let ticket = handle.generate_batch(request)?;
         let event_receiver = ticket.events.clone();

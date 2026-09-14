@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 desktop-context.workspace = true
+desktop-generation-policy.workspace = true
 desktop-model-defaults.workspace = true
 attachment-native-host.workspace = true
 attachment-native-types.workspace = true

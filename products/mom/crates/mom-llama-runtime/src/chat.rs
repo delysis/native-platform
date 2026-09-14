@@ -21,7 +21,7 @@ use llama_native_engine::GenerationTicket;
 use llama_native_types::{
     ChatMessage, ChatRole, ChatTemplateChoice, GenerationEventKind, GenerationInput,
     GenerationOutput, GenerationRequest, GenerationState, NativeError, NativeErrorCode,
-    SamplingConfig, SequenceStateBlob,
+    SequenceStateBlob,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -634,6 +634,8 @@ where
         &attachment_context.text_by_message_id,
         &attachment_context.current_text,
     );
+    let sampling =
+        settings.sampling_for_profile(conversation.execution_profile.sampling.as_ref())?;
     let request_id = Uuid::new_v4().to_string();
     let cancel_path = format!("native://request/{request_id}");
     register_active_request(
@@ -754,11 +756,6 @@ where
         } else {
             (None, false)
         };
-        let sampling = conversation
-            .execution_profile
-            .sampling
-            .clone()
-            .unwrap_or_else(|| sampling_config(&settings));
         let build_request = |cached_prefix: Option<SequenceStateBlob>| GenerationRequest {
             request_id: request_id.clone(),
             model_id: status.model_id.clone(),
@@ -1159,10 +1156,6 @@ pub fn chat_skip_reasoning_in_scope(
         false,
         false,
     ))
-}
-
-fn sampling_config(settings: &crate::config::Settings) -> SamplingConfig {
-    settings.sampling_config()
 }
 
 pub(crate) fn build_native_messages(
