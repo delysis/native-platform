@@ -1,4 +1,11 @@
 const COMMANDS: &[&str] = &[
+    "signal_request",
+    "cabal_snapshot",
+    "cabal_share",
+    "cabal_join",
+    "cabal_edit",
+    "cabal_revoke",
+    "cabal_recover",
     "project_open_default",
     "project_prepare_open",
     "project_commit_open",
@@ -76,6 +83,10 @@ const COMMANDS: &[&str] = &[
 ];
 
 fn main() {
+    println!(
+        "cargo:rustc-env=LOOM_BUILD_TARGET={}",
+        std::env::var("TARGET").expect("Cargo sets TARGET")
+    );
     if let Err(error) = tauri_plugin::Builder::new(COMMANDS).try_build() {
         panic!("failed to build Loom plugin metadata: {error}");
     }

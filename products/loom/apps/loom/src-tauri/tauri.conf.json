@@ -5,9 +5,9 @@
   "version": "0.1.0",
   "identifier": "app.delysis.loom",
   "build": {
-    "beforeDevCommand": "pnpm dev",
+    "beforeDevCommand": "node ../../../../scripts/build-loom-signal.mjs && pnpm dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "pnpm build",
+    "beforeBuildCommand": "node ../../../../scripts/build-loom-signal.mjs --release && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -31,6 +31,7 @@
   },
   "bundle": {
     "active": true,
+    "externalBin": ["binaries/loom-signal"],
     "targets": ["app"],
     "category": "Productivity",
     "shortDescription": "Local-first writing with private model branches",

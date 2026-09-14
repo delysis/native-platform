@@ -71,6 +71,8 @@ struct TerminalMediaEvidence {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RunReceipt {
+    #[serde(default)]
+    literal_input: bool,
     run: TerminalRun,
     request_fingerprint: BlobId,
     source_document_id: DocumentId,
@@ -317,6 +319,7 @@ pub(super) async fn terminal_run<R: Runtime>(
     presentation: Option<TerminalPresentation>,
     context_references: Option<Vec<String>>,
     turn_boundary: Option<TerminalTurnBoundary>,
+    literal_input: Option<bool>,
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<TerminalRun, IpcFailure> {
@@ -350,6 +353,9 @@ pub(super) async fn terminal_run<R: Runtime>(
     }
     if let Some(boundary) = turn_boundary {
         fingerprint_bytes.extend(serde_json::to_vec(&boundary).map_err(io_failure)?);
+    }
+    if let Some(literal) = literal_input {
+        fingerprint_bytes.extend(serde_json::to_vec(&literal).map_err(io_failure)?);
     }
     let fingerprint = BlobId::digest(&fingerprint_bytes);
     let admission = lock_application_admission(&state, "an experiment")?;
@@ -395,18 +401,38 @@ pub(super) async fn terminal_run<R: Runtime>(
     if entry.trim().is_empty() {
         return Err(failure("Write or select an idea to try."));
     }
-    let command = parse_neural_command(&entry).map_err(io_failure)?;
+    let literal = literal_input.unwrap_or(false);
+    if literal
+        && (source_start_byte != 0
+            || source_end_byte != 0
+            || context_references
+                .as_ref()
+                .is_some_and(|references| !references.is_empty()))
+    {
+        return Err(failure(
+            "Literal input cannot select source text or document references.",
+        ));
+    }
+    let command = if literal {
+        NeuralCommand::Prompt(bounded(entry.clone())?)
+    } else {
+        parse_neural_command(&entry).map_err(io_failure)?
+    };
     let mut names = BTreeSet::new();
     let mut calls = 0;
     match &command {
         NeuralCommand::Prompt(text) => {
-            names = prompt_reference_names(
-                text,
-                context_references.as_deref(),
-                presentation
-                    .as_ref()
-                    .map(|presentation| presentation.input.as_str()),
-            )?;
+            names = if literal {
+                BTreeSet::new()
+            } else {
+                prompt_reference_names(
+                    text,
+                    context_references.as_deref(),
+                    presentation
+                        .as_ref()
+                        .map(|presentation| presentation.input.as_str()),
+                )?
+            };
             calls = 1;
         }
         NeuralCommand::Expression(expression) => {
@@ -473,7 +499,9 @@ pub(super) async fn terminal_run<R: Runtime>(
         }
         bindings.insert(name, bounded(text)?);
     }
-    let media = if let Some(model) = &model {
+    let media = if let Some(model) = &model
+        && !literal
+    {
         let media = crate::terminal_media::resolve(
             store,
             &source,
@@ -520,6 +548,7 @@ pub(super) async fn terminal_run<R: Runtime>(
             .collect(),
     };
     let receipt = RunReceipt {
+        literal_input: literal,
         run: TerminalRun {
             run_id: command_id.to_string(),
             status: "running".into(),

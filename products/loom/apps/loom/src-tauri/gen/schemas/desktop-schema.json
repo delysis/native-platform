@@ -2259,10 +2259,10 @@
           "markdownDescription": "Denies the save command without any pre-configured scope."
         },
         {
-          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
+          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-signal-request`\n- `allow-cabal-snapshot`\n- `allow-cabal-share`\n- `allow-cabal-join`\n- `allow-cabal-edit`\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
           "type": "string",
           "const": "loom:default",
-          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
+          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-signal-request`\n- `allow-cabal-snapshot`\n- `allow-cabal-share`\n- `allow-cabal-join`\n- `allow-cabal-edit`\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
         },
         {
           "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-audio-synthesize`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-terminal-run`\n- `allow-terminal-list`\n- `allow-terminal-cancel`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
@@ -2365,6 +2365,30 @@
           "type": "string",
           "const": "loom:allow-build-model-policy-get",
           "markdownDescription": "Enables the build_model_policy_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_edit command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-edit",
+          "markdownDescription": "Enables the cabal_edit command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_join command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-join",
+          "markdownDescription": "Enables the cabal_join command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_share command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-share",
+          "markdownDescription": "Enables the cabal_share command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-snapshot",
+          "markdownDescription": "Enables the cabal_snapshot command without any pre-configured scope."
         },
         {
           "description": "Enables the candidate_keep command without any pre-configured scope.",
@@ -2649,6 +2673,12 @@
           "markdownDescription": "Enables the shader_preview command without any pre-configured scope."
         },
         {
+          "description": "Enables the signal_request command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-signal-request",
+          "markdownDescription": "Enables the signal_request command without any pre-configured scope."
+        },
+        {
           "description": "Enables the speech_input_cancel command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-speech-input-cancel",
@@ -2809,6 +2839,30 @@
           "type": "string",
           "const": "loom:deny-build-model-policy-get",
           "markdownDescription": "Denies the build_model_policy_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_edit command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-edit",
+          "markdownDescription": "Denies the cabal_edit command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_join command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-join",
+          "markdownDescription": "Denies the cabal_join command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_share command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-share",
+          "markdownDescription": "Denies the cabal_share command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-snapshot",
+          "markdownDescription": "Denies the cabal_snapshot command without any pre-configured scope."
         },
         {
           "description": "Denies the candidate_keep command without any pre-configured scope.",
@@ -3091,6 +3145,12 @@
           "type": "string",
           "const": "loom:deny-shader-preview",
           "markdownDescription": "Denies the shader_preview command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the signal_request command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-signal-request",
+          "markdownDescription": "Denies the signal_request command without any pre-configured scope."
         },
         {
           "description": "Denies the speech_input_cancel command without any pre-configured scope.",

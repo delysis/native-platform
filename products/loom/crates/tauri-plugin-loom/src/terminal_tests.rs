@@ -90,6 +90,7 @@ impl TerminalFixture {
             presentation,
             None,
             boundary,
+            None,
             self.app.handle().clone(),
             self.app.state::<PluginState>(),
         ))

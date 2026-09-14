@@ -2,6 +2,7 @@
 
 mod attachments;
 mod audio_io;
+mod cabals;
 mod co_writer;
 mod context_attachments;
 mod document_bindings;
@@ -11,6 +12,7 @@ mod microphone_capture;
 mod model_catalog;
 mod model_download;
 mod shader_preview;
+mod signal;
 mod speech_input;
 mod terminal;
 mod terminal_media;
@@ -74,6 +76,9 @@ use crate::attachments::{
     read_image_asset, store_image_asset,
 };
 use crate::audio_io::{audio_record_start, audio_record_stop, audio_synthesize};
+use crate::cabals::{
+    cabal_edit, cabal_join, cabal_recover, cabal_revoke, cabal_share, cabal_snapshot,
+};
 use crate::co_writer::{
     CoWriterError, CoWriterSummary, apply_to_document as apply_co_writer,
     delete as delete_co_writer, list as list_co_writers, save_from_document as save_co_writer,
@@ -93,6 +98,7 @@ use crate::model_download::{
     ModelLibraryError, ReservationOutcome, model_target_path, prepare_model_library,
 };
 use crate::shader_preview::shader_preview;
+use crate::signal::signal_request;
 use crate::speech_input::{
     SpeechInputError, SpeechInputService, SpeechInputSnapshot, SpeechInputTarget,
     SpeechRecordingSnapshot,
@@ -373,6 +379,8 @@ pub struct PluginState {
     downloads: Arc<ModelDownloadRegistry>,
     download_workers: DownloadWorkerRegistry,
     speech_input: Arc<SpeechInputService>,
+    signal: Arc<signal::SignalService>,
+    cabals: Arc<cabals::CabalService>,
     audio_capture: audio_io::CapturePersistence,
     app_local_data_root: Option<PathBuf>,
     isolate_model_discovery: bool,
@@ -418,6 +426,8 @@ impl PluginState {
             downloads: Arc::new(ModelDownloadRegistry::default()),
             download_workers: DownloadWorkerRegistry::default(),
             speech_input: Arc::new(SpeechInputService::new(app_local_data_root.clone())),
+            signal: Arc::new(signal::SignalService::default()),
+            cabals: Arc::new(cabals::CabalService::default()),
             audio_capture: audio_io::CapturePersistence::default(),
             app_local_data_root,
             isolate_model_discovery,
@@ -450,6 +460,8 @@ impl Drop for PluginState {
             eprintln!("Loom could not quiesce generation lifecycle during plugin drop: {error}");
         }
         let _desktop_workers = self.join_desktop_workers_for_exit();
+        tauri::async_runtime::block_on(self.signal.shutdown());
+        tauri::async_runtime::block_on(self.cabals.shutdown());
         if let Err(error) = tauri::async_runtime::block_on(self.speech_input.shutdown()) {
             eprintln!("Loom speech input did not stop during plugin drop: {error}");
         }
@@ -1927,6 +1939,13 @@ impl Builder {
                 workspace_preview::response(&state, context.webview_label(), &request)
             })
             .invoke_handler(tauri::generate_handler![
+                signal_request,
+                cabal_snapshot,
+                cabal_share,
+                cabal_join,
+                cabal_edit,
+                cabal_revoke,
+                cabal_recover,
                 project_open_default,
                 project_prepare_open,
                 project_commit_open,
@@ -2011,6 +2030,7 @@ impl Builder {
                     isolate_model_discovery,
                     build_model_policy,
                 ));
+                signal::resume(app);
                 Ok(())
             })
             .on_window_ready(|window| {
@@ -10036,6 +10056,8 @@ fn application_close<R: Runtime>(
         IpcFailure::new("generation_lifecycle_not_drained", error.to_string(), true)
     })?;
     let permit = close_attempt.authorize(proof);
+    tauri::async_runtime::block_on(state.signal.shutdown());
+    tauri::async_runtime::block_on(state.cabals.shutdown());
     exit_application(&app, permit);
     Ok(())
 }

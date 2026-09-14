@@ -62,9 +62,11 @@
     "product-loom": [
       "loom-app",
       "loom-backend-llama",
+      "loom-cabal",
       "loom-cli",
       "loom-document",
       "loom-host",
+      "loom-signal-protocol",
       "loom-store",
       "loom-types",
       "tauri-plugin-loom"
@@ -102,8 +104,10 @@
       "information-native-types",
       "llama-native-cache",
       "llama-native-types",
+      "loom-cabal",
       "loom-document",
       "loom-host",
+      "loom-signal-protocol",
       "loom-store",
       "loom-types",
       "mom-llama-runtime",

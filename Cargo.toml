@@ -41,10 +41,12 @@ members = [
     "products/fte/src-tauri",
     "products/loom/apps/loom/src-tauri",
     "products/loom/crates/loom-backend-llama",
+    "products/loom/crates/loom-cabal",
     "products/loom/crates/loom-cli",
     "products/loom/crates/loom-document",
     "products/loom/crates/loom-host",
     "products/loom/crates/loom-store",
+    "products/loom/crates/loom-signal-protocol",
     "products/loom/crates/loom-types",
     "products/loom/crates/tauri-plugin-loom",
     "products/mom/apps/mom-llama/src-tauri",
@@ -52,7 +54,7 @@ members = [
     "products/mom/crates/mom-llama-runtime",
     "xtask",
 ]
-exclude = ["crates/services/attachment/fuzz", "vendor/glib"]
+exclude = ["crates/services/attachment/fuzz", "products/loom/signal", "vendor/glib"]
 resolver = "3"
 
 [workspace.package]

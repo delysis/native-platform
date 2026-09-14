@@ -562,6 +562,7 @@ export interface TerminalRun {
 }
 
 export interface TerminalRunRequest {
+  literalInput?: boolean;
   turnBoundary?: 'chat';
   contextReferences?: string[];
   presentation?: { pane_id: string; input: string };

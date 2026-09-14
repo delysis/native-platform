@@ -50,6 +50,7 @@ jobs:
         with:
           shared-key: full-root-${{ runner.os }}
           cache-on-failure: true
+      - uses: ./.github/actions/loom-signal
       - run: cargo fmt --all -- --check
       - name: Compile macOS smoke support
         if: runner.os == 'macOS'

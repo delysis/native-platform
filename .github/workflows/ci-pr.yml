@@ -96,6 +96,7 @@ jobs:
         with:
           shared-key: root-linux
           save-if: ${{ matrix.command == 'test' }}
+      - uses: ./.github/actions/loom-signal
       - if: ${{ matrix.command == 'test' }}
         run: cargo fmt --all -- --check
       - if: ${{ matrix.command == 'test' }}
@@ -287,6 +288,7 @@ jobs:
         with:
           shared-key: loom-linux
           save-if: ${{ matrix.command == 'test' }}
+      - uses: ./.github/actions/loom-signal
       - if: ${{ matrix.command == 'test' }}
         run: node scripts/ci/cargo-group.mjs fmt product-loom
       - if: ${{ matrix.command == 'test' }}
@@ -307,6 +309,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           shared-key: loom-windows
+      - uses: ./.github/actions/loom-signal
       - run: node scripts/ci/cargo-group.mjs test product-loom
 
   frontend:
@@ -372,6 +375,9 @@ jobs:
         if: ${{ matrix.component == 'release' }}
         run: cargo run --locked -p xtask -- macos-smoke-support target/macos-smoke-support
       - name: Root platform graph
+        if: ${{ matrix.component == 'root' || matrix.component == 'loom' }}
+        uses: ./.github/actions/loom-signal
+      - name: Check root platform graph
         if: ${{ matrix.component == 'root' }}
         run: cargo check --locked --workspace --all-targets
       - name: Mom macOS parity

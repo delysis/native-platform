@@ -7,6 +7,12 @@
   import type { TerminalSourceRange } from './lib/terminalSelection';
   import { workspaceRows } from './lib/workspaceTree';
   import WorkspacePane from './lib/WorkspacePane.svelte';
+  import SignalPane from './lib/SignalPane.svelte';
+  import CabalPane from './lib/CabalPane.svelte';
+  import { SignalDraftEditor } from './lib/signalDraft';
+  import { CabalEditor, cabalSnapshot, editCabal, shareCabal, joinCabal, recoverCabalEdits, revokeCabalMember, type CabalSnapshot, type SharedDocument } from './lib/cabal';
+  import type { SignalConversation } from './lib/signal';
+  import { RetainedOutputLoader } from './lib/retainedOutput';
   import type { WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
   import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
   import { startAudioRecording, stopAudioRecording, synthesizeAudio, type AudioRecording } from './lib/ipc';
@@ -406,6 +412,20 @@
   let outlineOpen = false;
   let collapsedFolders = new Set<string>(['Runs/']);
   let terminalOpen = false;
+  let signalOpen = false;
+  let cabalOpen = false;
+  const signalDraftEditor = new SignalDraftEditor();
+  let cabal: CabalSnapshot | null = null;
+  let cabalEditor: CabalEditor | null = null;
+  let cabalScope = '';
+  let cabalAttaching = false;
+  let cabalRefreshing = false;
+  let cabalApplying = false;
+  let cabalTimer: ReturnType<typeof setTimeout> | undefined;
+  $: if (componentMounted && desktop && project && document && transition === 'idle') {
+    const scope = `${project.project_id}/${project.session_id}/${document.summary.document_id}`;
+    if (scope !== cabalScope) { cabalScope = scope; void attachCabal(scope); }
+  }
   let terminalEntry = '';
   let terminalRuns: TerminalRun[] = [];
   let terminalDispatching = false;
@@ -680,6 +700,7 @@
     insertTextAtAnchor: (anchor: VisualTextInsertionAnchor, text: string) => boolean;
   } | null = null;
   let sourceEditor: {
+    applyRemoteValue: (text: string) => void;
     focusAtDocumentEnd: () => boolean;
     focusCurrentSelection: () => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
@@ -908,7 +929,11 @@
       }
       return true;
     },
-    closeProject: async () => project ? closeProject() : detachedProjectCloseCoordinator.close(),
+    closeProject: async () => {
+      try { await signalDraftEditor.flush(); }
+      catch (failure) { recordFailure(failure); signalOpen = true; return { status: 'resume' }; }
+      return project ? closeProject() : detachedProjectCloseCoordinator.close();
+    },
     authorizeNativeClose: requestApplicationClose,
     abortNativeClose: abortApplicationClose,
     reset: () => {
@@ -1315,7 +1340,7 @@
   $: showVisual = mode === 'visual';
   $: showSource = mode === 'source';
   $: exactTextSurface = document?.summary.kind === 'verse';
-  $: editorReadonly = transition !== 'idle' || renameDocumentEditorLocked || deleteDocumentEditorLocked || missingDocumentBoundaryInFlight || missingDocumentCapturePending !== null || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
+  $: editorReadonly = cabalAttaching || transition !== 'idle' || renameDocumentEditorLocked || deleteDocumentEditorLocked || missingDocumentBoundaryInFlight || missingDocumentCapturePending !== null || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
   $: reconciliationResolutionLocked = reconciliationApplying || pendingReconciliationApply !== null;
   $: reconciliationResolutionIsExact = Boolean(
     reconciliation && (
@@ -2230,6 +2255,8 @@
     window.document.addEventListener('visibilitychange', handleRendererResume);
     return () => {
       componentMounted = false;
+      cabalEditor?.dispose();
+      if (cabalTimer) clearTimeout(cabalTimer);
       if (terminalPollTimer !== undefined) window.clearTimeout(terminalPollTimer);
       startupHeldForApplicationClose = false;
       workspaceRestoreSerial += 1;
@@ -2386,6 +2413,8 @@
   }
 
   function detachDocumentForReconciliation(): void {
+    cabalEditor?.dispose(); cabalEditor = null; cabalScope = ''; cabalAttaching = false;
+    if (cabalTimer) clearTimeout(cabalTimer);
     if (saveTimer !== undefined) {
       window.clearTimeout(saveTimer);
       saveTimer = undefined;
@@ -3024,6 +3053,7 @@
             currentDocumentId
           );
           project = refreshed;
+          if (cabalEditor) { void refreshCabal(cabalScope); return; }
           if (current.externally_modified) {
             const previewBoundary = captureProjectFilesystemRefreshBoundary(
               currentProjectFilesystemRefreshBoundary()
@@ -5872,7 +5902,7 @@
     });
   }
 
-  async function doOpenProject(): Promise<void> {
+  async function doOpenProject(prepare: () => Promise<string | null> = prepareProjectOpen): Promise<void> {
     if (fileCommandInFlight || opening || applicationClosePhase !== 'running') return;
     opening = true;
     fileCommandInFlight = true;
@@ -5880,7 +5910,7 @@
     let handoffStarted = false;
     try {
       // The chooser and validation leave the current editor/session intact.
-      preparationId = await prepareProjectOpen();
+      preparationId = await prepare();
       if (!preparationId || !componentMounted || applicationClosePhase !== 'running') return;
       clearFailure();
       if (project) {
@@ -6464,6 +6494,7 @@
     if (text === documentText) return;
     documentText = text;
     editVersion += 1;
+    if (cabalEditor && !cabalApplying) cabalEditor.change(text);
     uncertainWeave = null;
     saveState = 'dirty';
     saveMessage = saveInFlight ? 'Saving earlier changes…' : 'Unsaved changes';
@@ -6729,6 +6760,7 @@
 
   function scheduleSave(): void {
     if (!desktop || !document) return;
+    if (cabalEditor) return;
     if (saveTimer !== undefined) window.clearTimeout(saveTimer);
     saveTimer = window.setTimeout(() => void saveNow(), saveDelayMs);
   }
@@ -6931,6 +6963,7 @@
   }
 
   function scheduleDraftJournal(delay = draftIntervalMs): void {
+    if (cabalEditor) return;
     if (
       !desktop ||
       !project ||
@@ -6947,6 +6980,7 @@
   }
 
   async function persistTransientDraft(): Promise<boolean> {
+    if (cabalEditor) return cabalEditor.flush();
     if (draftInFlight) {
       return draftInFlight;
     }
@@ -7073,6 +7107,7 @@
   }
 
   async function saveNow(): Promise<void> {
+    if (cabalEditor) { await cabalEditor.flush(); return; }
     if (!document || !desktop || editVersion === savedVersion) return;
     if (!(await flushDraftJournal())) return;
     if (saveInFlight) {
@@ -7283,6 +7318,7 @@
   }
 
   async function flushCurrentDocument(): Promise<boolean> {
+    if (cabalEditor) { if (!flushEditors()) return false; return cabalEditor.flush(); }
     if (!desktop || !document) return true;
     if (saveTimer !== undefined) {
       window.clearTimeout(saveTimer);
@@ -7682,6 +7718,9 @@
   }
 
   async function runRetainedOutput(expression: string): Promise<void> {
+    if (expression.trim() === ':signal') { await toggleSignal(); terminalEntry = ''; return; }
+    if (expression.trim().startsWith(':join ')) { const invitation = expression.trim().slice(6).trim(); terminalEntry = ''; await doOpenProject(() => joinCabal(invitation)); return; }
+    if (expression.trim() === ':cabal') { cabalOpen = !cabalOpen; signalOpen = false; terminalEntry = ''; return; }
     if (!project || !document || terminalIsBusy() || editorReadonly || compositionActive || applicationClosePhase !== 'running') return;
     terminalOpen = true;
     terminalError = '';
@@ -7815,6 +7854,7 @@
     const modifier = event.metaKey || event.ctrlKey;
     if (modifier && event.shiftKey && !event.altKey && !event.isComposing) {
       const key = event.key.toLowerCase();
+      if (key === 'y') { event.preventDefault(); void toggleSignal(); return; }
       if (key === 'u') { event.preventDefault(); void readAloud(); return; }
       if (event.code === 'Comma') { event.preventDefault(); void refreshWorkspaceTemplate(true); return; }
       if (key === 'l') { event.preventDefault(); toggleAppearance(); return; }
@@ -8918,6 +8958,8 @@
   }
 
   async function performCloseProject(): Promise<ProjectCloseOutcome> {
+    try { await signalDraftEditor.flush(); }
+    catch (failure) { recordFailure(failure); signalOpen = true; return { status: 'resume' }; }
     if (!project) return { status: 'closed' };
     if (speechStarting) { announce('Finishing the microphone operation before closing'); return { status: 'resume' }; }
     if (speechRecording) {
@@ -9169,6 +9211,144 @@
     return document;
   }
 
+  function currentCabalScope(): string {
+    return project && document ? `${project.project_id}/${project.session_id}/${document.summary.document_id}` : '';
+  }
+
+  async function attachCabal(scope: string): Promise<void> {
+    if (cabalTimer) clearTimeout(cabalTimer);
+    cabalEditor?.dispose(); cabalEditor = null; cabal = null;
+    cabalAttaching = true;
+    try {
+      if (saveInFlight) await saveInFlight;
+      if (draftInFlight) await draftInFlight;
+      if (currentCabalScope() !== scope) return;
+      if (editVersion !== savedVersion && !await flushCurrentDocument()) return;
+      await refreshCabal(scope, true);
+    } catch (failure) { if (currentCabalScope() === scope) recordFailure(failure); }
+  }
+
+  async function refreshCabal(scope: string, attach = false): Promise<void> {
+    if (!project || !document || !componentMounted || currentCabalScope() !== scope) return;
+    if (cabalRefreshing) {
+      if (attach) cabalTimer = setTimeout(() => void refreshCabal(scope, true), 100);
+      return;
+    }
+    cabalRefreshing = true;
+    const projectId = project.project_id, sessionId = project.session_id;
+    const controller = cabalEditor, version = controller?.version ?? 0;
+    try {
+      const snapshot = await cabalSnapshot(projectId, sessionId);
+      if (!componentMounted || currentCabalScope() !== scope || !project || !document) return;
+      cabal = snapshot;
+      if (!snapshot) { cabalAttaching = false; return; }
+      const summaries = new Map(project.documents.map(item => [item.document_id, item]));
+      for (const item of snapshot.documents) summaries.set(item.local.summary.document_id, item.local.summary);
+      project = { ...project, documents: [...summaries.values()] };
+      const current = snapshot.documents.find(item => item.local.summary.document_id === document?.summary.document_id);
+      if (!current) { cabalAttaching = false; return; }
+      if (transition !== 'idle' || compositionActive || visualMutationPending || sourceDirty) return;
+      if (attach && !cabalEditor) {
+        cabalEditor = new CabalEditor(current, edit => editCabal(projectId, sessionId, edit),
+          item => currentCabalScope() === scope && adoptCabalDocument(item),
+          () => compositionActive || sourceDirty || visualMutationPending,
+          failure => { if (currentCabalScope() === scope) { saveState = 'error'; saveMessage = 'Shared edit needs attention'; recordFailure(failure); } });
+        if (saveTimer !== undefined) { clearTimeout(saveTimer); saveTimer = undefined; }
+        if (draftTimer !== undefined) { clearTimeout(draftTimer); draftTimer = undefined; }
+        adoptCabalDocument(current);
+      } else if (controller && controller === cabalEditor) controller.receive(current, version);
+      cabalAttaching = false;
+    } catch (failure) {
+      if (currentCabalScope() === scope) recordFailure(failure);
+    } finally {
+      cabalRefreshing = false;
+      if (componentMounted && currentCabalScope() === scope) {
+        if (cabalTimer) clearTimeout(cabalTimer);
+        cabalTimer = setTimeout(() => void refreshCabal(scope, attach && !cabalEditor), cabal ? 1000 : 5000);
+      }
+    }
+  }
+
+  function adoptCabalDocument(item: SharedDocument): boolean {
+    if (!document || !project || item.local.summary.document_id !== document.summary.document_id || compositionActive || sourceDirty || visualMutationPending || transition !== 'idle') return false;
+    cabalApplying = true;
+    try {
+      updateText(item.shared.text);
+      document = item.local;
+      if (mode === 'source') {
+        const decoded = decodeSourceForEditor(item.shared.text);
+        sourceCodec = decoded.codec; sourceDisplayText = decoded.display;
+        sourceEditor?.applyRemoteValue(decoded.display);
+      }
+      project = { ...project, documents: project.documents.map(summary => summary.document_id === item.local.summary.document_id ? item.local.summary : summary) };
+      savedVersion = editVersion; draftSavedEditVersion = editVersion;
+      saveState = 'clean'; saveMessage = 'Saved · shared';
+      return true;
+    } finally { cabalApplying = false; }
+  }
+
+  async function inviteCabal(name: string): Promise<string> {
+    if (!await preparePaneRun() || !project) throw new Error('Finish saving this workspace before sharing it.');
+    const invitation = await shareCabal(project.project_id, project.session_id, project.title, name);
+    cabalScope = '';
+    return invitation;
+  }
+
+  async function removeCabalMember(member: string, rosterHash: string): Promise<void> {
+    if (!project || !await flushCurrentDocument()) throw new Error('Finish saving before changing membership.');
+    await revokeCabalMember(project.project_id, project.session_id, member, rosterHash);
+    await refreshCabal(currentCabalScope());
+  }
+
+  async function recoverCabalCopies(): Promise<string[]> {
+    if (!project) throw new Error('Open the cabal workspace first.');
+    const paths = await recoverCabalEdits(project.project_id, project.session_id);
+    await refreshProjectFilesystemState(); outlineOpen = true;
+    return paths;
+  }
+
+  async function inviteSignalConversation(_conversation: SignalConversation): Promise<string> {
+    const invitation = await inviteCabal('Loom');
+    if (!project) throw new Error('The workspace changed.');
+    return `Make something with me in ${project.title}:\n${invitation}`;
+  }
+
+  async function toggleSignal(): Promise<void> {
+    if (signalOpen) {
+      try { await signalDraftEditor.flush(); }
+      catch (failure) { recordFailure(failure); return; }
+    }
+    signalOpen = !signalOpen;
+    if (signalOpen) cabalOpen = false;
+  }
+
+  async function draftSignalReply(prompt: string): Promise<string> {
+    const current = await preparePaneRun();
+    if (!current?.summary.revision_id || !project) throw new Error('Open a saved document before drafting.');
+    const projectId = project.project_id, sessionId = project.session_id;
+    const commandId = newUlid();
+    const run = await runTerminal({ projectId, sessionId, commandId, documentId: current.summary.document_id,
+      sourceRevisionId: current.summary.revision_id, expectedVisibleBlobId: current.visible_blob_id,
+      sourceStartByte: 0, sourceEndByte: 0, expression: prompt, contextReferences: [], literalInput: true,
+      turnBoundary: 'chat', presentation: { pane_id: 'signal', input: 'Draft a Signal reply' } });
+    const loader = new RetainedOutputLoader();
+    let result = run;
+    const deadline = Date.now() + 180_000;
+    while (result.status === 'running') {
+      if (!signalOpen || !terminalScopeIsCurrent(projectId, sessionId) || Date.now() >= deadline) {
+        await cancelTerminalRun(projectId, sessionId, commandId);
+        throw new Error('Drafting stopped. Its retained result remains in Runs.');
+      }
+      await new Promise(resolve => setTimeout(resolve, 600));
+      result = (await listTerminalRuns(projectId, sessionId)).find(item => item.run_id === commandId) ?? result;
+    }
+    if (result.status !== 'completed') throw new Error(result.error || 'The local draft did not complete.');
+    const refreshed = await currentProjectSession();
+    if (!terminalScopeIsCurrent(projectId, sessionId)) throw new Error('The workspace changed while drafting.');
+    project = refreshed;
+    return loader.read(projectId, sessionId, result, refreshed.documents);
+  }
+
   function kindLabel(kind: DocumentKind): string {
     if (kind === 'verse') return 'Poem';
     if (kind === 'hybrid') return 'Hybrid';
@@ -9292,7 +9472,7 @@
   {/if}
 
   {#if project}
-    <div class:outline-open={outlineOpen} class:has-right-pane={paneSlots.some(slot => slot.position === 'right' && slot.selected)} class="workspace-grid">
+    <div class:outline-open={outlineOpen} class:has-right-pane={signalOpen || cabalOpen || paneSlots.some(slot => slot.position === 'right' && slot.selected)} class="workspace-grid">
       <aside
         id="project-outline"
         class:open={outlineOpen}
@@ -9675,6 +9855,7 @@
                   {#if canUseVisual}
                     <LoomEditor
                       bind:this={visualEditor}
+                      collaborative={Boolean(cabalEditor)}
                       value={documentText}
                       label={`${document.summary.title}, manuscript editor`}
                       ghostText={ghostSuggestion?.text ?? ''}
@@ -9794,7 +9975,7 @@
         {/if}
       </main>
       {#each paneSlots as slot (slot.position)}
-        {#if slot.selected && (slot.position !== 'main' || customMain)}
+        {#if slot.selected && !((signalOpen || cabalOpen) && slot.position === 'right') && (slot.position !== 'main' || customMain)}
           {@const selected = slot.selected}
           <aside class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
             <header class="workspace-pane-header">
@@ -9806,6 +9987,9 @@
           </aside>
         {/if}
       {/each}
+
+      {#if signalOpen}<aside class="workspace-pane-slot workspace-pane-right" aria-label="Signal pane"><SignalPane editor={signalDraftEditor} onClose={() => void toggleSignal()} onDraft={draftSignalReply} onCabal={inviteSignalConversation} onJoin={(invitation) => doOpenProject(() => joinCabal(invitation))} modelLabel={currentModel?.display_name ?? 'Local model'} /></aside>{/if}
+      {#if cabalOpen}<aside class="workspace-pane-slot workspace-pane-right" aria-label="Cabal pane"><CabalPane {cabal} projectName={project?.title ?? 'Workspace'} onClose={() => cabalOpen = false} onInvite={inviteCabal} onJoin={(invitation, name) => doOpenProject(() => joinCabal(invitation, name))} onRemove={removeCabalMember} onRecover={recoverCabalCopies} /></aside>{/if}
 
     </div>
       <TerminalPane
@@ -9845,7 +10029,7 @@
               Retry
             </button>
           {/if}
-          <button class="secondary-button" type="button" on:click={doOpenProject} disabled={!desktop || opening}>
+          <button class="secondary-button" type="button" on:click={() => void doOpenProject()} disabled={!desktop || opening}>
             {opening ? 'Opening…' : 'Open folder…'}
           </button>
         </div>

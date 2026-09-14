@@ -4,6 +4,13 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 
 #### This default permission set includes the following:
 
+- `allow-signal-request`
+- `allow-cabal-snapshot`
+- `allow-cabal-share`
+- `allow-cabal-join`
+- `allow-cabal-edit`
+- `allow-cabal-revoke`
+- `allow-cabal-recover`
 - `allow-project-open-default`
 - `allow-project-prepare-open`
 - `allow-project-commit-open`
@@ -452,6 +459,162 @@ Enables the build_model_policy_get command without any pre-configured scope.
 <td>
 
 Denies the build_model_policy_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-edit`
+
+</td>
+<td>
+
+Enables the cabal_edit command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-edit`
+
+</td>
+<td>
+
+Denies the cabal_edit command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-join`
+
+</td>
+<td>
+
+Enables the cabal_join command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-join`
+
+</td>
+<td>
+
+Denies the cabal_join command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-recover`
+
+</td>
+<td>
+
+Enables the cabal_recover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-recover`
+
+</td>
+<td>
+
+Denies the cabal_recover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-revoke`
+
+</td>
+<td>
+
+Enables the cabal_revoke command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-revoke`
+
+</td>
+<td>
+
+Denies the cabal_revoke command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-share`
+
+</td>
+<td>
+
+Enables the cabal_share command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-share`
+
+</td>
+<td>
+
+Denies the cabal_share command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-snapshot`
+
+</td>
+<td>
+
+Enables the cabal_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-snapshot`
+
+</td>
+<td>
+
+Denies the cabal_snapshot command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1674,6 +1837,32 @@ Enables the shader_preview command without any pre-configured scope.
 <td>
 
 Denies the shader_preview command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-signal-request`
+
+</td>
+<td>
+
+Enables the signal_request command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-signal-request`
+
+</td>
+<td>
+
+Denies the signal_request command without any pre-configured scope.
 
 </td>
 </tr>
