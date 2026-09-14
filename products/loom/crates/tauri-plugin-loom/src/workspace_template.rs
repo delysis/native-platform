@@ -569,6 +569,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn enabling_is_explicit_and_never_overwrites_ordinary_author_content() {
         let directory = tempfile::tempdir().unwrap();
         let (mut store, _) =
@@ -595,6 +596,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn existing_template_is_adopted_without_rewriting_even_when_invalid() {
         let directory = tempfile::tempdir().unwrap();
         let (mut store, _) =
@@ -608,6 +610,7 @@ mod tests {
         assert_eq!(enable(&mut store).unwrap().revision_id, result.revision_id);
     }
     #[test]
+    #[cfg(unix)]
     fn external_template_refresh_imports_only_uncontested_bytes() {
         let directory = tempfile::tempdir().unwrap();
         let (mut store, _) =

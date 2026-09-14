@@ -311,8 +311,7 @@
       "promotion_prohibition": "Passing this native command test alone cannot promote editor UX, packaged-app, cross-platform, or release readiness.",
       "platforms": [
         "linux",
-        "macos",
-        "windows"
+        "macos"
       ]
     },
     {

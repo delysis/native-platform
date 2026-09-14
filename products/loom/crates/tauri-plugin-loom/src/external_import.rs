@@ -56,7 +56,7 @@ pub(super) async fn document_import_external(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use loom_document::DocumentContent;

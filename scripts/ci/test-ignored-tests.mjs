@@ -585,6 +585,10 @@ test("the only platform-limited tests match their source cfg gates", () => {
     .map((entry) => [entry.test_id, entry.platforms]);
   assert.deepEqual(limited, [
     [
+      "terminal::integration_tests::real_native_terminal_retains_raw_inference_without_changing_source",
+      ["linux", "macos"],
+    ],
+    [
       "apple_backend::tests::real_apple_tts_returns_silent_wav_bytes_without_permission",
       ["macos"],
     ],

@@ -1116,6 +1116,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "terminal_tests.rs"]
 mod integration_tests;

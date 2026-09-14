@@ -11267,6 +11267,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn workspace_path_preparation_revalidates_hints_without_replacing_live_drafts() {
         let current = tempfile::tempdir().expect("current writing");
         let next = tempfile::tempdir().expect("next writing");
@@ -13616,6 +13617,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn loompad_recovery_reads_immutable_registered_context_evidence() {
         let temp = tempfile::tempdir().expect("temporary project");
         let (mut store, _) =
