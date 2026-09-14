@@ -139,12 +139,7 @@ impl Ledger {
                 ))
             };
         }
-        let count: i64 = self
-            .database
-            .query_row("SELECT count(*) FROM grants", [], |row| row.get(0))?;
-        if count >= MAX_GRANTS {
-            return Err(Error::Invalid("Compute grant ledger is full"));
-        }
+        self.ensure_grant_capacity()?;
         self.database.execute(
             "INSERT INTO grants(id, body) VALUES (?, ?)",
             params![grant.id.to_string(), body],
@@ -153,11 +148,39 @@ impl Ledger {
     }
 
     pub fn revoke(&mut self, id: Uuid) -> Result<()> {
-        self.database.execute(
+        if self.database.execute(
             "UPDATE grants SET revoked = 1 WHERE id = ?",
             [id.to_string()],
-        )?;
+        )? == 0
+        {
+            self.ensure_grant_capacity()?;
+            // A cancelled, uncertain local grant must reject even a delayed
+            // first admission. This tombstone shares the grant identity bound.
+            self.database.execute(
+                "INSERT INTO grants(id, body, revoked) VALUES (?, '', 1)",
+                [id.to_string()],
+            )?;
+        }
         Ok(())
+    }
+
+    fn ensure_grant_capacity(&self) -> Result<()> {
+        let count: i64 = self
+            .database
+            .query_row("SELECT count(*) FROM grants", [], |row| row.get(0))?;
+        if count >= MAX_GRANTS {
+            return Err(Error::Invalid("Compute grant ledger is full"));
+        }
+        Ok(())
+    }
+
+    pub fn remaining_jobs(&self, grant: &ComputeGrant) -> Result<u32> {
+        let used: u32 = self.database.query_row(
+            "SELECT count(*) FROM jobs WHERE grant_id = ?",
+            [grant.id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(grant.jobs.saturating_sub(used))
     }
 
     pub fn grants(&self) -> Result<Vec<ComputeGrant>> {
@@ -184,11 +207,6 @@ impl Ledger {
         let total: i64 = self
             .database
             .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))?;
-        let used: i64 = self.database.query_row(
-            "SELECT count(*) FROM jobs WHERE grant_id = ?",
-            [grant.id.to_string()],
-            |row| row.get(0),
-        )?;
         let bytes: i64 = self.database.query_row(
             "SELECT (SELECT coalesce(sum(length(CAST(input AS BLOB))), 0) FROM jobs)
                 + (SELECT coalesce(sum(length(CAST(body AS BLOB))), 0) FROM receipts)",
@@ -196,7 +214,7 @@ impl Ledger {
             |row| row.get(0),
         )?;
         Ok(total < MAX_JOBS
-            && used < i64::from(grant.jobs)
+            && self.remaining_jobs(grant)? > 0
             && bytes <= MAX_STORED_BYTES - JOB_STORAGE_RESERVE)
     }
 
@@ -442,6 +460,43 @@ mod tests {
                     .is_err()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn revoking_an_uncertain_grant_before_admission_prevents_a_late_retry() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let identity = Identity::generate()?;
+        let job = job(&identity);
+        let mut ledger = Ledger::open(directory.path(), identity.clone())?;
+        ledger.revoke(job.grant.id)?;
+        ledger.revoke(job.grant.id)?;
+        assert!(ledger.grants()?.is_empty());
+        drop(ledger);
+        let mut ledger = Ledger::open(directory.path(), identity)?;
+        assert!(
+            ledger.grant(job.grant).is_err(),
+            "a late grant must stay revoked"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn uncertain_revocations_share_the_bounded_grant_identity_ledger() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let identity = Identity::generate()?;
+        let mut ledger = Ledger::open(directory.path(), identity)?;
+        let mut first = Uuid::nil();
+        for index in 0..MAX_GRANTS {
+            let id = Uuid::new_v4();
+            if index == 0 {
+                first = id;
+            }
+            ledger.revoke(id)?;
+        }
+        assert!(ledger.revoke(Uuid::new_v4()).is_err());
+        ledger.revoke(first)?;
+        assert!(ledger.grants()?.is_empty());
         Ok(())
     }
 

@@ -176,7 +176,14 @@ before taking over the model. Received prompts and actual native execution
 evidence live in a private project under the application profile; they never
 borrow the active manuscript's authority or modify it. Persisted grants reopen
 with the cabal profile and only serve their exact model configuration when idle.
-User controls and caller-side result retention remain to be implemented.
+The cabal pane's Share idle compute control reviews a friend, exact model,
+output/time limits, and lifetime job budget before granting access. It shows
+remaining jobs and inactive membership/model bindings. An app-owned pending
+grant survives closing the pane and retains its exact retry ID; status checks
+cannot create a second budget. Revoking even an uncertain, not-yet-admitted
+grant durably rejects a delayed first admission. These revocation records share
+the bounded grant ledger. Caller-side job submission and result retention
+remain to be integrated into the terminal.
 
 An accepted job is committed before dispatch. Each authenticated caller owns its
 job IDs, and a retry must match the exact original input and grant. Status checks
@@ -264,6 +271,11 @@ receipt for an exact retry, and left the active manuscript unchanged. Both
 endpoints shut down and the actual model unloaded. This test uses a mock Tauri
 application host; it establishes native engine and protocol behavior, not the
 packaged controls, Signal enrollment, or two-machine Internet connectivity.
+
+WebKit exercised the compute grant review and revocation controls, refusal of a
+review after the selected model changed, and closing/reopening a pane with an
+uncertain grant. These browser checks use explicit IPC fixtures and do not
+establish a packaged two-device model-sharing interaction.
 
 The feature is not complete until the following have concrete evidence:
 

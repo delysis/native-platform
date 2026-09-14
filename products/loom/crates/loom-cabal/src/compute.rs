@@ -51,6 +51,13 @@ pub struct ComputeGrant {
     pub jobs: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ComputeGrantStatus {
+    pub grant: ComputeGrant,
+    pub jobs_remaining: u32,
+    pub current: bool,
+}
+
 impl ComputeGrant {
     fn validate(&self) -> Result<()> {
         if self.id.is_nil()
@@ -286,6 +293,9 @@ impl ComputeHost {
     }
 
     pub fn revoke(&self, grant: Uuid) -> Result<()> {
+        if grant.is_nil() {
+            return Err(Error::Invalid("Invalid compute grant identity"));
+        }
         let result = (|| {
             let mut state = self.lock()?;
             state.ledger.revoke(grant)?;
@@ -304,6 +314,22 @@ impl ComputeHost {
 
     pub fn grants(&self) -> Result<Vec<ComputeGrant>> {
         self.lock()?.ledger.grants()
+    }
+
+    pub fn grant_statuses(&self) -> Result<Vec<ComputeGrantStatus>> {
+        let state = self.lock()?;
+        state
+            .ledger
+            .grants()?
+            .into_iter()
+            .map(|grant| {
+                Ok(ComputeGrantStatus {
+                    jobs_remaining: state.ledger.remaining_jobs(&grant)?,
+                    current: (self.authority)(&grant),
+                    grant,
+                })
+            })
+            .collect()
     }
 
     pub fn stop(&self) {
@@ -356,19 +382,18 @@ impl ComputeHost {
                         reason: ComputeRejection::Stopped,
                     });
                 }
-                Ok(Response::Offers {
-                    grants: state
-                        .ledger
-                        .grants()?
-                        .into_iter()
-                        .filter(|grant| {
-                            grant.peer == peer
-                                && grant.cabal == cabal
-                                && (self.authority)(grant)
-                                && self.executor.available(&grant.model)
-                        })
-                        .collect(),
-                })
+                let mut grants = Vec::new();
+                for grant in state.ledger.grants()? {
+                    if grant.peer == peer
+                        && grant.cabal == cabal
+                        && (self.authority)(&grant)
+                        && self.executor.available(&grant.model)
+                        && state.ledger.has_capacity(&grant)?
+                    {
+                        grants.push(grant);
+                    }
+                }
+                Ok(Response::Offers { grants })
             }
             Request::Submit { job, grant, input } => {
                 let reject = |reason| Ok(Response::Rejected { reason });

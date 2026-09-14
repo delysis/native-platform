@@ -3,7 +3,9 @@
 //! crashes between the CRDT commit and the visible file commit.
 use super::*;
 use fs2::FileExt;
-use loom_cabal::compute::{ComputeExecutor, ComputeGrant, ComputeHost, ComputeModel};
+use loom_cabal::compute::{
+    ComputeExecutor, ComputeGrant, ComputeGrantStatus, ComputeHost, ComputeModel,
+};
 use loom_cabal::{
     Cabal, Create, DocumentView, Edit, EditResult, Identity, Invitation, MetadataEdit, Network,
     NetworkMode, PeerStatus, Roster, TextKind,
@@ -309,7 +311,7 @@ struct ComputeBinding {
 pub(crate) struct ComputeHostSnapshot {
     model: Option<ComputeModel>,
     idle: bool,
-    grants: Vec<ComputeGrant>,
+    grants: Vec<ComputeGrantStatus>,
     problem: Option<String>,
 }
 
@@ -350,10 +352,10 @@ pub(crate) async fn compute_host_snapshot(
     let stopped = binding.host.as_ref().is_some_and(|host| host.is_stopped());
     let grants = match binding.host {
         Some(host) => host
-            .grants()
+            .grant_statuses()
             .map_err(failure)?
             .into_iter()
-            .filter(|grant| grant.cabal == cabal_id)
+            .filter(|item| item.grant.cabal == cabal_id)
             .collect(),
         None => Vec::new(),
     };
@@ -430,7 +432,7 @@ pub(crate) async fn compute_revoke(
     let root = root_for(&state, &project_id, &session_id)?;
     let Some(binding) = state
         .cabals
-        .compute_binding(&directory(&state)?, &root, false)
+        .compute_binding(&directory(&state)?, &root, true)
         .await?
     else {
         return Ok(());
@@ -1547,6 +1549,27 @@ mod tests {
             .is_err()
         );
         assert!(!profile_root.join("compute").exists());
+        let mut withdrawn = request.clone();
+        withdrawn.id = Uuid::new_v4();
+        compute_revoke(
+            project.clone(),
+            session_id.clone(),
+            withdrawn.id,
+            state.clone(),
+        )
+        .await
+        .expect("withdraw uncertain grant before a host exists");
+        assert!(
+            compute_grant(
+                project.clone(),
+                session_id.clone(),
+                withdrawn,
+                state.clone()
+            )
+            .await
+            .is_err(),
+            "late first admission must remain revoked"
+        );
         let grant = compute_grant(
             project.clone(),
             session_id.clone(),
@@ -1592,7 +1615,14 @@ mod tests {
             .await
             .expect("snapshot")
             .expect("cabal");
-        assert_eq!(snapshot.grants, vec![grant]);
+        assert_eq!(
+            snapshot.grants,
+            vec![ComputeGrantStatus {
+                jobs_remaining: grant.jobs,
+                grant,
+                current: true
+            }]
+        );
         cabal
             .lock()
             .expect("cabal")

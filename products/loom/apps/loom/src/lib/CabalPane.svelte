@@ -1,8 +1,13 @@
 <script lang="ts">
   import type { CabalSnapshot } from './cabal';
   import { normalizeFailure } from './ipc';
+  import ComputeHostControls from './ComputeHostControls.svelte';
+  import type { ComputeSharing } from './compute';
   export let cabal: CabalSnapshot | null;
   export let projectName: string;
+  export let projectId: string;
+  export let sessionId: string;
+  export let computeSharing: ComputeSharing;
   export let unsaved = false;
   export let onClose: () => void;
   export let onInvite: (name: string) => Promise<string>;
@@ -42,6 +47,7 @@
     {#if cabal.documents.some(item => item.shared.deleted)}<p class="quiet">An open document was removed from this cabal. Its text stays here until you leave it.</p>{/if}
     {#if unsaved || cabal.read_only || cabal.orphaned_changes || cabal.removed_documents}<div class="recovery"><p>Unsent edits and removed writing can be kept in private recovery copies.</p><button type="button" disabled={busy} on:click={() => void run(async () => { const paths = await onRecover(); note = `${paths.length} recovery ${paths.length === 1 ? 'copy' : 'copies'} in the workspace`; })}>Recover my copies</button></div>{/if}
     {#if owner}<button class="invite" type="button" disabled={busy} on:click={() => void run(invite)}>Invite someone</button>{/if}
+    {#key cabal.id}<ComputeHostControls {cabal} scope={{ projectId, sessionId, cabalId: cabal.id }} sharing={computeSharing} />{/key}
   {:else}
     <p class="intro">A little shared mind. Make this workspace a place your people can write together.</p>
     <label>Your name<input maxlength="64" autocomplete="nickname" bind:value={name} placeholder="What your friends call you" /></label>

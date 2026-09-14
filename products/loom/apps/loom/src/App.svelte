@@ -16,6 +16,7 @@
   import WorkspacePane from './lib/WorkspacePane.svelte';
   import SignalPane from './lib/SignalPane.svelte';
   import CabalPane from './lib/CabalPane.svelte';
+  import { ComputeSharing } from './lib/compute';
   import { SignalDraftEditor } from './lib/signalDraft';
   import { CabalEditor, cabalSnapshot, cabalWorkspace, openCabal, editCabal, shareCabal, joinCabal, recoverCabalEdits, revokeCabalMember, type CabalSnapshot, type SharedDocument } from './lib/cabal';
   import { rememberSignalWorkspace, type SignalConversation } from './lib/signal';
@@ -443,6 +444,7 @@
   let signalOpen = false;
   let cabalOpen = false;
   const signalDraftEditor = new SignalDraftEditor();
+  const computeSharing = new ComputeSharing();
   let cabal: CabalSnapshot | null = null;
   let cabalEditor: CabalEditor | null = null;
   let cabalScope = '';
@@ -10360,6 +10362,7 @@
           <PaneDivider edge="left" label="Resize cabal" size={Math.min(rightWidth, rightLimit)} min={200} max={rightLimit} onResize={size => rightWidth = size} />
           {#key project?.session_id}
             <CabalPane {cabal} unsaved={Boolean(cabalEditor) && saveState === 'error'} projectName={project?.title ?? 'Workspace'}
+              projectId={project.project_id} sessionId={project.session_id} {computeSharing}
               onClose={() => cabalOpen = false} onInvite={inviteCabal}
               onJoin={async (invitation, name) => { await doOpenProject(() => joinCabal(invitation, name)); }}
               onRemove={removeCabalMember} onRecover={recoverCabalCopies} />

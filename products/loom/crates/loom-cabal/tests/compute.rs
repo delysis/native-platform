@@ -229,6 +229,7 @@ async fn explicit_grant_and_authenticated_job_retries_run_once_over_quic() -> Re
     outsider_grant.peer = Identity::generate()?.public_key();
     assert!(pair.host.grant(outsider_grant).is_err());
     pair.host.grant(pair.grant.clone())?;
+    assert_eq!(pair.host.grant_statuses()?[0].jobs_remaining, 1);
     let offers = pair
         .peer
         .compute_offers(pair.network.address(), pair.grant.cabal)
@@ -246,6 +247,17 @@ async fn explicit_grant_and_authenticated_job_retries_run_once_over_quic() -> Re
     notified(&pair.executor.started).await;
     let retried = receipt(pair.submit(job).await?);
     assert_eq!(retried.payload.job, job);
+    let status = pair.host.grant_statuses()?.remove(0);
+    assert_eq!(
+        status.jobs_remaining, 0,
+        "an exact retry spends no extra job"
+    );
+    assert!(status.current);
+    assert!(
+        matches!(pair.peer.compute_offers(pair.network.address(), pair.grant.cabal).await?,
+        ComputeReply::Offers { grants } if grants.is_empty()),
+        "exhausted grants cannot advertise new work"
+    );
     let mut changed = input();
     changed.seed += 1;
     rejected(

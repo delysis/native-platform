@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { compile } from 'svelte/compiler';
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 
 function dependencyThunkFor(compiled: string, assignment: string): string {
   const assignmentIndex = compiled.indexOf(assignment);
@@ -11,14 +11,19 @@ function dependencyThunkFor(compiled: string, assignment: string): string {
 }
 
 describe('App ghost reactivity wiring', () => {
-  it('tracks late branch hydration and caret changes in both ghost effects', () => {
-    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
-    const compiled = compile(source, {
+  const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+  let compiled: string;
+  // Compiling the full app is fixture preparation, with the runner's bounded
+  // setup timeout. The behavior assertions retain their normal test timeout.
+  beforeAll(() => {
+    compiled = compile(source, {
       filename: 'App.svelte',
       generate: 'client',
       dev: false
     }).js.code;
+  });
 
+  it('tracks late branch hydration and caret changes in both ghost effects', () => {
     const visual = dependencyThunkFor(compiled, '$.set(visualAutocompleteDisposition');
     expect(visual).toContain('verifiedBranchBodyByRun');
     expect(visual).toContain('currentReadyBranches');
