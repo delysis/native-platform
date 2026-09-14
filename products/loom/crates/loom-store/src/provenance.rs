@@ -329,8 +329,15 @@ impl ProjectStore {
     }
 
     pub fn reconstruct_revision(&self, revision_id: RevisionId) -> Result<Vec<u8>> {
+        Ok(self.revision_document(revision_id)?.text().into_bytes())
+    }
+
+    pub fn revision_document(
+        &self,
+        revision_id: RevisionId,
+    ) -> Result<workspace_document::Document<'static, ArtifactId, ContributionKind>> {
         let segments = self.load_revision_segments(revision_id)?;
-        reconstruct_segments(self, &segments)
+        document_from_segments(self, &segments)
     }
 
     pub(crate) fn verify_visible_source(
@@ -1072,11 +1079,14 @@ pub(crate) fn slice_segments(
     Ok(selected)
 }
 
-pub(crate) fn reconstruct_segments(
+/// The shared content document retains every artifact occurrence, source range,
+/// and contribution. Callers may render it as writing or use its typed parts as
+/// untrusted chat context without flattening the stored provenance.
+fn document_from_segments(
     store: &ProjectStore,
     segments: &[StoredSegment],
-) -> Result<Vec<u8>> {
-    let mut reconstructed = Vec::new();
+) -> Result<workspace_document::Document<'static, ArtifactId, ContributionKind>> {
+    let mut document = workspace_document::Document::new();
     for segment in segments {
         let blob_id: String = store.connection.query_row(
             "SELECT blob_id FROM artifacts WHERE artifact_id = ?1",
@@ -1084,25 +1094,29 @@ pub(crate) fn reconstruct_segments(
             |row| row.get(0),
         )?;
         let bytes = store.read_blob(parse_blob_id(&blob_id)?)?;
-        let start = usize::try_from(segment.start)
-            .map_err(|_| StoreError::CorruptDatabase("segment start overflow".into()))?;
-        let end = usize::try_from(segment.end)
-            .map_err(|_| StoreError::CorruptDatabase("segment end overflow".into()))?;
-        let slice = bytes.get(start..end).ok_or_else(|| {
-            StoreError::CorruptDatabase(format!(
-                "segment range is outside artifact {}",
-                segment.artifact_id
-            ))
-        })?;
-        std::str::from_utf8(slice).map_err(|_| {
-            StoreError::CorruptDatabase(format!(
-                "segment range splits UTF-8 in artifact {}",
-                segment.artifact_id
-            ))
-        })?;
-        reconstructed.extend_from_slice(slice);
+        document
+            .push_slice(
+                segment.artifact_id,
+                &bytes,
+                segment.start..segment.end,
+                workspace_document::PartKind::Text,
+                segment.contribution,
+            )
+            .map_err(|error| {
+                StoreError::CorruptDatabase(format!(
+                    "invalid document part for artifact {}: {error}",
+                    segment.artifact_id
+                ))
+            })?;
     }
-    Ok(reconstructed)
+    Ok(document)
+}
+
+pub(crate) fn reconstruct_segments(
+    store: &ProjectStore,
+    segments: &[StoredSegment],
+) -> Result<Vec<u8>> {
+    Ok(document_from_segments(store, segments)?.text().into_bytes())
 }
 
 pub(crate) fn validate_segment_projection(

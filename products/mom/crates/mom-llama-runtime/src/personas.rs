@@ -260,7 +260,7 @@ pub fn persona_freeze(input: PersonaFreezeInput) -> Result<CommandResult<Convers
             "The source chat no longer exists.",
         ));
     };
-    let active = active_path_messages(&source);
+    let active = active_path_messages(&source)?;
     let Some(index) = active
         .iter()
         .position(|message| message.id == input.message_id)
@@ -652,7 +652,7 @@ fn build_persona_version(persona: &Conversation) -> Result<PersonaVersion> {
         &persona.title,
         &persona.execution_profile,
         &persona.active_leaf_message_id,
-        active_path_messages(persona),
+        active_path_messages(persona)?,
     ))?;
     let version = PersonaVersion {
         persona_id: persona.id.clone(),
@@ -1341,7 +1341,7 @@ fn persona_instantiate_inner(
             profile.mention_handle =
                 unique_handle(db, &groups.groups, &format!("{}-chat", persona.title));
             profile.version = 1;
-            let mut messages = remap_messages(&id, active_path_messages(&persona));
+            let mut messages = remap_messages(&id, active_path_messages(&persona)?);
             crate::attachments::snapshot_message_attachments_from_documents(
                 &id,
                 &mut messages,

@@ -444,8 +444,10 @@ pub fn chat_regenerate_in_scope(
         .conversations
         .iter()
         .find(|conversation| conversation.id == conversation_id)
-        .and_then(|conversation| {
-            active_path_messages(conversation)
+        .map(active_path_messages)
+        .transpose()?
+        .and_then(|messages| {
+            messages
                 .into_iter()
                 .rev()
                 .find(|message| message.role == MessageRole::User)
@@ -534,7 +536,7 @@ where
         conversation.selected_model_path.clone(),
         conversation.execution_profile.mmproj_path.clone(),
     );
-    let active_messages = active_path_messages(&conversation);
+    let active_messages = active_path_messages(&conversation)?;
     let attachment_context = match prepare_chat_attachments(
         &input.conversation_id,
         &active_messages,

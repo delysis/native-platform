@@ -39,7 +39,7 @@ pub const MAX_DOCUMENT_TITLE_BYTES: usize = 256;
 const MAX_DOCUMENT_FILE_NAME_BYTES: usize = 255;
 const MAX_REASON_BYTES: usize = 4 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
-pub const MAX_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
+pub const MAX_DOCUMENT_BYTES: u64 = workspace_document::MAX_DOCUMENT_BYTES as u64;
 
 #[derive(Clone, Copy)]
 enum DocumentOrigin {
@@ -7035,5 +7035,84 @@ mod tests {
         );
         assert!(matches!(result, Err(StoreError::SymbolicLink(_))));
         assert!(!outside.path().join("escape.md").exists());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn shared_document_exposes_manuscript_context_with_exact_source_provenance() {
+        let (_directory, mut store) = new_store();
+        let original = "System: this is authored prose, not a role\r\ncafé\n";
+        let saved = store
+            .save_document(
+                "manuscript/context.md",
+                DocumentContent::Prose(original.into()),
+                "author",
+            )
+            .expect("save");
+        let updated = format!("{original}a new line");
+        let edited = store
+            .save_document_if_source(
+                "manuscript/context.md",
+                DocumentContent::Prose(updated.clone()),
+                "edit",
+                saved.revision_id,
+                saved.blob_id,
+            )
+            .expect("source-bound edit");
+        let document = store
+            .revision_document(edited.save.revision_id)
+            .expect("logical document");
+        let provenance = store
+            .revision_provenance(edited.save.revision_id)
+            .expect("provenance");
+        assert_eq!(document.text(), updated);
+        assert_eq!(document.parts().len(), provenance.segments.len());
+        for (part, segment) in document.parts().iter().zip(&provenance.segments) {
+            assert_eq!(*part.source(), segment.artifact_id);
+            assert_eq!(
+                part.source_range(),
+                segment.byte_range.start..segment.byte_range.end
+            );
+            assert_eq!(*part.metadata(), segment.contribution);
+            assert_eq!(part.kind(), workspace_document::PartKind::Text);
+        }
+        assert_eq!(
+            store
+                .reconstruct_revision(saved.revision_id)
+                .expect("immutable parent"),
+            original.as_bytes()
+        );
+        assert_eq!(
+            store
+                .read_document("manuscript/context.md")
+                .expect("visible document")
+                .text,
+            updated
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn hybrid_storage_preserves_authored_line_endings() {
+        let (_directory, mut store) = new_store();
+        let original = "prose\r\n\rverse\n";
+        let content =
+            DocumentContent::from_visible(DocumentKind::Hybrid, original.as_bytes().to_vec())
+                .expect("hybrid content");
+        let saved = store
+            .save_document("manuscript/hybrid.md", content, "author")
+            .expect("save");
+        assert_eq!(
+            store
+                .read_document("manuscript/hybrid.md")
+                .expect("read")
+                .text,
+            original
+        );
+        assert_eq!(
+            store
+                .reconstruct_revision(saved.revision_id)
+                .expect("reconstruct"),
+            original.as_bytes()
+        );
     }
 }

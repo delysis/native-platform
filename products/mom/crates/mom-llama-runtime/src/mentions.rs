@@ -3013,7 +3013,7 @@ where
             ),
         ));
     };
-    let host_snapshot = active_path_messages(&db.conversations[host_index]);
+    let host_snapshot = active_path_messages(&db.conversations[host_index])?;
     let attachment_context =
         match prepare_chat_attachments(&input.conversation_id, &host_snapshot, None)? {
             Ok(context) => context,
@@ -3938,7 +3938,7 @@ fn resolve_targets_from_registry(
 }
 
 fn snapshot_target(target: &ResolvedTarget) -> Result<MentionTargetSnapshot> {
-    let source_messages = active_path_messages(&target.conversation);
+    let source_messages = active_path_messages(&target.conversation)?;
     let encoded = serde_json::to_vec(&(
         &target.conversation.id,
         &target.conversation.execution_profile,

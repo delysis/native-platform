@@ -3,7 +3,8 @@
   "primary": {
     "desktop": [
       "desktop-context",
-      "desktop-model-defaults"
+      "desktop-model-defaults",
+      "workspace-document"
     ],
     "native": [
       "llama-native-cache",
@@ -78,6 +79,7 @@
     "portable": [
       "desktop-context",
       "desktop-model-defaults",
+      "workspace-document",
       "attachment-native-document",
       "attachment-native-host",
       "attachment-native-inspect",
