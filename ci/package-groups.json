@@ -5,6 +5,7 @@
       "desktop-context",
       "desktop-generation-policy",
       "desktop-model-defaults",
+      "operation-lifecycle",
       "workspace-document"
     ],
     "native": [
@@ -78,14 +79,14 @@
   },
   "secondary": {
     "portable": [
-      "desktop-context",
-      "desktop-model-defaults",
-      "workspace-document",
       "attachment-native-document",
       "attachment-native-host",
       "attachment-native-inspect",
       "attachment-native-plan",
       "attachment-native-types",
+      "desktop-context",
+      "desktop-generation-policy",
+      "desktop-model-defaults",
       "fte-loopback",
       "fte-protocols",
       "fte-providers",
@@ -112,9 +113,11 @@
       "loom-store",
       "loom-types",
       "mom-llama-runtime",
+      "operation-lifecycle",
       "speech-native-host",
       "speech-native-router",
-      "speech-native-types"
+      "speech-native-types",
+      "workspace-document"
     ],
     "platform-linux": [
       "free-token-energy",
