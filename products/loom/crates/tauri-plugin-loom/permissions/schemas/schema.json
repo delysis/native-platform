@@ -295,6 +295,12 @@
       "type": "string",
       "oneOf": [
         {
+          "description": "Review and revoke device-specific idle model grants. Each new grant is bound to the selected verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`",
+          "type": "string",
+          "const": "peer-compute",
+          "markdownDescription": "Review and revoke device-specific idle model grants. Each new grant is bound to the selected verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`"
+        },
+        {
           "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-audio-synthesize`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-terminal-run`\n- `allow-terminal-list`\n- `allow-terminal-cancel`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
           "type": "string",
           "const": "local-generation",
@@ -677,6 +683,42 @@
           "type": "string",
           "const": "deny-completion-snapshot",
           "markdownDescription": "Denies the completion_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_grant command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-compute-grant",
+          "markdownDescription": "Enables the compute_grant command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_grant command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-compute-grant",
+          "markdownDescription": "Denies the compute_grant command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_host_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-compute-host-snapshot",
+          "markdownDescription": "Enables the compute_host_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_host_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-compute-host-snapshot",
+          "markdownDescription": "Denies the compute_host_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_revoke command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-compute-revoke",
+          "markdownDescription": "Enables the compute_revoke command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_revoke command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-compute-revoke",
+          "markdownDescription": "Denies the compute_revoke command without any pre-configured scope."
         },
         {
           "description": "Enables the document_checkpoint command without any pre-configured scope.",

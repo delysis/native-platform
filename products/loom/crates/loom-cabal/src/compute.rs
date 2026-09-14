@@ -195,6 +195,12 @@ pub enum ComputeRejection {
 /// after cancellation. Dropping a future is not worker shutdown. Local model
 /// selection and idle admission belong to that adapter, never to peer input.
 pub trait ComputeExecutor: std::fmt::Debug + Send + Sync + 'static {
+    /// An advisory admission check. Execute must recheck its native authority
+    /// because local activity or model selection can change before dispatch.
+    fn available(&self, _model: &ComputeModel) -> bool {
+        true
+    }
+
     fn execute(
         &self,
         job: HostComputeJob,
@@ -222,6 +228,7 @@ struct HostState {
 pub struct ComputeHost {
     state: Arc<Mutex<HostState>>,
     authority: Authority,
+    executor: Arc<dyn ComputeExecutor>,
     pending: mpsc::Sender<HostComputeJob>,
     stop: CancellationToken,
     worker: tokio::sync::Mutex<Option<JoinHandle<Result<()>>>>,
@@ -251,13 +258,14 @@ impl ComputeHost {
         let worker = tokio::spawn(supervise(
             state.clone(),
             authority.clone(),
-            executor,
+            executor.clone(),
             receiver,
             stop.clone(),
         ));
         Ok(Arc::new(Self {
             state,
             authority,
+            executor,
             pending,
             stop,
             worker: tokio::sync::Mutex::new(Some(worker)),
@@ -300,6 +308,10 @@ impl ComputeHost {
 
     pub fn stop(&self) {
         self.stop.cancel();
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.stop.is_cancelled()
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -350,7 +362,10 @@ impl ComputeHost {
                         .grants()?
                         .into_iter()
                         .filter(|grant| {
-                            grant.peer == peer && grant.cabal == cabal && (self.authority)(grant)
+                            grant.peer == peer
+                                && grant.cabal == cabal
+                                && (self.authority)(grant)
+                                && self.executor.available(&grant.model)
                         })
                         .collect(),
                 })
@@ -382,7 +397,7 @@ impl ComputeHost {
                 if input.max_output_tokens > grant.max_output_tokens {
                     return reject(ComputeRejection::InvalidRequest);
                 }
-                if state.active.is_some() {
+                if state.active.is_some() || !self.executor.available(&grant.model) {
                     return reject(ComputeRejection::Busy);
                 }
                 if !state.ledger.has_capacity(&grant)? {

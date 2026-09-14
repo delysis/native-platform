@@ -83,6 +83,19 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 <tr>
 <td>
 
+`loom:peer-compute`
+
+</td>
+<td>
+
+Review and revoke device-specific idle model grants. Each new grant is bound to the selected verified model and current cabal membership. This does not grant manuscript or local-tool authority.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:local-generation`
 
 </td>
@@ -908,6 +921,84 @@ Enables the completion_snapshot command without any pre-configured scope.
 <td>
 
 Denies the completion_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-grant`
+
+</td>
+<td>
+
+Enables the compute_grant command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-grant`
+
+</td>
+<td>
+
+Denies the compute_grant command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-host-snapshot`
+
+</td>
+<td>
+
+Enables the compute_host_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-host-snapshot`
+
+</td>
+<td>
+
+Denies the compute_host_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-revoke`
+
+</td>
+<td>
+
+Enables the compute_revoke command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-revoke`
+
+</td>
+<td>
+
+Denies the compute_revoke command without any pre-configured scope.
 
 </td>
 </tr>

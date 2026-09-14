@@ -169,8 +169,14 @@ the old epoch's grants. Revoking a grant cannot be undone by replaying its ID.
 The current input contract accepts resolved text, a seed, and an output limit.
 It carries no expressions, document paths, implicit references, or local-tool
 authority. Images and audio need their own bounded input contract before they
-can use this protocol. The native model adapter and user controls remain to be
-implemented; this transport is not yet a usable model-sharing feature.
+can use this protocol. The native adapter uses the loaded, verified model and
+reserves an independent job owner after two seconds without local model work.
+Foreground generation, model changes, and shutdown cancel and drain that owner
+before taking over the model. Received prompts and actual native execution
+evidence live in a private project under the application profile; they never
+borrow the active manuscript's authority or modify it. Persisted grants reopen
+with the cabal profile and only serve their exact model configuration when idle.
+User controls and caller-side result retention remain to be implemented.
 
 An accepted job is committed before dispatch. Each authenticated caller owns its
 job IDs, and a retry must match the exact original input and grant. Status checks
@@ -250,6 +256,14 @@ Keychain lookup remained blocked; its credentials were not reset or bypassed.
 No phone was enrolled and no Signal message was sent. Neither these results nor
 synthetic browser composition tests establish a physical IME session or
 connectivity across separate Internet NATs.
+
+A separate native adapter test on 2026-09-14 submitted an authenticated QUIC job
+to the actual local SmolLM2-135M Q4 model on Metal. It generated 16 tokens, retained
+matching exact-prompt and model evidence privately, returned the same signed
+receipt for an exact retry, and left the active manuscript unchanged. Both
+endpoints shut down and the actual model unloaded. This test uses a mock Tauri
+application host; it establishes native engine and protocol behavior, not the
+packaged controls, Signal enrollment, or two-machine Internet connectivity.
 
 The feature is not complete until the following have concrete evidence:
 

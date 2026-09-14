@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 44,
+  "expected_test_count": 45,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -272,7 +272,7 @@
     {
       "package": "tauri-plugin-loom",
       "src_path": "products/loom/crates/tauri-plugin-loom/build.rs",
-      "sha256": "6695e45e7cc6339ef3474c2f0b7123058a622390e73e56df37a35d761f975ab7"
+      "sha256": "1980423ed26ae813528c748e83e10b2a03a2f7374f9fef1ab8018dc4152653b7"
     },
     {
       "package": "mom-llama-app",
@@ -1023,6 +1023,22 @@
       ],
       "evidence_class": "real-product-model-runtime",
       "promotion_prohibition": "Passing this runtime test cannot promote device-wide memory safety, visible model UX, packaged-app, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos"
+      ]
+    },
+    {
+      "test_id": "peer_compute::tests::real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript",
+      "package": "tauri-plugin-loom",
+      "target": "lib",
+      "source": "products/loom/crates/tauri-plugin-loom/src/peer_compute_tests.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and executes a real local model through authenticated peer compute; private project storage requires Unix",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local model and QUIC test cannot promote native sharing UI, Signal linking, Internet NAT traversal, or release acceptance.",
       "platforms": [
         "linux",
         "macos"

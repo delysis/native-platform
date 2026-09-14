@@ -1,6 +1,11 @@
 "$schema" = "schemas/schema.json"
 
 [[set]]
+identifier = "peer-compute"
+description = "Review and revoke device-specific idle model grants. Each new grant is bound to the selected verified model and current cabal membership. This does not grant manuscript or local-tool authority."
+permissions = ["allow-compute-host-snapshot", "allow-compute-grant", "allow-compute-revoke"]
+
+[[set]]
 identifier = "local-generation"
 description = "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript."
 permissions = [

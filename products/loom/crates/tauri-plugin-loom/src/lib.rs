@@ -13,6 +13,7 @@ mod import_batch;
 mod microphone_capture;
 mod model_catalog;
 mod model_download;
+mod peer_compute;
 mod shader_preview;
 mod signal;
 mod speech_input;
@@ -80,7 +81,7 @@ use crate::attachments::{
 use crate::audio_io::{audio_record_start, audio_record_stop, audio_synthesize};
 use crate::cabals::{
     cabal_edit, cabal_join, cabal_open, cabal_recover, cabal_revoke, cabal_share, cabal_snapshot,
-    cabal_workspace,
+    cabal_workspace, compute_grant, compute_host_snapshot, compute_revoke,
 };
 use crate::co_writer::{
     CoWriterError, CoWriterSummary, apply_to_document as apply_co_writer,
@@ -463,21 +464,22 @@ struct PreparedProject {
 
 #[derive(Debug)]
 pub struct PluginState {
-    close_requested: AtomicBool,
+    close_requested: Arc<AtomicBool>,
     exit_authorized: AtomicBool,
-    application: Mutex<ApplicationPhase>,
+    application: Arc<Mutex<ApplicationPhase>>,
     session: Mutex<Session>,
     prepared_project: Mutex<Option<PreparedProject>>,
     folder_picker_open: AtomicBool,
     native_runtime: Arc<NativeHostRuntime>,
     backend: Arc<LlamaBackend>,
-    model: Mutex<ModelRegistry>,
-    model_lifecycle: Mutex<()>,
+    model: Arc<Mutex<ModelRegistry>>,
+    model_lifecycle: Arc<Mutex<()>>,
+    peer_compute: Arc<peer_compute::IdleComputeOwner>,
     user_model_paths: Mutex<BTreeSet<PathBuf>>,
     automatic_budget: AutomaticBudgetAuthority,
     loompad_budget: Mutex<LoompadBudget>,
     foreground_commands: ForegroundCommandRegistry,
-    generations: GenerationRegistry,
+    generations: Arc<GenerationRegistry>,
     generation_lifecycle: GenerationSupervisor,
     generation_workers: GenerationWorkerRegistry,
     model_loads: Arc<ModelLoadRegistry>,
@@ -510,22 +512,23 @@ impl PluginState {
         )));
         let generation_lifecycle = GenerationSupervisor::new(64)
             .expect("the production generation progress capacity is valid");
-        Self {
-            close_requested: AtomicBool::new(false),
+        let state = Self {
+            close_requested: Arc::new(AtomicBool::new(false)),
             exit_authorized: AtomicBool::new(false),
-            application: Mutex::new(ApplicationPhase::default()),
+            application: Arc::new(Mutex::new(ApplicationPhase::default())),
             session: Mutex::new(Session::default()),
             prepared_project: Mutex::new(None),
             folder_picker_open: AtomicBool::new(false),
             native_runtime,
             backend,
-            model: Mutex::new(ModelRegistry::default()),
-            model_lifecycle: Mutex::new(()),
+            model: Arc::new(Mutex::new(ModelRegistry::default())),
+            model_lifecycle: Arc::new(Mutex::new(())),
+            peer_compute: Arc::new(peer_compute::IdleComputeOwner::default()),
             user_model_paths: Mutex::new(BTreeSet::new()),
             automatic_budget: AutomaticBudgetAuthority::default(),
             loompad_budget: Mutex::new(LoompadBudget::default()),
             foreground_commands: ForegroundCommandRegistry::default(),
-            generations: GenerationRegistry::default(),
+            generations: Arc::new(GenerationRegistry::default()),
             generation_workers: GenerationWorkerRegistry::new(generation_lifecycle.clone()),
             generation_lifecycle,
             model_loads: Arc::new(ModelLoadRegistry::default()),
@@ -538,7 +541,11 @@ impl PluginState {
             app_local_data_root,
             isolate_model_discovery,
             build_model_policy,
-        }
+        };
+        state
+            .cabals
+            .set_compute_executor(Arc::new(peer_compute::NativeExecutor::from_state(&state)));
+        state
     }
 }
 
@@ -559,9 +566,10 @@ impl Drop for PluginState {
         // native authority that those callbacks can wake in the renderer.
         let document_filesystem_watcher = session.document_filesystem_watcher.take();
         drop(document_filesystem_watcher);
-        if let Ok(phase) = self.application.get_mut() {
+        if let Ok(mut phase) = self.application.lock() {
             *phase = ApplicationPhase::Closing;
         }
+        self.peer_compute.close_and_drain();
         if let Err(error) = self.generation_lifecycle.quiesce() {
             eprintln!("Loom could not quiesce generation lifecycle during plugin drop: {error}");
         }
@@ -2057,6 +2065,9 @@ impl Builder {
                 cabal_edit,
                 cabal_revoke,
                 cabal_recover,
+                compute_host_snapshot,
+                compute_grant,
+                compute_revoke,
                 project_open_default,
                 project_prepare_open,
                 project_prepare_open_path,
@@ -10069,6 +10080,9 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
     *phase = ApplicationPhase::Closing;
+    state.peer_compute.close_and_drain();
+    tauri::async_runtime::block_on(state.signal.shutdown());
+    tauri::async_runtime::block_on(state.cabals.shutdown());
     state
         .prepared_project
         .lock()
@@ -10727,8 +10741,15 @@ fn lock_model_registry(
     })
 }
 
-fn lock_model_lifecycle(state: &PluginState) -> Result<std::sync::MutexGuard<'_, ()>, IpcFailure> {
-    state
+#[derive(Debug)]
+struct ModelLifecycleGuard<'a> {
+    _model: std::sync::MutexGuard<'a, ()>,
+    _foreground: peer_compute::ForegroundModel,
+}
+
+fn lock_model_lifecycle(state: &PluginState) -> Result<ModelLifecycleGuard<'_>, IpcFailure> {
+    let foreground = state.peer_compute.foreground();
+    let model = state
         .model_lifecycle
         .try_lock()
         .map_err(|error| match error {
@@ -10742,7 +10763,11 @@ fn lock_model_lifecycle(state: &PluginState) -> Result<std::sync::MutexGuard<'_,
                 "the model lifecycle entered an invalid state; restart Loom",
                 false,
             ),
-        })
+        })?;
+    Ok(ModelLifecycleGuard {
+        _model: model,
+        _foreground: foreground,
+    })
 }
 
 fn ensure_no_active_generations(
@@ -11734,7 +11759,7 @@ mod tests {
         }
     }
 
-    fn test_loaded_model(path: &Path, stable_model_id: &str) -> LoadedModel {
+    pub(super) fn test_loaded_model(path: &Path, stable_model_id: &str) -> LoadedModel {
         let expectation = test_policy_expectation(stable_model_id.as_bytes());
         LoadedModel {
             selected_path: path.to_path_buf(),

@@ -3,11 +3,13 @@
 //! crashes between the CRDT commit and the visible file commit.
 use super::*;
 use fs2::FileExt;
+use loom_cabal::compute::{ComputeExecutor, ComputeGrant, ComputeHost, ComputeModel};
 use loom_cabal::{
     Cabal, Create, DocumentView, Edit, EditResult, Identity, Invitation, MetadataEdit, Network,
     NetworkMode, PeerStatus, Roster, TextKind,
 };
 use std::io::Write;
+use std::sync::OnceLock;
 use uuid::Uuid;
 
 type Shared = Arc<Mutex<Cabal>>;
@@ -16,6 +18,7 @@ type Shared = Arc<Mutex<Cabal>>;
 pub(crate) struct CabalService {
     profile: tokio::sync::Mutex<Option<Profile>>,
     closed: AtomicBool,
+    compute_executor: OnceLock<Arc<dyn ComputeExecutor>>,
 }
 
 #[derive(Debug)]
@@ -25,6 +28,8 @@ struct Profile {
     network: Arc<Network>,
     cabals: BTreeMap<Uuid, Shared>,
     bindings: BTreeMap<PathBuf, Uuid>,
+    compute: Option<Arc<ComputeHost>>,
+    compute_problem: Option<String>,
     _lease: File,
 }
 
@@ -119,6 +124,12 @@ fn directory(state: &PluginState) -> Result<PathBuf, IpcFailure> {
 }
 
 impl CabalService {
+    pub(super) fn set_compute_executor(&self, executor: Arc<dyn ComputeExecutor>) {
+        self.compute_executor
+            .set(executor)
+            .expect("one native compute executor per cabal service");
+    }
+
     async fn start(&self, directory: &Path) -> Result<(), IpcFailure> {
         let mut slot = self.profile.lock().await;
         if self.closed.load(Ordering::Acquire) {
@@ -175,12 +186,30 @@ impl CabalService {
                 return Err(failure(error));
             }
         }
+        let (compute, compute_problem) = if directory.join("compute/compute.db").is_file() {
+            match self.compute_executor.get() {
+                Some(executor) => {
+                    match network.host_compute(&directory.join("compute"), executor.clone()) {
+                        Ok(host) => (Some(host), None),
+                        Err(error) => (None, Some(error.to_string())),
+                    }
+                }
+                None => (
+                    None,
+                    Some("The native compute executor is unavailable.".into()),
+                ),
+            }
+        } else {
+            (None, None)
+        };
         *slot = Some(Profile {
             directory: directory.into(),
             identity,
             network,
             cabals,
             bindings,
+            compute,
+            compute_problem,
             _lease: lease,
         });
         Ok(())
@@ -225,10 +254,205 @@ impl CabalService {
 
     pub async fn shutdown(&self) {
         self.closed.store(true, Ordering::Release);
-        if let Some(profile) = self.profile.lock().await.take() {
-            let _ = profile.network.shutdown().await;
+        let mut slot = self.profile.lock().await;
+        if let Some(profile) = slot.take()
+            && let Err(error) = profile.network.shutdown().await
+        {
+            eprintln!("Loom cabal shutdown preserved an unfinished operation: {error}");
         }
     }
+
+    async fn compute_binding(
+        &self,
+        directory: &Path,
+        root: &Path,
+        create: bool,
+    ) -> Result<Option<ComputeBinding>, IpcFailure> {
+        if self.bound(directory, root).await?.is_none() {
+            return Ok(None);
+        }
+        let mut slot = self.profile.lock().await;
+        let profile = slot.as_mut().ok_or_else(|| failure("Cabals are closing"))?;
+        let cabal = profile
+            .bindings
+            .get(root)
+            .and_then(|id| profile.cabals.get(id))
+            .cloned()
+            .ok_or_else(|| failure("This folder is not a cabal"))?;
+        if create && profile.compute.is_none() {
+            let executor = self
+                .compute_executor
+                .get()
+                .ok_or_else(|| failure("Native compute is unavailable"))?;
+            let host = profile
+                .network
+                .host_compute(&directory.join("compute"), executor.clone())
+                .map_err(failure)?;
+            profile.compute = Some(host);
+            profile.compute_problem = None;
+        }
+        Ok(Some(ComputeBinding {
+            cabal,
+            host: profile.compute.clone(),
+            problem: profile.compute_problem.clone(),
+        }))
+    }
+}
+
+struct ComputeBinding {
+    cabal: Shared,
+    host: Option<Arc<ComputeHost>>,
+    problem: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ComputeHostSnapshot {
+    model: Option<ComputeModel>,
+    idle: bool,
+    grants: Vec<ComputeGrant>,
+    problem: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ComputeGrantRequest {
+    id: Uuid,
+    member_key: String,
+    roster_hash: String,
+    model_fingerprint: String,
+    max_output_tokens: u32,
+    max_seconds: u32,
+    jobs: u32,
+}
+
+#[tauri::command]
+pub(crate) async fn compute_host_snapshot(
+    project_id: String,
+    session_id: String,
+    state: State<'_, PluginState>,
+) -> Result<Option<ComputeHostSnapshot>, IpcFailure> {
+    let root = root_for(&state, &project_id, &session_id)?;
+    let Some(binding) = state
+        .cabals
+        .compute_binding(&directory(&state)?, &root, false)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let cabal_id = binding
+        .cabal
+        .lock()
+        .map_err(|_| failure("Cabal owner stopped"))?
+        .id();
+    let model = loaded_model_for_state(&state)
+        .ok()
+        .and_then(|model| crate::peer_compute::model_claim(&model).ok());
+    let stopped = binding.host.as_ref().is_some_and(|host| host.is_stopped());
+    let grants = match binding.host {
+        Some(host) => host
+            .grants()
+            .map_err(failure)?
+            .into_iter()
+            .filter(|grant| grant.cabal == cabal_id)
+            .collect(),
+        None => Vec::new(),
+    };
+    Ok(Some(ComputeHostSnapshot {
+        idle: model.is_some()
+            && !stopped
+            && state.peer_compute.idle()
+            && state.generations.active_branch_count().map_err(failure)? == 0,
+        model,
+        grants,
+        problem: binding.problem.or_else(|| {
+            stopped.then(|| "Compute sharing stopped. Restart Loom to resume it.".into())
+        }),
+    }))
+}
+
+#[tauri::command]
+pub(crate) async fn compute_grant(
+    project_id: String,
+    session_id: String,
+    request: ComputeGrantRequest,
+    state: State<'_, PluginState>,
+) -> Result<ComputeGrant, IpcFailure> {
+    let root = root_for(&state, &project_id, &session_id)?;
+    let model = crate::peer_compute::model_claim(&loaded_model_for_state(&state)?)
+        .map_err(|_| failure("Choose a verified text-completion model before sharing compute."))?;
+    if model.fingerprint != request.model_fingerprint {
+        return Err(failure(
+            "The selected model changed. Review the grant again.",
+        ));
+    }
+    let Some(binding) = state
+        .cabals
+        .compute_binding(&directory(&state)?, &root, true)
+        .await?
+    else {
+        return Err(failure("Share this workspace before granting compute."));
+    };
+    let grant = {
+        let cabal = binding
+            .cabal
+            .lock()
+            .map_err(|_| failure("Cabal owner stopped"))?;
+        if cabal.roster().hash().map_err(failure)? != request.roster_hash {
+            return Err(failure("Cabal membership changed. Review the grant again."));
+        }
+        ComputeGrant {
+            id: request.id,
+            cabal: cabal.id(),
+            epoch: cabal.roster().payload.epoch,
+            peer: request.member_key.parse().map_err(failure)?,
+            model,
+            max_output_tokens: request.max_output_tokens,
+            max_seconds: request.max_seconds,
+            jobs: request.jobs,
+        }
+    };
+    // The cabal mutex is released before the compute owner rechecks membership.
+    binding
+        .host
+        .ok_or_else(|| failure("Compute sharing is unavailable"))?
+        .grant(grant.clone())
+        .map_err(failure)?;
+    Ok(grant)
+}
+
+#[tauri::command]
+pub(crate) async fn compute_revoke(
+    project_id: String,
+    session_id: String,
+    grant_id: Uuid,
+    state: State<'_, PluginState>,
+) -> Result<(), IpcFailure> {
+    let root = root_for(&state, &project_id, &session_id)?;
+    let Some(binding) = state
+        .cabals
+        .compute_binding(&directory(&state)?, &root, false)
+        .await?
+    else {
+        return Ok(());
+    };
+    let Some(host) = binding.host else {
+        return Ok(());
+    };
+    let cabal = binding
+        .cabal
+        .lock()
+        .map_err(|_| failure("Cabal owner stopped"))?
+        .id();
+    if let Some(grant) = host
+        .grants()
+        .map_err(failure)?
+        .iter()
+        .find(|grant| grant.id == grant_id)
+        && grant.cabal != cabal
+    {
+        return Err(failure("This compute grant belongs to another workspace."));
+    }
+    host.revoke(grant_id).map_err(failure)
 }
 
 impl Profile {
@@ -1241,6 +1465,184 @@ fn save_projection(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn compute_commands_bind_exact_model_membership_and_workspace() {
+        let temporary = tempfile::tempdir().expect("fixture");
+        let (store, mut cabal, _) = fixture(temporary.path());
+        let root = store.root().to_owned();
+        let project = store.manifest().project_id.to_string();
+        let session_id = CommandId::new().to_string();
+        let identity = cabal.identity().clone();
+        let peer = Identity::generate().expect("peer");
+        let invite = cabal.invite(identity.public_key().into()).expect("invite");
+        cabal
+            .admit(&invite.token, peer.public_key(), "Friend")
+            .expect("admit");
+        let model = crate::tests::test_loaded_model(Path::new("metadata-only.gguf"), "Test model");
+        let model_claim = crate::peer_compute::model_claim(&model).expect("metadata claim");
+        let request = ComputeGrantRequest {
+            id: Uuid::new_v4(),
+            member_key: peer.public_key().to_string(),
+            roster_hash: cabal.roster().hash().expect("membership hash"),
+            model_fingerprint: model_claim.fingerprint,
+            max_output_tokens: 16,
+            max_seconds: 120,
+            jobs: 1,
+        };
+        let id = cabal.id();
+        let cabal = Arc::new(Mutex::new(cabal));
+        let network = Arc::new(
+            Network::start(&identity, NetworkMode::Local)
+                .await
+                .expect("local endpoint"),
+        );
+        network.add(cabal.clone()).expect("current membership");
+        let state = PluginState::with_app_local_data_root(
+            Some(temporary.path().join("app-data")),
+            true,
+            BuildModelPolicy::default(),
+        );
+        {
+            let mut session = state.session.lock().expect("session");
+            session.phase = SessionPhase::Open;
+            session.active_session_id = Some(session_id.parse().expect("session ID"));
+            session.store = Some(store);
+        }
+        *state.model.lock().expect("model registry") = ModelRegistry::Loaded(Box::new(model));
+        let profile_root = directory(&state).expect("profile location");
+        *state.cabals.profile.lock().await = Some(Profile {
+            directory: profile_root.clone(),
+            identity,
+            network,
+            cabals: BTreeMap::from([(id, cabal.clone())]),
+            bindings: BTreeMap::from([(root, id)]),
+            compute: None,
+            compute_problem: None,
+            _lease: File::create(temporary.path().join("lease")).expect("lease"),
+        });
+        let app = tauri::test::mock_app();
+        assert!(app.manage(state));
+        let state = app.state::<PluginState>();
+        let snapshot = compute_host_snapshot(project.clone(), session_id.clone(), state.clone())
+            .await
+            .expect("snapshot")
+            .expect("cabal");
+        assert!(snapshot.grants.is_empty());
+        assert!(
+            !profile_root.join("compute").exists(),
+            "reading a snapshot cannot configure sharing"
+        );
+        let mut changed_model = request.clone();
+        changed_model.model_fingerprint = "00".repeat(32);
+        assert!(
+            compute_grant(
+                project.clone(),
+                session_id.clone(),
+                changed_model,
+                state.clone()
+            )
+            .await
+            .is_err()
+        );
+        assert!(!profile_root.join("compute").exists());
+        let grant = compute_grant(
+            project.clone(),
+            session_id.clone(),
+            request.clone(),
+            state.clone(),
+        )
+        .await
+        .expect("explicit grant");
+        assert_eq!(grant.id, request.id);
+        assert_eq!(
+            compute_grant(
+                project.clone(),
+                session_id.clone(),
+                request.clone(),
+                state.clone()
+            )
+            .await
+            .expect("exact retry"),
+            grant
+        );
+        let mut outsider = request.clone();
+        outsider.id = Uuid::new_v4();
+        outsider.member_key = Identity::generate()
+            .expect("outsider")
+            .public_key()
+            .to_string();
+        assert!(
+            compute_grant(project.clone(), session_id.clone(), outsider, state.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            compute_grant(
+                project.clone(),
+                CommandId::new().to_string(),
+                request.clone(),
+                state.clone()
+            )
+            .await
+            .is_err()
+        );
+        let snapshot = compute_host_snapshot(project.clone(), session_id.clone(), state.clone())
+            .await
+            .expect("snapshot")
+            .expect("cabal");
+        assert_eq!(snapshot.grants, vec![grant]);
+        cabal
+            .lock()
+            .expect("cabal")
+            .revoke(peer.public_key())
+            .expect("revoke membership");
+        assert!(
+            compute_grant(
+                project.clone(),
+                session_id.clone(),
+                request.clone(),
+                state.clone()
+            )
+            .await
+            .is_err(),
+            "old UI membership cannot restore access"
+        );
+        compute_revoke(
+            project.clone(),
+            session_id.clone(),
+            request.id,
+            state.clone(),
+        )
+        .await
+        .expect("stop sharing");
+        compute_revoke(
+            project.clone(),
+            session_id.clone(),
+            request.id,
+            state.clone(),
+        )
+        .await
+        .expect("exact revocation retry");
+        assert!(
+            compute_host_snapshot(project, session_id, state.clone())
+                .await
+                .expect("snapshot")
+                .expect("cabal")
+                .grants
+                .is_empty()
+        );
+        state.cabals.shutdown().await;
+        assert!(
+            !temporary
+                .path()
+                .join("app-data/peer-compute-writing")
+                .exists(),
+            "granting alone never runs a model"
+        );
+    }
+
     #[tokio::test]
     async fn public_workspace_ids_open_only_existing_profile_bindings() {
         let directory = tempfile::tempdir().expect("directory");
@@ -1271,6 +1673,8 @@ mod tests {
             network,
             cabals: BTreeMap::from([(id, Arc::new(Mutex::new(cabal)))]),
             bindings: BTreeMap::from([(root.clone(), id)]),
+            compute: None,
+            compute_problem: None,
             _lease: File::create(directory.path().join("lease")).expect("lease"),
         });
         assert_eq!(
