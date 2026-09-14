@@ -2155,6 +2155,9 @@ impl IpcFailure {
             CoWriterError::Limit => "co_writer_limit",
             CoWriterError::NotFound => "co_writer_not_found",
             CoWriterError::Invalid => "co_writer_store_invalid",
+            CoWriterError::Configured => "co_writer_configured",
+            CoWriterError::Configuration(_) => "co_writer_configuration_invalid",
+            CoWriterError::Snapshot(_) => "co_writer_snapshot_invalid",
             CoWriterError::State => "co_writer_state_unavailable",
             CoWriterError::Context(_) => "co_writer_context_failed",
             CoWriterError::Io(_) => "co_writer_storage_failed",
@@ -8242,8 +8245,11 @@ fn weave_start_inner<R: Runtime>(
         }
         // Resolve and bound exact authored policy before consuming automatic
         // budget or persisting any generation artifacts.
-        let generation_profile =
-            generation_profiles::freeze(store.root(), generation_profiles::task(preset))?;
+        let (generation_profile, applied_co_writer) = generation_profiles::freeze_for_document(
+            store.root(),
+            &document_id.to_string(),
+            generation_profiles::task(preset),
+        )?;
         let initial_sampling = generation_profiles::sampling(
             &generation_profile,
             command_id,
@@ -8355,6 +8361,7 @@ fn weave_start_inner<R: Runtime>(
             let identity = serde_json::to_vec(&generation_profiles::ProfiledContextEvidence {
                 retrieval: attachment_context.retrieval_evidence.clone(),
                 generation_profile: Some(generation_profile.clone()),
+                applied_co_writer,
                 request_sampling: Some(generation_profiles::RequestSampling {
                     max_tokens,
                     temperature,

@@ -144,7 +144,7 @@ struct AttachmentManifest {
     processing_receipt: AttachmentReceipt,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct DocumentContexts {
     schema: String,
     documents: BTreeMap<String, Vec<String>>,
@@ -152,6 +152,8 @@ struct DocumentContexts {
     manual_text: BTreeMap<String, String>,
     #[serde(default)]
     text_imports: BTreeMap<String, Vec<ContextTextSourcePresentation>>,
+    #[serde(default)]
+    applied_co_writers: BTreeMap<String, crate::co_writer::AppliedCoWriter>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -514,6 +516,56 @@ pub(crate) fn set_document_context_snapshot_with_sources(
     attachment_ids: &[String],
     text_sources: Option<&[ContextTextSourcePresentation]>,
 ) -> Result<DocumentContextSnapshot, ContextAttachmentError> {
+    set_context_snapshot(
+        project_root,
+        document_id,
+        markdown,
+        attachment_ids,
+        text_sources,
+        None,
+    )
+}
+
+pub(crate) fn applied_co_writer(
+    project_root: &Path,
+    document_id: &str,
+) -> Result<Option<crate::co_writer::AppliedCoWriter>, ContextAttachmentError> {
+    Ok(read_contexts(project_root)?
+        .applied_co_writers
+        .remove(document_id))
+}
+
+pub(crate) fn set_document_context_with_co_writer(
+    project_root: &Path,
+    document_id: &str,
+    frozen: &crate::co_writer::AppliedCoWriter,
+) -> Result<DocumentContextSnapshot, ContextAttachmentError> {
+    let markdown = frozen
+        .markdown()
+        .map_err(|_| ContextAttachmentError::ContextInvalid)?;
+    set_context_snapshot(
+        project_root,
+        document_id,
+        markdown,
+        &frozen.context.metadata().attachment_ids,
+        Some(&frozen.context.metadata().text_sources),
+        Some(frozen),
+    )
+}
+
+fn set_context_snapshot(
+    project_root: &Path,
+    document_id: &str,
+    markdown: &str,
+    attachment_ids: &[String],
+    text_sources: Option<&[ContextTextSourcePresentation]>,
+    co_writer: Option<&crate::co_writer::AppliedCoWriter>,
+) -> Result<DocumentContextSnapshot, ContextAttachmentError> {
+    if let Some(co_writer) = co_writer {
+        co_writer
+            .validate()
+            .map_err(|_| ContextAttachmentError::ContextInvalid)?;
+    }
     if markdown.contains("(loom-attachment:") || markdown.contains("(loom-media:") {
         return Err(ContextAttachmentError::ContextInvalid);
     }
@@ -540,6 +592,11 @@ pub(crate) fn set_document_context_snapshot_with_sources(
         contexts.text_imports.remove(document_id);
     }
     set_authoritative_context(&mut contexts, document_id, internal, ids);
+    if let Some(co_writer) = co_writer {
+        contexts
+            .applied_co_writers
+            .insert(document_id.to_owned(), co_writer.clone());
+    }
     write_contexts(project_root, &contexts)?;
     snapshot_from_contexts(project_root, &contexts, document_id)
 }
@@ -1887,9 +1944,13 @@ fn read_contexts(project_root: &Path) -> Result<DocumentContexts, ContextAttachm
                 return Err(ContextAttachmentError::ContextInvalid);
             }
             if contexts
-                .documents
+                .applied_co_writers
                 .values()
-                .any(|ids| ids.len() > MAX_CONTEXT_ATTACHMENTS)
+                .any(|preset| preset.validate().is_err())
+                || contexts
+                    .documents
+                    .values()
+                    .any(|ids| ids.len() > MAX_CONTEXT_ATTACHMENTS)
                 || contexts
                     .manual_text
                     .values()
@@ -1915,6 +1976,7 @@ fn read_contexts(project_root: &Path) -> Result<DocumentContexts, ContextAttachm
             documents: BTreeMap::new(),
             manual_text: BTreeMap::new(),
             text_imports: BTreeMap::new(),
+            applied_co_writers: BTreeMap::new(),
         }),
         Err(error) => Err(error.into()),
     }
@@ -2085,6 +2147,7 @@ mod tests {
                 documents: BTreeMap::from([("doc".to_owned(), vec![attachment.id.clone()])]),
                 manual_text: BTreeMap::new(),
                 text_imports: BTreeMap::new(),
+                applied_co_writers: BTreeMap::new(),
             },
         )
         .expect("write legacy selection");

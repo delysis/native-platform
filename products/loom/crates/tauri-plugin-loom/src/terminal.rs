@@ -86,6 +86,10 @@ struct RunReceipt {
     source_revision_id: RevisionId,
     #[serde(default)]
     generation_profile: Option<loom_config::FrozenGenerationProfile>,
+    #[serde(default)]
+    co_writer: Option<crate::co_writer::AppliedCoWriter>,
+    #[serde(default)]
+    co_writer_context: Option<FrozenCoWriterContext>,
     input_blob_id: BlobId,
     #[serde(default)]
     context_references: Option<Vec<String>>,
@@ -95,6 +99,12 @@ struct RunReceipt {
     bindings: BTreeMap<String, String>,
     sources: Vec<crate::document_bindings::ResolvedDocument>,
     steps: Vec<BlobId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct FrozenCoWriterContext {
+    preamble: String,
+    retrieval: crate::context_attachments::ContextRetrievalEvidence,
 }
 
 #[derive(Debug, Default)]
@@ -443,23 +453,41 @@ pub(super) async fn terminal_run<R: Runtime>(
         Some(loaded_model(&state)?)
     };
     // Capture policy before receipts, reservations, or a worker can be started.
-    let generation_profile = if let Some(model) = &model {
+    let (generation_profile, co_writer, co_writer_context) = if let Some(model) = &model {
         let task = if turn_boundary.is_some() {
             GenerationTask::Chat
         } else {
             GenerationTask::ManualWriting
         };
-        let profile = generation_profiles::freeze(&root, task)?;
+        let (profile, co_writer) =
+            generation_profiles::freeze_for_document(&root, &document_id.to_string(), task)?;
         let sampling = terminal_sampling(&profile, command_id, 1, turn_boundary)?;
-        generation_profiles::reserve_context(
+        let context_window = generation_profiles::reserve_context(
             resident_context_tokens(model),
             &generation_profiles::preamble(&profile),
             1,
             sampling.max_tokens,
         )?;
-        Some(profile)
+        let co_writer_context = if co_writer.is_some() {
+            let context = resolve_for_generation_with_budget(
+                &root,
+                &document_id.to_string(),
+                &source.text,
+                context_window,
+                1,
+                sampling.max_tokens,
+            )
+            .map_err(|error| IpcFailure::context_attachment(&error))?;
+            Some(FrozenCoWriterContext {
+                preamble: context.context_preamble,
+                retrieval: context.retrieval_evidence,
+            })
+        } else {
+            None
+        };
+        (Some(profile), co_writer, co_writer_context)
     } else {
-        None
+        (None, None, None)
     };
     let names = names.into_iter().collect::<Vec<_>>();
     // Only called functions contribute direct context. Reference values remain
@@ -568,6 +596,8 @@ pub(super) async fn terminal_run<R: Runtime>(
         source_document_id: document_id,
         source_revision_id: source.revision_id,
         generation_profile,
+        co_writer,
+        co_writer_context,
         input_blob_id,
         context_references,
         media: media_evidence,
@@ -818,6 +848,10 @@ impl Evaluator<'_> {
             self.step,
             self.receipt.run.turn_boundary,
         )?;
+        if let Some(context) = &self.receipt.co_writer_context {
+            prompt.insert_str(0, "\n\n");
+            prompt.insert_str(0, &context.preamble);
+        }
         prompt.insert_str(0, &generation_profiles::preamble(profile));
         let prompt = bounded(prompt)?;
         generation_profiles::reserve_context(
@@ -853,6 +887,8 @@ impl Evaluator<'_> {
                         &self.receipt.sources,
                         &self.receipt.media,
                         &self.receipt.generation_profile,
+                        &self.receipt.co_writer,
+                        &self.receipt.co_writer_context,
                     ))
                     .map_err(io_failure)?,
                 )

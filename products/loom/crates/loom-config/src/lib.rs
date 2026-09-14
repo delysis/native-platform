@@ -137,6 +137,10 @@ pub struct FrozenGenerationProfile {
     pub profile_sha256: Option<String>,
     pub sampling: SamplingOverrides,
     pub context: Option<AuthoredContext>,
+    /// An explicitly applied co-writer copied this context into the document's
+    /// editable context. Retain its source evidence without injecting it twice.
+    #[serde(default)]
+    pub context_in_document: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -166,6 +170,7 @@ impl FrozenGenerationProfile {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != 1
+            || (self.context_in_document && self.context.is_none())
             || self
                 .config_sha256
                 .as_ref()
@@ -314,6 +319,7 @@ impl MineConfig {
                 profile.sampling.clone()
             }),
             context,
+            context_in_document: false,
         })
     }
 }

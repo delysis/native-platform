@@ -26,6 +26,30 @@ pub(super) fn freeze(
         .map_err(config_failure)
 }
 
+pub(super) fn freeze_for_document(
+    root: &std::path::Path,
+    document_id: &str,
+    task: GenerationTask,
+) -> Result<
+    (
+        FrozenGenerationProfile,
+        Option<crate::co_writer::AppliedCoWriter>,
+    ),
+    IpcFailure,
+> {
+    let applied =
+        crate::context_attachments::applied_co_writer(root, document_id).map_err(config_failure)?;
+    let profile = if let Some(applied) = &applied {
+        applied.validate().map_err(config_failure)?;
+        let mut profile = applied.generation.clone();
+        profile.task = task;
+        profile
+    } else {
+        freeze(root, task)?
+    };
+    Ok((profile, applied))
+}
+
 pub(super) fn sampling(
     profile: &FrozenGenerationProfile,
     command: CommandId,
@@ -62,7 +86,7 @@ pub(super) fn sampling(
 }
 
 pub(super) fn preamble(profile: &FrozenGenerationProfile) -> String {
-    if profile.context_text().is_empty() {
+    if profile.context_in_document || profile.context_text().is_empty() {
         return String::new();
     }
     format!(
@@ -98,6 +122,8 @@ pub(super) struct ProfiledContextEvidence {
     #[serde(default)]
     pub generation_profile: Option<FrozenGenerationProfile>,
     #[serde(default)]
+    pub applied_co_writer: Option<crate::co_writer::AppliedCoWriter>,
+    #[serde(default)]
     pub request_sampling: Option<RequestSampling>,
 }
 
@@ -122,6 +148,19 @@ pub(super) fn recorded_profile(
     let bytes = store.read_blob(blob).map_err(IpcFailure::store)?;
     let evidence: ProfiledContextEvidence =
         serde_json::from_slice(&bytes).map_err(config_failure)?;
+    if let Some(applied) = &evidence.applied_co_writer {
+        applied.validate().map_err(config_failure)?;
+    }
+    if evidence
+        .generation_profile
+        .as_ref()
+        .is_some_and(|profile| profile.context_in_document)
+        && evidence.applied_co_writer.is_none()
+    {
+        return Err(config_failure(
+            "the applied persona source snapshot is missing from generation evidence",
+        ));
+    }
     match (&evidence.generation_profile, evidence.request_sampling) {
         (None, None) => {}
         (Some(profile), Some(request))
@@ -193,6 +232,7 @@ mod tests {
         let evidence = ProfiledContextEvidence {
             retrieval: crate::context_attachments::ContextRetrievalEvidence::default(),
             generation_profile: Some(profile),
+            applied_co_writer: None,
             request_sampling: Some(RequestSampling {
                 max_tokens: 512,
                 temperature: 0.8,
