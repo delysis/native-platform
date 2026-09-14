@@ -77,7 +77,8 @@ use crate::attachments::{
 };
 use crate::audio_io::{audio_record_start, audio_record_stop, audio_synthesize};
 use crate::cabals::{
-    cabal_edit, cabal_join, cabal_recover, cabal_revoke, cabal_share, cabal_snapshot,
+    cabal_edit, cabal_join, cabal_open, cabal_recover, cabal_revoke, cabal_share, cabal_snapshot,
+    cabal_workspace,
 };
 use crate::co_writer::{
     CoWriterError, CoWriterSummary, apply_to_document as apply_co_writer,
@@ -1943,6 +1944,8 @@ impl Builder {
                 cabal_snapshot,
                 cabal_share,
                 cabal_join,
+                cabal_open,
+                cabal_workspace,
                 cabal_edit,
                 cabal_revoke,
                 cabal_recover,

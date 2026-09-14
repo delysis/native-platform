@@ -91,6 +91,7 @@ impl Vault {
         .execute(&database)
         .await?;
         sqlx::query("CREATE TABLE IF NOT EXISTS loom_drafts_v1(conversation TEXT PRIMARY KEY, command TEXT NOT NULL, body TEXT NOT NULL)").execute(&database).await?;
+        crate::workspaces::initialize(&database).await?;
         Ok(Self {
             store,
             database,

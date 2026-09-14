@@ -246,6 +246,59 @@ async fn handle(
         return failure("unlinked", "Link Signal from your phone first.", false);
     };
     match command {
+        Command::Workspaces { conversation_id } => {
+            let result = async {
+                messages::resolve(&vault.store, &conversation_id).await?;
+                crate::workspaces::load(&vault.database, &conversation_id).await
+            }
+            .await;
+            match result {
+                Ok(links) => Event::Workspaces {
+                    conversation_id,
+                    links,
+                },
+                Err(_) => failure(
+                    "workspace_read_failed",
+                    "This conversation's saved workspaces could not be read.",
+                    true,
+                ),
+            }
+        }
+        Command::UpdateWorkspace {
+            conversation_id,
+            expected_version,
+            workspace_id,
+            title,
+        } => {
+            let result = async {
+                messages::resolve(&vault.store, &conversation_id).await?;
+                let remove = title.is_none();
+                crate::workspaces::update(
+                    &vault.database,
+                    &conversation_id,
+                    request_id,
+                    expected_version,
+                    loom_signal_protocol::Workspace {
+                        id: workspace_id,
+                        title: title.unwrap_or_default(),
+                    },
+                    remove,
+                )
+                .await
+            }
+            .await;
+            match result {
+                Ok(links) => Event::Workspaces {
+                    conversation_id,
+                    links,
+                },
+                Err(_) => failure(
+                    "workspace_save_failed",
+                    "Workspace links could not be saved. Refresh this conversation before retrying.",
+                    true,
+                ),
+            }
+        }
         Command::Draft { conversation_id } => {
             match crate::drafts::load(&vault.database, &conversation_id).await {
                 Ok(draft) => Event::Draft {

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_SIZE: usize = 100;
@@ -24,6 +24,15 @@ pub enum Command {
     },
     CancelLink,
     Conversations,
+    Workspaces {
+        conversation_id: String,
+    },
+    UpdateWorkspace {
+        conversation_id: String,
+        expected_version: u64,
+        workspace_id: uuid::Uuid,
+        title: Option<String>,
+    },
     Messages {
         conversation_id: String,
         before: Option<u64>,
@@ -68,6 +77,10 @@ pub enum Event {
     },
     Conversations {
         conversations: Vec<Conversation>,
+    },
+    Workspaces {
+        conversation_id: String,
+        links: WorkspaceLinks,
     },
     Messages {
         conversation_id: String,
@@ -121,6 +134,21 @@ pub struct Conversation {
     pub is_group: bool,
     pub disappearing: bool,
     pub description: Option<String>,
+}
+
+/// A local bookmark, never an invitation or a filesystem capability.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Workspace {
+    pub id: uuid::Uuid,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceLinks {
+    pub version: u64,
+    pub workspaces: Vec<Workspace>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

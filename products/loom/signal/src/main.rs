@@ -7,6 +7,7 @@ mod drafts;
 mod messages;
 mod retention;
 mod vault;
+mod workspaces;
 
 use loom_signal_protocol::{Event, Request, Response, read_frame, write_frame};
 use std::path::PathBuf;

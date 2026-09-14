@@ -8,6 +8,8 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-cabal-snapshot`
 - `allow-cabal-share`
 - `allow-cabal-join`
+- `allow-cabal-open`
+- `allow-cabal-workspace`
 - `allow-cabal-edit`
 - `allow-cabal-revoke`
 - `allow-cabal-recover`
@@ -520,6 +522,32 @@ Denies the cabal_join command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-cabal-open`
+
+</td>
+<td>
+
+Enables the cabal_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-open`
+
+</td>
+<td>
+
+Denies the cabal_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-cabal-recover`
 
 </td>
@@ -617,6 +645,32 @@ Enables the cabal_snapshot command without any pre-configured scope.
 <td>
 
 Denies the cabal_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-workspace`
+
+</td>
+<td>
+
+Enables the cabal_workspace command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-workspace`
+
+</td>
+<td>
+
+Denies the cabal_workspace command without any pre-configured scope.
 
 </td>
 </tr>

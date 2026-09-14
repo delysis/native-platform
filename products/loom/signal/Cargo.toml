@@ -30,6 +30,9 @@ tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
 url = "2.5"
 
+[dev-dependencies]
+tempfile = "3"
+
 [target.'cfg(windows)'.dependencies]
 libsqlite3-sys = { version = "0.36", features = ["bundled-sqlcipher-vendored-openssl"] }
 

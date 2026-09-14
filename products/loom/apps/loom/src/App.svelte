@@ -12,8 +12,8 @@
   import SignalPane from './lib/SignalPane.svelte';
   import CabalPane from './lib/CabalPane.svelte';
   import { SignalDraftEditor } from './lib/signalDraft';
-  import { CabalEditor, cabalSnapshot, editCabal, shareCabal, joinCabal, recoverCabalEdits, revokeCabalMember, type CabalSnapshot, type SharedDocument } from './lib/cabal';
-  import type { SignalConversation } from './lib/signal';
+  import { CabalEditor, cabalSnapshot, cabalWorkspace, openCabal, editCabal, shareCabal, joinCabal, recoverCabalEdits, revokeCabalMember, type CabalSnapshot, type SharedDocument } from './lib/cabal';
+  import { rememberSignalWorkspace, type SignalConversation } from './lib/signal';
   import { RetainedOutputLoader } from './lib/retainedOutput';
   import { workspaceWriterCandidates, workspaceWriterModel, type WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
   import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
@@ -9353,8 +9353,12 @@
   }
 
   async function inviteCabal(name: string): Promise<string> {
-    if (!await preparePaneRun() || !project) throw new Error('Finish saving this workspace before sharing it.');
-    const invitation = await shareCabal(project.project_id, project.session_id, project.title, name);
+    const captured = project;
+    if (!captured || compositionActive || !flushEditors() || !await flushCurrentDocument() || !terminalScopeIsCurrent(captured.project_id, captured.session_id)) {
+      throw new Error('Finish saving this workspace before sharing it.');
+    }
+    const invitation = await shareCabal(captured.project_id, captured.session_id, captured.title, name);
+    if (!terminalScopeIsCurrent(captured.project_id, captured.session_id)) throw new Error('The workspace changed while preparing its invitation.');
     cabalScope = '';
     return invitation;
   }
@@ -9386,10 +9390,22 @@
     return paths;
   }
 
-  async function inviteSignalConversation(_conversation: SignalConversation): Promise<string> {
+  async function inviteSignalConversation(conversation: SignalConversation): Promise<string> {
+    const captured = project;
+    if (!captured) throw new Error('Open a workspace before inviting someone.');
     const invitation = await inviteCabal('Loom');
-    if (!project) throw new Error('The workspace changed.');
-    return `Make something with me in ${project.title}:\n${invitation}`;
+    const workspace = await cabalWorkspace(captured.project_id, captured.session_id);
+    if (!workspace || !terminalScopeIsCurrent(captured.project_id, captured.session_id)) throw new Error('The workspace changed.');
+    await rememberSignalWorkspace(conversation.id, workspace);
+    return `Make something with me in ${workspace.title}:\n${invitation}\n\nWorkspace: loom://workspace/${workspace.id}`;
+  }
+
+  async function openSignalWorkspace(conversation: SignalConversation, value: string, join = false): Promise<void> {
+    if (!await doOpenProject(() => join ? joinCabal(value) : openCabal(value))) return;
+    const captured = project;
+    if (!captured) return;
+    const workspace = await cabalWorkspace(captured.project_id, captured.session_id);
+    if (workspace) await rememberSignalWorkspace(conversation.id, workspace);
   }
 
   async function toggleSignal(): Promise<void> {
@@ -9402,9 +9418,10 @@
   }
 
   async function draftSignalReply(prompt: string): Promise<string> {
+    const captured = project;
     const current = await preparePaneRun();
-    if (!current?.summary.revision_id || !project) throw new Error('Open a saved document before drafting.');
-    const projectId = project.project_id, sessionId = project.session_id;
+    if (!current?.summary.revision_id || !captured || !terminalScopeIsCurrent(captured.project_id, captured.session_id)) throw new Error('Open a saved document before drafting.');
+    const projectId = captured.project_id, sessionId = captured.session_id;
     const commandId = newUlid();
     const run = await runTerminal({ projectId, sessionId, commandId, documentId: current.summary.document_id,
       sourceRevisionId: current.summary.revision_id, expectedVisibleBlobId: current.visible_blob_id,
@@ -10087,8 +10104,26 @@
         {/if}
       {/each}
 
-      {#if signalOpen}<aside class="workspace-pane-slot workspace-pane-right" aria-label="Signal pane"><PaneDivider edge="left" label="Resize Signal" size={Math.min(rightWidth, rightLimit)} min={200} max={rightLimit} onResize={size => rightWidth = size} /><SignalPane editor={signalDraftEditor} onClose={() => void toggleSignal()} onDraft={draftSignalReply} onCabal={inviteSignalConversation} onJoin={async invitation => { await doOpenProject(() => joinCabal(invitation)); }} modelLabel={currentModel?.display_name ?? 'Local model'} /></aside>{/if}
-      {#if cabalOpen}<aside class="workspace-pane-slot workspace-pane-right" aria-label="Cabal pane"><PaneDivider edge="left" label="Resize cabal" size={Math.min(rightWidth, rightLimit)} min={200} max={rightLimit} onResize={size => rightWidth = size} /><CabalPane {cabal} unsaved={Boolean(cabalEditor) && saveState === 'error'} projectName={project?.title ?? 'Workspace'} onClose={() => cabalOpen = false} onInvite={inviteCabal} onJoin={async (invitation, name) => { await doOpenProject(() => joinCabal(invitation, name)); }} onRemove={removeCabalMember} onRecover={recoverCabalCopies} /></aside>{/if}
+      {#if signalOpen}
+        <aside class="workspace-pane-slot workspace-pane-right" aria-label="Signal pane">
+          <PaneDivider edge="left" label="Resize Signal" size={Math.min(rightWidth, rightLimit)} min={200} max={rightLimit} onResize={size => rightWidth = size} />
+          <SignalPane editor={signalDraftEditor} onClose={() => void toggleSignal()} onDraft={draftSignalReply}
+            onCabal={inviteSignalConversation} onJoin={(conversation, invitation) => openSignalWorkspace(conversation, invitation, true)}
+            onWorkspace={openSignalWorkspace} workspaceScope={project ? `${project.project_id}/${project.session_id}` : ''}
+            modelLabel={currentModel?.display_name ?? 'Local model'} />
+        </aside>
+      {/if}
+      {#if cabalOpen}
+        <aside class="workspace-pane-slot workspace-pane-right" aria-label="Cabal pane">
+          <PaneDivider edge="left" label="Resize cabal" size={Math.min(rightWidth, rightLimit)} min={200} max={rightLimit} onResize={size => rightWidth = size} />
+          {#key project?.session_id}
+            <CabalPane {cabal} unsaved={Boolean(cabalEditor) && saveState === 'error'} projectName={project?.title ?? 'Workspace'}
+              onClose={() => cabalOpen = false} onInvite={inviteCabal}
+              onJoin={async (invitation, name) => { await doOpenProject(() => joinCabal(invitation, name)); }}
+              onRemove={removeCabalMember} onRecover={recoverCabalCopies} />
+          {/key}
+        </aside>
+      {/if}
 
     </div>
       <div class="terminal-dock" bind:clientHeight={terminalDockHeight} class:closed={!terminalOpen} style={`height:${effectiveTerminalHeight}px`}>

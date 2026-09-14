@@ -1,17 +1,18 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { normalizeFailure } from './ipc';
-  import { newUlid } from './ulid';
   import type { SignalDraftEditor } from './signalDraft';
-  import { listenSignal, signalRequest, signalDraftPrompt, type SignalConversation, type SignalEvent, type SignalMessage, type SignalStatus } from './signal';
+  import { listenSignal, signalRequest, signalDraftPrompt, signalWorkspaces, updateSignalWorkspace, signalWorkspaceIds, type SignalConversation, type SignalEvent, type SignalMessage, type SignalStatus, type SignalWorkspaceLinks } from './signal';
 
   export let onClose: () => void;
   export let onDraft: (prompt: string) => Promise<string>;
   export let onCabal: (conversation: SignalConversation) => Promise<string>;
-  export let onJoin: (invitation: string) => Promise<void>;
+  export let onJoin: (conversation: SignalConversation, invitation: string) => Promise<void>;
+  export let onWorkspace: (conversation: SignalConversation, id: string) => Promise<void>;
   export let editor: SignalDraftEditor;
   export let modelLabel = 'Local model';
-  let status: SignalStatus = { version: 1, phase: 'unlinked', account_id: null, device_name: null };
+  export let workspaceScope = '';
+  let status: SignalStatus = { version: 2, phase: 'unlinked', account_id: null, device_name: null };
   let conversations: SignalConversation[] = [];
   let selected = editor.conversation;
   let search = '';
@@ -20,7 +21,7 @@
   let proposal = '';
   let error = '';
   let qr = '';
-  let busy = false;
+  let busy = true;
   let drafting = false;
   let mounted = false;
   let loading = false;
@@ -31,17 +32,27 @@
   let composer: HTMLTextAreaElement;
   let uncertain = editor.pending;
   let saving = false;
+  let links: SignalWorkspaceLinks | null = null;
+  let linksSerial = 0;
   $: conversation = conversations.find(item => item.id === selected);
   $: visible = messages.filter(message => message.expires_at === null || message.expires_at > now);
-  $: canDraft = conversation && !conversation.disappearing && !visible.some(message => message.ephemeral) && !drafting && !busy;
+  $: canDraft = conversation && !conversation.disappearing && !visible.some(message => message.ephemeral) && !drafting && !busy && !uncertain;
+  $: if (workspaceScope !== proposalScope) proposal = '';
+  let proposalScope = workspaceScope;
 
   onMount(() => {
     mounted = true;
+    void editor.settle().catch(failure => { if (mounted) error = normalizeFailure(failure).message; })
+      .finally(() => {
+        if (!mounted) return;
+        selected = editor.conversation; draft = editor.text; uncertain = editor.pending; busy = false;
+        if (status.account_id) void refresh();
+      });
     let unlisten: (() => void) | undefined;
     void listenSignal(event => void observe(event)).then(value => { if (mounted) unlisten = value; else value(); });
     void signalRequest({ kind: 'status' }).then(observe).catch(failure => error = normalizeFailure(failure).message);
     const timer = setInterval(() => { now = Date.now(); }, 1000);
-    return () => { mounted = false; serial++; clearInterval(timer); unlisten?.(); };
+    return () => { mounted = false; serial++; linksSerial++; clearInterval(timer); unlisten?.(); };
   });
 
   async function observe(event: SignalEvent): Promise<void> {
@@ -70,7 +81,7 @@
       if (!mounted) return;
       if (result.kind === 'failure') { error = result.message; return; }
       if (result.kind === 'conversations') conversations = result.conversations;
-      if (selected) await loadMessages();
+      if (selected) await Promise.all([loadMessages(), loadWorkspaces()]);
     } catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
     finally {
       loading = false;
@@ -83,20 +94,29 @@
     busy = true;
     try {
       await editor.open(id);
+      if (!mounted) return;
       selected = id; draft = editor.text; proposal = ''; error = ''; messages = []; uncertain = editor.pending;
-      await loadMessages();
+      links = null;
+      await Promise.all([loadMessages(), loadWorkspaces()]);
       await tick(); composer?.focus();
     } catch (failure) { error = normalizeFailure(failure).message; }
     finally { busy = false; }
   }
 
   async function saveDraft(): Promise<void> {
+    if (!mounted || editor.conversation !== selected) return;
     editor.text = draft; editor.pending = uncertain; saving = true;
     try { await editor.flush(); }
     finally { saving = false; }
   }
 
   function changeDraft(text: string): void {
+    if (busy) return;
+    replaceDraft(text);
+  }
+
+  function replaceDraft(text: string): void {
+    if (!mounted || editor.conversation !== selected || uncertain || editor.pending) return;
     draft = text;
     void saveDraft().catch(failure => error = normalizeFailure(failure).message);
   }
@@ -113,6 +133,34 @@
     } else if (result.kind === 'failure') error = result.message;
   }
 
+  async function loadWorkspaces(): Promise<void> {
+    const expected = selected, version = ++linksSerial;
+    if (!expected) return;
+    const result = await signalWorkspaces(expected);
+    if (mounted && selected === expected && version === linksSerial) links = result;
+  }
+
+  async function forgetWorkspace(id: string): Promise<void> {
+    if (!links || busy) return;
+    const expected = selected, version = ++linksSerial;
+    busy = true; error = '';
+    try {
+      const result = await updateSignalWorkspace(expected, links.version, id, null);
+      if (mounted && selected === expected && version === linksSerial) links = result;
+    } catch (failure) { if (mounted) { error = normalizeFailure(failure).message; await loadWorkspaces().catch(() => {}); } }
+    finally { if (mounted) busy = false; }
+  }
+
+  async function visitWorkspace(value: string, join: boolean): Promise<void> {
+    if (!conversation || busy || drafting) return;
+    busy = true; error = '';
+    try {
+      if (join) await onJoin(conversation, value); else await onWorkspace(conversation, value);
+      if (mounted) await loadWorkspaces();
+    } catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
+    finally { if (mounted) busy = false; }
+  }
+
   async function link(): Promise<void> {
     busy = true; error = ''; status = { ...status, phase: 'linking' };
     try { await observe(await signalRequest({ kind: 'link', device_name: 'Loom' })); }
@@ -122,42 +170,39 @@
 
   async function send(check = false): Promise<void> {
     if (busy || !selected || !draft.trim()) return;
-    const request = check && uncertain ? uncertain : { id: newUlid(), conversation: selected, text: draft, timestamp: Date.now() };
     busy = true; error = '';
     try {
-      await editor.withSend(async () => {
-      uncertain = request;
-      await saveDraft();
-      const result = check
-        ? await signalRequest({ kind: 'check_send', attempt: request })
-        : await signalRequest({ kind: 'send', conversation_id: request.conversation, text: request.text, timestamp: request.timestamp }, request.id);
-      if (result.kind === 'sent') {
-        if (draft === request.text && selected === request.conversation) draft = '';
-        uncertain = null; await saveDraft(); if (mounted) await loadMessages();
-      } else if (result.kind === 'not_sent') {
-        uncertain = null; await saveDraft(); error = 'This message was not sent. Your draft is ready.';
-      } else if (result.kind === 'failure') {
-        error = result.message;
-      }
-      });
-    } catch (failure) { error = normalizeFailure(failure).message; uncertain = request; }
-    finally { busy = false; }
+      const result = await editor.send(check);
+      if (!mounted) return;
+      if (result.kind === 'sent') await loadMessages();
+      else if (result.kind === 'not_sent') error = 'This message was not sent. Your draft is ready.';
+      else if (result.kind === 'failure') error = result.message;
+    } catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
+    finally { if (mounted) { draft = editor.text; uncertain = editor.pending; busy = false; } }
   }
 
   async function draftReply(): Promise<void> {
     if (!conversation || !canDraft) return;
+    const expected = selected, scope = workspaceScope;
     drafting = true; error = '';
-    try { proposal = await onDraft(signalDraftPrompt(conversation, visible, draft)); }
+    try {
+      const result = await onDraft(signalDraftPrompt(conversation, visible, draft));
+      if (!mounted || expected !== selected || scope !== workspaceScope) return;
+      proposalScope = scope; proposal = result;
+    }
     catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
     finally { drafting = false; }
   }
 
   async function invite(): Promise<void> {
-    if (!conversation || busy) return;
+    if (!conversation || busy || uncertain) return;
+    const expected = selected, scope = workspaceScope;
     busy = true; error = '';
     try {
       const invitation = await onCabal(conversation);
-      changeDraft(`${draft}${draft ? '\n\n' : ''}${invitation}`);
+      if (!mounted || expected !== selected || scope !== workspaceScope) return;
+      replaceDraft(`${draft}${draft ? '\n\n' : ''}${invitation}`);
+      await loadWorkspaces();
       await tick(); composer?.focus();
     } catch (failure) { error = normalizeFailure(failure).message; }
     finally { busy = false; }
@@ -191,25 +236,38 @@
     </div>
     {#if conversation}
       {#if conversation.description}<p class="description">{conversation.description}</p>{/if}
+      {#if links?.workspaces.length || signalWorkspaceIds(conversation.description ?? '').length}
+        <div class="workspaces" aria-label="Conversation workspaces">
+          {#each links?.workspaces ?? [] as workspace (workspace.id)}
+            <div><button type="button" disabled={busy || drafting} on:click={() => void visitWorkspace(workspace.id, false)}>{workspace.title}</button><button type="button" aria-label={`Forget workspace ${workspace.title}`} disabled={busy} on:click={() => void forgetWorkspace(workspace.id)}>×</button></div>
+          {/each}
+          {#each signalWorkspaceIds(conversation.description ?? '').filter(id => !links?.workspaces.some(item => item.id === id)) as id}
+            <button type="button" disabled={busy || drafting} on:click={() => void visitWorkspace(id, false)}>Open workspace</button>
+          {/each}
+        </div>
+      {/if}
       <div class="messages" bind:this={viewport} role="log" aria-label={`Messages with ${conversation.title}`} aria-live="polite">
         {#each visible as message (message.id)}
           <article class:outgoing={message.outgoing}>
             <div class="byline"><span>{message.outgoing ? 'You' : message.sender_name}</span><time datetime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time></div>
             <p>{message.deleted ? 'Message deleted' : message.text}</p>
-            {#if !message.deleted}{#each invitations(message.text) as invitation}<button type="button" disabled={busy || drafting} on:click={() => void onJoin(invitation)}>Join cabal</button>{/each}{/if}
+            {#if !message.deleted}
+              {#each invitations(message.text) as invitation}<button type="button" disabled={busy || drafting} on:click={() => void visitWorkspace(invitation, true)}>Join cabal</button>{/each}
+              {#each signalWorkspaceIds(message.text) as id}<button type="button" disabled={busy || drafting} on:click={() => void visitWorkspace(id, false)}>Open workspace</button>{/each}
+            {/if}
             {#if message.attachment_count}<small>{message.attachment_count} attachment{message.attachment_count === 1 ? '' : 's'} · Open in Signal</small>{/if}
             {#if message.edited}<small>Edited</small>{/if}
           </article>
         {/each}
         {#if !visible.length}<p class="quiet">New messages will appear here after Signal syncs this device.</p>{/if}
       </div>
-      {#if proposal}<div class="proposal"><p>{proposal}</p><button type="button" on:click={() => { changeDraft(proposal); proposal = ''; }}>Use draft</button><button type="button" on:click={() => proposal = ''}>Discard</button></div>{/if}
+      {#if proposal}<div class="proposal"><p>{proposal}</p><button type="button" disabled={busy || !!uncertain} on:click={() => { changeDraft(proposal); proposal = ''; }}>Use draft</button><button type="button" on:click={() => proposal = ''}>Discard</button></div>{/if}
       <div class="compose">
         <textarea bind:this={composer} aria-label="Signal message draft" placeholder="Write a message…" rows="3" value={draft} on:input={event => changeDraft(event.currentTarget.value)} on:keydown={keydown} disabled={busy || !!uncertain}></textarea>
         {#if saving}<span class="quiet" role="status">Saving draft…</span>{/if}
         <div class="actions">
           <button type="button" title={`Draft locally with ${modelLabel} using the last 20 messages. The draft is retained in this workspace.`} disabled={!canDraft} on:click={() => void draftReply()}>{drafting ? 'Drafting…' : 'Draft locally'}</button>
-          <button type="button" disabled={busy || drafting} on:click={() => void invite()}>Invite to cabal</button>
+          <button type="button" disabled={busy || drafting || !!uncertain} on:click={() => void invite()}>Invite to cabal</button>
           {#if uncertain}<button type="button" disabled={busy} on:click={() => void send(true)}>Check send</button>
           {:else}<button type="button" class="send" disabled={busy || drafting || !draft.trim() || status.phase !== 'connected'} on:click={() => void send()}>Send</button>{/if}
         </div>
@@ -231,6 +289,9 @@
   .conversation-picker { display:flex; flex-direction:column; gap:6px; padding:10px 12px; }
   input, select, textarea { box-sizing:border-box; width:100%; border:1px solid var(--line); border-radius:5px; color:var(--ink); background:transparent; font:inherit; padding:7px 8px; }
   .description { margin:0; padding:0 12px 10px; color:var(--muted); white-space:pre-wrap; overflow-wrap:anywhere; }
+  .workspaces { display:flex; flex-wrap:wrap; gap:3px; padding:0 8px 8px; border-bottom:1px solid var(--line); }
+  .workspaces > div { display:flex; align-items:center; background:var(--paper-deep); border-radius:5px; max-width:100%; }
+  .workspaces button:first-child { min-width:0; overflow-wrap:anywhere; text-align:left; }
   .messages { flex:1; min-height:80px; overflow:auto; padding:4px 12px 12px; }
   article { margin:12px 18px 12px 0; } article.outgoing { margin:12px 0 12px 18px; }
   .byline { display:flex; align-items:baseline; gap:8px; font-size:10px; color:var(--muted); } time { margin-left:auto; }

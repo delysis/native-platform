@@ -10,6 +10,8 @@ A cabal is a shared workspace, with a durable device identity and admitted
 members who can edit together, go offline, and resume later. Documents remain
 readable Markdown. Shared prompts enter the same document library and explicit
 `@` reference mechanism as local prompts. Receiving a document never executes it.
+Sharing requires saved writing, without requiring a loaded model or an initial
+document. An empty workspace can become a cabal before its first words exist.
 
 Signal brings existing relationships into a pane beside the manuscript. Link
 Loom from the phone's Linked Devices screen. Contacts and groups come from the
@@ -36,6 +38,20 @@ opens with `:join loom://cabal/...` or the chat's Join cabal button. Invite to c
 prepares a message in the composer. Sending always requires a separate explicit
 action. A local model can propose a reply from quoted conversation context; Use
 draft copies that proposal into the composer. It never sends the proposal.
+
+Inviting or joining from a conversation remembers its workspace in the encrypted
+Signal account. Reopening the pane restores those bookmarks. The public link
+`loom://workspace/<cabal UUID>` opens an existing local cabal binding; it cannot
+admit a new member, create a networking profile, or choose a filesystem path.
+These links work in message bodies and group descriptions. The invitation still
+grants one admission and must be sent separately to each intended new member.
+Forget workspace removes only the local conversation bookmark, preserving the
+workspace, manuscripts, and membership. Loom does not yet write group descriptions.
+
+One persistent draft owner serializes conversation switches and explicit sends.
+Hiding a pane cannot interrupt send settlement or transplant an invitation into
+another conversation. Local proposals belong to the workspace that started them
+and disappear on a workspace switch; a delayed proposal never replaces the draft.
 
 ## Ownership and authority
 
@@ -87,6 +103,10 @@ Send uncertainty is committed before network submission. Repeating the same
 send ID checks its existing receipt; Check send is strictly read-only and cannot
 dispatch a new message. Authored drafts and pending-send identities are saved
 inside the encrypted database with optimistic versions and exact retry IDs.
+Workspace bookmarks use the same database, with versioned updates, exact retries,
+16 links per conversation, and bounded total storage. They contain no invitation
+tokens or group keys. The bundled frontend/native host and worker use IPC version 2;
+an older worker is rejected instead of partially serving newer requests.
 
 Disappearing-message expiry is recorded at first receipt, before receiving the
 next event. Later group settings cannot extend an already recorded expiry.
@@ -142,7 +162,7 @@ The feature is not complete until the following have concrete evidence:
 * Two actual editors typing concurrently, offline/restart convergence, IME,
   source/visual switching, undo, navigation, and joined application shutdown.
 * Cabal membership controls, orphan recovery, coherent new/renamed/deleted
-  documents, and persistent workspace/chat association.
+  documents, and persistent workspace/chat association in real paired sessions.
 * Portable attachment sharing and prompt modality requirements.
 * Explicit, revocable idle-compute grants; host-owned whole model jobs; durable
   job identities; cancellation and resource limits; correctly attributed remote

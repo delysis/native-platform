@@ -7,6 +7,8 @@ permissions = [
   "allow-cabal-snapshot",
   "allow-cabal-share",
   "allow-cabal-join",
+  "allow-cabal-open",
+  "allow-cabal-workspace",
   "allow-cabal-edit",
   "allow-cabal-revoke",
   "allow-cabal-recover",

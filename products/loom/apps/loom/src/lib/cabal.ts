@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { OpenDocument } from './types';
+import type { SignalWorkspace } from './signal';
 
 export interface SharedView { id: string; name: string; kind: 'prose' | 'verse'; deleted: boolean; text: string; heads: string[] }
 export interface SharedDocument { shared: SharedView; local: OpenDocument }
@@ -24,6 +25,12 @@ export function shareCabal(projectId: string, sessionId: string, name: string, d
 }
 export function joinCabal(invitation: string, displayName = 'Loom'): Promise<string | null> {
   return invoke('plugin:loom|cabal_join', { invitation, displayName });
+}
+export function cabalWorkspace(projectId: string, sessionId: string): Promise<SignalWorkspace | null> {
+  return invoke('plugin:loom|cabal_workspace', { projectId, sessionId });
+}
+export function openCabal(workspaceId: string): Promise<string | null> {
+  return invoke('plugin:loom|cabal_open', { workspaceId });
 }
 export function editCabal(projectId: string, sessionId: string, edit: CabalEdit): Promise<CabalEditReply> {
   return invoke('plugin:loom|cabal_edit', { projectId, sessionId, edit });

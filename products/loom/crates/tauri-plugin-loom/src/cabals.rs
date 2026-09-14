@@ -206,6 +206,23 @@ impl CabalService {
             .map(|cabal| (cabal.clone(), profile.network.clone())))
     }
 
+    async fn workspace_root(&self, directory: &Path, id: Uuid) -> Result<PathBuf, IpcFailure> {
+        if self.profile.lock().await.is_none() && !directory.join("index.json").is_file() {
+            return Err(failure("Join this cabal with an invitation first."));
+        }
+        self.start(directory).await?;
+        let slot = self.profile.lock().await;
+        let root = slot
+            .as_ref()
+            .and_then(|profile| profile.bindings.iter().find(|(_, bound)| **bound == id))
+            .map(|(root, _)| root.clone())
+            .ok_or_else(|| failure("Join this cabal with an invitation first."))?;
+        if !root.is_dir() {
+            return Err(failure("This cabal's saved folder is unavailable."));
+        }
+        Ok(root)
+    }
+
     pub async fn shutdown(&self) {
         self.closed.store(true, Ordering::Release);
         if let Some(profile) = self.profile.lock().await.take() {
@@ -276,6 +293,38 @@ pub(crate) async fn cabal_snapshot(
             .filter(|view| view.deleted)
             .count(),
     }))
+}
+
+#[tauri::command]
+pub(crate) async fn cabal_workspace(
+    project_id: String,
+    session_id: String,
+    state: State<'_, PluginState>,
+) -> Result<Option<loom_signal_protocol::Workspace>, IpcFailure> {
+    ensure_application_running(&state, "reading a cabal workspace")?;
+    let root = root_for(&state, &project_id, &session_id)?;
+    let Some((cabal, _)) = state.cabals.bound(&directory(&state)?, &root).await? else {
+        return Ok(None);
+    };
+    let cabal = cabal.lock().map_err(|_| failure("Cabal owner stopped"))?;
+    Ok(Some(loom_signal_protocol::Workspace {
+        id: cabal.id(),
+        title: cabal.roster().payload.name.clone(),
+    }))
+}
+
+#[tauri::command]
+pub(crate) async fn cabal_open(
+    workspace_id: Uuid,
+    state: State<'_, PluginState>,
+) -> Result<Option<String>, IpcFailure> {
+    ensure_application_running(&state, "opening a cabal workspace")?;
+    let root = state
+        .cabals
+        .workspace_root(&directory(&state)?, workspace_id)
+        .await?;
+    let _admission = lock_application_admission(&state, "opening a cabal workspace")?;
+    prepare_project_folder(&state, Some(root))
 }
 
 #[tauri::command]
@@ -1191,6 +1240,62 @@ fn save_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn public_workspace_ids_open_only_existing_profile_bindings() {
+        let directory = tempfile::tempdir().expect("directory");
+        let profile_root = directory.path().join("profile");
+        let service = CabalService::default();
+        assert!(
+            service
+                .workspace_root(&profile_root, Uuid::new_v4())
+                .await
+                .is_err()
+        );
+        assert!(
+            !profile_root.exists(),
+            "an unknown link cannot initialize a networking profile"
+        );
+        let (store, cabal, _) = fixture(directory.path());
+        let id = cabal.id();
+        let root = store.root().to_owned();
+        let identity = Identity::generate().expect("identity");
+        let network = Arc::new(
+            Network::start(&identity, NetworkMode::Local)
+                .await
+                .expect("network"),
+        );
+        *service.profile.lock().await = Some(Profile {
+            directory: profile_root.clone(),
+            identity,
+            network,
+            cabals: BTreeMap::from([(id, Arc::new(Mutex::new(cabal)))]),
+            bindings: BTreeMap::from([(root.clone(), id)]),
+            _lease: File::create(directory.path().join("lease")).expect("lease"),
+        });
+        assert_eq!(
+            service
+                .workspace_root(&profile_root, id)
+                .await
+                .expect("registered workspace"),
+            root
+        );
+        assert!(
+            service
+                .workspace_root(&profile_root, Uuid::new_v4())
+                .await
+                .is_err()
+        );
+        drop(store);
+        let moved = directory.path().join("moved-writing");
+        std::fs::rename(&root, &moved).expect("move the folder");
+        assert!(service.workspace_root(&profile_root, id).await.is_err());
+        assert!(
+            !root.exists(),
+            "opening a bookmark cannot recreate a missing workspace"
+        );
+        service.shutdown().await;
+    }
 
     #[test]
     fn revocation_recovery_preserves_file_and_unsent_editor_versions_privately() {

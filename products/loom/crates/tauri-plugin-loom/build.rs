@@ -5,6 +5,8 @@ const COMMANDS: &[&str] = &[
     "cabal_snapshot",
     "cabal_share",
     "cabal_join",
+    "cabal_open",
+    "cabal_workspace",
     "cabal_edit",
     "cabal_revoke",
     "cabal_recover",
