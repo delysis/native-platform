@@ -30,6 +30,8 @@
   export let source: OpenDocument | null = null;
   export let value = '';
   export let readonly = false;
+  export let collaborative = false;
+  export let onImmediateDocumentMutation: () => void = () => {};
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onChange: (value: string) => void = () => {};
   export let beforeRun: () => Promise<OpenDocument | null>;
@@ -56,6 +58,7 @@
   const outputLoader = new RetainedOutputLoader();
   const MAX_PROMPT_BYTES = 64 * 1024;
   let editor: LoomEditor | undefined;
+  let sourceEditor: SourceEditor | undefined;
   let historyViewport: HTMLDivElement | undefined;
   let following = true;
   afterUpdate(() => { if (following && historyViewport) historyViewport.scrollTop = historyViewport.scrollHeight; });
@@ -76,6 +79,9 @@
   $: preview = mounted && config.kind === 'browser' ? previewUrl(projectId, sessionId, target, runs, documents) : '';
 
   export function flush(): boolean { return !composing && (editor?.flushPending() ?? true); }
+  export function applyRemoteValue(text: string): void {
+    if (editingCurrent && !composing) sourceEditor?.applyRemoteValue(decodeSourceForEditor(text).display);
+  }
 
   function reportBusy(value: boolean): void { onBusyChange(value); }
   function selectVisual(text: string, key: string): boolean {
@@ -232,9 +238,9 @@
       <div class="editor">
         {#key editorKey}
           {#if visual}
-            <LoomEditor bind:this={editor} {value} {readonly} {onChange} onCompositionChange={setComposing} acceptImageAttachments={false} label={config.title ?? 'Pane editor'} onGhostPresentationRejected={() => {}} />
+            <LoomEditor bind:this={editor} {value} {readonly} {collaborative} {onImmediateDocumentMutation} {onChange} onCompositionChange={setComposing} acceptImageAttachments={false} label={config.title ?? 'Pane editor'} onGhostPresentationRejected={() => {}} />
           {:else}
-            <SourceEditor element={undefined} value={sourceDecoded.display} readonly={readonly || !sourceDecoded.codec.editable} verseNewline={sourceDecoded.codec.newline} label={config.title ?? 'Pane editor'} onValueInput={(area) => onChange(encodeSourceFromEditor(area.value, sourceDecoded.codec))} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} />
+            <SourceEditor bind:this={sourceEditor} element={undefined} value={sourceDecoded.display} readonly={readonly || !sourceDecoded.codec.editable} verseNewline={sourceDecoded.codec.newline} label={config.title ?? 'Pane editor'} onValueInput={(area) => onChange(encodeSourceFromEditor(area.value, sourceDecoded.codec))} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} />
           {/if}
         {/key}
       </div>

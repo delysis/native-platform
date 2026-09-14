@@ -17,6 +17,20 @@ linked account; Loom never imports a running Signal Desktop application's keys
 or database. Chat messages and workspace invitations travel through Signal;
 workspace changes travel directly between cabal devices.
 
+Names, prose/verse kind, and removal state live alongside text in each document's
+CRDT. A local rename keeps its document identity and merges with unseen edits.
+Conflicting names receive deterministic filename suffixes; filename swaps use
+the existing recoverable, no-clobber file moves. Exact creation and save receipts
+resolve interrupted projections without recreating or overwriting a manuscript.
+Projection failures are reported per document so other writing can continue.
+
+Removing an open document lets pending composition finish before its file is
+retired. Its shared text remains recoverable. Recover my copies retains removed
+or orphaned writing under `Recovery/`, outside the shared namespace. After a
+membership loss it can also retain the exact rejected editor draft and external
+file version privately, preserving verse bytes. The editor advances away from
+rejected input only after that explicit recovery has a durable copy.
+
 Open Signal with `:signal` in Loom's terminal or Cmd/Ctrl+Shift+Y. An invitation
 opens with `:join loom://cabal/...` or the chat's Join cabal button. Invite to cabal
 prepares a message in the composer. Sending always requires a separate explicit
@@ -100,6 +114,10 @@ compressed change blocks are rejected before their unbounded upstream decoder.
 The storage cap currently stops new edits with an error. Long-lived history
 compaction must preserve signed provenance and offline recovery before that cap
 can be relaxed.
+
+The current cabal store and signed document payload format is version 2. Older
+experimental stores are rejected without being rewritten. No compatibility
+layer is retained for the unreleased version 1 prototype.
 
 ## Build and licensing
 

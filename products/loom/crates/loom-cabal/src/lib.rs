@@ -7,7 +7,7 @@ mod store;
 mod transport;
 
 pub use crypto::{Identity, Signed};
-pub use document::{DocumentView, Edit, EditResult};
+pub use document::{Create, DocumentView, Edit, EditResult, MetadataEdit, TextKind};
 pub use store::{Cabal, ChangeEnvelope, ChangePayload, Invitation, Member, Membership, Roster};
 pub use transport::{Network, NetworkMode, PeerStatus};
 

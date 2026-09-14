@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { CabalEditor, type CabalEditReply, type SharedDocument } from './cabal';
 
 function document(text: string, head: string): SharedDocument {
-  return { shared: { id: 'shared', name: 'Draft.md', text, heads: [head] }, local: {
+  return { shared: { id: 'shared', name: 'Draft.md', kind: 'prose', deleted: false, text, heads: [head] }, local: {
     summary: { document_id: 'local', relative_path: 'Draft.md', title: 'Draft', kind: 'prose', revision_id: head, active_blob_id: head, word_count: 1, externally_modified: false },
     text, visible_blob_id: head, transient_draft: null,
   } };
@@ -11,6 +11,27 @@ function document(text: string, head: string): SharedDocument {
 function deferred<T>() { let resolve!: (value: T) => void; const promise = new Promise<T>(done => resolve = done); return { promise, resolve }; }
 
 describe('one editor causal cursor', () => {
+  it('retains a rejected edit until its exact private recovery copy is acknowledged', async () => {
+    const send = vi.fn().mockRejectedValue(new Error('Membership ended'));
+    const apply = vi.fn().mockReturnValue(true);
+    const editor = new CabalEditor(document('A', 'one'), send, apply, () => false, vi.fn(), 'device');
+    editor.change('An unfinished sentence');
+    expect(await editor.flush()).toBe(false);
+    const old = editor.recoveryEdit()!;
+    editor.change('An unfinished sentence, finished.');
+    expect(editor.acknowledgeRecovery(old)).toBe(false);
+    expect(await editor.flush()).toBe(false);
+    const current = editor.recoveryEdit()!;
+    expect(current.text).toBe('An unfinished sentence, finished.');
+    expect(editor.acknowledgeRecovery(current)).toBe(true);
+    const submitted = send.mock.calls.length;
+    expect(await editor.flush()).toBe(true);
+    editor.receive(document('A stale remote copy', 'two'), editor.version);
+    expect(apply).not.toHaveBeenCalled();
+    expect(send.mock.calls.length).toBe(submitted);
+    editor.dispose();
+  });
+
   it('bases queued typing on its own acknowledged heads, then adopts both authors', async () => {
     const first = deferred<CabalEditReply>();
     const send = vi.fn().mockReturnValueOnce(first.promise).mockResolvedValueOnce({ ...document('Alice Bob!', 'merged-two'), local_heads: ['local-two'] });

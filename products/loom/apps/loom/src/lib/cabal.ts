@@ -1,20 +1,23 @@
 import { invoke } from '@tauri-apps/api/core';
 import type { OpenDocument } from './types';
 
-export interface SharedView { id: string; name: string; text: string; heads: string[] }
+export interface SharedView { id: string; name: string; kind: 'prose' | 'verse'; deleted: boolean; text: string; heads: string[] }
 export interface SharedDocument { shared: SharedView; local: OpenDocument }
 export interface CabalSnapshot {
-  id: string; name: string; my_key: string; orphaned_changes: number;
+  id: string; name: string; my_key: string; orphaned_changes: number; removed_documents: number;
   roster_hash: string;
   roster: { payload: { owner: string; epoch: number; members: { key: string; name: string }[] } };
   peers: { cabal: string; key: string; connected: boolean; changed: boolean }[];
   documents: SharedDocument[];
+  deleted_document_ids: string[];
+  problems: { document_id: string | null; name: string; message: string }[];
+  read_only: boolean;
 }
 export interface CabalEdit { document: string; client: string; basis: string[]; text: string }
 export interface CabalEditReply extends SharedDocument { local_heads: string[] }
 
-export function cabalSnapshot(projectId: string, sessionId: string): Promise<CabalSnapshot | null> {
-  return invoke('plugin:loom|cabal_snapshot', { projectId, sessionId });
+export function cabalSnapshot(projectId: string, sessionId: string, protectedDocumentId: string | null): Promise<CabalSnapshot | null> {
+  return invoke('plugin:loom|cabal_snapshot', { projectId, sessionId, protectedDocumentId });
 }
 export function shareCabal(projectId: string, sessionId: string, name: string, displayName = 'Loom'): Promise<string> {
   return invoke('plugin:loom|cabal_share', { projectId, sessionId, name, displayName });
@@ -28,8 +31,8 @@ export function editCabal(projectId: string, sessionId: string, edit: CabalEdit)
 export function revokeCabalMember(projectId: string, sessionId: string, memberKey: string, rosterHash: string): Promise<void> {
   return invoke('plugin:loom|cabal_revoke', { projectId, sessionId, memberKey, rosterHash });
 }
-export function recoverCabalEdits(projectId: string, sessionId: string): Promise<string[]> {
-  return invoke('plugin:loom|cabal_recover', { projectId, sessionId });
+export function recoverCabalEdits(projectId: string, sessionId: string, edit: CabalEdit | null = null): Promise<{ paths: string[]; draft_path: string | null }> {
+  return invoke('plugin:loom|cabal_recover', { projectId, sessionId, edit });
 }
 
 /** One editor's causal cursor. Edits queued during a round trip continue from
@@ -46,6 +49,7 @@ export class CabalEditor {
   private deferred: CabalEditReply | null = null;
   private uncertain: CabalEdit | null = null;
   private disposed = false;
+  private recovered = false;
 
   constructor(initial: SharedDocument, private readonly send: (edit: CabalEdit) => Promise<CabalEditReply>,
     private readonly apply: (document: SharedDocument) => boolean, private readonly composing: () => boolean,
@@ -55,13 +59,13 @@ export class CabalEditor {
   }
 
   change(text: string): void {
-    if (this.disposed) return;
+    if (this.disposed || this.recovered) return;
     this.desired = text; this.version++;
     if (!this.timer) this.timer = setTimeout(() => { this.timer = undefined; void this.flush(); }, 100);
   }
 
   receive(document: SharedDocument, expectedVersion: number): void {
-    if (this.disposed || this.version !== expectedVersion || this.running || this.composing() || this.uncertain || this.desired !== this.baseText) return;
+    if (this.disposed || this.recovered || this.version !== expectedVersion || this.running || this.composing() || this.uncertain || this.desired !== this.baseText) return;
     this.accept(document);
   }
 
@@ -80,10 +84,25 @@ export class CabalEditor {
     if (this.timer) { clearTimeout(this.timer); this.timer = undefined; }
     if (this.running) return this.running;
     if (this.disposed || this.composing()) return false;
+    if (this.recovered) return true;
     const operation = this.drain();
     this.running = operation;
     try { return await operation; }
     finally { if (this.running === operation) this.running = null; }
+  }
+
+  recoveryEdit(): CabalEdit | null {
+    if (this.disposed || this.recovered || this.running || this.composing() || (!this.uncertain && this.desired === this.baseText)) return null;
+    return { document: this.id, client: this.client, basis: [...this.basis], text: this.desired };
+  }
+
+  /** Call only after an explicit recovery action has durably retained this exact
+   * text. This freezes the old editor so navigation can open the private copy. */
+  acknowledgeRecovery(edit: CabalEdit): boolean {
+    if (this.disposed || this.running || this.composing() || edit.document !== this.id || edit.client !== this.client || edit.text !== this.desired || edit.basis.join() !== this.basis.join()) return false;
+    this.recovered = true;
+    this.version++;
+    return true;
   }
 
   private async drain(): Promise<boolean> {

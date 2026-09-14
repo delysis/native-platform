@@ -3,6 +3,7 @@
   import { normalizeFailure } from './ipc';
   export let cabal: CabalSnapshot | null;
   export let projectName: string;
+  export let unsaved = false;
   export let onClose: () => void;
   export let onInvite: (name: string) => Promise<string>;
   export let onJoin: (invitation: string, name: string) => Promise<void>;
@@ -36,8 +37,10 @@
         {#if removing === member.key}<li class="removal"><p>{member.name} will stop receiving new changes. Their existing copies remain theirs.</p><button type="button" disabled={busy} on:click={() => void run(async () => { if (cabal) await onRemove(member.key, cabal.roster_hash); removing = ''; })}>Remove member</button><button type="button" on:click={() => removing = ''}>Keep</button></li>{/if}
       {/each}
     </ul>
-    {#if !cabal.roster.payload.members.some(member => member.key === cabal?.my_key)}<p class="quiet">This device is no longer a member. Your existing text remains here.</p>{/if}
-    {#if cabal.orphaned_changes}<div class="recovery"><p>Some edits are outside the current membership history.</p><button type="button" disabled={busy} on:click={() => void run(async () => { const paths = await onRecover(); note = `${paths.length} recovery ${paths.length === 1 ? 'copy' : 'copies'} in the workspace`; })}>Recover my copies</button></div>{/if}
+    {#if cabal.read_only}<p class="quiet">This device is no longer a member. Your existing text remains here.</p>{/if}
+    {#each cabal.problems as problem}<p class="error" role="alert"><strong>{problem.name}</strong><br />{problem.message}</p>{/each}
+    {#if cabal.documents.some(item => item.shared.deleted)}<p class="quiet">An open document was removed from this cabal. Its text stays here until you leave it.</p>{/if}
+    {#if unsaved || cabal.read_only || cabal.orphaned_changes || cabal.removed_documents}<div class="recovery"><p>Unsent edits and removed writing can be kept in private recovery copies.</p><button type="button" disabled={busy} on:click={() => void run(async () => { const paths = await onRecover(); note = `${paths.length} recovery ${paths.length === 1 ? 'copy' : 'copies'} in the workspace`; })}>Recover my copies</button></div>{/if}
     {#if owner}<button class="invite" type="button" disabled={busy} on:click={() => void run(invite)}>Invite someone</button>{/if}
   {:else}
     <p class="intro">A little shared mind. Make this workspace a place your people can write together.</p>

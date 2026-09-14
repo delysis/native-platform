@@ -109,7 +109,7 @@ fn signatures_and_membership_are_not_editable_document_data() -> Result<()> {
     let (mut alice, mut bob) = pair(directory.path())?;
     alice.create_document("spell.md", "Honest words")?;
     let mut envelopes = alice.missing(&BTreeSet::new())?;
-    envelopes[0].payload.name = "forged.md".into();
+    envelopes[0].payload.document = Uuid::new_v4();
     assert!(bob.apply(envelopes).is_err());
     assert!(bob.views()?.is_empty());
     let outsider = Identity::generate()?;
@@ -201,5 +201,102 @@ async fn real_quic_pairing_sync_and_invitation_retry_are_bound_to_device() -> Re
     alice_network.shutdown().await?;
     bob_network.shutdown().await?;
     mallory_network.shutdown().await?;
+    Ok(())
+}
+
+#[test]
+fn rename_delete_and_offline_typing_keep_one_document_and_all_words() -> Result<()> {
+    use loom_cabal::{MetadataEdit, TextKind};
+    let directory = tempfile::tempdir()?;
+    let (mut alice, mut bob) = pair(directory.path())?;
+    let document =
+        alice.create_document_with_kind("poems/Rain.md", "Rain\n  falls\n", TextKind::Verse)?;
+    sync(&mut alice, &mut bob)?;
+    let rename = MetadataEdit {
+        document: document.id,
+        client: Uuid::new_v4(),
+        basis: document.heads.clone(),
+        name: "poems/Silver rain.md".into(),
+        deleted: false,
+    };
+    alice.edit_metadata(&rename)?;
+    bob.edit(&Edit {
+        document: document.id,
+        client: Uuid::new_v4(),
+        basis: document.heads.clone(),
+        text: "Rain\n  falls softly\n".into(),
+    })?;
+    // Bob deletes from the same old metadata snapshot without knowing the rename.
+    bob.edit_metadata(&MetadataEdit {
+        document: document.id,
+        client: Uuid::new_v4(),
+        basis: bob.view(document.id)?.heads,
+        name: document.name,
+        deleted: true,
+    })?;
+    sync(&mut alice, &mut bob)?;
+    let merged = alice.view(document.id)?;
+    assert_eq!(merged.name, "poems/Silver rain.md");
+    assert_eq!(merged.text, "Rain\n  falls softly\n");
+    assert_eq!(merged.kind, TextKind::Verse);
+    assert!(merged.deleted);
+    assert_eq!(merged.heads, bob.view(document.id)?.heads);
+    // Retrying the rename must not resurrect the now-deleted document.
+    let hashes = alice.hashes()?;
+    alice.edit_metadata(&rename)?;
+    assert!(alice.view(document.id)?.deleted);
+    assert_eq!(alice.hashes()?, hashes);
+    Ok(())
+}
+
+#[test]
+fn a_lost_creation_reply_retries_after_reconnect_and_membership_change() -> Result<()> {
+    use loom_cabal::{Create, TextKind};
+    let directory = tempfile::tempdir()?;
+    let (mut alice, bob) = pair(directory.path())?;
+    let request = Create {
+        document: Uuid::new_v4(),
+        client: Uuid::new_v4(),
+        name: "Notebook.md".into(),
+        kind: TextKind::Prose,
+        text: "An exact first version".into(),
+    };
+    let created = alice.create_document_idempotent(&request)?;
+    alice.revoke(bob.identity().public_key())?;
+    let hashes = alice.hashes()?;
+    let identity = alice.identity().clone();
+    drop(alice);
+    let mut reopened = Cabal::open(&directory.path().join("alice.db"), identity)?;
+    let retried = reopened.create_document_idempotent(&request)?;
+    assert_eq!(retried.local_heads, created.local_heads);
+    assert_eq!(reopened.hashes()?, hashes);
+    let mut changed = request;
+    changed.text.push_str(" with a conflicting reuse");
+    assert!(reopened.create_document_idempotent(&changed).is_err());
+    assert_eq!(reopened.view(changed.document)?.text, created.merged.text);
+    Ok(())
+}
+
+#[test]
+fn unprojectable_paths_are_rejected_before_entering_the_log() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let (mut alice, _) = pair(directory.path())?;
+    for name in [
+        "../Escape.md",
+        "/Absolute.md",
+        "notes/.loom/secret.md",
+        "Runs/Result.md",
+        "recovery/draft.md",
+        "CON.md",
+        "a\\b.md",
+        "x//y.md",
+        "bad:stream.md",
+        "trailing. /a.md",
+    ] {
+        assert!(alice.create_document(name, "preserved").is_err(), "{name}");
+    }
+    assert!(alice.hashes()?.is_empty());
+    alice.create_document("Poems/雨.md", "Rain")?;
+    assert_eq!(alice.views()?.len(), 1);
     Ok(())
 }

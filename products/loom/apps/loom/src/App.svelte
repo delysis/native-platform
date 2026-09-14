@@ -440,10 +440,15 @@
   let cabalScope = '';
   let cabalAttaching = false;
   let cabalRefreshing = false;
+  let cabalSnapshotPending: Promise<CabalSnapshot | null> | null = null;
   let cabalApplying = false;
+  let cabalRecovered = false;
   let cabalTimer: ReturnType<typeof setTimeout> | undefined;
-  $: if (componentMounted && desktop && project && document && transition === 'idle') {
-    const scope = `${project.project_id}/${project.session_id}/${document.summary.document_id}`;
+  $: cabalDocumentRemoved = Boolean(cabal?.documents.find(item => item.local.summary.document_id === document?.summary.document_id)?.shared.deleted);
+  $: cabalDocumentProblem = cabal?.problems.find(item => item.document_id === document?.summary.document_id);
+  $: cabalWriteBlocked = Boolean(cabalRecovered || (cabal?.read_only && cabal.documents.some(item => item.local.summary.document_id === document?.summary.document_id)) || cabalDocumentRemoved || cabalDocumentProblem) && !compositionActive && !sourceDirty && !visualMutationPending;
+  $: if (componentMounted && desktop && project && transition === 'idle') {
+    const scope = `${project.project_id}/${project.session_id}/${document?.summary.document_id ?? ''}`;
     if (scope !== cabalScope) { cabalScope = scope; void attachCabal(scope); }
   }
   let terminalEntry = '';
@@ -1351,7 +1356,7 @@
   $: showVisual = mode === 'visual';
   $: showSource = mode === 'source';
   $: exactTextSurface = document?.summary.kind === 'verse';
-  $: editorReadonly = cabalAttaching || transition !== 'idle' || renameDocumentEditorLocked || deleteDocumentEditorLocked || missingDocumentBoundaryInFlight || missingDocumentCapturePending !== null || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
+  $: editorReadonly = cabalAttaching || cabalWriteBlocked || transition !== 'idle' || renameDocumentEditorLocked || deleteDocumentEditorLocked || missingDocumentBoundaryInFlight || missingDocumentCapturePending !== null || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
   $: reconciliationResolutionLocked = reconciliationApplying || pendingReconciliationApply !== null;
   $: reconciliationResolutionIsExact = Boolean(
     reconciliation && (
@@ -7343,6 +7348,7 @@
   }
 
   async function flushCurrentDocument(): Promise<boolean> {
+    if (cabalSnapshotPending) { try { await cabalSnapshotPending; } catch { /* The refresh reports its own error. */ } }
     if (cabalEditor) { if (!flushEditors()) return false; return cabalEditor.flush(); }
     if (!desktop || !document) return true;
     if (saveTimer !== undefined) {
@@ -9251,24 +9257,39 @@
   }
 
   function currentCabalScope(): string {
-    return project && document ? `${project.project_id}/${project.session_id}/${document.summary.document_id}` : '';
+    return project ? `${project.project_id}/${project.session_id}/${document?.summary.document_id ?? ''}` : '';
   }
 
   async function attachCabal(scope: string): Promise<void> {
+    cabalRecovered = false;
     if (cabalTimer) clearTimeout(cabalTimer);
+    cabalTimer = undefined;
     cabalEditor?.dispose(); cabalEditor = null; cabal = null;
     cabalAttaching = true;
     try {
       if (saveInFlight) await saveInFlight;
       if (draftInFlight) await draftInFlight;
       if (currentCabalScope() !== scope) return;
-      if (editVersion !== savedVersion && !await flushCurrentDocument()) return;
+      if (editVersion !== savedVersion && !await flushCurrentDocument()) {
+        cabalAttaching = false;
+        return;
+      }
       await refreshCabal(scope, true);
     } catch (failure) { if (currentCabalScope() === scope) recordFailure(failure); }
+    finally {
+      if (componentMounted && currentCabalScope() === scope && !cabalTimer && !cabalEditor) {
+        cabalTimer = setTimeout(() => void attachCabal(scope), 1000);
+      }
+    }
   }
 
   async function refreshCabal(scope: string, attach = false): Promise<void> {
-    if (!project || !document || !componentMounted || currentCabalScope() !== scope) return;
+    if (!project || !componentMounted || currentCabalScope() !== scope) return;
+    if (transition !== 'idle' || fileCommandInFlight || renameDocumentEditorLocked || deleteDocumentEditorLocked) {
+      if (cabalTimer) clearTimeout(cabalTimer);
+      cabalTimer = setTimeout(() => void refreshCabal(scope, attach), 500);
+      return;
+    }
     if (cabalRefreshing) {
       if (attach) cabalTimer = setTimeout(() => void refreshCabal(scope, true), 100);
       return;
@@ -9277,15 +9298,18 @@
     const projectId = project.project_id, sessionId = project.session_id;
     const controller = cabalEditor, version = controller?.version ?? 0;
     try {
-      const snapshot = await cabalSnapshot(projectId, sessionId);
-      if (!componentMounted || currentCabalScope() !== scope || !project || !document) return;
+      cabalSnapshotPending = cabalSnapshot(projectId, sessionId, document?.summary.document_id ?? null);
+      const snapshot = await cabalSnapshotPending;
+      if (!componentMounted || currentCabalScope() !== scope || !project) return;
       cabal = snapshot;
       if (!snapshot) { cabalAttaching = false; return; }
       const summaries = new Map(project.documents.map(item => [item.document_id, item]));
+      for (const id of snapshot.deleted_document_ids) summaries.delete(id);
       for (const item of snapshot.documents) summaries.set(item.local.summary.document_id, item.local.summary);
       project = { ...project, documents: [...summaries.values()] };
+      if (!document) { cabalAttaching = false; return; }
       const current = snapshot.documents.find(item => item.local.summary.document_id === document?.summary.document_id);
-      if (!current) { cabalAttaching = false; return; }
+      if (!current) { cabalAttaching = snapshot.problems.some(item => item.document_id === document?.summary.document_id); return; }
       if (transition !== 'idle' || compositionActive || visualMutationPending || sourceDirty) return;
       if (attach && !cabalEditor) {
         cabalEditor = new CabalEditor(current, edit => editCabal(projectId, sessionId, edit),
@@ -9301,6 +9325,7 @@
       if (currentCabalScope() === scope) recordFailure(failure);
     } finally {
       cabalRefreshing = false;
+      cabalSnapshotPending = null;
       if (componentMounted && currentCabalScope() === scope) {
         if (cabalTimer) clearTimeout(cabalTimer);
         cabalTimer = setTimeout(() => void refreshCabal(scope, attach && !cabalEditor), cabal ? 1000 : 5000);
@@ -9314,6 +9339,7 @@
     try {
       updateText(item.shared.text);
       document = item.local;
+      for (const editor of Object.values(paneEditors)) editor?.applyRemoteValue(item.shared.text);
       if (mode === 'source') {
         const decoded = decodeSourceForEditor(item.shared.text);
         sourceCodec = decoded.codec; sourceDisplayText = decoded.display;
@@ -9321,7 +9347,7 @@
       }
       project = { ...project, documents: project.documents.map(summary => summary.document_id === item.local.summary.document_id ? item.local.summary : summary) };
       savedVersion = editVersion; draftSavedEditVersion = editVersion;
-      saveState = 'clean'; saveMessage = 'Saved · shared';
+      saveState = 'clean'; saveMessage = item.shared.deleted ? 'Removed from cabal · text retained' : cabal?.read_only ? 'Saved copy · no longer a member' : 'Saved · shared';
       return true;
     } finally { cabalApplying = false; }
   }
@@ -9341,8 +9367,22 @@
 
   async function recoverCabalCopies(): Promise<string[]> {
     if (!project) throw new Error('Open the cabal workspace first.');
-    const paths = await recoverCabalEdits(project.project_id, project.session_id);
+    if (!flushEditors()) throw new Error('Finish composing before recovering this writing.');
+    const scope = currentCabalScope(), controller = cabalEditor;
+    if (controller) await controller.flush();
+    if (!project || currentCabalScope() !== scope) throw new Error('The workspace changed.');
+    const edit = controller?.recoveryEdit() ?? null;
+    const { paths, draft_path } = await recoverCabalEdits(project.project_id, project.session_id, edit);
+    if (!project || currentCabalScope() !== scope) return paths;
+    if (edit && controller === cabalEditor && controller?.acknowledgeRecovery(edit)) {
+      cabalRecovered = true;
+      saveState = 'clean'; saveMessage = 'Private recovery copy saved';
+    }
     await refreshProjectFilesystemState(); outlineOpen = true;
+    if (edit && currentCabalScope() === scope) {
+      const recovered = project?.documents.find(item => item.relative_path === draft_path);
+      if (recovered) await selectDocument(recovered, true);
+    }
     return paths;
   }
 
@@ -10040,7 +10080,7 @@
             </header>
             {#each slot.choices as [paneId, paneConfig] (paneId)}
               <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
-            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
+            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} collaborative={Boolean(cabalEditor)} onImmediateDocumentMutation={invalidateVisualSuggestionImmediately} onChange={updateText} beforeRun={preparePaneRun} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
               </div>
             {/each}
           </aside>
@@ -10048,7 +10088,7 @@
       {/each}
 
       {#if signalOpen}<aside class="workspace-pane-slot workspace-pane-right" aria-label="Signal pane"><PaneDivider edge="left" label="Resize Signal" size={Math.min(rightWidth, rightLimit)} min={200} max={rightLimit} onResize={size => rightWidth = size} /><SignalPane editor={signalDraftEditor} onClose={() => void toggleSignal()} onDraft={draftSignalReply} onCabal={inviteSignalConversation} onJoin={async invitation => { await doOpenProject(() => joinCabal(invitation)); }} modelLabel={currentModel?.display_name ?? 'Local model'} /></aside>{/if}
-      {#if cabalOpen}<aside class="workspace-pane-slot workspace-pane-right" aria-label="Cabal pane"><PaneDivider edge="left" label="Resize cabal" size={Math.min(rightWidth, rightLimit)} min={200} max={rightLimit} onResize={size => rightWidth = size} /><CabalPane {cabal} projectName={project?.title ?? 'Workspace'} onClose={() => cabalOpen = false} onInvite={inviteCabal} onJoin={async (invitation, name) => { await doOpenProject(() => joinCabal(invitation, name)); }} onRemove={removeCabalMember} onRecover={recoverCabalCopies} /></aside>{/if}
+      {#if cabalOpen}<aside class="workspace-pane-slot workspace-pane-right" aria-label="Cabal pane"><PaneDivider edge="left" label="Resize cabal" size={Math.min(rightWidth, rightLimit)} min={200} max={rightLimit} onResize={size => rightWidth = size} /><CabalPane {cabal} unsaved={Boolean(cabalEditor) && saveState === 'error'} projectName={project?.title ?? 'Workspace'} onClose={() => cabalOpen = false} onInvite={inviteCabal} onJoin={async (invitation, name) => { await doOpenProject(() => joinCabal(invitation, name)); }} onRemove={removeCabalMember} onRecover={recoverCabalCopies} /></aside>{/if}
 
     </div>
       <div class="terminal-dock" bind:clientHeight={terminalDockHeight} class:closed={!terminalOpen} style={`height:${effectiveTerminalHeight}px`}>

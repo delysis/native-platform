@@ -13,10 +13,10 @@ use uuid::Uuid;
 
 use crate::{
     Error, Identity, MAX_CHANGE_BYTES, MAX_CHANGES, MAX_DOCUMENTS, MAX_MEMBERS, Result, Signed,
-    document::{self, DocumentView, Edit, EditResult},
+    document::{self, Create, DocumentView, Edit, EditResult, MetadataEdit, TextKind},
 };
 
-const STORE_VERSION: i64 = 1;
+const STORE_VERSION: i64 = 2;
 const MAX_STORED_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,7 +50,6 @@ pub struct ChangePayload {
     pub cabal: Uuid,
     pub epoch: u64,
     pub document: Uuid,
-    pub name: String,
     pub change: String,
 }
 
@@ -96,7 +95,7 @@ pub struct Cabal {
     identity: Identity,
     database: Connection,
     roster: Roster,
-    documents: BTreeMap<Uuid, (String, Automerge)>,
+    documents: BTreeMap<Uuid, Automerge>,
     stored_bytes: usize,
 }
 
@@ -230,47 +229,75 @@ impl Cabal {
     pub fn views(&self) -> Result<Vec<DocumentView>> {
         self.documents
             .iter()
-            .filter(|(_, (_, document))| document.get_missing_deps(&[]).is_empty())
-            .map(|(id, (name, value))| document::view(value, *id, name.clone()))
+            .filter(|(_, document)| document.get_missing_deps(&[]).is_empty())
+            .map(|(id, value)| document::view(value, *id))
             .collect()
     }
 
     pub fn view(&self, id: Uuid) -> Result<DocumentView> {
-        let (name, document) = self
+        let document = self
             .documents
             .get(&id)
             .ok_or(Error::Invalid("Unknown shared document"))?;
-        document::view(document, id, name.clone())
+        document::view(document, id)
     }
 
     pub fn create_document(&mut self, name: &str, text: &str) -> Result<DocumentView> {
-        self.require_member()?;
-        validate_name(name)?;
-        if self
-            .documents
-            .values()
-            .any(|(existing, _)| existing == name)
-        {
-            return Err(Error::Invalid("Shared document name already exists"));
-        }
-        let id = Uuid::new_v4();
-        let (_, change) = document::initial(&self.identity, Uuid::new_v4(), text)?;
-        let envelope = self.envelope(id, name, change)?;
-        self.apply(vec![envelope])?;
-        self.view(id)
+        self.create_document_with_kind(name, text, TextKind::Prose)
     }
 
-    pub fn edit(&mut self, edit: &Edit) -> Result<EditResult> {
+    pub fn create_document_with_kind(
+        &mut self,
+        name: &str,
+        text: &str,
+        kind: TextKind,
+    ) -> Result<DocumentView> {
+        Ok(self
+            .create_document_idempotent(&Create {
+                document: Uuid::new_v4(),
+                client: Uuid::new_v4(),
+                name: name.into(),
+                kind,
+                text: text.into(),
+            })?
+            .merged)
+    }
+
+    pub fn create_document_idempotent(&mut self, create: &Create) -> Result<EditResult> {
         self.require_member()?;
-        let (name, document) = self
+        document::check_name(&create.name)?;
+        let (local, change) = document::initial(
+            &self.identity,
+            create.client,
+            &create.name,
+            create.kind,
+            &create.text,
+        )?;
+        let local_heads = document::encode_heads(&local);
+        if self
+            .documents
+            .get(&create.document)
+            .is_some_and(|document| document.get_change_by_hash(&change.hash()).is_none())
+        {
+            return Err(Error::Invalid("Document creation identity was reused"));
+        }
+        self.apply_local_change(create.document, change)?;
+        Ok(EditResult {
+            local_heads,
+            merged: self.view(create.document)?,
+        })
+    }
+
+    pub fn edit_metadata(&mut self, edit: &MetadataEdit) -> Result<EditResult> {
+        self.require_member()?;
+        let document = self
             .documents
             .get(&edit.document)
             .ok_or(Error::Invalid("Unknown shared document"))?;
-        let (local, change) = document::edit(document, &self.identity, edit)?;
+        let (local, change) = document::edit_metadata(document, &self.identity, edit)?;
         let local_heads = document::encode_heads(&local);
         if let Some(change) = change {
-            let envelope = self.envelope(edit.document, name, change)?;
-            self.apply(vec![envelope])?;
+            self.apply_local_change(edit.document, change)?;
         }
         Ok(EditResult {
             local_heads,
@@ -278,13 +305,44 @@ impl Cabal {
         })
     }
 
-    fn envelope(&self, id: Uuid, name: &str, change: Change) -> Result<ChangeEnvelope> {
+    pub fn edit(&mut self, edit: &Edit) -> Result<EditResult> {
+        self.require_member()?;
+        let document = self
+            .documents
+            .get(&edit.document)
+            .ok_or(Error::Invalid("Unknown shared document"))?;
+        let (local, change) = document::edit(document, &self.identity, edit)?;
+        let local_heads = document::encode_heads(&local);
+        if let Some(change) = change {
+            self.apply_local_change(edit.document, change)?;
+        }
+        Ok(EditResult {
+            local_heads,
+            merged: self.view(edit.document)?,
+        })
+    }
+
+    fn apply_local_change(&mut self, id: Uuid, change: Change) -> Result<()> {
+        // A retry after membership advances must not create another envelope
+        // for the same causal change under a new epoch.
+        if self
+            .documents
+            .get(&id)
+            .is_some_and(|document| document.get_change_by_hash(&change.hash()).is_some())
+        {
+            return Ok(());
+        }
+        let envelope = self.envelope(id, change)?;
+        self.apply(vec![envelope])?;
+        Ok(())
+    }
+
+    fn envelope(&self, id: Uuid, change: Change) -> Result<ChangeEnvelope> {
         self.identity.sign(ChangePayload {
-            schema: 1,
+            schema: 2,
             cabal: self.id(),
             epoch: self.roster.payload.epoch,
             document: id,
-            name: name.into(),
             change: URL_SAFE_NO_PAD.encode(change.raw_bytes()),
         })
     }
@@ -347,7 +405,7 @@ impl Cabal {
         build_documents(&all)?
             .into_iter()
             .filter(|(id, _)| affected.contains(id))
-            .map(|(id, (name, document))| document::view(&document, id, name))
+            .map(|(id, document)| document::view(&document, id))
             .collect()
     }
 
@@ -418,15 +476,9 @@ impl Cabal {
         let mut documents = BTreeMap::new();
         for (envelope, change, _) in pending.values() {
             let id = envelope.payload.document;
-            let (name, document) = documents.entry(id).or_insert_with(|| {
-                self.documents
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| (envelope.payload.name.clone(), Automerge::new()))
-            });
-            if name != &envelope.payload.name {
-                return Err(Error::Invalid("Conflicting shared document names"));
-            }
+            let document = documents
+                .entry(id)
+                .or_insert_with(|| self.documents.get(&id).cloned().unwrap_or_default());
             document.apply_changes([change.clone()])?;
         }
         if self
@@ -439,9 +491,9 @@ impl Cabal {
         {
             return Err(Error::Invalid("Cabal document limit reached"));
         }
-        for (id, (name, value)) in &documents {
+        for (id, value) in &documents {
             if value.get_missing_deps(&[]).is_empty() {
-                document::view(value, *id, name.clone())?;
+                document::view(value, *id)?;
             }
         }
         let transaction = self.database.transaction()?;
@@ -643,14 +695,14 @@ fn open_database(path: &Path) -> Result<Connection> {
     }
     let connection = Connection::open(path)?;
     connection.busy_timeout(std::time::Duration::from_secs(2))?;
-    connection.pragma_update(None, "journal_mode", "WAL")?;
-    connection.pragma_update(None, "synchronous", "FULL")?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if existing && version != STORE_VERSION {
         return Err(Error::Invalid(
             "Unsupported cabal store version; storage was preserved",
         ));
     }
+    connection.pragma_update(None, "journal_mode", "WAL")?;
+    connection.pragma_update(None, "synchronous", "FULL")?;
     connection.execute_batch("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS changes(hash TEXT PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS orphaned(hash TEXT PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS invitations(hash TEXT PRIMARY KEY, member TEXT);")?;
     connection.pragma_update(None, "user_version", STORE_VERSION)?;
     Ok(connection)
@@ -694,8 +746,7 @@ fn validate_envelope(envelope: &ChangeEnvelope, roster: &Roster) -> Result<Chang
     }
     envelope.verify()?;
     let payload = &envelope.payload;
-    validate_name(&payload.name)?;
-    if payload.schema != 1 || payload.cabal != roster.payload.cabal {
+    if payload.schema != 2 || payload.cabal != roster.payload.cabal {
         return Err(Error::Invalid("Change belongs to another cabal"));
     }
     let sealed = roster.payload.sealed.contains(&envelope.hash()?);
@@ -728,16 +779,11 @@ fn validate_envelope(envelope: &ChangeEnvelope, roster: &Roster) -> Result<Chang
     Ok(change)
 }
 
-fn build_documents(envelopes: &[ChangeEnvelope]) -> Result<BTreeMap<Uuid, (String, Automerge)>> {
-    let mut documents: BTreeMap<Uuid, (String, Automerge)> = BTreeMap::new();
+fn build_documents(envelopes: &[ChangeEnvelope]) -> Result<BTreeMap<Uuid, Automerge>> {
+    let mut documents: BTreeMap<Uuid, Automerge> = BTreeMap::new();
     for envelope in envelopes {
         let payload = &envelope.payload;
-        let (name, document) = documents
-            .entry(payload.document)
-            .or_insert_with(|| (payload.name.clone(), Automerge::new()));
-        if name != &payload.name {
-            return Err(Error::Invalid("Conflicting shared document names"));
-        }
+        let document = documents.entry(payload.document).or_default();
         let bytes = URL_SAFE_NO_PAD
             .decode(&payload.change)
             .map_err(|_| Error::Invalid("Invalid CRDT change"))?;
@@ -748,9 +794,9 @@ fn build_documents(envelopes: &[ChangeEnvelope]) -> Result<BTreeMap<Uuid, (Strin
     if documents.len() > MAX_DOCUMENTS {
         return Err(Error::Invalid("Cabal document limit reached"));
     }
-    for (id, (name, value)) in &documents {
+    for (id, value) in &documents {
         if value.get_missing_deps(&[]).is_empty() {
-            document::view(value, *id, name.clone())?;
+            document::view(value, *id)?;
         }
     }
     Ok(documents)
