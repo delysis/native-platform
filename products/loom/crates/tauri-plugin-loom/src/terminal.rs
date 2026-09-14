@@ -9,6 +9,11 @@ use loom_document::{
 use std::fmt::Write as _;
 use std::sync::atomic::AtomicUsize;
 
+#[path = "terminal_remote.rs"]
+mod remote;
+use remote::{PeerTarget, RecoveryMode};
+pub(super) use remote::{terminal_recover, terminal_run_peer};
+
 const MAX_CALLS: usize = 8;
 const MAX_PROMPT_BYTES: usize = 65_536;
 const MAX_HISTORY: usize = 64;
@@ -30,6 +35,8 @@ pub(super) struct TerminalRun {
     preview: String,
     error: Option<String>,
     created_at_ms: i64,
+    #[serde(default)]
+    remote: Option<remote::PeerModel>,
 }
 
 /// Display metadata is retained with the exact native input, never substituted
@@ -72,6 +79,8 @@ struct TerminalMediaEvidence {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct RunReceipt {
     #[serde(default)]
+    remote: Option<PeerTarget>,
+    #[serde(default)]
     literal_input: bool,
     run: TerminalRun,
     request_fingerprint: BlobId,
@@ -91,14 +100,34 @@ struct RunReceipt {
 #[derive(Debug, Default)]
 pub(super) struct TerminalControl {
     cancelled: AtomicBool,
+    settled: AtomicBool,
     current: Mutex<Option<Arc<LlamaGenerationControl>>>,
     joined: AtomicUsize,
     panicked: AtomicBool,
+    remote_cancel: Option<(PathBuf, String)>,
+    cancel_error: Mutex<Option<String>>,
 }
 
 impl TerminalControl {
+    pub(super) fn is_settled(&self) -> bool {
+        self.settled.load(Ordering::Acquire)
+    }
+
     pub(super) fn cancel(&self) {
+        // Joining a finished worker is cleanup, never new user intent. In
+        // particular, checking an unknown result must leave it resumable.
+        if self.is_settled() {
+            return;
+        }
         self.cancelled.store(true, Ordering::Release);
+        if let Some((root, id)) = &self.remote_cancel
+            && let Err(error) = crate::terminal_receipts::request_cancel(root, id)
+        {
+            *self
+                .cancel_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.message);
+        }
         if let Some(current) = self
             .current
             .lock()
@@ -298,14 +327,20 @@ fn settle_interrupted(run: &mut TerminalRun, state: &PluginState) -> Result<(), 
             .map_err(io_failure)?
             .is_none()
     {
-        run.status = "failed".into();
-        run.error = Some("Interrupted before completion; retained results are in Runs.".into());
+        if run.remote.is_some() {
+            run.status = "unconfirmed".into();
+            run.error =
+                Some("The peer outcome is unconfirmed. Check saved jobs before resuming.".into());
+        } else {
+            run.status = "failed".into();
+            run.error = Some("Interrupted before completion; retained results are in Runs.".into());
+        }
     }
     Ok(())
 }
 
 #[tauri::command]
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn terminal_run<R: Runtime>(
     project_id: String,
     session_id: String,
@@ -323,7 +358,46 @@ pub(super) async fn terminal_run<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<TerminalRun, IpcFailure> {
-    let command_id = parse_command_id(&command_id)?;
+    terminal_start(
+        &project_id,
+        &session_id,
+        &command_id,
+        &document_id,
+        &source_revision_id,
+        &expected_visible_blob_id,
+        source_start_byte,
+        source_end_byte,
+        &expression,
+        presentation,
+        context_references,
+        turn_boundary,
+        literal_input,
+        None,
+        app,
+        &state,
+    )
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn terminal_start<R: Runtime>(
+    project_id: &str,
+    session_id: &str,
+    command_id: &str,
+    document_id: &str,
+    source_revision_id: &str,
+    expected_visible_blob_id: &str,
+    source_start_byte: u64,
+    source_end_byte: u64,
+    expression: &str,
+    presentation: Option<TerminalPresentation>,
+    context_references: Option<Vec<String>>,
+    turn_boundary: Option<TerminalTurnBoundary>,
+    literal_input: Option<bool>,
+    remote_target: Option<PeerTarget>,
+    app: AppHandle<R>,
+    state: &State<'_, PluginState>,
+) -> Result<TerminalRun, IpcFailure> {
+    let command_id = parse_command_id(command_id)?;
     if let Some(presentation) = &presentation
         && (!crate::workspace_template::valid_pane_id(&presentation.pane_id)
             || presentation.input.len() > MAX_PROMPT_BYTES)
@@ -333,10 +407,10 @@ pub(super) async fn terminal_run<R: Runtime>(
         ));
     }
     let mut fingerprint_bytes = serde_json::to_vec(&(
-        &project_id,
+        project_id,
         &document_id,
-        &source_revision_id,
-        &expected_visible_blob_id,
+        source_revision_id,
+        expected_visible_blob_id,
         source_start_byte,
         source_end_byte,
         &expression,
@@ -357,15 +431,27 @@ pub(super) async fn terminal_run<R: Runtime>(
     if let Some(literal) = literal_input {
         fingerprint_bytes.extend(serde_json::to_vec(&literal).map_err(io_failure)?);
     }
+    if let Some(target) = &remote_target {
+        if turn_boundary.is_some() {
+            return Err(failure(
+                "Peer jobs currently accept raw text without chat stop sequences.",
+            ));
+        }
+        fingerprint_bytes.extend(serde_json::to_vec(target).map_err(io_failure)?);
+    }
     let fingerprint = BlobId::digest(&fingerprint_bytes);
-    let admission = lock_application_admission(&state, "an experiment")?;
-    let model_guard = lock_model_lifecycle(&state)?;
-    let mut session = lock_session(&state)?;
+    let admission = lock_application_admission(state, "an experiment")?;
+    let model_guard = if remote_target.is_none() {
+        Some(lock_model_lifecycle(state)?)
+    } else {
+        None
+    };
+    let mut session = lock_session(state)?;
     session
         .agency
         .admit_manual_generation()
         .map_err(io_failure)?;
-    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    let store = require_bound_store(&mut session, project_id, session_id)?;
     let root = store.root().to_owned();
     if let Some(receipt) = read_receipt(&root, &command_id.to_string(), false)? {
         if receipt.request_fingerprint != fingerprint {
@@ -374,7 +460,7 @@ pub(super) async fn terminal_run<R: Runtime>(
             ));
         }
         let mut result = read_receipt(&root, &command_id.to_string(), true)?.unwrap_or(receipt);
-        settle_interrupted(&mut result.run, &state)?;
+        settle_interrupted(&mut result.run, state)?;
         return Ok(result.run);
     }
     let document_id = document_id.parse::<DocumentId>().map_err(io_failure)?;
@@ -396,7 +482,7 @@ pub(super) async fn terminal_run<R: Runtime>(
     let entry = if expression.is_empty() {
         input.clone()
     } else {
-        expression.clone()
+        expression.to_owned()
     };
     if entry.trim().is_empty() {
         return Err(failure("Write or select an idea to try."));
@@ -452,10 +538,13 @@ pub(super) async fn terminal_run<R: Runtime>(
             "An experiment can contain at most eight model calls.",
         ));
     }
-    let model = if calls == 0 {
+    // A pure reference or literal is a local derivation even when the model
+    // picker names a friend. It carries no remote-execution claim.
+    let remote_target = remote_target.filter(|_| calls != 0);
+    let model = if calls == 0 || remote_target.is_some() {
         None
     } else {
-        Some(loaded_model(&state)?)
+        Some(loaded_model(state)?)
     };
     let names = names.into_iter().collect::<Vec<_>>();
     // Only called functions contribute direct context. Reference values remain
@@ -513,6 +602,14 @@ pub(super) async fn terminal_run<R: Runtime>(
     } else {
         Vec::new()
     };
+    if remote_target.is_some()
+        && !literal
+        && !crate::terminal_media::resolve(store, &source, &sources, 2048)?.is_empty()
+    {
+        return Err(failure(
+            "Peer jobs currently accept text. Choose a local model for attached images or audio.",
+        ));
+    }
     let media_evidence = media
         .iter()
         .map(|item| {
@@ -548,6 +645,7 @@ pub(super) async fn terminal_run<R: Runtime>(
             .collect(),
     };
     let receipt = RunReceipt {
+        remote: remote_target.clone(),
         literal_input: literal,
         run: TerminalRun {
             run_id: command_id.to_string(),
@@ -562,6 +660,7 @@ pub(super) async fn terminal_run<R: Runtime>(
             preview: String::new(),
             error: None,
             created_at_ms: now_unix_ms(),
+            remote: remote_target.as_ref().map(remote::PeerModel::from),
         },
         request_fingerprint: fingerprint,
         source_document_id: document_id,
@@ -577,16 +676,80 @@ pub(super) async fn terminal_run<R: Runtime>(
     let identity = GenerationFamilyIdentity {
         request_id: format!("terminal-{command_id}"),
         project_id: store.manifest().project_id,
-        session_id: parse_command_id(&session_id)?,
+        session_id: parse_command_id(session_id)?,
         document_id,
     };
+    let response = spawn_worker(
+        app,
+        state,
+        RunWork {
+            root,
+            identity,
+            receipt,
+            input,
+            command,
+            source: Some(source),
+            model,
+            media,
+            recovery: RecoveryMode::Resume,
+        },
+        &admission,
+        session,
+    );
+    drop(model_guard);
+    response
+}
+
+struct RunWork {
+    root: PathBuf,
+    identity: GenerationFamilyIdentity,
+    receipt: RunReceipt,
+    input: String,
+    command: NeuralCommand,
+    source: Option<LoadedDocument>,
+    model: Option<LoadedModel>,
+    media: Vec<llama_native_types::MediaInput>,
+    recovery: RecoveryMode,
+}
+
+#[allow(clippy::too_many_lines)]
+fn spawn_worker<R: Runtime>(
+    app: AppHandle<R>,
+    state: &PluginState,
+    work: RunWork,
+    admission: &std::sync::MutexGuard<'_, ApplicationPhase>,
+    session: std::sync::MutexGuard<'_, Session>,
+) -> Result<TerminalRun, IpcFailure> {
+    let RunWork {
+        root,
+        identity,
+        receipt,
+        input,
+        command,
+        source,
+        model,
+        media,
+        recovery,
+    } = work;
     let run_id = GenerationRunId::new();
     let branch_id = BranchId::new();
-    let control = Arc::new(TerminalControl::default());
-    state
-        .generations
-        .reserve(identity.clone(), vec![(run_id, branch_id)])
-        .map_err(|error| IpcFailure::generation_registry(&error))?;
+    let control = Arc::new(TerminalControl {
+        remote_cancel: receipt
+            .remote
+            .as_ref()
+            .map(|_| (root.clone(), receipt.run.run_id.clone())),
+        ..TerminalControl::default()
+    });
+    let reserved = if receipt.remote.is_some() {
+        state
+            .generations
+            .reserve_remote(identity.clone(), vec![(run_id, branch_id)])
+    } else {
+        state
+            .generations
+            .reserve(identity.clone(), vec![(run_id, branch_id)])
+    };
+    reserved.map_err(|error| IpcFailure::generation_registry(&error))?;
     if let Err(error) = state
         .generations
         .attach_cancellation(&identity.request_id, control.clone())
@@ -620,10 +783,12 @@ pub(super) async fn terminal_run<R: Runtime>(
         let _ = state.generations.complete_family(&identity.request_id);
         return Err(error);
     }
+    // Keep the source/session admission through route publication: project
+    // close must see this owner before it revokes and drains the session.
     drop(session);
     let reservation = match state
         .generation_workers
-        .reserve(&identity.request_id, &admission)
+        .reserve(&identity.request_id, admission)
     {
         Ok(value) => value,
         Err(error) => {
@@ -635,7 +800,7 @@ pub(super) async fn terminal_run<R: Runtime>(
     let start = Arc::new(GenerationWorkerStartGate::default());
     let worker_start = Arc::clone(&start);
     let worker_control = Arc::clone(&control);
-    let worker_app = app.clone();
+    let worker_app = app;
     let worker_identity = identity.clone();
     let response = receipt.run.clone();
     let worker = std::thread::Builder::new()
@@ -644,11 +809,13 @@ pub(super) async fn terminal_run<R: Runtime>(
             worker_start.wait();
             let state = worker_app.state::<PluginState>();
             let mut evaluator = Evaluator {
-                state: &state,
+                state: state.clone(),
                 identity: &worker_identity,
                 model: model.as_ref(),
                 control: &worker_control,
-                source: &source,
+                source: source.as_ref(),
+                root: &root,
+                recovery,
                 input,
                 receipt,
                 media,
@@ -671,6 +838,7 @@ pub(super) async fn terminal_run<R: Runtime>(
                     _ => GenerationTerminalClass::Failed,
                 }
             };
+            worker_control.settled.store(true, Ordering::Release);
             if let Err(error) = saved {
                 let _ = state
                     .generations
@@ -706,16 +874,17 @@ pub(super) async fn terminal_run<R: Runtime>(
     }
     start.release();
     ticket.detach();
-    drop(model_guard);
     Ok(response)
 }
 
 struct Evaluator<'a> {
-    state: &'a PluginState,
+    state: State<'a, PluginState>,
     identity: &'a GenerationFamilyIdentity,
     model: Option<&'a LoadedModel>,
     control: &'a TerminalControl,
-    source: &'a LoadedDocument,
+    source: Option<&'a LoadedDocument>,
+    root: &'a Path,
+    recovery: RecoveryMode,
     input: String,
     receipt: RunReceipt,
     media: Vec<llama_native_types::MediaInput>,
@@ -727,7 +896,7 @@ impl Evaluator<'_> {
         &self,
         operation: impl FnOnce(&mut ProjectStore) -> Result<T, IpcFailure>,
     ) -> Result<T, IpcFailure> {
-        let mut session = lock_session_internal(self.state)?;
+        let mut session = lock_session_internal(&self.state)?;
         operation(require_bound_store(
             &mut session,
             &self.identity.project_id.to_string(),
@@ -736,6 +905,9 @@ impl Evaluator<'_> {
     }
 
     fn evaluate_command(&mut self, command: &NeuralCommand) -> Result<String, IpcFailure> {
+        if self.receipt.remote.is_some() && self.remote_cancel_requested()? {
+            return self.settle_remote_cancellation();
+        }
         match command {
             NeuralCommand::Prompt(text) => {
                 let mut prefix = String::new();
@@ -750,7 +922,7 @@ impl Evaluator<'_> {
     }
 
     fn evaluate(&mut self, expression: &NeuralExpression) -> Result<String, IpcFailure> {
-        if self.control.cancelled.load(Ordering::Acquire) {
+        if self.receipt.remote.is_none() && self.control.cancelled.load(Ordering::Acquire) {
             return Err(failure("Cancelled"));
         }
         match expression {
@@ -798,6 +970,12 @@ impl Evaluator<'_> {
 
     #[allow(clippy::too_many_lines)]
     fn complete(&mut self, prompt: String) -> Result<String, IpcFailure> {
+        if self.receipt.remote.is_some() {
+            return self.complete_remote(prompt);
+        }
+        let source = self
+            .source
+            .ok_or_else(|| failure("The local source is unavailable."))?;
         if self.control.cancelled.load(Ordering::Acquire) {
             return Err(failure("Cancelled"));
         }
@@ -815,7 +993,7 @@ impl Evaluator<'_> {
             let environment_artifact = store
                 .record_model_environment(&environment)
                 .map_err(IpcFailure::store)?;
-            let mut inputs = vec![self.source.artifact_id];
+            let mut inputs = vec![source.artifact_id];
             inputs.extend(self.receipt.sources.iter().map(|source| source.artifact_id));
             inputs.sort();
             inputs.dedup();
@@ -837,7 +1015,7 @@ impl Evaluator<'_> {
                 .map_err(IpcFailure::store)?;
             let context = store
                 .record_context_recipe(&ContextRecipe {
-                    source_revision_id: self.source.revision_id,
+                    source_revision_id: source.revision_id,
                     ordered_source_artifact_ids: inputs,
                     token_budget: u64::from(model.profile.context_tokens),
                     retrieval_evidence_blob_id: Some(context_evidence),
@@ -858,8 +1036,8 @@ impl Evaluator<'_> {
             let generation = GenerationStart {
                 run_id: GenerationRunId::new(),
                 branch_id: BranchId::new(),
-                document_id: self.source.document_id,
-                source_revision_id: self.source.revision_id,
+                document_id: source.document_id,
+                source_revision_id: source.revision_id,
                 target_range: ByteRange::new(0, 0).expect("empty range"),
                 model_environment_artifact_id: environment_artifact.artifact_id,
                 prompt_recipe_artifact_id: prompt_artifact.artifact_id,
@@ -962,7 +1140,26 @@ impl Evaluator<'_> {
             title.trim()
         };
         let path = format!("Runs/{}/{}/{title}.md", self.receipt.run.run_id, self.step);
-        let id = self.with_store(|store| {
+        let (id, path) = self.with_store(|store| {
+            if self.receipt.remote.is_some() {
+                let saved = store
+                    .create_derived_document_idempotent(
+                        remote::output_id(&self.receipt.run.run_id, self.step),
+                        &path,
+                        DocumentContent::Prose(text.to_owned()),
+                        evidence,
+                    )
+                    .map_err(IpcFailure::store)?;
+                if saved.visible_projection != loom_store::VisibleProjectionState::Applied {
+                    return Err(failure(
+                        "The retained result needs file recovery before continuing.",
+                    ));
+                }
+                let document = store
+                    .document_for_revision(saved.save.revision_id)
+                    .map_err(IpcFailure::store)?;
+                return Ok((document.document_id, document.relative_path));
+            }
             if self.step == 0 {
                 store
                     .create_derived_document_if_absent(
@@ -982,10 +1179,13 @@ impl Evaluator<'_> {
                     )
                     .map_err(IpcFailure::store)?;
             }
-            Ok(store
-                .read_document(&path)
-                .map_err(IpcFailure::store)?
-                .document_id)
+            Ok((
+                store
+                    .read_document(&path)
+                    .map_err(IpcFailure::store)?
+                    .document_id,
+                path.clone(),
+            ))
         })?;
         self.receipt.run.output_document_id = Some(id.to_string());
         self.receipt.run.output_relative_path = Some(path);
@@ -994,6 +1194,27 @@ impl Evaluator<'_> {
     }
 
     fn finish(&mut self, outcome: Result<String, IpcFailure>) -> Result<(), IpcFailure> {
+        if self.receipt.remote.is_some() {
+            if let Some(error) = self
+                .control
+                .cancel_error
+                .lock()
+                .map_err(io_failure)?
+                .as_ref()
+            {
+                return Err(failure(error));
+            }
+            if let Err(error) = &outcome
+                && error.code != "terminal_remote_failed"
+                && error.code != "terminal_remote_cancelled"
+            {
+                // Keep the immutable start and exact per-step jobs recoverable.
+                // Neither an IPC timeout nor a lost process proves a peer outcome.
+                self.receipt.run.status = "unconfirmed".into();
+                self.receipt.run.error = Some(error.message.clone());
+                return Ok(());
+            }
+        }
         match outcome {
             Ok(text) => {
                 if self.receipt.run.output_document_id.is_none() {
@@ -1009,7 +1230,10 @@ impl Evaluator<'_> {
                 self.receipt.run.status = "completed".into();
             }
             Err(error) => {
-                self.receipt.run.status = if self.control.cancelled.load(Ordering::Acquire) {
+                self.receipt.run.status = if error.code == "terminal_remote_cancelled"
+                    || (self.receipt.remote.is_none()
+                        && self.control.cancelled.load(Ordering::Acquire))
+                {
                     "cancelled"
                 } else {
                     "failed"
@@ -1069,24 +1293,30 @@ pub(super) async fn terminal_cancel(
     run_id: String,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
-    let mut session = lock_session(&state)?;
-    let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    if read_receipt(store.root(), &run_id, false)?.is_none() {
-        return Err(failure("This experiment does not exist"));
-    }
-    if let Some(route) = state
+    let (receipt, project) = {
+        let mut session = lock_session(&state)?;
+        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        let receipt = read_receipt(store.root(), &run_id, false)?
+            .ok_or_else(|| failure("This experiment does not exist"))?;
+        if read_receipt(store.root(), &run_id, true)?.is_some() {
+            return Ok(());
+        }
+        if receipt.remote.is_some() {
+            crate::terminal_receipts::request_cancel(store.root(), &run_id)?;
+        }
+        (receipt, store.manifest().project_id)
+    };
+    let route = state
         .generations
         .active_routes_for_document(
-            store.manifest().project_id,
+            project,
             parse_command_id(&session_id)?,
-            read_receipt(store.root(), &run_id, false)?
-                .expect("checked receipt")
-                .source_document_id,
+            receipt.source_document_id,
         )
         .map_err(|error| IpcFailure::generation_registry(&error))?
         .into_iter()
-        .find(|route| route.identity.request_id == format!("terminal-{run_id}"))
-    {
+        .find(|route| route.identity.request_id == format!("terminal-{run_id}"));
+    if let Some(route) = route {
         state
             .generations
             .cancel_run(
@@ -1095,6 +1325,8 @@ pub(super) async fn terminal_cancel(
                 route.run_id,
             )
             .map_err(|error| IpcFailure::generation_registry(&error))?;
+    } else if receipt.remote.is_some() {
+        remote::cancel_saved_jobs(&project_id, &session_id, &receipt, state).await?;
     }
     Ok(())
 }

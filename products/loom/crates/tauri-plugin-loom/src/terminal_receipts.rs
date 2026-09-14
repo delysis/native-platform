@@ -17,10 +17,13 @@ pub(super) fn directory(root: &Path) -> Result<PathBuf, IpcFailure> {
 }
 
 pub(super) fn write(root: &Path, id: &str, finished: bool, bytes: &[u8]) -> Result<(), IpcFailure> {
-    let name = file_name(id, finished)?;
+    write_named(root, &file_name(id, finished)?, bytes)
+}
+
+fn write_named(root: &Path, name: &str, bytes: &[u8]) -> Result<(), IpcFailure> {
     validate_bytes(bytes)?;
     #[cfg(all(unix, not(any(target_os = "redox", target_os = "espidf"))))]
-    return unix::write(root, &name, bytes, || Ok(()));
+    return unix::write(root, name, bytes, || Ok(()));
     #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "espidf")))))]
     {
         let _ = (root, name);
@@ -29,14 +32,36 @@ pub(super) fn write(root: &Path, id: &str, finished: bool, bytes: &[u8]) -> Resu
 }
 
 pub(super) fn read(root: &Path, id: &str, finished: bool) -> Result<Option<Vec<u8>>, IpcFailure> {
-    let name = file_name(id, finished)?;
+    read_named(root, &file_name(id, finished)?)
+}
+
+fn read_named(root: &Path, name: &str) -> Result<Option<Vec<u8>>, IpcFailure> {
     #[cfg(all(unix, not(any(target_os = "redox", target_os = "espidf"))))]
-    return unix::Directory::open(root)?.read(&name);
+    return unix::Directory::open(root)?.read(name);
     #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "espidf")))))]
     {
         let _ = (root, name);
         Err(failure("Receipt storage is unsupported on this platform."))
     }
+}
+
+const CANCEL_INTENT: &[u8] = br#"{"cancel_requested":true}"#;
+
+pub(super) fn request_cancel(root: &Path, id: &str) -> Result<(), IpcFailure> {
+    write_named(root, &cancel_name(id)?, CANCEL_INTENT)
+}
+
+pub(super) fn cancel_requested(root: &Path, id: &str) -> Result<bool, IpcFailure> {
+    match read_named(root, &cancel_name(id)?)? {
+        None => Ok(false),
+        Some(bytes) if bytes == CANCEL_INTENT => Ok(true),
+        Some(_) => Err(failure("The cancellation receipt has different bytes.")),
+    }
+}
+
+fn cancel_name(id: &str) -> Result<String, IpcFailure> {
+    file_name(id, false)?;
+    Ok(format!("{id}.cancel-requested.json"))
 }
 
 fn file_name(id: &str, finished: bool) -> Result<String, IpcFailure> {
@@ -283,6 +308,22 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn cancellation_is_durable_idempotent_and_refuses_a_replaced_marker() {
+        let root = fixture();
+        let id = loom_types::CommandId::new().to_string();
+        assert!(!cancel_requested(root.path(), &id).unwrap());
+        request_cancel(root.path(), &id).unwrap();
+        request_cancel(root.path(), &id).unwrap();
+        assert!(cancel_requested(root.path(), &id).unwrap());
+        let marker = directory(root.path())
+            .unwrap()
+            .join(cancel_name(&id).unwrap());
+        fs::write(marker, br#"{"cancel_requested":false}"#).unwrap();
+        assert!(cancel_requested(root.path(), &id).is_err());
+        assert!(request_cancel(root.path(), &id).is_err());
     }
 
     #[test]

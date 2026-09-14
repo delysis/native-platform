@@ -87,3 +87,21 @@ describe('retained output pane', () => {
   });
 
 });
+
+it('keeps an unconfirmed peer result inert until Check, Resume, or Cancel is selected', async () => {
+  const target = document.createElement('div'); document.body.append(target);
+  const onRecover = vi.fn(), onCancelRun = vi.fn(), onRun = vi.fn();
+  const run = { run_id: 'peer-run', status: 'unconfirmed' as const, expression: '=@Polish(@Draft)',
+    remote: { host: 'bob', model: { name: 'Shared Gemma', fingerprint: 'model' } },
+    output_document_id: null, output_relative_path: null, preview: '', error: 'The peer outcome is unconfirmed.', created_at_ms: 1 };
+  mounted = mount(TerminalPane, { target, props: { open: true, runs: [run], onRecover, onCancelRun, onRun,
+    onCancel: vi.fn(), onOpen: vi.fn(), onClose: vi.fn(), onCheck: vi.fn() } });
+  await expect.element(page.getByRole('button', { name: 'Check', exact: true })).toBeVisible();
+  expect(onRecover).not.toHaveBeenCalled(); expect(onRun).not.toHaveBeenCalled();
+  await page.getByRole('button', { name: 'Check', exact: true }).click();
+  expect(onRecover.mock.calls).toEqual([[run, 'check']]);
+  await page.getByRole('button', { name: 'Resume', exact: true }).click();
+  expect(onRecover.mock.calls[1]).toEqual([run, 'resume']);
+  await page.getByRole('button', { name: 'Cancel remaining steps' }).click();
+  expect(onCancelRun).toHaveBeenCalledWith(run); expect(onRun).not.toHaveBeenCalled();
+});

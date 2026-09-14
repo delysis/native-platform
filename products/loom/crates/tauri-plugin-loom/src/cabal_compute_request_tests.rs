@@ -7,7 +7,7 @@ use loom_cabal::compute::{
 
 #[cfg(unix)]
 #[derive(Debug, Default)]
-struct Executor(std::sync::atomic::AtomicUsize);
+pub(crate) struct Executor(pub(crate) std::sync::atomic::AtomicUsize);
 
 #[cfg(unix)]
 impl ComputeExecutor for Executor {
@@ -23,24 +23,24 @@ impl ComputeExecutor for Executor {
 }
 
 #[cfg(unix)]
-struct Pair {
-    temporary: tempfile::TempDir,
-    app: tauri::App<tauri::test::MockRuntime>,
-    host_network: Network,
-    host: Arc<ComputeHost>,
-    host_cabal: Shared,
-    local_cabal: Shared,
-    executor: Arc<Executor>,
-    project: String,
-    session: String,
-    request: ClientRequest,
-    roster_hash: String,
+pub(crate) struct Pair {
+    pub(crate) temporary: tempfile::TempDir,
+    pub(crate) app: tauri::App<tauri::test::MockRuntime>,
+    pub(crate) host_network: Network,
+    pub(crate) host: Arc<ComputeHost>,
+    pub(crate) host_cabal: Shared,
+    pub(crate) local_cabal: Shared,
+    pub(crate) executor: Arc<Executor>,
+    pub(crate) project: String,
+    pub(crate) session: String,
+    pub(crate) request: ClientRequest,
+    pub(crate) roster_hash: String,
 }
 
 #[cfg(unix)]
 impl Pair {
     #[allow(clippy::too_many_lines)]
-    async fn new() -> Self {
+    pub(crate) async fn new() -> Self {
         let temporary = tempfile::tempdir().expect("fixture");
         let host_identity = Identity::generate().expect("host");
         let identity = Identity::generate().expect("requester");
@@ -193,7 +193,19 @@ impl Pair {
         .expect("check")
     }
 
-    async fn close(self) {
+    pub(crate) async fn reopen_requester(&self) {
+        self.app
+            .state::<PluginState>()
+            .cabals
+            .profile
+            .lock()
+            .await
+            .as_mut()
+            .unwrap()
+            .compute_client = None;
+    }
+
+    pub(crate) async fn close(self) {
         self.app.state::<PluginState>().cabals.shutdown().await;
         self.host_network.shutdown().await.expect("host shutdown");
     }

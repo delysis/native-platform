@@ -56,6 +56,8 @@ const INDEPENDENT_COMMANDS = new Set([
   'application_close_abort',
   'application_close_pending',
   'audio_synthesize',
+  // Peer cancellation can wait for a network reply; ordinary saves keep moving.
+  'terminal_cancel',
   'build_model_policy_get',
   'shader_preview',
   'model_catalog_list',
@@ -926,7 +928,7 @@ export function normalizeFailure(error: unknown): LoomFailure {
 }
 
 export function runTerminal(request: TerminalRunRequest): Promise<TerminalRun> {
-  return call('terminal_run', { ...request });
+  return request.remoteTarget ? call('terminal_run_peer', { request }) : call('terminal_run', { ...request });
 }
 
 export function listTerminalRuns(projectId: string, sessionId: string): Promise<TerminalRun[]> {
@@ -935,6 +937,10 @@ export function listTerminalRuns(projectId: string, sessionId: string): Promise<
 
 export function cancelTerminalRun(projectId: string, sessionId: string, runId: string): Promise<void> {
   return call('terminal_cancel', { projectId, sessionId, runId });
+}
+
+export function recoverTerminalRun(projectId: string, sessionId: string, runId: string, mode: 'check' | 'resume'): Promise<TerminalRun> {
+  return call('terminal_recover', { projectId, sessionId, runId, mode });
 }
 
 export function compileShaderPreview(source: string): Promise<{ fragment: string }> {

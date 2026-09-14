@@ -16,7 +16,8 @@
   import WorkspacePane from './lib/WorkspacePane.svelte';
   import SignalPane from './lib/SignalPane.svelte';
   import CabalPane from './lib/CabalPane.svelte';
-  import { ComputeSharing } from './lib/compute';
+  import { ComputeSharing, type PeerTarget } from './lib/compute';
+  import PeerModelPicker from './lib/PeerModelPicker.svelte';
   import { SignalDraftEditor } from './lib/signalDraft';
   import { CabalEditor, cabalSnapshot, cabalWorkspace, openCabal, editCabal, shareCabal, joinCabal, recoverCabalEdits, revokeCabalMember, type CabalSnapshot, type SharedDocument } from './lib/cabal';
   import { rememberSignalWorkspace, type SignalConversation } from './lib/signal';
@@ -33,6 +34,7 @@
     runTerminal,
     listTerminalRuns,
     cancelTerminalRun,
+    recoverTerminalRun,
     addDocumentContexts,
     applyCoWriter,
     applicationClosePending,
@@ -462,6 +464,8 @@
     if (scope !== cabalScope) { cabalScope = scope; void attachCabal(scope); }
   }
   let terminalEntry = '';
+  let terminalPeerHost = '';
+  let terminalTarget: PeerTarget | null = null;
   let terminalRuns: TerminalRun[] = [];
   let terminalDispatching = false;
   let terminalCancelRequested = false;
@@ -1023,6 +1027,8 @@
     terminalRefreshSerial += 1;
     terminalRuns = [];
     terminalEntry = '';
+    terminalPeerHost = '';
+    terminalTarget = null;
     terminalError = '';
     terminalDispatching = false;
     terminalCancelRequested = false;
@@ -7921,7 +7927,11 @@
     if (!project || !document || terminalIsBusy() || editorReadonly || compositionActive || applicationClosePhase !== 'running') return;
     terminalOpen = true;
     terminalError = '';
-    if (!expression && !currentModel?.completion) { terminalError = 'Load a local completion model to try this.'; return; }
+    const remoteTarget = terminalTarget ? structuredClone(terminalTarget) : undefined;
+    if (terminalPeerHost && (!remoteTarget || remoteTarget.host !== terminalPeerHost || remoteTarget.roster_hash !== cabal?.roster_hash)) {
+      terminalError = 'Choose a current model shared by this friend.'; return;
+    }
+    if (!expression && !remoteTarget && !currentModel?.completion) { terminalError = 'Load a local completion model to try this.'; return; }
     if (!flushEditors()) return;
     const scope = { projectId: project.project_id, sessionId: project.session_id };
     const documentId = document.summary.document_id;
@@ -7939,7 +7949,7 @@
       const sourceRevisionId = document.summary.revision_id;
       if (!sourceRevisionId) throw new Error('The document does not have a saved source revision.');
       const request: TerminalRunRequest = {
-        ...scope, commandId: newUlid(), documentId, sourceRevisionId,
+        ...scope, commandId: newUlid(), documentId, sourceRevisionId, remoteTarget,
         expectedVisibleBlobId: document.visible_blob_id,
         sourceStartByte: range.start, sourceEndByte: range.end, expression, presentation: { pane_id: 'terminal', input: expression || new TextDecoder().decode(new TextEncoder().encode(documentText).slice(range.start, range.end)) }
       };
@@ -7963,6 +7973,25 @@
       }
     } finally {
       if (terminalScopeIsCurrent(scope.projectId, scope.sessionId)) terminalDispatching = false;
+    }
+  }
+
+  async function recoverPeerRun(run: TerminalRun, mode: 'check' | 'resume', cancel = false): Promise<void> {
+    if (!project || terminalIsBusy() || applicationClosePhase !== 'running' || editorNavigationLocked) return;
+    const { project_id: projectId, session_id: sessionId } = project;
+    terminalDispatching = true;
+    terminalError = '';
+    try {
+      if (cancel) await cancelTerminalRun(projectId, sessionId, run.run_id);
+      if (!terminalScopeIsCurrent(projectId, sessionId)) return;
+      const recovered = await recoverTerminalRun(projectId, sessionId, run.run_id, mode);
+      if (!terminalScopeIsCurrent(projectId, sessionId)) return;
+      if (recovered.run_id !== run.run_id) throw new Error('The reply belongs to another experiment.');
+      terminalRuns = [recovered, ...terminalRuns.filter(item => item.run_id !== run.run_id)];
+    } catch (failure) {
+      if (terminalScopeIsCurrent(projectId, sessionId)) terminalError = normalizeFailure(failure).message;
+    } finally {
+      if (terminalScopeIsCurrent(projectId, sessionId)) { terminalDispatching = false; await refreshTerminalRuns(); }
     }
   }
 
@@ -10382,16 +10411,22 @@
         runs={terminalRuns}
         busy={terminalBusy}
         disabled={applicationClosePhase !== 'running'}
-        runDisabled={editorNavigationLocked || (!workspaceCommand(terminalEntry) && (!document || (!terminalEntry && !currentModel?.completion) || editorReadonly))}
+        runDisabled={editorNavigationLocked || (!workspaceCommand(terminalEntry) && (!document || (!terminalEntry && !terminalTarget && !currentModel?.completion) || (terminalPeerHost && (!terminalTarget || terminalTarget.roster_hash !== cabal?.roster_hash)) || editorReadonly))}
         error={terminalError}
         uncertain={terminalPendingRequest !== null}
         onCheck={() => void refreshTerminalRuns()}
         modelLabel={currentModel?.display_name ?? ''}
         onRun={() => void runRetainedOutput(terminalEntry)}
         onCancel={() => void stopTerminalRun()}
+        onRecover={(run, mode) => void recoverPeerRun(run, mode)}
+        onCancelRun={(run) => void recoverPeerRun(run, 'check', true)}
         onOpen={(run) => void openTerminalOutput(run)}
         onClose={closeTerminal}
-      />
+      >
+        <PeerModelPicker slot="model" projectId={project.project_id} sessionId={project.session_id} {cabal}
+          localModel={currentModel?.display_name ?? 'Local model'} bind:host={terminalPeerHost} bind:target={terminalTarget}
+          disabled={terminalBusy || applicationClosePhase !== 'running'} />
+      </TerminalPane>
       </div>
   {:else}
     <main class="welcome" id="manuscript">

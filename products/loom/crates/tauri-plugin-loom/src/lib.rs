@@ -109,7 +109,9 @@ use crate::speech_input::{
     SpeechInputError, SpeechInputService, SpeechInputSnapshot, SpeechInputTarget,
     SpeechRecordingSnapshot,
 };
-use crate::terminal::{terminal_cancel, terminal_list, terminal_run};
+use crate::terminal::{
+    terminal_cancel, terminal_list, terminal_recover, terminal_run, terminal_run_peer,
+};
 use crate::workspace_template::{workspace_template_enable, workspace_template_get};
 use speech_native_host::SpeechHostStatus;
 
@@ -1375,7 +1377,8 @@ impl GenerationWorkerRegistry {
                 .workers
                 .iter()
                 .filter_map(|(request_id, slot)| match slot {
-                    GenerationWorkerSlot::Running { worker, .. } if worker.is_finished() => {
+                    GenerationWorkerSlot::Running { worker, owner, .. }
+                        if worker.is_finished() || matches!(owner, GenerationWorkerOwner::Terminal(control) if control.is_settled()) => {
                         Some(request_id.clone())
                     }
                     GenerationWorkerSlot::Reserved | GenerationWorkerSlot::Running { .. } => None,
@@ -2153,6 +2156,8 @@ impl Builder {
                 terminal_run,
                 terminal_list,
                 terminal_cancel,
+                terminal_recover,
+                terminal_run_peer,
                 shader_preview,
                 generation_cancel,
                 candidate_keep,
@@ -10785,7 +10790,7 @@ fn ensure_no_active_generations(
 ) -> Result<(), IpcFailure> {
     if state
         .generations
-        .active_branch_count()
+        .active_local_branch_count()
         .map_err(|error| IpcFailure::generation_registry(&error))?
         == 0
     {

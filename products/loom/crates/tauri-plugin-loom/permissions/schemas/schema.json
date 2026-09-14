@@ -295,10 +295,10 @@
       "type": "string",
       "oneOf": [
         {
-          "description": "Review device-specific idle model grants and explicitly prepare, submit, check, or cancel exact peer jobs. Grants bind the verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`\n- `allow-compute-peer-offers`\n- `allow-compute-job-prepare`\n- `allow-compute-job-get`\n- `allow-compute-jobs`\n- `allow-compute-job-submit`\n- `allow-compute-job-check`\n- `allow-compute-job-cancel`",
+          "description": "Review device-specific idle model grants and explicitly prepare, submit, check, or cancel exact peer jobs. Grants bind the verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`\n- `allow-compute-peer-offers`\n- `allow-compute-job-prepare`\n- `allow-compute-job-get`\n- `allow-compute-jobs`\n- `allow-compute-job-submit`\n- `allow-compute-job-check`\n- `allow-compute-job-cancel`\n- `allow-terminal-recover`\n- `allow-terminal-run-peer`",
           "type": "string",
           "const": "peer-compute",
-          "markdownDescription": "Review device-specific idle model grants and explicitly prepare, submit, check, or cancel exact peer jobs. Grants bind the verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`\n- `allow-compute-peer-offers`\n- `allow-compute-job-prepare`\n- `allow-compute-job-get`\n- `allow-compute-jobs`\n- `allow-compute-job-submit`\n- `allow-compute-job-check`\n- `allow-compute-job-cancel`"
+          "markdownDescription": "Review device-specific idle model grants and explicitly prepare, submit, check, or cancel exact peer jobs. Grants bind the verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`\n- `allow-compute-peer-offers`\n- `allow-compute-job-prepare`\n- `allow-compute-job-get`\n- `allow-compute-jobs`\n- `allow-compute-job-submit`\n- `allow-compute-job-check`\n- `allow-compute-job-cancel`\n- `allow-terminal-recover`\n- `allow-terminal-run-peer`"
         },
         {
           "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-audio-synthesize`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-terminal-run`\n- `allow-terminal-list`\n- `allow-terminal-cancel`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
@@ -1513,6 +1513,18 @@
           "markdownDescription": "Denies the terminal_list command without any pre-configured scope."
         },
         {
+          "description": "Enables the terminal_recover command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-terminal-recover",
+          "markdownDescription": "Enables the terminal_recover command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the terminal_recover command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-terminal-recover",
+          "markdownDescription": "Denies the terminal_recover command without any pre-configured scope."
+        },
+        {
           "description": "Enables the terminal_run command without any pre-configured scope.",
           "type": "string",
           "const": "allow-terminal-run",
@@ -1523,6 +1535,18 @@
           "type": "string",
           "const": "deny-terminal-run",
           "markdownDescription": "Denies the terminal_run command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the terminal_run_peer command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-terminal-run-peer",
+          "markdownDescription": "Enables the terminal_run_peer command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the terminal_run_peer command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-terminal-run-peer",
+          "markdownDescription": "Denies the terminal_run_peer command without any pre-configured scope."
         },
         {
           "description": "Enables the weave_start command without any pre-configured scope.",

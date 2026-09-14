@@ -96,6 +96,8 @@ const COMMANDS: &[&str] = &[
     "terminal_run",
     "terminal_list",
     "terminal_cancel",
+    "terminal_recover",
+    "terminal_run_peer",
     "shader_preview",
     "generation_cancel",
     "candidate_keep",

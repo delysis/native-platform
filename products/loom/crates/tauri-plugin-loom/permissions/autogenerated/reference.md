@@ -2722,6 +2722,32 @@ Denies the terminal_list command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-terminal-recover`
+
+</td>
+<td>
+
+Enables the terminal_recover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-terminal-recover`
+
+</td>
+<td>
+
+Denies the terminal_recover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-terminal-run`
 
 </td>
@@ -2741,6 +2767,32 @@ Enables the terminal_run command without any pre-configured scope.
 <td>
 
 Denies the terminal_run command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-terminal-run-peer`
+
+</td>
+<td>
+
+Enables the terminal_run_peer command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-terminal-run-peer`
+
+</td>
+<td>
+
+Denies the terminal_run_peer command without any pre-configured scope.
 
 </td>
 </tr>

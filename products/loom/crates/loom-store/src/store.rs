@@ -395,6 +395,44 @@ impl ProjectStore {
         )
     }
 
+    /// Retain one derived result across restart without rewriting its file or
+    /// claiming local inference. Both exact content and provenance bind a retry.
+    pub fn create_derived_document_idempotent(
+        &mut self,
+        command_id: CommandId,
+        relative_path: &str,
+        content: DocumentContent,
+        evidence_blob_id: BlobId,
+    ) -> Result<crate::IdempotentSaveOutcome> {
+        self.read_blob(evidence_blob_id)?;
+        let path = normalize_document_path(Path::new(relative_path))?;
+        let projection = content.project_visible()?;
+        let fingerprint = BlobId::digest(&serde_json::to_vec(&(
+            "loom:derived-document-create:v1",
+            &path,
+            content.kind(),
+            BlobId::digest(&projection.bytes),
+            evidence_blob_id,
+        ))?);
+        if let Some(outcome) = self.replay_idempotent_save(command_id, fingerprint)? {
+            return Ok(outcome);
+        }
+        let save = self.create_document_with_identity(
+            &path,
+            content,
+            "retained remote experiment",
+            DocumentOrigin::Derived { evidence_blob_id },
+            Some((command_id, fingerprint)),
+            |_| Ok(()),
+        )?;
+        Ok(crate::IdempotentSaveOutcome {
+            save,
+            visible_projection: VisibleProjectionState::Applied,
+            request_fingerprint: fingerprint,
+            replayed: false,
+        })
+    }
+
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     fn create_document_if_absent_with_boundary<F>(
         &mut self,
@@ -6782,6 +6820,58 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn derived_creation_replays_exact_evidence_and_preserves_later_writing() {
+        let (_directory, mut store) = new_store();
+        let command = CommandId::new();
+        let evidence = store
+            .store_provenance_blob(b"signed remote assertion")
+            .unwrap();
+        let first = store
+            .create_derived_document_idempotent(
+                command,
+                "Runs/peer.md",
+                DocumentContent::Prose("Remote text".into()),
+                evidence,
+            )
+            .unwrap();
+        std::fs::write(store.root().join("Runs/peer.md"), "My revision").unwrap();
+        let replay = store
+            .create_derived_document_idempotent(
+                command,
+                "Runs/peer.md",
+                DocumentContent::Prose("Remote text".into()),
+                evidence,
+            )
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(first.save, replay.save);
+        let different = store.store_provenance_blob(b"different assertion").unwrap();
+        assert!(matches!(
+            store.create_derived_document_idempotent(
+                command,
+                "Runs/peer.md",
+                DocumentContent::Prose("Remote text".into()),
+                different,
+            ),
+            Err(StoreError::IdempotencyConflict { .. })
+        ));
+        assert!(matches!(
+            store.create_derived_document_idempotent(
+                command,
+                "Runs/peer.md",
+                DocumentContent::Prose("Different text".into()),
+                evidence,
+            ),
+            Err(StoreError::IdempotencyConflict { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(store.root().join("Runs/peer.md")).unwrap(),
+            "My revision"
+        );
+        assert_eq!(store.list_documents().unwrap().len(), 1);
+    }
+
     #[test]
     fn generated_document_rejects_missing_evidence_without_creating_writing() {
         let (_directory, mut store) = new_store();

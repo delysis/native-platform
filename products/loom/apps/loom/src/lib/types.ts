@@ -555,12 +555,13 @@ export interface ReconciliationPreview {
 }
 
 export interface TerminalRun {
+  remote?: { host: string; model: import('./compute').ComputeModel } | null;
   turn_boundary?: 'chat' | null;
   source_document_id?: string;
   presentation?: { pane_id: string; input: string } | null;
   run_id: string;
   title?: string;
-  status: 'running' | 'completed' | 'cancelled' | 'failed';
+  status: 'running' | 'completed' | 'cancelled' | 'failed' | 'unconfirmed';
   expression: string;
   output_document_id: string | null;
   output_relative_path: string | null;
@@ -570,6 +571,7 @@ export interface TerminalRun {
 }
 
 export interface TerminalRunRequest {
+  remoteTarget?: import('./compute').PeerTarget;
   literalInput?: boolean;
   turnBoundary?: 'chat';
   contextReferences?: string[];

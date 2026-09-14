@@ -62,6 +62,23 @@ Hiding a pane cannot interrupt send settlement or transplant an invitation into
 another conversation. Local proposals belong to the workspace that started them
 and disappear on a workspace switch; a delayed proposal never replaces the draft.
 
+The terminal can explicitly select a friend's shared model. Only the resolved
+text for each call crosses that connection; raw expressions and document paths
+stay on the requesting device. Text-only peer calls use the same document
+functions and nested pipelines as local calls. Attached images/audio and chat
+stop sequences still require the local model path.
+
+Every peer step is saved before transmission. A lost connection leaves the run
+unconfirmed. **Check** retrieves existing jobs without preparing or submitting a
+later step; **Resume** explicitly continues the exact saved expression, input,
+bindings, host, and grant. Reopening a workspace or listing history never resumes
+execution. A cancellation record covers the whole pipeline across restart.
+Retained output has signed remote evidence, not local inference attribution.
+Reimporting it reuses its creation receipt and preserves later author edits.
+Outbound requests keep their session owner while leaving the local model free
+for a friend's incoming job. The local-generation permission cannot dispatch a
+peer terminal call; dispatch and recovery use the peer-compute permission.
+
 ## Ownership and authority
 
 * `loom-cabal` owns device identity, signed membership, Automerge documents,
@@ -182,8 +199,8 @@ remaining jobs and inactive membership/model bindings. An app-owned pending
 grant survives closing the pane and retains its exact retry ID; status checks
 cannot create a second budget. Revoking even an uncertain, not-yet-admitted
 grant durably rejects a delayed first admission. These revocation records share
-the bounded grant ledger. Caller-side job submission and result retention
-remain to be integrated into the terminal. The requesting-device ledger already
+the bounded grant ledger. The terminal submits explicitly selected peer calls
+and retains their derived output. The requesting-device ledger
 retains exact prompts, grant/model targets, and cancellation intent before
 dispatch. It reserves result space, verifies every retained host assertion
 against that saved input, and rejects model substitution, rewritten terminal
@@ -197,8 +214,8 @@ only exact already-saved requests remain recoverable after membership changes.
 Status rejection or a lost connection leaves the latest signed receipt intact
 and reports delivery separately. A persisted cancellation wins over a later
 submission; terminal results are returned from storage without dispatching again.
-The app history returns bounded previews. Terminal prompt composition, target
-selection, and derived output retention are still separate integration work.
+The app history returns bounded previews. Remote terminal calls remain text-only;
+packaged two-device model selection and result recovery still need acceptance.
 
 An accepted job is committed before dispatch. Each authenticated caller owns its
 job IDs, and a retry must match the exact original input and grant. Status checks

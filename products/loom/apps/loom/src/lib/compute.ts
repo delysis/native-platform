@@ -100,3 +100,9 @@ function matchesGrant(grant: ComputeGrant, attempt: PendingComputeGrant): boolea
 }
 
 function scopeKey(scope: ComputeScope): string { return `${scope.projectId}/${scope.cabalId}`; }
+
+export interface PeerTarget { host: string; grant: ComputeGrant; roster_hash: string }
+export interface PeerOffers { host: string; roster_hash: string; grants: ComputeGrant[] }
+export function peerOffers(projectId: string, sessionId: string, host: string): Promise<PeerOffers> {
+  return invoke('plugin:loom|compute_peer_offers', { projectId, sessionId, host });
+}

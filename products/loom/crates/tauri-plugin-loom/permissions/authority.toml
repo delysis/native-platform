@@ -6,7 +6,7 @@ description = "Review device-specific idle model grants and explicitly prepare, 
 permissions = [
   "allow-compute-host-snapshot", "allow-compute-grant", "allow-compute-revoke",
   "allow-compute-peer-offers", "allow-compute-job-prepare", "allow-compute-job-get",
-  "allow-compute-jobs", "allow-compute-job-submit", "allow-compute-job-check", "allow-compute-job-cancel",
+  "allow-compute-jobs", "allow-compute-job-submit", "allow-compute-job-check", "allow-compute-job-cancel", "allow-terminal-recover", "allow-terminal-run-peer",
 ]
 
 [[set]]

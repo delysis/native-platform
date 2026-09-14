@@ -198,7 +198,7 @@ impl ComputeExecutor for NativeExecutor {
             && self.owner.idle()
             && self
                 .generations
-                .active_branch_count()
+                .active_local_branch_count()
                 .is_ok_and(|count| count == 0)
             && self
                 .selected()
@@ -266,7 +266,11 @@ impl NativeExecutor {
         if *admission != ApplicationPhase::Running
             || self.close_requested.load(Ordering::Acquire)
             || lease.cancel.is_cancelled()
-            || self.generations.active_branch_count().map_err(failed)? != 0
+            || self
+                .generations
+                .active_local_branch_count()
+                .map_err(failed)?
+                != 0
         {
             return Err(ComputeFailure::HostBusy);
         }

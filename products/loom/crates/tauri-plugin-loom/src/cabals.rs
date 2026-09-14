@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use uuid::Uuid;
 
 #[path = "cabal_compute_requests.rs"]
-mod requesting;
+pub(crate) mod requesting;
 pub(crate) use requesting::{
     compute_job_cancel, compute_job_check, compute_job_get, compute_job_prepare,
     compute_job_submit, compute_jobs, compute_peer_offers,
@@ -372,7 +372,11 @@ pub(crate) async fn compute_host_snapshot(
         idle: model.is_some()
             && !stopped
             && state.peer_compute.idle()
-            && state.generations.active_branch_count().map_err(failure)? == 0,
+            && state
+                .generations
+                .active_local_branch_count()
+                .map_err(failure)?
+                == 0,
         model,
         grants,
         problem: binding.problem.or_else(|| {

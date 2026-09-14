@@ -101,8 +101,8 @@ pub(crate) enum JobDelivery {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct JobReply {
-    job: ClientJob,
-    delivery: JobDelivery,
+    pub(crate) job: ClientJob,
+    pub(crate) delivery: JobDelivery,
 }
 
 #[derive(Debug, Serialize)]
@@ -235,6 +235,28 @@ pub(crate) async fn compute_job_get(
         .await?;
     root_for(&state, &project_id, &session_id)?;
     binding.job(job_id)
+}
+
+pub(crate) async fn find_job(
+    project: &str,
+    session: &str,
+    id: Uuid,
+    state: &PluginState,
+) -> Result<Option<ClientJob>, IpcFailure> {
+    let root = root_for(state, project, session)?;
+    let binding = state
+        .cabals
+        .request_binding(&directory(state)?, &root, false)
+        .await?;
+    root_for(state, project, session)?;
+    if binding.client.is_none() {
+        return Ok(None);
+    }
+    let job = binding.client()?.get(id).map_err(failure)?;
+    if job.is_some() {
+        return binding.job(id).map(Some);
+    }
+    Ok(None)
 }
 
 #[tauri::command]
@@ -407,4 +429,4 @@ pub(crate) async fn compute_job_cancel(
 
 #[cfg(all(test, unix))]
 #[path = "cabal_compute_request_tests.rs"]
-mod tests;
+pub(crate) mod tests;
