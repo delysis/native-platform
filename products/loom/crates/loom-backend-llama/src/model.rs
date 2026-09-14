@@ -41,6 +41,19 @@ pub struct LocalModelProfile {
 }
 
 impl LocalModelProfile {
+    /// Digest assertions validate content; they do not name a native worker.
+    /// Keep this aligned with the native host's resident model key.
+    pub fn same_resident_configuration(&self, other: &Self) -> bool {
+        self.model_id == other.model_id
+            && self.model_path == other.model_path
+            && self.projector_path == other.projector_path
+            && self.device == other.device
+            && self.context_tokens == other.context_tokens
+            && self.batch_tokens == other.batch_tokens
+            && self.max_parallel_cases == other.max_parallel_cases
+            && self.gpu_layers == other.gpu_layers
+    }
+
     #[must_use]
     pub fn for_gguf(model_path: impl Into<PathBuf>) -> Self {
         let model_path = model_path.into();

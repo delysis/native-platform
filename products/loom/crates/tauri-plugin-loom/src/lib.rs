@@ -9,6 +9,7 @@ mod document_watcher;
 mod external_import;
 mod microphone_capture;
 mod model_catalog;
+mod model_config;
 mod model_download;
 mod shader_preview;
 mod speech_input;
@@ -88,6 +89,7 @@ use crate::context_attachments::{
 use crate::document_watcher::DocumentFilesystemWatcher;
 use crate::external_import::document_import_external;
 use crate::model_catalog::{ModelCatalogSnapshot, catalog_model_identity, embedded_model_catalog};
+use crate::model_config::{ModelLoadSettings, validate_resident_assertions};
 use crate::model_download::{
     ModelDownloadRegistry, ModelDownloadRegistryError, ModelDownloadSnapshot, ModelDownloadSpec,
     ModelLibraryError, ReservationOutcome, model_target_path, prepare_model_library,
@@ -467,6 +469,7 @@ struct LoadedModel {
     /// sibling artifacts (notably the multimodal projector) remain discoverable.
     selected_path: PathBuf,
     profile: LocalModelProfile,
+    requested_settings: ModelLoadSettings,
     descriptor: VerifiedModelDescriptor,
 }
 
@@ -1813,6 +1816,7 @@ enum ModelLoadPlan {
         selected_path: PathBuf,
         canonical_path: PathBuf,
         profile: LocalModelProfile,
+        settings: ModelLoadSettings,
     },
 }
 
@@ -1822,6 +1826,7 @@ enum PolicyModelLoadPlan {
         selected_path: PathBuf,
         canonical_path: PathBuf,
         profile: LocalModelProfile,
+        settings: ModelLoadSettings,
         expectation: PolicyWriterExpectation,
     },
 }
@@ -5318,7 +5323,10 @@ async fn model_list(
             ModelRegistry::ResidencyUnknown { .. } | ModelRegistry::Empty => None,
         }
     };
-    let options = desktop_model_discovery_options(&state)?;
+    let mut options = desktop_model_discovery_options(&state)?;
+    if let Some(path) = ModelLoadSettings::read(&state)?.configured_path() {
+        options.user_paths.insert(0, path);
+    }
     let report = discover_gguf_models(&options)
         .map_err(|error| IpcFailure::new("model_discovery_error", error.to_string(), false))?;
     let mut models = report
@@ -5336,7 +5344,11 @@ async fn model_list(
                 .as_ref()
                 .filter(|loaded| loaded.profile.model_path == model.resolved_path)
             {
-                return model_summary(loaded, true, &state.build_model_policy);
+                let mut summary = model_summary(loaded, true, &state.build_model_policy);
+                // The configured alias wins discovery even when this resident
+                // was originally loaded through another spelling of the path.
+                summary.model_path = model_path;
+                return summary;
             }
             ModelCapabilitySummary {
                 model_id: format!("discovered:{}", BlobId::digest(model_path.as_bytes())),
@@ -5457,13 +5469,14 @@ async fn model_load<R: Runtime>(
         let plan = prepare_model_load(&model_path, &state)?;
         (model_load, plan)
     };
-    let (selected_path, canonical_path, profile) = match plan {
+    let (selected_path, canonical_path, profile, settings) = match plan {
         ModelLoadPlan::Ready(summary) => return Ok(summary),
         ModelLoadPlan::Inspect {
             selected_path,
             canonical_path,
             profile,
-        } => (selected_path, canonical_path, profile),
+            settings,
+        } => (selected_path, canonical_path, profile, settings),
     };
     let worker_app = app.clone();
     let worker_path = canonical_path.clone();
@@ -5485,6 +5498,7 @@ async fn model_load<R: Runtime>(
                 LoadedModel {
                     selected_path: worker_selected_path,
                     profile: worker_profile,
+                    requested_settings: settings,
                     descriptor,
                 },
             )
@@ -5555,14 +5569,21 @@ async fn model_load_exact_writer<R: Runtime>(
         let plan = prepare_exact_model_load(expectation, &model_path, &state)?;
         (model_load, plan)
     };
-    let (selected_path, canonical_path, profile, expectation) = match plan {
+    let (selected_path, canonical_path, profile, settings, expectation) = match plan {
         PolicyModelLoadPlan::Ready(summary) => return Ok(summary),
         PolicyModelLoadPlan::Inspect {
             selected_path,
             canonical_path,
             profile,
+            settings,
             expectation,
-        } => (selected_path, canonical_path, profile, expectation),
+        } => (
+            selected_path,
+            canonical_path,
+            profile,
+            settings,
+            expectation,
+        ),
     };
     let worker_app = app.clone();
     let worker_path = canonical_path.clone();
@@ -5600,6 +5621,7 @@ async fn model_load_exact_writer<R: Runtime>(
                 LoadedModel {
                     selected_path: worker_selected_path,
                     profile: worker_profile,
+                    requested_settings: settings,
                     descriptor,
                 },
             )
@@ -5628,9 +5650,10 @@ async fn model_load_exact_writer<R: Runtime>(
 fn prepare_exact_model_load(
     expectation: PolicyWriterExpectation,
     model_path: &str,
-    state: &State<'_, PluginState>,
+    state: &PluginState,
 ) -> Result<PolicyModelLoadPlan, IpcFailure> {
-    let requested = PathBuf::from(model_path);
+    let settings = ModelLoadSettings::read(state)?;
+    let requested = settings.selected_path(model_path)?;
     let canonical_path = requested.canonicalize().map_err(|error| {
         IpcFailure::new(
             "policy_model_path_error",
@@ -5661,29 +5684,55 @@ fn prepare_exact_model_load(
             false,
         ));
     }
+    {
+        let _lifecycle = lock_model_lifecycle(state)?;
+        let registry = lock_model_registry(state)?;
+        if let ModelRegistry::Loaded(loaded) = &*registry
+            && loaded.profile.model_path == canonical_path
+            && settings.matches(&loaded.requested_settings)
+        {
+            validate_policy_model_descriptor(&loaded.descriptor, &canonical_path, &expectation)?;
+            return Ok(PolicyModelLoadPlan::Ready(model_summary(
+                loaded,
+                true,
+                &state.build_model_policy,
+            )));
+        }
+    }
     let mut profile = state
         .native_runtime
         .model_profile_for_current_memory(
             canonical_path.clone(),
             expectation.model_file_bytes,
             expectation.projector_file_bytes.unwrap_or(0),
-            expectation.maximum_context_tokens,
+            settings.maximum_context_tokens(expectation.maximum_context_tokens),
         )
         .map_err(|error| IpcFailure::new("model_context_plan_failed", error.to_string(), true))?;
+    profile.expected_model_sha256 = Some(expectation.model_sha256.to_string());
+    let configured_projector = settings.projector_path()?;
+    if configured_projector.is_some() && expectation.projector_sha256.is_none() {
+        return Err(IpcFailure::new(
+            "model_settings_invalid",
+            "this text-only writer policy does not authorize a configured projector",
+            false,
+        ));
+    }
     if let (Some(projector_name), Some(projector_sha256), Some(projector_file_bytes)) = (
         expectation.projector_name.as_deref(),
         expectation.projector_sha256.as_deref(),
         expectation.projector_file_bytes,
     ) {
-        let projector_path = sibling_catalog_artifact_path(&selected_path, projector_name)?
-            .canonicalize()
-            .map_err(|_| {
-                IpcFailure::new(
-                    "catalog_projector_missing",
-                    "the exact Gemma 4 multimodal projector is not installed beside the model",
-                    false,
-                )
-            })?;
+        let selected_projector = configured_projector.map_or_else(
+            || sibling_catalog_artifact_path(&selected_path, projector_name),
+            Ok,
+        )?;
+        let projector_path = selected_projector.canonicalize().map_err(|_| {
+            IpcFailure::new(
+                "catalog_projector_missing",
+                "the exact Gemma 4 multimodal projector is not installed beside the model",
+                false,
+            )
+        })?;
         ensure_model_path_in_isolated_library(state, &projector_path)?;
         ensure_regular_policy_path(&projector_path)?;
         if std::fs::metadata(&projector_path)
@@ -5700,11 +5749,14 @@ fn prepare_exact_model_load(
         profile.projector_path = Some(projector_path);
         profile.expected_mmproj_sha256 = Some(projector_sha256.to_owned());
     }
+    settings.apply(&mut profile)?;
     let _lifecycle = lock_model_lifecycle(state)?;
     let mut registry = lock_model_registry(state)?;
-    match &*registry {
-        ModelRegistry::Loaded(loaded) if loaded.profile.model_path == canonical_path => {
+    match &mut *registry {
+        ModelRegistry::Loaded(loaded) if loaded.profile.same_resident_configuration(&profile) => {
+            validate_resident_assertions(&profile, &loaded.descriptor)?;
             validate_policy_model_descriptor(&loaded.descriptor, &canonical_path, &expectation)?;
+            loaded.requested_settings = settings.snapshot();
             let summary = model_summary(loaded, true, &state.build_model_policy);
             return Ok(PolicyModelLoadPlan::Ready(summary));
         }
@@ -5745,6 +5797,7 @@ fn prepare_exact_model_load(
         selected_path,
         canonical_path: canonical_path.clone(),
         profile,
+        settings: settings.snapshot(),
         expectation,
     })
 }
@@ -6097,11 +6150,12 @@ fn policy_model_file_changed() -> IpcFailure {
     )
 }
 
-fn prepare_model_load(
-    model_path: &str,
-    state: &State<'_, PluginState>,
-) -> Result<ModelLoadPlan, IpcFailure> {
-    let requested = PathBuf::from(model_path);
+// Keep requested settings, asset identity, and registry staging in one ordered
+// admission boundary, as for the pinned loader above.
+#[allow(clippy::too_many_lines)]
+fn prepare_model_load(model_path: &str, state: &PluginState) -> Result<ModelLoadPlan, IpcFailure> {
+    let settings = ModelLoadSettings::read(state)?;
+    let requested = settings.selected_path(model_path)?;
     let canonical = requested.canonicalize().map_err(|error| {
         IpcFailure::new(
             "model_path_error",
@@ -6110,12 +6164,52 @@ fn prepare_model_load(
         )
     })?;
     ensure_model_path_in_isolated_library(state, &canonical)?;
-    let discovered = discover_loadable_model(state, &canonical)?;
+    let discovered = if settings.configured_path().is_some() {
+        discover_strict_policy_candidate(&requested)?
+    } else {
+        discover_loadable_model(state, &canonical)?
+    };
     let selected_path = discovered.selected_path.clone();
+    {
+        let _lifecycle = lock_model_lifecycle(state)?;
+        let registry = lock_model_registry(state)?;
+        if let ModelRegistry::Loaded(loaded) = &*registry
+            && loaded.profile.model_path == canonical
+            && settings.matches(&loaded.requested_settings)
+        {
+            return Ok(ModelLoadPlan::Ready(model_summary(
+                loaded,
+                true,
+                &state.build_model_policy,
+            )));
+        }
+    }
+    let projector_path = settings.projector_path()?;
+    let projector_bytes = if let Some(path) = projector_path.as_ref() {
+        ensure_model_path_in_isolated_library(state, path)?;
+        std::fs::metadata(path)
+            .map_err(|error| IpcFailure::new("model_settings_invalid", error.to_string(), false))?
+            .len()
+    } else {
+        0
+    };
+    let mut profile = state
+        .native_runtime
+        .model_profile_for_current_memory(
+            discovered.resolved_path,
+            discovered.file_bytes,
+            projector_bytes,
+            settings.maximum_context_tokens(None),
+        )
+        .map_err(|error| IpcFailure::new("model_context_plan_failed", error.to_string(), true))?;
+    profile.projector_path = projector_path;
+    settings.apply(&mut profile)?;
     let _lifecycle = lock_model_lifecycle(state)?;
     let mut registry = lock_model_registry(state)?;
-    match &*registry {
-        ModelRegistry::Loaded(loaded) if loaded.profile.model_path == canonical => {
+    match &mut *registry {
+        ModelRegistry::Loaded(loaded) if loaded.profile.same_resident_configuration(&profile) => {
+            validate_resident_assertions(&profile, &loaded.descriptor)?;
+            loaded.requested_settings = settings.snapshot();
             return Ok(ModelLoadPlan::Ready(model_summary(
                 loaded,
                 true,
@@ -6142,10 +6236,6 @@ fn prepare_model_load(
         ModelRegistry::Loaded(_) | ModelRegistry::Empty => {}
     }
     ensure_no_active_generations(state, "switching local models")?;
-    let profile = state
-        .native_runtime
-        .model_profile_for_current_memory(discovered.resolved_path, discovered.file_bytes, 0, None)
-        .map_err(|error| IpcFailure::new("model_context_plan_failed", error.to_string(), true))?;
     let previous = match std::mem::take(&mut *registry) {
         ModelRegistry::Loaded(previous) => Some(previous),
         ModelRegistry::Empty => None,
@@ -6163,6 +6253,7 @@ fn prepare_model_load(
         selected_path,
         canonical_path: canonical,
         profile,
+        settings: settings.snapshot(),
     })
 }
 
@@ -6741,7 +6832,7 @@ fn emit_model_download_snapshot<R: Runtime>(
 }
 
 fn discover_loadable_model(
-    state: &State<'_, PluginState>,
+    state: &PluginState,
     canonical: &Path,
 ) -> Result<loom_backend_llama::DiscoveredGguf, IpcFailure> {
     let options = desktop_model_discovery_options(state)?;
@@ -6811,7 +6902,7 @@ fn discover_strict_policy_candidate(
 }
 
 fn desktop_model_discovery_options(
-    state: &State<'_, PluginState>,
+    state: &PluginState,
 ) -> Result<ModelDiscoveryOptions, IpcFailure> {
     let mut options = base_desktop_model_discovery_options(state.isolate_model_discovery);
     if !state.isolate_model_discovery
@@ -6852,7 +6943,7 @@ fn base_desktop_model_discovery_options(isolate: bool) -> ModelDiscoveryOptions 
 }
 
 fn ensure_model_path_in_isolated_library(
-    state: &State<'_, PluginState>,
+    state: &PluginState,
     canonical_path: &Path,
 ) -> Result<(), IpcFailure> {
     ensure_model_path_in_isolated_library_from(
@@ -10355,10 +10446,7 @@ fn lock_model_lifecycle(state: &PluginState) -> Result<std::sync::MutexGuard<'_,
         })
 }
 
-fn ensure_no_active_generations(
-    state: &State<'_, PluginState>,
-    action: &str,
-) -> Result<(), IpcFailure> {
+fn ensure_no_active_generations(state: &PluginState, action: &str) -> Result<(), IpcFailure> {
     if state
         .generations
         .active_branch_count()
@@ -11251,6 +11339,7 @@ mod tests {
         LoadedModel {
             selected_path: path.to_path_buf(),
             profile: LocalModelProfile::for_gguf(path),
+            requested_settings: ModelLoadSettings::default(),
             descriptor: test_descriptor(path, &expectation, stable_model_id),
         }
     }
@@ -11262,6 +11351,7 @@ mod tests {
         LoadedModel {
             selected_path: path.to_path_buf(),
             profile: LocalModelProfile::for_gguf(path),
+            requested_settings: ModelLoadSettings::default(),
             descriptor: test_descriptor(path, &expectation, "policy-writer"),
         }
     }
@@ -11282,6 +11372,125 @@ mod tests {
             panic!("expected the previous model to remain loaded");
         };
         assert_eq!(loaded.descriptor.stable_model_id, expected);
+    }
+
+    fn model_settings_fixture(source: &str) -> (tempfile::TempDir, PluginState, PathBuf) {
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let (store, _) = ProjectStore::initialize(directory.path().join("Writing"), "Writing")
+            .expect("fixture project");
+        let path = store.root().join("writer.gguf");
+        std::fs::write(&path, b"GGUF").expect("container fixture, never natively loaded");
+        std::fs::write(store.root().join(".mine.toml"), source).expect("settings fixture");
+        let state = PluginState::default();
+        state.session.lock().expect("session").store = Some(store);
+        *state.model.lock().expect("registry") =
+            ModelRegistry::Loaded(Box::new(test_loaded_model(&path, "previous-model")));
+        (directory, state, path)
+    }
+
+    #[test]
+    fn invalid_model_settings_preserve_the_previous_registry_before_staging() {
+        let (_directory, state, path) =
+            model_settings_fixture("[model]\npath = 'writer.gguf'\ncontext_tokens = 0");
+        let result = prepare_model_load(path.to_str().expect("UTF-8"), &state);
+        let Err(error) = result else {
+            panic!("invalid settings must fail")
+        };
+        assert_eq!(error.code, "model_settings_invalid");
+        assert_loaded_model_id(&state, "previous-model");
+    }
+
+    #[test]
+    fn same_file_runtime_change_stages_exact_settings_and_retains_rollback_owner() {
+        let (_directory, state, path) = model_settings_fixture(
+            "[model]\npath = 'writer.gguf'\ndevice = 'cpu'\ncontext_tokens = 4096\nbatch_tokens = 128\nmax_sequences = 2",
+        );
+        let plan = prepare_model_load(path.to_str().expect("UTF-8"), &state).expect("prepare load");
+        let ModelLoadPlan::Inspect {
+            profile,
+            canonical_path,
+            ..
+        } = plan
+        else {
+            panic!("the old same-path profile must not be returned as Ready");
+        };
+        assert_eq!(
+            (
+                profile.context_tokens,
+                profile.batch_tokens,
+                profile.max_parallel_cases
+            ),
+            (4096, 128, 2)
+        );
+        assert_eq!(
+            profile.device,
+            loom_backend_llama::LocalDevicePreference::Cpu
+        );
+        assert_eq!(profile.gpu_layers, 0);
+        assert!(
+            state
+                .native_runtime
+                .shutdown_joined()
+                .expect("no native inspection occurred")
+                .joined_worker_count()
+                == 0
+        );
+        restore_staged_model(&state, &canonical_path).expect("restore prior authority");
+        assert_loaded_model_id(&state, "previous-model");
+    }
+
+    #[test]
+    fn configured_hash_cannot_override_a_pinned_policy_digest() {
+        let (_directory, state, path) = model_settings_fixture(&format!(
+            "[model]\npath = 'writer.gguf'\nexpected_model_sha256 = '{}'",
+            "00".repeat(32)
+        ));
+        let result = prepare_exact_model_load(
+            test_policy_expectation(b"GGUF"),
+            path.to_str().expect("UTF-8"),
+            &state,
+        );
+        let Err(error) = result else {
+            panic!("conflicting assertions must fail")
+        };
+        assert_eq!(error.code, "model_settings_invalid");
+        assert_loaded_model_id(&state, "previous-model");
+    }
+
+    #[test]
+    fn digest_only_change_checks_the_resident_without_staging_or_releasing_it() {
+        let (_directory, state, path) = model_settings_fixture(&format!(
+            "[model]\npath = 'writer.gguf'\ncontext_tokens = 8192\nexpected_model_sha256 = '{}'",
+            "00".repeat(32)
+        ));
+        let result = prepare_model_load(path.to_str().expect("UTF-8"), &state);
+        let Err(error) = result else {
+            panic!("the resident bytes do not match the new assertion")
+        };
+        assert_eq!(error.code, "model_settings_invalid");
+        assert_loaded_model_id(&state, "previous-model");
+    }
+
+    #[test]
+    fn unchanged_model_request_keeps_its_existing_memory_plan() {
+        let source = "[model]\npath = 'writer.gguf'";
+        let (_directory, state, path) = model_settings_fixture(source);
+        let requested_settings = ModelLoadSettings::read(&state).expect("frozen settings");
+        {
+            let mut registry = state.model.lock().expect("registry");
+            let ModelRegistry::Loaded(loaded) = &mut *registry else {
+                panic!("loaded fixture")
+            };
+            loaded.profile.context_tokens = 32_768;
+            loaded.requested_settings = requested_settings;
+        }
+        let plan =
+            prepare_model_load(path.to_str().expect("UTF-8"), &state).expect("idempotent request");
+        assert!(
+            matches!(plan, ModelLoadPlan::Ready(_)),
+            "memory consumed by the existing resident must not trigger replanning on the same request"
+        );
+        assert_loaded_model_id(&state, "previous-model");
     }
 
     #[test]

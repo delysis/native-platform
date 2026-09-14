@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -162,7 +161,37 @@ struct ResidencyLedger {
     // release, and shutdown gives us an independent ownership fact and makes
     // any in-runtime panic poison this boundary too. Do not add a
     // residency-mutating host call outside it.
-    model_paths: BTreeSet<PathBuf>,
+    profiles: Vec<LocalModelProfile>,
+}
+
+impl ResidencyLedger {
+    fn record(&mut self, profile: &LocalModelProfile) {
+        if !self.contains(profile) {
+            self.profiles.push(profile.clone());
+        }
+    }
+
+    fn contains(&self, profile: &LocalModelProfile) -> bool {
+        self.profiles
+            .iter()
+            .any(|tracked| tracked.same_resident_configuration(profile))
+    }
+
+    fn remove(&mut self, profile: &LocalModelProfile) {
+        self.profiles
+            .retain(|tracked| !tracked.same_resident_configuration(profile));
+    }
+}
+
+/// Teardown addresses a worker, independently of later content assertions.
+/// Acquisition is the boundary that checks expected digests.
+fn resident_configuration(
+    profile: &LocalModelProfile,
+) -> Result<llama_native_types::NativeModelConfig, NativeError> {
+    let mut config = profile.as_native_config()?;
+    config.expected_model_sha256 = None;
+    config.expected_mmproj_sha256 = None;
+    Ok(config)
 }
 
 #[derive(Debug)]
@@ -224,7 +253,7 @@ impl NativeHostRuntime {
     ) -> Result<NativeModelHandle, NativeError> {
         let mut residency = self.lock_residency()?;
         let handle = self.host.acquire(profile.as_native_config()?)?;
-        residency.model_paths.insert(profile.model_path.clone());
+        residency.record(profile);
         Ok(handle)
     }
 
@@ -236,7 +265,7 @@ impl NativeHostRuntime {
         handle: &NativeModelHandle,
     ) -> Result<JoinedHostSlot, NativeError> {
         let mut residency = self.lock_residency()?;
-        let (slot_id, model_path) = self
+        let slot_id = self
             .host
             .slots()
             .into_iter()
@@ -244,7 +273,7 @@ impl NativeHostRuntime {
                 self.host
                     .handle(slot.slot_id)
                     .filter(|resident| resident.is_same_worker(handle))
-                    .map(|_| (slot.slot_id, slot.model_path))
+                    .map(|_| slot.slot_id)
             })
             .ok_or_else(|| {
                 NativeError::new(
@@ -252,15 +281,20 @@ impl NativeHostRuntime {
                     "research handle does not belong to a live slot in this host",
                 )
             })?;
+        let mut matching_profiles = Vec::new();
+        for profile in &residency.profiles {
+            if self
+                .host
+                .resident(&resident_configuration(profile)?)?
+                .is_some_and(|resident| resident.is_same_worker(handle))
+            {
+                matching_profiles.push(profile.clone());
+            }
+        }
         match self.host.shutdown_slot_joined(slot_id)? {
             HostSlotShutdown::Joined(joined) if joined.belongs_to(&self.host) => {
-                let has_survivor = self
-                    .host
-                    .slots()
-                    .iter()
-                    .any(|slot| slot.model_path == model_path);
-                if !has_survivor {
-                    residency.model_paths.remove(&model_path);
+                for profile in matching_profiles {
+                    residency.remove(&profile);
                 }
                 Ok(joined)
             }
@@ -279,20 +313,16 @@ impl NativeHostRuntime {
     /// model worker owned by it has been joined.
     pub fn shutdown_joined(&self) -> Result<JoinedLlamaRuntime, NativeError> {
         let mut residency = self.lock_residency()?;
-        let slots = self.host.slots();
-        if slots.is_empty() && !residency.model_paths.is_empty() {
-            return Err(unobservable_residency_error(
-                "tracked models remained while the native host reported no slots",
-            ));
-        }
-        let observed_paths = slots
-            .iter()
-            .map(|slot| slot.model_path.clone())
-            .collect::<BTreeSet<_>>();
-        if !residency.model_paths.is_subset(&observed_paths) {
-            return Err(unobservable_residency_error(
-                "the native slot snapshot omitted tracked model ownership",
-            ));
+        for profile in &residency.profiles {
+            if self
+                .host
+                .resident(&resident_configuration(profile)?)?
+                .is_none()
+            {
+                return Err(unobservable_residency_error(
+                    "the native host omitted a tracked model configuration",
+                ));
+            }
         }
 
         let native = self.host.shutdown_joined()?;
@@ -302,7 +332,7 @@ impl NativeHostRuntime {
                 "native host returned shutdown authority for a different host instance",
             ));
         }
-        residency.model_paths.clear();
+        residency.profiles.clear();
         Ok(JoinedLlamaRuntime { native })
     }
 
@@ -317,7 +347,7 @@ impl NativeHostRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let native = self.host.shutdown_for_process_exit();
-        residency.model_paths.clear();
+        residency.profiles.clear();
         ProcessExitJoinedLlamaRuntime { native }
     }
 }
@@ -342,7 +372,7 @@ impl BatchRuntime for NativeHostRuntime {
     ) -> Result<RuntimeModelInspection, NativeError> {
         let mut residency = self.lock_residency()?;
         let handle = self.host.acquire(profile.as_native_config()?)?;
-        residency.model_paths.insert(profile.model_path.clone());
+        residency.record(profile);
         let status = handle.status();
         let live_model_path = status.model_path;
         Ok(RuntimeModelInspection {
@@ -364,7 +394,7 @@ impl BatchRuntime for NativeHostRuntime {
     ) -> Result<Arc<dyn BatchExecution>, NativeError> {
         let mut residency = self.lock_residency()?;
         let handle = self.host.acquire(profile.as_native_config()?)?;
-        residency.model_paths.insert(profile.model_path.clone());
+        residency.record(profile);
         let ticket = handle.generate_batch(request)?;
         let event_receiver = ticket.events.clone();
         Ok(Arc::new(NativeBatchExecution {
@@ -375,47 +405,40 @@ impl BatchRuntime for NativeHostRuntime {
 
     fn release_model(&self, profile: &LocalModelProfile) -> Result<ModelRelease, NativeError> {
         let mut residency = self.lock_residency()?;
-        let slot_ids = self
-            .host
-            .slots()
-            .into_iter()
-            .filter(|slot| slot.model_path == profile.model_path)
-            .map(|slot| slot.slot_id)
-            .collect::<Vec<_>>();
-        if slot_ids.is_empty() {
-            if residency.model_paths.contains(&profile.model_path) {
+        let config = resident_configuration(profile)?;
+        let Some(handle) = self.host.resident(&config)? else {
+            if residency.contains(profile) {
                 return Err(unobservable_residency_error(
-                    "a tracked model had no observable native slot",
+                    "a tracked model configuration had no observable native slot",
                 ));
             }
             return Ok(ModelRelease::NeverAcquired);
-        }
-
-        residency.model_paths.insert(profile.model_path.clone());
-        let matched = slot_ids.len();
-        let mut joined_slots = Vec::with_capacity(matched);
-        for slot_id in &slot_ids {
-            match self.host.shutdown_slot_joined(*slot_id)? {
-                HostSlotShutdown::Joined(joined) if joined.belongs_to(&self.host) => {
-                    joined_slots.push(joined);
-                }
-                HostSlotShutdown::Joined(_) | HostSlotShutdown::Vacant => {
-                    return Err(incomplete_release_error(
-                        matched,
-                        joined_slots.len(),
-                        self.host.slots().len(),
-                    ));
-                }
-            }
-        }
-        let survivors = self
+        };
+        residency.record(profile);
+        let slot_id = self
             .host
             .slots()
             .into_iter()
-            .filter(|slot| slot.model_path == profile.model_path)
-            .count();
-        let proof = prove_complete_model_release(matched, joined_slots, survivors)?;
-        residency.model_paths.remove(&profile.model_path);
+            .find_map(|slot| {
+                self.host
+                    .handle(slot.slot_id)
+                    .filter(|resident| resident.is_same_worker(&handle))
+                    .map(|_| slot.slot_id)
+            })
+            .ok_or_else(|| {
+                unobservable_residency_error(
+                    "the exact resident worker had no observable host slot",
+                )
+            })?;
+        let joined = match self.host.shutdown_slot_joined(slot_id)? {
+            HostSlotShutdown::Joined(joined) if joined.belongs_to(&self.host) => joined,
+            HostSlotShutdown::Joined(_) | HostSlotShutdown::Vacant => {
+                return Err(incomplete_release_error(1, 0, self.host.slots().len()));
+            }
+        };
+        let survivors = usize::from(self.host.resident(&config)?.is_some());
+        let proof = prove_complete_model_release(1, vec![joined], survivors)?;
+        residency.remove(profile);
         Ok(ModelRelease::Released { proof })
     }
 }
@@ -557,8 +580,7 @@ mod tests {
             .residency
             .lock()
             .expect("residency ledger")
-            .model_paths
-            .insert(profile.model_path.clone());
+            .record(&profile);
 
         assert!(runtime.release_model(&profile).is_err());
         assert!(runtime.shutdown_joined().is_err());
@@ -576,5 +598,31 @@ mod tests {
         let joined = runtime.shutdown_joined().expect("fresh runtime joins");
         assert!(joined.belongs_to(&runtime));
         assert_eq!(joined.joined_worker_count(), 0);
+    }
+
+    #[test]
+    fn failed_reconfiguration_does_not_release_a_different_profile_at_the_same_path() {
+        let runtime = NativeHostRuntime::default();
+        let previous = LocalModelProfile::for_gguf("same-model.gguf");
+        runtime.residency.lock().expect("ledger").record(&previous);
+        let mut staged = previous.clone();
+        staged.context_tokens = 4_096;
+        assert!(matches!(
+            runtime
+                .release_model(&staged)
+                .expect("the new configuration was never acquired"),
+            ModelRelease::NeverAcquired
+        ));
+        assert!(
+            runtime
+                .residency
+                .lock()
+                .expect("ledger")
+                .contains(&previous)
+        );
+        assert!(
+            runtime.release_model(&previous).is_err(),
+            "the previous ownership claim must remain fail closed"
+        );
     }
 }
