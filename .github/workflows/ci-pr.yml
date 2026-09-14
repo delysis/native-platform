@@ -481,22 +481,8 @@ jobs:
     needs:
       - plan
       - policy
-      - root-linux
-      - native-linux
-      - gateway-linux
-      - attachment-linux
-      - information-linux
-      - information-windows
-      - speech-linux
-      - mom-linux
-      - mom-windows
-      - loom-linux
-      - loom-windows
       - frontend
       - platform-macos
-      - ignored-tests
-      - dependency-graph
-      - fuzz-build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683

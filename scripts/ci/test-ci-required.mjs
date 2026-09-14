@@ -57,7 +57,7 @@ test("a focused Mom plan accepts skipped root and requires its selected lanes", 
   assert.notEqual(run(momPlan, needs).status, 0);
 });
 
-test("a Mom plan cannot omit or skip its Windows product gate", () => {
+test("a Mom plan keeps Windows coverage scheduled without gating on its result", () => {
   const momPlan = {
     ...docsPlan,
     risk: "behavior",
@@ -75,7 +75,7 @@ test("a Mom plan cannot omit or skip its Windows product gate", () => {
 
   const skippedWindows = structuredClone(needs);
   skippedWindows["mom-windows"].result = "skipped";
-  assert.notEqual(run(momPlan, skippedWindows).status, 0);
+  assert.equal(run(momPlan, skippedWindows).status, 0);
 
   const omittedWindows = structuredClone(momPlan);
   omittedWindows.jobs = omittedWindows.jobs.filter((job) => job !== "mom-windows");
@@ -114,7 +114,7 @@ test("a Loom frontend plan cannot omit or skip its macOS WebKit gate", () => {
   assert.notEqual(run(omittedMatrixEntry, needs).status, 0);
 });
 
-test("a Loom plan cannot omit or skip its Windows product gate", () => {
+test("a Loom plan keeps Windows coverage scheduled without gating on its result", () => {
   const loomPlan = {
     ...docsPlan,
     risk: "behavior",
@@ -132,14 +132,14 @@ test("a Loom plan cannot omit or skip its Windows product gate", () => {
 
   const skippedWindows = structuredClone(needs);
   skippedWindows["loom-windows"].result = "skipped";
-  assert.notEqual(run(loomPlan, skippedWindows).status, 0);
+  assert.equal(run(loomPlan, skippedWindows).status, 0);
 
   const omittedWindows = structuredClone(loomPlan);
   omittedWindows.jobs = omittedWindows.jobs.filter((job) => job !== "loom-windows");
   assert.notEqual(run(omittedWindows, needs).status, 0);
 });
 
-test("an Information plan cannot omit or skip its Windows portability gate", () => {
+test("an Information plan keeps Windows coverage scheduled without gating on its result", () => {
   const informationPlan = {
     ...docsPlan,
     risk: "behavior",
@@ -156,7 +156,7 @@ test("an Information plan cannot omit or skip its Windows portability gate", () 
 
   const skippedWindows = structuredClone(needs);
   skippedWindows["information-windows"].result = "skipped";
-  assert.notEqual(run(informationPlan, skippedWindows).status, 0);
+  assert.equal(run(informationPlan, skippedWindows).status, 0);
 
   const omittedWindows = structuredClone(informationPlan);
   omittedWindows.jobs = omittedWindows.jobs.filter(
@@ -183,11 +183,11 @@ test("matrix-backed job IDs are consumed as one fail-closed aggregate result", (
   for (const job of ["root-linux", "mom-linux", "platform-macos"]) {
     const failed = structuredClone(needs);
     failed[job].result = "failure";
-    assert.notEqual(run(matrixPlan, failed).status, 0, `${job} must fail closed`);
+    assert.equal(run(matrixPlan, failed).status === 0, job !== "platform-macos", job);
   }
 });
 
-test("a selected ignored-test reconciliation is an authoritative required job", () => {
+test("selected cross-platform inventory runs outside the merge gate", () => {
   const ignoredPlan = {
     ...docsPlan,
     risk: "behavior",
@@ -201,7 +201,7 @@ test("a selected ignored-test reconciliation is an authoritative required job", 
   };
   assert.equal(run(ignoredPlan, needs).status, 0);
   needs["ignored-tests"] = { result: "skipped" };
-  assert.notEqual(run(ignoredPlan, needs).status, 0);
+  assert.equal(run(ignoredPlan, needs).status, 0);
 });
 
 test("a required skipped, failed, or missing job fails", () => {
@@ -210,8 +210,8 @@ test("a required skipped, failed, or missing job fails", () => {
       plan: { result: "success" },
       policy: { result: "success" },
     };
-    if (resultName !== undefined) needs["root-linux"] = { result: resultName };
-    const result = run({ ...docsPlan, jobs: ["policy", "root-linux"] }, needs);
+    if (resultName !== undefined) needs["platform-macos"] = { result: resultName };
+    const result = run({ ...docsPlan, jobs: ["policy", "platform-macos"] }, needs);
     assert.notEqual(result.status, 0, `unexpected pass for ${resultName}`);
   }
 });
@@ -225,13 +225,13 @@ test("planner failure cannot be hidden by a stale-looking plan", () => {
   assert.match(result.stderr, /plan/i);
 });
 
-test("an unexpected observed failure fails the aggregate", () => {
+test("an advisory platform failure does not block macOS development", () => {
   const result = run(docsPlan, {
     plan: { result: "success" },
     policy: { result: "success" },
     "root-linux": { result: "failure" },
   });
-  assert.notEqual(result.status, 0);
+  assert.equal(result.status, 0);
 });
 
 test("malformed and internally incomplete full plans fail closed", () => {
@@ -252,4 +252,13 @@ test("malformed and internally incomplete full plans fail closed", () => {
   );
   assert.notEqual(incompleteFull.status, 0);
   assert.match(incompleteFull.stderr, /full/i);
+});
+
+test("the gate completes while selected advisory jobs are absent or still running", () => {
+  const plan = { ...docsPlan, jobs: ["policy", "platform-macos", "root-linux", "ignored-tests"] };
+  for (const advisory of [undefined, "failure", "cancelled", "pending"]) {
+    const needs = { plan: { result: "success" }, policy: { result: "success" }, "platform-macos": { result: "success" } };
+    if (advisory) needs["root-linux"] = { result: advisory };
+    assert.equal(run(plan, needs).status, 0, advisory);
+  }
 });
