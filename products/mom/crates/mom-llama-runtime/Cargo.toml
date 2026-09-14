@@ -9,6 +9,7 @@ description = "Rust-owned product state, personas, conversations, tools and cach
 
 [dependencies]
 desktop-context.workspace = true
+operation-lifecycle.workspace = true
 desktop-model-defaults.workspace = true
 anyhow.workspace = true
 attachment-native-host.workspace = true

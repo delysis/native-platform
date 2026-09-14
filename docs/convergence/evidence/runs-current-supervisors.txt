@@ -1,0 +1,14 @@
+
+running 9 tests
+test loom::tests::completed_history_does_not_grow_with_operation_count ... ok
+test loom::tests::identical_public_ids_and_sequences_do_not_cross_supervisor_owners ... ok
+test loom::tests::late_cancellation_does_not_rewrite_terminal_history ... ok
+test loom::tests::poisoned_state_never_projects_successful_shutdown_facts ... ok
+test loom::tests::pre_executor_failure_records_failed_terminal_before_release ... ok
+test mom::publication_tests::completed_worker_diagnostics_are_bounded_without_losing_join_accounting ... ok
+test mom::publication_tests::operation_handles_do_not_target_other_owners_or_reused_public_ids ... ok
+test mom::publication_tests::public_identity_survives_until_final_send_even_when_consumer_drops ... ok
+test mom::publication_tests::shutdown_waits_for_a_join_already_owned_by_another_thread ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+

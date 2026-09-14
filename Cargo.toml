@@ -2,6 +2,7 @@
 members = [
     "crates/desktop-context",
     "crates/desktop-model-defaults",
+    "crates/operation-lifecycle",
     "crates/native/crates/llama-native-cache",
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
@@ -66,6 +67,7 @@ publish = false
 
 [workspace.dependencies]
 desktop-context = { path = "crates/desktop-context" }
+operation-lifecycle = { path = "crates/operation-lifecycle" }
 desktop-model-defaults = { path = "crates/desktop-model-defaults" }
 anyhow = "1.0.100"
 async-stream = "0.3.6"

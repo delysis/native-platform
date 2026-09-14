@@ -1,3 +1,4 @@
+use operation_lifecycle::{InstanceId, RunControl, WorkerLedger};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -32,6 +33,7 @@ pub enum GenerationSupervisorPhase {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct GenerationAttemptIdentity {
+    owner: InstanceId,
     pub operation_id: String,
     pub attempt_id: String,
     pub sequence: u64,
@@ -131,11 +133,11 @@ struct GenerationSupervisorInner {
 
 #[derive(Debug)]
 struct GenerationSupervisorState {
+    identity: InstanceId,
     phase: GenerationSupervisorPhase,
     next_sequence: u64,
     operations: BTreeMap<String, SupervisedOperation>,
-    expected_workers: BTreeSet<u64>,
-    joined_workers: BTreeSet<u64>,
+    workers: WorkerLedger<u64>,
     canonical_close: Option<GenerationSupervisorClosedFacts>,
 }
 
@@ -144,7 +146,7 @@ struct SupervisedOperation {
     released: Arc<OnceLock<GenerationOperationSnapshot>>,
     current: GenerationAttemptIdentity,
     phase: GenerationOperationPhase,
-    cancellation_requested: bool,
+    control: RunControl,
     terminal: Option<GenerationTerminalRecord>,
     progress: VecDeque<u64>,
     attempts: BTreeMap<u64, SupervisedAttempt>,
@@ -153,7 +155,7 @@ struct SupervisedOperation {
 #[derive(Debug)]
 struct SupervisedAttempt {
     identity: GenerationAttemptIdentity,
-    cancellation_requested: bool,
+    control: RunControl,
 }
 
 impl GenerationSupervisor {
@@ -171,11 +173,11 @@ impl GenerationSupervisor {
         Ok(Self {
             inner: Arc::new(GenerationSupervisorInner {
                 state: Mutex::new(GenerationSupervisorState {
+                    identity: InstanceId::default(),
                     phase: GenerationSupervisorPhase::Running,
                     next_sequence,
                     operations: BTreeMap::new(),
-                    expected_workers: BTreeSet::new(),
-                    joined_workers: BTreeSet::new(),
+                    workers: WorkerLedger::new(COMPLETED_WORKER_HISTORY),
                     canonical_close: None,
                 }),
                 changed: Condvar::new(),
@@ -208,7 +210,7 @@ impl GenerationSupervisor {
                 released: Arc::clone(&released),
                 current: identity.clone(),
                 phase: GenerationOperationPhase::Reserved,
-                cancellation_requested: false,
+                control: RunControl::new(false),
                 terminal: None,
                 progress: VecDeque::with_capacity(self.inner.progress_capacity),
                 attempts: BTreeMap::new(),
@@ -253,6 +255,10 @@ impl GenerationSupervisor {
         if !operation.attempts.is_empty() {
             return Err(GenerationSupervisorError::AttemptsActive);
         }
+        operation
+            .control
+            .claim_terminal()
+            .ok_or(GenerationSupervisorError::InvalidTransition)?;
         let terminal = GenerationTerminalRecord {
             identity: lease.identity.clone(),
             class,
@@ -340,9 +346,9 @@ impl GenerationSupervisor {
     ) -> Result<(), GenerationSupervisorError> {
         let mut state = self.lock()?;
         let operation = current_operation_mut(&mut state, identity)?;
-        operation.cancellation_requested = true;
+        operation.control.request_cancel();
         for attempt in operation.attempts.values_mut() {
-            attempt.cancellation_requested = true;
+            attempt.control.request_cancel();
         }
         drop(state);
         self.inner.changed.notify_all();
@@ -455,9 +461,9 @@ impl GenerationSupervisor {
             state.phase = GenerationSupervisorPhase::Quiescing;
         }
         for operation in state.operations.values_mut() {
-            operation.cancellation_requested = true;
+            operation.control.request_cancel();
             for attempt in operation.attempts.values_mut() {
-                attempt.cancellation_requested = true;
+                attempt.control.request_cancel();
             }
         }
         drop(state);
@@ -480,7 +486,7 @@ impl GenerationSupervisor {
         if let Some(closed) = &state.canonical_close {
             return Ok(closed.clone());
         }
-        if !state.operations.is_empty() || state.expected_workers != state.joined_workers {
+        if !state.operations.is_empty() || state.workers.outstanding_count() != 0 {
             return Err(GenerationSupervisorError::NotDrained);
         }
         state.phase = GenerationSupervisorPhase::Closed;
@@ -491,7 +497,7 @@ impl GenerationSupervisor {
 
     pub fn note_worker_started(&self, worker_id: u64) -> Result<(), GenerationSupervisorError> {
         let mut state = self.lock()?;
-        if state.canonical_close.is_some() || !state.expected_workers.insert(worker_id) {
+        if state.canonical_close.is_some() || !state.workers.note_started(worker_id) {
             return Err(GenerationSupervisorError::DuplicateWorker(worker_id));
         }
         Ok(())
@@ -499,13 +505,8 @@ impl GenerationSupervisor {
 
     pub fn note_worker_joined(&self, worker_id: u64) -> Result<(), GenerationSupervisorError> {
         let mut state = self.lock()?;
-        if !state.expected_workers.contains(&worker_id) || !state.joined_workers.insert(worker_id) {
+        if !state.workers.note_joined(&worker_id) {
             return Err(GenerationSupervisorError::UnknownWorker(worker_id));
-        }
-        while state.joined_workers.len() > COMPLETED_WORKER_HISTORY {
-            if let Some(oldest) = state.joined_workers.pop_first() {
-                state.expected_workers.remove(&oldest);
-            }
         }
         drop(state);
         self.inner.changed.notify_all();
@@ -514,10 +515,7 @@ impl GenerationSupervisor {
 
     pub fn retained_task_count(&self) -> Result<usize, GenerationSupervisorError> {
         let state = self.lock()?;
-        Ok(state
-            .expected_workers
-            .len()
-            .saturating_sub(state.joined_workers.len()))
+        Ok(state.workers.outstanding_count())
     }
 
     pub fn closed_facts(
@@ -554,7 +552,7 @@ impl GenerationSupervisor {
             identity.sequence,
             SupervisedAttempt {
                 identity: identity.clone(),
-                cancellation_requested: record.cancellation_requested,
+                control: RunControl::new(record.control.cancellation_requested()),
             },
         );
         Ok(GenerationOperationLease {
@@ -592,7 +590,7 @@ impl GenerationSupervisor {
             .get(&attempt.identity.operation_id)
             .and_then(|operation| operation.attempts.get(&attempt.identity.sequence))
             .is_some_and(|candidate| {
-                candidate.identity == attempt.identity && candidate.cancellation_requested
+                candidate.identity == attempt.identity && candidate.control.cancellation_requested()
             }))
     }
 
@@ -607,11 +605,12 @@ impl GenerationSupervisor {
             .ok_or(GenerationSupervisorError::StaleLease)?;
         let removed = operation
             .attempts
-            .remove(&attempt.identity.sequence)
+            .get(&attempt.identity.sequence)
             .ok_or(GenerationSupervisorError::StaleLease)?;
         if removed.identity != attempt.identity {
             return Err(GenerationSupervisorError::StaleLease);
         }
+        operation.attempts.remove(&attempt.identity.sequence);
         Ok(())
     }
 
@@ -668,6 +667,7 @@ fn allocate_identity(
         .checked_add(1)
         .ok_or(GenerationSupervisorError::SequenceExhausted)?;
     Ok(GenerationAttemptIdentity {
+        owner: state.identity.clone(),
         attempt_id: format!("{operation_id}:{sequence}"),
         operation_id,
         sequence,
@@ -709,7 +709,7 @@ fn snapshot_for(
     GenerationOperationSnapshot {
         identity: operation.current.clone(),
         phase,
-        cancellation_requested: operation.cancellation_requested,
+        cancellation_requested: operation.control.cancellation_requested(),
         authoritative_terminal: operation.terminal.clone(),
         final_projection: operation.terminal.clone(),
         progress_projection: operation.progress.iter().copied().collect(),
@@ -722,6 +722,10 @@ fn terminal_and_release_locked(
     class: GenerationTerminalClass,
 ) -> Result<(), GenerationSupervisorError> {
     let operation = current_operation_mut(state, &lease.identity)?;
+    operation
+        .control
+        .claim_terminal()
+        .ok_or(GenerationSupervisorError::InvalidTransition)?;
     let terminal = GenerationTerminalRecord {
         identity: lease.identity.clone(),
         class,
@@ -741,12 +745,9 @@ fn closed_facts(state: &GenerationSupervisorState) -> GenerationSupervisorClosed
     GenerationSupervisorClosedFacts {
         lifecycle: state.phase,
         active_operations: state.operations.len(),
-        retained_tasks: state
-            .expected_workers
-            .len()
-            .saturating_sub(state.joined_workers.len()),
-        expected_workers: state.expected_workers.clone(),
-        joined_workers: state.joined_workers.clone(),
+        retained_tasks: state.workers.outstanding_count(),
+        expected_workers: state.workers.expected(),
+        joined_workers: state.workers.joined().clone(),
     }
 }
 
@@ -785,6 +786,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn identical_public_ids_and_sequences_do_not_cross_supervisor_owners() {
+        let left = GenerationSupervisor::new(4).expect("left owner");
+        let right = GenerationSupervisor::new(4).expect("right owner");
+        let (_, left_lease) = left.reserve("same-request").expect("left run");
+        let (_, right_lease) = right.reserve("same-request").expect("right run");
+        assert_eq!(
+            left_lease.identity().sequence,
+            right_lease.identity().sequence
+        );
+        assert_eq!(
+            right.request_cancel(left_lease.identity()),
+            Err(GenerationSupervisorError::StaleLease)
+        );
+        assert_eq!(
+            right.queue(&left_lease),
+            Err(GenerationSupervisorError::StaleLease)
+        );
+        assert_eq!(
+            right
+                .snapshot(&right_lease)
+                .expect("snapshot")
+                .expect("current")
+                .phase,
+            GenerationOperationPhase::Reserved
+        );
+        let left_attempt = left.start_attempt(&left_lease).expect("left attempt");
+        let right_attempt = right.start_attempt(&right_lease).expect("right attempt");
+        assert_eq!(
+            right.finish_attempt(&left_attempt),
+            Err(GenerationSupervisorError::StaleLease)
+        );
+        assert_eq!(
+            right.active_attempts(&right_lease).expect("right attempts"),
+            [right_attempt.identity().clone()]
+        );
+    }
+
+    #[test]
+    fn late_cancellation_does_not_rewrite_terminal_history() {
+        let supervisor = GenerationSupervisor::new(4).expect("owner");
+        let (ticket, lease) = supervisor.reserve("request").expect("run");
+        ticket.detach();
+        supervisor.queue(&lease).expect("queue");
+        supervisor.start(&lease).expect("start");
+        supervisor
+            .terminal(&lease, GenerationTerminalClass::Completed)
+            .expect("terminal");
+        supervisor
+            .request_cancel(lease.identity())
+            .expect("late cancellation is harmless");
+        assert!(
+            !supervisor
+                .cancellation_requested(&lease)
+                .expect("unchanged terminal")
+        );
+        assert_eq!(
+            supervisor.terminal(&lease, GenerationTerminalClass::Failed),
+            Err(GenerationSupervisorError::InvalidTransition)
+        );
+        supervisor.release(&lease).expect("release");
+    }
+
+    #[test]
     fn completed_history_does_not_grow_with_operation_count() {
         let supervisor = GenerationSupervisor::new(4).expect("supervisor");
         let mut retained = None;
@@ -815,8 +879,8 @@ mod tests {
             drop(ticket);
             let state = supervisor.lock().expect("state");
             assert!(state.operations.is_empty());
-            assert!(state.expected_workers.len() <= COMPLETED_WORKER_HISTORY);
-            assert!(state.joined_workers.len() <= COMPLETED_WORKER_HISTORY);
+            assert!(state.workers.expected().len() <= COMPLETED_WORKER_HISTORY);
+            assert!(state.workers.joined().len() <= COMPLETED_WORKER_HISTORY);
         }
         let old = retained.expect("retained lease");
         assert!(supervisor.snapshot(&old).expect("old snapshot").is_some());

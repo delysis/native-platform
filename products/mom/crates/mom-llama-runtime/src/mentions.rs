@@ -3712,7 +3712,7 @@ impl MentionCancelLifecycle {
             let mut registrations = Vec::with_capacity(targets.len());
             for target in targets {
                 let key = (invocation_id.to_string(), target.target_id.clone());
-                let flag = Arc::new(MentionCancelControl::running(quiescing));
+                let flag = Arc::new(MentionCancelControl::new(quiescing));
                 registry.insert(key.clone(), Arc::clone(&flag));
                 registrations.push((key, flag));
             }
@@ -3730,7 +3730,7 @@ impl MentionCancelLifecycle {
     ) -> Result<std::result::Result<Self, Blocker>> {
         scope.with_mention_registry(|registry, quiescing| {
             let key = (invocation_id.to_string(), target_id.to_string());
-            let flag = Arc::new(MentionCancelControl::running(quiescing));
+            let flag = Arc::new(MentionCancelControl::new(quiescing));
             let mut registrations = Vec::new();
             if registry.contains_key(&key) {
                 return Ok(Err(Blocker::new(
@@ -3752,7 +3752,11 @@ impl MentionCancelLifecycle {
         self.registrations
             .iter()
             .find(|(key, _)| key.0 == invocation_id && key.1 == target_id)
-            .is_some_and(|(_, control)| control.arbitrate_terminal())
+            .is_some_and(|(_, control)| {
+                control
+                    .claim_terminal()
+                    .is_some_and(|claim| claim.cancellation_requested)
+            })
     }
 
     fn requested(&self) -> bool {
@@ -6392,9 +6396,9 @@ mod tests {
     fn cancellation_lifecycle_removes_only_the_exact_registered_target_and_generation() {
         let first_key = ("invocation".to_string(), "first".to_string());
         let second_key = ("invocation".to_string(), "second".to_string());
-        let first = Arc::new(MentionCancelControl::running(false));
-        let replacement = Arc::new(MentionCancelControl::running(false));
-        let second = Arc::new(MentionCancelControl::running(false));
+        let first = Arc::new(MentionCancelControl::new(false));
+        let replacement = Arc::new(MentionCancelControl::new(false));
+        let second = Arc::new(MentionCancelControl::new(false));
         let mut registry = BTreeMap::from([
             (first_key.clone(), Arc::clone(&replacement)),
             (second_key.clone(), Arc::clone(&second)),
@@ -6411,13 +6415,23 @@ mod tests {
 
     #[test]
     fn cancellation_terminal_arbitration_is_monotonic() {
-        let cancelled = MentionCancelControl::running(false);
+        let cancelled = MentionCancelControl::new(false);
         assert!(cancelled.request_cancel());
-        assert!(cancelled.arbitrate_terminal());
+        assert!(
+            cancelled
+                .claim_terminal()
+                .expect("cancelled terminal")
+                .cancellation_requested
+        );
         assert!(!cancelled.request_cancel());
 
-        let completed = MentionCancelControl::running(false);
-        assert!(!completed.arbitrate_terminal());
+        let completed = MentionCancelControl::new(false);
+        assert!(
+            !completed
+                .claim_terminal()
+                .expect("completed terminal")
+                .cancellation_requested
+        );
         assert!(!completed.request_cancel());
     }
 
