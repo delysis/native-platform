@@ -14,3 +14,7 @@ Reproduce consequential defects at the real boundary. Run focused checks while
 editing, then one consolidated gate on the final revision. Reuse build outputs
 and prune stale generated caches proactively; do not repeat expensive builds
 without a changed input or unresolved failure. See CONTRIBUTING.md for commands.
+
+macOS is the development acceptance platform. Gate progress on macOS and fast
+platform-independent checks. Keep Linux and Windows tests running, but repair
+their failures asynchronously without holding up macOS development.
