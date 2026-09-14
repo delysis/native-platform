@@ -1,5 +1,6 @@
 //! Whole, explicitly granted model jobs. These receipts are remote assertions;
 //! a signature authenticates the host, not its model or execution environment.
+mod client;
 mod store;
 mod wire;
 
@@ -21,9 +22,10 @@ use uuid::Uuid;
 use crate::{Error, Identity, Result, Signed};
 use store::Ledger;
 
+pub use client::{ClientJob, ClientRequest, ComputeClient};
 pub use wire::Response as ComputeReply;
 pub(crate) use wire::{Handler, Request, Response, request};
-pub(crate) const ALPN: &[u8] = b"app.delysis.loom/compute/1";
+pub(crate) const ALPN: &[u8] = b"app.delysis.loom/compute/2";
 pub const MAX_COMPUTE_TEXT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_TOKENS: u32 = 2048;
 const MAX_JOB_SECONDS: u32 = 120;
@@ -367,15 +369,12 @@ impl ComputeHost {
 
     fn respond(&self, peer: PublicKey, request: Request) -> Result<Response> {
         let mut state = self.lock()?;
-        // Retrieval/cancellation only touch this peer's existing jobs. They do
-        // not require a continuing grant and can never start model execution.
+        let cancel = matches!(&request, Request::Cancel { .. });
+        // Retrieval and existing-job cancellation survive grant revocation.
+        // Cancelling an unobserved job spends its reviewed grant once and binds
+        // the exact input, so a delayed submission can never execute it.
         match request {
             Request::Status { job } => Ok(receipt_response(state.ledger.get(peer, job)?)),
-            Request::Cancel { job } => Ok(receipt_response(state.ledger.cancel(
-                peer,
-                job,
-                ComputeCancellation::Requested,
-            )?)),
             Request::Offers { cabal } => {
                 if state.closed || self.stop.is_cancelled() {
                     return Ok(Response::Rejected {
@@ -395,7 +394,7 @@ impl ComputeHost {
                 }
                 Ok(Response::Offers { grants })
             }
-            Request::Submit { job, grant, input } => {
+            Request::Submit { job, grant, input } | Request::Cancel { job, grant, input } => {
                 let reject = |reason| Ok(Response::Rejected { reason });
                 if job.is_nil() || input.validate().is_err() {
                     return reject(ComputeRejection::InvalidRequest);
@@ -403,9 +402,13 @@ impl ComputeHost {
                 let fingerprint = input.fingerprint(grant)?;
                 if let Some(existing) = state.ledger.get(peer, job)? {
                     return if existing.payload.request_fingerprint == fingerprint {
-                        Ok(Response::Receipt {
-                            receipt: Box::new(existing),
-                        })
+                        Ok(receipt_response(if cancel {
+                            state
+                                .ledger
+                                .cancel(peer, job, ComputeCancellation::Requested)?
+                        } else {
+                            Some(existing)
+                        }))
                     } else {
                         reject(ComputeRejection::MismatchedRetry)
                     };
@@ -422,7 +425,7 @@ impl ComputeHost {
                 if input.max_output_tokens > grant.max_output_tokens {
                     return reject(ComputeRejection::InvalidRequest);
                 }
-                if state.active.is_some() || !self.executor.available(&grant.model) {
+                if !cancel && (state.active.is_some() || !self.executor.available(&grant.model)) {
                     return reject(ComputeRejection::Busy);
                 }
                 if !state.ledger.has_capacity(&grant)? {
@@ -435,6 +438,21 @@ impl ComputeHost {
                     input,
                 };
                 let receipt = state.ledger.accept(&pending, fingerprint)?;
+                if cancel {
+                    state
+                        .ledger
+                        .cancel(peer, job, ComputeCancellation::Requested)?;
+                    let receipt = state.ledger.transition(
+                        peer,
+                        job,
+                        ComputeStatus::Cancelled {
+                            reason: ComputeCancellation::Requested,
+                        },
+                    )?;
+                    return Ok(Response::Receipt {
+                        receipt: Box::new(receipt),
+                    });
+                }
                 state.active = Some(pending.clone());
                 if self.pending.try_send(pending).is_err() {
                     state.closed = true;

@@ -218,6 +218,94 @@ async fn notified(notify: &Notify) {
 }
 
 #[tokio::test]
+async fn cancelling_before_admission_prevents_a_delayed_submission_from_executing() -> Result<()> {
+    let pair = Pair::new("must not run", 1, 10).await?;
+    pair.host.grant(pair.grant.clone())?;
+    let job = Uuid::new_v4();
+    let cancelled = receipt(
+        pair.peer
+            .compute_cancel(pair.network.address(), job, pair.grant.id, input())
+            .await?,
+    );
+    assert!(matches!(
+        cancelled.payload.status,
+        ComputeStatus::Cancelled { .. }
+    ));
+    assert_eq!(receipt(pair.submit(job).await?).hash()?, cancelled.hash()?);
+    assert_eq!(pair.executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(pair.host.grant_statuses()?[0].jobs_remaining, 0);
+    pair.close().await
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn requesting_device_restart_recovers_lost_replies_and_preserves_cancellation_intent()
+-> Result<()> {
+    use loom_cabal::compute::{ClientRequest, ComputeClient};
+    let pair = Pair::new("discard cancelled output", 1, 10).await?;
+    pair.host.grant(pair.grant.clone())?;
+    let directory = pair.directory.path().join("caller");
+    let mut client = ComputeClient::open(&directory, pair.peer.address().id)?;
+    let request = ClientRequest {
+        id: Uuid::new_v4(),
+        host: pair.network.address().id,
+        grant: pair.grant.clone(),
+        input: input(),
+    };
+    client.prepare(request.clone())?;
+    let _lost_reply = pair.submit(request.id).await?;
+    notified(&pair.executor.started).await;
+    drop(client);
+    let mut client = ComputeClient::open(&directory, pair.peer.address().id)?;
+    assert!(
+        client
+            .get(request.id)?
+            .expect("saved job")
+            .receipt
+            .is_none()
+    );
+    let observed = receipt(
+        pair.peer
+            .compute_status(pair.network.address(), request.id)
+            .await?,
+    );
+    client.record(observed)?;
+    client.request_cancel(request.id)?;
+    drop(client);
+    let mut client = ComputeClient::open(&directory, pair.peer.address().id)?;
+    let saved = client.get(request.id)?.expect("cancel intent");
+    assert!(saved.cancel_requested);
+    let cancelling = receipt(
+        pair.peer
+            .compute_cancel(
+                pair.network.address(),
+                saved.request.id,
+                saved.request.grant.id,
+                saved.request.input,
+            )
+            .await?,
+    );
+    client.record(cancelling)?;
+    notified(&pair.executor.cancelled).await;
+    pair.executor.release.add_permits(1);
+    let terminal = pair.wait_terminal(request.id).await?;
+    client.record(terminal.clone())?;
+    let retried = receipt(pair.submit(request.id).await?);
+    assert_eq!(retried.hash()?, terminal.hash()?);
+    assert_eq!(
+        client.record(retried)?.receipt.expect("terminal").hash()?,
+        terminal.hash()?
+    );
+    assert_eq!(
+        pair.executor.calls.load(Ordering::SeqCst),
+        1,
+        "only the original reviewed submission executes"
+    );
+    assert_eq!(client.jobs(pair.grant.cabal)?.len(), 1);
+    pair.close().await
+}
+
+#[tokio::test]
 async fn explicit_grant_and_authenticated_job_retries_run_once_over_quic() -> Result<()> {
     let pair = Pair::new("A host assertion", 1, 10).await?;
     let job = Uuid::new_v4();
@@ -273,7 +361,9 @@ async fn explicit_grant_and_authenticated_job_retries_run_once_over_quic() -> Re
         ComputeRejection::Denied,
     );
     rejected(
-        stranger.compute_cancel(pair.network.address(), job).await?,
+        stranger
+            .compute_cancel(pair.network.address(), job, pair.grant.id, input())
+            .await?,
         ComputeRejection::Denied,
     );
     rejected(
@@ -362,7 +452,7 @@ async fn cancellation_does_not_release_capacity_or_claim_join_before_worker_retu
     notified(&pair.executor.started).await;
     let cancelling = receipt(
         pair.peer
-            .compute_cancel(pair.network.address(), job)
+            .compute_cancel(pair.network.address(), job, pair.grant.id, input())
             .await?,
     );
     assert_eq!(

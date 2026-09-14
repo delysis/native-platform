@@ -224,8 +224,14 @@ impl Network {
             .await
     }
 
-    pub async fn compute_cancel(&self, host: EndpointAddr, job: Uuid) -> Result<ComputeReply> {
-        self.request_compute(host, compute::Request::Cancel { job })
+    pub async fn compute_cancel(
+        &self,
+        host: EndpointAddr,
+        job: Uuid,
+        grant: Uuid,
+        input: ComputeInput,
+    ) -> Result<ComputeReply> {
+        self.request_compute(host, compute::Request::Cancel { job, grant, input })
             .await
     }
 

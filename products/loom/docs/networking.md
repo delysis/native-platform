@@ -183,11 +183,20 @@ grant survives closing the pane and retains its exact retry ID; status checks
 cannot create a second budget. Revoking even an uncertain, not-yet-admitted
 grant durably rejects a delayed first admission. These revocation records share
 the bounded grant ledger. Caller-side job submission and result retention
-remain to be integrated into the terminal.
+remain to be integrated into the terminal. The requesting-device ledger already
+retains exact prompts, grant/model targets, and cancellation intent before
+dispatch. It reserves result space, verifies every retained host assertion
+against that saved input, and rejects model substitution, rewritten terminal
+receipts, and state rollback. Reopening the ledger never resubmits a job or
+invents a remote completion.
 
 An accepted job is committed before dispatch. Each authenticated caller owns its
 job IDs, and a retry must match the exact original input and grant. Status checks
-and cancellation never dispatch work. Completed replies survive restart; an
+and cancellation never dispatch model work. The current compute protocol is
+version 2: cancellation carries the exact grant and input, so even cancellation
+that arrives before submission receives a durable terminal receipt. This spends
+one job from the reviewed budget and prevents any delayed exact submission from
+executing. Completed replies survive restart; an
 unfinished job receives an interrupted receipt and is never automatically rerun.
 There is one active host job, no waiting model queue, eight incoming connections,
 and four outgoing requests. Text input and output each stop at 64 KiB, output at

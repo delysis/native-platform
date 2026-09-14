@@ -248,6 +248,18 @@ fn real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript() 
         let peer = Network::start(&peer_identity, NetworkMode::Local)
             .await
             .expect("peer endpoint");
+        let client_path = directory.path().join("caller");
+        let mut client =
+            loom_cabal::compute::ComputeClient::open(&client_path, peer_identity.public_key())
+                .expect("private caller ledger");
+        client
+            .prepare(loom_cabal::compute::ClientRequest {
+                id: job.id,
+                host: host_identity.public_key(),
+                grant: job.grant.clone(),
+                input: job.input.clone(),
+            })
+            .expect("persist exact intent before sending");
         let accepted = peer
             .compute_submit(
                 host_network.address(),
@@ -260,6 +272,19 @@ fn real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript() 
         assert!(
             matches!(accepted, ComputeReply::Receipt { .. }),
             "{accepted:?}"
+        );
+        // Simulate losing the admission response and restarting the caller.
+        drop(client);
+        let mut client =
+            loom_cabal::compute::ComputeClient::open(&client_path, peer_identity.public_key())
+                .expect("reopen caller without resubmitting");
+        assert!(
+            client
+                .get(job.id)
+                .expect("saved request")
+                .expect("prepared job")
+                .receipt
+                .is_none()
         );
         let completed = tokio::time::timeout(Duration::from_mins(2), async {
             loop {
@@ -279,6 +304,24 @@ fn real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript() 
         .await
         .expect("native job deadline");
         completed.verify().expect("host signature");
+        client
+            .record((*completed).clone())
+            .expect("bind the actual result to saved intent");
+        drop(client);
+        let client =
+            loom_cabal::compute::ComputeClient::open(&client_path, peer_identity.public_key())
+                .expect("reopen retained remote result");
+        assert_eq!(
+            client
+                .get(job.id)
+                .expect("saved result")
+                .expect("job")
+                .receipt
+                .expect("terminal")
+                .hash()
+                .expect("retained digest"),
+            completed.hash().expect("remote digest")
+        );
         let ComputeStatus::Completed { text } = &completed.payload.status else {
             panic!("native result: {:?}", completed.payload.status);
         };

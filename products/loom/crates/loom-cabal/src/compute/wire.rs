@@ -22,6 +22,8 @@ pub(crate) enum Request {
     },
     Cancel {
         job: Uuid,
+        grant: Uuid,
+        input: ComputeInput,
     },
 }
 
@@ -201,14 +203,15 @@ fn validate_response(
         }
         (
             Response::Receipt { receipt },
-            Request::Submit { job, .. } | Request::Status { job } | Request::Cancel { job },
+            Request::Submit { job, .. } | Request::Status { job } | Request::Cancel { job, .. },
         ) => {
             receipt.verify()?;
             if receipt.signer != host || receipt.payload.peer != peer || receipt.payload.job != *job
             {
                 return Err(Error::Invalid("Remote compute receipt identity mismatch"));
             }
-            if let Request::Submit { grant, input, .. } = request
+            if let Request::Submit { grant, input, .. } | Request::Cancel { grant, input, .. } =
+                request
                 && (receipt.payload.grant != *grant
                     || receipt.payload.request_fingerprint != input.fingerprint(*grant)?)
             {
