@@ -1709,6 +1709,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-generation-policy"
+version = "0.0.0"
+dependencies = [
+ "llama-native-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "desktop-model-defaults"
 version = "0.0.0"
 
@@ -4035,6 +4045,7 @@ name = "loom-backend-llama"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
+ "desktop-generation-policy",
  "fs4",
  "hex",
  "llama-native-engine",
@@ -4415,6 +4426,7 @@ dependencies = [
  "chacha20poly1305",
  "crossbeam-channel",
  "desktop-context",
+ "desktop-generation-policy",
  "desktop-model-defaults",
  "fs2",
  "getrandom 0.3.4",
@@ -7165,6 +7177,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "desktop-context",
+ "desktop-generation-policy",
  "desktop-model-defaults",
  "hound",
  "http",
