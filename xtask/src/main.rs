@@ -267,6 +267,11 @@ fn check_git_dependencies(value: &toml::Value, manifest: &Path) -> Result<()> {
                     {
                         "3a45e915520348cbd93fc13de47c482b8e855c99"
                     }
+                    "https://github.com/whisperfish/libsignal-service-rs"
+                        if manifest.ends_with("products/loom/signal/vendor/presage/Cargo.toml") =>
+                    {
+                        "9e6c08b8e6d413391831dc49065e5b05490d6c82"
+                    }
                     _ => anyhow::bail!(
                         "forbidden Git dependency in {}: {repository}",
                         manifest.display()
@@ -450,5 +455,23 @@ mod tests {
         assert!(check_git_dependencies(&manifest, Path::new("Cargo.toml")).is_err());
         manifest["dependency"]["rev"] = toml::Value::String("main".into());
         assert!(check_git_dependencies(&manifest, worker).is_err());
+    }
+
+    #[test]
+    fn vendored_signal_client_keeps_its_existing_service_pin_isolated() {
+        let mut dependency: toml::Value = toml::from_str(
+            r#"dependency = { git = "https://github.com/whisperfish/libsignal-service-rs", rev = "9e6c08b8e6d413391831dc49065e5b05490d6c82" }"#,
+        ).expect("manifest");
+        let vendored = Path::new("products/loom/signal/vendor/presage/Cargo.toml");
+        check_git_dependencies(&dependency, vendored).expect("unchanged upstream pin");
+        for other in [
+            "Cargo.toml",
+            "products/loom/signal/Cargo.toml",
+            "vendor/presage/Cargo.toml",
+        ] {
+            assert!(check_git_dependencies(&dependency, Path::new(other)).is_err());
+        }
+        dependency["dependency"]["rev"] = toml::Value::String("main".into());
+        assert!(check_git_dependencies(&dependency, vendored).is_err());
     }
 }

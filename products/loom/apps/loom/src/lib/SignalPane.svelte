@@ -2,6 +2,7 @@
   import { onMount, tick } from 'svelte';
   import { normalizeFailure } from './ipc';
   import type { SignalDraftEditor } from './signalDraft';
+  import SignalIdentity from './SignalIdentity.svelte';
   import { listenSignal, signalRequest, signalDraftPrompt, signalWorkspaces, updateSignalWorkspace, signalWorkspaceIds, type SignalConversation, type SignalEvent, type SignalMessage, type SignalStatus, type SignalWorkspaceLinks } from './signal';
 
   export let onClose: () => void;
@@ -12,7 +13,8 @@
   export let editor: SignalDraftEditor;
   export let modelLabel = 'Local model';
   export let workspaceScope = '';
-  let status: SignalStatus = { version: 2, phase: 'unlinked', account_id: null, device_name: null };
+  let status: SignalStatus = { version: 3, phase: 'unlinked', account_id: null, device_name: null };
+  let identityRefresh = 0;
   let conversations: SignalConversation[] = [];
   let selected = editor.conversation;
   let search = '';
@@ -58,10 +60,12 @@
   async function observe(event: SignalEvent): Promise<void> {
     if (!mounted) return;
     if (event.kind === 'status') {
+      identityRefresh++;
       status = event.status;
       if (status.phase !== 'linking') qr = '';
       if (status.account_id) await refresh();
     } else if (event.kind === 'changed') {
+      identityRefresh++;
       await refresh();
     } else if (event.kind === 'failure') {
       error = event.message;
@@ -235,6 +239,7 @@
       </select>
     </div>
     {#if conversation}
+      {#key selected}<SignalIdentity conversation={selected} refreshToken={identityRefresh} />{/key}
       {#if conversation.description}<p class="description">{conversation.description}</p>{/if}
       {#if links?.workspaces.length || signalWorkspaceIds(conversation.description ?? '').length}
         <div class="workspaces" aria-label="Conversation workspaces">

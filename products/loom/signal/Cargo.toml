@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["vendor/presage", "vendor/presage-store-sqlite"]
 
 [package]
 name = "loom-signal"
@@ -42,3 +43,7 @@ unsafe_code = "forbid"
 [profile.dev]
 debug = "line-tables-only"
 incremental = false
+
+[patch."https://github.com/whisperfish/presage"]
+presage = { path = "vendor/presage" }
+presage-store-sqlite = { path = "vendor/presage-store-sqlite" }

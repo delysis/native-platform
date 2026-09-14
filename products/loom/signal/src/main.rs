@@ -4,6 +4,7 @@
 
 mod client;
 mod drafts;
+mod identity;
 mod messages;
 mod retention;
 mod vault;
@@ -81,7 +82,11 @@ async fn run() -> anyhow::Result<()> {
         output_stop.cancel();
     });
     let result = match vault::Vault::open(&directory).await {
-        Ok(vault) => client::run(vault, requests, responses.clone(), stop.clone()).await,
+        Ok(vault) => {
+            let result = client::run(&vault, requests, responses.clone(), stop.clone()).await;
+            vault.close().await;
+            result
+        }
         Err(_) => {
             let _ = responses.send(Response { id: None, event: Event::Failure {
                 code: "vault_unavailable".into(),

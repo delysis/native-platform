@@ -332,12 +332,15 @@ pub(crate) async fn signal_request<R: tauri::Runtime>(
     super::ensure_application_running(&state, "Signal work")?;
     if matches!(
         request.command,
-        Command::Send { .. } | Command::Link { .. } | Command::CancelLink
+        Command::Send { .. }
+            | Command::Link { .. }
+            | Command::CancelLink
+            | Command::VerifyIdentity { .. }
     ) && !window.is_focused().unwrap_or(false)
     {
         return Err(super::IpcFailure::new(
             "signal_focus_required",
-            "Return to Loom before linking or sending a Signal message.",
+            "Return to Loom before linking, verifying a safety number, or sending a Signal message.",
             false,
         ));
     }

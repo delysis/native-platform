@@ -16,6 +16,7 @@ use sqlx::{
 pub struct Vault {
     pub store: SqliteStore,
     pub database: SqlitePool,
+    protocol_database: SqlitePool,
     _lease: File,
 }
 
@@ -72,32 +73,69 @@ impl Vault {
             .max_connections(1)
             .connect_with(options.clone())
             .await?;
-        let cipher: Option<String> = sqlx::query_scalar("PRAGMA cipher_version")
-            .fetch_optional(&database)
-            .await?;
-        anyhow::ensure!(
-            cipher.is_some_and(|value| !value.is_empty()),
-            "SQLCipher unavailable"
-        );
-        // Presage trusts an identity on first use. Changed identities remain
-        // rejected; the UI must not silently replace them to restore a session.
-        let store = SqliteStore::open_with_options(options, OnNewIdentity::Reject).await?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS loom_send_v1 (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('uncertain', 'sent')), conversation TEXT NOT NULL, timestamp INTEGER NOT NULL, UNIQUE(conversation, timestamp))")
-            .execute(&database).await?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS loom_retention_v1 (thread_id INTEGER NOT NULL, ts INTEGER NOT NULL, expires_at INTEGER, PRIMARY KEY(thread_id, ts))").execute(&database).await?;
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS loom_retention_expiry_v1 ON loom_retention_v1(expires_at)",
-        )
-        .execute(&database)
-        .await?;
-        sqlx::query("CREATE TABLE IF NOT EXISTS loom_drafts_v1(conversation TEXT PRIMARY KEY, command TEXT NOT NULL, body TEXT NOT NULL)").execute(&database).await?;
-        crate::workspaces::initialize(&database).await?;
+        let protocol_database = match SqlitePoolOptions::new()
+            .max_connections(10)
+            .connect_with(options)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                database.close().await;
+                return Err(error.into());
+            }
+        };
+        let initialized = initialize_store(&database, &protocol_database).await;
+        let store = match initialized {
+            Ok(store) => store,
+            Err(error) => {
+                protocol_database.close().await;
+                database.close().await;
+                return Err(error);
+            }
+        };
         Ok(Self {
             store,
             database,
+            protocol_database,
             _lease: lease,
         })
     }
+
+    /// SQLx owns native SQLite threads. Join both pools before process exit;
+    /// simply dropping their handles leaves SQLCipher cleanup running detached.
+    pub async fn close(&self) {
+        self.protocol_database.close().await;
+        self.database.close().await;
+    }
+}
+
+async fn initialize_store(
+    database: &SqlitePool,
+    protocol_database: &SqlitePool,
+) -> Result<SqliteStore> {
+    let cipher: Option<String> = sqlx::query_scalar("PRAGMA cipher_version")
+        .fetch_optional(database)
+        .await?;
+    anyhow::ensure!(
+        cipher.is_some_and(|value| !value.is_empty()),
+        "SQLCipher unavailable"
+    );
+    // Presage trusts an identity on first use. Changed identities remain
+    // rejected; the UI must not silently replace them to restore a session.
+    let store =
+        SqliteStore::open_with_pool(protocol_database.clone(), OnNewIdentity::Reject).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS loom_send_v1 (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('uncertain', 'sent')), conversation TEXT NOT NULL, timestamp INTEGER NOT NULL, UNIQUE(conversation, timestamp))")
+    .execute(database).await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS loom_retention_v1 (thread_id INTEGER NOT NULL, ts INTEGER NOT NULL, expires_at INTEGER, PRIMARY KEY(thread_id, ts))").execute(database).await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS loom_retention_expiry_v1 ON loom_retention_v1(expires_at)",
+    )
+    .execute(database)
+    .await?;
+    sqlx::query("CREATE TABLE IF NOT EXISTS loom_drafts_v1(conversation TEXT PRIMARY KEY, command TEXT NOT NULL, body TEXT NOT NULL)").execute(database).await?;
+    crate::workspaces::initialize(database).await?;
+    crate::identity::initialize(database).await?;
+    Ok(store)
 }
 
 fn private_file(path: &Path, exclusive: bool) -> Result<File> {

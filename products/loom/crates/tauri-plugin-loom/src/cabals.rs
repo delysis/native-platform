@@ -1476,11 +1476,12 @@ fn save_projection(
     Ok(outcome.visible_projection)
 }
 
-#[cfg(test)]
+// ProjectStore uses anchored filesystem capabilities, currently Unix-only.
+// The non-Unix fail-closed behavior is covered in loom-store.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn compute_commands_bind_exact_model_membership_and_workspace() {

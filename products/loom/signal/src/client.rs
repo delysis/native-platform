@@ -31,11 +31,12 @@ struct Output {
 }
 
 pub async fn run(
-    vault: Vault,
+    vault: &Vault,
     mut requests: mpsc::Receiver<Request>,
     output: mpsc::Sender<Response>,
     stop: CancellationToken,
 ) -> Result<()> {
+    crate::identity::apply_approved(&vault.database).await?;
     retention::sweep(&vault.database).await?;
     let output = Output {
         sender: output,
@@ -171,8 +172,13 @@ pub async fn run(
                     }
                     command => {
                         let observed = *phase.borrow();
-                        let result = handle(&vault, manager.as_mut(), observed, &id, command).await;
+                        let result = handle(vault, manager.as_mut(), observed, &id, command).await;
+                        let restart = matches!(&result, Event::Identity { review: Some(review), .. } if review.state == loom_signal_protocol::IdentityState::Pending);
                         emit(&output, Some(id), result).await;
+                        // Retire this process before applying a reviewed key.
+                        // Upstream receive/sync work may retain old sessions.
+                        // The supervisor waits for exit, then reopens our vault.
+                        if restart { break; }
                     }
                 }
             }
@@ -188,7 +194,6 @@ pub async fn run(
     if let Some(task) = receiver.take() {
         let _ = task.await;
     }
-    vault.database.close().await;
     result
 }
 
@@ -242,6 +247,43 @@ async fn handle(
         return failure("unlinked", "Link Signal from your phone first.", false);
     };
     match command {
+        Command::Identity {
+            conversation_id,
+            recipient_id,
+            refresh,
+        } => {
+            match crate::identity::inspect(
+                vault,
+                manager,
+                &conversation_id,
+                recipient_id.as_deref(),
+                refresh,
+            )
+            .await
+            {
+                Ok(event) => event,
+                Err(_) => failure(
+                    "identity_unavailable",
+                    "The safety number could not be read. Reconnect and refresh it before verifying.",
+                    true,
+                ),
+            }
+        }
+        Command::VerifyIdentity {
+            conversation_id,
+            recipient_id,
+            review_id,
+        } => {
+            match crate::identity::approve(vault, &conversation_id, &recipient_id, &review_id).await
+            {
+                Ok(event) => event,
+                Err(_) => failure(
+                    "identity_review_stale",
+                    "This safety-number review is no longer current. Refresh and compare it again.",
+                    true,
+                ),
+            }
+        }
         Command::Workspaces { conversation_id } => {
             let result = async {
                 messages::resolve(&vault.store, &conversation_id).await?;
@@ -445,6 +487,16 @@ async fn send(
         body: Some(text.into()),
         ..Default::default()
     };
+    if crate::identity::ensure_send_allowed(&vault.store, &vault.database, conversation)
+        .await
+        .is_err()
+    {
+        return failure(
+            "identity_check_required",
+            "Review this conversation's safety numbers before sending. This message has not been sent.",
+            false,
+        );
+    }
     if let Thread::Group(key) = &thread {
         let Ok(Some(group)) = vault.store.group(*key).await else {
             return failure(
@@ -576,7 +628,7 @@ fn start_receiver(
                             emit(&output, None, Event::Changed { conversation_id }).await;
                         }
                         Received::DecryptionError(_) => emit(&output, None,
-                            failure("decryption_failed", "A Signal message could not be decrypted. Check the contact's safety number in Signal.", false)).await,
+                            failure("decryption_failed", "A Signal message could not be decrypted. Open Safety numbers and review this contact.", false)).await,
                     }
                 }
                 Ok::<(), presage::Error<presage_store_sqlite::SqliteStoreError>>(())

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_SIZE: usize = 100;
@@ -24,6 +24,16 @@ pub enum Command {
     },
     CancelLink,
     Conversations,
+    Identity {
+        conversation_id: String,
+        recipient_id: Option<String>,
+        refresh: bool,
+    },
+    VerifyIdentity {
+        conversation_id: String,
+        recipient_id: String,
+        review_id: String,
+    },
     Workspaces {
         conversation_id: String,
     },
@@ -77,6 +87,11 @@ pub enum Event {
     },
     Conversations {
         conversations: Vec<Conversation>,
+    },
+    Identity {
+        conversation_id: String,
+        members: Vec<IdentityMember>,
+        review: Option<IdentityReview>,
     },
     Workspaces {
         conversation_id: String,
@@ -134,6 +149,35 @@ pub struct Conversation {
     pub is_group: bool,
     pub disappearing: bool,
     pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityMember {
+    pub id: String,
+    pub title: String,
+}
+
+/// Public comparison material only. Private keys and protocol sessions never
+/// leave the isolated worker. A review ID authorizes only the displayed pair.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityReview {
+    pub recipient_id: String,
+    pub review_id: String,
+    pub safety_number: String,
+    pub qr_code: String,
+    pub state: IdentityState,
+    pub refreshed_at: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityState {
+    Unverified,
+    Verified,
+    Changed,
+    Pending,
 }
 
 /// A local bookmark, never an invitation or a filesystem capability.

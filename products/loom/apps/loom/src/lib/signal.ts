@@ -17,9 +17,16 @@ export interface SignalSendAttempt { id: string; conversation: string; text: str
 export interface SignalDraft { version: number; text: string; pending: SignalSendAttempt | null }
 export interface SignalWorkspace { id: string; title: string }
 export interface SignalWorkspaceLinks { version: number; workspaces: SignalWorkspace[] }
+export interface SignalIdentityMember { id: string; title: string }
+export interface SignalIdentityReview {
+  recipient_id: string; review_id: string; safety_number: string; qr_code: string;
+  state: 'unverified' | 'verified' | 'changed' | 'pending'; refreshed_at: number | null;
+}
 export type SignalCommand =
   | { kind: 'status' | 'conversations' | 'cancel_link' }
   | { kind: 'link'; device_name: string }
+  | { kind: 'identity'; conversation_id: string; recipient_id: string | null; refresh: boolean }
+  | { kind: 'verify_identity'; conversation_id: string; recipient_id: string; review_id: string }
   | { kind: 'messages'; conversation_id: string; before: number | null; limit: number }
   | { kind: 'workspaces'; conversation_id: string }
   | { kind: 'update_workspace'; conversation_id: string; expected_version: number; workspace_id: string; title: string | null }
@@ -31,6 +38,7 @@ export type SignalEvent =
   | { kind: 'status'; status: SignalStatus }
   | { kind: 'link'; url: string; qr_code: string }
   | { kind: 'conversations'; conversations: SignalConversation[] }
+  | { kind: 'identity'; conversation_id: string; members: SignalIdentityMember[]; review: SignalIdentityReview | null }
   | { kind: 'messages'; conversation_id: string; messages: SignalMessage[] }
   | { kind: 'workspaces'; conversation_id: string; links: SignalWorkspaceLinks }
   | { kind: 'draft'; conversation_id: string; draft: SignalDraft }

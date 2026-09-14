@@ -121,9 +121,23 @@ transfer need an explicit recovery design before this can be called complete.
 
 Signal uses pinned Presage and libsignal implementations. Its database key lives
 in the OS credential vault; an unavailable vault never falls back to plaintext.
-Presage uses trust on first use and rejects changed identities. Loom must provide
-an explicit verification workflow before treating changed-identity recovery as
-finished. It must never silently replace an identity to make a send succeed.
+Presage uses trust on first use and rejects changed identities. The Safety numbers
+panel supports direct chats and current group members. It uses libsignal's
+version-2, 5200-iteration fingerprint over raw ACI UUIDs, matching Signal Desktop.
+Looking up a fresh public key does not trust it or consume a prekey. Each review
+binds the exact local key, recipient, and both stored recipient identities;
+refreshing invalidates the old review ID. Verification is local to this Loom
+device and requires an explicit comparison of the displayed number or QR code.
+
+Accepting a review journals approval in SQLCipher, then retires the owned worker.
+Its supervisor waits for the process to exit before reopening the same vault.
+Before any networking starts, one transaction checks that the reviewed keys are
+still current, adopts the approved recipient identity, retires changed device and
+group sender sessions, and records verification. A stale approval cannot adopt
+another key. A failed transaction preserves the old keys and pending approval.
+An approval does not resend any message. Chats with a known changed identity
+cannot start a new send until it has been reviewed. The panel shows verification
+only after the new worker confirms the committed record.
 
 Send uncertainty is committed before network submission. Repeating the same
 send ID checks its existing receipt; Check send is strictly read-only and cannot
@@ -131,7 +145,7 @@ dispatch a new message. Authored drafts and pending-send identities are saved
 inside the encrypted database with optimistic versions and exact retry IDs.
 Workspace bookmarks use the same database, with versioned updates, exact retries,
 16 links per conversation, and bounded total storage. They contain no invitation
-tokens or group keys. The bundled frontend/native host and worker use IPC version 2;
+tokens or group keys. The bundled frontend/native host and worker use IPC version 3;
 an older worker is rejected instead of partially serving newer requests.
 
 Shutdown is a terminal stdin command: the reader forwards it in order and does
@@ -267,6 +281,13 @@ Presage and the Signal worker are AGPL-3.0-only. Preserve the worker's license,
 upstream notices, pinned dependency lockfile, and corresponding source when
 distributing it. The process boundary provides lifecycle and dependency isolation;
 it is not a declaration about the legal scope of the combined distribution.
+
+The worker vendors the pinned Presage and SQLite store crates with three small
+source-file patches: a public identity lookup, an owned-pool constructor, and
+unsafe-code prohibitions. Each crate carries its upstream revision, original
+file hashes, license, and patch notes. Loom joins both SQLite pools before exit,
+including initialization failures; dropping the store alone left SQLCipher
+connection cleanup detached and reproduced a crash during process exit.
 
 ## Remaining acceptance and implementation
 
