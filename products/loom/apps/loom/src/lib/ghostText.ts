@@ -577,7 +577,7 @@ function ghostWidget(
   widget.contentEditable = 'false';
   widget.draggable = false;
   widget.spellcheck = false;
-  widget.textContent = plan.text;
+  widget.textContent = plan.hidden ? '' : (nextVisualSuggestionWord(plan.text)?.trimEnd() ?? '');
   container.append(widget);
 
   if (plan.alternatives.length > 1) {
@@ -670,7 +670,7 @@ function synchronizeGhostWidgetDom(
   const container = view.dom.querySelector<HTMLElement>('.loom-ghost-widget');
   const widget = container?.querySelector<HTMLElement>('.loom-visual-ghost');
   if (!container || !widget) return;
-  widget.textContent = plan.text;
+  widget.textContent = plan.hidden ? '' : (nextVisualSuggestionWord(plan.text)?.trimEnd() ?? '');
   widget.classList.toggle('ghost-text-hidden', plan.hidden);
   widget.setAttribute(GHOST_PRESENTATION_ATTRIBUTE, plan.presentationKey);
   container.classList.toggle('fan-visible', plan.fanVisible);
@@ -1053,17 +1053,18 @@ export function createGhostTextPlugin(
             // Claim parent authority while its exact visibility witness still
             // exists. Clearing first would invalidate every legitimate
             // acceptance before the parent can bind it to durable authority.
-            const accepted = plan.insertsOnAccept
+            const word = nextVisualSuggestionWord(plan.text);
+            const accepted = word && (plan.insertsOnAccept
               ? Boolean(handlers.insert?.(
                   plan.candidateId,
                   plan.presentationKey,
-                  plan.text,
+                  word,
                   'inline_tab'
                 ))
-              : handlers.accept(plan.candidateId, plan.presentationKey);
+              : word === plan.text && handlers.accept(plan.candidateId, plan.presentationKey));
             if (accepted) {
               view.dispatch(plan.insertsOnAccept
-                ? view.state.tr.insertText(plan.text)
+                ? view.state.tr.insertText(word!)
                 : clearTransaction(view));
               return true;
             }

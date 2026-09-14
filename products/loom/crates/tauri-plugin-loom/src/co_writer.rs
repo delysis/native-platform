@@ -26,6 +26,7 @@ use crate::context_attachments::{
 };
 
 const PROFILE_SCHEMA: &str = "loom.co-writer-profiles.v2";
+const CONTEXT_PROFILE_SCHEMA: &str = "loom.co-writer-profiles.v1";
 const MAX_PROFILES: usize = 64;
 const MAX_NAME_BYTES: usize = 96;
 const MAX_MARKDOWN_BYTES: usize = 256 * 1024;
@@ -98,12 +99,36 @@ impl AppliedCoWriter {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredCoWriterProfile {
+struct FrozenCoWriterProfile {
     id: String,
     name: String,
     frozen: AppliedCoWriter,
     created_at_unix_ms: i64,
     updated_at_unix_ms: i64,
+}
+
+/// Current-main libraries recorded context only. Keep that distinction until
+/// an explicit save or apply freezes a generation profile; a read cannot
+/// manufacture historical settings or a source revision that never existed.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ContextCoWriterProfile {
+    id: String,
+    name: String,
+    source_document_id: String,
+    markdown: String,
+    attachment_ids: Vec<String>,
+    #[serde(default)]
+    text_sources: Vec<ContextTextSourcePresentation>,
+    created_at_unix_ms: i64,
+    updated_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum StoredCoWriterProfile {
+    Frozen(Box<FrozenCoWriterProfile>),
+    Context(ContextCoWriterProfile),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -161,13 +186,20 @@ pub(crate) fn list(project_root: &Path) -> Result<Vec<CoWriterSummary>, CoWriter
         .values()
         .map(profile_summary)
         .collect::<Result<Vec<_>, _>>()?;
-    let config = MineConfig::read(project_root)?;
+    // Workspace settings report their own errors. A broken configured persona
+    // must not hide or prevent deletion of independent saved library entries.
+    let Ok(config) = MineConfig::read(project_root) else {
+        return Ok(summaries);
+    };
     for (name, definition) in &config.profiles {
         if definition.context_file.is_none() {
             continue;
         }
-        let frozen =
-            config.freeze_named(project_root, GenerationTask::ManualWriting, Some(name))?;
+        let Ok(frozen) =
+            config.freeze_named(project_root, GenerationTask::ManualWriting, Some(name))
+        else {
+            continue;
+        };
         summaries.push(CoWriterSummary {
             id: format!("{CONFIGURED_PREFIX}{name}"),
             name: name.clone(),
@@ -207,9 +239,17 @@ pub(crate) fn save_from_document(
         return Err(CoWriterError::Limit);
     }
     let previous = store.profiles.get(&id);
-    let created_at_unix_ms = previous.map_or(now_unix_ms, |profile| profile.created_at_unix_ms);
+    let created_at_unix_ms = previous
+        .map(profile_summary)
+        .transpose()?
+        .map_or(now_unix_ms, |profile| profile.created_at_unix_ms);
     let parent_revision = previous
-        .and_then(|profile| profile.frozen.context.lineage().revision.as_ref())
+        .and_then(|profile| match profile {
+            StoredCoWriterProfile::Frozen(profile) => {
+                profile.frozen.context.lineage().revision.as_ref()
+            }
+            StoredCoWriterProfile::Context(_) => None,
+        })
         .map(|revision| revision.revision_id.clone());
     let frozen = freeze_context(
         &id,
@@ -224,13 +264,13 @@ pub(crate) fn save_from_document(
         generation,
         parent_revision,
     )?;
-    let profile = StoredCoWriterProfile {
+    let profile = StoredCoWriterProfile::Frozen(Box::new(FrozenCoWriterProfile {
         id: id.clone(),
         name,
         frozen,
         created_at_unix_ms,
         updated_at_unix_ms: now_unix_ms,
-    };
+    }));
     let summary = profile_summary(&profile)?;
     store.profiles.insert(id, profile);
     write_profiles(project_root, &store)?;
@@ -311,11 +351,28 @@ pub(crate) fn apply_to_document(
             None,
         )?
     } else {
-        read_profiles(project_root)?
+        let profile = read_profiles(project_root)?
             .profiles
             .remove(profile_id)
-            .ok_or(CoWriterError::NotFound)?
-            .frozen
+            .ok_or(CoWriterError::NotFound)?;
+        match profile {
+            StoredCoWriterProfile::Frozen(profile) => profile.frozen,
+            StoredCoWriterProfile::Context(profile) => {
+                // These are the settings at this explicit application, not
+                // settings attributed to the original context-only save.
+                let generation = MineConfig::read(project_root)?
+                    .freeze(project_root, GenerationTask::ManualWriting)?;
+                freeze_context(
+                    &profile.id,
+                    &profile.source_document_id,
+                    profile.markdown,
+                    profile.attachment_ids,
+                    profile.text_sources,
+                    generation,
+                    None,
+                )?
+            }
+        }
     };
     frozen.validate()?;
     set_document_context_with_co_writer(project_root, document_id, &frozen).map_err(Into::into)
@@ -359,24 +416,36 @@ fn profile_id(name: &str) -> String {
 }
 
 fn profile_summary(profile: &StoredCoWriterProfile) -> Result<CoWriterSummary, CoWriterError> {
-    Ok(CoWriterSummary {
-        id: profile.id.clone(),
-        name: profile.name.clone(),
-        source_document_id: profile
-            .frozen
-            .context
-            .lineage()
-            .source
-            .as_ref()
-            .ok_or(CoWriterError::Invalid)?
-            .document_id
-            .clone(),
-        context_bytes: profile.frozen.markdown()?.len() as u64,
-        attachment_count: u32::try_from(profile.frozen.context.metadata().attachment_ids.len())
-            .unwrap_or(u32::MAX),
-        created_at_unix_ms: profile.created_at_unix_ms,
-        updated_at_unix_ms: profile.updated_at_unix_ms,
-        configured: false,
+    Ok(match profile {
+        StoredCoWriterProfile::Context(profile) => CoWriterSummary {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            source_document_id: profile.source_document_id.clone(),
+            context_bytes: profile.markdown.len() as u64,
+            attachment_count: u32::try_from(profile.attachment_ids.len()).unwrap_or(u32::MAX),
+            created_at_unix_ms: profile.created_at_unix_ms,
+            updated_at_unix_ms: profile.updated_at_unix_ms,
+            configured: false,
+        },
+        StoredCoWriterProfile::Frozen(profile) => CoWriterSummary {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            source_document_id: profile
+                .frozen
+                .context
+                .lineage()
+                .source
+                .as_ref()
+                .ok_or(CoWriterError::Invalid)?
+                .document_id
+                .clone(),
+            context_bytes: profile.frozen.markdown()?.len() as u64,
+            attachment_count: u32::try_from(profile.frozen.context.metadata().attachment_ids.len())
+                .unwrap_or(u32::MAX),
+            created_at_unix_ms: profile.created_at_unix_ms,
+            updated_at_unix_ms: profile.updated_at_unix_ms,
+            configured: false,
+        },
     })
 }
 
@@ -401,20 +470,45 @@ fn read_profiles(project_root: &Path) -> Result<CoWriterProfiles, CoWriterError>
     if bytes.len() > MAX_STORE_BYTES {
         return Err(CoWriterError::Limit);
     }
-    let store: CoWriterProfiles = serde_json::from_slice(&bytes)?;
-    if store.schema != PROFILE_SCHEMA || store.profiles.len() > MAX_PROFILES {
+    let mut store: CoWriterProfiles = serde_json::from_slice(&bytes)?;
+    if !matches!(
+        store.schema.as_str(),
+        PROFILE_SCHEMA | CONTEXT_PROFILE_SCHEMA
+    ) || store.profiles.len() > MAX_PROFILES
+    {
         return Err(CoWriterError::Invalid);
     }
     for (id, profile) in &store.profiles {
-        if id != &profile.id
-            || validate_name(&profile.name).is_err()
-            || profile_id(&profile.name) != profile.id
-            || profile.frozen.context.document_id() != id
+        let summary = profile_summary(profile)?;
+        if id != &summary.id
+            || validate_name(&summary.name).is_err()
+            || profile_id(&summary.name) != summary.id
         {
             return Err(CoWriterError::Invalid);
         }
-        profile.frozen.validate()?;
+        match profile {
+            StoredCoWriterProfile::Frozen(profile) => {
+                if store.schema == CONTEXT_PROFILE_SCHEMA
+                    || profile.frozen.context.document_id() != id
+                {
+                    return Err(CoWriterError::Invalid);
+                }
+                profile.frozen.validate()?;
+            }
+            StoredCoWriterProfile::Context(profile) => {
+                if profile.markdown.len() > MAX_MARKDOWN_BYTES
+                    || profile.attachment_ids.len() > 32
+                    || profile.attachment_ids.iter().any(|id| !is_sha256(id))
+                    || profile.text_sources.len() > 256
+                {
+                    return Err(CoWriterError::Invalid);
+                }
+            }
+        }
     }
+    // Only an explicit mutation writes the canonical envelope. Context-only
+    // entries retain their original fields, with no invented frozen profile.
+    store.schema = PROFILE_SCHEMA.into();
     Ok(store)
 }
 
@@ -464,6 +558,237 @@ mod tests {
     use super::*;
     use desktop_generation_policy::SamplingOverrides;
 
+    /// The fields emitted by current main's v1 writer, independent of the new
+    /// codec. A byte comparison catches accidental writes while reading it.
+    fn write_context_library(
+        project: &Path,
+        names: &[&str],
+        snapshot: &DocumentContextSnapshot,
+    ) -> (PathBuf, Vec<u8>) {
+        let profiles = names
+            .iter()
+            .map(|name| {
+                let id = profile_id(name);
+                let value = serde_json::json!({
+                    "id": id,
+                    "name": name,
+                    "source_document_id": "source",
+                    "markdown": snapshot.markdown,
+                    "attachment_ids": snapshot.attachments.iter().map(|item| &item.id).collect::<Vec<_>>(),
+                    "text_sources": snapshot.text_sources,
+                    "created_at_unix_ms": 10,
+                    "updated_at_unix_ms": 20
+                });
+                (id, value)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema": "loom.co-writer-profiles.v1",
+            "profiles": profiles
+        }))
+        .unwrap();
+        let path = project.join(".loom/co-writers.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        (path, bytes)
+    }
+
+    #[test]
+    fn current_main_library_reads_and_applies_without_rewriting_or_historical_settings() {
+        use crate::context_attachments::{add_document_context_snapshot, import_path};
+
+        let project = tempfile::tempdir().unwrap();
+        let text_path = project.path().join("voice.md");
+        fs::write(&text_path, "Retained source evidence.").unwrap();
+        let text = import_path(project.path(), &text_path).unwrap();
+        let snapshot = add_document_context_snapshot(project.path(), "source", &[text.id]).unwrap();
+        let snapshot = crate::context_attachments::set_document_context_snapshot_with_sources(
+            project.path(),
+            "source",
+            "  Original α.\r\n",
+            &[],
+            Some(&snapshot.text_sources),
+        )
+        .unwrap();
+        let (path, source_bytes) = write_context_library(project.path(), &["Voice"], &snapshot);
+        let choices = list(project.path()).unwrap();
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].source_document_id, "source");
+        assert_eq!(choices[0].context_bytes, snapshot.markdown.len() as u64);
+        assert_eq!(choices[0].created_at_unix_ms, 10);
+        assert_eq!(fs::read(&path).unwrap(), source_bytes);
+
+        fs::write(
+            project.path().join(".mine.toml"),
+            "[generation]\nmanual_writing='voice'\n[profiles.voice.sampling]\ntemperature=0.375",
+        )
+        .unwrap();
+        let applied = apply_to_document(project.path(), "target", &choices[0].id).unwrap();
+        assert_eq!(applied.markdown, snapshot.markdown);
+        assert_eq!(applied.text_sources, snapshot.text_sources);
+        assert_eq!(fs::read(&path).unwrap(), source_bytes);
+        let frozen = applied_co_writer(project.path(), "target")
+            .unwrap()
+            .unwrap();
+        assert_eq!(frozen.generation.sampling.temperature, Some(0.375));
+        assert!(
+            frozen
+                .context
+                .lineage()
+                .revision
+                .as_ref()
+                .unwrap()
+                .parent_revision_id
+                .is_none()
+        );
+        assert!(matches!(
+            read_profiles(project.path())
+                .unwrap()
+                .profiles
+                .remove(&choices[0].id)
+                .unwrap(),
+            StoredCoWriterProfile::Context(_)
+        ));
+        fs::write(project.path().join(".mine.toml"), "invalid=true").unwrap();
+        let (retained, _) = crate::generation_profiles::freeze_for_document(
+            project.path(),
+            "target",
+            GenerationTask::AutomaticProse,
+        )
+        .unwrap();
+        assert_eq!(retained.sampling.temperature, Some(0.375));
+    }
+
+    #[test]
+    fn explicit_save_updates_one_current_main_entry_without_inventing_other_profiles() {
+        let project = tempfile::tempdir().unwrap();
+        let snapshot =
+            set_document_context_snapshot(project.path(), "source", "Original.\r\n", &[]).unwrap();
+        let (path, _) = write_context_library(project.path(), &["Voice", "Untouched"], &snapshot);
+        set_document_context_snapshot(project.path(), "source", "Edited.\r\n", &[]).unwrap();
+        let updated = save_from_document(project.path(), "source", "voice", 30).unwrap();
+        assert_eq!(updated.id, profile_id("Voice"));
+        assert_eq!(updated.created_at_unix_ms, 10);
+        assert_eq!(updated.updated_at_unix_ms, 30);
+        let disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk["schema"], PROFILE_SCHEMA);
+        let untouched = &disk["profiles"][profile_id("Untouched")];
+        assert_eq!(untouched["markdown"], "Original.\r\n");
+        assert_eq!(untouched["updated_at_unix_ms"], 20);
+        assert!(untouched.get("frozen").is_none());
+        let stored = read_profiles(project.path()).unwrap();
+        let StoredCoWriterProfile::Frozen(updated) = &stored.profiles[&updated.id] else {
+            panic!("explicit save must freeze its source");
+        };
+        assert!(
+            updated
+                .frozen
+                .context
+                .lineage()
+                .revision
+                .as_ref()
+                .unwrap()
+                .parent_revision_id
+                .is_none()
+        );
+        assert_eq!(list(project.path()).unwrap().len(), 2);
+
+        // Invalid settings do not stop an independent saved-library deletion.
+        fs::write(project.path().join(".mine.toml"), "invalid=true").unwrap();
+        let remaining = delete(project.path(), &profile_id("voice")).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "Untouched");
+        let disk: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(&disk["profiles"][profile_id("Untouched")], untouched);
+    }
+
+    #[test]
+    fn invalid_configured_persona_does_not_hide_saved_or_valid_configured_entries() {
+        let project = tempfile::tempdir().unwrap();
+        set_document_context_snapshot(project.path(), "source", "Saved context.", &[]).unwrap();
+        let saved = save_from_document(project.path(), "source", "Saved", 1).unwrap();
+        fs::create_dir_all(project.path().join(".mine/personas")).unwrap();
+        fs::write(
+            project.path().join(".mine/personas/valid.md"),
+            "Configured context.",
+        )
+        .unwrap();
+        fs::write(project.path().join(".mine.toml"), "[profiles.valid]\ncontext_file='.mine/personas/valid.md'\n[profiles.missing]\ncontext_file='.mine/personas/missing.md'").unwrap();
+        let choices = list(project.path()).unwrap();
+        assert_eq!(choices.len(), 2);
+        assert!(choices.iter().any(|item| item.id == saved.id));
+        assert!(choices.iter().any(|item| item.id == "configured-valid"));
+        assert!(matches!(
+            apply_to_document(project.path(), "target", "configured-missing"),
+            Err(CoWriterError::Configuration(_))
+        ));
+        fs::write(project.path().join(".mine.toml"), "invalid=true").unwrap();
+        assert_eq!(list(project.path()).unwrap(), vec![saved.clone()]);
+        apply_to_document(project.path(), "target", &saved.id).unwrap();
+        assert!(delete(project.path(), &saved.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn current_main_delete_preserves_remaining_context_without_freezing_missing_settings() {
+        let project = tempfile::tempdir().unwrap();
+        let snapshot =
+            set_document_context_snapshot(project.path(), "source", "Original.\r\n", &[]).unwrap();
+        let (path, bytes) = write_context_library(project.path(), &["Delete", "Keep"], &snapshot);
+        let mut disk: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // v1 explicitly permits this field to be absent.
+        disk["profiles"][profile_id("Keep")]
+            .as_object_mut()
+            .unwrap()
+            .remove("text_sources");
+        fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+        fs::write(project.path().join(".mine.toml"), "invalid=true").unwrap();
+        let remaining = delete(project.path(), &profile_id("Delete")).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].name, "Keep");
+        assert_eq!(remaining[0].updated_at_unix_ms, 20);
+        let disk: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(disk["schema"], PROFILE_SCHEMA);
+        assert_eq!(disk["profiles"].as_object().unwrap().len(), 1);
+        let kept = &disk["profiles"][profile_id("Keep")];
+        assert_eq!(kept["markdown"], "Original.\r\n");
+        assert!(kept.get("frozen").is_none());
+        assert!(matches!(
+            read_profiles(project.path())
+                .unwrap()
+                .profiles
+                .remove(&profile_id("Keep"))
+                .unwrap(),
+            StoredCoWriterProfile::Context(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_current_main_receipt_leaves_target_and_library_unchanged() {
+        let project = tempfile::tempdir().unwrap();
+        let snapshot =
+            set_document_context_snapshot(project.path(), "source", "Original.", &[]).unwrap();
+        let (path, bytes) = write_context_library(project.path(), &["Voice"], &snapshot);
+        let mut disk: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        disk["profiles"][profile_id("Voice")]["attachment_ids"] =
+            serde_json::json!(["a".repeat(64)]);
+        let bytes = serde_json::to_vec(&disk).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        set_document_context_snapshot(project.path(), "target", "Keep this.", &[]).unwrap();
+        assert!(apply_to_document(project.path(), "target", &profile_id("Voice")).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            document_context_snapshot(project.path(), "target")
+                .unwrap()
+                .markdown,
+            "Keep this."
+        );
+        assert!(
+            applied_co_writer(project.path(), "target")
+                .unwrap()
+                .is_none()
+        );
+    }
+
     #[test]
     fn applied_document_and_sampling_survive_library_updates_and_deletion() {
         let project = tempfile::tempdir().unwrap();
@@ -489,11 +814,14 @@ mod tests {
         set_document_context_snapshot(project.path(), "source", "Edited library body", &[])
             .unwrap();
         save_from_document(project.path(), "source", "Voice", 20).unwrap();
-        let newer = read_profiles(project.path())
+        let StoredCoWriterProfile::Frozen(newer) = read_profiles(project.path())
             .unwrap()
             .profiles
             .remove(&first.id)
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("explicit save must freeze the source");
+        };
         assert_eq!(
             newer
                 .frozen
@@ -617,7 +945,7 @@ mod tests {
     fn incompatible_library_is_rejected_without_rewriting_source() {
         let project = tempfile::tempdir().unwrap();
         fs::create_dir(project.path().join(".loom")).unwrap();
-        let source = b"{\"schema\":\"loom.co-writer-profiles.v1\",\"profiles\":{}}";
+        let source = b"{\"schema\":\"loom.co-writer-profiles.v0\",\"profiles\":{}}";
         let path = project.path().join(".loom/co-writers.json");
         fs::write(&path, source).unwrap();
         assert!(matches!(list(project.path()), Err(CoWriterError::Invalid)));

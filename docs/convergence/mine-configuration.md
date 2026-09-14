@@ -14,6 +14,7 @@ suggestions = true
 [generation]
 chat = "editor"
 automatic_prose = "editor"
+loompad = "editor"
 manual_writing = "editor"
 
 [profiles.editor]
@@ -38,7 +39,7 @@ The schema exposes all sampling controls implemented by `desktop-generation-poli
 
 `workspace.rs` preserves Loom's existing @document reference parser and bounded pane rules, makes chat/terminal/browser opt-in, and retains the one-main-editor constraint until a main-chat consumer exists. Model fields are requested settings for an explicit load; model identity and machine admission remain the loader's responsibility. Assistance omission inherits existing per-project behavior.
 
-The production Weave and terminal/chat paths now freeze the selected profile once before consuming automatic budget, writing generation artifacts, or starting a worker. Profile sampling values override request defaults. A configured seed is a family seed: each branch adds its index, so a fixed seed does not create four identical branches. Automatic suggestions still admit at most 48 output tokens; manual writing and chat admit at most 2048. Requests above those bounds fail rather than silently resetting the preference.
+The production Weave and terminal/chat paths now freeze the selected profile once before consuming automatic budget, writing generation artifacts, or starting a worker. Profile sampling values override request defaults. A configured seed is a family seed: each branch adds its index, so a fixed seed does not create four identical branches. Inline suggestions admit at most 48 output tokens; Loompad admits 128; manual writing and chat admit at most 2048. `generation.loompad` is independent of `automatic_prose`; omission preserves the main Loompad defaults. Requests above those bounds fail rather than silently resetting the preference.
 
 Selected persona bytes are included as authored context, separately framed from retrieved attachment excerpts. Weave reserves their exact byte cost before attachment retrieval using the existing conservative one-byte-per-token allowance; the native tokenizer remains the final admission authority. Terminal prompts include the exact persona preamble in the persisted prompt blob and enforce both the prompt byte limit and resident budget. Required chat speaker stops are appended to, rather than substituted for, configured stop strings.
 
@@ -64,6 +65,12 @@ Named `.mine.toml` profiles with a `context_file` participate in the same co-wri
 
 Weave consumes the applied context through its normal attachment/context budget. Terminal and chat capture the applied context's bounded rendering and retrieval receipts once before their worker begins, preserving source snapshots and native media identities. Applying changes neither the manuscript nor model identity, prompt grammar, or tool authority.
 
-The named library remains a bounded local JSON projection (64 names, 40 MiB serialized limit). Its current schema is `loom.co-writer-profiles.v2`. Earlier unreleased v1 files are rejected and preserved; this change contains no silent conversion or deletion. Updates create a new source revision linked to the prior revision. Applied copies retain their old payload, rather than looking up whichever library entry currently has the same name. There is no speculative history UI or separate binding database.
+The named library remains a bounded local JSON projection (64 names, 40 MiB serialized limit). Its current schema is `loom.co-writer-profiles.v2`. Current-main v1 libraries remain readable and applicable without rewriting the library. Explicit edits write v2 while preserving untouched context-only entries. Applying such an entry freezes current settings at apply time, without inventing a historical generation profile. Updates create a new source revision linked to the prior revision. Applied copies retain their old payload, rather than looking up whichever library entry currently has the same name. There is no speculative history UI or separate binding database.
 
 Access boundary: `.mine.toml` task-to-profile selection is a live production control. Co-writer save/list/apply/delete remain existing IPC capabilities; the current quiet application has no rendered co-writer picker. This work does not claim a visible co-writer menu or completed native interaction acceptance.
+
+## Current-main workspace settings
+
+Existing registered `.loom.md` workspace files retain their pane visibility, named-model selection, theme and context references when `.mine.toml` is absent. Opening settings adopts an existing unregistered `.loom.md` without rewriting it. An explicitly authored `.mine.toml` takes precedence; malformed Mine settings never silently fall back to another source. There is one active configuration source, with no read-time conversion.
+
+New TOML uses `[workspace.theme]` (`mode`, `canvas`, `text`, `accent`) and `[workspace.model]` (exactly one `catalog` or `profile`) for main's presentation/model-selection controls. These select existing verified authorities; `[model]` contains native sizing, device and optional path settings. Model paths and named identities are both mandatory when both are specified. Reloading a different alias of an existing native resident updates the selected alias while retaining the native worker.

@@ -107,9 +107,12 @@ creation paths: create, adopt visible file, ordinary save (`store.rs`), source-b
 save (`provenance.rs`), candidate promotion (`generation.rs`), and external
 reconciliation (`reconciliation.rs`). Each part references an immutable artifact
 occurrence and byte range instead of duplicating manuscript text in JSON.
-`load_revision_segments` now obtains authoritative parts from the validated
-snapshot, checking SQL segment indexes against it. Reconstruction, provenance,
-and source-bound edits therefore cannot silently bypass the durable record.
+`load_revision_segments` obtains parts from a validated shared view. New revision
+snapshots must agree with their immutable SQL segment indexes. Current-main
+revision records without a snapshot derive that same view in memory from their
+existing authoritative segments; no historical records are rewritten or backfilled.
+Reconstruction, provenance, and source-bound edits cannot silently bypass a
+present snapshot.
 
 Mom `conversation_snapshot.rs::freeze`, used by `conversation_export` with the
 `document` format, retains every branch, role, selected head, Persona attribution,
@@ -139,15 +142,22 @@ The normal Mom encrypted payload is neither migrated nor rewritten. Preserve the
 original store: this is a content/metadata/reference transfer, **not** an attachment,
 Persona catalog, credential, or full tool-receipt bundle migration.
 
-The current Loom store schema advances from **15 to 16**. Older stores refuse
-opening at schema validation, before recovery or any semantic write can mix old
-and new revision formats. A fixture compares the original database and ordinary
-UTF-8 manuscript bytes after refusal. A current-version revision whose required
-snapshot is missing also refuses reconstruction/source-bound edits. Preserve the
-original project, copy its ordinary manuscript files (or use its original binary
-to export them), and explicitly import into a new project. This recovers visible
-writing, not the old immutable history. No automatic rewrite, inferred lineage,
-or historical provenance migration is implemented.
+The current Loom store schema remains **15**, byte-identical in SQL structure to
+`origin/main` at `95c446b`. Snapshots are an additive immutable metadata extension,
+not a new database format. Main-created projects retain opening, editing, history,
+drafts, receipts, and recovery behavior. Existing revision/artifact/segment rows
+remain authoritative and unchanged; the shared document is derived from them in
+memory. Every newly written revision carries `revision_format =
+"workspace-document.v1"` and its durable snapshot in one existing artifact insert.
+A declared-but-missing snapshot, any malformed present snapshot, or disagreement
+with immutable revision/source indexes is corruption and refuses reconstruction
+and source-bound editing. A malformed snapshot never falls back to old rows.
+
+No historical migration, second writable document store, schema rewrite, or
+compatibility chain is added. Genuinely incompatible database schemas still
+refuse opening before recovery or semantic mutation. The short-lived convergence
+schema-16 artifact was never an accepted release target; current main is the
+compatibility boundary for this integration.
 
 ## Class-by-class remaining integration verdict
 
@@ -210,7 +220,12 @@ original value.
 New tests cover durable JSON validation, metadata bounds, exact source range
 resolution, full branch/metadata import and reopen, source-only contribution,
 external-reference import refusal, snapshot/index disagreement blocking edits,
-and old-format refusal without rewriting original manuscript or metadata.
+and current-main schema-15 open/edit/reopen without rewriting old manuscript
+history, metadata, provenance, or receipts. Main-shaped fixture records are
+inserted directly with immutable triggers enabled. Empty writing and exact CRLF/
+non-ASCII writing both gain new snapshot revisions through the normal source-bound
+edit path. Corrupt old source ranges and malformed/missing-declared new snapshots
+remain fail-closed.
 Import rendering follows typed parts: a sequence of messages retains role
 headings, while a selected branch of writing retains exact concatenated bytes.
 Selection policy never substitutes for content kind.
@@ -255,3 +270,15 @@ semantic revision and evidence for outbox recovery.
 
 Follow-up validation: `cargo test --locked -p loom-store --lib` passed **141/141**;
 `cargo clippy --locked -p loom-store --all-targets -- -D warnings` passed.
+
+Main-readiness correction: the initial version-16 refusal was replaced by
+an additive metadata design after the no-regression review. The earlier 383/141
+counts are historical gates on that initial implementation; final merged-tree
+validation is recorded by the root integration receipt. No user store was opened.
+
+The main-readiness store gate passed `cargo test --locked -p loom-store`: **145
+passed, one opt-in legacy Python fixture ignored**, including all 142 unit tests,
+three integration tests, schema admission checks, and successful empty doctest
+targets. The focused snapshot gate passed 8/8 before the package gate.
+`cargo clippy --locked -p loom-store --all-targets -- -D warnings` also passed.
+These are local fixture results; no user project or native inference was used.

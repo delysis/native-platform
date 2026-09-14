@@ -15,12 +15,13 @@
   import LoomEditor from './LoomEditor.svelte';
   import TerminalPane from './TerminalPane.svelte';
   import SourceEditor from './SourceEditor.svelte';
-  import { cancelTerminalRun, listTerminalRuns, normalizeFailure, runTerminal } from './ipc';
+  import { addDocumentContexts, importAttachmentPaths, cancelTerminalRun, listTerminalRuns, normalizeFailure, runTerminal } from './ipc';
+  import { editableImportMarkdown } from './importedMarkdown';
   import { decodeVerseForEditor as decodeSourceForEditor, encodeVerseFromEditor as encodeSourceFromEditor } from './verseCodec';
   import { canUseVisualMarkdown } from './markdownSafety';
   import { newUlid } from './ulid';
   import { RetainedOutputLoader } from './retainedOutput';
-  import type { DocumentSummary, OpenDocument, TerminalRun, TerminalRunRequest } from './types';
+  import type { DocumentContextSnapshot, DocumentSummary, OpenDocument, TerminalRun, TerminalRunRequest } from './types';
 
   export let paneId: string;
   export let config: WorkspacePaneConfig;
@@ -30,13 +31,13 @@
   export let source: OpenDocument | null = null;
   export let value = '';
   export let readonly = false;
-  export let modelLabel = '';
-  export let onModelSelect: ((trigger: HTMLElement) => void) | null = null;
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onChange: (value: string) => void = () => {};
   export let beforeRun: () => Promise<OpenDocument | null>;
   export let onOpenDocument: (id: string) => void;
   export let onRunsChanged: () => void = () => {};
+  export let beforeAttachmentImport: () => Promise<boolean> = async () => true;
+  export let onContextChanged: (snapshot: DocumentContextSnapshot, project: string, session: string, document: string) => void = () => {};
   export let onBusyChange: (busy: boolean) => void = () => {};
 
   let composing = false;
@@ -47,6 +48,7 @@
   let runs: TerminalRun[] = [];
   let error = '';
   let dispatching = false;
+  let importing = false;
   let pending: TerminalRunRequest | null = null;
   let cancelRequested = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -58,6 +60,7 @@
   const outputLoader = new RetainedOutputLoader();
   const MAX_PROMPT_BYTES = 64 * 1024;
   let editor: LoomEditor | undefined;
+  let sourceEditor: SourceEditor | undefined;
   let historyViewport: HTMLDivElement | undefined;
   let following = true;
   afterUpdate(() => { if (following && historyViewport) historyViewport.scrollTop = historyViewport.scrollHeight; });
@@ -66,7 +69,7 @@
   }
   $: nextScope = `${projectId}/${sessionId}/${paneId}`;
   $: if (mounted && scope !== nextScope) resetScope(nextScope);
-  $: busy = dispatching || pending !== null || runs.some((run) => run.status === 'running');
+  $: busy = importing || dispatching || pending !== null || runs.some((run) => run.status === 'running');
   $: reportBusy(busy);
   $: target = resolveDocument(config.document, documents, source);
   $: recentRuns = runs.slice(-8);
@@ -78,6 +81,53 @@
   $: preview = mounted && config.kind === 'browser' ? previewUrl(projectId, sessionId, target, runs, documents) : '';
 
   export function flush(): boolean { return !composing && (editor?.flushPending() ?? true); }
+
+  export async function importDroppedPaths(paths: string[], point: { x: number; y: number }): Promise<void> {
+    if (!mounted || readonly || composing || busy || !source || !paths.length ||
+        (config.kind === 'editor' && !editingCurrent)) return;
+    if (!flush()) return;
+    const captured = { scope, projectId, sessionId, documentId: source.summary.document_id,
+      kind: config.kind, value, entry, visual };
+    const visualAnchor = visual && config.kind === 'editor' ? editor?.captureAttachmentAnchor(point.x, point.y) : null;
+    const sourceAnchor = !visual && config.kind === 'editor' ? sourceEditor?.captureTextInsertionAnchor() : null;
+    importing = true; error = '';
+    const current = () => mounted && scope === captured.scope && !readonly && !composing &&
+      source?.summary.document_id === captured.documentId && config.kind === captured.kind &&
+      value === captured.value && entry === captured.entry && visual === captured.visual;
+    try {
+      if (!await beforeAttachmentImport()) return;
+      if (!current()) throw new Error('The pane changed before import. Drop the files again at the intended location.');
+      const imported = await importAttachmentPaths(captured.projectId, captured.sessionId, paths);
+      if (!current()) throw new Error('The pane changed during import. The files are retained; drop them again at the intended location.');
+      const markdown = imported.map(editableImportMarkdown).join('\n\n');
+      if (captured.kind === 'editor') {
+        const before = sourceAnchor?.value.slice(0, sourceAnchor.start) ?? '';
+        const after = sourceAnchor?.value.slice(sourceAnchor.end) ?? '';
+        const prefix = before && !before.endsWith('\n\n') ? (before.endsWith('\n') ? '\n' : '\n\n') : '';
+        const suffix = after && !after.startsWith('\n\n') ? (after.startsWith('\n') ? '\n' : '\n\n') : '';
+        const inserted = captured.visual
+          ? visualAnchor && editor?.insertMarkdownAtAnchor(visualAnchor, markdown)
+          : sourceAnchor && sourceEditor?.insertTextAtAnchor(sourceAnchor, `${prefix}${markdown}${suffix}`);
+        if (!inserted) throw new Error('The files are retained, but their content could not be inserted at this selection.');
+      } else {
+        const next = [captured.entry, markdown].filter(Boolean).join('\n\n');
+        if (new TextEncoder().encode(next).length > MAX_PROMPT_BYTES) throw new Error('The imported text exceeds the 64 KiB input limit. The original files are retained.');
+        // Terminal media comes from registered document context, not arbitrary
+        // links pasted into a prompt. Bind exact retained identities first.
+        const cards = imported.filter((item) => item.media_kinds.length > 0 || item.text_bytes === 0);
+        if (cards.length) {
+          const snapshot = await addDocumentContexts(captured.projectId, captured.sessionId,
+            captured.documentId, cards.map((item) => item.id));
+          onContextChanged(snapshot, captured.projectId, captured.sessionId, captured.documentId);
+        }
+        if (!current()) throw new Error('The pane changed during import. The files remain attached to their original document.');
+        entry = next;
+        onRunsChanged();
+      }
+    } catch (failure) {
+      if (mounted && scope === captured.scope) error = normalizeFailure(failure).message;
+    } finally { if (mounted && scope === captured.scope) importing = false; }
+  }
 
   function reportBusy(value: boolean): void { onBusyChange(value); }
   function selectVisual(text: string, key: string): boolean {
@@ -98,7 +148,7 @@
   function resetScope(next: string): void {
     if (timer) clearTimeout(timer);
     scope = next; following = true;
-    runs = []; entry = ''; error = ''; pending = null; dispatching = false;
+    runs = []; entry = ''; error = ''; pending = null; dispatching = false; importing = false;
     refreshing = false; cancelRequested = false;
     outputText = {}; outputLoader.clear(); outputSerial += 1;
     void refresh(next);
@@ -227,7 +277,7 @@
 </script>
 
 {#if config.visible}
-<section class="workspace-pane" class:browser={config.kind === 'browser'} aria-label={config.title ?? config.kind} aria-busy={busy}>
+<section data-workspace-pane={paneId} class="workspace-pane" class:browser={config.kind === 'browser'} aria-label={config.title ?? config.kind} aria-busy={busy}>
   {#if error && config.kind !== 'terminal'}<p class="error" role="alert">{error}{#if pending}<button on:click={() => void refresh()}>Check result</button>{/if}</p>{/if}
   {#if config.kind === 'editor'}
     {#if source && editingCurrent}
@@ -236,14 +286,14 @@
           {#if visual}
             <LoomEditor bind:this={editor} {value} {readonly} {onChange} onCompositionChange={setComposing} acceptImageAttachments={false} label={config.title ?? 'Pane editor'} onGhostPresentationRejected={() => {}} />
           {:else}
-            <SourceEditor element={undefined} value={sourceDecoded.display} readonly={readonly || !sourceDecoded.codec.editable} verseNewline={sourceDecoded.codec.newline} label={config.title ?? 'Pane editor'} onValueInput={(area) => onChange(encodeSourceFromEditor(area.value, sourceDecoded.codec))} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} />
+            <SourceEditor bind:this={sourceEditor} element={undefined} value={sourceDecoded.display} readonly={readonly || !sourceDecoded.codec.editable} verseNewline={sourceDecoded.codec.newline} label={config.title ?? 'Pane editor'} onValueInput={(area) => onChange(encodeSourceFromEditor(area.value, sourceDecoded.codec))} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} />
           {/if}
         {/key}
       </div>
     {:else if target}<button on:click={() => onOpenDocument(target.document_id)}>Open {target.title}</button>
     {:else}<p class="empty">{config.document ? 'Document unavailable' : 'Open a document'}</p>{/if}
   {:else if config.kind === 'terminal'}
-    <TerminalPane embedded open={true} bind:entry {projectId} {sessionId} {documents} {runs} {busy} {error} {modelLabel} disabled={readonly} runDisabled={!entry.trim()} uncertain={pending !== null} onCheck={() => void refresh()} onRun={() => void submit()} onCancel={() => void stop()} onOpen={(run) => run.output_document_id && onOpenDocument(run.output_document_id)} onClose={() => {}} />
+    <TerminalPane embedded open={true} bind:entry {projectId} {sessionId} {documents} {runs} {busy} {error} disabled={readonly} runDisabled={!entry.trim()} uncertain={pending !== null} onCheck={() => void refresh()} onRun={() => void submit()} onCancel={() => void stop()} onOpen={(run) => run.output_document_id && onOpenDocument(run.output_document_id)} onClose={() => {}} />
   {:else}
     {#if config.kind === 'browser'}
       {#if preview}<iframe title={config.title ?? 'Page preview'} sandbox="" referrerpolicy="no-referrer" src={preview}></iframe>{/if}
@@ -262,11 +312,12 @@
     {/if}
     <form on:submit|preventDefault={() => void submit()}>
       <textarea bind:value={entry} rows="1" aria-label={config.kind === 'chat' ? 'Message' : 'Page description'} on:keydown={keydown} on:compositionstart={() => setComposing(true)} on:compositionend={() => setComposing(false)} disabled={readonly}></textarea>
+      {#if busy || config.kind === 'browser'}
       <div class="composer-actions">
-      {#if onModelSelect}<button class="model" type="button" title={modelLabel || 'Choose model'} aria-label={modelLabel ? `Model: ${modelLabel}` : 'Choose model'} disabled={readonly || busy} on:click={(event) => onModelSelect?.(event.currentTarget)}>{modelLabel || 'Model'}</button>{/if}
       {#if busy}<button class="send" type="button" aria-label="Stop" on:click={() => void stop()} disabled={readonly}>■</button>
-      {:else}<button class="send" type="submit" aria-label={config.kind === 'chat' ? 'Send' : 'Run'} disabled={readonly || composing || !entry.trim()}>↑</button>{/if}
+      {:else}<button class="send" type="submit" aria-label="Run" disabled={readonly || composing || !entry.trim()}>↑</button>{/if}
       </div>
+      {/if}
     </form>
   {/if}
 </section>
@@ -288,7 +339,6 @@
   .send { margin-left:auto; width:28px; }
   textarea { width:100%; box-sizing:border-box; min-width:0; min-height:28px; max-height:120px; padding:5px; resize:vertical; background:transparent; color:inherit; font:inherit; border:1px solid #8884; border-radius:4px; }
   button { min-height:30px; padding:4px 8px; cursor:pointer; }
-  .model { max-width:110px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.75rem; }
   .error { color:#b64238; font-size:.8rem; padding:4px 8px; }
   small,.empty { opacity:.65; }
   iframe { flex:1; width:100%; min-height:120px; border:0; background:white; }

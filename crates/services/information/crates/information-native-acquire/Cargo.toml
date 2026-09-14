@@ -8,6 +8,8 @@ readme = "../../README.md"
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
+getrandom.workspace = true
 fs2.workspace = true
 hex.workspace = true
 information-native-types.workspace = true

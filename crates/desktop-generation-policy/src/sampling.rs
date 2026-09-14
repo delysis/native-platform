@@ -12,6 +12,7 @@ pub enum GenerationTask {
     Chat,
     AutomaticProse,
     AutomaticVerse,
+    Loompad,
     ManualWriting,
 }
 
@@ -21,7 +22,7 @@ impl GenerationTask {
         let mut sampling = SamplingConfig::default();
         match self {
             Self::Chat => sampling.max_tokens = 512,
-            Self::AutomaticProse => {
+            Self::AutomaticProse | Self::Loompad => {
                 sampling.min_p = 0.05;
                 sampling.dry_allowed_length = 4;
                 sampling.dry_penalty_last_n = 256;
@@ -270,12 +271,16 @@ mod tests {
             GenerationTask::Chat,
             GenerationTask::AutomaticProse,
             GenerationTask::AutomaticVerse,
+            GenerationTask::Loompad,
             GenerationTask::ManualWriting,
         ] {
             let sampling = resolve_sampling(task, &[]).expect("task defaults");
             assert_eq!(
                 sampling.min_p,
-                if task == GenerationTask::AutomaticProse {
+                if matches!(
+                    task,
+                    GenerationTask::AutomaticProse | GenerationTask::Loompad
+                ) {
                     0.05
                 } else {
                     0.0
@@ -284,6 +289,19 @@ mod tests {
             assert_eq!(sampling.dry_multiplier, 0.0);
             assert_eq!(sampling.repeat_penalty, 1.0);
         }
+    }
+
+    #[test]
+    fn loompad_retains_main_prose_sampling_with_its_128_token_default() {
+        let sampling = resolve_sampling(GenerationTask::Loompad, &[]).expect("Loompad defaults");
+        assert_eq!(sampling.max_tokens, 128);
+        assert_eq!(sampling.min_p, 0.05);
+        assert_eq!(sampling.dry_allowed_length, 4);
+        assert_eq!(sampling.dry_penalty_last_n, 256);
+        assert_eq!(
+            sampling.fingerprint(),
+            GenerationTask::AutomaticProse.defaults().fingerprint()
+        );
     }
 
     #[test]

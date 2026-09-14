@@ -3755,7 +3755,13 @@ fn document_path_for_title(relative_path: &str, title: &str) -> Result<String> {
         file_name.push('.');
         file_name.push_str(extension);
     }
-    normalize_document_path(&Path::new(parent).join(file_name))
+    // Stored paths use '/' on every host; Path::join would insert '\\' on Windows.
+    let target = if parent.is_empty() {
+        file_name
+    } else {
+        format!("{parent}/{file_name}")
+    };
+    normalize_document_path(Path::new(&target))
 }
 
 fn validate_stored_document_display_title(stored: Option<String>) -> Result<Option<String>> {
@@ -4144,18 +4150,40 @@ mod tests {
 
     #[test]
     fn document_title_codec_is_portable_and_rejects_invalid_input() {
-        let target =
-            document_path_for_title("manuscript/chapters/Untitled.md", "A Portable Manuscript")
-                .expect("construct target path");
-
-        assert_eq!(target, "manuscript/chapters/A Portable Manuscript.md");
-        assert!(!target.contains('\\'));
-        for invalid in ["../escape", "CON", "trailing.", "bad:name"] {
+        for (source, title, expected) in [
+            (
+                "manuscript/chapters/Untitled.md",
+                "A Portable Manuscript",
+                "manuscript/chapters/A Portable Manuscript.md",
+            ),
+            ("Untitled.md", "A Root Document", "A Root Document.md"),
+            (
+                "templates/Untitled.markdown",
+                ".chat",
+                "templates/.chat.markdown",
+            ),
+            ("notes/Untitled.txt", "Café", "notes/Café.txt"),
+        ] {
+            let target = document_path_for_title(source, title).expect("construct target path");
+            assert_eq!(target, expected);
+            assert!(!target.contains('\\'));
+        }
+        for invalid in [
+            "../escape",
+            "nested\\escape",
+            "CON",
+            "trailing.",
+            "bad:name",
+        ] {
             assert!(matches!(
                 document_path_for_title("manuscript/Untitled.md", invalid),
                 Err(StoreError::InvalidDocumentFileName { .. })
             ));
         }
+        assert!(matches!(
+            document_path_for_title("manuscript\\Untitled.md", "Valid Title"),
+            Err(StoreError::UnsafeRelativePath(_))
+        ));
         for invalid in ["   ".to_owned(), "line\nbreak".to_owned(), "é".repeat(129)] {
             assert!(matches!(
                 normalize_document_display_title(&invalid),
@@ -6546,6 +6574,7 @@ mod tests {
         assert_eq!(store.pending_outbox_count().expect("pending outbox"), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_document_retains_evidence_and_generated_authorship_after_reopen() {
         let (_directory, mut store) = new_store();
@@ -6592,6 +6621,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn derived_document_is_source_material_without_claiming_model_generation() {
         let (_directory, mut store) = new_store();
@@ -6621,6 +6651,7 @@ mod tests {
         assert_eq!(kind, "import");
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_document_rejects_missing_evidence_without_creating_writing() {
         let (_directory, mut store) = new_store();

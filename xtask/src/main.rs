@@ -59,9 +59,13 @@ fn check_workspace(root: &Path) -> Result<()> {
                     .iter()
                     .filter_map(toml::Value::as_str)
                     .collect::<BTreeSet<_>>()
-                    == BTreeSet::from(["crates/services/attachment/fuzz", "vendor/glib"])
+                    == BTreeSet::from([
+                        "crates/services/attachment/fuzz",
+                        "vendor/glib",
+                        "vendor/ort-sys",
+                    ])
             }),
-        "only the Attachment fuzz workspace and the patched external GLib crate may be excluded"
+        "only the Attachment fuzz workspace and patched external GLib/ort-sys crates may be excluded"
     );
 
     let output = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
@@ -127,6 +131,8 @@ fn check_workspace(root: &Path) -> Result<()> {
             == BTreeSet::from([
                 root.join("Cargo.lock"),
                 root.join("crates/services/attachment/fuzz/Cargo.lock"),
+                // Published dependency source; the root lock resolves this patch.
+                root.join("vendor/ort-sys/Cargo.lock"),
             ]),
         "unknown nested Cargo lock"
     );

@@ -6,6 +6,8 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 
 - `allow-project-open-default`
 - `allow-project-prepare-open`
+- `allow-project-prepare-open-path`
+- `allow-project-drop-directories`
 - `allow-project-commit-open`
 - `allow-project-discard-open`
 - `allow-project-close`
@@ -19,6 +21,9 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-attachment-ingest`
 - `allow-attachment-import-choose`
 - `allow-attachment-import-paths`
+- `allow-attachment-reveal-original`
+- `allow-import-text-sources`
+- `allow-attachment-import-batch-choose`
 - `allow-document-context-list`
 - `allow-document-context-add`
 - `allow-document-context-add-many`
@@ -199,6 +204,32 @@ Denies the application_close_pending command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-attachment-import-batch-choose`
+
+</td>
+<td>
+
+Enables the attachment_import_batch_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-attachment-import-batch-choose`
+
+</td>
+<td>
+
+Denies the attachment_import_batch_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-attachment-import-choose`
 
 </td>
@@ -270,6 +301,32 @@ Enables the attachment_ingest command without any pre-configured scope.
 <td>
 
 Denies the attachment_ingest command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-attachment-reveal-original`
+
+</td>
+<td>
+
+Enables the attachment_reveal_original command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-attachment-reveal-original`
+
+</td>
+<td>
+
+Denies the attachment_reveal_original command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1187,6 +1244,188 @@ Denies the generation_cancel command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-import-account-cancel`
+
+</td>
+<td>
+
+Enables the import_account_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-import-account-cancel`
+
+</td>
+<td>
+
+Denies the import_account_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-import-account-connect`
+
+</td>
+<td>
+
+Enables the import_account_connect command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-import-account-connect`
+
+</td>
+<td>
+
+Denies the import_account_connect command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-import-account-disconnect`
+
+</td>
+<td>
+
+Enables the import_account_disconnect command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-import-account-disconnect`
+
+</td>
+<td>
+
+Denies the import_account_disconnect command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-import-account-sync`
+
+</td>
+<td>
+
+Enables the import_account_sync command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-import-account-sync`
+
+</td>
+<td>
+
+Denies the import_account_sync command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-import-accounts`
+
+</td>
+<td>
+
+Enables the import_accounts command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-import-accounts`
+
+</td>
+<td>
+
+Denies the import_accounts command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-import-source-url`
+
+</td>
+<td>
+
+Enables the import_source_url command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-import-source-url`
+
+</td>
+<td>
+
+Denies the import_source_url command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-import-text-sources`
+
+</td>
+<td>
+
+Enables the import_text_sources command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-import-text-sources`
+
+</td>
+<td>
+
+Denies the import_text_sources command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-model-catalog-list`
 
 </td>
@@ -1577,6 +1816,32 @@ Denies the project_discard_open command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-project-drop-directories`
+
+</td>
+<td>
+
+Enables the project_drop_directories command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-project-drop-directories`
+
+</td>
+<td>
+
+Denies the project_drop_directories command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-project-open-default`
 
 </td>
@@ -1622,6 +1887,32 @@ Enables the project_prepare_open command without any pre-configured scope.
 <td>
 
 Denies the project_prepare_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-project-prepare-open-path`
+
+</td>
+<td>
+
+Enables the project_prepare_open_path command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-project-prepare-open-path`
+
+</td>
+<td>
+
+Denies the project_prepare_open_path command without any pre-configured scope.
 
 </td>
 </tr>
@@ -2038,6 +2329,19 @@ Enables the workspace_template_get command without any pre-configured scope.
 <td>
 
 Denies the workspace_template_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:connected-import`
+
+</td>
+<td>
+
+Explicit read-only account authorization and imports, with credentials in the OS credential store.
 
 </td>
 </tr>

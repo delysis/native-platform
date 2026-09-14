@@ -208,11 +208,17 @@ fn enqueue_roots(
     remaining: usize,
     truncated: &mut bool,
 ) {
-    *truncated |= roots.len() > remaining;
-    let mut ordered = roots.iter().take(remaining).cloned().collect::<Vec<_>>();
-    ordered.sort();
-    ordered.dedup();
-    pending.extend(ordered.into_iter().map(|path| (path, source, 0)));
+    // Root order is caller policy: a configured alias must win over an older
+    // explicit alias of the same file. Sorting is appropriate for directory
+    // children and the final presentation, but would erase that precedence.
+    let mut seen = BTreeSet::new();
+    for (admitted, path) in roots.iter().filter(|path| seen.insert(*path)).enumerate() {
+        if admitted == remaining {
+            *truncated = true;
+            break;
+        }
+        pending.push_back((path.clone(), source, 0));
+    }
 }
 
 fn inspect_symlink(
@@ -442,6 +448,36 @@ mod tests {
         );
         assert_eq!(report.models[0].source, ModelDiscoverySource::UserSelected);
         assert!(!report.warnings.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_alias_precedes_an_older_explicit_alias_of_the_same_model() {
+        let directory = tempfile::tempdir().expect("directory");
+        let blob = directory.path().join("blob");
+        std::fs::write(&blob, b"GGUF").expect("blob");
+        let configured = directory.path().join("z-configured.gguf");
+        let remembered = directory.path().join("a-remembered.gguf");
+        std::os::unix::fs::symlink(&blob, &configured).expect("configured alias");
+        std::os::unix::fs::symlink(&blob, &remembered).expect("remembered alias");
+
+        let report = discover_gguf_models(&ModelDiscoveryOptions {
+            hugging_face_cache_roots: Vec::new(),
+            user_paths: vec![configured.clone(), configured.clone(), remembered],
+            max_entries: 2,
+            max_depth: 1,
+        })
+        .expect("scan explicit aliases");
+
+        assert_eq!(report.models.len(), 1);
+        assert_eq!(report.models[0].selected_path, configured);
+        assert_eq!(
+            report.models[0].resolved_path,
+            blob.canonicalize().expect("canonical blob")
+        );
+        assert_eq!(report.models[0].source, ModelDiscoverySource::UserSelected);
+        assert_eq!(report.visited_entries, 2);
+        assert!(!report.truncated);
     }
 
     #[test]

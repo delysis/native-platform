@@ -653,6 +653,7 @@ pub enum TransformKind {
     EmbeddedRange,
     DocumentPart,
     EmailPart,
+    MailboxMessage,
     PdfEmbeddedFile,
 }
 
@@ -748,6 +749,7 @@ pub enum DetectedFormat {
     IWorkKeynote,
     OleCompound,
     Email,
+    Mbox,
     Zip,
     Tar,
     Gzip,
@@ -800,6 +802,7 @@ impl DetectedFormat {
                 | Self::IWorkKeynote
                 | Self::OleCompound
                 | Self::Email
+                | Self::Mbox
                 | Self::Tar
                 | Self::Gzip
                 | Self::Bzip2
@@ -869,6 +872,7 @@ impl DetectedFormat {
             Self::IWorkKeynote => "application/vnd.apple.keynote",
             Self::OleCompound => "application/x-ole-storage",
             Self::Email => "message/rfc822",
+            Self::Mbox => "application/mbox",
             Self::Zip => "application/zip",
             Self::Tar => "application/x-tar",
             Self::Gzip => "application/gzip",

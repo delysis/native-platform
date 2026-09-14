@@ -5,6 +5,8 @@ description = "Open and edit Loom's app-owned default project or a user-selected
 permissions = [
   "allow-project-open-default",
   "allow-project-prepare-open",
+  "allow-project-prepare-open-path",
+  "allow-project-drop-directories",
   "allow-project-commit-open",
   "allow-project-discard-open",
   "allow-project-close",
@@ -18,6 +20,9 @@ permissions = [
   "allow-attachment-ingest",
   "allow-attachment-import-choose",
   "allow-attachment-import-paths",
+  "allow-attachment-reveal-original",
+  "allow-import-text-sources",
+  "allow-attachment-import-batch-choose",
   "allow-document-context-list",
   "allow-document-context-add",
   "allow-document-context-add-many",

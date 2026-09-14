@@ -640,9 +640,10 @@
     if (action === 'accept' && visible) {
       // The parent must consume the exact visibility witness before this
       // component clears it. Its boolean result is the authority to promote.
-      const accepted = ghostInsertsOnAccept
-        ? insertVisibleGhostText(visible, visible.text, 'inline_tab')
-        : onGhostAccept(visible.candidateId, visible.presentationKey);
+      const word = nextSuggestionWord(visible.text);
+      const accepted = word && (ghostInsertsOnAccept
+        ? insertVisibleGhostText(visible, word, 'inline_tab')
+        : word === visible.text && onGhostAccept(visible.candidateId, visible.presentationKey));
       suppressCurrentGhost();
       if (accepted) {
         event.preventDefault();
@@ -858,6 +859,15 @@
     return accepted;
   }
 
+  export function acceptLoompadText(candidateId: string, presentationKey: string, text: string): boolean {
+    const candidate = currentPlan();
+    if (!focused || composing || !candidate || candidate.candidateId !== candidateId ||
+        candidate.presentationKey !== presentationKey || !text || !candidate.text.startsWith(text)) return false;
+    const accepted = insertVisibleGhostText(candidate, text, 'loompad');
+    if (accepted) suppressCurrentGhost();
+    return accepted;
+  }
+
   onMount(() => {
     if (!element) return;
     selectionStart = element.selectionStart;
@@ -898,7 +908,7 @@
     ? completionPopupDomIds.listboxId
     : undefined;
 
-  $: lensVisible = completionLensVisible(completionLens);
+  $: lensVisible = !ghostHidden && completionLensVisible(completionLens);
   $: optionFanVisible = completionLens.momentary;
   $: if (ghostAlternatives.length < 2 && completionLens !== CLOSED_COMPLETION_LENS) {
     completionLens = reduceCompletionLens(completionLens, {
@@ -969,7 +979,7 @@
   <div class="source-ghost-viewport" aria-hidden="true" hidden={!plan} bind:this={viewport}>
     <div class="source-ghost-mirror" bind:this={mirror}>
       {#if plan}
-        <span>{plan.prefix}</span><span class:ghost-text-hidden={ghostHidden} class="loom-source-ghost-text" bind:this={ghostSpan}>{plan.text}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
+        <span>{plan.prefix}</span><span class:ghost-text-hidden={ghostHidden} class="loom-source-ghost-text" bind:this={ghostSpan}>{ghostHidden ? '' : nextSuggestionWord(plan.text)?.trimEnd() ?? ''}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
       {/if}
     </div>
   </div>

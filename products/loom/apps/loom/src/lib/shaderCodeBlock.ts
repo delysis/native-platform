@@ -1,5 +1,7 @@
 import type { Node as ProseMirrorNode } from 'prosemirror-model';
-import type { NodeView, ViewMutationRecord } from 'prosemirror-view';
+import type { EditorView, NodeView, ViewMutationRecord } from 'prosemirror-view';
+import { NodeSelection, TextSelection } from 'prosemirror-state';
+import { objectMenu } from './objectMenu';
 import { compileShaderPreview, normalizeFailure } from './ipc';
 
 const MAX_SOURCE_BYTES = 16 * 1024;
@@ -109,8 +111,11 @@ function drawStaticPreview(canvas: HTMLCanvasElement, fragment: string): void {
   }
 }
 
-/** Editable code remains ProseMirror-owned; the canvas is a disposable projection. */
-export function shaderCodeBlockView(node: ProseMirrorNode, compiler: Compiler = compileShaderPreview): NodeView {
+/** Source stays in the document; switching its projection never edits Markdown. */
+export function shaderCodeBlockView(
+  node: ProseMirrorNode, view: EditorView, getPos: () => number | undefined,
+  compiler: Compiler = compileShaderPreview
+): NodeView {
   const pre = document.createElement('pre');
   const code = document.createElement('code');
   pre.append(code);
@@ -135,7 +140,7 @@ export function shaderCodeBlockView(node: ProseMirrorNode, compiler: Compiler = 
   canvas.contentEditable = 'false';
   canvas.setAttribute('role', 'img');
   canvas.setAttribute('aria-label', 'Shader preview');
-  canvas.hidden = true;
+  canvas.hidden = false;
   const error = document.createElement('small');
   error.className = 'loom-shader-error';
   error.contentEditable = 'false';
@@ -147,9 +152,49 @@ export function shaderCodeBlockView(node: ProseMirrorNode, compiler: Compiler = 
   let destroyed = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const queueKey = {};
+  // A freshly typed opening fence must stay editable until the writer leaves it.
+  let editing = source.length === 0;
+  let rendered = false;
+  function project(): void {
+    dom.dataset.shaderMode = editing ? 'source' : 'render';
+    pre.style.display = editing ? '' : 'none';
+    canvas.hidden = editing || !rendered;
+  }
+
+  function selectObject(): void {
+    const position = getPos();
+    if (position === undefined || view.isDestroyed) return;
+    view.dispatch(view.state.tr.setSelection(NodeSelection.create(view.state.doc, position)));
+  }
+
+  function setEditing(value: boolean): void {
+    editing = value;
+    project();
+    const position = getPos();
+    if (position === undefined || view.isDestroyed) return;
+    if (editing) {
+      view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc, position + 1)));
+    } else selectObject();
+    view.focus();
+  }
+
+  const closeMenu = objectMenu(dom, () => editing ? 'Render' : 'Edit', () => setEditing(!editing), () => view.focus());
+  dom.addEventListener('mousedown', (event) => {
+    if (editing || event.button !== 0) return;
+    event.preventDefault();
+    selectObject();
+    view.focus();
+  });
+  dom.addEventListener('loom-render-object', () => setEditing(false));
+  dom.addEventListener('loom-leave-object', () => {
+    if (rendered) { editing = false; project(); }
+  });
+  project();
 
   function report(message: string): void {
-    canvas.hidden = true;
+    rendered = false;
+    editing = true;
+    project();
     error.textContent = message;
     error.hidden = false;
   }
@@ -163,7 +208,13 @@ export function shaderCodeBlockView(node: ProseMirrorNode, compiler: Compiler = 
       if (destroyed || captured !== revision) return;
       drawStaticPreview(canvas, result.fragment);
       error.hidden = true;
-      canvas.hidden = false;
+      rendered = true;
+      const position = getPos();
+      const inside = position !== undefined && view.state.selection.from > position &&
+        view.state.selection.to < position + node.nodeSize;
+      if (!inside) editing = false;
+      project();
+      if (!editing && inside) selectObject();
     } catch (failure) {
       if (!destroyed && captured === revision) report(normalizeFailure(failure).message);
     }
@@ -173,7 +224,8 @@ export function shaderCodeBlockView(node: ProseMirrorNode, compiler: Compiler = 
     const captured = ++revision;
     pending.delete(queueKey);
     if (timer !== undefined) clearTimeout(timer);
-    canvas.hidden = true;
+    rendered = false;
+    project();
     error.hidden = true;
     timer = setTimeout(() => {
       timer = undefined;
@@ -187,14 +239,19 @@ export function shaderCodeBlockView(node: ProseMirrorNode, compiler: Compiler = 
     dom, contentDOM: code,
     update(next) {
       if (!isShader(next)) return false;
+      node = next;
       pre.dataset.params = next.attrs.params;
       if (next.textContent !== source) { source = next.textContent; schedule(); }
       return true;
     },
+    selectNode() { dom.classList.add('ProseMirror-selectednode'); },
+    deselectNode() { dom.classList.remove('ProseMirror-selectednode'); },
+    stopEvent(event) { return event.type === 'contextmenu' || (!editing && event.type === 'mousedown'); },
     ignoreMutation(mutation: ViewMutationRecord) {
       return mutation.type !== 'selection' && !code.contains(mutation.target);
     },
     destroy() {
+      closeMenu();
       destroyed = true;
       revision += 1;
       if (timer !== undefined) clearTimeout(timer);

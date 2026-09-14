@@ -6,6 +6,67 @@ use serde::{Deserialize, Serialize};
 
 pub const MAX_PANES: usize = 8;
 
+/// A name selects existing native authority; it cannot grant authority to a
+/// path, URL, arbitrary model digest, or download operation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceModel {
+    Catalog(String),
+    Profile(String),
+}
+
+impl WorkspaceModel {
+    fn validate(&self) -> Result<(), String> {
+        let (Self::Catalog(id) | Self::Profile(id)) = self;
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(
+                "Model names use up to 128 letters, digits, dots, hyphens, or underscores.".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkspaceTheme {
+    pub mode: WorkspaceThemeMode,
+    pub canvas: Option<String>,
+    pub text: Option<String>,
+    pub accent: Option<String>,
+}
+
+impl WorkspaceTheme {
+    fn validate(&self) -> Result<(), String> {
+        for color in [&self.canvas, &self.text, &self.accent]
+            .into_iter()
+            .flatten()
+        {
+            if color.len() != 7
+                || !color.starts_with('#')
+                || !color.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+            {
+                return Err("Theme colors use exactly #RRGGBB hexadecimal values.".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneKind {
@@ -26,6 +87,8 @@ pub enum PanePosition {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkspaceOverrides {
+    pub model: Option<WorkspaceModel>,
+    pub theme: WorkspaceTheme,
     pub panes: BTreeMap<String, PaneOverrides>,
 }
 
@@ -73,12 +136,16 @@ impl PaneConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorkspaceConfig {
+    pub model: Option<WorkspaceModel>,
+    pub theme: WorkspaceTheme,
     pub panes: BTreeMap<String, PaneConfig>,
 }
 
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
+            model: None,
+            theme: WorkspaceTheme::default(),
             panes: [
                 ("writing", PaneKind::Editor),
                 ("chat", PaneKind::Chat),
@@ -94,10 +161,25 @@ impl Default for WorkspaceConfig {
 
 impl WorkspaceOverrides {
     pub fn resolve(&self) -> Result<WorkspaceConfig, String> {
+        self.resolve_with_defaults(false)
+    }
+
+    fn resolve_with_defaults(&self, all_panes_visible: bool) -> Result<WorkspaceConfig, String> {
         if self.panes.len() > MAX_PANES {
             return Err("A workspace supports at most eight panes.".into());
         }
         let mut config = WorkspaceConfig::default();
+        if let Some(model) = &self.model {
+            model.validate()?;
+        }
+        self.theme.validate()?;
+        config.model.clone_from(&self.model);
+        config.theme.clone_from(&self.theme);
+        if all_panes_visible {
+            for pane in config.panes.values_mut() {
+                pane.visible = true;
+            }
+        }
         for (name, overrides) in &self.panes {
             if !valid_pane_id(name) {
                 return Err(
@@ -112,7 +194,10 @@ impl WorkspaceOverrides {
                         .ok_or_else(|| format!("Pane {name} needs a kind."))?,
                 ),
             };
-            let resolved = resolve_pane(name, base, overrides)?;
+            let mut resolved = resolve_pane(name, base, overrides)?;
+            if all_panes_visible && overrides.visible.is_none() {
+                resolved.visible = true;
+            }
             config.panes.insert(name.clone(), resolved);
             if config.panes.len() > MAX_PANES {
                 return Err("A workspace supports at most eight panes.".into());
@@ -194,9 +279,136 @@ fn validate_reference(reference: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Read the current-main Markdown workspace format without modifying its source.
+/// Mine TOML is preferred when present; callers choose exactly one source.
+pub fn parse_loom_workspace(markdown: &str) -> Result<WorkspaceConfig, String> {
+    if markdown.len() > crate::MAX_CONFIG_BYTES {
+        return Err("The workspace template exceeds 64 KiB.".into());
+    }
+    let overrides: WorkspaceOverrides = toml::from_str(config_fence(markdown)?)
+        .map_err(|error| format!("Workspace settings: {error}"))?;
+    overrides.resolve_with_defaults(true)
+}
+
+/// Ignore configuration-looking text inside other Markdown fences. Only one
+/// complete, top-level `loom-workspace` fence is authoritative.
+fn config_fence(markdown: &str) -> Result<&str, String> {
+    let mut open: Option<(u8, usize, bool, usize)> = None;
+    let mut found = None;
+    let mut offset = 0;
+    for line in markdown.split_inclusive('\n') {
+        let trimmed = line.trim_start_matches(' ');
+        let indent = line.len() - trimmed.len();
+        if indent <= 3 {
+            let marker = trimmed.as_bytes().first().copied().unwrap_or_default();
+            let count = trimmed.bytes().take_while(|byte| *byte == marker).count();
+            if matches!(marker, b'`' | b'~') && count >= 3 {
+                let suffix = trimmed[count..].trim();
+                if let Some((opening_marker, opening_count, selected, start)) = open {
+                    if marker == opening_marker && count >= opening_count && suffix.is_empty() {
+                        if selected {
+                            found = Some(&markdown[start..offset]);
+                        }
+                        open = None;
+                    }
+                } else {
+                    let selected = suffix == "loom-workspace";
+                    if selected && found.is_some() {
+                        return Err("Use one loom-workspace settings fence.".into());
+                    }
+                    open = Some((marker, count, selected, offset + line.len()));
+                }
+            }
+        }
+        offset += line.len();
+    }
+    if matches!(open, Some((_, _, true, _))) {
+        return Err("Close the loom-workspace settings fence.".into());
+    }
+    Ok(found.unwrap_or(""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_theme_defaults_and_strict_colors() {
+        assert_eq!(
+            parse_loom_workspace("").unwrap().theme,
+            WorkspaceTheme::default()
+        );
+        let config = parse_loom_workspace("```loom-workspace\n[theme]\nmode='dark'\ncanvas='#123abc'\ntext='#ABCDEF'\naccent='#000000'\n```").unwrap();
+        assert_eq!(config.theme.mode, WorkspaceThemeMode::Dark);
+        assert_eq!(config.theme.canvas.as_deref(), Some("#123abc"));
+        for invalid in [
+            "red",
+            "#123",
+            "#12345678",
+            "#gg0000",
+            "url(x)",
+            "#ffffff;",
+            "#éaaaa",
+        ] {
+            assert!(
+                parse_loom_workspace(&format!(
+                    "```loom-workspace\n[theme]\ncanvas='{invalid}'\n```"
+                ))
+                .is_err()
+            );
+        }
+        assert!(parse_loom_workspace("```loom-workspace\n[theme]\nmode='auto'\n```").is_err());
+        assert!(
+            parse_loom_workspace("```loom-workspace\n[theme]\nstylesheet='https://x'\n```")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn model_selection_names_exactly_one_bounded_native_authority() {
+        for (field, expected) in [
+            (
+                "catalog",
+                WorkspaceModel::Catalog("google.gemma-4-12b-it-qat-q4_0".into()),
+            ),
+            (
+                "profile",
+                WorkspaceModel::Profile("google.gemma-4-12b-it-qat-q4_0".into()),
+            ),
+        ] {
+            let config = parse_loom_workspace(&format!(
+                "```loom-workspace\n[model]\n{field}='google.gemma-4-12b-it-qat-q4_0'\n```"
+            ))
+            .expect("bounded native identity");
+            assert_eq!(config.model, Some(expected));
+            assert_eq!(config.panes, parse_loom_workspace("").unwrap().panes);
+        }
+        for model in [
+            "catalog='one'\nprofile='two'".to_owned(),
+            "path='/tmp/model.gguf'".to_owned(),
+            "catalog='../model'".to_owned(),
+            "catalog=''".to_owned(),
+            "catalog='https://example.invalid/model'".to_owned(),
+            format!("catalog='{}'", "x".repeat(129)),
+        ] {
+            assert!(
+                parse_loom_workspace(&format!("```loom-workspace\n[model]\n{model}\n```")).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn current_markdown_workspace_retains_default_visibility_and_exact_fences() {
+        let text = "# Workspace\r\n~~~loom-workspace\r\n[theme]\r\nmode='dark'\r\n[panes.chat]\r\nvisible=false\r\n~~~\r\n";
+        let config = parse_loom_workspace(text).unwrap();
+        assert!(config.panes["terminal"].visible);
+        assert!(!config.panes["chat"].visible);
+        assert_eq!(config.theme.mode, WorkspaceThemeMode::Dark);
+        let example = "````markdown\n```loom-workspace\ninvalid\n```\n````\n";
+        assert!(parse_loom_workspace(example).is_ok());
+        assert!(parse_loom_workspace("```loom-workspace\n").is_err());
+        assert!(parse_loom_workspace("```loom-workspace\n```\n```loom-workspace\n```\n").is_err());
+    }
 
     fn parse(source: &str) -> Result<WorkspaceConfig, String> {
         toml::from_str::<WorkspaceOverrides>(source)

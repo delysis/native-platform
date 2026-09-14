@@ -31,13 +31,13 @@ async function render(config: Partial<WorkspacePaneConfig> = {}, value = source.
   const target = document.createElement('div'); target.style.height = '400px'; target.style.width = '320px'; document.body.append(target);
   ipc.list.mockResolvedValue(config.kind === 'browser' ? [] : [run('old'), run('unrelated', 'other')]);
   if (!ipc.open.getMockImplementation()) ipc.open.mockResolvedValue({ ...source, text: fullAnswer });
-  const beforeRun = vi.fn(async () => currentSource), onOpenDocument = vi.fn(), onChange = vi.fn(), onModelSelect = vi.fn(), onCompositionChange = vi.fn();
+  const beforeRun = vi.fn(async () => currentSource), onOpenDocument = vi.fn(), onChange = vi.fn(), onCompositionChange = vi.fn();
   mounted = mount(WorkspacePane, { target, props: {
     paneId: 'conversation', config: { kind: 'chat', position: 'right', visible: true, title: null, document: null, context: ['Voice notes'], ...config },
-    projectId: 'project', sessionId: 'session', source: currentSource, value, documents: [currentSource.summary, { ...source.summary, document_id: 'result', relative_path: 'Runs/1/Answer.md', title: 'Answer' }], beforeRun, onOpenDocument, onChange, modelLabel: 'Gemma', onModelSelect, onCompositionChange
+    projectId: 'project', sessionId: 'session', source: currentSource, value, documents: [currentSource.summary, { ...source.summary, document_id: 'result', relative_path: 'Runs/1/Answer.md', title: 'Answer' }], beforeRun, onOpenDocument, onChange, onCompositionChange
   } });
   await tick(); await expect.poll(() => ipc.list.mock.calls.length).toBe(1);
-  return { beforeRun, onOpenDocument, onChange, onModelSelect, onCompositionChange };
+  return { beforeRun, onOpenDocument, onChange, onCompositionChange };
 }
 
 describe('workspace panes', () => {
@@ -54,7 +54,7 @@ describe('workspace panes', () => {
   });
 
   it('restores only this pane history and submits one retained raw prompt with explicit context and full prior output', async () => {
-    const { beforeRun, onOpenDocument, onModelSelect } = await render({ context: ['@document', '@"Voice notes"'], document: '@Draft' });
+    const { beforeRun, onOpenDocument } = await render({ context: ['@document', '@"Voice notes"'], document: '@Draft' });
     await expect.poll(() => document.querySelector('.output')?.textContent).toBe(fullAnswer);
     await page.getByText(fullAnswer, { exact: true }).click();
     const range = document.createRange(); range.selectNodeContents(document.querySelector('.output')!);
@@ -62,20 +62,18 @@ describe('workspace panes', () => {
     expect(selection?.toString()).toBe(fullAnswer);
     expect(onOpenDocument).not.toHaveBeenCalled();
     expect(document.querySelectorAll('article')).toHaveLength(1);
-    await page.getByRole('button', { name: 'Model: Gemma' }).click();
-    expect(onModelSelect).toHaveBeenCalledWith(expect.any(HTMLElement));
     await page.getByRole('button', { name: 'Open output document' }).click();
     expect(onOpenDocument).toHaveBeenCalledWith('result');
     ipc.run.mockImplementation(async (request) => ({ ...run(request.commandId), presentation: request.presentation }));
     const input = page.getByRole('textbox', { name: 'Message' });
     const inputRect = input.element().getBoundingClientRect();
-    const actionsRect = document.querySelector('.composer-actions')!.getBoundingClientRect();
+    expect(document.querySelector('.composer-actions')).toBeNull();
+    expect(document.querySelector('form button')).toBeNull();
     const formRect = document.querySelector('form')!.getBoundingClientRect();
     expect(inputRect.width).toBeGreaterThan(formRect.width - 12);
-    expect(actionsRect.top).toBeGreaterThanOrEqual(inputRect.bottom - 1);
-    expect(formRect.height).toBeLessThanOrEqual(76);
+    expect(formRect.height).toBeLessThanOrEqual(48);
     await input.fill('Continue that idea');
-    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await userEvent.keyboard('{Enter}');
     await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
     expect(beforeRun).toHaveBeenCalledOnce();
     const request = ipc.run.mock.calls[0][0];
@@ -158,6 +156,40 @@ describe('workspace panes', () => {
     expect(onCompositionChange).toHaveBeenLastCalledWith(true);
     input.element().dispatchEvent(new CompositionEvent('compositionend', { bubbles: true }));
     await expect.poll(() => onCompositionChange.mock.calls.at(-1)?.[0]).toBe(false);
+  });
+
+
+  it('keeps idle chat input-only while Shift+Enter adds a line and an active run remains cancellable', async () => {
+    await render();
+    const input = page.getByRole('textbox', { name: 'Message' });
+    await input.fill('Line one');
+    await userEvent.keyboard('{Shift>}{Enter}{/Shift}Line two');
+    await expect.element(input).toHaveValue('Line one\nLine two');
+    expect(ipc.run).not.toHaveBeenCalled();
+    expect(document.querySelector('form button')).toBeNull();
+    let active: TerminalRun | undefined;
+    ipc.run.mockImplementation(async (request) => {
+      active = { ...run(request.commandId), status: 'running', presentation: request.presentation };
+      return active;
+    });
+    ipc.list.mockImplementation(async () => active ? [active] : []);
+    await userEvent.keyboard('{Enter}');
+    await expect.element(page.getByRole('button', { name: 'Stop', exact: true })).toBeVisible();
+    expect(ipc.run.mock.calls[0][0].presentation.input).toBe('Line one\nLine two');
+    ipc.cancel.mockImplementation(async () => { active = { ...active!, status: 'cancelled' }; });
+    await page.getByRole('button', { name: 'Stop', exact: true }).click();
+    await expect.poll(() => document.querySelector('form button')).toBeNull();
+    expect(ipc.cancel).toHaveBeenCalledWith('project', 'session', active!.run_id);
+  });
+
+  it('retains explicit recovery for an uncertain chat admission', async () => {
+    await render();
+    ipc.run.mockRejectedValue(new Error('Reply interrupted'));
+    await page.getByRole('textbox', { name: 'Message' }).fill('Continue');
+    await userEvent.keyboard('{Enter}');
+    await expect.element(page.getByRole('button', { name: 'Check result' })).toBeVisible();
+    await page.getByRole('button', { name: 'Check result' }).click();
+    expect(ipc.run).toHaveBeenCalledOnce();
   });
 
 });

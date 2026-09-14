@@ -4,15 +4,21 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
   import TerminalPane from './lib/TerminalPane.svelte';
+  import PaneDivider from './lib/PaneDivider.svelte';
+  import Loompad from './lib/Loompad.svelte';
+  import { loompadPrefix, type LoompadLength } from './lib/loompad';
+  import type { CompletionCandidate } from './lib/completionSession';
   import type { TerminalSourceRange } from './lib/terminalSelection';
   import { workspaceRows } from './lib/workspaceTree';
+  import { readWorkspaceFolders, rememberWorkspaceFolder, type WorkspaceFolder } from './lib/workspaceFolders';
   import WorkspacePane from './lib/WorkspacePane.svelte';
   import SetupFlow from './lib/SetupFlow.svelte';
-  import type { SetupChoices, WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
+  import { workspaceWriterCandidates, workspaceWriterModel, type SetupChoices, type WorkspaceTemplateSnapshot, type WorkspaceWriterCandidate } from './lib/workspaceTemplate';
   import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
   import { startAudioRecording, stopAudioRecording, synthesizeAudio, type AudioRecording } from './lib/ipc';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
+  import ImportSources from './lib/ImportSources.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
@@ -50,6 +56,7 @@
     getWeaveStatus,
     ingestImageAttachment,
     importAttachmentPaths,
+    revealAttachmentOriginal,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
     listenForDocumentFilesystemHints,
@@ -65,6 +72,8 @@
     listModels,
     listModelDownloads,
     openDefaultProject,
+    prepareProjectOpenPath,
+    projectDropDirectories,
     openDocument,
     importExternalDocument,
     previewDocumentReconciliation,
@@ -167,7 +176,6 @@
   import { suggestionsEnabledFromStoredPreference } from './lib/suggestionPreference';
   import {
     resolveAppearance,
-    toggledAppearance,
     type AppearancePreference
   } from './lib/appearance';
   import {
@@ -176,12 +184,6 @@
     legacyLocalCatalogMatch,
     validateCuratedModelCatalog
   } from './lib/modelCatalog';
-  import {
-    AUTOCOMPLETE_MODEL_MENU_LONG_PRESS_MS,
-    autocompleteModelMenuLongPressMoved,
-    canStartAutocompleteModelMenuLongPress,
-    isAutocompleteModelMenuKey
-  } from './lib/autocompleteModelMenu';
   import {
     captureProjectCloseAgency,
     restoreProjectCloseAgency,
@@ -201,6 +203,7 @@
   } from './lib/suggestionInteraction';
   import {
     acceptedCompletionText,
+    insertAtUtf8Boundary,
     completionPresentation as completionSessionPresentation,
     completionSessionContextKey,
     completionShouldRequestNextBatch,
@@ -277,6 +280,7 @@
     observeTextMutation,
     reconcileCompletionController,
     refreshCompletionCandidate,
+    refreshCompatibleCompletionFamily,
     rejectVisualPresentation,
     resetCompletionDiscovery,
     resetCompletionSurface,
@@ -316,8 +320,7 @@
     looksLikeVisionAdapter,
     orderedLocalTextModels,
     preferredWriterModelPath,
-    suggestionWriter,
-    startupWriterCandidates
+    suggestionWriter
   } from './lib/modelPolicy';
   import type {
     BranchCard,
@@ -383,7 +386,15 @@
   let lastFailure: LoomFailure | null = null;
   let opening = false;
   let search = '';
+  let workspaceFolders: WorkspaceFolder[] = [];
+  let workspaceRootExpanded = true;
+  let workspaceDocuments: Record<string, string> = {};
+  let workspaceDropActive = false;
+  let outlineElement: HTMLElement | undefined;
+  $: visibleWorkspaceFolders = project && !workspaceFolders.some(folder => folder.root === project?.root)
+    ? [...workspaceFolders, { root: project.root, title: project.title }] : workspaceFolders;
   let workspaceTemplate: WorkspaceTemplateSnapshot | null = null;
+  let workspaceTemplateScope = '';
   let deferredWorkspaceTemplate: WorkspaceTemplateSnapshot | null = null;
   let deferredTemplateSession = '';
   let workspaceSettingsSession = '';
@@ -409,24 +420,39 @@
   let templateKey = '';
   let templateSerial = 0;
   let paneSelection: Record<string, string> = {};
+  let hiddenPaneSlots = new Set<string>();
+  let workspaceWidth = 1000;
+  let workspaceHeight = 600;
+  let outlineWidth = 220;
+  let rightWidth = 320;
+  let bottomHeight = 240;
+  let terminalHeight = 220;
+  let terminalDockHeight = 0;
+  $: terminalLimit = Math.max(100, (workspaceHeight + terminalDockHeight) * 0.6);
+  $: effectiveTerminalHeight = Math.min(terminalHeight, terminalLimit);
+  $: outlineLimit = Math.max(150, workspaceWidth * 0.35);
+  $: rightLimit = Math.max(180, workspaceWidth - (outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0) - 200);
+  $: rightPaneOpen = paneSlots.some(slot => slot.position === 'right' && slot.selected && !hiddenPaneSlots.has('right'));
+  $: bottomPaneOpen = paneSlots.some(slot => slot.position === 'bottom' && slot.selected && !hiddenPaneSlots.has('bottom'));
   let paneEditors: Record<string, WorkspacePane> = {};
   let paneBusy: Record<string, boolean> = {};
   let paneComposing: Record<string, boolean> = {};
   $: configuredPanes = workspaceTemplate?.enabled ? Object.entries(workspaceTemplate.config.panes) : [];
+  $: busyPaneSlots = new Set(configuredPanes.filter(([id]) => paneBusy[id]).map(([, config]) => config.position));
   $: paneSlots = (['main', 'right', 'bottom'] as const).map(position => {
     const choices = configuredPanes.filter(([, config]) => config.position === position && config.visible);
     return { position, choices, selected: choices.find(([id]) => id === paneSelection[position]) ?? choices[0] };
   });
   $: mainPane = paneSlots.find(slot => slot.position === 'main')?.selected;
-  $: customMain = document?.summary.relative_path !== '.mine.toml' && Boolean(mainPane && (mainPane[1].kind !== 'editor' || mainPane[1].document));
+  $: customMain = !['.mine.toml', '.loom.md'].includes(document?.summary.relative_path ?? '') && Boolean(mainPane && (mainPane[1].kind !== 'editor' || mainPane[1].document));
   $: if (desktop && project) {
     if (workspaceSettingsSession !== project.session_id) {
-      workspaceSettingsSession = project.session_id; workspaceTemplate = null; deferredWorkspaceTemplate = null;
+      workspaceSettingsSession = project.session_id; workspaceTemplate = null; workspaceTemplateScope = ''; deferredWorkspaceTemplate = null;
       assistanceReadySession = ''; appliedAssistanceKey = ''; attemptedAssistance = null; setupFlowOpen = false; setupError = ''; setupDownloadIds = [];
     }
-    const key = `${project.project_id}/${project.session_id}/${project.documents.find(item => item.relative_path === '.mine.toml')?.revision_id ?? ''}`;
+    const key = `${project.project_id}/${project.session_id}/${project.documents.find(item => item.relative_path === '.mine.toml')?.revision_id ?? project.documents.find(item => item.relative_path === '.loom.md')?.revision_id ?? ''}`;
     if (key !== templateKey) { templateKey = key; void refreshWorkspaceTemplate(); }
-  } else { workspaceTemplate = null; deferredWorkspaceTemplate = null; templateKey = ''; }
+  } else { workspaceTemplate = null; workspaceTemplateScope = ''; deferredWorkspaceTemplate = null; templateKey = ''; }
   let outlineOpen = false;
   let collapsedFolders = new Set<string>(['Runs/']);
   let terminalOpen = false;
@@ -525,6 +551,7 @@
   let speechPlaybackScope = '';
   $: if (speechPlaybackScope !== `${project?.session_id ?? ''}/${document?.summary.document_id ?? ''}`) { speechPlaybackScope = `${project?.session_id ?? ''}/${document?.summary.document_id ?? ''}`; stopReadAloud(); }
   let appearance: AppearancePreference = 'system';
+  let appearanceOverride = false;
   let systemDark = false;
   let appearanceMedia: MediaQueryList | null = null;
   let models: ModelCapabilitySummary[] = [];
@@ -588,19 +615,14 @@
   let missingDocumentCopyState: 'idle' | 'copied' | 'failed' = 'idle';
   let appliedNativeTitle = '';
   let suggestionsEnabled = false;
+  let suggestionInteraction: 'ghost' | 'loompad' = 'ghost';
+  let loompadAccepting = false;
+  $: loompadActive = suggestionsEnabled && suggestionInteraction === 'loompad';
+  $: ghostTextHidden = loompadActive || inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled });
   let suggestionsChanging = false;
   let reportedGenerationFailureRun: string | null = null;
   let contextPresentationFingerprint = '';
   let requireExplicitCompletionFamily = false;
-  let autocompleteModelMenuLongPressTimer: number | undefined;
-  let autocompleteModelMenuLongPress: {
-    pointerId: number;
-    x: number;
-    y: number;
-    trigger: HTMLButtonElement;
-  } | null = null;
-  let suppressAutocompleteToggleClick = false;
-  let suppressAutocompleteToggleClickTimer: number | undefined;
   let suggestionsIdleTimer: number | undefined;
   let suggestionWakeQueued = false;
   let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
@@ -653,6 +675,16 @@
   let branchPollEpoch = 0;
   let completionActiveRunIds: string[] = [];
   let authoritativeCompletionFamilyId: string | null = null;
+  let loompadReservoir: {
+    key: string; snapshotId: string; familyIds: string[]; nextOffset: number;
+    admittedAt: number; capture: WeaveCapture;
+  } | null = null;
+  $: loompadSnapshotKey = JSON.stringify([project?.project_id, project?.session_id,
+    document?.summary.document_id, document?.summary.revision_id, document?.visible_blob_id,
+    mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte, currentModel?.model_id,
+    contextEpoch, documentEpoch, completionController.intentEpoch, editVersion]);
+  $: loompadFamilyIds = loompadActive && loompadReservoir?.key === loompadSnapshotKey
+    ? loompadReservoir.familyIds : undefined;
   let cancellingRunIds: string[] = [];
   let cancellationCommandByRun: Record<string, string> = {};
   let promotionArmedCandidateId: string | null = null;
@@ -696,6 +728,7 @@
     refreshGhostPresentation: () => boolean;
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
+    acceptLoompadText: (candidateId: string, presentationKey: string, text: string) => boolean;
     insertAttachmentMarkdown: (markdown: string, clientX?: number, clientY?: number) => boolean;
     captureAttachmentAnchor: (x: number, y: number) => VisualTextInsertionAnchor | null;
     insertMarkdownAtAnchor: (anchor: VisualTextInsertionAnchor, markdown: string) => boolean;
@@ -707,6 +740,7 @@
     focusAtDocumentEnd: () => boolean;
     focusCurrentSelection: () => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
+    acceptLoompadText: (candidateId: string, presentationKey: string, text: string) => boolean;
     insertAttachmentMarkdown: (markdown: string) => boolean;
     insertTextAtSelection: (text: string) => boolean;
     captureTextInsertionAnchor: () => SourceTextInsertionAnchor | null;
@@ -851,6 +885,9 @@
     editVersion: number;
     intentEpoch: number;
     modelId: string;
+    sourceDocument: OpenDocument;
+    sourceMarkdown: string;
+    speculation?: { sampleTarget: 4 | 16 | 64 | 256; offset: number; key: string };
   }
 
   interface ModelDownloadCapture extends VerifiedDownloadForm {
@@ -990,7 +1027,7 @@
   $: folderWarnings = project?.folder_warnings ?? [];
   $: fileRows = workspaceRows(project?.documents ?? [], collapsedFolders, search);
   $: loadedModel = models.find((model) => model.loaded) ?? null;
-  $: currentModel = suggestionWriter(models, buildModelPolicy);
+  $: currentModel = workspaceWriterModel(models, buildModelPolicy, curatedModels, workspaceTemplate, workspaceTemplateScope === `${project?.project_id}/${project?.session_id}`);
   $: suggestionSetupNeeded = Boolean(
     project &&
     document &&
@@ -1066,6 +1103,7 @@
   $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual', {
     branches,
     authoritativeFamilyId: authoritativeCompletionFamilyId,
+    authoritativeFamilyIds: loompadFamilyIds,
     requireExplicitFamily: requireExplicitCompletionFamily,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     liveTextByRun: liveBranchTextByRun,
@@ -1082,6 +1120,7 @@
   $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source', {
     branches,
     authoritativeFamilyId: authoritativeCompletionFamilyId,
+    authoritativeFamilyIds: loompadFamilyIds,
     requireExplicitFamily: requireExplicitCompletionFamily,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     liveTextByRun: liveBranchTextByRun,
@@ -1100,14 +1139,15 @@
     : mode === 'source'
       ? sourceSuggestionFamily
       : [];
-  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily);
+  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, loompadActive);
   $: completionView = completionControllerView(
     completionController,
     completionContextKey,
-    baseSuggestionFamily
+    baseSuggestionFamily,
+    loompadActive
   );
   $: boundCompletionSession = completionView.boundSession;
-  $: if (boundCompletionSession) {
+  $: if (boundCompletionSession && !loompadActive) {
     const selected = selectedCompletionCandidate(boundCompletionSession);
     const branch = selected
       ? branches.find((candidate) => candidate.run_id === selected.runId)
@@ -1141,6 +1181,32 @@
         text,
         projectedInlinePresentationKey(rawPresentationKey, rawText, text)
       );
+    }
+  }
+  $: if (loompadActive && boundCompletionSession && loompadReservoir) {
+    const captured = loompadReservoir.capture;
+    const selected = selectedCompletionCandidate(boundCompletionSession);
+    const familyRunIds = new Set(branches.filter(branch =>
+      loompadReservoir?.familyIds.includes(branch.weave_command_id ?? '') &&
+      branch.source_revision_id === captured.sourceRevisionId
+    ).map(branch => branch.run_id));
+    // Only the exact author-approved prefix may separate this document from
+    // the retained native snapshot. Manual edits/context changes revoke it.
+    if (selected && familyRunIds.has(selected.runId) &&
+        project?.project_id === captured.projectId && project.session_id === captured.sessionId &&
+        document?.summary.document_id === captured.documentId && documentEpoch === captured.epoch &&
+        contextEpoch === captured.contextEpoch && currentModel?.model_id === captured.modelId &&
+        insertAtUtf8Boundary(captured.sourceMarkdown, captured.cursorByte,
+          acceptedCompletionText(boundCompletionSession)) === documentText) {
+      const originals = inlineSuggestionFamily(captured.cursorByte, mode, {
+        branches, authoritativeFamilyIds: loompadReservoir.familyIds, requireExplicitFamily: true,
+        verifiedBodyByRun: verifiedBranchBodyByRun, liveTextByRun: liveBranchTextByRun,
+        liveTextSequenceByRun: liveBranchTextSequenceByRun, currentModel,
+        document: captured.sourceDocument, suggestionsEnabled: true, promotionReady: true,
+        dismissedCandidateIds, unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
+        manuscriptText: captured.sourceMarkdown, sourceNewline: sourceGhostNewline
+      });
+      refreshVisibleCompletionFamily(boundCompletionSession, originals);
     }
   }
   $: activeSuggestionFamily = completionView.activeFamily;
@@ -1183,10 +1249,7 @@
       : 0,
     autocomplete_enabled: suggestionsEnabled,
     shuttle_enabled: shuttleEnabled,
-    inline_hidden_requested: inlineGhostHidden({
-      autocomplete: suggestionsEnabled,
-      shuttle: shuttleEnabled
-    }),
+    inline_hidden_requested: ghostTextHidden,
     inline_visible_key: mode === 'visual'
       ? visibleVisualGhostPresentationKey
       : mode === 'source'
@@ -1245,11 +1308,17 @@
             ? 'Ready'
             : 'Set up';
   $: nativeWindowTitle = document?.summary.title ?? project?.title ?? 'Loom';
-  $: resolvedAppearance = resolveAppearance(appearance, systemDark);
+  $: workspaceTheme = workspaceTemplate?.error ? null : workspaceTemplate?.config.theme;
+  $: resolvedAppearance = resolveAppearance(appearanceOverride ? appearance : workspaceTheme?.mode ?? 'system', systemDark);
   $: if (desktop) void syncNativeWindowTitle(nativeWindowTitle);
   $: if (componentMounted) {
     window.document.documentElement.dataset.theme = resolvedAppearance;
     window.document.documentElement.style.colorScheme = resolvedAppearance;
+    for (const token of ['canvas', 'text', 'accent'] as const) {
+      const value = workspaceTheme?.[token];
+      if (value) window.document.documentElement.style.setProperty(`--loom-${token}`, value);
+      else window.document.documentElement.style.removeProperty(`--loom-${token}`);
+    }
   }
   $: if (
     suggestionsEnabled &&
@@ -1258,7 +1327,7 @@
     activeGhostSuggestion.presentationKey !== announcedGhostPresentationKey
   ) {
     announcedGhostPresentationKey = activeGhostSuggestion.presentationKey;
-    announce('Suggestion available. Tab accepts all; Option Right accepts one word; Option Up or Down switches.');
+    announce('Suggestion available. Tab accepts one word; Option WASD chooses a word.');
   }
   $: shuttleCandidate = shuttleEnabled ? selectedInlineSuggestion : activeGhostSuggestion;
   $: shuttleScheduleKey = completionShuttleScheduleKey(
@@ -2083,6 +2152,26 @@
     }
   }
 
+  async function useImportedSources(items: import('./lib/types').ContextAttachment[]): Promise<boolean> {
+    if (!project || !document || editorReadonly || contextAttachmentBusy || items.length === 0) return false;
+    const captured = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id };
+    contextAttachmentBusy = true;
+    try {
+      if (!await persistCurrentContextText()) return false;
+      if (
+        project?.project_id !== captured.projectId ||
+        project.session_id !== captured.sessionId ||
+        document?.summary.document_id !== captured.documentId ||
+        editorReadonly
+      ) return false;
+      const previousText = contextText;
+      const snapshot = await addDocumentContexts(captured.projectId, captured.sessionId, captured.documentId, [...new Set(items.map((item) => item.id))]);
+      if (!adoptAuthoritativeContext(snapshot, captured.projectId, captured.sessionId, captured.documentId)) return false;
+      await normalizeImportedContext(previousText);
+      return true;
+    } finally { contextAttachmentBusy = false; }
+  }
+
   async function removeContextAttachment(attachmentId: string): Promise<void> {
     if (!project || !document || contextAttachmentBusy) return;
     const captured = {
@@ -2192,18 +2281,62 @@
     }
   }
 
+  async function openDroppedFolders(paths: string[]): Promise<void> {
+    if (fileCommandInFlight || opening || !paths.length) return;
+    // Each folder uses the same prepared-open/save/commit path as the picker.
+    for (const path of paths.slice(0, 32)) {
+      if (!await doOpenProject(path)) break;
+    }
+  }
+
+  async function handleNativeDrop(paths: string[], point: { x: number; y: number }): Promise<void> {
+    if (fileCommandInFlight || opening || !paths.length) return;
+    const captured = { session: project?.session_id, document: document?.summary.document_id, markdown: documentText, mode };
+    try {
+      const directories = await projectDropDirectories(paths);
+      if (!componentMounted || applicationClosePhase !== 'running' || fileCommandInFlight || opening ||
+          project?.session_id !== captured.session || document?.summary.document_id !== captured.document ||
+          documentText !== captured.markdown || mode !== captured.mode) return;
+      if (directories.length) {
+        await openDroppedFolders(directories);
+      } else {
+        const pane = Array.from(window.document.querySelectorAll<HTMLElement>('[data-workspace-pane]')).find(element => {
+          const rect = element.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom;
+        });
+        const paneId = pane?.dataset.workspacePane;
+        if (paneId && paneEditors[paneId]) {
+          await paneEditors[paneId].importDroppedPaths(paths, point);
+          await refreshDocumentContext();
+          return;
+        }
+        const scope = nativeAttachmentDropScope(point);
+        if (scope) await importNativeAttachmentDrop(paths, point, scope);
+      }
+    } catch (error) {
+      recordFailure(error);
+    }
+  }
+
   async function installNativeAttachmentDrop(): Promise<void> {
     unlistenNativeAttachmentDrop = await getCurrentWindow().onDragDropEvent(({ payload }) => {
       if (payload.type === 'leave') {
         contextDropActive = false;
+        workspaceDropActive = false;
         return;
       }
       const point = nativeDropPoint(payload.position);
+      const outline = outlineElement?.getBoundingClientRect();
+      const inOutline = Boolean(outlineOpen && outline && point.x >= outline.left && point.x < outline.right && point.y >= outline.top && point.y < outline.bottom);
+      workspaceDropActive = inOutline;
+      if (payload.type === 'drop') {
+        workspaceDropActive = false;
+        contextDropActive = false;
+        void handleNativeDrop(payload.paths, point);
+        return;
+      }
       const scope = nativeAttachmentDropScope(point);
       contextDropActive = scope === 'context';
-      if (payload.type === 'drop' && scope) {
-        void importNativeAttachmentDrop(payload.paths, point, scope);
-      }
     });
   }
 
@@ -2214,9 +2347,12 @@
     systemDark = appearanceMedia.matches;
     const syncSystemAppearance = (event: MediaQueryListEvent): void => {
       systemDark = event.matches;
+      appearanceOverride = false;
+      appearance = 'system';
     };
     appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
+    try { workspaceFolders = readWorkspaceFolders(window.localStorage); } catch { workspaceFolders = []; }
     if (desktop) void refreshCuratedModels();
     if (desktop) void installNativeAttachmentDrop();
     documentContextRevealLabel = desktop
@@ -2251,13 +2387,16 @@
         }
       })();
     }
+    const loompadIdleTimer = window.setInterval(() => void prefetchLoompad(), 5_000);
     window.addEventListener('keydown', handleGlobalKeydownCapture, true);
+    window.addEventListener('click', handleAttachmentLink, true);
     window.addEventListener('keydown', handleGlobalKeydown);
     window.addEventListener('pointerdown', handleGlobalPointerdown);
     window.addEventListener('pageshow', handleRendererResume);
     window.document.addEventListener('visibilitychange', handleRendererResume);
     return () => {
       componentMounted = false;
+      window.clearInterval(loompadIdleTimer);
       if (terminalPollTimer !== undefined) window.clearTimeout(terminalPollTimer);
       startupHeldForApplicationClose = false;
       workspaceRestoreSerial += 1;
@@ -2266,6 +2405,7 @@
       modelLoadSerial += 1;
       clearPreferredWriterRequest();
       window.removeEventListener('keydown', handleGlobalKeydownCapture, true);
+      window.removeEventListener('click', handleAttachmentLink, true);
       window.removeEventListener('keydown', handleGlobalKeydown);
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
       window.removeEventListener('pageshow', handleRendererResume);
@@ -2273,11 +2413,6 @@
       stopReadAloud();
       appearanceMedia?.removeEventListener('change', syncSystemAppearance);
       appearanceMedia = null;
-      clearAutocompleteModelMenuLongPress();
-      if (suppressAutocompleteToggleClickTimer !== undefined) {
-        window.clearTimeout(suppressAutocompleteToggleClickTimer);
-        suppressAutocompleteToggleClickTimer = undefined;
-      }
       clearDocumentContextLongPress();
       if (documentContextSuppressClickTimer !== undefined) {
         window.clearTimeout(documentContextSuppressClickTimer);
@@ -2668,6 +2803,7 @@
       const unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
         windowFocused = focused;
         if (focused) {
+          resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
           resumeCompletionObservation();
           scheduleProjectFilesystemRefresh();
           // A hidden WKWebView may stay DOM-focused and emit neither browser
@@ -2693,6 +2829,7 @@
 
   function handleRendererResume(): void {
     if (window.document.visibilityState === 'hidden') return;
+    resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
     resumeCompletionObservation();
     scheduleProjectFilesystemRefresh();
   }
@@ -3885,7 +4022,7 @@
       if (failed && failed.run_id !== reportedGenerationFailureRun) {
         reportedGenerationFailureRun = failed.run_id;
         recordLocalFailure('generation_runtime_failed', failed.error!);
-        announce('Suggestions failed. Open Suggestions to reload the local model.');
+        announce('Ghost text is unavailable.');
       }
       reconcileBranchActionState();
       if (completionActiveRunIds.length > 0) scheduleActiveBranchPoll();
@@ -4143,6 +4280,33 @@
     };
   }
 
+  let unavailableWorkspaceWriterKey = '';
+
+  function workspaceWriterKey(): string {
+    return `${workspaceTemplateScope}/${workspaceTemplate?.source_sha256 ?? workspaceTemplate?.revision_id ?? ''}/${workspaceTemplate?.model_path ?? ''}/${JSON.stringify(workspaceTemplate?.config.model ?? null)}`;
+  }
+
+  function workspaceWriterSwapIsIdle(): boolean {
+    return transition === 'idle' && !compositionActive && !weaveStarting &&
+      completionActiveRunIds.length === 0 && !terminalDispatching &&
+      !terminalPendingRequest && !terminalRuns.some((run) => run.status === 'running') &&
+      (!models.some((model) => model.loaded) || !Object.values(paneBusy).some(Boolean));
+  }
+
+  async function prepareWorkspaceWriterTemplate(captured: WorkspaceRestoreCapture): Promise<boolean> {
+    const scope = `${captured.projectId}/${captured.sessionId}`;
+    if (workspaceTemplateScope !== scope || !workspaceTemplate) await refreshWorkspaceTemplate();
+    await tick();
+    return workspaceRestoreIsCurrent(captured) && workspaceTemplateScope === scope &&
+      Boolean(workspaceTemplate && !workspaceTemplate.error);
+  }
+
+  $: if (preferredWriterPending && !modelLoading && !modelUnloading &&
+    transition === 'idle' && !compositionActive && !weaveStarting &&
+    completionActiveRunIds.length === 0 && !terminalDispatching &&
+    !terminalPendingRequest && !terminalRuns.some((run) => run.status === 'running') &&
+    (!models.some((model) => model.loaded) || !Object.values(paneBusy).some(Boolean))) wakePreferredWriterEnsure();
+
   function clearPreferredWriterRequest(captured?: WorkspaceRestoreCapture): void {
     if (!captured || workspaceCapturesMatch(preferredWriterPending, captured)) {
       preferredWriterPending = null;
@@ -4182,7 +4346,7 @@
       !applicationAllowsModelPreparation(applicationClosePhase) ||
       !captured ||
       !completionAutomationEnabled() ||
-      currentModel
+      currentModel || unavailableWorkspaceWriterKey === workspaceWriterKey()
     ) return;
     requestPreferredWriterEnsure(captured);
   }
@@ -4191,6 +4355,10 @@
     if (preferredWriterEnsureInFlight) return preferredWriterEnsureInFlight;
     const captured = preferredWriterPending;
     if (!captured) return Promise.resolve(Boolean(currentModel));
+    if (unavailableWorkspaceWriterKey === workspaceWriterKey()) {
+      clearPreferredWriterRequest(captured);
+      return Promise.resolve(false);
+    }
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
       !completionAutomationEnabled() ||
@@ -4203,7 +4371,7 @@
       modelLoading ||
       modelUnloading ||
       modelRefreshInFlightCount > 0 ||
-      transition !== 'idle' ||
+      !workspaceWriterSwapIsIdle() ||
       !document
     ) return Promise.resolve(false);
 
@@ -4226,6 +4394,7 @@
       !completionAutomationEnabled() ||
       !workspaceRestoreIsCurrent(captured)
     ) return false;
+    if (!await prepareWorkspaceWriterTemplate(captured)) return false;
     if (currentModel) {
       if (document) scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
       return true;
@@ -4304,6 +4473,7 @@
   }
 
   async function retryPreferredWriter(): Promise<void> {
+    unavailableWorkspaceWriterKey = '';
     quietModelLoadFailure = null;
     if (modelSetupError.startsWith('Automatic writer setup failed.')) modelSetupError = '';
     await refreshCurrentModelsAndEnsureWriter();
@@ -4347,13 +4517,18 @@
   }
 
   function setAppearance(next: AppearancePreference): void {
+    appearanceOverride = true;
     appearance = next;
     const label = next === 'system' ? 'Appearance follows the system' : `${next} appearance`;
     announce(`${label} for this session`);
   }
 
   function toggleAppearance(): void {
-    setAppearance(toggledAppearance(appearance, systemDark));
+    if (appearanceOverride) {
+      appearanceOverride = false;
+      appearance = 'system';
+      announce('Appearance follows the system');
+    } else setAppearance(resolvedAppearance === 'dark' ? 'light' : 'dark');
   }
 
   function startTitlebarDrag(event: MouseEvent): void {
@@ -5313,102 +5488,49 @@
     }
   }
 
-  async function toggleSuggestionsFromTitlebar(): Promise<void> {
-    await setSuggestionsEnabled(!suggestionsEnabled);
+  async function setSuggestionInteraction(next: 'ghost' | 'loompad'): Promise<void> {
+    if (suggestionsChanging) return;
+    const enabled = suggestionInteraction !== next || !suggestionsEnabled;
+    if (shuttleEnabled) await setShuttleEnabled(false);
+    suggestionInteraction = next;
+    await setSuggestionsEnabled(enabled);
+    if (enabled && next === 'loompad') {
+      if (activeBranchCount > 0) await cancelActiveBranches();
+      scheduleAutomaticSuggestions(editVersion, 250, 'document_edit');
+    }
     await tick();
     if (mode === 'source') sourceEditor?.focusCurrentSelection();
     else visualEditor?.focusCurrentSelection();
   }
 
-  function clearAutocompleteModelMenuLongPress(): void {
-    if (autocompleteModelMenuLongPressTimer !== undefined) {
-      window.clearTimeout(autocompleteModelMenuLongPressTimer);
-      autocompleteModelMenuLongPressTimer = undefined;
-    }
-    const pending = autocompleteModelMenuLongPress;
-    if (pending?.trigger.hasPointerCapture(pending.pointerId)) {
-      pending.trigger.releasePointerCapture(pending.pointerId);
-    }
-    autocompleteModelMenuLongPress = null;
+  function chooseLoompadCandidate(candidate: CompletionCandidate): void {
+    if (!loompadActive) return;
+    const current = activeSuggestionFamily.findIndex(item => item.runId === selectedInlineSuggestion?.runId);
+    const target = activeSuggestionFamily.findIndex(item => item.runId === candidate.runId && item.presentationKey === candidate.presentationKey);
+    if (target >= 0 && current >= 0) cycleActiveSuggestion(target - current);
   }
 
-  function suppressNextAutocompleteToggleClick(): void {
-    suppressAutocompleteToggleClick = true;
-    if (suppressAutocompleteToggleClickTimer !== undefined) {
-      window.clearTimeout(suppressAutocompleteToggleClickTimer);
-    }
-    suppressAutocompleteToggleClickTimer = window.setTimeout(() => {
-      suppressAutocompleteToggleClick = false;
-      suppressAutocompleteToggleClickTimer = undefined;
-    }, 1_000);
-  }
-
-  function handleAutocompleteToggleClick(event: MouseEvent): void {
-    if (suppressAutocompleteToggleClick) {
-      event.preventDefault();
-      event.stopPropagation();
-      suppressAutocompleteToggleClick = false;
-      if (suppressAutocompleteToggleClickTimer !== undefined) {
-        window.clearTimeout(suppressAutocompleteToggleClickTimer);
-        suppressAutocompleteToggleClickTimer = undefined;
-      }
-      return;
-    }
-    void toggleSuggestionsFromTitlebar();
-  }
-
-  function openAutocompleteModelMenu(event: MouseEvent | KeyboardEvent): void {
-    event.preventDefault();
-    event.stopPropagation();
-    clearAutocompleteModelMenuLongPress();
-    openModelManager(event.currentTarget as HTMLButtonElement);
-  }
-
-  function handleAutocompleteModelMenuKey(event: KeyboardEvent): void {
-    if (isAutocompleteModelMenuKey(event)) openAutocompleteModelMenu(event);
-  }
-
-  function beginAutocompleteModelMenuLongPress(event: PointerEvent): void {
-    if (!canStartAutocompleteModelMenuLongPress(event)) return;
-    clearAutocompleteModelMenuLongPress();
-    const trigger = event.currentTarget as HTMLButtonElement;
-    const pending = {
-      pointerId: event.pointerId,
-      x: event.clientX,
-      y: event.clientY,
-      trigger
-    };
-    autocompleteModelMenuLongPress = pending;
+  async function acceptLoompadCandidate(candidate: CompletionCandidate, length: LoompadLength): Promise<void> {
+    if (!loompadActive || loompadAccepting || editorReadonly || compositionActive || !windowFocused) return;
+    const captured = { context: completionContextKey, text: documentText, version: editVersion };
+    const text = loompadPrefix(candidate.text, length, mode === 'visual');
+    if (!text) return;
+    loompadAccepting = true;
     try {
-      trigger.setPointerCapture(event.pointerId);
-    } catch {
-      // A detached titlebar button cancels through the identity check below.
-    }
-    autocompleteModelMenuLongPressTimer = window.setTimeout(() => {
-      autocompleteModelMenuLongPressTimer = undefined;
-      if (autocompleteModelMenuLongPress !== pending || !pending.trigger.isConnected) {
-        clearAutocompleteModelMenuLongPress();
-        return;
+      chooseLoompadCandidate(candidate);
+      await tick();
+      if (!loompadActive || captured.context !== completionContextKey || captured.text !== documentText ||
+          captured.version !== editVersion || !windowFocused) return;
+      const accepted = mode === 'visual'
+        ? visualEditor?.acceptLoompadText(candidate.candidateId, candidate.presentationKey, text)
+        : sourceEditor?.acceptLoompadText(candidate.candidateId, candidate.presentationKey, text);
+      if (accepted) {
+        await tick();
+        // Keep admitted tails growing; refill only after a pause or exhaustion.
+        if (loompadActive) scheduleAutomaticSuggestions(editVersion,
+          activeSuggestionFamily.length ? 5_000 : 250, 'document_edit');
       }
-      clearAutocompleteModelMenuLongPress();
-      suppressNextAutocompleteToggleClick();
-      openModelManager(pending.trigger);
-    }, AUTOCOMPLETE_MODEL_MENU_LONG_PRESS_MS);
-  }
-
-  function updateAutocompleteModelMenuLongPress(event: PointerEvent): void {
-    const pending = autocompleteModelMenuLongPress;
-    if (!pending || pending.pointerId !== event.pointerId) return;
-    if (autocompleteModelMenuLongPressMoved(
-      { x: pending.x, y: pending.y },
-      { x: event.clientX, y: event.clientY }
-    )) clearAutocompleteModelMenuLongPress();
-  }
-
-  function finishAutocompleteModelMenuLongPress(event: PointerEvent): void {
-    if (autocompleteModelMenuLongPress?.pointerId === event.pointerId) {
-      clearAutocompleteModelMenuLongPress();
-    }
+    } finally { loompadAccepting = false; }
   }
 
   function focusableElementsWithin(container: HTMLElement): HTMLElement[] {
@@ -5476,33 +5598,42 @@
   async function loadPreferredSuggestionModel(
     expectedWorkspace?: WorkspaceRestoreCapture
   ): Promise<boolean> {
-    if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
+    const captured = expectedWorkspace ?? currentWorkspaceCapture();
+    if (!captured || !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !await prepareWorkspaceWriterTemplate(captured)) return false;
     if (currentModel) return true;
+    const requestKey = workspaceWriterKey();
+    const selection = workspaceTemplate?.config.model;
+    const selectionIsCurrent = () => workspaceRestoreIsCurrent(captured) && workspaceWriterKey() === requestKey;
+    if (unavailableWorkspaceWriterKey === requestKey || !workspaceWriterSwapIsIdle()) return false;
     if (!document || transition !== 'idle' || modelLoading || modelUnloading) return false;
-    if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+    if (!selectionIsCurrent()) return false;
     quietModelLoadFailure = null;
     // Existing local Gemma files must never race the embedded catalog and be
     // admitted as a generic text-only model before the pinned projector is
     // known. All callers share the same in-flight catalog read.
     if (curatedModels.length === 0) await refreshCuratedModels();
-    if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+    await tick();
+    if (!selectionIsCurrent()) return false;
+    if (currentModel) return true;
     const rememberedPath = loadLastLocalModelPath();
     const configuredPath = workspaceTemplate?.model_path;
-    const discoveredCandidates = startupWriterCandidates(models, rememberedPath);
-    const candidates = configuredPath
-      ? [discoveredCandidates.find(candidate => candidate.modelPath === configuredPath) ?? { modelPath: configuredPath, profileId: null, remembered: false }]
+    const discoveredCandidates = workspaceWriterCandidates(selection, models, curatedModels, rememberedPath);
+    const candidates: WorkspaceWriterCandidate[] = configuredPath
+      ? [discoveredCandidates.find(candidate => candidate.modelPath === configuredPath) ?? { modelPath: configuredPath, profileId: null, policyRank: 0, remembered: false }]
       : discoveredCandidates;
     let terminalFailure: LoomFailure | null = null;
     for (const candidate of candidates) {
       if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
-      if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+      if (!selectionIsCurrent()) return false;
       const loadSerial = ++modelLoadSerial;
       modelLoading = true;
       try {
         const discovered = models.find((model) => model.model_path === candidate.modelPath);
-        const catalogEntry = discovered
-          ? curatedModels.find((entry) => legacyLocalCatalogMatch(entry, discovered)) ?? null
-          : null;
+        const catalogEntry = candidate.catalogId
+          ? curatedModels.find((entry) => entry.catalog_id === candidate.catalogId) ?? null
+          : discovered ? curatedModels.find((entry) => legacyLocalCatalogMatch(entry, discovered)) ?? null : null;
+        if (selection && !candidate.profileId && !catalogEntry) continue;
         if (discovered && isOfficialGemma4CatalogHint(discovered) && !catalogEntry) {
           continue;
         }
@@ -5515,7 +5646,7 @@
           !componentMounted ||
           !applicationAllowsModelPreparation(applicationClosePhase) ||
           loadSerial !== modelLoadSerial ||
-          (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
+          !selectionIsCurrent()
         ) return false;
         if (candidate.profileId
           ? !isVerifiedPolicyWriter(loaded, candidate.profileId)
@@ -5525,16 +5656,16 @@
           if (candidate.remembered && !candidate.profileId) {
             forgetLastLocalModelPath(candidate.modelPath);
           }
-          await refreshModels(expectedWorkspace);
+          await refreshModels(captured);
           continue;
         }
-        return await installLoadedModel(loaded, true, expectedWorkspace);
+        return await installLoadedModel(loaded, true, captured);
       } catch (error) {
         if (
           !componentMounted ||
           !applicationAllowsModelPreparation(applicationClosePhase) ||
           loadSerial !== modelLoadSerial ||
-          (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
+          !selectionIsCurrent()
         ) return false;
         const failure = normalizeFailure(error);
         terminalFailure = failure;
@@ -5544,7 +5675,7 @@
         )) {
           forgetLastLocalModelPath(candidate.modelPath);
         }
-        await refreshModels(expectedWorkspace);
+        await refreshModels(captured);
       } finally {
         if (loadSerial === modelLoadSerial) {
           modelLoading = false;
@@ -5552,15 +5683,21 @@
         }
       }
     }
+    if (selectionIsCurrent()) {
+      unavailableWorkspaceWriterKey = requestKey;
+      if (selection && !terminalFailure) terminalFailure = {
+        code: 'workspace_model_unavailable', message: 'The model named in workspace settings is not available in the local model library.', retryable: false
+      };
+    }
     if (
       terminalFailure &&
       componentMounted &&
       applicationAllowsModelPreparation(applicationClosePhase) &&
-      (!expectedWorkspace || workspaceRestoreIsCurrent(expectedWorkspace))
+      selectionIsCurrent()
     ) {
       quietModelLoadFailure = terminalFailure;
       modelSetupError = `Automatic writer setup failed. ${terminalFailure.message}`;
-      announce('Suggestions need attention; open their menu for details');
+      announce('Ghost text is unavailable.');
     }
     return false;
   }
@@ -5924,22 +6061,24 @@
     });
   }
 
-  async function doOpenProject(): Promise<void> {
-    if (fileCommandInFlight || opening || applicationClosePhase !== 'running') return;
+  async function doOpenProject(path?: string): Promise<boolean> {
+    if (fileCommandInFlight || opening || applicationClosePhase !== 'running') return false;
     opening = true;
     fileCommandInFlight = true;
     let preparationId: string | null = null;
     let handoffStarted = false;
     try {
       // The chooser and validation leave the current editor/session intact.
-      preparationId = await prepareProjectOpen();
-      if (!preparationId || !componentMounted || applicationClosePhase !== 'running') return;
+      preparationId = await (path ? prepareProjectOpenPath(path) : prepareProjectOpen());
+      if (!preparationId) return Boolean(path);
+      if (!componentMounted || applicationClosePhase !== 'running') return false;
       clearFailure();
       if (project) {
+        if (document) workspaceDocuments = { ...workspaceDocuments, [project.root]: document.summary.document_id };
         const outcome = await closeProject();
-        if (outcome.status !== 'closed') return;
+        if (outcome.status !== 'closed') return false;
       }
-      if (!componentMounted || applicationClosePhase !== 'running') return;
+      if (!componentMounted || applicationClosePhase !== 'running') return false;
       const restoreSerial = ++workspaceRestoreSerial;
       modelRefreshSerial += 1;
       handoffStarted = true;
@@ -5954,26 +6093,29 @@
         attach: (selected) => { project = selected; },
         onHeld: holdWorkspaceForApplicationClose
       });
-      if (!opened) return;
+      if (!opened) return false;
       if (await finishOpeningProject(opened, restoreSerial)) {
         const captured = currentWorkspaceCapture();
         if (!captured || !workspaceRestoreIsCurrent(captured)) {
           holdWorkspaceForApplicationClose();
-          return;
+          return false;
         }
         await tick();
         if (!workspaceRestoreIsCurrent(captured)) {
           holdWorkspaceForApplicationClose();
-          return;
+          return false;
         }
         await waitForWritingSurfacePaint();
         if (!workspaceRestoreIsCurrent(captured)) {
           holdWorkspaceForApplicationClose();
-          return;
+          return false;
         }
         focusCurrentWritingSurfaceAtEnd();
         if (workspaceRestoreIsCurrent(captured)) void restoreCompletionBackground(captured);
+        outlineOpen = true;
+        workspaceRootExpanded = true;
         announce(`Opened ${opened.title}`);
+        return true;
       }
     } catch (error) {
       // Only an uncertain commit needs native reattachment. Picker/validation
@@ -5991,6 +6133,7 @@
       opening = false;
       fileCommandInFlight = false;
     }
+    return false;
   }
 
   async function openAnotherProject(): Promise<void> {
@@ -6134,7 +6277,12 @@
       missingDocumentRecovery = null;
       missingDocumentCopyState = 'idle';
     }
-    outlineOpen = false;
+    let folderStorage: Storage | undefined;
+    try { folderStorage = window.localStorage; } catch { /* Workspace navigation does not require storage. */ }
+    workspaceFolders = rememberWorkspaceFolder(workspaceFolders, { root: opened.root, title: opened.title }, folderStorage);
+    workspaceRootExpanded = true;
+    hiddenPaneSlots = new Set();
+    paneSelection = {};
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
     clearCompletionSession();
@@ -6162,7 +6310,8 @@
       project = { ...project, pending_recovery: 0 };
     }
     if (!workspaceRestoreIsCurrent(captured) || !project) return false;
-    const first = project.documents.find(item => !item.relative_path.split('/').at(-1)?.startsWith('.'))
+    const first = project.documents.find(item => item.document_id === workspaceDocuments[opened.root])
+      ?? project.documents.find(item => !item.relative_path.split('/').at(-1)?.startsWith('.'))
       ?? project.documents[0];
     if (first) {
       await selectDocument(first);
@@ -6845,6 +6994,7 @@
   function resumeScheduledAutomaticSuggestion(wakeKey: string): void {
     if (
       !wakeKey ||
+      loompadBackgroundPaused() ||
       suggestionWakeQueued ||
       suggestionsIdleTimer !== undefined ||
       !completionController.scheduled ||
@@ -6927,6 +7077,10 @@
     });
   }
 
+  function loompadBackgroundPaused(): boolean {
+    return loompadActive && (!windowFocused || window.document.visibilityState === 'hidden');
+  }
+
   async function tryStartAutomaticSuggestions(schedule: CompletionSchedule): Promise<void> {
     const targetEditVersion = schedule.kind === 'edit_pause'
       ? schedule.editVersion
@@ -6947,6 +7101,8 @@
       completionController = setCompletionSchedule(completionController, null);
       return;
     }
+    // Retain the schedule without polling while the writer is away.
+    if (loompadBackgroundPaused()) return;
     if (!canStartAutomaticSuggestions) {
       if (!retainsScheduledCompletion(completionLifecycle)) {
         completionController = setCompletionSchedule(completionController, null);
@@ -7409,14 +7565,24 @@
 
   function reconcileVisibleCompletionController(
     contextKey: string,
-    family: readonly InlineGhostSuggestion[]
+    family: readonly InlineGhostSuggestion[],
+    forkAtCurrentCaret = false
   ): void {
     const reconciled = reconcileCompletionController(
       completionController,
       contextKey,
-      family
+      family,
+      forkAtCurrentCaret
     );
     if (reconciled !== completionController) completionController = reconciled;
+  }
+
+  function refreshVisibleCompletionFamily(
+    expected: CompletionSession,
+    originals: readonly InlineGhostSuggestion[]
+  ): void {
+    const refreshed = refreshCompatibleCompletionFamily(completionController, expected, originals);
+    if (refreshed !== completionController) completionController = refreshed;
   }
 
   function refreshVisibleCompletionCandidate(
@@ -7548,7 +7714,8 @@
     const cycled = cycleCompletion(
       completionController,
       activeSuggestionFamily,
-      offset
+      offset,
+      loompadActive
     );
     if (cycled.state === completionController) return;
     completionController = cycled.state;
@@ -7813,6 +7980,14 @@
     }
   }
 
+  function handleAttachmentLink(event: MouseEvent): void {
+    const link = event.target instanceof Element ? event.target.closest('a[href^="loom-attachment:"]') : null;
+    if (!link) return;
+    event.preventDefault(); event.stopPropagation();
+    const id = link.getAttribute('href')?.match(/^loom-attachment:([a-f0-9]{64})$/u)?.[1];
+    if (project && id) void revealAttachmentOriginal(project.project_id, project.session_id, id).catch(recordFailure);
+  }
+
   function handleGlobalKeydownCapture(event: KeyboardEvent): void {
     if (!shouldCaptureFormatMenuEscape(event, {
       formatMenuOpen: formatMenu?.isOpen() ?? false,
@@ -7871,6 +8046,7 @@
     }
     if (modifier && event.shiftKey && !event.altKey && !event.isComposing) {
       const key = event.key.toLowerCase();
+      if (key === 'p') { event.preventDefault(); openModelManager(window.document.activeElement as HTMLElement); return; }
       if (key === 'u') { event.preventDefault(); void readAloud(); return; }
       if (key === 'r') { event.preventDefault(); void reloadModelFromSettings(); return; }
       if (key === 'l') { event.preventDefault(); toggleAppearance(); return; }
@@ -7960,6 +8136,25 @@
       throw new Error('The desktop returned a branch outside the requested manuscript boundary.');
     }
     if (!weaveCaptureStillCurrent(captured)) return false;
+    if (captured.speculation) {
+      const batch = started.speculation;
+      if (!batch || !/^[a-f0-9]{64}$/.test(batch.snapshot_id) ||
+          batch.batch_offset !== captured.speculation.offset || batch.sample_target !== captured.speculation.sampleTarget) {
+        throw new Error('The desktop returned choices for a different sampling boundary.');
+      }
+      const previous = loompadReservoir?.key === captured.speculation.key ? loompadReservoir : null;
+      if (previous && previous.snapshotId !== batch.snapshot_id) throw new Error('The idle choice snapshot changed.');
+      const familyIds = previous?.familyIds ?? [];
+      if (!familyIds.includes(started.command_id) && batch.batch_offset !== familyIds.length * 4) {
+        throw new Error('The desktop skipped an idle choice batch.');
+      }
+      loompadReservoir = {
+        key: captured.speculation.key, snapshotId: batch.snapshot_id,
+        familyIds: familyIds.includes(started.command_id) ? familyIds : [...familyIds, started.command_id],
+        nextOffset: Math.max(previous?.nextOffset ?? 0, batch.batch_offset + 4),
+        admittedAt: previous?.familyIds.includes(started.command_id) ? previous.admittedAt : Date.now(), capture: captured
+      };
+    } else if (started.speculation) throw new Error('An ordinary suggestion returned an idle sampling policy.');
     const runIds = new Set(started.branches.map((branch) => branch.run_id));
     authoritativeCompletionFamilyId = started.command_id;
     branches = [
@@ -8098,8 +8293,36 @@
     staleWeaveCleanupTimers.add(timer);
   }
 
+  async function prefetchLoompad(): Promise<void> {
+    const reservoir = loompadReservoir;
+    if (!componentMounted || !loompadActive || !windowFocused || !reservoir || reservoir.nextOffset >= 256 ||
+        Date.now() - reservoir.admittedAt < 5_000 || compositionActive || loompadAccepting ||
+        activeBranchCount > 0 || completionActiveRunIds.length > 0 || !weaveCaptureStillCurrent(reservoir.capture)) return;
+    await startAutomaticWeave();
+  }
+
+  async function recoverLoompad(captured: WeaveCapture, recovery: NonNullable<LoomFailure['speculation_recovery']>): Promise<void> {
+    if (!captured.speculation || !weaveCaptureStillCurrent(captured)) return;
+    loompadReservoir = null;
+    let recovered = 0;
+    for (const [index, commandId] of recovery.command_ids.entries()) {
+      const status = await getWeaveStatus(captured.projectId, captured.sessionId, commandId);
+      if (!weaveCaptureStillCurrent(captured)) return;
+      if (!status?.speculation || status.speculation.snapshot_id !== recovery.snapshot_id ||
+          status.speculation.batch_offset !== index * 4 || ![4, 16, 64, 256].includes(status.speculation.sample_target)) {
+        throw new Error('Stored idle choices do not match their exact snapshot.');
+      }
+      if (!installWeaveSnapshot(status, { ...captured, commandId,
+        speculation: { ...captured.speculation, offset: index * 4, sampleTarget: status.speculation.sample_target } })) return;
+      recovered += 4;
+    }
+    if (recovered !== recovery.next_offset) {
+      throw new Error('Stored idle choices returned an incomplete batch history.');
+    }
+  }
+
   async function startAutomaticWeave(): Promise<boolean> {
-    if (terminalIsBusy() || weaveStarting || !project || !document || !currentModel) return false;
+    if (loompadBackgroundPaused() || terminalIsBusy() || weaveStarting || !project || !document || !currentModel) return false;
     const startingEditVersion = editVersion;
     if (compositionActive || !flushEditors()) return false;
     if (editVersion !== startingEditVersion) {
@@ -8132,8 +8355,18 @@
       cursorByte,
       editVersion,
       intentEpoch: completionController.intentEpoch,
-      modelId: currentModel.model_id
+      modelId: currentModel.model_id,
+      sourceDocument: document,
+      sourceMarkdown: documentText
     };
+    if (loompadActive) {
+      const key = JSON.stringify([captured.projectId, captured.sessionId, captured.documentId,
+        captured.sourceRevisionId, captured.visibleBlobId, captured.cursorByte, captured.modelId,
+        captured.contextEpoch, captured.epoch, captured.intentEpoch, captured.editVersion]);
+      const offset = loompadReservoir?.key === key ? loompadReservoir.nextOffset : 0;
+      if (offset >= 256) return true;
+      captured.speculation = { key, offset, sampleTarget: offset < 4 ? 4 : offset < 16 ? 16 : offset < 64 ? 64 : 256 };
+    }
     weaveStarting = true;
     clearFailure();
     try {
@@ -8146,7 +8379,9 @@
         sourceRevisionId: captured.sourceRevisionId,
         expectedVisibleBlobId: captured.visibleBlobId,
         cursorByte: captured.cursorByte,
-        policy: { kind: 'automatic_v2' }
+        policy: captured.speculation
+          ? { kind: 'loompad_v1', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
+          : { kind: 'automatic_v2' }
       });
       if (installWeaveSnapshot(started, captured)) {
         uncertainWeave = null;
@@ -8165,7 +8400,18 @@
       ) {
         const captureIsCurrent = weaveCaptureStillCurrent(captured);
         const failure = normalizeFailure(error);
-        if (captureIsCurrent && failure.code === 'automatic_generation_throttled') {
+        if (captureIsCurrent && captured.speculation && failure.speculation_recovery) {
+          uncertainWeave = null;
+          try { await recoverLoompad(captured, failure.speculation_recovery); }
+          catch (recoveryError) {
+            recordFailure(recoveryError);
+            if (normalizeFailure(recoveryError).retryable) scheduleAutomaticSuggestions(editVersion, 5_000, 'retry');
+          }
+          if (failure.speculation_recovery.next_offset === 0) scheduleAutomaticSuggestions(editVersion, 5_000, 'retry');
+          return true;
+        }
+        if (captureIsCurrent && (failure.code === 'automatic_generation_throttled' ||
+            (captured.speculation && failure.code === 'generation_active'))) {
           uncertainWeave = null;
           scheduleAutomaticSuggestions(editVersion, 5_000, 'retry');
           return true;
@@ -9183,7 +9429,7 @@
     if (enable && (compositionActive || contextCompositionActive || !flushEditors())) {
       announce('Finish composing text before opening settings'); return;
     }
-    if (document?.summary.relative_path === '.mine.toml' && editVersion !== savedVersion) return;
+    if (['.mine.toml', '.loom.md'].includes(document?.summary.relative_path ?? '') && editVersion !== savedVersion) return;
     const scope = { projectId: project.project_id, sessionId: project.session_id };
     const serial = ++templateSerial;
     try {
@@ -9197,6 +9443,7 @@
       if (enable && snapshot.document_id) {
         await refreshProjectFilesystemState();
         await openPaneDocument(snapshot.document_id);
+        await setMode('source');
         outlineOpen = true;
       }
     } catch (error) {
@@ -9216,6 +9463,8 @@
     workspaceTemplate = snapshot.error && workspaceTemplate
       ? { ...snapshot, config: workspaceTemplate.config }
       : snapshot;
+    workspaceTemplateScope = `${project.project_id}/${project.session_id}`;
+    void tick().then(requestPreferredWriterForCurrentWorkspace);
   }
 
   async function applyConfiguredAssistance(): Promise<void> {
@@ -9232,7 +9481,7 @@
   async function reloadModelFromSettings(): Promise<void> {
     const captured = currentWorkspaceCapture();
     if (!captured || modelLoading || modelUnloading || compositionActive || contextCompositionActive) return;
-    if (document?.summary.relative_path === '.mine.toml' && !await flushCurrentDocument()) return;
+    if (['.mine.toml', '.loom.md'].includes(document?.summary.relative_path ?? '') && !await flushCurrentDocument()) return;
     if (!workspaceRestoreIsCurrent(captured)) return;
     const serial = ++templateSerial;
     try {
@@ -9292,8 +9541,15 @@
     if (deferredWorkspaceTemplate) acceptWorkspaceSettings(deferredWorkspaceTemplate);
   }
 
-  function selectPane(position: string, id: string): void {
-    if (!flushEditors()) return;
+  function togglePane(position: 'main' | 'right' | 'bottom'): void {
+    if (!flushEditors() || busyPaneSlots.has(position)) return;
+    const next = new Set(hiddenPaneSlots);
+    if (next.has(position)) next.delete(position); else next.add(position);
+    hiddenPaneSlots = next;
+  }
+
+  function selectPane(position: 'main' | 'right' | 'bottom', id: string): void {
+    if (!flushEditors() || busyPaneSlots.has(position)) return;
     paneSelection = { ...paneSelection, [position]: id };
   }
 
@@ -9304,6 +9560,8 @@
     cancelSuggestionTimer();
     await cancelActiveBranches();
     if (!current() || !await flushCurrentDocument() || !current()) return null;
+    if (!currentModel && !await loadPreferredSuggestionModel(currentWorkspaceCapture() ?? undefined)) return null;
+    if (!current() || !currentModel) return null;
     return document;
   }
 
@@ -9360,6 +9618,14 @@
         on:mousedown={startTitlebarDrag}
       ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
       <div class="canvas-controls-right" data-no-window-drag>
+        {#each paneSlots.filter(slot => slot.position !== 'main' && slot.selected) as slot (slot.position)}
+          {@const title = slot.selected![1].title ?? slot.selected![0]}
+          <button class="titlebar-button" class:active={!hiddenPaneSlots.has(slot.position)} type="button"
+            aria-label={`${hiddenPaneSlots.has(slot.position) ? 'Show' : 'Hide'} ${title}`} aria-pressed={!hiddenPaneSlots.has(slot.position)} title={title}
+            disabled={busyPaneSlots.has(slot.position)} on:click={() => togglePane(slot.position)}>
+            <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/>{#if slot.position === 'right'}<path d="M10 2.5v11"/>{:else}<path d="M2 10h12"/>{/if}</svg>
+          </button>
+        {/each}
         {#if document && mode === 'visual' && canUseVisual && (!contextPaneOpen || canUseVisualMarkdown(contextText, true))}
           <VisualFormatMenu
             bind:this={formatMenu}
@@ -9397,33 +9663,18 @@
           ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="6.4" y="2.5" width="5.2" height="8.3" rx="2.6"/><path d="M4.4 8.8a4.6 4.6 0 0 0 9.2 0M9 13.4v2.1M6.8 15.5h4.4"/></svg></button>
           <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Audio stays on this device and is attached to this document')}</span>
         {/if}
-        <button
-          class:active={suggestionsEnabled && Boolean(currentModel)}
-          class:preparing={suggestionsEnabled && !currentModel && !quietModelLoadFailure && (modelLoading || preferredWriterEnsureInFlight !== null || preferredWriterPending !== null)}
-          class:needs-attention={suggestionsEnabled && !currentModel && Boolean(quietModelLoadFailure)}
-          class="titlebar-button suggestions-toggle"
-          type="button"
-          aria-label={suggestionsEnabled ? 'Turn autocomplete off' : 'Turn autocomplete on'}
-          aria-describedby="completion-lifecycle-help autocomplete-model-menu-help autocomplete-model-failure-help"
-          aria-haspopup="dialog"
-          aria-keyshortcuts="Shift+F10"
-          aria-pressed={suggestionsEnabled}
-          title={`${suggestionsEnabled ? `Autocomplete: ${suggestionMenuState}` : 'Autocomplete: Off'} · right-click or hold for models`}
-          disabled={!project || suggestionsChanging}
-          on:click={handleAutocompleteToggleClick}
-          on:contextmenu={openAutocompleteModelMenu}
-          on:keydown={handleAutocompleteModelMenuKey}
-          on:pointerdown={beginAutocompleteModelMenuLongPress}
-          on:pointermove={updateAutocompleteModelMenuLongPress}
-          on:pointerup={finishAutocompleteModelMenuLongPress}
-          on:pointercancel={finishAutocompleteModelMenuLongPress}
-          on:lostpointercapture={finishAutocompleteModelMenuLongPress}
-        >
-          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M3.5 15V8a5.5 5.5 0 0 1 11 0v7l-2.75-2-2.75 2-2.75-2-2.75 2Z"/><path d="M7 7v1M11 7v1"/></svg>
-        </button>
-        <span id="completion-lifecycle-help" class="sr-only">{completionLifecycleHelp}</span>
-        <span id="autocomplete-model-menu-help" class="sr-only">Right-click, touch and hold, or press the Menu key or Shift F10 to open local writing model setup.</span>
-        <span id="autocomplete-model-failure-help" class="sr-only">{quietModelLoadFailure ? `Local model setup failed: ${quietModelLoadFailure.message}` : ''}</span>
+        <div class="completion-mode-toggle" role="group" aria-label="Writing suggestions">
+          <button class="titlebar-button suggestions-toggle" class:active={suggestionsEnabled && suggestionInteraction === 'ghost'}
+            type="button" aria-label="Ghost text" aria-pressed={suggestionsEnabled && suggestionInteraction === 'ghost'}
+            title="Ghost text" disabled={!project || suggestionsChanging} on:click={() => void setSuggestionInteraction('ghost')}>
+            <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M3.5 15V8a5.5 5.5 0 0 1 11 0v7l-2.75-2-2.75 2-2.75-2-2.75 2Z"/><path d="M7 7v1M11 7v1"/></svg>
+          </button>
+          <button class="titlebar-button loompad-toggle" class:active={loompadActive}
+            type="button" aria-label="Loompad" aria-pressed={loompadActive} title="Loompad"
+            disabled={!project || suggestionsChanging} on:click={() => void setSuggestionInteraction('loompad')}>
+            <svg aria-hidden="true" viewBox="0 0 20 18"><rect x="7.5" y="2" width="5" height="5" rx="1"/><rect x="1.5" y="8.5" width="5" height="5" rx="1"/><rect x="7.5" y="8.5" width="5" height="5" rx="1"/><rect x="13.5" y="8.5" width="5" height="5" rx="1"/></svg>
+          </button>
+        </div>
 
       </div>
     </div>
@@ -9433,19 +9684,33 @@
     {#if workspaceTemplate?.error}
       <div class="error-banner" role="alert">{workspaceTemplate.error}<button type="button" class="bare-button compact" on:click={() => void refreshWorkspaceTemplate(true)}>Open settings file</button></div>
     {/if}
-    <div class:outline-open={outlineOpen} class:has-right-pane={paneSlots.some(slot => slot.position === 'right' && slot.selected)} class="workspace-grid">
+    <div bind:clientWidth={workspaceWidth} bind:clientHeight={workspaceHeight} class:outline-open={outlineOpen} class="workspace-grid"
+      style={`grid-template-columns:${outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0}px minmax(0,1fr) ${rightPaneOpen ? Math.min(rightWidth, rightLimit) : 0}px; grid-template-rows:minmax(0,1fr) ${bottomPaneOpen ? Math.min(bottomHeight, workspaceHeight * 0.6) : 0}px;`}>
       <aside
         id="project-outline"
+        bind:this={outlineElement}
+        class:drop-active={workspaceDropActive}
         class:open={outlineOpen}
         class="outline-panel"
         aria-label="Documents"
       >
+        {#if outlineOpen}<PaneDivider edge="right" label="Resize documents" size={Math.min(outlineWidth, outlineLimit)} min={150} max={outlineLimit} onResize={(size) => outlineWidth = size} />{/if}
         <label class="search-field">
-          <span class="sr-only">Search project</span>
+          <span class="sr-only">Search folder</span>
           <span aria-hidden="true">⌕</span>
-          <input bind:value={search} type="search" placeholder="Find in project" />
+          <input bind:value={search} type="search" placeholder="Find in folder" />
         </label>
-        <nav class="document-list" aria-label="Documents">
+        <nav class="document-list" aria-label="Workspace folders">
+          {#each visibleWorkspaceFolders as folder (folder.root)}
+            {@const active = folder.root === project.root}
+            <button class="folder-row workspace-root" class:active type="button" title={folder.root}
+              aria-label={`${active && workspaceRootExpanded ? 'Collapse' : 'Open'} folder ${folder.title}`}
+              aria-expanded={active && workspaceRootExpanded} disabled={fileCommandInFlight || opening}
+              on:click={() => { if (active) workspaceRootExpanded = !workspaceRootExpanded; else void doOpenProject(folder.root); }}>
+              <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{folder.title}</span>
+            </button>
+            {#if active && workspaceRootExpanded}
+            <div class="workspace-root-documents">
           {#each fileRows as row (row.path)}
             {#if row.folder}
               <button class="folder-row" type="button" style={`padding-left: ${8 + row.depth * 14}px`} aria-expanded={!collapsedFolders.has(row.path) || Boolean(search.trim())} on:click={() => { const next = new Set(collapsedFolders); if (next.has(row.path)) next.delete(row.path); else next.add(row.path); collapsedFolders = next; }}>
@@ -9517,6 +9782,14 @@
           {:else}
             <p class="empty-copy">No notes.</p>
           {/each}
+            </div>
+            {/if}
+          {/each}
+          {#if desktop && document}
+            {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
+              <ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={document.summary.title} onUse={useImportedSources} />
+            {/key}
+          {/if}
         </nav>
         {#if folderWarnings.length > 0}
           <details class="folder-warnings">
@@ -9824,7 +10097,7 @@
                       ghostAnchorByteOffset={ghostSuggestion?.targetByte ?? null}
                       ghostInsertsOnAccept={ghostSuggestion?.insertsOnAccept ?? false}
                       ghostAlternatives={ghostAlternatives}
-                      ghostHidden={inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled })}
+                      ghostHidden={ghostTextHidden}
                       {ghostUnconsumeText}
                       surfaceKey={visualGhostSurfaceKey}
                       onChange={updateText}
@@ -9884,7 +10157,7 @@
                   ghostPresentationKey={sourceGhostSuggestion?.presentationKey ?? ''}
                   ghostInsertsOnAccept={sourceGhostSuggestion?.insertsOnAccept ?? false}
                   ghostAlternatives={ghostAlternatives}
-                  ghostHidden={inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled })}
+                  ghostHidden={ghostTextHidden}
                   {ghostUnconsumeText}
                   onCompositionStart={beginSourceComposition}
                   onCompositionEnd={finishSourceComposition}
@@ -9907,6 +10180,12 @@
                   label={exactTextSurface ? 'Exact-whitespace verse editor' : 'Markdown source editor'}
                 />
               </div>
+            {/if}
+            {#if loompadActive}
+              <Loompad choices={activeSuggestionFamily} scope={completionContextKey} focused={windowFocused} selectedRunId={selectedInlineSuggestion?.runId ?? ''}
+                blocked={editorReadonly || compositionActive} visual={mode === 'visual'}
+                onChoose={chooseLoompadCandidate} onAccept={(candidate, length) => void acceptLoompadCandidate(candidate, length)}
+                onExit={() => { suggestionInteraction = 'ghost'; }} />
             {/if}
           </section>
 
@@ -9937,13 +10216,21 @@
       {#each paneSlots as slot (slot.position)}
         {#if slot.selected && (slot.position !== 'main' || customMain)}
           {@const selected = slot.selected}
-          <aside class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
+          <aside class:hidden-pane={hiddenPaneSlots.has(slot.position)} class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
+            {#if slot.position === 'right'}<PaneDivider edge="left" label="Resize right pane" size={Math.min(rightWidth, rightLimit)} min={180} max={rightLimit} onResize={(size) => rightWidth = size} />{/if}
+            {#if slot.position === 'bottom'}<PaneDivider edge="top" label="Resize bottom pane" size={Math.min(bottomHeight, workspaceHeight * 0.6)} min={100} max={workspaceHeight * 0.6} onResize={(size) => bottomHeight = size} />{/if}
             <header class="workspace-pane-header">
-              <select aria-label="Pane" value={selected[0]} on:change={(event) => selectPane(slot.position, event.currentTarget.value)}>
-                {#each slot.choices as [id, config]}<option value={id}>{config.title ?? id}</option>{/each}
-              </select>
+              {#if slot.choices.length > 1}
+                <select aria-label="Pane" value={selected[0]} disabled={busyPaneSlots.has(slot.position)} on:change={(event) => selectPane(slot.position, event.currentTarget.value)}>
+                  {#each slot.choices as [id, config]}<option value={id}>{config.title ?? id}</option>{/each}
+                </select>
+              {:else}<span>{selected[1].title ?? selected[0]}</span>{/if}
             </header>
-            <WorkspacePane bind:this={paneEditors[slot.position]} paneId={selected[0]} config={selected[1]} modelLabel={currentModel?.display_name ?? 'Local model'} onModelSelect={openModelManager} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} onCompositionChange={(active) => paneComposing = { ...paneComposing, [slot.position]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [slot.position]: busy }} />
+            {#each slot.choices as [paneId, paneConfig] (paneId)}
+              <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
+            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
+              </div>
+            {/each}
           </aside>
         {/if}
       {/each}
@@ -9961,6 +10248,8 @@
           />
         {/key}
       {/if}
+      <div class="terminal-dock" bind:clientHeight={terminalDockHeight} class:closed={!terminalOpen} style={`height:${effectiveTerminalHeight}px`}>
+      {#if terminalOpen}<PaneDivider edge="top" label="Resize terminal" size={effectiveTerminalHeight} min={100} max={terminalLimit} onResize={(size) => terminalHeight = size} />{/if}
       <TerminalPane
         bind:open={terminalOpen}
         bind:entry={terminalEntry}
@@ -9980,6 +10269,7 @@
         onOpen={(run) => void openTerminalOutput(run)}
         onClose={closeTerminal}
       />
+      </div>
   {:else}
     <main class="welcome" id="manuscript">
       <section class="welcome-note" aria-labelledby="welcome-title">
@@ -9998,7 +10288,7 @@
               Retry
             </button>
           {/if}
-          <button class="secondary-button" type="button" on:click={doOpenProject} disabled={!desktop || opening}>
+          <button class="secondary-button" type="button" on:click={() => void doOpenProject()} disabled={!desktop || opening}>
             {opening ? 'Opening…' : 'Open folder…'}
           </button>
         </div>

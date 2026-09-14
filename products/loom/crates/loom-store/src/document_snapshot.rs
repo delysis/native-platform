@@ -1,5 +1,6 @@
 //! Durable shared document snapshots inside immutable revision artifact metadata.
-//! SQL segment rows remain lookup indexes and are checked against the snapshot.
+//! Current-main revisions derive the same view from their authoritative segments.
+//! When present, durable snapshots must agree with the immutable SQL records.
 use loom_types::{ArtifactId, ContributionKind, DocumentId, DocumentKind, RevisionId};
 use rusqlite::params;
 use serde_json::Value;
@@ -12,6 +13,7 @@ use crate::provenance::StoredSegment;
 use crate::{ProjectStore, Result, StoreError};
 
 pub(crate) type RevisionSnapshot = DocumentSnapshot<DocumentKind, ContributionKind>;
+const REVISION_FORMAT: &str = "workspace-document.v1";
 
 #[derive(Clone, Copy)]
 pub(crate) struct RevisionIdentity {
@@ -26,6 +28,19 @@ pub(crate) fn seal(
     identity: RevisionIdentity,
     segments: &[StoredSegment],
 ) -> Result<Value> {
+    let snapshot = from_segments(identity, segments)?;
+    let object = metadata
+        .as_object_mut()
+        .ok_or_else(|| StoreError::CorruptDatabase("revision metadata is not an object".into()))?;
+    object.insert("revision_format".into(), REVISION_FORMAT.into());
+    object.insert("document_snapshot".into(), serde_json::to_value(snapshot)?);
+    Ok(metadata)
+}
+
+fn from_segments(
+    identity: RevisionIdentity,
+    segments: &[StoredSegment],
+) -> Result<RevisionSnapshot> {
     let parts = segments
         .iter()
         .enumerate()
@@ -43,7 +58,7 @@ pub(crate) fn seal(
             metadata: segment.contribution,
         })
         .collect();
-    let snapshot = DocumentSnapshot::new(
+    Ok(DocumentSnapshot::new(
         identity.document_id.to_string(),
         DocumentSelection::Sequence,
         DocumentLineage {
@@ -55,12 +70,7 @@ pub(crate) fn seal(
         },
         identity.kind,
         parts,
-    )?;
-    metadata
-        .as_object_mut()
-        .ok_or_else(|| StoreError::CorruptDatabase("revision metadata is not an object".into()))?
-        .insert("document_snapshot".into(), serde_json::to_value(snapshot)?);
-    Ok(metadata)
+    )?)
 }
 
 pub(crate) fn single_segment(
@@ -86,8 +96,43 @@ pub(crate) fn load(store: &ProjectStore, revision_id: RevisionId) -> Result<Revi
         params![revision_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     )?;
     let mut metadata: Value = serde_json::from_str(&row.3)?;
-    let value = metadata.as_object_mut().and_then(|metadata| metadata.remove("document_snapshot"))
-        .ok_or_else(|| StoreError::CorruptDatabase("revision is missing its required document snapshot; preserve the project and copy its ordinary UTF-8 manuscript before an explicit import into a new project".into()))?;
+    let metadata = metadata
+        .as_object_mut()
+        .ok_or_else(|| StoreError::CorruptDatabase("revision metadata is not an object".into()))?;
+    let declared_format = metadata.get("revision_format");
+    if declared_format.is_some_and(|format| format.as_str() != Some(REVISION_FORMAT)) {
+        return Err(StoreError::CorruptDatabase(
+            "unsupported revision format".into(),
+        ));
+    }
+    let snapshot_required = declared_format.is_some();
+    let segments = store.load_revision_segment_index(revision_id)?;
+    let Some(value) = metadata.remove("document_snapshot") else {
+        if snapshot_required {
+            return Err(StoreError::CorruptDatabase(
+                "revision is missing its declared document snapshot".into(),
+            ));
+        }
+        // Schema-15 revisions have one existing immutable authority. Adapt it
+        // in memory; never rewrite old artifacts or backfill another store.
+        return from_segments(
+            RevisionIdentity {
+                document_id: row.0.parse().map_err(|error| {
+                    StoreError::CorruptDatabase(format!("invalid document identity: {error}"))
+                })?,
+                revision_id,
+                parent_revision_id: row.1.as_deref().map(str::parse).transpose().map_err(
+                    |error| {
+                        StoreError::CorruptDatabase(format!("invalid parent revision: {error}"))
+                    },
+                )?,
+                kind: row.2.parse().map_err(|error| {
+                    StoreError::CorruptDatabase(format!("invalid document kind: {error}"))
+                })?,
+            },
+            &segments,
+        );
+    };
     let snapshot: RevisionSnapshot = serde_json::from_value(value)?;
     let revision = snapshot.lineage().revision.as_ref().ok_or_else(|| {
         StoreError::CorruptDatabase("document snapshot has no revision lineage".into())
@@ -103,7 +148,6 @@ pub(crate) fn load(store: &ProjectStore, revision_id: RevisionId) -> Result<Revi
             "document snapshot disagrees with revision identity".into(),
         ));
     }
-    let segments = store.load_revision_segment_index(revision_id)?;
     if snapshot.parts().len() != segments.len() {
         return Err(StoreError::CorruptDatabase(
             "document snapshot disagrees with its segment index".into(),
@@ -174,7 +218,9 @@ impl ProjectStore {
     }
 }
 
-#[cfg(test)]
+// These fixtures exercise the Unix-only private project storage boundary.
+// Portable document schema validation remains in workspace-document's tests.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use loom_document::DocumentContent;
@@ -404,82 +450,276 @@ mod tests {
         );
     }
 
-    #[test]
-    fn missing_snapshot_refusal_preserves_original_manuscript_and_metadata() {
-        let dir = tempfile::tempdir().expect("snapshot store fixture");
-        let (mut store, _) =
-            ProjectStore::initialize(dir.path(), "Old format").expect("snapshot store fixture");
-        let saved = store
-            .create_document_if_absent(
-                "story.md",
-                DocumentContent::Prose("  exact\r\n".into()),
-                "create",
-            )
-            .expect("snapshot store fixture");
-        store
-            .connection
-            .execute_batch("DROP TRIGGER artifacts_are_immutable_update")
-            .expect("snapshot store fixture");
-        store
-            .connection
+    /// Reproduce origin/main 95c446b's `adopt_visible_document_if_absent` records.
+    /// This inserts the main-format rows directly, with all immutable triggers
+    /// enabled. It never manufactures a snapshot and then strips it afterward.
+    fn main_revision_fixture(root: &std::path::Path, text: &str) -> crate::SaveOutcome {
+        use loom_types::{CommandKind, OperationId};
+        let (mut store, _) = ProjectStore::initialize(root, "Current main").expect("fixture");
+        let blob_id = store.put_blob(text.as_bytes()).expect("fixture blob");
+        std::fs::write(root.join("story.md"), text).expect("fixture manuscript");
+        let document_id = DocumentId::new();
+        let artifact_id = ArtifactId::new();
+        let operation_id = OperationId::new();
+        let revision_id = RevisionId::new();
+        let byte_len = i64::try_from(text.len()).expect("bounded fixture");
+        let metadata = serde_json::json!({
+            "workflow": "adopt_visible_document", "source": "existing_visible_file",
+            "relative_path": "story.md", "reason": "current main fixture",
+            "source_blob_id": blob_id,
+        })
+        .to_string();
+        let transaction = store.connection.transaction().expect("fixture transaction");
+        transaction
             .execute(
-                "UPDATE artifacts SET metadata_json = '{}' WHERE artifact_id = ?1",
-                [saved.artifact_id.to_string()],
+                "INSERT INTO blobs VALUES (?1, ?2, 'application/octet-stream', 1)",
+                params![blob_id.to_string(), byte_len],
             )
-            .expect("snapshot store fixture");
-        let error = store
-            .reconstruct_revision(saved.revision_id)
-            .expect_err("reject previous revision format")
-            .to_string();
-        assert!(error.contains("preserve the project"));
-        let metadata: String = store
-            .connection
-            .query_row(
-                "SELECT metadata_json FROM artifacts WHERE artifact_id = ?1",
-                [saved.artifact_id.to_string()],
-                |row| row.get(0),
+            .expect("main blob row");
+        transaction.execute(
+            "INSERT INTO documents(document_id, relative_path, document_kind, created_at_ms) VALUES (?1, 'story.md', 'prose', 1)",
+            [document_id.to_string()],
+        ).expect("main document row");
+        transaction.execute(
+            "INSERT INTO artifacts VALUES (?1, ?2, 'human_contribution', 'text/markdown; charset=utf-8', ?3, 1)",
+            params![artifact_id.to_string(), blob_id.to_string(), metadata],
+        ).expect("main artifact row");
+        transaction
+            .execute(
+                "INSERT INTO operations VALUES (?1, 'import', ?2, 1)",
+                params![operation_id.to_string(), metadata],
             )
-            .expect("snapshot store fixture");
-        assert_eq!(metadata, "{}");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("story.md")).expect("snapshot store fixture"),
-            "  exact\r\n"
+            .expect("main operation row");
+        transaction
+            .execute(
+                "INSERT INTO operation_outputs VALUES (?1, 0, ?2)",
+                params![operation_id.to_string(), artifact_id.to_string()],
+            )
+            .expect("main output row");
+        transaction
+            .execute(
+                "INSERT INTO revisions VALUES (?1, ?2, NULL, ?3, 'current main fixture', 1)",
+                params![
+                    revision_id.to_string(),
+                    document_id.to_string(),
+                    artifact_id.to_string()
+                ],
+            )
+            .expect("main revision row");
+        if byte_len != 0 {
+            transaction
+                .execute(
+                    "INSERT INTO revision_segments VALUES (?1, 0, ?2, 0, ?3, 'human')",
+                    params![revision_id.to_string(), artifact_id.to_string(), byte_len],
+                )
+                .expect("main source segment");
+        }
+        transaction.execute(
+            "INSERT INTO visible_file_outbox(revision_id, relative_path, target_blob_id, expected_visible_blob_id, state, created_at_ms, completed_at_ms) VALUES (?1, 'story.md', ?2, ?2, 'completed', 1, 1)",
+            params![revision_id.to_string(), blob_id.to_string()],
+        ).expect("main outbox row");
+        transaction.commit().expect("main records");
+        let receipt = store.new_receipt(
+            CommandKind::Import,
+            1,
+            None,
+            &[artifact_id],
+            &[operation_id],
+            &[revision_id],
         );
-    }
-
-    #[test]
-    fn previous_store_format_is_rejected_before_recovery_or_semantic_mutation() {
-        let dir = tempfile::tempdir().expect("snapshot store fixture");
-        let (mut store, _) = ProjectStore::initialize(dir.path(), "Previous format")
-            .expect("snapshot store fixture");
-        store
-            .create_document_if_absent(
-                "story.md",
-                DocumentContent::Prose("  exact\r\n".into()),
-                "create",
-            )
-            .expect("snapshot store fixture");
+        store.persist_receipt(&receipt).expect("main receipt");
+        // Pin the actual opening boundary, independently of this build's value.
         store
             .connection
             .pragma_update(None, "user_version", 15)
-            .expect("previous format fixture");
-        drop(store);
-        let database = dir.path().join(".loom").join(crate::store::DATABASE_FILE);
-        let before = std::fs::read(&database).expect("database bytes");
-        assert!(matches!(
-            ProjectStore::open(dir.path()),
-            Err(StoreError::UnsupportedSchema {
-                found: 15,
-                supported: 16
-            })
-        ));
-        assert_eq!(
-            std::fs::read(&database).expect("preserved database"),
-            before
-        );
-        assert_eq!(
-            std::fs::read(dir.path().join("story.md")).expect("preserved manuscript"),
-            b"  exact\r\n"
-        );
+            .expect("main schema");
+        crate::SaveOutcome {
+            blob_id,
+            artifact_id,
+            operation_id,
+            revision_id,
+            receipt,
+        }
+    }
+
+    fn revision_metadata(store: &ProjectStore, artifact_id: ArtifactId) -> String {
+        store
+            .connection
+            .query_row(
+                "SELECT metadata_json FROM artifacts WHERE artifact_id = ?1",
+                [artifact_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("revision metadata")
+    }
+
+    #[test]
+    fn current_main_store_opens_edits_and_reopens_without_rewriting_history() {
+        for original in ["  café\r\nexact  ", ""] {
+            let dir = tempfile::tempdir().expect("fixture directory");
+            let saved = main_revision_fixture(dir.path(), original);
+            let mut store = ProjectStore::open(dir.path()).expect("open current-main store");
+            assert_eq!(crate::CURRENT_STORE_SCHEMA_VERSION, 15);
+            let before = revision_metadata(&store, saved.artifact_id);
+            assert!(!before.contains("document_snapshot"));
+            assert_eq!(
+                store
+                    .reconstruct_revision(saved.revision_id)
+                    .expect("original"),
+                original.as_bytes()
+            );
+            let provenance = store
+                .revision_provenance(saved.revision_id)
+                .expect("original provenance");
+            let edited = format!("{original}added é\r\n");
+            let changed = store
+                .save_document_if_source(
+                    "story.md",
+                    DocumentContent::Prose(edited.clone()),
+                    "edit main document",
+                    saved.revision_id,
+                    saved.blob_id,
+                )
+                .expect("edit current-main revision")
+                .save;
+            assert_eq!(revision_metadata(&store, saved.artifact_id), before);
+            assert_eq!(
+                load(&store, changed.revision_id)
+                    .expect("new snapshot")
+                    .lineage()
+                    .revision
+                    .as_ref()
+                    .expect("lineage")
+                    .parent_revision_id,
+                Some(saved.revision_id.to_string())
+            );
+            let new_metadata: Value =
+                serde_json::from_str(&revision_metadata(&store, changed.artifact_id))
+                    .expect("metadata");
+            assert_eq!(new_metadata["revision_format"], REVISION_FORMAT);
+            assert!(new_metadata["document_snapshot"].is_object());
+            drop(store);
+            let store = ProjectStore::open(dir.path()).expect("reopen mixed revisions");
+            assert_eq!(
+                store
+                    .reconstruct_revision(saved.revision_id)
+                    .expect("old revision"),
+                original.as_bytes()
+            );
+            assert_eq!(
+                store
+                    .reconstruct_revision(changed.revision_id)
+                    .expect("new revision"),
+                edited.as_bytes()
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("story.md")).expect("visible writing"),
+                edited.as_bytes()
+            );
+            assert_eq!(revision_metadata(&store, saved.artifact_id), before);
+            assert_eq!(
+                store
+                    .revision_provenance(saved.revision_id)
+                    .expect("unchanged provenance"),
+                provenance
+            );
+            assert_eq!(
+                store
+                    .load_receipt(saved.receipt.command_id)
+                    .expect("retained receipt"),
+                Some(saved.receipt)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_or_missing_declared_snapshot_never_falls_back_to_segment_rows() {
+        for replacement in [
+            serde_json::json!({ "revision_format": REVISION_FORMAT }),
+            serde_json::json!({ "document_snapshot": null }),
+            serde_json::json!({ "document_snapshot": {} }),
+            serde_json::json!({ "revision_format": "unknown-format" }),
+        ] {
+            let dir = tempfile::tempdir().expect("fixture directory");
+            let (mut store, _) =
+                ProjectStore::initialize(dir.path(), "Integrity").expect("fixture");
+            let saved = store
+                .create_document_if_absent(
+                    "story.md",
+                    DocumentContent::Prose("original".into()),
+                    "create",
+                )
+                .expect("fixture");
+            store
+                .connection
+                .execute_batch("DROP TRIGGER artifacts_are_immutable_update")
+                .expect("tamper fixture");
+            store
+                .connection
+                .execute(
+                    "UPDATE artifacts SET metadata_json = ?1 WHERE artifact_id = ?2",
+                    params![replacement.to_string(), saved.artifact_id.to_string()],
+                )
+                .expect("tampered metadata");
+            assert!(
+                store.reconstruct_revision(saved.revision_id).is_err(),
+                "{replacement}"
+            );
+            assert!(
+                store
+                    .save_document_if_source(
+                        "story.md",
+                        DocumentContent::Prose("edited".into()),
+                        "edit",
+                        saved.revision_id,
+                        saved.blob_id
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("story.md")).expect("preserved writing"),
+                b"original"
+            );
+            assert_eq!(
+                revision_metadata(&store, saved.artifact_id),
+                replacement.to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn current_main_segments_still_reject_corrupt_source_ranges() {
+        for end_byte in [1, 999] {
+            let dir = tempfile::tempdir().expect("fixture directory");
+            let saved = main_revision_fixture(dir.path(), "é exact");
+            let mut store = ProjectStore::open(dir.path()).expect("main fixture");
+            store
+                .connection
+                .execute_batch("DROP TRIGGER revision_segments_are_immutable_update")
+                .expect("tamper fixture");
+            store
+                .connection
+                .execute(
+                    "UPDATE revision_segments SET end_byte = ?1 WHERE revision_id = ?2",
+                    params![end_byte, saved.revision_id.to_string()],
+                )
+                .expect("tampered source");
+            assert!(store.reconstruct_revision(saved.revision_id).is_err());
+            assert!(
+                store
+                    .save_document_if_source(
+                        "story.md",
+                        DocumentContent::Prose("edited".into()),
+                        "edit",
+                        saved.revision_id,
+                        saved.blob_id
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("story.md")).expect("preserved writing"),
+                "é exact".as_bytes()
+            );
+        }
     }
 }

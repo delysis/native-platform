@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Cursor;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -9,14 +9,15 @@ use std::sync::{Mutex, OnceLock};
 use atomic_write_file::AtomicWriteFile;
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
 use attachment_native_types::{
-    AttachmentReceipt, AudioPreparationPolicy, Coverage, MediaFamily, PreparationPlan,
-    PreparationPolicy, PreparedPart, TargetCapabilities,
+    AttachmentReceipt, AudioPreparationPolicy, Coverage, DetectedFormat, MediaFamily,
+    PreparationPlan, PreparationPolicy, PreparedPart, TargetCapabilities,
 };
 use desktop_context::{
     ContextExcerptEvidence, ContextSource, render_source, select_excerpts, trailing_utf8,
 };
 #[cfg(test)]
 use desktop_context::{EXCERPT_CHUNK_BYTES, excerpt_chunk_ranges};
+use image::{ImageDecoder as _, ImageEncoder as _};
 use llama_native_types::{MediaInput, MediaKind};
 use same_file::Handle as FileIdentityHandle;
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,7 @@ pub(crate) struct StoredAttachment {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContextAttachmentPresentationKind {
     Text,
+    File,
     Image,
     Audio,
     Mixed,
@@ -129,6 +131,14 @@ struct StoredMedia {
     byte_count: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     waveform_peaks: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_conversion: Option<ImageConversion>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ImageConversion {
+    source_sha256: String,
+    method: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -212,11 +222,11 @@ pub(crate) struct ResolvedContext {
 pub(crate) enum ContextAttachmentError {
     #[error("the attachment path is not an ordinary local file")]
     UnsafeSource,
-    #[error("the attachment is empty or exceeds Loom's 128 MB per-file limit")]
+    #[error("the attachment exceeds Loom's 128 MB per-file limit")]
     SourceSize,
     #[error("attachment processing failed: {0}")]
     Processing(String),
-    #[error("the attachment produced no safe representation for Gemma 4")]
+    #[error("the attachment produced no safe text or media representation")]
     NoRepresentation,
     #[error("the document context already contains Loom's 32-attachment limit")]
     ContextLimit,
@@ -239,6 +249,15 @@ pub(crate) fn import_path(
     project_root: &Path,
     source_path: &Path,
 ) -> Result<StoredAttachment, ContextAttachmentError> {
+    import_path_bounded(project_root, source_path, MAX_ATTACHMENT_BYTES)
+}
+
+pub(crate) fn import_path_bounded(
+    project_root: &Path,
+    source_path: &Path,
+    max_bytes: u64,
+) -> Result<StoredAttachment, ContextAttachmentError> {
+    let max_bytes = max_bytes.min(MAX_ATTACHMENT_BYTES);
     let file_name = source_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -246,28 +265,47 @@ pub(crate) fn import_path(
         .ok_or(ContextAttachmentError::UnsafeSource)?
         .to_owned();
     let metadata = fs::symlink_metadata(source_path)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() == 0
-        || metadata.len() > MAX_ATTACHMENT_BYTES
-    {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ContextAttachmentError::UnsafeSource);
+    }
+    if metadata.len() == 0 || metadata.len() > max_bytes {
         return Err(ContextAttachmentError::SourceSize);
     }
-    let mut source = File::open(source_path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut source = options.open(source_path)?;
+    if !source.metadata()?.is_file() {
+        return Err(ContextAttachmentError::UnsafeSource);
+    }
     let identity = FileIdentityHandle::from_file(source.try_clone()?)?;
-    let provided = ProvidedAttachment::read_bounded(
-        file_name.clone(),
-        None,
-        &mut source,
-        MAX_ATTACHMENT_BYTES,
-    )
-    .map_err(|error| ContextAttachmentError::Processing(error.safe_message))?;
+    let provided =
+        ProvidedAttachment::read_bounded(file_name.clone(), None, &mut source, max_bytes)
+            .map_err(|error| ContextAttachmentError::Processing(error.safe_message))?;
     let visible = FileIdentityHandle::from_path(source_path)?;
     if visible != identity {
         return Err(ContextAttachmentError::UnsafeSource);
     }
 
-    import_provided(project_root, file_name, metadata.len(), provided)
+    let attachment = import_provided(project_root, provided)?;
+    record_import_origin(
+        project_root,
+        &serde_json::json!({
+            "schema": "loom.file-import.v1", "source_path": source_path,
+            "source_sha256": attachment.id, "source_bytes": attachment.byte_count,
+            "network_used": false, "human_reviewed": false,
+        }),
+    )?;
+    Ok(attachment)
 }
 
 /// Retains an explicitly captured recording through the same direct-media
@@ -278,22 +316,28 @@ pub(crate) fn import_recorded_wav(
     wav: &[u8],
 ) -> Result<StoredAttachment, ContextAttachmentError> {
     let provided = ProvidedAttachment::read_bounded(
-        file_name.clone(),
+        file_name,
         Some("audio/wav".to_owned()),
         &mut Cursor::new(wav),
         MAX_ATTACHMENT_BYTES,
     )
     .map_err(|error| ContextAttachmentError::Processing(error.safe_message))?;
-    import_provided(project_root, file_name, wav.len() as u64, provided)
+    import_provided(project_root, provided)
 }
 
+// Account downloads, folder imports, recordings, and native file grants share
+// one parser and persistence path. Callers provide bytes, never URLs to the parser.
 #[allow(clippy::too_many_lines)]
-fn import_provided(
+pub(crate) fn import_provided(
     project_root: &Path,
-    file_name: String,
-    byte_count: u64,
     provided: ProvidedAttachment,
 ) -> Result<StoredAttachment, ContextAttachmentError> {
+    let mut file_name = provided.display_name.clone();
+    let byte_count = provided.bytes.len() as u64;
+    if byte_count == 0 || byte_count > MAX_ATTACHMENT_BYTES {
+        return Err(ContextAttachmentError::SourceSize);
+    }
+    let original = std::sync::Arc::clone(&provided.bytes);
     let mut host_config = AttachmentHostConfig {
         preparation: PreparationPolicy {
             // Gemma consumes decoded audio itself. Loom must never silently
@@ -350,6 +394,9 @@ fn import_provided(
                     MediaFamily::Audio => MediaKind::Audio,
                     MediaFamily::Video => continue,
                 };
+                if blob.media_type == "image/gif" {
+                    warnings.push("The model receives the first frame of GIF images; the original animation is retained.".to_owned());
+                }
                 let bytes = prepared
                     .bundle
                     .blobs
@@ -369,6 +416,7 @@ fn import_provided(
                     mime: blob.media_type.clone(),
                     sha256: blob.sha256.clone(),
                     byte_count: blob.byte_len,
+                    image_conversion: None,
                     waveform_peaks: (kind == MediaKind::Audio)
                         .then(|| wav_waveform_peaks(bytes))
                         .flatten(),
@@ -377,21 +425,63 @@ fn import_provided(
             PreparedPart::OpaqueReference { .. } => {}
         }
     }
+    let root_format = prepared
+        .bundle
+        .graph
+        .objects
+        .iter()
+        .find(|object| object.id == prepared.bundle.graph.root)
+        .and_then(|object| object.detection.selected);
+    if coverage_complete
+        && matches!(
+            root_format,
+            Some(DetectedFormat::Webp | DetectedFormat::Bmp | DetectedFormat::Tiff)
+        )
+    {
+        match image_as_png(&original) {
+            Ok(bytes) => {
+                let sha256 = format!("{:x}", Sha256::digest(&bytes));
+                install_object(project_root, &sha256, &bytes)?;
+                media_kinds.insert("image".to_owned());
+                stored_media.push(StoredMedia {
+                    id: sha256.clone(),
+                    kind: MediaKind::Image,
+                    mime: "image/png".to_owned(),
+                    sha256,
+                    byte_count: bytes.len() as u64,
+                    waveform_peaks: None,
+                    image_conversion: Some(ImageConversion {
+                        source_sha256: prepared.bundle.graph.root.0.clone(),
+                        method: "bounded-first-frame-png-v1".to_owned(),
+                    }),
+                });
+                warnings.push("A PNG of the first image or page is sent to the model; the exact original file is retained.".to_owned());
+            }
+            Err(message) => warnings.push(message),
+        }
+    }
     let canonical_text = canonical_text.join("\n\n");
     if canonical_text.len() > MAX_CANONICAL_TEXT_BYTES {
         return Err(ContextAttachmentError::Processing(
             "canonical attachment text exceeded Loom's 64 MB retained-text limit".to_owned(),
         ));
     }
-    if canonical_text.is_empty() && stored_media.is_empty() {
-        let detail = coverage_failure_detail(&prepared.bundle.graph.coverage);
-        return if detail.is_empty() {
-            Err(ContextAttachmentError::NoRepresentation)
-        } else {
-            Err(ContextAttachmentError::Processing(detail))
-        };
-    }
     let id = prepared.bundle.graph.root.0.clone();
+    if prepared.bundle.graph.objects.iter().any(|object| {
+        object.id == prepared.bundle.graph.root
+            && object.detection.selected == Some(DetectedFormat::Executable)
+    }) {
+        return Err(ContextAttachmentError::NoRepresentation);
+    }
+    // Retaining an original does not assert extraction or model support.
+    // Identity is the root's content hash, shared with its immutable receipt.
+    install_object(project_root, &id, &original)?;
+    if canonical_text.is_empty() && stored_media.is_empty() {
+        warnings.push(
+            "Original file retained. No supported text or native media was extracted; this file is not sent to the model.".to_owned(),
+        );
+    }
+
     let detected_format = prepared
         .bundle
         .graph
@@ -403,6 +493,14 @@ fn import_provided(
             || "unknown".to_owned(),
             |format| format!("{format:?}").to_ascii_lowercase(),
         );
+    if detected_format == "email"
+        && file_name.starts_with("Gmail message ")
+        && let Some(subject) = canonical_text
+            .lines()
+            .find_map(|line| line.strip_prefix("**Subject:** "))
+    {
+        file_name = format!("{}.eml", subject.chars().take(160).collect::<String>());
+    }
     let text_bytes = u64::try_from(canonical_text.len()).unwrap_or(u64::MAX);
     let canonical_text_sha256 = (!canonical_text.is_empty())
         .then(|| format!("{:x}", Sha256::digest(canonical_text.as_bytes())));
@@ -430,7 +528,6 @@ fn import_provided(
                             .plan
                             .blockers
                             .iter()
-                            .filter(|blocker| blocker.code != "unsupported_opaque_attachment")
                             .map(|blocker| &blocker.safe_message),
                     )
                     .cloned(),
@@ -570,7 +667,7 @@ fn set_context_snapshot(
         return Err(ContextAttachmentError::ContextInvalid);
     }
     let ids = ordered_unique_attachment_ids(attachment_ids)?;
-    let manifests = media_manifest_metadata_for_ids(project_root, &ids)?;
+    let manifests = card_manifest_metadata_for_ids(project_root, &ids)?;
     let internal = encode_context_markdown(markdown, &manifests);
     if internal.len() > MAX_MANUAL_CONTEXT_BYTES {
         return Err(ContextAttachmentError::ManualTextLimit);
@@ -639,7 +736,7 @@ pub(crate) fn add_document_context_snapshot(
         .map_err(|_| ContextAttachmentError::ContextInvalid)?;
     let mut contexts = read_contexts(project_root)?;
     let current_internal = effective_context_text(project_root, &contexts, document_id)?;
-    let mut selected_ids = media_attachment_ids(
+    let mut selected_ids = card_attachment_ids(
         project_root,
         &authoritative_context_ids(&contexts, document_id),
     )?;
@@ -649,7 +746,7 @@ pub(crate) fn add_document_context_snapshot(
         if already_selected && manifest.attachment.text_bytes == 0 {
             continue;
         }
-        if !manifest.media.is_empty() && !already_selected {
+        if has_attachment_card(&manifest) && !already_selected {
             selected_ids.push(id.clone());
         }
         let canonical = read_canonical_text(project_root, &manifest)?;
@@ -683,7 +780,7 @@ pub(crate) fn add_document_context_snapshot(
                 receipt.attachment_id != id || receipt.source_sha256 != source_sha256
             });
         }
-        let selected = media_manifest_metadata_for_ids(project_root, &selected_ids)?;
+        let selected = card_manifest_metadata_for_ids(project_root, &selected_ids)?;
         let marker_bytes = encoded_marker_bytes(&markdown, &selected);
         let separator_bytes = usize::from(!markdown.is_empty()) * 2;
         let available = MAX_MANUAL_CONTEXT_BYTES
@@ -718,7 +815,7 @@ pub(crate) fn add_document_context_snapshot(
             imports.push(receipt);
         }
     }
-    let selected = media_manifest_metadata_for_ids(project_root, &selected_ids)?;
+    let selected = card_manifest_metadata_for_ids(project_root, &selected_ids)?;
     let internal = encode_context_markdown(&markdown, &selected);
     if internal.len() > MAX_MANUAL_CONTEXT_BYTES {
         return Err(ContextAttachmentError::ManualTextLimit);
@@ -739,7 +836,7 @@ pub(crate) fn remove_document_context_snapshot(
     let mut contexts = read_contexts(project_root)?;
     let internal = effective_context_text(project_root, &contexts, document_id)?;
     let markdown = strip_inline_attachment_markers(&internal);
-    let ids = media_attachment_ids(
+    let ids = card_attachment_ids(
         project_root,
         &authoritative_context_ids(&contexts, document_id),
     )?
@@ -984,28 +1081,28 @@ fn manifest_metadata_for_ids(
         .collect()
 }
 
-fn media_manifest_metadata_for_ids(
+fn card_manifest_metadata_for_ids(
     project_root: &Path,
     ids: &[String],
 ) -> Result<Vec<(String, AttachmentManifest)>, ContextAttachmentError> {
     let manifests = manifest_metadata_for_ids(project_root, ids)?;
     if manifests
         .iter()
-        .any(|(_, manifest)| manifest.media.is_empty())
+        .any(|(_, manifest)| !has_attachment_card(manifest))
     {
         return Err(ContextAttachmentError::ContextInvalid);
     }
     Ok(manifests)
 }
 
-fn media_attachment_ids(
+fn card_attachment_ids(
     project_root: &Path,
     ids: &[String],
 ) -> Result<Vec<String>, ContextAttachmentError> {
     manifest_metadata_for_ids(project_root, ids).map(|manifests| {
         manifests
             .into_iter()
-            .filter_map(|(id, manifest)| (!manifest.media.is_empty()).then_some(id))
+            .filter_map(|(id, manifest)| has_attachment_card(&manifest).then_some(id))
             .collect()
     })
 }
@@ -1023,7 +1120,7 @@ fn snapshot_from_contexts(
         attachments: manifests
             .into_iter()
             .filter_map(|(_, manifest)| {
-                (!manifest.media.is_empty()).then(|| attachment_presentation(manifest))
+                has_attachment_card(&manifest).then(|| attachment_presentation(manifest))
             })
             .collect(),
         text_sources: contexts
@@ -1032,6 +1129,10 @@ fn snapshot_from_contexts(
             .cloned()
             .unwrap_or_default(),
     })
+}
+
+fn has_attachment_card(manifest: &AttachmentManifest) -> bool {
+    !manifest.media.is_empty() || manifest.attachment.text_bytes == 0
 }
 
 fn attachment_presentation(manifest: AttachmentManifest) -> ContextAttachmentPresentation {
@@ -1045,6 +1146,7 @@ fn attachment_presentation(manifest: AttachmentManifest) -> ContextAttachmentPre
         .iter()
         .any(|media| media.kind == MediaKind::Audio);
     let presentation_kind = match (has_text, has_image, has_audio) {
+        (false, false, false) => ContextAttachmentPresentationKind::File,
         (true, false, false) => ContextAttachmentPresentationKind::Text,
         (false, true, false) => ContextAttachmentPresentationKind::Image,
         (false, false, true) => ContextAttachmentPresentationKind::Audio,
@@ -1548,12 +1650,72 @@ fn middle_out_manuscript(text: &str, budget: usize) -> (String, Option<(usize, u
     (rendered, Some((head_end, tail_start)))
 }
 
+fn image_as_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    const MAX_PNG_BYTES: usize = 16 * 1024 * 1024;
+    struct Output(Vec<u8>);
+    impl std::io::Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_PNG_BYTES.saturating_sub(self.0.len()) {
+                return Err(std::io::Error::other("PNG exceeds 16 MiB"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let format = image::guess_format(bytes).map_err(|error| error.to_string())?;
+    if !matches!(
+        format,
+        image::ImageFormat::WebP | image::ImageFormat::Bmp | image::ImageFormat::Tiff
+    ) {
+        return Err("No image conversion is configured for this file.".into());
+    }
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), format);
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder().map_err(|error| error.to_string())?;
+    let (width, height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > 16 * 1024 * 1024 {
+        return Err("Image conversion exceeds its 16-megapixel limit.".into());
+    }
+    // Match ImageReader::decode's accounting while keeping the dimension
+    // check and conversion on one bounded decoder.
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(|error| error.to_string())?;
+    decoder
+        .set_limits(limits)
+        .map_err(|error| error.to_string())?;
+    let pixels = image::DynamicImage::from_decoder(decoder)
+        .map_err(|error| error.to_string())?
+        .into_rgba8();
+    let mut output = Output(Vec::new());
+    image::codecs::png::PngEncoder::new(&mut output)
+        .write_image(
+            &pixels,
+            pixels.width(),
+            pixels.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(output.0)
+}
+
 fn gemma_target() -> TargetCapabilities {
     TargetCapabilities {
         target_id: "google.gemma-4-12b-it".to_owned(),
         fingerprint: "loom:gemma-4-12b-it:native-image-audio:excerpted-text:v2".to_owned(),
-        accepted_media_types: BTreeSet::new(),
-        accepted_media_families: BTreeSet::from([MediaFamily::Image, MediaFamily::Audio]),
+        // The pinned mtmd decoder does not support raw WebP or TIFF.
+        accepted_media_types: ["image/png", "image/jpeg", "image/gif", "audio/wav"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        accepted_media_families: BTreeSet::new(),
         max_media_objects: 32,
         max_media_bytes: MAX_ATTACHMENT_BYTES,
         max_text_bytes: MAX_CANONICAL_TEXT_BYTES as u64,
@@ -1570,20 +1732,6 @@ fn coverage_warnings(coverage: &Coverage) -> Vec<String> {
             .iter()
             .map(|reason| format!("Only part of this file was canonicalized ({reason})."))
             .collect(),
-    }
-}
-
-fn coverage_failure_detail(coverage: &Coverage) -> String {
-    match coverage {
-        Coverage::Complete => String::new(),
-        Coverage::Partial { reasons } if reasons.is_empty() => {
-            "attachment inspection was incomplete and produced no usable text or direct media"
-                .to_owned()
-        }
-        Coverage::Partial { reasons } => format!(
-            "attachment inspection was incomplete and produced no usable representation: {}",
-            reasons.join(", ")
-        ),
     }
 }
 
@@ -1778,11 +1926,32 @@ fn read_object(
         return Err(ContextAttachmentError::ContextInvalid);
     }
     let path = attachment_root(project_root)?.join("objects").join(sha256);
-    let bytes = fs::read(path)?;
-    if bytes.len() as u64 != expected_bytes || format!("{:x}", Sha256::digest(&bytes)) != sha256 {
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != expected_bytes
+    {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    let file = File::open(&path)?;
+    let identity = FileIdentityHandle::from_file(file.try_clone()?)?;
+    let mut bytes = Vec::new();
+    file.take(expected_bytes + 1).read_to_end(&mut bytes)?;
+    if FileIdentityHandle::from_path(&path)? != identity
+        || fs::symlink_metadata(&path)?.file_type().is_symlink()
+        || bytes.len() as u64 != expected_bytes
+        || format!("{:x}", Sha256::digest(&bytes)) != sha256
+    {
         return Err(ContextAttachmentError::ContextInvalid);
     }
     Ok(bytes)
+}
+
+pub(crate) fn original_path(
+    project_root: &Path,
+    id: &str,
+) -> Result<PathBuf, ContextAttachmentError> {
+    let manifest = read_manifest_metadata(project_root, id)?;
+    let _ = read_object(project_root, id, manifest.attachment.byte_count)?;
+    Ok(attachment_root(project_root)?.join("objects").join(id))
 }
 
 fn write_manifest(
@@ -1793,6 +1962,20 @@ fn write_manifest(
         .join("manifests")
         .join(format!("{}.json", manifest.attachment.id));
     let bytes = serde_json::to_vec_pretty(manifest)?;
+    install_immutable(&path, &bytes)
+}
+
+/// Acquisition provenance is separate from the offline processing receipt.
+/// The receipt is immutable and contains no OAuth credential material.
+pub(crate) fn record_import_origin(
+    project_root: &Path,
+    origin: &impl Serialize,
+) -> Result<(), ContextAttachmentError> {
+    let bytes = serde_json::to_vec_pretty(origin)?;
+    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let path = attachment_root(project_root)?
+        .join("manifests")
+        .join(format!("source-{hash}.json"));
     install_immutable(&path, &bytes)
 }
 
@@ -1880,6 +2063,12 @@ fn read_manifest_if_present(
                 || !media_mime_matches_kind(media.kind, &media.mime)
                 || media.byte_count == 0
                 || media.byte_count > MAX_ATTACHMENT_BYTES
+                || media.image_conversion.as_ref().is_some_and(|conversion| {
+                    conversion.source_sha256 != manifest.attachment.id
+                        || conversion.method != "bounded-first-frame-png-v1"
+                        || media.kind != MediaKind::Image
+                        || media.mime != "image/png"
+                })
                 || media
                     .waveform_peaks
                     .as_ref()
@@ -1894,7 +2083,6 @@ fn read_manifest_if_present(
         || manifest.preparation_plan.source_job_id != manifest.processing_receipt.job_id
         || manifest.preparation_plan.target_id != gemma_target().target_id
         || !target_fingerprint_is_valid
-        || !manifest.preparation_plan.transforms.is_empty()
     {
         return Err(ContextAttachmentError::ContextInvalid);
     }
@@ -2056,6 +2244,118 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn source_only_files_retain_originals_without_inventing_model_content() {
+        let project = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let bytes = b"\x00\xff\xfe\xfd\x80\x81\x82\x83";
+        let path = source.path().join("Archive.bin");
+        fs::write(&path, bytes).unwrap();
+        let attachment = import_path(project.path(), &path).unwrap();
+        assert_eq!(attachment.text_bytes, 0);
+        assert!(attachment.media_kinds.is_empty());
+        assert!(attachment.editable_markdown.is_none());
+        assert!(
+            attachment
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("not sent to the model"))
+        );
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            fs::read(original_path(project.path(), &attachment.id).unwrap()).unwrap(),
+            bytes
+        );
+        let snapshot = add_document_context_snapshot(
+            project.path(),
+            "doc",
+            std::slice::from_ref(&attachment.id),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.attachments[0].presentation_kind,
+            ContextAttachmentPresentationKind::File
+        );
+        let persisted = set_document_context_snapshot(
+            project.path(),
+            "doc",
+            "",
+            std::slice::from_ref(&attachment.id),
+        )
+        .unwrap();
+        assert_eq!(persisted.attachments.len(), 1);
+        let resolved =
+            resolve_for_generation_with_budget(project.path(), "doc", "Writing", 32768, 4, 128)
+                .unwrap();
+        assert!(resolved.media.is_empty());
+        assert!(resolved.context_preamble.is_empty());
+        assert_eq!(resolved.manuscript_prompt, "Writing");
+        assert!(
+            remove_document_context_snapshot(project.path(), "doc", &attachment.id)
+                .unwrap()
+                .attachments
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn common_web_images_resolve_exact_native_bytes_and_keep_truncated_sources_opaque() {
+        let project = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        for (extension, format) in [
+            ("gif", image::ImageFormat::Gif),
+            ("webp", image::ImageFormat::WebP),
+            ("bmp", image::ImageFormat::Bmp),
+            ("tiff", image::ImageFormat::Tiff),
+        ] {
+            let mut encoded = Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(2, 2)
+                .write_to(&mut encoded, format)
+                .unwrap();
+            let bytes = encoded.into_inner();
+            let path = source.path().join(format!("picture.{extension}"));
+            fs::write(&path, &bytes).unwrap();
+            let attachment = import_path(project.path(), &path).unwrap();
+            let markdown = attachment.media_markdown.unwrap();
+            let resolved =
+                resolve_for_generation_with_budget(project.path(), "doc", &markdown, 32768, 4, 128)
+                    .unwrap();
+            assert_eq!(resolved.media.len(), 1);
+            assert_eq!(resolved.media[0].kind, MediaKind::Image);
+            if extension == "gif" {
+                assert_eq!(resolved.media[0].bytes, bytes);
+            } else {
+                assert_eq!(resolved.media[0].mime, "image/png");
+                let manifest = read_manifest(project.path(), &attachment.id).unwrap();
+                assert_eq!(
+                    manifest.media[0]
+                        .image_conversion
+                        .as_ref()
+                        .unwrap()
+                        .source_sha256,
+                    attachment.id
+                );
+                let decoded = image::load_from_memory(&resolved.media[0].bytes).unwrap();
+                assert_eq!((decoded.width(), decoded.height()), (2, 2));
+                assert_eq!(
+                    fs::read(original_path(project.path(), &attachment.id).unwrap()).unwrap(),
+                    bytes
+                );
+            }
+            if matches!(extension, "bmp" | "tiff") {
+                continue;
+            }
+            fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+            let truncated = import_path(project.path(), &path).unwrap();
+            assert!(truncated.media_kinds.is_empty());
+            assert!(truncated.media_markdown.is_none());
+            assert_eq!(
+                fs::read(original_path(project.path(), &truncated.id).unwrap()).unwrap(),
+                bytes[..bytes.len() - 1]
+            );
+        }
+    }
+
+    #[test]
     fn inline_media_keeps_native_bytes_and_editable_markdown_preview_identity() {
         let project = tempfile::tempdir().expect("project");
         for (extension, expected_kind) in [("png", MediaKind::Image), ("wav", MediaKind::Audio)] {
@@ -2088,6 +2388,10 @@ mod tests {
                 .join(format!("editable.{extension}"));
             for _ in 0..2 {
                 let attachment = import_path(project.path(), &path).expect(extension);
+                assert_eq!(
+                    fs::read(original_path(project.path(), &attachment.id).unwrap()).unwrap(),
+                    fs::read(&path).unwrap()
+                );
                 let markdown = attachment.editable_markdown.as_deref().expect(extension);
                 assert!(
                     markdown.contains("Loom editable fixture"),

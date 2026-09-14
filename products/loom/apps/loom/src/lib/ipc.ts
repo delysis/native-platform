@@ -47,6 +47,12 @@ const PREFIX = 'plugin:loom|';
 // its bounded critical sections, so renderer classification is an ordering and
 // latency optimization rather than a correctness boundary.
 const INDEPENDENT_COMMANDS = new Set([
+  'import_account_cancel',
+  'import_source_url',
+  'import_accounts',
+  'import_account_connect',
+  'import_account_disconnect',
+  'import_account_sync',
   'application_close_abort',
   'application_close_pending',
   'audio_synthesize',
@@ -132,6 +138,14 @@ export function prepareProjectOpen(): Promise<string | null> {
   return call('project_prepare_open');
 }
 
+export function prepareProjectOpenPath(path: string): Promise<string | null> {
+  return call('project_prepare_open_path', { path });
+}
+
+export function projectDropDirectories(paths: string[]): Promise<string[]> {
+  return call('project_drop_directories', { paths });
+}
+
 export function commitProjectOpen(preparationId: string): Promise<ProjectSnapshot> {
   return call('project_commit_open', { preparationId });
 }
@@ -204,6 +218,10 @@ export function importAttachmentPaths(
   paths: readonly string[]
 ): Promise<ContextAttachment[]> {
   return call('attachment_import_paths', { projectId, sessionId, paths: [...paths] });
+}
+
+export function revealAttachmentOriginal(projectId: string, sessionId: string, attachmentId: string): Promise<void> {
+  return call('attachment_reveal_original', { projectId, sessionId, attachmentId });
 }
 
 export function chooseAttachments(
@@ -732,6 +750,7 @@ export interface WeaveStartArgs {
   cursorByte: number;
   policy:
     | { kind: 'automatic_v2' }
+    | { kind: 'loompad_v1'; sample_target: 4 | 16 | 64 | 256; batch_offset: number }
     | {
         kind: 'manual_v2';
         branch_count: number;
@@ -886,7 +905,14 @@ export function normalizeFailure(error: unknown): LoomFailure {
       : typeof value.error === 'string'
         ? value.error
         : 'Loom could not complete that command.';
+    const recovery = value.speculation_recovery as Record<string, unknown> | undefined;
+    const validRecovery = recovery && typeof recovery.snapshot_id === 'string' && /^[a-f0-9]{64}$/.test(recovery.snapshot_id) &&
+      Number.isInteger(recovery.next_offset) && Number(recovery.next_offset) >= 0 && Number(recovery.next_offset) <= 256 &&
+      Array.isArray(recovery.command_ids) && recovery.command_ids.length * 4 === recovery.next_offset &&
+      recovery.command_ids.every(id => typeof id === 'string' && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(id)) &&
+      new Set(recovery.command_ids).size === recovery.command_ids.length;
     return {
+      ...(validRecovery ? { speculation_recovery: recovery as NonNullable<LoomFailure['speculation_recovery']> } : {}),
       code: typeof value.code === 'string' ? value.code : 'command_failed',
       message,
       retryable: value.retryable === true
@@ -920,4 +946,35 @@ export function getWorkspaceTemplate(projectId: string, sessionId: string): Prom
 }
 export function enableWorkspaceTemplate(projectId: string, sessionId: string, choices?: import('./workspaceTemplate').SetupChoices): Promise<import('./workspaceTemplate').WorkspaceTemplateSnapshot> {
   return call('workspace_template_enable', { projectId, sessionId, choices: choices ?? null });
+}
+
+export type ImportSource = 'gmail' | 'google_alerts' | 'linked_in' | 'drive';
+export interface ImportAccount { service: 'gmail' | 'drive'; email: string | null }
+export interface ImportBatch { imported: ContextAttachment[]; failures: { name: string; message: string }[]; next_page_token: string | null }
+export function importAccounts(projectId: string, sessionId: string): Promise<ImportAccount[]> {
+  return call('import_accounts', { projectId, sessionId });
+}
+export function connectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', clientId: string, clientSecret: string): Promise<ImportAccount> {
+  return call('import_account_connect', { projectId, sessionId, service, clientId, clientSecret });
+}
+export function disconnectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', accountEmail: string): Promise<void> {
+  return call('import_account_disconnect', { projectId, sessionId, service, accountEmail });
+}
+export function syncImportAccount(projectId: string, sessionId: string, source: ImportSource, accountEmail: string, query: string, pageToken: string | null): Promise<ImportBatch> {
+  return call('import_account_sync', { projectId, sessionId, source, accountEmail, query, pageToken });
+}
+export function chooseImportBatch(projectId: string, sessionId: string, folder: boolean): Promise<ImportBatch> {
+  return call('attachment_import_batch_choose', { projectId, sessionId, folder });
+}
+
+export function importSourceUrl(projectId: string, sessionId: string, url: string): Promise<ImportBatch> {
+  return call('import_source_url', { projectId, sessionId, url });
+}
+
+export function importPastedSources(projectId: string, sessionId: string, text: string, separator: string): Promise<ImportBatch> {
+  return call('import_text_sources', { projectId, sessionId, text, separator });
+}
+
+export function cancelImportAccount(projectId: string, sessionId: string): Promise<void> {
+  return call('import_account_cancel', { projectId, sessionId });
 }

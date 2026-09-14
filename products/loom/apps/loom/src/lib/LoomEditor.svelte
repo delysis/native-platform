@@ -7,6 +7,8 @@
   import { EditorView } from 'prosemirror-view';
   import { onDestroy, onMount } from 'svelte';
   import { visualTerminalRange, type TerminalSourceRange } from './terminalSelection';
+  import { flushMediaObjectDrafts, mediaObjectView } from './mediaObjectView';
+  import { objectNavigation } from './objectNavigation';
   import { shaderCodeBlockView } from './shaderCodeBlock';
   import {
     normalizeVisualMarkdownSource,
@@ -340,8 +342,8 @@
       // Once a word is consumed the session is locked to one candidate. Do
       // not hide its cached remainder behind a now-empty alternatives fan
       // while Option is still held.
-      fanVisible: snapshot.optionHeld && snapshot.alternatives.length > 1,
-      fanPinned: snapshot.lensPinned && snapshot.alternatives.length > 1
+      fanVisible: !snapshot.hidden && snapshot.optionHeld && snapshot.alternatives.length > 1,
+      fanPinned: !snapshot.hidden && snapshot.lensPinned && snapshot.alternatives.length > 1
     } : null;
     setGhostText(editorView, presentation, forceRender);
     reportCompletionAccessibility();
@@ -406,7 +408,7 @@
   }
 
   export function flushPending(): boolean {
-    if (composing) return false;
+    if (composing || (view && !flushMediaObjectDrafts(view))) return false;
     projectDocument();
     return true;
   }
@@ -691,6 +693,16 @@
     return true;
   }
 
+  export function acceptLoompadText(candidateId: string, presentationKey: string, text: string): boolean {
+    if (!view || readonly || composing || !view.hasFocus()) return false;
+    const plan = currentGhostTextPlan(view.state);
+    if (!plan || plan.candidateId !== candidateId || plan.presentationKey !== presentationKey ||
+        !text || !plan.text.startsWith(text) || selectionBoundary(view.state) !== plan.anchorByteOffset) return false;
+    if (!authorizeCompletionInsertion(candidateId, presentationKey, text, 'loompad')) return false;
+    view.dispatch(view.state.tr.insertText(text));
+    return true;
+  }
+
   function authorizeCompletionInsertion(
     candidateId: string,
     presentationKey: string,
@@ -728,6 +740,7 @@
       doc,
       plugins: [
         history(),
+        objectNavigation(),
         visualMarkdownInputRules(schema),
         keymap({
           Enter: visualMarkdownFenceEnter,
@@ -799,7 +812,7 @@
     return attributes;
   }
 
-  function imageNodeView(node: ProseMirrorNode): { dom: HTMLElement; destroy: () => void } {
+  function imageNodeView(node: ProseMirrorNode, editor: EditorView, getPos: () => number | undefined) {
     const markdownPath = typeof node.attrs.src === 'string' ? node.attrs.src : '';
     const isAudio = markdownPath.startsWith('loom-attachment:') && String(node.attrs.alt).startsWith('Audio:');
     const media = document.createElement(isAudio ? 'audio' : 'img');
@@ -841,7 +854,8 @@
       }
     };
     load();
-    return { dom, destroy: () => { media.onerror = null; window.clearTimeout(retry); } };
+    const object = mediaObjectView(node, editor, getPos, dom);
+    return { ...object, destroy: () => { object.destroy?.(); media.onerror = null; window.clearTimeout(retry); } };
   }
 
   function attachmentSelection(event: DragEvent | ClipboardEvent): Selection | null {
@@ -1028,7 +1042,7 @@
     lastEmitted = initialMarkdown;
     view = new EditorView(mount, {
       state: stateFor(initialMarkdown),
-      nodeViews: { image: imageNodeView, code_block: (node) => shaderCodeBlockView(node) },
+      nodeViews: { image: imageNodeView, code_block: (node, editor, getPos) => shaderCodeBlockView(node, editor, getPos) },
       editable: () => !readonly,
       attributes: editorAttributes(),
       dispatchTransaction(transaction) {
@@ -1272,3 +1286,14 @@
 <div class="loom-editor-shell">
   <div class="editor-mount" bind:this={mount}></div>
 </div>
+
+<style>
+  :global(.loom-object-menu) { position: fixed; z-index: 1000; padding: 3px; border: 1px solid var(--line, #777); border-radius: 5px; background: var(--paper); box-shadow: 0 3px 12px #0003; }
+  :global(.loom-object-menu button) { min-width: 80px; min-height: 28px; text-align: left; padding: 3px 10px; border: 0; border-radius: 3px; color: var(--ink); background: transparent; font-size: 13px; }
+  :global(.loom-object-menu button:hover), :global(.loom-object-menu button:focus-visible) { background: var(--chrome-hover); }
+  :global(.loom-shader-block.ProseMirror-selectednode) { outline: 2px solid var(--moss); outline-offset: 2px; }
+  :global(.loom-shader-block[data-shader-mode="render"]) { width: fit-content; max-width: 100%; }
+  :global(.loom-media-object.ProseMirror-selectednode) { outline: 2px solid var(--moss); outline-offset: 2px; }
+  :global(.loom-object-source) { width: min(100%, 48em); font: inherit; font-family: ui-monospace, monospace; }
+  :global(.loom-object-error) { display: block; color: var(--danger); font-size: 11px; }
+</style>

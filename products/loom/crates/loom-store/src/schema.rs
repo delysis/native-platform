@@ -3,9 +3,8 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::{Result, StoreError};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
-// Version 16 requires the shared document snapshot on every immutable revision.
-// Reject older stores before recovery or new writes can mix revision formats.
-pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 16;
+// Shared snapshots add immutable artifact metadata; the SQL schema is unchanged.
+pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 15;
 const APPLICATION_ID: u32 = 0x4c4f_4f4d;
 const SCHEMA: &str = include_str!("../schema.sql");
 

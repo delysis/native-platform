@@ -34,7 +34,11 @@ pub(crate) fn canonicalize_plain(
     Ok((!document.text.is_empty()).then_some(document))
 }
 
-pub(crate) fn canonicalize_json(bytes: &[u8], limits: &DocumentLimits) -> RenderResult {
+pub(crate) fn canonicalize_json(
+    bytes: &[u8],
+    limits: &DocumentLimits,
+    max_output_bytes: usize,
+) -> RenderResult {
     let (text, truncated) = bounded_utf8(bytes, limits.max_processor_input_bytes)?;
     if truncated {
         return Err(ProcessorFailure::partial(
@@ -48,6 +52,9 @@ pub(crate) fn canonicalize_json(bytes: &[u8], limits: &DocumentLimits) -> Render
             "The attachment has JSON-like bytes but is not valid JSON.",
         )
     })?;
+    if let Some(result) = crate::exports::conversation_export(&value, limits, max_output_bytes) {
+        return result;
+    }
     let pretty = serde_json::to_string_pretty(&value).map_err(|_| {
         ProcessorFailure::malformed(
             "json_render_failed",
@@ -75,6 +82,7 @@ pub(crate) fn canonicalize_delimited(
     } else {
         bytes
     };
+    let (input, linkedin_preamble) = linkedin_csv_payload(input);
     let delimiter = if format == DetectedFormat::Tsv {
         b'\t'
     } else {
@@ -141,6 +149,9 @@ pub(crate) fn canonicalize_delimited(
     }
     let output_budget_exhausted = markdown.was_truncated();
     let mut document = RenderedDocument::document(TextFormat::Markdown, markdown.into_string());
+    if linkedin_preamble {
+        document.warnings.push("LinkedIn's introductory Notes section was omitted. All table columns, including commentary and URL, remain separate.".to_string());
+    }
     document.output_budget_exhausted = output_budget_exhausted;
     if truncated {
         document.record_issue(ProcessorFailure::partial(
@@ -149,6 +160,24 @@ pub(crate) fn canonicalize_delimited(
         ));
     }
     Ok(Some(document))
+}
+
+fn linkedin_csv_payload(bytes: &[u8]) -> (&[u8], bool) {
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    if !bytes.starts_with(b"Notes:") {
+        return (bytes, false);
+    }
+    let mut offset = 0;
+    for line in bytes.split_inclusive(|byte| *byte == b'\n').take(64) {
+        if line.starts_with(b"First Name,Last Name,") {
+            return (&bytes[offset..], true);
+        }
+        offset += line.len();
+        if offset > 8192 {
+            break;
+        }
+    }
+    (bytes, false)
 }
 
 pub(crate) fn canonicalize_html(bytes: &[u8], limits: &DocumentLimits) -> RenderResult {
@@ -376,6 +405,12 @@ pub(crate) fn canonicalize_email(
     }
     if let Some(subject) = message.subject() {
         push_email_header(&mut header, "Subject", subject.trim());
+    }
+    if let Some(labels) = message
+        .header("X-Gmail-Labels")
+        .and_then(|value| value.as_text())
+    {
+        push_email_header(&mut header, "Gmail labels", labels);
     }
     header.push_str("**Attachments:** ");
     header.push_str(&message.attachment_count().to_string());
@@ -821,7 +856,7 @@ mod tests {
 
     #[test]
     fn malformed_json_is_an_explicit_failure() {
-        let result = canonicalize_json(b"{not json", &DocumentLimits::default());
+        let result = canonicalize_json(b"{not json", &DocumentLimits::default(), 4096);
         assert!(matches!(
             result,
             Err(ProcessorFailure {

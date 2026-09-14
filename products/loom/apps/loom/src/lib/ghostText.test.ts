@@ -844,10 +844,13 @@ describe('ghost-text plugin state', () => {
 
   it('accepts a rendered ghost and otherwise inserts visual indentation', () => {
     let accepted = '';
+    let wholeCandidateAccepted = false;
     let wasInstalledWhenClaimed = false;
     let visible = false;
     const plugin = createGhostTextPlugin({
-      accept: (candidateId) => {
+      accept: () => { wholeCandidateAccepted = true; return true; },
+      insert: (candidateId, _key, text) => {
+        expect(text).toBe(' for');
         accepted = candidateId;
         wasInstalledWhenClaimed = ghostTextPluginKey.getState(state) !== null;
         return true;
@@ -867,7 +870,7 @@ describe('ghost-text plugin state', () => {
         state = state.apply(transaction);
       }
     } as unknown as EditorView;
-    setGhostText(view, suggestion);
+    setGhostText(view, { ...suggestion, insertsOnAccept: true });
 
     const tab = {
       key: 'Tab',
@@ -889,12 +892,19 @@ describe('ghost-text plugin state', () => {
       selection: Selection.atEnd(resetDoc),
       plugins: [plugin]
     });
+    // A whole-candidate-only callback cannot promote a hidden suffix.
     setGhostText(view, suggestion);
     visible = true;
+    expect(plugin.props.handleKeyDown?.call(plugin, view, tab)).toBe(true);
+    expect(wholeCandidateAccepted).toBe(false);
+    expect(state.doc.textContent).toBe(`The sentence waits${VISUAL_TAB_INDENT}`);
+    state = EditorState.create({ doc: resetDoc, selection: Selection.atEnd(resetDoc), plugins: [plugin] });
+    setGhostText(view, { ...suggestion, insertsOnAccept: true });
     const handled = plugin.props.handleKeyDown?.call(plugin, view, tab);
     expect(handled).toBe(true);
     expect(accepted).toBe(suggestion.candidateId);
     expect(wasInstalledWhenClaimed).toBe(true);
+    expect(state.doc.textContent).toBe('The sentence waits for');
     expect(ghostTextPluginKey.getState(state)).toBeNull();
   });
 

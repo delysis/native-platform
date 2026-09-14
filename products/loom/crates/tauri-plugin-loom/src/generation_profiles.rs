@@ -12,6 +12,7 @@ pub(super) fn config_failure(error: impl std::fmt::Display) -> IpcFailure {
 pub(super) const fn task(preset: WeavePreset) -> GenerationTask {
     match preset {
         WeavePreset::AutomaticProseV2 => GenerationTask::AutomaticProse,
+        WeavePreset::LoompadV1 => GenerationTask::Loompad,
         WeavePreset::AutomaticVerseV2 => GenerationTask::AutomaticVerse,
         WeavePreset::ManualV2 => GenerationTask::ManualWriting,
     }
@@ -74,6 +75,7 @@ pub(super) fn sampling(
         GenerationTask::AutomaticProse | GenerationTask::AutomaticVerse => {
             AUTOMATIC_WEAVE_MAX_TOKENS_V2
         }
+        GenerationTask::Loompad => 128,
         GenerationTask::Chat | GenerationTask::ManualWriting => 2_048,
     };
     if sampling.max_tokens > limit {
@@ -123,6 +125,8 @@ pub(super) struct ProfiledContextEvidence {
     pub generation_profile: Option<FrozenGenerationProfile>,
     #[serde(default)]
     pub applied_co_writer: Option<crate::co_writer::AppliedCoWriter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loompad: Option<LoompadBatch>,
     #[serde(default)]
     pub request_sampling: Option<RequestSampling>,
 }
@@ -146,8 +150,21 @@ pub(super) fn recorded_profile(
         return Ok(None);
     };
     let bytes = store.read_blob(blob).map_err(IpcFailure::store)?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(config_failure)?;
+    // Main recorded both a direct retrieval record and, for Loompad, a wrapped
+    // record. Neither has a frozen project profile. Validate that original
+    // evidence rather than interpreting the current dotfile as historical policy.
+    if value.get("generation_profile").is_none()
+        && value.get("request_sampling").is_none()
+        && value.get("applied_co_writer").is_none()
+    {
+        let _: crate::context_attachments::ContextRetrievalEvidence =
+            serde_json::from_value(value.get("retrieval").unwrap_or(&value).clone())
+                .map_err(config_failure)?;
+        return Ok(None);
+    }
     let evidence: ProfiledContextEvidence =
-        serde_json::from_slice(&bytes).map_err(config_failure)?;
+        serde_json::from_value(value).map_err(config_failure)?;
     if let Some(applied) = &evidence.applied_co_writer {
         applied.validate().map_err(config_failure)?;
     }
@@ -213,6 +230,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn recorded_profile_replays_frozen_sources_after_config_changes() {
         let root = tempfile::tempdir().unwrap();
         let (mut store, _) =
@@ -233,6 +251,7 @@ mod tests {
             retrieval: crate::context_attachments::ContextRetrievalEvidence::default(),
             generation_profile: Some(profile),
             applied_co_writer: None,
+            loompad: None,
             request_sampling: Some(RequestSampling {
                 max_tokens: 512,
                 temperature: 0.8,
@@ -265,5 +284,35 @@ mod tests {
             0.25_f32.to_bits()
         );
         assert!(recorded_profile(&store, recipe.artifact_id, 1024, 0.8).is_err());
+
+        let batch = LoompadBatch {
+            snapshot_id: BlobId::digest(b"main-loompad").to_string(),
+            sample_target: 16,
+            batch_offset: 0,
+        };
+        let original = serde_json::json!({
+            "retrieval": crate::context_attachments::ContextRetrievalEvidence::default(),
+            "loompad": batch,
+        });
+        let blob = store
+            .store_provenance_blob(&serde_json::to_vec(&original).unwrap())
+            .unwrap();
+        let recipe = store
+            .record_context_recipe(&ContextRecipe {
+                source_revision_id: document.revision_id,
+                ordered_source_artifact_ids: vec![],
+                token_budget: 4096,
+                retrieval_evidence_blob_id: Some(blob),
+            })
+            .unwrap();
+        assert!(
+            recorded_profile(&store, recipe.artifact_id, 128, 0.8)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            recorded_loompad_batch(&store, recipe.artifact_id).unwrap(),
+            Some(batch)
+        );
     }
 }

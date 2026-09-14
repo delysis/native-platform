@@ -5,7 +5,7 @@ use super::*;
 pub(super) use loom_config::valid_pane_id;
 use loom_config::{CONFIG_FILE, MineConfig, WorkspaceConfig};
 
-const DEFAULT_TEMPLATE: &str = r#"# Mine settings. Omitted values inherit defaults.
+const DEFAULT_TEMPLATE: &str = r##"# Mine settings. Omitted values inherit defaults.
 version = 1
 
 # [assistance]
@@ -22,6 +22,14 @@ version = 1
 # visible = true
 # document = "@.browser"
 
+# [workspace.theme]
+# mode = "system"
+# accent = "#566F53"
+
+# Select a verified catalog or policy identity, independently of native sizing.
+# [workspace.model]
+# catalog = "google.gemma-4-12b-it-qat-q4_0"
+
 # Reload model settings explicitly with Command/Ctrl-Shift-R.
 # [model]
 # path = "../models/writer.gguf"
@@ -37,7 +45,7 @@ version = 1
 # [profiles.my_writer.sampling]
 # temperature = 0.7
 # top_p = 0.95
-"#;
+"##;
 
 /// Answers to the optional setup flow. No model or download authority lives here.
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -101,20 +109,41 @@ fn resolved_snapshot(
 }
 
 fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
-    let document = store
-        .list_documents()
-        .map_err(IpcFailure::store)?
-        .into_iter()
+    let documents = store.list_documents().map_err(IpcFailure::store)?;
+    let document = documents
+        .iter()
         .find(|document| document.relative_path == CONFIG_FILE);
     let Some(document) = document else {
         // A hand-authored dotfile works without registering it as a document.
         // Reads create neither a file nor a document/revision record.
-        return Ok(resolved_snapshot(
-            MineConfig::read(store.root()),
-            store.root(),
-            None,
-            None,
-        ));
+        let settings = resolved_snapshot(MineConfig::read(store.root()), store.root(), None, None);
+        if settings.enabled {
+            return Ok(settings);
+        }
+        let Some(document) = documents
+            .iter()
+            .find(|document| document.relative_path == ".loom.md")
+        else {
+            return Ok(settings);
+        };
+        store
+            .import_external_changes_if_uncontested(".loom.md", "Read external workspace settings")
+            .map_err(IpcFailure::store)?;
+        let loaded = store.read_document(".loom.md").map_err(IpcFailure::store)?;
+        let (config, error) = match loom_config::parse_loom_workspace(&loaded.text) {
+            Ok(config) => (config, None),
+            Err(error) => (WorkspaceConfig::default(), Some(error)),
+        };
+        return Ok(WorkspaceTemplateSnapshot {
+            enabled: true,
+            document_id: Some(document.document_id.to_string()),
+            revision_id: Some(loaded.revision_id.to_string()),
+            source_sha256: Some(BlobId::digest(loaded.text.as_bytes()).to_string()),
+            suggestions: None,
+            model_path: None,
+            config,
+            error,
+        });
     };
     store
         .import_external_changes_if_uncontested(CONFIG_FILE, "Read external Mine settings")
@@ -149,6 +178,25 @@ fn enable(
                 .map_err(IpcFailure::store)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // An existing main-format settings file keeps its meaning and exact
+            // authored bytes. Mine only creates a new format for a new setup.
+            if store
+                .root()
+                .join(".loom.md")
+                .try_exists()
+                .map_err(|error| {
+                    IpcFailure::new("workspace_template_failed", error.to_string(), false)
+                })?
+            {
+                store
+                    .adopt_visible_document_if_absent(
+                        ".loom.md",
+                        DocumentKind::Prose,
+                        "Open workspace settings",
+                    )
+                    .map_err(IpcFailure::store)?;
+                return snapshot(store);
+            }
             let source = choices.map_or_else(|| DEFAULT_TEMPLATE.into(), setup_source);
             // Validate generated settings before entering the store transaction.
             MineConfig::parse(&source).map_err(|error| {
@@ -199,7 +247,7 @@ pub(super) async fn workspace_template_enable(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -273,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_defaults_are_quiet_and_legacy_document_is_ordinary_prose() {
+    fn existing_main_workspace_keeps_its_settings_until_mine_is_explicitly_authored() {
         let directory = tempfile::tempdir().unwrap();
         let (mut store, _) =
             ProjectStore::initialize(directory.path().join("Writing"), "Writing").unwrap();
@@ -281,7 +329,21 @@ mod tests {
         std::fs::write(store.root().join(".loom.md"), legacy).unwrap();
         assert!(!snapshot(&mut store).unwrap().enabled);
         let result = enable(&mut store, None).unwrap();
-        assert!(!result.config.panes["chat"].visible);
+        assert!(result.config.panes["chat"].visible);
+        assert!(result.config.panes["terminal"].visible);
+        assert!(!store.root().join(CONFIG_FILE).exists());
+        assert_eq!(
+            std::fs::read_to_string(store.root().join(".loom.md")).unwrap(),
+            legacy
+        );
+        std::fs::write(
+            store.root().join(CONFIG_FILE),
+            "[workspace.panes.chat]\nvisible=false\n",
+        )
+        .unwrap();
+        let mine = snapshot(&mut store).unwrap();
+        assert!(!mine.config.panes["chat"].visible);
+        assert!(!mine.config.panes["terminal"].visible);
         assert_eq!(
             std::fs::read_to_string(store.root().join(".loom.md")).unwrap(),
             legacy

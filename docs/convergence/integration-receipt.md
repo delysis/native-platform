@@ -1,5 +1,7 @@
 # Mine integration receipt — 2026-09-14
 
+Historical first-pass receipt for the source revision below. Main-integration follow-up preserves schema-15 projects and v1 co-writers and incorporates newer main behavior; its separate checks supersede the compatibility limits stated in this original receipt.
+
 Implementation source: `1a0e5bdd7eadea6c99142ac4e77e8c1139537135` on `codex/mom-loom-convergence`, compared with integrated base `1cee70d53605ba3bfba6a479e15eda308066ad21`. This worktree is `/Users/george/.codex/worktrees/native-platform-mom-loom-convergence`. Subsequent receipt/documentation commits do not change tested application source. Nothing in this pass was pushed, merged, installed, or tested against an existing user project.
 
 ## Delivered behavior

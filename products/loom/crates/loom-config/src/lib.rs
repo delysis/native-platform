@@ -32,6 +32,8 @@ pub struct GenerationDefaults {
     pub chat: Option<String>,
     pub automatic_prose: Option<String>,
     pub automatic_verse: Option<String>,
+    /// Loompad can select its own profile; absent settings retain its defaults.
+    pub loompad: Option<String>,
     pub manual_writing: Option<String>,
 }
 
@@ -41,6 +43,7 @@ impl GenerationDefaults {
             GenerationTask::Chat => &self.chat,
             GenerationTask::AutomaticProse => &self.automatic_prose,
             GenerationTask::AutomaticVerse => &self.automatic_verse,
+            GenerationTask::Loompad => &self.loompad,
             GenerationTask::ManualWriting => &self.manual_writing,
         }
         .as_deref()
@@ -262,6 +265,7 @@ impl MineConfig {
             GenerationTask::Chat,
             GenerationTask::AutomaticProse,
             GenerationTask::AutomaticVerse,
+            GenerationTask::Loompad,
             GenerationTask::ManualWriting,
         ] {
             if let Some(name) = self.generation.profile(task)
@@ -404,6 +408,7 @@ mod tests {
             "version=2",
             "unknown=true",
             "[generation]\nmanual_writing='missing'",
+            "[generation]\nloompad='missing'",
             "[profiles.voice.sampling]\ntop_p=1.5",
             "[profiles.voice]\ncontext_file='../voice.md'",
             "[profiles.voice]\ntools=['shell']",
@@ -448,6 +453,43 @@ mod tests {
         assert_ne!(
             frozen.context.unwrap().sha256,
             newer.context.unwrap().sha256
+        );
+    }
+
+    #[test]
+    fn loompad_profiles_are_explicit_and_preserve_the_task_through_freeze() {
+        let root = tempfile::tempdir().unwrap();
+        let source = "[generation]\nloompad='pad'\nautomatic_prose='prose'\n[profiles.pad.sampling]\nmax_tokens=128\ntemperature=0.4\n[profiles.prose.sampling]\nmax_tokens=48\ntemperature=0.8";
+        let config = MineConfig::parse(source).unwrap();
+        let frozen = config.freeze(root.path(), GenerationTask::Loompad).unwrap();
+        assert_eq!(frozen.task, GenerationTask::Loompad);
+        assert_eq!(frozen.profile_name.as_deref(), Some("pad"));
+        let sampling = frozen.resolve(SamplingOverrides::default()).unwrap();
+        assert_eq!(sampling.max_tokens, 128);
+        assert_eq!(sampling.temperature, 0.4);
+        assert_eq!(sampling.min_p, 0.05);
+        let replay: FrozenGenerationProfile =
+            serde_json::from_slice(&serde_json::to_vec(&frozen).unwrap()).unwrap();
+        assert_eq!(
+            replay
+                .resolve(SamplingOverrides::default())
+                .unwrap()
+                .fingerprint(),
+            sampling.fingerprint()
+        );
+        let implicit = MineConfig::parse(
+            "[generation]\nautomatic_prose='prose'\n[profiles.prose.sampling]\nmax_tokens=48",
+        )
+        .unwrap()
+        .freeze(root.path(), GenerationTask::Loompad)
+        .unwrap();
+        assert!(implicit.profile_name.is_none());
+        assert_eq!(
+            implicit
+                .resolve(SamplingOverrides::default())
+                .unwrap()
+                .max_tokens,
+            128
         );
     }
 
