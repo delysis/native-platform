@@ -1948,6 +1948,8 @@ impl Builder {
                 cabal_recover,
                 project_open_default,
                 project_prepare_open,
+                project_prepare_open_path,
+                project_drop_directories,
                 project_commit_open,
                 project_discard_open,
                 project_close,
@@ -2771,6 +2773,65 @@ async fn project_prepare_open<R: Runtime>(
     let picker = reserve_folder_picker(&state)?;
     let path = choose_project_folder(&app)?;
     picker.finish(path)
+}
+
+/// A dropped or remembered workspace is prepared through the same lease and
+/// shutdown boundary as a native folder choice. Its path is only a hint until
+/// the ordinary directory and sidecar have been opened and validated again.
+#[tauri::command]
+async fn project_prepare_open_path(
+    path: String,
+    state: State<'_, PluginState>,
+) -> Result<Option<String>, IpcFailure> {
+    prepare_project_path(&state, &path)
+}
+
+/// Classify native drop hints without acquiring a store or reading file contents.
+/// The subsequent prepared-open boundary revalidates each selected directory.
+#[tauri::command]
+async fn project_drop_directories(paths: Vec<String>) -> Result<Vec<String>, IpcFailure> {
+    dropped_directories(paths)
+}
+
+fn dropped_directories(paths: Vec<String>) -> Result<Vec<String>, IpcFailure> {
+    if paths.len() > 32 {
+        return Err(IpcFailure::new(
+            "workspace_drop_limit",
+            "drop at most 32 paths at once",
+            false,
+        ));
+    }
+    // Validate the whole batch before filesystem access, including discarded files.
+    if paths
+        .iter()
+        .any(|path| path.len() > 32_768 || path.contains('\0') || !Path::new(path).is_absolute())
+    {
+        return Err(IpcFailure::new(
+            "selected_folder_unavailable",
+            "dropped paths must be absolute local paths",
+            false,
+        ));
+    }
+    let mut directories = Vec::new();
+    for path in paths {
+        if !directories.contains(&path)
+            && std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir())
+        {
+            directories.push(path);
+        }
+    }
+    Ok(directories)
+}
+
+fn prepare_project_path(state: &PluginState, path: &str) -> Result<Option<String>, IpcFailure> {
+    if path.len() > 32_768 || path.contains('\0') || !Path::new(path).is_absolute() {
+        return Err(IpcFailure::new(
+            "selected_folder_unavailable",
+            "the workspace needs an absolute local directory path",
+            false,
+        ));
+    }
+    reserve_folder_picker(state)?.finish(Some(PathBuf::from(path)))
 }
 
 struct FolderPickerReservation<'a> {
@@ -10921,6 +10982,103 @@ mod tests {
                 .lock()
                 .expect("prepared slot")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_drop_classifies_directories_without_opening_or_changing_files() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("Writing");
+        let file = root.path().join("Notes.md");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&file, "Exact writing.\r\n").unwrap();
+        let folder = folder.to_str().unwrap().to_owned();
+        let paths = vec![
+            file.to_str().unwrap().to_owned(),
+            folder.clone(),
+            root.path().join("missing").to_str().unwrap().to_owned(),
+            folder.clone(),
+            root.path().to_str().unwrap().to_owned(),
+        ];
+        assert_eq!(
+            dropped_directories(paths).unwrap(),
+            vec![folder.clone(), root.path().to_str().unwrap().to_owned()]
+        );
+        assert!(std::fs::read_dir(&folder).unwrap().next().is_none());
+        assert_eq!(std::fs::read(&file).unwrap(), b"Exact writing.\r\n");
+        assert!(dropped_directories(vec![folder.clone(); 33]).is_err());
+        for invalid in [
+            "relative".to_owned(),
+            "/bad\0path".into(),
+            format!("/{}", "x".repeat(32_768)),
+        ] {
+            assert!(dropped_directories(vec![folder.clone(), invalid]).is_err());
+        }
+        #[cfg(unix)]
+        {
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(&folder, &alias).unwrap();
+            let alias = alias.to_str().unwrap().to_owned();
+            assert_eq!(
+                dropped_directories(vec![alias.clone()]).unwrap(),
+                vec![alias]
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_path_preparation_revalidates_hints_without_replacing_live_drafts() {
+        let current = tempfile::tempdir().expect("current writing");
+        let next = tempfile::tempdir().expect("next writing");
+        std::fs::write(next.path().join("Notes.md"), "Exact next writing.\r\n").unwrap();
+        let state = PluginState::default();
+        let mut store = initialize_project(current.path(), "Current".into()).unwrap();
+        let source = store.read_document(INITIAL_DOCUMENT).unwrap();
+        store
+            .upsert_transient_draft(
+                INITIAL_DOCUMENT,
+                source.revision_id,
+                0,
+                DocumentContent::Prose("Unsaved author text.\r\n".into()),
+            )
+            .unwrap();
+        reserve_project_choice(&state)
+            .unwrap()
+            .finish_without_document_filesystem_watcher(Ok(store))
+            .unwrap();
+        for invalid in [
+            "relative/folder".to_owned(),
+            "\0".into(),
+            "x".repeat(32_769),
+            next.path().join("Notes.md").to_string_lossy().into_owned(),
+        ] {
+            assert!(prepare_project_path(&state, &invalid).is_err());
+        }
+        assert!(
+            prepare_project_path(&state, current.path().to_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let id = prepare_project_path(&state, next.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let candidate = take_prepared_project(&state, id.parse().unwrap()).unwrap();
+        assert_eq!(
+            candidate.read_document("Notes.md").unwrap().text,
+            "Exact next writing.\r\n"
+        );
+        let session = state.session.lock().unwrap();
+        assert_eq!(session.phase, SessionPhase::Open);
+        assert_eq!(
+            session
+                .store
+                .as_ref()
+                .unwrap()
+                .load_transient_draft(INITIAL_DOCUMENT)
+                .unwrap()
+                .unwrap()
+                .text,
+            "Unsaved author text.\r\n"
         );
     }
 

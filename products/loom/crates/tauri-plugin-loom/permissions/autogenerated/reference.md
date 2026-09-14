@@ -13,6 +13,8 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-cabal-recover`
 - `allow-project-open-default`
 - `allow-project-prepare-open`
+- `allow-project-prepare-open-path`
+- `allow-project-drop-directories`
 - `allow-project-commit-open`
 - `allow-project-discard-open`
 - `allow-project-close`
@@ -1740,6 +1742,32 @@ Denies the project_discard_open command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-project-drop-directories`
+
+</td>
+<td>
+
+Enables the project_drop_directories command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-project-drop-directories`
+
+</td>
+<td>
+
+Denies the project_drop_directories command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-project-open-default`
 
 </td>
@@ -1785,6 +1813,32 @@ Enables the project_prepare_open command without any pre-configured scope.
 <td>
 
 Denies the project_prepare_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-project-prepare-open-path`
+
+</td>
+<td>
+
+Enables the project_prepare_open_path command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-project-prepare-open-path`
+
+</td>
+<td>
+
+Denies the project_prepare_open_path command without any pre-configured scope.
 
 </td>
 </tr>

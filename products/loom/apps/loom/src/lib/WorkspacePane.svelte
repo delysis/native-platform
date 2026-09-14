@@ -30,8 +30,6 @@
   export let source: OpenDocument | null = null;
   export let value = '';
   export let readonly = false;
-  export let modelLabel = '';
-  export let onModelSelect: ((trigger: HTMLElement) => void) | null = null;
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onChange: (value: string) => void = () => {};
   export let beforeRun: () => Promise<OpenDocument | null>;
@@ -243,7 +241,7 @@
     {:else if target}<button on:click={() => onOpenDocument(target.document_id)}>Open {target.title}</button>
     {:else}<p class="empty">{config.document ? 'Document unavailable' : 'Open a document'}</p>{/if}
   {:else if config.kind === 'terminal'}
-    <TerminalPane embedded open={true} bind:entry {projectId} {sessionId} {documents} {runs} {busy} {error} {modelLabel} disabled={readonly} runDisabled={!entry.trim()} uncertain={pending !== null} onCheck={() => void refresh()} onRun={() => void submit()} onCancel={() => void stop()} onOpen={(run) => run.output_document_id && onOpenDocument(run.output_document_id)} onClose={() => {}} />
+    <TerminalPane embedded open={true} bind:entry {projectId} {sessionId} {documents} {runs} {busy} {error} disabled={readonly} runDisabled={!entry.trim()} uncertain={pending !== null} onCheck={() => void refresh()} onRun={() => void submit()} onCancel={() => void stop()} onOpen={(run) => run.output_document_id && onOpenDocument(run.output_document_id)} onClose={() => {}} />
   {:else}
     {#if config.kind === 'browser'}
       {#if preview}<iframe title={config.title ?? 'Page preview'} sandbox="" referrerpolicy="no-referrer" src={preview}></iframe>{/if}
@@ -262,11 +260,12 @@
     {/if}
     <form on:submit|preventDefault={() => void submit()}>
       <textarea bind:value={entry} rows="1" aria-label={config.kind === 'chat' ? 'Message' : 'Page description'} on:keydown={keydown} on:compositionstart={() => setComposing(true)} on:compositionend={() => setComposing(false)} disabled={readonly}></textarea>
+      {#if busy || config.kind === 'browser'}
       <div class="composer-actions">
-      {#if onModelSelect}<button class="model" type="button" title={modelLabel || 'Choose model'} aria-label={modelLabel ? `Model: ${modelLabel}` : 'Choose model'} disabled={readonly || busy} on:click={(event) => onModelSelect?.(event.currentTarget)}>{modelLabel || 'Model'}</button>{/if}
       {#if busy}<button class="send" type="button" aria-label="Stop" on:click={() => void stop()} disabled={readonly}>■</button>
-      {:else}<button class="send" type="submit" aria-label={config.kind === 'chat' ? 'Send' : 'Run'} disabled={readonly || composing || !entry.trim()}>↑</button>{/if}
+      {:else}<button class="send" type="submit" aria-label="Run" disabled={readonly || composing || !entry.trim()}>↑</button>{/if}
       </div>
+      {/if}
     </form>
   {/if}
 </section>
@@ -288,7 +287,6 @@
   .send { margin-left:auto; width:28px; }
   textarea { width:100%; box-sizing:border-box; min-width:0; min-height:28px; max-height:120px; padding:5px; resize:vertical; background:transparent; color:inherit; font:inherit; border:1px solid #8884; border-radius:4px; }
   button { min-height:30px; padding:4px 8px; cursor:pointer; }
-  .model { max-width:110px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.75rem; }
   .error { color:#b64238; font-size:.8rem; padding:4px 8px; }
   small,.empty { opacity:.65; }
   iframe { flex:1; width:100%; min-height:120px; border:0; background:white; }

@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { userEvent } from 'vitest/browser';
-import { EditorState, TextSelection } from 'prosemirror-state';
+import { page, userEvent } from 'vitest/browser';
+import { EditorState, NodeSelection, TextSelection } from 'prosemirror-state';
 import { EditorView } from 'prosemirror-view';
 import { parseVisualMarkdown, serializeVisualMarkdown } from './markdownSafety';
+import { objectNavigation } from './objectNavigation';
 import { shaderCodeBlockView } from './shaderCodeBlock';
 import '../app.css';
 
@@ -22,9 +23,9 @@ function render(code: string, compiler: (source: string) => Promise<{ fragment: 
   const target = document.createElement('div');
   document.body.append(target);
   view = new EditorView(target, {
-    state: EditorState.create({ doc: parseVisualMarkdown('```' + language + '\n' + code + '\n```' + suffix) }),
+    state: EditorState.create({ doc: parseVisualMarkdown('```' + language + '\n' + code + '\n```' + suffix), plugins: [objectNavigation()] }),
     attributes: { role: 'textbox', 'aria-label': 'Code editor' },
-    nodeViews: { code_block: (node) => shaderCodeBlockView(node, compiler) },
+    nodeViews: { code_block: (node, editor, getPos) => shaderCodeBlockView(node, editor, getPos, compiler) },
     dispatchTransaction(transaction) { view!.updateState(view!.state.apply(transaction)); }
   });
   return view;
@@ -45,16 +46,24 @@ describe('inline shader code block', () => {
     expect(pixel(canvas, 16, 239)).toEqual([0, 0, 255, 255]);
     expect(pixel(canvas, 48, 239)).toEqual([255, 0, 0, 255]);
     expect(serializeVisualMarkdown(editor.state.doc)).toBe('```wgsl\n' + source + '\n```\n');
+    expect((document.querySelector('pre') as HTMLElement).getBoundingClientRect().height).toBe(0);
+    await page.getByRole('img', { name: 'Shader preview' }).click({ button: 'right' });
+    await page.getByRole('menuitem', { name: 'Edit', exact: true }).click();
+    expect(canvas.hidden).toBe(true);
+    expect((document.querySelector('pre') as HTMLElement).getBoundingClientRect().height).toBeGreaterThan(0);
     editor.dispatch(editor.state.tr.setSelection(TextSelection.create(editor.state.doc, 1)));
     editor.focus();
     await userEvent.keyboard('x');
     await expect.poll(() => editor.state.doc.firstChild!.textContent).toBe('x' + source);
     await expect.poll(() => compiler.mock.calls.length).toBe(2);
     expect(serializeVisualMarkdown(editor.state.doc)).toBe('```wgsl\nx' + source + '\n```\n');
+    await userEvent.keyboard('{Escape}');
+    await expect.poll(() => canvas.hidden).toBe(false);
+    expect(editor.state.selection).toBeInstanceOf(NodeSelection);
+    expect((document.querySelector('pre') as HTMLElement).getBoundingClientRect().height).toBe(0);
     const reopened = parseVisualMarkdown(serializeVisualMarkdown(editor.state.doc));
     expect(reopened.eq(editor.state.doc)).toBe(true);
     editor.updateState(EditorState.create({ doc: reopened }));
-    expect(document.querySelector('pre > code')?.textContent).toBe('x' + source);
     expect(document.querySelector('pre > code')?.textContent).toBe('x' + source);
   });
 

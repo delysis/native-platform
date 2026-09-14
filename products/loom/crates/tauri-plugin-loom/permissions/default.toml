@@ -12,6 +12,8 @@ permissions = [
   "allow-cabal-recover",
   "allow-project-open-default",
   "allow-project-prepare-open",
+  "allow-project-prepare-open-path",
+  "allow-project-drop-directories",
   "allow-project-commit-open",
   "allow-project-discard-open",
   "allow-project-close",

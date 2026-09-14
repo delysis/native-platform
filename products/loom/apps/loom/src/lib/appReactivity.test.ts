@@ -381,10 +381,6 @@ describe('App ghost reactivity wiring', () => {
     expect(arm).not.toContain('!currentModel');
     expect(start).toContain('retainsScheduledCompletion(completionLifecycle)');
     expect(start).not.toContain("saveState === 'dirty'");
-    expect(source).toContain(
-      'aria-describedby="completion-lifecycle-help autocomplete-model-menu-help autocomplete-model-failure-help"'
-    );
-    expect(source).toContain('{completionLifecycleHelp}</span>');
   });
 
   it('uses the macOS overlay titlebar for one integrated toolbar', () => {
