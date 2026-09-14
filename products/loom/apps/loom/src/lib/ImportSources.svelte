@@ -25,10 +25,11 @@
   let selected: string[] = [];
   let lastQuery = '';
   let lastSource: ImportSource = 'gmail';
+  let lastAccount = '';
   $: service = source === 'drive' ? 'drive' : 'gmail';
   $: availableAccounts = accounts.filter((item) => item.service === service && item.email);
   $: account = availableAccounts.find((item) => item.email === chosenEmail)?.email ?? availableAccounts[0]?.email;
-  $: canNext = Boolean(report?.next_page_token && lastQuery === query && lastSource === source);
+  $: canNext = Boolean(report?.next_page_token && lastQuery === query && lastSource === source && lastAccount === account);
 
   function errorText(error: unknown): string {
     if (error && typeof error === 'object') {
@@ -48,7 +49,7 @@
     try {
       const result = await connectImportAccount(projectId, sessionId, service, clientId.trim(), clientSecret);
       accounts = [...accounts.filter((item) => item.service !== result.service || item.email !== result.email), result];
-      chosenEmail = result.email ?? ''; configuring = false;
+      chosenEmail = result.email ?? ''; configuring = false; report = null; selected = [];
       message = `Connected ${result.email}. Sync runs only when you request it.`;
     } catch (error) { message = errorText(error); }
     finally { clientSecret = ''; busy = false; authorizing = false; }
@@ -67,7 +68,7 @@
     try {
       const token = next && canNext ? report?.next_page_token : undefined;
       report = await syncImportAccount(projectId, sessionId, source, account ?? '', query, token ?? null);
-      lastQuery = query; lastSource = source; selected = [];
+      lastQuery = query; lastSource = source; lastAccount = account ?? ''; selected = [];
       message = `${report.imported.length} imported; ${report.failures.length} failed.${report.next_page_token ? ' More results are available.' : ' End of results.'}`;
     } catch (error) { message = errorText(error); }
     finally { busy = false; }
