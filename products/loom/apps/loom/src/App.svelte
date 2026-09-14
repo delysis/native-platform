@@ -6236,11 +6236,11 @@
           : null;
         if (!projectNavigationIsCurrent() || requestSerial !== navigationSerial) return;
         if (imported && project) {
+          project = { ...project, documents: project.documents.map(item =>
+            item.document_id === imported.document_id ? imported : item) };
           const fresh = captureDocumentTarget(project, imported);
           if (!fresh) throw new Error('External document returned an incomplete identity.');
           target = fresh;
-          project = { ...project, documents: project.documents.map(item =>
-            item.document_id === imported.document_id ? imported : item) };
         } else {
           const preview = await requestReconciliationPreview({
             document_id: target.documentId, kind: target.kind,
