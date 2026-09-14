@@ -21,30 +21,47 @@ pub(crate) fn initialize_schema(connection: &mut Connection, initializing: bool)
         transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
         transaction.pragma_update(None, "user_version", CURRENT_STORE_SCHEMA_VERSION)?;
     } else {
-        if version != CURRENT_STORE_SCHEMA_VERSION {
-            return Err(StoreError::UnsupportedSchema {
-                found: version,
-                supported: CURRENT_STORE_SCHEMA_VERSION,
-            });
-        }
-        if application != APPLICATION_ID {
-            return Err(StoreError::CorruptDatabase(
-                "database is not a current Loom store".into(),
-            ));
-        }
-        let expected = Connection::open_in_memory()?;
-        expected.execute_batch(SCHEMA)?;
-        if objects != schema_objects(&expected)? {
-            return Err(StoreError::CorruptDatabase(
-                "Loom schema does not match this build".into(),
-            ));
-        }
+        validate_schema_snapshot(application, version, &objects)?;
     }
     transaction.commit()?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "trusted_schema", "OFF")?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
+    Ok(())
+}
+
+/// Validate the exact current schema without a write transaction, WAL mode
+/// change, migrations, or repairs. Used before a source-preserving copy.
+pub(crate) fn validate_current_schema(connection: &Connection) -> Result<()> {
+    let application = connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    let version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    validate_schema_snapshot(application, version, &schema_objects(connection)?)
+}
+
+fn validate_schema_snapshot(
+    application: u32,
+    version: u32,
+    objects: &[(String, String)],
+) -> Result<()> {
+    if version != CURRENT_STORE_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema {
+            found: version,
+            supported: CURRENT_STORE_SCHEMA_VERSION,
+        });
+    }
+    if application != APPLICATION_ID {
+        return Err(StoreError::CorruptDatabase(
+            "database is not a current Loom store".into(),
+        ));
+    }
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(SCHEMA)?;
+    if objects != schema_objects(&expected)? {
+        return Err(StoreError::CorruptDatabase(
+            "Loom schema does not match this build".into(),
+        ));
+    }
     Ok(())
 }
 

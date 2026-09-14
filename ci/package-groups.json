@@ -2,6 +2,7 @@
   "schema_version": 1,
   "primary": {
     "desktop": [
+      "desktop-vault",
       "desktop-context",
       "desktop-generation-policy",
       "desktop-model-defaults",

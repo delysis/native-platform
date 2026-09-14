@@ -1,21 +1,23 @@
 [package]
-name = "loom-config"
+name = "desktop-vault"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-repository.workspace = true
 
 [dependencies]
-desktop-generation-policy.workspace = true
-llama-native-types.workspace = true
-loom-document = { path = "../loom-document" }
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+hkdf = "0.12.4"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-toml.workspace = true
-url.workspace = true
+zeroize = "1.8.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10.1"
+security-framework = "3.7"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }

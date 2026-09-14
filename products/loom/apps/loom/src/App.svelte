@@ -19,6 +19,7 @@
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
   import ImportSources from './lib/ImportSources.svelte';
+  import ConfiguredDownloads from './lib/ConfiguredDownloads.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
@@ -302,12 +303,11 @@
     VisualFormatState
   } from './lib/visualFormatting';
   import {
-    DEFAULT_MODEL_DOWNLOAD_LIMIT_GIB,
-    deriveGgufFileName,
+    captureConfiguredDownload,
     downloadProgressPercent,
     formatByteCount,
-    validateVerifiedDownload,
-    type VerifiedDownloadForm
+    type ModelDownloadCapture,
+    type ConfiguredModelDownload
   } from './lib/modelDownload';
   import {
     generationEventBelongsToScope
@@ -627,12 +627,6 @@
   let suggestionWakeQueued = false;
   let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
   let announcedGhostPresentationKey = '';
-  let modelDownloadUrl = '';
-  let modelDownloadFileName = '';
-  let lastDerivedModelFileName = '';
-  let modelDownloadSha256 = '';
-  let modelDownloadExpectedBytes = '';
-  let modelDownloadMaximumGiB = String(DEFAULT_MODEL_DOWNLOAD_LIMIT_GIB);
   let modelDownloadStarting = false;
   let modelDownloadCancellingIds: string[] = [];
   let modelDownloadError = '';
@@ -890,10 +884,6 @@
     speculation?: { sampleTarget: 4 | 16 | 64 | 256; offset: number; key: string };
   }
 
-  interface ModelDownloadCapture extends VerifiedDownloadForm {
-    commandId: string;
-  }
-
   interface HydratedBranchBodies {
     cards: BranchCard[];
     bodyBlobByRun: Record<string, string>;
@@ -1044,9 +1034,9 @@
   $: selectedModel = models.find((model) => model.model_path === selectedModelPath) ?? null;
   $: availableWriterModels = orderedLocalTextModels(models, loadLastLocalModelPath());
   $: activeModelDownloads = modelDownloads.filter((download) => !modelDownloadIsTerminal(download));
-  $: pendingModelDownloadSnapshot = pendingModelDownload
-    ? modelDownloads.find((download) => download.command_id === pendingModelDownload?.commandId) ?? null
-    : null;
+  $: configuredModelDownloads = project && !workspaceTemplate?.error &&
+    workspaceTemplateScope === `${project.project_id}/${project.session_id}`
+    ? workspaceTemplate?.downloads ?? {} : {};
   $: activeBranchCount = branches.filter(
     (branch) => branch.status === 'queued' || branch.status === 'generating'
   ).length;
@@ -3528,15 +3518,6 @@
     }
   }
 
-  function updateModelDownloadUrl(value: string): void {
-    modelDownloadUrl = value;
-    const derived = deriveGgufFileName(value);
-    if (!modelDownloadFileName || modelDownloadFileName === lastDerivedModelFileName) {
-      modelDownloadFileName = derived;
-    }
-    lastDerivedModelFileName = derived;
-  }
-
   function localCatalogModel(
     entry: CuratedModelCatalogEntry
   ): ModelCapabilitySummary | undefined {
@@ -3611,26 +3592,16 @@
     }
   }
 
-  async function beginOrRetryModelDownload(): Promise<void> {
+  async function beginOrRetryModelDownload(definition?: ConfiguredModelDownload): Promise<void> {
     if (modelDownloadStarting) return;
     let capture = pendingModelDownload;
     if (!capture) {
-      let request: VerifiedDownloadForm;
-      try {
-        request = validateVerifiedDownload({
-          url: modelDownloadUrl,
-          fileName: modelDownloadFileName,
-          sha256: modelDownloadSha256,
-          expectedBytes: modelDownloadExpectedBytes,
-          maximumGiB: modelDownloadMaximumGiB
-        });
-      } catch (error) {
-        modelDownloadError = error instanceof Error ? error.message : 'Review the download request.';
-        return;
-      }
-      capture = { commandId: newUlid(), ...request };
+      // Only a definition actually displayed for the current project may start.
+      // A pending command below retains its original immutable request on retry.
+      if (!desktop || !definition || !Object.values(configuredModelDownloads).includes(definition)) return;
+      capture = captureConfiguredDownload(newUlid(), definition);
       pendingModelDownload = capture;
-    }
+    } else if (definition || !modelDownloadUncertain) return;
     modelDownloadStarting = true;
     modelDownloadUncertain = false;
     modelDownloadCanAbandon = false;
@@ -4544,6 +4515,7 @@
     modelManagerReturnFocus = trigger;
     modelManagerOpen = true;
     modelDownloadError = '';
+    void refreshWorkspaceTemplate();
     if (curatedModels.length === 0) void refreshCuratedModels();
     void recoverModelDownloads();
     void refreshCurrentModelsAndEnsureWriter();
@@ -5905,7 +5877,7 @@
     }
   }
 
-  async function openInitialProject(restoreSerial: number): Promise<WorkspaceRestoreCapture | null> {
+  async function openInitialProject(restoreSerial: number, retryUnlock: boolean): Promise<WorkspaceRestoreCapture | null> {
     const startupIsCurrent = () => Boolean(
       componentMounted &&
       restoreSerial === workspaceRestoreSerial &&
@@ -5914,7 +5886,7 @@
     try {
       const acquisition = await acquireStartupProject({
         currentProject: currentProjectSession,
-        openDefaultProject,
+        openDefaultProject: () => openDefaultProject(retryUnlock),
         mayContinue: startupIsCurrent,
         projectIsAbsent: (error) => normalizeFailure(error).code === 'project_not_open',
         onHeld: holdWorkspaceForApplicationClose
@@ -6034,10 +6006,10 @@
     requestPreferredWriterEnsure(captured);
   }
 
-  async function restoreDesktopWorkspace(): Promise<void> {
+  async function restoreDesktopWorkspace(retryUnlock = false): Promise<void> {
     const restoreSerial = ++workspaceRestoreSerial;
     await restoreBeforeBackgroundWork({
-      restore: () => openInitialProject(restoreSerial),
+      restore: () => openInitialProject(restoreSerial, retryUnlock),
       present: async (captured) => {
         await tick();
         if (!workspaceRestoreIsCurrent(captured)) {
@@ -6145,7 +6117,7 @@
     opening = true;
     clearFailure();
     try {
-      await restoreDesktopWorkspace();
+      await restoreDesktopWorkspace(true);
     } finally {
       opening = false;
     }
@@ -9787,7 +9759,9 @@
           {/each}
           {#if desktop && document}
             {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
-              <ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={document.summary.title} onUse={useImportedSources} />
+              <ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={document.summary.title} onUse={useImportedSources}
+                googleClientConfigured={workspaceTemplateScope === `${project.project_id}/${project.session_id}` && !workspaceTemplate?.error && Boolean(workspaceTemplate?.google_client_configured)}
+                onSettings={() => void refreshWorkspaceTemplate(true)} />
             {/key}
           {/if}
         </nav>
@@ -10363,25 +10337,12 @@
         on:keydown={trapModelManagerFocus}
       >
         <header class="model-manager-header">
-          <h2 id="model-manager-title">Suggestions</h2>
-          <button class="icon-button" type="button" on:click={() => closeModelManager()} aria-label="Close suggestions">×</button>
+          <h2 id="model-manager-title">Models</h2>
+          <button data-model-manager-initial-focus class="icon-button" type="button" on:click={() => closeModelManager()} aria-label="Close models">×</button>
         </header>
 
         <div class="model-manager-body">
-          <section class="model-manager-summary" aria-label="Suggestion settings">
-            <label class="suggestions-setting">
-              <input
-                data-model-manager-initial-focus
-                type="checkbox"
-                checked={suggestionsEnabled}
-                disabled={!project || suggestionsChanging}
-                on:change={(event) => void setSuggestionsEnabled(event.currentTarget.checked)}
-              />
-              <span>
-                <strong>Suggestions {suggestionsEnabled ? 'on' : 'off'}</strong>
-              </span>
-            </label>
-
+          <section class="model-manager-summary" aria-label="Model status">
             <div class="model-readiness" role="status" aria-live="polite">
               <span
                 class:ready={Boolean(currentModel) && !modelLoading && !modelUnloading}
@@ -10572,17 +10533,14 @@
             </section>
           {/if}
 
-          <details class="model-advanced-panel">
-            <summary>Advanced</summary>
-            <div class="model-advanced-content">
-            {#if selectedModel?.loaded}
-              <section class="model-library" aria-labelledby="model-library-title">
-            <div class="section-heading">
-              <div>
-                <h3 id="model-library-title">Loaded model</h3>
-                <p>Native runtime details for the writer currently in memory.</p>
+          {#if selectedModel?.loaded}
+            <section class="model-library" aria-labelledby="model-library-title">
+              <div class="section-heading">
+                <div>
+                  <h3 id="model-library-title">Loaded model</h3>
+                  <p>Native runtime details for the writer currently in memory.</p>
+                </div>
               </div>
-            </div>
               <article class="model-facts">
                 <details class="model-technical">
                   <summary>Loaded writer details</summary>
@@ -10608,91 +10566,34 @@
                   </button>
                 </div>
               </article>
-              </section>
-            {/if}
+            </section>
+          {/if}
 
-              <details class="model-download-panel">
-            <summary>Add a model from a verified URL</summary>
-            <div class="model-download-content">
-            <div class="section-heading">
-              <div>
-                <h3>Add a verified GGUF</h3>
-                <p>Bring a publisher URL and its exact checksum. Loom will not guess either one.</p>
-              </div>
-            </div>
-
-            {#if !desktop}
-              <div class="runtime-note" role="note">Verified downloads are available in the Tauri desktop build.</div>
-            {/if}
-
-            <form class="model-download-form" on:submit|preventDefault={() => void beginOrRetryModelDownload()}>
-              <label class="wide-field">
-                <span>HTTPS model URL</span>
-                <input
-                  value={modelDownloadUrl}
-                  on:input={(event) => updateModelDownloadUrl(event.currentTarget.value)}
-                  type="url"
-                  inputmode="url"
-                  autocomplete="off"
-                  placeholder="https://publisher.example/model.gguf"
-                  disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting}
-                  required
-                />
-              </label>
-              <label class="wide-field">
-                <span>Local file name</span>
-                <input bind:value={modelDownloadFileName} autocomplete="off" spellcheck="false" placeholder="writer-base.Q8_0.gguf" disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting} required />
-              </label>
-              <label class="wide-field">
-                <span>Expected SHA-256 <small>required · 64 hexadecimal characters</small></span>
-                <input bind:value={modelDownloadSha256} autocomplete="off" spellcheck="false" inputmode="text" placeholder="Publisher checksum" disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting} required />
-              </label>
-              <label>
-                <span>Exact bytes <small>optional</small></span>
-                <input bind:value={modelDownloadExpectedBytes} autocomplete="off" inputmode="numeric" placeholder="4954576032" disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting} />
-              </label>
-              <label>
-                <span>Hard ceiling <small>GiB</small></span>
-                <input bind:value={modelDownloadMaximumGiB} type="number" min="0.001" max="1024" step="0.001" disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting} required />
-              </label>
-              <p class="download-boundary wide-field">The URL is contacted only after you press download. Credentials in URLs are refused. A partial file may be resumed, but installation occurs only after a cold SHA-256 check and GGUF validation.</p>
-
+          <ConfiguredDownloads
+            downloads={configuredModelDownloads}
+            disabled={!desktop || modelDownloadStarting || pendingModelDownload !== null}
+            error={workspaceTemplate?.error ?? ''}
+            onStart={(definition) => void beginOrRetryModelDownload(definition)}
+            onSettings={() => { closeModelManager(); void refreshWorkspaceTemplate(true); }}
+          />
+          {#if modelDownloadError || (modelDownloadUncertain && pendingModelDownload)}
+            <section class="model-download-content" aria-label="Download recovery">
               {#if modelDownloadError}
-                <div class="download-error wide-field" role="alert">{modelDownloadError}</div>
+                <div class="download-error" role="alert">{modelDownloadError}</div>
               {/if}
               {#if modelDownloadUncertain && pendingModelDownload}
-                <div class="uncertain-download wide-field" role="status">
+                <div class="uncertain-download" role="status">
                   <strong>Command reply uncertain.</strong>
-                  Retrying preserves command <code>{pendingModelDownload.commandId}</code> and every request byte.
+                  Retrying {pendingModelDownload.fileName} preserves command <code>{pendingModelDownload.commandId}</code> and its original request, even if settings change.
+                  <button class="secondary-button compact" type="button" disabled={!desktop || modelDownloadStarting} on:click={() => void beginOrRetryModelDownload()}>Retry exact command safely</button>
                   {#if modelDownloadCanAbandon}
-                    The desktop confirmed that this non-retryable request was not registered, so it is safe to edit.
-                    <button class="bare-button compact" type="button" on:click={abandonUnstartedModelDownload}>Edit rejected request</button>
-                  {:else}
-                    Inputs remain locked until authoritative status is recovered.
+                    The desktop confirmed that this rejected request was not registered.
+                    <button class="bare-button compact" type="button" on:click={abandonUnstartedModelDownload}>Dismiss rejected request</button>
                   {/if}
                 </div>
               {/if}
-
-              <div class="model-download-actions wide-field">
-                <button
-                  class="primary-button"
-                  type="submit"
-                  disabled={!desktop || modelDownloadStarting || (pendingModelDownload !== null && !modelDownloadUncertain)}
-                >
-                  {modelDownloadStarting
-                    ? 'Registering verified transfer…'
-                    : modelDownloadUncertain
-                      ? 'Retry exact command safely'
-                      : pendingModelDownloadSnapshot
-                        ? 'Download in progress'
-                        : 'Download and verify'}
-                </button>
-              </div>
-            </form>
-            </div>
-              </details>
-            </div>
-          </details>
+            </section>
+          {/if}
         </div>
       </div>
     </div>

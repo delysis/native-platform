@@ -14,7 +14,7 @@ const model: ModelCapabilitySummary = {
 };
 const template: WorkspaceTemplateSnapshot = {
   enabled: true, document_id: 'settings', revision_id: 'one',
-  source_sha256: 'settings-source', suggestions: null, model_path: null,
+  source_sha256: 'settings-source', suggestions: null, model_path: null, downloads: {}, google_client_configured: false,
   config: { model: { profile: 'writer-v1' }, panes: {} }, error: null
 };
 

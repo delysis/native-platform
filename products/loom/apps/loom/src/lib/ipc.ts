@@ -130,8 +130,8 @@ async function call<T>(command: string, args: Record<string, unknown> = {}): Pro
   return enqueueSessionCommand(() => invokeWhenProjectSessionAdmitted<T>(command, args));
 }
 
-export function openDefaultProject(): Promise<ProjectSnapshot> {
-  return call('project_open_default');
+export function openDefaultProject(retryUnlock = false): Promise<ProjectSnapshot> {
+  return call('project_open_default', { retryUnlock });
 }
 
 export function prepareProjectOpen(): Promise<string | null> {
@@ -954,8 +954,8 @@ export interface ImportBatch { imported: ContextAttachment[]; failures: { name: 
 export function importAccounts(projectId: string, sessionId: string): Promise<ImportAccount[]> {
   return call('import_accounts', { projectId, sessionId });
 }
-export function connectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', clientId: string, clientSecret: string): Promise<ImportAccount> {
-  return call('import_account_connect', { projectId, sessionId, service, clientId, clientSecret });
+export function connectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive'): Promise<ImportAccount> {
+  return call('import_account_connect', { projectId, sessionId, service });
 }
 export function disconnectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', accountEmail: string): Promise<void> {
   return call('import_account_disconnect', { projectId, sessionId, service, accountEmail });

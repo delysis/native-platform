@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+desktop-vault.workspace = true
 workspace-document.workspace = true
 desktop-context.workspace = true
 loom-config.workspace = true

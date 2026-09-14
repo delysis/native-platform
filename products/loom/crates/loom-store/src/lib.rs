@@ -2,11 +2,15 @@
 
 mod document_snapshot;
 mod draft;
+#[cfg(all(test, unix))]
+mod encrypted_tests;
 mod error;
 mod file_io;
 mod folder;
 mod generation;
 mod paths;
+mod private_io;
+mod protected_copy;
 mod provenance;
 mod reconciliation;
 mod schema;
@@ -24,6 +28,7 @@ pub use generation::{
     StoredGenerationTerminalEvidence, TerminalCandidateInput, TerminalCandidateOutcome,
     TerminalEvidenceInput, TerminalGenerationInput, TerminalGenerationOutcome,
 };
+pub use protected_copy::ProtectedCopy;
 pub use provenance::{
     IdempotentSaveOutcome, MAX_EDIT_DIFF_WINDOW_BYTES, MAX_EDIT_DIFF_WINDOW_CHARACTERS,
     MAX_EDIT_DIFF_WORK, MAX_REVISION_SEGMENTS, ProvenanceSegment, RevisionProvenance,

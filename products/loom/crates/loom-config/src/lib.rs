@@ -3,13 +3,19 @@
 //! Project-owned Mine settings. Reading settings grants no tools, model loading,
 //! network access, or document mutation authority.
 
+mod downloads;
+mod imports;
 mod model;
 mod workspace;
+pub use downloads::ModelDownloadConfig;
+pub use imports::{GoogleDesktopClient, GoogleImportConfig, ImportsConfig};
 pub use model::ModelConfig;
 pub use workspace::*;
 
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+#[cfg(any(not(unix), test))]
+use std::fs;
+use std::fs::File;
 use std::io::Read as _;
 use std::path::{Component, Path};
 
@@ -73,6 +79,8 @@ pub struct MineConfig {
     pub workspace: WorkspaceOverrides,
     pub generation: GenerationDefaults,
     pub profiles: BTreeMap<String, NamedProfile>,
+    pub downloads: BTreeMap<String, ModelDownloadConfig>,
+    pub imports: ImportsConfig,
     #[serde(skip)]
     source_sha256: Option<String>,
 }
@@ -86,6 +94,8 @@ impl Default for MineConfig {
             workspace: WorkspaceOverrides::default(),
             generation: GenerationDefaults::default(),
             profiles: BTreeMap::new(),
+            downloads: BTreeMap::new(),
+            imports: ImportsConfig::default(),
             source_sha256: None,
         }
     }
@@ -103,6 +113,10 @@ pub enum ConfigError {
     Workspace(String),
     #[error("model settings: {0}")]
     Model(String),
+    #[error("download settings: {0}")]
+    Download(String),
+    #[error("import settings: {0}")]
+    Import(String),
     #[error("the frozen generation profile is invalid")]
     Frozen,
     #[error("profile names use 1 to 64 letters, digits, hyphens, or underscores")]
@@ -246,6 +260,22 @@ impl MineConfig {
         }
         self.workspace.resolve().map_err(ConfigError::Workspace)?;
         self.model.validate().map_err(ConfigError::Model)?;
+        self.imports.google.validate()?;
+        if self.downloads.len() > downloads::MAX_NAMED_DOWNLOADS {
+            return Err(ConfigError::Download(
+                "at most 32 named downloads are supported".into(),
+            ));
+        }
+        for (name, download) in &self.downloads {
+            if !valid_profile_name(name) {
+                return Err(ConfigError::Download(
+                    "names use 1 to 64 letters, digits, hyphens, or underscores".into(),
+                ));
+            }
+            download
+                .validate()
+                .map_err(|error| ConfigError::Download(format!("`{name}`: {error}")))?;
+        }
         if self.profiles.len() > MAX_PROFILES {
             return Err(ConfigError::ProfileLimit);
         }
@@ -350,6 +380,60 @@ fn validate_context_path(value: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn read_project_file(root: &Path, relative: &Path, limit: usize) -> Result<String, ConfigError> {
+    read_project_file_before_open(root, relative, limit, || {})
+}
+
+#[cfg(unix)]
+fn read_project_file_before_open(
+    root: &Path,
+    relative: &Path,
+    limit: usize,
+    before_open: impl FnOnce(),
+) -> Result<String, ConfigError> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+
+    let mut components = relative.components();
+    let Some(Component::Normal(name)) = components.next_back() else {
+        return Err(ConfigError::FileKind);
+    };
+    if components
+        .clone()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ConfigError::FileKind);
+    }
+
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let directory_flags = flags | OFlags::DIRECTORY;
+    let mut directory = open(root, directory_flags, Mode::empty()).map_err(source_open_error)?;
+    for component in components {
+        directory = openat(
+            &directory,
+            component.as_os_str(),
+            directory_flags,
+            Mode::empty(),
+        )
+        .map_err(source_open_error)?;
+    }
+    // Hold the parent descriptor through the final open. A renamed parent cannot
+    // redirect the read, and a substituted FIFO cannot block before fstat.
+    before_open();
+    let file =
+        File::from(openat(&directory, name, flags, Mode::empty()).map_err(source_open_error)?);
+    read_bounded_regular_file(file, limit)
+}
+
+#[cfg(unix)]
+fn source_open_error(error: rustix::io::Errno) -> ConfigError {
+    match error {
+        rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => ConfigError::FileKind,
+        _ => ConfigError::Io(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
 fn read_project_file(root: &Path, relative: &Path, limit: usize) -> Result<String, ConfigError> {
     let mut path = root.to_path_buf();
     let mut components = relative.components().peekable();
@@ -366,7 +450,10 @@ fn read_project_file(root: &Path, relative: &Path, limit: usize) -> Result<Strin
             return Err(ConfigError::FileKind);
         }
     }
-    let file = File::open(path)?;
+    read_bounded_regular_file(File::open(path)?, limit)
+}
+
+fn read_bounded_regular_file(file: File, limit: usize) -> Result<String, ConfigError> {
     if !file.metadata()?.is_file() {
         return Err(ConfigError::FileKind);
     }
@@ -522,6 +609,66 @@ mod tests {
                 Err(ConfigError::FileKind)
             ));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_reject_symlink_and_fifo_replacements_at_open() {
+        for replace_with_fifo in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let source = root.path().join("client.json");
+            fs::write(&source, "original").unwrap();
+            fs::write(root.path().join("other.json"), "replacement").unwrap();
+            let result =
+                read_project_file_before_open(root.path(), Path::new("client.json"), 64, || {
+                    fs::remove_file(&source).unwrap();
+                    if replace_with_fifo {
+                        rustix::fs::mkfifo(&source, rustix::fs::Mode::RUSR).unwrap();
+                    } else {
+                        std::os::unix::fs::symlink("other.json", &source).unwrap();
+                    }
+                });
+            assert!(matches!(result, Err(ConfigError::FileKind)));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_keep_the_opened_parent_when_its_path_is_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let parent = root.path().join("credentials");
+        fs::create_dir(&parent).unwrap();
+        fs::write(parent.join("client.json"), "original").unwrap();
+        fs::write(outside.path().join("client.json"), "outside").unwrap();
+        let result = read_project_file_before_open(
+            root.path(),
+            Path::new("credentials/client.json"),
+            64,
+            || {
+                fs::rename(&parent, root.path().join("original-credentials")).unwrap();
+                std::os::unix::fs::symlink(outside.path(), &parent).unwrap();
+            },
+        );
+        assert_eq!(result.unwrap(), "original");
+        assert!(matches!(
+            read_project_file(root.path(), Path::new("credentials/client.json"), 64),
+            Err(ConfigError::FileKind)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_regular_files_still_obey_the_read_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("client.json");
+        fs::write(&source, "original").unwrap();
+        let result =
+            read_project_file_before_open(root.path(), Path::new("client.json"), 64, || {
+                fs::remove_file(&source).unwrap();
+                fs::write(&source, " ".repeat(65)).unwrap();
+            });
+        assert!(matches!(result, Err(ConfigError::SourceLimit(64))));
     }
 
     #[test]

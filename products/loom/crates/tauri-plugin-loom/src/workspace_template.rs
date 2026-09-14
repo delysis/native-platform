@@ -37,6 +37,20 @@ version = 1
 # batch_tokens = 512
 # max_sequences = 4
 
+# Named downloads appear in the model library (Command/Ctrl-Shift-P).
+# Reading this file never contacts a URL. Supply the publisher's real checksum.
+# [downloads.my_writer]
+# url = "https://publisher.example/writer.gguf"
+# file_name = "writer.gguf"
+# sha256 = "<64 hexadecimal digits>"
+# expected_bytes = 4954576032
+# max_bytes = 8589934592
+
+# Optional Google Desktop app setup; Connect remains an explicit action.
+# Tokens stay in the system credential store. This file contains only a path.
+# [imports.google]
+# client_file = ".mine/google-desktop.json"
+
 # [generation]
 # manual_writing = "my_writer"
 
@@ -70,6 +84,8 @@ pub(super) struct WorkspaceTemplateSnapshot {
     source_sha256: Option<String>,
     suggestions: Option<bool>,
     model_path: Option<String>,
+    downloads: std::collections::BTreeMap<String, loom_config::ModelDownloadConfig>,
+    google_client_configured: bool,
     config: WorkspaceConfig,
     error: Option<String>,
 }
@@ -93,6 +109,8 @@ fn resolved_snapshot(
                 .map(|path| path.to_string_lossy().into_owned()),
             // Parsing has already validated the same immutable workspace value.
             config: settings.workspace.resolve().expect("validated workspace"),
+            google_client_configured: settings.imports.google.is_configured(),
+            downloads: settings.downloads,
             error: None,
         },
         Err(error) => WorkspaceTemplateSnapshot {
@@ -102,6 +120,8 @@ fn resolved_snapshot(
             source_sha256: None,
             suggestions: None,
             model_path: None,
+            downloads: std::collections::BTreeMap::new(),
+            google_client_configured: false,
             config: WorkspaceConfig::default(),
             error: Some(error.to_string()),
         },
@@ -141,6 +161,8 @@ fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFa
             source_sha256: Some(BlobId::digest(loaded.text.as_bytes()).to_string()),
             suggestions: None,
             model_path: None,
+            downloads: std::collections::BTreeMap::new(),
+            google_client_configured: false,
             config,
             error,
         });
@@ -250,6 +272,38 @@ pub(super) async fn workspace_template_enable(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_downloads_are_inert_snapshot_data_and_invalid_source_exposes_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut store, _) =
+            ProjectStore::initialize(directory.path().join("Writing"), "Writing").unwrap();
+        let source = format!(
+            "[downloads.writer]\nurl='https://models.example/writer.gguf'\nfile_name='writer.gguf'\nsha256='{}'\nexpected_bytes=42\nmax_bytes=100\n[imports.google]\nclient_file='.mine/missing-client.json'\n",
+            "ab".repeat(32)
+        );
+        std::fs::write(store.root().join(CONFIG_FILE), &source).unwrap();
+        let documents = store.list_documents().unwrap().len();
+        let settings = snapshot(&mut store).unwrap();
+        assert_eq!(settings.downloads["writer"].expected_bytes, Some(42));
+        assert_eq!(settings.downloads["writer"].max_bytes, 100);
+        assert!(settings.google_client_configured);
+        assert!(settings.document_id.is_none());
+        assert_eq!(store.list_documents().unwrap().len(), documents);
+        assert_eq!(
+            std::fs::read_to_string(store.root().join(CONFIG_FILE)).unwrap(),
+            source
+        );
+        std::fs::write(
+            store.root().join(CONFIG_FILE),
+            source.replace("max_bytes=100", "max_bytes=0"),
+        )
+        .unwrap();
+        let invalid = snapshot(&mut store).unwrap();
+        assert!(invalid.error.is_some());
+        assert!(invalid.downloads.is_empty());
+        assert!(!invalid.google_client_configured);
+    }
 
     #[test]
     fn each_setup_answer_reaches_settings_without_enabling_other_panes() {

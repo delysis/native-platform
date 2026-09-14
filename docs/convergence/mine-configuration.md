@@ -74,3 +74,39 @@ Access boundary: `.mine.toml` task-to-profile selection is a live production con
 Existing registered `.loom.md` workspace files retain their pane visibility, named-model selection, theme and context references when `.mine.toml` is absent. Opening settings adopts an existing unregistered `.loom.md` without rewriting it. An explicitly authored `.mine.toml` takes precedence; malformed Mine settings never silently fall back to another source. There is one active configuration source, with no read-time conversion.
 
 New TOML uses `[workspace.theme]` (`mode`, `canvas`, `text`, `accent`) and `[workspace.model]` (exactly one `catalog` or `profile`) for main's presentation/model-selection controls. These select existing verified authorities; `[model]` contains native sizing, device and optional path settings. Model paths and named identities are both mandatory when both are specified. Reloading a different alias of an existing native resident updates the selected alias while retaining the native worker.
+
+## Power settings and explicit commands
+
+The remaining model-download and Google client setup forms now use the same typed configuration source. Command/Control-Shift-P opens **Models**, an action library for verified downloads, local selection, status, cancellation and unload. Its duplicate suggestions checkbox and nested Advanced form are removed. The immediate writing-suggestions control remains available, with `[assistance].suggestions` supplying the durable preference.
+
+| Choice or operation | Configuration or retained action |
+| --- | --- |
+| Model identity, paths, device and memory limits | `[workspace.model]` and `[model]`; reload with Command/Control-Shift-R |
+| Sampling and authored personas | `[generation]` and `[profiles.<name>]` |
+| Theme and pane layout | `[workspace.theme]` and `[workspace.panes.<name>]`; the appearance shortcut is a session override |
+| Custom download URL, destination name, checksum and size bounds | `[downloads.<name>]`; explicit Download and verify in Models |
+| Google Desktop client setup | `[imports.google]`; explicit Connect in Import sources |
+| Account connection, cancellation, sync, import queries and selected sources | Explicit contextual actions; configuration does not grant access or start a sync |
+| Formatting, links, file operations, export, document actions and window controls | Immediate edits and standard commands; these are operations rather than durable settings |
+
+```toml
+[downloads.my_writer]
+url = "https://publisher.example/writer.gguf"
+file_name = "writer.gguf"
+sha256 = "<replace with the publisher's 64 hexadecimal digits>"
+expected_bytes = 4954576032 # optional exact length
+max_bytes = 8589934592     # 8 GiB, expressed as exact bytes
+
+[imports.google]
+client_file = ".mine/google-desktop.json"
+```
+
+Download names use the same 1–64 character ASCII naming rule as profiles, with at most 32 definitions. Every definition requires an HTTPS URL, one portable `.gguf` filename and an exact SHA-256. URL user/password credentials, unknown fields, reserved device filenames and invalid byte bounds fail during config validation. The default ceiling is 64 GiB; the permitted ceiling is 1 byte through 1 TiB. An optional `expected_bytes` must be positive and no larger than that ceiling. A projector is another named GGUF download. No definition acquires a pinned catalog identity or permission to load a model.
+
+The command list shows each file, byte bound, URL and checksum before the user starts it. A click copies every request field and command ID once. An uncertain retry retains that request even if the author edits settings or switches projects; configuration never rewrites an admitted download. Existing native transfer ownership, cancellation, cold checksum verification, GGUF validation and atomic installation remain authoritative. Invalid settings expose repair, with no stale configured-download action offered. Catalog downloads retain their embedded publisher pins.
+
+Google `client_file` names an existing project-relative JSON file downloaded for a **Desktop app** client. Paths cannot escape the project; explicit reads reject observed symlinks and nonregular files, require UTF-8, and stop at 64 KiB. Only `installed.client_id` and `installed.client_secret` are consumed. Endpoints and authorization scopes remain owned by the Google connector; metadata in the downloaded JSON cannot replace them. Public desktop clients without a secret can instead set `client_id`. Supplying both sources, an inline `client_secret`, or unknown import settings is an error. The commented settings template contains only a file reference, never credential material.
+
+A settings snapshot reports only whether Google setup is configured; it does not read the client file or expose a secret. Connect rereads and validates the current project settings and referenced file under the bound project session, then starts the existing explicit browser authorization. Tokens and the resulting credential remain in the existing OS credential store. Invalid or missing client files cannot replace an existing connection. The file reference is a setup input, not an account grant. Existing connected accounts can continue syncing without repeating client setup.
+
+The rendered browser checks cover inert download/config presentation, explicit command dispatch, invalid-source repair, credential-free connection IPC and retained import actions. Portable tests cover exact retry capture and strict native configuration validation. Real provider authorization, network transfer and installed native interaction remain separate acceptance boundaries.

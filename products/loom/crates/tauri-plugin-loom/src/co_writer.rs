@@ -2,7 +2,7 @@
 //! source revision and generation profile, independent of the library entry.
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -451,25 +451,13 @@ fn profile_summary(profile: &StoredCoWriterProfile) -> Result<CoWriterSummary, C
 
 fn read_profiles(project_root: &Path) -> Result<CoWriterProfiles, CoWriterError> {
     let path = profile_path(project_root)?;
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CoWriterProfiles {
-                schema: PROFILE_SCHEMA.into(),
-                profiles: BTreeMap::new(),
-            });
-        }
-        Err(error) => return Err(error.into()),
+    let Some(bytes) = crate::private_sidecar::read(project_root, &path, MAX_STORE_BYTES as u64)?
+    else {
+        return Ok(CoWriterProfiles {
+            schema: PROFILE_SCHEMA.into(),
+            profiles: BTreeMap::new(),
+        });
     };
-    if !file.metadata()?.is_file() {
-        return Err(CoWriterError::Invalid);
-    }
-    let mut bytes = Vec::new();
-    file.take((MAX_STORE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_STORE_BYTES {
-        return Err(CoWriterError::Limit);
-    }
     let mut store: CoWriterProfiles = serde_json::from_slice(&bytes)?;
     if !matches!(
         store.schema.as_str(),
@@ -525,8 +513,11 @@ fn write_profiles(project_root: &Path, store: &CoWriterProfiles) -> Result<(), C
         return Err(CoWriterError::Limit);
     }
     let path = profile_path(project_root)?;
+    let namespace = crate::private_sidecar::namespace(project_root, &path)?;
+    let stored =
+        crate::private_sidecar::PayloadCodec::open(project_root)?.seal(&namespace, &bytes)?;
     let mut file = AtomicWriteFile::options().open(&path)?;
-    file.write_all(&bytes)?;
+    file.write_all(&stored)?;
     file.commit()?;
     if let Some(parent) = path.parent() {
         #[cfg(unix)]
@@ -557,6 +548,49 @@ fn profile_path(project_root: &Path) -> Result<PathBuf, CoWriterError> {
 mod tests {
     use super::*;
     use desktop_generation_policy::SamplingOverrides;
+
+    #[test]
+    #[cfg(unix)]
+    fn secured_co_writers_reopen_and_apply_exact_frozen_context_without_plaintext() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join(".loom")).unwrap();
+        desktop_vault::ProjectVault::initialize_with_key(project.path(), [41; 32]).unwrap();
+        let source = "Private co-writer cadence: precise, patient, and spare.";
+        set_document_context_snapshot(project.path(), "source", source, &[]).unwrap();
+        let saved = save_from_document(project.path(), "source", "Private Voice", 1).unwrap();
+        let path = profile_path(project.path()).unwrap();
+        let sealed = fs::read(&path).unwrap();
+        assert!(sealed.starts_with(b"MINEENC\x01"));
+        assert!(
+            !sealed
+                .windows(source.len())
+                .any(|window| window == source.as_bytes())
+        );
+        assert!(serde_json::from_slice::<serde_json::Value>(&sealed).is_err());
+        assert_eq!(list(project.path()).unwrap()[0].id, saved.id);
+        set_document_context_snapshot(project.path(), "source", "Later source edit.", &[]).unwrap();
+        apply_to_document(project.path(), "target", &saved.id).unwrap();
+        assert_eq!(
+            document_context_snapshot(project.path(), "target")
+                .unwrap()
+                .markdown,
+            source
+        );
+        assert_eq!(fs::read(&path).unwrap(), sealed);
+
+        let mut tampered = sealed.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        fs::write(&path, tampered).unwrap();
+        assert!(list(project.path()).is_err());
+        let plaintext = crate::private_sidecar::PayloadCodec::open(project.path())
+            .unwrap()
+            .open_bytes(".loom/co-writers.json", &sealed, MAX_STORE_BYTES as u64)
+            .unwrap();
+        fs::write(&path, &plaintext).unwrap();
+        assert!(list(project.path()).is_err());
+        assert!(delete(project.path(), &saved.id).is_err());
+        assert_eq!(fs::read(path).unwrap(), plaintext);
+    }
 
     /// The fields emitted by current main's v1 writer, independent of the new
     /// codec. A byte comparison catches accidental writes while reading it.

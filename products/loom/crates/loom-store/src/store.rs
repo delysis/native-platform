@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 
+use desktop_vault::ProjectVault;
 use fs4::TryLockError;
 use loom_document::DocumentContent;
 use loom_types::{
@@ -17,9 +18,9 @@ use serde_json::json;
 use unicode_normalization::UnicodeNormalization as _;
 
 use crate::file_io::{
-    BoundedNoFollowFile, atomic_install_if_absent, atomic_replace, atomic_replace_private,
-    create_private_file_if_absent, ensure_document_lifecycle_supported, hard_link_if_absent,
-    read_bounded, read_bounded_no_follow, rename_if_absent, sync_parent, sync_rename_parents,
+    BoundedNoFollowFile, atomic_install_if_absent, atomic_replace, create_private_file_if_absent,
+    ensure_document_lifecycle_supported, hard_link_if_absent, read_bounded, read_bounded_no_follow,
+    rename_if_absent, sync_parent, sync_rename_parents,
 };
 use crate::paths::{
     ensure_document_parent, ensure_private_directory, inspect_document_path,
@@ -32,6 +33,7 @@ const PROJECT_FORMAT: &str = "loom-project";
 pub(crate) const DATABASE_FILE: &str = "loom.sqlite3";
 const PROJECT_LEASE_FILE: &str = "session.lock";
 const MANIFEST_FILE: &str = "project.json";
+pub(crate) const MANIFEST_NAMESPACE: &str = "loom/project-manifest/v1";
 const DOCUMENT_RENAME_DIRECTORY: &str = ".loom/renames";
 const DOCUMENT_DELETED_DIRECTORY: &str = ".loom/deleted";
 const MAX_PROJECT_NAME_BYTES: usize = 512;
@@ -97,6 +99,7 @@ pub struct ProjectStore {
     pub(crate) root: PathBuf,
     pub(crate) manifest: ProjectManifest,
     pub(crate) connection: Connection,
+    pub(crate) vault: Option<ProjectVault>,
     pub(crate) folder_warnings: Vec<String>,
     _lease: ProjectLease,
 }
@@ -125,18 +128,77 @@ impl fmt::Debug for ProjectStore {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OpenPurpose {
+    Editing,
+    ProtectedCopy,
+}
+
 impl ProjectStore {
     pub fn initialize(
         path: impl AsRef<Path>,
         name: impl Into<String>,
     ) -> Result<(Self, CommandReceipt)> {
+        Self::initialize_using(path.as_ref(), name.into(), |root| {
+            if root.join(".loom/vault.json").try_exists()? {
+                return Err(StoreError::CorruptDatabase(
+                    "an existing project vault requires encrypted initialization".into(),
+                ));
+            }
+            Ok(None)
+        })
+    }
+
+    /// Create a project whose private history and drafts are encrypted using
+    /// the OS-protected project vault. Visible manuscripts remain ordinary UTF-8.
+    pub fn initialize_encrypted(
+        path: impl AsRef<Path>,
+        name: impl Into<String>,
+    ) -> Result<(Self, CommandReceipt)> {
+        Self::initialize_encrypted_using(path.as_ref(), name.into(), ProjectVault::initialize)
+    }
+
+    pub(crate) fn initialize_encrypted_using(
+        path: &Path,
+        name: String,
+        create_vault: impl FnOnce(&Path) -> std::result::Result<ProjectVault, desktop_vault::VaultError>,
+    ) -> Result<(Self, CommandReceipt)> {
+        Self::initialize_using(path, name, |root| {
+            // Check under the project lease, including when an earlier unlock
+            // failed. A manifest, database, vault, or unknown payload is never
+            // evidence that initialization may be restarted.
+            if !is_initialization_skeleton(root)? {
+                return Err(StoreError::NotAProject(root.to_owned()));
+            }
+            require_database_encryption(&Connection::open_in_memory()?)?;
+            Ok(Some(create_vault(root)?))
+        })
+    }
+
+    /// Explicit key-owner injection for callers that already unlocked a vault.
+    pub fn initialize_with_vault(
+        path: impl AsRef<Path>,
+        name: impl Into<String>,
+        vault: ProjectVault,
+    ) -> Result<(Self, CommandReceipt)> {
+        Self::initialize_using(path.as_ref(), name.into(), |root| {
+            reject_existing_database_for_encryption(root)?;
+            require_database_encryption(&Connection::open_in_memory()?)?;
+            vault.validate_root(root)?;
+            Ok(Some(vault))
+        })
+    }
+
+    fn initialize_using(
+        requested_root: &Path,
+        name: String,
+        prepare_vault: impl FnOnce(&Path) -> Result<Option<ProjectVault>>,
+    ) -> Result<(Self, CommandReceipt)> {
         crate::paths::ensure_private_storage_supported()?;
-        let requested_root = path.as_ref();
         reject_root_symlink(requested_root)?;
         fs::create_dir_all(requested_root)?;
         let root = requested_root.canonicalize()?;
 
-        let name = name.into();
         if name.trim().is_empty() || name.len() > MAX_PROJECT_NAME_BYTES {
             return Err(StoreError::InvalidProjectName {
                 max_bytes: MAX_PROJECT_NAME_BYTES,
@@ -175,10 +237,17 @@ impl ProjectStore {
             name,
             created_at_ms: started_at_ms,
         };
+        let vault = prepare_vault(&root)?;
         let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
-        atomic_replace_private(&manifest_path, &manifest_bytes)?;
+        crate::private_io::write(
+            vault.as_ref(),
+            &manifest_path,
+            MANIFEST_NAMESPACE,
+            &manifest_bytes,
+        )?;
 
-        let mut store = Self::open_internal(root, manifest, Some(lease))?;
+        let mut store =
+            Self::open_internal(root, manifest, Some(lease), vault, OpenPurpose::Editing)?;
         let receipt =
             store.new_receipt(CommandKind::InitProject, started_at_ms, None, &[], &[], &[]);
         store.persist_receipt(&receipt)?;
@@ -186,8 +255,43 @@ impl ProjectStore {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_using(path.as_ref(), OpenPurpose::Editing, |root| {
+            Ok(ProjectVault::open(root)?)
+        })
+    }
+
+    pub fn open_with_vault(path: impl AsRef<Path>, vault: ProjectVault) -> Result<Self> {
+        Self::open_using(path.as_ref(), OpenPurpose::Editing, |root| {
+            vault.validate_root(root)?;
+            Ok(Some(vault))
+        })
+    }
+
+    /// Validate and lock a source for an explicit protected copy, without
+    /// replaying pending manuscript operations or removing recovery anchors.
+    /// The copy operation must check quiescence before exporting any data.
+    pub fn open_for_protected_copy(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_using(path.as_ref(), OpenPurpose::ProtectedCopy, |root| {
+            Ok(ProjectVault::open(root)?)
+        })
+    }
+
+    pub(crate) fn open_for_protected_copy_with_vault(
+        path: impl AsRef<Path>,
+        vault: ProjectVault,
+    ) -> Result<Self> {
+        Self::open_using(path.as_ref(), OpenPurpose::ProtectedCopy, |root| {
+            vault.validate_root(root)?;
+            Ok(Some(vault))
+        })
+    }
+
+    fn open_using(
+        requested_root: &Path,
+        purpose: OpenPurpose,
+        unlock_vault: impl FnOnce(&Path) -> Result<Option<ProjectVault>>,
+    ) -> Result<Self> {
         crate::paths::ensure_private_storage_supported()?;
-        let requested_root = path.as_ref();
         reject_root_symlink(requested_root)?;
         let root = requested_root.canonicalize()?;
         if !root.is_dir() {
@@ -204,16 +308,23 @@ impl ProjectStore {
         if !manifest_path.exists() {
             return Err(StoreError::NotAProject(root));
         }
-        let manifest: ProjectManifest =
-            serde_json::from_slice(&read_bounded(&manifest_path, MAX_MANIFEST_BYTES)?)?;
+        let vault = unlock_vault(&root)?;
+        let manifest: ProjectManifest = serde_json::from_slice(&crate::private_io::read(
+            vault.as_ref(),
+            &manifest_path,
+            MANIFEST_NAMESPACE,
+            MAX_MANIFEST_BYTES,
+        )?)?;
         validate_manifest(&manifest)?;
-        Self::open_internal(root, manifest, None)
+        Self::open_internal(root, manifest, None, vault, purpose)
     }
 
     fn open_internal(
         root: PathBuf,
         manifest: ProjectManifest,
         lease: Option<ProjectLease>,
+        vault: Option<ProjectVault>,
+        purpose: OpenPurpose,
     ) -> Result<Self> {
         let initializing = lease.is_some();
         let loom_dir = root.join(".loom");
@@ -224,14 +335,16 @@ impl ProjectStore {
                 "project database is missing".into(),
             ));
         }
-        for directory in [
-            loom_dir.clone(),
-            loom_dir.join("blobs"),
-            loom_dir.join("blobs/sha256"),
-            loom_dir.join("indexes"),
-            loom_dir.join("backups"),
-        ] {
-            ensure_private_directory(&directory)?;
+        if purpose == OpenPurpose::Editing {
+            for directory in [
+                loom_dir.clone(),
+                loom_dir.join("blobs"),
+                loom_dir.join("blobs/sha256"),
+                loom_dir.join("indexes"),
+                loom_dir.join("backups"),
+            ] {
+                ensure_private_directory(&directory)?;
+            }
         }
         let lease = match lease {
             Some(lease) => lease,
@@ -240,21 +353,55 @@ impl ProjectStore {
         if initializing {
             create_private_file_if_absent(&database_path)?;
         }
+        if purpose == OpenPurpose::ProtectedCopy
+            && loom_dir
+                .join(format!("{DATABASE_FILE}-journal"))
+                .try_exists()?
+        {
+            // A hot rollback journal can make SQLite recover the source on its
+            // first read. Copy admission must leave recovery to normal opening.
+            return Err(StoreError::CorruptDatabase(
+                "resolve the source database rollback journal before copying".into(),
+            ));
+        }
         let mut connection = Connection::open_with_flags(
             &database_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        initialize_schema(&mut connection, initializing)?;
+        if purpose == OpenPurpose::ProtectedCopy {
+            // Even a read-only SQL workload would otherwise checkpoint WAL on
+            // last-connection close, rewriting the source's physical database.
+            connection.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )?;
+        }
+        if let Some(vault) = &vault {
+            configure_encrypted_database(&connection, vault)?;
+        }
+        if purpose == OpenPurpose::ProtectedCopy {
+            crate::schema::validate_current_schema(&connection)?;
+            // Connection-local safety settings do not rewrite source state.
+            connection.busy_timeout(std::time::Duration::from_secs(5))?;
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+            connection.pragma_update(None, "trusted_schema", "OFF")?;
+            connection.pragma_update(None, "temp_store", "MEMORY")?;
+        } else {
+            initialize_schema(&mut connection, initializing)?;
+        }
         let store = Self {
             root,
             manifest,
             connection,
+            vault,
             folder_warnings: Vec::new(),
             _lease: lease,
         };
-        store.recover_document_rename_operations()?;
-        store.recover_document_delete_operations()?;
-        store.cleanup_terminal_rename_anchors();
+        if purpose == OpenPurpose::Editing {
+            store.recover_document_rename_operations()?;
+            store.recover_document_delete_operations()?;
+            store.cleanup_terminal_rename_anchors();
+        }
         Ok(store)
     }
 
@@ -264,6 +411,10 @@ impl ProjectStore {
 
     pub const fn manifest(&self) -> &ProjectManifest {
         &self.manifest
+    }
+
+    pub fn vault(&self) -> Option<&ProjectVault> {
+        self.vault.as_ref()
     }
 
     pub fn record_open(&mut self) -> Result<CommandReceipt> {
@@ -2624,7 +2775,12 @@ impl ProjectStore {
         if !path.exists() {
             return Err(StoreError::MissingBlob { blob_id, path });
         }
-        let bytes = read_bounded(&path, max_bytes)?;
+        let bytes = crate::private_io::read(
+            self.vault.as_ref(),
+            &path,
+            &format!("loom/blob/{blob_id}"),
+            max_bytes,
+        )?;
         let actual = BlobId::digest(&bytes);
         if actual != blob_id {
             return Err(StoreError::CorruptBlob {
@@ -2665,7 +2821,12 @@ impl ProjectStore {
             .parent()
             .ok_or_else(|| StoreError::CorruptDatabase("blob path has no parent".into()))?;
         ensure_private_directory(parent)?;
-        atomic_replace_private(&path, bytes)?;
+        crate::private_io::write(
+            self.vault.as_ref(),
+            &path,
+            &format!("loom/blob/{blob_id}"),
+            bytes,
+        )?;
         Ok(blob_id)
     }
 
@@ -2988,6 +3149,40 @@ pub(crate) fn persist_receipt_in(connection: &Connection, receipt: &CommandRecei
     Ok(())
 }
 
+fn reject_existing_database_for_encryption(root: &Path) -> Result<()> {
+    if root.join(".loom").join(DATABASE_FILE).try_exists()? {
+        return Err(StoreError::AlreadyInitialized(root.to_owned()));
+    }
+    Ok(())
+}
+
+fn require_database_encryption(connection: &Connection) -> Result<()> {
+    let version: String = connection
+        .pragma_query_value(None, "cipher_version", |row| row.get(0))
+        .map_err(|_| StoreError::EncryptionUnavailable)?;
+    // The previous SQLCipher bundle silently regressed main's SQLite 3.51.3
+    // WAL-reset corruption fix to 3.50.4. Encryption cannot weaken durability.
+    if version.trim().is_empty() || rusqlite::version_number() < 3_051_003 {
+        return Err(StoreError::EncryptionUnavailable);
+    }
+    Ok(())
+}
+
+fn configure_encrypted_database(connection: &Connection, vault: &ProjectVault) -> Result<()> {
+    // A stock SQLite build silently ignores unknown PRAGMAs. Require a real
+    // SQLCipher engine before providing key material or opening any schema.
+    require_database_encryption(connection)?;
+    vault.with_database_key(|key| connection.pragma_update(None, "key", key))?;
+    connection.pragma_update(None, "cipher_memory_security", true)?;
+    connection.pragma_update(None, "temp_store", "MEMORY")?;
+    // Key assignment alone does not authenticate an existing database. Force
+    // its first page to be authenticated before schema transactions or recovery.
+    connection.query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    Ok(())
+}
+
 fn media_type(kind: DocumentKind) -> &'static str {
     match kind {
         DocumentKind::Hybrid | DocumentKind::Prose => "text/markdown; charset=utf-8",
@@ -3263,6 +3458,41 @@ fn remove_if_present(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+/// The only resumable state is the empty directory skeleton created before
+/// credentials were available. This inspection is bounded by its fixed layout.
+/// Callers that mutate must repeat it after acquiring the existing lease inode.
+pub(crate) fn is_initialization_skeleton(root: &Path) -> Result<bool> {
+    let private = root.join(".loom");
+    let mut pending = vec![PathBuf::new()];
+    while let Some(relative) = pending.pop() {
+        let directory = private.join(&relative);
+        let metadata = fs::symlink_metadata(&directory)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Ok(false);
+        }
+        for entry in fs::read_dir(&directory)? {
+            let entry = entry?;
+            let path = relative.join(entry.file_name());
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if matches!(
+                path.to_str(),
+                Some("blobs" | "blobs/sha256" | "indexes" | "backups")
+            ) && metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+            {
+                pending.push(path);
+            } else if path != Path::new(PROJECT_LEASE_FILE)
+                || !metadata.is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() != 0
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn acquire_project_lease(loom_dir: &Path, root: &Path) -> Result<ProjectLease> {
@@ -4715,6 +4945,37 @@ mod tests {
         );
         let root = store.root.clone();
         drop(store);
+
+        let database_before =
+            fs::read(root.join(".loom").join(DATABASE_FILE)).expect("source database");
+        let copy_source = ProjectStore::open_for_protected_copy(&root)
+            .expect("inspect copy source without recovery");
+        assert!(!root.join("manuscript/Source.md").exists());
+        assert_eq!(
+            fs::read(rename_directory.join(format!("{operation_id}.capture")))
+                .expect("unmodified captured manuscript"),
+            b"recover rename\n"
+        );
+        let pending_state: String = copy_source
+            .connection
+            .query_row(
+                "SELECT state FROM document_rename_operations WHERE operation_id = ?1",
+                [operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .expect("inspect pending operation");
+        assert_eq!(pending_state, "prepared");
+        assert!(
+            copy_source
+                .export_encrypted_copy(directory.path().join("protected-copy"))
+                .is_err()
+        );
+        assert!(!directory.path().join("protected-copy").exists());
+        drop(copy_source);
+        assert_eq!(
+            fs::read(root.join(".loom").join(DATABASE_FILE)).unwrap(),
+            database_before
+        );
 
         let reopened = ProjectStore::open(&root).expect("recover prepared rename on reopen");
 

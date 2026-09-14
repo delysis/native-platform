@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+desktop-vault.workspace = true
 workspace-document.workspace = true
 atomic-write-file.workspace = true
 fs4.workspace = true
@@ -20,6 +21,12 @@ similar.workspace = true
 thiserror.workspace = true
 unicase.workspace = true
 unicode-normalization.workspace = true
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher"] }
+
+[target.'cfg(not(target_vendor = "apple"))'.dependencies]
+rusqlite = { workspace = true, features = ["bundled-sqlcipher-vendored-openssl"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

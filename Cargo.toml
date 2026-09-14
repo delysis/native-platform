@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/desktop-vault",
     "crates/desktop-context",
     "crates/desktop-model-defaults",
     "crates/desktop-speech",
@@ -71,6 +72,7 @@ repository = "https://github.com/delysis/native-platform"
 publish = false
 
 [workspace.dependencies]
+desktop-vault = { path = "crates/desktop-vault" }
 desktop-context = { path = "crates/desktop-context" }
 desktop-speech = { path = "crates/desktop-speech" }
 operation-lifecycle = { path = "crates/operation-lifecycle" }
@@ -105,7 +107,7 @@ rand = "0.9"
 rand_chacha = "0.9.0"
 rand_core = "0.9.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
-rusqlite = { version = "=0.39.0", features = ["bundled"] }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
 same-file = "1.0.6"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"

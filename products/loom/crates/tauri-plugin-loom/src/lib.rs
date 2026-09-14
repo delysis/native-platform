@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod private_sidecar;
+
 mod attachments;
 mod audio_io;
 mod co_writer;
@@ -7,6 +9,7 @@ mod connected_imports;
 mod context_attachments;
 mod document_bindings;
 mod document_watcher;
+mod export_original;
 mod external_import;
 mod generation_profiles;
 mod import_batch;
@@ -2326,6 +2329,12 @@ impl IpcFailure {
         use loom_store::StoreError;
 
         let code = match &error {
+            StoreError::Vault(desktop_vault::VaultError::Locked) => "vault_locked",
+            StoreError::Vault(desktop_vault::VaultError::Unsupported) => {
+                "private_storage_unsupported"
+            }
+            StoreError::Vault(_) => "private_storage_invalid",
+            StoreError::EncryptionUnavailable => "vault_unavailable",
             StoreError::Io(_) => "filesystem_error",
             StoreError::Sqlite(_) => "database_error",
             StoreError::Json(_) => "manifest_json_error",
@@ -2413,7 +2422,9 @@ impl IpcFailure {
         };
         let retryable = matches!(
             error,
-            StoreError::ProjectAlreadyOpen(_) | StoreError::DocumentLifecycleUncertain(_)
+            StoreError::ProjectAlreadyOpen(_)
+                | StoreError::DocumentLifecycleUncertain(_)
+                | StoreError::Vault(desktop_vault::VaultError::Locked)
         );
         Self::new(code, error.to_string(), retryable)
     }
@@ -2868,9 +2879,14 @@ struct DesktopLoomEvent {
 async fn project_open_default<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
+    retry_unlock: Option<bool>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
     ensure_application_running(&state, "a project session")?;
     let choice = reserve_project_choice(&state)?;
+    if retry_unlock == Some(true) {
+        desktop_vault::retry_unlock()
+            .map_err(|error| IpcFailure::new("vault_locked", error.to_string(), true))?;
+    }
     let result =
         default_project_path(&state).and_then(|path| open_or_initialize_default_project(&path));
     choice.finish(&app, result)
@@ -3021,7 +3037,7 @@ fn prepare_project_folder(
             return Ok(None);
         }
     }
-    let mut store = ProjectStore::open_folder(&path).map_err(IpcFailure::store)?;
+    let mut store = open_desktop_folder(&path).map_err(IpcFailure::store)?;
     store
         .recover_interrupted_generations()
         .map_err(IpcFailure::store)?;
@@ -3255,7 +3271,7 @@ fn open_or_initialize_default_project(path: &Path) -> Result<ProjectStore, IpcFa
     std::fs::create_dir_all(path).map_err(|error| {
         IpcFailure::new("default_project_creation_failed", error.to_string(), true)
     })?;
-    let mut store = ProjectStore::open_folder(path).map_err(IpcFailure::store)?;
+    let mut store = open_desktop_folder(path).map_err(IpcFailure::store)?;
 
     // Settle an initialization/adoption transaction before deciding whether
     // the default document is absent. A registered document whose visible file
@@ -3268,6 +3284,18 @@ fn open_or_initialize_default_project(path: &Path) -> Result<ProjectStore, IpcFa
     ensure_default_document(&mut store)?;
     store.record_open().map_err(IpcFailure::store)?;
     Ok(store)
+}
+
+fn open_desktop_folder(path: &Path) -> loom_store::Result<ProjectStore> {
+    // macOS debug and release apps use the real Keychain. Other platforms keep
+    // their existing ordinary project initialization until they have a native
+    // credential backend. Opening a marked vault still fails closed there.
+    // Unit-test IPC fixtures remain independent of OS credentials; protected
+    // store tests inject their own keys.
+    #[cfg(any(test, not(target_os = "macos")))]
+    return ProjectStore::open_folder(path);
+    #[cfg(all(not(test), target_os = "macos"))]
+    return ProjectStore::open_folder_encrypted(path);
 }
 
 fn validate_default_document_candidate(path: &Path) -> Result<(), IpcFailure> {
@@ -4674,23 +4702,46 @@ async fn document_export_choose<R: Runtime>(
     reservation.export(&destination).map(Some)
 }
 
-/// Reveal retained source bytes without opening or executing their contents.
+/// Export verified original bytes only after an explicit native Save choice.
+/// The IPC name is retained for existing attachment actions.
 #[tauri::command]
-async fn attachment_reveal_original(
+async fn attachment_reveal_original<R: Runtime>(
     project_id: String,
     session_id: String,
     attachment_id: String,
+    app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
-    let _admission = lock_application_admission(&state, "an attachment reveal")?;
-    let path = {
+    let (file_name, bytes) = {
+        let _admission = lock_application_admission(&state, "an original attachment export")?;
         let mut session = lock_session(&state)?;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;
-        context_attachments::original_path(store.root(), &attachment_id)
+        context_attachments::original_for_export(store.root(), &attachment_id)
             .map_err(|error| IpcFailure::context_attachment(&error))?
     };
-    tauri_plugin_opener::reveal_item_in_dir(path)
-        .map_err(|error| IpcFailure::new("attachment_reveal_failed", error.to_string(), false))
+    // Neither application nor project locks remain held across the OS dialog.
+    let Some(destination) = app
+        .dialog()
+        .file()
+        .set_title("Save Original")
+        .set_file_name(export_original::suggested_file_name(&file_name))
+        .blocking_save_file()
+    else {
+        return Ok(());
+    };
+    let destination = destination
+        .into_path()
+        .map_err(|error| IpcFailure::new("attachment_export_failed", error.to_string(), false))?;
+    let _admission = lock_application_admission(&state, "an original attachment export")?;
+    let mut session = lock_session(&state)?;
+    require_bound_store(&mut session, &project_id, &session_id)?;
+    export_original::write_new(&destination, &bytes).map_err(|error| {
+        IpcFailure::new(
+            "attachment_export_failed",
+            format!("The original could not be saved: {error}"),
+            false,
+        )
+    })
 }
 
 #[tauri::command]

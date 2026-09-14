@@ -1,4 +1,5 @@
 import type { WorkspacePaneConfig } from './WorkspacePane.svelte';
+import type { ConfiguredModelDownload } from './modelDownload';
 export type WorkspaceModelSelection = { catalog: string } | { profile: string };
 
 export interface WorkspaceTemplateSnapshot {
@@ -8,6 +9,8 @@ export interface WorkspaceTemplateSnapshot {
   source_sha256: string | null;
   suggestions: boolean | null;
   model_path: string | null;
+  downloads: Record<string, ConfiguredModelDownload>;
+  google_client_configured: boolean;
   config: { model?: WorkspaceModelSelection | null; theme?: { mode: 'system' | 'light' | 'dark'; canvas?: string | null; text?: string | null; accent?: string | null }; panes: Record<string, WorkspacePaneConfig> };
   error: string | null;
 }
