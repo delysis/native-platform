@@ -188,7 +188,17 @@ retains exact prompts, grant/model targets, and cancellation intent before
 dispatch. It reserves result space, verifies every retained host assertion
 against that saved input, and rejects model substitution, rewritten terminal
 receipts, and state rollback. Reopening the ledger never resubmits a job or
-invents a remote completion.
+invents a remote completion. Native app commands now discover one selected
+friend's offers, prepare exact requests, submit by saved job ID, and separately
+read, check, or cancel a job. Discovery and history reads cannot create a request
+ledger. Reopening saved history refuses a missing database instead of creating
+an empty replacement. Every command binds the current workspace and session;
+only exact already-saved requests remain recoverable after membership changes.
+Status rejection or a lost connection leaves the latest signed receipt intact
+and reports delivery separately. A persisted cancellation wins over a later
+submission; terminal results are returned from storage without dispatching again.
+The app history returns bounded previews. Terminal prompt composition, target
+selection, and derived output retention are still separate integration work.
 
 An accepted job is committed before dispatch. Each authenticated caller owns its
 job IDs, and a retry must match the exact original input and grant. Status checks
@@ -226,6 +236,9 @@ The main workspace and Signal worker use the root Rust 1.95.0 toolchain pin.
 The worker has its own locked workspace because its SQLx/SQLCipher dependency
 graph cannot coexist with the main workspace's rusqlite link dependency. Install
 the root toolchain, Protobuf's `protoc`, and the platform OpenSSL development dependencies.
+Windows source builds additionally require native Strawberry Perl for OpenSSL;
+Git Bash's Perl is not the native MSVC build interpreter. CI sets
+`OPENSSL_SRC_PERL` explicitly and verifies its required modules.
 `node scripts/build-loom-signal.mjs` builds and places the required Tauri sidecar.
 Tauri dev/build hooks invoke it; plain Cargo workspace builds need this step first.
 The sidecar follows Tauri's debug/release build profile, so a development bundle

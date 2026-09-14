@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-compute-job-prepare"
+description = "Enables the compute_job_prepare command without any pre-configured scope."
+commands.allow = ["compute_job_prepare"]
+
+[[permission]]
+identifier = "deny-compute-job-prepare"
+description = "Denies the compute_job_prepare command without any pre-configured scope."
+commands.deny = ["compute_job_prepare"]

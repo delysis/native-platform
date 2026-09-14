@@ -2283,10 +2283,10 @@
           "markdownDescription": "Start, stop, or cancel a user-requested local microphone recording and its local speech-recognition request.\n#### This permission set includes:\n\n- `allow-speech-input-record-start`\n- `allow-audio-record-start`\n- `allow-audio-record-stop`\n- `allow-speech-input-record-stop`\n- `allow-speech-input-record-cancel`\n- `allow-speech-input-cancel`"
         },
         {
-          "description": "Review and revoke device-specific idle model grants. Each new grant is bound to the selected verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`",
+          "description": "Review device-specific idle model grants and explicitly prepare, submit, check, or cancel exact peer jobs. Grants bind the verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`\n- `allow-compute-peer-offers`\n- `allow-compute-job-prepare`\n- `allow-compute-job-get`\n- `allow-compute-jobs`\n- `allow-compute-job-submit`\n- `allow-compute-job-check`\n- `allow-compute-job-cancel`",
           "type": "string",
           "const": "loom:peer-compute",
-          "markdownDescription": "Review and revoke device-specific idle model grants. Each new grant is bound to the selected verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`"
+          "markdownDescription": "Review device-specific idle model grants and explicitly prepare, submit, check, or cancel exact peer jobs. Grants bind the verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`\n- `allow-compute-peer-offers`\n- `allow-compute-job-prepare`\n- `allow-compute-job-get`\n- `allow-compute-jobs`\n- `allow-compute-job-submit`\n- `allow-compute-job-check`\n- `allow-compute-job-cancel`"
         },
         {
           "description": "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`",
@@ -2485,6 +2485,48 @@
           "type": "string",
           "const": "loom:allow-compute-host-snapshot",
           "markdownDescription": "Enables the compute_host_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_job_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-job-cancel",
+          "markdownDescription": "Enables the compute_job_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_job_check command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-job-check",
+          "markdownDescription": "Enables the compute_job_check command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_job_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-job-get",
+          "markdownDescription": "Enables the compute_job_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_job_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-job-prepare",
+          "markdownDescription": "Enables the compute_job_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_job_submit command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-job-submit",
+          "markdownDescription": "Enables the compute_job_submit command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_jobs command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-jobs",
+          "markdownDescription": "Enables the compute_jobs command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_peer_offers command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-peer-offers",
+          "markdownDescription": "Enables the compute_peer_offers command without any pre-configured scope."
         },
         {
           "description": "Enables the compute_revoke command without any pre-configured scope.",
@@ -3073,6 +3115,48 @@
           "type": "string",
           "const": "loom:deny-compute-host-snapshot",
           "markdownDescription": "Denies the compute_host_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_job_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-job-cancel",
+          "markdownDescription": "Denies the compute_job_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_job_check command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-job-check",
+          "markdownDescription": "Denies the compute_job_check command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_job_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-job-get",
+          "markdownDescription": "Denies the compute_job_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_job_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-job-prepare",
+          "markdownDescription": "Denies the compute_job_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_job_submit command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-job-submit",
+          "markdownDescription": "Denies the compute_job_submit command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_jobs command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-jobs",
+          "markdownDescription": "Denies the compute_jobs command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_peer_offers command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-peer-offers",
+          "markdownDescription": "Denies the compute_peer_offers command without any pre-configured scope."
         },
         {
           "description": "Denies the compute_revoke command without any pre-configured scope.",

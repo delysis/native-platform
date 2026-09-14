@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-compute-peer-offers"
+description = "Enables the compute_peer_offers command without any pre-configured scope."
+commands.allow = ["compute_peer_offers"]
+
+[[permission]]
+identifier = "deny-compute-peer-offers"
+description = "Denies the compute_peer_offers command without any pre-configured scope."
+commands.deny = ["compute_peer_offers"]

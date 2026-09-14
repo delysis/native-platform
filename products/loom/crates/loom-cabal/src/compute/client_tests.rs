@@ -14,6 +14,25 @@ fn unsupported_private_storage_fails_before_creating_a_request_directory() -> Re
 mod supported {
     use super::*;
 
+    #[test]
+    fn recovery_never_creates_a_replacement_ledger() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let peer = Identity::generate()?.public_key();
+        let root = temporary.path().join("requests");
+        assert!(ComputeClient::open_existing(&root, peer).is_err());
+        assert!(!root.exists());
+        std::fs::create_dir(&root)?;
+        assert!(ComputeClient::open_existing(&root, peer).is_err());
+        assert_eq!(std::fs::read_dir(&root)?.count(), 0);
+        drop(ComputeClient::open(&root, peer)?);
+        drop(ComputeClient::open_existing(&root, peer)?);
+        std::fs::rename(root.join("requests.db"), root.join("preserved.db"))?;
+        assert!(ComputeClient::open_existing(&root, peer).is_err());
+        assert!(!root.join("requests.db").exists());
+        assert!(root.join("preserved.db").exists());
+        Ok(())
+    }
+
     struct Fixture {
         directory: tempfile::TempDir,
         peer: PublicKey,

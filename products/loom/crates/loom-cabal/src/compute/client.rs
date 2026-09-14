@@ -60,6 +60,16 @@ impl std::fmt::Debug for ComputeClient {
 
 impl ComputeClient {
     pub fn open(directory: &Path, peer: PublicKey) -> Result<Self> {
+        Self::open_inner(directory, peer, true)
+    }
+
+    /// Reopen saved requests without creating a replacement ledger if the
+    /// directory or database was removed. This operation never dispatches work.
+    pub fn open_existing(directory: &Path, peer: PublicKey) -> Result<Self> {
+        Self::open_inner(directory, peer, false)
+    }
+
+    fn open_inner(directory: &Path, peer: PublicKey, create: bool) -> Result<Self> {
         if !cfg!(unix) {
             return Err(Error::Invalid(
                 "Private compute request storage requires Unix",
@@ -73,7 +83,11 @@ impl ComputeClient {
                 "Compute request storage must use a private directory",
             ));
         }
-        std::fs::create_dir_all(directory)?;
+        if create {
+            std::fs::create_dir_all(directory)?;
+        } else if !directory.join("requests.db").try_exists()? {
+            return Err(Error::Invalid("Saved compute requests are unavailable"));
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -108,7 +122,11 @@ impl ComputeClient {
             .try_lock_exclusive()
             .map_err(|_| Error::Invalid("Another process owns these compute requests"))?;
         let exists = database_path.exists();
-        let database = Connection::open(&database_path)?;
+        let mut flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE;
+        if create {
+            flags |= rusqlite::OpenFlags::SQLITE_OPEN_CREATE;
+        }
+        let database = Connection::open_with_flags(&database_path, flags)?;
         let version: i64 = database.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if exists {
             if version != 1 {

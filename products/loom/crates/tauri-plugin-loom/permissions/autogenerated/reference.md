@@ -88,7 +88,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 </td>
 <td>
 
-Review and revoke device-specific idle model grants. Each new grant is bound to the selected verified model and current cabal membership. This does not grant manuscript or local-tool authority.
+Review device-specific idle model grants and explicitly prepare, submit, check, or cancel exact peer jobs. Grants bind the verified model and current cabal membership. This does not grant manuscript or local-tool authority.
 
 </td>
 </tr>
@@ -973,6 +973,188 @@ Enables the compute_host_snapshot command without any pre-configured scope.
 <td>
 
 Denies the compute_host_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-job-cancel`
+
+</td>
+<td>
+
+Enables the compute_job_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-job-cancel`
+
+</td>
+<td>
+
+Denies the compute_job_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-job-check`
+
+</td>
+<td>
+
+Enables the compute_job_check command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-job-check`
+
+</td>
+<td>
+
+Denies the compute_job_check command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-job-get`
+
+</td>
+<td>
+
+Enables the compute_job_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-job-get`
+
+</td>
+<td>
+
+Denies the compute_job_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-job-prepare`
+
+</td>
+<td>
+
+Enables the compute_job_prepare command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-job-prepare`
+
+</td>
+<td>
+
+Denies the compute_job_prepare command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-job-submit`
+
+</td>
+<td>
+
+Enables the compute_job_submit command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-job-submit`
+
+</td>
+<td>
+
+Denies the compute_job_submit command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-jobs`
+
+</td>
+<td>
+
+Enables the compute_jobs command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-jobs`
+
+</td>
+<td>
+
+Denies the compute_jobs command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-peer-offers`
+
+</td>
+<td>
+
+Enables the compute_peer_offers command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-peer-offers`
+
+</td>
+<td>
+
+Denies the compute_peer_offers command without any pre-configured scope.
 
 </td>
 </tr>

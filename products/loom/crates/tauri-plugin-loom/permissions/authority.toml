@@ -2,8 +2,12 @@
 
 [[set]]
 identifier = "peer-compute"
-description = "Review and revoke device-specific idle model grants. Each new grant is bound to the selected verified model and current cabal membership. This does not grant manuscript or local-tool authority."
-permissions = ["allow-compute-host-snapshot", "allow-compute-grant", "allow-compute-revoke"]
+description = "Review device-specific idle model grants and explicitly prepare, submit, check, or cancel exact peer jobs. Grants bind the verified model and current cabal membership. This does not grant manuscript or local-tool authority."
+permissions = [
+  "allow-compute-host-snapshot", "allow-compute-grant", "allow-compute-revoke",
+  "allow-compute-peer-offers", "allow-compute-job-prepare", "allow-compute-job-get",
+  "allow-compute-jobs", "allow-compute-job-submit", "allow-compute-job-check", "allow-compute-job-cancel",
+]
 
 [[set]]
 identifier = "local-generation"

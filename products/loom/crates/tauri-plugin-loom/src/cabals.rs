@@ -14,6 +14,13 @@ use std::io::Write;
 use std::sync::OnceLock;
 use uuid::Uuid;
 
+#[path = "cabal_compute_requests.rs"]
+mod requesting;
+pub(crate) use requesting::{
+    compute_job_cancel, compute_job_check, compute_job_get, compute_job_prepare,
+    compute_job_submit, compute_jobs, compute_peer_offers,
+};
+
 type Shared = Arc<Mutex<Cabal>>;
 
 #[derive(Debug, Default)]
@@ -32,6 +39,7 @@ struct Profile {
     bindings: BTreeMap<PathBuf, Uuid>,
     compute: Option<Arc<ComputeHost>>,
     compute_problem: Option<String>,
+    compute_client: Option<Arc<Mutex<loom_cabal::compute::ComputeClient>>>,
     _lease: File,
 }
 
@@ -212,6 +220,7 @@ impl CabalService {
             bindings,
             compute,
             compute_problem,
+            compute_client: None,
             _lease: lease,
         });
         Ok(())
@@ -1522,6 +1531,7 @@ mod tests {
             bindings: BTreeMap::from([(root, id)]),
             compute: None,
             compute_problem: None,
+            compute_client: None,
             _lease: File::create(temporary.path().join("lease")).expect("lease"),
         });
         let app = tauri::test::mock_app();
@@ -1705,6 +1715,7 @@ mod tests {
             bindings: BTreeMap::from([(root.clone(), id)]),
             compute: None,
             compute_problem: None,
+            compute_client: None,
             _lease: File::create(directory.path().join("lease")).expect("lease"),
         });
         assert_eq!(
