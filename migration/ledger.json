@@ -194,5 +194,8 @@
     "source_tag_peeled_commit": "1a9cf7c1e814b2831a8b358d00565d1b31605017",
     "status": "archived",
     "reason": "diagnostic historical input only; excluded from native-platform imports"
-  }
+  },
+  "capability_transitions": [
+    "migration/turbo-import-capabilities.json"
+  ]
 }

@@ -5,6 +5,7 @@
   import LoomEditor from './lib/LoomEditor.svelte';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
+  import ImportSources from './lib/ImportSources.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
@@ -1997,6 +1998,20 @@
     } finally {
       contextAttachmentBusy = false;
     }
+  }
+
+  async function useImportedSources(items: import('./lib/types').ContextAttachment[]): Promise<boolean> {
+    if (!project || !document || contextAttachmentBusy || items.length === 0) return false;
+    const captured = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id };
+    contextAttachmentBusy = true;
+    try {
+      if (!await persistCurrentContextText()) return false;
+      const previousText = contextText;
+      const snapshot = await addDocumentContexts(captured.projectId, captured.sessionId, captured.documentId, [...new Set(items.map((item) => item.id))]);
+      if (!adoptAuthoritativeContext(snapshot, captured.projectId, captured.sessionId, captured.documentId)) return false;
+      await normalizeImportedContext(previousText);
+      return true;
+    } finally { contextAttachmentBusy = false; }
   }
 
   async function removeContextAttachment(attachmentId: string): Promise<void> {
@@ -9299,6 +9314,11 @@
                 </span>
               </div>
             </div>
+            {#if desktop && project && document}
+              {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
+                <ImportSources projectId={project.project_id} sessionId={project.session_id} onUse={useImportedSources} />
+              {/key}
+            {/if}
             {#if contextTextSources.length > 0}
               <p class="context-source-note" title={contextTextSources.map((source) => source.file_name).join('\n')}>
                 {contextTextSources.length} imported text {contextTextSources.length === 1 ? 'source is' : 'sources are'} editable above

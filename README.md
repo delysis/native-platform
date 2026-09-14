@@ -56,3 +56,6 @@ Lifecycle, migration, and SQLite identity checks live with the product or
 service that owns the behavior. Product UI, real-model, and loaded-model
 shutdown evidence remain explicit acceptance gates and are not inferred from
 compilation.
+
+Source imports and explicit connected-account setup are documented in
+[the Turbo Danielle capability inventory](docs/imports/turbo-danielle.md).

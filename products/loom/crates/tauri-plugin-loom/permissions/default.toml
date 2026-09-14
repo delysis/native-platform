@@ -15,6 +15,8 @@ permissions = [
   "allow-attachment-ingest",
   "allow-attachment-import-choose",
   "allow-attachment-import-paths",
+  "allow-import-text-sources",
+  "allow-attachment-import-batch-choose",
   "allow-document-context-list",
   "allow-document-context-add",
   "allow-document-context-add-many",

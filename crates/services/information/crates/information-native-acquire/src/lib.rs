@@ -8,6 +8,8 @@
 //! canonical root. Artifact bytes are streamed into private staging files and
 //! become usable only after their declared length and SHA-256 both match.
 
+pub mod google_import;
+
 use information_native_types::{ArtifactId, PlannedArtifact};
 use reqwest::header::{
     ACCEPT_ENCODING, ACCEPT_RANGES, CONTENT_ENCODING, CONTENT_RANGE, ETAG, HeaderValue, IF_RANGE,
