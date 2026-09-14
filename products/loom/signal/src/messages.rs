@@ -170,6 +170,14 @@ pub async fn page(
         let Some(body) = data(&content.body) else {
             continue;
         };
+        // Group updates, reactions, and timer changes are protocol events,
+        // not empty messages to display or feed into an AI reply draft.
+        if body.body.as_deref().is_none_or(str::is_empty)
+            && body.attachments.is_empty()
+            && body.delete.is_none()
+        {
+            continue;
+        }
         let text = clipped(body.body.as_deref().unwrap_or_default(), MAX_MESSAGE_BYTES);
         bytes += text.len();
         if bytes > 1024 * 1024 {

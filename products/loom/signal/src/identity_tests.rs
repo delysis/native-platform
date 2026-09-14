@@ -364,6 +364,7 @@ async fn group_membership_scopes_reviews_and_changed_keys_block_a_new_send() {
             .collect(),
     };
     let group_key = [1; 32];
+    let old_snapshot = serde_json::to_string(&group).unwrap();
     fixture.store.save_group(group_key, group).await.unwrap();
     let conversation = messages::id(&Thread::Group(group_key));
     let people = members(&fixture.store, &conversation).await.unwrap();
@@ -398,6 +399,10 @@ async fn group_membership_scopes_reviews_and_changed_keys_block_a_new_send() {
         .retain(|member| ServiceId::from(member.aci).service_id_string() == BOB);
     group.revision += 1;
     fixture.store.save_group(group_key, group).await.unwrap();
+    // A slower, earlier server read must not restore a member after the
+    // receiver has already saved a newer membership revision.
+    let stale: Group = serde_json::from_str(&old_snapshot).unwrap();
+    fixture.store.save_group(group_key, stale).await.unwrap();
     assert!(
         recipient(
             &members(&fixture.store, &conversation).await.unwrap(),

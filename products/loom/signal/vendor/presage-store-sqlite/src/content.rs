@@ -425,22 +425,41 @@ impl ContentsStore for SqliteStore {
     ) -> Result<(), Self::ContentsStoreError> {
         let g = SqlGroup::from_group(&master_key, group.into());
         let master_key = g.master_key.as_ref();
-        query!(
-            "INSERT OR REPLACE INTO groups VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            master_key,
-            g.title,
-            g.revision,
-            g.invite_link_password,
-            g.access_control,
-            g.avatar,
-            g.description,
-            g.members,
-            g.pending_members,
-            g.requesting_members,
-            g.disappearing_messages_timer,
+        let mut transaction = self.db.begin().await.into_protocol_error()?;
+        sqlx::query("DELETE FROM group_avatars WHERE group_master_key = ? AND EXISTS(SELECT 1 FROM groups WHERE master_key = ? AND revision < ? AND avatar IS NOT ?)")
+            .bind(master_key).bind(master_key).bind(g.revision).bind(&g.avatar)
+            .execute(&mut *transaction).await?;
+        // Fetches and the receiver can finish out of order. Group revisions
+        // are immutable: an old snapshot must never restore removed members
+        // or superseded permissions. Retain the cached avatar only while its
+        // path is unchanged. Both cache operations commit together.
+        sqlx::query(
+            "INSERT INTO groups (master_key, title, revision, invite_link_password, access_control, avatar, description, members, pending_members, requesting_members, disappearing_messages_timer)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(master_key) DO UPDATE SET
+               title = excluded.title, revision = excluded.revision,
+               invite_link_password = excluded.invite_link_password,
+               access_control = excluded.access_control, avatar = excluded.avatar,
+               description = excluded.description, members = excluded.members,
+               pending_members = excluded.pending_members,
+               requesting_members = excluded.requesting_members,
+               disappearing_messages_timer = excluded.disappearing_messages_timer
+             WHERE excluded.revision > groups.revision",
         )
-        .execute(&self.db)
+        .bind(master_key)
+        .bind(g.title)
+        .bind(g.revision)
+        .bind(g.invite_link_password)
+        .bind(g.access_control)
+        .bind(g.avatar)
+        .bind(g.description)
+        .bind(g.members)
+        .bind(g.pending_members)
+        .bind(g.requesting_members)
+        .bind(g.disappearing_messages_timer)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await.into_protocol_error()?;
         Ok(())
     }
 

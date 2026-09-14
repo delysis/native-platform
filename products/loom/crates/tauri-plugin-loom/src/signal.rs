@@ -336,6 +336,8 @@ pub(crate) async fn signal_request<R: tauri::Runtime>(
             | Command::Link { .. }
             | Command::CancelLink
             | Command::VerifyIdentity { .. }
+            | Command::PublishGroupWorkspace { .. }
+            | Command::NotifyGroupWorkspace { .. }
     ) && !window.is_focused().unwrap_or(false)
     {
         return Err(super::IpcFailure::new(

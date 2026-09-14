@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_SIZE: usize = 100;
@@ -32,6 +32,25 @@ pub enum Command {
     VerifyIdentity {
         conversation_id: String,
         recipient_id: String,
+        review_id: String,
+    },
+    GroupWorkspace {
+        conversation_id: String,
+    },
+    PrepareGroupWorkspace {
+        conversation_id: String,
+        workspace_id: uuid::Uuid,
+    },
+    PublishGroupWorkspace {
+        conversation_id: String,
+        review_id: String,
+    },
+    CheckGroupWorkspace {
+        conversation_id: String,
+        review_id: String,
+    },
+    NotifyGroupWorkspace {
+        conversation_id: String,
         review_id: String,
     },
     Workspaces {
@@ -92,6 +111,10 @@ pub enum Event {
         conversation_id: String,
         members: Vec<IdentityMember>,
         review: Option<IdentityReview>,
+    },
+    GroupWorkspace {
+        conversation_id: String,
+        review: Option<GroupWorkspaceReview>,
     },
     Workspaces {
         conversation_id: String,
@@ -178,6 +201,35 @@ pub enum IdentityState {
     Verified,
     Changed,
     Pending,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupWorkspaceReview {
+    pub id: String,
+    pub workspace: Workspace,
+    pub before: String,
+    pub after: String,
+    pub revision: u32,
+    pub state: GroupWorkspaceState,
+    pub notification: GroupNotificationState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupWorkspaceState {
+    Prepared,
+    Unconfirmed,
+    Published,
+    Conflict,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupNotificationState {
+    None,
+    Unconfirmed,
+    Sent,
 }
 
 /// A local bookmark, never an invitation or a filesystem capability.

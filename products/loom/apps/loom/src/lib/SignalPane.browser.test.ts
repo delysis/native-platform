@@ -20,7 +20,7 @@ beforeEach(() => {
   drafts.clear(); links.clear(); description = ''; ipc.request.mockReset(); ipc.listen.mockResolvedValue(() => {});
   ipc.request.mockImplementation(async (command: SignalCommand): Promise<SignalEvent> => {
     switch (command.kind) {
-      case 'status': return { kind: 'status', status: { version: 3, phase: 'connected', account_id: 'me', device_name: 'Loom' } };
+      case 'status': return { kind: 'status', status: { version: 4, phase: 'connected', account_id: 'me', device_name: 'Loom' } };
       case 'conversations': return { kind: 'conversations', conversations: ['alice', 'bob'].map(id => ({ id, title: id, description, disappearing: false, is_group: false })) };
       case 'messages': return { kind: 'messages', conversation_id: command.conversation_id, messages: [] };
       case 'workspaces': return { kind: 'workspaces', conversation_id: command.conversation_id, links: links.get(command.conversation_id) ?? { version: 0, workspaces: [] } };

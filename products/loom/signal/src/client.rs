@@ -284,6 +284,13 @@ async fn handle(
                 ),
             }
         }
+        command @ (Command::GroupWorkspace { .. }
+        | Command::PrepareGroupWorkspace { .. }
+        | Command::PublishGroupWorkspace { .. }
+        | Command::CheckGroupWorkspace { .. }
+        | Command::NotifyGroupWorkspace { .. }) => {
+            group_workspace(vault, manager, phase, request_id, command).await
+        }
         Command::Workspaces { conversation_id } => {
             let result = async {
                 messages::resolve(&vault.store, &conversation_id).await?;
@@ -439,6 +446,84 @@ async fn handle(
             .await
         }
         _ => failure("invalid_request", "Unexpected Signal command.", false),
+    }
+}
+
+async fn group_workspace(
+    vault: &Vault,
+    manager: &mut Client,
+    phase: Phase,
+    request: &str,
+    command: Command,
+) -> Event {
+    let sharing = crate::group_workspace::Sharing {
+        store: &vault.store,
+        database: &vault.database,
+    };
+    if !matches!(command, Command::GroupWorkspace { .. }) && phase != Phase::Connected {
+        return failure(
+            "offline",
+            "Signal is reconnecting. Check the saved workspace review when connected.",
+            true,
+        );
+    }
+    let (conversation_id, result) = match command {
+        Command::GroupWorkspace { conversation_id } => {
+            let result = sharing.current(&conversation_id).await;
+            (conversation_id, result)
+        }
+        Command::PrepareGroupWorkspace {
+            conversation_id,
+            workspace_id,
+        } => {
+            let result = sharing
+                .prepare(manager, &conversation_id, request, workspace_id)
+                .await
+                .map(Some);
+            (conversation_id, result)
+        }
+        Command::PublishGroupWorkspace {
+            conversation_id,
+            review_id,
+        } => {
+            let result = sharing
+                .publish(manager, &conversation_id, &review_id)
+                .await
+                .map(Some);
+            (conversation_id, result)
+        }
+        Command::CheckGroupWorkspace {
+            conversation_id,
+            review_id,
+        } => {
+            let result = sharing
+                .check(manager, &conversation_id, &review_id)
+                .await
+                .map(Some);
+            (conversation_id, result)
+        }
+        Command::NotifyGroupWorkspace {
+            conversation_id,
+            review_id,
+        } => {
+            let result = sharing
+                .notify(manager, &conversation_id, &review_id)
+                .await
+                .map(Some);
+            (conversation_id, result)
+        }
+        _ => return failure("invalid_request", "Unexpected workspace command.", false),
+    };
+    match result {
+        Ok(review) => Event::GroupWorkspace {
+            conversation_id,
+            review,
+        },
+        Err(_) => failure(
+            "group_workspace_failed",
+            "The group workspace step could not finish. Reopen its saved review and check the description. Publishing requires a saved workspace, space in the description, and permission to edit this group.",
+            true,
+        ),
     }
 }
 

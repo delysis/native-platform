@@ -4,6 +4,8 @@
 
 mod client;
 mod drafts;
+mod group_workspace;
+mod group_workspace_crypto;
 mod identity;
 mod messages;
 mod retention;

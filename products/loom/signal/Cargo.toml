@@ -16,6 +16,7 @@ presage = { git = "https://github.com/whisperfish/presage", rev = "3a45e91552034
 presage-store-sqlite = { git = "https://github.com/whisperfish/presage", rev = "3a45e915520348cbd93fc13de47c482b8e855c99" }
 base64 = "0.22"
 prost = "0.14"
+rand = "0.9"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 anyhow = "1.0"
 fs2 = "0.4"

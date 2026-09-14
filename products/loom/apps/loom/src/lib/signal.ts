@@ -22,12 +22,19 @@ export interface SignalIdentityReview {
   recipient_id: string; review_id: string; safety_number: string; qr_code: string;
   state: 'unverified' | 'verified' | 'changed' | 'pending'; refreshed_at: number | null;
 }
+export interface SignalGroupWorkspaceReview {
+  id: string; workspace: SignalWorkspace; before: string; after: string; revision: number;
+  state: 'prepared' | 'unconfirmed' | 'published' | 'conflict'; notification: 'none' | 'unconfirmed' | 'sent';
+}
 export type SignalCommand =
   | { kind: 'status' | 'conversations' | 'cancel_link' }
   | { kind: 'link'; device_name: string }
   | { kind: 'identity'; conversation_id: string; recipient_id: string | null; refresh: boolean }
   | { kind: 'verify_identity'; conversation_id: string; recipient_id: string; review_id: string }
   | { kind: 'messages'; conversation_id: string; before: number | null; limit: number }
+  | { kind: 'group_workspace'; conversation_id: string }
+  | { kind: 'prepare_group_workspace'; conversation_id: string; workspace_id: string }
+  | { kind: 'publish_group_workspace' | 'check_group_workspace' | 'notify_group_workspace'; conversation_id: string; review_id: string }
   | { kind: 'workspaces'; conversation_id: string }
   | { kind: 'update_workspace'; conversation_id: string; expected_version: number; workspace_id: string; title: string | null }
   | { kind: 'draft'; conversation_id: string }
@@ -40,6 +47,7 @@ export type SignalEvent =
   | { kind: 'conversations'; conversations: SignalConversation[] }
   | { kind: 'identity'; conversation_id: string; members: SignalIdentityMember[]; review: SignalIdentityReview | null }
   | { kind: 'messages'; conversation_id: string; messages: SignalMessage[] }
+  | { kind: 'group_workspace'; conversation_id: string; review: SignalGroupWorkspaceReview | null }
   | { kind: 'workspaces'; conversation_id: string; links: SignalWorkspaceLinks }
   | { kind: 'draft'; conversation_id: string; draft: SignalDraft }
   | { kind: 'not_sent' }

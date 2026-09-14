@@ -585,6 +585,102 @@ impl<S: Store> Manager<S, Registered> {
         Ok(groups_manager)
     }
 
+    /// Read current group attributes through the existing authenticated client.
+    pub async fn retrieve_group_details(
+        &self,
+        master_key: &[u8; 32],
+    ) -> Result<libsignal_service::groups_v2::Group, Error<S::Error>> {
+        let mut groups = Box::pin(self.groups_manager()).await?;
+        let encrypted = groups
+            .fetch_encrypted_group(&mut rand::rng(), master_key)
+            .await?;
+        let group = decrypt_group(master_key, encrypted)?;
+        self.store.save_group(*master_key, group.clone()).await?;
+        Ok(group)
+    }
+
+    /// Publish only a prepared description at exactly the next group revision.
+    /// Repeating the same revision and ciphertext cannot apply it twice. This
+    /// method does not notify members. The caller must verify the returned
+    /// signature and exact action before confirming the edit or notifying anyone.
+    pub async fn publish_group_description(
+        &self,
+        master_key: &[u8; 32],
+        revision: u32,
+        encrypted_description: &[u8],
+    ) -> Result<libsignal_service::proto::GroupChange, Error<S::Error>> {
+        use libsignal_service::{
+            configuration::Endpoint,
+            prelude::ServiceError,
+            proto::{group_change, GroupChangeResponse},
+            push_service::HttpAuthOverride,
+        };
+        if revision == 0
+            || encrypted_description.is_empty()
+            || encrypted_description.len() > 4096
+        {
+            return Err(ServiceError::InvalidFrame {
+                reason: "invalid group description",
+            }
+            .into());
+        }
+        let params = GroupSecretParams::derive_from_master_key(
+            GroupMasterKey::new(*master_key),
+        );
+        let mut groups = Box::pin(self.groups_manager()).await?;
+        let authorization = groups
+            .get_authorization_for_today(&mut rand::rng(), params)
+            .await?;
+        let actions = group_change::Actions {
+            version: revision,
+            modify_description: Some(
+                group_change::actions::ModifyDescriptionAction {
+                    description: encrypted_description.to_vec(),
+                },
+            ),
+            ..Default::default()
+        };
+        // Signal Desktop WebAPI.preload.ts at 6aea489bd04f31f6070538ffdbcea9fcf492479d.
+        let mut response = self
+            .identified_push_service()
+            .request(
+                "PATCH".parse().expect("constant HTTP method"),
+                Endpoint::storage("/v2/groups"),
+                HttpAuthOverride::Identified(authorization),
+            )?
+            .header("Content-Type", "application/x-protobuf")
+            .body(actions.encode_to_vec())
+            .send()
+            .await
+            .map_err(ServiceError::from)?;
+        if !response.status().is_success() {
+            return Err(ServiceError::UnhandledResponseCode {
+                status: response.status(),
+                body: String::new(),
+            }
+            .into());
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) =
+            response.chunk().await.map_err(ServiceError::from)?
+        {
+            if bytes.len().saturating_add(chunk.len()) > 2 * 1024 * 1024 {
+                return Err(ServiceError::InvalidFrame {
+                    reason: "group response exceeds limit",
+                }
+                .into());
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let change = GroupChangeResponse::decode(bytes.as_slice())
+            .map_err(ServiceError::from)?
+            .group_change
+            .ok_or(ServiceError::InvalidFrame {
+                reason: "missing group change",
+            })?;
+        Ok(change)
+    }
+
     /// Starts receiving and storing messages.
     ///
     /// As a client, it is heavily recommended to process incoming messages and wait for the `Received::QueueEmpty` messages

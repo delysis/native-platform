@@ -55,7 +55,31 @@ admit a new member, create a networking profile, or choose a filesystem path.
 These links work in message bodies and group descriptions. The invitation still
 grants one admission and must be sent separately to each intended new member.
 Forget workspace removes only the local conversation bookmark, preserving the
-workspace, manuscripts, and membership. Loom does not yet write group descriptions.
+workspace, manuscripts, and membership.
+
+For a Signal group, **Workspace in group description** previews a saved workspace
+link appended to the current description. **Publish description** requires that
+exact native review, current edit permission, and the same group revision. A
+concurrent edit produces a conflict instead of replacing other people's words.
+The PATCH changes only the description; membership, avatar, permissions, and
+message timers retain their existing values. The small addition must fit Loom's
+conservative 480 UTF-16-unit description budget; Loom never truncates existing text.
+
+Publication and member notification have separate durable receipts. **Check
+description** reads the service without sending. After a lost PATCH reply, an
+explicit retry reuses the same revision and ciphertext; it cannot apply twice.
+**Notify group members** separately sends a bodyless group update so other Signal
+clients refresh their descriptions. Its receipt is reserved before sending, and
+an uncertain notification is never automatically repeated. Opening or reopening
+a review cannot publish or notify. Superseded reviews retain their receipts but
+cannot authorize new work. The encrypted journal stops at 2,000 reviews or 8 MiB
+instead of silently deleting uncertainty. Protocol metadata does not appear as
+an empty chat bubble or enter model drafting context.
+
+The worker verifies the server signature on the returned group change and binds
+it to the exact group, editor, revision, and encrypted description before recording
+publication. No group secrets cross IPC. Fresh group cache snapshots advance only
+to newer revisions; delayed reads cannot restore removed members or old permissions.
 
 One persistent draft owner serializes conversation switches and explicit sends.
 Hiding a pane cannot interrupt send settlement or transplant an invitation into
@@ -282,9 +306,9 @@ upstream notices, pinned dependency lockfile, and corresponding source when
 distributing it. The process boundary provides lifecycle and dependency isolation;
 it is not a declaration about the legal scope of the combined distribution.
 
-The worker vendors the pinned Presage and SQLite store crates with three small
-source-file patches: a public identity lookup, an owned-pool constructor, and
-unsafe-code prohibitions. Each crate carries its upstream revision, original
+The worker vendors the pinned Presage and SQLite store crates with four changed
+source files: public identity and group operations, an owned-pool constructor,
+monotonic group caching, and unsafe-code prohibitions. Each crate carries its upstream revision, original
 file hashes, license, and patch notes. Loom joins both SQLite pools before exit,
 including initialization failures; dropping the store alone left SQLCipher
 connection cleanup detached and reproduced a crash during process exit.
@@ -349,8 +373,10 @@ The feature is not complete until the following have concrete evidence:
 * Explicit, revocable idle-compute grants; host-owned whole model jobs; durable
   job identities; cancellation and resource limits; correctly attributed remote
   results. Remote assertions must never masquerade as local live-worker evidence.
-* Signal group-description workspace links, with existing permissions and
-  disappearing-message settings preserved.
+* Physical Signal group-description publication and member notification, with
+  existing permissions and disappearing-message settings preserved. Offline
+  faults, encrypted persistence, signed-response validation, and review UI are
+  covered locally; no account has been linked and no real group has been edited.
 
 Presage's current linking path does not import historical conversation backups.
 The pane currently displays text and attachment counts, not attachment contents.

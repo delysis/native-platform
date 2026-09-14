@@ -9,6 +9,11 @@ Changes:
 - Add `Manager::retrieve_identity_key(Aci)`, using Presage's authenticated
   connection and libsignal-service's profile endpoint. It returns only the
   decoded public key. It does not replace trusted keys or establish a session.
+- Add `Manager::retrieve_group_details` and `publish_group_description`, using
+  the existing authenticated group client. The description PATCH contains only
+  a revision and already encrypted description. It returns a bounded signed
+  response; Loom verifies its server signature, group, editor, revision, and
+  exact actions before recording publication. It does not notify members.
 - Forbid unsafe Rust in this vendored crate.
 
 This crate remains inside the isolated AGPL Signal worker. Its public extension
