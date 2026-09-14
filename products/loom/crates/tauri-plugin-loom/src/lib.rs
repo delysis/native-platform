@@ -4876,48 +4876,36 @@ async fn document_draft_upsert(
     })?;
     let content = DocumentContent::from_visible(kind, text.into_bytes())
         .map_err(|error| IpcFailure::new("invalid_document", error.to_string(), false))?;
-    let canonical_text = String::from_utf8(
-        content
-            .project_visible()
-            .map_err(|error| IpcFailure::new("invalid_document", error.to_string(), false))?
-            .bytes,
-    )
-    .map_err(|error| IpcFailure::new("invalid_document", error.to_string(), false))?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    ensure_registered_document(store, &relative_path, &document_id)?;
-    match store.upsert_transient_draft(
+    document_draft_upsert_for_store(
+        store,
         &relative_path,
+        &document_id,
         source_revision_id,
         expected_version,
         content,
-    ) {
-        Ok(outcome) => Ok(transient_draft_write_receipt(
-            &outcome.draft,
-            outcome.replayed,
-        )),
-        Err(loom_store::StoreError::TransientDraftVersionConflict { .. }) => {
-            let existing = store
-                .load_transient_draft(&relative_path)
-                .map_err(IpcFailure::store)?;
-            match existing {
-                Some(draft)
-                    if draft.document_id.to_string() == document_id
-                        && draft.source_revision_id == source_revision_id
-                        && draft.kind == kind
-                        && draft.text == canonical_text =>
-                {
-                    Ok(transient_draft_write_receipt(&draft, true))
-                }
-                _ => Err(IpcFailure::new(
-                    "transient_draft_version_conflict",
-                    "a newer transient draft exists; reload it before writing",
-                    false,
-                )),
-            }
-        }
-        Err(error) => Err(IpcFailure::store(error)),
-    }
+    )
+}
+
+fn document_draft_upsert_for_store(
+    store: &mut ProjectStore,
+    relative_path: &str,
+    document_id: &str,
+    source_revision_id: RevisionId,
+    expected_version: u64,
+    content: DocumentContent,
+) -> Result<TransientDraftWriteReceipt, IpcFailure> {
+    ensure_registered_document(store, relative_path, document_id)?;
+    // The store owns exact base/source/content replay inside its transaction.
+    // A matching later value is not evidence that this write committed.
+    let outcome = store
+        .upsert_transient_draft(relative_path, source_revision_id, expected_version, content)
+        .map_err(IpcFailure::store)?;
+    Ok(transient_draft_write_receipt(
+        &outcome.draft,
+        outcome.replayed,
+    ))
 }
 
 #[tauri::command]
@@ -14731,6 +14719,81 @@ mod tests {
         )
         .expect_err("hybrid reconciliation must fail closed");
         assert_eq!(error.code, "hybrid_reconciliation_unsupported");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn draft_ipc_does_not_treat_same_bytes_from_another_base_as_replay() {
+        let mut fixture = ReconciliationFixture::new("source\r\n");
+        let document_id = fixture.base.document_id.to_string();
+        let source = fixture.base.revision_id;
+        let mut version = 0;
+        for text in ["same\r\n", "intervening", "same\r\n"] {
+            let receipt = document_draft_upsert_for_store(
+                &mut fixture.store,
+                INITIAL_DOCUMENT,
+                &document_id,
+                source,
+                version,
+                DocumentContent::Prose(text.into()),
+            )
+            .unwrap();
+            version = receipt.version.parse().unwrap();
+        }
+        let stale = document_draft_upsert_for_store(
+            &mut fixture.store,
+            INITIAL_DOCUMENT,
+            &document_id,
+            source,
+            0,
+            DocumentContent::Prose("same\r\n".into()),
+        );
+        assert_eq!(
+            stale
+                .expect_err("matching bytes do not prove the same write")
+                .code,
+            "transient_draft_version_conflict"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .load_transient_draft(INITIAL_DOCUMENT)
+                .unwrap()
+                .unwrap()
+                .version,
+            version
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn draft_ipc_retains_store_exact_lost_ack_replay() {
+        let mut fixture = ReconciliationFixture::new("source");
+        let document_id = fixture.base.document_id.to_string();
+        let source = fixture.base.revision_id;
+        let content = DocumentContent::Prose("exact\r\n\t".into());
+        let committed = document_draft_upsert_for_store(
+            &mut fixture.store,
+            INITIAL_DOCUMENT,
+            &document_id,
+            source,
+            0,
+            content.clone(),
+        )
+        .unwrap();
+        let replay = document_draft_upsert_for_store(
+            &mut fixture.store,
+            INITIAL_DOCUMENT,
+            &document_id,
+            source,
+            0,
+            content,
+        )
+        .unwrap();
+        assert!(!committed.replayed);
+        assert!(replay.replayed);
+        assert_eq!(replay.version, committed.version);
+        assert_eq!(replay.blob_id, committed.blob_id);
     }
 
     #[test]
