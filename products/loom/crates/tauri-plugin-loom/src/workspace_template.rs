@@ -1,5 +1,5 @@
 //! Optional workspace layout, authored as an ordinary Markdown document.
-//! Parsing describes panes; it never resolves documents or invokes a model.
+//! Parsing describes panes and model identity; it never resolves files or invokes a model.
 
 use super::*;
 
@@ -13,8 +13,15 @@ Uncomment a setting to change it. Other settings keep their defaults.
 `@document` means the document currently being edited. Name another document
 with `@Name` or `@"A name with spaces"`; a trailing `/` names a directory.
 Pane documents are ordinary Markdown, too. Opening a pane never runs a prompt.
+Model selection names an installed catalog model or build-policy profile;
+choose only one. Leaving it commented keeps the usual local default.
 
 ```loom-workspace
+# [model]
+# catalog = "google.gemma-4-12b-it-qat-q4_0"
+# Or replace catalog with a build-policy profile:
+# profile = "gemma_4_e2b_base_q8_loom_v1"
+
 # [panes.writing]
 # kind = "editor"
 # position = "main"
@@ -88,14 +95,42 @@ impl PaneConfig {
     }
 }
 
+/// A name selects existing native authority; it cannot grant authority to a
+/// path, URL, arbitrary model digest, or download operation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum WorkspaceModel {
+    Catalog(String),
+    Profile(String),
+}
+
+impl WorkspaceModel {
+    fn validate(&self) -> Result<(), String> {
+        let (Self::Catalog(id) | Self::Profile(id)) = self;
+        if id.is_empty()
+            || id.len() > 128
+            || !id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+        {
+            return Err(
+                "Model names use up to 128 letters, digits, dots, hyphens, or underscores.".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct WorkspaceConfig {
+    model: Option<WorkspaceModel>,
     panes: BTreeMap<String, PaneConfig>,
 }
 
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
+            model: None,
             panes: [
                 ("writing", PaneKind::Editor),
                 ("chat", PaneKind::Chat),
@@ -112,6 +147,7 @@ impl Default for WorkspaceConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct WorkspaceOverrides {
+    model: Option<WorkspaceModel>,
     panes: BTreeMap<String, PaneOverrides>,
 }
 
@@ -163,6 +199,10 @@ fn parse_config(markdown: &str) -> Result<WorkspaceConfig, String> {
     let overrides: WorkspaceOverrides = toml::from_str(config_fence(markdown)?)
         .map_err(|error| format!("Workspace settings: {error}"))?;
     let mut config = WorkspaceConfig::default();
+    if let Some(model) = overrides.model {
+        model.validate()?;
+        config.model = Some(model);
+    }
     for (name, pane) in overrides.panes {
         if !valid_pane_id(&name) {
             return Err("Pane names use up to 64 letters, digits, hyphens, or underscores.".into());
@@ -369,6 +409,37 @@ mod tests {
         assert!(config.panes["chat"].visible);
         assert_eq!(config.panes["reader"].title.as_deref(), Some("読み手"));
         assert_eq!(config.panes["reader"].position, PanePosition::Right);
+    }
+
+    #[test]
+    fn model_selection_names_exactly_one_bounded_native_authority() {
+        for (field, expected) in [
+            (
+                "catalog",
+                WorkspaceModel::Catalog("google.gemma-4-12b-it-qat-q4_0".into()),
+            ),
+            (
+                "profile",
+                WorkspaceModel::Profile("google.gemma-4-12b-it-qat-q4_0".into()),
+            ),
+        ] {
+            let config = parse_config(&format!(
+                "```loom-workspace\n[model]\n{field}='google.gemma-4-12b-it-qat-q4_0'\n```"
+            ))
+            .expect("bounded native identity");
+            assert_eq!(config.model, Some(expected));
+            assert_eq!(config.panes, WorkspaceConfig::default().panes);
+        }
+        for model in [
+            "catalog='one'\nprofile='two'".to_owned(),
+            "path='/tmp/model.gguf'".to_owned(),
+            "catalog='../model'".to_owned(),
+            "catalog=''".to_owned(),
+            "catalog='https://example.invalid/model'".to_owned(),
+            format!("catalog='{}'", "x".repeat(129)),
+        ] {
+            assert!(parse_config(&format!("```loom-workspace\n[model]\n{model}\n```")).is_err());
+        }
     }
 
     #[test]
