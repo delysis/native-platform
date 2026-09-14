@@ -1,0 +1,78 @@
+{
+  "environment_id": "d99988c3cfedbe800f12ad6d47ca31d7e18c8aa56bb196acdf4eca5097286da3",
+  "model_identifier": "sha256:aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670",
+  "model_fingerprint": "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670",
+  "tokenizer_fingerprint": "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670",
+  "backend_identifier": "llama-native-build-v3-60b3660c0f77542915c60fb3e3374a0a114e05f80326c49c757b04707dcc8387",
+  "capabilities": {
+    "chat": "unsupported",
+    "completion_text": "supported",
+    "completion_token_ids": "supported",
+    "evidence": {
+      "distribution_observations": {
+        "declaration": "inspected",
+        "max_top_k": 256,
+        "selected_token": true,
+        "stages": {
+          "post_constraint": true,
+          "post_guidance": true,
+          "post_sampler": true,
+          "raw_model": true
+        },
+        "value_kinds": {
+          "log_probabilities": true,
+          "logits": true,
+          "probabilities": true
+        }
+      },
+      "embeddings": {
+        "declaration": "unreported",
+        "dimensions": null,
+        "max_batch_inputs": null,
+        "max_input_tokens": null,
+        "normalization": {
+          "l2": false,
+          "none": false
+        },
+        "pooling": {
+          "cls": false,
+          "last": false,
+          "mean": false,
+          "none": false,
+          "rank": false
+        }
+      },
+      "extended_sampling": {
+        "declaration": "inspected",
+        "max_sparse_logit_bias_entries": 4096,
+        "samplers": {
+          "eta_cutoff": true,
+          "mirostat_v1": true,
+          "mirostat_v2": true,
+          "sparse_logit_bias": true,
+          "top_n_sigma": true
+        }
+      },
+      "structured_constraints": {
+        "declaration": "inspected",
+        "gbnf": true,
+        "json_schema": true,
+        "max_artifact_bytes": 4194304
+      }
+    },
+    "fill_in_middle_contract_id": null,
+    "generated_token_ids": "supported",
+    "log_probability_stages": [],
+    "max_cases": 4,
+    "media": [],
+    "ordered_outputs": "supported",
+    "per_case_cancellation": "supported",
+    "per_case_restore": "supported",
+    "per_case_sampling": "supported",
+    "probability_stages": [],
+    "sequence_restore": "supported",
+    "sequence_snapshot": "supported",
+    "token_exact_shared_prefix": "supported",
+    "token_observations": "unsupported"
+  }
+}
