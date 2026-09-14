@@ -6872,6 +6872,7 @@ mod tests {
         assert_eq!(store.list_documents().unwrap().len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_document_rejects_missing_evidence_without_creating_writing() {
         let (_directory, mut store) = new_store();
