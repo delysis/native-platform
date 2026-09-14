@@ -1723,6 +1723,17 @@ name = "desktop-model-defaults"
 version = "0.0.0"
 
 [[package]]
+name = "desktop-speech"
+version = "0.0.0"
+dependencies = [
+ "speech-native-backend-parakeet",
+ "speech-native-host",
+ "speech-native-platform",
+ "speech-native-types",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4376,6 +4387,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "desktop-speech",
  "information-native-attachment-bridge",
  "information-native-backend-sqlite",
  "information-native-host",
@@ -7179,6 +7191,7 @@ dependencies = [
  "desktop-context",
  "desktop-generation-policy",
  "desktop-model-defaults",
+ "desktop-speech",
  "hound",
  "http",
  "image",

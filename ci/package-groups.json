@@ -5,6 +5,7 @@
       "desktop-context",
       "desktop-generation-policy",
       "desktop-model-defaults",
+      "desktop-speech",
       "operation-lifecycle",
       "workspace-document"
     ],
@@ -128,6 +129,7 @@
       "mom-llama-app"
     ],
     "platform-macos": [
+      "desktop-speech",
       "free-token-energy",
       "llama-native-engine",
       "llama-native-host",
