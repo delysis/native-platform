@@ -214,6 +214,10 @@ export function importAttachmentPaths(
   return call('attachment_import_paths', { projectId, sessionId, paths: [...paths] });
 }
 
+export function revealAttachmentOriginal(projectId: string, sessionId: string, attachmentId: string): Promise<void> {
+  return call('attachment_reveal_original', { projectId, sessionId, attachmentId });
+}
+
 export function chooseAttachments(
   projectId: string,
   sessionId: string
@@ -740,6 +744,7 @@ export interface WeaveStartArgs {
   cursorByte: number;
   policy:
     | { kind: 'automatic_v2' }
+    | { kind: 'loompad_v1'; sample_target: 4 | 16 | 64 | 256; batch_offset: number }
     | {
         kind: 'manual_v2';
         branch_count: number;
@@ -894,7 +899,14 @@ export function normalizeFailure(error: unknown): LoomFailure {
       : typeof value.error === 'string'
         ? value.error
         : 'Loom could not complete that command.';
+    const recovery = value.speculation_recovery as Record<string, unknown> | undefined;
+    const validRecovery = recovery && typeof recovery.snapshot_id === 'string' && /^[a-f0-9]{64}$/.test(recovery.snapshot_id) &&
+      Number.isInteger(recovery.next_offset) && Number(recovery.next_offset) >= 0 && Number(recovery.next_offset) <= 256 &&
+      Array.isArray(recovery.command_ids) && recovery.command_ids.length * 4 === recovery.next_offset &&
+      recovery.command_ids.every(id => typeof id === 'string' && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(id)) &&
+      new Set(recovery.command_ids).size === recovery.command_ids.length;
     return {
+      ...(validRecovery ? { speculation_recovery: recovery as NonNullable<LoomFailure['speculation_recovery']> } : {}),
       code: typeof value.code === 'string' ? value.code : 'command_failed',
       message,
       retryable: value.retryable === true

@@ -21,6 +21,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-attachment-ingest`
 - `allow-attachment-import-choose`
 - `allow-attachment-import-paths`
+- `allow-attachment-reveal-original`
 - `allow-document-context-list`
 - `allow-document-context-add`
 - `allow-document-context-add-many`
@@ -272,6 +273,32 @@ Enables the attachment_ingest command without any pre-configured scope.
 <td>
 
 Denies the attachment_ingest command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-attachment-reveal-original`
+
+</td>
+<td>
+
+Enables the attachment_reveal_original command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-attachment-reveal-original`
+
+</td>
+<td>
+
+Denies the attachment_reveal_original command without any pre-configured scope.
 
 </td>
 </tr>

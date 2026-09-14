@@ -7,7 +7,7 @@ const TEMPLATE_PATH: &str = ".loom.md";
 const MAX_TEMPLATE_BYTES: usize = 65_536;
 const MAX_PANES: usize = 8;
 
-const DEFAULT_TEMPLATE: &str = r#"# Workspace
+const DEFAULT_TEMPLATE: &str = r##"# Workspace
 
 Uncomment a setting to change it. Other settings keep their defaults.
 `@document` means the document currently being edited. Name another document
@@ -21,6 +21,12 @@ choose only one. Leaving it commented keeps the usual local default.
 # catalog = "google.gemma-4-12b-it-qat-q4_0"
 # Or replace catalog with a build-policy profile:
 # profile = "gemma_4_e2b_base_q8_loom_v1"
+
+# [theme]
+# mode = "system"
+# canvas = "#faf9f6"
+# text = "#242424"
+# accent = "#625bd6"
 
 # [panes.writing]
 # kind = "editor"
@@ -45,7 +51,7 @@ choose only one. Leaving it commented keeps the usual local default.
 # visible = true
 # document = "@.browser"
 ```
-"#;
+"##;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,9 +127,45 @@ impl WorkspaceModel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum WorkspaceThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct WorkspaceTheme {
+    mode: WorkspaceThemeMode,
+    canvas: Option<String>,
+    text: Option<String>,
+    accent: Option<String>,
+}
+
+impl WorkspaceTheme {
+    fn validate(&self) -> Result<(), String> {
+        for color in [&self.canvas, &self.text, &self.accent]
+            .into_iter()
+            .flatten()
+        {
+            if color.len() != 7
+                || !color.starts_with('#')
+                || !color.as_bytes()[1..].iter().all(u8::is_ascii_hexdigit)
+            {
+                return Err("Theme colors use exactly #RRGGBB hexadecimal values.".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct WorkspaceConfig {
     model: Option<WorkspaceModel>,
+    theme: WorkspaceTheme,
     panes: BTreeMap<String, PaneConfig>,
 }
 
@@ -131,6 +173,7 @@ impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             model: None,
+            theme: WorkspaceTheme::default(),
             panes: [
                 ("writing", PaneKind::Editor),
                 ("chat", PaneKind::Chat),
@@ -148,6 +191,7 @@ impl Default for WorkspaceConfig {
 #[serde(default, deny_unknown_fields)]
 struct WorkspaceOverrides {
     model: Option<WorkspaceModel>,
+    theme: WorkspaceTheme,
     panes: BTreeMap<String, PaneOverrides>,
 }
 
@@ -203,6 +247,8 @@ fn parse_config(markdown: &str) -> Result<WorkspaceConfig, String> {
         model.validate()?;
         config.model = Some(model);
     }
+    overrides.theme.validate()?;
+    config.theme = overrides.theme;
     for (name, pane) in overrides.panes {
         if !valid_pane_id(&name) {
             return Err("Pane names use up to 64 letters, digits, hyphens, or underscores.".into());
@@ -397,6 +443,35 @@ pub(super) async fn workspace_template_enable(
 mod tests {
     use super::*;
     use std::fmt::Write as _;
+
+    #[test]
+    fn workspace_theme_defaults_and_strict_colors() {
+        assert_eq!(
+            parse_config(DEFAULT_TEMPLATE).unwrap().theme,
+            WorkspaceTheme::default()
+        );
+        let config = parse_config("```loom-workspace\n[theme]\nmode='dark'\ncanvas='#123abc'\ntext='#ABCDEF'\naccent='#000000'\n```").unwrap();
+        assert_eq!(config.theme.mode, WorkspaceThemeMode::Dark);
+        assert_eq!(config.theme.canvas.as_deref(), Some("#123abc"));
+        for invalid in [
+            "red",
+            "#123",
+            "#12345678",
+            "#gg0000",
+            "url(x)",
+            "#ffffff;",
+            "#éaaaa",
+        ] {
+            assert!(
+                parse_config(&format!(
+                    "```loom-workspace\n[theme]\ncanvas='{invalid}'\n```"
+                ))
+                .is_err()
+            );
+        }
+        assert!(parse_config("```loom-workspace\n[theme]\nmode='auto'\n```").is_err());
+        assert!(parse_config("```loom-workspace\n[theme]\nstylesheet='https://x'\n```").is_err());
+    }
 
     #[test]
     fn comments_inherit_defaults_and_named_overrides_are_independent() {

@@ -693,6 +693,16 @@
     return true;
   }
 
+  export function acceptLoompadText(candidateId: string, presentationKey: string, text: string): boolean {
+    if (!view || readonly || composing || !view.hasFocus()) return false;
+    const plan = currentGhostTextPlan(view.state);
+    if (!plan || plan.candidateId !== candidateId || plan.presentationKey !== presentationKey ||
+        !text || !plan.text.startsWith(text) || selectionBoundary(view.state) !== plan.anchorByteOffset) return false;
+    if (!authorizeCompletionInsertion(candidateId, presentationKey, text, 'loompad')) return false;
+    view.dispatch(view.state.tr.insertText(text));
+    return true;
+  }
+
   function authorizeCompletionInsertion(
     candidateId: string,
     presentationKey: string,

@@ -188,6 +188,37 @@ describe('inline suggestion family', () => {
       .toEqual(['run-5', 'run-6', 'run-7', 'run-8']);
   });
 
+  it('admits only explicitly listed complete exact-scope families and preserves candidate provenance', () => {
+    const selection = state('hello');
+    const family = (id: string, start: number) => Array.from({ length: 4 }, (_, index) => ({
+      ...selection.branches[0], weave_command_id: id, run_id: `run-${start + index}`,
+      branch_id: `branch-${start + index}`, text: `choice ${start + index}`
+    }));
+    const one = family(FAMILY_ONE, 1);
+    const two = family(FAMILY_TWO, 5);
+    const wrongScope = family('wrong-scope', 9);
+    wrongScope[3].source_revision_id = 'earlier-revision';
+    const repeated = family('repeated', 13);
+    repeated[3].run_id = repeated[0].run_id;
+    const incomplete = family('incomplete', 17).slice(0, 3);
+    const unadmitted = family('not-authorized', 21);
+    selection.branches = [...one, ...two, ...wrongScope, ...repeated, ...incomplete, ...unadmitted].reverse();
+    selection.requireExplicitFamily = true;
+    selection.authoritativeFamilyIds = [FAMILY_ONE, FAMILY_TWO, FAMILY_ONE, 'wrong-scope', 'repeated', 'incomplete'];
+    selection.dismissedCandidateIds = ['run:run-5'];
+    const candidates = inlineSuggestionFamily(5, 'visual', selection);
+    expect(candidates.map(candidate => candidate.runId)).toEqual(['run-4','run-3','run-2','run-1','run-8','run-7','run-6']);
+    expect(candidates.find(candidate => candidate.runId === 'run-1')).toMatchObject({
+      text: ' world continues', presentationKey: 'stream:run-1:7:prose-prefix:16', insertsOnAccept: true
+    });
+    selection.authoritativeFamilyId = FAMILY_ONE;
+    selection.requireExplicitFamily = false;
+    selection.authoritativeFamilyIds = [];
+    expect(inlineSuggestionFamily(5, 'visual', selection)).toEqual([]);
+    delete selection.authoritativeFamilyIds;
+    expect(inlineSuggestionFamily(5, 'visual', selection)).toHaveLength(4);
+  });
+
   it('requires a fresh explicit family after completion context changes', () => {
     const selection = state('hello');
     selection.requireExplicitFamily = true;

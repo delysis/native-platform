@@ -17,7 +17,7 @@ cpal = "=0.16.0"
 crossbeam-channel.workspace = true
 hound.workspace = true
 http.workspace = true
-image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+image = { version = "0.25.9", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 loom-document = { path = "../loom-document" }
 loom-backend-llama = { path = "../loom-backend-llama" }
 loom-host = { path = "../loom-host", features = ["tauri-native-focus"] }

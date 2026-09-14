@@ -152,7 +152,8 @@ export function updateCompletionCandidate(
  */
 export function synchronizeCompletionCandidates(
   session: CompletionSession,
-  candidates: readonly CompletionCandidate[]
+  candidates: readonly CompletionCandidate[],
+  forkAtCurrentCaret = false
 ): CompletionSession | null {
   // An empty authoritative family means an unconsumed presentation was
   // dismissed or became ineligible. Only an already-authorized insertion may
@@ -167,7 +168,7 @@ export function synchronizeCompletionCandidates(
     const oldPresentationKeys = new Set(
       session.candidates.map((candidate) => candidate.presentationKey)
     );
-    const freshExhaustedFamily = remaining === '' &&
+    const freshExhaustedFamily = (remaining === '' || forkAtCurrentCaret) &&
       candidates.length > 0 &&
       candidates.every((candidate) =>
         candidate.targetByte === nextTarget &&

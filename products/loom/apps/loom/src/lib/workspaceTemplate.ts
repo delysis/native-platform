@@ -5,7 +5,7 @@ export interface WorkspaceTemplateSnapshot {
   enabled: boolean;
   document_id: string | null;
   revision_id: string | null;
-  config: { model?: WorkspaceModelSelection | null; panes: Record<string, WorkspacePaneConfig> };
+  config: { model?: WorkspaceModelSelection | null; theme?: { mode: 'system' | 'light' | 'dark'; canvas?: string | null; text?: string | null; accent?: string | null }; panes: Record<string, WorkspacePaneConfig> };
   error: string | null;
 }
 

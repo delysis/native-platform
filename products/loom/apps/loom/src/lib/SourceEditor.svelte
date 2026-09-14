@@ -858,6 +858,15 @@
     return accepted;
   }
 
+  export function acceptLoompadText(candidateId: string, presentationKey: string, text: string): boolean {
+    const candidate = currentPlan();
+    if (!focused || composing || !candidate || candidate.candidateId !== candidateId ||
+        candidate.presentationKey !== presentationKey || !text || !candidate.text.startsWith(text)) return false;
+    const accepted = insertVisibleGhostText(candidate, text, 'loompad');
+    if (accepted) suppressCurrentGhost();
+    return accepted;
+  }
+
   onMount(() => {
     if (!element) return;
     selectionStart = element.selectionStart;

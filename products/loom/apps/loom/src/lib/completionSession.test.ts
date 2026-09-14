@@ -26,6 +26,20 @@ const candidates: CompletionCandidate[] = [
 ];
 
 describe('cached completion session', () => {
+  it('forks a Loompad continuation only at its exact accepted boundary with fresh identities', () => {
+    const started = startCompletionSession('doc:visual', candidates, 'run-a')!;
+    const consumed = consumeCompletionWord(started)!.session;
+    const fresh = [{ ...candidates[0], candidateId: 'fresh', runId: 'new-run', presentationKey: 'new:1', targetByte: 10, text: 'three' }];
+    expect(synchronizeCompletionCandidates(consumed, fresh)).toBe(consumed);
+    expect(synchronizeCompletionCandidates(consumed, [{ ...fresh[0], targetByte: 9 }], true)).toBe(consumed);
+    expect(synchronizeCompletionCandidates(consumed, [{ ...fresh[0], runId: 'run-a' }], true)).toBe(consumed);
+    const forked = synchronizeCompletionCandidates(consumed, fresh, true)!;
+    expect(forked.acceptedChunks).toEqual([]);
+    expect(forked.selectedRunId).toBe('new-run');
+    expect(completionPresentation(forked)?.targetByte).toBe(10);
+    expect(acceptedCompletionText(consumed)).toBe(' one ');
+  });
+
   it('uses document lifetime identity rather than autosave revision identity', () => {
     expect(completionSessionContextKey('session', 'document', 7, 'visual'))
       .toBe('session:document:7:visual');

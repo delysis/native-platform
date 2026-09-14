@@ -20,6 +20,7 @@ permissions = [
   "allow-attachment-ingest",
   "allow-attachment-import-choose",
   "allow-attachment-import-paths",
+  "allow-attachment-reveal-original",
   "allow-document-context-list",
   "allow-document-context-add",
   "allow-document-context-add-many",

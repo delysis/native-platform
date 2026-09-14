@@ -185,7 +185,8 @@ export function setDismissedCompletionCandidates(
 export function reconcileCompletionController(
   state: CompletionControllerState,
   contextKey: string,
-  family: readonly InlineGhostSuggestion[]
+  family: readonly InlineGhostSuggestion[],
+  forkAtCurrentCaret = false
 ): CompletionControllerState {
   let session = state.session;
   let pendingText = state.pendingText;
@@ -197,7 +198,7 @@ export function reconcileCompletionController(
     if (!session && family.length > 0) {
       session = startCompletionSession(contextKey, family, family[0].runId);
     } else if (session) {
-      session = synchronizeCompletionCandidates(session, family);
+      session = synchronizeCompletionCandidates(session, family, forkAtCurrentCaret && pendingText === null);
       if (!session) pendingText = null;
     }
   }
