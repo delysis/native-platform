@@ -61,21 +61,22 @@ impl GoogleImportConfig {
         if let Some(id) = &self.client_id {
             validate_client_id(id)?;
         }
-        if let Some(path) = &self.client_file {
-            if path.is_empty()
+        if let Some(path) = &self.client_file
+            && (path.is_empty()
                 || path.len() > 1024
                 || path.contains('\\')
                 || path.contains(':')
                 || path.chars().any(char::is_control)
-                || !path.ends_with(".json")
+                || !Path::new(path)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
                 || Path::new(path)
                     .components()
-                    .any(|part| !matches!(part, Component::Normal(_)))
-            {
-                return Err(invalid(
-                    "client_file must name a project-relative JSON file without parent traversal",
-                ));
-            }
+                    .any(|part| !matches!(part, Component::Normal(_))))
+        {
+            return Err(invalid(
+                "client_file must name a project-relative JSON file without parent traversal",
+            ));
         }
         Ok(())
     }

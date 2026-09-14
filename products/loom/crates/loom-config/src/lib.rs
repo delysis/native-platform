@@ -623,7 +623,16 @@ mod tests {
                 read_project_file_before_open(root.path(), Path::new("client.json"), 64, || {
                     fs::remove_file(&source).unwrap();
                     if replace_with_fifo {
-                        rustix::fs::mkfifo(&source, rustix::fs::Mode::RUSR).unwrap();
+                        // rustix exposes no FIFO creation wrapper on macOS.
+                        // This fixture-only POSIX command keeps production and
+                        // first-party Rust free of an unsafe libc shim.
+                        assert!(
+                            std::process::Command::new("mkfifo")
+                                .arg(&source)
+                                .status()
+                                .unwrap()
+                                .success()
+                        );
                     } else {
                         std::os::unix::fs::symlink("other.json", &source).unwrap();
                     }
