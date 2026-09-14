@@ -5,7 +5,7 @@ use super::{
 use crate::context_attachments::{import_provided, record_import_origin};
 use attachment_native_host::ProvidedAttachment;
 use information_native_acquire::google_import::{
-    self, GoogleCredentials, GoogleService, GoogleSession, ImportQuery,
+    self, GoogleCredentials, GoogleService, GoogleSession, ImportQuery, RemoteFile,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
@@ -223,6 +223,20 @@ struct ImportOrigin<'a> {
     human_reviewed: bool,
 }
 
+async fn download_page_file(
+    remote: &GoogleSession,
+    file: &RemoteFile,
+    deadline: tokio::time::Instant,
+    remaining_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    match tokio::time::timeout_at(deadline, remote.download(file)).await {
+        Ok(Ok(bytes)) if bytes.len() <= remaining_bytes => Ok(bytes),
+        Ok(Ok(_)) => Err("This page exceeded the 64 MB import budget.".into()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(_) => Err("This page reached its three-minute time limit.".into()),
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn import_account_sync(
     project_id: String,
@@ -265,28 +279,19 @@ pub(crate) async fn import_account_sync(
     let mut total_bytes = 0usize;
     for file in page.files {
         validate_session(&state, &project_id, &session_id)?;
-        let bytes = match tokio::time::timeout_at(deadline, remote.download(&file)).await {
-            Ok(Ok(bytes)) if bytes.len() <= (64 * 1024 * 1024usize).saturating_sub(total_bytes) => {
-                bytes
-            }
-            Ok(Ok(_)) => {
+        let bytes = match download_page_file(
+            &remote,
+            &file,
+            deadline,
+            (64 * 1024 * 1024usize).saturating_sub(total_bytes),
+        )
+        .await
+        {
+            Ok(bytes) => bytes,
+            Err(message) => {
                 report.failures.push(SyncFailure {
                     name: file.name,
-                    message: "This page exceeded the 64 MB import budget.".into(),
-                });
-                continue;
-            }
-            Ok(Err(error)) => {
-                report.failures.push(SyncFailure {
-                    name: file.name,
-                    message: error.to_string(),
-                });
-                continue;
-            }
-            Err(_) => {
-                report.failures.push(SyncFailure {
-                    name: file.name,
-                    message: "This page reached its three-minute time limit.".into(),
+                    message,
                 });
                 continue;
             }
