@@ -11,6 +11,7 @@ import test from "node:test";
 const root = path.resolve(import.meta.dirname, "../..");
 const prPath = path.join(root, ".github/workflows/ci-pr.yml");
 const fullPath = path.join(root, ".github/workflows/ci-full.yml");
+const fullRootPath = path.join(root, ".github/workflows/ci-full-root.yml");
 const releasePath = path.join(root, ".github/workflows/release-macos.yml");
 const releaseScriptPath = path.join(root, "scripts/release-macos.sh");
 const smokeScriptPath = path.join(root, "scripts/smoke-macos-app.sh");
@@ -555,12 +556,12 @@ test("PR workflow is always triggered and has one truthful aggregate", () => {
 test("required job names and workflow matrices match the checked-in R3 snapshot", () => {
   const snapshot = JSON.parse(read(workflowSnapshotPath));
   const pr = read(prPath);
-  const full = read(fullPath);
+  const full = read(fullPath) + "\n" + read(fullRootPath);
   assert.equal(snapshot.schema, "native-platform.ci-workflow-snapshot.v1");
   assert.match(pr, new RegExp(`^name: ${snapshot.pr.workflow_name}$`, "m"));
   assert.match(full, new RegExp(`^name: ${snapshot.full.workflow_name}$`, "m"));
   assert.deepEqual(workflowJobIds(pr), snapshot.pr.job_ids);
-  assert.deepEqual(workflowJobIds(full), snapshot.full.job_ids);
+  assert.deepEqual(workflowJobIds(read(fullPath)), snapshot.full.job_ids);
   assert.match(
     pr,
     new RegExp(
@@ -601,12 +602,13 @@ test("required job names and workflow matrices match the checked-in R3 snapshot"
 });
 
 test("full CI reconciles each current-platform ignored-test subset through guarded listing", () => {
-  const source = read(fullPath);
+  const source = read(fullPath) + "\n" + read(fullRootPath);
   assert.match(
     source,
     /name: Reconcile ignored-test evidence registry with guarded list arguments/,
   );
-  assert.match(source, /os: \[ubuntu-latest, macos-latest, windows-latest\]/);
+  assert.match(source, /os: \[ubuntu-latest, windows-latest\]/);
+  assert.match(source, /runner: macos-latest/);
   const reconciliation = source.match(
     /- name: Reconcile ignored-test evidence registry[\s\S]*?--cargo-list/,
   )?.[0];
@@ -616,7 +618,7 @@ test("full CI reconciles each current-platform ignored-test subset through guard
   assert.doesNotMatch(source, /without executing test bodies/);
 });
 
-test("relevant PRs require exact guarded-list ignored-test reconciliation", () => {
+test("relevant PRs retain asynchronous guarded-list ignored-test reconciliation", () => {
   const source = read(prPath);
   assert.match(
     source,
@@ -638,7 +640,7 @@ test("relevant PRs require exact guarded-list ignored-test reconciliation", () =
   assert.doesNotMatch(block, /without executing test bodies/);
   assert.doesNotMatch(block, /cargo test[^\n]*--ignored(?! --list)/);
   const required = source.match(/^  ci-required:[\s\S]*$/m)?.[0];
-  assert.match(required, /^\s{6}- ignored-tests$/m);
+  assert.doesNotMatch(required, /^\s{6}- ignored-tests$/m);
 });
 
 test("PR workflow exposes every targeted partition and future product guards", () => {
@@ -673,7 +675,7 @@ test("PR workflow exposes every targeted partition and future product guards", (
   assert.doesNotMatch(source, /platform_windows/);
 });
 
-test("Information changes run their portable tests on Windows before merge", () => {
+test("Information changes run their portable tests on Windows without blocking merge", () => {
   const source = read(prPath);
   const windows = source.match(
     /^  information-windows:[\s\S]*?(?=^  speech-linux:)/m,
@@ -690,10 +692,10 @@ test("Information changes run their portable tests on Windows before merge", () 
     /node scripts\/ci\/cargo-group\.mjs test service-information/,
   );
   const required = source.match(/^  ci-required:[\s\S]*$/m)?.[0];
-  assert.match(required, /^\s{6}- information-windows$/m);
+  assert.doesNotMatch(required, /^\s{6}- information-windows$/m);
 });
 
-test("Mom changes run their product tests on Windows before merge", () => {
+test("Mom changes run their product tests on Windows without blocking merge", () => {
   const source = read(prPath);
   const windows = source.match(/^  mom-windows:[\s\S]*?(?=^  loom-linux:)/m)?.[0];
   assert.ok(windows, "mom-windows job block is missing");
@@ -705,10 +707,10 @@ test("Mom changes run their product tests on Windows before merge", () => {
   assert.match(windows, /git config --global core\.longpaths true/);
   assert.match(windows, /node scripts\/ci\/cargo-group\.mjs test product-mom/);
   const required = source.match(/^  ci-required:[\s\S]*$/m)?.[0];
-  assert.match(required, /^\s{6}- mom-windows$/m);
+  assert.doesNotMatch(required, /^\s{6}- mom-windows$/m);
 });
 
-test("Loom changes run their product tests on Windows before merge", () => {
+test("Loom changes run their product tests on Windows without blocking merge", () => {
   const source = read(prPath);
   const windows = source.match(/^  loom-windows:[\s\S]*?(?=^  frontend:)/m)?.[0];
   assert.ok(windows, "loom-windows job block is missing");
@@ -720,7 +722,7 @@ test("Loom changes run their product tests on Windows before merge", () => {
   assert.match(windows, /git config --global core\.longpaths true/);
   assert.match(windows, /node scripts\/ci\/cargo-group\.mjs test product-loom/);
   const required = source.match(/^  ci-required:[\s\S]*$/m)?.[0];
-  assert.match(required, /^\s{6}- loom-windows$/m);
+  assert.doesNotMatch(required, /^\s{6}- loom-windows$/m);
 });
 
 test("root workspace tests can inspect the retained migration evidence", () => {
@@ -792,9 +794,9 @@ test("Mom exposes the frontend syntax check used by PR CI", () => {
 
 test("PR and full CI enforce current service documentation paths", () => {
   const pr = read(prPath);
-  const full = read(fullPath);
+  const full = read(fullPath) + "\n" + read(fullRootPath);
   const prPolicy = pr.match(/^  policy:[\s\S]*?(?=^  root-linux:)/m)?.[0];
-  const fullRoot = full.match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0];
+  const fullRoot = read(fullRootPath);
   for (const block of [prPolicy, fullRoot]) {
     assert.ok(block, "documentation policy job block is missing");
     assert.match(block, /node --test scripts\/ci\/test-current-docs\.mjs/);
@@ -804,8 +806,8 @@ test("PR and full CI enforce current service documentation paths", () => {
 });
 
 test("full CI executes browser coverage and has no empty Information platform lane", () => {
-  const full = read(fullPath);
-  const loom = full.match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0];
+  const full = read(fullPath) + "\n" + read(fullRootPath);
+  const loom = read(fullRootPath);
   assert.ok(loom, "full Loom job is missing");
   assert.match(loom, /playwright install webkit/);
   assert.match(loom, /pnpm --filter @delysis\/loom run test:browser/);
@@ -841,7 +843,7 @@ test("the required macOS matrix preserves every gate without serializing them", 
   assert.match(macos, /name: Release tooling shell syntax\n\s+if: \$\{\{ matrix\.component == 'release' \}\}\n\s+run: sh -n scripts\/release-macos\.sh scripts\/smoke-macos-app\.sh/);
   assert.match(macos, /dtolnay\/rust-toolchain@[0-9a-f]{40}\n\s+with:/);
   assert.match(macos, /name: Compile macOS smoke support\n\s+if: \$\{\{ matrix\.component == 'release' \}\}\n\s+run: cargo run --locked -p xtask -- macos-smoke-support/);
-  assert.match(read(fullPath), /name: Compile macOS smoke support\n\s+if: runner.os == 'macOS'\n\s+run: cargo run --locked -p xtask -- macos-smoke-support/);
+  assert.match(read(fullRootPath), /name: Compile macOS smoke support\n\s+if: runner.os == 'macOS'\n\s+run: cargo run --locked -p xtask -- macos-smoke-support/);
   assert.match(macos, /Swatinem\/rust-cache@[0-9a-f]{40}\n\s+with:/);
   assert.match(macos, /shared-key: platform-macos-\$\{\{ matrix\.component \}\}/);
   assert.doesNotMatch(macos, /save-if:/);
@@ -857,7 +859,7 @@ test("the required macOS matrix preserves every gate without serializing them", 
 
 test("Speech Linux coverage provisions its GLib build dependencies", () => {
   const prSpeech = read(prPath).match(/^  speech-linux:[\s\S]*?(?=^  mom-linux:)/m)?.[0];
-  const fullSpeech = read(fullPath).match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0];
+  const fullSpeech = read(fullRootPath);
   for (const block of [prSpeech, fullSpeech]) {
     assert.ok(block, "Speech job block is missing");
     assert.match(block, /libglib2\.0-dev/);
@@ -868,12 +870,12 @@ test("Speech Linux coverage provisions its GLib build dependencies", () => {
 
 test("Mom and Loom Linux coverage provisions desktop build dependencies", () => {
   const pr = read(prPath);
-  const full = read(fullPath);
+  const full = read(fullPath) + "\n" + read(fullRootPath);
   const blocks = [
     pr.match(/^  mom-linux:[\s\S]*?(?=^  mom-windows:)/m)?.[0],
     pr.match(/^  loom-linux:[\s\S]*?(?=^  loom-windows:)/m)?.[0],
-    full.match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0],
-    full.match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0],
+    read(fullRootPath),
+    read(fullRootPath),
   ];
   for (const block of blocks) {
     assert.ok(block, "product job block is missing");
@@ -893,7 +895,7 @@ test("fuzz workflows select the owned nested fuzz workspace explicitly", () => {
 });
 
 test("full workflow covers main, nightly, dispatch, products, policy, and fuzz", () => {
-  const source = read(fullPath);
+  const source = read(fullPath) + "\n" + read(fullRootPath);
   assert.match(source, /^\s+push:\n\s+branches: \[main\]/m);
   assert.match(source, /^\s+schedule:/m);
   assert.match(source, /^\s+workflow_dispatch:/m);
@@ -908,7 +910,7 @@ test("full workflow covers main, nightly, dispatch, products, policy, and fuzz",
 
 test("Windows PR coverage is limited to selected portability and inventory gates", () => {
   const pr = read(prPath);
-  const full = read(fullPath);
+  const full = read(fullPath) + "\n" + read(fullRootPath);
   const ignored = pr.match(/^  ignored-tests:[\s\S]*?(?=^  fuzz-build:)/m)?.[0];
   const information = pr.match(
     /^  information-windows:[\s\S]*?(?=^  speech-linux:)/m,
@@ -932,9 +934,20 @@ test("Windows PR coverage is limited to selected portability and inventory gates
 });
 
 test("all third-party actions are pinned to immutable commits", () => {
-  for (const file of [prPath, fullPath, releasePath]) {
+  for (const file of [prPath, fullPath, fullRootPath, releasePath]) {
     for (const action of externalActionUses(read(file))) {
       assert.match(action, /^[^/@]+\/[^/@]+@[0-9a-f]{40}$/, `${file}: ${action}`);
     }
   }
+});
+
+test("development gates do not depend on advisory platform completion", () => {
+  const pr = read(prPath).match(/^  ci-required:[\s\S]*$/m)[0];
+  assert.deepEqual([...pr.matchAll(/^      - ([a-z-]+)$/gm)].map((m) => m[1]), ["plan", "policy", "frontend", "platform-macos"]);
+  const full = read(fullPath);
+  const gate = full.match(/^  macos-required:[\s\S]*?(?=^  full-summary:)/m)[0];
+  assert.match(gate, /needs: (?:\[)?root-macos/);
+  assert.doesNotMatch(gate, /needs:[\s\S]*?\n      - root$/m);
+  assert.match(full, /root-macos:[\s\S]*?uses: \.\/.github\/workflows\/ci-full-root.yml[\s\S]*?runner: macos-latest/);
+  assert.match(full, /os: \[ubuntu-latest, windows-latest\]/);
 });

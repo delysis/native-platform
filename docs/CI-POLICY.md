@@ -46,9 +46,15 @@ target, a ten-second input timeout, and a 2 GiB memory limit. Crashing inputs ar
 uploaded on failure. It uses the independent, locked fuzz workspace. A bounded
 fuzz run is not proof that arbitrary inputs are safe.
 
-Every job listed by `full-summary` must succeed. Failure, cancellation, or an
-unexpected skipped job fails the aggregate. Product absence is not an excuse
-to skip a declared workspace member.
+`ci-required` gates pull requests on the planner, fast policy/frontend checks,
+and selected macOS jobs. Linux, Windows, fuzzing, and cross-platform inventory
+remain scheduled and report failures, but do not delay this development gate.
+
+`macos-required` reports main's macOS acceptance independently of other platforms.
+`full-summary` remains a complete report: any failed, cancelled, or unexpectedly
+skipped job makes it fail. It is advisory for macOS development. Repair failures
+in scoped follow-up changes; never make a failing test silently pass or remove
+coverage to obtain a green report.
 
 ## Dependencies and platform qualification
 
