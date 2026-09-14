@@ -411,9 +411,11 @@ fn explicit_prompt_context_does_not_interpret_literal_history() {
 #[test]
 fn chat_turn_boundary_binds_sampling_and_command_replay() {
     let command = CommandId::new();
-    let ordinary = terminal_sampling(command, 1, None).expect("valid sampling");
-    let chat =
-        terminal_sampling(command, 1, Some(TerminalTurnBoundary::Chat)).expect("valid sampling");
+    let root = tempfile::tempdir().unwrap();
+    let profile = generation_profiles::freeze(root.path(), GenerationTask::Chat).unwrap();
+    let ordinary = terminal_sampling(&profile, command, 1, None).expect("valid sampling");
+    let chat = terminal_sampling(&profile, command, 1, Some(TerminalTurnBoundary::Chat))
+        .expect("valid sampling");
     assert!(ordinary.stop.is_empty());
     assert_eq!(chat.stop, ["\nUser:", "\nAssistant:"]);
     assert_eq!(chat.seed, ordinary.seed);

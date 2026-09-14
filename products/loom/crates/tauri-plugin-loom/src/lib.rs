@@ -7,6 +7,7 @@ mod context_attachments;
 mod document_bindings;
 mod document_watcher;
 mod external_import;
+mod generation_profiles;
 mod microphone_capture;
 mod model_catalog;
 mod model_config;
@@ -7874,13 +7875,36 @@ fn replay_weave_if_recorded(
                             return false;
                         };
                         let (run_id, branch_id) = derive_weave_case_ids(command_id, case_index);
-                        let Ok(sampling) = sampling_for_weave_case(
-                            command_id,
-                            case_index,
+                        let Ok(profile) = generation_profiles::recorded_profile(
+                            store,
+                            started.generation.context_recipe_artifact_id,
                             resolved.max_tokens,
                             resolved.temperature,
-                            resolved.preset,
                         ) else {
+                            return false;
+                        };
+                        let sampling = if let Some(profile) = profile {
+                            if profile.task != generation_profiles::task(resolved.preset) {
+                                return false;
+                            }
+                            generation_profiles::sampling(
+                                &profile,
+                                command_id,
+                                case_index,
+                                resolved.max_tokens,
+                                resolved.temperature,
+                                resolved.preset,
+                            )
+                        } else {
+                            sampling_for_weave_case(
+                                command_id,
+                                case_index,
+                                resolved.max_tokens,
+                                resolved.temperature,
+                                resolved.preset,
+                            )
+                        };
+                        let Ok(sampling) = sampling else {
                             return false;
                         };
                         serde_json::from_value::<SamplingConfig>(
@@ -7892,12 +7916,7 @@ fn replay_weave_if_recorded(
                                 && started.generation.document_id == document_id
                                 && started.generation.source_revision_id == source_revision_id
                                 && started.generation.target_range == expected_range
-                                && started.generation.seed
-                                    == u64::from(generation_seed(
-                                        command_id,
-                                        case_index,
-                                        resolved.preset,
-                                    ))
+                                && started.generation.seed == u64::from(sampling.seed)
                                 && recorded_sampling.fingerprint() == sampling.fingerprint()
                         })
                     })
@@ -8221,6 +8240,25 @@ fn weave_start_inner<R: Runtime>(
                 false,
             ));
         }
+        // Resolve and bound exact authored policy before consuming automatic
+        // budget or persisting any generation artifacts.
+        let generation_profile =
+            generation_profiles::freeze(store.root(), generation_profiles::task(preset))?;
+        let initial_sampling = generation_profiles::sampling(
+            &generation_profile,
+            command_id,
+            0,
+            max_tokens,
+            temperature,
+            preset,
+        )?;
+        let persona_context = generation_profiles::preamble(&generation_profile);
+        let retrieval_context_tokens = generation_profiles::reserve_context(
+            resident_context_tokens(loaded_model),
+            &persona_context,
+            branch_count,
+            initial_sampling.max_tokens,
+        )?;
         let automatic_budget_reservation = match authorized_model.automatic_writer() {
         Some(writer) => Some(
             state
@@ -8256,11 +8294,16 @@ fn weave_start_inner<R: Runtime>(
             store.root(),
             &document_id.to_string(),
             source_prefix,
-            resident_context_tokens(loaded_model),
+            retrieval_context_tokens,
             branch_count,
-            max_tokens,
+            initial_sampling.max_tokens,
         )
         .map_err(|error| IpcFailure::context_attachment(&error))?;
+        if !persona_context.is_empty() {
+            attachment_context
+                .context_preamble
+                .insert_str(0, &persona_context);
+        }
         let document_context = document_bindings::context_for_markdown(store, &loaded.text)?;
         if !document_context.is_empty() {
             attachment_context.context_preamble.push_str("\n\n");
@@ -8309,10 +8352,17 @@ fn weave_start_inner<R: Runtime>(
             .record_prompt_recipe(&prompt_recipe)
             .map_err(IpcFailure::store)?;
         let retrieval_evidence_blob_id = {
-            let identity =
-                serde_json::to_vec(&attachment_context.retrieval_evidence).map_err(|error| {
-                    IpcFailure::new("attachment_context_encode_failed", error.to_string(), false)
-                })?;
+            let identity = serde_json::to_vec(&generation_profiles::ProfiledContextEvidence {
+                retrieval: attachment_context.retrieval_evidence.clone(),
+                generation_profile: Some(generation_profile.clone()),
+                request_sampling: Some(generation_profiles::RequestSampling {
+                    max_tokens,
+                    temperature,
+                }),
+            })
+            .map_err(|error| {
+                IpcFailure::new("attachment_context_encode_failed", error.to_string(), false)
+            })?;
             Some(
                 store
                     .store_provenance_blob(&identity)
@@ -8344,8 +8394,14 @@ fn weave_start_inner<R: Runtime>(
         let mut cases = Vec::with_capacity(branch_count as usize);
         for index in 0..branch_count {
             let (run_id, branch_id) = derive_weave_case_ids(command_id, index);
-            let sampling =
-                sampling_for_weave_case(command_id, index, max_tokens, temperature, preset)?;
+            let sampling = generation_profiles::sampling(
+                &generation_profile,
+                command_id,
+                index,
+                max_tokens,
+                temperature,
+                preset,
+            )?;
             let generation = GenerationStart {
                 run_id,
                 branch_id,

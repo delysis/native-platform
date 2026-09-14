@@ -1,0 +1,16 @@
+# Reusable personas and co-writers in Loom / Mine
+
+Mama Llama is a read-only import source and deprecated product. New behavior belongs in Loom. The comparison is source based: Mama `personas.rs` freeze/update/version/instantiate and removal paths, Loom `co_writer.rs` and `context_attachments.rs`, and the common `workspace-document::DocumentSnapshot` codec.
+
+| Concern | Mama's useful behavior | Loom's useful behavior | Destination decision |
+| --- | --- | --- | --- |
+| Reuse | Freeze an active branch prefix, system-only history, or empty history; instantiate an independent conversation with source IDs | Copy named completion context to any document without changing the manuscript | A named co-writer owns a frozen context document; applying copies its exact content/provenance and generation profile into the target context |
+| Identity | Explicit persona version plus conversation/profile hashes, verified before instantiate | Case-normalized names replace an existing library entry and preserve creation time | Keep a stable library name and separately identified frozen document revision; applied copies survive later library changes |
+| Source fidelity | Remap message occurrence IDs while keeping source conversation/message lineage and attachment references | Freeze text import receipts and native image/audio attachment IDs | Preserve typed source references and exact UTF-8 context bytes in the common document snapshot; never infer model modality from prose |
+| Generation | Structured native sampling and execution settings, validated before updates | Stable writing task defaults and an explicit completion context | `.mine.toml` provides strict named sampling profiles; frozen profile evidence is separate from document revision identity |
+| Permissions | Removal tombstones and transactional cache/tool ownership checks matter for Mama's runtime | Context selection itself grants no tools | Do not port Mama tool grants or runtime lifecycle machinery into a context preset; permission acquisition remains an explicit separate product action |
+| Storage | Atomic encrypted multi-document mutation | Atomic local JSON commit and directory sync | Keep Loom's project-owned storage and use its existing single context mutation for an applied preset; do not introduce a second binding file |
+
+Mama's version record contains hashes of the current profile and branch, not the complete historical body. Loom's previous library simply overwrote the same name. A frozen document payload with its own revision identity gives the destination a concrete source to retain and inspect instead of claiming a digest can recover old prose. Encrypted Mama import must remain explicit; Loom's ordinary UTF-8 project is a different storage choice.
+
+The first implemented part is the `.mine.toml` profile parser and production Weave/terminal sampling/context resolution. It rejects invalid explicit requests, retains exact authored persona bytes, records separate source and profile hashes, and recovers a recorded run from frozen evidence after settings change. The subsequent co-writer cutover uses the durable document codec and one atomic context/profile mutation; its commit receipt, not this design table, establishes completion.

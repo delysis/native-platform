@@ -100,6 +100,8 @@ pub enum ConfigError {
     Workspace(String),
     #[error("model settings: {0}")]
     Model(String),
+    #[error("the frozen generation profile is invalid")]
+    Frozen,
     #[error("profile names use 1 to 64 letters, digits, hyphens, or underscores")]
     ProfileName,
     #[error("Mine settings support at most 64 named profiles")]
@@ -149,6 +151,7 @@ impl FrozenGenerationProfile {
     /// Explicit profile values override request defaults; the caller separately
     /// checks task and resident-model admission. Never silently clamp a request.
     pub fn resolve(&self, request: SamplingOverrides) -> Result<SamplingConfig, ConfigError> {
+        self.validate()?;
         Ok(resolve_sampling(
             self.task,
             &[request, self.sampling.clone()],
@@ -159,6 +162,46 @@ impl FrozenGenerationProfile {
         self.context
             .as_ref()
             .map_or("", |context| context.text.as_str())
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.schema_version != 1
+            || self
+                .config_sha256
+                .as_ref()
+                .is_some_and(|value| !is_digest(value))
+            || self
+                .profile_name
+                .as_ref()
+                .is_some_and(|name| !valid_profile_name(name))
+            || self.profile_name.is_some() != self.profile_sha256.is_some()
+        {
+            return Err(ConfigError::Frozen);
+        }
+        if let Some(context) = &self.context {
+            validate_context_path(&context.relative_path)?;
+            if context.text.len() > MAX_CONTEXT_BYTES
+                || digest(context.text.as_bytes()) != context.sha256
+            {
+                return Err(ConfigError::Frozen);
+            }
+        }
+        if let Some(expected) = &self.profile_sha256 {
+            let definition = NamedProfile {
+                context_file: self
+                    .context
+                    .as_ref()
+                    .map(|context| context.relative_path.clone()),
+                sampling: self.sampling.clone(),
+            };
+            if digest(&serde_json::to_vec(&definition)?) != *expected {
+                return Err(ConfigError::Frozen);
+            }
+        } else if self.context.is_some() {
+            return Err(ConfigError::Frozen);
+        }
+        resolve_sampling(self.task, std::slice::from_ref(&self.sampling))?;
+        Ok(())
     }
 }
 
@@ -330,6 +373,13 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn is_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +474,25 @@ mod tests {
                 Err(ConfigError::FileKind)
             ));
         }
+    }
+
+    #[test]
+    fn serialized_profile_rejects_changed_definition_or_frozen_source_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join(".mine/personas")).unwrap();
+        fs::write(root.path().join(".mine/personas/voice.md"), "Exact.").unwrap();
+        let config = MineConfig::parse(
+            "[generation]\nchat='voice'\n[profiles.voice]\ncontext_file='.mine/personas/voice.md'",
+        )
+        .unwrap();
+        let frozen = config.freeze(root.path(), GenerationTask::Chat).unwrap();
+        let mut replay: FrozenGenerationProfile =
+            serde_json::from_slice(&serde_json::to_vec(&frozen).unwrap()).unwrap();
+        replay.validate().unwrap();
+        replay.context.as_mut().unwrap().text.push('x');
+        assert!(matches!(replay.validate(), Err(ConfigError::Frozen)));
+        let mut replay = frozen;
+        replay.sampling.temperature = Some(0.25);
+        assert!(matches!(replay.validate(), Err(ConfigError::Frozen)));
     }
 }
