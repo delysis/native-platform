@@ -2,6 +2,14 @@
 
 This is the readiness record for [PR #47](https://github.com/delysis/native-platform/pull/47), separate from the [historical first-pass receipt](integration-receipt.md). It records preservation of current-main behavior and the limits of this additive integration. It does not certify that Mine already replaces every Mama capability or is better on every possible correctness, performance, storage, or interaction measure.
 
+**September 14 follow-up:** the sections below retain the earlier `6f15371`
+acceptance record. New macOS private-storage encryption and the remaining
+custom-download/Google-client settings forms are now implemented. The current
+scope, verification and source-preservation boundaries are recorded in
+[encryption and power configuration](encryption-and-power-config.md). The live PR
+is the authority for its current head, draft status and CI; the older readiness
+statements below do not certify the later encryption revision.
+
 ## Source and scope
 
 The reviewed main baseline is `8ce8948f3bcfc24df87ed0346801dedc7402feb0`. It is an ancestor of application source `6f153711b09d8f8c3b86a4578a762be1f24c77a3`. The branch therefore includes main's integrated-audit fixes and its macOS development gate. This is an ancestry observation at the stated revisions, not a guarantee that main has not advanced since inspection. A fresh fetch after native acceptance still reports zero commits behind that main. This receipt is a documentation-only follow-up; the live PR records the final documentation head and CI result.

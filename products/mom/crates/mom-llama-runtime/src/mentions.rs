@@ -5420,10 +5420,19 @@ mod tests {
         let model_config_sha256 = super::sha256_json(&model_config).expect("model config hash");
         let arguments = json!({"query": "exact"});
         let arguments_sha256 = sha256_json_value(&arguments).expect("arguments hash");
+        // The linked test runner can exceed the production executable cap.
+        // Supported hosts still bind these approvals through the real native
+        // validator; other hosts retain their opaque state-only identity.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let command = PathBuf::from("/usr/bin/true")
+            .canonicalize()
+            .expect("bounded native executable fixture");
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let command = std::env::current_exe().expect("test executable path");
         let frozen_server_config = McpServerConfig {
             executable_sha256: None,
             name: "local".to_string(),
-            command: std::env::current_exe().expect("test executable path"),
+            command,
             args: Vec::new(),
             enabled: true,
         };

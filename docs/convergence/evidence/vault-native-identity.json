@@ -1,0 +1,28 @@
+{
+  "source_sha": "5e320795d7348942fd90dcc1a93ff68cbbeaec54",
+  "bundle_path": "/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/mine-vault-acceptance-d9mfoxkq/Mine Vault Review.app",
+  "bundle_identifier": "app.delysis.loom.mine-vault-review",
+  "code_identifier": "app.delysis.mine.development",
+  "executable": "/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/mine-vault-acceptance-d9mfoxkq/Mine Vault Review.app/Contents/MacOS/loom-app",
+  "executable_sha256": "5933e077b305ae7a59ddb4aebfcfd88068389a2172f8224e0c7970f84a480ec8",
+  "executable_inode": 109640526,
+  "acceptance_product_root": "/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/mine-vault-acceptance-d9mfoxkq/product",
+  "review_config_sha256": "39b282f7c749caeed0bc418dd684f726cc04ae385df1757d860967f3a7899e5e",
+  "frontend_assets": {
+    "products/loom/apps/loom/dist/appearance-bootstrap.js": "698b4cd4f3ca242c7a0c6df1c4b7e40b9ed2991b1881a9ae35e49249e4234050",
+    "products/loom/apps/loom/dist/assets/index-BV8GqfNW.js": "2cc2ac392e0a1471b9d719e86de15e076b4e9a30f0c07563f2cca960dd079cbd",
+    "products/loom/apps/loom/dist/assets/index-DhzkMga3.css": "7dd05dd18892030cf6aba29f255a731ed790ef7aac8e5bd0c29c9ce2753fa182",
+    "products/loom/apps/loom/dist/index.html": "a040016b1cdf4b0c9756539f0b4e0fbbda1502665f092fae3f2764ad4a5f89c7"
+  },
+  "packaging": "Tauri debug --no-bundle build; prior bundle shell copied into a separate temporary path, executable replaced, review plist identity updated, development certificate signed and strict verified; original running bundle untouched",
+  "native_interaction": "pending; Mac locked",
+  "pid": 38590,
+  "native_initialization_files": [
+    ".loom/loom.sqlite3-wal",
+    ".loom/loom.sqlite3-shm",
+    ".loom/vault.json",
+    ".loom/project.json",
+    ".loom/loom.sqlite3",
+    ".loom/session.lock"
+  ]
+}

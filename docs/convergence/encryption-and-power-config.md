@@ -91,6 +91,16 @@ original plaintext project is preserved and must not be described as encrypted
 or securely erased by this command. Normal manuscript recovery keeps its exact
 inode/no-clobber behavior; those readable captures are an explicit boundary.
 
+`source_preserved` means persistent project data, database pages and committed
+WAL bytes remain preserved. SQLite may create an absent empty WAL and create or
+update its shared-memory coordination file (`-shm`, including read marks). It is
+not a promise of an identical directory inventory or unchanged coordination
+bytes. A real-engine comparison confirmed that read-only opening has these same
+side effects; immutable mode avoided them but missed a committed WAL row. The
+copy deliberately retains SQLite locking and visibility instead of deleting
+coordination files or ignoring committed data.
+[SQLite WAL coordination](https://sqlite.org/wal.html).
+
 Attachment links now offer explicit Save Original: verified decrypted bytes go
 only to a user-selected new file, after session revalidation. There is no
 automatic decrypted temporary file or reveal of ciphertext as if it were an
@@ -119,3 +129,41 @@ an external effect remain distinct. Mine's `=@Function(...)` currently performs
 bounded inference over document text. It does not implement Mama's persona
 model/template selection, consult groups, tool permission lifecycle or Information
 grants. Those live protocols remain unported; no inert settings pretend otherwise.
+
+## Verification of this revision
+
+Application source `5e320795d7348942fd90dcc1a93ff68cbbeaec54` includes main
+`8ce8948f3bcfc24df87ed0346801dedc7402feb0`. The local gate reports 1,833 Rust
+tests passed, 44 existing prerequisite-dependent tests ignored, 20 doctests,
+467 frontend tests, 121 WebKit component tests and 124 CI policy tests passed.
+Strict workspace Clippy (all targets and features), Svelte diagnostics, repository
+policy and Information authority boundaries passed. The
+[compact receipt](evidence/vault-checks.json) identifies exact source/run
+boundaries, local Rust 1.95 versus CI Rust 1.92, and the repaired initial failures.
+
+The first full Linux CI run found 12 Mama tests using the entire linked test
+runner as their sample native tool; its larger binary exceeded the existing
+128 MiB production limit. Those fixtures now use the system's bounded native
+`true` executable for real identity/staging checks. Windows keeps its opaque
+state-only fixture. Production limits and validation are unchanged. All 181 Mama
+library tests and strict Clippy passed locally after the repair; they overlap
+the workspace totals above. Fresh remote verification is recorded on the PR.
+
+A real signed CLI protected a synthetic existing project, reopened its encrypted
+copy in three fresh processes (0.052–0.054 seconds each), and exported byte-exact
+original text. Five pre-existing source files retained their hashes; SQLite
+created its documented coordination files. Private payload scans found none of
+the synthetic prose. The [CLI receipt](evidence/vault-cli-acceptance.json) and
+[WAL-mode experiment](evidence/vault-sqlite-coordination.txt) keep these results
+separate from fixture and GUI evidence. No injected credential or environment
+key was used.
+
+The isolated **Mine Vault Review** bundle was built, signed with the stable
+development identity and verified strictly. It launched and created an encrypted
+default project while the earlier user review window remained untouched. Its
+[identity receipt](evidence/vault-native-identity.json) records source, executable
+hash/inode, assets, bundle identity and PID. Native interaction is still pending:
+the computer-use tool reported the Mac locked and an unlock was requested. No
+current accessibility control, editor interaction, Save Original dialog or new
+inference interaction is claimed for this bundle. Fresh CI is tracked on PR #47;
+the PR remains draft until its remaining verification is resolved.
