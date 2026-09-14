@@ -7,10 +7,21 @@ import {
   canUseVisualMarkdown,
   normalizeVisualMarkdownSource,
   parseVisualMarkdown,
-  serializeVisualMarkdown
+  serializeVisualMarkdown,
+  visualMarkdownSchema
 } from './markdownSafety';
 
 describe('visual Markdown safety gate', () => {
+  it('describes the attachment save action without changing authored labels or titles', () => {
+    const source = `[Exact label](loom-attachment:${'ab'.repeat(32)} "Authored title")`;
+    const parsed = parseVisualMarkdown(source);
+    const mark = parsed.firstChild!.firstChild!.marks[0];
+    expect(visualMarkdownSchema.marks.link.spec.toDOM!(mark, true)).toEqual([
+      'a', { href: `loom-attachment:${'ab'.repeat(32)}`, title: 'Authored title', 'aria-description': 'Save original…' }, 0
+    ]);
+    expect(serializeVisualMarkdown(parsed)).toBe(source);
+  });
+
   it('admits the canonical subset used by the visual editor', () => {
     expect(canRoundTripMarkdownExactly('A quiet paragraph.')).toBe(true);
     expect(canRoundTripMarkdownExactly('# Heading\n\nA paragraph.')).toBe(true);

@@ -3,6 +3,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use crate::{Result, StoreError};
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+// Shared snapshots add immutable artifact metadata; the SQL schema is unchanged.
 pub const CURRENT_STORE_SCHEMA_VERSION: u32 = 15;
 const APPLICATION_ID: u32 = 0x4c4f_4f4d;
 const SCHEMA: &str = include_str!("../schema.sql");
@@ -20,30 +21,47 @@ pub(crate) fn initialize_schema(connection: &mut Connection, initializing: bool)
         transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
         transaction.pragma_update(None, "user_version", CURRENT_STORE_SCHEMA_VERSION)?;
     } else {
-        if version != CURRENT_STORE_SCHEMA_VERSION {
-            return Err(StoreError::UnsupportedSchema {
-                found: version,
-                supported: CURRENT_STORE_SCHEMA_VERSION,
-            });
-        }
-        if application != APPLICATION_ID {
-            return Err(StoreError::CorruptDatabase(
-                "database is not a current Loom store".into(),
-            ));
-        }
-        let expected = Connection::open_in_memory()?;
-        expected.execute_batch(SCHEMA)?;
-        if objects != schema_objects(&expected)? {
-            return Err(StoreError::CorruptDatabase(
-                "Loom schema does not match this build".into(),
-            ));
-        }
+        validate_schema_snapshot(application, version, &objects)?;
     }
     transaction.commit()?;
     connection.pragma_update(None, "foreign_keys", "ON")?;
     connection.pragma_update(None, "trusted_schema", "OFF")?;
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
+    Ok(())
+}
+
+/// Validate the exact current schema without a write transaction, WAL mode
+/// change, migrations, or repairs. Used before a source-preserving copy.
+pub(crate) fn validate_current_schema(connection: &Connection) -> Result<()> {
+    let application = connection.pragma_query_value(None, "application_id", |row| row.get(0))?;
+    let version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    validate_schema_snapshot(application, version, &schema_objects(connection)?)
+}
+
+fn validate_schema_snapshot(
+    application: u32,
+    version: u32,
+    objects: &[(String, String)],
+) -> Result<()> {
+    if version != CURRENT_STORE_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema {
+            found: version,
+            supported: CURRENT_STORE_SCHEMA_VERSION,
+        });
+    }
+    if application != APPLICATION_ID {
+        return Err(StoreError::CorruptDatabase(
+            "database is not a current Loom store".into(),
+        ));
+    }
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(SCHEMA)?;
+    if objects != schema_objects(&expected)? {
+        return Err(StoreError::CorruptDatabase(
+            "Loom schema does not match this build".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -62,9 +80,9 @@ mod tests {
     fn incompatible_databases_are_rejected_without_mutation_or_wal_creation() {
         for setup in [
             "CREATE TABLE unrelated(value TEXT); INSERT INTO unrelated VALUES ('preserve');",
-            "PRAGMA user_version = 14; CREATE TABLE manuscript(text TEXT);",
-            "PRAGMA application_id = 1280266061; PRAGMA user_version = 16;",
-            "PRAGMA user_version = 15;",
+            "PRAGMA user_version = 15; CREATE TABLE manuscript(text TEXT);",
+            "PRAGMA application_id = 1280266061; PRAGMA user_version = 17;",
+            "PRAGMA user_version = 16;",
         ] {
             let directory = tempfile::tempdir().expect("temporary directory");
             let path = directory.path().join("store.sqlite3");

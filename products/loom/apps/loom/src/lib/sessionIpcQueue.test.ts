@@ -15,6 +15,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 import {
   applicationClosePending,
   closeProject,
+  connectImportAccount,
   currentProjectSession,
   exportDocumentCopy,
   getBranch,
@@ -61,6 +62,15 @@ afterEach(() => {
 });
 
 describe('session IPC admission', () => {
+  it('connects using native project settings without accepting browser-supplied credentials', async () => {
+    installDesktopRuntime();
+    mocks.invoke.mockResolvedValue({ service: 'gmail', email: 'fixture@example.test' });
+    await connectImportAccount('project', 'session', 'gmail');
+    expect(mocks.invoke).toHaveBeenCalledExactlyOnceWith('plugin:loom|import_account_connect', {
+      projectId: 'project', sessionId: 'session', service: 'gmail'
+    });
+  });
+
   it('reads the embedded model catalog outside the project session lane', async () => {
     installDesktopRuntime();
     const projectRead = deferred<never>();

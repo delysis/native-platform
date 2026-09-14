@@ -1,7 +1,11 @@
 # Mom Llama
 
-Mom Llama is the canonical native, local-first chat product in the
-`delysis/native-platform` monorepo. The `products/mom` boundary owns its Rust
+Mom Llama is deprecated. Its useful capabilities are moving into Loom, becoming
+Mine; new product work belongs there. Keep this code as a reference and explicit
+export source until that cutover is accepted. See the
+[Mine integration review](../../docs/convergence/integration-review.md).
+
+The existing `delysis/native-platform` implementation remains buildable. The `products/mom` boundary owns its Rust
 product runtime, CLI, command/effect contracts, evidence receipts and
 Tauri/Maud interface.
 

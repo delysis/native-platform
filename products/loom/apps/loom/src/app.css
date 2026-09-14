@@ -317,28 +317,14 @@ button.document-row:hover { background: var(--chrome-hover); }
 .model-readiness .status-dot.preparing { background: #bf8a37; }
 .model-readiness .status-dot.failed { background: var(--danger); }
 .quiet-load-failure { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.model-advanced-panel { min-width: 0; border-top: 1px solid var(--line); }
-.model-advanced-panel > summary { padding: 12px 17px; color: var(--muted); cursor: pointer; font-size: 11px; font-weight: 650; }
-.model-advanced-panel[open] > summary { color: var(--ink); background: var(--paper-deep); }
-.model-advanced-content { border-top: 1px solid var(--line-soft); }
 .model-library { min-width: 0; padding: 16px 17px 18px; }
-.model-download-panel { min-width: 0; border-top: 1px solid var(--line); background: color-mix(in srgb, var(--paper-deep) 42%, var(--paper)); }
-.model-download-panel > summary { padding: 12px 17px; color: var(--muted); cursor: pointer; font-size: 11px; font-weight: 650; list-style-position: inside; }
-.model-download-panel[open] > summary { border-bottom: 1px solid var(--line-soft); color: var(--ink); }
 .model-download-content { padding: 16px 17px 20px; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 13px; }
 .section-heading h3 { margin: 0; font: 600 16px/1.25 Iowan Old Style, Palatino, Georgia, serif; }
-.suggestions-setting { display: flex; align-items: center; gap: 9px; margin: 0; cursor: pointer; }
-.suggestions-setting input { width: 16px; height: 16px; margin: 0; accent-color: var(--moss-dark); }
-.suggestions-setting > span { min-width: 0; display: grid; }
-.suggestions-setting strong { font-size: 13px; }
 .model-library-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
 .other-model-list { display: grid; gap: 7px; }
 .other-model-row { align-items: flex-start; }
 .other-model-row .model-incompatible { flex: 0 0 auto; max-width: 150px; color: var(--quiet); text-align: right; line-height: 1.35; }
-.model-manager-picker, .model-download-form label { display: grid; gap: 6px; color: var(--muted); font-size: 11px; font-weight: 650; }
-.model-manager-picker select, .model-download-form input { width: 100%; min-width: 0; min-height: 38px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; color: var(--ink); background: var(--paper); }
-.model-manager-picker select { cursor: pointer; }
 .model-empty-state { display: grid; gap: 5px; padding: 16px; border: 1px dashed var(--line); border-radius: 9px; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .model-empty-state strong { color: var(--ink); }
 .model-facts { margin-top: 15px; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
@@ -355,19 +341,12 @@ button.document-row:hover { background: var(--chrome-hover); }
 .model-evidence code { word-break: break-all; }
 .model-manager-actions { display: flex; justify-content: flex-end; padding: 12px 14px; }
 
-.model-download-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.model-download-form .wide-field { grid-column: 1 / -1; }
-.model-download-form label span { display: flex; justify-content: space-between; gap: 8px; }
-.model-download-form label small { color: var(--quiet); font-size: 9px; font-weight: 500; }
 .download-boundary { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .download-error, .uncertain-download { padding: 10px 11px; border-radius: 8px; font-size: 11px; line-height: 1.45; }
 .download-error { color: var(--danger); background: var(--danger-soft); }
 .uncertain-download { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; color: var(--warning); background: var(--warning-soft); }
 .uncertain-download code { overflow-wrap: anywhere; }
 .uncertain-download .bare-button { margin-left: auto; font-size: 10px; }
-.model-download-actions { display: flex; justify-content: flex-end; }
-.download-history { margin-top: 22px; }
-.download-history h4 { margin: 0 0 9px; color: var(--muted); font-size: 10px; letter-spacing: .07em; text-transform: uppercase; }
 .download-card { display: grid; gap: 8px; margin-bottom: 8px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--paper); }
 .download-card.terminal { background: color-mix(in srgb, var(--paper) 88%, var(--paper-deep)); }
 .download-card > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
@@ -460,9 +439,7 @@ button.document-row:hover { background: var(--chrome-hover); }
   .curated-model-catalog { padding-inline: 16px; }
   .curated-model-card { grid-template-columns: 1fr; }
   .model-library, .model-download-content { padding: 16px; }
-  .model-download-panel > summary { padding-inline: 16px; }
-  .model-download-form, .model-technical > dl:not(.model-evidence) { grid-template-columns: 1fr; }
-  .model-download-form label { grid-column: 1 / -1; }
+  .model-technical > dl:not(.model-evidence) { grid-template-columns: 1fr; }
   .model-technical > dl:not(.model-evidence) > div:nth-child(odd) { border-right: 0; }
 }
 

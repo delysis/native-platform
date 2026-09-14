@@ -3410,6 +3410,7 @@ fn model_picker(
             selected: true,
             loaded: false,
             size_bytes: None,
+            header: None,
         });
     let has_available = selected_external.is_some() || discovered.iter().any(|model| !model.loaded);
     let picker_state = if selected_discovered.is_some_and(|model| model.loaded) {
@@ -3880,7 +3881,9 @@ fn active_conversation(
                 .iter()
                 .find(|conversation| conversation.kind == ConversationKind::Chat)
         })
-        .map(mom_llama_runtime::conversation_store::project_conversation)
+        .and_then(|conversation| {
+            mom_llama_runtime::conversation_store::project_conversation(conversation).ok()
+        })
 }
 
 fn role_label(role: &MessageRole) -> &'static str {
@@ -5256,8 +5259,11 @@ mod tests {
         id: &str,
         title: &str,
         kind: ConversationKind,
-        messages: Vec<Message>,
+        mut messages: Vec<Message>,
     ) -> Conversation {
+        for message in &mut messages {
+            message.conversation_id = id.to_owned();
+        }
         Conversation {
             id: id.to_string(),
             title: title.to_string(),

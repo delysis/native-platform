@@ -93,17 +93,28 @@ pub(crate) async fn import_account_connect(
     project_id: String,
     session_id: String,
     service: GoogleService,
-    client_id: String,
-    client_secret: String,
     state: State<'_, PluginState>,
 ) -> Result<AccountStatus, IpcFailure> {
     let _operation = ACCOUNT_OPERATION
         .try_lock()
         .map_err(|_| failure("Another account import is running."))?;
+    let client = {
+        let _admission = lock_application_admission(&state, "connecting an import account")?;
+        let mut session = lock_session(&state)?;
+        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        let settings = loom_config::MineConfig::read(store.root())
+            .map_err(|error| failure(error.to_string()))?;
+        settings
+            .imports
+            .google
+            .read_client(store.root())
+            .map_err(|error| failure(error.to_string()))?
+    };
+    let pending =
+        google_import::begin_authorization(client.client_id, client.client_secret, service)
+            .await
+            .map_err(|e| failure(e.to_string()))?;
     validate_session(&state, &project_id, &session_id)?;
-    let pending = google_import::begin_authorization(client_id, client_secret, service)
-        .await
-        .map_err(|e| failure(e.to_string()))?;
     tauri_plugin_opener::open_url(&pending.authorization_url, None::<&str>)
         .map_err(|_| failure("The authorization browser could not be opened."))?;
     let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();

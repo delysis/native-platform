@@ -2,12 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use desktop_vault::ProjectVault;
 use loom_document::DocumentContent;
 use loom_types::{BlobId, DocumentId, DocumentKind, RevisionId, now_unix_ms};
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-use crate::file_io::{atomic_replace_private, read_bounded};
+#[cfg(all(test, unix))]
+use crate::file_io::atomic_replace_private;
 use crate::paths::{ensure_private_directory, normalize_document_path, reject_symlink_target};
 use crate::provenance::validate_active_in_transaction;
 use crate::store::ProjectStore;
@@ -96,8 +98,13 @@ impl ProjectStore {
             && current.source_revision_id == source_revision_id
             && current.blob_id == blob_id
         {
-            let draft =
-                load_draft_from_row(&self.root, document.kind, *current, &projection.bytes)?;
+            let draft = load_draft_from_row(
+                &self.root,
+                self.vault.as_ref(),
+                document.kind,
+                *current,
+                &projection.bytes,
+            )?;
             transaction.rollback()?;
             return Ok(TransientDraftWriteOutcome {
                 draft,
@@ -117,7 +124,12 @@ impl ProjectStore {
         if current.is_none() {
             remove_draft_slots(&self.root, document.id)?;
         }
-        atomic_replace_private(&draft_path, &projection.bytes)?;
+        crate::private_io::write(
+            self.vault.as_ref(),
+            &draft_path,
+            &draft_namespace(document.id, slot, version, blob_id),
+            &projection.bytes,
+        )?;
         let updated_at_ms = now_unix_ms();
         if current.is_none() {
             transaction.execute(
@@ -227,7 +239,7 @@ impl ProjectStore {
         };
         let kind = DocumentKind::from_str(&kind)
             .map_err(|error| StoreError::CorruptDatabase(error.to_string()))?;
-        load_draft_from_row(&self.root, kind, row, &[]).map(Some)
+        load_draft_from_row(&self.root, self.vault.as_ref(), kind, row, &[]).map(Some)
     }
 
     pub fn clear_transient_draft(
@@ -407,12 +419,18 @@ fn next_draft_version(
 
 fn load_draft_from_row(
     root: &Path,
+    vault: Option<&ProjectVault>,
     kind: DocumentKind,
     row: DraftRow,
     replay_bytes: &[u8],
 ) -> Result<TransientDraft> {
     let path = draft_slot_path(root, row.document_id, row.slot)?;
-    let bytes = read_bounded(&path, MAX_DOCUMENT_BYTES)?;
+    let bytes = crate::private_io::read(
+        vault,
+        &path,
+        &draft_namespace(row.document_id, row.slot, row.version, row.blob_id),
+        MAX_DOCUMENT_BYTES,
+    )?;
     let actual = BlobId::digest(&bytes);
     if actual != row.blob_id {
         return Err(StoreError::CorruptBlob {
@@ -438,7 +456,16 @@ fn load_draft_from_row(
     })
 }
 
-fn draft_slot_path(root: &Path, document_id: DocumentId, slot: u8) -> Result<PathBuf> {
+pub(crate) fn draft_namespace(
+    document_id: DocumentId,
+    slot: u8,
+    version: u64,
+    blob_id: BlobId,
+) -> String {
+    format!("loom/draft/{document_id}/{slot}/{version}/{blob_id}")
+}
+
+pub(crate) fn draft_slot_path(root: &Path, document_id: DocumentId, slot: u8) -> Result<PathBuf> {
     let directory = root.join(".loom/drafts");
     ensure_private_directory(&directory)?;
     let path = directory.join(format!("{document_id}.{slot}.draft"));

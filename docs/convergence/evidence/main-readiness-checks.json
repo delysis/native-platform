@@ -1,0 +1,84 @@
+{
+  "application_source": "6f153711b09d8f8c3b86a4578a762be1f24c77a3",
+  "main_baseline": "8ce8948f3bcfc24df87ed0346801dedc7402feb0",
+  "rust_source_equivalent_to": "22e3440f814f37397b30b69d690b4af3c2df928d",
+  "observed_behind_main": 0,
+  "checks": [
+    {
+      "name": "workspace_tests",
+      "local_log": "/tmp/mine-main-workspace-tests.txt",
+      "log_sha256": "32ac5454730d049743dcaf1afb1d2deec30b7bf25ff02e772cd3da4893f78ff4",
+      "passed": 1789,
+      "failed": 1,
+      "ignored": 44,
+      "boundary": "initial broad run before overflow repair"
+    },
+    {
+      "name": "overflow_repair",
+      "local_log": "/tmp/mine-main-overflow-repaired.txt",
+      "log_sha256": "0c00a8adfb571d4ce7217be80888c633317d9783ddc85cf33ed8a95aa873039e",
+      "passed": 64,
+      "failed": 0,
+      "ignored": 4,
+      "boundary": "backend and config; other workspace consumers unchanged"
+    },
+    {
+      "name": "doctests",
+      "local_log": "/tmp/mine-main-doctests.txt",
+      "log_sha256": "34d507d676f08f6bde016d4368d74be3a3eeb116b4fdac722fa13d3d8fbd007b",
+      "passed": 20,
+      "failed": 0
+    },
+    {
+      "name": "strict_workspace_clippy",
+      "local_log": "/tmp/mine-main-clippy-final.txt",
+      "log_sha256": "d9a1810970076c764130765a747788fd3c9f2ab2634c21fd3021ac0c0a2695e1",
+      "exit_code": 0
+    },
+    {
+      "name": "policy",
+      "local_log": "/tmp/mine-main-xtask-policy-final.txt",
+      "log_sha256": "9858b464ac07d67a757f12a4cbddb2c633a7564005c385b3b9f868c4dfc65dee",
+      "exit_code": 0
+    },
+    {
+      "name": "frontend_unit",
+      "local_log": "/tmp/mine-main-frontend-tests.txt",
+      "log_sha256": "6d47e5c969bb858c823990e4595fff24a1435a868cbc1e52a3ea7a409acfde4e",
+      "passed": 467,
+      "files": 64
+    },
+    {
+      "name": "webkit_final",
+      "local_log": "/tmp/mine-main-browser-final.txt",
+      "log_sha256": "7de416719961173a2674ac64209ab0df19412142129e31322f8d9cbbb8b3cecd",
+      "passed": 18,
+      "files": 3
+    },
+    {
+      "name": "svelte_final",
+      "local_log": "/tmp/mine-main-download-ui-check.txt",
+      "log_sha256": "841cc65c663ef3cab45e8103ea29cbca4d3d6d95957f237d5a329befb47ce75a",
+      "errors": 0,
+      "warnings": 0
+    },
+    {
+      "name": "policy_node",
+      "local_log": "/tmp/mine-main-policy-node-final.txt",
+      "log_sha256": "07ec93c98bb4736171d14affe6c63de649230cb038fb84608aa4b42f68d2dd6c",
+      "passed": 124
+    },
+    {
+      "name": "native_build",
+      "local_log": "/tmp/mine-main-native-final-build.txt",
+      "log_sha256": "c93bdf2ef00ec5f03feb92e5a07db577434018fd710d1e05aca772492345fcfa",
+      "exit_code": 0,
+      "type": "debug review app; not release qualification"
+    }
+  ],
+  "notes": [
+    "Overlapping test runs are not summed into an inflated unique-test count.",
+    "The initial workspace failure and earlier superseded CI failures remain explicit.",
+    "Latest remote CI is reported by PR47; no passing final remote result is inferred here."
+  ]
+}

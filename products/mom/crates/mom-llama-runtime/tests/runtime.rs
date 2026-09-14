@@ -687,6 +687,7 @@ fn live_chat_mentions_capture_the_committed_leaf_without_writeback() -> Result<(
     assert_eq!(
         invocation.targets[0].source_messages,
         mom_llama_runtime::conversation_store::active_path_messages(&source_before)
+            .expect("valid source")
     );
     assert_eq!(
         mom_llama_runtime::conversation_select(&source.id)?.result,
@@ -1313,7 +1314,7 @@ fn upstream_sampling_settings_drive_the_native_sampler_dto() -> Result<()> {
     let settings = updated
         .result
         .ok_or_else(|| anyhow!("settings update returned no result"))?;
-    let sampling = settings.sampling_config();
+    let sampling = settings.sampling_config()?;
     assert_eq!(sampling.temperature, 0.35);
     assert_eq!(sampling.dynamic_temperature_range, 0.2);
     assert_eq!(sampling.dynamic_temperature_exponent, 1.2);

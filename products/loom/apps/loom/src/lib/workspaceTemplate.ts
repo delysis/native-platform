@@ -1,10 +1,16 @@
 import type { WorkspacePaneConfig } from './WorkspacePane.svelte';
+import type { ConfiguredModelDownload } from './modelDownload';
 export type WorkspaceModelSelection = { catalog: string } | { profile: string };
 
 export interface WorkspaceTemplateSnapshot {
   enabled: boolean;
   document_id: string | null;
   revision_id: string | null;
+  source_sha256: string | null;
+  suggestions: boolean | null;
+  model_path: string | null;
+  downloads: Record<string, ConfiguredModelDownload>;
+  google_client_configured: boolean;
   config: { model?: WorkspaceModelSelection | null; theme?: { mode: 'system' | 'light' | 'dark'; canvas?: string | null; text?: string | null; accent?: string | null }; panes: Record<string, WorkspacePaneConfig> };
   error: string | null;
 }
@@ -22,8 +28,9 @@ export function workspaceWriterModel(
 ): SuggestionWriterSummary | undefined {
   if (!scopeCurrent || !template || template.error) return undefined;
   const selection = template.config.model;
-  if (!selection) return suggestionWriter(models, policy);
-  return models.find((model): model is SuggestionWriterSummary =>
+  const available = template.model_path ? models.filter(model => model.model_path === template.model_path) : models;
+  if (!selection) return suggestionWriter(available, policy);
+  return available.find((model): model is SuggestionWriterSummary =>
     isUsableSuggestionWriter(model) && ('profile' in selection
       ? isVerifiedPolicyWriter(model, selection.profile)
       : catalog.some((entry) => entry.catalog_id === selection.catalog && isVerifiedCatalogWriter(entry, model))));
@@ -46,4 +53,9 @@ export function workspaceWriterCandidates(
     .map((model) => ({ modelPath: model.model_path, profileId: 'profile' in selection ? selection.profile : null,
       ...('catalog' in selection ? { catalogId: selection.catalog } : {}), policyRank: 0, remembered: false }))
     .sort((left, right) => left.modelPath.localeCompare(right.modelPath));
+}
+
+export interface SetupChoices {
+  chat: boolean;
+  suggestions: boolean;
 }

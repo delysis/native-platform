@@ -1,0 +1,10 @@
+Baseline source: ea34dd6, loom-backend-llama/src/runtime.rs unchanged except the new regression adapted to its existing path ledger.
+Command: cargo test --locked -p loom-backend-llama --lib runtime::tests::failed_reconfiguration_does_not_release_a_different_profile_at_the_same_path -- --exact
+
+running 1 test
+runtime::tests::failed_reconfiguration_does_not_release_a_different_profile_at_the_same_path ... FAILED
+
+The new configuration was never acquired: NativeError { code: Internal, message: "a tracked model had no observable native slot; the pinned native host API cannot distinguish an empty registry from poisoned state" }
+Result: 0 passed; 1 failed; 54 filtered out.
+
+Fixture scope: the runtime ledger records the previous configuration of a path; a different context configuration at that same path has never been acquired. This proves the baseline cannot distinguish those ownership states. It is not a live native model replacement test.

@@ -260,7 +260,7 @@ pub fn persona_freeze(input: PersonaFreezeInput) -> Result<CommandResult<Convers
             "The source chat no longer exists.",
         ));
     };
-    let active = active_path_messages(&source);
+    let active = active_path_messages(&source)?;
     let Some(index) = active
         .iter()
         .position(|message| message.id == input.message_id)
@@ -411,6 +411,19 @@ pub fn persona_update(
         source_history_tokens,
         host_context_tokens,
     } = input;
+    if let Some(sampling) = &sampling
+        && let Err(error) = sampling.validate()
+    {
+        return Ok(CommandResult::blocked(
+            "mom_llama.persona_update",
+            "blocked_invalid_generation_profile",
+            Blocker::new(
+                "generation_profile_invalid",
+                error.to_string(),
+                vec!["Correct the Persona sampling settings.".into()],
+            ),
+        ));
+    }
     if auto_discover_mmproj {
         if let Some(model_path) = model_path.as_deref()
             && let Err(blocked) = crate::engine::validate_model_path(model_path)
@@ -652,7 +665,7 @@ fn build_persona_version(persona: &Conversation) -> Result<PersonaVersion> {
         &persona.title,
         &persona.execution_profile,
         &persona.active_leaf_message_id,
-        active_path_messages(persona),
+        active_path_messages(persona)?,
     ))?;
     let version = PersonaVersion {
         persona_id: persona.id.clone(),
@@ -1341,7 +1354,7 @@ fn persona_instantiate_inner(
             profile.mention_handle =
                 unique_handle(db, &groups.groups, &format!("{}-chat", persona.title));
             profile.version = 1;
-            let mut messages = remap_messages(&id, active_path_messages(&persona));
+            let mut messages = remap_messages(&id, active_path_messages(&persona)?);
             crate::attachments::snapshot_message_attachments_from_documents(
                 &id,
                 &mut messages,
@@ -2153,6 +2166,43 @@ mod tests {
             None,
         )
         .expect("catalog reconciliation must succeed")
+    }
+
+    #[test]
+    fn persona_sampling_is_validated_before_store_or_model_access() {
+        let directory =
+            std::env::temp_dir().join(format!("mom-invalid-persona-{}", uuid::Uuid::new_v4()));
+        crate::config::set_data_dir_override_for_tests(Some(directory.clone()));
+        let result = super::persona_update(
+            &crate::OperationScope::detached(),
+            super::PersonaUpdateInput {
+                persona_id: "absent".into(),
+                name: "Invalid".into(),
+                mention_handle: "invalid".into(),
+                model_path: None,
+                mmproj_path: None,
+                auto_discover_mmproj: false,
+                system_message: None,
+                sampling: Some(llama_native_types::SamplingConfig {
+                    top_p: 1.5,
+                    ..Default::default()
+                }),
+                chat_template: crate::conversation_store::ChatTemplatePolicy::ModelDefault,
+                tool_bindings: Vec::new(),
+                source_history_tokens: 4096,
+                host_context_tokens: 2048,
+            },
+        );
+        crate::config::set_data_dir_override_for_tests(None);
+        assert_eq!(
+            result
+                .expect("typed result")
+                .blocker
+                .expect("invalid profile")
+                .code,
+            "generation_profile_invalid"
+        );
+        assert!(!directory.exists());
     }
 
     #[test]

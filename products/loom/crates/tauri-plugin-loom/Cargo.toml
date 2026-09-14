@@ -8,6 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+desktop-vault.workspace = true
+workspace-document.workspace = true
+desktop-context.workspace = true
+loom-config.workspace = true
+desktop-model-discovery.workspace = true
+desktop-generation-policy.workspace = true
+desktop-speech.workspace = true
 desktop-model-defaults.workspace = true
 information-native-acquire.workspace = true
 keyring = "=4.1.6"

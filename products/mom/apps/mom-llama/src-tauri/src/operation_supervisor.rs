@@ -2,15 +2,16 @@
 // and observation methods are intentionally retained for focused unit tests.
 #![allow(dead_code)]
 
+use operation_lifecycle::{InstanceId, RunControl, WorkerLedger};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const DEFAULT_PROGRESS_CAPACITY: usize = 64;
+const COMPLETED_WORKER_HISTORY: usize = 256;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,12 +102,13 @@ struct AttemptData {
 #[derive(Debug)]
 struct AttemptControl {
     identity: AttemptIdentity,
-    cancellation_requested: AtomicBool,
+    control: RunControl,
     data: Mutex<AttemptData>,
 }
 
 #[derive(Debug)]
 struct OperationEntry {
+    identity: InstanceId,
     explicit: bool,
     cancellation_requested: bool,
     attempts: BTreeMap<u64, Arc<AttemptControl>>,
@@ -115,6 +117,7 @@ struct OperationEntry {
 #[derive(Debug)]
 struct WorkerEntry {
     join: Option<JoinHandle<()>>,
+    joined: Arc<OnceLock<()>>,
 }
 
 #[derive(Debug)]
@@ -127,9 +130,8 @@ struct SupervisorState {
     operations: BTreeMap<String, OperationEntry>,
     attempts: BTreeMap<u64, Arc<AttemptControl>>,
     workers: BTreeMap<String, WorkerEntry>,
-    expected_worker_ids: Vec<String>,
-    exited_worker_ids: Vec<String>,
-    joined_worker_ids: Vec<String>,
+    worker_history: WorkerLedger<String>,
+    exited_worker_ids: BTreeSet<String>,
     shutdown: Option<SupervisorShutdownOutcome>,
 }
 
@@ -144,6 +146,7 @@ pub struct OperationSupervisor(Arc<SupervisorInner>);
 
 #[derive(Clone, Debug)]
 pub struct OperationHandle {
+    identity: InstanceId,
     operation_id: String,
     supervisor: Weak<SupervisorInner>,
 }
@@ -170,6 +173,7 @@ pub struct SupervisedTask<T> {
     result: tokio::sync::oneshot::Receiver<Result<T, String>>,
     worker_id: String,
     supervisor: OperationSupervisor,
+    joined: Arc<OnceLock<()>>,
     _ticket: OperationTicket,
 }
 
@@ -178,9 +182,14 @@ impl<T> SupervisedTask<T> {
         let result = self.result.await.map_err(|_| {
             "Mom Llama's supervised worker stopped before returning a result".to_owned()
         })?;
-        self.supervisor
-            .reap_worker(&self.worker_id)
-            .map_err(|error| error.to_string())?;
+        if self.joined.get().is_none() {
+            let reaped = self.supervisor.reap_worker(&self.worker_id);
+            // Another owner may finish joining and age out the diagnostic
+            // history between our first observation and acquiring the lock.
+            if self.joined.get().is_none() {
+                reaped.map_err(|error| error.to_string())?;
+            }
+        }
         result
     }
 }
@@ -201,9 +210,8 @@ impl OperationSupervisor {
                 operations: BTreeMap::new(),
                 attempts: BTreeMap::new(),
                 workers: BTreeMap::new(),
-                expected_worker_ids: Vec::new(),
-                exited_worker_ids: Vec::new(),
-                joined_worker_ids: Vec::new(),
+                worker_history: WorkerLedger::new(COMPLETED_WORKER_HISTORY),
+                exited_worker_ids: BTreeSet::new(),
                 shutdown: None,
             }),
             changed: Condvar::new(),
@@ -247,15 +255,18 @@ impl OperationSupervisor {
         if state.operations.contains_key(operation_id) {
             return Err(SupervisorError::DuplicateOperation);
         }
+        let identity = InstanceId::default();
         state.operations.insert(
             operation_id.to_owned(),
             OperationEntry {
+                identity: identity.clone(),
                 explicit,
                 cancellation_requested: false,
                 attempts: BTreeMap::new(),
             },
         );
         Ok(OperationHandle {
+            identity,
             operation_id: operation_id.to_owned(),
             supervisor: Arc::downgrade(&self.0),
         })
@@ -291,6 +302,9 @@ impl OperationSupervisor {
             .operations
             .get(&operation.operation_id)
             .ok_or(SupervisorError::UnknownOperation)?;
+        if operation_entry.identity != operation.identity {
+            return Err(SupervisorError::StaleLease);
+        }
         let cancellation_requested = operation_entry.cancellation_requested;
         let identity = AttemptIdentity {
             operation_id: operation.operation_id.clone(),
@@ -299,7 +313,7 @@ impl OperationSupervisor {
         };
         let attempt = Arc::new(AttemptControl {
             identity,
-            cancellation_requested: AtomicBool::new(cancellation_requested),
+            control: RunControl::new(cancellation_requested),
             data: Mutex::new(AttemptData {
                 phase,
                 terminal: None,
@@ -386,6 +400,11 @@ impl OperationSupervisor {
         if data.phase != OperationPhase::Running || data.terminal.is_some() {
             return Err(SupervisorError::InvalidTransition);
         }
+        lease
+            .attempt
+            .control
+            .claim_terminal()
+            .ok_or(SupervisorError::InvalidTransition)?;
         data.terminal = Some(TerminalRecord {
             class,
             sequence: lease.attempt.identity.sequence,
@@ -455,6 +474,9 @@ impl OperationSupervisor {
             .operations
             .get(&operation.operation_id)
             .ok_or(SupervisorError::UnknownOperation)?;
+        if entry.identity != operation.identity {
+            return Err(SupervisorError::StaleLease);
+        }
         if !entry.explicit || !entry.attempts.is_empty() {
             return Err(SupervisorError::InvalidTransition);
         }
@@ -473,13 +495,14 @@ impl OperationSupervisor {
                 .operations
                 .get_mut(&operation.operation_id)
                 .ok_or(SupervisorError::UnknownOperation)?;
+            if entry.identity != operation.identity {
+                return Err(SupervisorError::StaleLease);
+            }
             entry.cancellation_requested = true;
             entry.attempts.values().cloned().collect::<Vec<_>>()
         };
         for attempt in attempts {
-            attempt
-                .cancellation_requested
-                .store(true, Ordering::Release);
+            attempt.control.request_cancel();
         }
         Ok(())
     }
@@ -497,14 +520,12 @@ impl OperationSupervisor {
         if !current {
             return Err(SupervisorError::StaleLease);
         }
-        attempt
-            .cancellation_requested
-            .store(true, Ordering::Release);
+        attempt.control.request_cancel();
         Ok(())
     }
 
     pub fn cancellation_requested(&self, lease: &OperationLease) -> bool {
-        lease.attempt.cancellation_requested.load(Ordering::Acquire)
+        lease.attempt.control.cancellation_requested()
     }
 
     pub fn snapshot(&self, lease: &OperationLease) -> Option<OperationSnapshot> {
@@ -540,6 +561,7 @@ impl OperationSupervisor {
         self.lock_state()
             .operations
             .get(&operation.operation_id)
+            .filter(|entry| entry.identity == operation.identity)
             .map(|entry| {
                 entry
                     .attempts
@@ -553,7 +575,8 @@ impl OperationSupervisor {
     pub fn operation_active(&self, operation: &OperationHandle) -> bool {
         self.lock_state()
             .operations
-            .contains_key(&operation.operation_id)
+            .get(&operation.operation_id)
+            .is_some_and(|entry| entry.identity == operation.identity)
     }
 
     pub fn active_count(&self) -> usize {
@@ -561,7 +584,7 @@ impl OperationSupervisor {
     }
 
     pub fn retained_task_count(&self) -> usize {
-        self.lock_state().workers.len()
+        self.lock_state().worker_history.outstanding_count()
     }
 
     pub fn progress_capacity(&self) -> usize {
@@ -585,9 +608,7 @@ impl OperationSupervisor {
             state.attempts.values().cloned().collect::<Vec<_>>()
         };
         for attempt in attempts {
-            attempt
-                .cancellation_requested
-                .store(true, Ordering::Release);
+            attempt.control.request_cancel();
         }
         self.0.changed.notify_all();
     }
@@ -623,6 +644,7 @@ impl OperationSupervisor {
         let thread_lease = lease.clone();
         let (start_tx, start_rx) = mpsc::sync_channel(0);
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let joined = Arc::new(OnceLock::new());
         let join = thread::Builder::new()
             .name(worker_id.clone())
             .spawn(move || {
@@ -671,10 +693,17 @@ impl OperationSupervisor {
             })?;
         {
             let mut state = self.lock_state();
-            state.expected_worker_ids.push(worker_id.clone());
-            state
-                .workers
-                .insert(worker_id.clone(), WorkerEntry { join: Some(join) });
+            assert!(
+                state.worker_history.note_started(worker_id.clone()),
+                "worker sequence is unique"
+            );
+            state.workers.insert(
+                worker_id.clone(),
+                WorkerEntry {
+                    join: Some(join),
+                    joined: Arc::clone(&joined),
+                },
+            );
         }
         if start_tx.send(()).is_err() {
             return Err(SupervisorError::WorkerStart);
@@ -683,6 +712,7 @@ impl OperationSupervisor {
             result: result_rx,
             worker_id,
             supervisor,
+            joined,
             _ticket: reservation.ticket,
         })
     }
@@ -704,7 +734,7 @@ impl OperationSupervisor {
                     .wait(state)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
-            if state.workers.is_empty() {
+            if state.worker_history.outstanding_count() == 0 {
                 break;
             }
             let worker_id = state
@@ -731,9 +761,9 @@ impl OperationSupervisor {
             // Poison recovery permits cleanup; it cannot certify clean state.
             state_poisoned: self.0.state.is_poisoned(),
             active_operations: state.attempts.len(),
-            retained_tasks: state.workers.len(),
-            expected_worker_ids: state.expected_worker_ids.clone(),
-            joined_worker_ids: state.joined_worker_ids.clone(),
+            retained_tasks: state.worker_history.outstanding_count(),
+            expected_worker_ids: state.worker_history.expected().into_iter().collect(),
+            joined_worker_ids: state.worker_history.joined().iter().cloned().collect(),
         };
         state.shutdown = Some(outcome.clone());
         self.0.changed.notify_all();
@@ -741,44 +771,40 @@ impl OperationSupervisor {
     }
 
     pub fn reap_worker(&self, worker_id: &str) -> Result<(), SupervisorError> {
-        let join = {
+        let (join, joined) = {
             let mut state = self.lock_state();
-            let Some(mut worker) = state.workers.remove(worker_id) else {
-                if state
-                    .joined_worker_ids
-                    .iter()
-                    .any(|joined| joined == worker_id)
-                {
-                    return Ok(());
+            loop {
+                let Some(worker) = state.workers.get_mut(worker_id) else {
+                    if state.worker_history.was_joined(&worker_id.to_owned()) {
+                        return Ok(());
+                    }
+                    return Err(SupervisorError::UnknownOperation);
+                };
+                if let Some(join) = worker.join.take() {
+                    break (join, Arc::clone(&worker.joined));
                 }
-                return Err(SupervisorError::UnknownOperation);
-            };
-            worker.join.take()
+                state = self
+                    .0
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
         };
-        if let Some(join) = join {
-            let _ = join.join();
-        }
+        let _ = join.join();
         let mut state = self.lock_state();
-        if !state
-            .joined_worker_ids
-            .iter()
-            .any(|joined| joined == worker_id)
-        {
-            state.joined_worker_ids.push(worker_id.to_owned());
+        if !state.worker_history.note_joined(&worker_id.to_owned()) {
+            return Err(SupervisorError::UnknownOperation);
         }
+        let _ = joined.set(());
+        state.workers.remove(worker_id);
+        state.exited_worker_ids.remove(worker_id);
         self.0.changed.notify_all();
         Ok(())
     }
 
     fn record_worker_exit(&self, worker_id: &str) {
         let mut state = self.lock_state();
-        if !state
-            .exited_worker_ids
-            .iter()
-            .any(|exited| exited == worker_id)
-        {
-            state.exited_worker_ids.push(worker_id.to_owned());
-        }
+        state.exited_worker_ids.insert(worker_id.to_owned());
         self.0.changed.notify_all();
     }
 
@@ -917,7 +943,7 @@ impl OperationLease {
     }
 
     pub fn cancellation_requested(&self) -> bool {
-        self.attempt.cancellation_requested.load(Ordering::Acquire)
+        self.attempt.control.cancellation_requested()
     }
 
     pub fn request_cancellation_from_executor(&self) -> Result<(), SupervisorError> {
@@ -938,6 +964,130 @@ pub fn validate_worker_sets(outcome: &SupervisorShutdownOutcome) -> bool {
 #[cfg(test)]
 mod publication_tests {
     use super::*;
+
+    #[test]
+    fn operation_handles_do_not_target_other_owners_or_reused_public_ids() {
+        let left = OperationSupervisor::new();
+        let right = OperationSupervisor::new();
+        let old = left
+            .create_operation("same-request")
+            .expect("left operation");
+        let other = right
+            .create_operation("same-request")
+            .expect("right operation");
+        assert_eq!(
+            right.request_operation_cancel(&old),
+            Err(SupervisorError::StaleLease)
+        );
+        assert_eq!(
+            right.finish_operation(&old),
+            Err(SupervisorError::StaleLease)
+        );
+        assert!(right.operation_active(&other));
+        left.finish_operation(&old)
+            .expect("release old incarnation");
+        let new = left
+            .create_operation("same-request")
+            .expect("new incarnation");
+        assert!(matches!(
+            left.start_attempt(&old),
+            Err(SupervisorError::StaleLease)
+        ));
+        assert_eq!(
+            left.request_operation_cancel(&old),
+            Err(SupervisorError::StaleLease)
+        );
+        assert!(left.operation_active(&new));
+    }
+
+    #[test]
+    fn shutdown_waits_for_a_join_already_owned_by_another_thread() {
+        let supervisor = OperationSupervisor::new();
+        let (release, blocked) = mpsc::sync_channel(0);
+        let worker_id = "joining-worker".to_owned();
+        let join = thread::spawn(move || blocked.recv().expect("release worker"));
+        {
+            let mut state = supervisor.lock_state();
+            assert!(state.worker_history.note_started(worker_id.clone()));
+            state.workers.insert(
+                worker_id.clone(),
+                WorkerEntry {
+                    join: Some(join),
+                    joined: Arc::new(OnceLock::new()),
+                },
+            );
+        }
+        let reaper = {
+            let supervisor = supervisor.clone();
+            let worker_id = worker_id.clone();
+            thread::spawn(move || supervisor.reap_worker(&worker_id))
+        };
+        // Wait until the reaper owns the handle and is blocked inside join.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while supervisor
+            .lock_state()
+            .workers
+            .get(&worker_id)
+            .is_some_and(|worker| worker.join.is_some())
+        {
+            assert!(Instant::now() < deadline, "reaper took the handle");
+            thread::yield_now();
+        }
+        let (closed, outcome) = mpsc::sync_channel(1);
+        let (starting, started) = mpsc::sync_channel(0);
+        let shutdown = {
+            let supervisor = supervisor.clone();
+            thread::spawn(move || {
+                supervisor.begin_quiesce();
+                starting.send(()).expect("shutdown started");
+                closed
+                    .send(supervisor.shutdown())
+                    .expect("shutdown outcome")
+            })
+        };
+        started.recv().expect("shutdown is scheduled");
+        let premature = outcome.recv_timeout(Duration::from_millis(50));
+        release.send(()).expect("release blocked worker");
+        reaper.join().expect("reaper").expect("joined worker");
+        shutdown.join().expect("shutdown caller");
+        assert!(
+            premature.is_err(),
+            "shutdown returned before the owner joined"
+        );
+        let outcome = outcome.recv().expect("joined shutdown outcome");
+        assert_eq!(outcome.retained_tasks, 0);
+        assert_eq!(outcome.joined_worker_ids, [worker_id]);
+        assert!(validate_worker_sets(&outcome));
+    }
+
+    #[test]
+    fn completed_worker_diagnostics_are_bounded_without_losing_join_accounting() {
+        let supervisor = OperationSupervisor::new();
+        for id in 0..300 {
+            let worker_id = format!("worker-{id}");
+            let join = thread::spawn(|| {});
+            {
+                let mut state = supervisor.lock_state();
+                assert!(state.worker_history.note_started(worker_id.clone()));
+                state.workers.insert(
+                    worker_id.clone(),
+                    WorkerEntry {
+                        join: Some(join),
+                        joined: Arc::new(OnceLock::new()),
+                    },
+                );
+            }
+            supervisor.record_worker_exit(&worker_id);
+            supervisor.reap_worker(&worker_id).expect("joined worker");
+        }
+        let state = supervisor.lock_state();
+        assert!(state.exited_worker_ids.is_empty());
+        assert_eq!(state.worker_history.outstanding_count(), 0);
+        assert_eq!(
+            state.worker_history.joined().len(),
+            COMPLETED_WORKER_HISTORY
+        );
+    }
 
     #[test]
     fn public_identity_survives_until_final_send_even_when_consumer_drops() {

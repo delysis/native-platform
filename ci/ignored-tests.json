@@ -3,6 +3,16 @@
   "expected_test_count": 44,
   "cargo_targets": [
     {
+      "package": "desktop-model-discovery",
+      "selector": "lib",
+      "name": "desktop_model_discovery",
+      "kinds": ["lib"],
+      "src_path": "crates/desktop-model-discovery/src/lib.rs",
+      "manifest_path": "crates/desktop-model-discovery/Cargo.toml",
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
+    },
+    {
       "package": "llama-native-engine",
       "selector": "lib",
       "name": "llama_native_engine",
@@ -778,9 +788,9 @@
     },
     {
       "test_id": "discovery::tests::real_default_cache_discovers_official_gemma_4_12b_qat",
-      "package": "loom-backend-llama",
+      "package": "desktop-model-discovery",
       "target": "lib",
-      "source": "products/loom/crates/loom-backend-llama/src/discovery.rs",
+      "source": "crates/desktop-model-discovery/src/discovery.rs",
       "prerequisite": "requires the official Gemma 4 12B QAT Q4_0 GGUF in the local Hugging Face cache",
       "required_environment": [],
       "evidence_class": "real-model-discovery",

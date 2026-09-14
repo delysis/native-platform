@@ -447,14 +447,16 @@ fn insert_reconciliation_artifacts(
             write.revision_artifact_id.to_string(),
             write.target_blob_id.to_string(),
             document_media_type(write.document_kind),
-            serde_json::to_string(&json!({
+            serde_json::to_string(&crate::document_snapshot::seal(json!({
                 "workflow": RECONCILIATION_WORKFLOW,
-                "relative_path": write.relative_path,
-                "reason": write.reason,
+                "relative_path": write.relative_path, "reason": write.reason,
                 "base_revision_id": write.expected_active.revision_id,
                 "base_blob_id": write.expected_active.blob_id,
                 "external_visible_blob_id": write.expected_visible_blob_id,
-            }))?,
+            }), crate::document_snapshot::RevisionIdentity {
+                document_id: write.document_id, revision_id: write.revision_id,
+                parent_revision_id: Some(write.expected_active.revision_id), kind: write.document_kind,
+            }, write.segments)?)?,
             write.created_at_ms,
         ],
     )?;

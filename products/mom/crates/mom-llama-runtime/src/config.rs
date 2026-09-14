@@ -2,7 +2,11 @@ use crate::engine::ValidationBlocker;
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::{Context, Result};
-use llama_native_types::{NativeDevice, SamplerKind, SamplingConfig};
+use desktop_generation_policy::{
+    GenerationTask, ModelExecutionLimits, SamplingOverrides, automatic_resident_memory_budget,
+    resolve_sampling,
+};
+use llama_native_types::{NativeDevice, SamplingConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -12,11 +16,10 @@ use std::sync::OnceLock;
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
 pub(crate) const SETTINGS_NAMESPACE: &str = "settings.v2";
+#[cfg(test)]
 const DEFAULT_MAX_TOKENS: u32 = 512;
+#[cfg(test)]
 const GIB: u64 = 1024 * 1024 * 1024;
-const FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 8 * GIB;
-const MIN_AUTO_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 2 * GIB;
-const MAX_AUTO_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 64 * GIB;
 const MEMORY_BUDGET_MODE_KEY: &str = "nativeMemoryBudgetMode";
 const COMPILED_DEFAULT_MODEL_PATH: Option<&str> = option_env!("MOM_LLAMA_DEFAULT_MODEL_PATH");
 const COMPILED_DEFAULT_MMPROJ_PATH: Option<&str> = option_env!("MOM_LLAMA_DEFAULT_MMPROJ_PATH");
@@ -50,10 +53,11 @@ pub struct GenerationDefaults {
 
 impl Default for GenerationDefaults {
     fn default() -> Self {
+        let sampling = GenerationTask::Chat.defaults();
         Self {
-            temperature: 0.7,
-            top_p: 0.95,
-            max_tokens: DEFAULT_MAX_TOKENS,
+            temperature: sampling.temperature,
+            top_p: sampling.top_p,
+            max_tokens: sampling.max_tokens,
         }
     }
 }
@@ -120,47 +124,75 @@ impl Settings {
         }
     }
 
-    pub fn sampling_config(&self) -> SamplingConfig {
-        let mut sampling = SamplingConfig {
-            seed: upstream_setting_i64(self, "seed")
-                .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or(u32::MAX),
-            temperature: upstream_setting_f32(self, "temperature")
-                .unwrap_or(self.default_temperature),
-            dynamic_temperature_range: upstream_setting_f32(self, "dynatemp_range").unwrap_or(0.0),
-            dynamic_temperature_exponent: upstream_setting_f32(self, "dynatemp_exponent")
-                .unwrap_or(1.0),
-            top_k: upstream_setting_i64(self, "top_k")
-                .and_then(|value| i32::try_from(value).ok())
-                .unwrap_or(40),
-            top_p: upstream_setting_f32(self, "top_p").unwrap_or(self.default_top_p),
-            min_p: upstream_setting_f32(self, "min_p").unwrap_or(0.0),
-            typical_p: upstream_setting_f32(self, "typ_p").unwrap_or(1.0),
-            xtc_probability: upstream_setting_f32(self, "xtc_probability").unwrap_or(0.0),
-            xtc_threshold: upstream_setting_f32(self, "xtc_threshold").unwrap_or(0.1),
-            repeat_last_n: upstream_setting_i64(self, "repeat_last_n")
-                .and_then(|value| i32::try_from(value).ok())
-                .unwrap_or(64),
-            repeat_penalty: upstream_setting_f32(self, "repeat_penalty").unwrap_or(1.0),
-            frequency_penalty: upstream_setting_f32(self, "frequency_penalty").unwrap_or(0.0),
-            presence_penalty: upstream_setting_f32(self, "presence_penalty").unwrap_or(0.0),
-            dry_multiplier: upstream_setting_f32(self, "dry_multiplier").unwrap_or(0.0),
-            dry_base: upstream_setting_f32(self, "dry_base").unwrap_or(1.75),
-            dry_allowed_length: upstream_setting_i64(self, "dry_allowed_length")
-                .and_then(|value| i32::try_from(value).ok())
-                .unwrap_or(2),
-            dry_penalty_last_n: upstream_setting_i64(self, "dry_penalty_last_n")
-                .and_then(|value| i32::try_from(value).ok())
-                .unwrap_or(-1),
-            sampler_order: sampler_order(self),
-            max_tokens: upstream_setting_i64(self, "max_tokens")
-                .and_then(|value| u32::try_from(value).ok())
-                .filter(|value| *value > 0)
-                .unwrap_or(self.default_max_tokens),
-            stop: Vec::new(),
+    pub fn sampling_config(&self) -> std::result::Result<SamplingConfig, ValidationBlocker> {
+        if let Some(value) = self.upstream_settings.get("customJson")
+            && let Some(blocker) =
+                validate_settings_update(&BTreeMap::from([("customJson".into(), value.clone())]))
+        {
+            return Err(ValidationBlocker {
+                readiness: "blocked_invalid_generation_profile".into(),
+                blocker,
+            });
+        }
+        let inherited = SamplingOverrides::from_settings(&self.upstream_settings)
+            .map_err(invalid_generation_profile)?;
+        let custom = match self.upstream_settings.get("customJson") {
+            None => SamplingOverrides::default(),
+            Some(Value::String(raw)) => {
+                SamplingOverrides::from_json(raw).map_err(invalid_generation_profile)?
+            }
+            Some(_) => return Err(invalid_generation_profile("customJson must be text")),
         };
-        apply_custom_json_sampling(self, &mut sampling);
-        sampling
+        resolve_sampling(
+            GenerationTask::Chat,
+            &[
+                SamplingOverrides {
+                    temperature: Some(self.default_temperature),
+                    top_p: Some(self.default_top_p),
+                    max_tokens: Some(self.default_max_tokens),
+                    ..SamplingOverrides::default()
+                },
+                inherited,
+                custom,
+            ],
+        )
+        .map_err(invalid_generation_profile)
+    }
+
+    pub fn sampling_for_profile(
+        &self,
+        frozen: Option<&SamplingConfig>,
+    ) -> std::result::Result<SamplingConfig, ValidationBlocker> {
+        match frozen {
+            Some(sampling) => {
+                sampling.validate().map_err(invalid_generation_profile)?;
+                Ok(sampling.clone())
+            }
+            None => self.sampling_config(),
+        }
+    }
+
+    fn validate_generation(&self) -> std::result::Result<(), ValidationBlocker> {
+        self.sampling_config()?;
+        ModelExecutionLimits {
+            context_tokens: self.context_tokens,
+            batch_tokens: self.batch_tokens,
+            parallel_sequences: self.max_parallel_sequences,
+        }
+        .validate()
+        .map_err(invalid_generation_profile)?;
+        Ok(())
+    }
+}
+
+fn invalid_generation_profile(error: impl std::fmt::Display) -> ValidationBlocker {
+    ValidationBlocker {
+        readiness: "blocked_invalid_generation_profile".into(),
+        blocker: Blocker::new(
+            "generation_profile_invalid",
+            error.to_string(),
+            vec!["Correct the requested sampling or model execution settings.".into()],
+        ),
     }
 }
 
@@ -252,36 +284,6 @@ const CUSTOM_JSON_SAMPLING_KEYS: &[&str] = &[
     "dry_penalty_last_n",
 ];
 
-fn sampler_order(settings: &Settings) -> Vec<SamplerKind> {
-    let Some(value) = settings
-        .upstream_settings
-        .get("samplers")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return SamplingConfig::default().sampler_order;
-    };
-    let parsed = value
-        .split([',', ';', ' '])
-        .filter_map(|name| match name.trim().to_ascii_lowercase().as_str() {
-            "penalties" => Some(SamplerKind::Penalties),
-            "dry" => Some(SamplerKind::Dry),
-            "top_k" | "top-k" => Some(SamplerKind::TopK),
-            "typ_p" | "typical" | "typical_p" => Some(SamplerKind::TypicalP),
-            "top_p" | "top-p" => Some(SamplerKind::TopP),
-            "min_p" | "min-p" => Some(SamplerKind::MinP),
-            "xtc" => Some(SamplerKind::Xtc),
-            "temperature" | "temp" => Some(SamplerKind::Temperature),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if parsed.is_empty() {
-        SamplingConfig::default().sampler_order
-    } else {
-        parsed
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct SettingsUpdate {
     /// `None` leaves the setting unchanged; `Some(None)` clears it.
@@ -325,16 +327,6 @@ fn physical_memory_bytes() -> Option<u64> {
         let bytes = system.total_memory();
         (bytes > 0).then_some(bytes)
     })
-}
-
-fn automatic_resident_memory_budget(physical_memory_bytes: Option<u64>) -> u64 {
-    match physical_memory_bytes {
-        Some(bytes) => (bytes / 2).clamp(
-            MIN_AUTO_RESIDENT_MEMORY_BUDGET_BYTES,
-            MAX_AUTO_RESIDENT_MEMORY_BUDGET_BYTES,
-        ),
-        None => FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +377,7 @@ fn write_resident_memory_budget_projection(
 }
 
 pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
+    let sampling = GenerationTask::Chat.defaults();
     BTreeMap::from([
         ("theme".to_string(), json!("system")),
         ("systemMessage".to_string(), json!("")),
@@ -407,16 +400,16 @@ pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
         ("showBuildVersion".to_string(), json!(false)),
         ("showSystemMessage".to_string(), json!(true)),
         ("renderThinkingAsMarkdown".to_string(), json!(true)),
-        ("temperature".to_string(), json!(0.7)),
+        ("temperature".to_string(), json!(sampling.temperature)),
         ("dynatemp_range".to_string(), Value::Null),
         ("dynatemp_exponent".to_string(), Value::Null),
         ("top_k".to_string(), Value::Null),
-        ("top_p".to_string(), json!(0.95)),
+        ("top_p".to_string(), json!(sampling.top_p)),
         ("min_p".to_string(), Value::Null),
         ("xtc_probability".to_string(), Value::Null),
         ("xtc_threshold".to_string(), Value::Null),
         ("typ_p".to_string(), Value::Null),
-        ("max_tokens".to_string(), json!(DEFAULT_MAX_TOKENS)),
+        ("max_tokens".to_string(), json!(sampling.max_tokens)),
         ("samplers".to_string(), json!("")),
         ("repeat_last_n".to_string(), Value::Null),
         ("repeat_penalty".to_string(), Value::Null),
@@ -460,7 +453,7 @@ pub fn upstream_setting_i64(settings: &Settings, key: &str) -> Option<i64> {
     match settings.upstream_settings.get(key) {
         Some(Value::Number(value)) => value
             .as_i64()
-            .or_else(|| value.as_u64().map(|value| value as i64)),
+            .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok())),
         Some(Value::String(value)) => value.parse::<i64>().ok(),
         _ => None,
     }
@@ -628,6 +621,7 @@ fn compiled_default_path(
 }
 
 pub fn save_settings(settings: &Settings) -> Result<PathBuf> {
+    settings.validate_generation()?;
     fs::create_dir_all(&settings.data_dir)?;
     let store = RuntimeStore::open(&settings.data_dir)?;
     store.put(SETTINGS_NAMESPACE, settings)?;
@@ -730,21 +724,21 @@ pub fn settings_update(update: SettingsUpdate) -> Result<CommandResult<Settings>
         );
     }
     if let Some(context_tokens) = update.context_tokens {
-        settings.context_tokens = context_tokens.max(512);
+        settings.context_tokens = context_tokens;
         settings.upstream_settings.insert(
             "nativeContextTokens".to_string(),
             json!(settings.context_tokens),
         );
     }
     if let Some(batch_tokens) = update.batch_tokens {
-        settings.batch_tokens = batch_tokens.max(1);
+        settings.batch_tokens = batch_tokens;
         settings.upstream_settings.insert(
             "nativeBatchTokens".to_string(),
             json!(settings.batch_tokens),
         );
     }
     if let Some(max_parallel_sequences) = update.max_parallel_sequences {
-        settings.max_parallel_sequences = max_parallel_sequences.clamp(1, 4);
+        settings.max_parallel_sequences = max_parallel_sequences;
         settings.upstream_settings.insert(
             "nativeModelSlots".to_string(),
             json!(settings.max_parallel_sequences),
@@ -799,6 +793,13 @@ pub fn settings_update(update: SettingsUpdate) -> Result<CommandResult<Settings>
     {
         settings.theme = Some(theme.to_string());
     }
+    if let Err(error) = settings.validate_generation() {
+        return Ok(CommandResult::blocked(
+            "mom_llama.settings_update",
+            "stub_blocked",
+            error.blocker,
+        ));
+    }
     let path = save_settings(&settings)?;
     Ok(CommandResult::passed(
         "mom_llama.settings_update",
@@ -835,6 +836,23 @@ fn validate_settings_update(values: &BTreeMap<String, Value>) -> Option<Blocker>
                 format!("`{key}` is not a current upstream or native setting."),
                 vec!["Use a setting exposed by the native Settings screen.".to_string()],
             ));
+        }
+        if matches!(
+            key.as_str(),
+            "nativeContextTokens" | "nativeBatchTokens" | "nativeModelSlots"
+        ) {
+            let parsed = value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|raw| raw.parse().ok()))
+                .and_then(|number| u32::try_from(number).ok());
+            let valid = parsed.is_some_and(|number| match key.as_str() {
+                "nativeContextTokens" => number >= 512,
+                "nativeBatchTokens" => number > 0,
+                _ => (1..=llama_native_types::MAX_PARALLEL_SEQUENCES).contains(&number),
+            });
+            if !valid {
+                return Some(invalid_generation_profile(format!("invalid {key}")).blocker);
+            }
         }
         if key == "customJson" {
             let Some(raw) = value.as_str() else {
@@ -886,82 +904,11 @@ fn validate_settings_update(values: &BTreeMap<String, Value>) -> Option<Blocker>
             }
         }
     }
-    None
-}
-
-fn apply_custom_json_sampling(settings: &Settings, sampling: &mut SamplingConfig) {
-    let Some(Value::String(raw)) = settings.upstream_settings.get("customJson") else {
-        return;
-    };
-    let Ok(Value::Object(custom)) = serde_json::from_str::<Value>(raw) else {
-        return;
-    };
-    let f32_value = |key: &str| {
-        custom
-            .get(key)
-            .and_then(Value::as_f64)
-            .map(|value| value as f32)
-    };
-    let i64_value = |key: &str| custom.get(key).and_then(Value::as_i64);
-    if let Some(value) = f32_value("temperature") {
-        sampling.temperature = value;
-    }
-    if let Some(value) = f32_value("dynatemp_range") {
-        sampling.dynamic_temperature_range = value;
-    }
-    if let Some(value) = f32_value("dynatemp_exponent") {
-        sampling.dynamic_temperature_exponent = value;
-    }
-    if let Some(value) = i64_value("top_k").and_then(|value| i32::try_from(value).ok()) {
-        sampling.top_k = value;
-    }
-    if let Some(value) = f32_value("top_p") {
-        sampling.top_p = value;
-    }
-    if let Some(value) = f32_value("min_p") {
-        sampling.min_p = value;
-    }
-    if let Some(value) = f32_value("xtc_probability") {
-        sampling.xtc_probability = value;
-    }
-    if let Some(value) = f32_value("xtc_threshold") {
-        sampling.xtc_threshold = value;
-    }
-    if let Some(value) = f32_value("typ_p") {
-        sampling.typical_p = value;
-    }
-    if let Some(value) = i64_value("max_tokens")
-        .and_then(|value| u32::try_from(value).ok())
-        .filter(|value| *value > 0)
-    {
-        sampling.max_tokens = value;
-    }
-    if let Some(value) = i64_value("repeat_last_n").and_then(|value| i32::try_from(value).ok()) {
-        sampling.repeat_last_n = value;
-    }
-    if let Some(value) = f32_value("repeat_penalty") {
-        sampling.repeat_penalty = value;
-    }
-    if let Some(value) = f32_value("presence_penalty") {
-        sampling.presence_penalty = value;
-    }
-    if let Some(value) = f32_value("frequency_penalty") {
-        sampling.frequency_penalty = value;
-    }
-    if let Some(value) = f32_value("dry_multiplier") {
-        sampling.dry_multiplier = value;
-    }
-    if let Some(value) = f32_value("dry_base") {
-        sampling.dry_base = value;
-    }
-    if let Some(value) = i64_value("dry_allowed_length").and_then(|value| i32::try_from(value).ok())
-    {
-        sampling.dry_allowed_length = value;
-    }
-    if let Some(value) = i64_value("dry_penalty_last_n").and_then(|value| i32::try_from(value).ok())
-    {
-        sampling.dry_penalty_last_n = value;
-    }
+    let parsed = SamplingOverrides::from_settings(values)
+        .and_then(|layer| resolve_sampling(GenerationTask::Chat, &[layer]));
+    parsed
+        .err()
+        .map(|error| invalid_generation_profile(error).blocker)
 }
 
 fn sync_generation_defaults_from_upstream(settings: &mut Settings) {
@@ -973,8 +920,9 @@ fn sync_generation_defaults_from_upstream(settings: &mut Settings) {
     }
     if let Some(max_tokens) = upstream_setting_i64(settings, "max_tokens")
         && max_tokens > 0
+        && let Ok(max_tokens) = u32::try_from(max_tokens)
     {
-        settings.default_max_tokens = max_tokens as u32;
+        settings.default_max_tokens = max_tokens;
     }
 }
 
@@ -997,17 +945,17 @@ fn sync_native_defaults_from_upstream(settings: &mut Settings) {
     if let Some(value) = upstream_setting_i64(settings, "nativeContextTokens")
         && let Ok(value) = u32::try_from(value)
     {
-        settings.context_tokens = value.max(512);
+        settings.context_tokens = value;
     }
     if let Some(value) = upstream_setting_i64(settings, "nativeBatchTokens")
         && let Ok(value) = u32::try_from(value)
     {
-        settings.batch_tokens = value.max(1);
+        settings.batch_tokens = value;
     }
     if let Some(value) = upstream_setting_i64(settings, "nativeModelSlots")
         && let Ok(value) = u32::try_from(value)
     {
-        settings.max_parallel_sequences = value.clamp(1, 4);
+        settings.max_parallel_sequences = value;
     }
     if let Some(value) = upstream_setting_i64(settings, "nativeMemoryBudgetMiB")
         && let Ok(value) = u64::try_from(value)
@@ -1219,7 +1167,13 @@ mod tests {
     fn generation_defaults_leave_room_for_reasoning_models_to_answer() {
         let settings = Settings::defaults_for_data_dir(std::env::temp_dir());
         assert_eq!(settings.default_max_tokens, DEFAULT_MAX_TOKENS);
-        assert_eq!(settings.sampling_config().max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(
+            settings
+                .sampling_config()
+                .expect("valid defaults")
+                .max_tokens,
+            DEFAULT_MAX_TOKENS
+        );
         assert_eq!(
             settings.upstream_settings.get("disableReasoningParsing"),
             Some(&json!(false))
@@ -1250,10 +1204,7 @@ mod tests {
 
     #[test]
     fn automatic_memory_budget_is_half_of_ram_with_conservative_bounds() {
-        assert_eq!(
-            automatic_resident_memory_budget(None),
-            FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES
-        );
+        assert_eq!(automatic_resident_memory_budget(None), 8 * GIB);
         assert_eq!(automatic_resident_memory_budget(Some(GIB)), 2 * GIB);
         assert_eq!(automatic_resident_memory_budget(Some(16 * GIB)), 8 * GIB);
         assert_eq!(automatic_resident_memory_budget(Some(128 * GIB)), 64 * GIB);
@@ -1421,7 +1372,7 @@ mod tests {
             )]))
             .is_none()
         );
-        let sampling = settings.sampling_config();
+        let sampling = settings.sampling_config().expect("valid sampling");
         assert_eq!(sampling.temperature, 0.25);
         assert_eq!(sampling.top_k, 7);
         assert_eq!(sampling.max_tokens, 33);
@@ -1432,6 +1383,88 @@ mod tests {
         )]))
         .expect("unknown custom JSON authority must block");
         assert_eq!(blocker.code, "custom_json_key_not_allowlisted");
+    }
+
+    #[test]
+    fn invalid_sampler_and_limits_reject_before_any_settings_write() -> Result<()> {
+        let data_dir =
+            std::env::temp_dir().join(format!("mom-invalid-profile-{}", uuid::Uuid::new_v4()));
+        let mut settings = Settings::defaults_for_data_dir(data_dir.clone());
+        settings
+            .upstream_settings
+            .insert("samplers".into(), json!("top_k;unknown;temperature"));
+        assert!(save_settings(&settings).is_err());
+        assert!(
+            !data_dir.exists(),
+            "invalid settings must not create a store"
+        );
+        settings
+            .upstream_settings
+            .insert("samplers".into(), json!(""));
+        settings.max_parallel_sequences = 5;
+        assert!(save_settings(&settings).is_err());
+        assert!(!data_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_update_preserves_the_stored_settings() -> Result<()> {
+        let data_dir =
+            std::env::temp_dir().join(format!("mom-profile-update-{}", uuid::Uuid::new_v4()));
+        set_data_dir_override_for_tests(Some(data_dir.clone()));
+        let outcome = (|| -> Result<()> {
+            let settings = Settings::defaults_for_data_dir(data_dir.clone());
+            save_settings(&settings)?;
+            for (key, value) in [
+                ("samplers", json!("top_k;typical_typo;temperature")),
+                ("top_k", json!("not a number")),
+                ("top_p", json!(1.5)),
+                ("nativeModelSlots", json!(5)),
+                ("nativeContextTokens", json!(-1)),
+                ("customJson", json!(r#"{"top_p":1.5}"#)),
+            ] {
+                let update = settings_update(SettingsUpdate {
+                    upstream_settings: Some(BTreeMap::from([(key.into(), value)])),
+                    ..SettingsUpdate::default()
+                })?;
+                assert_eq!(update.status, "blocked", "{key}");
+                let store = RuntimeStore::open(&data_dir)?;
+                assert_eq!(
+                    store.get::<Settings>(SETTINGS_NAMESPACE)?,
+                    Some(settings.clone())
+                );
+            }
+            Ok(())
+        })();
+        set_data_dir_override_for_tests(None);
+        if data_dir.exists() {
+            fs::remove_dir_all(data_dir)?;
+        }
+        outcome
+    }
+
+    #[test]
+    fn invalid_persisted_sampler_remains_readable_for_repair_but_cannot_generate() {
+        let data_dir = std::env::temp_dir();
+        let mut stored = Settings::defaults_for_data_dir(data_dir.clone());
+        stored
+            .upstream_settings
+            .insert("samplers".into(), json!("invalid-stage"));
+        let settings =
+            settings_from_document_with_model_sources(data_dir, Some(stored), None, None, None)
+                .expect("settings remain inspectable for repair");
+        assert_eq!(settings.upstream_settings["samplers"], "invalid-stage");
+        assert!(settings.sampling_config().is_err());
+    }
+
+    #[test]
+    fn frozen_invalid_profile_is_rejected_without_using_valid_global_defaults() {
+        let settings = Settings::defaults_for_data_dir(std::env::temp_dir());
+        let frozen = SamplingConfig {
+            temperature: f32::NAN,
+            ..SamplingConfig::default()
+        };
+        assert!(settings.sampling_for_profile(Some(&frozen)).is_err());
     }
 
     #[test]

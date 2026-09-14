@@ -345,9 +345,13 @@ pub(crate) fn model_configuration_for_profile(
     validate_model_path(model_path)?;
     let mut config = NativeModelConfig::local(model_path.to_path_buf());
     config.device = settings.native_device;
-    config.context_tokens = settings.context_tokens;
-    config.batch_tokens = settings.batch_tokens;
-    config.max_sequences = settings.max_parallel_sequences.clamp(1, 4);
+    desktop_generation_policy::ModelExecutionLimits {
+        context_tokens: settings.context_tokens,
+        batch_tokens: settings.batch_tokens,
+        parallel_sequences: settings.max_parallel_sequences,
+    }
+    .apply_to(&mut config)
+    .map_err(|error| native_blocker("model_execution_limits_invalid", &error.to_string()))?;
     // This boundary consumes an exact profile. In particular, a frozen/imported
     // `None` must remain `None` if a sibling projector appears later. Ordinary
     // model selection resolves and persists its pair before reaching the host.

@@ -12,12 +12,14 @@
   import { workspaceRows } from './lib/workspaceTree';
   import { readWorkspaceFolders, rememberWorkspaceFolder, type WorkspaceFolder } from './lib/workspaceFolders';
   import WorkspacePane from './lib/WorkspacePane.svelte';
-  import { workspaceWriterCandidates, workspaceWriterModel, type WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
+  import SetupFlow from './lib/SetupFlow.svelte';
+  import { workspaceWriterCandidates, workspaceWriterModel, type SetupChoices, type WorkspaceTemplateSnapshot, type WorkspaceWriterCandidate } from './lib/workspaceTemplate';
   import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
   import { startAudioRecording, stopAudioRecording, synthesizeAudio, type AudioRecording } from './lib/ipc';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
   import ImportSources from './lib/ImportSources.svelte';
+  import ConfiguredDownloads from './lib/ConfiguredDownloads.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
@@ -301,12 +303,11 @@
     VisualFormatState
   } from './lib/visualFormatting';
   import {
-    DEFAULT_MODEL_DOWNLOAD_LIMIT_GIB,
-    deriveGgufFileName,
+    captureConfiguredDownload,
     downloadProgressPercent,
     formatByteCount,
-    validateVerifiedDownload,
-    type VerifiedDownloadForm
+    type ModelDownloadCapture,
+    type ConfiguredModelDownload
   } from './lib/modelDownload';
   import {
     generationEventBelongsToScope
@@ -396,7 +397,26 @@
   let workspaceTemplateScope = '';
   let deferredWorkspaceTemplate: WorkspaceTemplateSnapshot | null = null;
   let deferredTemplateSession = '';
-  $: if (deferredWorkspaceTemplate && !compositionActive) applyDeferredTemplate();
+  let workspaceSettingsSession = '';
+  let assistanceReadySession = '';
+  let appliedAssistanceKey = '';
+  let attemptedAssistance: WorkspaceTemplateSnapshot | null = null;
+  let setupFlowOpen = false;
+  let setupSaving = false;
+  let setupError = '';
+  let setupDownloadIds: string[] = [];
+  $: setupDownloads = setupDownloadIds.map(id => modelDownloads.find(download => download.command_id === id));
+  $: setupDownloadStatus = setupDownloads.some(download => download?.status.status === 'failed')
+    ? 'The download needs attention. Your writing is available.'
+    : setupDownloads.some(download => download?.status.status === 'cancelled')
+      ? 'Download stopped. You can restart it in download details.'
+      : setupDownloads.some(download => !download)
+        ? 'Checking download progress. You can keep writing.'
+        : setupDownloads.length > 0 && setupDownloads.every(download => download?.status.status === 'completed')
+          ? 'Download verified. Your writing is available.'
+          : 'Your model is downloading. You can keep writing.';
+  $: if (project && assistanceReadySession === project.session_id && !suggestionsChanging && workspaceTemplate) void applyConfiguredAssistance();
+  $: if (deferredWorkspaceTemplate && !compositionActive && !contextCompositionActive) applyDeferredTemplate();
   let templateKey = '';
   let templateSerial = 0;
   let paneSelection: Record<string, string> = {};
@@ -417,16 +437,20 @@
   let paneEditors: Record<string, WorkspacePane> = {};
   let paneBusy: Record<string, boolean> = {};
   let paneComposing: Record<string, boolean> = {};
-  $: configuredPanes = workspaceTemplate?.enabled && !workspaceTemplate.error ? Object.entries(workspaceTemplate.config.panes) : [];
+  $: configuredPanes = workspaceTemplate?.enabled ? Object.entries(workspaceTemplate.config.panes) : [];
   $: busyPaneSlots = new Set(configuredPanes.filter(([id]) => paneBusy[id]).map(([, config]) => config.position));
   $: paneSlots = (['main', 'right', 'bottom'] as const).map(position => {
     const choices = configuredPanes.filter(([, config]) => config.position === position && config.visible);
     return { position, choices, selected: choices.find(([id]) => id === paneSelection[position]) ?? choices[0] };
   });
   $: mainPane = paneSlots.find(slot => slot.position === 'main')?.selected;
-  $: customMain = Boolean(mainPane && (mainPane[1].kind !== 'editor' || mainPane[1].document));
+  $: customMain = !['.mine.toml', '.loom.md'].includes(document?.summary.relative_path ?? '') && Boolean(mainPane && (mainPane[1].kind !== 'editor' || mainPane[1].document));
   $: if (desktop && project) {
-    const key = `${project.project_id}/${project.session_id}/${project.documents.find(item => item.relative_path === '.loom.md')?.revision_id ?? ''}`;
+    if (workspaceSettingsSession !== project.session_id) {
+      workspaceSettingsSession = project.session_id; workspaceTemplate = null; workspaceTemplateScope = ''; deferredWorkspaceTemplate = null;
+      assistanceReadySession = ''; appliedAssistanceKey = ''; attemptedAssistance = null; setupFlowOpen = false; setupError = ''; setupDownloadIds = [];
+    }
+    const key = `${project.project_id}/${project.session_id}/${project.documents.find(item => item.relative_path === '.mine.toml')?.revision_id ?? project.documents.find(item => item.relative_path === '.loom.md')?.revision_id ?? ''}`;
     if (key !== templateKey) { templateKey = key; void refreshWorkspaceTemplate(); }
   } else { workspaceTemplate = null; workspaceTemplateScope = ''; deferredWorkspaceTemplate = null; templateKey = ''; }
   let outlineOpen = false;
@@ -603,12 +627,6 @@
   let suggestionWakeQueued = false;
   let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
   let announcedGhostPresentationKey = '';
-  let modelDownloadUrl = '';
-  let modelDownloadFileName = '';
-  let lastDerivedModelFileName = '';
-  let modelDownloadSha256 = '';
-  let modelDownloadExpectedBytes = '';
-  let modelDownloadMaximumGiB = String(DEFAULT_MODEL_DOWNLOAD_LIMIT_GIB);
   let modelDownloadStarting = false;
   let modelDownloadCancellingIds: string[] = [];
   let modelDownloadError = '';
@@ -866,10 +884,6 @@
     speculation?: { sampleTarget: 4 | 16 | 64 | 256; offset: number; key: string };
   }
 
-  interface ModelDownloadCapture extends VerifiedDownloadForm {
-    commandId: string;
-  }
-
   interface HydratedBranchBodies {
     cards: BranchCard[];
     bodyBlobByRun: Record<string, string>;
@@ -1020,9 +1034,9 @@
   $: selectedModel = models.find((model) => model.model_path === selectedModelPath) ?? null;
   $: availableWriterModels = orderedLocalTextModels(models, loadLastLocalModelPath());
   $: activeModelDownloads = modelDownloads.filter((download) => !modelDownloadIsTerminal(download));
-  $: pendingModelDownloadSnapshot = pendingModelDownload
-    ? modelDownloads.find((download) => download.command_id === pendingModelDownload?.commandId) ?? null
-    : null;
+  $: configuredModelDownloads = project && !workspaceTemplate?.error &&
+    workspaceTemplateScope === `${project.project_id}/${project.session_id}`
+    ? workspaceTemplate?.downloads ?? {} : {};
   $: activeBranchCount = branches.filter(
     (branch) => branch.status === 'queued' || branch.status === 'generating'
   ).length;
@@ -1086,7 +1100,7 @@
     liveTextSequenceByRun: liveBranchTextSequenceByRun,
     currentModel,
     document,
-    suggestionsEnabled: completionAutomationEnabled(),
+    suggestionsEnabled: document?.summary.relative_path !== '.mine.toml' && completionAutomationEnabled(),
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
     unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
@@ -1103,7 +1117,7 @@
     liveTextSequenceByRun: liveBranchTextSequenceByRun,
     currentModel,
     document,
-    suggestionsEnabled: completionAutomationEnabled(),
+    suggestionsEnabled: document?.summary.relative_path !== '.mine.toml' && completionAutomationEnabled(),
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
     unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
@@ -1254,7 +1268,7 @@
       : '';
   $: finishCompletionIfExhausted(completionExhaustionKey);
   $: visualAutocompleteDisposition = autocompleteDisposition({
-    active: mode === 'visual' && completionAutomationEnabled() && !visualMutationPending && branchPromotionReady,
+    active: mode === 'visual' && document?.summary.relative_path !== '.mine.toml' && completionAutomationEnabled() && !visualMutationPending && branchPromotionReady,
     branches: currentReadyBranches,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     dismissedCandidateIds,
@@ -1263,7 +1277,7 @@
     presentationCompatible: visualGhostTextMayBePlainProse
   });
   $: sourceAutocompleteDisposition = autocompleteDisposition({
-    active: mode === 'source' && completionAutomationEnabled() && !sourceDirty && !compositionActive && branchPromotionReady,
+    active: mode === 'source' && document?.summary.relative_path !== '.mine.toml' && completionAutomationEnabled() && !sourceDirty && !compositionActive && branchPromotionReady,
     branches: currentReadyBranches,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     dismissedCandidateIds,
@@ -1319,7 +1333,7 @@
     ? visualSelectionByte !== null
     : mode === 'source' && Boolean(sourceTextarea) && sourceSelectionStart === sourceSelectionEnd;
   $: canUseVisual = Boolean(
-    document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')
+    document?.summary.relative_path !== '.mine.toml' && document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')
   );
   $: weaveCursorAtStart = mode === 'source'
     ? sourceSelectionStart === 0
@@ -1328,7 +1342,7 @@
     desktop,
     automationEnabled: completionAutomationEnabled(),
     projectAvailable: Boolean(project),
-    documentAvailable: Boolean(document),
+    documentAvailable: Boolean(document) && document?.summary.relative_path !== '.mine.toml',
     hybridDocument: document?.summary.kind === 'hybrid',
     intentArmed: completionGenerationIsArmed(
       completionGenerationIntent,
@@ -1604,6 +1618,10 @@
   }
 
   async function removeCoWriter(profile: CoWriterSummary): Promise<void> {
+    if (profile.configured) {
+      coWriterError = 'Edit .mine.toml to remove this co-writer';
+      return;
+    }
     if (!project || coWriterBusy) return;
     const captured = { projectId: project.project_id, sessionId: project.session_id };
     const serial = ++coWriterOperationSerial;
@@ -3500,15 +3518,6 @@
     }
   }
 
-  function updateModelDownloadUrl(value: string): void {
-    modelDownloadUrl = value;
-    const derived = deriveGgufFileName(value);
-    if (!modelDownloadFileName || modelDownloadFileName === lastDerivedModelFileName) {
-      modelDownloadFileName = derived;
-    }
-    lastDerivedModelFileName = derived;
-  }
-
   function localCatalogModel(
     entry: CuratedModelCatalogEntry
   ): ModelCapabilitySummary | undefined {
@@ -3555,8 +3564,10 @@
     modelDownloadError = '';
     try {
       await ensureModelDownloadEventListener();
+      const commandIds: string[] = [];
       for (const request of requests) {
         const commandId = newUlid();
+        commandIds.push(commandId);
         const snapshot = await startModelDownload({
           commandId,
           url: request.url,
@@ -3568,6 +3579,9 @@
         applyModelDownloadSnapshot(snapshot, false);
       }
       announce('Verified Gemma 4 model and multimodal projector downloads started');
+      if (project && !workspaceTemplate?.enabled) {
+        setupDownloadIds = commandIds; setupFlowOpen = true; setupError = ''; closeModelManager();
+      }
     } catch (error) {
       modelDownloadError = error instanceof Error
         ? error.message
@@ -3578,26 +3592,16 @@
     }
   }
 
-  async function beginOrRetryModelDownload(): Promise<void> {
+  async function beginOrRetryModelDownload(definition?: ConfiguredModelDownload): Promise<void> {
     if (modelDownloadStarting) return;
     let capture = pendingModelDownload;
     if (!capture) {
-      let request: VerifiedDownloadForm;
-      try {
-        request = validateVerifiedDownload({
-          url: modelDownloadUrl,
-          fileName: modelDownloadFileName,
-          sha256: modelDownloadSha256,
-          expectedBytes: modelDownloadExpectedBytes,
-          maximumGiB: modelDownloadMaximumGiB
-        });
-      } catch (error) {
-        modelDownloadError = error instanceof Error ? error.message : 'Review the download request.';
-        return;
-      }
-      capture = { commandId: newUlid(), ...request };
+      // Only a definition actually displayed for the current project may start.
+      // A pending command below retains its original immutable request on retry.
+      if (!desktop || !definition || !Object.values(configuredModelDownloads).includes(definition)) return;
+      capture = captureConfiguredDownload(newUlid(), definition);
       pendingModelDownload = capture;
-    }
+    } else if (definition || !modelDownloadUncertain) return;
     modelDownloadStarting = true;
     modelDownloadUncertain = false;
     modelDownloadCanAbandon = false;
@@ -4250,7 +4254,7 @@
   let unavailableWorkspaceWriterKey = '';
 
   function workspaceWriterKey(): string {
-    return `${workspaceTemplateScope}/${workspaceTemplate?.revision_id ?? ''}/${JSON.stringify(workspaceTemplate?.config.model ?? null)}`;
+    return `${workspaceTemplateScope}/${workspaceTemplate?.source_sha256 ?? workspaceTemplate?.revision_id ?? ''}/${workspaceTemplate?.model_path ?? ''}/${JSON.stringify(workspaceTemplate?.config.model ?? null)}`;
   }
 
   function workspaceWriterSwapIsIdle(): boolean {
@@ -4402,7 +4406,7 @@
       ) return false;
       models = discovered;
       const rememberedPath = loadLastLocalModelPath();
-      selectedModelPath = preferredWriterModelPath(
+      selectedModelPath = workspaceTemplate?.model_path ?? preferredWriterModelPath(
         discovered,
         rememberedPath,
         selectedModelPath
@@ -4511,6 +4515,7 @@
     modelManagerReturnFocus = trigger;
     modelManagerOpen = true;
     modelDownloadError = '';
+    void refreshWorkspaceTemplate();
     if (curatedModels.length === 0) void refreshCuratedModels();
     void recoverModelDownloads();
     void refreshCurrentModelsAndEnsureWriter();
@@ -5362,15 +5367,15 @@
     completionController = cancelCompletionSchedule(completionController);
   }
 
-  async function setSuggestionsEnabled(enabled: boolean, persist = true): Promise<void> {
+  async function setSuggestionsEnabled(enabled: boolean, persist = true): Promise<boolean> {
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
       !project ||
       suggestionsChanging
-    ) return;
+    ) return false;
     if (enabled && !buildModelPolicy) {
       announce('Suggestions remain off because this build could not verify its local writer policy');
-      return;
+      return false;
     }
     const boundProject = project;
     const previousEnabled = suggestionsEnabled;
@@ -5405,7 +5410,7 @@
         !applicationAllowsModelPreparation(applicationClosePhase) ||
         project?.project_id !== boundProject.project_id ||
         project.session_id !== boundProject.session_id
-      ) return;
+      ) return false;
       suggestionsEnabled = enabled;
       if (engineBecameDisabled) clearCompletionSession();
       if (persist) {
@@ -5437,6 +5442,7 @@
       if (engineBecameEnabled && writerReady && document) {
         scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'explicit_enable');
       }
+      return true;
     } catch (error) {
       suggestionsEnabled = previousEnabled;
       completionController = setDismissedCompletionCandidates(
@@ -5447,7 +5453,8 @@
       cancelSuggestionTimer();
       if (!enabled && activeBranchCount > 0) void cancelActiveBranches();
       recordFailure(error);
-      announce('Suggestions remain off because the project gate could not be changed');
+      announce('Suggestions could not be changed');
+      return false;
     } finally {
       suggestionsChanging = false;
     }
@@ -5581,23 +5588,12 @@
     await tick();
     if (!selectionIsCurrent()) return false;
     if (currentModel) return true;
-    if (selection && models.some((model) => model.loaded)) {
-      if (!workspaceWriterSwapIsIdle()) return false;
-      modelUnloading = true;
-      try {
-        await unloadModel();
-        await refreshModels(captured);
-      } catch (error) {
-        if (selectionIsCurrent()) {
-          quietModelLoadFailure = normalizeFailure(error);
-          unavailableWorkspaceWriterKey = requestKey;
-        }
-        return false;
-      } finally { modelUnloading = false; }
-      if (!selectionIsCurrent()) return false;
-    }
     const rememberedPath = loadLastLocalModelPath();
-    const candidates = workspaceWriterCandidates(selection, models, curatedModels, rememberedPath);
+    const configuredPath = workspaceTemplate?.model_path;
+    const discoveredCandidates = workspaceWriterCandidates(selection, models, curatedModels, rememberedPath);
+    const candidates: WorkspaceWriterCandidate[] = configuredPath
+      ? [discoveredCandidates.find(candidate => candidate.modelPath === configuredPath) ?? { modelPath: configuredPath, profileId: null, policyRank: 0, remembered: false }]
+      : discoveredCandidates;
     let terminalFailure: LoomFailure | null = null;
     for (const candidate of candidates) {
       if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
@@ -5662,7 +5658,7 @@
     if (selectionIsCurrent()) {
       unavailableWorkspaceWriterKey = requestKey;
       if (selection && !terminalFailure) terminalFailure = {
-        code: 'workspace_model_unavailable', message: 'The model named in .loom.md is not available in the local model library.', retryable: false
+        code: 'workspace_model_unavailable', message: 'The model named in workspace settings is not available in the local model library.', retryable: false
       };
     }
     if (
@@ -5881,7 +5877,7 @@
     }
   }
 
-  async function openInitialProject(restoreSerial: number): Promise<WorkspaceRestoreCapture | null> {
+  async function openInitialProject(restoreSerial: number, retryUnlock: boolean): Promise<WorkspaceRestoreCapture | null> {
     const startupIsCurrent = () => Boolean(
       componentMounted &&
       restoreSerial === workspaceRestoreSerial &&
@@ -5890,7 +5886,7 @@
     try {
       const acquisition = await acquireStartupProject({
         currentProject: currentProjectSession,
-        openDefaultProject,
+        openDefaultProject: () => openDefaultProject(retryUnlock),
         mayContinue: startupIsCurrent,
         projectIsAbsent: (error) => normalizeFailure(error).code === 'project_not_open',
         onHeld: holdWorkspaceForApplicationClose
@@ -5957,8 +5953,18 @@
       return false;
     }
 
-    const storedSuggestionsPreference = loadSuggestionPreference(captured.projectId);
+    let storedSuggestionsPreference = loadSuggestionPreference(captured.projectId);
     try {
+      const serial = ++templateSerial;
+      const settings = await getWorkspaceTemplate(captured.projectId, captured.sessionId);
+      if (!workspaceRestoreIsCurrent(captured)) return false;
+      if (serial !== templateSerial) {
+        assistanceReadySession = captured.sessionId;
+        return false;
+      }
+      acceptWorkspaceSettings(settings);
+      if (settings.error) throw new Error(settings.error);
+      storedSuggestionsPreference = settings.suggestions ?? storedSuggestionsPreference;
       const policy = await runCurrentWorkspaceStep({
         capture: captured,
         isCurrent: workspaceRestoreIsCurrent,
@@ -5970,10 +5976,13 @@
       });
       if (policy.status === 'stale') return false;
       suggestionsEnabled = storedSuggestionsPreference;
+      appliedAssistanceKey = `${captured.sessionId}/${settings.source_sha256 ?? ''}`;
+      assistanceReadySession = captured.sessionId;
     } catch (error) {
       if (!workspaceRestoreIsCurrent(captured)) return false;
       suggestionsEnabled = false;
       recordFailure(error);
+      assistanceReadySession = captured.sessionId;
       announce('Suggestions remain off because the project gate could not be restored');
       return false;
     }
@@ -5997,10 +6006,10 @@
     requestPreferredWriterEnsure(captured);
   }
 
-  async function restoreDesktopWorkspace(): Promise<void> {
+  async function restoreDesktopWorkspace(retryUnlock = false): Promise<void> {
     const restoreSerial = ++workspaceRestoreSerial;
     await restoreBeforeBackgroundWork({
-      restore: () => openInitialProject(restoreSerial),
+      restore: () => openInitialProject(restoreSerial, retryUnlock),
       present: async (captured) => {
         await tick();
         if (!workspaceRestoreIsCurrent(captured)) {
@@ -6108,7 +6117,7 @@
     opening = true;
     clearFailure();
     try {
-      await restoreDesktopWorkspace();
+      await restoreDesktopWorkspace(true);
     } finally {
       opening = false;
     }
@@ -6513,7 +6522,7 @@
         saveMessage = 'All changes saved';
         announce(`Opened ${target.title}`);
       }
-      mode = opened.summary.kind === 'prose' && canUseVisualMarkdown(effectiveText, false)
+      mode = opened.summary.relative_path !== '.mine.toml' && opened.summary.kind === 'prose' && canUseVisualMarkdown(effectiveText, false)
         ? preferredProseMode
         : 'source';
       void refreshBranchesFor(
@@ -6902,6 +6911,7 @@
     delay = suggestionsIdleDelayMs,
     trigger: CompletionGenerationTrigger = 'document_edit'
   ): void {
+    if (document?.summary.relative_path === '.mine.toml') return;
     const armed = armCompletionScheduleIntent(
       completionController,
       completionContextKey,
@@ -8003,11 +8013,14 @@
       return;
     }
     const modifier = event.metaKey || event.ctrlKey;
+    if (modifier && event.code === 'Comma' && !event.altKey && !event.isComposing) {
+      event.preventDefault(); void refreshWorkspaceTemplate(true); return;
+    }
     if (modifier && event.shiftKey && !event.altKey && !event.isComposing) {
       const key = event.key.toLowerCase();
       if (key === 'p') { event.preventDefault(); openModelManager(window.document.activeElement as HTMLElement); return; }
       if (key === 'u') { event.preventDefault(); void readAloud(); return; }
-      if (event.code === 'Comma') { event.preventDefault(); void refreshWorkspaceTemplate(true); return; }
+      if (key === 'r') { event.preventDefault(); void reloadModelFromSettings(); return; }
       if (key === 'l') { event.preventDefault(); toggleAppearance(); return; }
       if (key === 'm' && document) { event.preventDefault(); void setMode(mode === 'visual' ? 'source' : 'visual'); return; }
       if (key === 'f' && formatMenu) { event.preventDefault(); formatMenu.toggleOpen(); return; }
@@ -8752,7 +8765,7 @@
     uncertainSave = null;
     branches = [];
     resetLiveGenerationView();
-    mode = opened.summary.kind === 'prose' && canUseVisualMarkdown(opened.text, false)
+    mode = opened.summary.relative_path !== '.mine.toml' && opened.summary.kind === 'prose' && canUseVisualMarkdown(opened.text, false)
       ? preferredProseMode
       : 'source';
     if (opened.transient_draft) {
@@ -9066,6 +9079,10 @@
     }
     if (next === mode) return;
     if (!flushEditors()) return;
+    if (next === 'visual' && document?.summary.relative_path === '.mine.toml') {
+      announce('Settings use the source editor');
+      return;
+    }
     if (next === 'visual' && document?.summary.kind !== 'prose') {
       announce('Visual editing is available for prose manuscripts');
       return;
@@ -9088,7 +9105,7 @@
     }
     invalidateCompletionForCaretNavigation();
     if (next === 'source' && document) setSourceDocument(documentText);
-    if (document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')) {
+    if (document?.summary.relative_path !== '.mine.toml' && document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')) {
       preferredProseMode = next;
     }
     mode = next;
@@ -9380,17 +9397,17 @@
   }
 
   async function refreshWorkspaceTemplate(enable = false): Promise<void> {
-    if (!project || compositionActive || !flushEditors()) return;
-    if (document?.summary.relative_path === '.loom.md' && editVersion !== savedVersion) return;
+    if (!project) return;
+    if (enable && (compositionActive || contextCompositionActive || !flushEditors())) {
+      announce('Finish composing text before opening settings'); return;
+    }
+    if (['.mine.toml', '.loom.md'].includes(document?.summary.relative_path ?? '') && editVersion !== savedVersion) return;
     const scope = { projectId: project.project_id, sessionId: project.session_id };
     const serial = ++templateSerial;
     try {
       const snapshot = await (enable ? enableWorkspaceTemplate : getWorkspaceTemplate)(scope.projectId, scope.sessionId);
       if (serial !== templateSerial || !terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return;
-      if (!flushEditors()) { deferredTemplateSession = scope.sessionId; deferredWorkspaceTemplate = snapshot; return; }
-      workspaceTemplate = snapshot;
-      workspaceTemplateScope = `${scope.projectId}/${scope.sessionId}`;
-      void tick().then(requestPreferredWriterForCurrentWorkspace);
+      acceptWorkspaceSettings(snapshot);
       const registered = project?.documents.find(item => item.document_id === snapshot.document_id);
       if (snapshot.document_id && registered?.revision_id !== snapshot.revision_id) {
         scheduleProjectFilesystemRefresh(0);
@@ -9398,10 +9415,91 @@
       if (enable && snapshot.document_id) {
         await refreshProjectFilesystemState();
         await openPaneDocument(snapshot.document_id);
+        await setMode('source');
         outlineOpen = true;
       }
     } catch (error) {
       if (serial === templateSerial && terminalScopeIsCurrent(scope.projectId, scope.sessionId)) recordFailure(error);
+    }
+  }
+
+  function acceptWorkspaceSettings(snapshot: WorkspaceTemplateSnapshot): void {
+    if (!project) return;
+    if (compositionActive || contextCompositionActive || !flushEditors()) {
+      deferredTemplateSession = project.session_id;
+      if (deferredWorkspaceTemplate !== snapshot) deferredWorkspaceTemplate = snapshot;
+      return;
+    }
+    deferredWorkspaceTemplate = null;
+    // Keep the last valid layout visible while the author repairs invalid TOML.
+    workspaceTemplate = snapshot.error && workspaceTemplate
+      ? { ...snapshot, config: workspaceTemplate.config }
+      : snapshot;
+    workspaceTemplateScope = `${project.project_id}/${project.session_id}`;
+    void tick().then(requestPreferredWriterForCurrentWorkspace);
+  }
+
+  async function applyConfiguredAssistance(): Promise<void> {
+    if (!project || !workspaceTemplate || workspaceTemplate.error || suggestionsChanging) return;
+    const settings = workspaceTemplate;
+    const scope = project.session_id;
+    const key = `${scope}/${settings.source_sha256 ?? ''}`;
+    if (key === appliedAssistanceKey || attemptedAssistance === settings) return;
+    attemptedAssistance = settings;
+    const applied = await setSuggestionsEnabled(settings.suggestions ?? loadSuggestionPreference(project.project_id), false);
+    if (applied && project?.session_id === scope) appliedAssistanceKey = key;
+  }
+
+  async function reloadModelFromSettings(): Promise<void> {
+    const captured = currentWorkspaceCapture();
+    if (!captured || modelLoading || modelUnloading || compositionActive || contextCompositionActive) return;
+    if (['.mine.toml', '.loom.md'].includes(document?.summary.relative_path ?? '') && !await flushCurrentDocument()) return;
+    if (!workspaceRestoreIsCurrent(captured)) return;
+    const serial = ++templateSerial;
+    try {
+      const settings = await getWorkspaceTemplate(captured.projectId, captured.sessionId);
+      if (!workspaceRestoreIsCurrent(captured) || serial !== templateSerial) return;
+      acceptWorkspaceSettings(settings);
+      if (settings.error) throw new Error(settings.error);
+      const path = settings.model_path ?? currentModel?.model_path ?? selectedModelPath;
+      if (!path) throw new Error('Set model.path in .mine.toml or choose a local model first.');
+      await refreshModels(captured);
+      if (!workspaceRestoreIsCurrent(captured)) return;
+      const selected = models.find(model => model.model_path === path);
+      if (!selected) throw new Error('The configured model file is unavailable. Check model.path in .mine.toml.');
+      if (curatedModels.length === 0) await refreshCuratedModels();
+      if (!workspaceRestoreIsCurrent(captured)) return;
+      const catalogEntry = curatedModels.find(entry => legacyLocalCatalogMatch(entry, selected)) ?? null;
+      if (!await activateSuggestionWriter(selected, captured, catalogEntry) && modelSetupError) {
+        throw new Error(modelSetupError);
+      }
+    } catch (error) {
+      if (workspaceRestoreIsCurrent(captured)) recordFailure(error);
+    }
+  }
+
+  async function applySetup(choices: SetupChoices): Promise<void> {
+    if (!project || setupSaving) return;
+    const scope = { projectId: project.project_id, sessionId: project.session_id };
+    const serial = ++templateSerial;
+    setupSaving = true; setupError = '';
+    try {
+      const settings = await enableWorkspaceTemplate(scope.projectId, scope.sessionId, choices);
+      if (!terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return;
+      if (serial === templateSerial) acceptWorkspaceSettings(settings);
+      if (settings.error) throw new Error(settings.error);
+      if (settings.suggestions !== choices.suggestions || settings.config.panes.chat.visible !== choices.chat) {
+        throw new Error('A settings file already exists. Open it to adjust these choices.');
+      }
+      await refreshProjectFilesystemState();
+      if (!terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return;
+      // Setup does not replace the writing document with its settings file.
+      setupFlowOpen = false;
+      announce('Your space is configured');
+    } catch (error) {
+      if (terminalScopeIsCurrent(scope.projectId, scope.sessionId)) setupError = normalizeFailure(error).message;
+    } finally {
+      setupSaving = false;
     }
   }
 
@@ -9412,11 +9510,7 @@
 
   function applyDeferredTemplate(): void {
     if (project?.session_id !== deferredTemplateSession) { deferredWorkspaceTemplate = null; return; }
-    if (!flushEditors()) return;
-    workspaceTemplate = deferredWorkspaceTemplate;
-    workspaceTemplateScope = `${project?.project_id}/${project?.session_id}`;
-    deferredWorkspaceTemplate = null;
-    void tick().then(requestPreferredWriterForCurrentWorkspace);
+    if (deferredWorkspaceTemplate) acceptWorkspaceSettings(deferredWorkspaceTemplate);
   }
 
   function togglePane(position: 'main' | 'right' | 'bottom'): void {
@@ -9559,6 +9653,9 @@
   {/if}
 
   {#if project}
+    {#if workspaceTemplate?.error}
+      <div class="error-banner" role="alert">{workspaceTemplate.error}<button type="button" class="bare-button compact" on:click={() => void refreshWorkspaceTemplate(true)}>Open settings file</button></div>
+    {/if}
     <div bind:clientWidth={workspaceWidth} bind:clientHeight={workspaceHeight} class:outline-open={outlineOpen} class="workspace-grid"
       style={`grid-template-columns:${outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0}px minmax(0,1fr) ${rightPaneOpen ? Math.min(rightWidth, rightLimit) : 0}px; grid-template-rows:minmax(0,1fr) ${bottomPaneOpen ? Math.min(bottomHeight, workspaceHeight * 0.6) : 0}px;`}>
       <aside
@@ -9662,7 +9759,9 @@
           {/each}
           {#if desktop && document}
             {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
-              <ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={document.summary.title} onUse={useImportedSources} />
+              <ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={document.summary.title} onUse={useImportedSources}
+                googleClientConfigured={workspaceTemplateScope === `${project.project_id}/${project.session_id}` && !workspaceTemplate?.error && Boolean(workspaceTemplate?.google_client_configured)}
+                onSettings={() => void refreshWorkspaceTemplate(true)} />
             {/key}
           {/if}
         </nav>
@@ -10111,6 +10210,18 @@
       {/each}
 
     </div>
+      {#if setupFlowOpen}
+        {#key project.session_id}
+          <SetupFlow
+            status={setupDownloadStatus}
+            busy={setupSaving} error={setupError}
+            onApply={(choices) => void applySetup(choices)}
+            onSkip={() => { setupFlowOpen = false; announce('Setup skipped'); }}
+            onTransfers={openModelManager}
+            onSettings={() => { setupFlowOpen = false; void refreshWorkspaceTemplate(true); }}
+          />
+        {/key}
+      {/if}
       <div class="terminal-dock" bind:clientHeight={terminalDockHeight} class:closed={!terminalOpen} style={`height:${effectiveTerminalHeight}px`}>
       {#if terminalOpen}<PaneDivider edge="top" label="Resize terminal" size={effectiveTerminalHeight} min={100} max={terminalLimit} onResize={(size) => terminalHeight = size} />{/if}
       <TerminalPane
@@ -10226,25 +10337,12 @@
         on:keydown={trapModelManagerFocus}
       >
         <header class="model-manager-header">
-          <h2 id="model-manager-title">Suggestions</h2>
-          <button class="icon-button" type="button" on:click={() => closeModelManager()} aria-label="Close suggestions">×</button>
+          <h2 id="model-manager-title">Models</h2>
+          <button data-model-manager-initial-focus class="icon-button" type="button" on:click={() => closeModelManager()} aria-label="Close models">×</button>
         </header>
 
         <div class="model-manager-body">
-          <section class="model-manager-summary" aria-label="Suggestion settings">
-            <label class="suggestions-setting">
-              <input
-                data-model-manager-initial-focus
-                type="checkbox"
-                checked={suggestionsEnabled}
-                disabled={!project || suggestionsChanging}
-                on:change={(event) => void setSuggestionsEnabled(event.currentTarget.checked)}
-              />
-              <span>
-                <strong>Suggestions {suggestionsEnabled ? 'on' : 'off'}</strong>
-              </span>
-            </label>
-
+          <section class="model-manager-summary" aria-label="Model status">
             <div class="model-readiness" role="status" aria-live="polite">
               <span
                 class:ready={Boolean(currentModel) && !modelLoading && !modelUnloading}
@@ -10269,6 +10367,56 @@
               <span>{quietModelLoadFailure.message}</span>
               <button class="secondary-button compact" type="button" on:click={() => void retryPreferredWriter()}>Retry local writer</button>
             </div>
+          {/if}
+
+          {#if modelDownloads.length > 0}
+            <section class="model-download-content" aria-labelledby="model-downloads-title">
+              <div class="section-heading">
+                <h3 id="model-downloads-title">Downloads</h3>
+                {#if activeModelDownloads.length > 0}
+                  <span class="fact-chip verified">{activeModelDownloads.length} active</span>
+                {/if}
+              </div>
+              {#each modelDownloads.slice(0, 6) as download (download.command_id)}
+                {@const percent = downloadProgressPercent(download.downloaded_bytes, download.total_bytes)}
+                <article class:terminal={modelDownloadIsTerminal(download)} class="download-card">
+                  <header>
+                    <div>
+                      <strong>{download.display_name}</strong>
+                      <span>{modelDownloadStatusLabel(download)}</span>
+                    </div>
+                    <span>{formatByteCount(download.downloaded_bytes)}{download.total_bytes === null ? '' : ` / ${formatByteCount(download.total_bytes)}`}</span>
+                  </header>
+                  {#if percent === null && !modelDownloadIsTerminal(download)}
+                    <progress aria-label={`${download.display_name} download progress`}></progress>
+                  {:else if percent !== null}
+                    <progress max="100" value={percent} aria-label={`${download.display_name} download progress`}>{percent.toFixed(0)}%</progress>
+                  {/if}
+                  {#if download.resumed_from_bytes > 0}
+                    <small>Resumed after verifying {formatByteCount(download.resumed_from_bytes)} of partial data.</small>
+                  {/if}
+                  {#if download.cancel_requested && !modelDownloadIsTerminal(download)}
+                    <small>Cancellation requested; waiting for the transfer to reach a safe stop.</small>
+                  {/if}
+                  {#if download.status.status === 'failed'}
+                    <p class="download-card-error">{download.status.message}</p>
+                  {/if}
+                  {#if download.event_delivery_failures > 0}
+                    <small>Desktop event delivery missed {download.event_delivery_failures} update{download.event_delivery_failures === 1 ? '' : 's'}; this view reconciles from command status.</small>
+                  {/if}
+                  <footer>
+                    <code title={download.command_id}>{download.expected_sha256.slice(0, 12)}…</code>
+                    {#if !modelDownloadIsTerminal(download)}
+                      <button class="secondary-button compact" type="button" aria-label={`Cancel download of ${download.display_name}`} on:click={() => void cancelVerifiedModelDownload(download.command_id)} disabled={download.cancel_requested || modelDownloadCancellingIds.includes(download.command_id)}>
+                        {download.cancel_requested || modelDownloadCancellingIds.includes(download.command_id) ? 'Cancelling…' : 'Cancel'}
+                      </button>
+                    {:else if download.status.status === 'completed'}
+                      <button class="secondary-button compact" type="button" on:click={() => void selectCompletedModelDownload(download)}>Select model</button>
+                    {/if}
+                  </footer>
+                </article>
+              {/each}
+            </section>
           {/if}
 
           <section class="curated-model-catalog" aria-labelledby="curated-model-catalog-title">
@@ -10385,17 +10533,14 @@
             </section>
           {/if}
 
-          <details class="model-advanced-panel">
-            <summary>Advanced</summary>
-            <div class="model-advanced-content">
-            {#if selectedModel?.loaded}
-              <section class="model-library" aria-labelledby="model-library-title">
-            <div class="section-heading">
-              <div>
-                <h3 id="model-library-title">Loaded model</h3>
-                <p>Native runtime details for the writer currently in memory.</p>
+          {#if selectedModel?.loaded}
+            <section class="model-library" aria-labelledby="model-library-title">
+              <div class="section-heading">
+                <div>
+                  <h3 id="model-library-title">Loaded model</h3>
+                  <p>Native runtime details for the writer currently in memory.</p>
+                </div>
               </div>
-            </div>
               <article class="model-facts">
                 <details class="model-technical">
                   <summary>Loaded writer details</summary>
@@ -10421,139 +10566,34 @@
                   </button>
                 </div>
               </article>
-              </section>
-            {/if}
+            </section>
+          {/if}
 
-              <details class="model-download-panel">
-            <summary>Add a model from a verified URL</summary>
-            <div class="model-download-content">
-            <div class="section-heading">
-              <div>
-                <h3>Add a verified GGUF</h3>
-                <p>Bring a publisher URL and its exact checksum. Loom will not guess either one.</p>
-              </div>
-              {#if activeModelDownloads.length > 0}
-                <span class="fact-chip verified">{activeModelDownloads.length} active</span>
-              {/if}
-            </div>
-
-            {#if !desktop}
-              <div class="runtime-note" role="note">Verified downloads are available in the Tauri desktop build.</div>
-            {/if}
-
-            <form class="model-download-form" on:submit|preventDefault={() => void beginOrRetryModelDownload()}>
-              <label class="wide-field">
-                <span>HTTPS model URL</span>
-                <input
-                  value={modelDownloadUrl}
-                  on:input={(event) => updateModelDownloadUrl(event.currentTarget.value)}
-                  type="url"
-                  inputmode="url"
-                  autocomplete="off"
-                  placeholder="https://publisher.example/model.gguf"
-                  disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting}
-                  required
-                />
-              </label>
-              <label class="wide-field">
-                <span>Local file name</span>
-                <input bind:value={modelDownloadFileName} autocomplete="off" spellcheck="false" placeholder="writer-base.Q8_0.gguf" disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting} required />
-              </label>
-              <label class="wide-field">
-                <span>Expected SHA-256 <small>required · 64 hexadecimal characters</small></span>
-                <input bind:value={modelDownloadSha256} autocomplete="off" spellcheck="false" inputmode="text" placeholder="Publisher checksum" disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting} required />
-              </label>
-              <label>
-                <span>Exact bytes <small>optional</small></span>
-                <input bind:value={modelDownloadExpectedBytes} autocomplete="off" inputmode="numeric" placeholder="4954576032" disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting} />
-              </label>
-              <label>
-                <span>Hard ceiling <small>GiB</small></span>
-                <input bind:value={modelDownloadMaximumGiB} type="number" min="0.001" max="1024" step="0.001" disabled={!desktop || pendingModelDownload !== null || modelDownloadStarting} required />
-              </label>
-              <p class="download-boundary wide-field">The URL is contacted only after you press download. Credentials in URLs are refused. A partial file may be resumed, but installation occurs only after a cold SHA-256 check and GGUF validation.</p>
-
+          <ConfiguredDownloads
+            downloads={configuredModelDownloads}
+            disabled={!desktop || modelDownloadStarting || pendingModelDownload !== null}
+            error={workspaceTemplate?.error ?? ''}
+            onStart={(definition) => void beginOrRetryModelDownload(definition)}
+            onSettings={() => { closeModelManager(); void refreshWorkspaceTemplate(true); }}
+          />
+          {#if modelDownloadError || (modelDownloadUncertain && pendingModelDownload)}
+            <section class="model-download-content" aria-label="Download recovery">
               {#if modelDownloadError}
-                <div class="download-error wide-field" role="alert">{modelDownloadError}</div>
+                <div class="download-error" role="alert">{modelDownloadError}</div>
               {/if}
               {#if modelDownloadUncertain && pendingModelDownload}
-                <div class="uncertain-download wide-field" role="status">
+                <div class="uncertain-download" role="status">
                   <strong>Command reply uncertain.</strong>
-                  Retrying preserves command <code>{pendingModelDownload.commandId}</code> and every request byte.
+                  Retrying {pendingModelDownload.fileName} preserves command <code>{pendingModelDownload.commandId}</code> and its original request, even if settings change.
+                  <button class="secondary-button compact" type="button" disabled={!desktop || modelDownloadStarting} on:click={() => void beginOrRetryModelDownload()}>Retry exact command safely</button>
                   {#if modelDownloadCanAbandon}
-                    The desktop confirmed that this non-retryable request was not registered, so it is safe to edit.
-                    <button class="bare-button compact" type="button" on:click={abandonUnstartedModelDownload}>Edit rejected request</button>
-                  {:else}
-                    Inputs remain locked until authoritative status is recovered.
+                    The desktop confirmed that this rejected request was not registered.
+                    <button class="bare-button compact" type="button" on:click={abandonUnstartedModelDownload}>Dismiss rejected request</button>
                   {/if}
                 </div>
               {/if}
-
-              <div class="model-download-actions wide-field">
-                <button
-                  class="primary-button"
-                  type="submit"
-                  disabled={!desktop || modelDownloadStarting || (pendingModelDownload !== null && !modelDownloadUncertain)}
-                >
-                  {modelDownloadStarting
-                    ? 'Registering verified transfer…'
-                    : modelDownloadUncertain
-                      ? 'Retry exact command safely'
-                      : pendingModelDownloadSnapshot
-                        ? 'Download in progress'
-                        : 'Download and verify'}
-                </button>
-              </div>
-            </form>
-
-            {#if modelDownloads.length > 0}
-              <div class="download-history" aria-label="Recent model downloads">
-                <h4>Transfers on this app session</h4>
-                {#each modelDownloads.slice(0, 6) as download (download.command_id)}
-                  {@const percent = downloadProgressPercent(download.downloaded_bytes, download.total_bytes)}
-                  <article class:terminal={modelDownloadIsTerminal(download)} class="download-card">
-                    <header>
-                      <div>
-                        <strong>{download.display_name}</strong>
-                        <span>{modelDownloadStatusLabel(download)}</span>
-                      </div>
-                      <span>{formatByteCount(download.downloaded_bytes)}{download.total_bytes === null ? '' : ` / ${formatByteCount(download.total_bytes)}`}</span>
-                    </header>
-                    {#if percent === null && !modelDownloadIsTerminal(download)}
-                      <progress aria-label={`${download.display_name} download progress`}></progress>
-                    {:else if percent !== null}
-                      <progress max="100" value={percent} aria-label={`${download.display_name} download progress`}>{percent.toFixed(0)}%</progress>
-                    {/if}
-                    {#if download.resumed_from_bytes > 0}
-                      <small>Resumed after verifying {formatByteCount(download.resumed_from_bytes)} of partial data.</small>
-                    {/if}
-                    {#if download.cancel_requested && !modelDownloadIsTerminal(download)}
-                      <small>Cancellation requested; waiting for the transfer to reach a safe stop.</small>
-                    {/if}
-                    {#if download.status.status === 'failed'}
-                      <p class="download-card-error">{download.status.message}</p>
-                    {/if}
-                    {#if download.event_delivery_failures > 0}
-                      <small>Desktop event delivery missed {download.event_delivery_failures} update{download.event_delivery_failures === 1 ? '' : 's'}; this view reconciles from command status.</small>
-                    {/if}
-                    <footer>
-                      <code title={download.command_id}>{download.expected_sha256.slice(0, 12)}…</code>
-                      {#if !modelDownloadIsTerminal(download)}
-                        <button class="secondary-button compact" type="button" on:click={() => void cancelVerifiedModelDownload(download.command_id)} disabled={download.cancel_requested || modelDownloadCancellingIds.includes(download.command_id)}>
-                          {download.cancel_requested || modelDownloadCancellingIds.includes(download.command_id) ? 'Cancelling…' : 'Cancel'}
-                        </button>
-                      {:else if download.status.status === 'completed'}
-                        <button class="secondary-button compact" type="button" on:click={() => void selectCompletedModelDownload(download)}>Select model</button>
-                      {/if}
-                    </footer>
-                  </article>
-                {/each}
-              </div>
-            {/if}
-            </div>
-              </details>
-            </div>
-          </details>
+            </section>
+          {/if}
         </div>
       </div>
     </div>

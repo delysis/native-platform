@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { page, userEvent } from 'vitest/browser';
 import WorkspacePane, { type WorkspacePaneConfig } from './WorkspacePane.svelte';
 import type { OpenDocument, TerminalRun } from './types';
+import { canUseVisualMarkdown } from './markdownSafety';
 import '../app.css';
 
 vi.mock('@tauri-apps/api/core', async (original) => ({ ...await original<typeof import('@tauri-apps/api/core')>(), convertFileSrc: (path: string, protocol: string) => `${protocol}://localhost/${path}` }));
@@ -26,20 +27,32 @@ function run(id: string, paneId = 'conversation'): TerminalRun {
   return { run_id: id, status: 'completed', expression: 'prompt', presentation: { pane_id: paneId, input: 'Earlier message' },
     output_document_id: 'result', output_relative_path: 'Runs/1/Answer.md', preview: 'Earlier answer', error: null, created_at_ms: 1 };
 }
-async function render(config: Partial<WorkspacePaneConfig> = {}, value = source.text) {
+async function render(config: Partial<WorkspacePaneConfig> = {}, value = source.text, currentSource = source) {
   const target = document.createElement('div'); target.style.height = '400px'; target.style.width = '320px'; document.body.append(target);
   ipc.list.mockResolvedValue(config.kind === 'browser' ? [] : [run('old'), run('unrelated', 'other')]);
   if (!ipc.open.getMockImplementation()) ipc.open.mockResolvedValue({ ...source, text: fullAnswer });
-  const beforeRun = vi.fn(async () => source), onOpenDocument = vi.fn(), onChange = vi.fn(), onCompositionChange = vi.fn();
+  const beforeRun = vi.fn(async () => currentSource), onOpenDocument = vi.fn(), onChange = vi.fn(), onCompositionChange = vi.fn();
   mounted = mount(WorkspacePane, { target, props: {
     paneId: 'conversation', config: { kind: 'chat', position: 'right', visible: true, title: null, document: null, context: ['Voice notes'], ...config },
-    projectId: 'project', sessionId: 'session', source, value, documents: [source.summary, { ...source.summary, document_id: 'result', relative_path: 'Runs/1/Answer.md', title: 'Answer' }], beforeRun, onOpenDocument, onChange, onCompositionChange
+    projectId: 'project', sessionId: 'session', source: currentSource, value, documents: [currentSource.summary, { ...source.summary, document_id: 'result', relative_path: 'Runs/1/Answer.md', title: 'Answer' }], beforeRun, onOpenDocument, onChange, onCompositionChange
   } });
   await tick(); await expect.poll(() => ipc.list.mock.calls.length).toBe(1);
   return { beforeRun, onOpenDocument, onChange, onCompositionChange };
 }
 
 describe('workspace panes', () => {
+  it.each(['\n', '\r\n'])('edits Mine settings as exact source with %j line endings', async (newline) => {
+    const text = '# Mine\n\nversion = 1\n'.replaceAll('\n', newline);
+    if (newline === '\n') expect(canUseVisualMarkdown(text, false)).toBe(true);
+    const settings = { ...source, summary: { ...source.summary, relative_path: '.mine.toml', title: 'Mine settings' }, text };
+    const { onChange } = await render({ kind: 'editor' }, text, settings);
+    const editor = page.getByRole('textbox', { name: 'Pane editor' });
+    expect(editor.element().tagName).toBe('TEXTAREA');
+    expect(document.querySelector('[contenteditable=true]')).toBeNull();
+    await editor.fill('# Mine\n\nversion = 1\n[assistance]\nsuggestions = false\n');
+    expect(onChange).toHaveBeenLastCalledWith('# Mine\n\nversion = 1\n[assistance]\nsuggestions = false\n'.replaceAll('\n', newline));
+  });
+
   it('restores only this pane history and submits one retained raw prompt with explicit context and full prior output', async () => {
     const { beforeRun, onOpenDocument } = await render({ context: ['@document', '@"Voice notes"'], document: '@Draft' });
     await expect.poll(() => document.querySelector('.output')?.textContent).toBe(fullAnswer);

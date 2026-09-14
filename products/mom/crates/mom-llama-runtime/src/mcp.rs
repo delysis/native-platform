@@ -3008,7 +3008,9 @@ mod tests {
         let server = McpServerConfig {
             executable_sha256: None,
             name: "reviewed".to_string(),
-            command: std::env::current_exe()?,
+            // Validate and copy real native bytes without depending on the
+            // linked test runner fitting the production executable size cap.
+            command: PathBuf::from("/usr/bin/true").canonicalize()?,
             args: Vec::new(),
             enabled: true,
         };
@@ -3079,7 +3081,9 @@ mod tests {
         let configured = McpServerConfig {
             executable_sha256: None,
             name: "exact-native".to_string(),
-            command: std::env::current_exe().expect("test executable path"),
+            command: PathBuf::from("/usr/bin/true")
+                .canonicalize()
+                .expect("bounded native executable fixture"),
             args: Vec::new(),
             enabled: true,
         };

@@ -471,6 +471,7 @@ export interface DocumentContextSnapshot {
 
 export interface CoWriterSummary {
   id: string;
+  configured: boolean;
   name: string;
   source_document_id: string;
   context_bytes: number;

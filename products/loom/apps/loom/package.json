@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
+    "bundle:dev": "sh ../../../../scripts/build-mine-development.sh",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run --maxWorkers=4 --exclude '**/*.browser.test.ts'",
     "test:browser": "vitest run --config vitest.browser.config.ts",

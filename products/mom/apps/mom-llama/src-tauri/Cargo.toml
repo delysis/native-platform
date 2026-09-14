@@ -10,6 +10,8 @@ rust-version.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+desktop-speech.workspace = true
+operation-lifecycle.workspace = true
 anyhow = "1"
 mom-llama-runtime.workspace = true
 llama-native-types = { workspace = true }

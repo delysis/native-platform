@@ -300,6 +300,21 @@ pub enum StoredBranchStatus {
 }
 
 impl ProjectStore {
+    /// Read only a registered context recipe for immutable run replay.
+    pub fn generation_context_recipe(&self, artifact_id: ArtifactId) -> Result<ContextRecipe> {
+        let registered: bool = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM context_recipes WHERE artifact_id = ?1)",
+            [artifact_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !registered {
+            return Err(StoreError::CorruptDatabase(
+                "generation context recipe is not registered".into(),
+            ));
+        }
+        self.read_json_artifact(artifact_id)
+    }
+
     pub fn store_provenance_blob(&mut self, bytes: &[u8]) -> Result<BlobId> {
         ensure_payload_size("blob", bytes.len(), max_document_bytes_usize())?;
         let blob_id = self.put_blob(bytes)?;
@@ -1420,10 +1435,19 @@ impl ProjectStore {
             target_blob_id,
             ArtifactKind::DocumentRevision,
             document_media_type(candidate.document_kind),
-            &json!({
-                "source_revision_id": candidate.source_revision_id,
-                "candidate_id": candidate.candidate_id,
-            }),
+            &crate::document_snapshot::seal(
+                json!({
+                    "source_revision_id": candidate.source_revision_id,
+                    "candidate_id": candidate.candidate_id,
+                }),
+                crate::document_snapshot::RevisionIdentity {
+                    document_id: candidate.document_id,
+                    revision_id,
+                    parent_revision_id: Some(candidate.source_revision_id),
+                    kind: candidate.document_kind,
+                },
+                &promoted_segments,
+            )?,
             created_at_ms,
         )?;
         insert_artifact(

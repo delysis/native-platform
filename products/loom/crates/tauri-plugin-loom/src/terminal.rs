@@ -50,15 +50,24 @@ pub(super) enum TerminalTurnBoundary {
 }
 
 fn terminal_sampling(
+    profile: &loom_config::FrozenGenerationProfile,
     command_id: CommandId,
     step: u32,
     boundary: Option<TerminalTurnBoundary>,
-) -> SamplingConfig {
-    let mut sampling = sampling_for_weave_case(command_id, step, 512, 0.8, WeavePreset::ManualV2);
+) -> Result<SamplingConfig, IpcFailure> {
+    let mut sampling =
+        generation_profiles::sampling(profile, command_id, step, 512, 0.8, WeavePreset::ManualV2)?;
     if let Some(TerminalTurnBoundary::Chat) = boundary {
-        sampling.stop = vec!["\nUser:".into(), "\nAssistant:".into()];
+        for boundary in ["\nUser:", "\nAssistant:"] {
+            if !sampling.stop.iter().any(|stop| stop == boundary) {
+                sampling.stop.push(boundary.into());
+            }
+        }
     }
     sampling
+        .validate()
+        .map_err(generation_profiles::config_failure)?;
+    Ok(sampling)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -75,6 +84,12 @@ struct RunReceipt {
     request_fingerprint: BlobId,
     source_document_id: DocumentId,
     source_revision_id: RevisionId,
+    #[serde(default)]
+    generation_profile: Option<loom_config::FrozenGenerationProfile>,
+    #[serde(default)]
+    co_writer: Option<crate::co_writer::AppliedCoWriter>,
+    #[serde(default)]
+    co_writer_context: Option<FrozenCoWriterContext>,
     input_blob_id: BlobId,
     #[serde(default)]
     context_references: Option<Vec<String>>,
@@ -84,6 +99,12 @@ struct RunReceipt {
     bindings: BTreeMap<String, String>,
     sources: Vec<crate::document_bindings::ResolvedDocument>,
     steps: Vec<BlobId>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct FrozenCoWriterContext {
+    preamble: String,
+    retrieval: crate::context_attachments::ContextRetrievalEvidence,
 }
 
 #[derive(Debug, Default)]
@@ -431,6 +452,43 @@ pub(super) async fn terminal_run<R: Runtime>(
     } else {
         Some(loaded_model(&state)?)
     };
+    // Capture policy before receipts, reservations, or a worker can be started.
+    let (generation_profile, co_writer, co_writer_context) = if let Some(model) = &model {
+        let task = if turn_boundary.is_some() {
+            GenerationTask::Chat
+        } else {
+            GenerationTask::ManualWriting
+        };
+        let (profile, co_writer) =
+            generation_profiles::freeze_for_document(&root, &document_id.to_string(), task)?;
+        let sampling = terminal_sampling(&profile, command_id, 1, turn_boundary)?;
+        let context_window = generation_profiles::reserve_context(
+            resident_context_tokens(model),
+            &generation_profiles::preamble(&profile),
+            1,
+            sampling.max_tokens,
+        )?;
+        let co_writer_context = if co_writer.is_some() {
+            let context = resolve_for_generation_with_budget(
+                &root,
+                &document_id.to_string(),
+                &source.text,
+                context_window,
+                1,
+                sampling.max_tokens,
+            )
+            .map_err(|error| IpcFailure::context_attachment(&error))?;
+            Some(FrozenCoWriterContext {
+                preamble: context.context_preamble,
+                retrieval: context.retrieval_evidence,
+            })
+        } else {
+            None
+        };
+        (Some(profile), co_writer, co_writer_context)
+    } else {
+        (None, None, None)
+    };
     let names = names.into_iter().collect::<Vec<_>>();
     // Only called functions contribute direct context. Reference values remain
     // literal documents; their links never trigger recursive resolution.
@@ -537,6 +595,9 @@ pub(super) async fn terminal_run<R: Runtime>(
         request_fingerprint: fingerprint,
         source_document_id: document_id,
         source_revision_id: source.revision_id,
+        generation_profile,
+        co_writer,
+        co_writer_context,
         input_blob_id,
         context_references,
         media: media_evidence,
@@ -768,7 +829,7 @@ impl Evaluator<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn complete(&mut self, prompt: String) -> Result<String, IpcFailure> {
+    fn complete(&mut self, mut prompt: String) -> Result<String, IpcFailure> {
         if self.control.cancelled.load(Ordering::Acquire) {
             return Err(failure("Cancelled"));
         }
@@ -776,6 +837,29 @@ impl Evaluator<'_> {
             .model
             .ok_or_else(|| failure("Choose a local model before trying this idea."))?;
         self.step += 1;
+        let profile = self
+            .receipt
+            .generation_profile
+            .as_ref()
+            .ok_or_else(|| failure("The run has no frozen generation profile."))?;
+        let sampling = terminal_sampling(
+            profile,
+            parse_command_id(&self.receipt.run.run_id)?,
+            self.step,
+            self.receipt.run.turn_boundary,
+        )?;
+        if let Some(context) = &self.receipt.co_writer_context {
+            prompt.insert_str(0, "\n\n");
+            prompt.insert_str(0, &context.preamble);
+        }
+        prompt.insert_str(0, &generation_profiles::preamble(profile));
+        let prompt = bounded(prompt)?;
+        generation_profiles::reserve_context(
+            resident_context_tokens(model),
+            &prompt,
+            1,
+            sampling.max_tokens,
+        )?;
         let request_id = format!("{}-{}", self.identity.request_id, self.step);
         let environment = model_environment_from_verified(&model.descriptor)
             .map_err(|error| IpcFailure::backend(&error))?;
@@ -799,8 +883,14 @@ impl Evaluator<'_> {
             };
             let context_evidence = store
                 .store_provenance_blob(
-                    &serde_json::to_vec(&(&self.receipt.sources, &self.receipt.media))
-                        .map_err(io_failure)?,
+                    &serde_json::to_vec(&(
+                        &self.receipt.sources,
+                        &self.receipt.media,
+                        &self.receipt.generation_profile,
+                        &self.receipt.co_writer,
+                        &self.receipt.co_writer_context,
+                    ))
+                    .map_err(io_failure)?,
                 )
                 .map_err(IpcFailure::store)?;
             let prompt_artifact = store
@@ -821,11 +911,6 @@ impl Evaluator<'_> {
                     critic_environment_artifact_ids: Vec::new(),
                 })
                 .map_err(IpcFailure::store)?;
-            let sampling = terminal_sampling(
-                parse_command_id(&self.receipt.run.run_id)?,
-                self.step,
-                self.receipt.run.turn_boundary,
-            );
             let generation = GenerationStart {
                 run_id: GenerationRunId::new(),
                 branch_id: BranchId::new(),

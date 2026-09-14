@@ -8,6 +8,8 @@
   export let sessionId: string;
   export let documentTitle: string;
   export let onUse: (items: ContextAttachment[]) => Promise<boolean>;
+  export let googleClientConfigured = false;
+  export let onSettings: () => void;
   let accounts: ImportAccount[] = [];
   let service: 'gmail' | 'drive' = 'gmail';
   let webUrl = '';
@@ -17,8 +19,6 @@
   let configuring = false;
   let authorizing = false;
   let source: ImportSource = 'gmail';
-  let clientId = '';
-  let clientSecret = '';
   let query = 'newer_than:30d';
   let busy = false;
   let message = '';
@@ -48,12 +48,12 @@
   async function connect(): Promise<void> {
     busy = true; authorizing = true; message = 'Finish authorization in your browser. This request expires in five minutes.';
     try {
-      const result = await connectImportAccount(projectId, sessionId, service, clientId.trim(), clientSecret);
+      const result = await connectImportAccount(projectId, sessionId, service);
       accounts = [...accounts.filter((item) => item.service !== result.service || item.email !== result.email), result];
       chosenEmail = result.email ?? ''; configuring = false; report = null; selected = [];
       message = `Connected ${result.email}. Sync runs only when you request it.`;
     } catch (error) { message = errorText(error); }
-    finally { clientSecret = ''; busy = false; authorizing = false; }
+    finally { busy = false; authorizing = false; }
   }
   async function disconnect(): Promise<void> {
     busy = true;
@@ -139,11 +139,10 @@
     <div class="actions"><button disabled={busy} on:click={() => void sync()}>Sync now</button>
       {#if canNext}<button disabled={busy} on:click={() => void sync(true)}>Next page</button>{/if}</div>
   {:else}
-    <p>Connect with a Google Desktop app OAuth client. Loom requests read-only access and saves credentials in your system credential store.</p>
-    <label>Client ID <input bind:value={clientId} disabled={busy} autocomplete="off" maxlength="512" /></label>
-    <label>Client secret <input type="password" bind:value={clientSecret} disabled={busy} autocomplete="off" maxlength="1024" /></label>
+    <p>{googleClientConfigured ? 'Google Desktop client configured.' : 'Set imports.google.client_file in .mine.toml to your Google Desktop client JSON.'} Connecting requests read-only access and stores account tokens in your system credential store.</p>
+    <button disabled={busy} on:click={onSettings}>Open settings file</button>
     {#if configuring}<button disabled={busy} on:click={() => configuring = false}>Back to accounts</button>{/if}
-    <button disabled={busy || !clientId.trim()} on:click={() => void connect()}>Connect {service === 'drive' ? 'Drive' : 'Gmail'}</button>
+    <button disabled={busy || !googleClientConfigured} on:click={() => void connect()}>Connect {service === 'drive' ? 'Drive' : 'Gmail'}</button>
   {/if}
   {#if authorizing}<button on:click={() => { void cancelImportAccount(projectId, sessionId).catch((error) => message = errorText(error)); }}>Cancel connection</button>{/if}
   <p role="status">{message}</p>

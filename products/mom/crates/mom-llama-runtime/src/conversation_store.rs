@@ -5,7 +5,7 @@ use crate::store::RuntimeStore;
 use anyhow::Result;
 use llama_native_types::SamplingConfig;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -13,14 +13,8 @@ pub(crate) const CONVERSATIONS_NAMESPACE: &str = "conversations.v2";
 pub(crate) const DRAFTS_NAMESPACE: &str = "drafts.v2";
 const NEW_CHAT_DRAFT_KEY: &str = "__new_chat__";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageRole {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
+pub use workspace_document::MessageRole;
+use workspace_document::{BranchIndex, Document, HistoryNode, PartKind};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -167,15 +161,77 @@ pub struct Conversation {
     pub messages: Vec<Message>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConversationDb {
-    #[serde(default)]
     pub conversations: Vec<Conversation>,
     pub selected_conversation_id: Option<String>,
 }
 
+impl ConversationDb {
+    fn validate(&self) -> Result<()> {
+        let mut ids = HashSet::new();
+        for conversation in &self.conversations {
+            anyhow::ensure!(
+                !conversation.id.is_empty() && ids.insert(&conversation.id),
+                "conversation IDs must be nonempty and unique"
+            );
+            let mut total_bytes = 0_usize;
+            for message in &conversation.messages {
+                total_bytes = total_bytes
+                    .checked_add(message.content.len())
+                    .filter(|bytes| *bytes <= workspace_document::MAX_DOCUMENT_BYTES)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("conversation exceeds the document byte budget")
+                    })?;
+                anyhow::ensure!(
+                    !message.id.is_empty() && message.conversation_id == conversation.id,
+                    "message occurrence ID or conversation owner is invalid"
+                );
+            }
+            conversation_document(conversation)?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for ConversationDb {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct as _;
+        self.validate().map_err(serde::ser::Error::custom)?;
+        let mut record = serializer.serialize_struct("ConversationDb", 2)?;
+        record.serialize_field("conversations", &self.conversations)?;
+        record.serialize_field("selected_conversation_id", &self.selected_conversation_id)?;
+        record.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for ConversationDb {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Stored {
+            #[serde(default)]
+            conversations: Vec<Conversation>,
+            selected_conversation_id: Option<String>,
+        }
+        let stored = Stored::deserialize(deserializer)?;
+        let db = Self {
+            conversations: stored.conversations,
+            selected_conversation_id: stored.selected_conversation_id,
+        };
+        db.validate().map_err(serde::de::Error::custom)?;
+        Ok(db)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConversationExportFormat {
+    Document,
     Json,
     Markdown,
 }
@@ -280,7 +336,7 @@ pub fn conversation_new(title: Option<String>) -> Result<CommandResult<Conversat
             mention_handle,
             model_path: settings.model_path.clone(),
             mmproj_path: settings.mmproj_path.clone(),
-            sampling: Some(settings.sampling_config()),
+            sampling: Some(settings.sampling_config()?),
             ..ConversationExecutionProfile::default()
         },
         selected_model_path: settings.model_path,
@@ -367,7 +423,7 @@ pub fn conversation_select(id: &str) -> Result<CommandResult<Conversation>> {
     Ok(CommandResult::passed(
         "mom_llama.conversation_select",
         "contracted",
-        project_conversation(&conversation),
+        project_conversation(&conversation)?,
         vec![path.display().to_string()],
         Vec::new(),
         false,
@@ -452,7 +508,7 @@ pub fn conversation_system_message_update(
         return Ok(CommandResult::passed(
             "mom_llama.conversation_system_message_update",
             "contracted",
-            project_conversation(&conversation),
+            project_conversation(&conversation)?,
             Vec::new(),
             vec!["conversation instructions unchanged".to_string()],
             false,
@@ -467,7 +523,7 @@ pub fn conversation_system_message_update(
     Ok(CommandResult::passed(
         "mom_llama.conversation_system_message_update",
         "contracted",
-        project_conversation(&conversation),
+        project_conversation(&conversation)?,
         vec![path.display().to_string()],
         vec!["conversation-scoped instructions; blank inherits the app default".to_string()],
         false,
@@ -593,18 +649,20 @@ pub fn conversation_export(
         ));
     };
     let (format_name, content) = match format {
+        ConversationExportFormat::Document => (
+            "document".into(),
+            serde_json::to_string_pretty(&crate::conversation_snapshot::freeze(conversation)?)?,
+        ),
         ConversationExportFormat::Json => (
             "json".to_string(),
             serde_json::to_string_pretty(conversation)?,
         ),
         ConversationExportFormat::Markdown => {
-            let mut lines = vec![format!("# {}", conversation.title)];
-            for message in &conversation.messages {
-                lines.push(String::new());
-                lines.push(format!("## {:?}", message.role));
-                lines.push(message.content.clone());
-            }
-            ("markdown".to_string(), lines.join("\n"))
+            let document = conversation_document(conversation)?;
+            (
+                "markdown".to_owned(),
+                format!("# {}\n\n{}", conversation.title, document.transcript()?),
+            )
         }
     };
     Ok(CommandResult::passed(
@@ -736,7 +794,7 @@ pub fn message_delete(
         }
         HashSet::from([message_id.to_string()])
     } else {
-        descendant_ids(conversation, message_id)
+        descendant_ids(conversation, message_id)?
     };
     let removed_attachment_ids = conversation
         .messages
@@ -834,7 +892,7 @@ pub fn conversation_fork(
             conversation_id,
         ));
     };
-    let active = active_path_messages(&source);
+    let active = active_path_messages(&source)?;
     let Some(index) = active.iter().position(|message| message.id == message_id) else {
         return Ok(message_not_found("mom_llama.conversation_fork", message_id));
     };
@@ -903,7 +961,7 @@ pub fn message_branches(
         .map(|message| MessageBranchSibling {
             message_id: message.id.clone(),
             parent_id: message.parent_id.clone(),
-            role: message.role.clone(),
+            role: message.role,
             preview: message.content.chars().take(120).collect(),
             created_at: message.created_at.clone(),
             selected: message.id == message_id,
@@ -955,10 +1013,10 @@ pub fn message_branch_select(
             message_id,
         ));
     }
-    let leaf = preferred_leaf_from(conversation, message_id);
+    let leaf = preferred_leaf_from(conversation, message_id)?;
     conversation.active_leaf_message_id = Some(leaf);
     conversation.updated_at = now_ms().to_string();
-    let projected = project_conversation(conversation);
+    let projected = project_conversation(conversation)?;
     let path = save_db(&db)?;
     Ok(CommandResult::passed(
         "mom_llama.message_branch_select",
@@ -1173,33 +1231,58 @@ pub fn text_attachment_import(
     ))
 }
 
-pub fn active_path_messages(conversation: &Conversation) -> Vec<Message> {
-    let by_id = conversation
-        .messages
-        .iter()
-        .map(|message| (message.id.as_str(), message))
-        .collect::<HashMap<_, _>>();
-    let mut current = active_leaf_id(conversation);
-    let mut seen = HashSet::new();
-    let mut path = Vec::new();
-    while let Some(message_id) = current {
-        if !seen.insert(message_id.clone()) {
-            break;
-        }
-        let Some(message) = by_id.get(message_id.as_str()) else {
-            break;
-        };
-        path.push((*message).clone());
-        current = message.parent_id.clone();
+impl HistoryNode for Message {
+    type Id = String;
+    fn id(&self) -> &String {
+        &self.id
     }
-    path.reverse();
-    for message in &mut path {
-        let mut siblings = conversation
-            .messages
-            .iter()
-            .filter(|candidate| {
-                candidate.parent_id == message.parent_id && candidate.role == message.role
-            })
+    fn parent_id(&self) -> Option<&String> {
+        self.parent_id.as_ref()
+    }
+}
+
+/// One logical document, retaining the exact message occurrence and all typed
+/// receipt/attachment/speaker metadata while exposing a writing projection too.
+/// No role is inferred from message text and no branch is silently repaired.
+pub fn conversation_document(conversation: &Conversation) -> Result<Document<'_, &str, &Message>> {
+    let index = BranchIndex::new(&conversation.messages)?;
+    conversation_document_from_index(conversation, &index)
+}
+
+fn conversation_document_from_index<'a>(
+    conversation: &'a Conversation,
+    index: &BranchIndex<'a, Message>,
+) -> Result<Document<'a, &'a str, &'a Message>> {
+    let head = conversation
+        .active_leaf_message_id
+        .as_ref()
+        .or_else(|| conversation.messages.last().map(|message| &message.id));
+    let mut document = Document::new();
+    for message in index.path(head)? {
+        anyhow::ensure!(
+            message.conversation_id == conversation.id,
+            "message belongs to a different conversation"
+        );
+        document.push_text(
+            message.id.as_str(),
+            &message.content,
+            PartKind::Message(message.role),
+            message,
+        )?;
+    }
+    Ok(document)
+}
+
+pub fn active_path_messages(conversation: &Conversation) -> Result<Vec<Message>> {
+    let index = BranchIndex::new(&conversation.messages)?;
+    let document = conversation_document_from_index(conversation, &index)?;
+    let mut path = Vec::with_capacity(document.parts().len());
+    for part in document.parts() {
+        let mut message = (**part.metadata()).clone();
+        let mut siblings = index
+            .siblings(&message.id)?
+            .into_iter()
+            .filter(|candidate| candidate.role == message.role)
             .collect::<Vec<_>>();
         siblings.sort_by(|left, right| {
             left.created_at
@@ -1211,16 +1294,17 @@ pub fn active_path_messages(conversation: &Conversation) -> Vec<Message> {
             .iter()
             .position(|candidate| candidate.id == message.id)
             .map(|index| index + 1);
+        path.push(message);
     }
-    path
+    Ok(path)
 }
 
-pub fn project_conversation(conversation: &Conversation) -> Conversation {
+pub fn project_conversation(conversation: &Conversation) -> Result<Conversation> {
     let mut projected = conversation.clone();
     normalize_conversation_model_paths(&mut projected);
-    projected.messages = active_path_messages(conversation);
+    projected.messages = active_path_messages(conversation)?;
     projected.active_leaf_message_id = projected.messages.last().map(|message| message.id.clone());
-    projected
+    Ok(projected)
 }
 
 pub(crate) fn strip_reserved_attribution_prefix(value: &str) -> String {
@@ -1249,75 +1333,6 @@ fn split_reserved_attribution_prefix(value: &str) -> Option<(&str, &str)> {
     Some((handle, remainder[separator + 1..].trim_start()))
 }
 
-fn repair_inline_attribution_prefixes(db: &mut ConversationDb) -> bool {
-    let mut changed = false;
-    for conversation in &mut db.conversations {
-        let lineage = conversation
-            .messages
-            .iter()
-            .map(|message| {
-                (
-                    message.id.clone(),
-                    (
-                        message.parent_id.clone(),
-                        message
-                            .attribution
-                            .as_ref()
-                            .map(|attribution| attribution.handle.clone()),
-                    ),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        for message in &mut conversation.messages {
-            if message.role != MessageRole::Assistant {
-                continue;
-            }
-            let Some((handle, content)) = split_reserved_attribution_prefix(&message.content)
-            else {
-                continue;
-            };
-            let handle = handle.to_string();
-            let content = content.to_string();
-            let matches_own_attribution = message
-                .attribution
-                .as_ref()
-                .is_some_and(|attribution| attribution.handle.eq_ignore_ascii_case(&handle));
-            let matches_attributed_ancestor = message.attribution.is_none()
-                && attributed_ancestor_matches(message.parent_id.as_deref(), &handle, &lineage);
-            if matches_own_attribution || matches_attributed_ancestor {
-                message.content = content;
-                changed = true;
-            }
-        }
-    }
-    changed
-}
-
-fn attributed_ancestor_matches(
-    parent_id: Option<&str>,
-    handle: &str,
-    lineage: &HashMap<String, (Option<String>, Option<String>)>,
-) -> bool {
-    let mut current = parent_id.map(str::to_string);
-    let mut seen = HashSet::new();
-    while let Some(message_id) = current {
-        if !seen.insert(message_id.clone()) {
-            return false;
-        }
-        let Some((parent, attribution)) = lineage.get(&message_id) else {
-            return false;
-        };
-        if attribution
-            .as_deref()
-            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(handle))
-        {
-            return true;
-        }
-        current = parent.clone();
-    }
-    false
-}
-
 pub fn active_leaf_id(conversation: &Conversation) -> Option<String> {
     conversation
         .active_leaf_message_id
@@ -1337,24 +1352,16 @@ pub fn active_leaf_id(conversation: &Conversation) -> Option<String> {
         })
 }
 
-fn preferred_leaf_from(conversation: &Conversation, message_id: &str) -> String {
-    let mut current = message_id.to_string();
-    loop {
-        let next = conversation
-            .messages
-            .iter()
-            .filter(|message| message.parent_id.as_deref() == Some(current.as_str()))
-            .max_by(|left, right| {
-                left.created_at
-                    .cmp(&right.created_at)
-                    .then_with(|| left.id.cmp(&right.id))
-            })
-            .map(|message| message.id.clone());
-        match next {
-            Some(next) => current = next,
-            None => return current,
-        }
-    }
+fn preferred_leaf_from(conversation: &Conversation, message_id: &str) -> Result<String> {
+    let index = BranchIndex::new(&conversation.messages)?;
+    Ok(index
+        .preferred_leaf(&message_id.to_owned(), |left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        })?
+        .id
+        .clone())
 }
 
 fn clone_later_attributed_peers(
@@ -1422,52 +1429,25 @@ fn clone_later_attributed_peers(
     cloned_any.then_some(cloned_parent)
 }
 
-fn descendant_ids(conversation: &Conversation, message_id: &str) -> HashSet<String> {
-    let mut removed = HashSet::from([message_id.to_string()]);
-    loop {
-        let before = removed.len();
-        for message in &conversation.messages {
-            if message
-                .parent_id
-                .as_ref()
-                .is_some_and(|parent| removed.contains(parent))
-            {
-                removed.insert(message.id.clone());
-            }
-        }
-        if removed.len() == before {
-            return removed;
-        }
-    }
+fn descendant_ids(conversation: &Conversation, message_id: &str) -> Result<HashSet<String>> {
+    let index = BranchIndex::new(&conversation.messages)?;
+    Ok(index
+        .descendants(&message_id.to_owned())?
+        .into_iter()
+        .cloned()
+        .collect())
 }
 
 pub fn load_db() -> Result<ConversationDb> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    let mut db = store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default();
-    let repaired = repair_inline_attribution_prefixes(&mut db);
-    let normalized = normalize_db_model_paths(&mut db);
-    if !repaired && !normalized {
-        return Ok(db);
-    }
-    store.mutate_documents(
-        CONVERSATIONS_NAMESPACE,
-        ConversationDb::default,
-        |current, documents| {
-            repair_inline_attribution_prefixes(current);
-            normalize_db_model_paths(current);
-            crate::personas::reject_removed_conversation_writes_from_documents(current, documents)?;
-            Ok(current.clone())
-        },
-    )
-}
-
-fn normalize_db_model_paths(db: &mut ConversationDb) -> bool {
-    let mut changed = false;
+    // Reading content is never a migration or a prose rewrite. Validation is
+    // enforced by the document codec, before anything can reach generation.
+    let mut db: ConversationDb = store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default();
     for conversation in &mut db.conversations {
-        changed |= normalize_conversation_model_paths(conversation);
+        normalize_conversation_model_paths(conversation);
     }
-    changed
+    Ok(db)
 }
 
 fn normalize_conversation_model_paths(conversation: &mut Conversation) -> bool {
@@ -1656,8 +1636,8 @@ fn draft_key(conversation_id: Option<&str>) -> String {
 mod tests {
     use super::{
         Conversation, ConversationDb, ConversationExecutionProfile, ConversationKind, Message,
-        MessageAttribution, MessageRole, MessageSpeakerKind, project_conversation,
-        repair_inline_attribution_prefixes, strip_reserved_attribution_prefix,
+        MessageAttribution, MessageRole, MessageSpeakerKind, conversation_document,
+        project_conversation, strip_reserved_attribution_prefix,
     };
     use std::path::PathBuf;
 
@@ -1715,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_copied_prefix_is_repaired_only_when_structural_attribution_supports_it() {
+    fn reading_a_document_never_rewrites_attributed_or_literal_content() {
         let mut attributed = message("a", None, MessageRole::Assistant, "First answer");
         attributed.attribution = Some(MessageAttribution {
             kind: MessageSpeakerKind::LiveChat,
@@ -1739,7 +1719,7 @@ mod tests {
             MessageRole::Assistant,
             "Response from @unrelated-chat: Preserve this unverified literal",
         );
-        let mut db = ConversationDb {
+        let db = ConversationDb {
             conversations: vec![Conversation {
                 id: "host".to_string(),
                 title: "Host".to_string(),
@@ -1758,16 +1738,22 @@ mod tests {
             selected_conversation_id: Some("host".to_string()),
         };
 
-        assert!(repair_inline_attribution_prefixes(&mut db));
+        let encoded = serde_json::to_vec(&db).expect("encode document");
+        let decoded: ConversationDb = serde_json::from_slice(&encoded).expect("decode document");
+        assert_eq!(decoded, db);
         assert_eq!(
-            db.conversations[0].messages[2].content,
-            "A direct host answer"
+            decoded.conversations[0].messages[2].content,
+            "Response from @default-chat: A direct host answer"
+        );
+        let document = conversation_document(&decoded.conversations[0]).expect("project document");
+        assert_eq!(
+            document.parts()[2].text(),
+            decoded.conversations[0].messages[2].content
         );
         assert_eq!(
-            db.conversations[0].messages[3].content,
-            "Response from @unrelated-chat: Preserve this unverified literal"
+            document.parts()[0].metadata().attribution,
+            decoded.conversations[0].messages[0].attribution
         );
-        assert!(!repair_inline_attribution_prefixes(&mut db));
     }
 
     #[test]
@@ -1790,9 +1776,147 @@ mod tests {
         conversation.execution_profile.model_path = Some(PathBuf::from("   "));
         conversation.execution_profile.mmproj_path = Some(PathBuf::new());
 
-        let projected = project_conversation(&conversation);
+        let projected = project_conversation(&conversation).expect("valid projection");
         assert_eq!(projected.selected_model_path, None);
         assert_eq!(projected.execution_profile.model_path, None);
         assert_eq!(projected.execution_profile.mmproj_path, None);
+    }
+    fn conversation(messages: Vec<Message>, head: &str) -> Conversation {
+        Conversation {
+            id: "host".into(),
+            title: "Host".into(),
+            created_at: "1".into(),
+            updated_at: "2".into(),
+            kind: ConversationKind::Chat,
+            execution_profile: ConversationExecutionProfile::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: Some(head.into()),
+            current_skill_ids: Vec::new(),
+            messages,
+        }
+    }
+
+    #[test]
+    fn explicit_snapshot_export_preserves_private_metadata_without_changing_legacy_codec() {
+        let mut original = message("original", None, MessageRole::Assistant, "original answer");
+        original.receipt_id = Some("generated-receipt".into());
+        original.reasoning_content = Some("private reasoning".into());
+        let mut edited = message("edited", None, MessageRole::Assistant, "human revision");
+        edited.attachment_ids = vec!["attachment-occurrence".into()];
+        let conversation = conversation(vec![original, edited], "edited");
+        let db = ConversationDb {
+            conversations: vec![conversation.clone()],
+            selected_conversation_id: Some("host".into()),
+        };
+        let before = serde_json::to_value(&db).expect("conversation fixture");
+        let snapshot =
+            crate::conversation_snapshot::freeze(&conversation).expect("conversation fixture");
+        let value = serde_json::to_value(snapshot).expect("conversation fixture");
+        assert_eq!(value["selection"]["head"], "edited");
+        assert_eq!(
+            value["parts"][0]["metadata"]["receipt_id"],
+            "generated-receipt"
+        );
+        assert_eq!(
+            value["parts"][0]["metadata"]["reasoning_content"],
+            "private reasoning"
+        );
+        assert!(value["parts"][1]["metadata"]["receipt_id"].is_null());
+        assert_eq!(
+            value["parts"][1]["metadata"]["attachment_ids"][0],
+            "attachment-occurrence"
+        );
+        assert!(before["conversations"][0]["messages"].is_array());
+        assert_eq!(
+            before,
+            serde_json::to_value(db).expect("conversation fixture")
+        );
+    }
+
+    #[test]
+    fn transcript_as_writing_retains_selected_branch_roles_and_tool_receipts() {
+        let user = message("u", None, MessageRole::User, "  café\r\n");
+        let other = message(
+            "old",
+            Some("u"),
+            MessageRole::Assistant,
+            "unselected answer",
+        );
+        let mut tool = message("tool", Some("u"), MessageRole::Tool, "exact tool bytes");
+        tool.receipt_id = Some("tool-receipt".into());
+        tool.attachment_ids = vec!["attachment-7".into()];
+        let assistant = message("a", Some("tool"), MessageRole::Assistant, "selected answer");
+        let conversation = conversation(vec![user, other, tool, assistant], "a");
+        let document = conversation_document(&conversation).expect("conversation document");
+        let prose = document.transcript().expect("writing projection");
+        assert!(prose.contains("## User\n  café\r\n"));
+        assert!(!prose.contains("unselected answer"));
+        assert_eq!(
+            document.parts()[1].kind(),
+            workspace_document::PartKind::Message(MessageRole::Tool)
+        );
+        assert_eq!(
+            document.parts()[1].metadata().receipt_id.as_deref(),
+            Some("tool-receipt")
+        );
+        assert_eq!(
+            document.parts()[1].metadata().attachment_ids,
+            ["attachment-7"]
+        );
+        assert_eq!(
+            super::active_path_messages(&conversation)
+                .expect("path")
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn corrupt_history_cannot_replace_a_valid_encrypted_document() {
+        struct Directory(PathBuf);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory =
+            Directory(std::env::temp_dir().join(format!("mom-document-{}", uuid::Uuid::new_v4())));
+        let store = crate::store::RuntimeStore::open_with_key(&directory.0, [0x42; 32])
+            .expect("encrypted store");
+        let original = ConversationDb {
+            conversations: vec![conversation(
+                vec![message("u", None, MessageRole::User, "private exact text")],
+                "u",
+            )],
+            selected_conversation_id: Some("host".into()),
+        };
+        store
+            .put(super::CONVERSATIONS_NAMESPACE, &original)
+            .expect("initial write");
+        for failure in 0..4 {
+            let mut invalid = original.clone();
+            match failure {
+                0 => invalid.conversations[0].messages[0].parent_id = Some("u".into()),
+                1 => invalid.conversations[0].messages[0].parent_id = Some("missing".into()),
+                2 => invalid.conversations[0].active_leaf_message_id = Some("missing".into()),
+                _ => {
+                    let duplicate = invalid.conversations[0].messages[0].clone();
+                    invalid.conversations[0].messages.push(duplicate);
+                }
+            }
+            assert!(store.put(super::CONVERSATIONS_NAMESPACE, &invalid).is_err());
+            assert_eq!(
+                store
+                    .get::<ConversationDb>(super::CONVERSATIONS_NAMESPACE)
+                    .expect("read original"),
+                Some(original.clone())
+            );
+        }
+        let mut invalid_json = serde_json::to_value(&original).expect("fixture");
+        invalid_json["conversations"][0]["messages"][0]["parent_id"] = serde_json::json!("missing");
+        assert!(serde_json::from_value::<ConversationDb>(invalid_json).is_err());
     }
 }

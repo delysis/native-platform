@@ -2,6 +2,7 @@ pub mod attachments;
 pub mod chat;
 pub mod composer;
 pub mod config;
+mod conversation_snapshot;
 pub mod conversation_store;
 pub mod engine;
 pub mod kv_cache;

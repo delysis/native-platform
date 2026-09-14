@@ -1,0 +1,1095 @@
+   Compiling llama-native-engine v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/native/crates/llama-native-engine)
+   Compiling loom-document v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-document)
+   Compiling loom-host v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-host)
+   Compiling loom-config v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-config)
+   Compiling loom-store v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-store)
+   Compiling llama-native-host v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/native/crates/llama-native-host)
+   Compiling loom-backend-llama v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-backend-llama)
+   Compiling mom-llama-runtime v0.0.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/mom/crates/mom-llama-runtime)
+   Compiling tauri-plugin-loom v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/tauri-plugin-loom)
+   Compiling loom-cli v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-cli)
+   Compiling loom-app v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/apps/loom/src-tauri)
+   Compiling mom-llama-cli v0.0.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/mom/crates/mom-llama-cli)
+   Compiling mom-llama-app v0.0.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/mom/apps/mom-llama/src-tauri)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 59.42s
+     Running unittests src/lib.rs (target/debug/deps/desktop_context-76d470beac0712cf)
+
+running 3 tests
+test tests::chunks_reconstruct_exact_source_for_all_utf8_widths ... ok
+test tests::framing_and_escaped_metadata_are_included_in_the_budget ... ok
+test tests::small_budgets_retain_exact_evidence_for_unicode_and_line_endings ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/lib.rs (target/debug/deps/desktop_generation_policy-273c51c349a0d487)
+
+running 8 tests
+test sampling::tests::task_variation_is_explicit_and_inherits_neutral_penalties ... ok
+test context::tests::automatic_plan_preserves_requested_cap_and_labels_estimate ... ok
+test context::tests::automatic_context_never_invents_an_affordable_minimum ... ok
+test context::tests::automatic_host_budget_retains_conservative_bounds ... ok
+test context::tests::invalid_explicit_limits_leave_destination_unchanged ... ok
+test sampling::tests::unknown_or_duplicate_stage_rejects_entire_order ... ok
+test sampling::tests::custom_layer_has_last_precedence_and_rejects_unknown_fields ... ok
+test sampling::tests::supplied_bad_values_never_fall_back_or_hide_behind_an_override ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/desktop_model_discovery-2b0d5946b1e529e0)
+
+running 9 tests
+test discovery::tests::real_default_cache_discovers_official_gemma_4_12b_qat ... ignored, requires the official Gemma 4 12B QAT Q4_0 GGUF in the local Hugging Face cache
+test discovery::tests::projector_and_mtp_names_are_not_primary_model_choices ... ok
+test projector::tests::catalog_pairing_preserves_alias_and_rejects_path_traversal ... ok
+test discovery::tests::depth_limited_traversal_is_explicitly_partial ... ok
+test discovery::tests::discovers_verified_gguf_and_reports_invalid_header ... ok
+test projector::tests::no_choice_is_made_from_an_ambiguous_or_truncated_directory ... ok
+test discovery::tests::traversal_is_bounded_and_never_claims_completeness ... ok
+test discovery::tests::file_alias_is_retained_but_directory_symlinks_are_not_traversed ... ok
+test discovery::tests::wide_non_model_directory_consumes_the_same_finite_budget ... ok
+
+test result: ok. 8 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running unittests src/lib.rs (target/debug/deps/desktop_speech-af11940378e1e912)
+
+running 3 tests
+test tests::never_publishes_streamed_empty_or_remote_output ... ok
+test tests::transcription_publication_requires_the_exact_route_and_native_evidence ... ok
+test tests::exact_and_automatic_voice_share_identity_and_bounds_checks ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/loom_app_lib-0f1d9389a162a3ab)
+
+running 9 tests
+test tests::acceptance_directory_is_opt_in ... ok
+test tests::acceptance_directory_accepts_an_existing_absolute_temp_child ... ok
+test tests::acceptance_directory_rejects_the_temp_root_and_paths_outside_it ... ok
+test tests::build_sources_have_no_writer_path_embedding_channel ... ok
+test tests::embedded_policy_is_canonical_and_bound_to_its_build_identity ... ok
+test tests::macos_quit_source_cannot_reintroduce_appkit_terminate_bypass ... ok
+test tests::acceptance_directory_rejects_relative_missing_and_non_directory_paths ... ok
+test tests::acceptance_directory_rejects_a_symbolic_link_leaf ... ok
+test tests::native_file_menu_exposes_standard_document_accelerators ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/loom_app-0b03385bd570a9a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/loom_backend_llama-bc39dade95363d6d)
+
+running 55 tests
+test adapter::tests::native_config_preserves_digest_assertions ... ok
+test adapter::tests::instruction_tuned_writer_uses_bound_transport_while_base_writer_stays_raw ... ok
+test adapter::tests::inspected_gemma4_chat_capability_selects_chat_without_filename_guessing ... ok
+test adapter::tests::instruction_model_media_stays_byte_exact_with_its_bound_chat_transport ... ok
+test adapter::tests::only_the_typed_native_constructor_retains_shutdown_authority ... ok
+test adapter::tests::empty_manuscript_requires_context_or_native_media ... ok
+test adapter::tests::model_identity_is_path_free_but_live_path_must_match_the_request ... ok
+test adapter::tests::real_gemma4_e2b_base_raw_family_acceptance ... ignored, requires LOOM_GEMMA4_E2B_BASE_PATH and the pinned Gemma 4 E2B base Q8 GGUF
+test adapter::tests::real_gguf_cpu_cancellation_and_complete_release ... ignored, requires LOOM_GGUF_MODEL_PATH and a real local GGUF
+test adapter::tests::real_gguf_four_way_writer_acceptance ... ignored, requires LOOM_GGUF_MODEL_PATH, LOOM_GGUF_MODEL_SHA256, and a real local GGUF
+test adapter::tests::real_gguf_single_writer_acceptance ... ignored, requires LOOM_GGUF_MODEL_PATH, LOOM_GGUF_MODEL_SHA256, and a real local GGUF
+test adapter::tests::inspection_rechecks_configured_digest_assertions ... ok
+test adapter::tests::base_media_uses_raw_completion_and_binds_payload_order ... ok
+test adapter::tests::raw_completion_preserves_prompt_on_instruction_capable_models ... ok
+test adapter::tests::gemma4_multimodal_writer_freezes_the_same_non_thinking_contract ... ok
+test adapter::tests::prose_prefix_rejects_numeric_model_collapse_without_banning_numeric_writing ... ok
+test adapter::tests::affine_owner_joins_while_cloneable_control_remains_retained ... ok
+test adapter::tests::early_drop_cancels_every_case_and_joins_the_worker ... ok
+test adapter::tests::raw_media_receipt_case_index_is_independent_of_attachment_count ... ok
+test download::tests::cancellation_preserves_complete_partial ... ok
+test adapter::tests::fixture_runtime_cannot_label_a_result_as_live_inference ... ok
+test adapter::tests::cancellation_targets_one_branch_and_remains_recoverable ... ok
+test download::tests::parses_and_rejects_content_ranges_deterministically ... ok
+test adapter::tests::worker_panic_is_reported_by_the_join_boundary ... ok
+test adapter::tests::prepended_text_is_bound_but_does_not_replace_the_exact_manuscript_identity ... ok
+test adapter::tests::timeout_retains_worker_until_later_completion_is_joined ... ok
+test download::tests::resume_response_must_start_at_exact_partial_boundary ... ok
+test download::tests::hash_failure_preserves_complete_partial ... ok
+test adapter::tests::exact_prefix_batch_is_completion_only_and_fixture_evidence_stays_fixture ... ok
+test download::tests::ignored_range_selects_safe_restart ... ok
+test fit::tests::missing_kv_inputs_stay_unknown_but_provable_shortfall_fails ... ok
+test fit::tests::known_kv_inputs_produce_a_labeled_conservative_fit ... ok
+test model::context_tests::context_selection_honors_a_trained_limit_below_eight_k ... ok
+test model::context_tests::context_selection_scales_in_power_of_two_tiers_and_respects_model_limit ... ok
+test download::tests::retryability_is_narrow_and_explicit ... ok
+test model::context_tests::context_selection_does_not_force_eight_k_when_memory_cannot_afford_it ... ok
+test download::tests::validates_https_gguf_paths_and_bounds ... ok
+test download::tests::partial_lock_contention_is_typed ... gguf_init_from_file: failed to open GGUF file 'unloaded-gemma4.gguf' (No such file or directory)
+ok
+test download::tests::sha256_digest_requires_canonical_width ... ok
+test download::tests::install_primitive_never_clobbers_existing_target ... ok
+test runtime::tests::fixture_release_proof_is_affine_and_has_one_canonical_count ... ok
+test runtime::tests::failed_reconfiguration_does_not_release_a_different_profile_at_the_same_path ... ok
+test model::context_tests::default_gemma_context_fits_host_budget_on_a_large_memory_machine ... ok
+test download::tests::installed_target_is_cold_verified_even_when_size_matches ... ok
+test runtime::tests::empty_native_runtime_returns_exact_joined_authority ... ok
+test runtime::tests::process_exit_runtime_recovers_poison_and_returns_exact_drain_fact ... ok
+test runtime::tests::tracked_ownership_never_accepts_an_empty_untyped_host_snapshot ... ok
+test runtime::tests::untracked_profile_is_proved_never_acquired_by_this_runtime ... ok
+test download::tests::symbolic_link_target_is_rejected ... ok
+test download::tests::complete_partial_installs_without_network_and_without_clobber ... ok
+test download::tests::matching_existing_target_is_reused_without_network ... ok
+test adapter::tests::queue_pressure_splits_unicode_deltas_and_delivers_every_chunk_before_terminal ... ok
+test adapter::tests::retained_native_event_flood_fails_before_unbounded_provenance_growth ... ok
+test adapter::tests::text_over_native_output_ceiling_fails_authority_without_candidate ... ok
+test adapter::tests::cumulative_text_ceiling_survives_concurrent_pending_drains ... ok
+
+test result: ok. 51 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 3.66s
+
+     Running unittests src/main.rs (target/debug/deps/loom-5ca2c2f6cbeacdf1)
+
+running 10 tests
+test tests::bounded_reader_rejects_symbolic_links ... ok
+test tests::reconciliation_commands_have_stable_help_and_required_apply_bindings ... ok
+test tests::bounded_reader_rejects_oversize_and_invalid_utf8 ... ok
+test tests::flat_hybrid_preview_and_apply_fail_closed ... ok
+test tests::preview_defaults_app_side_to_base_and_never_writes ... ok
+test tests::verse_preview_preserves_crlf_and_whitespace_exactly ... ok
+test tests::preview_reports_conflict_and_deleted_external_without_applying ... ok
+test tests::apply_rejects_empty_reason_before_mutating ... ok
+test tests::reconciliation_preview_and_apply_preserve_exact_prose_crlf_bytes ... ok
+test tests::apply_requires_exact_bindings_and_records_explicit_resolution ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.77s
+
+     Running unittests src/lib.rs (target/debug/deps/loom_config-5bfdc0088efcd920)
+
+running 9 tests
+test model::tests::rejects_unapplied_keys_and_contradictory_hardware_requests ... ok
+test model::tests::path_resolution_is_lexical_and_requires_no_existing_asset ... ok
+test workspace::tests::pane_and_reference_limits_include_inherited_defaults ... ok
+test workspace::tests::invalid_layouts_and_embedded_commands_are_rejected ... ok
+test workspace::tests::the_default_surface_is_just_writing_and_power_panes_are_opt_in ... ok
+test tests::serialized_profile_rejects_changed_definition_or_frozen_source_bytes ... ok
+test tests::profile_freezes_exact_context_separately_from_sampling_and_source_config ... ok
+test tests::file_reads_are_bounded_and_reject_directory_and_symlink_sources ... ok
+test tests::absent_settings_do_not_write_and_invalid_settings_never_inherit ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/lib.rs (target/debug/deps/loom_document-93f5724b4bf6adb6)
+
+running 21 tests
+test merge::tests::composes_disjoint_edits ... ok
+test merge::tests::handles_empty_documents_and_conflicting_initial_insertions ... ok
+test merge::tests::hybrid_visible_text_is_held_without_block_metadata ... ok
+test merge::tests::identical_edits_are_applied_once ... ok
+test merge::tests::rejects_diff_windows_above_the_default_work_budget ... ok
+test merge::tests::reports_overlapping_edits_with_all_three_spans ... ok
+test merge::tests::unicode_changes_merge_only_at_scalar_boundaries ... ok
+test merge::tests::unicode_conflict_ranges_never_split_scalars ... ok
+test merge::tests::verse_merge_preserves_crlf_and_whitespace_exactly ... ok
+test neural_functions::tests::base_prompt_retains_exact_function_and_input_bytes ... ok
+test neural_functions::tests::code_delimiters_obey_run_lengths_and_unclosed_ticks_are_literal ... ok
+test neural_functions::tests::prose_punctuation_stays_outside_unicode_names ... ok
+test neural_functions::tests::limits_reject_deep_wide_and_oversized_input ... ok
+test neural_functions::tests::plain_prompts_and_reference_values_never_become_calls ... ok
+test neural_functions::tests::pipelines_elaborate_left_to_right_and_prepend_the_value ... ok
+test neural_functions::tests::markdown_references_skip_code_escapes_and_email_preserving_ranges ... ok
+test neural_functions::tests::quoted_names_paths_unicode_and_literal_arguments_round_trip ... ok
+test tests::hybrid_projection_records_exact_block_ranges ... ok
+test tests::prose_projection_preserves_authored_utf8_and_line_endings ... ok
+test tests::slice_projection_rejects_half_a_unicode_scalar ... ok
+test tests::verse_projection_preserves_every_byte ... ok
+
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/lib.rs (target/debug/deps/loom_host-39d4e37f786266ec)
+
+running 28 tests
+test generation_supervisor::tests::late_cancellation_does_not_rewrite_terminal_history ... ok
+test generation_supervisor::tests::pre_executor_failure_records_failed_terminal_before_release ... ok
+test tests::automation_is_opt_in_even_when_manual_generation_is_available ... ok
+test generation_supervisor::tests::identical_public_ids_and_sequences_do_not_cross_supervisor_owners ... ok
+test tests::generation_registry_routes_cancellation_and_releases_family_atomically ... ok
+test tests::application_teardown_cancels_every_registered_family ... ok
+test tests::cancellation_is_shared ... ok
+test tests::native_focus_recheck_fails_closed_and_spends_nonce ... ok
+test tests::completion_snapshot_routes_are_exactly_scoped_to_project_session_and_document ... ok
+test tests::focus_mode_atomically_blocks_manual_and_automatic_generation ... ok
+test tests::expired_nonce_rejected ... ok
+test tests::focus_epoch_change_rejected ... ok
+test tests::native_focus_sample_is_bound_to_registry_and_spends_nonce ... ok
+test tests::generation_registry_rejects_over_capacity_without_partial_routes ... ok
+test generation_supervisor::tests::poisoned_state_never_projects_successful_shutdown_facts ... ok
+test tests::queue_applies_backpressure ... ok
+test tests::restart_rejected ... ok
+test tests::second_use_rejected ... ok
+test tests::session_idle_wait_wakes_for_terminal_persistence_repair ... ok
+test tests::stale_native_focus_sample_fails_closed_and_spends_nonce ... ok
+test tests::wrong_window_rejected ... ok
+test tests::session_document_command_and_promotion_substitution_are_rejected ... ok
+test tests::stale_nonce_rejected ... ok
+test tests::session_idle_wait_is_bounded_and_observes_release ... ok
+test tests::wrong_candidate_rejected ... ok
+test tests::cancellation_before_backend_attachment_is_replayed_exactly_once ... ok
+test tests::foreground_registry_bounds_windows_and_pending_challenges ... ok
+test generation_supervisor::tests::completed_history_does_not_grow_with_operation_count ... ok
+
+test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running unittests src/lib.rs (target/debug/deps/loom_store-9efbf541b7bd3c0c)
+
+running 141 tests
+test document_snapshot::tests::missing_snapshot_refusal_preserves_original_manuscript_and_metadata ... ok
+test document_snapshot::tests::previous_store_format_is_rejected_before_recovery_or_semantic_mutation ... ok
+test file_io::tests::private_file_precreation_does_not_rewrite_an_existing_file ... ok
+test file_io::tests::private_atomic_files_are_owner_only_without_rewriting_existing_modes ... ok
+test document_snapshot::tests::invalid_or_external_import_cannot_create_visible_or_semantic_content ... ok
+test draft::tests::first_write_after_clear_replays_exactly_after_lost_acknowledgement ... ok
+test draft::tests::draft_retry_is_idempotent_and_stale_different_bytes_fail ... ok
+test folder::tests::discovery_ignores_hidden_generated_and_symlinked_content ... ok
+test document_snapshot::tests::snapshot_and_index_disagreement_refuses_reconstruction_and_source_edit ... ok
+test draft::tests::cleared_versions_are_never_reused_or_vulnerable_to_aba_clear ... ok
+test draft::tests::clear_removes_both_bounded_slots ... ok
+test draft::tests::crash_before_database_commit_cannot_replace_active_draft ... ok
+test document_snapshot::tests::explicit_import_retains_full_source_and_reopens_durable_writing_projection ... ok
+test draft::tests::checkpoint_refuses_mismatched_draft_without_consuming_or_saving ... ok
+test folder::tests::unsupported_text_does_not_block_open_or_refresh_of_readable_writing ... ok
+test document_snapshot::tests::import_rendering_uses_typed_parts_instead_of_confusing_selection_with_content ... ok
+test draft::tests::checkpoint_atomically_consumes_exact_lost_ack_draft_and_replays ... ok
+test draft::tests::prose_draft_and_checkpoint_preserve_exact_line_endings_after_reopen ... ok
+test folder::tests::ordinary_folder_opens_edits_and_reopens_without_rewriting_or_moving_files ... ok
+test generation::tests::bounded_branch_page_and_exact_records_rebuild_durable_state ... ok
+test document_snapshot::tests::refused_snapshot_destination_never_materializes_private_source_evidence ... ok
+test generation::tests::branch_query_uses_run_keyed_weave_index ... ok
+test generation::tests::branch_body_checks_indexed_and_filesystem_lengths_before_allocating ... ok
+test generation::tests::committed_checkpoint_wraps_projection_failure_as_retryable_state ... ok
+test generation::tests::caller_declared_live_inference_cannot_promote_legacy_prose ... ok
+test generation::tests::committed_checkpoint_returns_typed_pending_state_at_projection_boundary ... ok
+test generation::tests::branch_page_truncates_error_metadata_and_rejects_unbounded_limits ... ok
+test generation::tests::completed_terminal_links_candidate_output_and_token_evidence ... ok
+test generation::tests::branch_cursor_is_stable_across_newer_insertions_and_bound_to_its_run ... ok
+test generation::tests::branch_reads_keep_distinct_weave_families_and_ignore_cancellation_receipts ... ok
+test generation::tests::cancel_exact_retry_survives_terminal_and_rejects_command_reuse ... ok
+test generation::tests::generation_progress_event_budget_validator_accepts_exact_and_rejects_plus_one ... ok
+test generation::tests::critic_candidate_cannot_be_promoted ... ok
+test generation::tests::generation_family_preflight_returns_none_for_an_unknown_command_without_writes ... ok
+test generation::tests::generation_family_exact_retry_replays_identities_and_rejects_command_reuse ... ok
+test generation::tests::generation_family_commits_all_runs_under_one_shared_receipt ... ok
+test generation::tests::generation_family_preflight_rejects_a_non_weave_command_id ... ok
+test generation::tests::generation_family_preflight_reconstructs_existing_weave_without_writes ... ok
+test generation::tests::generation_family_rejects_empty_and_duplicate_identities_without_writes ... ok
+test generation::tests::duplicate_outputs_share_blob_but_keep_distinct_occurrences ... ok
+test generation::tests::empty_revision_survives_delete_type_and_undo ... ok
+test generation::tests::generation_has_exactly_one_terminal_event ... ok
+test generation::tests::generation_progress_event_budget_is_enforced_before_append ... ok
+test generation::tests::model_environment_recording_is_content_idempotent_and_rejects_identity_reuse ... ok
+test generation::tests::generation_progress_replays_durable_unicode_deltas_without_mutating_manuscript ... ok
+test generation::tests::completion_recovery_fixture_survives_autosave_and_store_reopen ... ok
+test generation::tests::exact_boundary_suggestion_promotion_survives_store_reopen ... ok
+test generation::tests::every_non_candidate_terminal_preserves_partial_output_receipt_trace_and_timings ... ok
+test generation::tests::generation_progress_text_budget_is_enforced_before_append ... ok
+test generation::tests::interrupted_generation_recovery_is_explicit_atomic_and_idempotent ... ok
+test generation::tests::generation_text_delta_accepts_exact_utf8_bound_and_rejects_larger_events ... ok
+test generation::tests::invalid_later_family_run_rolls_back_the_whole_sql_family ... ok
+test generation::tests::idempotent_checkpoint_replays_and_rejects_fingerprint_reuse ... ok
+test paths::tests::document_paths_are_confined_to_ordinary_files_in_the_folder ... ok
+test paths::tests::private_directory_creation_is_owner_only_and_existing_modes_are_preserved ... ok
+test generation::tests::keep_exact_retry_replays_selection_and_rejects_command_reuse ... ok
+test generation::tests::recipes_validate_and_preserve_ordered_artifact_references ... ok
+test reconciliation::tests::committed_reconciliation_wraps_projection_failure_as_retryable_state ... ok
+test schema::tests::current_schema_enforces_canonical_document_titles ... ok
+test generation::tests::source_bound_checkpoint_rejects_unbounded_diff_work ... ok
+test schema::tests::current_schema_reopens_and_rejects_removed_constraints ... ok
+test reconciliation::tests::exact_retry_replays_one_revision_and_different_request_conflicts ... ok
+test generation::tests::private_generation_and_keep_do_not_mutate_active_manuscript ... ok
+test generation::tests::source_bound_save_rejects_external_edit_without_overwrite ... ok
+test generation::tests::promotion_wraps_postcommit_projection_error_as_pending_retry ... ok
+test schema::tests::incompatible_databases_are_rejected_without_mutation_or_wal_creation ... ok
+test reconciliation::tests::reconciliation_preserves_base_segments_and_records_explicit_import_merge ... ok
+test generation::tests::promotion_returns_committed_identity_with_pending_conflict_then_replays_to_applied ... ok
+test generation::tests::one_character_edit_preserves_unmodified_generated_slices ... ok
+test generation::tests::promotion_exact_retry_returns_committed_identity_and_rejects_command_reuse ... ok
+test reconciliation::tests::second_external_edit_at_projection_boundary_is_never_overwritten ... ok
+test reconciliation::tests::visible_deletion_and_stale_external_hash_fail_closed_without_history ... ok
+test generation::tests::tombstoned_document_rejects_stale_candidate_promotion_after_path_recreation ... ok
+test store::tests::adopt_visible_document_boundary_conflict_never_clobbers_newer_bytes ... ok
+test generation::tests::two_disjoint_edits_preserve_generated_text_between_them ... ok
+test store::tests::adopt_visible_document_rejects_symlink_swapped_after_inspection ... ok
+test store::tests::adopt_visible_document_rejects_symlink_without_reading_or_mutating_target ... ok
+test store::tests::adopt_visible_document_rejects_non_file_and_invalid_utf8_without_state ... ok
+test store::tests::aborted_pre_capture_delete_reuses_the_exact_command_safely ... ok
+test store::tests::aborted_delete_command_does_not_follow_a_later_rename ... ok
+test store::tests::adopt_visible_document_interruption_recovers_committed_receipt_and_outbox ... ok
+test store::tests::adopt_visible_document_preserves_exact_prose_bytes_and_human_import_provenance ... ok
+test store::tests::active_and_unicode_normalized_path_aliases_are_reserved_portably ... ok
+test store::tests::adoption_outbox_never_accepts_same_hash_symlink_after_commit ... ok
+test store::tests::core_history_tables_are_strict ... ok
+test store::tests::close_project_has_a_public_receipt ... ok
+test store::tests::database_uses_required_durability_pragmas ... ok
+test store::tests::captured_rename_anchor_never_consumes_a_same_content_target_replacement ... ok
+test store::tests::corrupt_delete_recovery_evidence_stays_live ... ok
+test store::tests::delete_capture_race_restores_replacement_and_does_not_tombstone ... ok
+test store::tests::create_if_absent_supports_an_empty_zero_segment_revision ... ok
+test store::tests::case_only_rename_uses_capture_before_no_clobber_install ... ok
+test store::tests::document_title_codec_is_portable_and_rejects_invalid_input ... ok
+test store::tests::delete_commit_error_with_failed_readback_remains_retryable_uncertainty ... ok
+test store::tests::create_if_absent_refuses_file_appearing_at_projection_boundary ... ok
+test store::tests::document_path_cannot_traverse_symlinked_directory ... ok
+test store::tests::delete_refuses_a_recoverable_transient_draft_before_intent ... ok
+test store::tests::document_delete_moves_exact_file_to_command_recovery_and_replays ... ok
+test store::tests::derived_document_is_source_material_without_claiming_model_generation ... ok
+test store::tests::committed_rename_releases_the_old_path_for_a_new_document ... ok
+test store::tests::generated_document_rejects_missing_evidence_without_creating_writing ... ok
+test store::tests::delete_uncertainty_replays_after_reopen_and_tombstone_survives_recovery_loss ... ok
+test store::tests::document_display_title_rejects_blank_control_and_overlong_utf8_without_mutation ... ok
+test store::tests::document_summary_reads_reject_noncanonical_stored_titles ... ok
+test store::tests::hybrid_storage_preserves_authored_line_endings ... ok
+test store::tests::draft_admission_reconciles_a_live_captured_delete_before_mutation ... ok
+test store::tests::document_rename_moves_the_visible_file_and_preserves_identity ... ok
+test store::tests::document_rename_rejects_portable_name_violations_and_collisions_without_mutation ... ok
+test store::tests::immutable_rows_reject_updates ... ok
+test store::tests::identical_content_shares_blob_but_not_occurrence ... ok
+test store::tests::opening_a_damaged_project_never_recreates_its_database ... ok
+test store::tests::opening_a_missing_registered_document_reports_external_deletion ... ok
+test store::tests::generated_document_retains_evidence_and_generated_authorship_after_reopen ... ok
+test store::tests::newly_created_sidecar_state_is_private_without_chmodding_manuscript_directories ... ok
+test store::tests::project_lease_refuses_a_symbolic_link ... ok
+test store::tests::ordinary_markdown_can_be_named_as_a_hidden_template_without_rewriting_it ... ok
+test store::tests::outbox_boundary_race_preserves_external_bytes ... ok
+test store::tests::pending_outbox_blocks_namespace_changes_until_recovery ... ok
+test store::tests::project_lease_rejects_concurrent_open_and_releases_on_drop ... ok
+test store::tests::prepared_rename_recovery_preserves_a_recreated_source_and_private_original ... ok
+test store::tests::reconciliation_snapshot_reads_base_and_external_text_without_writing ... ok
+test store::tests::prepared_rename_with_corrupt_private_capture_stays_live ... ok
+test store::tests::prepared_rename_capture_recovers_the_old_path_after_reopen ... ok
+test store::tests::prepared_before_capture_never_consumes_an_unrelated_same_blob_target ... ok
+test store::tests::read_document_binds_visible_text_to_active_revision ... ok
+test store::tests::prepared_rename_recovery_does_not_confuse_same_blob_recreation_with_inode_restore ... ok
+test store::tests::post_target_precommit_failure_is_retryable_in_the_same_session ... ok
+test store::tests::recovery_finishes_crash_after_visible_replace ... ok
+test store::tests::rename_collision_with_an_existing_same_inode_never_consumes_either_name ... ok
+test store::tests::rename_capture_race_restores_the_replacement_without_unlinking_it ... ok
+test store::tests::registered_document_probe_is_exact_and_survives_reopen ... ok
+test store::tests::same_session_save_reconciles_a_captured_delete_without_resurrection ... ok
+test store::tests::sidecar_removal_leaves_manuscript_readable ... ok
+test store::tests::tombstoned_outbox_is_terminally_suppressed_without_visible_resurrection ... ok
+test store::tests::recovery_refuses_to_overwrite_external_change ... ok
+test store::tests::rename_to_a_tombstoned_historical_path_fails_before_capture ... ok
+test store::tests::same_session_action_resolution_recovers_a_prepared_target_before_retry ... ok
+test store::tests::shared_document_exposes_manuscript_context_with_exact_source_provenance ... ok
+test store::tests::save_checkpoint_and_import_cannot_bypass_portable_path_reservations ... ok
+test generation::tests::source_bound_checkpoint_accepts_large_contiguous_insertions_and_deletions ... ok
+test draft::tests::thousands_of_drafts_use_two_slots_without_semantic_history ... ok
+
+test result: ok. 141 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 31.20s
+
+     Running tests/legacy_python_fixture.rs (target/debug/deps/legacy_python_fixture-3894aef3e9bc7ef5)
+
+running 2 tests
+test preserved_python_assemblies_reconstruct_or_fail_on_empty_spans ... ignored, requires LOOM_LEGACY_FIXTURE_ROOT pointing at the preserved Python lab
+test python_character_offsets_translate_to_utf8_byte_offsets ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/project_format.rs (target/debug/deps/project_format-258c38466afe584d)
+
+running 2 tests
+test generation_protocol_v1_golden_file_remains_readable ... ok
+test project_v1_manifest_golden_file_remains_readable ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/mom_llama_app-d07306c6195a8574)
+
+running 75 tests
+test app_runtime::tests::persona_approval_recovery_retains_terminal_error_evidence ... ok
+test app_runtime::tests::persona_approval_recovery_runs_after_startup_and_joins_without_sleeping ... ok
+test app_runtime::tests::quiesce_closes_admission_once ... ok
+test app_runtime::tests::native_read_vs_quit_has_one_winner ... ok
+test command_registry::tests::admission_check_rejects_a_misordered_later_cfg_implementation ... ok
+test app_runtime::tests::quiesce_waits_for_every_previously_admitted_operation ... ok
+test app_runtime::tests::receipt_and_native_reads_drain_before_final_join ... ok
+test app_runtime::tests::final_persona_approval_recovery_waits_for_admitted_work_and_precedes_native_join ... ok
+test app_runtime::tests::repeated_quit_runs_one_shutdown ... ok
+test app_runtime::tests::model_select_vs_quit_has_one_winner ... ok
+test app_runtime::tests::cloned_handles_share_one_admission_gate ... ok
+test command_registry::tests::command_permission_matches_tauri_capability_identifier ... ok
+test command_registry::tests::contract_and_ui_registries_reference_classified_commands ... ok
+test command_registry::tests::command_registry_matches_invoke_handler ... ok
+test commands::tests::multi_second_tauri_commands_stay_off_the_async_dispatch_thread ... ok
+test app_runtime::tests::poisoned_operation_supervisor_drains_workers_and_remains_a_shutdown_error ... ok
+test commands::tests::path_setting_patch_distinguishes_omitted_clear_and_replace ... ok
+test commands::tests::speech_ipc_is_path_free_and_rebinds_exact_authority ... ok
+test app_runtime::tests::explicit_speculative_cancel_is_runtime_local_and_idempotent ... ok
+test app_runtime::tests::receipt_writing_read_vs_quit_has_one_winner ... ok
+test app_runtime::tests::speculative_admission_is_single_flight_and_yields_to_foreground ... ok
+test information::tests::denied_rights_never_consume_a_native_path_grant ... ok
+test command_registry::tests::every_long_operation_has_cancellation_and_app_lease ... ok
+test information::tests::model_evidence_packet_binds_exact_serialized_bytes_and_lineage_hashes ... ok
+test information::tests::path_grants_reject_relative_picker_results ... ok
+test information::tests::preview_hash_binds_every_renderer_visible_fact ... ok
+test information::tests::path_grants_are_opaque_single_use_and_expire ... ok
+test app_runtime::tests::settings_update_vs_quit_has_one_winner ... ok
+test speech::tests::active_registry_rejects_duplicate_target_and_finishes_exact_nonce ... ok
+test speech::tests::cancel_before_registration_and_close_suppress_publication ... ok
+test speech::tests::descriptor_hash_binds_request_to_exact_inventory ... ok
+test speech::tests::raw_wav_publication_revalidates_the_current_message_after_storage_lookup ... ok
+test operation_supervisor::publication_tests::operation_handles_do_not_target_other_owners_or_reused_public_ids ... ok
+test speech::tests::routes_are_exact_never_network_and_complete_input_only ... ok
+test speech::tests::stale_and_provenance_checks_reject_mismatched_results ... ok
+test tests::failed_native_join_never_permits_process_exit ... ok
+test tests::encrypted_runtime_initialization_is_renderer_driven_and_blocking_pool_bound ... ok
+test app_runtime::tests::two_runtime_characterization_keeps_injected_admission_and_cancel_seams_isolated ... ok
+test information::tests::model_grants_deny_policy_and_cross_conversation_use ... ok
+test tests::failed_runtime_build_is_retryable_before_owner_publication ... ok
+test tests::macos_quit_source_cannot_reintroduce_appkit_terminate_bypass ... ok
+test command_registry::tests::every_command_has_app_lease ... ok
+test command_registry::tests::command_semantics_match_product_authority ... ok
+test information::tests::removal_commit_requires_exact_live_server_capability_and_retries_cached_result ... ok
+test app_runtime::tests::cancellation_is_reswept_until_late_registered_work_drains ... ok
+test information::tests::model_evidence_packet_enforces_exact_serialized_byte_ceiling ... ok
+test tests::startup_controller_serializes_initialization_retry_and_shutdown ... ok
+test tests::shutdown_waits_when_native_runtime_construction_has_started ... ok
+test tests::smoke_receipt_reports_only_derived_registry_evidence ... ok
+test app_runtime::tests::direct_native_operation_drains_before_final_join ... ok
+test view::tests::compact_layout_is_reachable_at_the_native_window_minimum ... ok
+test view::tests::assistant_reasoning_renders_separately_from_the_visible_answer ... ok
+test view::tests::composer_renders_staged_draft_attachments_as_compact_removable_chips ... ok
+test view::tests::assistant_stats_use_the_persisted_message_model_not_the_global_default ... ok
+test information::tests::wrong_alexandria_schema_creates_no_durable_registration ... ok
+test view::tests::composer_admission_and_readiness_follow_the_conversation_model ... ok
+test view::tests::composer_projects_the_conversation_model_in_runtime_precedence_order ... ok
+test view::tests::generation_controls_are_reserved_for_the_active_ordinary_assistant ... ok
+test view::tests::store_blockers_remain_typed_in_the_visible_projection ... ok
+test view::tests::markdown_tables_render_without_frontend_runtime ... ok
+test view::tests::structured_tool_results_render_as_a_readable_card ... ok
+test view::tests::persona_menu_captures_one_target_and_exposes_only_approved_actions ... ok
+test view::tests::message_attachments_follow_the_messages_exact_order_and_keep_its_text ... ok
+test view::tests::speech_projection_rebinds_targets_and_keeps_transcript_insertion_explicit ... ok
+test operation_supervisor::publication_tests::public_identity_survives_until_final_send_even_when_consumer_drops ... ok
+test view::tests::selected_persona_projects_its_normal_editable_transcript ... ok
+test view::tests::persona_tool_approval_uses_one_exact_review_and_decision_surface ... ok
+test view::tests::frontend_model_picker_loads_the_chat_scoped_selection ... ok
+test view::tests::corrupt_product_storage_never_projects_an_empty_default_chat ... ok
+test view::tests::dynamic_interactions_are_contract_backed_and_validate_stale_choices ... ok
+test operation_supervisor::publication_tests::shutdown_waits_for_a_join_already_owned_by_another_thread ... ok
+test information::tests::nonempty_alexandria_wal_creates_no_durable_registration ... ok
+test operation_supervisor::publication_tests::completed_worker_diagnostics_are_bounded_without_losing_join_accounting ... ok
+test information::tests::alexandria_registration_remount_search_and_citation_preserve_source_identity ... ok
+test view::tests::rendered_app_controls_have_contract_metadata ... ok
+
+test result: ok. 75 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.01s
+
+     Running unittests src/main.rs (target/debug/deps/mom_llama_cli-2c05206691806ca3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cli.rs (target/debug/deps/cli-59b46801a5c1bc2c)
+
+running 11 tests
+test real_native_cli_stream_preserves_inference_evidence_without_executable ... ignored, requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF
+test path_selection_is_cli_exercisable_and_typed ... ok
+test skip_reasoning_is_typed_without_an_active_generation ... ok
+test engine_check_returns_typed_missing_model_blocker_without_executable_config ... ok
+test cli_imports_long_paste_directly_into_encrypted_storage ... ok
+test tool_loop_status_and_cancel_are_typed_without_an_active_run ... ok
+test cache_policy_cli_uses_plain_names ... ok
+test cli_attachment_preview_returns_metadata_without_decrypted_payload ... ok
+test chat_blocks_honestly_without_a_model ... ok
+test settings_skills_and_search_persist_in_encrypted_sqlite ... ok
+test attachment_and_mcp_are_exercisable_without_claiming_llama_inference ... ok
+
+test result: ok. 10 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.70s
+
+     Running unittests src/lib.rs (target/debug/deps/mom_llama_runtime-f937f6a2a9290f96)
+
+running 181 tests
+test attachments::tests::active_context_budget_rejects_each_aggregate_dimension ... ok
+test attachments::tests::concurrent_draft_edit_keeps_new_text_and_releases_sent_attachment_ids ... ok
+test attachments::tests::canonical_text_preview_preserves_page_locator_and_exact_caps ... ok
+test attachments::tests::generation_merge_never_resurrects_deleted_messages_or_deleted_hosts ... ok
+test attachments::tests::generation_merge_preserves_concurrent_metadata_selection_and_branch_changes ... ok
+test attachments::tests::encrypted_v2_to_v3_migration_is_additive_and_idempotent ... ok
+test attachments::tests::pdf_without_canonical_text_is_explicitly_metadata_only ... ok
+test attachments::tests::generation_context_checks_the_same_source_identity_as_preview ... ok
+test attachments::tests::every_stored_policy_fingerprint_must_match_the_current_host_policy ... ok
+test attachments::tests::content_address_mismatch_fails_closed_before_native_media ... ok
+test attachments::tests::explicit_pre_generation_leaf_commits_user_and_attributed_results ... ok
+test attachments::tests::legacy_attachment_records_fail_conservative_during_message_gc ... ok
+test attachments::tests::forked_persona_attachment_snapshot_is_independent_and_content_addressed ... ok
+test attachments::tests::untrusted_boundary_is_explicit_and_identity_scoped ... ok
+test attachments::tests::v2_records_deserialize_without_losing_legacy_linkage ... ok
+test chat::tests::attachment_only_turns_are_valid_but_empty_turns_are_not ... ok
+test chat::tests::attributed_speaker_identity_is_metadata_not_assistant_prose ... ok
+test attachments::tests::duplicate_attachment_references_cannot_bypass_the_active_count_limit ... ok
+test chat::tests::conversation_model_and_projector_override_the_global_pair_atomically ... ok
+test chat::tests::disabling_reasoning_parsing_preserves_raw_model_output ... ok
+test chat::tests::cancelled_receipt_and_terminal_preserve_the_same_invocation_fact ... ok
+test chat::tests::explicit_terminal_prevents_destructor_from_emitting_a_second_terminal ... ok
+test chat::tests::reasoning_context_policy_is_explicit ... ok
+test chat::tests::reasoning_only_blocker_preserves_real_inference_evidence ... ok
+test chat::tests::reasoning_parser_records_incomplete_reasoning_without_losing_text ... ok
+test chat::tests::reasoning_parser_routes_markers_split_across_stream_chunks ... ok
+test composer::tests::active_mentions_suppress_prediction_without_matching_email_prose ... ok
+test composer::tests::anchor_requires_the_exact_utf16_draft_end ... ok
+test composer::tests::generation_binding_changes_with_every_prompt_authority ... ok
+test composer::tests::suffix_is_single_line_echo_stripped_and_utf8_bounded ... ok
+test config::tests::automatic_and_manual_memory_budget_provenance_survives_document_resolution ... ok
+test config::tests::automatic_memory_budget_is_half_of_ram_with_conservative_bounds ... ok
+test config::tests::cache_defaults_are_automatic_and_policy_is_the_single_source_of_truth ... ok
+test config::tests::cached_default_binds_its_projector_and_preserves_explicit_selection ... ok
+test config::tests::custom_css_cannot_load_external_resources ... ok
+test config::tests::custom_json_is_allowlisted_and_changes_native_sampling ... ok
+test config::tests::data_dir_override_does_not_leak_into_parallel_tests ... ok
+test config::tests::empty_paths_never_become_dot_and_compile_defaults_must_be_absolute ... ok
+test config::tests::frozen_invalid_profile_is_rejected_without_using_valid_global_defaults ... ok
+test config::tests::generation_defaults_leave_room_for_reasoning_models_to_answer ... ok
+test config::tests::inactive_settings_remain_in_existing_data_but_reject_new_writes ... ok
+test config::tests::invalid_persisted_sampler_remains_readable_for_repair_but_cannot_generate ... ok
+test config::tests::invalid_sampler_and_limits_reject_before_any_settings_write ... ok
+test config::tests::plaintext_settings_are_rejected_without_import_or_source_mutation ... ok
+test chat::tests::dropping_started_stream_emits_one_failed_terminal_and_closes_registry_state ... ok
+test attachments::tests::partial_inspection_retains_bounded_text_with_explicit_coverage ... ok
+test config::tests::supported_upstream_setting_registry_is_complete_and_distinct_from_extensions ... ok
+test conversation_store::tests::corrupt_history_cannot_replace_a_valid_encrypted_document ... ok
+test conversation_store::tests::explicit_snapshot_export_preserves_private_metadata_without_changing_legacy_codec ... ok
+test conversation_store::tests::pre_attachment_messages_deserialize_with_an_empty_attachment_set ... ok
+test conversation_store::tests::projected_legacy_blank_model_paths_do_not_mask_fallbacks ... ok
+test conversation_store::tests::reading_a_document_never_rewrites_attributed_or_literal_content ... ok
+test conversation_store::tests::reserved_attribution_prefix_is_not_assistant_content ... ok
+test conversation_store::tests::transcript_as_writing_retains_selected_branch_roles_and_tool_receipts ... ok
+test engine::tests::model_path_blockers_are_friendly_and_never_echo_raw_paths ... ok
+test kv_cache::tests::built_in_cache_owner_has_a_stable_nonempty_prompt ... ok
+test kv_cache::tests::longest_cache_wins_across_memory_and_persistent_tiers ... ok
+test kv_cache::tests::memory_cache_budget_is_global_across_model_fingerprints ... ok
+test kv_cache::tests::memory_wins_equal_length_tie ... ok
+test kv_cache::tests::owner_generation_rejects_promotion_after_exact_invalidation ... ok
+test config::tests::rejected_update_preserves_the_stored_settings ... ok
+test kv_cache::tests::persistent_cache_budget_evicts_invalid_and_least_recent_entries ... ok
+test config::tests::runtime_and_compiled_models_resolve_one_projector_or_propagate_typed_ambiguity ... ok
+test kv_cache::tests::persistent_cache_rejects_invalid_or_oversized_state ... ok
+test kv_cache::tests::owner_invalidation_after_persistence_rejects_memory_promotion ... ok
+test kv_cache::tests::same_id_owned_ownerless_replacement_invalidates_selected_memory_authority ... ok
+test mcp::tests::cancellation_before_spawn_is_proven_before_effect ... ok
+test attachments::tests::structurally_valid_audio_requires_transcription_before_native_input ... ok
+test mcp::tests::effect_frame_failure_before_first_byte_is_proven_before_effect ... ok
+test kv_cache::tests::persistent_cache_transaction_enforces_entry_and_byte_budgets ... ok
+test mcp::tests::failed_os_spawn_remains_proven_before_external_process_authority ... ok
+test kv_cache::tests::persistent_cache_corruption_invalidates_and_falls_back_after_reopen ... ok
+test mcp::tests::exact_json_rpc_error_is_a_known_terminal_rejection ... ok
+test mcp::tests::malformed_call_result_after_dispatch_is_outcome_unknown ... ok
+test mcp::tests::malformed_json_rpc_error_after_dispatch_is_outcome_unknown ... ok
+test mcp::tests::partial_effect_frame_write_is_outcome_unknown ... ok
+test mcp::tests::malformed_reply_after_effect_dispatch_is_outcome_unknown ... ok
+test mcp::tests::post_spawn_path_identity_drift_is_outcome_unknown ... ok
+test mcp::tests::mcp_is_error_result_is_a_known_terminal_rejection ... ok
+test mcp::tests::replacing_a_configured_mcp_file_cannot_spawn_or_claim_an_unknown_effect ... ok
+test mcp::tests::schema_drift_after_spawn_is_outcome_unknown ... ok
+test mcp::tests::successful_spawn_makes_initialize_failure_outcome_unknown ... ok
+test mcp::tests::wrong_response_id_after_effect_dispatch_is_outcome_unknown ... ok
+test attachments::tests::structure_only_media_never_enters_native_inputs ... ok
+test mentions::tests::approval_deadline_uses_the_earlier_monotonic_or_durable_wall_boundary ... ok
+test mentions::tests::cancellation_lifecycle_removes_only_the_exact_registered_target_and_generation ... ok
+test mentions::tests::cancellation_terminal_arbitration_is_monotonic ... ok
+test mentions::tests::context_trimming_removes_whole_messages_and_never_drops_the_addressed_message ... ok
+test mentions::tests::duplicate_case_insensitive_registry_handles_are_ambiguous_not_last_wins ... ok
+test mcp::tests::reviewed_catalog_updates_serialize_one_mutable_fact ... ok
+test attachments::tests::generated_exchange_and_private_journal_roll_back_as_one_fact ... ok
+test mentions::tests::active_approval_index_is_bounded_derived_state_for_pending_and_resuming_only ... ok
+test mentions::tests::forced_monotonic_expiry_terminalizes_even_when_wall_time_moves_backward ... ok
+test mentions::tests::mention_parser_ignores_markdown_code ... ok
+test mentions::tests::mention_parser_is_stable_and_deduplicates_handles ... ok
+test mentions::tests::mention_parser_requires_the_explicit_composer_boundary ... ok
+test mentions::tests::mention_tool_calls_must_match_an_attached_allowlisted_binding_and_schema ... ok
+test attachments::tests::staged_canonical_text_and_current_turn_media_are_exact ... ok
+test mentions::tests::persona_resume_lease_keeps_a_stable_inode_and_binds_its_generation ... ok
+test mentions::tests::live_resume_is_not_reconciled_out_from_under_the_running_command ... ok
+test mentions::tests::legacy_mention_invocation_records_migrate_with_no_continuation_authority ... ok
+test mentions::tests::expiry_and_stale_resume_reconcile_to_one_terminal_without_retry ... ok
+test mentions::tests::persona_tool_call_hash_binds_turn_snapshot_arguments_and_model ... ok
+test mentions::tests::persona_tool_decision_requires_one_complete_strict_control_object ... ok
+test mentions::tests::persona_tool_decision_schema_binds_each_call_to_one_attached_contract ... ok
+test mentions::tests::persona_tool_contracts_are_count_and_byte_bounded_before_prompt_construction ... ok
+test attachments::tests::inactive_branch_attachment_never_enters_the_active_prompt ... ok
+test models::tests::cache_discovery_does_not_follow_directory_symlinks ... ok
+test attachments::tests::exact_media_preview_adds_bounded_native_video_without_transform_execution ... ok
+test models::tests::default_hugging_face_cache_uses_the_shared_desktop_location ... ok
+test models::tests::latest_default_model_intent_wins_when_fast_new_finishes_before_slow_old ... ok
+test models::tests::launch_time_model_override_remains_authoritative ... ok
+test models::tests::projector_discovery_is_bounded_to_zero_one_or_typed_ambiguity ... ok
+test models::tests::selecting_a_model_clears_or_replaces_the_previous_projector_pair ... ok
+test native_runtime::tests::changing_one_prefix_keeps_other_encrypted_payload_bytes_unchanged ... ok
+test mentions::tests::public_approval_resolution_never_serializes_the_frozen_continuation ... ok
+test native_runtime::tests::product_cache_policy_controls_every_native_host_cache_tier ... ok
+test native_runtime::tests::product_owners_have_independent_scopes_and_terminal_drop ... ok
+test native_runtime::tests::product_prefix_cache_clear_removes_the_encrypted_document ... ok
+test mentions::tests::unknown_effect_receipt_marks_spawn_boundary_and_identity_limits ... ok
+test operation_scope::tests::barrier_driven_quiesce_prevents_late_chat_native_admission ... ok
+test operation_scope::tests::barrier_driven_two_runtime_cancellation_is_exactly_isolated ... ok
+test operation_scope::tests::quiescing_scope_pre_cancels_late_registration_and_drains_to_zero ... ok
+test path_selection::tests::cancelling_a_native_picker_is_a_typed_noop ... ok
+test path_selection::tests::path_selection_is_typed_canonical_and_extension_bounded ... ok
+test models::tests::projector_discovery_fails_closed_when_the_sibling_bound_is_truncated ... ok
+test personas::tests::deleted_catalog_persona_is_not_silently_reseeded ... ok
+test personas::tests::edited_catalog_persona_is_never_overwritten_by_an_upgrade ... ok
+test personas::tests::first_catalog_seed_records_managed_provenance ... ok
+test persona_library::tests::catalog_is_the_exact_supplied_fourteen_persona_library ... ok
+test personas::tests::mention_handles_are_stable_and_human_readable ... ok
+test personas::tests::persona_sampling_is_validated_before_store_or_model_access ... ok
+test native_runtime::tests::product_prefix_cache_round_trips_through_encrypted_storage ... ok
+test personas::tests::persona_tool_normalization_preserves_a_bounded_stable_set ... ok
+test personas::tests::persona_tool_normalization_rejects_instead_of_truncating_over_limit ... ok
+test personas::tests::pristine_catalog_persona_upgrades_safely ... ok
+test native_runtime::tests::product_prefix_cache_quarantines_corruption_and_recovers_as_a_cold_cache ... ok
+test mentions::tests::persona_tool_approval_is_exact_one_use_and_decision_bound ... ok
+test personas::tests::repeating_the_same_catalog_seed_is_a_noop ... ok
+test personas::tests::same_id_in_another_namespace_never_exempts_a_handle_collision ... ok
+test receipts::tests::only_exact_closed_operation_results_are_authoritative_cancellation_evidence ... ok
+test personas::tests::removal_hash_revalidates_every_mutable_impact_fact ... ok
+test store::tests::concurrent_first_opens_publish_one_complete_store ... ok
+test store::tests::denied_installation_key_retries_only_after_explicit_cache_clear ... ok
+test store::tests::development_store_uses_a_prompt_free_predictable_key_only_when_enabled ... ok
+test store::tests::concurrent_foreign_creation_is_never_replaced_or_stamped ... ok
+test personas::tests::removal_transaction_rolls_back_every_document_on_fault ... ok
+test store::tests::encrypted_document_round_trips_without_plaintext_at_rest ... ok
+test store::tests::explicit_key_has_priority_over_the_deterministic_test_override ... ok
+test store::tests::disposable_cache_corruption_is_quarantined_but_product_corruption_is_not_masked ... ok
+test store::tests::installation_key_provider_runs_once_per_process_and_account ... ok
+test store::tests::exact_effect_receipt_and_terminal_journal_commit_once_or_roll_back_together ... ok
+test store::tests::legacy_plaintext_is_refused_before_database_creation ... ok
+test store::tests::immediate_transactions_do_not_lose_concurrent_mutations ... ok
+test store::tests::metadata_and_blob_mutations_commit_or_roll_back_together ... ok
+test attachments::tests::transcription_input_rebinds_exact_audio_authority_and_rejects_stale_targets ... ok
+test store::tests::native_prefix_corruption_quarantines_only_disposable_state_and_reopens_cold ... ok
+test store::tests::receipts_cannot_overwrite_an_existing_identity ... ok
+test store::tests::schema_preflight_refuses_unversioned_encrypted_schema_without_mutation ... ok
+test store::tests::paired_document_mutation_has_one_commit_and_rollback_boundary ... ok
+test store::tests::schema_preflight_rejects_changed_identity_on_an_existing_store_handle ... ok
+test tool_loop::tests::parses_only_the_bounded_call_shape_as_a_tool_request ... ok
+test store::tests::schema_preflight_rejects_foreign_future_and_partial_without_mutation ... ok
+test tool_loop::tests::rejects_missing_and_wrong_typed_tool_arguments ... ok
+test tool_loop::tests::tool_preview_truncation_preserves_utf8_boundaries ... ok
+test tool_loop::tests::treats_unstructured_model_text_as_a_terminal_answer ... ok
+test store::tests::wrong_key_and_tampering_fail_closed ... ok
+test tool_loop::tests::persisted_cancellation_reaches_the_live_tool_loop_control ... ok
+test store::tests::journal_mode_contention_retries_after_releasing_the_failed_connection ... ok
+test personas::tests::instantiate_rechecks_exact_persona_authority_in_its_write_transaction ... ok
+test mentions::tests::persona_approval_persists_one_crash_terminal_and_never_retries_after_relaunch ... ok
+test attachments::tests::deleting_an_attached_message_reclaims_its_committed_storage ... ok
+test personas::tests::removal_commit_is_exact_idempotent_and_preserves_history ... ok
+test attachments::tests::deleting_a_source_chat_preserves_a_fork_snapshot_and_shared_blob ... ok
+test mentions::tests::persona_tool_approval_rejects_tampering_and_expires_monotonically ... ok
+test attachments::tests::deleting_a_chat_reclaims_both_committed_and_staged_storage ... ok
+test attachments::tests::unlinking_or_clearing_a_draft_chip_reclaims_staged_storage ... ok
+test attachments::tests::canonical_text_preview_is_path_free_exact_and_stale_after_removal ... ok
+test attachments::tests::removing_a_persona_preserves_supporting_snapshot_records ... ok
+test mcp::tests::persona_review_stages_and_revalidates_content_addressed_native_bytes ... ok
+test mcp::tests::catalog_fault_rolls_back_only_newly_staged_unreferenced_bytes ... ok
+
+test result: ok. 181 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.57s
+
+     Running tests/runtime.rs (target/debug/deps/runtime-ae8dc9e028acb2f0)
+
+running 46 tests
+test conversation_import_validates_or_safely_assigns_mention_handles ... ok
+test conversation_system_message_is_scoped_persistent_and_clearable ... ok
+test editing_one_mention_result_preserves_later_peers_on_the_edited_branch ... ok
+test deleting_one_mention_result_splices_later_peers_and_host_history ... ok
+test conversations_search_skills_and_settings_survive_restart ... ok
+test blocked_dispatch_retains_captured_draft_after_selection_changes ... ok
+test engine_check_blocks_without_model_configuration ... ok
+test cache_mode_is_coherent_and_off_blocks_manual_cache_access ... ok
+test attachment_payload_is_encrypted_and_multimodal_is_honestly_blocked ... ok
+test blocked_chat_stream_never_claims_native_engine_invocation ... ok
+test product_runtime_rejects_network_process_and_copied_native_authority ... ok
+test real_four_persona_group_cancels_one_target_without_touching_sources ... ignored, requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF
+test real_native_base_completion_invokes_no_fixture ... ignored, requires MOM_LLAMA_MODEL_PATH pointing at a real local base GGUF
+test real_native_chat_invokes_no_fixture_and_persists ... ignored, requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF
+test real_native_kv_cache_save_restore_proves_equivalence ... ignored, requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF
+test real_native_multimodal_image_and_audio_use_loaded_projector_and_encrypted_bytes ... ignored, requires a real multimodal GGUF, matching mmproj, and local image
+test real_native_reasoning_stream_can_be_forced_to_the_answer ... ignored, requires MOM_LLAMA_REASONING_MODEL_PATH pointing at a reasoning-capable GGUF
+test real_native_tool_loop_cancels_an_active_model_request ... ignored, requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF
+test real_native_tool_loop_invokes_model_and_persists_tool_lineage ... ignored, requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF
+test real_persona_mentions_reuse_only_the_exact_versioned_prefix ... ignored, requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF
+test real_product_native_chat_cache_reuses_clears_and_disables_without_fte ... ignored, requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF
+test repeated_profile_acquisition_reuses_the_same_resident_worker ... ignored, requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF
+test resident_model_profiles_fail_closed_before_memory_overcommit_without_eviction ... ignored, requires MOM_LLAMA_MODEL_PATH pointing at a real local GGUF
+test chat_dispatch_ignores_email_embedded_and_code_at_tokens_but_blocks_explicit_unknowns ... ok
+test deprecated_server_aliases_report_only_in_process_residency ... ok
+test fixture_chat_persists_in_encrypted_sqlite_and_stays_labeled ... ok
+test duplicate_persona_handles_and_oversized_groups_fail_closed ... ok
+test fixture_mention_commits_staged_attachments_and_clears_the_draft_without_real_readiness ... ok
+test fixture_readiness_never_claims_native_inference ... ok
+test freezing_and_sending_from_a_persona_never_mutates_its_source_or_template ... ok
+test legacy_plaintext_conversations_are_reported_without_import_or_deletion ... ok
+test live_chat_mentions_capture_the_committed_leaf_without_writeback ... ok
+test long_paste_becomes_an_encrypted_text_attachment_without_a_plaintext_file ... ok
+test mcp_process_authority_is_explicit_bounded_and_receipted ... ok
+test mention_snapshots_are_version_pinned_ordered_and_source_isolated ... ok
+test message_tree_preserves_siblings_and_switches_the_active_leaf ... ok
+test persistent_tool_permissions_support_ask_allow_deny_and_revoke ... ok
+test settings_paths_can_be_replaced_and_explicitly_cleared ... ok
+test skill_cache_policy_controls_stable_prefix_ownership ... ok
+test skip_reasoning_without_an_active_request_is_typed ... ok
+test system_and_tool_messages_reject_edits_without_mutating_the_conversation ... ok
+test tool_loop_requires_an_exact_expiring_single_use_approval ... ok
+test tool_loop_without_model_is_blocked_and_never_claims_engine_execution ... ok
+test updating_a_conversation_does_not_reorder_the_sidebar ... ok
+test upstream_sampling_settings_drive_the_native_sampler_dto ... ok
+test user_and_assistant_edits_preserve_original_message_branches ... ok
+
+test result: ok. 34 passed; 0 failed; 12 ignored; 0 measured; 0 filtered out; finished in 17.49s
+
+     Running unittests src/lib.rs (target/debug/deps/operation_lifecycle-8c8dc36ccef77df8)
+
+running 4 tests
+test tests::terminal_claim_is_not_replayed_and_branches_are_independent ... ok
+test tests::zero_history_capacity_still_tracks_outstanding_workers ... ok
+test tests::worker_history_never_evicts_unjoined_owners ... ok
+test tests::cancellation_and_terminal_have_exactly_one_winner ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/tauri_plugin_loom-5c837fc0b20656e7)
+
+running 236 tests
+test audio_io::apple::tests::synthesis_is_exact_local_wav_without_download_or_fallback ... ok
+test audio_io::tests::energy_gate_rejects_clicks_and_bridges_short_pauses ... ok
+test attachments::tests::platform_directory_durability_boundary_accepts_an_ordinary_directory ... ok
+test audio_io::tests::silent_pcm_is_retained_but_not_classified_as_active ... ok
+test attachments::tests::enforces_dimension_and_decompression_limits_before_storage ... ok
+test attachments::tests::rejects_declared_type_spoofing_and_unbounded_payloads ... ok
+test attachments::tests::aggregate_quota_counts_every_ordinary_project_asset_entry ... ok
+test attachments::tests::rejects_magic_prefixes_without_a_complete_image_structure ... ok
+test co_writer::tests::incompatible_library_is_rejected_without_rewriting_source ... ok
+test attachments::tests::post_commit_sync_failure_is_typed_and_idempotently_recoverable ... ok
+test attachments::tests::refuses_symlinked_asset_directories_and_files ... ok
+test context_attachments::tests::excerpt_chunks_preserve_every_utf8_boundary ... ok
+test attachments::tests::aggregate_count_and_byte_quotas_preserve_content_addressed_deduplication ... ok
+test attachments::tests::reads_reject_digest_and_extension_mismatches ... ok
+test audio_io::tests::failed_capture_save_can_retry_with_the_exact_original_audio ... ok
+test context_attachments::tests::inline_references_are_ordered_unique_and_prefix_scoped ... ok
+test context_attachments::tests::captured_wav_survives_exactly_without_transcription_or_a_source_file ... ok
+test co_writer::tests::configured_persona_applies_exactly_once_and_keeps_its_source_after_file_edits ... ok
+test co_writer::tests::invalid_attachment_receipt_rejects_the_entire_atomic_apply ... ok
+test context_attachments::tests::middle_out_handles_tiny_utf8_budgets_without_overclaiming_retention ... ok
+test context_attachments::tests::oversized_utf8_document_is_retained_as_an_explicit_partial_excerpt ... ignored, allocates and canonicalizes a 65 MiB real-size document
+test attachments::tests::stores_reads_and_reuses_structurally_valid_supported_images ... ok
+test context_attachments::tests::image_and_audio_are_retained_as_exact_direct_media ... ok
+test context_attachments::tests::inline_media_keeps_native_bytes_and_editable_markdown_preview_identity ... ok
+test context_attachments::tests::waveform_peaks_are_bounded_and_derived_only_from_valid_wav_samples ... ok
+test context_attachments::tests::wild_format_exemplars_produce_safe_real_representations ... ignored, requires LOOM_ATTACHMENT_EXEMPLAR_MANIFEST with local wild files
+test context_attachments::tests::native_media_preflight_rejects_object_per_object_and_aggregate_overflow ... ok
+test context_attachments::tests::context_markers_and_retrieval_query_are_stable_between_growth_rebalances ... ok
+test context_attachments::tests::document_context_and_inline_markers_resolve_only_the_selected_scope ... ok
+test context_attachments::tests::pasted_context_is_persisted_and_bounded_for_generation ... ok
+test context_attachments::tests::long_attachment_uses_relevant_receipted_excerpts_and_a_recent_manuscript_window ... ok
+test context_attachments::tests::legacy_document_selection_is_synthesized_then_markers_become_authoritative ... ok
+test document_watcher::tests::access_only_events_are_ignored_even_without_paths ... ok
+test document_watcher::tests::empty_non_access_events_and_backend_errors_require_a_rescan ... ok
+test document_watcher::tests::event_name_and_payload_are_path_free ... ok
+test document_watcher::tests::explicit_rescan_flag_overrides_path_filtering ... ok
+test document_watcher::tests::manuscript_create_modify_and_remove_require_a_hint ... ok
+test document_watcher::tests::manuscript_directory_deletion_requires_a_hint ... ok
+test document_watcher::tests::metadata_and_unrelated_paths_are_ignored ... ok
+test document_watcher::tests::parent_directory_escape_is_not_a_manuscript_event ... ok
+test document_watcher::tests::relative_manuscript_paths_require_a_hint ... ok
+test document_watcher::tests::root_writing_and_folder_moves_require_a_hint ... ok
+test document_watcher::tests::watcher_can_be_owned_by_synchronized_plugin_state ... ok
+test co_writer::tests::named_profile_round_trips_and_replaces_document_context ... ok
+test generation_profiles::tests::authored_context_reservation_rejects_exhaustion_without_truncating_it ... ok
+test generation_profiles::tests::frozen_profile_changes_actual_case_sampling_and_preserves_task_admission ... ok
+test co_writer::tests::same_normalized_name_updates_without_allocating_a_second_profile ... ok
+test microphone_capture::tests::callback_pool_exhaustion_is_terminal ... ok
+test microphone_capture::tests::resampler_is_chunk_stable ... ok
+test microphone_capture::tests::wav_is_exact_pcm16_mono ... ok
+test model_catalog::tests::embedded_catalog_pins_one_local_only_verified_download ... ok
+test model_config::tests::configured_missing_or_different_model_never_falls_back ... ok
+test model_config::tests::runtime_settings_reach_native_configuration_and_preserve_pinned_identity ... ok
+test model_download::tests::active_jobs_are_bounded_and_terminal_jobs_free_capacity ... ok
+test model_download::tests::application_shutdown_cancels_every_active_download_and_requires_terminal_state ... ok
+test model_download::tests::completion_records_verified_result_once ... ok
+test model_download::tests::exact_command_replays_and_changed_input_fails_closed ... ok
+test model_download::tests::model_file_names_are_portable_single_components ... ok
+test document_bindings::tests::external_changes_and_symlinks_cannot_substitute_context ... ok
+test document_bindings::tests::context_ignores_code_literals_and_does_not_expand_referenced_documents ... ok
+test model_download::tests::model_library_refuses_symbolic_links ... ok
+test model_download::tests::progress_cancellation_and_terminal_state_are_queryable ... ok
+test shader_preview::tests::bounded_source_does_not_admit_exponential_helper_calls ... ok
+test shader_preview::tests::excessive_input_nesting_and_array_allocations_fail_before_compilation ... ok
+test shader_preview::tests::caller_entry_points_resources_and_wrong_interfaces_are_rejected ... ok
+test shader_preview::tests::gradient_compiles_to_webgl2_fragment_shader ... ok
+test shader_preview::tests::loops_are_rejected_even_in_unused_helpers ... ok
+test model_download::tests::model_library_refuses_symlinks_and_non_directories ... ok
+test speech_input::tests::cancellation_cannot_interleave_with_the_admission_first_poll ... ok
+test speech_input::tests::cancellation_after_host_route_registration_reaches_backend_and_terminalizes ... ok
+test context_attachments::tests::media_snapshot_hides_authority_marker_and_removal_revokes_bytes ... ok
+test speech_input::tests::close_revokes_start_still_waiting_for_readiness_and_new_session_can_record ... ok
+test speech_input::tests::microphone_recording_scope_binds_project_session_and_id ... ok
+test speech_input::tests::individual_and_scope_cancellation_before_first_poll_prevent_admission ... ok
+test speech_input::tests::explicit_audio_capture_never_initializes_or_admits_transcription ... ok
+test speech_input::tests::close_waits_for_admitted_start_and_stops_capture_before_returning ... ok
+test speech_input::tests::microphone_request_is_complete_wav_exact_local_only_and_never_downloads ... ok
+test speech_input::tests::revoked_scope_cannot_publish_transcription_after_host_initialization ... ok
+test speech_input::tests::shutdown_excludes_a_waiting_lazy_host_initialization ... ok
+test speech_input::tests::panicked_speech_task_does_not_abandon_blocked_follower ... ok
+test speech_input::tests::microphone_shutdown_failure_still_drains_host_and_all_tasks ... ok
+test speech_input::tests::speech_request_cannot_cross_project_session_scope ... ok
+test context_attachments::tests::empty_manuscript_resolves_manual_text_attachment_image_and_audio_context ... ok
+test terminal::integration_tests::explicit_prompt_context_does_not_interpret_literal_history ... ok
+test terminal::integration_tests::real_native_terminal_retains_raw_inference_without_changing_source ... ignored, requires MOM_LLAMA_MODEL_PATH and loads the real local model for retained terminal inference
+test document_bindings::tests::extension_aliases_must_be_unique_and_exact_paths_disambiguate ... ok
+test context_attachments::tests::add_and_remove_update_context_markdown_and_selection_in_one_write ... ok
+test terminal::tests::preflight_counts_nested_calls_without_executing_references ... ok
+test co_writer::tests::applied_document_and_sampling_survive_library_updates_and_deletion ... ok
+test terminal::tests::selection_is_exact_and_caret_uses_only_its_paragraph ... ok
+test context_attachments::tests::projected_text_is_editable_idempotent_and_never_hidden_twice ... ok
+test terminal::tests::receipt_directory_refuses_symlinks ... ok
+test terminal_receipts::tests::invalid_or_oversized_bytes_cannot_be_published_or_read ... ok
+test terminal_receipts::tests::receipts_are_atomic_idempotent_and_never_clobbered ... ok
+test terminal_receipts::tests::interrupted_staging_never_exposes_a_partial_receipt ... ok
+test tests::acceptance_discovery_excludes_user_hugging_face_cache_only ... ok
+test terminal_receipts::tests::replacing_the_directory_during_staging_cannot_redirect_publication ... ok
+test tests::acceptance_model_load_rejects_a_remembered_path_outside_its_library ... ok
+test tests::acceptance_model_load_rejects_a_symlinked_model_library ... ok
+test terminal_receipts::tests::symlink_receipts_and_private_directories_are_rejected ... ok
+test tests::asset_protocol_accepts_only_one_satisfiable_byte_range ... ok
+test tests::app_local_override_routes_default_project_and_model_library ... ok
+test tests::asset_protocol_parser_rejects_noncanonical_tokens_origins_and_paths ... ok
+test document_bindings::tests::display_titles_preserve_punctuation_and_ambiguity_requires_a_path ... ok
+test tests::automatic_budget_renews_for_new_authoritative_revision_or_session ... ok
+test tests::automatic_budget_renews_without_editing_and_stale_refunds_do_not_mint_slots ... ok
+test tests::automatic_budget_reservations_are_affine_and_revision_bounded ... ok
+test tests::automatic_policy_has_no_runtime_budget_fields ... ok
+test document_bindings::tests::folders_are_sorted_and_overlap_is_deduplicated_with_current_identities ... ok
+test generation_profiles::tests::recorded_profile_replays_frozen_sources_after_config_changes ... ok
+test tests::automatic_policy_is_bound_by_rust_to_the_authoritative_document_kind ... ok
+test tests::automatic_sampling_is_typed_and_repetition_resistant ... ok
+test tests::automatic_writer_authority_requires_raw_completion_and_generated_tokens ... ok
+test tests::branch_cursor_preserves_u64_sequence_as_decimal_text ... ok
+test tests::branch_snapshot_never_presents_an_orphan_as_live_generation ... ok
+test tests::catalog_candidate_requires_the_embedded_digest_before_admission ... ok
+test tests::catalog_projector_is_resolved_beside_selected_alias_not_canonical_blob ... ok
+test tests::changed_registry_and_absent_staged_release_latches_unknown_residency ... ok
+test tests::checkpoint_draft_version_preserves_decimal_u64_and_allows_lost_first_reply ... ok
+test external_import::tests::imports_external_only_bytes_and_rejects_stale_identity_or_distinct_draft ... ok
+test terminal::integration_tests::changed_source_is_rejected_before_reserving_a_run_or_creating_output ... ok
+test terminal::integration_tests::reference_run_retains_source_value_and_replays_without_duplicate_writing ... ok
+test context_attachments::tests::supported_document_files_return_editable_text_on_first_and_cached_import ... ok
+test terminal::integration_tests::chat_turn_boundary_binds_sampling_and_command_replay ... ok
+test tests::context_media_protocol_token_binds_every_authority_dimension ... ok
+test terminal::integration_tests::pane_presentation_is_retained_and_bound_to_replay_identity ... ok
+test tests::attachment_ingest_requires_exact_session_and_returns_only_bounded_paths ... ok
+test tests::asset_read_releases_session_lock_and_revalidates_authority ... ok
+test terminal::integration_tests::literal_run_retains_the_value_as_an_ordinary_document_without_a_model ... ok
+test tests::default_project_refuses_visible_symlink_before_creating_sidecar ... ok
+test terminal_media::tests::retained_source_and_reference_audio_are_ordered_and_links_grant_no_access ... ok
+test tests::close_timeout_is_bounded_and_leaves_session_revoked_for_exact_retry ... ok
+test tests::configured_hash_cannot_override_a_pinned_policy_digest ... ok
+test tests::completion_snapshot_rejects_stale_session_and_foreign_document_scope ... ok
+test context_attachments::tests::adding_context_files_is_atomic_at_the_document_limit ... ok
+test tests::asset_protocol_authority_is_exact_across_close_switch_and_reopen ... ok
+test tests::default_project_adopts_exact_visible_bytes_when_sidecar_is_absent ... ok
+test tests::download_worker_reservation_is_joined_and_bound_to_its_exact_registry ... ok
+test tests::digest_only_change_checks_the_resident_without_staging_or_releasing_it ... ok
+test tests::exact_policy_writer_mints_typed_automatic_authority ... ok
+test tests::close_repairs_recorded_terminal_persistence_failure_before_releasing_store ... ok
+test tests::explicitly_loaded_generic_text_model_mints_non_policy_automatic_authority ... ok
+test tests::default_project_repairs_interruption_after_manifest_before_document ... ok
+test tests::default_project_never_recreates_a_registered_external_deletion ... ok
+test tests::default_project_opens_directly_and_reuses_the_same_plain_text_workspace ... ok
+test tests::completion_snapshot_joins_scoped_supervisor_and_durable_terminal_facts ... ok
+test tests::default_project_reopens_after_explicit_initial_document_deletion_without_resurrection ... ok
+test tests::close_cancels_active_family_waits_for_terminal_release_and_replays ... ok
+test tests::delete_action_returns_an_authoritative_snapshot_and_replays_exactly ... ok
+test tests::failed_close_attempt_restores_admission_and_explicit_abort_is_idempotent ... ok
+test tests::file_menu_ids_route_only_to_explicit_renderer_commands ... ok
+test tests::failed_native_inspection_that_never_acquired_restores_empty_registry ... ok
+test tests::failed_native_inspection_that_never_acquired_restores_previous_model ... ok
+test tests::final_runtime_exit_path_is_not_optional_plugin_drop_cleanup ... ok
+test tests::fixture_tauri_command_consumes_authority_at_native_edge ... ok
+test tests::generation_seeds_are_deterministic_and_branch_specific ... ok
+test tests::generation_worker_panic_latches_fail_closed_teardown ... ok
+test tests::generation_worker_reservation_prevents_exit_race_and_join_is_owned ... ok
+test tests::generic_automatic_authority_accepts_only_a_complete_multimodal_contract ... ok
+test tests::generic_automatic_writer_uses_the_same_revision_budget ... ok
+test tests::generic_text_model_never_acquires_quiet_policy_identity ... ok
+test tests::generic_automatic_authority_rejects_projector_and_media_models ... ok
+test tests::default_project_reopen_does_not_recreate_initial_after_rename ... ok
+test tests::loaded_identity_mismatch_has_no_unverified_size_hint ... ok
+test tests::document_action_resolves_only_the_explicit_captured_document_id ... ok
+test tests::loaded_model_summary_preserves_selected_alias_and_canonical_execution_path ... ok
+test tests::loaded_registry_latches_unknown_residency_when_native_slot_access_is_absent ... ok
+test tests::model_load_lifetime_outlives_a_cancelled_async_command_until_worker_return ... ok
+test tests::manual_weave_authority_remains_independent_of_build_writer_policy ... ok
+test tests::native_exit_request_quiesces_until_a_private_permit_authorizes_exit ... ok
+test tests::native_exit_recording_never_blocks_on_an_owned_application_admission_boundary ... ok
+test tests::export_action_refuses_a_final_component_symlink_after_descriptor_capture ... ok
+test tests::default_project_recovers_after_complete_sidecar_loss_without_rewriting_text ... ok
+test tests::draft_ipc_retains_store_exact_lost_ack_replay ... ok
+test tests::panicking_completion_setup_returns_a_terminal_ipc_failure_without_clearing_poison ... ok
+test tests::pending_close_handshake_covers_an_exit_request_before_renderer_listener_installation ... ok
+test tests::export_action_refuses_a_same_byte_final_component_replacement ... ok
+test tests::plugin_drop_joins_every_owned_desktop_worker_before_state_destruction ... ok
+test tests::policy_candidate_and_exact_match_preserve_source_order_rank ... ok
+test tests::pending_folder_picker_does_not_hold_shutdown_admission_or_open_a_store_after_quit ... ok
+test tests::pre_native_policy_failure_restores_the_previous_model ... ok
+test tests::export_copy_is_document_bound_and_refuses_uncheckpointed_visible_bytes ... ok
+test tests::folder_preparation_keeps_current_writing_on_cancel_same_folder_and_invalid_choice ... ok
+test tests::draft_ipc_does_not_treat_same_bytes_from_another_base_as_replay ... ok
+test tests::project_choice_unwind_clears_its_reserved_session_phase ... ok
+test tests::project_choice_owns_application_admission_until_its_session_reservation_is_released ... ok
+test tests::export_dialog_reservation_blocks_application_close_until_released ... ok
+test tests::prompt_packing_uses_the_context_that_native_actually_made_resident ... ok
+test tests::read_only_build_policy_identity_preserves_versioned_activation_and_digest ... ok
+test tests::receipt_json_exposes_pending_projection_without_discarding_semantic_identity ... ok
+test tests::invalid_model_settings_preserve_the_previous_registry_before_staging ... ok
+test tests::existing_default_writing_ignores_unrelated_untitled_symlink ... ok
+test tests::export_dialog_reservation_revalidates_the_captured_identity_before_writing ... ok
+test tests::rejected_automatic_writers_leave_budget_ledger_untouched ... ok
+test tests::open_action_refuses_a_same_byte_final_component_replacement ... ok
+test tests::open_action_refuses_a_final_component_symlink_after_descriptor_capture ... ok
+test tests::project_commands_reject_stale_session_and_cross_project_identity ... ok
+test tests::resident_projector_limits_are_enforced_before_native_submission ... ok
+test tests::inline_media_authority_requires_current_document_membership_and_session ... ok
+test tests::new_document_skips_registered_and_unmanaged_visible_paths_without_overwriting ... ok
+test tests::new_document_never_reuses_a_tombstoned_historical_path ... ok
+test tests::preview_uses_current_draft_and_reports_conflicts_without_writing ... ok
+test tests::reconciliation_preview_returns_exact_authored_inputs_and_bound_hashes ... ok
+test tests::project_summary_keeps_active_identity_across_external_change_and_omits_deletion ... ok
+test tests::same_size_wrong_policy_digest_never_reaches_native_inspection ... ok
+test tests::rename_action_moves_the_manuscript_and_preserves_identity ... ok
+test tests::title_is_readable_without_changing_path_identity ... ok
+test tests::strict_policy_candidate_can_reopen_an_exact_path_after_restart ... ok
+test tests::uncommitted_automatic_budget_reservation_refunds_on_drop ... ok
+test tests::unknown_native_residency_blocks_inference_and_application_teardown ... ok
+test tests::strict_policy_candidate_preserves_hugging_face_snapshot_alias ... ok
+test tests::unknown_policy_profile_is_rejected_without_path_resolution ... ok
+test tests::weave_v2_sampling_has_stable_exact_bit_fingerprints ... ok
+test tests::unpreventable_exit_retains_cancellation_and_joins_every_desktop_worker ... ok
+test tests::word_count_handles_whitespace_without_normalizing_document ... ok
+test workspace_preview::tests::preview_tokens_are_canonical_and_fence_removal_preserves_html ... ok
+test tests::preview_rejects_a_draft_from_an_old_active_revision ... ok
+test tests::reconciliation_apply_is_replay_safe_and_never_clears_the_draft ... ok
+test tests::rename_action_rejects_invalid_titles_without_mutating_the_fallback_name ... ok
+test tests::reveal_action_refuses_a_same_byte_final_component_replacement ... ok
+test tests::reveal_path_is_store_derived_contained_and_bound_to_external_bytes ... ok
+test tests::same_file_runtime_change_stages_exact_settings_and_retains_rollback_owner ... ok
+test tests::unchanged_model_request_keeps_its_existing_memory_plan ... ok
+test tests::reveal_action_refuses_a_final_component_symlink_after_descriptor_capture ... ok
+test tests::prepared_folder_lease_survives_old_session_close_and_is_consumed_once ... ok
+test tests::reveal_path_refuses_a_symbolic_document_target ... ok
+test tests::rename_action_rejects_a_stale_source_revision ... ok
+test document_bindings::tests::oversized_documents_and_folders_fail_without_partial_results ... ok
+test tests::reconciliation_preview_rejects_deleted_hybrid_and_unbound_inputs ... ok
+test workspace_template::tests::explicit_defaults_are_quiet_and_legacy_document_is_ordinary_prose ... ok
+test workspace_preview::tests::preview_is_bound_to_session_and_exact_visible_revision ... ok
+test workspace_template::tests::reading_is_nonmutating_and_editing_existing_content_preserves_exact_bytes ... ok
+test workspace_template::tests::invalid_settings_remain_available_for_repair ... ok
+test workspace_template::tests::external_settings_refresh_imports_only_uncontested_bytes ... ok
+test workspace_template::tests::each_setup_answer_reaches_settings_without_enabling_other_panes ... ok
+test tests::completion_snapshot_recovers_one_observed_terminal_beyond_the_first_page ... ok
+
+test result: ok. 233 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 8.84s
+
+     Running unittests src/lib.rs (target/debug/deps/workspace_document-658d51b1cbcfc425)
+
+running 12 tests
+test history::tests::rejects_corrupt_unselected_branches_too ... ok
+test history::tests::branches_keep_ancestry_and_explicit_head ... ok
+test snapshot::tests::source_resolution_checks_exact_utf8_range_and_retains_occurrence_identity ... ok
+test snapshot::tests::durable_decoder_rejects_schema_identity_head_range_and_hidden_corruption ... ok
+test snapshot::tests::durable_round_trip_preserves_all_branches_but_resolves_only_selected_bytes ... ok
+test tests::manuscript_context_preserves_authored_bytes_and_never_infers_roles ... ok
+test tests::exact_byte_ceiling_accepts_boundary_and_rejects_an_additional_byte ... ok
+test tests::slices_preserve_identity_and_reject_invalid_ranges_atomically ... ok
+test tests::transcript_is_a_writing_projection_without_flattening_roles_or_receipts ... ok
+test tests::zero_byte_parts_still_obey_the_part_budget ... ok
+test history::tests::deep_history_is_iterative ... ok
+test snapshot::tests::durable_metadata_is_bounded_independently_of_text ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.03s
+
+   Doc-tests desktop_context
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests desktop_generation_policy
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests desktop_model_discovery
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests desktop_speech
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests loom_app_lib
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests loom_backend_llama
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests loom_config
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests loom_document
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests loom_host
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests loom_store
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mom_llama_runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests operation_lifecycle
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests tauri_plugin_loom
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests workspace_document
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -1,0 +1,22 @@
+{
+  "sha": "6f153711b09d8f8c3b86a4578a762be1f24c77a3",
+  "base_sha": "8ce8948f3bcfc24df87ed0346801dedc7402feb0",
+  "bundle": "/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/target/debug/bundle/macos/Mine Main Review.app",
+  "bundle_id": "app.delysis.loom.mine-review.6f15371",
+  "signing": "local ad-hoc; deep strict verification passed; not release notarization",
+  "exe": "/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/target/debug/bundle/macos/Mine Main Review.app/Contents/MacOS/loom-app",
+  "exe_sha256": "f0fddfcf8e6ea6c576091cdbcc6b67a4dd0651ac4fa82f9e949a171495f87ee4",
+  "exe_inode": 109313758,
+  "acceptance_root": "/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/mine-final-acceptance-ubz9wgt1/product",
+  "frontend": {
+    "products/loom/apps/loom/dist/appearance-bootstrap.js": "698b4cd4f3ca242c7a0c6df1c4b7e40b9ed2991b1881a9ae35e49249e4234050",
+    "products/loom/apps/loom/dist/assets/index-BIs58bmW.css": "818a78f615e24b535760ee1cc4465c1773287ba2dc84da5d2022a13c7144d33c",
+    "products/loom/apps/loom/dist/assets/index-BVvRYg8T.js": "e2fcb86e1d2ef676568da58513b815029f847043f793a281e06efba63c143fb7",
+    "products/loom/apps/loom/dist/index.html": "d2656eae197c039393239d119ac2e483141eebf59262d7ae74b11890a3111cea"
+  },
+  "pid": 35158,
+  "current_only_ax_control": "Downloads section with two individually named Cancel buttons above collapsed Advanced",
+  "model_asset": "/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/mine-final-acceptance-ubz9wgt1/product/models/gemma-4-E2B-base-Q8_0.gguf",
+  "model_inode": 69825204,
+  "reopened_pid": 40266
+}

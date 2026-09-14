@@ -1,103 +1,13 @@
 use llama_native_host::NativeHost;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-const MENTION_RUNNING: u8 = 0;
-const MENTION_CANCELLED: u8 = 1;
-const MENTION_TERMINAL: u8 = 2;
-const CHAT_RUNNING: u8 = 0;
-const CHAT_CANCELLED: u8 = 1;
-const CHAT_TERMINAL: u8 = 2;
+pub(crate) use operation_lifecycle::RunControl as MentionCancelControl;
+use operation_lifecycle::RunControl;
 
 pub(crate) type MentionCancelKey = (String, String);
 pub(crate) type MentionCancelRegistry = BTreeMap<MentionCancelKey, Arc<MentionCancelControl>>;
-
-pub(crate) struct MentionCancelControl(AtomicU8);
-
-impl MentionCancelControl {
-    pub(crate) fn running(cancelled: bool) -> Self {
-        Self(AtomicU8::new(if cancelled {
-            MENTION_CANCELLED
-        } else {
-            MENTION_RUNNING
-        }))
-    }
-
-    pub(crate) fn request_cancel(&self) -> bool {
-        self.0
-            .compare_exchange(
-                MENTION_RUNNING,
-                MENTION_CANCELLED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    pub(crate) fn cancellation_requested(&self) -> bool {
-        self.0.load(Ordering::Acquire) == MENTION_CANCELLED
-    }
-
-    pub(crate) fn arbitrate_terminal(&self) -> bool {
-        match self.0.compare_exchange(
-            MENTION_RUNNING,
-            MENTION_TERMINAL,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => false,
-            Err(MENTION_CANCELLED) => true,
-            Err(_) => false,
-        }
-    }
-}
-
-struct ChatCancelControl(AtomicU8);
-
-impl ChatCancelControl {
-    fn new(cancelled: bool) -> Self {
-        Self(AtomicU8::new(if cancelled {
-            CHAT_CANCELLED
-        } else {
-            CHAT_RUNNING
-        }))
-    }
-
-    fn request_cancel(&self) -> bool {
-        self.0
-            .compare_exchange(
-                CHAT_RUNNING,
-                CHAT_CANCELLED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-
-    fn cancellation_requested(&self) -> bool {
-        self.0.load(Ordering::Acquire) == CHAT_CANCELLED
-    }
-
-    fn arbitrate_terminal(&self) -> bool {
-        loop {
-            let state = self.0.load(Ordering::Acquire);
-            match state {
-                CHAT_RUNNING | CHAT_CANCELLED => {
-                    if self
-                        .0
-                        .compare_exchange(state, CHAT_TERMINAL, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        return state == CHAT_CANCELLED;
-                    }
-                }
-                CHAT_TERMINAL => return false,
-                _ => unreachable!("chat cancellation control entered an invalid state"),
-            }
-        }
-    }
-}
 
 #[derive(Clone)]
 pub(crate) struct ToolLoopControl {
@@ -137,7 +47,7 @@ impl ToolLoopControl {
 
 struct ChatOperation {
     conversation_id: String,
-    cancellation: Arc<ChatCancelControl>,
+    cancellation: Arc<RunControl>,
     identity: Arc<()>,
 }
 
@@ -235,9 +145,7 @@ impl OperationScope {
         if registries.chats.contains_key(request_id) {
             anyhow::bail!("chat request identity is already active in this runtime");
         }
-        let cancellation = Arc::new(ChatCancelControl::new(
-            self.0.quiescing.load(Ordering::Acquire),
-        ));
+        let cancellation = Arc::new(RunControl::new(self.0.quiescing.load(Ordering::Acquire)));
         registries.chats.insert(
             request_id.to_owned(),
             ChatOperation {
@@ -450,7 +358,7 @@ impl OperationScope {
 pub(crate) struct ChatOperationLease {
     scope: OperationScope,
     request_id: String,
-    cancellation: Arc<ChatCancelControl>,
+    cancellation: Arc<RunControl>,
     identity: Arc<()>,
 }
 
@@ -464,7 +372,9 @@ impl ChatOperationLease {
     }
 
     pub(crate) fn arbitrate_terminal(&self) -> bool {
-        self.cancellation.arbitrate_terminal()
+        self.cancellation
+            .claim_terminal()
+            .is_some_and(|claim| claim.cancellation_requested)
     }
 
     pub(crate) fn with_native_admission<R>(
@@ -571,7 +481,7 @@ mod tests {
         let register_mention = |scope: &OperationScope| {
             scope
                 .with_mention_registry(|registry, quiescing| {
-                    let control = Arc::new(MentionCancelControl::running(quiescing));
+                    let control = Arc::new(MentionCancelControl::new(quiescing));
                     registry.insert(
                         ("same-invocation".to_owned(), "same-target".to_owned()),
                         Arc::clone(&control),
@@ -641,7 +551,7 @@ mod tests {
             .expect("late tool registration");
         let mention = scope
             .with_mention_registry(|registry, quiescing| {
-                let mention = Arc::new(MentionCancelControl::running(quiescing));
+                let mention = Arc::new(MentionCancelControl::new(quiescing));
                 registry.insert(
                     ("late-invocation".to_owned(), "late-target".to_owned()),
                     Arc::clone(&mention),
