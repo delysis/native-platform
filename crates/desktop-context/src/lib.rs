@@ -55,7 +55,8 @@ pub fn render_source(
     );
     let footer = format!("\n[END UNTRUSTED ATTACHMENT DATA id={:?}]", source.id);
     let payload_budget = byte_budget.saturating_sub(header.len().saturating_add(footer.len()));
-    let (selected, evidence) = select_excerpts(source.id, source.text, query, payload_budget);
+    let (selected, evidence) =
+        select_excerpts_with_hash(source.id, source.text, query, payload_budget, &source_hash);
     if selected.is_empty() {
         return (String::new(), Vec::new());
     }
@@ -76,10 +77,23 @@ pub fn select_excerpts(
         return (String::new(), Vec::new());
     }
     let source_hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+    select_excerpts_with_hash(source_id, text, query, budget, &source_hash)
+}
+
+fn select_excerpts_with_hash(
+    source_id: &str,
+    text: &str,
+    query: &str,
+    budget: usize,
+    source_hash: &str,
+) -> (String, Vec<ContextExcerptEvidence>) {
+    if text.is_empty() || budget == 0 {
+        return (String::new(), Vec::new());
+    }
     if text.len() <= budget {
         return (
             text.to_owned(),
-            vec![evidence(source_id, &source_hash, text, 0, text.len())],
+            vec![evidence(source_id, source_hash, text, 0, text.len())],
         );
     }
     let terms = query_terms(query);
@@ -141,7 +155,7 @@ pub fn select_excerpts(
         }
         rendered.push_str(&excerpt_marker(start, end, text.len()));
         rendered.push_str(&text[start..end]);
-        selected_evidence.push(evidence(source_id, &source_hash, text, start, end));
+        selected_evidence.push(evidence(source_id, source_hash, text, start, end));
     }
     debug_assert!(rendered.len() <= budget);
     (rendered, selected_evidence)
