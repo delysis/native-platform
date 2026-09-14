@@ -2330,9 +2330,8 @@ impl IpcFailure {
 
         let code = match &error {
             StoreError::Vault(desktop_vault::VaultError::Locked) => "vault_locked",
-            StoreError::Vault(desktop_vault::VaultError::Unsupported) => {
-                "private_storage_unsupported"
-            }
+            StoreError::Vault(desktop_vault::VaultError::Unsupported)
+            | StoreError::UnsupportedStoragePlatform => "private_storage_unsupported",
             StoreError::Vault(_) => "private_storage_invalid",
             StoreError::EncryptionUnavailable => "vault_unavailable",
             StoreError::Io(_) => "filesystem_error",
@@ -2368,7 +2367,6 @@ impl IpcFailure {
             StoreError::DocumentHasPendingOutbox(_) => "document_has_pending_projection",
             StoreError::DocumentLifecycleUncertain(_) => "document_lifecycle_uncertain",
             StoreError::UnsupportedDocumentLifecyclePlatform => "document_lifecycle_unsupported",
-            StoreError::UnsupportedStoragePlatform => "private_storage_unsupported",
             StoreError::ExternalVisibleFileDeleted(_) => "external_file_deleted",
             StoreError::ExternalVisibleBlobMismatch { .. } => "external_file_conflict",
             StoreError::ExternalVisibleInvalidUtf8(_) => "external_file_invalid_utf8",
