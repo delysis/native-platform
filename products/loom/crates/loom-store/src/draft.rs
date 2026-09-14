@@ -553,6 +553,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn prose_draft_and_checkpoint_preserve_exact_line_endings_after_reopen() {
         let (directory, mut store, _) = new_store();
         let path = "manuscript/001.md";

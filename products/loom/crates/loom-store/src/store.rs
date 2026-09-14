@@ -6494,6 +6494,7 @@ mod tests {
         assert_eq!(store.pending_outbox_count().expect("pending outbox"), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_document_retains_evidence_and_generated_authorship_after_reopen() {
         let (_directory, mut store) = new_store();
@@ -6540,6 +6541,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn derived_document_is_source_material_without_claiming_model_generation() {
         let (_directory, mut store) = new_store();
@@ -6569,6 +6571,7 @@ mod tests {
         assert_eq!(kind, "import");
     }
 
+    #[cfg(unix)]
     #[test]
     fn generated_document_rejects_missing_evidence_without_creating_writing() {
         let (_directory, mut store) = new_store();
