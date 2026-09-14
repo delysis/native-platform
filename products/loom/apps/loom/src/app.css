@@ -366,8 +366,6 @@ button.document-row:hover { background: var(--chrome-hover); }
 .uncertain-download code { overflow-wrap: anywhere; }
 .uncertain-download .bare-button { margin-left: auto; font-size: 10px; }
 .model-download-actions { display: flex; justify-content: flex-end; }
-.download-history { margin-top: 22px; }
-.download-history h4 { margin: 0 0 9px; color: var(--muted); font-size: 10px; letter-spacing: .07em; text-transform: uppercase; }
 .download-card { display: grid; gap: 8px; margin-bottom: 8px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px; background: var(--paper); }
 .download-card.terminal { background: color-mix(in srgb, var(--paper) 88%, var(--paper-deep)); }
 .download-card > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }

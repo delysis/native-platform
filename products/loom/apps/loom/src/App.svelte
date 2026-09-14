@@ -10408,6 +10408,56 @@
             </div>
           {/if}
 
+          {#if modelDownloads.length > 0}
+            <section class="model-download-content" aria-labelledby="model-downloads-title">
+              <div class="section-heading">
+                <h3 id="model-downloads-title">Downloads</h3>
+                {#if activeModelDownloads.length > 0}
+                  <span class="fact-chip verified">{activeModelDownloads.length} active</span>
+                {/if}
+              </div>
+              {#each modelDownloads.slice(0, 6) as download (download.command_id)}
+                {@const percent = downloadProgressPercent(download.downloaded_bytes, download.total_bytes)}
+                <article class:terminal={modelDownloadIsTerminal(download)} class="download-card">
+                  <header>
+                    <div>
+                      <strong>{download.display_name}</strong>
+                      <span>{modelDownloadStatusLabel(download)}</span>
+                    </div>
+                    <span>{formatByteCount(download.downloaded_bytes)}{download.total_bytes === null ? '' : ` / ${formatByteCount(download.total_bytes)}`}</span>
+                  </header>
+                  {#if percent === null && !modelDownloadIsTerminal(download)}
+                    <progress aria-label={`${download.display_name} download progress`}></progress>
+                  {:else if percent !== null}
+                    <progress max="100" value={percent} aria-label={`${download.display_name} download progress`}>{percent.toFixed(0)}%</progress>
+                  {/if}
+                  {#if download.resumed_from_bytes > 0}
+                    <small>Resumed after verifying {formatByteCount(download.resumed_from_bytes)} of partial data.</small>
+                  {/if}
+                  {#if download.cancel_requested && !modelDownloadIsTerminal(download)}
+                    <small>Cancellation requested; waiting for the transfer to reach a safe stop.</small>
+                  {/if}
+                  {#if download.status.status === 'failed'}
+                    <p class="download-card-error">{download.status.message}</p>
+                  {/if}
+                  {#if download.event_delivery_failures > 0}
+                    <small>Desktop event delivery missed {download.event_delivery_failures} update{download.event_delivery_failures === 1 ? '' : 's'}; this view reconciles from command status.</small>
+                  {/if}
+                  <footer>
+                    <code title={download.command_id}>{download.expected_sha256.slice(0, 12)}…</code>
+                    {#if !modelDownloadIsTerminal(download)}
+                      <button class="secondary-button compact" type="button" aria-label={`Cancel download of ${download.display_name}`} on:click={() => void cancelVerifiedModelDownload(download.command_id)} disabled={download.cancel_requested || modelDownloadCancellingIds.includes(download.command_id)}>
+                        {download.cancel_requested || modelDownloadCancellingIds.includes(download.command_id) ? 'Cancelling…' : 'Cancel'}
+                      </button>
+                    {:else if download.status.status === 'completed'}
+                      <button class="secondary-button compact" type="button" on:click={() => void selectCompletedModelDownload(download)}>Select model</button>
+                    {/if}
+                  </footer>
+                </article>
+              {/each}
+            </section>
+          {/if}
+
           <section class="curated-model-catalog" aria-labelledby="curated-model-catalog-title">
             <div class="section-heading">
               <div>
@@ -10569,9 +10619,6 @@
                 <h3>Add a verified GGUF</h3>
                 <p>Bring a publisher URL and its exact checksum. Loom will not guess either one.</p>
               </div>
-              {#if activeModelDownloads.length > 0}
-                <span class="fact-chip verified">{activeModelDownloads.length} active</span>
-              {/if}
             </div>
 
             {#if !desktop}
@@ -10642,51 +10689,6 @@
                 </button>
               </div>
             </form>
-
-            {#if modelDownloads.length > 0}
-              <div class="download-history" aria-label="Recent model downloads">
-                <h4>Transfers on this app session</h4>
-                {#each modelDownloads.slice(0, 6) as download (download.command_id)}
-                  {@const percent = downloadProgressPercent(download.downloaded_bytes, download.total_bytes)}
-                  <article class:terminal={modelDownloadIsTerminal(download)} class="download-card">
-                    <header>
-                      <div>
-                        <strong>{download.display_name}</strong>
-                        <span>{modelDownloadStatusLabel(download)}</span>
-                      </div>
-                      <span>{formatByteCount(download.downloaded_bytes)}{download.total_bytes === null ? '' : ` / ${formatByteCount(download.total_bytes)}`}</span>
-                    </header>
-                    {#if percent === null && !modelDownloadIsTerminal(download)}
-                      <progress aria-label={`${download.display_name} download progress`}></progress>
-                    {:else if percent !== null}
-                      <progress max="100" value={percent} aria-label={`${download.display_name} download progress`}>{percent.toFixed(0)}%</progress>
-                    {/if}
-                    {#if download.resumed_from_bytes > 0}
-                      <small>Resumed after verifying {formatByteCount(download.resumed_from_bytes)} of partial data.</small>
-                    {/if}
-                    {#if download.cancel_requested && !modelDownloadIsTerminal(download)}
-                      <small>Cancellation requested; waiting for the transfer to reach a safe stop.</small>
-                    {/if}
-                    {#if download.status.status === 'failed'}
-                      <p class="download-card-error">{download.status.message}</p>
-                    {/if}
-                    {#if download.event_delivery_failures > 0}
-                      <small>Desktop event delivery missed {download.event_delivery_failures} update{download.event_delivery_failures === 1 ? '' : 's'}; this view reconciles from command status.</small>
-                    {/if}
-                    <footer>
-                      <code title={download.command_id}>{download.expected_sha256.slice(0, 12)}…</code>
-                      {#if !modelDownloadIsTerminal(download)}
-                        <button class="secondary-button compact" type="button" on:click={() => void cancelVerifiedModelDownload(download.command_id)} disabled={download.cancel_requested || modelDownloadCancellingIds.includes(download.command_id)}>
-                          {download.cancel_requested || modelDownloadCancellingIds.includes(download.command_id) ? 'Cancelling…' : 'Cancel'}
-                        </button>
-                      {:else if download.status.status === 'completed'}
-                        <button class="secondary-button compact" type="button" on:click={() => void selectCompletedModelDownload(download)}>Select model</button>
-                      {/if}
-                    </footer>
-                  </article>
-                {/each}
-              </div>
-            {/if}
             </div>
               </details>
             </div>
