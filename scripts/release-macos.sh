@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+# Cargo, rustc, rustdoc, and Clippy must resolve from the same pinned toolchain.
+PINNED_CARGO=$(rustup which --toolchain 1.95.0 cargo)
+export PATH="$(dirname "$PINNED_CARGO"):$PATH"
+
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 COMPONENT=${1:-}
 RELEASE_KIND=${2:-candidate}
@@ -74,9 +78,9 @@ run_exact_test() {
   test_name=$4
   test_list=$(mktemp -t delysis-release-tests.XXXXXX)
   if [ "$target_kind" = lib ]; then
-    rustup run 1.92.0 cargo test --locked -p "$package" --lib -- --list > "$test_list"
+    cargo test --locked -p "$package" --lib -- --list > "$test_list"
   else
-    rustup run 1.92.0 cargo test --locked -p "$package" --bin "$target_name" -- --list > "$test_list"
+    cargo test --locked -p "$package" --bin "$target_name" -- --list > "$test_list"
   fi
   if ! grep -Fqx "$test_name: test" "$test_list"; then
     rm -f "$test_list"
@@ -85,9 +89,9 @@ run_exact_test() {
   fi
   rm -f "$test_list"
   if [ "$target_kind" = lib ]; then
-    run rustup run 1.92.0 cargo test --locked -p "$package" --lib "$test_name" -- --exact
+    run cargo test --locked -p "$package" --lib "$test_name" -- --exact
   else
-    run rustup run 1.92.0 cargo test --locked -p "$package" --bin "$target_name" "$test_name" -- --exact
+    run cargo test --locked -p "$package" --bin "$target_name" "$test_name" -- --exact
   fi
   record_check "$package::$test_name"
 }
@@ -177,7 +181,7 @@ case "$COMPONENT" in
     ;;
 esac
 
-TARGET_DIR=$(rustup run 1.92.0 cargo metadata --locked --no-deps --format-version 1 | node -e 'let s=""; process.stdin.on("data", c => s += c).on("end", () => console.log(JSON.parse(s).target_directory))')
+TARGET_DIR=$(cargo metadata --locked --no-deps --format-version 1 | node -e 'let s=""; process.stdin.on("data", c => s += c).on("end", () => console.log(JSON.parse(s).target_directory))')
 BUNDLE="$TARGET_DIR/release/bundle/macos/$APP_NAME.app"
 EXECUTABLE="$BUNDLE/Contents/MacOS/$BINARY_NAME"
 if [ -d "$BUNDLE" ]; then

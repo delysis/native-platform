@@ -103,10 +103,10 @@ can be relaxed.
 
 ## Build and licensing
 
-The main workspace remains on Rust 1.92.0. The Signal worker has its own locked
-workspace and Rust 1.94.0 toolchain because its SQLx/SQLCipher dependency graph
-cannot coexist with the main workspace's rusqlite link dependency. Install that
-toolchain, Protobuf's `protoc`, and the platform OpenSSL development dependencies.
+The main workspace and Signal worker use the root Rust 1.95.0 toolchain pin.
+The worker has its own locked workspace because its SQLx/SQLCipher dependency
+graph cannot coexist with the main workspace's rusqlite link dependency. Install
+the root toolchain, Protobuf's `protoc`, and the platform OpenSSL development dependencies.
 `node scripts/build-loom-signal.mjs` builds and places the required Tauri sidecar.
 Tauri dev/build hooks invoke it; plain Cargo workspace builds need this step first.
 

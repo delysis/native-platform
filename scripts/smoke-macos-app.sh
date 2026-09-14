@@ -195,7 +195,9 @@ if [ -n "$SUPPLIED_ARTIFACT" ]; then
     *) BUNDLE=$ARTIFACT ;;
   esac
 else
-  TARGET_DIR=$(rustup run 1.92.0 cargo metadata --locked --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" |
+  PINNED_CARGO=$(rustup which --toolchain 1.95.0 cargo)
+  export PATH="$(dirname "$PINNED_CARGO"):$PATH"
+  TARGET_DIR=$(cargo metadata --locked --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" |
     node -e 'let s=""; process.stdin.on("data", c => s += c).on("end", () => console.log(JSON.parse(s).target_directory))')
   BUNDLE="$TARGET_DIR/release/bundle/macos/$APP_NAME.app"
 fi

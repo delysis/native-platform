@@ -1,10 +1,8 @@
 name: Loom Signal worker
-description: Build and check the separately pinned Rust Signal client before compiling Loom
+description: Build and check the isolated Signal client with the root Rust toolchain before compiling Loom
 runs:
   using: composite
   steps:
-    - shell: bash
-      run: rustup toolchain install 1.94.0 --profile minimal --component clippy --component rustfmt
     - shell: bash
       if: runner.os == 'Linux'
       run: |
@@ -18,7 +16,7 @@ runs:
       run: choco install protoc --no-progress --yes
     - shell: bash
       run: |
-        cargo +1.94.0 fmt --manifest-path products/loom/signal/Cargo.toml -- --check
-        cargo +1.94.0 test --locked --manifest-path products/loom/signal/Cargo.toml
-        cargo +1.94.0 clippy --locked --manifest-path products/loom/signal/Cargo.toml --all-targets -- -D warnings
+        cargo fmt --manifest-path products/loom/signal/Cargo.toml -- --check
+        cargo test --locked --manifest-path products/loom/signal/Cargo.toml
+        cargo clippy --locked --manifest-path products/loom/signal/Cargo.toml --all-targets -- -D warnings
         node scripts/build-loom-signal.mjs

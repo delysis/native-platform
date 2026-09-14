@@ -37,7 +37,7 @@ The `model-integration` job downloads one immutable Qwen3 0.6B CPU fixture and
 verifies its SHA-256. `cargo run --locked -p xtask -- model-check MODEL SHA256
 PACKAGE TEST_ID ...` lists the exact registered test and requires one executed
 passing test, with no ignored or filtered-zero substitute. The runner resolves
-Rust 1.92 rustc and rustdoc explicitly. Its selected saved-prefix and strict
+Rust 1.95 rustc and rustdoc explicitly. Its selected saved-prefix and strict
 pre-cancellation checks do not establish Metal, other model families, operating
 system credentials, or a packaged user journey.
 

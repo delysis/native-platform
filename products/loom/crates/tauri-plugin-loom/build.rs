@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 const COMMANDS: &[&str] = &[
     "signal_request",
     "cabal_snapshot",

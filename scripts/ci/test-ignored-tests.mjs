@@ -97,15 +97,15 @@ test("authoritative inventory requests no-run compilation and guarded list argum
 
 test("toolchain policy requires one exact stable Rust version", () => {
   assert.equal(
-    parsePinnedRustToolchain('[toolchain]\nchannel = "1.92.0"\n'),
-    "1.92.0",
+    parsePinnedRustToolchain('[toolchain]\nchannel = "1.95.0"\n'),
+    "1.95.0",
   );
   for (const source of [
     '[toolchain]\nchannel = "stable"\n',
-    '[toolchain]\nchannel = "1.92"\n',
-    '[toolchain]\nchannel = "1.92.0"\nchannel = "1.93.0"\n',
+    '[toolchain]\nchannel = "1.95"\n',
+    '[toolchain]\nchannel = "1.95.0"\nchannel = "1.93.0"\n',
     String.raw`[toolchain]
-"ch\u0061nnel" = "1.92.0"
+"ch\u0061nnel" = "1.95.0"
 `,
   ]) {
     assert.throws(
@@ -522,9 +522,9 @@ test("all ignored tests carry exact target, platform, evidence, and non-promotio
 
 test("Cargo reconciliation resolves the repository-pinned Rust toolchain", () => {
   const identity = readPinnedToolIdentity({ repoRoot: root });
-  assert.equal(identity.channel, "1.92.0");
-  assert.match(identity.cargo_version, /^cargo 1\.92\.0(?: |$)/);
-  assert.match(identity.rustc_version, /^rustc 1\.92\.0(?: |$)/);
+  assert.equal(identity.channel, "1.95.0");
+  assert.match(identity.cargo_version, /^cargo 1\.95\.0(?: |$)/);
+  assert.match(identity.rustc_version, /^rustc 1\.95\.0(?: |$)/);
   assert.ok(path.isAbsolute(identity.cargo_path));
   assert.ok(path.isAbsolute(identity.rustc_path));
 });

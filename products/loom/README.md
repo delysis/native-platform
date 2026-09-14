@@ -42,7 +42,7 @@ Loom uses root-workspace path dependencies in `crates/native`. The root `Cargo.l
 
 ## Build and test
 
-The root workspace pins Rust 1.92.0. Node.js and pnpm are also required. From the monorepo root:
+The root workspace pins Rust 1.95.0. Node.js and pnpm are also required. From the monorepo root:
 
 ```sh
 pnpm install --frozen-lockfile
