@@ -7,11 +7,24 @@ if (-not $dumpbin) { throw 'MSVC dumpbin was not found' }
 $profile = Join-Path $PWD 'target/debug'
 $deps = Join-Path $profile 'deps'
 $executables = @(Get-ChildItem $deps -Filter 'tauri_plugin_loom-*.exe' -ErrorAction SilentlyContinue)
+$manifestTool = Get-ChildItem (Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/bin') -Filter 'mt.exe' -Recurse -ErrorAction SilentlyContinue |
+    Where-Object { $_.Directory.Name -eq 'x64' } | Sort-Object FullName -Descending | Select-Object -First 1
+if ($manifestTool) {
+    foreach ($exe in $executables) {
+        $manifest = Join-Path $env:RUNNER_TEMP "$($exe.BaseName).manifest"
+        & $manifestTool.FullName -nologo "-inputresource:$($exe.FullName);#1" "-out:$manifest"
+        if (Test-Path $manifest) { Get-Content $manifest }
+    }
+}
 $libraries = @(
-    Get-ChildItem $profile -Filter '*.dll' -ErrorAction SilentlyContinue
-    Get-ChildItem $deps -Filter '*.dll' -ErrorAction SilentlyContinue
+    Get-ChildItem $profile -Filter '*.dll' -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('DirectML.dll', 'onnxruntime.dll') }
+    Get-ChildItem $deps -Filter '*.dll' -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('DirectML.dll', 'onnxruntime.dll') }
     Get-Item (Join-Path $env:SystemRoot 'System32/onnxruntime.dll') -ErrorAction SilentlyContinue
     Get-Item (Join-Path $env:SystemRoot 'System32/DirectML.dll') -ErrorAction SilentlyContinue
+    Get-Item (Join-Path $env:SystemRoot 'System32/comctl32.dll') -ErrorAction SilentlyContinue
+    Get-Item (Join-Path $env:SystemRoot 'System32/d3d12.dll') -ErrorAction SilentlyContinue
+    Get-Item (Join-Path $env:SystemRoot 'System32/msvcp140.dll') -ErrorAction SilentlyContinue
+    Get-Item (Join-Path $env:SystemRoot 'System32/msvcp140_1.dll') -ErrorAction SilentlyContinue
 )
 
 foreach ($file in $executables + $libraries) {
