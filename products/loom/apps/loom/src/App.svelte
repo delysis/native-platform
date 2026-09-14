@@ -7,6 +7,7 @@
   import PaneDivider from './lib/PaneDivider.svelte';
   import type { TerminalSourceRange } from './lib/terminalSelection';
   import { workspaceRows } from './lib/workspaceTree';
+  import { readWorkspaceFolders, rememberWorkspaceFolder, type WorkspaceFolder } from './lib/workspaceFolders';
   import WorkspacePane from './lib/WorkspacePane.svelte';
   import { workspaceWriterCandidates, workspaceWriterModel, type WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
   import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
@@ -65,6 +66,7 @@
     listModels,
     listModelDownloads,
     openDefaultProject,
+    prepareProjectOpenPath,
     openDocument,
     importExternalDocument,
     previewDocumentReconciliation,
@@ -376,6 +378,13 @@
   let lastFailure: LoomFailure | null = null;
   let opening = false;
   let search = '';
+  let workspaceFolders: WorkspaceFolder[] = [];
+  let workspaceRootExpanded = true;
+  let workspaceDocuments: Record<string, string> = {};
+  let workspaceDropActive = false;
+  let outlineElement: HTMLElement | undefined;
+  $: visibleWorkspaceFolders = project && !workspaceFolders.some(folder => folder.root === project?.root)
+    ? [...workspaceFolders, { root: project.root, title: project.title }] : workspaceFolders;
   let workspaceTemplate: WorkspaceTemplateSnapshot | null = null;
   let workspaceTemplateScope = '';
   let deferredWorkspaceTemplate: WorkspaceTemplateSnapshot | null = null;
@@ -2165,13 +2174,30 @@
     }
   }
 
+  async function openDroppedFolders(paths: string[]): Promise<void> {
+    if (fileCommandInFlight || opening || !paths.length) return;
+    // Each folder uses the same prepared-open/save/commit path as the picker.
+    for (const path of paths.slice(0, 32)) {
+      if (!await doOpenProject(path)) break;
+    }
+  }
+
   async function installNativeAttachmentDrop(): Promise<void> {
     unlistenNativeAttachmentDrop = await getCurrentWindow().onDragDropEvent(({ payload }) => {
       if (payload.type === 'leave') {
         contextDropActive = false;
+        workspaceDropActive = false;
         return;
       }
       const point = nativeDropPoint(payload.position);
+      const outline = outlineElement?.getBoundingClientRect();
+      const inOutline = Boolean(outlineOpen && outline && point.x >= outline.left && point.x < outline.right && point.y >= outline.top && point.y < outline.bottom);
+      workspaceDropActive = inOutline;
+      if (payload.type === 'drop' && (inOutline || !project)) {
+        workspaceDropActive = false;
+        void openDroppedFolders(payload.paths);
+        return;
+      }
       const scope = nativeAttachmentDropScope(point);
       contextDropActive = scope === 'context';
       if (payload.type === 'drop' && scope) {
@@ -2190,6 +2216,7 @@
     };
     appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
+    try { workspaceFolders = readWorkspaceFolders(window.localStorage); } catch { workspaceFolders = []; }
     if (desktop) void refreshCuratedModels();
     if (desktop) void installNativeAttachmentDrop();
     documentContextRevealLabel = desktop
@@ -5840,22 +5867,24 @@
     });
   }
 
-  async function doOpenProject(): Promise<void> {
-    if (fileCommandInFlight || opening || applicationClosePhase !== 'running') return;
+  async function doOpenProject(path?: string): Promise<boolean> {
+    if (fileCommandInFlight || opening || applicationClosePhase !== 'running') return false;
     opening = true;
     fileCommandInFlight = true;
     let preparationId: string | null = null;
     let handoffStarted = false;
     try {
       // The chooser and validation leave the current editor/session intact.
-      preparationId = await prepareProjectOpen();
-      if (!preparationId || !componentMounted || applicationClosePhase !== 'running') return;
+      preparationId = await (path ? prepareProjectOpenPath(path) : prepareProjectOpen());
+      if (!preparationId) return Boolean(path);
+      if (!componentMounted || applicationClosePhase !== 'running') return false;
       clearFailure();
       if (project) {
+        if (document) workspaceDocuments = { ...workspaceDocuments, [project.root]: document.summary.document_id };
         const outcome = await closeProject();
-        if (outcome.status !== 'closed') return;
+        if (outcome.status !== 'closed') return false;
       }
-      if (!componentMounted || applicationClosePhase !== 'running') return;
+      if (!componentMounted || applicationClosePhase !== 'running') return false;
       const restoreSerial = ++workspaceRestoreSerial;
       modelRefreshSerial += 1;
       handoffStarted = true;
@@ -5870,26 +5899,29 @@
         attach: (selected) => { project = selected; },
         onHeld: holdWorkspaceForApplicationClose
       });
-      if (!opened) return;
+      if (!opened) return false;
       if (await finishOpeningProject(opened, restoreSerial)) {
         const captured = currentWorkspaceCapture();
         if (!captured || !workspaceRestoreIsCurrent(captured)) {
           holdWorkspaceForApplicationClose();
-          return;
+          return false;
         }
         await tick();
         if (!workspaceRestoreIsCurrent(captured)) {
           holdWorkspaceForApplicationClose();
-          return;
+          return false;
         }
         await waitForWritingSurfacePaint();
         if (!workspaceRestoreIsCurrent(captured)) {
           holdWorkspaceForApplicationClose();
-          return;
+          return false;
         }
         focusCurrentWritingSurfaceAtEnd();
         if (workspaceRestoreIsCurrent(captured)) void restoreCompletionBackground(captured);
+        outlineOpen = true;
+        workspaceRootExpanded = true;
         announce(`Opened ${opened.title}`);
+        return true;
       }
     } catch (error) {
       // Only an uncertain commit needs native reattachment. Picker/validation
@@ -5907,6 +5939,7 @@
       opening = false;
       fileCommandInFlight = false;
     }
+    return false;
   }
 
   async function openAnotherProject(): Promise<void> {
@@ -6050,7 +6083,12 @@
       missingDocumentRecovery = null;
       missingDocumentCopyState = 'idle';
     }
-    outlineOpen = false;
+    let folderStorage: Storage | undefined;
+    try { folderStorage = window.localStorage; } catch { /* Workspace navigation does not require storage. */ }
+    workspaceFolders = rememberWorkspaceFolder(workspaceFolders, { root: opened.root, title: opened.title }, folderStorage);
+    workspaceRootExpanded = true;
+    hiddenPaneSlots = new Set();
+    paneSelection = {};
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
     clearCompletionSession();
@@ -6078,7 +6116,8 @@
       project = { ...project, pending_recovery: 0 };
     }
     if (!workspaceRestoreIsCurrent(captured) || !project) return false;
-    const first = project.documents.find(item => !item.relative_path.split('/').at(-1)?.startsWith('.'))
+    const first = project.documents.find(item => item.document_id === workspaceDocuments[opened.root])
+      ?? project.documents.find(item => !item.relative_path.split('/').at(-1)?.startsWith('.'))
       ?? project.documents[0];
     if (first) {
       await selectDocument(first);
@@ -9273,17 +9312,29 @@
       style={`grid-template-columns:${outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0}px minmax(0,1fr) ${rightPaneOpen ? Math.min(rightWidth, rightLimit) : 0}px; grid-template-rows:minmax(0,1fr) ${bottomPaneOpen ? Math.min(bottomHeight, workspaceHeight * 0.6) : 0}px;`}>
       <aside
         id="project-outline"
+        bind:this={outlineElement}
+        class:drop-active={workspaceDropActive}
         class:open={outlineOpen}
         class="outline-panel"
         aria-label="Documents"
       >
         {#if outlineOpen}<PaneDivider edge="right" label="Resize documents" size={Math.min(outlineWidth, outlineLimit)} min={150} max={outlineLimit} onResize={(size) => outlineWidth = size} />{/if}
         <label class="search-field">
-          <span class="sr-only">Search project</span>
+          <span class="sr-only">Search folder</span>
           <span aria-hidden="true">⌕</span>
-          <input bind:value={search} type="search" placeholder="Find in project" />
+          <input bind:value={search} type="search" placeholder="Find in folder" />
         </label>
-        <nav class="document-list" aria-label="Documents">
+        <nav class="document-list" aria-label="Workspace folders">
+          {#each visibleWorkspaceFolders as folder (folder.root)}
+            {@const active = folder.root === project.root}
+            <button class="folder-row workspace-root" class:active type="button" title={folder.root}
+              aria-label={`${active && workspaceRootExpanded ? 'Collapse' : 'Open'} folder ${folder.title}`}
+              aria-expanded={active && workspaceRootExpanded} disabled={fileCommandInFlight || opening}
+              on:click={() => { if (active) workspaceRootExpanded = !workspaceRootExpanded; else void doOpenProject(folder.root); }}>
+              <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{folder.title}</span>
+            </button>
+            {#if active && workspaceRootExpanded}
+            <div class="workspace-root-documents">
           {#each fileRows as row (row.path)}
             {#if row.folder}
               <button class="folder-row" type="button" style={`padding-left: ${8 + row.depth * 14}px`} aria-expanded={!collapsedFolders.has(row.path) || Boolean(search.trim())} on:click={() => { const next = new Set(collapsedFolders); if (next.has(row.path)) next.delete(row.path); else next.add(row.path); collapsedFolders = next; }}>
@@ -9354,6 +9405,9 @@
             {/if}
           {:else}
             <p class="empty-copy">No notes.</p>
+          {/each}
+            </div>
+            {/if}
           {/each}
         </nav>
         {#if folderWarnings.length > 0}
@@ -9835,7 +9889,7 @@
               Retry
             </button>
           {/if}
-          <button class="secondary-button" type="button" on:click={doOpenProject} disabled={!desktop || opening}>
+          <button class="secondary-button" type="button" on:click={() => void doOpenProject()} disabled={!desktop || opening}>
             {opening ? 'Opening…' : 'Open folder…'}
           </button>
         </div>

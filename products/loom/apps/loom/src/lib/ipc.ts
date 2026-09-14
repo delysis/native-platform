@@ -132,6 +132,10 @@ export function prepareProjectOpen(): Promise<string | null> {
   return call('project_prepare_open');
 }
 
+export function prepareProjectOpenPath(path: string): Promise<string | null> {
+  return call('project_prepare_open_path', { path });
+}
+
 export function commitProjectOpen(preparationId: string): Promise<ProjectSnapshot> {
   return call('project_commit_open', { preparationId });
 }

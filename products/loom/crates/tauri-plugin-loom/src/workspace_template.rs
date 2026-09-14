@@ -37,12 +37,12 @@ choose only one. Leaving it commented keeps the usual local default.
 # [panes.terminal]
 # kind = "terminal"
 # position = "bottom"
-# visible = false
+# visible = true
 
 # [panes.browser]
 # kind = "browser"
 # position = "bottom"
-# visible = false
+# visible = true
 # document = "@.browser"
 ```
 "#;
@@ -83,7 +83,7 @@ impl PaneConfig {
                 PaneKind::Chat => PanePosition::Right,
                 PaneKind::Terminal | PaneKind::Browser => PanePosition::Bottom,
             },
-            visible: matches!(kind, PaneKind::Editor | PaneKind::Chat),
+            visible: true,
             title: None,
             document: None,
             context: if kind == PaneKind::Chat {
@@ -403,6 +403,12 @@ mod tests {
         assert_eq!(
             parse_config(DEFAULT_TEMPLATE).unwrap(),
             WorkspaceConfig::default()
+        );
+        assert!(
+            WorkspaceConfig::default()
+                .panes
+                .values()
+                .all(|pane| pane.visible)
         );
         let config = parse_config("```loom-workspace\n[panes.terminal]\nvisible=true\n[panes.reader]\nkind='chat'\ntitle='読み手'\ncontext=['@\"My draft\"','@notes/']\n```\n").unwrap();
         assert!(config.panes["terminal"].visible);

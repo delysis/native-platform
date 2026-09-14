@@ -1929,6 +1929,7 @@ impl Builder {
             .invoke_handler(tauri::generate_handler![
                 project_open_default,
                 project_prepare_open,
+                project_prepare_open_path,
                 project_commit_open,
                 project_discard_open,
                 project_close,
@@ -2751,6 +2752,28 @@ async fn project_prepare_open<R: Runtime>(
     let picker = reserve_folder_picker(&state)?;
     let path = choose_project_folder(&app)?;
     picker.finish(path)
+}
+
+/// A dropped or remembered workspace is prepared through the same lease and
+/// shutdown boundary as a native folder choice. Its path is only a hint until
+/// the ordinary directory and sidecar have been opened and validated again.
+#[tauri::command]
+async fn project_prepare_open_path(
+    path: String,
+    state: State<'_, PluginState>,
+) -> Result<Option<String>, IpcFailure> {
+    prepare_project_path(&state, &path)
+}
+
+fn prepare_project_path(state: &PluginState, path: &str) -> Result<Option<String>, IpcFailure> {
+    if path.len() > 32_768 || path.contains('\0') || !Path::new(path).is_absolute() {
+        return Err(IpcFailure::new(
+            "selected_folder_unavailable",
+            "the workspace needs an absolute local directory path",
+            false,
+        ));
+    }
+    reserve_folder_picker(state)?.finish(Some(PathBuf::from(path)))
 }
 
 struct FolderPickerReservation<'a> {
@@ -10899,6 +10922,62 @@ mod tests {
                 .lock()
                 .expect("prepared slot")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_path_preparation_revalidates_hints_without_replacing_live_drafts() {
+        let current = tempfile::tempdir().expect("current writing");
+        let next = tempfile::tempdir().expect("next writing");
+        std::fs::write(next.path().join("Notes.md"), "Exact next writing.\r\n").unwrap();
+        let state = PluginState::default();
+        let mut store = initialize_project(current.path(), "Current".into()).unwrap();
+        let source = store.read_document(INITIAL_DOCUMENT).unwrap();
+        store
+            .upsert_transient_draft(
+                INITIAL_DOCUMENT,
+                source.revision_id,
+                0,
+                DocumentContent::Prose("Unsaved author text.\r\n".into()),
+            )
+            .unwrap();
+        reserve_project_choice(&state)
+            .unwrap()
+            .finish_without_document_filesystem_watcher(Ok(store))
+            .unwrap();
+        for invalid in [
+            "relative/folder".to_owned(),
+            "\0".into(),
+            "x".repeat(32_769),
+            next.path().join("Notes.md").to_string_lossy().into_owned(),
+        ] {
+            assert!(prepare_project_path(&state, &invalid).is_err());
+        }
+        assert!(
+            prepare_project_path(&state, current.path().to_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let id = prepare_project_path(&state, next.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let candidate = take_prepared_project(&state, id.parse().unwrap()).unwrap();
+        assert_eq!(
+            candidate.read_document("Notes.md").unwrap().text,
+            "Exact next writing.\r\n"
+        );
+        let session = state.session.lock().unwrap();
+        assert_eq!(session.phase, SessionPhase::Open);
+        assert_eq!(
+            session
+                .store
+                .as_ref()
+                .unwrap()
+                .load_transient_draft(INITIAL_DOCUMENT)
+                .unwrap()
+                .unwrap()
+                .text,
+            "Unsaved author text.\r\n"
         );
     }
 
