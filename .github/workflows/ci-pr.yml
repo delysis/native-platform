@@ -462,6 +462,7 @@ jobs:
           cache-on-failure: true
           shared-key: ignored-tests-${{ runner.os }}
           cache-directories: ${{ runner.os == 'macOS' && '~/Library/Caches/ort.pyke.io/dfbin' || runner.os == 'Windows' && '~/AppData/Local/ort.pyke.io/dfbin' || '' }}
+      - uses: ./.github/actions/loom-signal
       - name: Reconcile exact ignored-test inventory with guarded list arguments
         run: node scripts/ci/validate-ignored-tests.mjs --cargo-list
       - name: Inspect Windows native loader failure

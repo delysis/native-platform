@@ -1485,6 +1485,19 @@ export function assertSuccessfulHarnessList(listed, executable) {
   assert(!listed.error && listed.status === 0 && !listed.signal, diagnostics);
 }
 
+export function assertSuccessfulInventoryBuild(build) {
+  const diagnostics = [
+    `Cargo test-list build failed: exit=${build.status ?? "none"}; signal=${build.signal ?? "none"}`,
+    build.error && `spawn error: ${build.error.code ?? "unknown"}: ${build.error.message}`,
+    // Fresh CI builds can emit enough dependency chatter to truncate Node's
+    // exception output before the actual compiler failure. Keep the tails of
+    // both streams: --message-format puts some diagnostics on stdout.
+    build.stderr && `stderr: ${build.stderr.slice(-8192)}`,
+    build.stdout && `stdout: ${build.stdout.slice(-8192)}`,
+  ].filter(Boolean).join("\n");
+  assert(!build.error && build.status === 0 && !build.signal, diagnostics);
+}
+
 export function collectCargoIgnoredInventory({
   repoRoot,
   metadata,
@@ -1503,8 +1516,7 @@ export function collectCargoIgnoredInventory({
     repoRoot,
     environment,
   });
-  assert(!build.error, `Cargo test-list build failed to start: ${build.error?.message}`);
-  assert(build.status === 0, build.stderr || "Cargo test-list build failed");
+  assertSuccessfulInventoryBuild(build);
   assertSuccessfulCargoBuildFinished(build.stdout);
   const artifacts = parseCargoTestArtifacts(build.stdout, { metadata, repoRoot });
   assert(artifacts.length > 0, "Cargo produced no workspace test executables");

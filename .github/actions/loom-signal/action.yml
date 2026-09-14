@@ -3,6 +3,10 @@ description: Build and check the isolated Signal client with the root Rust toolc
 runs:
   using: composite
   steps:
+    # Callers may install only the compiler or one lint component. This action
+    # runs both checks, so establish its own prerequisites on the pinned toolchain.
+    - shell: bash
+      run: rustup component add rustfmt clippy
     - shell: bash
       if: runner.os == 'Linux'
       run: |
