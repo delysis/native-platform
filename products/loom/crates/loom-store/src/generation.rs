@@ -431,6 +431,21 @@ impl ProjectStore {
         )
     }
 
+    /// Reads bounded evidence from a generation's registered context recipe.
+    pub fn generation_context_evidence(&self, artifact_id: ArtifactId) -> Result<Option<Vec<u8>>> {
+        self.require_registered_artifact(
+            "context_recipes",
+            "artifact_id",
+            artifact_id,
+            "context recipe",
+        )?;
+        let recipe: ContextRecipe = self.read_json_artifact(artifact_id)?;
+        recipe
+            .retrieval_evidence_blob_id
+            .map(|blob_id| self.read_blob_bounded(blob_id, 1_048_576))
+            .transpose()
+    }
+
     pub fn record_context_recipe(&mut self, recipe: &ContextRecipe) -> Result<RecordedArtifact> {
         self.require_revision(recipe.source_revision_id)?;
         for artifact_id in &recipe.ordered_source_artifact_ids {

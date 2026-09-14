@@ -124,6 +124,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn preview_is_bound_to_session_and_exact_visible_revision() {
         let directory = tempfile::tempdir().unwrap();
         let (mut store, _) =

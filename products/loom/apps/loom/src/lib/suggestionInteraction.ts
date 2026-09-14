@@ -11,6 +11,7 @@ export type CompletionInsertionAction =
   | 'fan_return'
   | 'fan_tab'
   | 'inline_tab'
+  | 'loompad'
   | 'shuttle_word';
 
 /**

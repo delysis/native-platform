@@ -347,7 +347,14 @@ export interface BranchBody {
   text: string;
 }
 
+export interface LoompadBatch {
+  snapshot_id: string;
+  sample_target: 4 | 16 | 64 | 256;
+  batch_offset: number;
+}
+
 export interface WeaveStarted {
+  speculation?: LoompadBatch | null;
   command_id: string;
   request_id: string;
   project_id: string;
@@ -405,6 +412,7 @@ export interface DesktopGenerationEnvelope {
 }
 
 export interface LoomFailure {
+  speculation_recovery?: { snapshot_id: string; next_offset: number; command_ids: string[] };
   code: string;
   message: string;
   retryable?: boolean;
@@ -440,7 +448,7 @@ export interface ContextAttachmentPresentation {
   detected_format: string;
   coverage_complete: boolean;
   text_bytes: number;
-  presentation_kind: 'text' | 'image' | 'audio' | 'mixed';
+  presentation_kind: 'text' | 'image' | 'audio' | 'mixed' | 'file';
   media: ContextMediaPresentation[];
   warnings: string[];
 }

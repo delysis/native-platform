@@ -1,5 +1,6 @@
 use attachment_native_types::{BlobValidationGrade, DetectedFormat, MediaMetadata};
-use image::{ImageFormat, ImageReader, Limits};
+use image::codecs::{gif::GifDecoder, webp::WebPDecoder};
+use image::{AnimationDecoder as _, ImageDecoder as _, ImageFormat, ImageReader, Limits};
 use std::io::Cursor;
 
 #[derive(Debug)]
@@ -38,10 +39,16 @@ pub(crate) fn probe_media(
     }?;
     if matches!(
         format,
-        DetectedFormat::Png | DetectedFormat::Jpeg | DetectedFormat::Wav
+        DetectedFormat::Png
+            | DetectedFormat::Jpeg
+            | DetectedFormat::Gif
+            | DetectedFormat::Webp
+            | DetectedFormat::Wav
     ) {
         if format == DetectedFormat::Wav {
             decode_wav(bytes)?;
+        } else if matches!(format, DetectedFormat::Gif | DetectedFormat::Webp) {
+            decode_animation(format, bytes, max_image_pixels, &metadata)?;
         } else {
             decode_static_raster(format, bytes, max_image_pixels, &metadata)?;
         }
@@ -51,7 +58,7 @@ pub(crate) fn probe_media(
             method: if format == DetectedFormat::Wav {
                 "bounded complete WAV sample decode"
             } else {
-                "bounded complete static-image decode"
+                "bounded complete raster decode"
             },
         });
     }
@@ -60,6 +67,85 @@ pub(crate) fn probe_media(
         grade: BlobValidationGrade::HeaderOrStructureOnly,
         method: "bounded header or container-structure probe",
     })
+}
+
+fn decode_animation(
+    format: DetectedFormat,
+    bytes: &[u8],
+    max_image_pixels: u64,
+    metadata: &MediaMetadata,
+) -> Result<(), &'static str> {
+    const MAX_DECODE_BYTES: u64 = 128 * 1024 * 1024;
+    let mut limits = Limits::default();
+    limits.max_image_width = metadata.width;
+    limits.max_image_height = metadata.height;
+    limits.max_alloc = Some(max_image_pixels.saturating_mul(16).min(MAX_DECODE_BYTES));
+    let frames = match format {
+        DetectedFormat::Gif => {
+            if bytes.last() != Some(&0x3b) {
+                return Err("The GIF trailer is missing or has trailing data.");
+            }
+            let mut decoder = GifDecoder::new(Cursor::new(bytes))
+                .map_err(|_| "The GIF payload failed bounded decoding.")?;
+            decoder
+                .set_limits(limits)
+                .map_err(|_| "The GIF exceeds its decode budget.")?;
+            decoder.into_frames()
+        }
+        DetectedFormat::Webp => {
+            let declared = bytes
+                .get(4..8)
+                .and_then(|slice| <[u8; 4]>::try_from(slice).ok())
+                .map(u32::from_le_bytes)
+                .ok_or("The WebP length is missing.")?;
+            if u64::from(declared) + 8 != bytes.len() as u64 {
+                return Err("The WebP payload length is inconsistent.");
+            }
+            let mut decoder = WebPDecoder::new(Cursor::new(bytes))
+                .map_err(|_| "The WebP payload failed bounded decoding.")?;
+            decoder
+                .set_limits(limits.clone())
+                .map_err(|_| "The WebP exceeds its decode budget.")?;
+            if !decoder.has_animation() {
+                let mut reader = ImageReader::with_format(Cursor::new(bytes), ImageFormat::WebP);
+                reader.limits(limits);
+                let decoded = reader
+                    .decode()
+                    .map_err(|_| "The WebP payload failed bounded decoding.")?;
+                return if Some(decoded.width()) == metadata.width
+                    && Some(decoded.height()) == metadata.height
+                {
+                    Ok(())
+                } else {
+                    Err("The WebP dimensions disagree with its structural probe.")
+                };
+            }
+            decoder.into_frames()
+        }
+        _ => return Err("No animation decoder is configured for this format."),
+    };
+    let mut count = 0_u32;
+    let mut decoded_bytes = 0_u64;
+    for frame in frames {
+        count += 1;
+        if count > 120 {
+            return Err("The animation exceeds its 120-frame decode budget.");
+        }
+        let frame = frame.map_err(|_| "An animation frame failed bounded decoding.")?;
+        if Some(frame.buffer().width()) != metadata.width
+            || Some(frame.buffer().height()) != metadata.height
+        {
+            return Err("Animation dimensions disagree with the structural probe.");
+        }
+        decoded_bytes = decoded_bytes.saturating_add(frame.buffer().as_raw().len() as u64);
+        if decoded_bytes > MAX_DECODE_BYTES {
+            return Err("The animation exceeds its aggregate decode budget.");
+        }
+    }
+    if count == 0 {
+        return Err("The animation contains no decoded frames.");
+    }
+    Ok(())
 }
 
 fn decode_wav(bytes: &[u8]) -> Result<(), &'static str> {
@@ -804,6 +890,29 @@ mod tests {
         let mut bytes = Cursor::new(Vec::new());
         image.write_to(&mut bytes, format)?;
         Ok(bytes.into_inner())
+    }
+
+    #[test]
+    fn common_web_images_require_complete_payload_decode() {
+        for (format, detected) in [
+            (ImageFormat::Gif, DetectedFormat::Gif),
+            (ImageFormat::WebP, DetectedFormat::Webp),
+        ] {
+            let bytes = encoded_image(format).expect("encode image");
+            let probe = probe_media(detected, &bytes, 1_000_000).expect("decode valid image");
+            assert_eq!(probe.grade, BlobValidationGrade::PayloadDecoded);
+            assert!(probe_media(detected, &bytes[..bytes.len() - 1], 1_000_000).is_err());
+        }
+        let mut bytes = Cursor::new(Vec::new());
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            for _ in 0..121 {
+                encoder
+                    .encode_frame(image::Frame::new(image::RgbaImage::new(1, 1)))
+                    .expect("encode frame");
+            }
+        }
+        assert!(probe_media(DetectedFormat::Gif, &bytes.into_inner(), 1_000_000).is_err());
     }
 
     #[test]

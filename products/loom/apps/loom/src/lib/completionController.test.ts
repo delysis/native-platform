@@ -69,6 +69,34 @@ function insert(
 }
 
 describe('pure completion controller', () => {
+  it('switches compatible cached Loompad suffixes through the same insertion witness without fresh generation', () => {
+    const shared = [suggestion('run-a', 'a', ' one alpha'), suggestion('run-b', 'b', ' one beta'), suggestion('run-c', 'c', ' other')];
+    let state = reconcileCompletionController(initialCompletionControllerState(), contextKey, shared);
+    let view = completionControllerView(state, contextKey, shared, true);
+    const first = authorizeCompletionInsertion(state, {
+      contextKey, family: view.activeFamily, eligible: view.selected,
+      candidateId: view.selected!.candidateId, presentationKey: view.selected!.presentationKey,
+      text: ' one ', action: 'option_word', manuscriptText: manuscript, promotionReady: true
+    });
+    expect(first.authorized).toBe(true);
+    state = observeTextMutation(first.state, 'Hello one ', manuscript, false).state;
+    expect(completionControllerView(state, contextKey, [], false).activeFamily).toHaveLength(1);
+    view = completionControllerView(state, contextKey, [], true);
+    expect(view.activeFamily.map(candidate => candidate.text)).toEqual(['alpha', 'beta']);
+    state = cycleCompletion(state, view.activeFamily, 1, true).state;
+    view = completionControllerView(state, contextKey, [], true);
+    expect(view.selected?.runId).toBe('run-b');
+    const second = authorizeCompletionInsertion(state, {
+      contextKey, family: view.activeFamily, eligible: view.selected,
+      candidateId: view.selected!.candidateId, presentationKey: view.selected!.presentationKey,
+      text: 'beta', action: 'option_word', manuscriptText: 'Hello one ', promotionReady: true
+    });
+    expect(second.authorized).toBe(true);
+    expect(second.state.pendingText).toBe('Hello one beta');
+    expect(second.state.session?.acceptedChunks).toEqual([' one ', 'beta']);
+    expect(second.state.session?.candidates.map(candidate => candidate.text)).toEqual(shared.map(candidate => candidate.text));
+  });
+
   it('keeps one four-run family and cycles it in both Option directions', () => {
     const state = readyController();
     expect(completionControllerView(state, contextKey, family).activeFamily)

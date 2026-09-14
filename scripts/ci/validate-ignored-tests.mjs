@@ -1444,6 +1444,47 @@ export function reconcileCargoInventory(
   };
 }
 
+export function testHarnessEnvironment(
+  executable,
+  targetDirectory,
+  environment,
+  platform = process.platform,
+) {
+  if (platform !== "win32") return environment;
+  const targetRoot = fs.realpathSync(targetDirectory);
+  const profile = fs.realpathSync(path.join(targetRoot, "debug"));
+  assert(
+    pathIsContained(targetRoot, profile) && pathIsContained(profile, executable),
+    `test DLL directory is outside the guarded Cargo profile: ${profile}`,
+  );
+  assert(!profile.includes(";"), `test DLL directory contains a PATH separator: ${profile}`);
+  // ort-sys's Windows copy fallback puts DLLs in target/debug, not deps.
+  // Cargo adds that profile directory to PATH when running its test binaries.
+  // Preserve the empty listing cwd and admit no caller-selected library paths.
+  const result = { ...environment };
+  const pathKeys = Object.keys(result).filter((key) => key.toUpperCase() === "PATH").sort();
+  const inheritedPath = result[pathKeys[0]];
+  for (const key of pathKeys) delete result[key];
+  result.PATH = inheritedPath ? `${profile};${inheritedPath}` : profile;
+  return result;
+}
+
+export function assertSuccessfulHarnessList(listed, executable) {
+  const status = Number.isInteger(listed.status)
+    ? `${listed.status} (0x${(listed.status >>> 0).toString(16).padStart(8, "0")})`
+    : "none";
+  const diagnostics = [
+    `guarded test-profile artifact list failed: ${executable}`,
+    `exit=${status}; signal=${listed.signal ?? "none"}`,
+    listed.error?.code === "ETIMEDOUT"
+      ? `timed out after ${TEST_HARNESS_TIMEOUT_MS}ms`
+      : listed.error && `spawn error: ${listed.error.code ?? "unknown"}: ${listed.error.message}`,
+    listed.stderr && `stderr: ${listed.stderr.slice(-8192)}`,
+    listed.stdout && `stdout: ${listed.stdout.slice(-8192)}`,
+  ].filter(Boolean).join("\n");
+  assert(!listed.error && listed.status === 0 && !listed.signal, diagnostics);
+}
+
 export function collectCargoIgnoredInventory({
   repoRoot,
   metadata,
@@ -1495,24 +1536,13 @@ export function collectCargoIgnoredInventory({
       const listed = spawnSync(before.path, TEST_HARNESS_LIST_ARGUMENTS, {
         cwd: listingCwd,
         encoding: "utf8",
-        env: environment,
+        env: testHarnessEnvironment(before.path, metadata.target_directory, environment),
         killSignal: "SIGKILL",
         maxBuffer: 64 * 1024 * 1024,
         timeout: TEST_HARNESS_TIMEOUT_MS,
         windowsHide: true,
       });
-      assert(
-        listed.error?.code !== "ETIMEDOUT",
-        `guarded test-profile artifact list timed out after ${TEST_HARNESS_TIMEOUT_MS}ms: ${before.path}`,
-      );
-      assert(
-        !listed.error,
-        `guarded test-profile artifact failed to start: ${before.path}: ${listed.error?.message}`,
-      );
-      assert(
-        listed.status === 0,
-        listed.stderr || `guarded test-profile artifact list failed: ${before.path}`,
-      );
+      assertSuccessfulHarnessList(listed, before.path);
       const after = validateArtifactExecutable(before.path, metadata.target_directory);
       assert(
         after.sha256 === before.sha256,

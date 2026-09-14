@@ -22,6 +22,8 @@ export interface InlineSuggestionState {
   branches: BranchCard[];
   /** Exact live weave command authority. Null/absent derives the newest durable family. */
   authoritativeFamilyId?: string | null;
+  /** Multiple live authorities; presence (even empty) forbids durable fallback. */
+  authoritativeFamilyIds?: readonly string[];
   /** Context edits require a newly admitted family, not historical manuscript matches. */
   requireExplicitFamily?: boolean;
   verifiedBodyByRun: Record<string, VerifiedBranchBody>;
@@ -56,40 +58,33 @@ function branchBelongsToSuggestionScope(
   );
 }
 
-/**
- * Resolve one explicit four-run weave authority. ULIDs sort chronologically,
- * so reopen recovery chooses the greatest complete family ID without relying
- * on renderer timestamps, branch adjacency, or array slicing.
- */
-export function authoritativeInlineFamilyId(
-  targetByte: number,
-  state: InlineSuggestionState
-): string | null {
-  if (state.requireExplicitFamily && !state.authoritativeFamilyId) return null;
+function completeInlineFamilyIds(targetByte: number, state: InlineSuggestionState): Set<string> {
   const families = new Map<string, { count: number; runIds: Set<string> }>();
   for (const branch of state.branches) {
-    if (!branch.weave_command_id || !branchBelongsToSuggestionScope(branch, targetByte, state)) {
-      continue;
-    }
+    if (!branch.weave_command_id || !branchBelongsToSuggestionScope(branch, targetByte, state)) continue;
     const family = families.get(branch.weave_command_id) ?? { count: 0, runIds: new Set() };
     family.count += 1;
     family.runIds.add(branch.run_id);
     families.set(branch.weave_command_id, family);
   }
-  const complete = (familyId: string): boolean => {
-    const family = families.get(familyId);
-    return Boolean(
-      family &&
-      family.count === WEAVE_FAMILY_SIZE &&
-      family.runIds.size === WEAVE_FAMILY_SIZE
-    );
-  };
+  return new Set([...families].filter(([, family]) =>
+    family.count === WEAVE_FAMILY_SIZE && family.runIds.size === WEAVE_FAMILY_SIZE
+  ).map(([id]) => id));
+}
+
+/** Reopen recovers the newest complete weave, independently of branch ordering. */
+export function authoritativeInlineFamilyId(
+  targetByte: number,
+  state: InlineSuggestionState
+): string | null {
+  if (state.requireExplicitFamily && !state.authoritativeFamilyId) return null;
+  const complete = completeInlineFamilyIds(targetByte, state);
   if (state.authoritativeFamilyId) {
-    return complete(state.authoritativeFamilyId) ? state.authoritativeFamilyId : null;
+    return complete.has(state.authoritativeFamilyId) ? state.authoritativeFamilyId : null;
   }
   let newest: string | null = null;
-  for (const familyId of families.keys()) {
-    if (complete(familyId) && (newest === null || familyId > newest)) newest = familyId;
+  for (const familyId of complete) {
+    if (newest === null || familyId > newest) newest = familyId;
   }
   return newest;
 }
@@ -145,11 +140,18 @@ export function inlineSuggestionFamily(
     !state.currentModel
   ) return [];
 
-  const familyId = authoritativeInlineFamilyId(targetByte, state);
-  if (!familyId) return [];
+  let familyIds: Set<string>;
+  if (state.authoritativeFamilyIds !== undefined) {
+    const complete = completeInlineFamilyIds(targetByte, state);
+    familyIds = new Set(state.authoritativeFamilyIds.filter(id => complete.has(id)));
+  } else {
+    const familyId = authoritativeInlineFamilyId(targetByte, state);
+    familyIds = new Set(familyId ? [familyId] : []);
+  }
+  if (!familyIds.size) return [];
 
   const family: InlineGhostSuggestion[] = [];
-  for (const branch of state.branches) {
+  for (const familyId of familyIds) for (const branch of state.branches) {
     if (
       branch.weave_command_id !== familyId ||
       !branchBelongsToSuggestionScope(branch, targetByte, state) ||

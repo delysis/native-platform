@@ -7,6 +7,9 @@
   import { installManuscriptRunShortcut } from './lib/manuscriptShortcut';
   import { workspaceCommand } from './lib/workspaceCommand';
   import PaneDivider from './lib/PaneDivider.svelte';
+  import Loompad from './lib/Loompad.svelte';
+  import { loompadPrefix, type LoompadLength } from './lib/loompad';
+  import type { CompletionCandidate } from './lib/completionSession';
   import type { TerminalSourceRange } from './lib/terminalSelection';
   import { workspaceRows } from './lib/workspaceTree';
   import { readWorkspaceFolders, rememberWorkspaceFolder, type WorkspaceFolder } from './lib/workspaceFolders';
@@ -22,6 +25,7 @@
   import { startAudioRecording, stopAudioRecording, synthesizeAudio, type AudioRecording } from './lib/ipc';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
+  import ImportSources from './lib/ImportSources.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
@@ -59,6 +63,7 @@
     getWeaveStatus,
     ingestImageAttachment,
     importAttachmentPaths,
+    revealAttachmentOriginal,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
     listenForDocumentFilesystemHints,
@@ -178,7 +183,6 @@
   import { suggestionsEnabledFromStoredPreference } from './lib/suggestionPreference';
   import {
     resolveAppearance,
-    toggledAppearance,
     type AppearancePreference
   } from './lib/appearance';
   import {
@@ -206,6 +210,7 @@
   } from './lib/suggestionInteraction';
   import {
     acceptedCompletionText,
+    insertAtUtf8Boundary,
     completionPresentation as completionSessionPresentation,
     completionSessionContextKey,
     completionShouldRequestNextBatch,
@@ -282,6 +287,7 @@
     observeTextMutation,
     reconcileCompletionController,
     refreshCompletionCandidate,
+    refreshCompatibleCompletionFamily,
     rejectVisualPresentation,
     resetCompletionDiscovery,
     resetCompletionSurface,
@@ -548,6 +554,7 @@
   let speechPlaybackScope = '';
   $: if (speechPlaybackScope !== `${project?.session_id ?? ''}/${document?.summary.document_id ?? ''}`) { speechPlaybackScope = `${project?.session_id ?? ''}/${document?.summary.document_id ?? ''}`; stopReadAloud(); }
   let appearance: AppearancePreference = 'system';
+  let appearanceOverride = false;
   let systemDark = false;
   let appearanceMedia: MediaQueryList | null = null;
   let models: ModelCapabilitySummary[] = [];
@@ -611,6 +618,10 @@
   let missingDocumentCopyState: 'idle' | 'copied' | 'failed' = 'idle';
   let appliedNativeTitle = '';
   let suggestionsEnabled = false;
+  let suggestionInteraction: 'ghost' | 'loompad' = 'ghost';
+  let loompadAccepting = false;
+  $: loompadActive = suggestionsEnabled && suggestionInteraction === 'loompad';
+  $: ghostTextHidden = loompadActive || inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled });
   let suggestionsChanging = false;
   let reportedGenerationFailureRun: string | null = null;
   let contextPresentationFingerprint = '';
@@ -667,6 +678,16 @@
   let branchPollEpoch = 0;
   let completionActiveRunIds: string[] = [];
   let authoritativeCompletionFamilyId: string | null = null;
+  let loompadReservoir: {
+    key: string; snapshotId: string; familyIds: string[]; nextOffset: number;
+    admittedAt: number; capture: WeaveCapture;
+  } | null = null;
+  $: loompadSnapshotKey = JSON.stringify([project?.project_id, project?.session_id,
+    document?.summary.document_id, document?.summary.revision_id, document?.visible_blob_id,
+    mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte, currentModel?.model_id,
+    contextEpoch, documentEpoch, completionController.intentEpoch, editVersion]);
+  $: loompadFamilyIds = loompadActive && loompadReservoir?.key === loompadSnapshotKey
+    ? loompadReservoir.familyIds : undefined;
   let cancellingRunIds: string[] = [];
   let cancellationCommandByRun: Record<string, string> = {};
   let promotionArmedCandidateId: string | null = null;
@@ -710,6 +731,7 @@
     refreshGhostPresentation: () => boolean;
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
+    acceptLoompadText: (candidateId: string, presentationKey: string, text: string) => boolean;
     insertAttachmentMarkdown: (markdown: string, clientX?: number, clientY?: number) => boolean;
     captureAttachmentAnchor: (x: number, y: number) => VisualTextInsertionAnchor | null;
     insertMarkdownAtAnchor: (anchor: VisualTextInsertionAnchor, markdown: string) => boolean;
@@ -722,6 +744,7 @@
     focusAtDocumentEnd: () => boolean;
     focusCurrentSelection: () => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
+    acceptLoompadText: (candidateId: string, presentationKey: string, text: string) => boolean;
     insertAttachmentMarkdown: (markdown: string) => boolean;
     insertTextAtSelection: (text: string) => boolean;
     captureTextInsertionAnchor: () => SourceTextInsertionAnchor | null;
@@ -866,6 +889,9 @@
     editVersion: number;
     intentEpoch: number;
     modelId: string;
+    sourceDocument: OpenDocument;
+    sourceMarkdown: string;
+    speculation?: { sampleTarget: 4 | 16 | 64 | 256; offset: number; key: string };
   }
 
   interface ModelDownloadCapture extends VerifiedDownloadForm {
@@ -1085,6 +1111,7 @@
   $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual', {
     branches,
     authoritativeFamilyId: authoritativeCompletionFamilyId,
+    authoritativeFamilyIds: loompadFamilyIds,
     requireExplicitFamily: requireExplicitCompletionFamily,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     liveTextByRun: liveBranchTextByRun,
@@ -1101,6 +1128,7 @@
   $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source', {
     branches,
     authoritativeFamilyId: authoritativeCompletionFamilyId,
+    authoritativeFamilyIds: loompadFamilyIds,
     requireExplicitFamily: requireExplicitCompletionFamily,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     liveTextByRun: liveBranchTextByRun,
@@ -1119,14 +1147,15 @@
     : mode === 'source'
       ? sourceSuggestionFamily
       : [];
-  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily);
+  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, loompadActive);
   $: completionView = completionControllerView(
     completionController,
     completionContextKey,
-    baseSuggestionFamily
+    baseSuggestionFamily,
+    loompadActive
   );
   $: boundCompletionSession = completionView.boundSession;
-  $: if (boundCompletionSession) {
+  $: if (boundCompletionSession && !loompadActive) {
     const selected = selectedCompletionCandidate(boundCompletionSession);
     const branch = selected
       ? branches.find((candidate) => candidate.run_id === selected.runId)
@@ -1160,6 +1189,32 @@
         text,
         projectedInlinePresentationKey(rawPresentationKey, rawText, text)
       );
+    }
+  }
+  $: if (loompadActive && boundCompletionSession && loompadReservoir) {
+    const captured = loompadReservoir.capture;
+    const selected = selectedCompletionCandidate(boundCompletionSession);
+    const familyRunIds = new Set(branches.filter(branch =>
+      loompadReservoir?.familyIds.includes(branch.weave_command_id ?? '') &&
+      branch.source_revision_id === captured.sourceRevisionId
+    ).map(branch => branch.run_id));
+    // Only the exact author-approved prefix may separate this document from
+    // the retained native snapshot. Manual edits/context changes revoke it.
+    if (selected && familyRunIds.has(selected.runId) &&
+        project?.project_id === captured.projectId && project.session_id === captured.sessionId &&
+        document?.summary.document_id === captured.documentId && documentEpoch === captured.epoch &&
+        contextEpoch === captured.contextEpoch && currentModel?.model_id === captured.modelId &&
+        insertAtUtf8Boundary(captured.sourceMarkdown, captured.cursorByte,
+          acceptedCompletionText(boundCompletionSession)) === documentText) {
+      const originals = inlineSuggestionFamily(captured.cursorByte, mode, {
+        branches, authoritativeFamilyIds: loompadReservoir.familyIds, requireExplicitFamily: true,
+        verifiedBodyByRun: verifiedBranchBodyByRun, liveTextByRun: liveBranchTextByRun,
+        liveTextSequenceByRun: liveBranchTextSequenceByRun, currentModel,
+        document: captured.sourceDocument, suggestionsEnabled: true, promotionReady: true,
+        dismissedCandidateIds, unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
+        manuscriptText: captured.sourceMarkdown, sourceNewline: sourceGhostNewline
+      });
+      refreshVisibleCompletionFamily(boundCompletionSession, originals);
     }
   }
   $: activeSuggestionFamily = completionView.activeFamily;
@@ -1202,10 +1257,7 @@
       : 0,
     autocomplete_enabled: suggestionsEnabled,
     shuttle_enabled: shuttleEnabled,
-    inline_hidden_requested: inlineGhostHidden({
-      autocomplete: suggestionsEnabled,
-      shuttle: shuttleEnabled
-    }),
+    inline_hidden_requested: ghostTextHidden,
     inline_visible_key: mode === 'visual'
       ? visibleVisualGhostPresentationKey
       : mode === 'source'
@@ -1264,11 +1316,17 @@
             ? 'Ready'
             : 'Set up';
   $: nativeWindowTitle = document?.summary.title ?? project?.title ?? 'Loom';
-  $: resolvedAppearance = resolveAppearance(appearance, systemDark);
+  $: workspaceTheme = workspaceTemplate?.error ? null : workspaceTemplate?.config.theme;
+  $: resolvedAppearance = resolveAppearance(appearanceOverride ? appearance : workspaceTheme?.mode ?? 'system', systemDark);
   $: if (desktop) void syncNativeWindowTitle(nativeWindowTitle);
   $: if (componentMounted) {
     window.document.documentElement.dataset.theme = resolvedAppearance;
     window.document.documentElement.style.colorScheme = resolvedAppearance;
+    for (const token of ['canvas', 'text', 'accent'] as const) {
+      const value = workspaceTheme?.[token];
+      if (value) window.document.documentElement.style.setProperty(`--loom-${token}`, value);
+      else window.document.documentElement.style.removeProperty(`--loom-${token}`);
+    }
   }
   $: if (
     suggestionsEnabled &&
@@ -1277,7 +1335,7 @@
     activeGhostSuggestion.presentationKey !== announcedGhostPresentationKey
   ) {
     announcedGhostPresentationKey = activeGhostSuggestion.presentationKey;
-    announce('Suggestion available. Tab accepts all; Option Right accepts one word; Option Up or Down switches.');
+    announce('Suggestion available. Tab accepts one word; Option WASD chooses a word.');
   }
   $: shuttleCandidate = shuttleEnabled ? selectedInlineSuggestion : activeGhostSuggestion;
   $: shuttleScheduleKey = completionShuttleScheduleKey(
@@ -2099,6 +2157,26 @@
     }
   }
 
+  async function useImportedSources(items: import('./lib/types').ContextAttachment[]): Promise<boolean> {
+    if (!project || !document || editorReadonly || contextAttachmentBusy || items.length === 0) return false;
+    const captured = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id };
+    contextAttachmentBusy = true;
+    try {
+      if (!await persistCurrentContextText()) return false;
+      if (
+        project?.project_id !== captured.projectId ||
+        project.session_id !== captured.sessionId ||
+        document?.summary.document_id !== captured.documentId ||
+        editorReadonly
+      ) return false;
+      const previousText = contextText;
+      const snapshot = await addDocumentContexts(captured.projectId, captured.sessionId, captured.documentId, [...new Set(items.map((item) => item.id))]);
+      if (!adoptAuthoritativeContext(snapshot, captured.projectId, captured.sessionId, captured.documentId)) return false;
+      await normalizeImportedContext(previousText);
+      return true;
+    } finally { contextAttachmentBusy = false; }
+  }
+
   async function removeContextAttachment(attachmentId: string): Promise<void> {
     if (!project || !document || contextAttachmentBusy) return;
     const captured = {
@@ -2227,6 +2305,16 @@
       if (directories.length) {
         await openDroppedFolders(directories);
       } else {
+        const pane = Array.from(window.document.querySelectorAll<HTMLElement>('[data-workspace-pane]')).find(element => {
+          const rect = element.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom;
+        });
+        const paneId = pane?.dataset.workspacePane;
+        if (paneId && paneEditors[paneId]) {
+          await paneEditors[paneId].importDroppedPaths(paths, point);
+          await refreshDocumentContext();
+          return;
+        }
         const scope = nativeAttachmentDropScope(point);
         if (scope) await importNativeAttachmentDrop(paths, point, scope);
       }
@@ -2264,6 +2352,8 @@
     systemDark = appearanceMedia.matches;
     const syncSystemAppearance = (event: MediaQueryListEvent): void => {
       systemDark = event.matches;
+      appearanceOverride = false;
+      appearance = 'system';
     };
     appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
@@ -2302,8 +2392,10 @@
         }
       })();
     }
+    const loompadIdleTimer = window.setInterval(() => void prefetchLoompad(), 5_000);
     window.addEventListener('keydown', handleGlobalKeydownCapture, true);
     const stopManuscriptRunShortcut = installManuscriptRunShortcut(() => void runRetainedOutput(''));
+    window.addEventListener('click', handleAttachmentLink, true);
     window.addEventListener('keydown', handleGlobalKeydown);
     window.addEventListener('pointerdown', handleGlobalPointerdown);
     window.addEventListener('pageshow', handleRendererResume);
@@ -2312,6 +2404,7 @@
       componentMounted = false;
       cabalEditor?.dispose();
       if (cabalTimer) clearTimeout(cabalTimer);
+      window.clearInterval(loompadIdleTimer);
       if (terminalPollTimer !== undefined) window.clearTimeout(terminalPollTimer);
       startupHeldForApplicationClose = false;
       workspaceRestoreSerial += 1;
@@ -2321,6 +2414,7 @@
       clearPreferredWriterRequest();
       window.removeEventListener('keydown', handleGlobalKeydownCapture, true);
       stopManuscriptRunShortcut();
+      window.removeEventListener('click', handleAttachmentLink, true);
       window.removeEventListener('keydown', handleGlobalKeydown);
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
       window.removeEventListener('pageshow', handleRendererResume);
@@ -2720,6 +2814,7 @@
       const unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
         windowFocused = focused;
         if (focused) {
+          resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
           resumeCompletionObservation();
           scheduleProjectFilesystemRefresh();
           // A hidden WKWebView may stay DOM-focused and emit neither browser
@@ -2745,6 +2840,7 @@
 
   function handleRendererResume(): void {
     if (window.document.visibilityState === 'hidden') return;
+    resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
     resumeCompletionObservation();
     scheduleProjectFilesystemRefresh();
   }
@@ -4428,13 +4524,18 @@
   }
 
   function setAppearance(next: AppearancePreference): void {
+    appearanceOverride = true;
     appearance = next;
     const label = next === 'system' ? 'Appearance follows the system' : `${next} appearance`;
     announce(`${label} for this session`);
   }
 
   function toggleAppearance(): void {
-    setAppearance(toggledAppearance(appearance, systemDark));
+    if (appearanceOverride) {
+      appearanceOverride = false;
+      appearance = 'system';
+      announce('Appearance follows the system');
+    } else setAppearance(resolvedAppearance === 'dark' ? 'light' : 'dark');
   }
 
   function startTitlebarDrag(event: MouseEvent): void {
@@ -5392,11 +5493,49 @@
     }
   }
 
-  async function toggleSuggestionsFromTitlebar(): Promise<void> {
-    await setSuggestionsEnabled(!suggestionsEnabled);
+  async function setSuggestionInteraction(next: 'ghost' | 'loompad'): Promise<void> {
+    if (suggestionsChanging) return;
+    const enabled = suggestionInteraction !== next || !suggestionsEnabled;
+    if (shuttleEnabled) await setShuttleEnabled(false);
+    suggestionInteraction = next;
+    await setSuggestionsEnabled(enabled);
+    if (enabled && next === 'loompad') {
+      if (activeBranchCount > 0) await cancelActiveBranches();
+      scheduleAutomaticSuggestions(editVersion, 250, 'document_edit');
+    }
     await tick();
     if (mode === 'source') sourceEditor?.focusCurrentSelection();
     else visualEditor?.focusCurrentSelection();
+  }
+
+  function chooseLoompadCandidate(candidate: CompletionCandidate): void {
+    if (!loompadActive) return;
+    const current = activeSuggestionFamily.findIndex(item => item.runId === selectedInlineSuggestion?.runId);
+    const target = activeSuggestionFamily.findIndex(item => item.runId === candidate.runId && item.presentationKey === candidate.presentationKey);
+    if (target >= 0 && current >= 0) cycleActiveSuggestion(target - current);
+  }
+
+  async function acceptLoompadCandidate(candidate: CompletionCandidate, length: LoompadLength): Promise<void> {
+    if (!loompadActive || loompadAccepting || editorReadonly || compositionActive || !windowFocused) return;
+    const captured = { context: completionContextKey, text: documentText, version: editVersion };
+    const text = loompadPrefix(candidate.text, length, mode === 'visual');
+    if (!text) return;
+    loompadAccepting = true;
+    try {
+      chooseLoompadCandidate(candidate);
+      await tick();
+      if (!loompadActive || captured.context !== completionContextKey || captured.text !== documentText ||
+          captured.version !== editVersion || !windowFocused) return;
+      const accepted = mode === 'visual'
+        ? visualEditor?.acceptLoompadText(candidate.candidateId, candidate.presentationKey, text)
+        : sourceEditor?.acceptLoompadText(candidate.candidateId, candidate.presentationKey, text);
+      if (accepted) {
+        await tick();
+        // Keep admitted tails growing; refill only after a pause or exhaustion.
+        if (loompadActive) scheduleAutomaticSuggestions(editVersion,
+          activeSuggestionFamily.length ? 5_000 : 250, 'document_edit');
+      }
+    } finally { loompadAccepting = false; }
   }
 
   function focusableElementsWithin(container: HTMLElement): HTMLElement[] {
@@ -6859,6 +6998,7 @@
   function resumeScheduledAutomaticSuggestion(wakeKey: string): void {
     if (
       !wakeKey ||
+      loompadBackgroundPaused() ||
       suggestionWakeQueued ||
       suggestionsIdleTimer !== undefined ||
       !completionController.scheduled ||
@@ -6941,6 +7081,10 @@
     });
   }
 
+  function loompadBackgroundPaused(): boolean {
+    return loompadActive && (!windowFocused || window.document.visibilityState === 'hidden');
+  }
+
   async function tryStartAutomaticSuggestions(schedule: CompletionSchedule): Promise<void> {
     const targetEditVersion = schedule.kind === 'edit_pause'
       ? schedule.editVersion
@@ -6961,6 +7105,8 @@
       completionController = setCompletionSchedule(completionController, null);
       return;
     }
+    // Retain the schedule without polling while the writer is away.
+    if (loompadBackgroundPaused()) return;
     if (!canStartAutomaticSuggestions) {
       if (!retainsScheduledCompletion(completionLifecycle)) {
         completionController = setCompletionSchedule(completionController, null);
@@ -7428,14 +7574,24 @@
 
   function reconcileVisibleCompletionController(
     contextKey: string,
-    family: readonly InlineGhostSuggestion[]
+    family: readonly InlineGhostSuggestion[],
+    forkAtCurrentCaret = false
   ): void {
     const reconciled = reconcileCompletionController(
       completionController,
       contextKey,
-      family
+      family,
+      forkAtCurrentCaret
     );
     if (reconciled !== completionController) completionController = reconciled;
+  }
+
+  function refreshVisibleCompletionFamily(
+    expected: CompletionSession,
+    originals: readonly InlineGhostSuggestion[]
+  ): void {
+    const refreshed = refreshCompatibleCompletionFamily(completionController, expected, originals);
+    if (refreshed !== completionController) completionController = refreshed;
   }
 
   function refreshVisibleCompletionCandidate(
@@ -7567,7 +7723,8 @@
     const cycled = cycleCompletion(
       completionController,
       activeSuggestionFamily,
-      offset
+      offset,
+      loompadActive
     );
     if (cycled.state === completionController) return;
     completionController = cycled.state;
@@ -7837,6 +7994,14 @@
     }
   }
 
+  function handleAttachmentLink(event: MouseEvent): void {
+    const link = event.target instanceof Element ? event.target.closest('a[href^="loom-attachment:"]') : null;
+    if (!link) return;
+    event.preventDefault(); event.stopPropagation();
+    const id = link.getAttribute('href')?.match(/^loom-attachment:([a-f0-9]{64})$/u)?.[1];
+    if (project && id) void revealAttachmentOriginal(project.project_id, project.session_id, id).catch(recordFailure);
+  }
+
   function handleGlobalKeydownCapture(event: KeyboardEvent): void {
     if (!shouldCaptureFormatMenuEscape(event, {
       formatMenuOpen: formatMenu?.isOpen() ?? false,
@@ -7974,6 +8139,25 @@
       throw new Error('The desktop returned a branch outside the requested manuscript boundary.');
     }
     if (!weaveCaptureStillCurrent(captured)) return false;
+    if (captured.speculation) {
+      const batch = started.speculation;
+      if (!batch || !/^[a-f0-9]{64}$/.test(batch.snapshot_id) ||
+          batch.batch_offset !== captured.speculation.offset || batch.sample_target !== captured.speculation.sampleTarget) {
+        throw new Error('The desktop returned choices for a different sampling boundary.');
+      }
+      const previous = loompadReservoir?.key === captured.speculation.key ? loompadReservoir : null;
+      if (previous && previous.snapshotId !== batch.snapshot_id) throw new Error('The idle choice snapshot changed.');
+      const familyIds = previous?.familyIds ?? [];
+      if (!familyIds.includes(started.command_id) && batch.batch_offset !== familyIds.length * 4) {
+        throw new Error('The desktop skipped an idle choice batch.');
+      }
+      loompadReservoir = {
+        key: captured.speculation.key, snapshotId: batch.snapshot_id,
+        familyIds: familyIds.includes(started.command_id) ? familyIds : [...familyIds, started.command_id],
+        nextOffset: Math.max(previous?.nextOffset ?? 0, batch.batch_offset + 4),
+        admittedAt: previous?.familyIds.includes(started.command_id) ? previous.admittedAt : Date.now(), capture: captured
+      };
+    } else if (started.speculation) throw new Error('An ordinary suggestion returned an idle sampling policy.');
     const runIds = new Set(started.branches.map((branch) => branch.run_id));
     authoritativeCompletionFamilyId = started.command_id;
     branches = [
@@ -8112,8 +8296,36 @@
     staleWeaveCleanupTimers.add(timer);
   }
 
+  async function prefetchLoompad(): Promise<void> {
+    const reservoir = loompadReservoir;
+    if (!componentMounted || !loompadActive || !windowFocused || !reservoir || reservoir.nextOffset >= 256 ||
+        Date.now() - reservoir.admittedAt < 5_000 || compositionActive || loompadAccepting ||
+        activeBranchCount > 0 || completionActiveRunIds.length > 0 || !weaveCaptureStillCurrent(reservoir.capture)) return;
+    await startAutomaticWeave();
+  }
+
+  async function recoverLoompad(captured: WeaveCapture, recovery: NonNullable<LoomFailure['speculation_recovery']>): Promise<void> {
+    if (!captured.speculation || !weaveCaptureStillCurrent(captured)) return;
+    loompadReservoir = null;
+    let recovered = 0;
+    for (const [index, commandId] of recovery.command_ids.entries()) {
+      const status = await getWeaveStatus(captured.projectId, captured.sessionId, commandId);
+      if (!weaveCaptureStillCurrent(captured)) return;
+      if (!status?.speculation || status.speculation.snapshot_id !== recovery.snapshot_id ||
+          status.speculation.batch_offset !== index * 4 || ![4, 16, 64, 256].includes(status.speculation.sample_target)) {
+        throw new Error('Stored idle choices do not match their exact snapshot.');
+      }
+      if (!installWeaveSnapshot(status, { ...captured, commandId,
+        speculation: { ...captured.speculation, offset: index * 4, sampleTarget: status.speculation.sample_target } })) return;
+      recovered += 4;
+    }
+    if (recovered !== recovery.next_offset) {
+      throw new Error('Stored idle choices returned an incomplete batch history.');
+    }
+  }
+
   async function startAutomaticWeave(): Promise<boolean> {
-    if (terminalIsBusy() || weaveStarting || !project || !document || !currentModel) return false;
+    if (loompadBackgroundPaused() || terminalIsBusy() || weaveStarting || !project || !document || !currentModel) return false;
     const startingEditVersion = editVersion;
     if (compositionActive || !flushEditors()) return false;
     if (editVersion !== startingEditVersion) {
@@ -8146,8 +8358,18 @@
       cursorByte,
       editVersion,
       intentEpoch: completionController.intentEpoch,
-      modelId: currentModel.model_id
+      modelId: currentModel.model_id,
+      sourceDocument: document,
+      sourceMarkdown: documentText
     };
+    if (loompadActive) {
+      const key = JSON.stringify([captured.projectId, captured.sessionId, captured.documentId,
+        captured.sourceRevisionId, captured.visibleBlobId, captured.cursorByte, captured.modelId,
+        captured.contextEpoch, captured.epoch, captured.intentEpoch, captured.editVersion]);
+      const offset = loompadReservoir?.key === key ? loompadReservoir.nextOffset : 0;
+      if (offset >= 256) return true;
+      captured.speculation = { key, offset, sampleTarget: offset < 4 ? 4 : offset < 16 ? 16 : offset < 64 ? 64 : 256 };
+    }
     weaveStarting = true;
     clearFailure();
     try {
@@ -8160,7 +8382,9 @@
         sourceRevisionId: captured.sourceRevisionId,
         expectedVisibleBlobId: captured.visibleBlobId,
         cursorByte: captured.cursorByte,
-        policy: { kind: 'automatic_v2' }
+        policy: captured.speculation
+          ? { kind: 'loompad_v1', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
+          : { kind: 'automatic_v2' }
       });
       if (installWeaveSnapshot(started, captured)) {
         uncertainWeave = null;
@@ -8179,7 +8403,18 @@
       ) {
         const captureIsCurrent = weaveCaptureStillCurrent(captured);
         const failure = normalizeFailure(error);
-        if (captureIsCurrent && failure.code === 'automatic_generation_throttled') {
+        if (captureIsCurrent && captured.speculation && failure.speculation_recovery) {
+          uncertainWeave = null;
+          try { await recoverLoompad(captured, failure.speculation_recovery); }
+          catch (recoveryError) {
+            recordFailure(recoveryError);
+            if (normalizeFailure(recoveryError).retryable) scheduleAutomaticSuggestions(editVersion, 5_000, 'retry');
+          }
+          if (failure.speculation_recovery.next_offset === 0) scheduleAutomaticSuggestions(editVersion, 5_000, 'retry');
+          return true;
+        }
+        if (captureIsCurrent && (failure.code === 'automatic_generation_throttled' ||
+            (captured.speculation && failure.code === 'generation_active'))) {
           uncertainWeave = null;
           scheduleAutomaticSuggestions(editVersion, 5_000, 'retry');
           return true;
@@ -9541,20 +9776,18 @@
           ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="6.4" y="2.5" width="5.2" height="8.3" rx="2.6"/><path d="M4.4 8.8a4.6 4.6 0 0 0 9.2 0M9 13.4v2.1M6.8 15.5h4.4"/></svg></button>
           <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Audio stays on this device and is attached to this document')}</span>
         {/if}
-        <button
-          class:active={suggestionsEnabled && Boolean(currentModel)}
-          class:preparing={suggestionsEnabled && !currentModel && !quietModelLoadFailure && (modelLoading || preferredWriterEnsureInFlight !== null || preferredWriterPending !== null)}
-          class:needs-attention={suggestionsEnabled && !currentModel && Boolean(quietModelLoadFailure)}
-          class="titlebar-button suggestions-toggle"
-          type="button"
-          aria-label={suggestionsEnabled ? 'Turn autocomplete off' : 'Turn autocomplete on'}
-          aria-pressed={suggestionsEnabled}
-          title={suggestionsEnabled ? 'Ghost text on' : 'Ghost text off'}
-          disabled={!project || suggestionsChanging}
-          on:click={() => void toggleSuggestionsFromTitlebar()}
-        >
-          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M3.5 15V8a5.5 5.5 0 0 1 11 0v7l-2.75-2-2.75 2-2.75-2-2.75 2Z"/><path d="M7 7v1M11 7v1"/></svg>
-        </button>
+        <div class="completion-mode-toggle" role="group" aria-label="Writing suggestions">
+          <button class="titlebar-button suggestions-toggle" class:active={suggestionsEnabled && suggestionInteraction === 'ghost'}
+            type="button" aria-label="Ghost text" aria-pressed={suggestionsEnabled && suggestionInteraction === 'ghost'}
+            title="Ghost text" disabled={!project || suggestionsChanging} on:click={() => void setSuggestionInteraction('ghost')}>
+            <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M3.5 15V8a5.5 5.5 0 0 1 11 0v7l-2.75-2-2.75 2-2.75-2-2.75 2Z"/><path d="M7 7v1M11 7v1"/></svg>
+          </button>
+          <button class="titlebar-button loompad-toggle" class:active={loompadActive}
+            type="button" aria-label="Loompad" aria-pressed={loompadActive} title="Loompad"
+            disabled={!project || suggestionsChanging} on:click={() => void setSuggestionInteraction('loompad')}>
+            <svg aria-hidden="true" viewBox="0 0 20 18"><rect x="7.5" y="2" width="5" height="5" rx="1"/><rect x="1.5" y="8.5" width="5" height="5" rx="1"/><rect x="7.5" y="8.5" width="5" height="5" rx="1"/><rect x="13.5" y="8.5" width="5" height="5" rx="1"/></svg>
+          </button>
+        </div>
 
       </div>
     </div>
@@ -9662,6 +9895,11 @@
             </div>
             {/if}
           {/each}
+          {#if desktop && document}
+            {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
+              <ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={document.summary.title} onUse={useImportedSources} />
+            {/key}
+          {/if}
         </nav>
         {#if folderWarnings.length > 0}
           <details class="folder-warnings">
@@ -9970,7 +10208,7 @@
                       ghostAnchorByteOffset={ghostSuggestion?.targetByte ?? null}
                       ghostInsertsOnAccept={ghostSuggestion?.insertsOnAccept ?? false}
                       ghostAlternatives={ghostAlternatives}
-                      ghostHidden={inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled })}
+                      ghostHidden={ghostTextHidden}
                       {ghostUnconsumeText}
                       surfaceKey={visualGhostSurfaceKey}
                       onChange={updateText}
@@ -10030,7 +10268,7 @@
                   ghostPresentationKey={sourceGhostSuggestion?.presentationKey ?? ''}
                   ghostInsertsOnAccept={sourceGhostSuggestion?.insertsOnAccept ?? false}
                   ghostAlternatives={ghostAlternatives}
-                  ghostHidden={inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled })}
+                  ghostHidden={ghostTextHidden}
                   {ghostUnconsumeText}
                   onCompositionStart={beginSourceComposition}
                   onCompositionEnd={finishSourceComposition}
@@ -10053,6 +10291,12 @@
                   label={exactTextSurface ? 'Exact-whitespace verse editor' : 'Markdown source editor'}
                 />
               </div>
+            {/if}
+            {#if loompadActive}
+              <Loompad choices={activeSuggestionFamily} scope={completionContextKey} focused={windowFocused} selectedRunId={selectedInlineSuggestion?.runId ?? ''}
+                blocked={editorReadonly || compositionActive} visual={mode === 'visual'}
+                onChoose={chooseLoompadCandidate} onAccept={(candidate, length) => void acceptLoompadCandidate(candidate, length)}
+                onExit={() => { suggestionInteraction = 'ghost'; }} />
             {/if}
           </section>
 
@@ -10095,7 +10339,7 @@
             </header>
             {#each slot.choices as [paneId, paneConfig] (paneId)}
               <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
-            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} collaborative={Boolean(cabalEditor)} onImmediateDocumentMutation={invalidateVisualSuggestionImmediately} onChange={updateText} beforeRun={preparePaneRun} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
+            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} collaborative={Boolean(cabalEditor)} onImmediateDocumentMutation={invalidateVisualSuggestionImmediately} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
               </div>
             {/each}
           </aside>

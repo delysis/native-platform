@@ -344,8 +344,8 @@
       // Once a word is consumed the session is locked to one candidate. Do
       // not hide its cached remainder behind a now-empty alternatives fan
       // while Option is still held.
-      fanVisible: snapshot.optionHeld && snapshot.alternatives.length > 1,
-      fanPinned: snapshot.lensPinned && snapshot.alternatives.length > 1
+      fanVisible: !snapshot.hidden && snapshot.optionHeld && snapshot.alternatives.length > 1,
+      fanPinned: !snapshot.hidden && snapshot.lensPinned && snapshot.alternatives.length > 1
     } : null;
     setGhostText(editorView, presentation, forceRender);
     reportCompletionAccessibility();
@@ -692,6 +692,16 @@
       'shuttle_word'
     )) return false;
     view.dispatch(view.state.tr.insertText(word));
+    return true;
+  }
+
+  export function acceptLoompadText(candidateId: string, presentationKey: string, text: string): boolean {
+    if (!view || readonly || composing || !view.hasFocus()) return false;
+    const plan = currentGhostTextPlan(view.state);
+    if (!plan || plan.candidateId !== candidateId || plan.presentationKey !== presentationKey ||
+        !text || !plan.text.startsWith(text) || selectionBoundary(view.state) !== plan.anchorByteOffset) return false;
+    if (!authorizeCompletionInsertion(candidateId, presentationKey, text, 'loompad')) return false;
+    view.dispatch(view.state.tr.insertText(text));
     return true;
   }
 

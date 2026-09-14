@@ -11,6 +11,20 @@ pub(crate) fn detect(name: &str, declared_media_type: Option<&str>, bytes: &[u8]
     let mut candidates = Vec::new();
 
     signature_candidates(bytes, &mut candidates);
+    if bytes.starts_with(b"From ")
+        && bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .is_some_and(|index| looks_like_email_bytes(&bytes[index + 1..]))
+    {
+        push_candidate(
+            &mut candidates,
+            DetectedFormat::Mbox,
+            DetectionConfidence::ParserConfirmed,
+            DetectionEvidence::ParserStructure,
+            0,
+        );
+    }
     if let Some(kind) = infer::get(bytes)
         && let Some(format) = format_from_media_type(kind.mime_type())
     {
@@ -23,6 +37,17 @@ pub(crate) fn detect(name: &str, declared_media_type: Option<&str>, bytes: &[u8]
         );
     }
     text_candidates(bytes, extension_format, &mut candidates);
+    // RFC messages may carry an explicitly declared legacy charset in an
+    // eight-bit body. Header recognition must not require UTF-8 for that body.
+    if std::str::from_utf8(bytes).is_err() && looks_like_email_bytes(bytes) {
+        push_candidate(
+            &mut candidates,
+            DetectedFormat::Email,
+            DetectionConfidence::Probable,
+            DetectionEvidence::TextSyntax,
+            0,
+        );
+    }
     if let Some(format) = declared_format {
         push_candidate(
             &mut candidates,
@@ -318,6 +343,12 @@ fn text_candidates(
         DetectedFormat::Svg
     } else if lower_prefix.starts_with("<?xml") {
         DetectedFormat::Xml
+    } else if text.starts_with("From ")
+        && text
+            .split_once('\n')
+            .is_some_and(|(_, rest)| looks_like_email(rest))
+    {
+        DetectedFormat::Mbox
     } else if looks_like_email(text) {
         DetectedFormat::Email
     } else if matches!(extension, Some(DetectedFormat::JupyterNotebook))
@@ -466,6 +497,7 @@ fn format_from_extension(extension: &str) -> Option<DetectedFormat> {
             "key" | "keynote" => DetectedFormat::IWorkKeynote,
             "doc" | "xls" | "ppt" | "msg" => DetectedFormat::OleCompound,
             "eml" => DetectedFormat::Email,
+            "mbox" => DetectedFormat::Mbox,
             "zip" => DetectedFormat::Zip,
             "tar" => DetectedFormat::Tar,
             "gz" | "gzip" | "tgz" | "tar.gz" => DetectedFormat::Gzip,
@@ -549,6 +581,7 @@ fn format_from_media_type(media_type: &str) -> Option<DetectedFormat> {
             | "application/vnd.ms-excel"
             | "application/vnd.ms-powerpoint" => DetectedFormat::OleCompound,
             "message/rfc822" => DetectedFormat::Email,
+            "application/mbox" => DetectedFormat::Mbox,
             "application/zip" => DetectedFormat::Zip,
             "application/x-tar" => DetectedFormat::Tar,
             "application/gzip" => DetectedFormat::Gzip,
@@ -649,6 +682,11 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack
             .windows(needle.len())
             .any(|window| window == needle)
+}
+
+pub(crate) fn looks_like_email_bytes(bytes: &[u8]) -> bool {
+    let prefix = &bytes[..bytes.len().min(8192)];
+    looks_like_email(&String::from_utf8_lossy(prefix))
 }
 
 #[cfg(test)]

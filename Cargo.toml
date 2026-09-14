@@ -54,7 +54,7 @@ members = [
     "products/mom/crates/mom-llama-runtime",
     "xtask",
 ]
-exclude = ["crates/services/attachment/fuzz", "products/loom/signal", "vendor/glib"]
+exclude = ["crates/services/attachment/fuzz", "products/loom/signal", "vendor/glib", "vendor/ort-sys"]
 resolver = "3"
 
 [workspace.package]
@@ -203,3 +203,5 @@ strip = "symbols"
 [patch.crates-io]
 # GTK3 still requires the 0.18 API. Backport the upstream VariantStrIter fix.
 glib = { path = "vendor/glib" }
+# Keep verified ONNX Runtime DLLs beside Windows test/example executables.
+ort-sys = { path = "vendor/ort-sys" }

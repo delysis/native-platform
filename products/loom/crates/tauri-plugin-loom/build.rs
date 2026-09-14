@@ -27,9 +27,18 @@ const COMMANDS: &[&str] = &[
     "audio_synthesize",
     "document_rename",
     "document_delete",
+    "import_text_sources",
+    "attachment_import_batch_choose",
+    "import_account_cancel",
+    "import_source_url",
+    "import_accounts",
+    "import_account_connect",
+    "import_account_disconnect",
+    "import_account_sync",
     "attachment_ingest",
     "attachment_import_choose",
     "attachment_import_paths",
+    "attachment_reveal_original",
     "document_context_list",
     "document_context_add",
     "document_context_add_many",
@@ -93,6 +102,16 @@ fn main() {
         "cargo:rustc-env=LOOM_BUILD_TARGET={}",
         std::env::var("TARGET").expect("Cargo sets TARGET")
     );
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        // Library tests link rfd's TaskDialogIndirect too, but do not inherit
+        // the desktop app's manifest. Activate the same Common Controls API.
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
+        );
+    }
     if let Err(error) = tauri_plugin::Builder::new(COMMANDS).try_build() {
         panic!("failed to build Loom plugin metadata: {error}");
     }

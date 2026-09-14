@@ -63,6 +63,7 @@ jobs:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: policy-linux
       - run: node --test scripts/ci/test-ci-metadata-selection.mjs scripts/ci/test-ci-plan.mjs scripts/ci/test-ci-required.mjs scripts/ci/test-ignored-tests.mjs scripts/ci/test-product-state-backup.mjs scripts/ci/test-workflows.mjs
       - run: node --test scripts/ci/test-current-docs.mjs
@@ -94,6 +95,7 @@ jobs:
           components: ${{ matrix.command == 'test' && 'rustfmt' || 'clippy' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: root-linux
           save-if: ${{ matrix.command == 'test' }}
       - uses: ./.github/actions/loom-signal
@@ -117,6 +119,7 @@ jobs:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: native-linux
       - run: ./crates/native/scripts/check-architecture.sh
 
@@ -132,6 +135,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: gateway-linux
       - run: node scripts/ci/cargo-group.mjs test gateway
       - run: node scripts/ci/cargo-group.mjs clippy gateway
@@ -148,6 +152,7 @@ jobs:
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: attachment-linux
       - run: node scripts/ci/cargo-group.mjs fmt service-attachment
       - run: node scripts/ci/cargo-group.mjs test service-attachment
@@ -173,6 +178,7 @@ jobs:
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: information-linux
       - run: node scripts/ci/cargo-group.mjs fmt service-information
       - run: node scripts/ci/cargo-group.mjs test service-information
@@ -190,6 +196,7 @@ jobs:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: information-windows
       - run: node scripts/ci/cargo-group.mjs test service-information
 
@@ -213,6 +220,7 @@ jobs:
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: speech-linux
       - run: node scripts/ci/cargo-group.mjs fmt service-speech
       - run: node scripts/ci/cargo-group.mjs test service-speech
@@ -241,6 +249,7 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: mom-linux
           save-if: ${{ matrix.command == 'test' }}
       - if: ${{ matrix.command == 'test' }}
@@ -260,7 +269,9 @@ jobs:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: mom-windows
+          cache-directories: ~/AppData/Local/ort.pyke.io/dfbin
       - run: node scripts/ci/cargo-group.mjs test product-mom
 
   loom-linux:
@@ -286,6 +297,7 @@ jobs:
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: loom-linux
           save-if: ${{ matrix.command == 'test' }}
       - uses: ./.github/actions/loom-signal
@@ -308,9 +320,16 @@ jobs:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: loom-windows
+          cache-directories: ~/AppData/Local/ort.pyke.io/dfbin
       - uses: ./.github/actions/loom-signal
       - run: node scripts/ci/cargo-group.mjs test product-loom
+
+      - name: Inspect Windows native loader failure
+        if: failure()
+        shell: pwsh
+        run: ./scripts/ci/inspect-windows-linkage.ps1
 
   frontend:
     if: ${{ needs.plan.outputs.frontend_fte == 'true' || needs.plan.outputs.frontend_mom == 'true' || needs.plan.outputs.frontend_loom == 'true' || needs.plan.outputs.full == 'true' }}
@@ -357,7 +376,9 @@ jobs:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: platform-macos-${{ matrix.component }}
+          cache-directories: ~/Library/Caches/ort.pyke.io/dfbin
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         if: ${{ matrix.component == 'loom' }}
         with:
@@ -438,9 +459,15 @@ jobs:
           toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          cache-on-failure: true
           shared-key: ignored-tests-${{ runner.os }}
+          cache-directories: ${{ runner.os == 'macOS' && '~/Library/Caches/ort.pyke.io/dfbin' || runner.os == 'Windows' && '~/AppData/Local/ort.pyke.io/dfbin' || '' }}
       - name: Reconcile exact ignored-test inventory with guarded list arguments
         run: node scripts/ci/validate-ignored-tests.mjs --cargo-list
+      - name: Inspect Windows native loader failure
+        if: failure() && runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/inspect-windows-linkage.ps1
 
   fuzz-build:
     if: ${{ needs.plan.outputs.fuzz == 'true' || needs.plan.outputs.full == 'true' }}
@@ -460,22 +487,8 @@ jobs:
     needs:
       - plan
       - policy
-      - root-linux
-      - native-linux
-      - gateway-linux
-      - attachment-linux
-      - information-linux
-      - information-windows
-      - speech-linux
-      - mom-linux
-      - mom-windows
-      - loom-linux
-      - loom-windows
       - frontend
       - platform-macos
-      - ignored-tests
-      - dependency-graph
-      - fuzz-build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683

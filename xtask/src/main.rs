@@ -63,9 +63,10 @@ fn check_workspace(root: &Path) -> Result<()> {
                         "crates/services/attachment/fuzz",
                         "products/loom/signal",
                         "vendor/glib",
+                        "vendor/ort-sys",
                     ])
             }),
-        "only Attachment fuzzing, the Signal SQLCipher worker, and patched external GLib may be excluded"
+        "only Attachment fuzzing, the Signal SQLCipher worker, and patched external GLib/ort-sys may be excluded"
     );
 
     let output = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
@@ -133,6 +134,8 @@ fn check_workspace(root: &Path) -> Result<()> {
                 root.join("Cargo.lock"),
                 root.join("crates/services/attachment/fuzz/Cargo.lock"),
                 root.join("products/loom/signal/Cargo.lock"),
+                // Published dependency source; the root lock resolves this patch.
+                root.join("vendor/ort-sys/Cargo.lock"),
             ]),
         "unknown nested Cargo lock"
     );
