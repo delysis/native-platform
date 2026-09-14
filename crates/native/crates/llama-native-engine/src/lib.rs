@@ -3906,15 +3906,7 @@ fn generate_batch(
                 });
                 branch.event_index += 1;
             }
-            if let Some(stop) = branch
-                .request
-                .sampling
-                .stop
-                .iter()
-                .find(|stop| !stop.is_empty() && branch.text.ends_with(stop.as_str()))
-            {
-                let keep = branch.text.len().saturating_sub(stop.len());
-                branch.text.truncate(keep);
+            if apply_stop_sequences(&mut branch.text, &branch.request.sampling.stop) {
                 branch.state = GenerationState::Completed;
                 branch.finish_reason = "stop_sequence".to_string();
             } else if branch.generated >= branch.request.sampling.max_tokens as usize {
@@ -3949,8 +3941,11 @@ fn generate_batch(
             .map_err(|error| native_decode_error("failed to decode generation batch", error))?;
     }
     for branch in &mut branches {
-        let piece = decode_generated_utf8_piece(&mut branch.decoder, &[], true)?;
-        append_generated_utf8_piece(&mut branch.text, &piece)?;
+        let piece = finalize_generated_text(
+            &mut branch.decoder,
+            &mut branch.text,
+            branch.finish_reason == "stop_sequence",
+        )?;
         if !piece.is_empty() {
             supervision.emit(GenerationEvent {
                 request_id: request.request_id.clone(),
@@ -4295,15 +4290,7 @@ fn generate_multimodal_batch(
                 });
                 branch.event_index += 1;
             }
-            if let Some(stop) = branch
-                .request
-                .sampling
-                .stop
-                .iter()
-                .find(|stop| !stop.is_empty() && branch.text.ends_with(stop.as_str()))
-            {
-                let keep = branch.text.len().saturating_sub(stop.len());
-                branch.text.truncate(keep);
+            if apply_stop_sequences(&mut branch.text, &branch.request.sampling.stop) {
                 branch.state = GenerationState::Completed;
                 branch.finish_reason = "stop_sequence".to_string();
             } else if branch.generated >= branch.request.sampling.max_tokens as usize {
@@ -4341,8 +4328,11 @@ fn generate_multimodal_batch(
     }
 
     for branch in &mut branches {
-        let piece = decode_generated_utf8_piece(&mut branch.decoder, &[], true)?;
-        append_generated_utf8_piece(&mut branch.text, &piece)?;
+        let piece = finalize_generated_text(
+            &mut branch.decoder,
+            &mut branch.text,
+            branch.finish_reason == "stop_sequence",
+        )?;
         if !piece.is_empty() {
             supervision.emit(GenerationEvent {
                 request_id: request.request_id.clone(),
@@ -4786,10 +4776,9 @@ where
                     && output.generated_token_ids.len() == case.sampling.max_tokens as usize => {}
             (GenerationState::Completed, "stop_sequence")
                 if terminal_sampled_token_id.is_none()
-                    && case.sampling.stop.iter().any(|stop| {
-                        !stop.is_empty()
-                            && decoded_token_text[index] == format!("{}{stop}", output.text)
-                    }) => {}
+                    && stop_sequence_start(&decoded_token_text[index], &case.sampling.stop)
+                        .is_some_and(|start| output.text == decoded_token_text[index][..start]) => {
+            }
             _ => {
                 return Err(generation_verification_error(
                     "output text, stop condition, state, and finish reason disagree",
@@ -4844,6 +4833,38 @@ fn strict_verified_utf8_bytes(bytes: &[u8]) -> NativeResult<String> {
                 "generated token pieces are not complete canonical UTF-8: {error}"
             ))
         })
+}
+
+/// Match the earliest byte position, independent of stop-list ordering. `find`
+/// returns a UTF-8 boundary and catches delimiters split across sampled pieces.
+fn stop_sequence_start(text: &str, stops: &[String]) -> Option<usize> {
+    stops
+        .iter()
+        .filter(|stop| !stop.is_empty())
+        .filter_map(|stop| text.find(stop.as_str()))
+        .min()
+}
+
+fn apply_stop_sequences(text: &mut String, stops: &[String]) -> bool {
+    let Some(start) = stop_sequence_start(text, stops) else {
+        return false;
+    };
+    text.truncate(start);
+    true
+}
+
+/// Flush the exact sampled-byte stream for event evidence, but never append
+/// decoder residue to authoritative text after a stop boundary was accepted.
+fn finalize_generated_text(
+    decoder: &mut encoding_rs::Decoder,
+    text: &mut String,
+    stopped: bool,
+) -> NativeResult<String> {
+    let piece = decode_generated_utf8_piece(decoder, &[], true)?;
+    if !stopped {
+        append_generated_utf8_piece(text, &piece)?;
+    }
+    Ok(piece)
 }
 
 fn append_generated_utf8_piece(output: &mut String, piece: &str) -> NativeResult<()> {
@@ -5336,13 +5357,7 @@ fn generate_multimodal(
             );
             event_index += 1;
         }
-        if let Some(stop) = request
-            .sampling
-            .stop
-            .iter()
-            .find(|stop| !stop.is_empty() && text.ends_with(stop.as_str()))
-        {
-            text.truncate(text.len().saturating_sub(stop.len()));
+        if apply_stop_sequences(&mut text, &request.sampling.stop) {
             break "stop_sequence".to_string();
         }
         if generated >= request.sampling.max_tokens as usize {
@@ -5360,8 +5375,8 @@ fn generate_multimodal(
         next_position += 1;
         tracking.token_counts.insert(0, next_position as usize);
     };
-    let final_piece = decode_generated_utf8_piece(&mut decoder, &[], true)?;
-    append_generated_utf8_piece(&mut text, &final_piece)?;
+    let final_piece =
+        finalize_generated_text(&mut decoder, &mut text, finish_reason == "stop_sequence")?;
     if !final_piece.is_empty() {
         try_emit_nonterminal(
             supervision.event_tx,
@@ -8922,13 +8937,47 @@ mod tests {
     }
 
     #[test]
-    fn verified_batch_requires_exact_stop_suffix_and_published_projection() {
+    fn stop_sequences_span_pieces_and_choose_earliest_utf8_boundary() {
+        let stops = vec!["\nAssistant:".into(), "\nUser:".into(), String::new()];
+        let mut text = "éclat\nUs".to_owned();
+        assert!(!apply_stop_sequences(&mut text, &stops));
+        text.push_str("er: invented turn\nAssistant: more");
+        assert!(apply_stop_sequences(&mut text, &stops));
+        assert_eq!(text, "éclat");
+        let mut overlapping = "α界abc remainder".to_owned();
+        assert!(apply_stop_sequences(
+            &mut overlapping,
+            &["abc".into(), "界ab".into(), "界".into()]
+        ));
+        assert_eq!(overlapping, "α");
+        assert_eq!(stop_sequence_start("ordinary", &[String::new()]), None);
+    }
+
+    #[test]
+    fn stop_sequence_final_flush_preserves_evidence_without_reopening_output() {
+        let mut decoder = UTF_8.new_decoder();
+        let mut text = decode_generated_utf8_piece(&mut decoder, b"answer<stop>\xe2", false)
+            .expect("partial scalar is buffered");
+        assert!(apply_stop_sequences(&mut text, &["<stop>".into()]));
+        let residue = finalize_generated_text(&mut decoder, &mut text, true).expect("flush");
+        assert_eq!(
+            residue, "\u{fffd}",
+            "raw decoder evidence remains observable"
+        );
+        assert_eq!(
+            text, "answer",
+            "no bytes after the stop enter authoritative output"
+        );
+    }
+
+    #[test]
+    fn verified_batch_requires_earliest_stop_prefix_and_published_projection() {
         let (mut request, fingerprint, mut outputs, mut terminal_ids, mut events, mut decoded) =
             seal_fixture();
         request.cases[0].sampling.stop = vec!["<stop>".to_string()];
         outputs[0].finish_reason = "stop_sequence".to_string();
         terminal_ids[0] = None;
-        decoded[0] = "alpha<stop>".to_string();
+        decoded[0] = "alpha<stop>trailing token content".to_string();
         events[4].event = GenerationEventKind::Delta {
             text: decoded[0].clone(),
         };
@@ -8941,7 +8990,22 @@ mod tests {
             &decoded,
             is_test_eog_token,
         )
-        .expect("an exact removed stop suffix is a coherent output projection");
+        .expect("a delimiter and trailing bytes in one token have an exact output projection");
+
+        request.cases[0].sampling.stop = vec!["<stop>".to_string(), "alpha".to_string()];
+        assert!(
+            validate_verified_generation_batch(
+                &request,
+                &fingerprint,
+                &outputs,
+                &terminal_ids,
+                &events,
+                &decoded,
+                is_test_eog_token,
+            )
+            .is_err(),
+            "a later configured delimiter cannot justify skipping an earlier boundary"
+        );
 
         request.cases[0].sampling.stop = vec!["different".to_string()];
         let error = validate_verified_generation_batch(
@@ -8953,7 +9017,7 @@ mod tests {
             &decoded,
             is_test_eog_token,
         )
-        .expect_err("a claimed stop projection without its configured suffix must fail");
+        .expect_err("a claimed stop projection without its configured delimiter must fail");
         assert_eq!(error.code, NativeErrorCode::Internal);
     }
 

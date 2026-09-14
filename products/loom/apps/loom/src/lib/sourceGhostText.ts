@@ -271,9 +271,8 @@ export function sourceGhostTextForTextarea(
   text: string,
   verseNewline: VerseNewlineKind | null
 ): string | null {
-  // A textarea always exposes LF line breaks. Prose is persisted as
-  // deterministic LF Markdown, so a CR-bearing completion cannot be shown as
-  // byte-faithful source ghost text.
+  // A textarea exposes LF line breaks; the codec retains the document's
+  // original delimiter. Completion bytes must fit that same representation.
   if (verseNewline === null || verseNewline === 'lf' || verseNewline === 'none') {
     return text.includes('\r') ? null : text;
   }

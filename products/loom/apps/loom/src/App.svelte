@@ -92,10 +92,11 @@
     projectAssetProtocolToken
   } from './lib/attachments';
   import {
-    decodeVerseForEditor,
-    encodeVerseFromEditor,
-    type VerseEditorCodec
+    decodeVerseForEditor as decodeSourceForEditor,
+    encodeVerseFromEditor as encodeSourceFromEditor,
+    type VerseEditorCodec as SourceEditorCodec
   } from './lib/verseCodec';
+  import { sourceCaretByte } from './lib/sourceCaret';
   import { canUseVisualMarkdown } from './lib/markdownSafety';
   import {
     autocompleteDisposition,
@@ -304,8 +305,7 @@
     type VerifiedDownloadForm
   } from './lib/modelDownload';
   import {
-    generationEventBelongsToScope,
-    utf8ByteOffset
+    generationEventBelongsToScope
   } from './lib/weaveSafety';
   import {
     isEphemeralAcceptanceModelPath,
@@ -657,7 +657,7 @@
   let visualBoundaryFailure: VisualCaretBoundaryFailure | 'selection_settling' | 'uninitialized' | null = 'uninitialized';
   let visualBoundaryDiagnostic: string | null = null;
   let visualMutationPending = false;
-  let verseCodec: VerseEditorCodec | null = null;
+  let sourceCodec: SourceEditorCodec | null = null;
   let mainCompositionActive = false;
   $: compositionActive = mainCompositionActive || Object.values(paneComposing).some(Boolean);
   let sourceComposing = false;
@@ -1036,11 +1036,9 @@
     sourceDisplayText,
     document,
     documentText,
-    verseCodec
+    sourceCodec
   );
-  $: sourceGhostNewline = document?.summary.kind === 'verse'
-    ? verseCodec?.newline ?? 'mixed'
-    : null;
+  $: sourceGhostNewline = sourceCodec?.newline ?? null;
   $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual', {
     branches,
     authoritativeFamilyId: authoritativeCompletionFamilyId,
@@ -2406,7 +2404,7 @@
     documentText = '';
     sourceDisplayText = '';
     sourceDirty = false;
-    verseCodec = null;
+    sourceCodec = null;
     visualEditor = null;
     mainCompositionActive = false;
     sourceComposing = false;
@@ -6112,7 +6110,8 @@
       project = { ...project, pending_recovery: 0 };
     }
     if (!workspaceRestoreIsCurrent(captured) || !project) return false;
-    const first = project.documents[0];
+    const first = project.documents.find(item => !item.relative_path.split('/').at(-1)?.startsWith('.'))
+      ?? project.documents[0];
     if (first) {
       await selectDocument(first);
       if (!workspaceRestoreIsCurrent(captured)) return false;
@@ -6123,7 +6122,7 @@
       document = null;
       documentText = '';
       sourceDisplayText = '';
-      verseCodec = null;
+      sourceCodec = null;
       editVersion = 0;
       savedVersion = 0;
       draftVersion = '0';
@@ -6251,7 +6250,7 @@
           document = null;
           documentText = '';
           sourceDisplayText = '';
-          verseCodec = null;
+          sourceCodec = null;
           editVersion = 0;
           savedVersion = 0;
           draftVersion = '0';
@@ -6326,7 +6325,7 @@
         missingDocumentCopyState = 'idle';
       }
       documentText = effectiveText;
-      setSourceDocument(effectiveText, opened.summary.kind);
+      setSourceDocument(effectiveText);
       editVersion = draftIsCurrent ? 1 : 0;
       savedVersion = 0;
       draftSavedEditVersion = draftIsCurrent ? 1 : 0;
@@ -6490,7 +6489,7 @@
     applyCompletionEffects(invalidated.effects);
   }
 
-  function setSourceDocument(text: string, kind: DocumentKind): void {
+  function setSourceDocument(text: string): void {
     completionController = resetCompletionSurface(completionController);
     if (sourceProjectionTimer !== undefined) {
       window.clearTimeout(sourceProjectionTimer);
@@ -6505,14 +6504,9 @@
     visualBoundaryFailure = 'uninitialized';
     visualBoundaryDiagnostic = null;
     visualMutationPending = false;
-    if (kind === 'verse') {
-      const decoded = decodeVerseForEditor(text);
-      verseCodec = decoded.codec;
-      sourceDisplayText = decoded.display;
-    } else {
-      verseCodec = null;
-      sourceDisplayText = text;
-    }
+    const decoded = decodeSourceForEditor(text);
+    sourceCodec = decoded.codec;
+    sourceDisplayText = decoded.display;
   }
 
   function flushEditors(): boolean {
@@ -6645,7 +6639,7 @@
       sourceDisplayText,
       document,
       documentText,
-      verseCodec
+      sourceCodec
     );
     const expected = completionController.session
       ? completionSessionPresentation(completionController.session)?.targetByte ?? null
@@ -6724,12 +6718,8 @@
     }
     if (document?.summary.kind === 'hybrid') return;
     sourceDirty = false;
-    if (document?.summary.kind === 'verse') {
-      if (!verseCodec?.editable) return;
-      updateText(encodeVerseFromEditor(sourceDisplayText, verseCodec));
-    } else {
-      updateText(sourceDisplayText);
-    }
+    if (!sourceCodec?.editable) return;
+    updateText(encodeSourceFromEditor(sourceDisplayText, sourceCodec));
   }
 
   function setVisualComposition(active: boolean): void {
@@ -7317,7 +7307,7 @@
     displayText: string,
     currentDocument: OpenDocument | null,
     manuscriptText: string,
-    codec: VerseEditorCodec | null
+    codec: SourceEditorCodec | null
   ): number | null {
     if (
       currentMode !== 'source' ||
@@ -7327,16 +7317,7 @@
       !currentDocument
     ) return null;
     try {
-      const displayPrefix = displayText.slice(0, selectionStart);
-      if (
-        currentDocument.summary.kind === 'verse' &&
-        (!codec || !codec.editable)
-      ) return null;
-      const manuscriptPrefix = currentDocument.summary.kind === 'verse' && codec
-        ? encodeVerseFromEditor(displayPrefix, codec)
-        : displayPrefix;
-      if (!manuscriptText.startsWith(manuscriptPrefix)) return null;
-      return utf8ByteOffset(manuscriptPrefix, manuscriptPrefix.length);
+      return sourceCaretByte(displayText, selectionStart, manuscriptText, codec);
     } catch {
       return null;
     }
@@ -7696,16 +7677,7 @@
     }
     const anchor = sourceEditor?.captureTextInsertionAnchor();
     if (!anchor) throw new Error('Finish editing the selection before running.');
-    const byteAt = (offset: number): number => {
-      const prefix = anchor.value.slice(0, offset);
-      if (document?.summary.kind === 'verse' && (!verseCodec || !verseCodec.editable)) {
-        throw new Error('This poem does not expose an exact source boundary.');
-      }
-      const canonical = document?.summary.kind === 'verse' && verseCodec
-        ? encodeVerseFromEditor(prefix, verseCodec) : prefix;
-      if (!documentText.startsWith(canonical)) throw new Error('The selection changed; try again.');
-      return utf8ByteOffset(canonical, canonical.length);
-    };
+    const byteAt = (offset: number): number => sourceCaretByte(anchor.value, offset, documentText, sourceCodec);
     return { start: byteAt(anchor.start), end: byteAt(anchor.end) };
   }
 
@@ -7904,18 +7876,7 @@
       return visualSelectionByte;
     }
     if (!sourceTextarea) throw new Error('The source editor is not available.');
-    const selectionStart = sourceTextarea.selectionStart;
-    const displayPrefix = sourceTextarea.value.slice(0, selectionStart);
-    if (document.summary.kind === 'verse' && (!verseCodec || !verseCodec.editable)) {
-      throw new Error('This poem does not expose a lossless source-caret boundary.');
-    }
-    const manuscriptPrefix = document.summary.kind === 'verse' && verseCodec
-      ? encodeVerseFromEditor(displayPrefix, verseCodec)
-      : displayPrefix;
-    if (!documentText.startsWith(manuscriptPrefix)) {
-      throw new Error('The source caret no longer matches the saved manuscript bytes.');
-    }
-    return utf8ByteOffset(manuscriptPrefix, manuscriptPrefix.length);
+    return sourceCaretByte(sourceTextarea.value, sourceTextarea.selectionStart, documentText, sourceCodec);
   }
 
   function installWeaveSnapshot(started: WeaveStarted, captured: WeaveCapture): boolean {
@@ -8518,7 +8479,7 @@
     project = refreshed;
     document = { ...opened, text: opened.text };
     documentText = opened.text;
-    setSourceDocument(opened.text, opened.summary.kind);
+    setSourceDocument(opened.text);
     editVersion = 0;
     savedVersion = 0;
     draftVersion = opened.transient_draft?.version ?? '0';
@@ -8572,7 +8533,7 @@
     // version in one operation, so there is never a clear-then-write loss gap.
     draftVersion = recovered.version;
     documentText = recovered.text;
-    setSourceDocument(recovered.text, document.summary.kind);
+    setSourceDocument(recovered.text);
     editVersion += 1;
     draftSavedEditVersion = Math.min(draftSavedEditVersion, editVersion - 1);
     saveState = 'dirty';
@@ -8593,7 +8554,7 @@
       // editor projection and leave the original stale draft inspectable.
       if (staleDraft === recovered && document) {
         documentText = activeText;
-        setSourceDocument(activeText, document.summary.kind);
+        setSourceDocument(activeText);
         editVersion = previousEditVersion;
         draftSavedEditVersion = previousDraftSavedEditVersion;
         draftVersion = recovered.version;
@@ -8761,7 +8722,7 @@
       document = null;
       documentText = '';
       sourceDisplayText = '';
-      verseCodec = null;
+      sourceCodec = null;
       editVersion = 0;
       savedVersion = 0;
       draftVersion = '0';
@@ -8865,7 +8826,7 @@
       return;
     }
     invalidateCompletionForCaretNavigation();
-    if (next === 'source' && document) setSourceDocument(documentText, document.summary.kind);
+    if (next === 'source' && document) setSourceDocument(documentText);
     if (document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')) {
       preferredProseMode = next;
     }
@@ -9120,7 +9081,7 @@
     document = null;
     documentText = '';
     sourceDisplayText = '';
-    verseCodec = null;
+    sourceCodec = null;
     editVersion = 0;
     savedVersion = 0;
     branches = [];
@@ -9763,8 +9724,8 @@
             {/if}
             {#if showSource}
               <div class="editor-pane source-pane" aria-label="Source editor pane">
-                {#if exactTextSurface && verseCodec && !verseCodec.editable}
-                  <div class="verse-notice" role="alert">This poem uses mixed line-ending encodings. Loom will not normalize them silently; source editing stays locked until a lossless boundary editor is available.</div>
+                {#if sourceCodec && !sourceCodec.editable}
+                  <div class="verse-notice" role="alert">This document uses mixed line-ending encodings. Loom will not normalize them silently; source editing stays locked until a lossless boundary editor is available.</div>
                 {/if}
                 {#if document.summary.kind === 'hybrid'}
                   <div class="verse-notice" role="alert">Hybrid source editing is locked until its prose/verse block manifest can cross the IPC boundary losslessly.</div>
@@ -9773,9 +9734,9 @@
                   bind:this={sourceEditor}
                   bind:element={sourceTextarea}
                   value={sourceDisplayText}
-                  readonly={editorReadonly || document.summary.kind === 'hybrid' || Boolean(exactTextSurface && verseCodec && !verseCodec.editable)}
+                  readonly={editorReadonly || document.summary.kind === 'hybrid' || Boolean(sourceCodec && !sourceCodec.editable)}
                   verse={exactTextSurface}
-                  verseNewline={exactTextSurface ? verseCodec?.newline ?? 'mixed' : null}
+                  verseNewline={sourceCodec?.newline ?? null}
                   surfaceKey={completionContextKey}
                   ghostText={sourceGhostSuggestion?.text ?? ''}
                   ghostCandidateId={sourceGhostSuggestion?.candidateId ?? ''}

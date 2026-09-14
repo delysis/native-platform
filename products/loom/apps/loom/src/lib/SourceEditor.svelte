@@ -163,7 +163,7 @@
       readonly,
       exactGeometry,
       ltrContent,
-      verseNewline: verse ? verseNewline : null
+      verseNewline
     });
   }
 

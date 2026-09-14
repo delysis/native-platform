@@ -67,6 +67,16 @@ impl TerminalFixture {
         expression: &str,
         presentation: Option<TerminalPresentation>,
     ) -> Result<TerminalRun, IpcFailure> {
+        self.run_with_boundary(id, expression, presentation, None)
+    }
+
+    fn run_with_boundary(
+        &self,
+        id: CommandId,
+        expression: &str,
+        presentation: Option<TerminalPresentation>,
+        boundary: Option<TerminalTurnBoundary>,
+    ) -> Result<TerminalRun, IpcFailure> {
         tauri::async_runtime::block_on(terminal_run(
             self.project_id.clone(),
             self.session_id.clone(),
@@ -79,6 +89,7 @@ impl TerminalFixture {
             expression.into(),
             presentation,
             None,
+            boundary,
             self.app.handle().clone(),
             self.app.state::<PluginState>(),
         ))
@@ -395,4 +406,37 @@ fn explicit_prompt_context_does_not_interpret_literal_history() {
     );
     assert!(validate_explicit_references(&vec!["Draft".into(); 65]).is_err());
     assert!(validate_explicit_references(&["x".repeat(1025)]).is_err());
+}
+
+#[test]
+fn chat_turn_boundary_binds_sampling_and_command_replay() {
+    let command = CommandId::new();
+    let ordinary = terminal_sampling(command, 1, None);
+    let chat = terminal_sampling(command, 1, Some(TerminalTurnBoundary::Chat));
+    assert!(ordinary.stop.is_empty());
+    assert_eq!(chat.stop, ["\nUser:", "\nAssistant:"]);
+    assert_eq!(chat.seed, ordinary.seed);
+    assert!(serde_json::from_str::<TerminalTurnBoundary>("\"unknown\"").is_err());
+
+    let fixture = TerminalFixture::new();
+    fixture.run(command, "=@Draft").unwrap();
+    let completed = fixture.wait(command);
+    let conflict = fixture
+        .run_with_boundary(command, "=@Draft", None, Some(TerminalTurnBoundary::Chat))
+        .expect_err("changing the output grammar is a different command");
+    assert!(conflict.message.contains("different experiment"));
+    assert_eq!(fixture.list().len(), 1);
+    assert_eq!(
+        fixture.run(command, "=@Draft").unwrap().output_document_id,
+        completed.output_document_id
+    );
+    let invalid = fixture
+        .run_with_boundary(
+            CommandId::new(),
+            "=@Draft",
+            None,
+            Some(TerminalTurnBoundary::Chat),
+        )
+        .expect_err("chat boundaries cannot silently change function expressions");
+    assert!(invalid.message.contains("plain prompt"));
 }

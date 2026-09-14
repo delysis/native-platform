@@ -22,6 +22,8 @@ pub(super) struct TerminalRun {
     source_document_id: String,
     #[serde(default)]
     presentation: Option<TerminalPresentation>,
+    #[serde(default)]
+    turn_boundary: Option<TerminalTurnBoundary>,
     title: String,
     output_document_id: Option<String>,
     output_relative_path: Option<String>,
@@ -37,6 +39,26 @@ pub(super) struct TerminalRun {
 pub(super) struct TerminalPresentation {
     pane_id: String,
     input: String,
+}
+
+/// The caller selects an output grammar independently of pane identity. A chat
+/// continuation ends before the next speaker label; the prompt remains raw.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum TerminalTurnBoundary {
+    Chat,
+}
+
+fn terminal_sampling(
+    command_id: CommandId,
+    step: u32,
+    boundary: Option<TerminalTurnBoundary>,
+) -> SamplingConfig {
+    let mut sampling = sampling_for_weave_case(command_id, step, 512, 0.8, WeavePreset::ManualV2);
+    if let Some(TerminalTurnBoundary::Chat) = boundary {
+        sampling.stop = vec!["\nUser:".into(), "\nAssistant:".into()];
+    }
+    sampling
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -294,6 +316,7 @@ pub(super) async fn terminal_run<R: Runtime>(
     expression: String,
     presentation: Option<TerminalPresentation>,
     context_references: Option<Vec<String>>,
+    turn_boundary: Option<TerminalTurnBoundary>,
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<TerminalRun, IpcFailure> {
@@ -324,6 +347,9 @@ pub(super) async fn terminal_run<R: Runtime>(
     if let Some(references) = &context_references {
         validate_explicit_references(references)?;
         fingerprint_bytes.extend(serde_json::to_vec(references).map_err(io_failure)?);
+    }
+    if let Some(boundary) = turn_boundary {
+        fingerprint_bytes.extend(serde_json::to_vec(&boundary).map_err(io_failure)?);
     }
     let fingerprint = BlobId::digest(&fingerprint_bytes);
     let admission = lock_application_admission(&state, "an experiment")?;
@@ -384,6 +410,9 @@ pub(super) async fn terminal_run<R: Runtime>(
             calls = 1;
         }
         NeuralCommand::Expression(expression) => {
+            if turn_boundary.is_some() {
+                return Err(failure("A chat turn boundary requires a plain prompt."));
+            }
             if context_references.is_some() {
                 return Err(failure(
                     "Explicit context belongs to a plain prompt, not a function expression.",
@@ -498,6 +527,7 @@ pub(super) async fn terminal_run<R: Runtime>(
             expression: entry,
             source_document_id: document_id.to_string(),
             presentation,
+            turn_boundary,
             output_document_id: None,
             output_relative_path: None,
             preview: String::new(),
@@ -791,12 +821,10 @@ impl Evaluator<'_> {
                     critic_environment_artifact_ids: Vec::new(),
                 })
                 .map_err(IpcFailure::store)?;
-            let sampling = sampling_for_weave_case(
+            let sampling = terminal_sampling(
                 parse_command_id(&self.receipt.run.run_id)?,
                 self.step,
-                512,
-                0.8,
-                WeavePreset::ManualV2,
+                self.receipt.run.turn_boundary,
             );
             let generation = GenerationStart {
                 run_id: GenerationRunId::new(),

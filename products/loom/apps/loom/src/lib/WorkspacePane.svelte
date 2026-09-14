@@ -16,6 +16,7 @@
   import TerminalPane from './TerminalPane.svelte';
   import SourceEditor from './SourceEditor.svelte';
   import { cancelTerminalRun, listTerminalRuns, normalizeFailure, runTerminal } from './ipc';
+  import { decodeVerseForEditor as decodeSourceForEditor, encodeVerseFromEditor as encodeSourceFromEditor } from './verseCodec';
   import { canUseVisualMarkdown } from './markdownSafety';
   import { newUlid } from './ulid';
   import { RetainedOutputLoader } from './retainedOutput';
@@ -73,6 +74,7 @@
   $: editingCurrent = !config.document || target?.document_id === source?.summary.document_id;
   $: editorKey = `${scope}/${source?.summary.document_id ?? ''}`;
   $: visual = selectVisual(value, editorKey);
+  $: sourceDecoded = decodeSourceForEditor(value);
   $: preview = mounted && config.kind === 'browser' ? previewUrl(projectId, sessionId, target, runs, documents) : '';
 
   export function flush(): boolean { return !composing && (editor?.flushPending() ?? true); }
@@ -177,6 +179,7 @@
         projectId, sessionId, commandId: newUlid(), documentId: current.summary.document_id,
         sourceRevisionId: current.summary.revision_id, expectedVisibleBlobId: current.visible_blob_id,
         sourceStartByte: 0, sourceEndByte: 0, ...preparedPrompt,
+        ...(config.kind === 'chat' ? { turnBoundary: 'chat' as const } : {}),
         presentation: { pane_id: paneId, input }
       };
       pending = request;
@@ -225,7 +228,6 @@
 
 {#if config.visible}
 <section class="workspace-pane" class:browser={config.kind === 'browser'} aria-label={config.title ?? config.kind} aria-busy={busy}>
-  {#if config.title}<header>{config.title}</header>{/if}
   {#if error && config.kind !== 'terminal'}<p class="error" role="alert">{error}{#if pending}<button on:click={() => void refresh()}>Check result</button>{/if}</p>{/if}
   {#if config.kind === 'editor'}
     {#if source && editingCurrent}
@@ -234,7 +236,7 @@
           {#if visual}
             <LoomEditor bind:this={editor} {value} {readonly} {onChange} onCompositionChange={setComposing} acceptImageAttachments={false} label={config.title ?? 'Pane editor'} onGhostPresentationRejected={() => {}} />
           {:else}
-            <SourceEditor element={undefined} {value} {readonly} label={config.title ?? 'Pane editor'} onValueInput={(area) => onChange(area.value)} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} />
+            <SourceEditor element={undefined} value={sourceDecoded.display} readonly={readonly || !sourceDecoded.codec.editable} verseNewline={sourceDecoded.codec.newline} label={config.title ?? 'Pane editor'} onValueInput={(area) => onChange(encodeSourceFromEditor(area.value, sourceDecoded.codec))} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} />
           {/if}
         {/key}
       </div>
@@ -272,7 +274,6 @@
 
 <style>
   .workspace-pane { display:flex; flex-direction:column; min-width:0; min-height:0; height:100%; overflow:hidden; color:inherit; }
-  header { font-size:.8rem; font-weight:600; padding:6px 9px; border-bottom:1px solid #8883; }
   .history,.editor { min-height:0; flex:1; overflow:auto; }
   .history { padding:6px 9px; }
   article { margin-bottom:12px; }

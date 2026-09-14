@@ -1,5 +1,5 @@
 import { defaultMarkdownParser, defaultMarkdownSerializer } from 'prosemirror-markdown';
-import { Plugin, PluginKey, TextSelection, type EditorState, type Transaction } from 'prosemirror-state';
+import { Plugin, PluginKey, NodeSelection, TextSelection, type EditorState, type Transaction } from 'prosemirror-state';
 import { Decoration, DecorationSet, type EditorView } from 'prosemirror-view';
 import {
   insertionPreservesExtendedGraphemeEdges,
@@ -276,13 +276,35 @@ export function visualCaretBoundaryProof(
   if (!visibleCaretIsExtendedGraphemeBoundary(state)) {
     return rejectedBoundary('grapheme_boundary_invalid');
   }
+  return serializedBoundaryProof(state, canonicalMarkdown, state.selection);
+}
+
+/** Node boundaries are structural, so they need byte identity rather than a prose-grapheme proof. */
+export function visualInlineNodeBoundaryProof(
+  state: EditorState,
+  canonicalMarkdown: string,
+  edge: 'from' | 'to'
+): VisualCaretBoundaryProof {
+  if (!(state.selection instanceof NodeSelection) || !state.selection.node.isInline) {
+    return rejectedBoundary('selection_not_text', 'Expected an inline node selection');
+  }
+  return serializedBoundaryProof(
+    state, canonicalMarkdown, TextSelection.create(state.doc, state.selection[edge])
+  );
+}
+
+function serializedBoundaryProof(
+  state: EditorState,
+  canonicalMarkdown: string,
+  selection: TextSelection
+): VisualCaretBoundaryProof {
   if (canonicalMarkdown.includes(CARET_BOUNDARY_WITNESS)) {
     return rejectedBoundary('witness_collision');
   }
 
   try {
     const witnessed = serializeVisualMarkdown(
-      state.tr.insertText(CARET_BOUNDARY_WITNESS).doc
+      state.tr.setSelection(selection).insertText(CARET_BOUNDARY_WITNESS).doc
     );
     const boundary = witnessed.indexOf(CARET_BOUNDARY_WITNESS);
     if (boundary < 0) return rejectedBoundary('witness_missing');

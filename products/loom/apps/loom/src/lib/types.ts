@@ -547,6 +547,7 @@ export interface ReconciliationPreview {
 }
 
 export interface TerminalRun {
+  turn_boundary?: 'chat' | null;
   source_document_id?: string;
   presentation?: { pane_id: string; input: string } | null;
   run_id: string;
@@ -561,6 +562,7 @@ export interface TerminalRun {
 }
 
 export interface TerminalRunRequest {
+  turnBoundary?: 'chat';
   contextReferences?: string[];
   presentation?: { pane_id: string; input: string };
   projectId: string;

@@ -66,6 +66,7 @@ describe('workspace panes', () => {
     await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
     expect(beforeRun).toHaveBeenCalledOnce();
     const request = ipc.run.mock.calls[0][0];
+    expect(request.turnBoundary).toBe('chat');
     expect(request.presentation).toEqual({ pane_id: 'conversation', input: 'Continue that idea' });
     expect(request.contextReferences).toEqual(['Draft.md', 'Voice notes', 'Draft']);
     expect(request.expression).toContain('Assistant: ' + fullAnswer);
@@ -105,6 +106,7 @@ describe('workspace panes', () => {
     await page.getByRole('textbox', { name: 'Page description' }).fill('A quiet reading page');
     await page.getByRole('button', { name: 'Run', exact: true }).click();
     await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
+    expect(ipc.run.mock.calls[0][0].turnBoundary).toBeUndefined();
     expect(ipc.run.mock.calls[0][0].contextReferences).toEqual(['Voice notes', 'Draft.md']);
     expect(ipc.run.mock.calls[0][0].expression).toContain('Write a complete static HTML page for: A quiet reading page');
     expect(ipc.run.mock.calls[0][0].presentation).toEqual({ pane_id: 'conversation', input: 'A quiet reading page' });
