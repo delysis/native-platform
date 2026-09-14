@@ -68,13 +68,14 @@ References: [Google desktop OAuth](https://developers.google.com/identity/protoc
 - Folder batches are bounded; hidden entries are skipped and symlinks/special files are rejected. Parser failures consume their source-byte grant. Each file's nested expansion and MIME members use Attachment's existing monotonic graph budget.
 - RTF currently supports ANSI Windows-1252 and Unicode text. Unsupported encodings, malformed groups, or malformed Unicode fail explicitly. Hidden destinations, field instructions, and embedded objects are omitted with partial coverage, never executed.
 - Slack/Claude files and URLs referenced inside imported material are not fetched automatically. A non-text export block is retained as inert metadata, not treated as a successfully imported media object.
-- Large sources retain their full bounded canonical text on disk. Loom's existing context and excerpt budgets remain authoritative and can refuse promotion of an oversized text projection.
+- Large sources retain their full bounded canonical text on disk. Loom's existing context budget selects a bounded middle-out projection and records whether insertion was complete; promotion fails when no context space remains.
 
 ## Verification
 
 Automated fixtures cover mailbox boundaries/MIME decoding/budgets, conversation
 roles and metadata, Unicode RTF/embedded-content rejection, bounded HTTP bodies,
 OAuth state/PKCE, endpoint/query confinement, folder dedupe and symlink refusal.
-The receipt alongside this document records the final commands and outcomes.
+The [validation receipt](turbo-danielle-validation.md) records the commands,
+outcomes, exact native bundle, and exercised interactions.
 Live Google consent, OS credential access, and account downloads require an
 actual configured OAuth client and account; fixture tests cannot prove them.

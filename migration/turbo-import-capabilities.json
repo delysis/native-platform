@@ -12,5 +12,9 @@
     "crates/services/information/crates/information-native-acquire",
     "products/loom"
   ],
-  "status": "implemented_pending_validation"
+  "status": "implemented_locally_validated",
+  "validation_receipt": "docs/imports/turbo-danielle-validation.md",
+  "remaining_acceptance": [
+    "Live Google consent, credential write/refresh/disconnect, account downloads, and multi-account pagination require an actual configured Desktop OAuth client and account authorization."
+  ]
 }
