@@ -114,6 +114,8 @@ tasks and vault settle. The native supervisor closes stdin before awaiting the
 child, including an unsolicited stop after failure, so a pending OS read cannot
 keep the worker process alive. A real child-process test keeps the parent's pipe
 open to exercise this boundary.
+Nonzero child exits remain failures in the supervisor, preserving retry backoff
+when a worker repeatedly fails during startup.
 
 Disappearing-message expiry is recorded at first receipt, before receiving the
 next event. Later group settings cannot extend an already recorded expiry.

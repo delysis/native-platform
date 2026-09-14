@@ -256,7 +256,14 @@ async fn process(
             result = Err(error);
         }
     }
-    let _ = child.wait().await;
+    let exit = child.wait().await;
+    if result.is_ok() {
+        result = match exit {
+            Ok(status) if status.success() => Ok(()),
+            Ok(_) => Err(std::io::Error::other("Signal worker exited unsuccessfully")),
+            Err(error) => Err(error),
+        };
+    }
     reader.abort();
     let _ = reader.await;
     for (_, reply) in pending {
@@ -388,4 +395,29 @@ pub(crate) fn resume<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
             )
             .await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_failed_child_exit_remains_a_failure_for_restart_backoff() {
+        // The Rust test harness rejects the worker's --store argument. This
+        // exercises a real nonzero child exit through the supervisor adapter.
+        let (_sender, mut requests) = mpsc::channel(1);
+        let observer: Observer = Arc::new(|_| {});
+        let result = process(
+            &std::env::current_exe().expect("test executable"),
+            Path::new("unused-test-store"),
+            &mut requests,
+            &observer,
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a failed worker must not reset restart backoff"
+        );
+    }
 }
