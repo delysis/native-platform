@@ -298,6 +298,23 @@ impl OperationLease {
         Ok(())
     }
 
+    /// Check every normal completion precondition before publication, retaining
+    /// the identity until the caller has attempted its final send.
+    pub fn terminal_for_publication(&self, terminal: TerminalClass) -> Result<(), RegistryError> {
+        let mut state = self.registry.lock()?;
+        let _released_slot = self.released.lock().map_err(|_| RegistryError::Poisoned)?;
+        let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
+        if record.phase != OperationPhase::Running
+            || record.terminal.is_some()
+            || !record.attempts.is_empty()
+        {
+            return Err(RegistryError::InvalidTransition);
+        }
+        record.terminal = Some(terminal);
+        record.phase = OperationPhase::Terminal;
+        Ok(())
+    }
+
     pub fn terminal_and_release(&self, terminal: TerminalClass) -> Result<(), RegistryError> {
         let mut state = self.registry.lock()?;
         let mut released_slot = self.released.lock().map_err(|_| RegistryError::Poisoned)?;

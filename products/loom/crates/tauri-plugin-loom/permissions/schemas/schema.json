@@ -295,10 +295,10 @@
       "type": "string",
       "oneOf": [
         {
-          "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
+          "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-audio-synthesize`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-terminal-run`\n- `allow-terminal-list`\n- `allow-terminal-cancel`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
           "type": "string",
           "const": "local-generation",
-          "markdownDescription": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`"
+          "markdownDescription": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-audio-synthesize`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-terminal-run`\n- `allow-terminal-list`\n- `allow-terminal-cancel`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`"
         },
         {
           "description": "Promote an explicitly selected private candidate into the active manuscript through Loom's source-bound store command.\n#### This permission set includes:\n\n- `allow-candidate-promote`",
@@ -313,10 +313,10 @@
           "markdownDescription": "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`"
         },
         {
-          "description": "Start, stop, or cancel a user-requested local microphone recording and its local speech-recognition request.\n#### This permission set includes:\n\n- `allow-speech-input-record-start`\n- `allow-speech-input-record-stop`\n- `allow-speech-input-record-cancel`\n- `allow-speech-input-cancel`",
+          "description": "Start, stop, or cancel a user-requested local microphone recording and its local speech-recognition request.\n#### This permission set includes:\n\n- `allow-speech-input-record-start`\n- `allow-audio-record-start`\n- `allow-audio-record-stop`\n- `allow-speech-input-record-stop`\n- `allow-speech-input-record-cancel`\n- `allow-speech-input-cancel`",
           "type": "string",
           "const": "microphone-capture",
-          "markdownDescription": "Start, stop, or cancel a user-requested local microphone recording and its local speech-recognition request.\n#### This permission set includes:\n\n- `allow-speech-input-record-start`\n- `allow-speech-input-record-stop`\n- `allow-speech-input-record-cancel`\n- `allow-speech-input-cancel`"
+          "markdownDescription": "Start, stop, or cancel a user-requested local microphone recording and its local speech-recognition request.\n#### This permission set includes:\n\n- `allow-speech-input-record-start`\n- `allow-audio-record-start`\n- `allow-audio-record-stop`\n- `allow-speech-input-record-stop`\n- `allow-speech-input-record-cancel`\n- `allow-speech-input-cancel`"
         },
         {
           "description": "Enables the application_close command without any pre-configured scope.",
@@ -401,6 +401,54 @@
           "type": "string",
           "const": "deny-attachment-ingest",
           "markdownDescription": "Denies the attachment_ingest command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the attachment_reveal_original command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-attachment-reveal-original",
+          "markdownDescription": "Enables the attachment_reveal_original command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the attachment_reveal_original command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-attachment-reveal-original",
+          "markdownDescription": "Denies the attachment_reveal_original command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the audio_record_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-audio-record-start",
+          "markdownDescription": "Enables the audio_record_start command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the audio_record_start command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-audio-record-start",
+          "markdownDescription": "Denies the audio_record_start command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the audio_record_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-audio-record-stop",
+          "markdownDescription": "Enables the audio_record_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the audio_record_stop command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-audio-record-stop",
+          "markdownDescription": "Denies the audio_record_stop command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the audio_synthesize command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-audio-synthesize",
+          "markdownDescription": "Enables the audio_synthesize command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the audio_synthesize command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-audio-synthesize",
+          "markdownDescription": "Denies the audio_synthesize command without any pre-configured scope."
         },
         {
           "description": "Enables the branch_body command without any pre-configured scope.",
@@ -689,6 +737,18 @@
           "type": "string",
           "const": "deny-document-export-choose",
           "markdownDescription": "Denies the document_export_choose command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the document_import_external command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-document-import-external",
+          "markdownDescription": "Enables the document_import_external command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the document_import_external command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-document-import-external",
+          "markdownDescription": "Denies the document_import_external command without any pre-configured scope."
         },
         {
           "description": "Enables the document_open command without any pre-configured scope.",
@@ -991,30 +1051,6 @@
           "markdownDescription": "Denies the model_unload command without any pre-configured scope."
         },
         {
-          "description": "Enables the project_choose_create command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-project-choose-create",
-          "markdownDescription": "Enables the project_choose_create command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the project_choose_create command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-project-choose-create",
-          "markdownDescription": "Denies the project_choose_create command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the project_choose_open command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-project-choose-open",
-          "markdownDescription": "Enables the project_choose_open command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the project_choose_open command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-project-choose-open",
-          "markdownDescription": "Denies the project_choose_open command without any pre-configured scope."
-        },
-        {
           "description": "Enables the project_close command without any pre-configured scope.",
           "type": "string",
           "const": "allow-project-close",
@@ -1025,6 +1061,18 @@
           "type": "string",
           "const": "deny-project-close",
           "markdownDescription": "Denies the project_close command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_commit_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-commit-open",
+          "markdownDescription": "Enables the project_commit_open command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_commit_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-commit-open",
+          "markdownDescription": "Denies the project_commit_open command without any pre-configured scope."
         },
         {
           "description": "Enables the project_current command without any pre-configured scope.",
@@ -1039,6 +1087,30 @@
           "markdownDescription": "Denies the project_current command without any pre-configured scope."
         },
         {
+          "description": "Enables the project_discard_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-discard-open",
+          "markdownDescription": "Enables the project_discard_open command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_discard_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-discard-open",
+          "markdownDescription": "Denies the project_discard_open command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_drop_directories command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-drop-directories",
+          "markdownDescription": "Enables the project_drop_directories command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_drop_directories command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-drop-directories",
+          "markdownDescription": "Denies the project_drop_directories command without any pre-configured scope."
+        },
+        {
           "description": "Enables the project_open_default command without any pre-configured scope.",
           "type": "string",
           "const": "allow-project-open-default",
@@ -1051,6 +1123,30 @@
           "markdownDescription": "Denies the project_open_default command without any pre-configured scope."
         },
         {
+          "description": "Enables the project_prepare_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-prepare-open",
+          "markdownDescription": "Enables the project_prepare_open command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_prepare_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-prepare-open",
+          "markdownDescription": "Denies the project_prepare_open command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the project_prepare_open_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-project-prepare-open-path",
+          "markdownDescription": "Enables the project_prepare_open_path command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the project_prepare_open_path command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-project-prepare-open-path",
+          "markdownDescription": "Denies the project_prepare_open_path command without any pre-configured scope."
+        },
+        {
           "description": "Enables the project_recover command without any pre-configured scope.",
           "type": "string",
           "const": "allow-project-recover",
@@ -1061,6 +1157,18 @@
           "type": "string",
           "const": "deny-project-recover",
           "markdownDescription": "Denies the project_recover command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the shader_preview command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-shader-preview",
+          "markdownDescription": "Enables the shader_preview command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the shader_preview command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-shader-preview",
+          "markdownDescription": "Denies the shader_preview command without any pre-configured scope."
         },
         {
           "description": "Enables the speech_input_cancel command without any pre-configured scope.",
@@ -1147,6 +1255,42 @@
           "markdownDescription": "Denies the suggestions_set command without any pre-configured scope."
         },
         {
+          "description": "Enables the terminal_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-terminal-cancel",
+          "markdownDescription": "Enables the terminal_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the terminal_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-terminal-cancel",
+          "markdownDescription": "Denies the terminal_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the terminal_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-terminal-list",
+          "markdownDescription": "Enables the terminal_list command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the terminal_list command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-terminal-list",
+          "markdownDescription": "Denies the terminal_list command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the terminal_run command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-terminal-run",
+          "markdownDescription": "Enables the terminal_run command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the terminal_run command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-terminal-run",
+          "markdownDescription": "Denies the terminal_run command without any pre-configured scope."
+        },
+        {
           "description": "Enables the weave_start command without any pre-configured scope.",
           "type": "string",
           "const": "allow-weave-start",
@@ -1171,16 +1315,40 @@
           "markdownDescription": "Denies the weave_status command without any pre-configured scope."
         },
         {
+          "description": "Enables the workspace_template_enable command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-workspace-template-enable",
+          "markdownDescription": "Enables the workspace_template_enable command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_template_enable command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-workspace-template-enable",
+          "markdownDescription": "Denies the workspace_template_enable command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the workspace_template_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-workspace-template-get",
+          "markdownDescription": "Enables the workspace_template_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the workspace_template_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-workspace-template-get",
+          "markdownDescription": "Denies the workspace_template_get command without any pre-configured scope."
+        },
+        {
           "description": "Explicit read-only account authorization and imports, with credentials in the OS credential store.",
           "type": "string",
           "const": "connected-import",
           "markdownDescription": "Explicit read-only account authorization and imports, with credentials in the OS credential store."
         },
         {
-          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
+          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-prepare-open-path`\n- `allow-project-drop-directories`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-attachment-reveal-original`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
+          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-prepare-open-path`\n- `allow-project-drop-directories`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-attachment-reveal-original`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
         }
       ]
     }

@@ -591,7 +591,7 @@ impl SpeechHost {
                         &mut backend_events,
                         &mut backend_terminal,
                     );
-                    let finalized = executor.finish_backend(terminal_for_result(&result));
+                    let finalized = executor.terminalize(terminal_for_result(&result), true);
                     let delivered = match &finalized {
                         Ok(finished) if finished.cancellation_requested => {
                             Err(request_cancelled_error(
@@ -610,9 +610,11 @@ impl SpeechHost {
                     );
                     let terminal_delivered = send_transcription_terminal(&event_sender, terminal);
                     let _consumer_gone = final_sender.send(delivered).is_err();
+                    let released = if finalized.is_ok() { executor.release_terminal() } else { Ok(()) };
                     finalized
                         .map(|_| ())
                         .map_err(|error| error.to_string())
+                        .and(released.map_err(|error| error.to_string()))
                         .and(terminal_delivered)
                 }
                 FinalOutcome::Cancelled => {
@@ -630,9 +632,9 @@ impl SpeechHost {
                         &mut backend_events_open,
                     )
                     .await;
-                    let finalized = executor.finish(operation_lifecycle::TerminalClass::Cancelled);
+                    let finalized = executor.terminalize(operation_lifecycle::TerminalClass::Cancelled, false);
                     let delivered = match &finalized {
-                        Ok(()) => Err(cancellation_error),
+                        Ok(_) => Err(cancellation_error),
                         Err(error) => Err(lifecycle_speech_error(&monitor_request_id, error)),
                     };
                     let terminal = transcription_terminal_event(
@@ -643,8 +645,11 @@ impl SpeechHost {
                     let terminal_delivered =
                         send_transcription_terminal(&event_sender, terminal);
                     let _consumer_gone = final_sender.send(delivered).is_err();
+                    let released = if finalized.is_ok() { executor.release_terminal() } else { Ok(()) };
                     finalized
+                        .map(|_| ())
                         .map_err(|registry_error| registry_error.to_string())
+                        .and(released.map_err(|error| error.to_string()))
                         .and(terminal_delivered)
                 }
                 FinalOutcome::TimedOut(kind) => {
@@ -930,7 +935,7 @@ impl SpeechHost {
                         &mut backend_events,
                         &mut backend_terminal,
                     );
-                    let finalized = executor.finish_backend(terminal_for_result(&result));
+                    let finalized = executor.terminalize(terminal_for_result(&result), true);
                     let delivered = match &finalized {
                         Ok(finished) if finished.cancellation_requested => {
                             Err(request_cancelled_error(
@@ -946,9 +951,11 @@ impl SpeechHost {
                         synthesis_terminal_event(&monitor_request_id, &delivered, backend_terminal);
                     let terminal_delivered = send_synthesis_terminal(&event_sender, terminal);
                     let _consumer_gone = final_sender.send(delivered).is_err();
+                    let released = if finalized.is_ok() { executor.release_terminal() } else { Ok(()) };
                     finalized
                         .map(|_| ())
                         .map_err(|error| error.to_string())
+                        .and(released.map_err(|error| error.to_string()))
                         .and(terminal_delivered)
                 }
                 FinalOutcome::Cancelled => {
@@ -966,9 +973,9 @@ impl SpeechHost {
                         &mut backend_events_open,
                     )
                     .await;
-                    let finalized = executor.finish(operation_lifecycle::TerminalClass::Cancelled);
+                    let finalized = executor.terminalize(operation_lifecycle::TerminalClass::Cancelled, false);
                     let delivered = match &finalized {
-                        Ok(()) => Err(cancellation_error),
+                        Ok(_) => Err(cancellation_error),
                         Err(error) => Err(lifecycle_speech_error(&monitor_request_id, error)),
                     };
                     let terminal = synthesis_terminal_event(
@@ -978,8 +985,11 @@ impl SpeechHost {
                     );
                     let terminal_delivered = send_synthesis_terminal(&event_sender, terminal);
                     let _consumer_gone = final_sender.send(delivered).is_err();
+                    let released = if finalized.is_ok() { executor.release_terminal() } else { Ok(()) };
                     finalized
+                        .map(|_| ())
                         .map_err(|registry_error| registry_error.to_string())
+                        .and(released.map_err(|error| error.to_string()))
                         .and(terminal_delivered)
                 }
                 FinalOutcome::TimedOut(kind) => {
@@ -2820,6 +2830,34 @@ impl ExecutorOperation {
         self.finish_inner(terminal, true)
     }
 
+    fn terminalize(
+        &mut self,
+        terminal: operation_lifecycle::TerminalClass,
+        cancellation_wins: bool,
+    ) -> Result<operation_lifecycle::OperationSnapshot, operation_lifecycle::RegistryError> {
+        let attempt = self
+            .attempt
+            .as_ref()
+            .ok_or(operation_lifecycle::RegistryError::Stale)?;
+        let snapshot = self
+            .operation
+            .finish_attempt_terminal(attempt, terminal, cancellation_wins)
+            .inspect_err(|_| self.lifecycle.mark_faulted())?;
+        self.attempt.take();
+        Ok(snapshot)
+    }
+
+    fn release_terminal(&mut self) -> Result<(), operation_lifecycle::RegistryError> {
+        self.operation
+            .release()
+            .inspect_err(|_| self.lifecycle.mark_faulted())?;
+        self.lifecycle
+            .release_route(&self.request_id, &self.operation.identity())
+            .map_err(|_| operation_lifecycle::RegistryError::StateUnavailable)?;
+        self.finished = true;
+        Ok(())
+    }
+
     fn finish_inner(
         &mut self,
         terminal: operation_lifecycle::TerminalClass,
@@ -2851,12 +2889,15 @@ impl ExecutorOperation {
 
 impl Drop for ExecutorOperation {
     fn drop(&mut self) {
-        if !self.finished
-            && self
-                .cancel_and_finish(operation_lifecycle::TerminalClass::Cancelled)
-                .is_err()
-        {
-            self.lifecycle.mark_faulted();
+        if !self.finished {
+            let result = if self.attempt.is_none() {
+                self.release_terminal()
+            } else {
+                self.cancel_and_finish(operation_lifecycle::TerminalClass::Cancelled)
+            };
+            if result.is_err() {
+                self.lifecycle.mark_faulted();
+            }
         }
     }
 }

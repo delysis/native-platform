@@ -76,5 +76,16 @@
     "The required PR workflow passed in 19 minutes; its timing did not block local W10 work.",
     "Linux and Windows are informational compatibility follow-ups.",
     "Signing, notarization, stable releases, and source-repository retirement are W10 work."
+  ],
+  "corrections": [
+    {
+      "recorded_at": "2026-09-09",
+      "field": "shipping.research_file_retained",
+      "original": "products/loom/crates/loom-store/src/research_admission.rs",
+      "corrected": "products/loom/crates/loom-research-types/src/manifest_tests.rs",
+      "verified_commit": "7cd3627683061f9f51a56b4d61a73c3767819d30",
+      "basis": "git ls-tree at the recorded implementation commit; orphaned test source, not an active store boundary",
+      "scope": "Corrects attribution only; does not rerun the original census or acceptance."
+    }
   ]
 }

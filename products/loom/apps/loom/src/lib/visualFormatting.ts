@@ -4,7 +4,6 @@ import {
   toggleMark,
   wrapIn
 } from 'prosemirror-commands';
-import { defaultMarkdownSerializer, schema } from 'prosemirror-markdown';
 import type { Node as ProseMirrorNode } from 'prosemirror-model';
 import { liftListItem, wrapInList } from 'prosemirror-schema-list';
 import {
@@ -15,7 +14,7 @@ import {
   type EditorState,
   type Transaction
 } from 'prosemirror-state';
-import { parseVisualMarkdown } from './markdownSafety';
+import { parseVisualMarkdown, serializeVisualMarkdown } from './markdownSafety';
 
 export type VisualBlockStyle = 'body' | 'title' | 'heading' | 'subheading';
 export type VisualFormatAction =
@@ -83,7 +82,7 @@ function selectedStructures(state: EditorState, nodeName: string): SelectedStruc
 
 function unwrappedContent(node: ProseMirrorNode): readonly ProseMirrorNode[] {
   const blocks: ProseMirrorNode[] = [];
-  if (node.type === schema.nodes.bullet_list || node.type === schema.nodes.ordered_list) {
+  if (node.type === node.type.schema.nodes.bullet_list || node.type === node.type.schema.nodes.ordered_list) {
     node.forEach((item) => item.forEach((block) => blocks.push(block)));
   } else {
     node.forEach((block) => blocks.push(block));
@@ -201,7 +200,7 @@ function withTrimmedInlineSelection(command: Command): Command {
 }
 
 function activeMark(state: EditorState, markName: 'strong' | 'em' | 'link') {
-  const mark = schema.marks[markName];
+  const mark = state.schema.marks[markName];
   if (state.selection.empty) {
     return (state.storedMarks ?? state.selection.$from.marks())
       .find((candidate) => candidate.type === mark) ?? null;
@@ -216,7 +215,7 @@ function activeMark(state: EditorState, markName: 'strong' | 'em' | 'link') {
 
 export function visualFormatState(state: EditorState): VisualFormatState {
   const parent = state.selection.$from.parent;
-  const level = parent.type === schema.nodes.heading ? Number(parent.attrs.level) : 0;
+  const level = parent.type === state.schema.nodes.heading ? Number(parent.attrs.level) : 0;
   const link = activeMark(state, 'link');
   return {
     block: level === 1 ? 'title' : level === 2 ? 'heading' : level === 3 ? 'subheading' : 'body',
@@ -231,6 +230,7 @@ export function visualFormatState(state: EditorState): VisualFormatState {
 }
 
 function listCommand(state: EditorState, ordered: boolean): Command {
+  const schema = state.schema;
   const activeName = ordered ? 'ordered_list' : 'bullet_list';
   const command = structureIsActive(state, activeName)
     ? unwrapWithFallback(liftListItem(schema.nodes.list_item), activeName)
@@ -246,6 +246,7 @@ export function visualFormatCommand(
   action: VisualFormatAction,
   href = ''
 ): Command | null {
+  const schema = state.schema;
   switch (action) {
     case 'body': return setBlockType(schema.nodes.paragraph);
     case 'title': return setBlockType(schema.nodes.heading, { level: 1 });
@@ -295,8 +296,8 @@ export function applyVisualFormat(
   if (!command(state, (next) => { transaction = next; })) return false;
   if (!transaction) return false;
   const nextState = state.apply(transaction);
-  const markdown = defaultMarkdownSerializer.serialize(nextState.doc);
-  if (!parseVisualMarkdown(markdown).eq(nextState.doc)) return false;
+  const markdown = serializeVisualMarkdown(nextState.doc);
+  if (!parseVisualMarkdown(markdown, nextState.schema).eq(nextState.doc)) return false;
   dispatch(transaction);
   return true;
 }

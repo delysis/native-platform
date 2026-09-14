@@ -5,6 +5,8 @@ import {
   completionSessionMatchesPresentation,
   consumeCompletionText,
   cycleCompletionSession,
+  compatibleCompletionPresentations,
+  mergeCompatibleCompletionCandidates,
   insertAtUtf8Boundary,
   removeBeforeUtf8Boundary,
   selectedCompletionCandidate,
@@ -185,7 +187,8 @@ export function setDismissedCompletionCandidates(
 export function reconcileCompletionController(
   state: CompletionControllerState,
   contextKey: string,
-  family: readonly InlineGhostSuggestion[]
+  family: readonly InlineGhostSuggestion[],
+  forkAtCurrentCaret = false
 ): CompletionControllerState {
   let session = state.session;
   let pendingText = state.pendingText;
@@ -197,11 +200,11 @@ export function reconcileCompletionController(
     if (!session && family.length > 0) {
       session = startCompletionSession(contextKey, family, family[0].runId);
     } else if (session) {
-      session = synchronizeCompletionCandidates(session, family);
+      session = synchronizeCompletionCandidates(session, family, forkAtCurrentCaret && pendingText === null);
       if (!session) pendingText = null;
     }
   }
-  const activeFamily = completionActiveFamily(session, pendingText, family);
+  const activeFamily = completionActiveFamily(session, pendingText, family, forkAtCurrentCaret);
   const activeRunId = activeFamily.length > 0 &&
       !activeFamily.some((candidate) => candidate.runId === state.activeRunId)
     ? activeFamily[0].runId
@@ -217,10 +220,11 @@ export function reconcileCompletionController(
 export function completionControllerView(
   state: CompletionControllerState,
   contextKey: string,
-  baseFamily: readonly InlineGhostSuggestion[]
+  baseFamily: readonly InlineGhostSuggestion[],
+  sharedPrefixAlternatives = false
 ): CompletionControllerView {
   const boundSession = state.session?.contextKey === contextKey ? state.session : null;
-  const activeFamily = completionActiveFamily(boundSession, state.pendingText, baseFamily);
+  const activeFamily = completionActiveFamily(boundSession, state.pendingText, baseFamily, sharedPrefixAlternatives);
   const selected = activeFamily.find((candidate) => candidate.runId === state.activeRunId) ??
     activeFamily[0] ?? null;
   const witnessSelected = boundSession
@@ -244,15 +248,27 @@ export function completionControllerView(
 function completionActiveFamily(
   session: CompletionSession | null,
   pendingText: string | null,
-  baseFamily: readonly InlineGhostSuggestion[]
+  baseFamily: readonly InlineGhostSuggestion[],
+  sharedPrefixAlternatives = false
 ): InlineGhostSuggestion[] {
   if (pendingText !== null) return [];
   if (!session) return [...baseFamily];
   if (session.acceptedChunks.length === 0) {
     return session.candidates as InlineGhostSuggestion[];
   }
+  if (sharedPrefixAlternatives) return compatibleCompletionPresentations(session);
   const presentation = completionPresentation(session) as InlineGhostSuggestion | null;
   return presentation ? [presentation] : [];
+}
+
+export function refreshCompatibleCompletionFamily(
+  state: CompletionControllerState,
+  expected: CompletionSession,
+  candidates: readonly InlineGhostSuggestion[]
+): CompletionControllerState {
+  if (state.session !== expected || state.pendingText !== null) return state;
+  const session = mergeCompatibleCompletionCandidates(expected, candidates);
+  return session === expected ? state : { ...state, session };
 }
 
 export function refreshCompletionCandidate(
@@ -260,10 +276,11 @@ export function refreshCompletionCandidate(
   expected: CompletionSession,
   runId: string,
   text: string,
-  presentationKey: string
+  presentationKey: string,
+  allowFrozenAppend = false
 ): CompletionControllerState {
   if (state.session !== expected) return state;
-  const session = updateCompletionCandidate(expected, runId, text, presentationKey);
+  const session = updateCompletionCandidate(expected, runId, text, presentationKey, allowFrozenAppend);
   if (session === state.session) return state;
   return {
     ...state,
@@ -387,10 +404,11 @@ export function authorizeCompletionUnconsume(
 export function cycleCompletion(
   state: CompletionControllerState,
   family: readonly InlineGhostSuggestion[],
-  offset: number
+  offset: number,
+  sharedPrefixAlternatives = false
 ): CompletionControllerTransition {
   if (state.session) {
-    const session = cycleCompletionSession(state.session, offset);
+    const session = cycleCompletionSession(state.session, offset, sharedPrefixAlternatives);
     if (session === state.session) return { state, effects: [] };
     const index = session.candidates.findIndex(
       (candidate) => candidate.runId === session.selectedRunId

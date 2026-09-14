@@ -88,9 +88,9 @@ pub fn server_configure(
     ))
 }
 
-pub fn server_status() -> Result<CommandResult<ServerStatus>> {
+pub fn server_status(scope: &crate::OperationScope) -> Result<CommandResult<ServerStatus>> {
     let settings = resolve_settings()?;
-    let slots = resident_slots();
+    let slots = resident_slots(scope);
     let active_sequences = slots.iter().map(|slot| slot.status.active_sequences).sum();
     let resident_model_bytes = slots.iter().map(|slot| slot.reserved_bytes).sum();
     Ok(CommandResult::passed(
@@ -120,9 +120,9 @@ pub fn server_status() -> Result<CommandResult<ServerStatus>> {
     ))
 }
 
-pub fn server_start() -> Result<CommandResult<ServerStatus>> {
+pub fn server_start(scope: &crate::OperationScope) -> Result<CommandResult<ServerStatus>> {
     let settings = resolve_settings()?;
-    let handle = match resident_model(&settings) {
+    let handle = match resident_model(scope, &settings) {
         Ok(handle) => handle,
         Err(blocked) => {
             return Ok(CommandResult::blocked(
@@ -140,9 +140,9 @@ pub fn server_start() -> Result<CommandResult<ServerStatus>> {
             configured: true,
             running: true,
             transport: "in_process".to_string(),
-            resident_models: resident_slots().len(),
+            resident_models: resident_slots(scope).len(),
             active_sequences: status.active_sequences,
-            resident_model_bytes: resident_slots()
+            resident_model_bytes: resident_slots(scope)
                 .iter()
                 .map(|slot| slot.reserved_bytes)
                 .sum(),
@@ -162,9 +162,9 @@ pub fn server_start() -> Result<CommandResult<ServerStatus>> {
     ))
 }
 
-pub fn server_stop() -> Result<CommandResult<ServerStatus>> {
+pub fn server_stop(scope: &crate::OperationScope) -> Result<CommandResult<ServerStatus>> {
     let settings = resolve_settings()?;
-    unload_resident_model();
+    unload_resident_model(scope);
     Ok(CommandResult::passed(
         "mom_llama.server_stop",
         "contracted",
@@ -187,8 +187,8 @@ pub fn server_stop() -> Result<CommandResult<ServerStatus>> {
     ))
 }
 
-pub fn model_slot_list() -> Result<CommandResult<Vec<ModelSlot>>> {
-    let slots = resident_slots()
+pub fn model_slot_list(scope: &crate::OperationScope) -> Result<CommandResult<Vec<ModelSlot>>> {
+    let slots = resident_slots(scope)
         .into_iter()
         .map(|slot| ModelSlot {
             slot_id: slot.slot_id,
@@ -216,7 +216,11 @@ pub fn model_slot_list() -> Result<CommandResult<Vec<ModelSlot>>> {
     ))
 }
 
-pub fn model_slot_load(slot_id: usize, model_path: PathBuf) -> Result<CommandResult<ModelSlot>> {
+pub fn model_slot_load(
+    scope: &crate::OperationScope,
+    slot_id: usize,
+    model_path: PathBuf,
+) -> Result<CommandResult<ModelSlot>> {
     if let Err(blocked) = validate_model_path(&model_path) {
         return Ok(CommandResult::blocked(
             "mom_llama.model_slot_load",
@@ -233,7 +237,7 @@ pub fn model_slot_load(slot_id: usize, model_path: PathBuf) -> Result<CommandRes
         .result
         .unwrap_or(settings);
     }
-    let handle = match resident_model_for_slot(&settings, slot_id, Some(&model_path)) {
+    let handle = match resident_model_for_slot(scope, &settings, slot_id, Some(&model_path)) {
         Ok(handle) => handle,
         Err(blocked) => {
             return Ok(CommandResult::blocked(
@@ -247,7 +251,7 @@ pub fn model_slot_load(slot_id: usize, model_path: PathBuf) -> Result<CommandRes
     let model_bytes = std::fs::metadata(&model_path)
         .map(|metadata| metadata.len())
         .unwrap_or_default();
-    let reserved_bytes = resident_slots()
+    let reserved_bytes = resident_slots(scope)
         .into_iter()
         .find(|slot| slot.slot_id == slot_id)
         .map(|slot| slot.reserved_bytes)
@@ -272,8 +276,11 @@ pub fn model_slot_load(slot_id: usize, model_path: PathBuf) -> Result<CommandRes
     ))
 }
 
-pub fn model_slot_unload(slot_id: usize) -> Result<CommandResult<ModelSlot>> {
-    unload_resident_slot(slot_id);
+pub fn model_slot_unload(
+    scope: &crate::OperationScope,
+    slot_id: usize,
+) -> Result<CommandResult<ModelSlot>> {
+    unload_resident_slot(scope, slot_id);
     Ok(CommandResult::passed(
         "mom_llama.model_slot_unload",
         "contracted",

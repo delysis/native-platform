@@ -22,20 +22,30 @@ pub(crate) fn normalize_document_path(path: &Path) -> Result<String> {
     }
 
     let mut components = Vec::new();
-    for component in path.components() {
+    let mut path_components = path.components().peekable();
+    while let Some(component) = path_components.next() {
         let Component::Normal(component) = component else {
             return Err(StoreError::UnsafeRelativePath(path.display().to_string()));
         };
         let component = component
             .to_str()
             .ok_or_else(|| StoreError::NonUtf8Path(path.to_path_buf()))?;
-        if component == ".loom" {
+        // Dot-prefixed Markdown leaves are ordinary, explicitly opened writing
+        // (including .loom.md). Hidden directories remain outside this authority.
+        let hidden_markdown_leaf = path_components.peek().is_none()
+            && matches!(
+                Path::new(component)
+                    .extension()
+                    .and_then(|ext| ext.to_str()),
+                Some("md" | "markdown")
+            );
+        if component.starts_with('.') && !hidden_markdown_leaf {
             return Err(StoreError::UnsafeRelativePath(path.display().to_string()));
         }
         components.push(component.to_owned());
     }
 
-    if components.len() < 2 || components.first().map(String::as_str) != Some("manuscript") {
+    if components.is_empty() {
         return Err(StoreError::UnsafeRelativePath(path.display().to_string()));
     }
     Ok(components.join("/"))
@@ -46,7 +56,16 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
+    ensure_private_storage_supported()?;
     ensure_directory_with_policy(path, DirectoryPolicy::Private)
+}
+
+pub(crate) const fn ensure_private_storage_supported() -> Result<()> {
+    if cfg!(unix) {
+        Ok(())
+    } else {
+        Err(StoreError::UnsupportedStoragePlatform)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -153,14 +172,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn document_paths_are_confined_to_manuscript() {
+    fn document_paths_are_confined_to_ordinary_files_in_the_folder() {
         assert_eq!(
             normalize_document_path(Path::new("manuscript/poems/one.txt")).expect("valid path"),
             "manuscript/poems/one.txt"
         );
         assert!(normalize_document_path(Path::new("../secret")).is_err());
         assert!(normalize_document_path(Path::new(".loom/project.json")).is_err());
-        assert!(normalize_document_path(Path::new("assets/image.png")).is_err());
+        assert_eq!(
+            normalize_document_path(Path::new("Notes.md")).unwrap(),
+            "Notes.md"
+        );
+        assert!(normalize_document_path(Path::new("notes/.git/config")).is_err());
+        assert!(normalize_document_path(Path::new(".hidden.md/notes.md")).is_err());
+        assert!(normalize_document_path(Path::new(".env")).is_err());
+        for path in [".loom.md", "templates/.voice.markdown"] {
+            assert_eq!(normalize_document_path(Path::new(path)).unwrap(), path);
+        }
         assert!(normalize_document_path(Path::new("manuscript\\escape.md")).is_err());
     }
 

@@ -144,10 +144,12 @@ describe('synthetic autocomplete disposition to acceptance flow', () => {
     expect(available.kind).toBe('available');
     if (available.kind !== 'available') throw new Error('expected verified replacement');
 
-    let accepted: { candidateId: string; presentationKey: string } | null = null;
+    let accepted: { candidateId: string; presentationKey: string; text: string } | null = null;
     const plugin = createGhostTextPlugin({
-      accept: (candidateId, presentationKey) => {
-        accepted = { candidateId, presentationKey };
+      accept: () => false,
+      insert: (candidateId, presentationKey, text, action) => {
+        expect(action).toBe('inline_tab');
+        accepted = { candidateId, presentationKey, text };
         return true;
       },
       dismiss() {},
@@ -174,7 +176,8 @@ describe('synthetic autocomplete disposition to acceptance flow', () => {
       presentationKey: available.suggestion.presentationKey,
       surfaceKey: 'project:document:revision:visual',
       anchorByteOffset: available.suggestion.targetByte,
-      text: available.suggestion.text
+      text: available.suggestion.text,
+      insertsOnAccept: true
     });
 
     const handled = plugin.props.handleKeyDown?.call(plugin, view, {
@@ -189,8 +192,9 @@ describe('synthetic autocomplete disposition to acceptance flow', () => {
     expect(handled).toBe(true);
     expect(accepted).toEqual({
       candidateId: 'candidate-clean',
-      presentationKey: `candidate-clean:${clean.body.blobId}`
+      presentationKey: `candidate-clean:${clean.body.blobId}`,
+      text: ','
     });
-    expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(manuscriptBefore);
+    expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(`${manuscriptBefore},`);
   });
 });

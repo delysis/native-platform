@@ -9,7 +9,8 @@ publish = false
 
 [lib]
 name = "loom_app_lib"
-crate-type = ["lib", "cdylib", "staticlib"]
+# Desktop binaries link the Rust library directly. No C ABI/mobile artifact is consumed.
+crate-type = ["rlib"]
 
 [[bin]]
 name = "loom-app"

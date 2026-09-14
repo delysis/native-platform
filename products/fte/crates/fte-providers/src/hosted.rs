@@ -309,6 +309,8 @@ impl HostedProviderBackend {
         secrets: Arc<dyn SecretResolver>,
     ) -> Result<Self, GatewayError> {
         let client = reqwest::Client::builder()
+            // Provider credentials and prompts are authorized for this endpoint only.
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(config.connect_timeout)
             .timeout(config.request_timeout)
             .pool_idle_timeout(Duration::from_secs(90))
@@ -3701,6 +3703,116 @@ mod tests {
         CachePolicy, DeadlinePolicy, GenerationInput, ModelSelector, PrivacyPolicy, ResponseFormat,
         RoutingPolicy, SamplingOptions, StoragePolicy, StreamPolicy, ToolPolicy,
     };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct FixtureSecrets;
+
+    async fn read_fixture_request(socket: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 1024];
+            let count = socket.read(&mut chunk).await.expect("fixture request");
+            assert!(count > 0, "request ended early");
+            request.extend_from_slice(&chunk[..count]);
+            assert!(request.len() <= 16384, "fixture request exceeds bound");
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let headers = std::str::from_utf8(&request[..end]).expect("HTTP headers");
+                let length = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map_or(0, |(_, value)| {
+                        value.trim().parse::<usize>().expect("body length")
+                    });
+                if request.len() >= end + 4 + length {
+                    return;
+                }
+            }
+        }
+    }
+
+    impl SecretResolver for FixtureSecrets {
+        fn resolve(&self, _: &str) -> Result<Option<String>, GatewayError> {
+            Ok(Some("synthetic-redirect-secret".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn hosted_requests_never_follow_redirects() {
+        for status in [301, 302, 303, 307, 308] {
+            for auth in [
+                HostedAuth::Bearer,
+                HostedAuth::Header {
+                    name: "x-api-key".into(),
+                    prefix: String::new(),
+                },
+                HostedAuth::Header {
+                    name: "x-goog-api-key".into(),
+                    prefix: String::new(),
+                },
+            ] {
+                let source = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("source");
+                let sink = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("sink");
+                let source_addr = source.local_addr().expect("source address");
+                let sink_addr = sink.local_addr().expect("sink address");
+                let reached = Arc::new(AtomicBool::new(false));
+                let observed = Arc::clone(&reached);
+                let sink_task = tokio::spawn(async move {
+                    let (mut socket, _) = sink.accept().await.expect("sink accept");
+                    observed.store(true, Ordering::SeqCst);
+                    read_fixture_request(&mut socket).await;
+                    socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.expect("sink response");
+                });
+                let source_task = tokio::spawn(async move {
+                    let (mut socket, _) = source.accept().await.expect("source accept");
+                    read_fixture_request(&mut socket).await;
+                    let response = format!(
+                        "HTTP/1.1 {status} Redirect\r\nLocation: http://{sink_addr}/sink\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    socket
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("redirect response");
+                });
+                let mut config = HostedProviderConfig::openai_compatible(
+                    "provider",
+                    "Fixture",
+                    "fixture",
+                    format!("http://{source_addr}/chat"),
+                    Vec::new(),
+                );
+                config.auth = auth;
+                let backend =
+                    HostedProviderBackend::new(config, Arc::new(FixtureSecrets)).expect("backend");
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    backend.execute(request(GenerationInput::Chat {
+                        items: vec![fte_types::InputItem::Message {
+                            id: None,
+                            role: fte_types::MessageRole::User,
+                            content: vec![fte_types::ContentBlock::Text {
+                                text: "private fixture prompt".into(),
+                            }],
+                        }],
+                    })),
+                )
+                .await
+                .expect("bounded request");
+                source_task.await.expect("source task");
+                sink_task.abort();
+                let _ = sink_task.await;
+                assert!(result.is_err(), "redirect must be rejected");
+                assert!(
+                    !reached.load(Ordering::SeqCst),
+                    "followed HTTP {status} redirect"
+                );
+            }
+        }
+    }
 
     fn request(input: GenerationInput) -> BackendRequest {
         BackendRequest {

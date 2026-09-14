@@ -1337,6 +1337,32 @@ fn display_error(error: impl std::fmt::Display) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_private_storage_preserves_the_product_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "mom-information-unsupported-{}",
+            InstallationId::new()
+        ));
+        let error = match MomInformation::open(&root) {
+            Ok(_) => panic!("unsupported private store opened"),
+            Err(error) => error,
+        };
+        assert!(error.contains("unsupported"));
+        assert!(!root.exists());
+        std::fs::create_dir(&root).expect("fixture directory");
+        let source = root.join("preserved.db");
+        std::fs::write(&source, b"existing source").expect("fixture source");
+        assert!(MomInformation::open(&root).is_err());
+        assert_eq!(
+            std::fs::read(&source).expect("source remains"),
+            b"existing source"
+        );
+        assert_eq!(std::fs::read_dir(&root).expect("directory").count(), 1);
+        std::fs::remove_file(source).expect("remove fixture");
+        std::fs::remove_dir(root).expect("remove fixture directory");
+    }
+
     fn create_alexandria_fixture(path: &Path) {
         let connection = rusqlite::Connection::open(path).expect("open Alexandria fixture");
         connection
@@ -1419,6 +1445,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn path_grants_are_opaque_single_use_and_expire() {
         let information = MomInformation::empty_for_tests();
         let expected_path = std::env::temp_dir().join("alexandria.db");
@@ -1450,6 +1477,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn path_grants_reject_relative_picker_results() {
         let information = MomInformation::empty_for_tests();
         let relative_path = PathBuf::from("alexandria.db");
@@ -1489,6 +1517,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn denied_rights_never_consume_a_native_path_grant() {
         let information = MomInformation::empty_for_tests();
         let expected_path = std::env::temp_dir().join("alexandria.db");
@@ -1520,6 +1549,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn wrong_alexandria_schema_creates_no_durable_registration() {
         let information = MomInformation::empty_for_tests();
         let source =
@@ -1546,6 +1576,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn nonempty_alexandria_wal_creates_no_durable_registration() {
         let temporary = tempfile::tempdir().expect("temporary information app");
         let source = temporary.path().join("alexandria.db");
@@ -1573,6 +1604,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn alexandria_registration_remount_search_and_citation_preserve_source_identity() {
         let temporary = tempfile::tempdir().expect("temporary information app");
         let source = temporary.path().join("alexandria.db");
@@ -1628,6 +1660,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn model_grants_deny_policy_and_cross_conversation_use() {
         let denied = UsePolicy {
             local_search: UsePermission::Allowed,
@@ -1719,6 +1752,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn removal_commit_requires_exact_live_server_capability_and_retries_cached_result() {
         let information = MomInformation::empty_for_tests();
         let mut preview = ManagedRemovalPreview {

@@ -1,5 +1,29 @@
-import { defaultMarkdownParser, defaultMarkdownSerializer } from 'prosemirror-markdown';
-import type { Node as ProseMirrorNode } from 'prosemirror-model';
+import {
+  MarkdownParser, defaultMarkdownParser, defaultMarkdownSerializer, schema as markdownSchema
+} from 'prosemirror-markdown';
+import { Schema, type Node as ProseMirrorNode } from 'prosemirror-model';
+
+// Root attributes survive ProseMirror transactions and keep source-only EOF
+// whitespace out of the editable text while retaining its exact bytes.
+export const visualMarkdownSchema = new Schema({
+  nodes: {
+    ...markdownSchema.spec.nodes.toObject(),
+    doc: {
+      ...markdownSchema.spec.nodes.get('doc')!,
+      attrs: { terminalSuffix: { default: '' } }
+    }
+  },
+  marks: markdownSchema.spec.marks.toObject()
+});
+const parsers = new WeakMap<Schema, MarkdownParser>();
+function parserFor(schema: Schema): MarkdownParser {
+  let parser = parsers.get(schema);
+  if (!parser) {
+    parser = new MarkdownParser(schema, defaultMarkdownParser.tokenizer, defaultMarkdownParser.tokens);
+    parsers.set(schema, parser);
+  }
+  return parser;
+}
 
 /**
  * Parse Loom's exact visual Markdown dialect. That dialect deliberately
@@ -8,17 +32,26 @@ import type { Node as ProseMirrorNode } from 'prosemirror-model';
  * byte. Character references are decoded in prose but remain literal in fenced
  * or inline code, so unsupported tabbed code stays outside the visual subset.
  */
-export function parseVisualMarkdown(markdown: string): ProseMirrorNode {
-  let parserSource = markdown.replaceAll('\t', '&#9;');
-  if (differsOnlyByHarmlessTerminalProseSpace(markdown)) {
+export function parseVisualMarkdown(
+  markdown: string,
+  schema: Schema = visualMarkdownSchema
+): ProseMirrorNode {
+  const terminalSuffix = markdown.match(/(?:\r\n|\n)+$/)?.[0] ?? '';
+  if (terminalSuffix && !schema.topNodeType.spec.attrs?.terminalSuffix) {
+    throw new Error('This document schema cannot retain terminal newlines.');
+  }
+  const body = markdown.slice(0, markdown.length - terminalSuffix.length);
+  let parserSource = body.replaceAll('\t', '&#9;');
+  if (differsOnlyByHarmlessTerminalProseSpace(body)) {
     parserSource = `${parserSource.slice(0, -1)}&#32;`;
   }
-  return defaultMarkdownParser.parse(parserSource);
+  const parsed = parserFor(schema).parse(parserSource);
+  return parsed.type.create({ ...parsed.attrs, terminalSuffix }, parsed.content, parsed.marks);
 }
 
 export function canRoundTripMarkdownExactly(markdown: string): boolean {
   try {
-    return defaultMarkdownSerializer.serialize(parseVisualMarkdown(markdown)) === markdown;
+    return serializeVisualMarkdown(parseVisualMarkdown(markdown)) === markdown;
   } catch {
     return false;
   }
@@ -61,7 +94,7 @@ export function normalizeVisualMarkdownSource(markdown: string): string {
  * externally restored Markdown must cross the same normalization boundary.
  */
 export function serializeVisualMarkdown(document: ProseMirrorNode): string {
-  return normalizeVisualMarkdownSource(defaultMarkdownSerializer.serialize(document));
+  return defaultMarkdownSerializer.serialize(document) + (document.attrs.terminalSuffix ?? '');
 }
 
 /**

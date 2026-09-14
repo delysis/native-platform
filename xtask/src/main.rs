@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-mod lean;
+mod macos_smoke_support;
+mod model_check;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -23,8 +24,11 @@ fn main() -> Result<()> {
     let command = arguments.next().unwrap_or_else(|| "policy".to_owned());
     match command.as_str() {
         "policy" => check_policy(&workspace_root()),
-        "lean" => lean::run(&workspace_root(), arguments.collect()),
-        _ => bail!("usage: cargo xtask <policy|lean>"),
+        "model-check" => model_check::run(&workspace_root(), &arguments.collect::<Vec<_>>()),
+        "macos-smoke-support" => {
+            macos_smoke_support::run(&workspace_root(), &arguments.collect::<Vec<_>>())
+        }
+        _ => bail!("usage: cargo xtask <policy|model-check|macos-smoke-support>"),
     }
 }
 
@@ -51,9 +55,17 @@ fn check_workspace(root: &Path) -> Result<()> {
         cargo["workspace"]["exclude"]
             .as_array()
             .is_some_and(|exclude| {
-                exclude.len() == 1 && exclude[0].as_str() == Some("crates/services/attachment/fuzz")
+                exclude
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .collect::<BTreeSet<_>>()
+                    == BTreeSet::from([
+                        "crates/services/attachment/fuzz",
+                        "vendor/glib",
+                        "vendor/ort-sys",
+                    ])
             }),
-        "only the Attachment fuzz workspace may be excluded"
+        "only the Attachment fuzz workspace and patched external GLib/ort-sys crates may be excluded"
     );
 
     let output = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
@@ -119,6 +131,8 @@ fn check_workspace(root: &Path) -> Result<()> {
             == BTreeSet::from([
                 root.join("Cargo.lock"),
                 root.join("crates/services/attachment/fuzz/Cargo.lock"),
+                // Published dependency source; the root lock resolves this patch.
+                root.join("vendor/ort-sys/Cargo.lock"),
             ]),
         "unknown nested Cargo lock"
     );
@@ -172,6 +186,7 @@ fn check_package_groups(
             .map(String::as_str)
             .collect::<BTreeSet<_>>()
             == BTreeSet::from([
+                "desktop",
                 "native",
                 "gateway",
                 "service-attachment",
@@ -248,7 +263,7 @@ fn check_git_dependencies(value: &toml::Value, manifest: &Path) -> Result<()> {
                 );
                 ensure!(
                     table.get("rev").and_then(toml::Value::as_str)
-                        == Some("a3cf95eb1d4fa748480eb780e6fcbfc1a5c1c391"),
+                        == Some("eb0e47b57c2fba97ed13e8fe5e949d11798232cb"),
                     "unsealed llama-cpp-rs dependency: {}",
                     manifest.display()
                 );
@@ -320,6 +335,7 @@ mod tests {
 
     fn package_groups() -> (PackageGroups, BTreeSet<String>) {
         let primary = [
+            "desktop",
             "native",
             "gateway",
             "service-attachment",

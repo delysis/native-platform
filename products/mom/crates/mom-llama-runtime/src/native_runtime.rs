@@ -1,17 +1,19 @@
+use crate::OperationScope;
 use crate::config::{KvCachePolicy, Settings};
 use crate::engine::{ValidationBlocker, validate_model_path};
 use crate::receipts::Blocker;
 use crate::store::{DocumentMutations, DocumentSnapshot};
-use llama_native_cache::PrefixCacheValue;
+use llama_native_cache::{PrefixCacheMetadata, PrefixCacheValue};
 use llama_native_engine::NativeModelHandle;
 use llama_native_host::{
     HostCachePolicy, NativeHost, NativeHostConfig, PrefixCachePromotionLease, PrefixCacheStore,
-    ProcessExitJoinedNativeHost, SystemClock,
+    SystemClock,
 };
 use llama_native_types::{NativeError, NativeErrorCode, NativeModelConfig, ResidentModelStatus};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResidentSlotStatus {
@@ -27,121 +29,45 @@ const PERSISTENT_PREFIX_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const PRODUCT_PREFIX_CACHE_NAMESPACE: &str = "mom-llama";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProductHostKey {
+pub(crate) struct ProductHostKey {
     memory_budget_bytes: u64,
     max_slots: usize,
     data_dir: PathBuf,
     cache_policy: KvCachePolicy,
 }
 
-#[derive(Debug)]
-struct ProductHost {
-    key: ProductHostKey,
-    host: Weak<NativeHost>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProductPhase {
-    Running,
-    Quiescing,
-    Closed,
-}
-
-struct ProductRuntimeState {
-    phase: ProductPhase,
-    host: Option<ProductHost>,
-}
-
-/// Sole installation authority held by a product composition root. Runtime
-/// modules retain only compatibility access through `PRODUCT_HOST`; they can
-/// neither manufacture nor replace the process host identity.
+/// Composition-root owner. Every caller receives its explicit operation scope;
+/// dropping this owner cancels that scope and joins this host's workers.
 pub struct ProductRuntimeOwner {
     host: Arc<NativeHost>,
+    scope: OperationScope,
 }
 
 impl ProductRuntimeOwner {
     pub fn initialize(settings: &Settings) -> anyhow::Result<Self> {
-        let key = host_key(settings);
-        let mut current = product_host()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("The native model host is unavailable."))?;
-        if current.phase != ProductPhase::Running {
-            anyhow::bail!("The product runtime is shutting down.");
-        }
-        if current.host.is_some() {
-            anyhow::bail!("The product native host already has an owner.");
-        }
-        let host =
-            create_product_host(&key).map_err(|error| anyhow::anyhow!(error.message.clone()))?;
-        current.host = Some(ProductHost {
-            key,
-            host: Arc::downgrade(&host),
-        });
-        Ok(Self { host })
+        Self::from_key(host_key(settings)).map_err(|error| anyhow::anyhow!(error.message))
+    }
+
+    fn from_key(key: ProductHostKey) -> Result<Self, NativeError> {
+        let host = create_product_host(&key)?;
+        let scope = OperationScope::for_product_host(&host, key);
+        Ok(Self { host, scope })
     }
 
     pub fn host(&self) -> Arc<NativeHost> {
         Arc::clone(&self.host)
     }
+
+    pub fn operation_scope(&self) -> OperationScope {
+        self.scope.clone()
+    }
 }
 
 impl Drop for ProductRuntimeOwner {
     fn drop(&mut self) {
-        let _ = shutdown_product_runtime_for_process_exit(&self.host);
+        let _ = self.scope.request_cancellation();
+        let _joined = self.host.shutdown_for_process_exit();
     }
-}
-
-fn installed_host_for_key(
-    runtime: &ProductRuntimeState,
-    key: &ProductHostKey,
-) -> Result<Option<Arc<NativeHost>>, ()> {
-    match runtime.host.as_ref() {
-        Some(product) if product.key == *key => Ok(product.host.upgrade()),
-        Some(_) => Err(()),
-        None => Ok(None),
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProductShutdownError {
-    StateUnavailable,
-    AlreadyShuttingDown,
-    AlreadyClosed,
-    HostMissing,
-    HostIdentityMismatch,
-}
-
-impl std::fmt::Display for ProductShutdownError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let message = match self {
-            Self::StateUnavailable => "the product runtime state is unavailable",
-            Self::AlreadyShuttingDown => "the product runtime is already shutting down",
-            Self::AlreadyClosed => "the product runtime is already closed",
-            Self::HostMissing => "the product runtime has no native host to shut down",
-            Self::HostIdentityMismatch => "the product runtime native host identity changed",
-        };
-        formatter.write_str(message)
-    }
-}
-
-impl std::error::Error for ProductShutdownError {}
-
-static PRODUCT_HOST: OnceLock<Mutex<ProductRuntimeState>> = OnceLock::new();
-
-fn product_host() -> &'static Mutex<ProductRuntimeState> {
-    PRODUCT_HOST.get_or_init(|| {
-        Mutex::new(ProductRuntimeState {
-            phase: ProductPhase::Running,
-            host: None,
-        })
-    })
-}
-
-pub(crate) fn current_product_host() -> Option<Arc<NativeHost>> {
-    product_host()
-        .lock()
-        .ok()
-        .and_then(|runtime| runtime.host.as_ref()?.host.upgrade())
 }
 
 fn host_key(settings: &Settings) -> ProductHostKey {
@@ -181,6 +107,14 @@ impl ProductPrefixCacheStore {
     fn document(namespace: &str) -> String {
         format!("native-host-prefix-cache.{namespace}")
     }
+
+    fn entry(namespace: &str, id: &str) -> String {
+        format!(
+            "{}.entry.{:x}",
+            Self::document(namespace),
+            Sha256::digest(id.as_bytes())
+        )
+    }
 }
 
 pub(crate) fn persona_native_cache_ids_from_snapshot(
@@ -188,7 +122,7 @@ pub(crate) fn persona_native_cache_ids_from_snapshot(
     owner_id: &str,
 ) -> anyhow::Result<Vec<String>> {
     let values = snapshot
-        .get::<Vec<PrefixCacheValue>>(&ProductPrefixCacheStore::document(
+        .get::<Vec<PrefixCacheMetadata>>(&ProductPrefixCacheStore::document(
             PRODUCT_PREFIX_CACHE_NAMESPACE,
         ))?
         .unwrap_or_default();
@@ -200,7 +134,7 @@ pub(crate) fn persona_native_cache_ids_from_documents(
     owner_id: &str,
 ) -> anyhow::Result<Vec<String>> {
     let values = documents
-        .get::<Vec<PrefixCacheValue>>(&ProductPrefixCacheStore::document(
+        .get::<Vec<PrefixCacheMetadata>>(&ProductPrefixCacheStore::document(
             PRODUCT_PREFIX_CACHE_NAMESPACE,
         ))?
         .unwrap_or_default();
@@ -213,36 +147,35 @@ pub(crate) fn remove_persona_native_cache_from_documents(
 ) -> anyhow::Result<Vec<String>> {
     let namespace = ProductPrefixCacheStore::document(PRODUCT_PREFIX_CACHE_NAMESPACE);
     let mut values = documents
-        .get::<Vec<PrefixCacheValue>>(&namespace)?
+        .get::<Vec<PrefixCacheMetadata>>(&namespace)?
         .unwrap_or_default();
     let removed = prefix_cache_ids_for_owner(&values, owner_id);
-    values.retain(|value| value.metadata.owner_id.as_deref() != Some(owner_id));
+    for id in &removed {
+        documents.delete(&ProductPrefixCacheStore::entry(
+            PRODUCT_PREFIX_CACHE_NAMESPACE,
+            id,
+        ));
+    }
+    values.retain(|value| value.owner_id.as_deref() != Some(owner_id));
     documents.put_bytes(&namespace, &serde_json::to_vec(&values)?)?;
     Ok(removed)
 }
 
-fn prefix_cache_ids_for_owner(values: &[PrefixCacheValue], owner_id: &str) -> Vec<String> {
+fn prefix_cache_ids_for_owner(values: &[PrefixCacheMetadata], owner_id: &str) -> Vec<String> {
     let mut ids = values
         .iter()
-        .filter(|value| value.metadata.owner_id.as_deref() == Some(owner_id))
-        .map(|value| value.metadata.id.clone())
+        .filter(|value| value.owner_id.as_deref() == Some(owner_id))
+        .map(|value| value.id.clone())
         .collect::<Vec<_>>();
     ids.sort();
     ids
 }
 
-pub(crate) fn invalidate_loaded_native_cache_owner(owner_id: &str) -> anyhow::Result<usize> {
-    let current = product_host()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("The native model host is unavailable."))?;
-    if current.phase != ProductPhase::Running {
-        anyhow::bail!("The product runtime is shutting down.");
-    }
-    let Some(host) = current
-        .host
-        .as_ref()
-        .and_then(|product| product.host.upgrade())
-    else {
+pub(crate) fn invalidate_loaded_native_cache_owner(
+    scope: &OperationScope,
+    owner_id: &str,
+) -> anyhow::Result<usize> {
+    let Some(host) = scope.native_host() else {
         return Ok(0);
     };
     host.invalidate_live_cache_owner(owner_id)
@@ -250,45 +183,51 @@ pub(crate) fn invalidate_loaded_native_cache_owner(owner_id: &str) -> anyhow::Re
 }
 
 impl PrefixCacheStore for ProductPrefixCacheStore {
-    fn load(&self, namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
+    fn list(&self, namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
         self.store
-            .get_disposable_cache(&Self::document(namespace))
+            .get_disposable_cache_with_members(
+                &Self::document(namespace),
+                Some(&format!("{}.entry.", Self::document(namespace))),
+            )
             .map(|values| values.unwrap_or_default())
             .map_err(prefix_store_error)
     }
 
-    fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
-        let document = Self::document(namespace);
+    fn load_entry(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<PrefixCacheValue>, NativeError> {
         self.store
-            .mutate_documents(
-                &document,
-                Vec::<PrefixCacheValue>::new,
-                |values, documents| {
-                    if let Some(owner_id) = value.metadata.owner_id.as_deref()
-                        && crate::personas::persona_cache_owner_is_removed_from_documents(
-                            documents, owner_id,
-                        )?
-                    {
-                        anyhow::bail!(
-                            "refusing to restore cache authority for removed Persona owner {owner_id}"
-                        );
-                    }
-                    values.retain(|candidate| candidate.metadata.id != value.metadata.id);
-                    values.push(value.clone());
-                    values.sort_by_key(|candidate| candidate.metadata.last_used_at_ms);
-                    while values.len() > PERSISTENT_PREFIX_CACHE_MAX_ENTRIES
-                        || values
-                            .iter()
-                            .map(|candidate| candidate.metadata.state_bytes)
-                            .sum::<usize>()
-                            > PERSISTENT_PREFIX_CACHE_MAX_BYTES
-                    {
-                        values.remove(0);
-                    }
-                    Ok(())
-                },
-            )
+            .get_disposable_cache(&Self::entry(namespace, id))
             .map_err(prefix_store_error)
+    }
+
+    fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
+        if !value.is_valid() {
+            return Err(NativeError::new(
+                NativeErrorCode::CacheIncompatible,
+                "refusing an invalid persistent prefix",
+            ));
+        }
+        self.store.mutate_documents(&Self::document(namespace), Vec::<PrefixCacheMetadata>::new, |entries, documents| {
+            if let Some(owner_id) = value.metadata.owner_id.as_deref()
+                && crate::personas::persona_cache_owner_is_removed_from_documents(documents, owner_id)?
+            { anyhow::bail!("refusing to restore cache authority for removed Persona owner {owner_id}"); }
+            entries.retain(|entry| entry.id != value.metadata.id);
+            entries.push(value.metadata.clone());
+            entries.sort_by_key(|entry| entry.last_used_at_ms);
+            while entries.len() > PERSISTENT_PREFIX_CACHE_MAX_ENTRIES
+                || entries.iter().try_fold(0_usize, |total, entry| total.checked_add(entry.state_bytes))
+                    .is_none_or(|bytes| bytes > PERSISTENT_PREFIX_CACHE_MAX_BYTES) {
+                let removed = entries.remove(0);
+                documents.delete(&Self::entry(namespace, &removed.id));
+            }
+            if entries.iter().any(|entry| entry.id == value.metadata.id) {
+                documents.put_bytes(&Self::entry(namespace, &value.metadata.id), &serde_json::to_vec(value)?)?;
+            }
+            Ok(())
+        }).map_err(prefix_store_error)
     }
 
     fn acquire_owner_promotion_lease(
@@ -307,24 +246,26 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
     }
 
     fn delete(&self, namespace: &str, id: &str) -> Result<(), NativeError> {
-        let document = Self::document(namespace);
         self.store
-            .mutate(&document, Vec::<PrefixCacheValue>::new, |values| {
-                values.retain(|candidate| candidate.metadata.id != id);
-                Ok(())
-            })
+            .mutate_documents(
+                &Self::document(namespace),
+                Vec::<PrefixCacheMetadata>::new,
+                |entries, documents| {
+                    entries.retain(|entry| entry.id != id);
+                    documents.delete(&Self::entry(namespace, id));
+                    Ok(())
+                },
+            )
             .map_err(prefix_store_error)
     }
 
     fn clear(&self, namespace: &str) -> Result<usize, NativeError> {
-        let document = Self::document(namespace);
-        let entries = self
-            .store
-            .get_disposable_cache::<Vec<PrefixCacheValue>>(&document)
-            .map_err(prefix_store_error)?
-            .map_or(0, |values| values.len());
-        self.store.delete(&document).map_err(prefix_store_error)?;
-        Ok(entries)
+        self.store
+            .clear_cache_family(
+                &Self::document(namespace),
+                &format!("{}.entry.", Self::document(namespace)),
+            )
+            .map_err(prefix_store_error)
     }
 }
 
@@ -368,39 +309,32 @@ const fn host_cache_policy(policy: KvCachePolicy) -> HostCachePolicy {
 /// by the embedded gateway. This deliberately works while caching is disabled,
 /// so switching the runtime policy off cannot strand an older encrypted
 /// checkpoint on disk.
-pub fn clear_native_prefix_cache(settings: &Settings) -> anyhow::Result<usize> {
-    with_host(settings, NativeHost::clear_cache)
+pub fn clear_native_prefix_cache(
+    scope: &crate::OperationScope,
+    settings: &Settings,
+) -> anyhow::Result<usize> {
+    with_host(scope, settings, NativeHost::clear_cache)
         .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))
 }
 
 fn with_host<T>(
+    scope: &OperationScope,
     settings: &Settings,
     operation: impl FnOnce(&NativeHost) -> Result<T, NativeError>,
 ) -> Result<T, ValidationBlocker> {
-    let key = host_key(settings);
-    let current = product_host().lock().map_err(|_| {
-        native_blocker(
-            "native_host_poisoned",
-            "The native model host is unavailable.",
-        )
-    })?;
-    if current.phase != ProductPhase::Running {
+    if !scope.matches_native_key(&host_key(settings)) {
         return Err(native_blocker(
-            "product_shutting_down",
-            "The product runtime is shutting down.",
-        ));
-    }
-    match installed_host_for_key(&current, &key) {
-        Ok(Some(host)) => operation(&host).map_err(native_error_blocker),
-        Ok(None) => Err(native_blocker(
-            "product_native_host_uninitialized",
-            "The product composition root has not initialized the native host.",
-        )),
-        Err(()) => Err(native_blocker(
             "product_native_host_identity_locked",
             "Host-level native settings changed; restart Mom Llama to apply them.",
-        )),
+        ));
     }
+    let host = scope.native_host().ok_or_else(|| {
+        native_blocker(
+            "product_native_host_unavailable",
+            "This operation scope has no running native host.",
+        )
+    })?;
+    operation(&host).map_err(native_error_blocker)
 }
 
 pub(crate) fn model_configuration_for_profile(
@@ -423,38 +357,44 @@ pub(crate) fn model_configuration_for_profile(
     Ok(config)
 }
 
-pub fn resident_model(settings: &Settings) -> Result<NativeModelHandle, ValidationBlocker> {
-    resident_model_for_slot(settings, 0, settings.model_path.as_deref())
+pub fn resident_model(
+    scope: &crate::OperationScope,
+    settings: &Settings,
+) -> Result<NativeModelHandle, ValidationBlocker> {
+    resident_model_for_slot(scope, settings, 0, settings.model_path.as_deref())
 }
 
 pub fn resident_model_for_profile(
+    scope: &crate::OperationScope,
     settings: &Settings,
     model_path: &Path,
     mmproj_path: Option<&Path>,
 ) -> Result<NativeModelHandle, ValidationBlocker> {
     let config = model_configuration_for_profile(settings, model_path, mmproj_path)?;
-    resident_model_for_configuration(settings, &config)
+    resident_model_for_configuration(scope, settings, &config)
 }
 
 /// Resolves the exact profile only when its worker is already resident. This
 /// boundary never loads a model and is used by speculative product work that
 /// must disappear rather than compete for residency.
 pub(crate) fn resident_model_for_profile_if_loaded(
+    scope: &crate::OperationScope,
     settings: &Settings,
     model_path: &Path,
     mmproj_path: Option<&Path>,
 ) -> Result<Option<NativeModelHandle>, ValidationBlocker> {
     let config = model_configuration_for_profile(settings, model_path, mmproj_path)?;
     validate_model_path(&config.model_path)?;
-    with_host(settings, |host| host.resident(&config))
+    with_host(scope, settings, |host| host.resident(&config))
 }
 
 pub(crate) fn resident_model_for_configuration(
+    scope: &crate::OperationScope,
     settings: &Settings,
     config: &NativeModelConfig,
 ) -> Result<NativeModelHandle, ValidationBlocker> {
     validate_model_path(&config.model_path)?;
-    with_host(settings, |host| host.acquire(config.clone()))
+    with_host(scope, settings, |host| host.acquire(config.clone()))
 }
 
 /// Reuses the exact frozen resident identity or reloads only the exact private
@@ -462,12 +402,13 @@ pub(crate) fn resident_model_for_configuration(
 /// tuning settings are intentionally ignored; only the AppRuntime host identity
 /// and its process-level ownership policy come from `settings`.
 pub(crate) fn resident_model_for_frozen_config(
+    scope: &crate::OperationScope,
     settings: &Settings,
     config: &NativeModelConfig,
     expected: &llama_native_types::ModelFingerprint,
 ) -> Result<NativeModelHandle, ValidationBlocker> {
     validate_model_path(&config.model_path)?;
-    with_host(settings, |host| {
+    with_host(scope, settings, |host| {
         if let Some(slot_id) = host
             .slots()
             .into_iter()
@@ -496,10 +437,11 @@ pub(crate) fn resident_model_for_frozen_config(
 /// Approval resumption must never start an uncancellable model load after an
 /// external-effect intent has been durably consumed.
 pub fn resident_model_for_fingerprint(
+    scope: &crate::OperationScope,
     settings: &Settings,
     expected: &llama_native_types::ModelFingerprint,
 ) -> Result<NativeModelHandle, ValidationBlocker> {
-    with_host(settings, |host| {
+    with_host(scope, settings, |host| {
         let slot_id = host
             .slots()
             .into_iter()
@@ -521,6 +463,7 @@ pub fn resident_model_for_fingerprint(
 }
 
 pub fn resident_model_for_slot(
+    scope: &crate::OperationScope,
     settings: &Settings,
     slot_id: usize,
     requested_model_path: Option<&Path>,
@@ -531,21 +474,10 @@ pub fn resident_model_for_slot(
             "The requested resident model slot is outside the configured bound.",
         ));
     }
-    if requested_model_path.is_none() {
-        let current = product_host().lock().map_err(|_| {
-            native_blocker(
-                "native_host_poisoned",
-                "The native model host is unavailable.",
-            )
-        })?;
-        if let Some(handle) = current
-            .host
-            .as_ref()
-            .and_then(|product| product.host.upgrade())
-            .and_then(|host| host.handle(slot_id))
-        {
-            return Ok(handle);
-        }
+    if requested_model_path.is_none()
+        && let Some(handle) = with_host(scope, settings, |host| Ok(host.handle(slot_id)))?
+    {
+        return Ok(handle);
     }
     let Some(model_path) = requested_model_path else {
         return Err(ValidationBlocker {
@@ -559,139 +491,49 @@ pub fn resident_model_for_slot(
     };
     let config =
         model_configuration_for_profile(settings, model_path, settings.mmproj_path.as_deref())?;
-    with_host(settings, |host| host.load_into_slot(slot_id, config))
+    with_host(scope, settings, |host| host.load_into_slot(slot_id, config))
 }
 
-pub fn resident_status() -> Option<ResidentModelStatus> {
-    product_host().lock().ok().and_then(|current| {
-        current.host.as_ref().and_then(|host| {
-            host.host
-                .upgrade()?
-                .slots()
-                .into_iter()
-                .find(|slot| slot.slot_id == 0)
-                .map(|slot| slot.status)
+pub fn resident_status(scope: &OperationScope) -> Option<ResidentModelStatus> {
+    scope
+        .native_host()?
+        .slots()
+        .into_iter()
+        .find(|slot| slot.slot_id == 0)
+        .map(|slot| slot.status)
+}
+
+pub fn resident_slots(scope: &OperationScope) -> Vec<ResidentSlotStatus> {
+    scope
+        .native_host()
+        .into_iter()
+        .flat_map(|host| host.slots())
+        .map(|slot| ResidentSlotStatus {
+            slot_id: slot.slot_id,
+            model_path: slot.model_path,
+            model_bytes: slot.model_bytes,
+            reserved_bytes: slot.reserved_bytes,
+            status: slot.status,
         })
-    })
+        .collect()
 }
 
-pub fn resident_slots() -> Vec<ResidentSlotStatus> {
-    product_host()
-        .lock()
-        .map(|current| {
-            current
-                .host
-                .as_ref()
-                .map(|product| {
-                    product
-                        .host
-                        .upgrade()
-                        .into_iter()
-                        .flat_map(|host| {
-                            host.slots().into_iter().map(|slot| ResidentSlotStatus {
-                                slot_id: slot.slot_id,
-                                model_path: slot.model_path,
-                                model_bytes: slot.model_bytes,
-                                reserved_bytes: slot.reserved_bytes,
-                                status: slot.status,
-                            })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        })
-        .unwrap_or_default()
+pub fn unload_resident_slot(scope: &OperationScope, slot_id: usize) -> bool {
+    scope.native_host().is_some_and(|host| host.unload(slot_id))
 }
 
-pub fn unload_resident_slot(slot_id: usize) -> bool {
-    product_host()
-        .lock()
-        .ok()
-        .and_then(|current| current.host.as_ref()?.host.upgrade())
-        .map(|host| host.unload(slot_id))
-        .unwrap_or(false)
+pub fn unload_resident_model(scope: &OperationScope) -> bool {
+    scope
+        .native_host()
+        .is_some_and(|host| host.unload_all() > 0)
 }
 
-pub fn unload_resident_model() -> bool {
-    product_host()
-        .lock()
-        .ok()
-        .and_then(|current| current.host.as_ref()?.host.upgrade())
-        .map(|host| host.unload_all() > 0)
-        .unwrap_or(false)
-}
-
-pub fn cancel_native_request(request_id: &str, branch_id: Option<&str>) -> usize {
-    product_host()
-        .lock()
-        .ok()
-        .and_then(|current| {
-            current
-                .host
-                .as_ref()
-                .and_then(|host| host.host.upgrade())
-                .map(|host| host.cancel(request_id, branch_id))
-        })
-        .unwrap_or_default()
-}
-
-pub fn skip_native_reasoning(request_id: &str, branch_id: Option<&str>) -> usize {
-    product_host()
-        .lock()
-        .ok()
-        .and_then(|current| {
-            current
-                .host
-                .as_ref()
-                .and_then(|host| host.host.upgrade())
-                .map(|host| host.skip_reasoning(request_id, branch_id))
-        })
-        .unwrap_or_default()
-}
-
-/// Consumes the product runtime's native-host slot exactly once and joins all
-/// native workers outside the global state mutex. This is terminal process
-/// shutdown, not an ordinary user-requested model unload.
-pub fn shutdown_product_runtime_for_process_exit(
-    expected: &Arc<NativeHost>,
-) -> Result<ProcessExitJoinedNativeHost, ProductShutdownError> {
-    let host = {
-        let mut runtime = product_host()
-            .lock()
-            .map_err(|_| ProductShutdownError::StateUnavailable)?;
-        take_product_host(&mut runtime, expected)?
-    };
-
-    let joined = host.shutdown_for_process_exit();
-    let mut runtime = product_host()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    runtime.phase = ProductPhase::Closed;
-    Ok(joined)
-}
-
-fn take_product_host(
-    runtime: &mut ProductRuntimeState,
-    expected: &Arc<NativeHost>,
-) -> Result<Arc<NativeHost>, ProductShutdownError> {
-    match runtime.phase {
-        ProductPhase::Running => runtime.phase = ProductPhase::Quiescing,
-        ProductPhase::Quiescing => return Err(ProductShutdownError::AlreadyShuttingDown),
-        ProductPhase::Closed => return Err(ProductShutdownError::AlreadyClosed),
-    }
-    let Some(product) = runtime.host.take() else {
-        runtime.phase = ProductPhase::Closed;
-        return Err(ProductShutdownError::HostMissing);
-    };
-    let Some(host) = product.host.upgrade() else {
-        runtime.phase = ProductPhase::Closed;
-        return Err(ProductShutdownError::HostMissing);
-    };
-    if !Arc::ptr_eq(&host, expected) {
-        runtime.phase = ProductPhase::Closed;
-        return Err(ProductShutdownError::HostIdentityMismatch);
-    }
-    Ok(host)
+pub fn cancel_native_request(
+    scope: &OperationScope,
+    request_id: &str,
+    branch_id: Option<&str>,
+) -> usize {
+    scope.cancel_native(request_id, branch_id)
 }
 
 fn native_error_blocker(error: NativeError) -> ValidationBlocker {
@@ -732,13 +574,11 @@ fn native_blocker(code: &str, message: &str) -> ValidationBlocker {
 #[cfg(test)]
 mod tests {
     use super::{
-        HostCachePolicy, PrefixCacheStore, ProductHost, ProductHostKey, ProductPhase,
-        ProductPrefixCacheStore, ProductRuntimeState, ProductShutdownError, create_product_host,
-        host_cache_policy, installed_host_for_key, take_product_host,
+        HostCachePolicy, PrefixCacheStore, ProductHostKey, ProductPrefixCacheStore,
+        ProductRuntimeOwner, create_product_host, host_cache_policy,
     };
     use crate::config::KvCachePolicy;
     use llama_native_cache::{CacheFingerprint, CacheTier, PrefixCacheMetadata, PrefixCacheValue};
-    use llama_native_host::{NativeHost, NativeHostConfig, memory_reservation};
     use llama_native_types::{PromptForm, PromptTokenPolicy, SequenceStateBlob};
 
     fn cache_value() -> PrefixCacheValue {
@@ -777,111 +617,92 @@ mod tests {
         }
     }
 
-    fn test_product(host: &std::sync::Arc<NativeHost>) -> ProductHost {
-        ProductHost {
-            key: ProductHostKey {
-                memory_budget_bytes: 1,
-                max_slots: 1,
-                data_dir: std::path::PathBuf::from("test"),
-                cache_policy: KvCachePolicy::None,
-            },
-            host: std::sync::Arc::downgrade(host),
-        }
-    }
-
     #[test]
-    fn product_host_is_taken_exactly_once_for_terminal_shutdown() {
-        let host = std::sync::Arc::new(NativeHost::new(NativeHostConfig::default()));
-        let mut runtime = ProductRuntimeState {
-            phase: ProductPhase::Running,
-            host: Some(test_product(&host)),
-        };
-
-        let taken = take_product_host(&mut runtime, &host).expect("take exact host");
-        assert!(std::sync::Arc::ptr_eq(&taken, &host));
-        assert_eq!(runtime.phase, ProductPhase::Quiescing);
-        assert!(runtime.host.is_none());
-        assert!(matches!(
-            take_product_host(&mut runtime, &host),
-            Err(ProductShutdownError::AlreadyShuttingDown)
-        ));
-    }
-
-    #[test]
-    fn product_host_take_fails_closed_on_missing_or_wrong_identity() {
-        let expected = std::sync::Arc::new(NativeHost::new(NativeHostConfig::default()));
-        let actual = std::sync::Arc::new(NativeHost::new(NativeHostConfig::default()));
-        let mut missing = ProductRuntimeState {
-            phase: ProductPhase::Running,
-            host: None,
-        };
-        assert!(matches!(
-            take_product_host(&mut missing, &expected),
-            Err(ProductShutdownError::HostMissing)
-        ));
-        assert_eq!(missing.phase, ProductPhase::Closed);
-
-        let mut mismatch = ProductRuntimeState {
-            phase: ProductPhase::Running,
-            host: Some(test_product(&actual)),
-        };
-        assert!(matches!(
-            take_product_host(&mut mismatch, &expected),
-            Err(ProductShutdownError::HostIdentityMismatch)
-        ));
-        assert_eq!(mismatch.phase, ProductPhase::Closed);
-        assert!(mismatch.host.is_none());
-    }
-
-    #[test]
-    fn product_host_key_mismatch_cannot_replace_hidden_compatibility_slot() {
-        let original = std::sync::Arc::new(NativeHost::new(NativeHostConfig::default()));
-        let runtime = ProductRuntimeState {
-            phase: ProductPhase::Running,
-            host: Some(test_product(&original)),
-        };
-        let replacement_key = ProductHostKey {
-            memory_budget_bytes: 2,
+    fn product_owners_have_independent_scopes_and_terminal_drop() {
+        let first_dir =
+            std::env::temp_dir().join(format!("mom-owner-first-{}", uuid::Uuid::new_v4()));
+        let second_dir =
+            std::env::temp_dir().join(format!("mom-owner-second-{}", uuid::Uuid::new_v4()));
+        let key = |data_dir| ProductHostKey {
+            memory_budget_bytes: 1024 * 1024 * 1024,
             max_slots: 1,
-            data_dir: std::path::PathBuf::from("test"),
+            data_dir,
             cache_policy: KvCachePolicy::None,
         };
-        assert!(installed_host_for_key(&runtime, &replacement_key).is_err());
-        assert!(std::sync::Weak::ptr_eq(
-            &runtime.host.as_ref().expect("installed host").host,
-            &std::sync::Arc::downgrade(&original)
-        ));
+        let first = ProductRuntimeOwner::from_key(key(first_dir.clone())).expect("first owner");
+        let second = ProductRuntimeOwner::from_key(key(second_dir.clone())).expect("second owner");
+        let first_scope = first.operation_scope();
+        let second_scope = second.operation_scope();
+        assert!(!std::sync::Arc::ptr_eq(&first.host(), &second.host()));
+        assert!(first_scope.matches_native_key(&key(first_dir.clone())));
+        assert!(!first_scope.matches_native_key(&key(second_dir.clone())));
+        drop(first);
+        assert!(first_scope.native_host().is_none());
+        assert!(second_scope.native_host().is_some());
+        second_scope
+            .native_host()
+            .expect("second remains live")
+            .clear_cache()
+            .expect("second cache");
+        drop(second);
+        assert!(second_scope.native_host().is_none());
+        std::fs::remove_dir_all(first_dir).expect("first cleanup");
+        std::fs::remove_dir_all(second_dir).expect("second cleanup");
     }
 
     #[test]
-    fn compatibility_slot_never_owns_or_recreates_the_native_host() {
-        let owner = std::sync::Arc::new(NativeHost::new(NativeHostConfig::default()));
-        let key = ProductHostKey {
-            memory_budget_bytes: 1,
-            max_slots: 1,
-            data_dir: std::path::PathBuf::from("test"),
-            cache_policy: KvCachePolicy::None,
+    fn changing_one_prefix_keeps_other_encrypted_payload_bytes_unchanged() {
+        let dir =
+            std::env::temp_dir().join(format!("mom-prefix-entry-cost-{}", uuid::Uuid::new_v4()));
+        let store = crate::store::RuntimeStore::open_with_key(&dir, [19; 32]).expect("store");
+        let path = store.path().to_path_buf();
+        let cache = ProductPrefixCacheStore { store };
+        let mut first = cache_value();
+        let mut second = first.clone();
+        second.metadata.id = "second".into();
+        cache.save("cost", &first).expect("first");
+        cache.save("cost", &second).expect("second");
+        let snapshot = || {
+            let db = rusqlite::Connection::open(&path).expect("db");
+            let mut query = db
+                .prepare("SELECT namespace, ciphertext FROM encrypted_documents ORDER BY namespace")
+                .expect("query");
+            query
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })
+                .expect("rows")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("snapshot")
         };
-        let runtime = ProductRuntimeState {
-            phase: ProductPhase::Running,
-            host: Some(ProductHost {
-                key: key.clone(),
-                host: std::sync::Arc::downgrade(&owner),
-            }),
-        };
-        assert!(installed_host_for_key(&runtime, &key).is_ok_and(|host| host.is_some()));
-        drop(owner);
-        assert!(installed_host_for_key(&runtime, &key).is_ok_and(|host| host.is_none()));
-    }
-
-    #[test]
-    fn resident_budget_reserves_runtime_context_and_projector_memory() {
-        let mib = 1024 * 1024;
-        assert_eq!(memory_reservation(100 * mib, 0), 484 * mib);
+        let before = snapshot();
         assert_eq!(
-            memory_reservation(4 * 1024 * mib, 500 * mib),
-            6 * 1024 * mib + 500 * mib
+            before.len(),
+            3,
+            "one small index and two independently encrypted entries"
         );
+        first.metadata.last_used_at_ms += 1;
+        cache.save("cost", &first).expect("update");
+        let after = snapshot();
+        assert_eq!(
+            before
+                .iter()
+                .zip(&after)
+                .filter(|(old, new)| old == new)
+                .count(),
+            1,
+            "the unrelated encrypted payload must not be rewritten"
+        );
+        assert_eq!(
+            cache.load_entry("cost", "second").expect("exact read"),
+            Some(second)
+        );
+        assert_eq!(cache.clear("cost").expect("clear"), 2);
+        assert!(
+            snapshot().is_empty(),
+            "clear atomically removes metadata and every payload"
+        );
+        std::fs::remove_dir_all(dir).expect("cleanup");
     }
 
     #[test]

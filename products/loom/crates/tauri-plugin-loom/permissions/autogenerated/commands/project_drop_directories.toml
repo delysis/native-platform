@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-project-drop-directories"
+description = "Enables the project_drop_directories command without any pre-configured scope."
+commands.allow = ["project_drop_directories"]
+
+[[permission]]
+identifier = "deny-project-drop-directories"
+description = "Denies the project_drop_directories command without any pre-configured scope."
+commands.deny = ["project_drop_directories"]

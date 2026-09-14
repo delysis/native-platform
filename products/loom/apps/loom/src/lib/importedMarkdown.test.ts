@@ -10,6 +10,6 @@ describe('editable import projection', () => {
     expect(converted).not.toContain('loom-attachment:');
   });
   it('selects extracted content instead of the stored paperclip identity', () => {
-    expect(editableImportMarkdown({ editable_markdown: 'Editable body.\n', inline_markdown: '[paperclip](loom-attachment:id)' } as ContextAttachment)).toBe('Editable body.');
+    expect(editableImportMarkdown({ editable_markdown: 'Editable body.\n', inline_markdown: '[paperclip](loom-attachment:id)' } as ContextAttachment)).toBe('Editable body.\n');
   });
 });

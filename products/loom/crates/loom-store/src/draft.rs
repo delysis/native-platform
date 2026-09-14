@@ -51,7 +51,7 @@ impl ProjectStore {
     /// Two alternating mutable slots bound storage to two full drafts per
     /// document, including every crash phase. `expected_version == 0` means
     /// the caller expects no draft. Retrying a committed write with the same
-    /// source, expected version, and canonical bytes replays its result.
+    /// source, expected version, and exact bytes replays its result.
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     pub fn upsert_transient_draft(
         &mut self,
@@ -553,6 +553,79 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn prose_draft_and_checkpoint_preserve_exact_line_endings_after_reopen() {
+        let (directory, mut store, _) = new_store();
+        let path = "manuscript/001.md";
+        let root = directory.path().join("Novel");
+        let external = "# Quiet tablet\r\n\r\nCafé.\r\n";
+        fs::write(root.join(path), external).expect("external CRLF writing");
+        store
+            .import_external_changes_if_uncontested(path, "read external writing")
+            .expect("import external bytes")
+            .expect("external revision");
+        let source = store.read_document(path).expect("read external revision");
+        assert_eq!(source.text, external);
+        let edited = "# Quiet tablet\r\n\r\nCafé.\r\nPlay. β\rnext\n";
+        let content = DocumentContent::Prose(edited.into());
+        let draft = store
+            .upsert_transient_draft(path, source.revision_id, 0, content.clone())
+            .expect("save recoverable exact draft")
+            .draft;
+        assert_eq!(draft.text, edited);
+        assert_eq!(draft.blob_id, BlobId::digest(edited.as_bytes()));
+        assert_eq!(fs::read(root.join(path)).unwrap(), external.as_bytes());
+        drop(store);
+
+        let mut store = ProjectStore::open(&root).expect("reopen project");
+        let recovered = store
+            .load_transient_draft(path)
+            .expect("load draft")
+            .expect("retained draft");
+        assert_eq!(recovered, draft);
+        let command = loom_types::CommandId::new();
+        let checkpoint = store
+            .save_document_if_source_idempotent_consuming_draft(
+                command,
+                path,
+                content.clone(),
+                "save writing",
+                source.revision_id,
+                source.blob_id,
+                draft.version,
+            )
+            .expect("checkpoint exact draft");
+        assert_eq!(fs::read(root.join(path)).unwrap(), edited.as_bytes());
+        assert!(store.load_transient_draft(path).unwrap().is_none());
+        let replay = store
+            .save_document_if_source_idempotent_consuming_draft(
+                command,
+                path,
+                content,
+                "save writing",
+                source.revision_id,
+                source.blob_id,
+                draft.version,
+            )
+            .expect("replay exact checkpoint");
+        assert!(replay.replayed);
+        assert_eq!(replay.save.revision_id, checkpoint.save.revision_id);
+        drop(store);
+
+        let store = ProjectStore::open(&root).expect("reopen checkpoint");
+        let reopened = store.read_document(path).expect("read checkpoint");
+        assert_eq!(reopened.text, edited);
+        assert_eq!(reopened.blob_id, BlobId::digest(edited.as_bytes()));
+        assert_eq!(
+            store.read_blob(reopened.blob_id).unwrap(),
+            edited.as_bytes()
+        );
+        let start = edited.find("β").unwrap();
+        assert_eq!(&reopened.text[start..start + "β".len()], "β");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn thousands_of_drafts_use_two_slots_without_semantic_history() {
         let (_directory, mut store, source) = new_store();
         let counts = store.counts().expect("semantic counts");
@@ -585,6 +658,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn draft_retry_is_idempotent_and_stale_different_bytes_fail() {
         let (_directory, mut store, source) = new_store();
         let request = DocumentContent::Prose("newer".into());
@@ -612,6 +686,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn crash_before_database_commit_cannot_replace_active_draft() {
         let (_directory, mut store, source) = new_store();
         let first = store
@@ -648,6 +723,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn clear_removes_both_bounded_slots() {
         let (_directory, mut store, source) = new_store();
         let first = store
@@ -680,6 +756,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn cleared_versions_are_never_reused_or_vulnerable_to_aba_clear() {
         let (_directory, mut store, source) = new_store();
         let first = store
@@ -721,6 +798,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn first_write_after_clear_replays_exactly_after_lost_acknowledgement() {
         let (_directory, mut store, source) = new_store();
         let first = store
@@ -748,6 +826,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn checkpoint_atomically_consumes_exact_lost_ack_draft_and_replays() {
         let (_directory, mut store, source) = new_store();
         let text = "semantic checkpoint";
@@ -798,6 +877,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn checkpoint_refuses_mismatched_draft_without_consuming_or_saving() {
         let (_directory, mut store, source) = new_store();
         let current = store

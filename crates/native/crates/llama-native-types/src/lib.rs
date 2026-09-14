@@ -704,6 +704,10 @@ pub struct GenerationRequest {
     pub model_id: String,
     pub input: GenerationInput,
     pub sampling: SamplingConfig,
+    /// For a text Completion, media are encoded in this order before the exact
+    /// text: one native media marker per item, separated by newlines, then two
+    /// newlines and the original text. No chat template is applied. The text
+    /// must not contain native media markers; token-ID prompts cannot carry media.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<MediaInput>,
     #[serde(default)]
@@ -735,7 +739,8 @@ pub struct GenerationBatchRequest {
     pub model_id: String,
     /// Ordered media shared by every case in this exact batch. Media bytes
     /// remain request-scoped so a product cannot accidentally bind different
-    /// evidence to sibling alternatives in one completion family.
+    /// evidence to sibling alternatives in one completion family. Text completion
+    /// cases use the same ordered marker prefix contract as `GenerationRequest`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<MediaInput>,
     pub cases: Vec<GenerationCase>,
@@ -823,6 +828,9 @@ pub struct GenerationCacheMetrics {
     pub supplied_prefix_tokens: usize,
     /// Supplied prefix tokens restored into this case's sequence.
     pub restored_prefix_tokens: usize,
+    /// Prefix tokens recomputed from a durable snapshot; never counted as a KV hit.
+    #[serde(default)]
+    pub replayed_prefix_tokens: usize,
     /// Token-exact prefix tokens decoded once and copied within this batch.
     pub batch_shared_prefix_tokens: usize,
     /// Token-exact prefix cells retained in this model worker from the prior
@@ -2743,6 +2751,15 @@ pub enum ModelRuntimeState {
     Failed,
     Stopping,
     Stopped,
+}
+
+/// How a saved prefix was reconstructed. Durable snapshots do not authorize
+/// opaque native bytes after their exporting worker exits.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SequenceRestoreKind {
+    NativeState,
+    TokenReplay,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

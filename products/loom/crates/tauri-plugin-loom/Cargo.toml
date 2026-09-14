@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+desktop-model-defaults.workspace = true
 information-native-acquire.workspace = true
 keyring = "=4.1.6"
 attachment-native-host.workspace = true
@@ -18,7 +19,7 @@ cpal = "=0.16.0"
 crossbeam-channel.workspace = true
 hound.workspace = true
 http.workspace = true
-image = { version = "0.25.9", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+image = { version = "0.25.9", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 loom-document = { path = "../loom-document" }
 loom-backend-llama = { path = "../loom-backend-llama" }
 loom-host = { path = "../loom-host", features = ["tauri-native-focus"] }
@@ -26,22 +27,25 @@ loom-store = { path = "../loom-store" }
 loom-types = { path = "../loom-types" }
 llama-native-types.workspace = true
 notify.workspace = true
+naga = { version = "29.0.3", default-features = false, features = ["wgsl-in", "glsl-out"] }
 same-file.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 speech-native-backend-parakeet.workspace = true
 speech-native-host.workspace = true
+speech-native-platform.workspace = true
 speech-native-types.workspace = true
-sysinfo.workspace = true
 tauri = { version = "2.11.5", default-features = false }
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-opener = "2.5.4"
 thiserror.workspace = true
 tokio.workspace = true
+toml.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
@@ -50,6 +54,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 tauri-plugin = { version = "2.5.4", features = ["build"] }
 
 [dev-dependencies]
+async-trait.workspace = true
 loom-host = { path = "../loom-host", features = ["test-fixtures"] }
 tauri = { version = "2.11.5", default-features = false, features = ["test"] }
 tempfile.workspace = true

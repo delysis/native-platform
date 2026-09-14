@@ -12,6 +12,7 @@
   import { onDestroy } from 'svelte';
   import type { VisualFormatAction, VisualFormatState } from './visualFormatting';
 
+  export let hiddenTrigger = false;
   export let editor: VisualFormattingEditor | null | undefined;
   export let formatting: VisualFormatState;
   export let onCommandResult: (
@@ -74,7 +75,7 @@
     if (action === 'link') href = destination.trim();
   }
 
-  function toggleOpen(): void {
+  export function toggleOpen(): void {
     if (open) {
       close();
       return;
@@ -118,7 +119,7 @@
 </script>
 
 <div class="format-menu" bind:this={menu} on:focusin={preserveSelectionFromFocus}>
-  <button
+  {#if !hiddenTrigger}<button
     class="titlebar-button format-button"
     type="button"
     title="Format text"
@@ -127,7 +128,7 @@
     aria-expanded={open}
     on:pointerdown={preserveSelection}
     on:click={toggleOpen}
-  >Aa</button>
+  >Aa</button>{/if}
   {#if open}
   <div id="visual-format-popover" class="format-popover" aria-label="Text formatting">
     <div class="format-style-grid" aria-label="Paragraph style">

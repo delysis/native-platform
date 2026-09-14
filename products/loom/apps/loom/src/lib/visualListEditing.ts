@@ -1,5 +1,6 @@
 import { keymap } from 'prosemirror-keymap';
-import { schema } from 'prosemirror-markdown';
+import { schema as markdownSchema } from 'prosemirror-markdown';
+import type { Schema } from 'prosemirror-model';
 import { liftListItem, sinkListItem, splitListItem } from 'prosemirror-schema-list';
 import type { Command, EditorState, Plugin } from 'prosemirror-state';
 import type { EditorView } from 'prosemirror-view';
@@ -9,7 +10,7 @@ export type VisualListTabReservation = (
   view: EditorView | undefined
 ) => boolean;
 
-export function visualListKeyBindings(): Readonly<Record<string, Command>> {
+export function visualListKeyBindings(schema: Schema = markdownSchema): Readonly<Record<string, Command>> {
   const listItem = schema.nodes.list_item;
   return {
     Enter: splitListItem(listItem),
@@ -18,8 +19,8 @@ export function visualListKeyBindings(): Readonly<Record<string, Command>> {
   };
 }
 
-export function visualListKeymap(tabReserved: VisualListTabReservation): Plugin {
-  const bindings = visualListKeyBindings();
+export function visualListKeymap(tabReserved: VisualListTabReservation, schema: Schema = markdownSchema): Plugin {
+  const bindings = visualListKeyBindings(schema);
   return keymap({
     ...bindings,
     Tab: (state, dispatch, view) => tabReserved(state, view)

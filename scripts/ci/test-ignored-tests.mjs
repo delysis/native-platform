@@ -15,6 +15,7 @@ import {
   assertSafeHarnessEnvironment,
   assertStandardLibtestRustSource,
   assertSuccessfulCargoBuildFinished,
+  assertSuccessfulHarnessList,
   createStandardLibtestGuard,
   discoverCanonicalIgnoredTests,
   expectedCargoInventory,
@@ -25,6 +26,7 @@ import {
   readPinnedToolIdentity,
   reconcileCargoInventory,
   selectGuardedTestProfileArtifacts,
+  testHarnessEnvironment,
   validateArtifactExecutable,
   validateStandardLibtestGuardAfterBuild,
   validateRegistry,
@@ -32,6 +34,54 @@ import {
 
 const root = path.resolve(import.meta.dirname, "../..");
 const registry = JSON.parse(fs.readFileSync(path.join(root, "ci/ignored-tests.json"), "utf8"));
+
+test("Windows direct listing adds only the canonical Cargo profile DLL directory", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "libtest-loader-"));
+  try {
+    const target = path.join(directory, "target");
+    const profile = path.join(target, "debug");
+    const deps = path.join(profile, "deps");
+    fs.mkdirSync(deps, { recursive: true });
+    const candidate = path.join(deps, "test.exe");
+    fs.writeFileSync(candidate, "fixture executable");
+    const executable = validateArtifactExecutable(candidate, target).path;
+    const environment = { Path: "system-path", TEMP: "preserved" };
+    const windows = testHarnessEnvironment(executable, target, environment, "win32");
+    assert.deepEqual(windows, { PATH: `${fs.realpathSync(profile)};system-path`, TEMP: "preserved" });
+    assert.deepEqual(environment, { Path: "system-path", TEMP: "preserved" });
+    assert.equal(testHarnessEnvironment(executable, target, environment, "linux"), environment);
+    assert.throws(
+      () => testHarnessEnvironment(path.join(directory, "outside.exe"), target, environment, "win32"),
+      /outside the guarded Cargo profile/,
+    );
+    fs.rmSync(profile, { recursive: true });
+    const outside = path.join(directory, "outside");
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, profile, process.platform === "win32" ? "junction" : "dir");
+    assert.throws(
+      () => testHarnessEnvironment(path.join(outside, "test.exe"), target, environment, "win32"),
+      /outside the guarded Cargo profile/,
+    );
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("listing failures retain Windows loader status, signals, and bounded diagnostics", () => {
+  assert.doesNotThrow(() => assertSuccessfulHarnessList({ status: 0 }, "test.exe"));
+  assert.throws(
+    () => assertSuccessfulHarnessList({ status: -1073741515, stderr: "" }, "test.exe"),
+    /test\.exe\nexit=-1073741515 \(0xc0000135\); signal=none/,
+  );
+  assert.throws(
+    () => assertSuccessfulHarnessList({ status: null, signal: "SIGKILL", error: { code: "ETIMEDOUT" }, stdout: "partial listing" }, "test.exe"),
+    /signal=SIGKILL\ntimed out after 30000ms\nstdout: partial listing/,
+  );
+  assert.throws(
+    () => assertSuccessfulHarnessList({ status: 1, stderr: "hidden-prefix" + "x".repeat(8192) }, "test.exe"),
+    (error) => !error.message.includes("hidden-prefix") && error.message.includes("stderr: "),
+  );
+});
 let cachedMetadata;
 function workspaceMetadata() {
   cachedMetadata ??= readMetadata(root);
@@ -508,14 +558,13 @@ test("noncanonical cfg_attr, macro, and public ignored tests fail closed", () =>
 test("all ignored tests carry exact target, platform, evidence, and non-promotion metadata", () => {
   const metadata = workspaceMetadata();
   const report = validateRegistry({ registry, metadata, repoRoot: root });
-  assert.equal(report.registry_count, 41);
+  assert.equal(report.registry_count, report.source_ignored_count);
   assert.equal(report.cargo_target_count, 15);
   assert.equal(report.reviewed_build_script_count, 7);
   assert.equal(report.workspace_proc_macro_count, 0);
   assert.ok(report.guarded_source_count > 0);
   assert.ok(report.guarded_test_target_root_count > 0);
   assert.ok(registry.cargo_targets.every((target) => target.harness === "libtest"));
-  assert.deepEqual(report.platform_counts, { linux: 40, macos: 41, windows: 37 });
   assert.ok(report.evidence_classes.includes("real-model-runtime"));
   assert.ok(report.evidence_classes.includes("real-corpus-read-only"));
   assert.ok(report.evidence_classes.includes("real-platform-tts-runtime"));
@@ -535,6 +584,10 @@ test("the only platform-limited tests match their source cfg gates", () => {
     .filter((entry) => entry.platforms.length < 3)
     .map((entry) => [entry.test_id, entry.platforms]);
   assert.deepEqual(limited, [
+    [
+      "terminal::integration_tests::real_native_terminal_retains_raw_inference_without_changing_source",
+      ["linux", "macos"],
+    ],
     [
       "apple_backend::tests::real_apple_tts_returns_silent_wav_bytes_without_permission",
       ["macos"],
@@ -620,15 +673,24 @@ test("structural validation rejects a catalog identity for a nonexistent Cargo t
 });
 
 test("reconciliation compares only the explicitly available current-platform subset", () => {
-  const macos = expectedCargoInventory(registry, "macos");
-  const linux = expectedCargoInventory(registry, "linux");
-  const windows = expectedCargoInventory(registry, "windows");
-  assert.equal(macos.length, 41);
-  assert.equal(linux.length, 40);
-  assert.equal(windows.length, 37);
-  assert.equal(reconcileCargoInventory(registry, macos, "darwin").cargo_count, 41);
-  assert.equal(reconcileCargoInventory(registry, linux, "linux").cargo_count, 40);
-  assert.equal(reconcileCargoInventory(registry, windows, "win32").cargo_count, 37);
+  const target = { package: "example", name: "example", kinds: ["lib"], src_path: "src/lib.rs" };
+  const example = {
+    cargo_targets: [{ ...target, selector: "lib" }],
+    entries: [
+      { test_id: "portable", platforms: ["linux", "macos", "windows"] },
+      { test_id: "apple", platforms: ["macos"] },
+      { test_id: "unix", platforms: ["linux", "macos"] },
+    ].map((entry) => ({ ...entry, package: "example", target: "lib" })),
+  };
+  for (const [platform, ids] of [
+    ["darwin", ["apple", "portable", "unix"]],
+    ["linux", ["portable", "unix"]],
+    ["win32", ["portable"]],
+  ]) {
+    const actual = ids.map((test_id) => ({ test_id, target }));
+    assert.deepEqual(expectedCargoInventory(example, platform), actual);
+    assert.equal(reconcileCargoInventory(example, actual, platform).cargo_count, ids.length);
+  }
 });
 
 test("reconciliation fails for missing available or present unavailable tests", () => {

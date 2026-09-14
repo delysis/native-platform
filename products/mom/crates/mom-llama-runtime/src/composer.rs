@@ -103,6 +103,7 @@ pub struct ComposerAutocompleteCancelOutput {
 }
 
 pub fn composer_autocomplete_accept(
+    scope: &crate::OperationScope,
     anchor: ComposerAutocompleteAnchor,
     suffix: String,
 ) -> Result<CommandResult<ComposerAutocompleteAcceptOutput>> {
@@ -182,6 +183,7 @@ pub fn composer_autocomplete_accept(
         return Ok(stale_accept_anchor());
     };
     let handle = match resident_model_for_profile_if_loaded(
+        scope,
         &settings,
         &model_path,
         settings.mmproj_path.as_deref(),
@@ -286,6 +288,7 @@ pub fn composer_autocomplete_accept(
 }
 
 pub fn composer_autocomplete_supervised(
+    scope: &crate::OperationScope,
     input: ComposerAutocompleteInput,
     request_id: String,
     cancellation_requested: impl Fn() -> bool,
@@ -354,6 +357,7 @@ pub fn composer_autocomplete_supervised(
         ));
     };
     let handle = match resident_model_for_profile_if_loaded(
+        scope,
         &settings,
         &model_path,
         settings.mmproj_path.as_deref(),

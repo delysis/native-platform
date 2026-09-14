@@ -1,6 +1,6 @@
 # Loom Native implementation status
 
-Status date: 2026-09-04.
+Status date: 2026-09-09.
 
 This document describes Loom's lean shipping surface after W9. Historical
 research engines, migration adapters, and candidate plans remain available in
@@ -21,12 +21,12 @@ open or create project
     -> quit and reopen without losing accepted work
 ```
 
-The current workspace retains seven Loom Rust packages:
+The current workspace contains these Loom components:
 
 - `loom-types`: durable identities and protocol-neutral writing DTOs;
 - `loom-document`: canonical text projection and bounded merge logic;
 - `loom-store`: content-addressed artifacts, SQLite history, drafts, outbox,
-  generation evidence, and forward-compatible migrations;
+  generation evidence, and strict current-schema identity;
 - `loom-host`: product admission, generation lifecycle, and cancellation;
 - `loom-backend-llama`: the in-process `llama-native-kit` adapter;
 - `loom-cli`: storage and reconciliation oracle;
@@ -54,14 +54,13 @@ The lean pass preserves these product contracts:
   caret-prefix scope, bounded canonical text, and exact PNG/JPEG/WAV media
   bindings for Gemma 4 without OCR or transcription;
 - literal Tab behavior when a suggestion cannot be accepted exactly;
-- cancellation and joined application shutdown;
-- compatibility opening for prior store schemas and the prior-v10 project
-  fixture.
+- cancellation and joined application shutdown.
 
-Research-era SQLite migrations 7-10 remain installed because an existing Loom
-project may already contain those tables. They preserve readable history; no
-default production code recreates the deleted research authority or schedules
-research work. Migration 11 records ordinary foreground writing commands.
+The unreleased store uses one current schema. Research tables and old upgrade
+paths are retired. Opening an incompatible database reports a failure without
+rewriting it; ordinary manuscript bytes remain available. Private project
+storage requires Unix permissions and directory synchronization. Other
+platforms return an explicit unsupported result before mutation.
 
 ## Completion recovery boundary
 
@@ -110,9 +109,16 @@ the model context.
 The resident llama.cpp context is selected at model load rather than fixed at
 8,192 tokens. Loom samples currently available and total system memory, reserves
 the model, projector, conservative runtime overhead, and system headroom, then
-selects the largest safe power-of-two tier up to the model's known or native-
-clamped trained limit. Generation packing reserves all branches' output cells
-and transport overhead first. If the remaining conservative byte budget cannot
+selects a power-of-two tier bounded by the same native host's 12 GiB admission
+budget and the model's known or native-clamped trained limit. More system RAM
+alone cannot authorize a context above that host budget. With sufficient free
+RAM, the official Gemma 4 12B QAT model and projector select 4,096 shared context
+cells. This leaves 2,880 conservative prompt bytes after four automatic
+48-token branches and 1,024 scaffold cells; branches share the prompt rather
+than dividing the entire context by four. These are estimates, not an allocator
+limit; native admission independently checks its estimate and resident models.
+Generation packing reserves all branches' output cells and transport overhead
+first. If the remaining conservative byte budget cannot
 hold the manuscript, it preserves the opening and the live tail, inserts an
 explicit omitted-middle marker, and receipts the exact omitted byte range.
 Attachment relevance is recalculated only at coarse manuscript-growth epochs,

@@ -6,6 +6,7 @@
 
   export let projectId: string;
   export let sessionId: string;
+  export let documentTitle: string;
   export let onUse: (items: ContextAttachment[]) => Promise<boolean>;
   let accounts: ImportAccount[] = [];
   let service: 'gmail' | 'drive' = 'gmail';
@@ -106,6 +107,7 @@
 
 <details class="import-sources">
   <summary>Import sources</summary>
+  <p>Selected sources become context for <strong>{documentTitle}</strong>.</p>
   <p>Bring documents, Slack archives, Claude conversations, LinkedIn exports, and mailboxes into this project.</p>
   <div class="actions">
     <button disabled={busy} on:click={() => void local(false)}>Choose files</button>
@@ -160,17 +162,23 @@
 </details>
 
 <style>
-  .import-sources { margin-block: .8rem; font-size: .85rem; }
-  summary { cursor: pointer; }
-  p { line-height: 1.45; }
-  label { display: grid; gap: .35rem; margin-block: .65rem; }
-  input, select, button { font: inherit; color: inherit; }
-  input:not([type=checkbox]), select { width: 100%; box-sizing: border-box; padding: .5rem; border: 1px solid #8886; border-radius: 4px; background: transparent; }
-  button { padding: .4rem .65rem; border: 1px solid #8886; border-radius: 4px; background: transparent; cursor: pointer; }
+  .import-sources { min-width: 0; margin: 0; color: var(--ink); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+  summary { box-sizing: border-box; min-height: 26px; padding: 4px 8px; border-radius: 4px; cursor: pointer; }
+  summary:hover { background: var(--chrome-hover); }
+  .import-sources > :not(summary) { max-width: calc(100% - 16px); margin-inline: 8px; }
+  p { margin-block: 6px; }
+  label { display: grid; min-width: 0; gap: 4px; margin-block: 8px; }
+  input, textarea, select, button { min-width: 0; max-width: 100%; box-sizing: border-box; font: inherit; color: inherit; }
+  input:not([type=checkbox]), textarea, select { width: 100%; padding: 5px 6px; border: 1px solid var(--line); border-radius: 4px; background: var(--paper); }
+  textarea { resize: vertical; }
+  button { min-height: 26px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 4px; background: transparent; cursor: pointer; white-space: normal; overflow-wrap: anywhere; }
+  button:hover { background: var(--chrome-hover); }
   button:disabled { opacity: .5; cursor: default; }
-  .actions { display: flex; gap: .5rem; }
-  .results { max-height: 22rem; overflow: auto; }
-  .result { display: flex; gap: .5rem; align-items: start; }
-  small { display: block; opacity: .75; margin-top: .2rem; }
-  .failure { color: #bb5544; }
+  .actions { display: flex; flex-wrap: wrap; gap: 4px; }
+  .results { max-height: 22rem; min-width: 0; overflow: auto; }
+  .result { display: flex; gap: 5px; align-items: start; }
+  .result input { flex: none; }
+  .result span { min-width: 0; }
+  small { display: block; color: var(--muted); margin-top: 2px; }
+  .failure { color: var(--danger); }
 </style>

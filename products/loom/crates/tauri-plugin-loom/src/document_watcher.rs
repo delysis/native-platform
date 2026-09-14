@@ -1,4 +1,3 @@
-use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Component, Path};
 
@@ -86,27 +85,36 @@ fn event_requires_hint(project_root: &Path, event: &notify::Result<Event>) -> bo
     event
         .paths
         .iter()
-        .any(|path| is_manuscript_path(project_root, path))
+        .any(|path| is_writing_path(project_root, path))
 }
 
-fn is_manuscript_path(project_root: &Path, event_path: &Path) -> bool {
+fn is_writing_path(project_root: &Path, event_path: &Path) -> bool {
     let relative = relative_event_path(project_root, event_path);
     let Some(relative) = relative else {
         return false;
     };
-    let mut components = relative.components();
-    let first_is_manuscript = matches!(
-        components.next(),
-        Some(Component::Normal(component)) if component == OsStr::new("manuscript")
-    );
-
-    first_is_manuscript
-        && components.all(|component| {
-            !matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        let hidden_markdown_leaf = components.peek().is_none()
+            && matches!(
+                Path::new(name)
+                    .extension()
+                    .and_then(|extension| extension.to_str()),
+                Some("md" | "markdown")
+            );
+        if (name.starts_with('.') && !hidden_markdown_leaf)
+            || matches!(name, "node_modules" | "target")
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn relative_event_path<'a>(project_root: &Path, event_path: &'a Path) -> Option<&'a Path> {
@@ -205,11 +213,34 @@ mod tests {
     }
 
     #[test]
+    fn root_writing_and_folder_moves_require_a_hint() {
+        // A removed or renamed directory may itself have an extension.
+        for path in [
+            "Notes.md",
+            "Notes.TXT",
+            "chapters",
+            "drafts.v2",
+            ".loom.md",
+            "templates/.chat.md",
+        ] {
+            assert!(event_requires_hint(
+                &project_root(),
+                &Ok(event(
+                    EventKind::Modify(ModifyKind::Any),
+                    [project_path(path)],
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn metadata_and_unrelated_paths_are_ignored() {
         let root = project_root();
         for path in [
             project_path(".loom/project.sqlite3"),
-            project_path("attachments/image.png"),
+            project_path(".hidden.md/prompt.md"),
+            project_path(".env"),
+            project_path("target/generated.md"),
             std::env::temp_dir().join("other-project/manuscript/chapter.md"),
         ] {
             assert!(!event_requires_hint(

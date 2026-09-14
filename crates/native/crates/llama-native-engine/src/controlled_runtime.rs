@@ -1229,6 +1229,7 @@ fn execute_disabled_baseline(
             reasoning_forces: &reasoning,
         },
         BatchSequenceState {
+            fingerprint: request.control().writer().fingerprint(),
             tracking,
             resident: None,
         },
@@ -1573,16 +1574,13 @@ fn execute_active_controls(
             if let Some(observation) = observation {
                 active.observations.push(observation);
             }
-            let bytes = model
-                .token_to_piece_bytes(token, 512, false, None)
-                .map_err(|error| {
-                    NativeError::new(
-                        NativeErrorCode::DecodeFailed,
-                        format!("failed to decode controlled token: {error}"),
-                    )
-                })?;
-            let mut piece = String::with_capacity(bytes.len());
-            let _ = active.decoder.decode_to_string(&bytes, &mut piece, false);
+            let bytes = super::generated_token_piece(model, token).map_err(|error| {
+                NativeError::new(
+                    NativeErrorCode::DecodeFailed,
+                    format!("failed to decode controlled token: {error}"),
+                )
+            })?;
+            let piece = decode_generated_utf8_piece(&mut active.decoder, &bytes, false)?;
             if active.first_token_ms.is_none() {
                 active.first_token_ms = Some(started.elapsed().as_millis());
             }
@@ -1599,14 +1597,7 @@ fn execute_active_controls(
                 active.event_index += 1;
             }
             let case = &request.cases()[case_index];
-            if let Some(stop) = case
-                .sampling()
-                .stop
-                .iter()
-                .find(|stop| !stop.is_empty() && active.text.ends_with(stop.as_str()))
-            {
-                let keep = active.text.len().saturating_sub(stop.len());
-                active.text.truncate(keep);
+            if apply_stop_sequences(&mut active.text, &case.sampling().stop) {
                 active.state = GenerationState::Completed;
                 active.finish_reason = "stop_sequence".to_string();
             } else if active.generated_token_ids.len() >= case.sampling().max_tokens as usize {
@@ -1625,8 +1616,24 @@ fn execute_active_controls(
     let duration_ms = started.elapsed().as_millis();
     let mut outputs = Vec::with_capacity(cases.len());
     let mut terminal_sampled_token_ids = Vec::with_capacity(cases.len());
-    for (case_index, active) in cases.into_iter().enumerate() {
+    for (case_index, mut active) in cases.into_iter().enumerate() {
         let case = &request.cases()[case_index];
+        let final_piece = finalize_generated_text(
+            &mut active.decoder,
+            &mut active.text,
+            active.finish_reason == "stop_sequence",
+        )?;
+        if !final_piece.is_empty() {
+            emit_controlled_event(
+                event_tx,
+                retained_events,
+                request,
+                case_index,
+                active.event_index,
+                GenerationEventKind::Delta { text: final_piece },
+            );
+            active.event_index += 1;
+        }
         debug_assert!(matches!(
             active.state,
             GenerationState::Completed | GenerationState::Cancelled
@@ -1667,6 +1674,7 @@ fn execute_active_controls(
                 cache: GenerationCacheMetrics {
                     supplied_prefix_tokens: 0,
                     restored_prefix_tokens: 0,
+                    replayed_prefix_tokens: 0,
                     batch_shared_prefix_tokens: layout.conditional_shared_prefix,
                     resident_prefix_tokens: 0,
                 },
@@ -3187,9 +3195,8 @@ fn verify_controlled_authority(
                         == case.sampling().max_tokens as usize => {}
             (GenerationState::Completed, "stop_sequence")
                 if terminal_token.is_none()
-                    && case.sampling().stop.iter().any(|stop| {
-                        !stop.is_empty() && decoded == format!("{}{stop}", generation.text)
-                    }) => {}
+                    && stop_sequence_start(&decoded, &case.sampling().stop)
+                        .is_some_and(|start| generation.text == decoded[..start]) => {}
             _ => {
                 return Err(generation_verification_error(
                     "controlled terminal token, text projection, and finish reason disagree",
@@ -3330,6 +3337,30 @@ impl StableEvidenceDigest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controlled_stop_preserves_split_utf8_and_raw_token_text() {
+        let stops = vec!["\nUser:".to_string()];
+        let mut decoder = UTF_8.new_decoder();
+        let mut output = String::new();
+        let mut deltas = String::new();
+        let mut stopped = false;
+        for bytes in [&b"caf\xc3"[..], &b"\xa9\nUs"[..], &b"er: another turn"[..]] {
+            let piece = decode_generated_utf8_piece(&mut decoder, bytes, false).expect("decode");
+            deltas.push_str(&piece);
+            append_generated_utf8_piece(&mut output, &piece).expect("bounded output");
+            stopped = apply_stop_sequences(&mut output, &stops);
+            if stopped {
+                break;
+            }
+        }
+        deltas
+            .push_str(&finalize_generated_text(&mut decoder, &mut output, stopped).expect("flush"));
+        assert!(stopped);
+        assert_eq!(output, "café");
+        assert_eq!(deltas, "café\nUser: another turn");
+        assert_eq!(stop_sequence_start(&deltas, &stops), Some(output.len()));
+    }
     use llama_native_types::{
         ConstraintArtifactReference, ControlProgram, DistributionValueKindSet, EtaCutoff, ExactF32,
         ExactTokenPrompt, ExtendedSamplerProgram, MirostatV1Config, MirostatV2Config,

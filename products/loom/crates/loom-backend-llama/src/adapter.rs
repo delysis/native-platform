@@ -1336,6 +1336,8 @@ struct OwnedBackendReceipt {
 enum WriterInputContract {
     #[default]
     RawCompletion,
+    /// Ordered native media markers precede the unchanged raw prompt, without roles.
+    RawCompletionWithMediaPrefix,
     InstructionChat,
     Gemma4NonThinkingChat,
 }
@@ -1350,6 +1352,7 @@ pub fn validate_candidate_receipt_binding(
     record: &CandidateProvenanceRecord,
     expected_request_id: &str,
     expected_prompt_blob_id: BlobId,
+    expected_prompt_mode: PromptMode,
     expected_context_binding: &ContinuationContextBinding,
     expected_model: &VerifiedModelDescriptor,
     expected_input_index: usize,
@@ -1381,8 +1384,11 @@ pub fn validate_candidate_receipt_binding(
         }
     };
     let output_blob_id = BlobId::digest(output.text.as_bytes());
-    let expected_input_contract =
-        writer_input_contract_for_media(!expected_context_binding.media.is_empty(), expected_model);
+    let expected_input_contract = writer_input_contract_for_mode(
+        expected_prompt_mode,
+        !expected_context_binding.media.is_empty(),
+        expected_model,
+    );
     let identities_match = receipt.exact_prompt_blob_id == expected_prompt_blob_id
         && receipt.model_environment_id == expected_model.model_environment_id
         && receipt.input_contract == expected_input_contract
@@ -1663,9 +1669,19 @@ fn validate_request(
         ));
     }
     let prompt_blob_id = BlobId::digest(request.exact_manuscript_prefix.as_bytes());
-    if request.prompt_recipe.mode != PromptMode::Completion {
+    if !matches!(
+        request.prompt_recipe.mode,
+        PromptMode::Completion | PromptMode::RawCompletion
+    ) {
         return Err(LlamaBackendError::InvalidRequest(
-            "raw continuation requires PromptMode::Completion".to_string(),
+            "continuation requires Completion or RawCompletion mode".to_string(),
+        ));
+    }
+    if request.prompt_recipe.mode == PromptMode::RawCompletion
+        && !request.context_preamble.is_empty()
+    {
+        return Err(LlamaBackendError::InvalidRequest(
+            "raw completion requires a self-contained text prompt without a hidden context preamble".to_string(),
         ));
     }
     if request.prompt_recipe.exact_prompt_blob_id != prompt_blob_id {
@@ -1676,11 +1692,6 @@ fn validate_request(
     if request.prompt_recipe.exact_prompt_token_ids.is_some() {
         return Err(LlamaBackendError::InvalidRequest(
             "text completion cannot accept an unverified predeclared token prompt".to_string(),
-        ));
-    }
-    if !request.media.is_empty() && !model.capabilities.chat.is_supported() {
-        return Err(LlamaBackendError::InvalidRequest(
-            "media attachments require a model with an exact native chat contract".to_string(),
         ));
     }
     let _ = continuation_context_binding(&request.context_preamble, &request.media)?;
@@ -1756,7 +1767,8 @@ fn build_native_request(
             .map(|case| GenerationCase {
                 case_id: case.generation.branch_id.to_string(),
                 input: match input_contract {
-                    WriterInputContract::RawCompletion => {
+                    WriterInputContract::RawCompletion
+                    | WriterInputContract::RawCompletionWithMediaPrefix => {
                         llama_native_types::GenerationInput::Completion {
                             prompts: vec![CompletionPrompt::Text {
                                 text: contextual_prefix.clone(),
@@ -1820,7 +1832,19 @@ fn writer_input_contract_for_request(
     request: &ExactContinuationRequest,
     model: &VerifiedModelDescriptor,
 ) -> WriterInputContract {
-    writer_input_contract_for_media(!request.media.is_empty(), model)
+    writer_input_contract_for_mode(request.prompt_recipe.mode, !request.media.is_empty(), model)
+}
+
+fn writer_input_contract_for_mode(
+    mode: PromptMode,
+    has_media: bool,
+    model: &VerifiedModelDescriptor,
+) -> WriterInputContract {
+    if mode == PromptMode::RawCompletion {
+        raw_input_contract(has_media)
+    } else {
+        writer_input_contract_for_media(has_media, model)
+    }
 }
 
 fn writer_input_contract_for_media(
@@ -1828,10 +1852,18 @@ fn writer_input_contract_for_media(
     model: &VerifiedModelDescriptor,
 ) -> WriterInputContract {
     let contract = writer_input_contract(model);
-    if !has_media || contract == WriterInputContract::Gemma4NonThinkingChat {
-        contract
+    if contract == WriterInputContract::RawCompletion {
+        raw_input_contract(has_media)
     } else {
-        WriterInputContract::InstructionChat
+        contract
+    }
+}
+
+fn raw_input_contract(has_media: bool) -> WriterInputContract {
+    if has_media {
+        WriterInputContract::RawCompletionWithMediaPrefix
+    } else {
+        WriterInputContract::RawCompletion
     }
 }
 
@@ -1982,6 +2014,7 @@ pub fn model_environment_from_verified(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use crossbeam_channel::RecvTimeoutError;
@@ -1996,6 +2029,7 @@ mod tests {
     use super::*;
     use crate::model::RuntimeModelInspection;
     use crate::runtime::CompleteModelRelease;
+    use std::time::Instant;
 
     #[derive(Debug)]
     struct FakeExecution {
@@ -2272,6 +2306,7 @@ mod tests {
                 cache: GenerationCacheMetrics {
                     supplied_prefix_tokens: 0,
                     restored_prefix_tokens: 0,
+                    replayed_prefix_tokens: 0,
                     batch_shared_prefix_tokens: 6,
                     resident_prefix_tokens: 0,
                 },
@@ -2449,6 +2484,7 @@ mod tests {
                 record,
                 &result.request_id,
                 result.exact_prompt_blob_id,
+                PromptMode::Completion,
                 &result.context_binding,
                 &result.model,
                 input_index,
@@ -2829,7 +2865,8 @@ mod tests {
             event_rx,
             result: Mutex::new(Some(outputs)),
             ready: AtomicBool::new(false),
-            complete_on_cancel: AtomicBool::new(false),
+            // Assertion failure must not deadlock the real owner's Drop/join.
+            complete_on_cancel: AtomicBool::new(true),
             panic_on_receive: AtomicBool::new(false),
             cancelled: Mutex::new(Vec::new()),
         });
@@ -2862,14 +2899,30 @@ mod tests {
                     },
                 })
                 .expect("send bounded native delta");
-            for _ in 0..chunks_per_delta {
-                delivered.push(
-                    handle
-                        .receive_event_timeout(Duration::from_millis(100))
-                        .expect("receive concurrently drained chunk")
-                        .expect("native delta must produce a chunk"),
-                );
+            // Coalescing and consumer scheduling determine chunk boundaries.
+            // Wait for the exact submitted bytes, not a presumed chunk count
+            // or a guarantee that every 100 ms polling interval has an event.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut received_bytes = 0;
+            while received_bytes < one_mibibyte.len() {
+                assert!(Instant::now() < deadline, "native delta delivery timed out");
+                let Some(event) = handle
+                    .receive_event_timeout(Duration::from_millis(100))
+                    .expect("receive concurrently drained chunk")
+                else {
+                    continue;
+                };
+                let LoomEvent::Generation(GenerationEvent {
+                    kind: GenerationEventKind::TextDelta { text },
+                    ..
+                }) = &event
+                else {
+                    panic!("unexpected event before native completion: {event:?}");
+                };
+                received_bytes += text.len();
+                delivered.push(event);
             }
+            assert_eq!(received_bytes, one_mibibyte.len());
         }
         event_tx
             .send(NativeEvent {
@@ -3106,7 +3159,85 @@ mod tests {
     }
 
     #[test]
-    fn native_media_stays_byte_exact_and_forces_the_bound_chat_transport() {
+    fn raw_media_receipt_case_index_is_independent_of_attachment_count() {
+        let mut request = request_with_two_cases();
+        request.cases.truncate(1);
+        request.prompt_recipe.mode = PromptMode::RawCompletion;
+        let bytes = b"audio payload for fixture receipt validation".to_vec();
+        request.media.push(MediaInput {
+            id: "recording".into(),
+            kind: MediaKind::Audio,
+            mime: "audio/wav".into(),
+            sha256: BlobId::digest(&bytes).to_string(),
+            bytes,
+        });
+        let expected_context =
+            continuation_context_binding("", &request.media).expect("input binding");
+        let output = native_output(&request, 0, GenerationState::Completed, true);
+        let runtime = fake_runtime(
+            &request,
+            vec![output],
+            native_events(&request),
+            true,
+            RuntimeEvidenceClass::TestFixture,
+        );
+        let backend = LlamaBackend::with_runtime(runtime, 64).expect("backend");
+        let owner = backend
+            .start_exact_continuation(request.clone())
+            .expect("admit raw media");
+        let result = owner
+            .wait_timeout(Duration::from_secs(2))
+            .expect("fixture result");
+        let candidate = &result.candidates[0];
+        let receipt: OwnedBackendReceipt =
+            serde_json::from_slice(&candidate.backend_receipt_bytes).expect("preserved receipt");
+        assert_eq!(
+            receipt.input_contract,
+            WriterInputContract::RawCompletionWithMediaPrefix
+        );
+        assert_eq!(receipt.output.input_index, 0);
+        validate_candidate_receipt_binding(
+            candidate,
+            &request.request_id,
+            request.prompt_recipe.exact_prompt_blob_id,
+            PromptMode::RawCompletion,
+            &expected_context,
+            &result.model,
+            0,
+        )
+        .expect("the sole case remains index zero with an attachment");
+        assert!(
+            validate_candidate_receipt_binding(
+                candidate,
+                &request.request_id,
+                request.prompt_recipe.exact_prompt_blob_id,
+                PromptMode::RawCompletion,
+                &expected_context,
+                &result.model,
+                request.media.len(),
+            )
+            .is_err(),
+            "attachment count must never be used as the output case index"
+        );
+        let mut wrong_context = expected_context;
+        wrong_context.media[0].sha256 = "0".repeat(64);
+        assert!(
+            validate_candidate_receipt_binding(
+                candidate,
+                &request.request_id,
+                request.prompt_recipe.exact_prompt_blob_id,
+                PromptMode::RawCompletion,
+                &wrong_context,
+                &result.model,
+                0,
+            )
+            .is_err(),
+            "correcting the case index must not weaken media identity checks"
+        );
+    }
+
+    #[test]
+    fn instruction_model_media_stays_byte_exact_with_its_bound_chat_transport() {
         let mut request = request_with_two_cases();
         request.context_preamble = "Reference the attached sound and image.".to_owned();
         let bytes = b"native media fixture".to_vec();
@@ -3120,6 +3251,7 @@ mod tests {
         let mut model = verify_model_inspection(&request.model, model_inspection(&request.model))
             .expect("verified fixture model");
         model.capabilities.chat = crate::CapabilitySupport::Supported;
+        model.display_name = "fixture-instruct".to_owned();
 
         let native = build_native_request(&request, &model);
         assert_eq!(native.media, request.media);
@@ -3331,6 +3463,90 @@ mod tests {
             verify_model_inspection(&first_profile, mismatched),
             Err(ModelInspectionError::ModelPathMismatch)
         ));
+    }
+
+    #[test]
+    fn base_media_uses_raw_completion_and_binds_payload_order() {
+        let mut request = request_with_two_cases();
+        for (id, kind, mime) in [
+            ("voice", MediaKind::Audio, "audio/wav"),
+            ("picture", MediaKind::Image, "image/png"),
+        ] {
+            let bytes = id.as_bytes().to_vec();
+            request.media.push(MediaInput {
+                id: id.into(),
+                kind,
+                mime: mime.into(),
+                sha256: BlobId::digest(&bytes).to_string(),
+                bytes,
+            });
+        }
+        let mut model = verify_model_inspection(&request.model, model_inspection(&request.model))
+            .expect("verified base fixture");
+        model.capabilities.chat = crate::CapabilitySupport::Unsupported;
+        for mode in [PromptMode::Completion, PromptMode::RawCompletion] {
+            request.prompt_recipe.mode = mode;
+            validate_request(&request, &model, 64)
+                .expect("media needs a projector, not chat roles");
+            assert_eq!(
+                writer_input_contract_for_request(&request, &model),
+                WriterInputContract::RawCompletionWithMediaPrefix
+            );
+            let native = build_native_request(&request, &model);
+            assert_eq!(native.media, request.media);
+            for case in native.cases {
+                assert_eq!(
+                    case.input,
+                    llama_native_types::GenerationInput::Completion {
+                        prompts: vec![CompletionPrompt::Text {
+                            text: request.exact_manuscript_prefix.clone(),
+                            special_tokens: SpecialTokenPolicy::AddBosParseSpecial,
+                        }],
+                    }
+                );
+            }
+        }
+        let first = continuation_context_binding("", &request.media).expect("binding");
+        request.media.reverse();
+        let reversed = continuation_context_binding("", &request.media).expect("binding");
+        assert_ne!(
+            first, reversed,
+            "payload order is part of preserved provenance"
+        );
+    }
+
+    #[test]
+    fn raw_completion_preserves_prompt_on_instruction_capable_models() {
+        let mut request = request_with_two_cases();
+        request.prompt_recipe.mode = PromptMode::RawCompletion;
+        let mut model =
+            verify_model_inspection(&request.model, model_inspection(&request.model)).unwrap();
+        model.architecture = Some("gemma4".into());
+        model.capabilities.chat = crate::model::CapabilitySupport::Supported;
+        assert_eq!(
+            writer_input_contract(&model),
+            WriterInputContract::Gemma4NonThinkingChat
+        );
+        validate_request(&request, &model, 64).unwrap();
+        let native = build_native_request(&request, &model);
+        for case in native.cases {
+            let llama_native_types::GenerationInput::Completion { prompts } = case.input else {
+                panic!("explicit raw completion must bypass chat templates");
+            };
+            let [
+                CompletionPrompt::Text {
+                    text,
+                    special_tokens,
+                },
+            ] = prompts.as_slice()
+            else {
+                panic!("expected the exact text prompt");
+            };
+            assert_eq!(text, &request.exact_manuscript_prefix);
+            assert_eq!(*special_tokens, SpecialTokenPolicy::AddBosParseSpecial);
+        }
+        request.context_preamble = "must not silently wrap this".into();
+        assert!(validate_request(&request, &model, 64).is_err());
     }
 
     #[test]
@@ -3687,7 +3903,25 @@ mod tests {
             request.cases.push(case);
         }
         request.cases.truncate(case_count);
-        request.model = LocalModelProfile::for_gguf(model_path);
+        let runtime = Arc::new(NativeHostRuntime::default());
+        let projector_path = std::env::var_os("LOOM_GGUF_MMPROJ_PATH").map(PathBuf::from);
+        let projector_bytes = projector_path
+            .as_ref()
+            .map(std::fs::metadata)
+            .transpose()?
+            .map_or(0, |metadata| metadata.len());
+        request.model = runtime.model_profile_for_current_memory(
+            PathBuf::from(model_path),
+            std::fs::metadata(model_path)?.len(),
+            projector_bytes,
+            None,
+        );
+        request.model.projector_path = projector_path;
+        request.model.expected_mmproj_sha256 = std::env::var("LOOM_GGUF_MMPROJ_SHA256").ok();
+        eprintln!(
+            "production writer context: {} cells",
+            request.model.context_tokens
+        );
         request.model.expected_model_sha256 = Some(expected_sha256.to_string());
         request.model.max_parallel_cases = u32::try_from(case_count)?;
         request.request_id = "real-raw-family".to_string();
@@ -3709,7 +3943,7 @@ mod tests {
             case.sampling.max_tokens = 48;
             case.generation.sampling = serde_json::to_value(&case.sampling)?;
         }
-        let backend = LlamaBackend::default();
+        let backend = LlamaBackend::with_default_native_runtime(runtime);
         let handle = backend.start_exact_continuation(request)?;
         Ok(handle.wait_timeout(Duration::from_mins(5))?)
     }

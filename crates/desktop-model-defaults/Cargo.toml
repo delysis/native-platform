@@ -1,0 +1,12 @@
+[package]
+name = "desktop-model-defaults"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Shared desktop model policy and local Hugging Face cache discovery"
+
+[lints]
+workspace = true

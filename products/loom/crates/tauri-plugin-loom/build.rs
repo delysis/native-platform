@@ -1,11 +1,19 @@
 const COMMANDS: &[&str] = &[
     "project_open_default",
-    "project_choose_create",
-    "project_choose_open",
+    "project_prepare_open",
+    "project_prepare_open_path",
+    "project_drop_directories",
+    "project_commit_open",
+    "project_discard_open",
     "project_close",
     "project_current",
     "project_recover",
     "document_create",
+    "workspace_template_get",
+    "workspace_template_enable",
+    "audio_record_start",
+    "audio_record_stop",
+    "audio_synthesize",
     "document_rename",
     "document_delete",
     "import_text_sources",
@@ -19,6 +27,7 @@ const COMMANDS: &[&str] = &[
     "attachment_ingest",
     "attachment_import_choose",
     "attachment_import_paths",
+    "attachment_reveal_original",
     "document_context_list",
     "document_context_add",
     "document_context_add_many",
@@ -37,6 +46,7 @@ const COMMANDS: &[&str] = &[
     "speech_input_status",
     "speech_input_cancel",
     "document_open",
+    "document_import_external",
     "document_checkpoint",
     "document_export_choose",
     "document_reveal",
@@ -62,6 +72,10 @@ const COMMANDS: &[&str] = &[
     "branch_body",
     "weave_status",
     "weave_start",
+    "terminal_run",
+    "terminal_list",
+    "terminal_cancel",
+    "shader_preview",
     "generation_cancel",
     "candidate_keep",
     "candidate_promote",
@@ -73,6 +87,16 @@ const COMMANDS: &[&str] = &[
 ];
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        // Library tests link rfd's TaskDialogIndirect too, but do not inherit
+        // the desktop app's manifest. Activate the same Common Controls API.
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'"
+        );
+    }
     if let Err(error) = tauri_plugin::Builder::new(COMMANDS).try_build() {
         panic!("failed to build Loom plugin metadata: {error}");
     }

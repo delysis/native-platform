@@ -84,6 +84,11 @@ requests/stream lifetimes, and never exposes hosted credentials. The local
 token lives in an app-private file so ordinary SDK clients do not cause
 Keychain prompts. Provider secrets remain behind an injected resolver.
 
+HTTP model IDs are opaque, including any slashes, and can be used unchanged
+from `/v1/models`. Only the documented `local-only`, `hosted-only`,
+`prefer-local`, and `auto` names select routing profiles. Canonical Rust callers
+can separately select an exact backend and model through `ModelSelector`.
+
 Anthropic streaming obtains an exact token count from the selected route
 before emitting `message_start`. If that route cannot supply an exact count,
 the request fails with a typed capability error instead of fabricating zero

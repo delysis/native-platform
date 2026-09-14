@@ -152,7 +152,6 @@ struct ToolLoopOperation {
 }
 
 struct OperationRegistries {
-    quiescing: bool,
     next_mcp_id: u64,
     chats: BTreeMap<String, ChatOperation>,
     mentions: MentionCancelRegistry,
@@ -162,6 +161,8 @@ struct OperationRegistries {
 
 struct OperationScopeInner {
     native_host: Weak<NativeHost>,
+    quiescing: AtomicBool,
+    native_key: Option<crate::native_runtime::ProductHostKey>,
     registries: Mutex<OperationRegistries>,
 }
 
@@ -176,26 +177,41 @@ pub struct OperationScope(Arc<OperationScopeInner>);
 impl OperationScope {
     #[must_use]
     pub fn for_native_host(host: &Arc<NativeHost>) -> Self {
-        Self::new(Arc::downgrade(host))
+        Self::new(Arc::downgrade(host), None)
     }
 
     #[must_use]
     pub fn detached() -> Self {
-        Self::new(Weak::new())
+        Self::new(Weak::new(), None)
     }
 
-    pub(crate) fn for_current_product_host() -> Self {
-        match crate::native_runtime::current_product_host() {
-            Some(host) => Self::for_native_host(&host),
-            None => Self::detached(),
+    pub(crate) fn for_product_host(
+        host: &Arc<NativeHost>,
+        key: crate::native_runtime::ProductHostKey,
+    ) -> Self {
+        Self::new(Arc::downgrade(host), Some(key))
+    }
+
+    pub(crate) fn matches_native_key(&self, key: &crate::native_runtime::ProductHostKey) -> bool {
+        self.0.native_key.as_ref().is_none_or(|bound| bound == key)
+    }
+
+    pub(crate) fn native_host(&self) -> Option<Arc<NativeHost>> {
+        if self.0.quiescing.load(Ordering::Acquire) || self.0.registries.is_poisoned() {
+            return None;
         }
+        self.0.native_host.upgrade()
     }
 
-    fn new(native_host: Weak<NativeHost>) -> Self {
+    fn new(
+        native_host: Weak<NativeHost>,
+        native_key: Option<crate::native_runtime::ProductHostKey>,
+    ) -> Self {
         Self(Arc::new(OperationScopeInner {
             native_host,
+            quiescing: AtomicBool::new(false),
+            native_key,
             registries: Mutex::new(OperationRegistries {
-                quiescing: false,
                 next_mcp_id: 0,
                 chats: BTreeMap::new(),
                 mentions: BTreeMap::new(),
@@ -219,7 +235,9 @@ impl OperationScope {
         if registries.chats.contains_key(request_id) {
             anyhow::bail!("chat request identity is already active in this runtime");
         }
-        let cancellation = Arc::new(ChatCancelControl::new(registries.quiescing));
+        let cancellation = Arc::new(ChatCancelControl::new(
+            self.0.quiescing.load(Ordering::Acquire),
+        ));
         registries.chats.insert(
             request_id.to_owned(),
             ChatOperation {
@@ -273,7 +291,7 @@ impl OperationScope {
             .registries
             .lock()
             .map_err(|_| anyhow::anyhow!("Persona cancellation registry is unavailable"))?;
-        let quiescing = registries.quiescing;
+        let quiescing = self.0.quiescing.load(Ordering::Acquire);
         operation(&mut registries.mentions, quiescing)
     }
 
@@ -290,7 +308,7 @@ impl OperationScope {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("MCP operation identity space is exhausted"))?;
         registries.next_mcp_id = id;
-        if registries.quiescing {
+        if self.0.quiescing.load(Ordering::Acquire) {
             cancellation.store(true, Ordering::Release);
         }
         registries.mcp.insert(
@@ -321,7 +339,7 @@ impl OperationScope {
         if registries.tool_loops.contains_key(request_id) {
             anyhow::bail!("tool-loop request identity is already active in this runtime");
         }
-        let control = ToolLoopControl::new(registries.quiescing);
+        let control = ToolLoopControl::new(self.0.quiescing.load(Ordering::Acquire));
         registries.tool_loops.insert(
             request_id.to_owned(),
             ToolLoopOperation {
@@ -366,10 +384,10 @@ impl OperationScope {
     /// cancellation from every operation currently owned by this runtime.
     pub fn request_cancellation(&self) -> usize {
         let (chat_requests, mention_requests, mcp_cancellations, tool_controls) = {
-            let Ok(mut registries) = self.0.registries.lock() else {
+            let Ok(registries) = self.0.registries.lock() else {
                 return 0;
             };
-            registries.quiescing = true;
+            self.0.quiescing.store(true, Ordering::Release);
             let chats = registries
                 .chats
                 .iter()

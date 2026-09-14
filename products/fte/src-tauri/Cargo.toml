@@ -9,6 +9,9 @@ repository.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[lints]
+workspace = true
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
@@ -16,12 +19,14 @@ publish.workspace = true
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "free_token_energy_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+# Desktop binaries link the Rust library directly. No C ABI/mobile artifact is consumed.
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+desktop-model-defaults.workspace = true
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
@@ -42,4 +47,5 @@ llama-native-types.workspace = true
 tauri-plugin-free-token-energy = { path = "../crates/tauri-plugin-free-token-energy", features = ["native-llama"] }
 
 [dev-dependencies]
+fte-loopback = { path = "../crates/fte-loopback" }
 async-trait = "0.1.92"

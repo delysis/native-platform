@@ -1422,10 +1422,16 @@ fn store_information_error(error: &StoreError) -> InformationError {
             "information_managed_documents_database_failure",
             false,
         ),
-        StoreError::CommittedDurabilityUnknown { .. } => (
+        StoreError::CommittedDurabilityUnknown { .. }
+        | StoreError::ManagedDocumentsCommitted { .. } => (
             ErrorClass::Io,
             "information_store_commit_durability_unknown",
             true,
+        ),
+        StoreError::UnsupportedPlatform => (
+            ErrorClass::Unsupported,
+            "information_private_store_unsupported",
+            false,
         ),
         StoreError::Io { .. } => (ErrorClass::Io, "information_store_io_failure", false),
         StoreError::IntegerOverflow => (
@@ -2234,6 +2240,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn network_attempt_history_survives_host_receipt_mapping() -> TestResult {
         let uri = "https://example.test/archive.zim".to_string();
@@ -2297,6 +2304,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn exact_publication_recovery_does_not_fabricate_source_contact() -> TestResult {
         let artifact = PlannedArtifact {
@@ -2342,6 +2350,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn file_acquisition_reaches_ready_only_after_exact_verification() -> TestResult {
         let directory = tempdir()?;
@@ -2446,6 +2455,8 @@ mod tests {
 
     #[test]
     fn store_failures_keep_their_structured_error_class() -> TestResult {
+        let unsupported = HostError::Store(StoreError::UnsupportedPlatform).as_information_error();
+        assert_eq!(unsupported.class, ErrorClass::Unsupported);
         let busy = HostError::Store(StoreError::StoreBusy).as_information_error();
         assert_eq!(busy.class, ErrorClass::ResourceBusy);
         assert!(busy.retryable);

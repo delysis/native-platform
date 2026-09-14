@@ -1,6 +1,7 @@
 import { defaultMarkdownParser } from 'prosemirror-markdown';
-import { EditorState, Selection } from 'prosemirror-state';
+import { EditorState, Selection, TextSelection } from 'prosemirror-state';
 import { describe, expect, it } from 'vitest';
+import { history, undo } from 'prosemirror-history';
 import {
   canRoundTripMarkdownExactly,
   canUseVisualMarkdown,
@@ -54,7 +55,7 @@ describe('visual Markdown safety gate', () => {
   });
 
   it('round-trips a terminal space produced by a live ProseMirror edit', () => {
-    const document = defaultMarkdownParser.parse('hello');
+    const document = parseVisualMarkdown('hello');
     const state = EditorState.create({
       doc: document,
       selection: Selection.atEnd(document)
@@ -64,4 +65,31 @@ describe('visual Markdown safety gate', () => {
     expect(serializeVisualMarkdown(edited)).toBe('hello ');
     expect(parseVisualMarkdown(serializeVisualMarkdown(edited)).eq(edited)).toBe(true);
   });
+
+  it.each(['\n', '\n\n', '\r\n', '\r\n\r\n'])(
+    'retains terminal %j through fenced-code editing, undo, and reopen', (suffix) => {
+      const source = '```wgsl\nfn shade() {}\n```' + suffix;
+      expect(canRoundTripMarkdownExactly(source)).toBe(true);
+      const doc = parseVisualMarkdown(source);
+      let state = EditorState.create({
+        doc, selection: TextSelection.create(doc, 4), plugins: [history()]
+      });
+      expect(serializeVisualMarkdown(state.doc)).toBe(source);
+      state = state.apply(state.tr.insertText('new_'));
+      const edited = '```wgsl\nfn new_shade() {}\n```' + suffix;
+      expect(serializeVisualMarkdown(state.doc)).toBe(edited);
+      expect(parseVisualMarkdown(edited).eq(state.doc)).toBe(true);
+      expect(undo(state, (transaction) => { state = state.apply(transaction); })).toBe(true);
+      expect(serializeVisualMarkdown(state.doc)).toBe(source);
+      expect(parseVisualMarkdown(source).eq(state.doc)).toBe(true);
+    }
+  );
+
+  it('keeps unsupported syntax and internal line-ending normalization fail-closed', () => {
+    expect(canRoundTripMarkdownExactly('~~unsupported~~\r\n')).toBe(false);
+    expect(canRoundTripMarkdownExactly('```wgsl\r\ncode\r\n```\r\n')).toBe(false);
+    expect(canRoundTripMarkdownExactly('It  \n')).toBe(false);
+    expect(serializeVisualMarkdown(parseVisualMarkdown('It \r\n'))).toBe('It \r\n');
+  });
+
 });

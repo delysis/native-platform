@@ -186,7 +186,10 @@ pub fn kv_cache_status() -> Result<CommandResult<KvCacheStatus>> {
     ))
 }
 
-pub fn kv_cache_save(skill_id: Option<String>) -> Result<CommandResult<KvCacheMetadata>> {
+pub fn kv_cache_save(
+    scope: &crate::OperationScope,
+    skill_id: Option<String>,
+) -> Result<CommandResult<KvCacheMetadata>> {
     let settings = resolve_settings()?;
     if !settings.kv_cache_policy.allows_prefix_reuse() {
         return Ok(CommandResult::blocked(
@@ -199,7 +202,7 @@ pub fn kv_cache_save(skill_id: Option<String>) -> Result<CommandResult<KvCacheMe
             ),
         ));
     }
-    let handle = match resident_model(&settings) {
+    let handle = match resident_model(scope, &settings) {
         Ok(handle) => handle,
         Err(blocked) => {
             return Ok(CommandResult::blocked(
@@ -261,7 +264,10 @@ pub fn kv_cache_save(skill_id: Option<String>) -> Result<CommandResult<KvCacheMe
     ))
 }
 
-pub fn kv_cache_restore(cache_id: Option<String>) -> Result<CommandResult<KvCacheMetadata>> {
+pub fn kv_cache_restore(
+    scope: &crate::OperationScope,
+    cache_id: Option<String>,
+) -> Result<CommandResult<KvCacheMetadata>> {
     let settings = resolve_settings()?;
     if !settings.kv_cache_policy.allows_prefix_reuse() {
         return Ok(CommandResult::blocked(
@@ -274,7 +280,7 @@ pub fn kv_cache_restore(cache_id: Option<String>) -> Result<CommandResult<KvCach
             ),
         ));
     }
-    let handle = match resident_model(&settings) {
+    let handle = match resident_model(scope, &settings) {
         Ok(handle) => handle,
         Err(blocked) => {
             return Ok(CommandResult::blocked(
@@ -392,7 +398,7 @@ pub fn kv_cache_restore(cache_id: Option<String>) -> Result<CommandResult<KvCach
             ),
         ));
     };
-    handle
+    let restore_kind = handle
         .restore_sequence(value.sequence.clone(), 0)
         .map_err(|error| anyhow!(error))?;
     let restored = value.metadata.clone();
@@ -418,15 +424,23 @@ pub fn kv_cache_restore(cache_id: Option<String>) -> Result<CommandResult<KvCach
                 .display()
                 .to_string(),
         ],
-        Vec::new(),
+        vec![match restore_kind {
+            llama_native_types::SequenceRestoreKind::NativeState => {
+                "Restored native KV state from the live exporting worker.".to_string()
+            }
+            llama_native_types::SequenceRestoreKind::TokenReplay => {
+                "Recomputed the saved prefix from token IDs; no native KV cache hit was claimed."
+                    .to_string()
+            }
+        }],
         true,
         false,
     ))
 }
 
-pub fn kv_cache_clear() -> Result<CommandResult<KvCacheStatus>> {
+pub fn kv_cache_clear(scope: &crate::OperationScope) -> Result<CommandResult<KvCacheStatus>> {
     let settings = resolve_settings()?;
-    clear_native_prefix_cache(&settings)?;
+    clear_native_prefix_cache(scope, &settings)?;
     let store = RuntimeStore::open(&settings.data_dir)?;
     store.mutate_documents(
         KV_CACHE_NAMESPACE,
@@ -470,11 +484,12 @@ pub fn kv_cache_clear() -> Result<CommandResult<KvCacheStatus>> {
     ))
 }
 
-pub fn compatible_cached_prefix(
+pub(crate) fn compatible_conversation_prefix(
     handle: &NativeModelHandle,
     messages: &[ChatMessage],
+    conversation_id: &str,
 ) -> Result<Option<(String, SequenceStateBlob)>> {
-    compatible_cached_prefix_for_owner(handle, messages, None)
+    compatible_cached_prefix_for_owner(handle, messages, Some(conversation_id))
 }
 
 fn compatible_cached_prefix_for_owner(

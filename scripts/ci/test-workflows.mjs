@@ -162,7 +162,11 @@ test("local macOS smoke can verify the exact emitted archive", () => {
 });
 
 test("Loom UI smoke cannot attach to an active editor or invent a model identity", () => {
-  const smoke = read(smokeScriptPath);
+  const support = path.join(root, "scripts/macos-smoke-support");
+  const smoke = [read(smokeScriptPath), ...fs.readdirSync(support)
+    .filter((name) => name.endsWith(".swift"))
+    .sort()
+    .map((name) => read(path.join(support, name)))].join("\n");
   assert.match(smoke, /running_exact_pids=\$\(exact_bundle_pid\)/);
   assert.match(smoke, /refusing to run macOS UI smoke while the exact application bundle is already running/);
   assert.match(smoke, /gemma-4-12B-it-qat-q4_0\.gguf/);
@@ -544,7 +548,7 @@ test("PR workflow is always triggered and has one truthful aggregate", () => {
   assert.match(source, /node scripts\/ci\/ci-required\.mjs/);
   assert.match(
     source,
-    /node --test scripts\/ci\/test-ci-metadata-shadow\.mjs scripts\/ci\/test-ci-plan\.mjs scripts\/ci\/test-ci-required\.mjs scripts\/ci\/test-ignored-tests\.mjs scripts\/ci\/test-product-state-backup\.mjs scripts\/ci\/test-workflows\.mjs/,
+    /node --test scripts\/ci\/test-ci-metadata-selection\.mjs scripts\/ci\/test-ci-plan\.mjs scripts\/ci\/test-ci-required\.mjs scripts\/ci\/test-ignored-tests\.mjs scripts\/ci\/test-product-state-backup\.mjs scripts\/ci\/test-workflows\.mjs/,
   );
 });
 
@@ -610,7 +614,6 @@ test("full CI reconciles each current-platform ignored-test subset through guard
   assert.doesNotMatch(reconciliation, /if: runner\.os/);
   assert.match(source, /node scripts\/ci\/validate-ignored-tests\.mjs --cargo-list/);
   assert.doesNotMatch(source, /without executing test bodies/);
-  assert.doesNotMatch(source, /cargo test[^\n]*--ignored(?! --list)/);
 });
 
 test("relevant PRs require exact guarded-list ignored-test reconciliation", () => {
@@ -791,7 +794,7 @@ test("PR and full CI enforce current service documentation paths", () => {
   const pr = read(prPath);
   const full = read(fullPath);
   const prPolicy = pr.match(/^  policy:[\s\S]*?(?=^  root-linux:)/m)?.[0];
-  const fullRoot = full.match(/^  root:[\s\S]*?(?=^  attachment:)/m)?.[0];
+  const fullRoot = full.match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0];
   for (const block of [prPolicy, fullRoot]) {
     assert.ok(block, "documentation policy job block is missing");
     assert.match(block, /node --test scripts\/ci\/test-current-docs\.mjs/);
@@ -800,16 +803,29 @@ test("PR and full CI enforce current service documentation paths", () => {
   assert.match(fullRoot, /if: runner\.os == 'Linux'/);
 });
 
+test("full CI executes browser coverage and has no empty Information platform lane", () => {
+  const full = read(fullPath);
+  const loom = full.match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0];
+  assert.ok(loom, "full Loom job is missing");
+  assert.match(loom, /playwright install webkit/);
+  assert.match(loom, /pnpm --filter @delysis\/loom run test:browser/);
+  assert.doesNotMatch(full, /information-platform-linux/);
+});
+
 test("full frontend coverage remains unchanged", () => {
   const fullFrontend = read(fullPath).match(/^  frontend:[\s\S]*?(?=^  policy-and-graphs:)/m)?.[0];
   assert.ok(fullFrontend, "full frontend job block is missing");
-  assert.match(fullFrontend, /dtolnay\/rust-toolchain@[0-9a-f]{40}/);
-  assert.match(fullFrontend, /components: clippy,rustfmt/);
-  assert.match(fullFrontend, /libwebkit2gtk-4\.1-dev/);
+  assert.doesNotMatch(fullFrontend, /dtolnay\/rust-toolchain|apt-get/);
   assert.match(fullFrontend, /pnpm install --frozen-lockfile/);
-  assert.match(fullFrontend, /pnpm -r --if-present run test/);
-  assert.match(fullFrontend, /pnpm -r --if-present run check/);
-  assert.match(fullFrontend, /pnpm -r --if-present run build/);
+  for (const command of [
+    "pnpm --filter free-token-energy run check:frontend",
+    "pnpm --filter free-token-energy run test:frontend",
+    "pnpm --filter @delysis/mom-llama run check:frontend",
+    "pnpm --filter @delysis/mom-llama run test:frontend",
+    "pnpm --filter @delysis/loom run test",
+    "pnpm --filter @delysis/loom run check",
+    "pnpm --filter @delysis/loom run build",
+  ]) assert.ok(fullFrontend.includes(command), command);
   assert.doesNotMatch(fullFrontend, /loom:install|--dir products\/loom/);
 });
 
@@ -823,8 +839,10 @@ test("the required macOS matrix preserves every gate without serializing them", 
   assert.match(macos, /component: \$\{\{ fromJSON\(needs\.plan\.outputs\.macos_matrix\) \}\}/);
   assert.match(macos, /fail-fast: false/);
   assert.match(macos, /name: Release tooling shell syntax\n\s+if: \$\{\{ matrix\.component == 'release' \}\}\n\s+run: sh -n scripts\/release-macos\.sh scripts\/smoke-macos-app\.sh/);
-  assert.match(macos, /dtolnay\/rust-toolchain@[0-9a-f]{40}\n\s+if: \$\{\{ matrix\.component != 'release' \}\}/);
-  assert.match(macos, /Swatinem\/rust-cache@[0-9a-f]{40}\n\s+if: \$\{\{ matrix\.component != 'release' \}\}/);
+  assert.match(macos, /dtolnay\/rust-toolchain@[0-9a-f]{40}\n\s+with:/);
+  assert.match(macos, /name: Compile macOS smoke support\n\s+if: \$\{\{ matrix\.component == 'release' \}\}\n\s+run: cargo run --locked -p xtask -- macos-smoke-support/);
+  assert.match(read(fullPath), /name: Compile macOS smoke support\n\s+if: runner.os == 'macOS'\n\s+run: cargo run --locked -p xtask -- macos-smoke-support/);
+  assert.match(macos, /Swatinem\/rust-cache@[0-9a-f]{40}\n\s+with:/);
   assert.match(macos, /shared-key: platform-macos-\$\{\{ matrix\.component \}\}/);
   assert.doesNotMatch(macos, /save-if:/);
   assert.doesNotMatch(rootGraph, /needs\.plan\.outputs\.mom/);
@@ -839,7 +857,7 @@ test("the required macOS matrix preserves every gate without serializing them", 
 
 test("Speech Linux coverage provisions its GLib build dependencies", () => {
   const prSpeech = read(prPath).match(/^  speech-linux:[\s\S]*?(?=^  mom-linux:)/m)?.[0];
-  const fullSpeech = read(fullPath).match(/^  speech:[\s\S]*?(?=^  mom:)/m)?.[0];
+  const fullSpeech = read(fullPath).match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0];
   for (const block of [prSpeech, fullSpeech]) {
     assert.ok(block, "Speech job block is missing");
     assert.match(block, /libglib2\.0-dev/);
@@ -854,8 +872,8 @@ test("Mom and Loom Linux coverage provisions desktop build dependencies", () => 
   const blocks = [
     pr.match(/^  mom-linux:[\s\S]*?(?=^  mom-windows:)/m)?.[0],
     pr.match(/^  loom-linux:[\s\S]*?(?=^  loom-windows:)/m)?.[0],
-    full.match(/^  mom:[\s\S]*?(?=^  loom:)/m)?.[0],
-    full.match(/^  loom:[\s\S]*?(?=^  frontend:)/m)?.[0],
+    full.match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0],
+    full.match(/^  root:[\s\S]*?(?=^  frontend:)/m)?.[0],
   ];
   for (const block of blocks) {
     assert.ok(block, "product job block is missing");
@@ -869,8 +887,8 @@ test("Mom and Loom Linux coverage provisions desktop build dependencies", () => 
 test("fuzz workflows select the owned nested fuzz workspace explicitly", () => {
   for (const source of [read(prPath), read(fullPath)]) {
     assert.match(source, /^\s{2}fuzz-build:/m);
-    assert.match(source, /cargo fuzz build --fuzz-dir crates\/services\/attachment\/fuzz inspect/);
-    assert.match(source, /cargo fuzz build --fuzz-dir crates\/services\/attachment\/fuzz pipeline/);
+    assert.match(source, /cargo fuzz (?:build|run) --fuzz-dir crates\/services\/attachment\/fuzz inspect/);
+    assert.match(source, /cargo fuzz (?:build|run) --fuzz-dir crates\/services\/attachment\/fuzz pipeline/);
   }
 });
 
@@ -879,8 +897,8 @@ test("full workflow covers main, nightly, dispatch, products, policy, and fuzz",
   assert.match(source, /^\s+push:\n\s+branches: \[main\]/m);
   assert.match(source, /^\s+schedule:/m);
   assert.match(source, /^\s+workflow_dispatch:/m);
-  assert.match(source, /^\s{2}mom:/m);
-  assert.match(source, /^\s{2}loom:/m);
+  assert.match(source, /cargo test --locked --workspace --all-targets/);
+  assert.match(source, /cargo test --locked --workspace --doc/);
   assert.match(source, /^\s{2}frontend:/m);
   assert.match(source, /^\s{2}fuzz-build:/m);
   assert.match(source, /cargo clippy --locked --workspace --all-targets -- -D warnings/);

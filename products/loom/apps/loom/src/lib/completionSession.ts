@@ -112,27 +112,37 @@ export function unconsumeCompletionWord(session: CompletionSession): CompletionS
 
 export function cycleCompletionSession(
   session: CompletionSession,
-  offset: number
+  offset: number,
+  sharedPrefixAlternatives = false
 ): CompletionSession {
-  if (session.acceptedChunks.length > 0 || session.candidates.length < 2) return session;
-  const current = session.candidates.findIndex((candidate) => candidate.runId === session.selectedRunId);
+  if (session.acceptedChunks.length > 0 && !sharedPrefixAlternatives) return session;
+  const candidates = session.acceptedChunks.length > 0
+    ? compatibleCompletionPresentations(session)
+    : session.candidates;
+  if (candidates.length === 0) return session;
+  const current = candidates.findIndex((candidate) => candidate.runId === session.selectedRunId);
   const normalized = current < 0 ? 0 : current;
-  const next = (normalized + offset % session.candidates.length + session.candidates.length) %
-    session.candidates.length;
-  return next === normalized ? session : { ...session, selectedRunId: session.candidates[next].runId };
+  const next = (normalized + offset % candidates.length + candidates.length) % candidates.length;
+  return candidates[next].runId === session.selectedRunId
+    ? session : { ...session, selectedRunId: candidates[next].runId };
 }
 
 export function updateCompletionCandidate(
   session: CompletionSession,
   runId: string,
   text: string,
-  presentationKey: string
+  presentationKey: string,
+  allowFrozenAppend = false
 ): CompletionSession | null {
-  // A consumed candidate is an immutable authorization snapshot. Late stream
-  // chunks must not rewrite either the reversible text or its presentation
-  // identity, including after every accepted chunk has been unconsumed.
-  if (session.authorityFrozen) return session;
+  // Default frozen authority cannot change. Loompad may grow an exact existing
+  // prefix under a new presentation identity; it never rewrites any prior byte.
   const accepted = acceptedCompletionText(session);
+  if (session.authorityFrozen) {
+    const previous = session.candidates.find(candidate => candidate.runId === runId);
+    if (!allowFrozenAppend || !previous || !previous.text.startsWith(accepted) ||
+        text.length <= previous.text.length || !text.startsWith(previous.text) ||
+        presentationKey === previous.presentationKey) return session;
+  }
   if (runId === session.selectedRunId && !text.startsWith(accepted)) return null;
   let changed = false;
   const candidates = session.candidates.map((candidate) => {
@@ -152,7 +162,8 @@ export function updateCompletionCandidate(
  */
 export function synchronizeCompletionCandidates(
   session: CompletionSession,
-  candidates: readonly CompletionCandidate[]
+  candidates: readonly CompletionCandidate[],
+  forkAtCurrentCaret = false
 ): CompletionSession | null {
   // An empty authoritative family means an unconsumed presentation was
   // dismissed or became ineligible. Only an already-authorized insertion may
@@ -167,7 +178,10 @@ export function synchronizeCompletionCandidates(
     const oldPresentationKeys = new Set(
       session.candidates.map((candidate) => candidate.presentationKey)
     );
-    const freshExhaustedFamily = remaining === '' &&
+    const cachedChoicesExhausted = forkAtCurrentCaret
+      ? compatibleCompletionPresentations(session).length === 0
+      : remaining === '';
+    const freshExhaustedFamily = cachedChoicesExhausted &&
       candidates.length > 0 &&
       candidates.every((candidate) =>
         candidate.targetByte === nextTarget &&
@@ -197,6 +211,53 @@ export function synchronizeCompletionCandidates(
         previous.insertsOnAccept === candidate.insertsOnAccept;
     });
   return unchanged ? session : { ...session, candidates: snapshots, selectedRunId };
+}
+
+/** Caller supplies only the proven original family, never a new caret's candidates. */
+export function mergeCompatibleCompletionCandidates(
+  session: CompletionSession,
+  candidates: readonly CompletionCandidate[]
+): CompletionSession {
+  if (!session.authorityFrozen || candidates.length > 256) return session;
+  const selected = selectedCompletionCandidate(session);
+  const accepted = acceptedCompletionText(session);
+  if (!selected || !selected.text.startsWith(accepted) ||
+      new Set(candidates.map(candidate => candidate.runId)).size !== candidates.length ||
+      new Set(candidates.map(candidate => candidate.candidateId)).size !== candidates.length ||
+      new Set(candidates.map(candidate => candidate.presentationKey)).size !== candidates.length) return session;
+  let next = session;
+  for (const candidate of candidates) {
+    if (candidate.targetByte !== selected.targetByte || !candidate.text.startsWith(accepted)) continue;
+    const existing = next.candidates.find(previous => previous.runId === candidate.runId);
+    if (existing) {
+      if (existing.candidateId !== candidate.candidateId || existing.targetByte !== candidate.targetByte) continue;
+      next = updateCompletionCandidate(next, candidate.runId, candidate.text, candidate.presentationKey, true) ?? next;
+    } else if (next.candidates.length < 256 && !next.candidates.some(previous =>
+      previous.candidateId === candidate.candidateId || previous.presentationKey === candidate.presentationKey
+    )) {
+      next = { ...next, candidates: [...next.candidates, { ...candidate }] };
+    }
+  }
+  return next;
+}
+
+/** Retain only immutable alternatives that agree with every byte already inserted. */
+export function compatibleCompletionPresentations(session: CompletionSession): CompletionCandidate[] {
+  const selected = selectedCompletionCandidate(session);
+  if (!selected) return [];
+  const accepted = acceptedCompletionText(session);
+  if (!selected.text.startsWith(accepted)) return [];
+  const acceptedBytes = new TextEncoder().encode(accepted).byteLength;
+  return session.candidates.filter(candidate =>
+    candidate.targetByte === selected.targetByte &&
+    candidate.text.startsWith(accepted) && candidate.text.length > accepted.length
+  ).map(candidate => ({
+    ...candidate,
+    presentationKey: `${candidate.presentationKey}:session:${acceptedBytes}`,
+    text: candidate.text.slice(accepted.length),
+    targetByte: candidate.targetByte + acceptedBytes,
+    insertsOnAccept: true
+  }));
 }
 
 export function completionPresentation(session: CompletionSession): CompletionCandidate | null {

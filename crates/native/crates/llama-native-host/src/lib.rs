@@ -6,10 +6,15 @@
 //! optional persistent cache storage, then route typed requests to its model
 //! handles.
 
-use llama_native_cache::{CacheFingerprint, CacheOwnerScope, MemoryPrefixCache, PrefixCacheValue};
-pub use llama_native_engine::SpeculativeAdmissionStatus;
+use llama_native_cache::{
+    CacheFingerprint, CacheOwnerScope, MemoryPrefixCache, PrefixCacheMetadata, PrefixCacheValue,
+};
 use llama_native_engine::{
     GenerationTicket, JoinedNativeModel, NativeModelHandle, NativeModelOwner,
+};
+pub use llama_native_engine::{
+    MemoryEstimateBasis, NativeMemoryEstimate, SpeculativeAdmissionStatus,
+    estimate_memory_reservation,
 };
 use llama_native_types::{
     GenerationBatchRequest, GenerationRequest, ModelFingerprint, NativeDevice, NativeError,
@@ -43,7 +48,22 @@ impl HostClock for SystemClock {
 /// product may inject an authenticated implementation; routers may inject a
 /// database-backed implementation; tests may inject an in-memory store.
 pub trait PrefixCacheStore: Send + Sync {
-    fn load(&self, namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError>;
+    fn list(&self, namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError>;
+    fn load_entry(
+        &self,
+        namespace: &str,
+        id: &str,
+    ) -> Result<Option<PrefixCacheValue>, NativeError>;
+
+    fn load(&self, namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
+        let mut values = Vec::new();
+        for metadata in self.list(namespace)? {
+            if let Some(value) = self.load_entry(namespace, &metadata.id)? {
+                values.push(value);
+            }
+        }
+        Ok(values)
+    }
     fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError>;
     fn delete(&self, namespace: &str, id: &str) -> Result<(), NativeError>;
 
@@ -60,9 +80,9 @@ pub trait PrefixCacheStore: Send + Sync {
     }
 
     fn clear(&self, namespace: &str) -> Result<usize, NativeError> {
-        let values = self.load(namespace)?;
+        let values = self.list(namespace)?;
         for value in &values {
-            self.delete(namespace, &value.metadata.id)?;
+            self.delete(namespace, &value.id)?;
         }
         Ok(values.len())
     }
@@ -477,7 +497,8 @@ impl NativeHost {
             })?
             .map(|metadata| metadata.len())
             .unwrap_or_default();
-        let reserved_bytes = memory_reservation(model_bytes, projector_bytes);
+        let estimate = estimate_memory_reservation(&model, model_bytes, projector_bytes);
+        let reserved_bytes = estimate.total_bytes;
         {
             let state = self.state.lock().map_err(host_poisoned)?;
             let used = state
@@ -485,13 +506,18 @@ impl NativeHost {
                 .iter()
                 .filter(|(candidate, _)| **candidate != slot_id)
                 .map(|(_, entry)| entry.reserved_bytes)
-                .sum::<u64>();
-            if used.saturating_add(reserved_bytes) > self.config.memory_budget_bytes {
+                .fold(0_u64, u64::saturating_add);
+            if reserved_bytes == u64::MAX
+                || used
+                    .checked_add(reserved_bytes)
+                    .is_none_or(|total| total > self.config.memory_budget_bytes)
+            {
                 return Err(NativeError::new(
                     NativeErrorCode::MemoryBudgetExceeded,
                     format!(
-                        "loading the model would reserve {} bytes, above the {} byte host budget",
+                        "loading the model estimates {} bytes ({:?}), above the {} byte host budget",
                         used.saturating_add(reserved_bytes),
+                        estimate.basis,
                         self.config.memory_budget_bytes
                     ),
                 ));
@@ -1012,20 +1038,20 @@ impl NativeHost {
         let Some(store) = &self.persistent_cache else {
             return Ok(0);
         };
-        let values = store.load(&self.config.cache_namespace)?;
+        let values = store.list(&self.config.cache_namespace)?;
         let mut restored = 0;
         for candidate in values {
             if !candidate.is_valid() {
                 continue;
             }
-            let owner_generation = candidate.metadata.owner_id.as_deref().map(|owner_id| {
+            let owner_generation = candidate.owner_id.as_deref().map(|owner_id| {
                 self.state
                     .lock()
                     .map(|state| cache_owner_generation(&state, owner_id))
                     .map_err(host_poisoned)
             });
             let owner_generation = owner_generation.transpose()?;
-            let promotion_lease = match candidate.metadata.owner_id.as_deref() {
+            let promotion_lease = match candidate.owner_id.as_deref() {
                 Some(owner_id) => {
                     let Some(lease) = store
                         .acquire_owner_promotion_lease(&self.config.cache_namespace, owner_id)?
@@ -1036,14 +1062,10 @@ impl NativeHost {
                 }
                 None => None,
             };
-            let Some(value) = store
-                .load(&self.config.cache_namespace)?
-                .into_iter()
-                .find(|value| value.metadata.id == candidate.metadata.id)
-            else {
+            let Some(value) = store.load_entry(&self.config.cache_namespace, &candidate.id)? else {
                 continue;
             };
-            if !value.is_valid() || value != candidate {
+            if !value.is_valid() || value.metadata != candidate {
                 continue;
             }
             if let Some(lease) = &promotion_lease {
@@ -1189,19 +1211,6 @@ fn validate_resident_digest_assertions(
     Ok(())
 }
 
-#[must_use]
-pub const fn memory_reservation(model_bytes: u64, projector_bytes: u64) -> u64 {
-    const MINIMUM_RUNTIME_RESERVE: u64 = 384 * 1024 * 1024;
-    let runtime = if model_bytes / 2 > MINIMUM_RUNTIME_RESERVE {
-        model_bytes / 2
-    } else {
-        MINIMUM_RUNTIME_RESERVE
-    };
-    model_bytes
-        .saturating_add(projector_bytes)
-        .saturating_add(runtime)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,8 +1227,27 @@ mod tests {
     }
 
     impl PrefixCacheStore for TestPrefixStore {
-        fn load(&self, _namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
-            Ok(self.values.lock().expect("test store lock").clone())
+        fn list(&self, _namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
+            Ok(self
+                .values
+                .lock()
+                .expect("test store lock")
+                .iter()
+                .map(|value| value.metadata.clone())
+                .collect())
+        }
+        fn load_entry(
+            &self,
+            _namespace: &str,
+            id: &str,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            Ok(self
+                .values
+                .lock()
+                .expect("test store lock")
+                .iter()
+                .find(|value| value.metadata.id == id)
+                .cloned())
         }
 
         fn save(&self, _namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
@@ -1242,8 +1270,15 @@ mod tests {
     struct RejectingPrefixStore;
 
     impl PrefixCacheStore for RejectingPrefixStore {
-        fn load(&self, _namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
+        fn list(&self, _namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
             Ok(Vec::new())
+        }
+        fn load_entry(
+            &self,
+            _namespace: &str,
+            _id: &str,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            Ok(None)
         }
 
         fn save(&self, _namespace: &str, _value: &PrefixCacheValue) -> Result<(), NativeError> {
@@ -1265,8 +1300,27 @@ mod tests {
     }
 
     impl PrefixCacheStore for BlockingSavePrefixStore {
-        fn load(&self, _namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
-            Ok(self.values.lock().expect("test store lock").clone())
+        fn list(&self, _namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
+            Ok(self
+                .values
+                .lock()
+                .expect("test store lock")
+                .iter()
+                .map(|value| value.metadata.clone())
+                .collect())
+        }
+        fn load_entry(
+            &self,
+            _namespace: &str,
+            id: &str,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            Ok(self
+                .values
+                .lock()
+                .expect("test store lock")
+                .iter()
+                .find(|value| value.metadata.id == id)
+                .cloned())
         }
 
         fn save(&self, _namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
@@ -1296,13 +1350,33 @@ mod tests {
     }
 
     impl PrefixCacheStore for BlockingRestorePrefixStore {
-        fn load(&self, _namespace: &str) -> Result<Vec<PrefixCacheValue>, NativeError> {
+        fn list(&self, _namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
+            self.load_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self
+                .values
+                .lock()
+                .expect("test store lock")
+                .iter()
+                .map(|value| value.metadata.clone())
+                .collect())
+        }
+        fn load_entry(
+            &self,
+            _namespace: &str,
+            id: &str,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
             let call = self.load_calls.fetch_add(1, Ordering::SeqCst);
             if call == 1 {
                 self.authoritative_reload.wait();
                 self.release_reload.wait();
             }
-            Ok(self.values.lock().expect("test store lock").clone())
+            Ok(self
+                .values
+                .lock()
+                .expect("test store lock")
+                .iter()
+                .find(|value| value.metadata.id == id)
+                .cloned())
         }
 
         fn save(&self, _namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
@@ -1320,6 +1394,59 @@ mod tests {
                 .retain(|candidate| candidate.metadata.id != id);
             Ok(())
         }
+    }
+
+    #[derive(Default)]
+    struct CountingPrefixStore {
+        inner: TestPrefixStore,
+        lists: AtomicUsize,
+        payload_bytes: AtomicUsize,
+    }
+    impl PrefixCacheStore for CountingPrefixStore {
+        fn list(&self, namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
+            self.lists.fetch_add(1, Ordering::Relaxed);
+            self.inner.list(namespace)
+        }
+        fn load_entry(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            let value = self.inner.load_entry(namespace, id)?;
+            if let Some(value) = &value {
+                self.payload_bytes
+                    .fetch_add(value.sequence.bytes.len(), Ordering::Relaxed);
+            }
+            Ok(value)
+        }
+        fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
+            self.inner.save(namespace, value)
+        }
+        fn delete(&self, namespace: &str, id: &str) -> Result<(), NativeError> {
+            self.inner.delete(namespace, id)
+        }
+    }
+
+    #[test]
+    fn restore_enumerates_once_and_reads_each_payload_once() {
+        let store = Arc::new(CountingPrefixStore::default());
+        let mut expected_bytes = 0;
+        for index in 0..16 {
+            let value = cache_value(&format!("entry-{index}"), index + 1);
+            expected_bytes += value.sequence.bytes.len();
+            store.save("test", &value).expect("save");
+        }
+        let host = NativeHost::with_dependencies(
+            NativeHostConfig {
+                cache_namespace: "test".into(),
+                ..Default::default()
+            },
+            Arc::new(SystemClock),
+            Some(store.clone()),
+        );
+        assert_eq!(host.restore_persistent_cache().expect("restore"), 16);
+        assert_eq!(store.lists.load(Ordering::Relaxed), 1);
+        assert_eq!(store.payload_bytes.load(Ordering::Relaxed), expected_bytes);
     }
 
     fn resident_test_config(expected_model_sha256: Option<&str>) -> NativeModelConfig {
@@ -1728,16 +1855,6 @@ mod tests {
         assert!(debug.contains("slot_id: 3"));
         assert!(!debug.contains("HOST_PATH_SENTINEL"));
         assert!(!debug.contains("RESIDENT_PATH_SENTINEL"));
-    }
-
-    #[test]
-    fn memory_reservation_is_bounded_and_includes_projector() {
-        let mib = 1024 * 1024;
-        assert_eq!(memory_reservation(100 * mib, 0), 484 * mib);
-        assert_eq!(
-            memory_reservation(4 * 1024 * mib, 500 * mib),
-            6 * 1024 * mib + 500 * mib
-        );
     }
 
     #[test]

@@ -29,7 +29,9 @@ import type {
   LoomFailure,
   TransientDraftSnapshot,
   TransientDraftWriteReceipt,
-  WeaveStarted
+  WeaveStarted,
+  TerminalRun,
+  TerminalRunRequest
 } from './types';
 import { decodeBuildModelPolicy } from './buildModelPolicy';
 import type { ImageAttachmentReceipt } from './attachments';
@@ -53,7 +55,9 @@ const INDEPENDENT_COMMANDS = new Set([
   'import_account_sync',
   'application_close_abort',
   'application_close_pending',
+  'audio_synthesize',
   'build_model_policy_get',
+  'shader_preview',
   'model_catalog_list',
   'model_download_cancel',
   'model_download_list',
@@ -126,16 +130,28 @@ async function call<T>(command: string, args: Record<string, unknown> = {}): Pro
   return enqueueSessionCommand(() => invokeWhenProjectSessionAdmitted<T>(command, args));
 }
 
-export function chooseAndCreateProject(title: string): Promise<ProjectSnapshot> {
-  return call('project_choose_create', { title });
-}
-
 export function openDefaultProject(): Promise<ProjectSnapshot> {
   return call('project_open_default');
 }
 
-export function chooseAndOpenProject(): Promise<ProjectSnapshot> {
-  return call('project_choose_open');
+export function prepareProjectOpen(): Promise<string | null> {
+  return call('project_prepare_open');
+}
+
+export function prepareProjectOpenPath(path: string): Promise<string | null> {
+  return call('project_prepare_open_path', { path });
+}
+
+export function projectDropDirectories(paths: string[]): Promise<string[]> {
+  return call('project_drop_directories', { paths });
+}
+
+export function commitProjectOpen(preparationId: string): Promise<ProjectSnapshot> {
+  return call('project_commit_open', { preparationId });
+}
+
+export function discardProjectOpen(preparationId: string): Promise<void> {
+  return call('project_discard_open', { preparationId });
 }
 
 export function currentProjectSession(): Promise<ProjectSnapshot> {
@@ -202,6 +218,10 @@ export function importAttachmentPaths(
   paths: readonly string[]
 ): Promise<ContextAttachment[]> {
   return call('attachment_import_paths', { projectId, sessionId, paths: [...paths] });
+}
+
+export function revealAttachmentOriginal(projectId: string, sessionId: string, attachmentId: string): Promise<void> {
+  return call('attachment_reveal_original', { projectId, sessionId, attachmentId });
 }
 
 export function chooseAttachments(
@@ -324,6 +344,44 @@ export function getSpeechInputCapabilities(
   return call('speech_input_capabilities', { projectId, sessionId });
 }
 
+export interface AudioActivity {
+  duration_ms: number;
+  signal_detected: boolean;
+  limit_reached: boolean;
+  segments: Array<{ start_ms: number; end_ms: number }>;
+}
+
+export interface AudioRecording {
+  recording_id: string;
+  document_id: string;
+  attachment: ContextAttachment;
+  activity: AudioActivity;
+}
+
+export interface AudioSpeech {
+  wav: number[];
+}
+
+export function startAudioRecording(
+  projectId: string,
+  sessionId: string,
+  documentId: string
+): Promise<SpeechRecordingSnapshot> {
+  return call('audio_record_start', { projectId, sessionId, documentId });
+}
+
+export function stopAudioRecording(
+  projectId: string,
+  sessionId: string,
+  recordingId: string
+): Promise<AudioRecording> {
+  return call('audio_record_stop', { projectId, sessionId, recordingId });
+}
+
+export function synthesizeAudio(text: string): Promise<AudioSpeech> {
+  return call('audio_synthesize', { text });
+}
+
 export function startSpeechRecording(
   projectId: string,
   sessionId: string,
@@ -368,6 +426,15 @@ export function cancelSpeechInput(
 export async function getBuildModelPolicy(): Promise<BuildModelPolicySummary> {
   const value = await call<unknown>('build_model_policy_get');
   return decodeBuildModelPolicy(value);
+}
+
+export function importExternalDocument(
+  projectId: string, sessionId: string, documentId: string,
+  expectedRevisionId: string, expectedBlobId: string
+): Promise<DocumentSummary | null> {
+  return call('document_import_external', {
+    projectId, sessionId, documentId, expectedRevisionId, expectedBlobId
+  });
 }
 
 export function openDocument(
@@ -683,6 +750,7 @@ export interface WeaveStartArgs {
   cursorByte: number;
   policy:
     | { kind: 'automatic_v2' }
+    | { kind: 'loompad_v1'; sample_target: 4 | 16 | 64 | 256; batch_offset: number }
     | {
         kind: 'manual_v2';
         branch_count: number;
@@ -837,7 +905,14 @@ export function normalizeFailure(error: unknown): LoomFailure {
       : typeof value.error === 'string'
         ? value.error
         : 'Loom could not complete that command.';
+    const recovery = value.speculation_recovery as Record<string, unknown> | undefined;
+    const validRecovery = recovery && typeof recovery.snapshot_id === 'string' && /^[a-f0-9]{64}$/.test(recovery.snapshot_id) &&
+      Number.isInteger(recovery.next_offset) && Number(recovery.next_offset) >= 0 && Number(recovery.next_offset) <= 256 &&
+      Array.isArray(recovery.command_ids) && recovery.command_ids.length * 4 === recovery.next_offset &&
+      recovery.command_ids.every(id => typeof id === 'string' && /^[0-9A-HJKMNP-TV-Z]{26}$/.test(id)) &&
+      new Set(recovery.command_ids).size === recovery.command_ids.length;
     return {
+      ...(validRecovery ? { speculation_recovery: recovery as NonNullable<LoomFailure['speculation_recovery']> } : {}),
       code: typeof value.code === 'string' ? value.code : 'command_failed',
       message,
       retryable: value.retryable === true
@@ -848,6 +923,29 @@ export function normalizeFailure(error: unknown): LoomFailure {
     message: 'Loom could not complete that command.',
     retryable: true
   };
+}
+
+export function runTerminal(request: TerminalRunRequest): Promise<TerminalRun> {
+  return call('terminal_run', { ...request });
+}
+
+export function listTerminalRuns(projectId: string, sessionId: string): Promise<TerminalRun[]> {
+  return call('terminal_list', { projectId, sessionId });
+}
+
+export function cancelTerminalRun(projectId: string, sessionId: string, runId: string): Promise<void> {
+  return call('terminal_cancel', { projectId, sessionId, runId });
+}
+
+export function compileShaderPreview(source: string): Promise<{ fragment: string }> {
+  return call('shader_preview', { source });
+}
+
+export function getWorkspaceTemplate(projectId: string, sessionId: string): Promise<import('./workspaceTemplate').WorkspaceTemplateSnapshot> {
+  return call('workspace_template_get', { projectId, sessionId });
+}
+export function enableWorkspaceTemplate(projectId: string, sessionId: string): Promise<import('./workspaceTemplate').WorkspaceTemplateSnapshot> {
+  return call('workspace_template_enable', { projectId, sessionId });
 }
 
 export type ImportSource = 'gmail' | 'google_alerts' | 'linked_in' | 'drive';

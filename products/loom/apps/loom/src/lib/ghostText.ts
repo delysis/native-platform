@@ -1,11 +1,11 @@
 import { defaultMarkdownParser, defaultMarkdownSerializer } from 'prosemirror-markdown';
-import { Plugin, PluginKey, TextSelection, type EditorState, type Transaction } from 'prosemirror-state';
+import { Plugin, PluginKey, NodeSelection, TextSelection, type EditorState, type Transaction } from 'prosemirror-state';
 import { Decoration, DecorationSet, type EditorView } from 'prosemirror-view';
 import {
   insertionPreservesExtendedGraphemeEdges,
   isExtendedGraphemeBoundary
 } from './graphemeBoundary';
-import { parseVisualMarkdown } from './markdownSafety';
+import { parseVisualMarkdown, serializeVisualMarkdown } from './markdownSafety';
 import {
   nextVisualSuggestionWord,
   type CompletionInsertionAction,
@@ -69,6 +69,7 @@ export interface GhostTextHandlers {
   unconsume?: (candidateId: string, presentationKey: string, text: string) => boolean;
   cycle?: (offset: number) => void;
   modifier?: (held: boolean) => void;
+  navigate?: () => void;
   pin?: (pinned: boolean) => void;
   dismiss: (candidateId: string, presentationKey: string) => void;
   visible: (
@@ -275,13 +276,35 @@ export function visualCaretBoundaryProof(
   if (!visibleCaretIsExtendedGraphemeBoundary(state)) {
     return rejectedBoundary('grapheme_boundary_invalid');
   }
+  return serializedBoundaryProof(state, canonicalMarkdown, state.selection);
+}
+
+/** Node boundaries are structural, so they need byte identity rather than a prose-grapheme proof. */
+export function visualInlineNodeBoundaryProof(
+  state: EditorState,
+  canonicalMarkdown: string,
+  edge: 'from' | 'to'
+): VisualCaretBoundaryProof {
+  if (!(state.selection instanceof NodeSelection) || !state.selection.node.isInline) {
+    return rejectedBoundary('selection_not_text', 'Expected an inline node selection');
+  }
+  return serializedBoundaryProof(
+    state, canonicalMarkdown, TextSelection.create(state.doc, state.selection[edge])
+  );
+}
+
+function serializedBoundaryProof(
+  state: EditorState,
+  canonicalMarkdown: string,
+  selection: TextSelection
+): VisualCaretBoundaryProof {
   if (canonicalMarkdown.includes(CARET_BOUNDARY_WITNESS)) {
     return rejectedBoundary('witness_collision');
   }
 
   try {
-    const witnessed = defaultMarkdownSerializer.serialize(
-      state.tr.insertText(CARET_BOUNDARY_WITNESS).doc
+    const witnessed = serializeVisualMarkdown(
+      state.tr.setSelection(selection).insertText(CARET_BOUNDARY_WITNESS).doc
     );
     const boundary = witnessed.indexOf(CARET_BOUNDARY_WITNESS);
     if (boundary < 0) return rejectedBoundary('witness_missing');
@@ -414,8 +437,8 @@ export function visualGhostTextIsFaithfulAtSelection(
     const promotedMarkdown =
       canonicalMarkdown.slice(0, boundary) + text + canonicalMarkdown.slice(boundary);
     const literalDocument = state.tr.insertText(text).doc;
-    return defaultMarkdownSerializer.serialize(literalDocument) === promotedMarkdown &&
-      parseVisualMarkdown(promotedMarkdown).eq(literalDocument);
+    return serializeVisualMarkdown(literalDocument) === promotedMarkdown &&
+      parseVisualMarkdown(promotedMarkdown, state.schema).eq(literalDocument);
   } catch {
     return false;
   }
@@ -554,7 +577,7 @@ function ghostWidget(
   widget.contentEditable = 'false';
   widget.draggable = false;
   widget.spellcheck = false;
-  widget.textContent = plan.text;
+  widget.textContent = plan.hidden ? '' : (nextVisualSuggestionWord(plan.text)?.trimEnd() ?? '');
   container.append(widget);
 
   if (plan.alternatives.length > 1) {
@@ -632,11 +655,6 @@ function ghostWidget(
       });
       fan.append(row);
     });
-    const hint = document.createElement('span');
-    hint.className = 'loom-ghost-fan-hint';
-    hint.setAttribute('aria-hidden', 'true');
-    hint.textContent = '↑↓ choose  ·  Tab insert  ·  click counter to pin';
-    fan.append(hint);
     container.append(fan);
   }
   container.classList.toggle('fan-visible', plan.fanVisible);
@@ -652,7 +670,7 @@ function synchronizeGhostWidgetDom(
   const container = view.dom.querySelector<HTMLElement>('.loom-ghost-widget');
   const widget = container?.querySelector<HTMLElement>('.loom-visual-ghost');
   if (!container || !widget) return;
-  widget.textContent = plan.text;
+  widget.textContent = plan.hidden ? '' : (nextVisualSuggestionWord(plan.text)?.trimEnd() ?? '');
   widget.classList.toggle('ghost-text-hidden', plan.hidden);
   widget.setAttribute(GHOST_PRESENTATION_ATTRIBUTE, plan.presentationKey);
   container.classList.toggle('fan-visible', plan.fanVisible);
@@ -1035,17 +1053,18 @@ export function createGhostTextPlugin(
             // Claim parent authority while its exact visibility witness still
             // exists. Clearing first would invalidate every legitimate
             // acceptance before the parent can bind it to durable authority.
-            const accepted = plan.insertsOnAccept
+            const word = nextVisualSuggestionWord(plan.text);
+            const accepted = word && (plan.insertsOnAccept
               ? Boolean(handlers.insert?.(
                   plan.candidateId,
                   plan.presentationKey,
-                  plan.text,
+                  word,
                   'inline_tab'
                 ))
-              : handlers.accept(plan.candidateId, plan.presentationKey);
+              : word === plan.text && handlers.accept(plan.candidateId, plan.presentationKey));
             if (accepted) {
               view.dispatch(plan.insertsOnAccept
-                ? view.state.tr.insertText(plan.text)
+                ? view.state.tr.insertText(word!)
                 : clearTransaction(view));
               return true;
             }
@@ -1056,6 +1075,31 @@ export function createGhostTextPlugin(
           // hand focus traversal to surrounding application chrome.
           view.dispatch(view.state.tr.insertText(VISUAL_TAB_INDENT));
           return true;
+        }
+        if (plan && ['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) {
+          // Native caret movement must see the manuscript, without an adjacent
+          // uneditable decoration or a parent refresh restoring that decoration.
+          clearGhostText(view);
+          handlers.navigate?.();
+          if (event.altKey && !event.metaKey && !event.ctrlKey &&
+              (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+            const selection = view.dom.ownerDocument.getSelection();
+            if (selection?.anchorNode && selection.focusNode &&
+                view.dom.contains(selection.anchorNode) && view.dom.contains(selection.focusNode)) {
+              // Let WebKit choose its native word boundary, then commit it to
+              // ProseMirror before another decoration update can restore the
+              // preceding caret. The default arrow path can stick beside a
+              // recently removed contenteditable=false widget.
+              selection.modify(event.shiftKey ? 'extend' : 'move',
+                event.key === 'ArrowLeft' ? 'left' : 'right', 'word');
+              const anchor = view.posAtDOM(selection.anchorNode, selection.anchorOffset);
+              const head = view.posAtDOM(selection.focusNode, selection.focusOffset);
+              view.dispatch(view.state.tr.setSelection(TextSelection.between(
+                view.state.doc.resolve(anchor), view.state.doc.resolve(head)
+              )).scrollIntoView());
+              return true;
+            }
+          }
         }
         return false;
       },

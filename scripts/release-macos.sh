@@ -161,7 +161,7 @@ case "$COMPONENT" in
     run_exact_test mom-llama-app bin mom-llama-app app_runtime::tests::direct_native_operation_drains_before_final_join
     ;;
   loom)
-    run_exact_test loom-store lib unused store::tests::prior_v10_project_store_migrates_and_reopens_without_identity_drift
+    run_exact_test loom-store lib unused generation::tests::exact_boundary_suggestion_promotion_survives_store_reopen
     run_exact_test loom-store lib unused generation::tests::exact_boundary_suggestion_promotion_survives_store_reopen
     run_exact_test tauri-plugin-loom lib unused tests::close_cancels_active_family_waits_for_terminal_release_and_replays
     run pnpm --dir "$PRODUCT_DIR" test

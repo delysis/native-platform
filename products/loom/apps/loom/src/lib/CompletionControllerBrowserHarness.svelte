@@ -2,10 +2,13 @@
   import { onMount, tick } from 'svelte';
   import LoomEditor from './LoomEditor.svelte';
   import SourceEditor from './SourceEditor.svelte';
+  import Loompad from './Loompad.svelte';
+  import { loompadPrefix, type LoompadLength } from './loompad';
   import {
     authorizeCompletionInsertion,
     clearCompletionSession,
     completionControllerView,
+    cycleCompletion,
     initialCompletionControllerState,
     observeTextMutation,
     reconcileCompletionController
@@ -15,6 +18,7 @@
   import type { CompletionInsertionAction } from './suggestionInteraction';
 
   export let mode: 'visual' | 'source' = 'visual';
+  export let loompad = false;
 
   const family: InlineGhostSuggestion[] = [
     {
@@ -87,6 +91,26 @@
     return authorization.authorized;
   }
 
+  function chooseLoompad(candidate: InlineGhostSuggestion): void {
+    const active = controllerView.activeFamily;
+    const target = active.findIndex(item => item.runId === candidate.runId);
+    const current = active.findIndex(item => item.runId === selected?.runId);
+    if (target >= 0 && current >= 0) controller = cycleCompletion(controller, active, target - current).state;
+  }
+
+  export function attemptLoompad(candidateId: string, presentationKey: string, text: string): boolean {
+    return mode === 'visual'
+      ? visualEditor.acceptLoompadText(candidateId, presentationKey, text)
+      : sourceEditor.acceptLoompadText(candidateId, presentationKey, text);
+  }
+
+  async function acceptLoompad(candidate: InlineGhostSuggestion, length: LoompadLength): Promise<void> {
+    chooseLoompad(candidate);
+    await tick();
+    const prefix = loompadPrefix(candidate.text, length, mode === 'visual');
+    if (prefix) attemptLoompad(candidate.candidateId, candidate.presentationKey, prefix);
+  }
+
   function observe(next: string): void {
     const mutation = observeTextMutation(controller, next, markdown, false);
     controller = mutation.state;
@@ -123,7 +147,7 @@
   });
 </script>
 
-<main>
+<main class="editor-stage" style="height:600px">
   {#if mode === 'visual'}
     <div class="editor-pane visual-pane">
       <LoomEditor
@@ -134,6 +158,7 @@
         ghostPresentationKey={selected?.presentationKey ?? ''}
         ghostAnchorByteOffset={selected?.targetByte ?? null}
         ghostInsertsOnAccept={true}
+        ghostHidden={loompad}
         ghostAlternatives={controllerView.alternatives}
         ghostUnconsumeText={controllerView.unconsumeText}
         surfaceKey={contextKey}
@@ -155,6 +180,7 @@
         ghostCandidateId={selected?.candidateId ?? ''}
         ghostPresentationKey={selected?.presentationKey ?? ''}
         ghostInsertsOnAccept={true}
+        ghostHidden={loompad}
         ghostAlternatives={controllerView.alternatives}
         ghostUnconsumeText={controllerView.unconsumeText}
         onValueInput={sourceInput}
@@ -163,6 +189,14 @@
       />
     </div>
   {/if}
+  {#if loompad}
+    <Loompad choices={controllerView.activeFamily} selectedRunId={selected?.runId ?? ''}
+      scope={contextKey} visual={mode === 'visual'} onChoose={chooseLoompad}
+      onAccept={(candidate, length) => void acceptLoompad(candidate, length)} />
+  {/if}
+  <output aria-label="Controller Frozen">{controller.session?.authorityFrozen ? 'yes' : 'no'}</output>
+  <output aria-label="Controller Actions">{controller.actionSequence}</output>
+  <output aria-label="Controller Action Kind">{controller.lastAction?.kind ?? 'none'}</output>
   <output aria-label="Controller Markdown">{markdown}</output>
   <output aria-label="Controller Remainder">{selected?.text ?? 'none'}</output>
   <output aria-label="Controller Invalidations">{invalidations}</output>

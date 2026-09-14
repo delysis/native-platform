@@ -58,6 +58,45 @@ impl ProjectStore {
         self.reconcile_external_with_boundary(command_id, request, |_| Ok(()))
     }
 
+    /// Import an external-only edit without rewriting its UTF-8 bytes. A local
+    /// draft with different content is left for explicit reconciliation.
+    pub fn import_external_changes_if_uncontested(
+        &mut self,
+        relative_path: impl AsRef<Path>,
+        reason: impl Into<String>,
+    ) -> Result<Option<ExternalReconciliationOutcome>> {
+        let snapshot = self.reconciliation_snapshot(relative_path)?;
+        if snapshot.visible_matches_active || snapshot.kind == loom_types::DocumentKind::Hybrid {
+            return Ok(None);
+        }
+        let Some(visible) = snapshot.visible else {
+            return Err(StoreError::ExternalVisibleFileDeleted(
+                snapshot.relative_path,
+            ));
+        };
+        if let Some(draft) = self.load_transient_draft(&snapshot.relative_path)? {
+            if draft.blob_id != snapshot.active_blob_id {
+                return Ok(None);
+            }
+            // These bytes remain in the immutable base even if the external
+            // file changes again before import. No distinct writing is lost.
+            self.clear_transient_draft(&snapshot.relative_path, draft.version)?;
+        }
+        let request = ExternalReconciliationRequest {
+            relative_path: snapshot.relative_path,
+            expected_active_revision_id: snapshot.active_revision_id,
+            expected_base_blob_id: snapshot.active_blob_id,
+            expected_visible_blob_id: visible.blob_id,
+            resolved_content: DocumentContent::from_visible(
+                snapshot.kind,
+                visible.text.into_bytes(),
+            )?,
+            reason: reason.into(),
+        };
+        self.reconcile_external_idempotent(CommandId::new(), request)
+            .map(Some)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn reconcile_external_with_boundary<F>(
         &mut self,
@@ -713,6 +752,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reconciliation_preserves_base_segments_and_records_explicit_import_merge() {
         let mut fixture = Fixture::new("abc");
         let initial_artifact_id = fixture.base.artifact_id;
@@ -804,6 +844,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn exact_retry_replays_one_revision_and_different_request_conflicts() {
         let mut fixture = Fixture::new("base");
         let external_blob_id = fixture.set_external("external");
@@ -858,6 +899,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn second_external_edit_at_projection_boundary_is_never_overwritten() {
         let mut fixture = Fixture::new("base");
         let external_blob_id = fixture.set_external("external one");
@@ -928,6 +970,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn committed_reconciliation_wraps_projection_failure_as_retryable_state() {
         let mut fixture = Fixture::new("base");
         let external_blob_id = fixture.set_external("external");
@@ -963,6 +1006,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn visible_deletion_and_stale_external_hash_fail_closed_without_history() {
         let mut fixture = Fixture::new("base");
         let counts = fixture.store.counts().expect("initial counts");

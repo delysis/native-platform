@@ -19,6 +19,7 @@ fn cli(root: &Path, args: &[&str]) -> Result<Output> {
         .args(args)
         .env("LLAMA_NATIVE_KIT_DATA_DIR", root)
         .env("LLAMA_NATIVE_KIT_STORE_KEY_HEX", TEST_STORE_KEY)
+        .env("HF_HUB_CACHE", root.join("model-cache"))
         .env_remove("MOM_LLAMA_MODEL_PATH")
         .env_remove("MOM_LLAMA_ENGINE_PATH")
         .output()?)
@@ -178,14 +179,12 @@ fn settings_skills_and_search_persist_in_encrypted_sqlite() -> Result<()> {
 }
 
 #[test]
-fn cache_policy_cli_uses_plain_names_and_preserves_legacy_aliases() -> Result<()> {
+fn cache_policy_cli_uses_plain_names() -> Result<()> {
     let root = data_dir("cache-policy-cli")?;
     for (argument, expected, preencode) in [
         ("automatic", "kv_cache_candidate", true),
         ("prefixes-only", "prompt_prefix", false),
         ("off", "none", false),
-        ("prompt-prefix", "prompt_prefix", false),
-        ("kv-cache-candidate", "kv_cache_candidate", true),
     ] {
         let value = json_output(&cli(
             &root,
@@ -331,69 +330,6 @@ fn path_selection_is_cli_exercisable_and_typed() -> Result<()> {
 }
 
 #[test]
-fn legacy_consult_cli_is_hidden_but_remains_available_for_recovery() -> Result<()> {
-    let root = data_dir("legacy-consult-recovery")?;
-    let help = cli(&root, &["--help"])?;
-    assert!(help.status.success());
-    let help = String::from_utf8(help.stdout)?;
-    assert!(
-        !help
-            .lines()
-            .any(|line| line.trim_start().starts_with("consult")),
-        "legacy Consult commands must not be advertised in the product CLI"
-    );
-
-    let recovered = json_output(&cli(&root, &["consult", "panel-list", "--json"])?)?;
-    assert_eq!(
-        recovered.get("command").and_then(Value::as_str),
-        Some("mom_llama.consult_panel_list")
-    );
-    assert_eq!(
-        recovered.get("readiness").and_then(Value::as_str),
-        Some("contracted")
-    );
-    Ok(())
-}
-
-#[test]
-fn legacy_consult_cli_rejects_every_mutating_subcommand() -> Result<()> {
-    let root = data_dir("legacy-consult-read-only")?;
-    let help = cli(&root, &["consult", "--help"])?;
-    assert!(help.status.success());
-    let help = String::from_utf8(help.stdout)?;
-    for retired in ["panel-create", "start", "cancel", "synthesize"] {
-        assert!(
-            !help.lines().any(|line| line.contains(retired)),
-            "retired mutating subcommand `{retired}` must not be parseable"
-        );
-    }
-
-    for args in [
-        &["consult", "panel-create"][..],
-        &["consult", "start"][..],
-        &["consult", "cancel"][..],
-        &["consult", "synthesize"][..],
-    ] {
-        let rejected = cli(&root, args)?;
-        assert!(
-            !rejected.status.success(),
-            "retired mutating command `{}` unexpectedly succeeded",
-            args.join(" ")
-        );
-        assert!(
-            String::from_utf8_lossy(&rejected.stderr).contains("unrecognized subcommand"),
-            "retired command `{}` did not fail during parsing",
-            args.join(" ")
-        );
-    }
-    assert!(
-        !root.join("runtime.sqlite3").exists(),
-        "rejected legacy writes must not initialize product storage"
-    );
-    Ok(())
-}
-
-#[test]
 fn attachment_and_mcp_are_exercisable_without_claiming_llama_inference() -> Result<()> {
     let root = data_dir("adapters")?;
     let image = root.join("photo.png");
@@ -481,39 +417,6 @@ fn attachment_and_mcp_are_exercisable_without_claiming_llama_inference() -> Resu
                 .and_then(Value::as_bool),
             Some(false)
         );
-    }
-    Ok(())
-}
-
-#[test]
-fn deprecated_server_alias_is_hidden_and_never_opens_a_server() -> Result<()> {
-    let root = data_dir("server-alias")?;
-    let help = cli(&root, &["--help"])?;
-    assert!(help.status.success());
-    let help_text = String::from_utf8_lossy(&help.stdout);
-    assert!(!help_text.contains("server"));
-
-    let status = json_output(&cli(&root, &["server", "status", "--json"])?)?;
-    assert_eq!(
-        status.pointer("/result/transport").and_then(Value::as_str),
-        Some("in_process")
-    );
-    assert_eq!(
-        status.pointer("/result/running").and_then(Value::as_bool),
-        Some(false)
-    );
-    assert_eq!(
-        status
-            .pointer("/result/resident_models")
-            .and_then(Value::as_u64),
-        Some(0)
-    );
-    let result = status
-        .get("result")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("missing native status"))?;
-    for forbidden in ["host", "port", "pid", "server_path"] {
-        assert!(!result.contains_key(forbidden));
     }
     Ok(())
 }

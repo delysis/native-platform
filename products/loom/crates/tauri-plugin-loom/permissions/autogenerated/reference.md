@@ -5,17 +5,23 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 #### This default permission set includes the following:
 
 - `allow-project-open-default`
-- `allow-project-choose-create`
-- `allow-project-choose-open`
+- `allow-project-prepare-open`
+- `allow-project-prepare-open-path`
+- `allow-project-drop-directories`
+- `allow-project-commit-open`
+- `allow-project-discard-open`
 - `allow-project-close`
 - `allow-project-current`
 - `allow-project-recover`
 - `allow-document-create`
+- `allow-workspace-template-get`
+- `allow-workspace-template-enable`
 - `allow-document-rename`
 - `allow-document-delete`
 - `allow-attachment-ingest`
 - `allow-attachment-import-choose`
 - `allow-attachment-import-paths`
+- `allow-attachment-reveal-original`
 - `allow-import-text-sources`
 - `allow-attachment-import-batch-choose`
 - `allow-document-context-list`
@@ -32,6 +38,8 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-speech-input-capabilities`
 - `allow-speech-input-status`
 - `allow-document-open`
+- `allow-document-import-external`
+- `allow-shader-preview`
 - `allow-document-checkpoint`
 - `allow-document-export-choose`
 - `allow-document-reveal`
@@ -293,6 +301,110 @@ Enables the attachment_ingest command without any pre-configured scope.
 <td>
 
 Denies the attachment_ingest command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-attachment-reveal-original`
+
+</td>
+<td>
+
+Enables the attachment_reveal_original command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-attachment-reveal-original`
+
+</td>
+<td>
+
+Denies the attachment_reveal_original command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-audio-record-start`
+
+</td>
+<td>
+
+Enables the audio_record_start command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-audio-record-start`
+
+</td>
+<td>
+
+Denies the audio_record_start command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-audio-record-stop`
+
+</td>
+<td>
+
+Enables the audio_record_stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-audio-record-stop`
+
+</td>
+<td>
+
+Denies the audio_record_stop command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-audio-synthesize`
+
+</td>
+<td>
+
+Enables the audio_synthesize command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-audio-synthesize`
+
+</td>
+<td>
+
+Denies the audio_synthesize command without any pre-configured scope.
 
 </td>
 </tr>
@@ -917,6 +1029,32 @@ Enables the document_export_choose command without any pre-configured scope.
 <td>
 
 Denies the document_export_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-import-external`
+
+</td>
+<td>
+
+Enables the document_import_external command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-import-external`
+
+</td>
+<td>
+
+Denies the document_import_external command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1574,58 +1712,6 @@ Denies the model_unload command without any pre-configured scope.
 <tr>
 <td>
 
-`loom:allow-project-choose-create`
-
-</td>
-<td>
-
-Enables the project_choose_create command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`loom:deny-project-choose-create`
-
-</td>
-<td>
-
-Denies the project_choose_create command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`loom:allow-project-choose-open`
-
-</td>
-<td>
-
-Enables the project_choose_open command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`loom:deny-project-choose-open`
-
-</td>
-<td>
-
-Denies the project_choose_open command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
 `loom:allow-project-close`
 
 </td>
@@ -1645,6 +1731,32 @@ Enables the project_close command without any pre-configured scope.
 <td>
 
 Denies the project_close command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-project-commit-open`
+
+</td>
+<td>
+
+Enables the project_commit_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-project-commit-open`
+
+</td>
+<td>
+
+Denies the project_commit_open command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1678,6 +1790,58 @@ Denies the project_current command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-project-discard-open`
+
+</td>
+<td>
+
+Enables the project_discard_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-project-discard-open`
+
+</td>
+<td>
+
+Denies the project_discard_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-project-drop-directories`
+
+</td>
+<td>
+
+Enables the project_drop_directories command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-project-drop-directories`
+
+</td>
+<td>
+
+Denies the project_drop_directories command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-project-open-default`
 
 </td>
@@ -1704,6 +1868,58 @@ Denies the project_open_default command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-project-prepare-open`
+
+</td>
+<td>
+
+Enables the project_prepare_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-project-prepare-open`
+
+</td>
+<td>
+
+Denies the project_prepare_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-project-prepare-open-path`
+
+</td>
+<td>
+
+Enables the project_prepare_open_path command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-project-prepare-open-path`
+
+</td>
+<td>
+
+Denies the project_prepare_open_path command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-project-recover`
 
 </td>
@@ -1723,6 +1939,32 @@ Enables the project_recover command without any pre-configured scope.
 <td>
 
 Denies the project_recover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-shader-preview`
+
+</td>
+<td>
+
+Enables the shader_preview command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-shader-preview`
+
+</td>
+<td>
+
+Denies the shader_preview command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1912,6 +2154,84 @@ Denies the suggestions_set command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-terminal-cancel`
+
+</td>
+<td>
+
+Enables the terminal_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-terminal-cancel`
+
+</td>
+<td>
+
+Denies the terminal_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-terminal-list`
+
+</td>
+<td>
+
+Enables the terminal_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-terminal-list`
+
+</td>
+<td>
+
+Denies the terminal_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-terminal-run`
+
+</td>
+<td>
+
+Enables the terminal_run command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-terminal-run`
+
+</td>
+<td>
+
+Denies the terminal_run command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-weave-start`
 
 </td>
@@ -1957,6 +2277,58 @@ Enables the weave_status command without any pre-configured scope.
 <td>
 
 Denies the weave_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-template-enable`
+
+</td>
+<td>
+
+Enables the workspace_template_enable command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-template-enable`
+
+</td>
+<td>
+
+Denies the workspace_template_enable command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-template-get`
+
+</td>
+<td>
+
+Enables the workspace_template_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-template-get`
+
+</td>
+<td>
+
+Denies the workspace_template_get command without any pre-configured scope.
 
 </td>
 </tr>

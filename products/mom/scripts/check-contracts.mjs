@@ -353,9 +353,13 @@ const runtimeUpstreamKeys = extractConstStringValues(
   "UPSTREAM_SETTING_KEYS",
   "pub const NATIVE_SETTING_EXTENSION_KEYS",
 );
-if (!sameSet(settingKeys, runtimeUpstreamKeys)) {
+const implementedSettings = settingsParityDocument.settings.filter(
+  (setting) => setting.status === "implemented",
+);
+const activeSettingKeys = implementedSettings.map((setting) => setting.key);
+if (!sameSet(activeSettingKeys, runtimeUpstreamKeys)) {
   fail(
-    `runtime upstream settings disagree with ledger: runtime=${runtimeUpstreamKeys.join(",")} ledger=${settingKeys.join(",")}`,
+    `runtime upstream settings disagree with implemented ledger entries: runtime=${runtimeUpstreamKeys.join(",")} ledger=${activeSettingKeys.join(",")}`,
   );
 }
 const settingsFieldStart = viewProductionSource.indexOf("const SETTINGS_FIELDS");
@@ -366,7 +370,7 @@ const visibleUpstreamKeys = [
     .slice(settingsFieldStart, settingsFieldEnd)
     .matchAll(/key: "([A-Za-z][A-Za-z0-9_]*)"/g),
 ].map((match) => match[1]);
-const directlyRenderedSettingKeys = settingsParityDocument.settings
+const directlyRenderedSettingKeys = implementedSettings
   .filter((setting) => !["derived", "backend_only"].includes(setting.ui_projection))
   .map((setting) => setting.key);
 if (!sameSet(directlyRenderedSettingKeys, visibleUpstreamKeys)) {

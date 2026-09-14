@@ -1,20 +1,14 @@
+use desktop_model_defaults::{
+    GEMMA_ARTIFACT_BYTES, GEMMA_ARTIFACT_NAME, GEMMA_DOWNLOAD_URL, GEMMA_PROJECTOR_BYTES,
+    GEMMA_PROJECTOR_DOWNLOAD_URL, GEMMA_PROJECTOR_NAME, GEMMA_PROJECTOR_SHA256, GEMMA_REPOSITORY,
+    GEMMA_REVISION, GEMMA_SHA256,
+};
 use serde::Serialize;
 
 const CATALOG_SCHEMA_VERSION: u32 = 2;
 const GEMMA_CATALOG_ID: &str = "google.gemma-4-12b-it-qat-q4_0";
 const GEMMA_DISPLAY_NAME: &str = "Gemma 4 12B QAT Q4_0";
 const GEMMA_PUBLISHER: &str = "Google";
-const GEMMA_REPOSITORY: &str = "google/gemma-4-12B-it-qat-q4_0-gguf";
-const GEMMA_REVISION: &str = "29d097773436b69ff9feafd636ab4cf873786537";
-const GEMMA_ARTIFACT_NAME: &str = "gemma-4-12b-it-qat-q4_0.gguf";
-const GEMMA_DOWNLOAD_URL: &str = "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/29d097773436b69ff9feafd636ab4cf873786537/gemma-4-12b-it-qat-q4_0.gguf?download=true";
-const GEMMA_SHA256: &str = "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b";
-const GEMMA_ARTIFACT_BYTES: u64 = 6_975_879_296;
-const GEMMA_PROJECTOR_NAME: &str = "mmproj-gemma-4-12b-it-qat-q4_0.gguf";
-const GEMMA_PROJECTOR_DOWNLOAD_URL: &str = "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/29d097773436b69ff9feafd636ab4cf873786537/mmproj-gemma-4-12b-it-qat-q4_0.gguf?download=true";
-const GEMMA_PROJECTOR_SHA256: &str =
-    "cb018338a7538a9814d994bfe54644c71eb7ed54e31eae2f721e45fd3c260da7";
-const GEMMA_PROJECTOR_BYTES: u64 = 175_115_616;
 const GEMMA_CONTEXT_TOKENS: u32 = 262_144;
 const GEMMA_RECOMMENDED_SYSTEM_MEMORY_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 

@@ -12,8 +12,11 @@ source: it is the separately reviewed unsafe upstream boundary.
 
 ## Workspace
 
+The [current architecture index](docs/architecture/CURRENT-DECISIONS.md) records
+scope changes since the sealed ADR import.
+
 - Rust 1.92.0, edition 2024, resolver 3.
-- All 47 first-party packages are members of one root Cargo workspace.
+- All first-party packages are members of one root Cargo workspace; [the package groups](ci/package-groups.json) record the current inventory.
 - One root `Cargo.lock` resolves exact `rusqlite 0.39.0` and one
   `libsqlite3-sys 0.37.0` native link.
 - One pnpm 11.16.0 workspace and root `pnpm-lock.yaml` own the FTE, Mom, and
@@ -23,12 +26,22 @@ source: it is the separately reviewed unsafe upstream boundary.
 - `ci/ignored-tests.json` registers every opt-in test with its exact source,
   prerequisite, evidence class, and prohibition on automatic promotion.
 - The Attachment fuzz target is the only deliberately excluded auxiliary
-  Cargo workspace.
+  Cargo workspace. The externally sourced GLib security backport is excluded
+  from first-party workspace membership; see [its patch record](vendor/glib/PATCH.md).
 
 Check the live repository invariants with:
 
 ```text
 cargo run --locked -p xtask -- policy
+```
+
+When a system Cargo installation precedes rustup on PATH, select the whole
+toolchain before running these commands:
+
+```sh
+export PATH="$(dirname "$(rustup which --toolchain 1.92.0 cargo)"):$PATH"
+rustc --version
+cargo clippy --version
 ```
 
 Then test and lint only the affected package group during normal development:
@@ -42,17 +55,16 @@ node scripts/ci/cargo-group.mjs clippy product-mom
 workspace, lockfile, and release changes. It does not run the guarded
 ignored-test inventory listing; when the planner selects `ignored-tests`, run
 `node scripts/ci/validate-ignored-tests.mjs --cargo-list` separately.
-`cargo xtask lean verify` is an explicit historical W8/W9 census check, not
-part of ordinary policy.
+Historical W8/W9 census commands are retired; Git retains their implementation
+and original receipts.
 
 PR selection derives changed packages and local reverse consumers from locked
 Cargo metadata. `dependency_selection` is applied; unknown or unavailable
 metadata forces the full plan. `ci/ci-path-exceptions.json` contains only
-evidenced non-Cargo asset, platform, workspace, and workflow rules. The former
-path planner remains under `dependency_shadow` as an observational equivalence
-report, and any unexplained reduction against it also forces full coverage.
+evidenced non-Cargo asset, platform, workspace, and workflow rules. One planner
+selects the actual dependency closure; the former path overlay is retired.
 
-Lifecycle, migration, and SQLite identity checks live with the product or
+Lifecycle, storage, and SQLite identity checks live with the product or
 service that owns the behavior. Product UI, real-model, and loaded-model
 shutdown evidence remain explicit acceptance gates and are not inferred from
 compilation.

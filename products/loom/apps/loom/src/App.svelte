@@ -3,12 +3,27 @@
   import { convertFileSrc } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
+  import TerminalPane from './lib/TerminalPane.svelte';
+  import PaneDivider from './lib/PaneDivider.svelte';
+  import Loompad from './lib/Loompad.svelte';
+  import { loompadPrefix, type LoompadLength } from './lib/loompad';
+  import type { CompletionCandidate } from './lib/completionSession';
+  import type { TerminalSourceRange } from './lib/terminalSelection';
+  import { workspaceRows } from './lib/workspaceTree';
+  import { readWorkspaceFolders, rememberWorkspaceFolder, type WorkspaceFolder } from './lib/workspaceFolders';
+  import WorkspacePane from './lib/WorkspacePane.svelte';
+  import { workspaceWriterCandidates, workspaceWriterModel, type WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
+  import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
+  import { startAudioRecording, stopAudioRecording, synthesizeAudio, type AudioRecording } from './lib/ipc';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
   import ImportSources from './lib/ImportSources.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
+    runTerminal,
+    listTerminalRuns,
+    cancelTerminalRun,
     addDocumentContexts,
     applyCoWriter,
     applicationClosePending,
@@ -20,7 +35,9 @@
     clearTransientDraft,
     applyDocumentReconciliation,
     chooseAttachments,
-    chooseAndOpenProject,
+    prepareProjectOpen,
+    commitProjectOpen,
+    discardProjectOpen,
     chooseModel,
     closeProject as closeProjectSession,
     createDocument,
@@ -38,6 +55,7 @@
     getWeaveStatus,
     ingestImageAttachment,
     importAttachmentPaths,
+    revealAttachmentOriginal,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
     listenForDocumentFilesystemHints,
@@ -53,7 +71,10 @@
     listModels,
     listModelDownloads,
     openDefaultProject,
+    prepareProjectOpenPath,
+    projectDropDirectories,
     openDocument,
+    importExternalDocument,
     previewDocumentReconciliation,
     promoteCandidate,
     recoverProject,
@@ -80,10 +101,11 @@
     projectAssetProtocolToken
   } from './lib/attachments';
   import {
-    decodeVerseForEditor,
-    encodeVerseFromEditor,
-    type VerseEditorCodec
+    decodeVerseForEditor as decodeSourceForEditor,
+    encodeVerseFromEditor as encodeSourceFromEditor,
+    type VerseEditorCodec as SourceEditorCodec
   } from './lib/verseCodec';
+  import { sourceCaretByte } from './lib/sourceCaret';
   import { canUseVisualMarkdown } from './lib/markdownSafety';
   import {
     autocompleteDisposition,
@@ -152,10 +174,7 @@
   import { nativeDropPoint as convertNativeDropPoint, nativeDropScope } from './lib/nativeAttachmentDrop';
   import { suggestionsEnabledFromStoredPreference } from './lib/suggestionPreference';
   import {
-    loadAppearancePreference,
-    persistAppearancePreference,
     resolveAppearance,
-    toggledAppearance,
     type AppearancePreference
   } from './lib/appearance';
   import {
@@ -164,12 +183,6 @@
     legacyLocalCatalogMatch,
     validateCuratedModelCatalog
   } from './lib/modelCatalog';
-  import {
-    AUTOCOMPLETE_MODEL_MENU_LONG_PRESS_MS,
-    autocompleteModelMenuLongPressMoved,
-    canStartAutocompleteModelMenuLongPress,
-    isAutocompleteModelMenuKey
-  } from './lib/autocompleteModelMenu';
   import {
     captureProjectCloseAgency,
     restoreProjectCloseAgency,
@@ -189,6 +202,7 @@
   } from './lib/suggestionInteraction';
   import {
     acceptedCompletionText,
+    insertAtUtf8Boundary,
     completionPresentation as completionSessionPresentation,
     completionSessionContextKey,
     completionShouldRequestNextBatch,
@@ -265,6 +279,7 @@
     observeTextMutation,
     reconcileCompletionController,
     refreshCompletionCandidate,
+    refreshCompatibleCompletionFamily,
     rejectVisualPresentation,
     resetCompletionDiscovery,
     resetCompletionSurface,
@@ -294,8 +309,7 @@
     type VerifiedDownloadForm
   } from './lib/modelDownload';
   import {
-    generationEventBelongsToScope,
-    utf8ByteOffset
+    generationEventBelongsToScope
   } from './lib/weaveSafety';
   import {
     isEphemeralAcceptanceModelPath,
@@ -305,8 +319,7 @@
     looksLikeVisionAdapter,
     orderedLocalTextModels,
     preferredWriterModelPath,
-    suggestionWriter,
-    startupWriterCandidates
+    suggestionWriter
   } from './lib/modelPolicy';
   import type {
     BranchCard,
@@ -337,7 +350,9 @@
     SpeechRecordingSnapshot,
     TransientDraftSnapshot,
     DocumentContextSnapshot,
-    WeaveStarted
+    WeaveStarted,
+    TerminalRun,
+    TerminalRunRequest
   } from './lib/types';
 
   type VisualTextInsertionAnchor = {
@@ -370,7 +385,63 @@
   let lastFailure: LoomFailure | null = null;
   let opening = false;
   let search = '';
+  let workspaceFolders: WorkspaceFolder[] = [];
+  let workspaceRootExpanded = true;
+  let workspaceDocuments: Record<string, string> = {};
+  let workspaceDropActive = false;
+  let outlineElement: HTMLElement | undefined;
+  $: visibleWorkspaceFolders = project && !workspaceFolders.some(folder => folder.root === project?.root)
+    ? [...workspaceFolders, { root: project.root, title: project.title }] : workspaceFolders;
+  let workspaceTemplate: WorkspaceTemplateSnapshot | null = null;
+  let workspaceTemplateScope = '';
+  let deferredWorkspaceTemplate: WorkspaceTemplateSnapshot | null = null;
+  let deferredTemplateSession = '';
+  $: if (deferredWorkspaceTemplate && !compositionActive) applyDeferredTemplate();
+  let templateKey = '';
+  let templateSerial = 0;
+  let paneSelection: Record<string, string> = {};
+  let hiddenPaneSlots = new Set<string>();
+  let workspaceWidth = 1000;
+  let workspaceHeight = 600;
+  let outlineWidth = 220;
+  let rightWidth = 320;
+  let bottomHeight = 240;
+  let terminalHeight = 220;
+  let terminalDockHeight = 0;
+  $: terminalLimit = Math.max(100, (workspaceHeight + terminalDockHeight) * 0.6);
+  $: effectiveTerminalHeight = Math.min(terminalHeight, terminalLimit);
+  $: outlineLimit = Math.max(150, workspaceWidth * 0.35);
+  $: rightLimit = Math.max(180, workspaceWidth - (outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0) - 200);
+  $: rightPaneOpen = paneSlots.some(slot => slot.position === 'right' && slot.selected && !hiddenPaneSlots.has('right'));
+  $: bottomPaneOpen = paneSlots.some(slot => slot.position === 'bottom' && slot.selected && !hiddenPaneSlots.has('bottom'));
+  let paneEditors: Record<string, WorkspacePane> = {};
+  let paneBusy: Record<string, boolean> = {};
+  let paneComposing: Record<string, boolean> = {};
+  $: configuredPanes = workspaceTemplate?.enabled && !workspaceTemplate.error ? Object.entries(workspaceTemplate.config.panes) : [];
+  $: busyPaneSlots = new Set(configuredPanes.filter(([id]) => paneBusy[id]).map(([, config]) => config.position));
+  $: paneSlots = (['main', 'right', 'bottom'] as const).map(position => {
+    const choices = configuredPanes.filter(([, config]) => config.position === position && config.visible);
+    return { position, choices, selected: choices.find(([id]) => id === paneSelection[position]) ?? choices[0] };
+  });
+  $: mainPane = paneSlots.find(slot => slot.position === 'main')?.selected;
+  $: customMain = Boolean(mainPane && (mainPane[1].kind !== 'editor' || mainPane[1].document));
+  $: if (desktop && project) {
+    const key = `${project.project_id}/${project.session_id}/${project.documents.find(item => item.relative_path === '.loom.md')?.revision_id ?? ''}`;
+    if (key !== templateKey) { templateKey = key; void refreshWorkspaceTemplate(); }
+  } else { workspaceTemplate = null; workspaceTemplateScope = ''; deferredWorkspaceTemplate = null; templateKey = ''; }
   let outlineOpen = false;
+  let collapsedFolders = new Set<string>(['Runs/']);
+  let terminalOpen = false;
+  let terminalEntry = '';
+  let terminalRuns: TerminalRun[] = [];
+  let terminalDispatching = false;
+  let terminalCancelRequested = false;
+  let cancelledTerminalIds = new Set<string>();
+  let terminalPendingRequest: TerminalRunRequest | null = null;
+  let terminalError = '';
+  let terminalSessionKey = '';
+  let terminalRefreshSerial = 0;
+  let terminalPollTimer: number | undefined;
   let contextPaneOpen = false;
   let focusedSpeechTarget: SpeechInputTarget = 'manuscript';
   let contextPaneElement: HTMLDivElement | undefined;
@@ -449,7 +520,14 @@
   } | null = null;
   let documentContextSuppressClickId: string | null = null;
   let documentContextSuppressClickTimer: number | undefined;
+  let retainedRecording: AudioRecording | null = null;
+  let spokenAudio: HTMLAudioElement | null = null;
+  let spokenAudioUrl: string | null = null;
+  let speechPlaybackSerial = 0;
+  let speechPlaybackScope = '';
+  $: if (speechPlaybackScope !== `${project?.session_id ?? ''}/${document?.summary.document_id ?? ''}`) { speechPlaybackScope = `${project?.session_id ?? ''}/${document?.summary.document_id ?? ''}`; stopReadAloud(); }
   let appearance: AppearancePreference = 'system';
+  let appearanceOverride = false;
   let systemDark = false;
   let appearanceMedia: MediaQueryList | null = null;
   let models: ModelCapabilitySummary[] = [];
@@ -513,19 +591,14 @@
   let missingDocumentCopyState: 'idle' | 'copied' | 'failed' = 'idle';
   let appliedNativeTitle = '';
   let suggestionsEnabled = false;
+  let suggestionInteraction: 'ghost' | 'loompad' = 'ghost';
+  let loompadAccepting = false;
+  $: loompadActive = suggestionsEnabled && suggestionInteraction === 'loompad';
+  $: ghostTextHidden = loompadActive || inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled });
   let suggestionsChanging = false;
   let reportedGenerationFailureRun: string | null = null;
   let contextPresentationFingerprint = '';
   let requireExplicitCompletionFamily = false;
-  let autocompleteModelMenuLongPressTimer: number | undefined;
-  let autocompleteModelMenuLongPress: {
-    pointerId: number;
-    x: number;
-    y: number;
-    trigger: HTMLButtonElement;
-  } | null = null;
-  let suppressAutocompleteToggleClick = false;
-  let suppressAutocompleteToggleClickTimer: number | undefined;
   let suggestionsIdleTimer: number | undefined;
   let suggestionWakeQueued = false;
   let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
@@ -578,6 +651,16 @@
   let branchPollEpoch = 0;
   let completionActiveRunIds: string[] = [];
   let authoritativeCompletionFamilyId: string | null = null;
+  let loompadReservoir: {
+    key: string; snapshotId: string; familyIds: string[]; nextOffset: number;
+    admittedAt: number; capture: WeaveCapture;
+  } | null = null;
+  $: loompadSnapshotKey = JSON.stringify([project?.project_id, project?.session_id,
+    document?.summary.document_id, document?.summary.revision_id, document?.visible_blob_id,
+    mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte, currentModel?.model_id,
+    contextEpoch, documentEpoch, completionController.intentEpoch, editVersion]);
+  $: loompadFamilyIds = loompadActive && loompadReservoir?.key === loompadSnapshotKey
+    ? loompadReservoir.familyIds : undefined;
   let cancellingRunIds: string[] = [];
   let cancellationCommandByRun: Record<string, string> = {};
   let promotionArmedCandidateId: string | null = null;
@@ -606,10 +689,12 @@
   let visualBoundaryFailure: VisualCaretBoundaryFailure | 'selection_settling' | 'uninitialized' | null = 'uninitialized';
   let visualBoundaryDiagnostic: string | null = null;
   let visualMutationPending = false;
-  let verseCodec: VerseEditorCodec | null = null;
-  let compositionActive = false;
+  let sourceCodec: SourceEditorCodec | null = null;
+  let mainCompositionActive = false;
+  $: compositionActive = mainCompositionActive || Object.values(paneComposing).some(Boolean);
   let sourceComposing = false;
   let visualEditor: {
+    captureTerminalSourceRange: () => TerminalSourceRange | null;
     flushPending: () => boolean;
     focusAtDocumentEnd: () => boolean;
     focusCurrentSelection: () => boolean;
@@ -619,6 +704,7 @@
     refreshGhostPresentation: () => boolean;
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
+    acceptLoompadText: (candidateId: string, presentationKey: string, text: string) => boolean;
     insertAttachmentMarkdown: (markdown: string, clientX?: number, clientY?: number) => boolean;
     captureAttachmentAnchor: (x: number, y: number) => VisualTextInsertionAnchor | null;
     insertMarkdownAtAnchor: (anchor: VisualTextInsertionAnchor, markdown: string) => boolean;
@@ -630,6 +716,7 @@
     focusAtDocumentEnd: () => boolean;
     focusCurrentSelection: () => boolean;
     acceptGhostWord: (requireVisible?: boolean) => boolean;
+    acceptLoompadText: (candidateId: string, presentationKey: string, text: string) => boolean;
     insertAttachmentMarkdown: (markdown: string) => boolean;
     insertTextAtSelection: (text: string) => boolean;
     captureTextInsertionAnchor: () => SourceTextInsertionAnchor | null;
@@ -774,6 +861,9 @@
     editVersion: number;
     intentEpoch: number;
     modelId: string;
+    sourceDocument: OpenDocument;
+    sourceMarkdown: string;
+    speculation?: { sampleTarget: 4 | 16 | 64 | 256; offset: number; key: string };
   }
 
   interface ModelDownloadCapture extends VerifiedDownloadForm {
@@ -893,12 +983,27 @@
   $: unpresentableVisualGhostPresentationKeys = completionController.unpresentableVisualKeys;
   $: scheduledSuggestion = completionController.scheduled;
 
-  $: visibleDocuments = project?.documents.filter((candidate) => {
-    const query = search.trim().toLocaleLowerCase();
-    return !query || candidate.title.toLocaleLowerCase().includes(query) || candidate.relative_path.toLocaleLowerCase().includes(query);
-  }) ?? [];
+  $: terminalBusy = terminalDispatching || terminalPendingRequest !== null || terminalRuns.some((run) => run.status === 'running') || Object.values(paneBusy).some(Boolean);
+  $: if (terminalSessionKey !== `${project?.project_id ?? ''}:${project?.session_id ?? ''}`) {
+    terminalSessionKey = `${project?.project_id ?? ''}:${project?.session_id ?? ''}`;
+    terminalRefreshSerial += 1;
+    terminalRuns = [];
+    terminalEntry = '';
+    terminalError = '';
+    terminalDispatching = false;
+    terminalCancelRequested = false;
+    cancelledTerminalIds = new Set();
+    terminalPendingRequest = null;
+    terminalOpen = false;
+    if (terminalPollTimer !== undefined) window.clearTimeout(terminalPollTimer);
+    terminalPollTimer = undefined;
+    if (desktop && project) void refreshTerminalRuns();
+  }
+
+  $: folderWarnings = project?.folder_warnings ?? [];
+  $: fileRows = workspaceRows(project?.documents ?? [], collapsedFolders, search);
   $: loadedModel = models.find((model) => model.loaded) ?? null;
-  $: currentModel = suggestionWriter(models, buildModelPolicy);
+  $: currentModel = workspaceWriterModel(models, buildModelPolicy, curatedModels, workspaceTemplate, workspaceTemplateScope === `${project?.project_id}/${project?.session_id}`);
   $: suggestionSetupNeeded = Boolean(
     project &&
     document &&
@@ -968,14 +1073,13 @@
     sourceDisplayText,
     document,
     documentText,
-    verseCodec
+    sourceCodec
   );
-  $: sourceGhostNewline = document?.summary.kind === 'verse'
-    ? verseCodec?.newline ?? 'mixed'
-    : null;
+  $: sourceGhostNewline = sourceCodec?.newline ?? null;
   $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual', {
     branches,
     authoritativeFamilyId: authoritativeCompletionFamilyId,
+    authoritativeFamilyIds: loompadFamilyIds,
     requireExplicitFamily: requireExplicitCompletionFamily,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     liveTextByRun: liveBranchTextByRun,
@@ -992,6 +1096,7 @@
   $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source', {
     branches,
     authoritativeFamilyId: authoritativeCompletionFamilyId,
+    authoritativeFamilyIds: loompadFamilyIds,
     requireExplicitFamily: requireExplicitCompletionFamily,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     liveTextByRun: liveBranchTextByRun,
@@ -1010,14 +1115,15 @@
     : mode === 'source'
       ? sourceSuggestionFamily
       : [];
-  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily);
+  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, loompadActive);
   $: completionView = completionControllerView(
     completionController,
     completionContextKey,
-    baseSuggestionFamily
+    baseSuggestionFamily,
+    loompadActive
   );
   $: boundCompletionSession = completionView.boundSession;
-  $: if (boundCompletionSession) {
+  $: if (boundCompletionSession && !loompadActive) {
     const selected = selectedCompletionCandidate(boundCompletionSession);
     const branch = selected
       ? branches.find((candidate) => candidate.run_id === selected.runId)
@@ -1051,6 +1157,32 @@
         text,
         projectedInlinePresentationKey(rawPresentationKey, rawText, text)
       );
+    }
+  }
+  $: if (loompadActive && boundCompletionSession && loompadReservoir) {
+    const captured = loompadReservoir.capture;
+    const selected = selectedCompletionCandidate(boundCompletionSession);
+    const familyRunIds = new Set(branches.filter(branch =>
+      loompadReservoir?.familyIds.includes(branch.weave_command_id ?? '') &&
+      branch.source_revision_id === captured.sourceRevisionId
+    ).map(branch => branch.run_id));
+    // Only the exact author-approved prefix may separate this document from
+    // the retained native snapshot. Manual edits/context changes revoke it.
+    if (selected && familyRunIds.has(selected.runId) &&
+        project?.project_id === captured.projectId && project.session_id === captured.sessionId &&
+        document?.summary.document_id === captured.documentId && documentEpoch === captured.epoch &&
+        contextEpoch === captured.contextEpoch && currentModel?.model_id === captured.modelId &&
+        insertAtUtf8Boundary(captured.sourceMarkdown, captured.cursorByte,
+          acceptedCompletionText(boundCompletionSession)) === documentText) {
+      const originals = inlineSuggestionFamily(captured.cursorByte, mode, {
+        branches, authoritativeFamilyIds: loompadReservoir.familyIds, requireExplicitFamily: true,
+        verifiedBodyByRun: verifiedBranchBodyByRun, liveTextByRun: liveBranchTextByRun,
+        liveTextSequenceByRun: liveBranchTextSequenceByRun, currentModel,
+        document: captured.sourceDocument, suggestionsEnabled: true, promotionReady: true,
+        dismissedCandidateIds, unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
+        manuscriptText: captured.sourceMarkdown, sourceNewline: sourceGhostNewline
+      });
+      refreshVisibleCompletionFamily(boundCompletionSession, originals);
     }
   }
   $: activeSuggestionFamily = completionView.activeFamily;
@@ -1093,10 +1225,7 @@
       : 0,
     autocomplete_enabled: suggestionsEnabled,
     shuttle_enabled: shuttleEnabled,
-    inline_hidden_requested: inlineGhostHidden({
-      autocomplete: suggestionsEnabled,
-      shuttle: shuttleEnabled
-    }),
+    inline_hidden_requested: ghostTextHidden,
     inline_visible_key: mode === 'visual'
       ? visibleVisualGhostPresentationKey
       : mode === 'source'
@@ -1155,11 +1284,17 @@
             ? 'Ready'
             : 'Set up';
   $: nativeWindowTitle = document?.summary.title ?? project?.title ?? 'Loom';
-  $: resolvedAppearance = resolveAppearance(appearance, systemDark);
+  $: workspaceTheme = workspaceTemplate?.error ? null : workspaceTemplate?.config.theme;
+  $: resolvedAppearance = resolveAppearance(appearanceOverride ? appearance : workspaceTheme?.mode ?? 'system', systemDark);
   $: if (desktop) void syncNativeWindowTitle(nativeWindowTitle);
   $: if (componentMounted) {
     window.document.documentElement.dataset.theme = resolvedAppearance;
     window.document.documentElement.style.colorScheme = resolvedAppearance;
+    for (const token of ['canvas', 'text', 'accent'] as const) {
+      const value = workspaceTheme?.[token];
+      if (value) window.document.documentElement.style.setProperty(`--loom-${token}`, value);
+      else window.document.documentElement.style.removeProperty(`--loom-${token}`);
+    }
   }
   $: if (
     suggestionsEnabled &&
@@ -1168,11 +1303,11 @@
     activeGhostSuggestion.presentationKey !== announcedGhostPresentationKey
   ) {
     announcedGhostPresentationKey = activeGhostSuggestion.presentationKey;
-    announce('Suggestion available. Tab accepts all; Option Right accepts one word; Option Up or Down switches.');
+    announce('Suggestion available. Tab accepts one word; Option WASD chooses a word.');
   }
   $: shuttleCandidate = shuttleEnabled ? selectedInlineSuggestion : activeGhostSuggestion;
   $: shuttleScheduleKey = completionShuttleScheduleKey(
-    shuttleEnabled,
+    shuttleEnabled && !terminalBusy,
     windowFocused,
     shuttleCandidate,
     boundCompletionSession?.acceptedChunks.length ?? 0,
@@ -1654,21 +1789,11 @@
       documentId: document.summary.document_id,
       target: speechTarget()
     };
-    const insertionAnchor = captureSpeechInsertionAnchor(captured.target);
-    if (!insertionAnchor) {
-      speechError = 'Place the caret in an editable manuscript or context surface before dictating.';
-      announce(speechError);
-      return;
-    }
+    const insertion = captureSpeechInsertionAnchor('manuscript');
     speechStarting = true;
     speechError = '';
     try {
-      const recording = await startSpeechRecording(
-        captured.projectId,
-        captured.sessionId,
-        captured.documentId,
-        captured.target
-      );
+      const recording = await startAudioRecording(captured.projectId, captured.sessionId, captured.documentId);
       const inScope =
         project?.project_id === captured.projectId &&
         project.session_id === captured.sessionId &&
@@ -1682,8 +1807,8 @@
         return;
       }
       speechRecording = recording;
-      speechInsertionAnchor = insertionAnchor;
-      announce(`Dictating into ${recording.target === 'context' ? 'context' : 'the manuscript'}`);
+      speechInsertionAnchor = insertion;
+      announce('Recording audio locally');
     } catch (error) {
       speechRecording = null;
       speechInput = null;
@@ -1701,31 +1826,25 @@
     if (!recording || speechStarting) return;
     speechStarting = true;
     try {
-      const snapshot = await stopSpeechRecording(
-        recording.project_id,
-        recording.session_id,
-        recording.recording_id
-      );
-      speechRecording = null;
-      speechInput = snapshot;
-      await acceptSpeechSnapshot(snapshot);
-    } catch (error) {
-      try {
-        await cancelSpeechRecording(
-          recording.project_id,
-          recording.session_id,
-          recording.recording_id
-        );
-      } catch {
-        // Stop may already have consumed the native recording. Either way the
-        // backend owns no reusable client handle after this terminal failure.
+      const captured = retainedRecording ?? await stopAudioRecording(recording.project_id, recording.session_id, recording.recording_id);
+      retainedRecording = captured;
+      const snapshot = await addDocumentContexts(recording.project_id, recording.session_id, captured.document_id, [captured.attachment.id]);
+      adoptAuthoritativeContext(snapshot, recording.project_id, recording.session_id, captured.document_id);
+      const markdown = captured.attachment.media_markdown;
+      const insertion = speechInsertionAnchor;
+      if (markdown && insertion && project?.project_id === recording.project_id && document?.summary.document_id === captured.document_id) {
+        if (insertion.kind === 'visual') visualEditor?.insertMarkdownAtAnchor(insertion.anchor, markdown);
+        else if (insertion.kind === 'source') sourceEditor?.insertTextAtAnchor(insertion.anchor, markdown);
       }
-      speechRecording = null;
-      speechInput = null;
       speechInsertionAnchor = null;
-      speechError = normalizeFailure(error).message;
+      speechRecording = null;
+      retainedRecording = null;
+      speechError = '';
+      announce(captured.activity.limit_reached ? 'Five minutes of audio retained and attached to this document' : captured.activity.signal_detected ? 'Audio retained and attached to this document' : 'Quiet recording retained and attached to this document');
+    } catch (error) {
+      speechError = `${normalizeFailure(error).message} Click the microphone to retry saving this recording.`;
       recordFailure(error);
-      announce('Loom could not stop dictation cleanly');
+      announce(speechError);
     } finally {
       speechStarting = false;
     }
@@ -1735,6 +1854,11 @@
     if (speechStarting) return;
     speechStarting = true;
     try {
+      if (speechRecording && (retainedRecording || speechError)) {
+        speechStarting = false;
+        await finishSpeechRecording();
+        return;
+      }
       if (speechRecording) {
         const recording = speechRecording;
         await cancelSpeechRecording(
@@ -2001,11 +2125,17 @@
   }
 
   async function useImportedSources(items: import('./lib/types').ContextAttachment[]): Promise<boolean> {
-    if (!project || !document || contextAttachmentBusy || items.length === 0) return false;
+    if (!project || !document || editorReadonly || contextAttachmentBusy || items.length === 0) return false;
     const captured = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id };
     contextAttachmentBusy = true;
     try {
       if (!await persistCurrentContextText()) return false;
+      if (
+        project?.project_id !== captured.projectId ||
+        project.session_id !== captured.sessionId ||
+        document?.summary.document_id !== captured.documentId ||
+        editorReadonly
+      ) return false;
       const previousText = contextText;
       const snapshot = await addDocumentContexts(captured.projectId, captured.sessionId, captured.documentId, [...new Set(items.map((item) => item.id))]);
       if (!adoptAuthoritativeContext(snapshot, captured.projectId, captured.sessionId, captured.documentId)) return false;
@@ -2123,31 +2253,78 @@
     }
   }
 
+  async function openDroppedFolders(paths: string[]): Promise<void> {
+    if (fileCommandInFlight || opening || !paths.length) return;
+    // Each folder uses the same prepared-open/save/commit path as the picker.
+    for (const path of paths.slice(0, 32)) {
+      if (!await doOpenProject(path)) break;
+    }
+  }
+
+  async function handleNativeDrop(paths: string[], point: { x: number; y: number }): Promise<void> {
+    if (fileCommandInFlight || opening || !paths.length) return;
+    const captured = { session: project?.session_id, document: document?.summary.document_id, markdown: documentText, mode };
+    try {
+      const directories = await projectDropDirectories(paths);
+      if (!componentMounted || applicationClosePhase !== 'running' || fileCommandInFlight || opening ||
+          project?.session_id !== captured.session || document?.summary.document_id !== captured.document ||
+          documentText !== captured.markdown || mode !== captured.mode) return;
+      if (directories.length) {
+        await openDroppedFolders(directories);
+      } else {
+        const pane = Array.from(window.document.querySelectorAll<HTMLElement>('[data-workspace-pane]')).find(element => {
+          const rect = element.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom;
+        });
+        const paneId = pane?.dataset.workspacePane;
+        if (paneId && paneEditors[paneId]) {
+          await paneEditors[paneId].importDroppedPaths(paths, point);
+          await refreshDocumentContext();
+          return;
+        }
+        const scope = nativeAttachmentDropScope(point);
+        if (scope) await importNativeAttachmentDrop(paths, point, scope);
+      }
+    } catch (error) {
+      recordFailure(error);
+    }
+  }
+
   async function installNativeAttachmentDrop(): Promise<void> {
     unlistenNativeAttachmentDrop = await getCurrentWindow().onDragDropEvent(({ payload }) => {
       if (payload.type === 'leave') {
         contextDropActive = false;
+        workspaceDropActive = false;
         return;
       }
       const point = nativeDropPoint(payload.position);
+      const outline = outlineElement?.getBoundingClientRect();
+      const inOutline = Boolean(outlineOpen && outline && point.x >= outline.left && point.x < outline.right && point.y >= outline.top && point.y < outline.bottom);
+      workspaceDropActive = inOutline;
+      if (payload.type === 'drop') {
+        workspaceDropActive = false;
+        contextDropActive = false;
+        void handleNativeDrop(payload.paths, point);
+        return;
+      }
       const scope = nativeAttachmentDropScope(point);
       contextDropActive = scope === 'context';
-      if (payload.type === 'drop' && scope) {
-        void importNativeAttachmentDrop(payload.paths, point, scope);
-      }
     });
   }
 
   onMount(() => {
     componentMounted = true;
-    appearance = loadAppearancePreference(window);
+    appearance = 'system';
     appearanceMedia = window.matchMedia('(prefers-color-scheme: dark)');
     systemDark = appearanceMedia.matches;
     const syncSystemAppearance = (event: MediaQueryListEvent): void => {
       systemDark = event.matches;
+      appearanceOverride = false;
+      appearance = 'system';
     };
     appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
+    try { workspaceFolders = readWorkspaceFolders(window.localStorage); } catch { workspaceFolders = []; }
     if (desktop) void refreshCuratedModels();
     if (desktop) void installNativeAttachmentDrop();
     documentContextRevealLabel = desktop
@@ -2182,13 +2359,17 @@
         }
       })();
     }
+    const loompadIdleTimer = window.setInterval(() => void prefetchLoompad(), 5_000);
     window.addEventListener('keydown', handleGlobalKeydownCapture, true);
+    window.addEventListener('click', handleAttachmentLink, true);
     window.addEventListener('keydown', handleGlobalKeydown);
     window.addEventListener('pointerdown', handleGlobalPointerdown);
     window.addEventListener('pageshow', handleRendererResume);
     window.document.addEventListener('visibilitychange', handleRendererResume);
     return () => {
       componentMounted = false;
+      window.clearInterval(loompadIdleTimer);
+      if (terminalPollTimer !== undefined) window.clearTimeout(terminalPollTimer);
       startupHeldForApplicationClose = false;
       workspaceRestoreSerial += 1;
       projectFilesystemRefreshSerial += 1;
@@ -2196,17 +2377,14 @@
       modelLoadSerial += 1;
       clearPreferredWriterRequest();
       window.removeEventListener('keydown', handleGlobalKeydownCapture, true);
+      window.removeEventListener('click', handleAttachmentLink, true);
       window.removeEventListener('keydown', handleGlobalKeydown);
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
       window.removeEventListener('pageshow', handleRendererResume);
       window.document.removeEventListener('visibilitychange', handleRendererResume);
+      stopReadAloud();
       appearanceMedia?.removeEventListener('change', syncSystemAppearance);
       appearanceMedia = null;
-      clearAutocompleteModelMenuLongPress();
-      if (suppressAutocompleteToggleClickTimer !== undefined) {
-        window.clearTimeout(suppressAutocompleteToggleClickTimer);
-        suppressAutocompleteToggleClickTimer = undefined;
-      }
       clearDocumentContextLongPress();
       if (documentContextSuppressClickTimer !== undefined) {
         window.clearTimeout(documentContextSuppressClickTimer);
@@ -2361,9 +2539,9 @@
     documentText = '';
     sourceDisplayText = '';
     sourceDirty = false;
-    verseCodec = null;
+    sourceCodec = null;
     visualEditor = null;
-    compositionActive = false;
+    mainCompositionActive = false;
     sourceComposing = false;
     branches = [];
     promotionArmedCandidateId = null;
@@ -2597,6 +2775,7 @@
       const unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
         windowFocused = focused;
         if (focused) {
+          resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
           resumeCompletionObservation();
           scheduleProjectFilesystemRefresh();
           // A hidden WKWebView may stay DOM-focused and emit neither browser
@@ -2622,6 +2801,7 @@
 
   function handleRendererResume(): void {
     if (window.document.visibilityState === 'hidden') return;
+    resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
     resumeCompletionObservation();
     scheduleProjectFilesystemRefresh();
   }
@@ -2985,6 +3165,10 @@
             const previewBoundary = captureProjectFilesystemRefreshBoundary(
               currentProjectFilesystemRefreshBoundary()
             );
+            if (editVersion === savedVersion && documentText === document.text) {
+              await selectDocument(current, true);
+              return;
+            }
             const preview = await requestReconciliationPreview(current, documentText, {
               projectId: refreshed.project_id,
               sessionId: refreshed.session_id,
@@ -3015,6 +3199,10 @@
             current.revision_id !== liveCurrent.revision_id ||
             current.active_blob_id !== liveCurrent.active_blob_id
           ) {
+            if (compositionActive || !flushEditors() || editVersion !== savedVersion) {
+              projectFilesystemRefreshQueued = true;
+              return;
+            }
             cancelSuggestionTimer();
             clearCompletionSession();
             detachDocumentForReconciliation();
@@ -3035,6 +3223,7 @@
         projectFilesystemRefreshQueued = !deleteDocumentUncertain;
         return;
       }
+      if (project?.session_id === boundProject.session_id) await refreshWorkspaceTemplate();
     } catch (error) {
       const failure = normalizeFailure(error);
       if (
@@ -3800,7 +3989,7 @@
       if (failed && failed.run_id !== reportedGenerationFailureRun) {
         reportedGenerationFailureRun = failed.run_id;
         recordLocalFailure('generation_runtime_failed', failed.error!);
-        announce('Suggestions failed. Open Suggestions to reload the local model.');
+        announce('Ghost text is unavailable.');
       }
       reconcileBranchActionState();
       if (completionActiveRunIds.length > 0) scheduleActiveBranchPoll();
@@ -4058,6 +4247,33 @@
     };
   }
 
+  let unavailableWorkspaceWriterKey = '';
+
+  function workspaceWriterKey(): string {
+    return `${workspaceTemplateScope}/${workspaceTemplate?.revision_id ?? ''}/${JSON.stringify(workspaceTemplate?.config.model ?? null)}`;
+  }
+
+  function workspaceWriterSwapIsIdle(): boolean {
+    return transition === 'idle' && !compositionActive && !weaveStarting &&
+      completionActiveRunIds.length === 0 && !terminalDispatching &&
+      !terminalPendingRequest && !terminalRuns.some((run) => run.status === 'running') &&
+      (!models.some((model) => model.loaded) || !Object.values(paneBusy).some(Boolean));
+  }
+
+  async function prepareWorkspaceWriterTemplate(captured: WorkspaceRestoreCapture): Promise<boolean> {
+    const scope = `${captured.projectId}/${captured.sessionId}`;
+    if (workspaceTemplateScope !== scope || !workspaceTemplate) await refreshWorkspaceTemplate();
+    await tick();
+    return workspaceRestoreIsCurrent(captured) && workspaceTemplateScope === scope &&
+      Boolean(workspaceTemplate && !workspaceTemplate.error);
+  }
+
+  $: if (preferredWriterPending && !modelLoading && !modelUnloading &&
+    transition === 'idle' && !compositionActive && !weaveStarting &&
+    completionActiveRunIds.length === 0 && !terminalDispatching &&
+    !terminalPendingRequest && !terminalRuns.some((run) => run.status === 'running') &&
+    (!models.some((model) => model.loaded) || !Object.values(paneBusy).some(Boolean))) wakePreferredWriterEnsure();
+
   function clearPreferredWriterRequest(captured?: WorkspaceRestoreCapture): void {
     if (!captured || workspaceCapturesMatch(preferredWriterPending, captured)) {
       preferredWriterPending = null;
@@ -4097,7 +4313,7 @@
       !applicationAllowsModelPreparation(applicationClosePhase) ||
       !captured ||
       !completionAutomationEnabled() ||
-      currentModel
+      currentModel || unavailableWorkspaceWriterKey === workspaceWriterKey()
     ) return;
     requestPreferredWriterEnsure(captured);
   }
@@ -4106,6 +4322,10 @@
     if (preferredWriterEnsureInFlight) return preferredWriterEnsureInFlight;
     const captured = preferredWriterPending;
     if (!captured) return Promise.resolve(Boolean(currentModel));
+    if (unavailableWorkspaceWriterKey === workspaceWriterKey()) {
+      clearPreferredWriterRequest(captured);
+      return Promise.resolve(false);
+    }
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
       !completionAutomationEnabled() ||
@@ -4118,7 +4338,7 @@
       modelLoading ||
       modelUnloading ||
       modelRefreshInFlightCount > 0 ||
-      transition !== 'idle' ||
+      !workspaceWriterSwapIsIdle() ||
       !document
     ) return Promise.resolve(false);
 
@@ -4141,6 +4361,7 @@
       !completionAutomationEnabled() ||
       !workspaceRestoreIsCurrent(captured)
     ) return false;
+    if (!await prepareWorkspaceWriterTemplate(captured)) return false;
     if (currentModel) {
       if (document) scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
       return true;
@@ -4219,6 +4440,7 @@
   }
 
   async function retryPreferredWriter(): Promise<void> {
+    unavailableWorkspaceWriterKey = '';
     quietModelLoadFailure = null;
     if (modelSetupError.startsWith('Automatic writer setup failed.')) modelSetupError = '';
     await refreshCurrentModelsAndEnsureWriter();
@@ -4234,15 +4456,46 @@
     await tick();
   }
 
+  function stopReadAloud(): void {
+    speechPlaybackSerial++;
+    spokenAudio?.pause();
+    spokenAudio = null;
+    if (spokenAudioUrl) URL.revokeObjectURL(spokenAudioUrl);
+    spokenAudioUrl = null;
+  }
+
+  async function readAloud(): Promise<void> {
+    if (spokenAudio) { stopReadAloud(); return; }
+    if (!document) return;
+    const text = window.getSelection()?.toString().trim() || (sourceTextarea && sourceTextarea.selectionStart !== sourceTextarea.selectionEnd ? sourceTextarea.value.slice(sourceTextarea.selectionStart, sourceTextarea.selectionEnd) : documentText);
+    if (!text.trim()) return;
+    if (new TextEncoder().encode(text).length > 4096) { announce('Select a shorter passage to read aloud'); return; }
+    const serial = ++speechPlaybackSerial;
+    const scope = document.summary.document_id;
+    try {
+      const result = await synthesizeAudio(text);
+      if (serial !== speechPlaybackSerial || document?.summary.document_id !== scope) return;
+      spokenAudioUrl = URL.createObjectURL(new Blob([new Uint8Array(result.wav)], { type: 'audio/wav' }));
+      spokenAudio = new Audio(spokenAudioUrl);
+      spokenAudio.onended = stopReadAloud;
+      await spokenAudio.play();
+      announce('Reading aloud');
+    } catch (error) { if (serial === speechPlaybackSerial) { stopReadAloud(); recordFailure(error); } }
+  }
+
   function setAppearance(next: AppearancePreference): void {
+    appearanceOverride = true;
     appearance = next;
-    const persisted = persistAppearancePreference(window, next);
     const label = next === 'system' ? 'Appearance follows the system' : `${next} appearance`;
-    announce(persisted ? label : `${label} for this session`);
+    announce(`${label} for this session`);
   }
 
   function toggleAppearance(): void {
-    setAppearance(toggledAppearance(appearance, systemDark));
+    if (appearanceOverride) {
+      appearanceOverride = false;
+      appearance = 'system';
+      announce('Appearance follows the system');
+    } else setAppearance(resolvedAppearance === 'dark' ? 'light' : 'dark');
   }
 
   function startTitlebarDrag(event: MouseEvent): void {
@@ -5200,102 +5453,49 @@
     }
   }
 
-  async function toggleSuggestionsFromTitlebar(): Promise<void> {
-    await setSuggestionsEnabled(!suggestionsEnabled);
+  async function setSuggestionInteraction(next: 'ghost' | 'loompad'): Promise<void> {
+    if (suggestionsChanging) return;
+    const enabled = suggestionInteraction !== next || !suggestionsEnabled;
+    if (shuttleEnabled) await setShuttleEnabled(false);
+    suggestionInteraction = next;
+    await setSuggestionsEnabled(enabled);
+    if (enabled && next === 'loompad') {
+      if (activeBranchCount > 0) await cancelActiveBranches();
+      scheduleAutomaticSuggestions(editVersion, 250, 'document_edit');
+    }
     await tick();
     if (mode === 'source') sourceEditor?.focusCurrentSelection();
     else visualEditor?.focusCurrentSelection();
   }
 
-  function clearAutocompleteModelMenuLongPress(): void {
-    if (autocompleteModelMenuLongPressTimer !== undefined) {
-      window.clearTimeout(autocompleteModelMenuLongPressTimer);
-      autocompleteModelMenuLongPressTimer = undefined;
-    }
-    const pending = autocompleteModelMenuLongPress;
-    if (pending?.trigger.hasPointerCapture(pending.pointerId)) {
-      pending.trigger.releasePointerCapture(pending.pointerId);
-    }
-    autocompleteModelMenuLongPress = null;
+  function chooseLoompadCandidate(candidate: CompletionCandidate): void {
+    if (!loompadActive) return;
+    const current = activeSuggestionFamily.findIndex(item => item.runId === selectedInlineSuggestion?.runId);
+    const target = activeSuggestionFamily.findIndex(item => item.runId === candidate.runId && item.presentationKey === candidate.presentationKey);
+    if (target >= 0 && current >= 0) cycleActiveSuggestion(target - current);
   }
 
-  function suppressNextAutocompleteToggleClick(): void {
-    suppressAutocompleteToggleClick = true;
-    if (suppressAutocompleteToggleClickTimer !== undefined) {
-      window.clearTimeout(suppressAutocompleteToggleClickTimer);
-    }
-    suppressAutocompleteToggleClickTimer = window.setTimeout(() => {
-      suppressAutocompleteToggleClick = false;
-      suppressAutocompleteToggleClickTimer = undefined;
-    }, 1_000);
-  }
-
-  function handleAutocompleteToggleClick(event: MouseEvent): void {
-    if (suppressAutocompleteToggleClick) {
-      event.preventDefault();
-      event.stopPropagation();
-      suppressAutocompleteToggleClick = false;
-      if (suppressAutocompleteToggleClickTimer !== undefined) {
-        window.clearTimeout(suppressAutocompleteToggleClickTimer);
-        suppressAutocompleteToggleClickTimer = undefined;
-      }
-      return;
-    }
-    void toggleSuggestionsFromTitlebar();
-  }
-
-  function openAutocompleteModelMenu(event: MouseEvent | KeyboardEvent): void {
-    event.preventDefault();
-    event.stopPropagation();
-    clearAutocompleteModelMenuLongPress();
-    openModelManager(event.currentTarget as HTMLButtonElement);
-  }
-
-  function handleAutocompleteModelMenuKey(event: KeyboardEvent): void {
-    if (isAutocompleteModelMenuKey(event)) openAutocompleteModelMenu(event);
-  }
-
-  function beginAutocompleteModelMenuLongPress(event: PointerEvent): void {
-    if (!canStartAutocompleteModelMenuLongPress(event)) return;
-    clearAutocompleteModelMenuLongPress();
-    const trigger = event.currentTarget as HTMLButtonElement;
-    const pending = {
-      pointerId: event.pointerId,
-      x: event.clientX,
-      y: event.clientY,
-      trigger
-    };
-    autocompleteModelMenuLongPress = pending;
+  async function acceptLoompadCandidate(candidate: CompletionCandidate, length: LoompadLength): Promise<void> {
+    if (!loompadActive || loompadAccepting || editorReadonly || compositionActive || !windowFocused) return;
+    const captured = { context: completionContextKey, text: documentText, version: editVersion };
+    const text = loompadPrefix(candidate.text, length, mode === 'visual');
+    if (!text) return;
+    loompadAccepting = true;
     try {
-      trigger.setPointerCapture(event.pointerId);
-    } catch {
-      // A detached titlebar button cancels through the identity check below.
-    }
-    autocompleteModelMenuLongPressTimer = window.setTimeout(() => {
-      autocompleteModelMenuLongPressTimer = undefined;
-      if (autocompleteModelMenuLongPress !== pending || !pending.trigger.isConnected) {
-        clearAutocompleteModelMenuLongPress();
-        return;
+      chooseLoompadCandidate(candidate);
+      await tick();
+      if (!loompadActive || captured.context !== completionContextKey || captured.text !== documentText ||
+          captured.version !== editVersion || !windowFocused) return;
+      const accepted = mode === 'visual'
+        ? visualEditor?.acceptLoompadText(candidate.candidateId, candidate.presentationKey, text)
+        : sourceEditor?.acceptLoompadText(candidate.candidateId, candidate.presentationKey, text);
+      if (accepted) {
+        await tick();
+        // Keep admitted tails growing; refill only after a pause or exhaustion.
+        if (loompadActive) scheduleAutomaticSuggestions(editVersion,
+          activeSuggestionFamily.length ? 5_000 : 250, 'document_edit');
       }
-      clearAutocompleteModelMenuLongPress();
-      suppressNextAutocompleteToggleClick();
-      openModelManager(pending.trigger);
-    }, AUTOCOMPLETE_MODEL_MENU_LONG_PRESS_MS);
-  }
-
-  function updateAutocompleteModelMenuLongPress(event: PointerEvent): void {
-    const pending = autocompleteModelMenuLongPress;
-    if (!pending || pending.pointerId !== event.pointerId) return;
-    if (autocompleteModelMenuLongPressMoved(
-      { x: pending.x, y: pending.y },
-      { x: event.clientX, y: event.clientY }
-    )) clearAutocompleteModelMenuLongPress();
-  }
-
-  function finishAutocompleteModelMenuLongPress(event: PointerEvent): void {
-    if (autocompleteModelMenuLongPress?.pointerId === event.pointerId) {
-      clearAutocompleteModelMenuLongPress();
-    }
+    } finally { loompadAccepting = false; }
   }
 
   function focusableElementsWithin(container: HTMLElement): HTMLElement[] {
@@ -5363,29 +5563,53 @@
   async function loadPreferredSuggestionModel(
     expectedWorkspace?: WorkspaceRestoreCapture
   ): Promise<boolean> {
-    if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
+    const captured = expectedWorkspace ?? currentWorkspaceCapture();
+    if (!captured || !applicationAllowsModelPreparation(applicationClosePhase) ||
+      !await prepareWorkspaceWriterTemplate(captured)) return false;
     if (currentModel) return true;
+    const requestKey = workspaceWriterKey();
+    const selection = workspaceTemplate?.config.model;
+    const selectionIsCurrent = () => workspaceRestoreIsCurrent(captured) && workspaceWriterKey() === requestKey;
+    if (unavailableWorkspaceWriterKey === requestKey || !workspaceWriterSwapIsIdle()) return false;
     if (!document || transition !== 'idle' || modelLoading || modelUnloading) return false;
-    if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+    if (!selectionIsCurrent()) return false;
     quietModelLoadFailure = null;
     // Existing local Gemma files must never race the embedded catalog and be
     // admitted as a generic text-only model before the pinned projector is
     // known. All callers share the same in-flight catalog read.
     if (curatedModels.length === 0) await refreshCuratedModels();
-    if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+    await tick();
+    if (!selectionIsCurrent()) return false;
+    if (currentModel) return true;
+    if (selection && models.some((model) => model.loaded)) {
+      if (!workspaceWriterSwapIsIdle()) return false;
+      modelUnloading = true;
+      try {
+        await unloadModel();
+        await refreshModels(captured);
+      } catch (error) {
+        if (selectionIsCurrent()) {
+          quietModelLoadFailure = normalizeFailure(error);
+          unavailableWorkspaceWriterKey = requestKey;
+        }
+        return false;
+      } finally { modelUnloading = false; }
+      if (!selectionIsCurrent()) return false;
+    }
     const rememberedPath = loadLastLocalModelPath();
-    const candidates = startupWriterCandidates(models, rememberedPath);
+    const candidates = workspaceWriterCandidates(selection, models, curatedModels, rememberedPath);
     let terminalFailure: LoomFailure | null = null;
     for (const candidate of candidates) {
       if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
-      if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
+      if (!selectionIsCurrent()) return false;
       const loadSerial = ++modelLoadSerial;
       modelLoading = true;
       try {
         const discovered = models.find((model) => model.model_path === candidate.modelPath);
-        const catalogEntry = discovered
-          ? curatedModels.find((entry) => legacyLocalCatalogMatch(entry, discovered)) ?? null
-          : null;
+        const catalogEntry = candidate.catalogId
+          ? curatedModels.find((entry) => entry.catalog_id === candidate.catalogId) ?? null
+          : discovered ? curatedModels.find((entry) => legacyLocalCatalogMatch(entry, discovered)) ?? null : null;
+        if (selection && !candidate.profileId && !catalogEntry) continue;
         if (discovered && isOfficialGemma4CatalogHint(discovered) && !catalogEntry) {
           continue;
         }
@@ -5398,7 +5622,7 @@
           !componentMounted ||
           !applicationAllowsModelPreparation(applicationClosePhase) ||
           loadSerial !== modelLoadSerial ||
-          (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
+          !selectionIsCurrent()
         ) return false;
         if (candidate.profileId
           ? !isVerifiedPolicyWriter(loaded, candidate.profileId)
@@ -5408,16 +5632,16 @@
           if (candidate.remembered && !candidate.profileId) {
             forgetLastLocalModelPath(candidate.modelPath);
           }
-          await refreshModels(expectedWorkspace);
+          await refreshModels(captured);
           continue;
         }
-        return await installLoadedModel(loaded, true, expectedWorkspace);
+        return await installLoadedModel(loaded, true, captured);
       } catch (error) {
         if (
           !componentMounted ||
           !applicationAllowsModelPreparation(applicationClosePhase) ||
           loadSerial !== modelLoadSerial ||
-          (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
+          !selectionIsCurrent()
         ) return false;
         const failure = normalizeFailure(error);
         terminalFailure = failure;
@@ -5427,7 +5651,7 @@
         )) {
           forgetLastLocalModelPath(candidate.modelPath);
         }
-        await refreshModels(expectedWorkspace);
+        await refreshModels(captured);
       } finally {
         if (loadSerial === modelLoadSerial) {
           modelLoading = false;
@@ -5435,15 +5659,21 @@
         }
       }
     }
+    if (selectionIsCurrent()) {
+      unavailableWorkspaceWriterKey = requestKey;
+      if (selection && !terminalFailure) terminalFailure = {
+        code: 'workspace_model_unavailable', message: 'The model named in .loom.md is not available in the local model library.', retryable: false
+      };
+    }
     if (
       terminalFailure &&
       componentMounted &&
       applicationAllowsModelPreparation(applicationClosePhase) &&
-      (!expectedWorkspace || workspaceRestoreIsCurrent(expectedWorkspace))
+      selectionIsCurrent()
     ) {
       quietModelLoadFailure = terminalFailure;
       modelSetupError = `Automatic writer setup failed. ${terminalFailure.message}`;
-      announce('Suggestions need attention; open their menu for details');
+      announce('Ghost text is unavailable.');
     }
     return false;
   }
@@ -5794,14 +6024,30 @@
     });
   }
 
-  async function doOpenProject(): Promise<void> {
-    const restoreSerial = ++workspaceRestoreSerial;
-    modelRefreshSerial += 1;
+  async function doOpenProject(path?: string): Promise<boolean> {
+    if (fileCommandInFlight || opening || applicationClosePhase !== 'running') return false;
     opening = true;
-    clearFailure();
+    fileCommandInFlight = true;
+    let preparationId: string | null = null;
+    let handoffStarted = false;
     try {
+      // The chooser and validation leave the current editor/session intact.
+      preparationId = await (path ? prepareProjectOpenPath(path) : prepareProjectOpen());
+      if (!preparationId) return Boolean(path);
+      if (!componentMounted || applicationClosePhase !== 'running') return false;
+      clearFailure();
+      if (project) {
+        if (document) workspaceDocuments = { ...workspaceDocuments, [project.root]: document.summary.document_id };
+        const outcome = await closeProject();
+        if (outcome.status !== 'closed') return false;
+      }
+      if (!componentMounted || applicationClosePhase !== 'running') return false;
+      const restoreSerial = ++workspaceRestoreSerial;
+      modelRefreshSerial += 1;
+      handoffStarted = true;
+      const selectedPreparation = preparationId;
       const opened = await attachWorkspaceProjectReply({
-        open: chooseAndOpenProject,
+        open: () => commitProjectOpen(selectedPreparation),
         mayAttach: () => Boolean(
           componentMounted &&
           applicationClosePhase === 'running' &&
@@ -5810,42 +6056,61 @@
         attach: (selected) => { project = selected; },
         onHeld: holdWorkspaceForApplicationClose
       });
-      if (!opened) return;
+      if (!opened) return false;
       if (await finishOpeningProject(opened, restoreSerial)) {
         const captured = currentWorkspaceCapture();
         if (!captured || !workspaceRestoreIsCurrent(captured)) {
           holdWorkspaceForApplicationClose();
-          return;
+          return false;
         }
         await tick();
         if (!workspaceRestoreIsCurrent(captured)) {
           holdWorkspaceForApplicationClose();
-          return;
+          return false;
         }
         await waitForWritingSurfacePaint();
         if (!workspaceRestoreIsCurrent(captured)) {
           holdWorkspaceForApplicationClose();
-          return;
+          return false;
         }
         focusCurrentWritingSurfaceAtEnd();
         if (workspaceRestoreIsCurrent(captured)) void restoreCompletionBackground(captured);
+        outlineOpen = true;
+        workspaceRootExpanded = true;
         announce(`Opened ${opened.title}`);
+        return true;
       }
     } catch (error) {
-      if (!(await reattachNativeProject())) recordFailure(error);
+      // Only an uncertain commit needs native reattachment. Picker/validation
+      // failures must not replace the current editor or conceal the failure.
+      if (handoffStarted) await reattachNativeProject();
+      recordFailure(error);
     } finally {
+      if (preparationId) {
+        try {
+          await discardProjectOpen(preparationId);
+        } catch (error) {
+          recordFailure(error);
+        }
+      }
       opening = false;
+      fileCommandInFlight = false;
     }
+    return false;
   }
 
   async function openAnotherProject(): Promise<void> {
-    if (fileCommandInFlight || opening) return;
-    fileCommandInFlight = true;
+    await doOpenProject();
+  }
+
+  async function retryInitialProject(): Promise<void> {
+    if (opening || fileCommandInFlight || project || applicationClosePhase !== 'running') return;
+    opening = true;
+    clearFailure();
     try {
-      const outcome = await closeProject();
-      if (outcome.status === 'closed') await doOpenProject();
+      await restoreDesktopWorkspace();
     } finally {
-      fileCommandInFlight = false;
+      opening = false;
     }
   }
 
@@ -5975,7 +6240,12 @@
       missingDocumentRecovery = null;
       missingDocumentCopyState = 'idle';
     }
-    outlineOpen = false;
+    let folderStorage: Storage | undefined;
+    try { folderStorage = window.localStorage; } catch { /* Workspace navigation does not require storage. */ }
+    workspaceFolders = rememberWorkspaceFolder(workspaceFolders, { root: opened.root, title: opened.title }, folderStorage);
+    workspaceRootExpanded = true;
+    hiddenPaneSlots = new Set();
+    paneSelection = {};
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
     clearCompletionSession();
@@ -6003,7 +6273,9 @@
       project = { ...project, pending_recovery: 0 };
     }
     if (!workspaceRestoreIsCurrent(captured) || !project) return false;
-    const first = project.documents[0];
+    const first = project.documents.find(item => item.document_id === workspaceDocuments[opened.root])
+      ?? project.documents.find(item => !item.relative_path.split('/').at(-1)?.startsWith('.'))
+      ?? project.documents[0];
     if (first) {
       await selectDocument(first);
       if (!workspaceRestoreIsCurrent(captured)) return false;
@@ -6014,7 +6286,7 @@
       document = null;
       documentText = '';
       sourceDisplayText = '';
-      verseCodec = null;
+      sourceCodec = null;
       editVersion = 0;
       savedVersion = 0;
       draftVersion = '0';
@@ -6121,39 +6393,37 @@
     clearFailure();
     try {
       if (target.externallyModified) {
-        const preview = await requestReconciliationPreview({
-          document_id: target.documentId,
-          kind: target.kind,
-          revision_id: target.expectedRevisionId,
-          active_blob_id: target.expectedBlobId
-        }, null, source);
-        if (
-          applicationClosePhase !== 'running' ||
-          requestSerial !== navigationSerial ||
-          !navigationScopeIsCurrent(
-            project,
-            document,
-            documentEpoch,
-            editVersion,
-            workspaceRestoreSerial,
-            source
-          )
-        ) {
+        const imported = !targetWasCurrent || editVersion === savedVersion
+          ? await importExternalDocument(source.projectId, source.sessionId, target.documentId,
+              target.expectedRevisionId, target.expectedBlobId)
+          : null;
+        if (!projectNavigationIsCurrent() || requestSerial !== navigationSerial) return;
+        if (imported && project) {
+          project = { ...project, documents: project.documents.map(item =>
+            item.document_id === imported.document_id ? imported : item) };
+          const fresh = captureDocumentTarget(project, imported);
+          if (!fresh) throw new Error('External document returned an incomplete identity.');
+          target = fresh;
+        } else {
+          const preview = await requestReconciliationPreview({
+            document_id: target.documentId, kind: target.kind,
+            revision_id: target.expectedRevisionId, active_blob_id: target.expectedBlobId
+          }, targetWasCurrent ? documentText : null, source);
+          if (!projectNavigationIsCurrent() || requestSerial !== navigationSerial) return;
+          documentEpoch += 1;
+          document = null;
+          documentText = '';
+          sourceDisplayText = '';
+          sourceCodec = null;
+          editVersion = 0;
+          savedVersion = 0;
+          draftVersion = '0';
+          draftSavedEditVersion = 0;
+          staleDraft = null;
+          uncertainDraft = null;
+          activateReconciliation(preview);
           return;
         }
-        documentEpoch += 1;
-        document = null;
-        documentText = '';
-        sourceDisplayText = '';
-        verseCodec = null;
-        editVersion = 0;
-        savedVersion = 0;
-        draftVersion = '0';
-        draftSavedEditVersion = 0;
-        staleDraft = null;
-        uncertainDraft = null;
-        activateReconciliation(preview);
-        return;
       }
       const opened = await openDocument(
         source.projectId,
@@ -6219,7 +6489,7 @@
         missingDocumentCopyState = 'idle';
       }
       documentText = effectiveText;
-      setSourceDocument(effectiveText, opened.summary.kind);
+      setSourceDocument(effectiveText);
       editVersion = draftIsCurrent ? 1 : 0;
       savedVersion = 0;
       draftSavedEditVersion = draftIsCurrent ? 1 : 0;
@@ -6383,7 +6653,7 @@
     applyCompletionEffects(invalidated.effects);
   }
 
-  function setSourceDocument(text: string, kind: DocumentKind): void {
+  function setSourceDocument(text: string): void {
     completionController = resetCompletionSurface(completionController);
     if (sourceProjectionTimer !== undefined) {
       window.clearTimeout(sourceProjectionTimer);
@@ -6398,17 +6668,13 @@
     visualBoundaryFailure = 'uninitialized';
     visualBoundaryDiagnostic = null;
     visualMutationPending = false;
-    if (kind === 'verse') {
-      const decoded = decodeVerseForEditor(text);
-      verseCodec = decoded.codec;
-      sourceDisplayText = decoded.display;
-    } else {
-      verseCodec = null;
-      sourceDisplayText = text;
-    }
+    const decoded = decodeSourceForEditor(text);
+    sourceCodec = decoded.codec;
+    sourceDisplayText = decoded.display;
   }
 
   function flushEditors(): boolean {
+    if (Object.values(paneEditors).some(pane => pane && !pane.flush())) return false;
     if (contextPaneOpen && !flushContextEditorProjection()) return false;
     if (!(visualEditor?.flushPending() ?? true) || sourceComposing) return false;
     commitSourceDraft();
@@ -6417,12 +6683,12 @@
 
   function beginSourceComposition(): void {
     sourceComposing = true;
-    compositionActive = true;
+    mainCompositionActive = true;
   }
 
   function finishSourceComposition(textarea: HTMLTextAreaElement): void {
     sourceComposing = false;
-    compositionActive = false;
+    mainCompositionActive = false;
     updateSourceSelection(textarea);
     updateFromSource(textarea.value);
     scheduleSourceProjection(0);
@@ -6537,7 +6803,7 @@
       sourceDisplayText,
       document,
       documentText,
-      verseCodec
+      sourceCodec
     );
     const expected = completionController.session
       ? completionSessionPresentation(completionController.session)?.targetByte ?? null
@@ -6616,16 +6882,12 @@
     }
     if (document?.summary.kind === 'hybrid') return;
     sourceDirty = false;
-    if (document?.summary.kind === 'verse') {
-      if (!verseCodec?.editable) return;
-      updateText(encodeVerseFromEditor(sourceDisplayText, verseCodec));
-    } else {
-      updateText(sourceDisplayText);
-    }
+    if (!sourceCodec?.editable) return;
+    updateText(encodeSourceFromEditor(sourceDisplayText, sourceCodec));
   }
 
   function setVisualComposition(active: boolean): void {
-    compositionActive = active;
+    mainCompositionActive = active;
     if (!active) scheduleSave();
   }
 
@@ -6694,6 +6956,7 @@
   function resumeScheduledAutomaticSuggestion(wakeKey: string): void {
     if (
       !wakeKey ||
+      loompadBackgroundPaused() ||
       suggestionWakeQueued ||
       suggestionsIdleTimer !== undefined ||
       !completionController.scheduled ||
@@ -6776,11 +7039,16 @@
     });
   }
 
+  function loompadBackgroundPaused(): boolean {
+    return loompadActive && (!windowFocused || window.document.visibilityState === 'hidden');
+  }
+
   async function tryStartAutomaticSuggestions(schedule: CompletionSchedule): Promise<void> {
     const targetEditVersion = schedule.kind === 'edit_pause'
       ? schedule.editVersion
       : schedule.ticket.editVersion;
     if (
+      terminalIsBusy() ||
       completionController.scheduled !== schedule ||
       targetEditVersion !== editVersion ||
       !completionAutomationEnabled() ||
@@ -6795,6 +7063,8 @@
       completionController = setCompletionSchedule(completionController, null);
       return;
     }
+    // Retain the schedule without polling while the writer is away.
+    if (loompadBackgroundPaused()) return;
     if (!canStartAutomaticSuggestions) {
       if (!retainsScheduledCompletion(completionLifecycle)) {
         completionController = setCompletionSchedule(completionController, null);
@@ -7208,7 +7478,7 @@
     displayText: string,
     currentDocument: OpenDocument | null,
     manuscriptText: string,
-    codec: VerseEditorCodec | null
+    codec: SourceEditorCodec | null
   ): number | null {
     if (
       currentMode !== 'source' ||
@@ -7218,16 +7488,7 @@
       !currentDocument
     ) return null;
     try {
-      const displayPrefix = displayText.slice(0, selectionStart);
-      if (
-        currentDocument.summary.kind === 'verse' &&
-        (!codec || !codec.editable)
-      ) return null;
-      const manuscriptPrefix = currentDocument.summary.kind === 'verse' && codec
-        ? encodeVerseFromEditor(displayPrefix, codec)
-        : displayPrefix;
-      if (!manuscriptText.startsWith(manuscriptPrefix)) return null;
-      return utf8ByteOffset(manuscriptPrefix, manuscriptPrefix.length);
+      return sourceCaretByte(displayText, selectionStart, manuscriptText, codec);
     } catch {
       return null;
     }
@@ -7266,14 +7527,24 @@
 
   function reconcileVisibleCompletionController(
     contextKey: string,
-    family: readonly InlineGhostSuggestion[]
+    family: readonly InlineGhostSuggestion[],
+    forkAtCurrentCaret = false
   ): void {
     const reconciled = reconcileCompletionController(
       completionController,
       contextKey,
-      family
+      family,
+      forkAtCurrentCaret
     );
     if (reconciled !== completionController) completionController = reconciled;
+  }
+
+  function refreshVisibleCompletionFamily(
+    expected: CompletionSession,
+    originals: readonly InlineGhostSuggestion[]
+  ): void {
+    const refreshed = refreshCompatibleCompletionFamily(completionController, expected, originals);
+    if (refreshed !== completionController) completionController = refreshed;
   }
 
   function refreshVisibleCompletionCandidate(
@@ -7405,7 +7676,8 @@
     const cycled = cycleCompletion(
       completionController,
       activeSuggestionFamily,
-      offset
+      offset,
+      loompadActive
     );
     if (cycled.state === completionController) return;
     completionController = cycled.state;
@@ -7501,7 +7773,7 @@
     if (!key) return;
     shuttleTimer = window.setTimeout(() => {
       shuttleTimer = undefined;
-      if (shuttleTimerKey !== key || !windowFocused || !shuttleEnabled) return;
+      if (shuttleTimerKey !== key || !windowFocused || !shuttleEnabled || terminalIsBusy()) return;
       const accepted = mode === 'visual'
         ? visualEditor?.acceptGhostWord(false) ?? false
         : sourceEditor?.acceptGhostWord(false) ?? false;
@@ -7533,6 +7805,151 @@
     if (dismissed.authorized) announce('Suggestion dismissed');
   }
 
+  function terminalIsBusy(): boolean {
+    return terminalDispatching || terminalPendingRequest !== null || terminalRuns.some((run) => run.status === 'running') || Object.values(paneBusy).some(Boolean);
+  }
+
+  function terminalScopeIsCurrent(projectId: string, sessionId: string): boolean {
+    return componentMounted && project?.project_id === projectId && project.session_id === sessionId;
+  }
+
+  async function refreshTerminalRuns(): Promise<void> {
+    if (!project || !desktop || applicationClosePhase !== 'running') return;
+    const { project_id: projectId, session_id: sessionId } = project;
+    const refreshSerial = ++terminalRefreshSerial;
+    try {
+      const runs = await listTerminalRuns(projectId, sessionId);
+      if (!terminalScopeIsCurrent(projectId, sessionId) || refreshSerial !== terminalRefreshSerial) return;
+      const newlyRetained = runs.some((run) => run.output_document_id &&
+        !terminalRuns.some((previous) => previous.run_id === run.run_id && previous.output_document_id));
+      terminalRuns = runs;
+      if (terminalPendingRequest && (!terminalDispatching || runs.some((run) => run.run_id === terminalPendingRequest?.commandId))) {
+        terminalPendingRequest = null;
+      }
+      if (cancelledTerminalIds.size) {
+        for (const run of runs.filter((candidate) => candidate.status === 'running' && cancelledTerminalIds.has(candidate.run_id))) {
+          await cancelTerminalRun(projectId, sessionId, run.run_id);
+        }
+      }
+      if (newlyRetained) scheduleProjectFilesystemRefresh(0);
+    } catch (error) {
+      if (terminalScopeIsCurrent(projectId, sessionId)) terminalError = normalizeFailure(error).message;
+    }
+    if (terminalScopeIsCurrent(projectId, sessionId) && terminalRuns.some((run) => run.status === 'running')) {
+      if (terminalPollTimer !== undefined) window.clearTimeout(terminalPollTimer);
+      terminalPollTimer = window.setTimeout(() => {
+        terminalPollTimer = undefined;
+        void refreshTerminalRuns();
+      }, 800);
+    }
+  }
+
+  function closeTerminal(): void {
+    terminalOpen = false;
+    if (mode === 'source') sourceEditor?.focusCurrentSelection();
+    else visualEditor?.focusCurrentSelection();
+  }
+
+  function captureTerminalRange(): TerminalSourceRange {
+    if (!document) throw new Error('Open a document first.');
+    if (mode === 'visual') {
+      const range = visualEditor?.captureTerminalSourceRange();
+      if (!range) throw new Error('This selection needs the Markdown editor before it can run.');
+      return range;
+    }
+    const anchor = sourceEditor?.captureTextInsertionAnchor();
+    if (!anchor) throw new Error('Finish editing the selection before running.');
+    const byteAt = (offset: number): number => sourceCaretByte(anchor.value, offset, documentText, sourceCodec);
+    return { start: byteAt(anchor.start), end: byteAt(anchor.end) };
+  }
+
+  async function runRetainedOutput(expression: string): Promise<void> {
+    if (!project || !document || terminalIsBusy() || editorReadonly || compositionActive || applicationClosePhase !== 'running') return;
+    terminalOpen = true;
+    terminalError = '';
+    if (!expression && !currentModel?.completion) { terminalError = 'Load a local completion model to try this.'; return; }
+    if (!flushEditors()) return;
+    const scope = { projectId: project.project_id, sessionId: project.session_id };
+    const documentId = document.summary.document_id;
+    const text = documentText;
+    const epoch = documentEpoch;
+    terminalDispatching = true;
+    terminalCancelRequested = false;
+    cancelSuggestionTimer();
+    try {
+      const range = captureTerminalRange();
+      await cancelActiveBranches();
+      if (!(await flushCurrentDocument())) throw new Error('Finish saving this document before running.');
+      if (!terminalScopeIsCurrent(scope.projectId, scope.sessionId) ||
+        document?.summary.document_id !== documentId || documentEpoch !== epoch || documentText !== text || terminalCancelRequested) return;
+      const sourceRevisionId = document.summary.revision_id;
+      if (!sourceRevisionId) throw new Error('The document does not have a saved source revision.');
+      const request: TerminalRunRequest = {
+        ...scope, commandId: newUlid(), documentId, sourceRevisionId,
+        expectedVisibleBlobId: document.visible_blob_id,
+        sourceStartByte: range.start, sourceEndByte: range.end, expression, presentation: { pane_id: 'terminal', input: expression || new TextDecoder().decode(new TextEncoder().encode(documentText).slice(range.start, range.end)) }
+      };
+      terminalPendingRequest = request;
+      const run = await runTerminal(request);
+      if (!terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return;
+      if (run.run_id !== request.commandId) throw new Error('The result belongs to a different run.');
+      terminalPendingRequest = null;
+      if (terminalEntry === expression) terminalEntry = '';
+      terminalRefreshSerial += 1;
+      terminalRuns = [run, ...terminalRuns.filter((previous) => previous.run_id !== run.run_id)];
+      if (run.output_document_id) scheduleProjectFilesystemRefresh(0);
+      void refreshTerminalRuns();
+    } catch (error) {
+      if (terminalScopeIsCurrent(scope.projectId, scope.sessionId)) {
+        terminalError = normalizeFailure(error).message;
+        terminalDispatching = false;
+        // A lost response never authorizes a second generation. Read retained
+        // native receipts before the author decides whether to try again.
+        await refreshTerminalRuns();
+      }
+    } finally {
+      if (terminalScopeIsCurrent(scope.projectId, scope.sessionId)) terminalDispatching = false;
+    }
+  }
+
+  async function stopTerminalRun(): Promise<void> {
+    if (!project) return;
+    terminalCancelRequested = true;
+    const { project_id: projectId, session_id: sessionId } = project;
+    try {
+      const runIds = new Set(terminalRuns.filter((run) => run.status === 'running').map((run) => run.run_id));
+      if (terminalPendingRequest) runIds.add(terminalPendingRequest.commandId);
+      cancelledTerminalIds = new Set([...cancelledTerminalIds, ...runIds]);
+      for (const runId of runIds) await cancelTerminalRun(projectId, sessionId, runId);
+      if (terminalScopeIsCurrent(projectId, sessionId)) await refreshTerminalRuns();
+    } catch (error) {
+      if (terminalScopeIsCurrent(projectId, sessionId)) terminalError = normalizeFailure(error).message;
+    }
+  }
+
+  async function openTerminalOutput(run: TerminalRun): Promise<void> {
+    if (!project || !run.output_document_id) return;
+    const { project_id: projectId, session_id: sessionId } = project;
+    try {
+      const refreshed = await currentProjectSession();
+      if (!terminalScopeIsCurrent(projectId, sessionId)) return;
+      const output = refreshed.documents.find((candidate) => candidate.document_id === run.output_document_id);
+      if (!output) throw new Error('This retained output is no longer in the folder.');
+      project = refreshed;
+      await selectDocument(output, true);
+    } catch (error) {
+      if (terminalScopeIsCurrent(projectId, sessionId)) terminalError = normalizeFailure(error).message;
+    }
+  }
+
+  function handleAttachmentLink(event: MouseEvent): void {
+    const link = event.target instanceof Element ? event.target.closest('a[href^="loom-attachment:"]') : null;
+    if (!link) return;
+    event.preventDefault(); event.stopPropagation();
+    const id = link.getAttribute('href')?.match(/^loom-attachment:([a-f0-9]{64})$/u)?.[1];
+    if (project && id) void revealAttachmentOriginal(project.project_id, project.session_id, id).catch(recordFailure);
+  }
+
   function handleGlobalKeydownCapture(event: KeyboardEvent): void {
     if (!shouldCaptureFormatMenuEscape(event, {
       formatMenuOpen: formatMenu?.isOpen() ?? false,
@@ -7548,6 +7965,7 @@
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
     if (event.defaultPrevented) return;
+    if (event.key === 'Escape' && spokenAudio) { event.preventDefault(); stopReadAloud(); return; }
     if (event.key === 'Escape' && documentContextTarget) {
       event.preventDefault();
       closeDocumentContextMenu();
@@ -7585,6 +8003,25 @@
       return;
     }
     const modifier = event.metaKey || event.ctrlKey;
+    if (modifier && event.shiftKey && !event.altKey && !event.isComposing) {
+      const key = event.key.toLowerCase();
+      if (key === 'p') { event.preventDefault(); openModelManager(window.document.activeElement as HTMLElement); return; }
+      if (key === 'u') { event.preventDefault(); void readAloud(); return; }
+      if (event.code === 'Comma') { event.preventDefault(); void refreshWorkspaceTemplate(true); return; }
+      if (key === 'l') { event.preventDefault(); toggleAppearance(); return; }
+      if (key === 'm' && document) { event.preventDefault(); void setMode(mode === 'visual' ? 'source' : 'visual'); return; }
+      if (key === 'f' && formatMenu) { event.preventDefault(); formatMenu.toggleOpen(); return; }
+      if (key === 'j') { event.preventDefault(); void toggleShuttleFromTitlebar(); return; }
+    }
+    if (modifier && event.key === 'Enter' && !event.altKey && !event.shiftKey && !event.isComposing) {
+      const target = event.target;
+      const inManuscript = target instanceof Element && Boolean(target.closest('.editor-stage'));
+      if (target === sourceTextarea || inManuscript) {
+        event.preventDefault();
+        void runRetainedOutput('');
+        return;
+      }
+    }
     if (modifier && event.key.toLocaleLowerCase() === 's') {
       event.preventDefault();
       if (reconciliation) {
@@ -7630,18 +8067,7 @@
       return visualSelectionByte;
     }
     if (!sourceTextarea) throw new Error('The source editor is not available.');
-    const selectionStart = sourceTextarea.selectionStart;
-    const displayPrefix = sourceTextarea.value.slice(0, selectionStart);
-    if (document.summary.kind === 'verse' && (!verseCodec || !verseCodec.editable)) {
-      throw new Error('This poem does not expose a lossless source-caret boundary.');
-    }
-    const manuscriptPrefix = document.summary.kind === 'verse' && verseCodec
-      ? encodeVerseFromEditor(displayPrefix, verseCodec)
-      : displayPrefix;
-    if (!documentText.startsWith(manuscriptPrefix)) {
-      throw new Error('The source caret no longer matches the saved manuscript bytes.');
-    }
-    return utf8ByteOffset(manuscriptPrefix, manuscriptPrefix.length);
+    return sourceCaretByte(sourceTextarea.value, sourceTextarea.selectionStart, documentText, sourceCodec);
   }
 
   function installWeaveSnapshot(started: WeaveStarted, captured: WeaveCapture): boolean {
@@ -7669,6 +8095,25 @@
       throw new Error('The desktop returned a branch outside the requested manuscript boundary.');
     }
     if (!weaveCaptureStillCurrent(captured)) return false;
+    if (captured.speculation) {
+      const batch = started.speculation;
+      if (!batch || !/^[a-f0-9]{64}$/.test(batch.snapshot_id) ||
+          batch.batch_offset !== captured.speculation.offset || batch.sample_target !== captured.speculation.sampleTarget) {
+        throw new Error('The desktop returned choices for a different sampling boundary.');
+      }
+      const previous = loompadReservoir?.key === captured.speculation.key ? loompadReservoir : null;
+      if (previous && previous.snapshotId !== batch.snapshot_id) throw new Error('The idle choice snapshot changed.');
+      const familyIds = previous?.familyIds ?? [];
+      if (!familyIds.includes(started.command_id) && batch.batch_offset !== familyIds.length * 4) {
+        throw new Error('The desktop skipped an idle choice batch.');
+      }
+      loompadReservoir = {
+        key: captured.speculation.key, snapshotId: batch.snapshot_id,
+        familyIds: familyIds.includes(started.command_id) ? familyIds : [...familyIds, started.command_id],
+        nextOffset: Math.max(previous?.nextOffset ?? 0, batch.batch_offset + 4),
+        admittedAt: previous?.familyIds.includes(started.command_id) ? previous.admittedAt : Date.now(), capture: captured
+      };
+    } else if (started.speculation) throw new Error('An ordinary suggestion returned an idle sampling policy.');
     const runIds = new Set(started.branches.map((branch) => branch.run_id));
     authoritativeCompletionFamilyId = started.command_id;
     branches = [
@@ -7684,6 +8129,7 @@
 
   function weaveCaptureStillCurrent(captured: WeaveCapture): boolean {
     return Boolean(
+      !terminalIsBusy() &&
       project?.project_id === captured.projectId &&
       project.session_id === captured.sessionId &&
       document?.summary.document_id === captured.documentId &&
@@ -7806,8 +8252,36 @@
     staleWeaveCleanupTimers.add(timer);
   }
 
+  async function prefetchLoompad(): Promise<void> {
+    const reservoir = loompadReservoir;
+    if (!componentMounted || !loompadActive || !windowFocused || !reservoir || reservoir.nextOffset >= 256 ||
+        Date.now() - reservoir.admittedAt < 5_000 || compositionActive || loompadAccepting ||
+        activeBranchCount > 0 || completionActiveRunIds.length > 0 || !weaveCaptureStillCurrent(reservoir.capture)) return;
+    await startAutomaticWeave();
+  }
+
+  async function recoverLoompad(captured: WeaveCapture, recovery: NonNullable<LoomFailure['speculation_recovery']>): Promise<void> {
+    if (!captured.speculation || !weaveCaptureStillCurrent(captured)) return;
+    loompadReservoir = null;
+    let recovered = 0;
+    for (const [index, commandId] of recovery.command_ids.entries()) {
+      const status = await getWeaveStatus(captured.projectId, captured.sessionId, commandId);
+      if (!weaveCaptureStillCurrent(captured)) return;
+      if (!status?.speculation || status.speculation.snapshot_id !== recovery.snapshot_id ||
+          status.speculation.batch_offset !== index * 4 || ![4, 16, 64, 256].includes(status.speculation.sample_target)) {
+        throw new Error('Stored idle choices do not match their exact snapshot.');
+      }
+      if (!installWeaveSnapshot(status, { ...captured, commandId,
+        speculation: { ...captured.speculation, offset: index * 4, sampleTarget: status.speculation.sample_target } })) return;
+      recovered += 4;
+    }
+    if (recovered !== recovery.next_offset) {
+      throw new Error('Stored idle choices returned an incomplete batch history.');
+    }
+  }
+
   async function startAutomaticWeave(): Promise<boolean> {
-    if (weaveStarting || !project || !document || !currentModel) return false;
+    if (loompadBackgroundPaused() || terminalIsBusy() || weaveStarting || !project || !document || !currentModel) return false;
     const startingEditVersion = editVersion;
     if (compositionActive || !flushEditors()) return false;
     if (editVersion !== startingEditVersion) {
@@ -7840,8 +8314,18 @@
       cursorByte,
       editVersion,
       intentEpoch: completionController.intentEpoch,
-      modelId: currentModel.model_id
+      modelId: currentModel.model_id,
+      sourceDocument: document,
+      sourceMarkdown: documentText
     };
+    if (loompadActive) {
+      const key = JSON.stringify([captured.projectId, captured.sessionId, captured.documentId,
+        captured.sourceRevisionId, captured.visibleBlobId, captured.cursorByte, captured.modelId,
+        captured.contextEpoch, captured.epoch, captured.intentEpoch, captured.editVersion]);
+      const offset = loompadReservoir?.key === key ? loompadReservoir.nextOffset : 0;
+      if (offset >= 256) return true;
+      captured.speculation = { key, offset, sampleTarget: offset < 4 ? 4 : offset < 16 ? 16 : offset < 64 ? 64 : 256 };
+    }
     weaveStarting = true;
     clearFailure();
     try {
@@ -7854,7 +8338,9 @@
         sourceRevisionId: captured.sourceRevisionId,
         expectedVisibleBlobId: captured.visibleBlobId,
         cursorByte: captured.cursorByte,
-        policy: { kind: 'automatic_v2' }
+        policy: captured.speculation
+          ? { kind: 'loompad_v1', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
+          : { kind: 'automatic_v2' }
       });
       if (installWeaveSnapshot(started, captured)) {
         uncertainWeave = null;
@@ -7873,7 +8359,18 @@
       ) {
         const captureIsCurrent = weaveCaptureStillCurrent(captured);
         const failure = normalizeFailure(error);
-        if (captureIsCurrent && failure.code === 'automatic_generation_throttled') {
+        if (captureIsCurrent && captured.speculation && failure.speculation_recovery) {
+          uncertainWeave = null;
+          try { await recoverLoompad(captured, failure.speculation_recovery); }
+          catch (recoveryError) {
+            recordFailure(recoveryError);
+            if (normalizeFailure(recoveryError).retryable) scheduleAutomaticSuggestions(editVersion, 5_000, 'retry');
+          }
+          if (failure.speculation_recovery.next_offset === 0) scheduleAutomaticSuggestions(editVersion, 5_000, 'retry');
+          return true;
+        }
+        if (captureIsCurrent && (failure.code === 'automatic_generation_throttled' ||
+            (captured.speculation && failure.code === 'generation_active'))) {
           uncertainWeave = null;
           scheduleAutomaticSuggestions(editVersion, 5_000, 'retry');
           return true;
@@ -8243,7 +8740,7 @@
     project = refreshed;
     document = { ...opened, text: opened.text };
     documentText = opened.text;
-    setSourceDocument(opened.text, opened.summary.kind);
+    setSourceDocument(opened.text);
     editVersion = 0;
     savedVersion = 0;
     draftVersion = opened.transient_draft?.version ?? '0';
@@ -8297,7 +8794,7 @@
     // version in one operation, so there is never a clear-then-write loss gap.
     draftVersion = recovered.version;
     documentText = recovered.text;
-    setSourceDocument(recovered.text, document.summary.kind);
+    setSourceDocument(recovered.text);
     editVersion += 1;
     draftSavedEditVersion = Math.min(draftSavedEditVersion, editVersion - 1);
     saveState = 'dirty';
@@ -8318,7 +8815,7 @@
       // editor projection and leave the original stale draft inspectable.
       if (staleDraft === recovered && document) {
         documentText = activeText;
-        setSourceDocument(activeText, document.summary.kind);
+        setSourceDocument(activeText);
         editVersion = previousEditVersion;
         draftSavedEditVersion = previousDraftSavedEditVersion;
         draftVersion = recovered.version;
@@ -8486,7 +8983,7 @@
       document = null;
       documentText = '';
       sourceDisplayText = '';
-      verseCodec = null;
+      sourceCodec = null;
       editVersion = 0;
       savedVersion = 0;
       draftVersion = '0';
@@ -8590,7 +9087,7 @@
       return;
     }
     invalidateCompletionForCaretNavigation();
-    if (next === 'source' && document) setSourceDocument(documentText, document.summary.kind);
+    if (next === 'source' && document) setSourceDocument(documentText);
     if (document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')) {
       preferredProseMode = next;
     }
@@ -8683,6 +9180,12 @@
 
   async function performCloseProject(): Promise<ProjectCloseOutcome> {
     if (!project) return { status: 'closed' };
+    if (speechStarting) { announce('Finishing the microphone operation before closing'); return { status: 'resume' }; }
+    if (speechRecording) {
+      await finishSpeechRecording();
+      if (speechRecording) return { status: 'resume' };
+    }
+    stopReadAloud();
     const retryingPreparedClose = transition === 'closing' && pendingCloseCommandId !== null;
     if (
       missingDocumentRecoveryRequiresCopy(
@@ -8839,7 +9342,7 @@
     document = null;
     documentText = '';
     sourceDisplayText = '';
-    verseCodec = null;
+    sourceCodec = null;
     editVersion = 0;
     savedVersion = 0;
     branches = [];
@@ -8876,6 +9379,70 @@
     return { status: 'closed' };
   }
 
+  async function refreshWorkspaceTemplate(enable = false): Promise<void> {
+    if (!project || compositionActive || !flushEditors()) return;
+    if (document?.summary.relative_path === '.loom.md' && editVersion !== savedVersion) return;
+    const scope = { projectId: project.project_id, sessionId: project.session_id };
+    const serial = ++templateSerial;
+    try {
+      const snapshot = await (enable ? enableWorkspaceTemplate : getWorkspaceTemplate)(scope.projectId, scope.sessionId);
+      if (serial !== templateSerial || !terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return;
+      if (!flushEditors()) { deferredTemplateSession = scope.sessionId; deferredWorkspaceTemplate = snapshot; return; }
+      workspaceTemplate = snapshot;
+      workspaceTemplateScope = `${scope.projectId}/${scope.sessionId}`;
+      void tick().then(requestPreferredWriterForCurrentWorkspace);
+      const registered = project?.documents.find(item => item.document_id === snapshot.document_id);
+      if (snapshot.document_id && registered?.revision_id !== snapshot.revision_id) {
+        scheduleProjectFilesystemRefresh(0);
+      }
+      if (enable && snapshot.document_id) {
+        await refreshProjectFilesystemState();
+        await openPaneDocument(snapshot.document_id);
+        outlineOpen = true;
+      }
+    } catch (error) {
+      if (serial === templateSerial && terminalScopeIsCurrent(scope.projectId, scope.sessionId)) recordFailure(error);
+    }
+  }
+
+  async function openPaneDocument(id: string): Promise<void> {
+    const candidate = project?.documents.find(item => item.document_id === id);
+    if (candidate) await selectDocument(candidate, true);
+  }
+
+  function applyDeferredTemplate(): void {
+    if (project?.session_id !== deferredTemplateSession) { deferredWorkspaceTemplate = null; return; }
+    if (!flushEditors()) return;
+    workspaceTemplate = deferredWorkspaceTemplate;
+    workspaceTemplateScope = `${project?.project_id}/${project?.session_id}`;
+    deferredWorkspaceTemplate = null;
+    void tick().then(requestPreferredWriterForCurrentWorkspace);
+  }
+
+  function togglePane(position: 'main' | 'right' | 'bottom'): void {
+    if (!flushEditors() || busyPaneSlots.has(position)) return;
+    const next = new Set(hiddenPaneSlots);
+    if (next.has(position)) next.delete(position); else next.add(position);
+    hiddenPaneSlots = next;
+  }
+
+  function selectPane(position: 'main' | 'right' | 'bottom', id: string): void {
+    if (!flushEditors() || busyPaneSlots.has(position)) return;
+    paneSelection = { ...paneSelection, [position]: id };
+  }
+
+  async function preparePaneRun(): Promise<OpenDocument | null> {
+    if (!project || !document || editorReadonly || compositionActive || !flushEditors()) return null;
+    const expected = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id, epoch: documentEpoch, text: documentText };
+    const current = () => terminalScopeIsCurrent(expected.projectId, expected.sessionId) && document?.summary.document_id === expected.documentId && documentEpoch === expected.epoch && documentText === expected.text;
+    cancelSuggestionTimer();
+    await cancelActiveBranches();
+    if (!current() || !await flushCurrentDocument() || !current()) return null;
+    if (!currentModel && !await loadPreferredSuggestionModel(currentWorkspaceCapture() ?? undefined)) return null;
+    if (!current() || !currentModel) return null;
+    return document;
+  }
+
   function kindLabel(kind: DocumentKind): string {
     if (kind === 'verse') return 'Poem';
     if (kind === 'hybrid') return 'Hybrid';
@@ -8897,16 +9464,19 @@
       aria-label="Writing controls"
     >
       <div class="canvas-controls-left" data-no-window-drag>
-        {#if project.documents.length > 0}
+        {#if project.documents.length > 0 || folderWarnings.length > 0}
           <button
             bind:this={outlineToggle}
             class="titlebar-button outline-toggle"
             type="button"
             aria-controls="project-outline"
             aria-expanded={outlineOpen}
-            aria-label={outlineOpen ? 'Close manuscript outline' : 'Open manuscript outline'}
+            aria-label={`${outlineOpen ? 'Close' : 'Open'} manuscript outline${folderWarnings.length ? `, ${folderWarnings.length} files not opened` : ''}`}
+            title={folderWarnings.length ? `${folderWarnings.length} files not opened — see folder details` : 'Manuscript outline'}
             on:click={() => void setOutlineOpen(!outlineOpen)}
-          ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 4h10M3 8h10M3 12h10" /></svg></button>
+          ><svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/><path d="M6 2.5v11"/></svg>
+            {#if folderWarnings.length}<span class="folder-warning-dot" aria-hidden="true"></span>{/if}
+          </button>
         {/if}
         {#if transition === 'idle'}
           <button
@@ -8918,23 +9488,7 @@
             on:click={() => void newDocument()}
           ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
         {/if}
-        {#if document?.summary.kind === 'prose'}
-          <button
-            class="titlebar-button mode-toggle"
-            type="button"
-            aria-label={mode === 'visual' ? 'Switch to Markdown editor' : 'Switch to visual editor'}
-            aria-pressed={mode === 'source'}
-            title={mode === 'visual' ? 'Markdown source' : 'Visual writing'}
-            disabled={editorReadonly}
-            on:click={() => void setMode(mode === 'visual' ? 'source' : 'visual')}
-          >
-            {#if mode === 'visual'}
-              <svg aria-hidden="true" viewBox="0 0 18 18"><path d="m5 13 1.2-3.6 6.6-6.6 2.4 2.4-6.6 6.6L5 13Z"/><path d="m6.2 9.4 2.4 2.4M4.4 14.3h9.2"/></svg>
-            {:else}
-              <span class="markdown-monogram" aria-hidden="true">MD</span>
-            {/if}
-          </button>
-        {/if}
+
       </div>
       <div
         class="titlebar-drag-surface"
@@ -8942,9 +9496,18 @@
         on:mousedown={startTitlebarDrag}
       ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
       <div class="canvas-controls-right" data-no-window-drag>
+        {#each paneSlots.filter(slot => slot.position !== 'main' && slot.selected) as slot (slot.position)}
+          {@const title = slot.selected![1].title ?? slot.selected![0]}
+          <button class="titlebar-button" class:active={!hiddenPaneSlots.has(slot.position)} type="button"
+            aria-label={`${hiddenPaneSlots.has(slot.position) ? 'Show' : 'Hide'} ${title}`} aria-pressed={!hiddenPaneSlots.has(slot.position)} title={title}
+            disabled={busyPaneSlots.has(slot.position)} on:click={() => togglePane(slot.position)}>
+            <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/>{#if slot.position === 'right'}<path d="M10 2.5v11"/>{:else}<path d="M2 10h12"/>{/if}</svg>
+          </button>
+        {/each}
         {#if document && mode === 'visual' && canUseVisual && (!contextPaneOpen || canUseVisualMarkdown(contextText, true))}
           <VisualFormatMenu
             bind:this={formatMenu}
+            hiddenTrigger
             editor={contextPaneOpen ? contextVisualEditor : visualEditor}
             formatting={contextPaneOpen ? contextFormatting : visualFormatting}
             onCommandResult={(action, applied) => {
@@ -8955,183 +9518,84 @@
           />
         {/if}
         {#if document}
-          <div class="co-writer-control">
-            <button
-              bind:this={coWriterTrigger}
-              class:active={coWriterOpen}
-              class="titlebar-button co-writer-toggle"
-              type="button"
-              aria-label="Choose a co-writer"
-              aria-haspopup="dialog"
-              aria-expanded={coWriterOpen}
-              aria-controls="co-writer-popover"
-              title="Co-writer"
-              disabled={editorReadonly}
-              on:click={toggleCoWriter}
-            ><svg aria-hidden="true" viewBox="0 0 18 18"><circle cx="9" cy="6" r="2.35"/><path d="M4.7 14.5c.55-2.7 2-4.05 4.3-4.05s3.75 1.35 4.3 4.05"/></svg></button>
-            {#if coWriterOpen}
-              <div
-                bind:this={coWriterPopover}
-                id="co-writer-popover"
-                class="co-writer-popover"
-                role="dialog"
-                aria-label="Co-writers"
-              >
-                <header><strong>Co-writers</strong><span>Reusable completion context</span></header>
-                <form on:submit|preventDefault={() => void saveCurrentCoWriter()}>
-                  <input
-                    bind:value={coWriterName}
-                    aria-label="New co-writer name"
-                    placeholder="Name this context"
-                    maxlength="96"
-                    disabled={coWriterBusy}
-                  />
-                  <button type="submit" disabled={coWriterBusy || !coWriterName.trim()}>Save</button>
-                </form>
-                {#if coWriterError}<p class="co-writer-error" role="alert">{coWriterError}</p>{/if}
-                {#if coWriters.length > 0}
-                  <div class="co-writer-list">
-                    {#each coWriters as profile (profile.id)}
-                      <div class="co-writer-row">
-                        <button
-                          class="co-writer-apply"
-                          type="button"
-                          disabled={coWriterBusy}
-                          on:click={() => void applySelectedCoWriter(profile)}
-                        ><strong>{profile.name}</strong><small>{formatByteCount(profile.context_bytes)}{profile.attachment_count ? ` · ${profile.attachment_count} media` : ''}</small></button>
-                        <button
-                          class="co-writer-delete"
-                          type="button"
-                          aria-label={`Delete co-writer ${profile.name}`}
-                          title="Delete co-writer"
-                          disabled={coWriterBusy}
-                          on:click={() => void removeCoWriter(profile)}
-                        >×</button>
-                      </div>
-                    {/each}
-                  </div>
-                {:else if !coWriterBusy}
-                  <p class="co-writer-empty">Save the current context here to reuse it.</p>
-                {/if}
-              </div>
-            {/if}
-          </div>
           <button
-            bind:this={contextToggleElement}
-            class:active={contextPaneOpen}
-            class="titlebar-button context-toggle"
-            type="button"
-            aria-label={contextPaneOpen ? 'Close completion context' : 'Open completion context'}
-            aria-controls="completion-context-pane"
-            aria-expanded={contextPaneOpen}
-            title="Completion context"
-            on:click={() => {
-              if (contextPaneOpen) closeContextPane();
-              else {
-                contextPaneOpen = true;
-                void refreshDocumentContext();
-              }
-            }}
-          ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="2.25" y="2.25" width="13.5" height="13.5" rx="2.4"/><path d="M2.75 7h12.5"/></svg></button>
-          <button
-            class:recording={Boolean(speechRecording)}
+            class:recording={Boolean(speechRecording) && !speechError}
             class:transcribing={Boolean(speechInput)}
-            class:needs-attention={Boolean(speechError) && !speechInputActive()}
+            class:needs-attention={Boolean(speechError)}
             class="titlebar-button microphone-toggle"
             type="button"
             aria-label={speechRecording
-              ? 'Stop dictation'
+              ? speechError ? 'Retry saving recording' : 'Stop recording'
               : speechInput
                 ? 'Cancel speech recognition'
-                : 'Start dictation'}
+                : 'Record audio'}
             aria-describedby="speech-input-help"
             aria-pressed={Boolean(speechRecording)}
             title={speechError || (speechRecording
-              ? 'Stop dictation'
+              ? 'Stop recording'
               : speechInput
                 ? 'Recognizing locally — click to cancel'
-                : 'Dictate locally')}
+                : 'Record audio for this document')}
             disabled={!desktop || !document || speechStarting || (editorReadonly && !speechInputActive())}
             on:click={toggleSpeechInput}
           ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="6.4" y="2.5" width="5.2" height="8.3" rx="2.6"/><path d="M4.4 8.8a4.6 4.6 0 0 0 9.2 0M9 13.4v2.1M6.8 15.5h4.4"/></svg></button>
-          <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Uses the local microphone and local speech model')}</span>
+          <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Audio stays on this device and is attached to this document')}</span>
         {/if}
-        <button
-          class:active={suggestionsEnabled && Boolean(currentModel)}
-          class:preparing={suggestionsEnabled && !currentModel && !quietModelLoadFailure && (modelLoading || preferredWriterEnsureInFlight !== null || preferredWriterPending !== null)}
-          class:needs-attention={suggestionsEnabled && !currentModel && Boolean(quietModelLoadFailure)}
-          class="titlebar-button suggestions-toggle"
-          type="button"
-          aria-label={suggestionsEnabled ? 'Turn autocomplete off' : 'Turn autocomplete on'}
-          aria-describedby="completion-lifecycle-help autocomplete-model-menu-help autocomplete-model-failure-help"
-          aria-haspopup="dialog"
-          aria-keyshortcuts="Shift+F10"
-          aria-pressed={suggestionsEnabled}
-          title={`${suggestionsEnabled ? `Autocomplete: ${suggestionMenuState}` : 'Autocomplete: Off'} · right-click or hold for models`}
-          disabled={!project || suggestionsChanging}
-          on:click={handleAutocompleteToggleClick}
-          on:contextmenu={openAutocompleteModelMenu}
-          on:keydown={handleAutocompleteModelMenuKey}
-          on:pointerdown={beginAutocompleteModelMenuLongPress}
-          on:pointermove={updateAutocompleteModelMenuLongPress}
-          on:pointerup={finishAutocompleteModelMenuLongPress}
-          on:pointercancel={finishAutocompleteModelMenuLongPress}
-          on:lostpointercapture={finishAutocompleteModelMenuLongPress}
-        >
-          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="m9 2 .65 2.1L12 5l-2.35.9L9 8l-.65-2.1L6 5l2.35-.9L9 2ZM4.4 8.4l.45 1.45 1.55.55-1.55.55-.45 1.45-.45-1.45-1.55-.55 1.55-.55.45-1.45ZM12.4 9.2l.85 2.55 2.55.85-2.55.85L12.4 16l-.85-2.55L9 12.6l2.55-.85.85-2.55Z"/></svg>
-        </button>
-        <span id="completion-lifecycle-help" class="sr-only">{completionLifecycleHelp}</span>
-        <span id="autocomplete-model-menu-help" class="sr-only">Right-click, touch and hold, or press the Menu key or Shift F10 to open local writing model setup.</span>
-        <span id="autocomplete-model-failure-help" class="sr-only">{quietModelLoadFailure ? `Local model setup failed: ${quietModelLoadFailure.message}` : ''}</span>
-        <button
-          class:active={shuttleEnabled}
-          class:preparing={shuttleEnabled && !currentModel && !quietModelLoadFailure && (modelLoading || preferredWriterEnsureInFlight !== null || preferredWriterPending !== null)}
-          class:needs-attention={shuttleEnabled && !currentModel && Boolean(quietModelLoadFailure)}
-          class="titlebar-button shuttle-toggle"
-          type="button"
-          aria-label={shuttleEnabled ? 'Turn Shuttle off' : 'Turn Shuttle on'}
-          aria-pressed={shuttleEnabled}
-          title={shuttleEnabled ? 'Shuttle: accepting one word every four idle seconds' : 'Shuttle: Off'}
-          disabled={!project || suggestionsChanging}
-          on:click={() => void toggleShuttleFromTitlebar()}
-        >
-          <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M4 4.5 10.5 9 4 13.5v-9ZM13.5 4.5v9"/></svg>
-        </button>
-        <button
-          class="titlebar-button appearance-button"
-          type="button"
-          aria-label={`Use ${resolvedAppearance === 'dark' ? 'light' : 'dark'} appearance`}
-          title={`Appearance: ${appearance === 'system' ? `System (${resolvedAppearance})` : appearance}`}
-          on:click={toggleAppearance}
-        >
-          {#if resolvedAppearance === 'dark'}
-            <svg aria-hidden="true" viewBox="0 0 18 18"><circle cx="9" cy="9" r="3"/><path d="M9 1.8v1.4M9 14.8v1.4M1.8 9h1.4M14.8 9h1.4M3.9 3.9l1 1M13.1 13.1l1 1M14.1 3.9l-1 1M4.9 13.1l-1 1"/></svg>
-          {:else}
-            <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M14.7 11.7A6.4 6.4 0 0 1 6.3 3.3a6.4 6.4 0 1 0 8.4 8.4Z"/></svg>
-          {/if}
-        </button>
+        <div class="completion-mode-toggle" role="group" aria-label="Writing suggestions">
+          <button class="titlebar-button suggestions-toggle" class:active={suggestionsEnabled && suggestionInteraction === 'ghost'}
+            type="button" aria-label="Ghost text" aria-pressed={suggestionsEnabled && suggestionInteraction === 'ghost'}
+            title="Ghost text" disabled={!project || suggestionsChanging} on:click={() => void setSuggestionInteraction('ghost')}>
+            <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M3.5 15V8a5.5 5.5 0 0 1 11 0v7l-2.75-2-2.75 2-2.75-2-2.75 2Z"/><path d="M7 7v1M11 7v1"/></svg>
+          </button>
+          <button class="titlebar-button loompad-toggle" class:active={loompadActive}
+            type="button" aria-label="Loompad" aria-pressed={loompadActive} title="Loompad"
+            disabled={!project || suggestionsChanging} on:click={() => void setSuggestionInteraction('loompad')}>
+            <svg aria-hidden="true" viewBox="0 0 20 18"><rect x="7.5" y="2" width="5" height="5" rx="1"/><rect x="1.5" y="8.5" width="5" height="5" rx="1"/><rect x="7.5" y="8.5" width="5" height="5" rx="1"/><rect x="13.5" y="8.5" width="5" height="5" rx="1"/></svg>
+          </button>
+        </div>
+
       </div>
     </div>
   {/if}
 
   {#if project}
-    <div class:outline-open={outlineOpen} class="workspace-grid">
+    <div bind:clientWidth={workspaceWidth} bind:clientHeight={workspaceHeight} class:outline-open={outlineOpen} class="workspace-grid"
+      style={`grid-template-columns:${outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0}px minmax(0,1fr) ${rightPaneOpen ? Math.min(rightWidth, rightLimit) : 0}px; grid-template-rows:minmax(0,1fr) ${bottomPaneOpen ? Math.min(bottomHeight, workspaceHeight * 0.6) : 0}px;`}>
       <aside
         id="project-outline"
+        bind:this={outlineElement}
+        class:drop-active={workspaceDropActive}
         class:open={outlineOpen}
         class="outline-panel"
         aria-label="Documents"
       >
+        {#if outlineOpen}<PaneDivider edge="right" label="Resize documents" size={Math.min(outlineWidth, outlineLimit)} min={150} max={outlineLimit} onResize={(size) => outlineWidth = size} />{/if}
         <label class="search-field">
-          <span class="sr-only">Search project</span>
+          <span class="sr-only">Search folder</span>
           <span aria-hidden="true">⌕</span>
-          <input bind:value={search} type="search" placeholder="Find in project" />
+          <input bind:value={search} type="search" placeholder="Find in folder" />
         </label>
-        <nav class="document-list" aria-label="Documents">
-          {#each visibleDocuments as candidate (candidate.document_id)}
+        <nav class="document-list" aria-label="Workspace folders">
+          {#each visibleWorkspaceFolders as folder (folder.root)}
+            {@const active = folder.root === project.root}
+            <button class="folder-row workspace-root" class:active type="button" title={folder.root}
+              aria-label={`${active && workspaceRootExpanded ? 'Collapse' : 'Open'} folder ${folder.title}`}
+              aria-expanded={active && workspaceRootExpanded} disabled={fileCommandInFlight || opening}
+              on:click={() => { if (active) workspaceRootExpanded = !workspaceRootExpanded; else void doOpenProject(folder.root); }}>
+              <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{folder.title}</span>
+            </button>
+            {#if active && workspaceRootExpanded}
+            <div class="workspace-root-documents">
+          {#each fileRows as row (row.path)}
+            {#if row.folder}
+              <button class="folder-row" type="button" style={`padding-left: ${8 + row.depth * 14}px`} aria-expanded={!collapsedFolders.has(row.path) || Boolean(search.trim())} on:click={() => { const next = new Set(collapsedFolders); if (next.has(row.path)) next.delete(row.path); else next.add(row.path); collapsedFolders = next; }}>
+                <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{row.title}</span>
+              </button>
+            {:else}
+            {@const candidate = row.document}
             {#if renamingDocumentId === candidate.document_id}
               <div class:active={candidate.document_id === document?.summary.document_id} class="document-row editing">
-                <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
+
                 <span class="document-label">
                   <input
                     bind:this={renameDocumentInput}
@@ -9146,12 +9610,14 @@
                     on:keydown={handleDocumentRenameKeydown}
                     on:blur={handleDocumentRenameBlur}
                   />
-                  <small>{candidate.word_count.toLocaleString()} {candidate.word_count === 1 ? 'word' : 'words'}</small>
+
                 </span>
               </div>
             {:else}
             <div
               class="document-row-group"
+              class:template-file={row.path.split('/').at(-1)?.startsWith('.')}
+              style={`padding-left: ${row.depth * 14}px`}
               class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}
             >
               <button
@@ -9169,10 +9635,10 @@
                 on:pointerup={finishDocumentContextLongPress}
                 on:pointercancel={finishDocumentContextLongPress}
               >
-                <span class="document-glyph" aria-hidden="true">{candidate.kind === 'verse' ? '≋' : '¶'}</span>
+
                 <span class="document-label">
                   <strong data-document-title>{candidate.title}</strong>
-                  <small>{candidate.word_count.toLocaleString()} {candidate.word_count === 1 ? 'word' : 'words'}</small>
+
                 </span>
               </button>
               <button
@@ -9187,10 +9653,25 @@
               ><span aria-hidden="true">•••</span></button>
             </div>
             {/if}
+            {/if}
           {:else}
             <p class="empty-copy">No notes.</p>
           {/each}
+            </div>
+            {/if}
+          {/each}
+          {#if desktop && document}
+            {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
+              <ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={document.summary.title} onUse={useImportedSources} />
+            {/key}
+          {/if}
         </nav>
+        {#if folderWarnings.length > 0}
+          <details class="folder-warnings">
+            <summary>{folderWarnings.length} {folderWarnings.length === 1 ? 'file' : 'files'} not opened</summary>
+            <ul>{#each folderWarnings as warning}<li>{warning}</li>{/each}</ul>
+          </details>
+        {/if}
         {#if documentContextTarget}
           <div
             bind:this={documentContextMenu}
@@ -9249,7 +9730,7 @@
         {/if}
       </aside>
 
-      <main id="manuscript" class="manuscript-area" tabindex="-1">
+      <main id="manuscript" class="manuscript-area" tabindex="-1" class:workspace-main-hidden={customMain}>
         {#if document && contextPaneOpen}
           <div
             bind:this={contextPaneElement}
@@ -9314,11 +9795,6 @@
                 </span>
               </div>
             </div>
-            {#if desktop && project && document}
-              {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
-                <ImportSources projectId={project.project_id} sessionId={project.session_id} onUse={useImportedSources} />
-              {/key}
-            {/if}
             {#if contextTextSources.length > 0}
               <p class="context-source-note" title={contextTextSources.map((source) => source.file_name).join('\n')}>
                 {contextTextSources.length} imported text {contextTextSources.length === 1 ? 'source is' : 'sources are'} editable above
@@ -9496,7 +9972,7 @@
                       ghostAnchorByteOffset={ghostSuggestion?.targetByte ?? null}
                       ghostInsertsOnAccept={ghostSuggestion?.insertsOnAccept ?? false}
                       ghostAlternatives={ghostAlternatives}
-                      ghostHidden={inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled })}
+                      ghostHidden={ghostTextHidden}
                       {ghostUnconsumeText}
                       surfaceKey={visualGhostSurfaceKey}
                       onChange={updateText}
@@ -9537,8 +10013,8 @@
             {/if}
             {#if showSource}
               <div class="editor-pane source-pane" aria-label="Source editor pane">
-                {#if exactTextSurface && verseCodec && !verseCodec.editable}
-                  <div class="verse-notice" role="alert">This poem uses mixed line-ending encodings. Loom will not normalize them silently; source editing stays locked until a lossless boundary editor is available.</div>
+                {#if sourceCodec && !sourceCodec.editable}
+                  <div class="verse-notice" role="alert">This document uses mixed line-ending encodings. Loom will not normalize them silently; source editing stays locked until a lossless boundary editor is available.</div>
                 {/if}
                 {#if document.summary.kind === 'hybrid'}
                   <div class="verse-notice" role="alert">Hybrid source editing is locked until its prose/verse block manifest can cross the IPC boundary losslessly.</div>
@@ -9547,16 +10023,16 @@
                   bind:this={sourceEditor}
                   bind:element={sourceTextarea}
                   value={sourceDisplayText}
-                  readonly={editorReadonly || document.summary.kind === 'hybrid' || Boolean(exactTextSurface && verseCodec && !verseCodec.editable)}
+                  readonly={editorReadonly || document.summary.kind === 'hybrid' || Boolean(sourceCodec && !sourceCodec.editable)}
                   verse={exactTextSurface}
-                  verseNewline={exactTextSurface ? verseCodec?.newline ?? 'mixed' : null}
+                  verseNewline={sourceCodec?.newline ?? null}
                   surfaceKey={completionContextKey}
                   ghostText={sourceGhostSuggestion?.text ?? ''}
                   ghostCandidateId={sourceGhostSuggestion?.candidateId ?? ''}
                   ghostPresentationKey={sourceGhostSuggestion?.presentationKey ?? ''}
                   ghostInsertsOnAccept={sourceGhostSuggestion?.insertsOnAccept ?? false}
                   ghostAlternatives={ghostAlternatives}
-                  ghostHidden={inlineGhostHidden({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled })}
+                  ghostHidden={ghostTextHidden}
                   {ghostUnconsumeText}
                   onCompositionStart={beginSourceComposition}
                   onCompositionEnd={finishSourceComposition}
@@ -9579,6 +10055,12 @@
                   label={exactTextSurface ? 'Exact-whitespace verse editor' : 'Markdown source editor'}
                 />
               </div>
+            {/if}
+            {#if loompadActive}
+              <Loompad choices={activeSuggestionFamily} scope={completionContextKey} focused={windowFocused} selectedRunId={selectedInlineSuggestion?.runId ?? ''}
+                blocked={editorReadonly || compositionActive} visual={mode === 'visual'}
+                onChoose={chooseLoompadCandidate} onAccept={(candidate, length) => void acceptLoompadCandidate(candidate, length)}
+                onExit={() => { suggestionInteraction = 'ghost'; }} />
             {/if}
           </section>
 
@@ -9606,7 +10088,51 @@
           </section>
         {/if}
       </main>
+      {#each paneSlots as slot (slot.position)}
+        {#if slot.selected && (slot.position !== 'main' || customMain)}
+          {@const selected = slot.selected}
+          <aside class:hidden-pane={hiddenPaneSlots.has(slot.position)} class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
+            {#if slot.position === 'right'}<PaneDivider edge="left" label="Resize right pane" size={Math.min(rightWidth, rightLimit)} min={180} max={rightLimit} onResize={(size) => rightWidth = size} />{/if}
+            {#if slot.position === 'bottom'}<PaneDivider edge="top" label="Resize bottom pane" size={Math.min(bottomHeight, workspaceHeight * 0.6)} min={100} max={workspaceHeight * 0.6} onResize={(size) => bottomHeight = size} />{/if}
+            <header class="workspace-pane-header">
+              {#if slot.choices.length > 1}
+                <select aria-label="Pane" value={selected[0]} disabled={busyPaneSlots.has(slot.position)} on:change={(event) => selectPane(slot.position, event.currentTarget.value)}>
+                  {#each slot.choices as [id, config]}<option value={id}>{config.title ?? id}</option>{/each}
+                </select>
+              {:else}<span>{selected[1].title ?? selected[0]}</span>{/if}
+            </header>
+            {#each slot.choices as [paneId, paneConfig] (paneId)}
+              <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
+            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
+              </div>
+            {/each}
+          </aside>
+        {/if}
+      {/each}
+
     </div>
+      <div class="terminal-dock" bind:clientHeight={terminalDockHeight} class:closed={!terminalOpen} style={`height:${effectiveTerminalHeight}px`}>
+      {#if terminalOpen}<PaneDivider edge="top" label="Resize terminal" size={effectiveTerminalHeight} min={100} max={terminalLimit} onResize={(size) => terminalHeight = size} />{/if}
+      <TerminalPane
+        bind:open={terminalOpen}
+        bind:entry={terminalEntry}
+        projectId={project.project_id}
+        sessionId={project.session_id}
+        documents={project.documents}
+        runs={terminalRuns}
+        busy={terminalBusy}
+        disabled={applicationClosePhase !== 'running'}
+        runDisabled={!document || (!terminalEntry && !currentModel?.completion) || editorReadonly}
+        error={terminalError}
+        uncertain={terminalPendingRequest !== null}
+        onCheck={() => void refreshTerminalRuns()}
+        modelLabel={currentModel?.display_name ?? ''}
+        onRun={() => void runRetainedOutput(terminalEntry)}
+        onCancel={() => void stopTerminalRun()}
+        onOpen={(run) => void openTerminalOutput(run)}
+        onClose={closeTerminal}
+      />
+      </div>
   {:else}
     <main class="welcome" id="manuscript">
       <section class="welcome-note" aria-labelledby="welcome-title">
@@ -9620,8 +10146,13 @@
           </div>
         {/if}
         <div class="welcome-actions">
-          <button class="secondary-button" type="button" on:click={doOpenProject} disabled={!desktop || opening}>
-            {opening ? 'Opening…' : 'Choose another folder…'}
+          {#if errorMessage && desktop}
+            <button class="secondary-button" type="button" on:click={retryInitialProject} disabled={opening}>
+              Retry
+            </button>
+          {/if}
+          <button class="secondary-button" type="button" on:click={() => void doOpenProject()} disabled={!desktop || opening}>
+            {opening ? 'Opening…' : 'Open folder…'}
           </button>
         </div>
       </section>

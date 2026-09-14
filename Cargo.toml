@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/desktop-model-defaults",
     "crates/native/crates/llama-native-cache",
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
@@ -51,7 +52,7 @@ members = [
     "products/mom/crates/mom-llama-runtime",
     "xtask",
 ]
-exclude = ["crates/services/attachment/fuzz"]
+exclude = ["crates/services/attachment/fuzz", "vendor/glib", "vendor/ort-sys"]
 resolver = "3"
 
 [workspace.package]
@@ -63,6 +64,7 @@ repository = "https://github.com/delysis/native-platform"
 publish = false
 
 [workspace.dependencies]
+desktop-model-defaults = { path = "crates/desktop-model-defaults" }
 anyhow = "1.0.100"
 async-stream = "0.3.6"
 async-trait = "0.1.89"
@@ -195,3 +197,9 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[patch.crates-io]
+# GTK3 still requires the 0.18 API. Backport the upstream VariantStrIter fix.
+glib = { path = "vendor/glib" }
+# Keep verified ONNX Runtime DLLs beside Windows test/example executables.
+ort-sys = { path = "vendor/ort-sys" }

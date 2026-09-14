@@ -239,8 +239,10 @@ impl ManagedStore {
         let active = active_root(self).join(&key);
         if path_exists(&active)? {
             let receipt = validate_active_materialization(self, &active)?;
-            make_materialization_directory_immutable(&active)?;
             if receipt_matches_materialization(&receipt, materialization) {
+                make_materialization_directory_immutable(&active)?;
+                sync_publication_roots(self)
+                    .map_err(|source| committed_documents_error(&receipt, true, source))?;
                 return Ok(receipt);
             }
             return Err(StoreError::ManagedDocumentsConflict(
@@ -354,8 +356,6 @@ impl ManagedStore {
                     source: error,
                 });
             }
-            sync_directory(&active_root(self))?;
-            sync_directory(&staging_root(self))?;
             removing
         } else if path_exists(&removing)? {
             removing
@@ -365,24 +365,36 @@ impl ManagedStore {
             ));
         };
 
-        let receipt: ManagedDocumentsReceipt =
-            read_json(&target.join(RECEIPT_FILE), "managed documents receipt")?;
-        receipt.validate()?;
-        require_exact_receipt(&receipt, request)?;
-        let removed_managed_bytes = directory_bytes(&target)?;
-        finish_removal(&target, &receipt)?;
-        sync_directory(&staging_root(self))?;
+        let finish = || {
+            sync_publication_roots(self)?;
+            let receipt: ManagedDocumentsReceipt =
+                read_json(&target.join(RECEIPT_FILE), "managed documents receipt")?;
+            receipt.validate()?;
+            require_exact_receipt(&receipt, request)?;
+            let removed_managed_bytes = directory_bytes(&target)?;
+            finish_removal(&target, &receipt)?;
+            sync_directory(&staging_root(self))?;
 
-        let removal = ManagedDocumentsRemovalReceipt {
-            schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
+            let removal = ManagedDocumentsRemovalReceipt {
+                schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
+                materialization_id: request.materialization_id.clone(),
+                content_sha256: request.content_sha256.clone(),
+                database_sha256: request.database_sha256.clone(),
+                removed_managed_bytes,
+                external_source_bytes_removed: false,
+                removed_at: Utc::now(),
+            };
+            removal.validate()?;
+            Ok(removal)
+        };
+        let removal = finish().map_err(|source| StoreError::ManagedDocumentsCommitted {
             materialization_id: request.materialization_id.clone(),
             content_sha256: request.content_sha256.clone(),
             database_sha256: request.database_sha256.clone(),
-            removed_managed_bytes,
-            external_source_bytes_removed: false,
-            removed_at: Utc::now(),
-        };
-        removal.validate()?;
+            visible: false,
+            source: Box::new(source),
+        })?;
+
         Ok(removal)
     }
 }
@@ -612,12 +624,56 @@ fn build_and_activate(
         source: error,
     })?;
     observe_publish_boundary(PublishBoundary::ActivationRenamed);
-    make_materialization_directory_immutable(active)?;
+    // macOS requires write permission on the directory being moved across
+    // parents. Hardening therefore happens after rename and must retain the
+    // committed identity if chmod fails.
+    make_materialization_directory_immutable(active)
+        .map_err(|source| committed_documents_error(&receipt, true, source))?;
     observe_publish_boundary(PublishBoundary::ActivationHardened);
-    sync_directory(&active_root(store))?;
-    sync_directory(&staging_root(store))?;
+    sync_publication_roots(store)
+        .map_err(|source| committed_documents_error(&receipt, true, source))?;
     observe_publish_boundary(PublishBoundary::ActivationSynced);
     Ok(receipt)
+}
+
+fn committed_documents_error(
+    receipt: &ManagedDocumentsReceipt,
+    visible: bool,
+    source: StoreError,
+) -> StoreError {
+    StoreError::ManagedDocumentsCommitted {
+        materialization_id: receipt.materialization_id.clone(),
+        content_sha256: receipt.content_sha256.clone(),
+        database_sha256: receipt.database_sha256.clone(),
+        visible,
+        source: Box::new(source),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static MANAGED_SYNC_FAULT: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+fn sync_managed_directory(path: &Path) -> Result<(), StoreError> {
+    #[cfg(test)]
+    MANAGED_SYNC_FAULT.with(|fault| {
+        if fault.borrow().as_deref() == Some(path) {
+            fault.replace(None);
+            return Err(StoreError::Io {
+                operation: "sync managed directory",
+                path: path.to_path_buf(),
+                source: std::io::Error::other("injected sync failure"),
+            });
+        }
+        Ok(())
+    })?;
+    sync_directory(path)
+}
+
+fn sync_publication_roots(store: &ManagedStore) -> Result<(), StoreError> {
+    sync_managed_directory(&active_root(store))?;
+    sync_managed_directory(&staging_root(store))
 }
 
 fn build_database(path: &Path, materialization: &ManagedDocumentsV1) -> Result<(), StoreError> {
@@ -1215,12 +1271,12 @@ fn make_materialization_directory_immutable(path: &Path) -> Result<(), StoreErro
 
 #[cfg(not(unix))]
 fn make_materialization_files_immutable(_path: &Path) -> Result<(), StoreError> {
-    Ok(())
+    Err(StoreError::UnsupportedPlatform)
 }
 
 #[cfg(not(unix))]
 fn make_materialization_directory_immutable(_path: &Path) -> Result<(), StoreError> {
-    Ok(())
+    Err(StoreError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]
@@ -1245,7 +1301,7 @@ fn make_materialization_writable(path: &Path) -> Result<(), StoreError> {
 
 #[cfg(not(unix))]
 fn make_materialization_writable(_path: &Path) -> Result<(), StoreError> {
-    Ok(())
+    Err(StoreError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]
@@ -1261,7 +1317,7 @@ fn make_materialization_directory_writable(path: &Path) -> Result<(), StoreError
 
 #[cfg(not(unix))]
 fn make_materialization_directory_writable(_path: &Path) -> Result<(), StoreError> {
-    Ok(())
+    Err(StoreError::UnsupportedPlatform)
 }
 
 #[cfg(test)]
@@ -1340,6 +1396,74 @@ mod tests {
         Ok(materialization)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn post_publication_sync_failure_preserves_visible_identity_and_retry()
+    -> Result<(), Box<dyn Error>> {
+        for destination in [true, false] {
+            let temp = tempdir()?;
+            let store = ManagedStore::open(temp.path().join("managed"))?;
+            let materialization = fixture_materialization()?;
+            MANAGED_SYNC_FAULT.with(|fault| {
+                fault.replace(Some(if destination {
+                    active_root(&store)
+                } else {
+                    staging_root(&store)
+                }))
+            });
+            let result = store.materialize_documents(&materialization);
+            let Err(StoreError::ManagedDocumentsCommitted {
+                materialization_id,
+                content_sha256,
+                visible,
+                ..
+            }) = result
+            else {
+                panic!("expected committed uncertainty: {result:?}");
+            };
+            assert!(visible);
+            assert_eq!(materialization_id, materialization.materialization_id);
+            assert_eq!(content_sha256, materialization.content_sha256);
+            assert!(
+                active_path(&store, &materialization_id)
+                    .join(DATABASE_FILE)
+                    .is_file()
+            );
+            let retry = store.materialize_documents(&materialization)?;
+            assert_eq!(retry.materialization_id, materialization_id);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removal_sync_failure_reports_hidden_identity_and_finishes_on_retry()
+    -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let store = ManagedStore::open(temp.path().join("managed"))?;
+        let materialization = fixture_materialization()?;
+        let receipt = store.materialize_documents(&materialization)?;
+        let request = ManagedDocumentsRemovalRequest {
+            schema: MANAGED_DOCUMENTS_REMOVAL_SCHEMA.to_string(),
+            materialization_id: receipt.materialization_id.clone(),
+            content_sha256: receipt.content_sha256,
+            database_sha256: receipt.database_sha256,
+        };
+        MANAGED_SYNC_FAULT.with(|fault| fault.replace(Some(active_root(&store))));
+        let result = store.remove_managed_documents(&request);
+        assert!(
+            matches!(
+                result,
+                Err(StoreError::ManagedDocumentsCommitted { visible: false, .. })
+            ),
+            "{result:?}"
+        );
+        assert!(!active_path(&store, &request.materialization_id).exists());
+        store.remove_managed_documents(&request)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
     #[test]
     fn materialization_is_atomic_searchable_idempotent_and_exactly_removable()
     -> Result<(), Box<dyn Error>> {
@@ -1387,6 +1511,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn active_receipt_enumeration_rejects_overflow_before_opening_entries()
     -> Result<(), Box<dyn Error>> {
@@ -1470,6 +1595,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn conflicting_content_and_stale_removal_confirmation_fail_closed() -> Result<(), Box<dyn Error>>
     {
@@ -1500,6 +1626,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn every_publish_boundary_recovers_to_one_exact_searchable_release()
     -> Result<(), Box<dyn Error>> {

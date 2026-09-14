@@ -321,7 +321,7 @@ impl OperationLease {
         attempt: &AttemptLease,
         terminal: TerminalClass,
     ) -> Result<OperationSnapshot, RegistryError> {
-        self.finish_attempt_and_release_inner(attempt, terminal, false)
+        self.finish_attempt_and_release_inner(attempt, terminal, false, true)
     }
 
     pub(crate) fn finish_backend_attempt_and_release(
@@ -329,7 +329,18 @@ impl OperationLease {
         attempt: &AttemptLease,
         terminal: TerminalClass,
     ) -> Result<OperationSnapshot, RegistryError> {
-        self.finish_attempt_and_release_inner(attempt, terminal, true)
+        self.finish_attempt_and_release_inner(attempt, terminal, true, true)
+    }
+
+    /// Arbitrates the terminal under the same lock as cancellation, retaining
+    /// public identity until the owner has attempted final publication.
+    pub(crate) fn finish_attempt_terminal(
+        &self,
+        attempt: &AttemptLease,
+        terminal: TerminalClass,
+        cancellation_wins: bool,
+    ) -> Result<OperationSnapshot, RegistryError> {
+        self.finish_attempt_and_release_inner(attempt, terminal, cancellation_wins, false)
     }
 
     fn finish_attempt_and_release_inner(
@@ -337,6 +348,7 @@ impl OperationLease {
         attempt: &AttemptLease,
         terminal: TerminalClass,
         cancellation_wins: bool,
+        release: bool,
     ) -> Result<OperationSnapshot, RegistryError> {
         if attempt.operation != self.identity {
             return Err(RegistryError::Stale);
@@ -357,10 +369,16 @@ impl OperationLease {
         } else {
             terminal
         });
-        record.phase = OperationPhase::Released;
+        record.phase = if release {
+            OperationPhase::Released
+        } else {
+            OperationPhase::Terminal
+        };
         let released = snapshot(record);
-        state.operations.remove(&self.identity.operation_id);
-        *released_slot = Some(released.clone());
+        if release {
+            state.operations.remove(&self.identity.operation_id);
+            *released_slot = Some(released.clone());
+        }
         Ok(released)
     }
 
@@ -530,6 +548,28 @@ fn snapshot(record: &OperationRecord) -> OperationSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_arbitration_retains_identity_until_owner_publication() {
+        let registry = OperationRegistry::new(1, 4);
+        let (guard, operation) = registry.reserve("publication").expect("reserve");
+        operation.queue().expect("queue");
+        operation.start().expect("start");
+        let attempt = operation.start_attempt().expect("attempt");
+        operation.request_cancel().expect("cancel");
+        let terminal = operation
+            .finish_attempt_terminal(&attempt, TerminalClass::Completed, true)
+            .expect("terminal arbitration");
+        assert_eq!(terminal.phase, OperationPhase::Terminal);
+        assert_eq!(terminal.terminal, Some(TerminalClass::Cancelled));
+        assert!(registry.reserve("publication").is_err());
+        drop(guard);
+        assert!(registry.current("publication").expect("current").is_some());
+        operation
+            .release()
+            .expect("release after owner publication");
+        assert!(registry.reserve("publication").is_ok());
+    }
 
     #[test]
     fn setup_rollback_is_failed_released_and_empty() {

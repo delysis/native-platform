@@ -333,26 +333,6 @@ pub fn tool_permission_revoke(server: &str, tool: &str) -> Result<CommandResult<
     ))
 }
 
-pub fn tool_loop_prepare(
-    conversation_id: &str,
-    prompt: String,
-    server: String,
-    tool: String,
-    arguments: Value,
-    max_turns: u32,
-) -> Result<CommandResult<ToolLoopApproval>> {
-    let scope = OperationScope::for_current_product_host();
-    tool_loop_prepare_in_scope(
-        &scope,
-        conversation_id,
-        prompt,
-        server,
-        tool,
-        arguments,
-        max_turns,
-    )
-}
-
 pub fn tool_loop_prepare_in_scope(
     scope: &OperationScope,
     conversation_id: &str,
@@ -437,28 +417,6 @@ pub fn tool_loop_prepare_in_scope(
     ))
 }
 
-pub fn tool_loop_run(
-    conversation_id: &str,
-    prompt: String,
-    server: String,
-    tool: String,
-    arguments: Value,
-    max_turns: u32,
-    approval_id: Option<String>,
-) -> Result<CommandResult<ToolLoopOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    tool_loop_run_in_scope(
-        &scope,
-        conversation_id,
-        prompt,
-        server,
-        tool,
-        arguments,
-        max_turns,
-        approval_id,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn tool_loop_run_in_scope(
     scope: &OperationScope,
@@ -483,17 +441,6 @@ pub fn tool_loop_run_in_scope(
         },
         None,
     )
-}
-
-pub fn tool_loop_run_stream<F>(
-    input: ToolLoopRunInput,
-    on_event: F,
-) -> Result<CommandResult<ToolLoopOutput>>
-where
-    F: FnMut(ToolLoopStreamEvent) -> Result<()>,
-{
-    let scope = OperationScope::for_current_product_host();
-    tool_loop_run_stream_in_scope(&scope, input, on_event)
 }
 
 pub fn tool_loop_run_stream_in_scope<F>(
@@ -595,6 +542,7 @@ fn tool_loop_run_with_events(
         ));
     };
     let handle = match resident_model_for_profile(
+        scope,
         &settings,
         model_path,
         source_conversation
@@ -968,11 +916,6 @@ fn tool_loop_run_with_events(
             }
         }
     }
-}
-
-pub fn tool_loop_cancel(conversation_id: &str) -> Result<CommandResult<ToolLoopCancelOutput>> {
-    let scope = OperationScope::for_current_product_host();
-    tool_loop_cancel_in_scope(&scope, conversation_id)
 }
 
 pub fn tool_loop_cancel_in_scope(

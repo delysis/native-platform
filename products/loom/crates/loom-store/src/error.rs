@@ -24,6 +24,14 @@ pub enum StoreError {
     SymbolicLink(PathBuf),
     #[error("path is not a directory: {0:?}")]
     NotDirectory(PathBuf),
+    #[error(
+        "folder discovery exceeds the {max_entries}-entry or {max_depth}-level limit at {path:?}"
+    )]
+    FolderTooLarge {
+        path: PathBuf,
+        max_entries: usize,
+        max_depth: usize,
+    },
     #[error("path is not a regular file: {0:?}")]
     NotRegularFile(PathBuf),
     #[error("project is already initialized at {0:?}")]
@@ -34,8 +42,12 @@ pub enum StoreError {
     NotAProject(PathBuf),
     #[error("unsupported project manifest format `{0}`")]
     UnsupportedFormat(String),
-    #[error("project schema {found} is newer than supported schema {supported}")]
+    #[error("project schema {found} does not match supported schema {supported}")]
     UnsupportedSchema { found: u32, supported: u32 },
+    #[error(
+        "this platform does not support Loom's private storage and directory durability requirements"
+    )]
+    UnsupportedStoragePlatform,
     #[error("project name must contain 1 to {max_bytes} UTF-8 bytes")]
     InvalidProjectName { max_bytes: usize },
     #[error("document title must contain 1 to {max_bytes} UTF-8 bytes and no control characters")]

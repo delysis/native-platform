@@ -1259,18 +1259,10 @@ fn base_request(
     stream: bool,
     defaults: EdgeDefaults,
 ) -> GatewayRequest {
-    let selector = match model.split_once('/') {
-        Some((backend_id, model_id)) if !backend_id.is_empty() && !model_id.is_empty() => {
-            ModelSelector::ExactRoute {
-                backend_id: backend_id.to_string(),
-                model_id: model_id.to_string(),
-            }
-        }
-        _ if matches!(
-            model.as_str(),
-            "local-only" | "hosted-only" | "prefer-local" | "auto"
-        ) =>
-        {
+    // Provider model IDs may contain slashes. They must round-trip unchanged
+    // from /v1/models instead of becoming an invented backend/model selector.
+    let selector = match model.as_str() {
+        "local-only" | "hosted-only" | "prefer-local" | "auto" => {
             ModelSelector::Profile { name: model }
         }
         _ => ModelSelector::ExactModel { model_id: model },
@@ -1902,15 +1894,10 @@ impl AnthropicStreamEncoder {
                 });
                 self.terminal = true;
             }
-            GatewayEvent::Cancelled { usage, .. } => {
-                self.finish_content_blocks(&mut events);
+            GatewayEvent::Cancelled { .. } => {
                 events.push(SseEvent {
-                    event: "message_delta".to_string(),
-                    data: json!({"type":"message_delta","delta":{"stop_reason":"stop_sequence","stop_sequence":Value::Null},"usage":anthropic_usage(usage)}),
-                });
-                events.push(SseEvent {
-                    event: "message_stop".to_string(),
-                    data: json!({"type":"message_stop"}),
+                    event: "error".to_string(),
+                    data: json!({"type":"error","error":{"type":"api_error","message":"Generation cancelled","code":"cancelled"}}),
                 });
                 self.terminal = true;
             }

@@ -40,6 +40,7 @@ export interface ProjectSnapshot {
   root: string;
   schema_version: number;
   documents: DocumentSummary[];
+  folder_warnings?: string[];
   pending_recovery: number;
 }
 
@@ -346,7 +347,14 @@ export interface BranchBody {
   text: string;
 }
 
+export interface LoompadBatch {
+  snapshot_id: string;
+  sample_target: 4 | 16 | 64 | 256;
+  batch_offset: number;
+}
+
 export interface WeaveStarted {
+  speculation?: LoompadBatch | null;
   command_id: string;
   request_id: string;
   project_id: string;
@@ -404,6 +412,7 @@ export interface DesktopGenerationEnvelope {
 }
 
 export interface LoomFailure {
+  speculation_recovery?: { snapshot_id: string; next_offset: number; command_ids: string[] };
   code: string;
   message: string;
   retryable?: boolean;
@@ -439,7 +448,7 @@ export interface ContextAttachmentPresentation {
   detected_format: string;
   coverage_complete: boolean;
   text_bytes: number;
-  presentation_kind: 'text' | 'image' | 'audio' | 'mixed';
+  presentation_kind: 'text' | 'image' | 'audio' | 'mixed' | 'file';
   media: ContextMediaPresentation[];
   warnings: string[];
 }
@@ -543,4 +552,34 @@ export interface ReconciliationPreview {
   app_source: 'caller' | 'transient_draft' | 'base';
   draft_version: string | null;
   outcome: MergeOutcome;
+}
+
+export interface TerminalRun {
+  turn_boundary?: 'chat' | null;
+  source_document_id?: string;
+  presentation?: { pane_id: string; input: string } | null;
+  run_id: string;
+  title?: string;
+  status: 'running' | 'completed' | 'cancelled' | 'failed';
+  expression: string;
+  output_document_id: string | null;
+  output_relative_path: string | null;
+  preview: string;
+  error: string | null;
+  created_at_ms: number;
+}
+
+export interface TerminalRunRequest {
+  turnBoundary?: 'chat';
+  contextReferences?: string[];
+  presentation?: { pane_id: string; input: string };
+  projectId: string;
+  sessionId: string;
+  commandId: string;
+  documentId: string;
+  sourceRevisionId: string;
+  expectedVisibleBlobId: string;
+  sourceStartByte: number;
+  sourceEndByte: number;
+  expression: string;
 }

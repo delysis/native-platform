@@ -1801,6 +1801,7 @@ impl From<StrictGenerationOutputWire> for GenerationOutput {
                 cache: GenerationCacheMetrics {
                     supplied_prefix_tokens: value.metrics.cache.supplied_prefix_tokens,
                     restored_prefix_tokens: value.metrics.cache.restored_prefix_tokens,
+                    replayed_prefix_tokens: 0,
                     batch_shared_prefix_tokens: value.metrics.cache.batch_shared_prefix_tokens,
                     resident_prefix_tokens: 0,
                 },
@@ -1816,6 +1817,11 @@ impl TryFrom<&GenerationOutput> for StrictGenerationOutputWire {
     type Error = NativeError;
 
     fn try_from(value: &GenerationOutput) -> Result<Self, Self::Error> {
+        if value.metrics.cache.replayed_prefix_tokens != 0 {
+            return Err(invalid(
+                "strict controlled output cannot discard token replay accounting",
+            ));
+        }
         let token_observations = value
             .token_observations
             .as_ref()

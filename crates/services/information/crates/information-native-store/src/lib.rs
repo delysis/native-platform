@@ -52,6 +52,8 @@ static PROCESS_LOCKS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 /// Failures returned by local store operations.
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("private managed storage is unsupported on this platform")]
+    UnsupportedPlatform,
     #[error("contract rejected by the store: {0}")]
     Contract(#[from] ContractError),
     #[error("could not {operation} {path}: {source}")]
@@ -66,6 +68,17 @@ pub enum StoreError {
         receipt: StoreCommitReceipt,
         #[source]
         source: io::Error,
+    },
+    #[error(
+        "managed documents {materialization_id} committed (visible={visible}, content={content_sha256}, database={database_sha256}), but cleanup or durability is incomplete: {source}"
+    )]
+    ManagedDocumentsCommitted {
+        materialization_id: ManagedMaterializationId,
+        content_sha256: String,
+        database_sha256: String,
+        visible: bool,
+        #[source]
+        source: Box<StoreError>,
     },
     #[error("could not encode or decode {context}: {source}")]
     Json {
@@ -411,6 +424,7 @@ pub struct ManagedStore {
 impl ManagedStore {
     /// Create or open a managed root and its fixed internal layout.
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
+        require_private_storage_support()?;
         let requested = root.as_ref();
         if requested.as_os_str().is_empty() {
             return Err(StoreError::UnsafePath {
@@ -2581,7 +2595,7 @@ fn enforce_private_directory(path: &Path) -> Result<(), StoreError> {
 
 #[cfg(not(unix))]
 fn enforce_private_directory(_path: &Path) -> Result<(), StoreError> {
-    Ok(())
+    Err(StoreError::UnsupportedPlatform)
 }
 
 #[cfg(unix)]
@@ -2594,7 +2608,15 @@ fn enforce_private_file(path: &Path) -> Result<(), StoreError> {
 
 #[cfg(not(unix))]
 fn enforce_private_file(_path: &Path) -> Result<(), StoreError> {
-    Ok(())
+    Err(StoreError::UnsupportedPlatform)
+}
+
+fn require_private_storage_support() -> Result<(), StoreError> {
+    if cfg!(unix) {
+        Ok(())
+    } else {
+        Err(StoreError::UnsupportedPlatform)
+    }
 }
 
 #[cfg(unix)]
@@ -2766,13 +2788,16 @@ fn sync_directory_io(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), StoreError> {
-    Ok(())
+fn sync_directory(path: &Path) -> Result<(), StoreError> {
+    sync_directory_io(path).map_err(|error| StoreError::io("sync directory", path, error))
 }
 
 #[cfg(not(unix))]
 fn sync_directory_io(_path: &Path) -> io::Result<()> {
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory durability is unsupported on this platform",
+    ))
 }
 
 #[cfg(test)]
@@ -2787,6 +2812,35 @@ mod tests {
     };
     use std::error::Error;
     use tempfile::TempDir;
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_private_store_refuses_before_creating_or_opening_state()
+    -> Result<(), Box<dyn Error>> {
+        let temporary = TempDir::new()?;
+        let root = temporary.path().join("private-store");
+        assert!(matches!(
+            ManagedStore::open(&root),
+            Err(StoreError::UnsupportedPlatform)
+        ));
+        assert!(!root.exists());
+        fs::create_dir(&root)?;
+        let marker = root.join("keep");
+        fs::write(&marker, b"unchanged")?;
+        assert!(matches!(
+            ManagedStore::open(&root),
+            Err(StoreError::UnsupportedPlatform)
+        ));
+        assert_eq!(fs::read(&marker)?, b"unchanged");
+        assert_eq!(fs::read_dir(&root)?.count(), 1);
+        assert_eq!(
+            sync_directory_io(&root)
+                .expect_err("unsupported directory sync")
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+        Ok(())
+    }
 
     fn digest(bytes: &[u8]) -> String {
         hex::encode(Sha256::digest(bytes))
@@ -2922,6 +2976,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn installation_lease_spans_the_transfer_critical_section() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
@@ -2939,6 +2994,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn partial_stage_is_not_listed_as_ready() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
@@ -2955,6 +3011,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn activation_rejects_size_and_digest_then_receipts_exact_bytes() -> Result<(), Box<dyn Error>>
     {
@@ -2989,6 +3046,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn activation_recovers_crash_after_atomic_rename() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
@@ -3017,6 +3075,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn activation_sync_failure_reports_visible_state_and_exact_retry() -> Result<(), Box<dyn Error>>
     {
@@ -3095,6 +3154,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn activation_source_sync_failure_records_destination_durability() -> Result<(), Box<dyn Error>>
     {
@@ -3135,6 +3195,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn ready_receipt_sync_failure_is_exactly_idempotent_and_conflict_safe()
     -> Result<(), Box<dyn Error>> {
@@ -3216,6 +3277,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn acquisition_journal_is_append_only_and_cleans_interrupted_temporaries()
     -> Result<(), Box<dyn Error>> {
@@ -3244,6 +3306,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn full_verification_detects_same_length_tampering() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
@@ -3303,6 +3366,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn traversal_and_unexpected_files_fail_closed() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
@@ -3328,6 +3392,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn immutable_external_rejects_wal_and_live_identity_is_distinct() -> Result<(), Box<dyn Error>>
     {
@@ -3410,6 +3475,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn registry_temp_event_is_ignored_and_removal_is_only_a_plan() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
@@ -3435,6 +3501,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_ready_receipt_remains_inspectable_but_not_visible() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
@@ -3498,6 +3565,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn receipt_bytes_are_derived_from_verified_files() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;
@@ -3515,6 +3583,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn competing_mutation_fails_fast_on_store_lock() -> Result<(), Box<dyn Error>> {
         let temporary = TempDir::new()?;

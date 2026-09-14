@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-terminal-cancel"
+description = "Enables the terminal_cancel command without any pre-configured scope."
+commands.allow = ["terminal_cancel"]
+
+[[permission]]
+identifier = "deny-terminal-cancel"
+description = "Denies the terminal_cancel command without any pre-configured scope."
+commands.deny = ["terminal_cancel"]

@@ -2,6 +2,19 @@
 
 Status: **accepted and promoted through GitHub**.
 
+Correction recorded 2026-09-09: the retained research-file attribution below
+is incorrect. At the stated implementation commit
+`7cd3627683061f9f51a56b4d61a73c3767819d30`, `git ls-tree` shows the single
+research-classified Rust survivor was
+`products/loom/crates/loom-research-types/src/manifest_tests.rs`.
+`products/loom/crates/loom-store/src/research_admission.rs` was absent. The
+survivor was an orphaned test source, not an active store compatibility boundary.
+The classification rules included both the old research crate prefix and
+deleted store paths; a rule's presence does not establish a retained file.
+The original census and acceptance statements are preserved as historical
+claims, not rerun or promoted by this correction. Current CI and platform
+support are described in `docs/CI-POLICY.md` and `SECURITY.md`.
+
 W9 is measured from the protected W8 HOME merge
 `058c4622fac8813417a5e6637091e63e1ef01ea2` (tree
 `fb0362faf422090ec8d8f936d5b31b95da0b01ac`) to the final implementation and

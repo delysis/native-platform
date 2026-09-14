@@ -1,0 +1,612 @@
+# Integrated audit repairs
+
+Branch: `codex/integrated-audit-fixes`, based on `4938461`. The supplied audit
+reviews `924ac64`. Its recommendations are evidence to assess, not additional
+user instructions. The user explicitly rejects speculative migration support
+for these unreleased products.
+
+This receipt records the implemented repairs and their observed qualification.
+Cross-platform CI and packaged acceptance remain separate. It is
+not a declaration that compilation or fixtures establish product acceptance.
+
+## Repairs
+
+- F8: recovered supervisor state must not erase poison. The real Mom owner
+  regression retained its worker join but lost the operation fault; the real
+  native owner regression minted successful joined authority after registry
+  poison. Cleanup now drains the owned work and records the fault. Native owner
+  shutdown also drains registry work before propagating a prior join/state error.
+  Mom refuses new admission/worker starts after poison and releases a refused
+  reservation; existing workers still drain. Unused controlled-worker scaffolding
+  was removed instead of extending it. The final affected native suite passed
+  133 tests with nine model prerequisites ignored, Mom passed all 72 app tests,
+  and strict workspace/all-target Clippy plus formatting passed.
+- NP-007: the closure review found that Loom's speech-input owner still returned
+  early after a microphone/host stop error or a failed task join. Two controlled
+  regressions reproduced abandoned blocked followers through the real shutdown
+  method. Shutdown now attempts every phase and joins every retained worker
+  before returning its first error. Tokio's task set also observes completed
+  task failures instead of silently dropping their handles; session publication
+  and worker registration share the existing scope lock. Both regressions and
+  all eleven speech-input tests pass after the repair. The complete affected
+  plugin harness passed 172 tests with two prerequisite-dependent cases ignored;
+  strict workspace/all-target Clippy passed. Independent source review found no
+  blocking ownership or drain defect. This closes the remaining
+  owner path rather than substituting the earlier underlying-host drain proof.
+- Packaged FTE qualification found an additional protocol-edge mismatch:
+  `/v1/models` advertised `local/default`, but submitting that exact ID returned
+  HTTP 503 because the codec split it into backend `local` and model `default`.
+  HTTP model IDs now remain opaque, including slashes. The actual HTTP router
+  regression failed with 503 before the repair and now accepts both one- and
+  multiple-slash IDs through the production codec and route selector. All 25
+  loopback/protocol tests and strict Clippy passed. An independent review found
+  no callers relying on the removed shorthand; canonical exact-route selection
+  remains available. Packaged requalification follows the pending UI/default work.
+- NP-002–005: FTE separates bounded authenticated control admission from
+  generation admission; response bodies own response-map registration. Requested
+  persistence failures and lost progress cannot produce successful completion.
+  Legacy Chat preserves tool calls; completion preserves every final choice and
+  emits a final suffix only when observed text is its prefix. Unrepresentable
+  output produces an error. Cancellation does not become a success terminator.
+- NP-012/F22: FTE and Loom inspect database identity before WAL/schema mutation.
+  Fresh/current formats are supported; incompatible formats are refused. Loom
+  has one current schema, with writing constraints, indexes, and triggers intact;
+  the fourteen-step migration chain and retired research tables are removed.
+  Opening a damaged project cannot create a replacement database. Existing
+  incompatible data is preserved; no speculative migration or backup framework
+  was introduced. The remaining FTE desktop v1-to-v2 upgrade is also removed;
+  a real prior-format file is rejected byte-for-byte without WAL/SHM creation.
+- F21/F14: Mom no longer automatically imports plaintext legacy JSON. Known
+  residual artifacts are refused before key/database creation. Explicit import
+  remains supported. A data-directory override cannot enable a deterministic
+  release key. Wrong keys do not rotate themselves; receipt insertion is unique.
+- F5: Mom callers receive an explicit runtime-owned operation scope. The global
+  host lookup and duplicate ambient-call wrappers are removed. A production
+  owner constructs its host, binds configuration, cancels its scope on drop,
+  and joins its workers. Native-host access does not recursively lock the
+  operation registry during Persona admission. Independently owned runtimes cannot discover each
+  other's host through ambient state.
+- Native empty-output and cancellation receipts preserve the actual invocation
+  fact from the owning stream lifecycle. Cancellation before admission remains
+  distinct from cancellation after the engine ran.
+- Loom avoids redundant editor property updates. Ordinary navigation removes
+  the completion decoration and its parent authority; Option word movement uses
+  WebKit's native word boundary and commits that selection to ProseMirror before
+  another refresh. This fixes a caret trapped next to a recently removed widget.
+  Real modifier-key rollback and refocus scenarios verify caret/document state.
+- F7: the production native worker supervisor invalidates Ready/active state on
+  unwind, including poisoned status locks, and preserves the failed join.
+- NP-008/F20: Information publication/removal errors retain exact committed
+  identity after rename. Same-identity retries sync the actual parent directories.
+  Unsupported synchronization cannot return success.
+- F15: Information, FTE, and Loom refuse unsupported private-storage capabilities
+  before mutation. Actual storage tests are Unix-scoped; portable logic remains
+  enabled and explicit non-Unix no-mutation regressions cover refusal.
+- NP-009: persistent cache metadata and encrypted entries are separate. Restoring
+  an entry reads that payload once. Owner generations are revalidated at live
+  promotion; corrupt metadata clears its family atomically. Updating one entry
+  preserves unrelated ciphertext. Mom conversation checkpoint lookup now supplies
+  the exact conversation owner, matching persistence; the old unowned lookup
+  could never reuse its own checkpoint.
+- NP-011: ZIM title ordering uses the path for an empty title, with independent
+  valid and reversed title-table fixtures.
+- F13: MCP configuration records executable SHA-256; every spawn checks it.
+  A replaced/missing executable requires reconfiguration. Managed Persona tools
+  retain native/no-argument restrictions. Scripts/interpreter inputs are not
+  represented as immutable or sandboxed. A replaced-script regression checks
+  that no marker process effect occurs.
+- F18: the pinned llama.cpp wrapper takes a destination slice and passes its real
+  length. Native export no longer needs an unsafe call. State import remains the
+  documented narrow unsafe boundary.
+- F17: Vitest/browser packages were updated to 4.1.11, chacha20 to 0.10.2, and the
+  GTK-compatible GLib 0.18.5 has a documented two-line upstream security backport.
+  Seven maintenance-only notices have scoped reasons and a 2026-12-09 review
+  date. No runtime vulnerability is waived. ort-sys already verifies the hash of
+  its downloaded archive; no redundant downloader was added.
+
+## Simpler development process
+
+Full CI executes one workspace matrix, doctests, and Linux Clippy. macOS adds
+browser interaction and packaging; frontend commands do not repeat Rust builds.
+Workspace execution reports failures across all binaries in one run instead of
+stopping after the first failing package and requiring another discovery cycle.
+The fuzz lane executes bounded inputs and retains crashes. A hash-pinned CPU
+model lane runs exact registered tests and rejects zero execution. Advisory
+checks scan the actual root and fuzz locks.
+
+PR selection uses Cargo's resolved and declared local dependency edges plus
+explicit non-Cargo rules. Unknown paths or unavailable metadata select full
+coverage. The old path planner, Mom overlay, and shadow comparison are removed.
+The obsolete W8/W9 `xtask lean` census is retired. Git retains its history.
+
+The eighteen existing Swift programs are extracted unchanged from the macOS
+smoke shell into `scripts/macos-smoke-support`. A safe Rust xtask command compiles
+and links them; the shell builds them once and reuses them for both launch/use/
+quit cycles. Full macOS CI and the selected release-tooling lane execute that
+compiler gate. Local compilation passed all eighteen programs; the compiled
+bundle-inventory helper also executed successfully. This closes the former
+shell-syntax-only check without rewriting the platform implementation.
+
+Mom's Consult-to-Persona migration and repair machinery is removed. Current
+builtin catalog updates still preserve user edits. The unused file-size-only
+native memory estimator and tests of its obsolete formula are removed;
+admission uses the configuration-sensitive estimator. Memory budget mode is
+explicit; the heuristic migration from historical default values is removed.
+
+Current contributor, product, security, and architecture documentation now
+states these boundaries. Dated ADRs and receipts remain historical. The W9
+correction names the actual orphan `manifest_tests.rs`, not the incorrectly
+attributed `research_admission.rs`; no historical evidence was silently resealed.
+
+Lifecycle finding qualifications remain explicit. F3's old universal-suite
+claim is superseded by `CURRENT-DECISIONS`; tests exercise actual owners with
+different scopes, not a universal acceptance matrix. F9's cancellation
+arbitration and F12's close-abort/resume are intentional behavior. For F10,
+executor drop requests cancellation while the actual Speech task supervisor
+retains monitor/backend-shutdown panic errors separately. F11's existing panic
+fixture covers its helper, not the full admission path. Source confirms the
+higher-level application/session poison mitigation; no additional observable
+admission leak was demonstrated. No stronger runtime proof is claimed for F11,
+and no generic conformance framework was introduced to satisfy a proposed test
+matrix.
+
+## Verification recorded so far
+
+Before the HTTP repairs, real adapter regressions observed control HTTP 429,
+a leaked response identity after body drop, and `response.completed` following
+storage failure. The independent valid ZIM archive also failed before repair.
+
+With the complete Rust 1.92 toolchain on PATH:
+
+- Consolidated workspace execution at `1135259` passed 1,591 tests in 63
+  harnesses, with 43 fixture-dependent tests ignored. This includes inherited
+  lifecycle, redirect, Speech, FTE, Information, and Mom/Loom store regressions.
+- Workspace doctests passed 20 cases across 44 harnesses, none ignored.
+- After the later cancellation/cache-owner fixes, the actual Mom library passed
+  172 tests, and FTE desktop/loopback activity passed 10 tests. The updated real
+  product cache scenario passed on Metal with the hash-verified Qwen fixture:
+  encrypted checkpoint creation, cold/warm reuse, explicit clearing, and cache
+  off were executed. This is product-runtime evidence, not packaged UI evidence.
+- Strict workspace/all-target Clippy passed after the final cache-owner and
+  CI runner corrections.
+- The wrapper's real CPU capacity test passed for zero, one, and undersized
+  buffers with canaries, then exact export/restore: 1 passed, none ignored.
+- Native saved-prefix live/durable restoration/context rejection and strict
+  pre-cancelled batch handling passed locally and in CI: two exact CPU tests.
+
+Other observed checks:
+
+- Full WebKit interaction suite: 74 passed after the native word-navigation fix;
+  the formerly intermittent rollback also passed in isolation. Svelte check
+  reports zero errors and warnings. The previous setProps-only repair passed
+  locally but failed in CI and was insufficient.
+- Loom unit suite passed 448 tests. Unit workers are capped at four; contention
+  with native CPU inference had exceeded the compiler test's five-second limit.
+  The limit was not increased.
+- Simplified metadata/planner checks: 37 passed. Consolidated workflow/planner,
+  ignored-registry, and backup checks: 120 passed. The changed workflow/registry
+  checks subsequently passed 63 cases.
+- Mom architecture and contracts passed (102 commands, 99 affordances, 46 effects,
+  36 parity rows, 58 upstream settings, zero blockers).
+- Current-document paths and ignored-test source registry validation passed.
+- Root/fuzz cargo-deny checks and JavaScript advisory scan passed after repairs.
+- CI `34401258044` passed frontend, policy, both bounded fuzz targets, and the
+  exact CPU model scenarios. Linux workspace tests/doctests/Clippy passed, but
+  its optimized GLib command could not test a non-workspace dependency. A small
+  Linux workspace integration target now exercises the real GLib string iterator
+  under release optimization. Windows compiled but correctly refused a private
+  loopback token in a test that assumed Unix support; desktop activity remains
+  portable, while the real private-token case is Unix-only. macOS compiled and
+  passed Rust tests, then reproduced the now-repaired native caret failure.
+  These failures are preserved, not relabeled as a green full run.
+- CI `34403997871` at `34980c0` passed Linux tests/doctests/Clippy and the optimized
+  GLib iterator, all three exact CPU model scenarios, frontend, policy, and fuzz.
+  macOS passed Rust tests/doctests, all 74 WebKit cases, and Loom/FTE packaging.
+  Windows passed the corrected FTE boundary and subsequently exposed 23 Mom
+  tests whose setup opened unsupported Information private storage. Those
+  composed-store tests now run only on Unix; independent supervisor, approval
+  worker, serialization, and policy tests remain portable. A Windows product
+  boundary test asserts refusal preserves existing source and creates no store.
+- The next consolidated local run completed 63 harnesses with 1,544 passes and
+  38 ignored cases. One additional Loom adapter harness was terminated after
+  an assertion unwind hung in a fixture that never completed cancellation;
+  this is not recorded as a passing consolidated run. That fixture now honours
+  cancellation and verifies delivered bytes across variable chunk boundaries,
+  retrying empty polls within a bounded deadline. Overflow, contiguous sequence,
+  and failed-terminal assertions remain intact. The final focused case passed
+  in 2.61 seconds; its full adapter harness then passed 48 tests with five
+  fixture-dependent cases ignored in 3.26 seconds. Together with the completed
+  unaffected harnesses this records 1,592 passing cases and 43 ignored cases,
+  not a claim that the interrupted invocation itself passed.
+- The FTE current/prior/foreign schema checks passed eight cases after removing
+  the upgrade path. Workflow and current-document checks passed 45 cases.
+  Strict workspace/all-target Clippy passed after all final fixture and schema
+  edits, using the existing dependency cache.
+
+Earlier Rust 1.95 results and the disk-full Rust 1.92 attempt are not substituted
+for current qualification. Commands select the complete 1.92 toolchain on PATH
+and reuse the active shared target. CI retains dependency caches on test failure;
+failed behavior still fails the aggregate. The model lane now includes Mom's
+registered product-cache integration test and rejects zero execution.
+
+## External wrapper
+
+Native-platform pins source commit `eb0e47b57c2fba97ed13e8fe5e949d11798232cb`.
+Draft PR: https://github.com/delysis/llama-cpp-rs/pull/11.
+
+The fork also retires upstream registry publication: it is consumed by immutable
+Git revision and must not accidentally package against the unrelated registry
+sys crate. Both crates are unpublished and upstream release-publication workflows
+are removed in `3cea96c5d09c1d9cdc0db418ea27d3f1e200465b`. Main's source pin need
+not change for workflow metadata.
+
+CI run 34394817229 passed Linux wrapper tests, Windows/macOS builds, workflow
+policy, and CUDA. The CUDA check took nearly its ninety-minute allowance because
+it built a multi-architecture binary. Commit `4c000bd5992da2a95beffe3b6777216f2a5fea67`
+pins Rust 1.92 and limits that compile check to representative CUDA architecture
+75 with a thirty-minute cap. Run `34403567854` passed all five jobs; CUDA completed
+in 26 minutes 24 seconds. This is compile coverage, not GPU runtime acceptance.
+
+## Local cache maintenance
+
+The user's September 9 instruction supersedes per-cache approval. The preference
+is saved. A dependency-free safe Rust helper checks Cargo identity, a fourteen-day
+age threshold, active builds, Cargo locks, symlinks, and open files. It only prunes
+reproducible Cargo output subdirectories; model fixtures and source stay intact.
+A real filesystem regression passed. The task automation currently follows audit
+CI every fifteen minutes; after completion it returns to daily 04:00 cleanup,
+quiet on successful cleanup or active-build deferral. It never broadens the
+helper's deletion paths or falls back to manual deletion. Research databases,
+including Alexandria, Community Archive, Encyclopedia, and MPC, were verified
+present after cleanup; the major Alexandria and Community Archive databases
+also opened successfully read-only.
+
+The automatic sweep removed 228,332,165,314 bytes, in addition to the obsolete W1
+and W9 targets. Available space was approximately 193 GiB after resumed builds.
+The disk blocker and old approval request are resolved.
+
+## Qualification checkpoints
+
+Full CI `34406935088` completed successfully at `6d49d14`: all eight jobs passed,
+including Windows, macOS, Linux, browser interactions, bounded fuzz execution,
+and the selected real-model scenarios. This qualifies the FTE schema
+simplification, Mom platform fixtures, and Loom cancellation fixture repair.
+
+The subsequent unused Consult engine and hidden CLI were removed; the current
+Persona catalog, mentions, and groups remain. Affected Mom checks passed 168
+library, 34 runtime integration, 71 app, and 11 CLI integration cases; thirteen
+prerequisite-dependent cases were skipped across those harnesses. Strict
+workspace/all-target Clippy passed. The ignored registry now contains 42 entries
+because the removed engine's integration case has no remaining implementation.
+
+The existing current four-Persona scenario passed with the hash-verified Qwen
+fixture on Metal in 10.88 seconds. It exercised targeted cancellation, real
+synthesis, attribution, and unchanged source conversations and Persona versions.
+Its dispatch worker now explicitly carries the thread-local fixture directory;
+previously it lost that binding and correctly hit the incompatible default-store
+rejection. Failure diagnostics now join the dispatch and expose its actual result.
+
+The FTE real OS credential test passed in 0.39 seconds, including create, replace,
+readback and deletion of a disposable Keychain entry. Two separate normal Mom
+CLI processes created and reopened the same encrypted conversation through the
+OS Keychain resolver with the environment-key override unset and secure storage
+explicitly enabled for the debug executable. These checks establish the named
+runtime paths, not release-bundle UI acceptance.
+
+Run `34409139337` at `ceaf885` passed Linux, macOS, Windows, model integration,
+frontend, and fuzz, while its policy tests exposed two stale copied ignored-test counts.
+Those assertions now use source reconciliation and a small explicit platform
+fixture; the complete 120-case policy test command passed locally. The subsequently found
+HTTP model-ID repair and the user's new UI/default-model punch list are not
+covered by that earlier revision.
+
+Keep packaged
+interaction, OS credentials, native quit/join, and reopen
+evidence separate from compilation and controlled fixture execution. No merge
+or distribution is implied by this receipt.
+
+## September 9 product punch list
+
+The first Mom pass used a compact overlay titlebar for Settings and the sidebar
+toggle, retaining native decorations and lowering the minimum to 640 by 480.
+The one-line composer grows with its draft; the permanent shortcut row, fixed
+150-pixel composer floor, and 180-pixel transcript spacer are removed. The
+space-efficiency preference is recorded in the root and Mom instructions.
+
+A small std-only workspace crate owns the official Gemma 4 12B QAT Q4_0
+artifact identity and exact Hugging Face cache lookup. Fresh Mom/FTE setup
+uses that cached candidate while preserving explicit choices. Loom's catalog
+shares the identity; its existing policy already prefers the official 12B
+artifact. Normal model inspection and validation still apply. The local
+6,975,879,296-byte artifact matched SHA-256
+`93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b`.
+The hidden Mom server CLI shim and obsolete cache-policy spellings are removed;
+current model residency, MCP, and cache commands remain.
+
+The consolidated Rust run recorded 1,586 passes, 42 prerequisite-dependent
+ignores, and one obsolete assertion requiring the previous 760-pixel minimum.
+That assertion now verifies entry into the actual compact breakpoint; the
+affected app harness then passed all 71 tests. Strict workspace Clippy, the
+120-case policy command, ignored-source reconciliation, Mom architecture, and
+29 frontend tests passed. This records the failed invocation and its focused
+repair rather than relabeling the original run as green.
+
+The active isolated Mom session now uses Gemma and normal reasoning parsing.
+Messages and system prompts were compared and preserved in all fifteen
+conversations/Personas. The supported model-selection command loaded Gemma on
+Metal and returned `host_integrated`. Native UI layout/resizing and the rebuilt
+FTE API journey remain to execute. Full CI `34411484993` passed all eight jobs
+at `54136ce`, including all three desktop platforms. That revision predates the
+following second UI pass.
+
+The user rejected the first layout pass after actual use. Settings now occupies
+a compact right sidebar instead of a centered modal. Conversation content uses
+the remaining width; invisible message actions reserve no row height. Duplicate
+headings, oversized sidebar branding, fixed reading gutters, and extra composer
+form margins are removed. Switching conversations updates the sidebar's chat
+instructions without replacing unrelated settings edits. The normal AppKit
+titlebar replaces Overlay/hiddenTitle; the webview no longer reserves stoplight
+space or repeats the native title. This is the standard native fallback, not a
+claim that the reported missing-stoplight or resize-cursor cause is established.
+
+The affected Mom app harness passed all 71 tests. Focused WebKit geometry checks
+covered 640 by 480 and desktop layouts, and the actual conversation-refresh
+function preserved unrelated settings edits/focus and rejected a stale projection.
+The debug bundle built in 7.98 seconds and passed local ad-hoc signature checking.
+The Mac was locked before native interaction could resume; the user's existing
+Mom process and conversation were preserved. Native controls, edge cursors and
+resize behavior still require verification in the rebuilt running app.
+
+The closure review also corrected two FTE documents that still described the
+removed schema upgrade as current. Historical receipts retain their original
+scope. Native memory reservations remain explicitly heuristic; no measured
+supported-device envelope or hard process-memory limit is claimed.
+
+Native access briefly resumed. The old Mom process was observed idle with an
+empty draft, then quit normally: native and speech hosts joined, all six named
+workers joined, zero operations/tasks remained, and the drain completed in
+110 milliseconds. The new sidebar bundle launched against the same encrypted
+store, but normal Keychain access remained pending in SecurityAgent. Computer
+Use refuses that protected app; the user was asked to complete the prompt.
+The screen subsequently locked again. No key override or alternate store was
+used to turn this into a claimed successful reopen.
+
+The current FTE bundle started its authenticated loopback at port 18491 through
+Settings. The advertised `local/default` now routes to actual local Gemma
+inference and its completed response can be retrieved from the response store.
+However, its generated text exposed another true defect: the shared model-default
+chat renderer used old Gemma framing for Gemma 4. The same sentence with the
+official Gemma 4 framing through raw completion immediately produced a normal
+13-token answer. Successful HTTP transport is therefore not recorded as model
+acceptance. A separate live cancellation after the first text delta returned
+`cancelling`, then `response.incomplete`, with no `response.completed` event.
+
+The shared renderer now recognizes Gemma 4 before the pinned simple-template
+API can misclassify it. It requires the supported canonical embedded template
+and follows its default non-thinking text semantics, assistant history and turn
+markers; ordinary tokenization adds BOS once. Unstructured tool turns without
+required call metadata fail explicitly. Other model families and explicit
+template choices retain their own paths. The native renderer suite passed;
+the identical packaged FTE request subsequently passed on the rebuilt bundle.
+
+At `e576891`, packaged FTE returned “The small boat reached the shore just as
+the sun began to set.” through the ordinary `local/default` Responses route:
+14 output tokens, `response.completed`, and `real_local_inference: true`.
+Retrieving that response returned the same text and completed status. A fresh
+stream cancelled after its first text delta returned `cancelling`, followed by
+`response.incomplete` and no completed event. Evidence is retained in
+`/tmp/integrated-audit-fte-e576891-{stream.sse,retrieved.json,cancellation.json}`.
+The preceding loaded-model FTE process quit normally in 107 milliseconds:
+gateway drained, native host joined, eight of eight workers joined, and no
+retained tasks. Reopening the rebuilt bundle displayed its persisted activity.
+
+The current Mom bundle reopened the existing store as far as the normal
+Keychain unlock screen; its new “Mom Llama” bootstrap title identifies the
+updated assets. The protected prompt and then the locked Mac still prevent
+native sidebar, stoplight and resize acceptance. The user's store remains
+untouched. Source review also leaves titlebar integration explicitly open:
+`Visible` retains a separate 38-pixel web control row. The installed safe Tauri
+API supports integrated decorated Overlay mode, but repositioning native
+buttons is not evidence that the missing-control report has been repaired.
+No new unsafe native toolbar bridge was introduced to evade that boundary.
+Loom's isolated native run exposed a separate startup failure:
+the default Gemma configuration reserves 36,806,870,528 heuristic bytes against
+a 12,884,901,888-byte host budget. The context selector used available system
+RAM without considering that host limit, choosing 131,072 cells on this
+machine. A focused regression reproduced those exact numbers before repair.
+
+The selector now bounds available RAM minus system headroom by the immutable
+host budget before allocating model, projector, workspace and context. The
+desktop and existing real-model writer check call the same runtime method;
+system memory sampling moved with it instead of being duplicated. The cap
+and native admission estimator remain unchanged. The official model selects
+4,096 cells; native admission estimates 9,767,211,792 bytes, while the product's
+more conservative sizing accounts for 12,249,547,296 bytes. Both are below the
+12 GiB cap. Existing output allowances and typed over-budget refusals remain.
+
+All four focused context tests passed. The existing opt-in four-way writer
+acceptance then loaded the exact cached model and projector on Metal and
+produced four ordinary prose continuations, passing in 16.76 seconds. Logs:
+`/tmp/integrated-audit-loom-memory-{before,after}.log` and
+`/tmp/integrated-audit-loom-gemma-writer-after.log`. This is real backend
+generation evidence; the visible native writing interaction remains open.
+
+Full CI `34412937976` passed all eight jobs at `f0c3ca8`. It qualifies the second
+Mom layout pass and the Loom speech drain repair, and predates the Gemma 4
+renderer and poison-evidence changes described above.
+
+Full CI `34414775472` passed at `e576891`, including Linux, macOS, Windows,
+frontend, policy, model integration and fuzz. It predates the newly reproduced
+Loom context-sizing defect's repair.
+
+Native access subsequently resumed. The `8a6a155` Loom bundle (PID 70239,
+executable SHA-256 `3851c06b591a33f237570bf08e909e413e09557a6e422a8a3599a6dcaacddcfc`)
+loaded Gemma and displayed four completion alternatives in its actual editor.
+Option-Right accepted one word; Tab accepted the remaining visible continuation.
+Turning autocomplete off removed the ghost presentation while preserving the
+accepted manuscript. Normal Command-Q ended the process and deallocated Metal
+buffers. Reopening restored the exact accepted text and the off preference.
+The isolated manuscript hash is
+`06eaecf243cc10b0bd1e7b7ee24240e38dd04d7fb8f8d6b4fca838db735ed9be`.
+This qualifies that writing path, without claiming a separately instrumented
+per-worker shutdown receipt or live in-flight cancellation from an idle toggle.
+
+During the same native session, the system control indicator occupied the
+traffic-light location in both Mom's stock Visible titlebar and macOS Finder.
+Both exposed native close/minimize/zoom accessibility controls. An edge drag
+visibly resized Mom's window. These observations establish that retaining the
+extra web toolbar row does not solve the indicator seen during Computer Use.
+Mom now uses decorated Overlay with its native title retained, controls in one
+38-pixel row, a 76-pixel macOS windowed inset, and a 6-pixel inset in fullscreen
+or on other platforms. All 29 frontend tests and six WebKit geometry cases
+passed. The normal encrypted-store Keychain prompt still gates the actual
+sidebar and integrated-titlebar interaction; that acceptance remains open.
+
+The rebuilt `f54c539` Mom bundle was subsequently exercised in its supported
+empty development store, explicitly separate from the user's encrypted store.
+The fixture is recorded in
+`/tmp/integrated-audit-mom-layout-development-directory.txt`; no key override or
+user-data copy was used. Actual native screenshots show the integrated toolbar,
+native title and red/yellow/green controls, right settings sidebar, and compact
+composer. Corner dragging reached exactly 640 by 480 with usable 320-pixel chat
+and settings panes; dragging the right edge expanded the window to 1101 by 480.
+Gemma returned “Hello!” to the fixture prompt while settings remained open and
+its current-chat instructions updated correctly. This qualifies native layout
+and chat in the development fixture, not encrypted-store reopening.
+
+FTE's current renderer also completed normal native quit and reopen after the
+real request/cancellation checks: 93 milliseconds, gateway drained, native host
+joined, eight of eight workers joined, no retained tasks, and stored activity
+restored. Its Overview exposed a presentation defect: the latest recorded
+request was cancelled (`499`) but labelled “Last call failed”. Cancellation now
+leaves an otherwise ready provider ready, and Activity displays neutral
+“Cancelled”; actual unavailable/quota states and failures retain precedence.
+Ten lifecycle tests and three frontend tests passed.
+
+Native Mom settings review removed ten inactive upstream-only controls, their
+unused rendering machinery, defaults and write authority. The historical
+58-key parity ledger remains intact; the active contract now follows its 48
+implemented entries. Existing unconsumed stored values remain inert and
+unchanged. Working model, MCP, permission and attachment controls remain.
+The empty chat uses Mom branding, and the settings close button uses an X.
+
+A further completion check found `settings.json` omitted from the current-only
+store guard. Production `resolve_settings` still parsed and imported that file,
+including its legacy shape. The actual fixture demonstrated the import before
+repair. The file now joins the existing early plaintext rejection list, before
+credential lookup or database creation, and all legacy parser/conversion/import
+and migration-receipt code is removed. Thirteen config tests and the six-file
+store rejection check passed, including byte preservation and no database
+creation for the refused file. All 29 Mom frontend tests, contract checks,
+19 actual app-binary view tests, and strict workspace Clippy passed. The first
+library-only view-test filter selected zero tests and is not counted as evidence;
+the corrected binary-target invocation executed the 19 tests.
+
+Full CI `34416191301` passed at `8a6a155`, qualifying the Loom memory repair.
+It predates the final Mom settings and FTE cancellation-display cleanup above.
+
+The `359bb9f` Mom and FTE debug bundles built sequentially in 8.07 and 4.32
+seconds and passed strict ad-hoc signature verification. Mom executable hash:
+`2801d7a1da84e751adef41871b5a00c721c95d2a5a03ea579083faa5bde3cbeb`;
+FTE executable hash:
+`3a4d43ae51bd936c14170c9c125f48e9f805365d27b6676b5df7f6e9992c6fee`.
+The final Mom development-store run (PID 76160) restored the fixture conversation,
+showed the active-only right settings sidebar with the X close control, and
+closed that sidebar correctly. The preceding loaded-model fixture quit joined
+its operation worker, native slot and persona recovery worker in 110 ms with
+no retained work. The development run was then quit normally and the final
+bundle relaunched against the original encrypted `/tmp/mom-audit-bundle.R1ZWQT`
+store with secure storage enabled (PID 76226). It again reached the native
+Keychain wait; encrypted-store reopen remains unverified and requires the user.
+The final FTE run (PID 76262) showed the same five stored requests and 275 tokens,
+now with a ready local provider and neutral Cancelled rows in native Activity.
+Full CI `34418019361` completed successfully at production-code checkpoint
+`359bb9f82ee1bff5952596fc85ab00415ee3a4bd`: all eight jobs passed, including
+Linux, macOS, Windows, model integration, frontend, fuzz, policy and the aggregate
+gate. Its existing watcher exited successfully; no duplicate matrix or unchanged
+local rebuild was started. Later receipt-only commits do not require rebuilding
+these unchanged executables.
+
+The remaining acceptance boundary is reopening Mom's original encrypted store
+through normal OS credential access. The app was observed waiting for its
+Keychain unlock; the subsequent final check was prevented by the locked Mac.
+Computer Use cannot operate SecurityAgent. This requires the user to unlock the
+Mac and approve the normal Keychain prompt, and has persisted across multiple
+goal turns. The goal is blocked on that user action, not marked complete. No
+credential override, original-store mutation or substitution of fixture evidence
+was used. The audit polling automation returns to daily deterministic cache
+maintenance while this user action is pending.
+
+### September 10 native follow-up
+
+The protected-store boundary is now verified. The unchanged Mom executable
+(`2801d7a1da84e751adef41871b5a00c721c95d2a5a03ea579083faa5bde3cbeb`)
+reopened the original encrypted `/tmp/mom-audit-bundle.R1ZWQT` store with secure
+storage enabled, PID 98321. Native accessibility showed the original four-message
+conversation, including both user prompts and replies, and the saved official
+Gemma model selection. The prior run also logged successful native/speech joins
+and persona recovery on quit. No fixture substitution or key override was used.
+
+The user's September 10 crash report revealed a separate FTE exit defect. Its
+binary UUID `41D9FE66-0B97-3A96-A35B-B61651BC255F` matches the final `359bb9f`
+executable above. AppleEvent Quit entered AppKit termination and reached
+`RunEvent::Exit` without `ExitRequested`; the application's unconditional final
+exit fallback called `std::process::abort`. The matching PID 76262 stderr records
+that exact branch. Previous Cmd+Q acceptance did not qualify this OS quit path.
+
+FTE now synchronously drains the same application-owned runtime at that final
+boundary, returning to AppKit only after the existing exact worker/native join
+check succeeds. Cmd+Q shares the drain/report policy. The unused plugin exit
+override and its mirror-only test are removed: the plugin's final event hook
+joins loopback listeners and Gateway work before the desktop joins its native
+host. Repeated/concurrent calls retain the existing owners and shutdown reports.
+No native bridge, extra runtime or replacement shutdown framework was added.
+
+The affected desktop library passed 49 tests (two prerequisite-dependent cases
+ignored); the plugin passed four. The new desktop regression invokes the actual
+final-exit function alongside requested shutdown. The existing async-runtime
+cleanup check now opens real listeners, cleans up twice and rebinds the same
+addresses on Unix; its portable cleanup assertions remain enabled elsewhere.
+Strict affected-package/all-target Clippy and formatting passed. Independent
+source review found no remaining event-ordering or ownership blocker. Native
+loaded-model OS-quit verification subsequently passed at `d88949f`:
+
+- The FTE debug bundle built in 4.83 seconds and passed strict ad-hoc signature
+  verification. Executable SHA-256:
+  `13043c04c58947bc9b0fad46ba760c5e2e9b8bcac4debf0a8c8d021717440910`.
+- PID 4926 served a real local Gemma response, then Activity Monitor's ordinary
+  Quit action exercised the final OS-exit path. The plugin joined both actual
+  loopback listeners, followed by the final-exit log, Metal deallocation, and
+  eight expected/eight joined gateway workers with zero retained tasks. The
+  native-host drain took 113 ms. The process disappeared and both listener
+  addresses rebound. Reopening preserved all six requests/302 tokens; API
+  retrieval returned the unchanged completed response
+  `resp_2b73600b-ac50-40dd-9e6e-2323b17dd8a4`.
+- PID 5296 then served a longer real Gemma stream. After output was observed,
+  ordinary OS Quit cancelled the active request: 1,588 output deltas, exactly
+  one `response.incomplete`, no `response.completed`. The plugin again joined
+  both listeners, Metal was freed, and eight/eight gateway workers joined with
+  zero retained tasks; native-host drain took 202 ms. This is active-generation
+  evidence, not an idle-toggle substitute. The process disappeared; the
+  listeners rebound with `SO_REUSEADDR` after the active TCP connection entered
+  normal TIME_WAIT (the initial plain bind was correctly refused by the kernel).
+- The only FTE crash report still present was the original PID 76262 report.
+  Final reopen PID 7019 displayed seven requests/1,938 tokens, a Ready local
+  provider, and the new request as Cancelled in native Activity. The isolated
+  credential fixture remains explicitly separate from hosted credential proof.
+
+Native logs and wire evidence are `/tmp/integrated-audit-fte-d88949f.stderr`,
+`/tmp/integrated-audit-fte-d88949f-reopen.stderr`,
+`/tmp/integrated-audit-fte-d88949f-generation.json`, and
+`/tmp/integrated-audit-fte-d88949f-active-quit.sse`. Full CI `34535642710`
+passed all eight jobs at production checkpoint
+`d88949fbd6be5b7e7ba70ac5120adb4fec636248`. Its logs confirm execution of both
+the actual-owner final-exit regression and async-runtime cleanup regression on
+Linux, macOS and Windows. The existing watcher exited successfully. The external
+wrapper PR 11 remains open/draft at `4c000bd5992da2a95beffe3b6777216f2a5fea67`,
+with all five checks passing.
+
+The original audit dispositions above, native UI/default work, protected-store
+reopen and reported OS-quit crash now have their recorded verification. No
+required audit work remains open. Daily deterministic cache maintenance remains
+in place. Receipt-only updates do not require rebuilding unchanged executables.

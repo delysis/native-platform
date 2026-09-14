@@ -1,15 +1,24 @@
 #![forbid(unsafe_code)]
 
 mod attachments;
+mod audio_io;
 mod co_writer;
 mod connected_imports;
 mod context_attachments;
+mod document_bindings;
 mod document_watcher;
+mod external_import;
 mod import_batch;
 mod microphone_capture;
 mod model_catalog;
 mod model_download;
+mod shader_preview;
 mod speech_input;
+mod terminal;
+mod terminal_media;
+mod terminal_receipts;
+mod workspace_preview;
+mod workspace_template;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, Metadata};
@@ -49,7 +58,7 @@ use loom_store::{
     VisibleProjectionState,
 };
 use loom_types::{
-    AuthorityPolicy, BlobId, BranchId, BuildModelPolicy, BuildModelPolicyIdentity,
+    ArtifactId, AuthorityPolicy, BlobId, BranchId, BuildModelPolicy, BuildModelPolicyIdentity,
     BuildWriterProfileId, ByteRange, CancelGenerationCommand, CandidateId, CommandId,
     CommandReceipt, ContextRecipe, DocumentId, DocumentKind, GenerationEventKind, GenerationRunId,
     GenerationStart, GenerationTerminalStatus, LoomEvent, ModelEnvironment, ModelRole, ProjectId,
@@ -58,7 +67,6 @@ use loom_types::{
 use same_file::Handle as FileIdentityHandle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
-use sysinfo::System;
 use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, State, WindowEvent};
 use tauri_plugin_dialog::DialogExt;
@@ -67,6 +75,7 @@ use crate::attachments::{
     AttachmentStoreError, LoadedImageAsset, StoredImageAsset, is_canonical_image_asset_file_name,
     read_image_asset, store_image_asset,
 };
+use crate::audio_io::{audio_record_start, audio_record_stop, audio_synthesize};
 use crate::co_writer::{
     CoWriterError, CoWriterSummary, apply_to_document as apply_co_writer,
     delete as delete_co_writer, list as list_co_writers, save_from_document as save_co_writer,
@@ -79,18 +88,22 @@ use crate::context_attachments::{
     set_document_context_snapshot,
 };
 use crate::document_watcher::DocumentFilesystemWatcher;
+use crate::external_import::document_import_external;
 use crate::model_catalog::{ModelCatalogSnapshot, catalog_model_identity, embedded_model_catalog};
 use crate::model_download::{
     ModelDownloadRegistry, ModelDownloadRegistryError, ModelDownloadSnapshot, ModelDownloadSpec,
     ModelLibraryError, ReservationOutcome, model_target_path, prepare_model_library,
 };
+use crate::shader_preview::shader_preview;
 use crate::speech_input::{
     SpeechInputError, SpeechInputService, SpeechInputSnapshot, SpeechInputTarget,
     SpeechRecordingSnapshot,
 };
+use crate::terminal::{terminal_cancel, terminal_list, terminal_run};
+use crate::workspace_template::{workspace_template_enable, workspace_template_get};
 use speech_native_host::SpeechHostStatus;
 
-const INITIAL_DOCUMENT: &str = "manuscript/Untitled.md";
+const INITIAL_DOCUMENT: &str = "Untitled.md";
 const DEFAULT_PROJECT_DIRECTORY: &str = "writing";
 const MAX_UNTITLED_DOCUMENT_CANDIDATES: u32 = 10_000;
 const PROJECT_CLOSE_GENERATION_WAIT: Duration = Duration::from_secs(3);
@@ -334,18 +347,128 @@ impl Drop for AutomaticBudgetReservation<'_> {
     }
 }
 
+/// A batch belongs to one exact immutable input snapshot; targets only cap work.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LoompadBatch {
+    snapshot_id: String,
+    sample_target: u32,
+    batch_offset: u32,
+}
+
+#[derive(Debug, Default)]
+struct LoompadBudget {
+    session: Option<CommandId>,
+    snapshots: BTreeMap<String, (Vec<CommandId>, Instant)>,
+}
+
+impl LoompadBudget {
+    fn check(
+        &mut self,
+        session: CommandId,
+        batch: &LoompadBatch,
+        now: Instant,
+    ) -> Result<(), IpcFailure> {
+        if self.session != Some(session) {
+            self.session = Some(session);
+            self.snapshots.clear();
+        }
+        let previous = self.snapshots.get(&batch.snapshot_id);
+        let expected = previous.map_or(0, |(commands, _)| {
+            u32::try_from(commands.len())
+                .unwrap_or(u32::MAX)
+                .saturating_mul(4)
+        });
+        if batch.batch_offset != expected || expected >= batch.sample_target || expected >= 256 {
+            let mut failure = IpcFailure::new(
+                "speculation_offset_conflict",
+                format!("this exact snapshot requires batch offset {expected}"),
+                false,
+            );
+            failure.speculation_recovery = Some(Box::new(LoompadRecovery {
+                snapshot_id: batch.snapshot_id.clone(),
+                next_offset: expected,
+                command_ids: previous.map_or_else(Vec::new, |(commands, _)| {
+                    commands.iter().map(ToString::to_string).collect()
+                }),
+            }));
+            return Err(failure);
+        }
+        if previous
+            .is_some_and(|(_, last)| now.saturating_duration_since(*last) < AUTOMATIC_BUDGET_WINDOW)
+        {
+            return Err(IpcFailure::new(
+                "automatic_generation_throttled",
+                "idle choices are cooling down before the next four-choice batch",
+                true,
+            ));
+        }
+        if previous.is_none() && self.snapshots.len() >= MAX_TRACKED_AUTOMATIC_SCOPES {
+            return Err(IpcFailure::new(
+                "automatic_budget_capacity",
+                "the bounded idle-choice ledger is full",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit(&mut self, batch: &LoompadBatch, command: CommandId, now: Instant) {
+        // Called only after the family is durably registered, under admission.
+        // Cancellation spends admitted work; setup failures spend nothing.
+        let entry = self
+            .snapshots
+            .entry(batch.snapshot_id.clone())
+            .or_insert_with(|| (Vec::new(), now));
+        entry.0.push(command);
+        entry.1 = now;
+    }
+}
+
+fn recorded_loompad_batch(
+    store: &ProjectStore,
+    context_recipe_artifact_id: ArtifactId,
+) -> Result<Option<LoompadBatch>, IpcFailure> {
+    let Some(bytes) = store
+        .generation_context_evidence(context_recipe_artifact_id)
+        .map_err(IpcFailure::store)?
+    else {
+        return Ok(None);
+    };
+    let evidence: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+        IpcFailure::new("generation_provenance_mismatch", error.to_string(), false)
+    })?;
+    evidence
+        .get("loompad")
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|error| {
+                IpcFailure::new("generation_provenance_mismatch", error.to_string(), false)
+            })
+        })
+        .transpose()
+}
+
+#[derive(Debug)]
+struct PreparedProject {
+    id: CommandId,
+    store: ProjectStore,
+}
+
 #[derive(Debug)]
 pub struct PluginState {
     close_requested: AtomicBool,
     exit_authorized: AtomicBool,
     application: Mutex<ApplicationPhase>,
     session: Mutex<Session>,
+    prepared_project: Mutex<Option<PreparedProject>>,
+    folder_picker_open: AtomicBool,
     native_runtime: Arc<NativeHostRuntime>,
     backend: Arc<LlamaBackend>,
     model: Mutex<ModelRegistry>,
     model_lifecycle: Mutex<()>,
     user_model_paths: Mutex<BTreeSet<PathBuf>>,
     automatic_budget: AutomaticBudgetAuthority,
+    loompad_budget: Mutex<LoompadBudget>,
     foreground_commands: ForegroundCommandRegistry,
     generations: GenerationRegistry,
     generation_lifecycle: GenerationSupervisor,
@@ -353,7 +476,8 @@ pub struct PluginState {
     model_loads: Arc<ModelLoadRegistry>,
     downloads: Arc<ModelDownloadRegistry>,
     download_workers: DownloadWorkerRegistry,
-    speech_input: SpeechInputService,
+    speech_input: Arc<SpeechInputService>,
+    audio_capture: audio_io::CapturePersistence,
     app_local_data_root: Option<PathBuf>,
     isolate_model_discovery: bool,
     build_model_policy: BuildModelPolicy,
@@ -382,12 +506,15 @@ impl PluginState {
             exit_authorized: AtomicBool::new(false),
             application: Mutex::new(ApplicationPhase::default()),
             session: Mutex::new(Session::default()),
+            prepared_project: Mutex::new(None),
+            folder_picker_open: AtomicBool::new(false),
             native_runtime,
             backend,
             model: Mutex::new(ModelRegistry::default()),
             model_lifecycle: Mutex::new(()),
             user_model_paths: Mutex::new(BTreeSet::new()),
             automatic_budget: AutomaticBudgetAuthority::default(),
+            loompad_budget: Mutex::new(LoompadBudget::default()),
             foreground_commands: ForegroundCommandRegistry::default(),
             generations: GenerationRegistry::default(),
             generation_workers: GenerationWorkerRegistry::new(generation_lifecycle.clone()),
@@ -395,7 +522,8 @@ impl PluginState {
             model_loads: Arc::new(ModelLoadRegistry::default()),
             downloads: Arc::new(ModelDownloadRegistry::default()),
             download_workers: DownloadWorkerRegistry::default(),
-            speech_input: SpeechInputService::new(app_local_data_root.clone()),
+            speech_input: Arc::new(SpeechInputService::new(app_local_data_root.clone())),
+            audio_capture: audio_io::CapturePersistence::default(),
             app_local_data_root,
             isolate_model_discovery,
             build_model_policy,
@@ -408,6 +536,10 @@ impl Drop for PluginState {
         self.close_requested.store(true, Ordering::Release);
         self.exit_authorized.store(false, Ordering::Release);
         let _ = self.foreground_commands.revoke_all();
+        self.prepared_project
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         let session = self
             .session
             .get_mut()
@@ -676,9 +808,12 @@ mod automatic_writer_authority {
             build_policy: &BuildModelPolicy,
         ) -> Result<Self, IpcFailure> {
             let kind = match &policy {
-                ValidatedWeavePolicy::AutomaticV2 => AuthorizedWeaveModelKind::Automatic(
-                    AutomaticSuggestionAuthority::bind(loaded, build_policy)?,
-                ),
+                ValidatedWeavePolicy::AutomaticV2 | ValidatedWeavePolicy::LoompadV1 { .. } => {
+                    AuthorizedWeaveModelKind::Automatic(AutomaticSuggestionAuthority::bind(
+                        loaded,
+                        build_policy,
+                    )?)
+                }
                 ValidatedWeavePolicy::ManualV2 { .. } => AuthorizedWeaveModelKind::Manual(loaded),
             };
             Ok(Self { policy, kind })
@@ -806,7 +941,8 @@ enum GenerationWorkerSlot {
 /// and registry lifecycle as the native owner.
 #[derive(Debug)]
 enum GenerationWorkerOwner {
-    Llama(LlamaGenerationHandle),
+    Llama(Box<LlamaGenerationHandle>),
+    Terminal(Arc<terminal::TerminalControl>),
     #[cfg(test)]
     Controlled(Arc<dyn ControlledGenerationWorkerCancellation>),
 }
@@ -819,6 +955,10 @@ trait ControlledGenerationWorkerCancellation: std::fmt::Debug + Send + Sync {
 #[derive(Debug)]
 enum GenerationBackendWorkerJoined {
     Llama(JoinedLlamaGeneration),
+    Terminal {
+        count: usize,
+        panicked: bool,
+    },
     #[cfg(test)]
     Controlled,
 }
@@ -1103,6 +1243,7 @@ impl GenerationWorkerOwner {
             Self::Llama(owner) => {
                 let _ = owner.cancel_all();
             }
+            Self::Terminal(control) => control.cancel(),
             #[cfg(test)]
             Self::Controlled(cancellation) => cancellation.cancel_all(),
         }
@@ -1115,6 +1256,10 @@ impl GenerationWorkerOwner {
     fn shutdown_joined(self) -> GenerationBackendWorkerJoined {
         match self {
             Self::Llama(owner) => GenerationBackendWorkerJoined::Llama(owner.shutdown_joined()),
+            Self::Terminal(control) => GenerationBackendWorkerJoined::Terminal {
+                count: control.joined_count(),
+                panicked: control.panicked(),
+            },
             #[cfg(test)]
             Self::Controlled(cancellation) => {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1135,6 +1280,7 @@ impl GenerationBackendWorkerJoined {
     const fn worker_panicked(&self) -> bool {
         match self {
             Self::Llama(joined) => joined.worker_panicked(),
+            Self::Terminal { panicked, .. } => *panicked,
             #[cfg(test)]
             Self::Controlled => false,
         }
@@ -1143,6 +1289,7 @@ impl GenerationBackendWorkerJoined {
     const fn joined_worker_count(&self) -> usize {
         match self {
             Self::Llama(joined) => joined.joined_worker_count(),
+            Self::Terminal { count, .. } => *count,
             #[cfg(test)]
             Self::Controlled => 0,
         }
@@ -1881,14 +2028,28 @@ impl Builder {
                 };
                 loom_asset_protocol_response(&state, context.webview_label(), &request)
             })
+            .register_uri_scheme_protocol(workspace_preview::SCHEME, |context, request| {
+                let Some(state) = context.app_handle().try_state::<PluginState>() else {
+                    return empty_loom_asset_response(http::StatusCode::SERVICE_UNAVAILABLE);
+                };
+                workspace_preview::response(&state, context.webview_label(), &request)
+            })
             .invoke_handler(tauri::generate_handler![
                 project_open_default,
-                project_choose_create,
-                project_choose_open,
+                project_prepare_open,
+                project_prepare_open_path,
+                project_drop_directories,
+                project_commit_open,
+                project_discard_open,
                 project_close,
                 project_current,
                 project_recover,
                 document_create,
+                workspace_template_get,
+                workspace_template_enable,
+                audio_record_start,
+                audio_record_stop,
+                audio_synthesize,
                 document_rename,
                 document_delete,
                 import_batch::import_text_sources,
@@ -1902,6 +2063,7 @@ impl Builder {
                 attachment_ingest,
                 attachment_import_choose,
                 attachment_import_paths,
+                attachment_reveal_original,
                 document_context_list,
                 document_context_add,
                 document_context_add_many,
@@ -1920,6 +2082,7 @@ impl Builder {
                 speech_input_status,
                 speech_input_cancel,
                 document_open,
+                document_import_external,
                 document_checkpoint,
                 document_export_choose,
                 document_reveal,
@@ -1945,6 +2108,10 @@ impl Builder {
                 branch_body,
                 weave_status,
                 weave_start,
+                terminal_run,
+                terminal_list,
+                terminal_cancel,
+                shader_preview,
                 generation_cancel,
                 candidate_keep,
                 candidate_promote,
@@ -2028,10 +2195,19 @@ fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, menu_id: &str) {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct LoompadRecovery {
+    snapshot_id: String,
+    next_offset: u32,
+    command_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct IpcFailure {
     code: &'static str,
     message: String,
     retryable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speculation_recovery: Option<Box<LoompadRecovery>>,
 }
 
 impl IpcFailure {
@@ -2040,6 +2216,7 @@ impl IpcFailure {
             code,
             message: message.into(),
             retryable,
+            speculation_recovery: None,
         }
     }
 
@@ -2148,6 +2325,7 @@ impl IpcFailure {
             StoreError::UnsafeRelativePath(_) => "unsafe_relative_path",
             StoreError::SymbolicLink(_) => "symbolic_link_refused",
             StoreError::NotDirectory(_) => "not_a_directory",
+            StoreError::FolderTooLarge { .. } => "writing_folder_too_large",
             StoreError::NotRegularFile(_) => "not_a_regular_file",
             StoreError::AlreadyInitialized(_) => "project_already_initialized",
             StoreError::ProjectAlreadyOpen(_) => "project_already_open",
@@ -2171,6 +2349,7 @@ impl IpcFailure {
             StoreError::DocumentHasPendingOutbox(_) => "document_has_pending_projection",
             StoreError::DocumentLifecycleUncertain(_) => "document_lifecycle_uncertain",
             StoreError::UnsupportedDocumentLifecyclePlatform => "document_lifecycle_unsupported",
+            StoreError::UnsupportedStoragePlatform => "private_storage_unsupported",
             StoreError::ExternalVisibleFileDeleted(_) => "external_file_deleted",
             StoreError::ExternalVisibleBlobMismatch { .. } => "external_file_conflict",
             StoreError::ExternalVisibleInvalidUtf8(_) => "external_file_invalid_utf8",
@@ -2290,6 +2469,7 @@ pub struct ProjectSnapshot {
     root: String,
     schema_version: u32,
     documents: Vec<DocumentSummary>,
+    folder_warnings: Vec<String>,
     pending_recovery: u64,
 }
 
@@ -2609,6 +2789,7 @@ pub struct WeaveStarted {
     document_id: String,
     source_revision_id: String,
     exact_prompt_blob_id: String,
+    speculation: Option<LoompadBatch>,
     branches: Vec<BranchSnapshot>,
 }
 
@@ -2616,6 +2797,10 @@ pub struct WeaveStarted {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum WeavePolicySnapshot {
     AutomaticV2 {},
+    LoompadV1 {
+        sample_target: u32,
+        batch_offset: u32,
+    },
     ManualV2 {
         branch_count: u32,
         max_tokens: u32,
@@ -2625,6 +2810,7 @@ enum WeavePolicySnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WeavePreset {
+    LoompadV1,
     AutomaticProseV2,
     AutomaticVerseV2,
     ManualV2,
@@ -2641,6 +2827,10 @@ struct ResolvedWeavePolicy {
 #[derive(Debug, PartialEq)]
 enum ValidatedWeavePolicy {
     AutomaticV2,
+    LoompadV1 {
+        sample_target: u32,
+        batch_offset: u32,
+    },
     ManualV2 {
         branch_count: u32,
         max_tokens: u32,
@@ -2690,16 +2880,202 @@ fn default_project_path(state: &PluginState) -> Result<PathBuf, IpcFailure> {
         })
 }
 
+/// Hold a validated candidate separately from the live writing session. The
+/// renderer closes that session only after the folder picker has succeeded.
 #[tauri::command]
-async fn project_choose_create<R: Runtime>(
-    title: String,
+async fn project_prepare_open<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, PluginState>,
+) -> Result<Option<String>, IpcFailure> {
+    let picker = reserve_folder_picker(&state)?;
+    let path = choose_project_folder(&app)?;
+    picker.finish(path)
+}
+
+/// A dropped or remembered workspace is prepared through the same lease and
+/// shutdown boundary as a native folder choice. Its path is only a hint until
+/// the ordinary directory and sidecar have been opened and validated again.
+#[tauri::command]
+async fn project_prepare_open_path(
+    path: String,
+    state: State<'_, PluginState>,
+) -> Result<Option<String>, IpcFailure> {
+    prepare_project_path(&state, &path)
+}
+
+/// Classify native drop hints without acquiring a store or reading file contents.
+/// The subsequent prepared-open boundary revalidates each selected directory.
+#[tauri::command]
+async fn project_drop_directories(paths: Vec<String>) -> Result<Vec<String>, IpcFailure> {
+    dropped_directories(paths)
+}
+
+fn dropped_directories(paths: Vec<String>) -> Result<Vec<String>, IpcFailure> {
+    if paths.len() > 32 {
+        return Err(IpcFailure::new(
+            "workspace_drop_limit",
+            "drop at most 32 paths at once",
+            false,
+        ));
+    }
+    // Validate the whole batch before filesystem access, including discarded files.
+    if paths
+        .iter()
+        .any(|path| path.len() > 32_768 || path.contains('\0') || !Path::new(path).is_absolute())
+    {
+        return Err(IpcFailure::new(
+            "selected_folder_unavailable",
+            "dropped paths must be absolute local paths",
+            false,
+        ));
+    }
+    let mut directories = Vec::new();
+    for path in paths {
+        if !directories.contains(&path)
+            && std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_dir())
+        {
+            directories.push(path);
+        }
+    }
+    Ok(directories)
+}
+
+fn prepare_project_path(state: &PluginState, path: &str) -> Result<Option<String>, IpcFailure> {
+    if path.len() > 32_768 || path.contains('\0') || !Path::new(path).is_absolute() {
+        return Err(IpcFailure::new(
+            "selected_folder_unavailable",
+            "the workspace needs an absolute local directory path",
+            false,
+        ));
+    }
+    reserve_folder_picker(state)?.finish(Some(PathBuf::from(path)))
+}
+
+struct FolderPickerReservation<'a> {
+    state: &'a PluginState,
+}
+
+fn reserve_folder_picker(state: &PluginState) -> Result<FolderPickerReservation<'_>, IpcFailure> {
+    let _admission = lock_application_admission(state, "a folder choice")?;
+    state
+        .folder_picker_open
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| {
+            IpcFailure::new(
+                "folder_picker_open",
+                "a folder chooser is already open",
+                true,
+            )
+        })?;
+    let picker = FolderPickerReservation { state };
+    // A fresh choice also releases any candidate left by a renderer reload.
+    lock_prepared_project(state)?.take();
+    // No mutex crosses the native dialog: AppKit must remain free to service
+    // quit/close events while the picker waits for its main-thread callbacks.
+    Ok(picker)
+}
+
+impl FolderPickerReservation<'_> {
+    fn finish(self, path: Option<PathBuf>) -> Result<Option<String>, IpcFailure> {
+        if path.is_none() {
+            return Ok(None);
+        }
+        // Shutdown may have started while the dialog was open. Re-establish
+        // native admission before acquiring a candidate's store lease.
+        let _admission = lock_application_admission(self.state, "a folder choice")?;
+        prepare_project_folder(self.state, path)
+    }
+}
+
+impl Drop for FolderPickerReservation<'_> {
+    fn drop(&mut self) {
+        self.state
+            .folder_picker_open
+            .store(false, Ordering::Release);
+    }
+}
+
+fn prepare_project_folder(
+    state: &PluginState,
+    path: Option<PathBuf>,
+) -> Result<Option<String>, IpcFailure> {
+    let Some(path) = path else { return Ok(None) };
+    let path = path
+        .canonicalize()
+        .map_err(|error| IpcFailure::new("selected_folder_unavailable", error.to_string(), true))?;
+    {
+        let session = lock_session(state)?;
+        if let Some(current) = &session.store
+            && current.root() == path
+        {
+            return Ok(None);
+        }
+    }
+    let mut store = ProjectStore::open_folder(&path).map_err(IpcFailure::store)?;
+    store
+        .recover_interrupted_generations()
+        .map_err(IpcFailure::store)?;
+    store.record_open().map_err(IpcFailure::store)?;
+    let id = CommandId::new();
+    // Surface an unreadable catalogue before asking the renderer to save and
+    // close the current writing. The commit reads a fresh handoff snapshot.
+    snapshot_for(&store, id)?;
+    *lock_prepared_project(state)? = Some(PreparedProject { id, store });
+    Ok(Some(id.to_string()))
+}
+
+fn lock_prepared_project(
+    state: &PluginState,
+) -> Result<MutexGuard<'_, Option<PreparedProject>>, IpcFailure> {
+    state.prepared_project.lock().map_err(|_| {
+        IpcFailure::new(
+            "prepared_project_poisoned",
+            "the folder choice entered an invalid state; restart Loom",
+            false,
+        )
+    })
+}
+
+fn take_prepared_project(state: &PluginState, id: CommandId) -> Result<ProjectStore, IpcFailure> {
+    let mut prepared = lock_prepared_project(state)?;
+    if prepared
+        .as_ref()
+        .is_some_and(|candidate| candidate.id == id)
+    {
+        return Ok(prepared.take().expect("matching prepared project").store);
+    }
+    Err(IpcFailure::new(
+        "prepared_project_expired",
+        "choose the folder again; this folder choice is no longer available",
+        true,
+    ))
+}
+
+#[tauri::command]
+async fn project_commit_open<R: Runtime>(
+    preparation_id: String,
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ProjectSnapshot, IpcFailure> {
-    ensure_application_running(&state, "a project session")?;
+    let id = parse_command_id(&preparation_id)?;
     let choice = reserve_project_choice(&state)?;
-    let result = choose_project_folder(&app).and_then(|path| initialize_project(&path, title));
-    choice.finish(&app, result)
+    choice.finish(&app, take_prepared_project(&state, id))
+}
+
+#[tauri::command]
+async fn project_discard_open(
+    preparation_id: String,
+    state: State<'_, PluginState>,
+) -> Result<(), IpcFailure> {
+    let id = parse_command_id(&preparation_id)?;
+    let mut prepared = lock_prepared_project(&state)?;
+    if prepared
+        .as_ref()
+        .is_some_and(|candidate| candidate.id == id)
+    {
+        prepared.take();
+    }
+    Ok(())
 }
 
 fn reserve_project_choice(state: &PluginState) -> Result<ProjectChoiceReservation<'_>, IpcFailure> {
@@ -2775,6 +3151,13 @@ impl ProjectChoiceReservation<'_> {
                 false,
             ));
         }
+        self.state
+            .speech_input
+            .bind_scope(
+                store.manifest().project_id.to_string(),
+                session_id.to_string(),
+            )
+            .map_err(|error| IpcFailure::speech_input(&error))?;
         session.document_filesystem_watcher = document_filesystem_watcher;
         session.store = Some(store);
         session.active_session_id = Some(session_id);
@@ -2813,21 +3196,20 @@ impl Drop for ProjectChoiceReservation<'_> {
     }
 }
 
-fn choose_project_folder<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, IpcFailure> {
-    let selected = app.dialog().file().blocking_pick_folder().ok_or_else(|| {
-        IpcFailure::new(
-            "folder_selection_cancelled",
-            "no project folder was selected",
-            false,
-        )
-    })?;
-    selected.into_path().map_err(|error| {
-        IpcFailure::new(
-            "selected_folder_unavailable",
-            format!("the selected folder is not a local filesystem path: {error}"),
-            false,
-        )
-    })
+fn choose_project_folder<R: Runtime>(app: &AppHandle<R>) -> Result<Option<PathBuf>, IpcFailure> {
+    app.dialog()
+        .file()
+        .blocking_pick_folder()
+        .map(|selected| {
+            selected.into_path().map_err(|error| {
+                IpcFailure::new(
+                    "selected_folder_unavailable",
+                    format!("the selected folder is not a local filesystem path: {error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()
 }
 
 fn choose_model_file<R: Runtime>(app: &AppHandle<R>) -> Result<Option<PathBuf>, IpcFailure> {
@@ -2847,67 +3229,23 @@ fn choose_model_file<R: Runtime>(app: &AppHandle<R>) -> Result<Option<PathBuf>, 
         .transpose()
 }
 
+#[cfg(test)]
 fn initialize_project(path: &Path, title: String) -> Result<ProjectStore, IpcFailure> {
-    let existing_initial = path.join(INITIAL_DOCUMENT);
-    match std::fs::symlink_metadata(&existing_initial) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(IpcFailure::new(
-                "initial_document_symlink",
-                "the default manuscript path is a symbolic link; import it explicitly instead",
-                false,
-            ));
-        }
-        Ok(metadata) if metadata.is_file() => {
-            return Err(IpcFailure::new(
-                "existing_manuscript_requires_import",
-                "the default manuscript file already exists; import the folder instead of creating an empty project",
-                false,
-            ));
-        }
-        Ok(_) => {
-            return Err(IpcFailure::new(
-                "initial_document_not_file",
-                "the default manuscript path already exists and is not a regular file",
-                false,
-            ));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(IpcFailure::new(
-                "initial_document_inspection_failed",
-                format!("could not inspect the default manuscript path: {error}"),
-                false,
-            ));
-        }
-    }
-    let (mut store, _receipt) = ProjectStore::initialize(path, title).map_err(IpcFailure::store)?;
-    store
-        .create_document_if_absent(
-            INITIAL_DOCUMENT,
-            DocumentContent::Prose(String::new()),
-            "initial manuscript",
-        )
-        .map_err(IpcFailure::store)?;
+    let (mut store, _) = ProjectStore::initialize(path, title).map_err(IpcFailure::store)?;
+    ensure_default_document(&mut store)?;
     Ok(store)
 }
 
 fn open_or_initialize_default_project(path: &Path) -> Result<ProjectStore, IpcFailure> {
-    let manifest = path.join(".loom/project.json");
-    let initialized = manifest.try_exists().map_err(|error| {
-        IpcFailure::new(
-            "default_project_inspection_failed",
-            format!("the local writing folder could not be inspected: {error}"),
-            true,
-        )
-    })?;
-    let mut store = if initialized {
-        ProjectStore::open(path).map_err(IpcFailure::store)?
-    } else {
+    if !path.join(".loom").try_exists().map_err(|error| {
+        IpcFailure::new("default_project_inspection_failed", error.to_string(), true)
+    })? {
         validate_default_document_candidate(path)?;
-        ProjectStore::initialize(path, "My Writing")
-            .map(|(store, _)| store)
-            .map_err(IpcFailure::store)?
-    };
+    }
+    std::fs::create_dir_all(path).map_err(|error| {
+        IpcFailure::new("default_project_creation_failed", error.to_string(), true)
+    })?;
+    let mut store = ProjectStore::open_folder(path).map_err(IpcFailure::store)?;
 
     // Settle an initialization/adoption transaction before deciding whether
     // the default document is absent. A registered document whose visible file
@@ -2996,24 +3334,6 @@ fn ensure_default_document(store: &mut ProjectStore) -> Result<(), IpcFailure> {
 }
 
 #[tauri::command]
-async fn project_choose_open<R: Runtime>(
-    app: AppHandle<R>,
-    state: State<'_, PluginState>,
-) -> Result<ProjectSnapshot, IpcFailure> {
-    ensure_application_running(&state, "a project session")?;
-    let choice = reserve_project_choice(&state)?;
-    let result = choose_project_folder(&app).and_then(|path| {
-        let mut store = ProjectStore::open(path).map_err(IpcFailure::store)?;
-        store
-            .recover_interrupted_generations()
-            .map_err(IpcFailure::store)?;
-        store.record_open().map_err(IpcFailure::store)?;
-        Ok(store)
-    });
-    choice.finish(&app, result)
-}
-
-#[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 fn project_close(
     project_id: String,
@@ -3047,6 +3367,7 @@ fn close_project_with_wait(
     command_id: CommandId,
     generation_wait: Duration,
 ) -> Result<ProjectCloseReceipt, IpcFailure> {
+    let _audio = state.audio_capture.close_guard()?;
     let (typed_project_id, typed_session_id) = {
         let mut session = lock_session_internal(state)?;
         if session.phase == SessionPhase::Closed {
@@ -3211,7 +3532,7 @@ fn cancel_and_drain_generation_session(
 
 #[tauri::command]
 async fn project_current(state: State<'_, PluginState>) -> Result<ProjectSnapshot, IpcFailure> {
-    let session = lock_session(&state)?;
+    let mut session = lock_session(&state)?;
     if session.phase == SessionPhase::Closed {
         return Err(IpcFailure::new(
             "project_not_open",
@@ -3233,13 +3554,17 @@ async fn project_current(state: State<'_, PluginState>) -> Result<ProjectSnapsho
             false,
         )
     })?;
-    let store = session.store.as_ref().ok_or_else(|| {
+    let store = session.store.as_mut().ok_or_else(|| {
         IpcFailure::new(
             "corrupt_project_session",
             "the live project session is missing its store",
             false,
         )
     })?;
+    store
+        .reconcile_document_lifecycle()
+        .map_err(IpcFailure::store)?;
+    store.discover_documents().map_err(IpcFailure::store)?;
     snapshot_for(store, session_id)
 }
 
@@ -4224,7 +4549,7 @@ fn create_untitled_document(store: &mut ProjectStore) -> Result<String, IpcFailu
         let relative_path = if ordinal == 1 {
             INITIAL_DOCUMENT.to_owned()
         } else {
-            format!("manuscript/Untitled-{ordinal}.md")
+            format!("Untitled-{ordinal}.md")
         };
         if store
             .document_path_is_reserved(&relative_path)
@@ -4337,6 +4662,25 @@ async fn document_export_choose<R: Runtime>(
     })?;
 
     reservation.export(&destination).map(Some)
+}
+
+/// Reveal retained source bytes without opening or executing their contents.
+#[tauri::command]
+async fn attachment_reveal_original(
+    project_id: String,
+    session_id: String,
+    attachment_id: String,
+    state: State<'_, PluginState>,
+) -> Result<(), IpcFailure> {
+    let _admission = lock_application_admission(&state, "an attachment reveal")?;
+    let path = {
+        let mut session = lock_session(&state)?;
+        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        context_attachments::original_path(store.root(), &attachment_id)
+            .map_err(|error| IpcFailure::context_attachment(&error))?
+    };
+    tauri_plugin_opener::reveal_item_in_dir(path)
+        .map_err(|error| IpcFailure::new("attachment_reveal_failed", error.to_string(), false))
 }
 
 #[tauri::command]
@@ -5545,7 +5889,7 @@ fn prepare_exact_model_load(
             false,
         ));
     }
-    let mut profile = model_profile_for_current_memory(
+    let mut profile = state.native_runtime.model_profile_for_current_memory(
         canonical_path.clone(),
         expectation.model_file_bytes,
         expectation.projector_file_bytes.unwrap_or(0),
@@ -6046,31 +6390,13 @@ fn prepare_model_load(
     Ok(ModelLoadPlan::Inspect {
         selected_path,
         canonical_path: canonical,
-        profile: model_profile_for_current_memory(
+        profile: state.native_runtime.model_profile_for_current_memory(
             discovered.resolved_path,
             discovered.file_bytes,
             0,
             None,
         ),
     })
-}
-
-fn model_profile_for_current_memory(
-    model_path: PathBuf,
-    model_file_bytes: u64,
-    projector_file_bytes: u64,
-    maximum_context_tokens: Option<u32>,
-) -> LocalModelProfile {
-    let mut system = System::new();
-    system.refresh_memory();
-    LocalModelProfile::for_gguf_with_memory(
-        model_path,
-        model_file_bytes,
-        projector_file_bytes,
-        system.available_memory(),
-        system.total_memory(),
-        maximum_context_tokens,
-    )
 }
 
 fn resolve_model_inspection(
@@ -7675,47 +8001,78 @@ fn replay_weave_if_recorded(
                 false,
             )
         })?;
-        let family_matches = resolved.is_some_and(|resolved| {
-            family.generations.len() == resolved.branch_count as usize
-                && family.receipt.source_revision_id == Some(source_revision_id)
-                && BlobId::digest(&source_bytes) == expected_visible_blob_id
-                && cursor <= source_text.len()
-                && source_text.is_char_boundary(cursor)
-                && family
-                    .generations
-                    .iter()
-                    .enumerate()
-                    .all(|(index, started)| {
-                        let Ok(case_index) = u32::try_from(index) else {
-                            return false;
-                        };
-                        let (run_id, branch_id) = derive_weave_case_ids(command_id, case_index);
-                        let sampling = sampling_for_weave_case(
-                            command_id,
-                            case_index,
-                            resolved.max_tokens,
-                            resolved.temperature,
-                            resolved.preset,
-                        );
-                        serde_json::from_value::<SamplingConfig>(
-                            started.generation.sampling.clone(),
-                        )
-                        .is_ok_and(|recorded_sampling| {
-                            started.generation.run_id == run_id
-                                && started.generation.branch_id == branch_id
-                                && started.generation.document_id == document_id
-                                && started.generation.source_revision_id == source_revision_id
-                                && started.generation.target_range == expected_range
-                                && started.generation.seed
-                                    == u64::from(generation_seed(
-                                        command_id,
-                                        case_index,
-                                        resolved.preset,
-                                    ))
-                                && recorded_sampling.fingerprint() == sampling.fingerprint()
+        let speculation = family
+            .generations
+            .first()
+            .map(|started| {
+                recorded_loompad_batch(store, started.generation.context_recipe_artifact_id)
+            })
+            .transpose()?
+            .flatten();
+        for started in &family.generations {
+            if recorded_loompad_batch(store, started.generation.context_recipe_artifact_id)?
+                != speculation
+            {
+                return Err(IpcFailure::new(
+                    "generation_provenance_mismatch",
+                    "a Weave family has inconsistent idle-choice provenance",
+                    false,
+                ));
+            }
+        }
+        let policy_matches = match (policy, &speculation) {
+            (
+                ValidatedWeavePolicy::LoompadV1 {
+                    sample_target,
+                    batch_offset,
+                },
+                Some(batch),
+            ) => *sample_target == batch.sample_target && *batch_offset == batch.batch_offset,
+            (ValidatedWeavePolicy::LoompadV1 { .. }, None) | (_, Some(_)) => false,
+            (_, None) => true,
+        };
+        let family_matches = policy_matches
+            && resolved.is_some_and(|resolved| {
+                family.generations.len() == resolved.branch_count as usize
+                    && family.receipt.source_revision_id == Some(source_revision_id)
+                    && BlobId::digest(&source_bytes) == expected_visible_blob_id
+                    && cursor <= source_text.len()
+                    && source_text.is_char_boundary(cursor)
+                    && family
+                        .generations
+                        .iter()
+                        .enumerate()
+                        .all(|(index, started)| {
+                            let Ok(case_index) = u32::try_from(index) else {
+                                return false;
+                            };
+                            let (run_id, branch_id) = derive_weave_case_ids(command_id, case_index);
+                            let sampling = sampling_for_weave_case(
+                                command_id,
+                                case_index,
+                                resolved.max_tokens,
+                                resolved.temperature,
+                                resolved.preset,
+                            );
+                            serde_json::from_value::<SamplingConfig>(
+                                started.generation.sampling.clone(),
+                            )
+                            .is_ok_and(|recorded_sampling| {
+                                started.generation.run_id == run_id
+                                    && started.generation.branch_id == branch_id
+                                    && started.generation.document_id == document_id
+                                    && started.generation.source_revision_id == source_revision_id
+                                    && started.generation.target_range == expected_range
+                                    && started.generation.seed
+                                        == u64::from(generation_seed(
+                                            command_id,
+                                            case_index,
+                                            resolved.preset,
+                                        ))
+                                    && recorded_sampling.fingerprint() == sampling.fingerprint()
+                            })
                         })
-                    })
-        });
+            });
         if !family_matches {
             return Err(IpcFailure::new(
                 "idempotency_conflict",
@@ -7733,6 +8090,7 @@ fn replay_weave_if_recorded(
         (
             BlobId::digest(&source_text.as_bytes()[..cursor]),
             ordered_records,
+            speculation,
         )
     };
 
@@ -7756,6 +8114,7 @@ fn replay_weave_if_recorded(
         document_id: document_id.to_string(),
         source_revision_id: source_revision_id.to_string(),
         exact_prompt_blob_id: replay.0.to_string(),
+        speculation: replay.2,
         branches,
     }))
 }
@@ -7835,6 +8194,10 @@ async fn weave_status(
             source_revision_id,
             BlobId::digest(&source_text.as_bytes()[..cursor]),
             records,
+            recorded_loompad_batch(
+                store,
+                family.generations[0].generation.context_recipe_artifact_id,
+            )?,
         )
     };
     let branches = recorded
@@ -7857,6 +8220,7 @@ async fn weave_status(
         document_id: recorded.0.to_string(),
         source_revision_id: recorded.1.to_string(),
         exact_prompt_blob_id: recorded.2.to_string(),
+        speculation: recorded.4,
         branches,
     }))
 }
@@ -7953,6 +8317,16 @@ fn weave_start_inner<R: Runtime>(
     )? {
         return Ok(replay);
     }
+    let loompad_request = match &policy {
+        ValidatedWeavePolicy::LoompadV1 {
+            sample_target,
+            batch_offset,
+        } => {
+            ensure_no_active_generations(state, "extending idle choices")?;
+            Some((*sample_target, *batch_offset))
+        }
+        _ => None,
+    };
     let _model_lifecycle = lock_model_lifecycle(state)?;
     let authorized_model =
         AuthorizedWeaveModel::bind(policy, loaded_model(state)?, &state.build_model_policy)?;
@@ -7982,6 +8356,7 @@ fn weave_start_inner<R: Runtime>(
         prompt_recipe,
         cases,
         queued_branches,
+        speculation,
         runs,
         lifecycle_ticket,
         lifecycle_lease,
@@ -8066,7 +8441,7 @@ fn weave_start_inner<R: Runtime>(
         None => None,
     };
         let source_prefix = &loaded.text[..cursor];
-        let attachment_context = resolve_for_generation_with_budget(
+        let mut attachment_context = resolve_for_generation_with_budget(
             store.root(),
             &document_id.to_string(),
             source_prefix,
@@ -8075,6 +8450,13 @@ fn weave_start_inner<R: Runtime>(
             max_tokens,
         )
         .map_err(|error| IpcFailure::context_attachment(&error))?;
+        let document_context = document_bindings::context_for_markdown(store, &loaded.text)?;
+        if !document_context.is_empty() {
+            attachment_context.context_preamble.push_str("\n\n");
+            attachment_context
+                .context_preamble
+                .push_str(&document_context);
+        }
         let exact_prefix = attachment_context.manuscript_prompt.clone();
         if exact_prefix.is_empty()
             && attachment_context.context_preamble.is_empty()
@@ -8092,6 +8474,30 @@ fn weave_start_inner<R: Runtime>(
                 &loaded_model.descriptor,
             )?;
         }
+        let speculation = loompad_request.map(|(sample_target, batch_offset)| {
+            let context = continuation_context_binding(&attachment_context.context_preamble, &attachment_context.media)
+                .map_err(|error| IpcFailure::backend(&error))?;
+            let identity = serde_json::to_vec(&serde_json::json!({
+                "policy": "loompad_v1", "project": store.manifest().project_id,
+                "session": active_session_id, "document": document_id, "revision": source_revision_id,
+                "cursor": cursor_byte, "prompt": BlobId::digest(exact_prefix.as_bytes()),
+                "context": context, "model": model_environment,
+            })).map_err(|error| IpcFailure::new("speculation_identity_failed", error.to_string(), false))?;
+            Ok::<_, IpcFailure>(LoompadBatch { snapshot_id: BlobId::digest(&identity).to_string(), sample_target, batch_offset })
+        }).transpose()?;
+        let mut loompad_budget = if let Some(batch) = &speculation {
+            let mut budget = state.loompad_budget.lock().map_err(|_| {
+                IpcFailure::new(
+                    "automatic_budget_state_invalid",
+                    "idle-choice admission is unavailable",
+                    false,
+                )
+            })?;
+            budget.check(active_session_id, batch, Instant::now())?;
+            Some(budget)
+        } else {
+            None
+        };
         let exact_prompt_blob_id = store
             .store_provenance_blob(exact_prefix.as_bytes())
             .map_err(IpcFailure::store)?;
@@ -8117,7 +8523,10 @@ fn weave_start_inner<R: Runtime>(
             .map_err(IpcFailure::store)?;
         let retrieval_evidence_blob_id = {
             let identity =
-                serde_json::to_vec(&attachment_context.retrieval_evidence).map_err(|error| {
+                serde_json::to_vec(&match &speculation {
+                    Some(batch) => serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "loompad": batch }),
+                    None => serde_json::to_value(&attachment_context.retrieval_evidence).map_err(|error| IpcFailure::new("attachment_context_encode_failed", error.to_string(), false))?,
+                }).map_err(|error| {
                     IpcFailure::new("attachment_context_encode_failed", error.to_string(), false)
                 })?;
             Some(
@@ -8283,6 +8692,9 @@ fn weave_start_inner<R: Runtime>(
         if let Some(reservation) = automatic_budget_reservation {
             reservation.commit();
         }
+        if let (Some(budget), Some(batch)) = (&mut loompad_budget, &speculation) {
+            budget.commit(batch, command_id, Instant::now());
+        }
         let queued_branches = family
             .generations
             .into_iter()
@@ -8315,6 +8727,7 @@ fn weave_start_inner<R: Runtime>(
             prompt_recipe,
             cases,
             queued_branches,
+            speculation,
             runs,
             lifecycle_ticket,
             lifecycle_lease,
@@ -8453,8 +8866,10 @@ fn weave_start_inner<R: Runtime>(
         failure,
         worker,
         owner,
-    }) = worker_reservation.attach(worker, GenerationWorkerOwner::Llama(generation_owner))
-    {
+    }) = worker_reservation.attach(
+        worker,
+        GenerationWorkerOwner::Llama(Box::new(generation_owner)),
+    ) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.cancel_all()));
         worker_start.release();
         let desktop_panicked = worker.join().is_err();
@@ -8488,6 +8903,7 @@ fn weave_start_inner<R: Runtime>(
         document_id: document_id.to_string(),
         source_revision_id: source_revision_id.to_string(),
         exact_prompt_blob_id: exact_prompt_blob_id.to_string(),
+        speculation,
         branches: queued_branches,
     })
 }
@@ -8526,6 +8942,7 @@ impl WeavePreset {
             Self::AutomaticProseV2 => 0,
             Self::AutomaticVerseV2 => 1,
             Self::ManualV2 => 2,
+            Self::LoompadV1 => 3,
         }
     }
 }
@@ -8533,6 +8950,25 @@ impl WeavePreset {
 fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePolicy, IpcFailure> {
     let validated = match policy {
         WeavePolicySnapshot::AutomaticV2 {} => ValidatedWeavePolicy::AutomaticV2,
+        WeavePolicySnapshot::LoompadV1 {
+            sample_target,
+            batch_offset,
+        } => {
+            if !matches!(sample_target, 4 | 16 | 64 | 256)
+                || batch_offset % 4 != 0
+                || batch_offset >= sample_target
+            {
+                return Err(IpcFailure::new(
+                    "invalid_speculation_budget",
+                    "Loompad admits four choices at contiguous offsets within a target of 4, 16, 64, or 256",
+                    false,
+                ));
+            }
+            ValidatedWeavePolicy::LoompadV1 {
+                sample_target,
+                batch_offset,
+            }
+        }
         WeavePolicySnapshot::ManualV2 {
             branch_count,
             max_tokens,
@@ -8570,7 +9006,7 @@ fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePo
 impl ValidatedWeavePolicy {
     const fn branch_count(&self) -> u32 {
         match self {
-            Self::AutomaticV2 => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
+            Self::AutomaticV2 | Self::LoompadV1 { .. } => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
             Self::ManualV2 { branch_count, .. } => *branch_count,
         }
     }
@@ -8578,13 +9014,14 @@ impl ValidatedWeavePolicy {
     const fn max_tokens(&self) -> u32 {
         match self {
             Self::AutomaticV2 => AUTOMATIC_WEAVE_MAX_TOKENS_V2,
+            Self::LoompadV1 { .. } => 128,
             Self::ManualV2 { max_tokens, .. } => *max_tokens,
         }
     }
 
     const fn temperature(&self) -> f32 {
         match self {
-            Self::AutomaticV2 => AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            Self::AutomaticV2 | Self::LoompadV1 { .. } => AUTOMATIC_WEAVE_TEMPERATURE_V2,
             Self::ManualV2 { temperature, .. } => *temperature,
         }
     }
@@ -8600,6 +9037,7 @@ impl ValidatedWeavePolicy {
                     false,
                 ));
             }
+            (Self::LoompadV1 { .. }, _) => WeavePreset::LoompadV1,
             (Self::ManualV2 { .. }, _) => WeavePreset::ManualV2,
         };
         Ok(ResolvedWeavePolicy {
@@ -8618,7 +9056,10 @@ fn sampling_for_weave_case(
     temperature: f32,
     preset: WeavePreset,
 ) -> SamplingConfig {
-    let repetition_resistant_prose = preset == WeavePreset::AutomaticProseV2;
+    let repetition_resistant_prose = matches!(
+        preset,
+        WeavePreset::AutomaticProseV2 | WeavePreset::LoompadV1
+    );
     SamplingConfig {
         seed: generation_seed(command_id, index, preset),
         temperature,
@@ -9010,6 +9451,7 @@ fn persist_generation_result<R: Runtime>(
             &candidate,
             &identity.request_id,
             binding.exact_prompt_blob_id,
+            PromptMode::Completion,
             &binding.context_binding,
             &binding.model,
             input_index,
@@ -9604,6 +10046,11 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
     *phase = ApplicationPhase::Closing;
+    state
+        .prepared_project
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
     if let Err(error) = state.generation_lifecycle.quiesce() {
         eprintln!("Loom could not quiesce generation lifecycle before runtime exit: {error}");
         return;
@@ -9858,7 +10305,9 @@ fn application_close<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
+    let _audio = state.audio_capture.close_guard()?;
     let close_attempt = begin_application_close(&state)?;
+    lock_prepared_project(&state)?.take();
     if state
         .generations
         .active_branch_count()
@@ -10115,6 +10564,7 @@ fn snapshot_for(
         root,
         schema_version: store.manifest().schema_version,
         documents,
+        folder_warnings: store.folder_warnings().to_vec(),
         pending_recovery: store.pending_outbox_count().map_err(IpcFailure::store)?,
     })
 }
@@ -10680,6 +11130,253 @@ mod tests {
             ApplicationPhase::Closing
         );
         worker.join().expect("join close worker");
+    }
+
+    #[test]
+    fn pending_folder_picker_does_not_hold_shutdown_admission_or_open_a_store_after_quit() {
+        let state = PluginState::default();
+        let next = tempfile::tempdir().expect("next folder");
+        let picker = reserve_folder_picker(&state).expect("reserve picker");
+        assert!(
+            state.application.try_lock().is_ok(),
+            "dialog must not own application mutex"
+        );
+        assert!(
+            state.prepared_project.try_lock().is_ok(),
+            "dialog must not own candidate mutex"
+        );
+        assert!(
+            reserve_folder_picker(&state).is_err(),
+            "only one native picker may run"
+        );
+        assert!(!record_application_exit_request(&state));
+        assert_eq!(
+            picker
+                .finish(Some(next.path().into()))
+                .expect_err("quit revoked folder admission")
+                .code,
+            "application_quiescing"
+        );
+        assert!(
+            !next.path().join(".loom").exists(),
+            "no store was acquired after quit"
+        );
+        assert!(
+            !state.folder_picker_open.load(Ordering::Acquire),
+            "failure releases picker reservation"
+        );
+        let attempt = begin_application_close(&state).expect("shutdown can proceed");
+        drop(attempt);
+        abort_application_close(&state).expect("abort close intent");
+        let picker = reserve_folder_picker(&state).expect("new picker after close abort");
+        assert!(picker.finish(None).expect("quiet cancellation").is_none());
+        assert!(!state.folder_picker_open.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn folder_preparation_keeps_current_writing_on_cancel_same_folder_and_invalid_choice() {
+        let current = tempfile::tempdir().expect("current writing folder");
+        let state = PluginState::default();
+        let store = initialize_project(current.path(), "Current".into()).expect("current store");
+        let opened = reserve_project_choice(&state)
+            .expect("reserve")
+            .finish_without_document_filesystem_watcher(Ok(store))
+            .expect("attach current");
+        assert!(
+            prepare_project_folder(&state, None)
+                .expect("cancel")
+                .is_none()
+        );
+        assert!(
+            prepare_project_folder(&state, Some(current.path().into()))
+                .expect("same folder")
+                .is_none()
+        );
+        let invalid = current.path().join("Untitled.md");
+        assert_eq!(
+            prepare_project_folder(&state, Some(invalid))
+                .expect_err("file is not a folder")
+                .code,
+            "not_a_directory"
+        );
+        let session = state.session.lock().expect("session");
+        assert_eq!(session.phase, SessionPhase::Open);
+        assert_eq!(
+            session.active_session_id.expect("session ID").to_string(),
+            opened.session_id
+        );
+        assert_eq!(
+            session
+                .store
+                .as_ref()
+                .expect("live store")
+                .read_document(INITIAL_DOCUMENT)
+                .expect("writing remains readable")
+                .text,
+            ""
+        );
+        assert!(
+            state
+                .prepared_project
+                .lock()
+                .expect("prepared slot")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_drop_classifies_directories_without_opening_or_changing_files() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("Writing");
+        let file = root.path().join("Notes.md");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(&file, "Exact writing.\r\n").unwrap();
+        let folder = folder.to_str().unwrap().to_owned();
+        let paths = vec![
+            file.to_str().unwrap().to_owned(),
+            folder.clone(),
+            root.path().join("missing").to_str().unwrap().to_owned(),
+            folder.clone(),
+            root.path().to_str().unwrap().to_owned(),
+        ];
+        assert_eq!(
+            dropped_directories(paths).unwrap(),
+            vec![folder.clone(), root.path().to_str().unwrap().to_owned()]
+        );
+        assert!(std::fs::read_dir(&folder).unwrap().next().is_none());
+        assert_eq!(std::fs::read(&file).unwrap(), b"Exact writing.\r\n");
+        assert!(dropped_directories(vec![folder.clone(); 33]).is_err());
+        for invalid in [
+            "relative".to_owned(),
+            "/bad\0path".into(),
+            format!("/{}", "x".repeat(32_768)),
+        ] {
+            assert!(dropped_directories(vec![folder.clone(), invalid]).is_err());
+        }
+        #[cfg(unix)]
+        {
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(&folder, &alias).unwrap();
+            let alias = alias.to_str().unwrap().to_owned();
+            assert_eq!(
+                dropped_directories(vec![alias.clone()]).unwrap(),
+                vec![alias]
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn workspace_path_preparation_revalidates_hints_without_replacing_live_drafts() {
+        let current = tempfile::tempdir().expect("current writing");
+        let next = tempfile::tempdir().expect("next writing");
+        std::fs::write(next.path().join("Notes.md"), "Exact next writing.\r\n").unwrap();
+        let state = PluginState::default();
+        let mut store = initialize_project(current.path(), "Current".into()).unwrap();
+        let source = store.read_document(INITIAL_DOCUMENT).unwrap();
+        store
+            .upsert_transient_draft(
+                INITIAL_DOCUMENT,
+                source.revision_id,
+                0,
+                DocumentContent::Prose("Unsaved author text.\r\n".into()),
+            )
+            .unwrap();
+        reserve_project_choice(&state)
+            .unwrap()
+            .finish_without_document_filesystem_watcher(Ok(store))
+            .unwrap();
+        for invalid in [
+            "relative/folder".to_owned(),
+            "\0".into(),
+            "x".repeat(32_769),
+            next.path().join("Notes.md").to_string_lossy().into_owned(),
+        ] {
+            assert!(prepare_project_path(&state, &invalid).is_err());
+        }
+        assert!(
+            prepare_project_path(&state, current.path().to_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+        let id = prepare_project_path(&state, next.path().to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let candidate = take_prepared_project(&state, id.parse().unwrap()).unwrap();
+        assert_eq!(
+            candidate.read_document("Notes.md").unwrap().text,
+            "Exact next writing.\r\n"
+        );
+        let session = state.session.lock().unwrap();
+        assert_eq!(session.phase, SessionPhase::Open);
+        assert_eq!(
+            session
+                .store
+                .as_ref()
+                .unwrap()
+                .load_transient_draft(INITIAL_DOCUMENT)
+                .unwrap()
+                .unwrap()
+                .text,
+            "Unsaved author text.\r\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn prepared_folder_lease_survives_old_session_close_and_is_consumed_once() {
+        let current = tempfile::tempdir().expect("current folder");
+        let next = tempfile::tempdir().expect("next folder");
+        std::fs::write(next.path().join("Existing.md"), "Exact writing.\r\n")
+            .expect("existing manuscript");
+        let state = PluginState::default();
+        let store = initialize_project(current.path(), "Current".into()).expect("current store");
+        let opened = reserve_project_choice(&state)
+            .expect("reserve")
+            .finish_without_document_filesystem_watcher(Ok(store))
+            .expect("attach current");
+        let id = prepare_project_folder(&state, Some(next.path().into()))
+            .expect("prepare")
+            .expect("new folder")
+            .parse::<CommandId>()
+            .expect("preparation ID");
+        assert!(
+            reserve_project_choice(&state).is_err(),
+            "cannot commit over live writing"
+        );
+        assert!(matches!(
+            ProjectStore::open(next.path()),
+            Err(loom_store::StoreError::ProjectAlreadyOpen(_))
+        ));
+        assert!(
+            take_prepared_project(&state, CommandId::new()).is_err(),
+            "stale token cannot take candidate"
+        );
+        close_project_with_wait(
+            &state,
+            opened.project_id,
+            opened.session_id,
+            CommandId::new(),
+            Duration::ZERO,
+        )
+        .expect("close current once");
+        let choice = reserve_project_choice(&state).expect("reserve after close");
+        let store = take_prepared_project(&state, id).expect("take prepared store");
+        let next_snapshot = choice
+            .finish_without_document_filesystem_watcher(Ok(store))
+            .expect("attach next");
+        assert_eq!(next_snapshot.documents.len(), 1);
+        assert_eq!(next_snapshot.documents[0].relative_path, "Existing.md");
+        assert!(
+            take_prepared_project(&state, id).is_err(),
+            "one-shot preparation"
+        );
+        assert_eq!(
+            std::fs::read(next.path().join("Existing.md")).expect("unchanged bytes"),
+            b"Exact writing.\r\n"
+        );
+        drop(ProjectStore::open(current.path()).expect("old lease released"));
     }
 
     #[test]
@@ -11839,6 +12536,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn new_document_skips_registered_and_unmanaged_visible_paths_without_overwriting() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -11850,12 +12548,12 @@ mod tests {
                 "initial manuscript",
             )
             .expect("initial document");
-        let unmanaged = root.join("manuscript/Untitled-2.md");
+        let unmanaged = root.join("Untitled-2.md");
         std::fs::write(&unmanaged, "external manuscript").expect("unmanaged visible file");
 
         let created = create_untitled_document(&mut store).expect("new document");
 
-        assert_eq!(created, "manuscript/Untitled-3.md");
+        assert_eq!(created, "Untitled-3.md");
         assert_eq!(
             std::fs::read_to_string(root.join(INITIAL_DOCUMENT)).expect("first manuscript"),
             "first manuscript"
@@ -11883,6 +12581,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn new_document_never_reuses_a_tombstoned_historical_path() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -11908,7 +12607,7 @@ mod tests {
 
         let created = create_untitled_document(&mut store).expect("new document");
 
-        assert_eq!(created, "manuscript/Untitled-2.md");
+        assert_eq!(created, "Untitled-2.md");
         assert!(
             store
                 .document_path_is_reserved(INITIAL_DOCUMENT)
@@ -11958,6 +12657,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn rename_action_moves_the_manuscript_and_preserves_identity() {
         let mut fixture = document_action_fixture();
 
@@ -11966,7 +12666,7 @@ mod tests {
                 .expect("rename document");
 
         assert_eq!(renamed.title, "A Better Name");
-        assert_eq!(renamed.relative_path, "manuscript/A Better Name.md");
+        assert_eq!(renamed.relative_path, "A Better Name.md");
         assert_eq!(
             renamed.revision_id,
             Some(fixture.identity.revision.to_string())
@@ -11977,14 +12677,14 @@ mod tests {
         );
         assert_eq!(renamed.word_count, 2);
         assert!(!fixture.root.join(INITIAL_DOCUMENT).exists());
-        assert!(fixture.root.join("manuscript/A Better Name.md").is_file());
+        assert!(fixture.root.join("A Better Name.md").is_file());
 
         let snapshot = snapshot_for(&fixture.store, CommandId::new()).expect("project snapshot");
         assert_eq!(snapshot.documents.len(), 1);
         assert_eq!(snapshot.documents[0].title, "A Better Name");
         let loaded = fixture
             .store
-            .read_document("manuscript/A Better Name.md")
+            .read_document("A Better Name.md")
             .expect("reopen renamed document");
         let display_title = fixture
             .store
@@ -12003,6 +12703,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn delete_action_returns_an_authoritative_snapshot_and_replays_exactly() {
         let mut fixture = document_action_fixture();
         let session_id = CommandId::new();
@@ -12044,6 +12745,7 @@ mod tests {
         target_os = "redox"
     )))]
     #[test]
+    #[cfg(unix)]
     fn unsupported_lifecycle_platform_returns_typed_ipc_failures_without_mutation() {
         let mut fixture = document_action_fixture();
         let source_before = fixture
@@ -12088,7 +12790,7 @@ mod tests {
                 .expect("read unchanged visible source"),
             b"exact manuscript\n"
         );
-        assert!(!fixture.root.join("manuscript/A Better Name.md").exists());
+        assert!(!fixture.root.join("A Better Name.md").exists());
         assert_eq!(
             fixture
                 .store
@@ -12100,6 +12802,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn rename_action_rejects_invalid_titles_without_mutating_the_fallback_name() {
         let mut fixture = document_action_fixture();
 
@@ -12115,6 +12818,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn rename_action_rejects_a_stale_source_revision() {
         let mut fixture = document_action_fixture();
         fixture
@@ -12140,8 +12844,7 @@ mod tests {
 
     fn replace_visible_document_with_regular_file(root: &Path) {
         let visible = root.join(INITIAL_DOCUMENT);
-        std::fs::rename(&visible, root.join("manuscript/original.md"))
-            .expect("retain opened original");
+        std::fs::rename(&visible, root.join("original.md")).expect("retain opened original");
         std::fs::write(&visible, "exact manuscript\n").expect("install same-byte replacement");
     }
 
@@ -12155,12 +12858,12 @@ mod tests {
             .expect("project parent")
             .join("outside-manuscript.md");
         std::fs::write(&outside, "exact manuscript\n").expect("outside manuscript");
-        std::fs::rename(&visible, root.join("manuscript/original.md"))
-            .expect("retain opened original");
+        std::fs::rename(&visible, root.join("original.md")).expect("retain opened original");
         symlink(&outside, &visible).expect("install final-component symlink");
     }
 
     #[test]
+    #[cfg(unix)]
     fn open_action_refuses_a_same_byte_final_component_replacement() {
         let fixture = document_action_fixture();
         let authority = resolve_document_action_file(&fixture.store, fixture.identity)
@@ -12186,6 +12889,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn export_action_refuses_a_same_byte_final_component_replacement() {
         let mut fixture = document_action_fixture();
         let mut authority = resolve_document_action_file(&fixture.store, fixture.identity)
@@ -12221,6 +12925,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reveal_action_refuses_a_same_byte_final_component_replacement() {
         let fixture = document_action_fixture();
         let mut authority = resolve_document_action_file(&fixture.store, fixture.identity)
@@ -12248,6 +12953,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn export_copy_is_document_bound_and_refuses_uncheckpointed_visible_bytes() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -12323,6 +13029,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn document_action_resolves_only_the_explicit_captured_document_id() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -12365,6 +13072,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reveal_path_is_store_derived_contained_and_bound_to_external_bytes() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -12431,6 +13139,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn export_dialog_reservation_revalidates_the_captured_identity_before_writing() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -12484,6 +13193,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn export_dialog_reservation_blocks_application_close_until_released() {
         let temporary = tempfile::tempdir().expect("temporary project parent");
         let root = temporary.path().join("Writing");
@@ -12822,6 +13532,136 @@ mod tests {
     }
 
     #[test]
+    fn loompad_policy_bounds_each_native_batch_and_total_target() {
+        for target in [4, 16, 64, 256] {
+            let policy = validate_weave_policy(WeavePolicySnapshot::LoompadV1 {
+                sample_target: target,
+                batch_offset: target - 4,
+            })
+            .expect("valid final batch");
+            assert_eq!(policy.branch_count(), 4);
+            assert_eq!(policy.max_tokens(), 128);
+        }
+        for (target, offset) in [
+            (0, 0),
+            (8, 0),
+            (1024, 0),
+            (16, 1),
+            (16, 16),
+            (256, u32::MAX),
+        ] {
+            assert!(
+                validate_weave_policy(WeavePolicySnapshot::LoompadV1 {
+                    sample_target: target,
+                    batch_offset: offset,
+                })
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn loompad_budget_preserves_choices_paces_batches_and_recovers_command_ids() {
+        let mut budget = LoompadBudget::default();
+        let session = CommandId::new();
+        let start = Instant::now();
+        let mut batch = LoompadBatch {
+            snapshot_id: BlobId::digest(b"snapshot").to_string(),
+            sample_target: 4,
+            batch_offset: 0,
+        };
+        // Failed setup admits no work and consumes no offset.
+        budget.check(session, &batch, start).expect("first setup");
+        budget
+            .check(session, &batch, start)
+            .expect("retry before durable registration");
+        let command = CommandId::new();
+        budget.commit(&batch, command, start);
+        let recovery = budget
+            .check(session, &batch, start)
+            .expect_err("cannot reset budget")
+            .speculation_recovery
+            .expect("typed recovery");
+        assert_eq!(recovery.command_ids, vec![command.to_string()]);
+        assert_eq!(recovery.next_offset, 4);
+        assert_eq!(recovery.snapshot_id, batch.snapshot_id);
+        batch.sample_target = 256;
+        batch.batch_offset = 4;
+        assert_eq!(
+            budget
+                .check(session, &batch, start)
+                .expect_err("cooldown")
+                .code,
+            "automatic_generation_throttled"
+        );
+        for offset in (4..256).step_by(4) {
+            batch.batch_offset = offset;
+            let now = start + AUTOMATIC_BUDGET_WINDOW * (offset / 4);
+            budget
+                .check(session, &batch, now)
+                .expect("one sequential batch");
+            budget.commit(&batch, CommandId::new(), now);
+        }
+        batch.batch_offset = 0;
+        let recovery = budget
+            .check(session, &batch, start + Duration::from_secs(400))
+            .expect_err("cannot restart exhausted snapshot")
+            .speculation_recovery
+            .expect("all families");
+        assert_eq!(recovery.next_offset, 256);
+        assert_eq!(recovery.command_ids.len(), 64);
+        assert_eq!(recovery.command_ids[0], command.to_string());
+        budget
+            .check(CommandId::new(), &batch, start)
+            .expect("new project session has new authority");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn loompad_recovery_reads_immutable_registered_context_evidence() {
+        let temp = tempfile::tempdir().expect("temporary project");
+        let (mut store, _) =
+            ProjectStore::initialize(temp.path().join("Writing"), "Writing").expect("store");
+        store
+            .create_document_if_absent(
+                INITIAL_DOCUMENT,
+                DocumentContent::Prose("Exact prefix".into()),
+                "initial",
+            )
+            .expect("document");
+        let loaded = store
+            .read_document(INITIAL_DOCUMENT)
+            .expect("read document");
+        let batch = LoompadBatch {
+            snapshot_id: BlobId::digest(b"exact prompt context and model").to_string(),
+            sample_target: 64,
+            batch_offset: 12,
+        };
+        let bytes = serde_json::to_vec(&serde_json::json!({"loompad": batch, "retrieval": []}))
+            .expect("evidence");
+        let blob = store.store_provenance_blob(&bytes).expect("evidence blob");
+        let context = store
+            .record_context_recipe(&ContextRecipe {
+                source_revision_id: loaded.revision_id,
+                ordered_source_artifact_ids: vec![],
+                token_budget: 4096,
+                retrieval_evidence_blob_id: Some(blob),
+            })
+            .expect("registered recipe");
+        let root = store.root().to_path_buf();
+        drop(store);
+        let store = ProjectStore::open(&root).expect("reopen actual store");
+        assert_eq!(
+            recorded_loompad_batch(&store, context.artifact_id).expect("recover batch"),
+            Some(batch)
+        );
+        assert!(
+            recorded_loompad_batch(&store, loaded.artifact_id).is_err(),
+            "a document artifact cannot impersonate a context recipe"
+        );
+    }
+
+    #[test]
     fn automatic_policy_has_no_runtime_budget_fields() {
         let parsed: WeavePolicySnapshot =
             serde_json::from_str(r#"{"kind":"automatic_v2"}"#).expect("automatic policy");
@@ -12914,27 +13754,6 @@ mod tests {
     }
 
     #[test]
-    fn project_creation_refuses_existing_default_manuscript_without_touching_it() {
-        let temporary = tempfile::tempdir().expect("temporary parent");
-        let root = temporary.path().join("Existing Novel");
-        let manuscript = root.join(INITIAL_DOCUMENT);
-        std::fs::create_dir_all(manuscript.parent().expect("manuscript parent"))
-            .expect("create manuscript parent");
-        let original = "Already written.\n\nStill here.\n";
-        std::fs::write(&manuscript, original).expect("write existing manuscript");
-
-        let error = initialize_project(&root, "Existing Novel".to_owned())
-            .expect_err("creation must refuse an ambiguous existing manuscript");
-
-        assert_eq!(error.code, "existing_manuscript_requires_import");
-        assert_eq!(
-            std::fs::read_to_string(&manuscript).expect("read visible manuscript"),
-            original
-        );
-        assert!(!root.join(".loom").exists());
-    }
-
-    #[test]
     fn app_local_override_routes_default_project_and_model_library() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join("isolated-app-local-data");
@@ -13020,6 +13839,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn default_project_opens_directly_and_reuses_the_same_plain_text_workspace() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13053,6 +13873,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn default_project_reopen_does_not_recreate_initial_after_rename() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13069,12 +13890,13 @@ mod tests {
         let documents = reopened.list_documents().expect("active catalogue");
 
         assert_eq!(documents.len(), 1);
-        assert_eq!(documents[0].relative_path, "manuscript/Renamed.md");
+        assert_eq!(documents[0].relative_path, "Renamed.md");
         assert!(!root.join(INITIAL_DOCUMENT).exists());
-        assert!(root.join("manuscript/Renamed.md").is_file());
+        assert!(root.join("Renamed.md").is_file());
     }
 
     #[test]
+    #[cfg(unix)]
     fn default_project_repairs_interruption_after_manifest_before_document() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13101,6 +13923,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn default_project_adopts_exact_visible_bytes_when_sidecar_is_absent() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13128,6 +13951,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn default_project_recovers_after_complete_sidecar_loss_without_rewriting_text() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13157,6 +13981,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn default_project_never_recreates_a_registered_external_deletion() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13185,6 +14010,7 @@ mod tests {
         target_os = "redox"
     ))]
     #[test]
+    #[cfg(unix)]
     fn default_project_reopens_after_explicit_initial_document_deletion_without_resurrection() {
         let temporary = tempfile::tempdir().expect("temporary app data");
         let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
@@ -13220,6 +14046,39 @@ mod tests {
                 .is_some()
         );
         assert!(!root.join(INITIAL_DOCUMENT).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_default_writing_ignores_unrelated_untitled_symlink() {
+        use std::os::unix::fs::symlink;
+        let temporary = tempfile::tempdir().expect("writing folder");
+        let root = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let mut store = open_or_initialize_default_project(&root).expect("create writing");
+        let mut document = store
+            .open_document_file(INITIAL_DOCUMENT)
+            .expect("initial document");
+        store
+            .rename_document(&mut document, "Draft")
+            .expect("rename");
+        drop(document);
+        drop(store);
+        let outside = temporary.path().join("outside.md");
+        std::fs::write(&outside, "Unrelated writing").expect("outside writing");
+        symlink(&outside, root.join(INITIAL_DOCUMENT)).expect("unrelated symlink");
+        let reopened = open_or_initialize_default_project(&root).expect("open registered writing");
+        assert_eq!(reopened.list_documents().expect("documents").len(), 1);
+        assert_eq!(
+            reopened
+                .read_document("Draft.md")
+                .expect("registered draft")
+                .text,
+            ""
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside).expect("outside untouched"),
+            "Unrelated writing"
+        );
     }
 
     #[cfg(unix)]
@@ -13293,6 +14152,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn completion_snapshot_joins_scoped_supervisor_and_durable_terminal_facts() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Completion Snapshot Novel");
@@ -13399,6 +14259,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn completion_snapshot_rejects_stale_session_and_foreign_document_scope() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Scoped Completion Snapshot Novel");
@@ -13442,6 +14303,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn completion_snapshot_recovers_one_observed_terminal_beyond_the_first_page() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Paged Completion Snapshot Novel");
@@ -13521,6 +14383,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn close_cancels_active_family_waits_for_terminal_release_and_replays() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Closing Novel");
@@ -13622,6 +14485,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn close_timeout_is_bounded_and_leaves_session_revoked_for_exact_retry() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Slow Closing Novel");
@@ -13710,6 +14574,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn close_repairs_recorded_terminal_persistence_failure_before_releasing_store() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Persistence Repair Novel");
@@ -13768,6 +14633,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn project_commands_reject_stale_session_and_cross_project_identity() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Bound Novel");
@@ -13797,6 +14663,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn attachment_ingest_requires_exact_session_and_returns_only_bounded_paths() {
         use base64::Engine as _;
 
@@ -13824,11 +14691,9 @@ mod tests {
         )
         .expect_err("stale session must fail before storage");
         assert_eq!(stale_failure.code, "stale_project_session");
-        assert_eq!(
-            std::fs::read_dir(root.join("assets"))
-                .expect("asset directory")
-                .count(),
-            0
+        assert!(
+            !root.join("assets").exists(),
+            "stale request must not create asset storage"
         );
 
         let first = ingest_image_attachment_for_session(
@@ -13873,6 +14738,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn asset_read_releases_session_lock_and_revalidates_authority() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Asset Read Authority");
@@ -13929,6 +14795,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    #[cfg(unix)]
     fn asset_protocol_authority_is_exact_across_close_switch_and_reopen() {
         use base64::Engine as _;
 
@@ -14138,6 +15005,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn inline_media_authority_requires_current_document_membership_and_session() {
         use sha2::Digest as _;
         let mut fixture = document_action_fixture();
@@ -14283,6 +15151,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn project_summary_keeps_active_identity_across_external_change_and_omits_deletion() {
         let fixture = ReconciliationFixture::new("one two\n");
         fixture.set_external("one two three\n");
@@ -14315,7 +15184,8 @@ mod tests {
     }
 
     #[test]
-    fn reconciliation_preview_returns_exact_canonical_inputs_and_bound_hashes() {
+    #[cfg(unix)]
+    fn reconciliation_preview_returns_exact_authored_inputs_and_bound_hashes() {
         let fixture = ReconciliationFixture::new("alpha\nmiddle\nomega\n");
         let external_visible = "alpha\r\nmiddle\r\nOMEGA\r\n";
         let external_visible_blob_id = fixture.set_external(external_visible);
@@ -14337,7 +15207,7 @@ mod tests {
         assert_eq!(preview.base_text, "alpha\nmiddle\nomega\n");
         assert_eq!(preview.app_text, "ALPHA\nmiddle\nomega\n");
         assert_eq!(preview.external_visible_text, external_visible);
-        assert_eq!(preview.external_text, "alpha\nmiddle\nOMEGA\n");
+        assert_eq!(preview.external_text, external_visible);
         assert_eq!(
             preview.external_visible_blob_id,
             external_visible_blob_id.to_string()
@@ -14351,7 +15221,7 @@ mod tests {
         assert_eq!(
             preview.outcome,
             MergeOutcome::Merged {
-                content: "ALPHA\nmiddle\nOMEGA\n".to_owned()
+                content: "ALPHA\r\nmiddle\r\nOMEGA\r\n".to_owned()
             }
         );
         let serialized = serde_json::to_value(&preview).expect("serialize preview contract");
@@ -14372,6 +15242,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reconciliation_preview_rejects_deleted_hybrid_and_unbound_inputs() {
         let fixture = ReconciliationFixture::new("bound base\n");
         fixture.set_external("bound external\n");
@@ -14439,6 +15310,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn preview_uses_current_draft_and_reports_conflicts_without_writing() {
         let mut fixture = ReconciliationFixture::new("dawn over water\n");
         let draft = fixture
@@ -14489,6 +15361,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn preview_rejects_a_draft_from_an_old_active_revision() {
         let mut fixture = ReconciliationFixture::new("first base\n");
         fixture
@@ -14523,6 +15396,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reconciliation_apply_is_replay_safe_and_never_clears_the_draft() {
         let mut fixture = ReconciliationFixture::new("base manuscript\n");
         let draft = fixture

@@ -1,5 +1,18 @@
-use crate::consult::{ConsultPanel, ConsultPersona};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct BuiltinPersona {
+    pub id: String,
+    pub label: String,
+    pub description: String,
+    pub perspective_prompt: String,
+    #[serde(default)]
+    pub public_figure: Option<String>,
+    #[serde(default)]
+    pub expertise: Option<String>,
+    #[serde(default)]
+    pub model_slot: Option<usize>,
+}
 
 pub(crate) const LIBRARY_REVISION: &str = "therapy-consult-personas-09557b34-2026-08-03";
 
@@ -18,10 +31,10 @@ fn source_personas() -> Vec<SourcePersona> {
     }
 }
 
-pub(crate) fn builtin_personas() -> Vec<ConsultPersona> {
+pub(crate) fn builtin_personas() -> Vec<BuiltinPersona> {
     source_personas()
         .into_iter()
-        .map(|source| ConsultPersona {
+        .map(|source| BuiltinPersona {
             id: source.id,
             label: source.name.clone(),
             description: source.modality.clone(),
@@ -31,72 +44,6 @@ pub(crate) fn builtin_personas() -> Vec<ConsultPersona> {
             model_slot: None,
         })
         .collect()
-}
-
-// The former default panels are retained only for the legacy consult CLI. The
-// chat-native product does not seed them as Persona groups; groups are created
-// and ordered by the user in Settings.
-pub(crate) fn builtin_panels() -> Vec<ConsultPanel> {
-    let personas = builtin_personas();
-    let get = |id: &str| {
-        personas
-            .iter()
-            .find(|persona| persona.id == id)
-            .cloned()
-            .unwrap_or_else(|| panic!("built-in consult Persona `{id}` is missing"))
-    };
-    vec![
-        panel(
-            "builtin-trauma-balanced",
-            "Balanced trauma consultation",
-            vec![
-                get("judith_herman"),
-                get("peter_levine"),
-                get("richard_schwartz"),
-                get("ad_de_jongh"),
-            ],
-        ),
-        panel(
-            "builtin-complex-trauma",
-            "Developmental & complex trauma",
-            vec![
-                get("bessel_van_der_kolk"),
-                get("janina_fisher"),
-                get("christine_courtois"),
-                get("dolores_mosquera"),
-            ],
-        ),
-        panel(
-            "builtin-emdr-formulation",
-            "EMDR case formulation",
-            vec![
-                get("francine_shapiro"),
-                get("ad_de_jongh"),
-                get("jim_knipe"),
-                get("dolores_mosquera"),
-            ],
-        ),
-        panel(
-            "builtin-compulsion-recovery",
-            "Compulsion & recovery",
-            vec![
-                get("gabor_mate"),
-                get("robert_miller_fsap"),
-                get("arnold_popky_detur"),
-                get("shirley_jean_schmidt_dnms"),
-            ],
-        ),
-    ]
-}
-
-fn panel(id: &str, name: &str, personas: Vec<ConsultPersona>) -> ConsultPanel {
-    ConsultPanel {
-        id: id.to_string(),
-        name: name.to_string(),
-        personas,
-        created_at: LIBRARY_REVISION.to_string(),
-        updated_at: LIBRARY_REVISION.to_string(),
-    }
 }
 
 #[cfg(test)]
@@ -126,16 +73,5 @@ mod tests {
                     .perspective_prompt
                     .contains(&format!("You are specifically modeling: {}", persona.label))
         }));
-    }
-
-    #[test]
-    fn legacy_panels_are_bounded_but_are_not_the_seeded_persona_groups() {
-        let panels = builtin_panels();
-        assert!(
-            panels
-                .iter()
-                .all(|panel| !panel.personas.is_empty() && panel.personas.len() <= 4)
-        );
-        assert!(panels.iter().all(|panel| panel.id.starts_with("builtin-")));
     }
 }

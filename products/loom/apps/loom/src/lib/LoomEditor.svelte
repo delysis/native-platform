@@ -2,11 +2,14 @@
   import { baseKeymap, setBlockType, toggleMark, wrapIn } from 'prosemirror-commands';
   import { history, redo, undo } from 'prosemirror-history';
   import { keymap } from 'prosemirror-keymap';
-  import { schema } from 'prosemirror-markdown';
   import type { Node as ProseMirrorNode } from 'prosemirror-model';
   import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
   import { onDestroy, onMount } from 'svelte';
+  import { visualTerminalRange, type TerminalSourceRange } from './terminalSelection';
+  import { flushMediaObjectDrafts, mediaObjectView } from './mediaObjectView';
+  import { objectNavigation } from './objectNavigation';
+  import { shaderCodeBlockView } from './shaderCodeBlock';
   import {
     normalizeVisualMarkdownSource,
     parseVisualMarkdown,
@@ -46,7 +49,7 @@
     type VisualFormatAction,
     type VisualFormatState
   } from './visualFormatting';
-  import { visualMarkdownInputRules } from './visualInputRules';
+  import { visualMarkdownFenceEnter, visualMarkdownInputRules } from './visualInputRules';
   import { visualListKeymap } from './visualListEditing';
   import {
     STALE_IMAGE_ATTACHMENT_ERROR,
@@ -276,10 +279,18 @@
   ): void {
     const editorView = view;
     if (!editorView || editorView.isDestroyed) return;
-    editorView.setProps({
-      editable: () => !snapshot.readonly,
-      attributes: editorAttributes(snapshot.label)
-    });
+    const attributes = editorAttributes(snapshot.label);
+    const previous = typeof editorView.props.attributes === 'function'
+      ? undefined : editorView.props.attributes;
+    if (
+      editorView.editable === snapshot.readonly ||
+      Object.keys(attributes).length !== Object.keys(previous ?? {}).length ||
+      Object.entries(attributes).some(([key, value]) => previous?.[key] !== value)
+    ) {
+      // A redundant setProps can restore stale ProseMirror selection before
+      // WebKit reports the default caret movement from the preceding key.
+      editorView.setProps({ editable: () => !snapshot.readonly, attributes });
+    }
     const anchorByteOffset = snapshot.anchorByteOffset;
     const provenAnchorByteOffset = anchorByteOffset ?? -1;
     const exactAnchor = anchorByteOffset !== null &&
@@ -331,8 +342,8 @@
       // Once a word is consumed the session is locked to one candidate. Do
       // not hide its cached remainder behind a now-empty alternatives fan
       // while Option is still held.
-      fanVisible: snapshot.optionHeld && snapshot.alternatives.length > 1,
-      fanPinned: snapshot.lensPinned && snapshot.alternatives.length > 1
+      fanVisible: !snapshot.hidden && snapshot.optionHeld && snapshot.alternatives.length > 1,
+      fanPinned: !snapshot.hidden && snapshot.lensPinned && snapshot.alternatives.length > 1
     } : null;
     setGhostText(editorView, presentation, forceRender);
     reportCompletionAccessibility();
@@ -397,7 +408,7 @@
   }
 
   export function flushPending(): boolean {
-    if (composing) return false;
+    if (composing || (view && !flushMediaObjectDrafts(view))) return false;
     projectDocument();
     return true;
   }
@@ -469,6 +480,10 @@
     projectDocument();
     view.focus();
     return true;
+  }
+
+  export function captureTerminalSourceRange(): TerminalSourceRange | null {
+    return view && !readonly && !composing ? visualTerminalRange(view.state, lastEmitted) : null;
   }
 
   export function captureTextInsertionAnchor(): {
@@ -678,6 +693,16 @@
     return true;
   }
 
+  export function acceptLoompadText(candidateId: string, presentationKey: string, text: string): boolean {
+    if (!view || readonly || composing || !view.hasFocus()) return false;
+    const plan = currentGhostTextPlan(view.state);
+    if (!plan || plan.candidateId !== candidateId || plan.presentationKey !== presentationKey ||
+        !text || !plan.text.startsWith(text) || selectionBoundary(view.state) !== plan.anchorByteOffset) return false;
+    if (!authorizeCompletionInsertion(candidateId, presentationKey, text, 'loompad')) return false;
+    view.dispatch(view.state.tr.insertText(text));
+    return true;
+  }
+
   function authorizeCompletionInsertion(
     candidateId: string,
     presentationKey: string,
@@ -704,17 +729,21 @@
   }
 
   function stateFor(markdown: string): EditorState {
+    const doc = parse(markdown);
+    const schema = doc.type.schema;
     const paragraph = schema.nodes.paragraph;
     const heading = schema.nodes.heading;
     const blockquote = schema.nodes.blockquote;
     const strong = schema.marks.strong;
     const em = schema.marks.em;
     return EditorState.create({
-      doc: parse(markdown),
+      doc,
       plugins: [
         history(),
-        visualMarkdownInputRules(),
+        objectNavigation(),
+        visualMarkdownInputRules(schema),
         keymap({
+          Enter: visualMarkdownFenceEnter,
           'Mod-z': undo,
           'Shift-Mod-z': redo,
           'Mod-y': redo,
@@ -735,13 +764,14 @@
             editorView &&
             visibleGhostWidgetPresentationKey(editorView) === plan.presentationKey
           );
-        }),
+        }, schema),
         createGhostTextPlugin({
           accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
           insert: authorizeCompletionInsertion,
           unconsume: authorizeCompletionReversal,
           cycle: onGhostCycle,
           modifier: setOptionHeld,
+          navigate: onCaretNavigation,
           pin: setLensPinned,
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
           visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>
@@ -782,7 +812,7 @@
     return attributes;
   }
 
-  function imageNodeView(node: ProseMirrorNode): { dom: HTMLElement; destroy: () => void } {
+  function imageNodeView(node: ProseMirrorNode, editor: EditorView, getPos: () => number | undefined) {
     const markdownPath = typeof node.attrs.src === 'string' ? node.attrs.src : '';
     const isAudio = markdownPath.startsWith('loom-attachment:') && String(node.attrs.alt).startsWith('Audio:');
     const media = document.createElement(isAudio ? 'audio' : 'img');
@@ -824,7 +854,8 @@
       }
     };
     load();
-    return { dom, destroy: () => { media.onerror = null; window.clearTimeout(retry); } };
+    const object = mediaObjectView(node, editor, getPos, dom);
+    return { ...object, destroy: () => { object.destroy?.(); media.onerror = null; window.clearTimeout(retry); } };
   }
 
   function attachmentSelection(event: DragEvent | ClipboardEvent): Selection | null {
@@ -1011,7 +1042,7 @@
     lastEmitted = initialMarkdown;
     view = new EditorView(mount, {
       state: stateFor(initialMarkdown),
-      nodeViews: { image: imageNodeView },
+      nodeViews: { image: imageNodeView, code_block: (node, editor, getPos) => shaderCodeBlockView(node, editor, getPos) },
       editable: () => !readonly,
       attributes: editorAttributes(),
       dispatchTransaction(transaction) {
@@ -1255,3 +1286,14 @@
 <div class="loom-editor-shell">
   <div class="editor-mount" bind:this={mount}></div>
 </div>
+
+<style>
+  :global(.loom-object-menu) { position: fixed; z-index: 1000; padding: 3px; border: 1px solid var(--line, #777); border-radius: 5px; background: var(--paper); box-shadow: 0 3px 12px #0003; }
+  :global(.loom-object-menu button) { min-width: 80px; min-height: 28px; text-align: left; padding: 3px 10px; border: 0; border-radius: 3px; color: var(--ink); background: transparent; font-size: 13px; }
+  :global(.loom-object-menu button:hover), :global(.loom-object-menu button:focus-visible) { background: var(--chrome-hover); }
+  :global(.loom-shader-block.ProseMirror-selectednode) { outline: 2px solid var(--moss); outline-offset: 2px; }
+  :global(.loom-shader-block[data-shader-mode="render"]) { width: fit-content; max-width: 100%; }
+  :global(.loom-media-object.ProseMirror-selectednode) { outline: 2px solid var(--moss); outline-offset: 2px; }
+  :global(.loom-object-source) { width: min(100%, 48em); font: inherit; font-family: ui-monospace, monospace; }
+  :global(.loom-object-error) { display: block; color: var(--danger); font-size: 11px; }
+</style>
