@@ -10,6 +10,11 @@ loom-types = { path = "../loom-types" }
 serde.workspace = true
 similar.workspace = true
 thiserror.workspace = true
+unicode-segmentation.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+sha2.workspace = true
 
 [lints.rust]
 unsafe_code = "forbid"
