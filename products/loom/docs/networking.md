@@ -165,6 +165,10 @@ graph cannot coexist with the main workspace's rusqlite link dependency. Install
 the root toolchain, Protobuf's `protoc`, and the platform OpenSSL development dependencies.
 `node scripts/build-loom-signal.mjs` builds and places the required Tauri sidecar.
 Tauri dev/build hooks invoke it; plain Cargo workspace builds need this step first.
+The sidecar follows Tauri's debug/release build profile, so a development bundle
+reuses the worker tested by CI. Direct script calls default to debug; `--release`
+selects an optimized worker. Tauri supplies its profile through
+[`TAURI_ENV_DEBUG`](https://v2.tauri.app/reference/environment-variables/).
 
 Presage and the Signal worker are AGPL-3.0-only. Preserve the worker's license,
 upstream notices, pinned dependency lockfile, and corresponding source when

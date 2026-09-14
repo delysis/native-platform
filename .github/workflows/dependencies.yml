@@ -8,6 +8,7 @@ on:
       - '**/package.json'
       - pnpm-lock.yaml
       - deny.toml
+      - '**/deny.toml'
       - vendor/**
       - .github/workflows/dependencies.yml
   schedule:
@@ -40,6 +41,7 @@ jobs:
           echo "$RUNNER_TEMP/cargo-deny-0.20.2-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
       - run: cargo deny --locked check advisories licenses sources
       - run: cargo deny --manifest-path crates/services/attachment/fuzz/Cargo.toml --locked --config deny.toml check advisories licenses sources
+      - run: cargo deny --manifest-path products/loom/signal/Cargo.toml --locked --config products/loom/signal/deny.toml check advisories licenses sources
       - name: Audit JavaScript lock
         run: |
           corepack enable

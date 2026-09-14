@@ -7,7 +7,7 @@
   "build": {
     "beforeDevCommand": "node ../../../../scripts/build-loom-signal.mjs && pnpm dev",
     "devUrl": "http://127.0.0.1:1420",
-    "beforeBuildCommand": "node ../../../../scripts/build-loom-signal.mjs --release && pnpm build",
+    "beforeBuildCommand": "node ../../../../scripts/build-loom-signal.mjs && pnpm build",
     "frontendDist": "../dist"
   },
   "app": {

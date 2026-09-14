@@ -59,16 +59,19 @@ coverage to obtain a green report.
 ## Dependencies and platform qualification
 
 `dependencies.yml` runs daily and for relevant manifest, lock, policy, or vendor
-changes. Hash-pinned cargo-deny checks both Rust locks for advisories, licenses,
+changes. Hash-pinned cargo-deny checks all three owned Rust locks for advisories, licenses,
 and permitted sources; pnpm checks the actual JavaScript lock. Maintenance-only
 exceptions name their reason and review date in `deny.toml`. GLib's compatible
 security backport has a source/patch record in `vendor/glib/PATCH.md`; its real
 iterator tests run with optimization on Linux.
 
-There is one first-party Cargo workspace and root lock plus the independent
-Attachment fuzz workspace/lock. The external GLib patch is not a first-party
-workspace member. External llama bindings use an exact Git revision. Historical
-migration receipts and seals do not gate ordinary changes.
+The main Cargo workspace, Attachment fuzzing, and Signal SQLCipher worker each
+have a committed lock. The Signal graph has its own license/source policy and
+does not relax the main workspace's policy. Its upstream release tags resolve
+to exact commits in the lock; mutable branches are disallowed. External GLib and
+ort-sys patches are not first-party workspace members. External llama bindings
+use an exact Git revision. Historical migration receipts and seals do not gate
+ordinary changes.
 
 macOS remains the product-acceptance target. Linux and Windows checks establish
 only their executed capabilities. Unsupported private Information, Loom project, and
