@@ -918,6 +918,6 @@ export function compileShaderPreview(source: string): Promise<{ fragment: string
 export function getWorkspaceTemplate(projectId: string, sessionId: string): Promise<import('./workspaceTemplate').WorkspaceTemplateSnapshot> {
   return call('workspace_template_get', { projectId, sessionId });
 }
-export function enableWorkspaceTemplate(projectId: string, sessionId: string): Promise<import('./workspaceTemplate').WorkspaceTemplateSnapshot> {
-  return call('workspace_template_enable', { projectId, sessionId });
+export function enableWorkspaceTemplate(projectId: string, sessionId: string, choices?: import('./workspaceTemplate').SetupChoices): Promise<import('./workspaceTemplate').WorkspaceTemplateSnapshot> {
+  return call('workspace_template_enable', { projectId, sessionId, choices: choices ?? null });
 }

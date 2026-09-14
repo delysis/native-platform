@@ -30,8 +30,8 @@ pub(crate) fn normalize_document_path(path: &Path) -> Result<String> {
         let component = component
             .to_str()
             .ok_or_else(|| StoreError::NonUtf8Path(path.to_path_buf()))?;
-        // Dot-prefixed Markdown leaves are ordinary, explicitly opened writing
-        // (including .loom.md). Hidden directories remain outside this authority.
+        // Named project settings and dot-prefixed Markdown leaves may be edited
+        // explicitly. Other hidden files/directories remain outside this authority.
         let hidden_markdown_leaf = path_components.peek().is_none()
             && matches!(
                 Path::new(component)
@@ -39,7 +39,7 @@ pub(crate) fn normalize_document_path(path: &Path) -> Result<String> {
                     .and_then(|ext| ext.to_str()),
                 Some("md" | "markdown")
             );
-        if component.starts_with('.') && !hidden_markdown_leaf {
+        if component.starts_with('.') && !hidden_markdown_leaf && encoded != ".mine.toml" {
             return Err(StoreError::UnsafeRelativePath(path.display().to_string()));
         }
         components.push(component.to_owned());
@@ -186,6 +186,18 @@ mod tests {
         assert!(normalize_document_path(Path::new("notes/.git/config")).is_err());
         assert!(normalize_document_path(Path::new(".hidden.md/notes.md")).is_err());
         assert!(normalize_document_path(Path::new(".env")).is_err());
+        assert_eq!(
+            normalize_document_path(Path::new(".mine.toml")).unwrap(),
+            ".mine.toml"
+        );
+        for path in [
+            ".other.toml",
+            "nested/.mine.toml",
+            ".mine.toml/notes.md",
+            ".mine/personas/voice.md",
+        ] {
+            assert!(normalize_document_path(Path::new(path)).is_err());
+        }
         for path in [".loom.md", "templates/.voice.markdown"] {
             assert_eq!(normalize_document_path(Path::new(path)).unwrap(), path);
         }

@@ -73,7 +73,7 @@
   $: if (mounted && config.kind === 'chat') void hydrateOutputs(scope, recentRuns, documents);
   $: editingCurrent = !config.document || target?.document_id === source?.summary.document_id;
   $: editorKey = `${scope}/${source?.summary.document_id ?? ''}`;
-  $: visual = selectVisual(value, editorKey);
+  $: visual = source?.summary.relative_path !== '.mine.toml' && selectVisual(value, editorKey);
   $: sourceDecoded = decodeSourceForEditor(value);
   $: preview = mounted && config.kind === 'browser' ? previewUrl(projectId, sessionId, target, runs, documents) : '';
 

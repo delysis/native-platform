@@ -2192,6 +2192,7 @@ impl IpcFailure {
             StoreError::Sqlite(_) => "database_error",
             StoreError::Json(_) => "manifest_json_error",
             StoreError::Document(_) => "document_projection_error",
+            StoreError::DocumentSnapshot(_) => "document_snapshot_error",
             StoreError::NonUtf8Path(_) => "non_utf8_path",
             StoreError::UnsafeRelativePath(_) => "unsafe_relative_path",
             StoreError::SymbolicLink(_) => "symbolic_link_refused",

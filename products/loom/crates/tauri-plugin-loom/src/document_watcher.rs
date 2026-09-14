@@ -93,6 +93,9 @@ fn is_writing_path(project_root: &Path, event_path: &Path) -> bool {
     let Some(relative) = relative else {
         return false;
     };
+    if relative == Path::new(".mine.toml") {
+        return true;
+    }
     let mut components = relative.components().peekable();
     while let Some(component) = components.next() {
         let Component::Normal(name) = component else {
@@ -221,6 +224,7 @@ mod tests {
             "chapters",
             "drafts.v2",
             ".loom.md",
+            ".mine.toml",
             "templates/.chat.md",
         ] {
             assert!(event_requires_hint(

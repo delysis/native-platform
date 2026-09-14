@@ -7,7 +7,8 @@
   import type { TerminalSourceRange } from './lib/terminalSelection';
   import { workspaceRows } from './lib/workspaceTree';
   import WorkspacePane from './lib/WorkspacePane.svelte';
-  import type { WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
+  import SetupFlow from './lib/SetupFlow.svelte';
+  import type { SetupChoices, WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
   import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
   import { startAudioRecording, stopAudioRecording, synthesizeAudio, type AudioRecording } from './lib/ipc';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
@@ -385,22 +386,45 @@
   let workspaceTemplate: WorkspaceTemplateSnapshot | null = null;
   let deferredWorkspaceTemplate: WorkspaceTemplateSnapshot | null = null;
   let deferredTemplateSession = '';
-  $: if (deferredWorkspaceTemplate && !compositionActive) applyDeferredTemplate();
+  let workspaceSettingsSession = '';
+  let assistanceReadySession = '';
+  let appliedAssistanceKey = '';
+  let attemptedAssistance: WorkspaceTemplateSnapshot | null = null;
+  let setupFlowOpen = false;
+  let setupSaving = false;
+  let setupError = '';
+  let setupDownloadIds: string[] = [];
+  $: setupDownloads = setupDownloadIds.map(id => modelDownloads.find(download => download.command_id === id));
+  $: setupDownloadStatus = setupDownloads.some(download => download?.status.status === 'failed')
+    ? 'The download needs attention. Your writing is available.'
+    : setupDownloads.some(download => download?.status.status === 'cancelled')
+      ? 'Download stopped. You can restart it in download details.'
+      : setupDownloads.some(download => !download)
+        ? 'Checking download progress. You can keep writing.'
+        : setupDownloads.length > 0 && setupDownloads.every(download => download?.status.status === 'completed')
+          ? 'Download verified. Your writing is available.'
+          : 'Your model is downloading. You can keep writing.';
+  $: if (project && assistanceReadySession === project.session_id && !suggestionsChanging && workspaceTemplate) void applyConfiguredAssistance();
+  $: if (deferredWorkspaceTemplate && !compositionActive && !contextCompositionActive) applyDeferredTemplate();
   let templateKey = '';
   let templateSerial = 0;
   let paneSelection: Record<string, string> = {};
   let paneEditors: Record<string, WorkspacePane> = {};
   let paneBusy: Record<string, boolean> = {};
   let paneComposing: Record<string, boolean> = {};
-  $: configuredPanes = workspaceTemplate?.enabled && !workspaceTemplate.error ? Object.entries(workspaceTemplate.config.panes) : [];
+  $: configuredPanes = workspaceTemplate?.enabled ? Object.entries(workspaceTemplate.config.panes) : [];
   $: paneSlots = (['main', 'right', 'bottom'] as const).map(position => {
     const choices = configuredPanes.filter(([, config]) => config.position === position && config.visible);
     return { position, choices, selected: choices.find(([id]) => id === paneSelection[position]) ?? choices[0] };
   });
   $: mainPane = paneSlots.find(slot => slot.position === 'main')?.selected;
-  $: customMain = Boolean(mainPane && (mainPane[1].kind !== 'editor' || mainPane[1].document));
+  $: customMain = document?.summary.relative_path !== '.mine.toml' && Boolean(mainPane && (mainPane[1].kind !== 'editor' || mainPane[1].document));
   $: if (desktop && project) {
-    const key = `${project.project_id}/${project.session_id}/${project.documents.find(item => item.relative_path === '.loom.md')?.revision_id ?? ''}`;
+    if (workspaceSettingsSession !== project.session_id) {
+      workspaceSettingsSession = project.session_id; workspaceTemplate = null; deferredWorkspaceTemplate = null;
+      assistanceReadySession = ''; appliedAssistanceKey = ''; attemptedAssistance = null; setupFlowOpen = false; setupError = ''; setupDownloadIds = [];
+    }
+    const key = `${project.project_id}/${project.session_id}/${project.documents.find(item => item.relative_path === '.mine.toml')?.revision_id ?? ''}`;
     if (key !== templateKey) { templateKey = key; void refreshWorkspaceTemplate(); }
   } else { workspaceTemplate = null; deferredWorkspaceTemplate = null; templateKey = ''; }
   let outlineOpen = false;
@@ -1048,7 +1072,7 @@
     liveTextSequenceByRun: liveBranchTextSequenceByRun,
     currentModel,
     document,
-    suggestionsEnabled: completionAutomationEnabled(),
+    suggestionsEnabled: document?.summary.relative_path !== '.mine.toml' && completionAutomationEnabled(),
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
     unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
@@ -1064,7 +1088,7 @@
     liveTextSequenceByRun: liveBranchTextSequenceByRun,
     currentModel,
     document,
-    suggestionsEnabled: completionAutomationEnabled(),
+    suggestionsEnabled: document?.summary.relative_path !== '.mine.toml' && completionAutomationEnabled(),
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
     unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
@@ -1191,7 +1215,7 @@
       : '';
   $: finishCompletionIfExhausted(completionExhaustionKey);
   $: visualAutocompleteDisposition = autocompleteDisposition({
-    active: mode === 'visual' && completionAutomationEnabled() && !visualMutationPending && branchPromotionReady,
+    active: mode === 'visual' && document?.summary.relative_path !== '.mine.toml' && completionAutomationEnabled() && !visualMutationPending && branchPromotionReady,
     branches: currentReadyBranches,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     dismissedCandidateIds,
@@ -1200,7 +1224,7 @@
     presentationCompatible: visualGhostTextMayBePlainProse
   });
   $: sourceAutocompleteDisposition = autocompleteDisposition({
-    active: mode === 'source' && completionAutomationEnabled() && !sourceDirty && !compositionActive && branchPromotionReady,
+    active: mode === 'source' && document?.summary.relative_path !== '.mine.toml' && completionAutomationEnabled() && !sourceDirty && !compositionActive && branchPromotionReady,
     branches: currentReadyBranches,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     dismissedCandidateIds,
@@ -1250,7 +1274,7 @@
     ? visualSelectionByte !== null
     : mode === 'source' && Boolean(sourceTextarea) && sourceSelectionStart === sourceSelectionEnd;
   $: canUseVisual = Boolean(
-    document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')
+    document?.summary.relative_path !== '.mine.toml' && document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')
   );
   $: weaveCursorAtStart = mode === 'source'
     ? sourceSelectionStart === 0
@@ -1259,7 +1283,7 @@
     desktop,
     automationEnabled: completionAutomationEnabled(),
     projectAvailable: Boolean(project),
-    documentAvailable: Boolean(document),
+    documentAvailable: Boolean(document) && document?.summary.relative_path !== '.mine.toml',
     hybridDocument: document?.summary.kind === 'hybrid',
     intentArmed: completionGenerationIsArmed(
       completionGenerationIntent,
@@ -3418,8 +3442,10 @@
     modelDownloadError = '';
     try {
       await ensureModelDownloadEventListener();
+      const commandIds: string[] = [];
       for (const request of requests) {
         const commandId = newUlid();
+        commandIds.push(commandId);
         const snapshot = await startModelDownload({
           commandId,
           url: request.url,
@@ -3431,6 +3457,9 @@
         applyModelDownloadSnapshot(snapshot, false);
       }
       announce('Verified Gemma 4 model and multimodal projector downloads started');
+      if (project && !workspaceTemplate?.enabled) {
+        setupDownloadIds = commandIds; setupFlowOpen = true; setupError = ''; closeModelManager();
+      }
     } catch (error) {
       modelDownloadError = error instanceof Error
         ? error.message
@@ -4233,7 +4262,7 @@
       ) return false;
       models = discovered;
       const rememberedPath = loadLastLocalModelPath();
-      selectedModelPath = preferredWriterModelPath(
+      selectedModelPath = workspaceTemplate?.model_path ?? preferredWriterModelPath(
         discovered,
         rememberedPath,
         selectedModelPath
@@ -5187,15 +5216,15 @@
     completionController = cancelCompletionSchedule(completionController);
   }
 
-  async function setSuggestionsEnabled(enabled: boolean, persist = true): Promise<void> {
+  async function setSuggestionsEnabled(enabled: boolean, persist = true): Promise<boolean> {
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
       !project ||
       suggestionsChanging
-    ) return;
+    ) return false;
     if (enabled && !buildModelPolicy) {
       announce('Suggestions remain off because this build could not verify its local writer policy');
-      return;
+      return false;
     }
     const boundProject = project;
     const previousEnabled = suggestionsEnabled;
@@ -5230,7 +5259,7 @@
         !applicationAllowsModelPreparation(applicationClosePhase) ||
         project?.project_id !== boundProject.project_id ||
         project.session_id !== boundProject.session_id
-      ) return;
+      ) return false;
       suggestionsEnabled = enabled;
       if (engineBecameDisabled) clearCompletionSession();
       if (persist) {
@@ -5262,6 +5291,7 @@
       if (engineBecameEnabled && writerReady && document) {
         scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'explicit_enable');
       }
+      return true;
     } catch (error) {
       suggestionsEnabled = previousEnabled;
       completionController = setDismissedCompletionCandidates(
@@ -5272,7 +5302,8 @@
       cancelSuggestionTimer();
       if (!enabled && activeBranchCount > 0) void cancelActiveBranches();
       recordFailure(error);
-      announce('Suggestions remain off because the project gate could not be changed');
+      announce('Suggestions could not be changed');
+      return false;
     } finally {
       suggestionsChanging = false;
     }
@@ -5452,7 +5483,11 @@
     if (curatedModels.length === 0) await refreshCuratedModels();
     if (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace)) return false;
     const rememberedPath = loadLastLocalModelPath();
-    const candidates = startupWriterCandidates(models, rememberedPath);
+    const configuredPath = workspaceTemplate?.model_path;
+    const discoveredCandidates = startupWriterCandidates(models, rememberedPath);
+    const candidates = configuredPath
+      ? [discoveredCandidates.find(candidate => candidate.modelPath === configuredPath) ?? { modelPath: configuredPath, profileId: null, remembered: false }]
+      : discoveredCandidates;
     let terminalFailure: LoomFailure | null = null;
     for (const candidate of candidates) {
       if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
@@ -5805,8 +5840,18 @@
       return false;
     }
 
-    const storedSuggestionsPreference = loadSuggestionPreference(captured.projectId);
+    let storedSuggestionsPreference = loadSuggestionPreference(captured.projectId);
     try {
+      const serial = ++templateSerial;
+      const settings = await getWorkspaceTemplate(captured.projectId, captured.sessionId);
+      if (!workspaceRestoreIsCurrent(captured)) return false;
+      if (serial !== templateSerial) {
+        assistanceReadySession = captured.sessionId;
+        return false;
+      }
+      acceptWorkspaceSettings(settings);
+      if (settings.error) throw new Error(settings.error);
+      storedSuggestionsPreference = settings.suggestions ?? storedSuggestionsPreference;
       const policy = await runCurrentWorkspaceStep({
         capture: captured,
         isCurrent: workspaceRestoreIsCurrent,
@@ -5818,10 +5863,13 @@
       });
       if (policy.status === 'stale') return false;
       suggestionsEnabled = storedSuggestionsPreference;
+      appliedAssistanceKey = `${captured.sessionId}/${settings.source_sha256 ?? ''}`;
+      assistanceReadySession = captured.sessionId;
     } catch (error) {
       if (!workspaceRestoreIsCurrent(captured)) return false;
       suggestionsEnabled = false;
       recordFailure(error);
+      assistanceReadySession = captured.sessionId;
       announce('Suggestions remain off because the project gate could not be restored');
       return false;
     }
@@ -6349,7 +6397,7 @@
         saveMessage = 'All changes saved';
         announce(`Opened ${target.title}`);
       }
-      mode = opened.summary.kind === 'prose' && canUseVisualMarkdown(effectiveText, false)
+      mode = opened.summary.relative_path !== '.mine.toml' && opened.summary.kind === 'prose' && canUseVisualMarkdown(effectiveText, false)
         ? preferredProseMode
         : 'source';
       void refreshBranchesFor(
@@ -6738,6 +6786,7 @@
     delay = suggestionsIdleDelayMs,
     trigger: CompletionGenerationTrigger = 'document_edit'
   ): void {
+    if (document?.summary.relative_path === '.mine.toml') return;
     const armed = armCompletionScheduleIntent(
       completionController,
       completionContextKey,
@@ -7813,10 +7862,13 @@
       return;
     }
     const modifier = event.metaKey || event.ctrlKey;
+    if (modifier && event.code === 'Comma' && !event.altKey && !event.isComposing) {
+      event.preventDefault(); void refreshWorkspaceTemplate(true); return;
+    }
     if (modifier && event.shiftKey && !event.altKey && !event.isComposing) {
       const key = event.key.toLowerCase();
       if (key === 'u') { event.preventDefault(); void readAloud(); return; }
-      if (event.code === 'Comma') { event.preventDefault(); void refreshWorkspaceTemplate(true); return; }
+      if (key === 'r') { event.preventDefault(); void reloadModelFromSettings(); return; }
       if (key === 'l') { event.preventDefault(); toggleAppearance(); return; }
       if (key === 'm' && document) { event.preventDefault(); void setMode(mode === 'visual' ? 'source' : 'visual'); return; }
       if (key === 'f' && formatMenu) { event.preventDefault(); formatMenu.toggleOpen(); return; }
@@ -8491,7 +8543,7 @@
     uncertainSave = null;
     branches = [];
     resetLiveGenerationView();
-    mode = opened.summary.kind === 'prose' && canUseVisualMarkdown(opened.text, false)
+    mode = opened.summary.relative_path !== '.mine.toml' && opened.summary.kind === 'prose' && canUseVisualMarkdown(opened.text, false)
       ? preferredProseMode
       : 'source';
     if (opened.transient_draft) {
@@ -8805,6 +8857,10 @@
     }
     if (next === mode) return;
     if (!flushEditors()) return;
+    if (next === 'visual' && document?.summary.relative_path === '.mine.toml') {
+      announce('Settings use the source editor');
+      return;
+    }
     if (next === 'visual' && document?.summary.kind !== 'prose') {
       announce('Visual editing is available for prose manuscripts');
       return;
@@ -8827,7 +8883,7 @@
     }
     invalidateCompletionForCaretNavigation();
     if (next === 'source' && document) setSourceDocument(documentText);
-    if (document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')) {
+    if (document?.summary.relative_path !== '.mine.toml' && document?.summary.kind === 'prose' && canUseVisualMarkdown(documentText, mode === 'visual')) {
       preferredProseMode = next;
     }
     mode = next;
@@ -9119,15 +9175,17 @@
   }
 
   async function refreshWorkspaceTemplate(enable = false): Promise<void> {
-    if (!project || compositionActive || !flushEditors()) return;
-    if (document?.summary.relative_path === '.loom.md' && editVersion !== savedVersion) return;
+    if (!project) return;
+    if (enable && (compositionActive || contextCompositionActive || !flushEditors())) {
+      announce('Finish composing text before opening settings'); return;
+    }
+    if (document?.summary.relative_path === '.mine.toml' && editVersion !== savedVersion) return;
     const scope = { projectId: project.project_id, sessionId: project.session_id };
     const serial = ++templateSerial;
     try {
       const snapshot = await (enable ? enableWorkspaceTemplate : getWorkspaceTemplate)(scope.projectId, scope.sessionId);
       if (serial !== templateSerial || !terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return;
-      if (!flushEditors()) { deferredTemplateSession = scope.sessionId; deferredWorkspaceTemplate = snapshot; return; }
-      workspaceTemplate = snapshot;
+      acceptWorkspaceSettings(snapshot);
       const registered = project?.documents.find(item => item.document_id === snapshot.document_id);
       if (snapshot.document_id && registered?.revision_id !== snapshot.revision_id) {
         scheduleProjectFilesystemRefresh(0);
@@ -9142,6 +9200,84 @@
     }
   }
 
+  function acceptWorkspaceSettings(snapshot: WorkspaceTemplateSnapshot): void {
+    if (!project) return;
+    if (compositionActive || contextCompositionActive || !flushEditors()) {
+      deferredTemplateSession = project.session_id;
+      if (deferredWorkspaceTemplate !== snapshot) deferredWorkspaceTemplate = snapshot;
+      return;
+    }
+    deferredWorkspaceTemplate = null;
+    // Keep the last valid layout visible while the author repairs invalid TOML.
+    workspaceTemplate = snapshot.error && workspaceTemplate
+      ? { ...snapshot, config: workspaceTemplate.config }
+      : snapshot;
+  }
+
+  async function applyConfiguredAssistance(): Promise<void> {
+    if (!project || !workspaceTemplate || workspaceTemplate.error || suggestionsChanging) return;
+    const settings = workspaceTemplate;
+    const scope = project.session_id;
+    const key = `${scope}/${settings.source_sha256 ?? ''}`;
+    if (key === appliedAssistanceKey || attemptedAssistance === settings) return;
+    attemptedAssistance = settings;
+    const applied = await setSuggestionsEnabled(settings.suggestions ?? loadSuggestionPreference(project.project_id), false);
+    if (applied && project?.session_id === scope) appliedAssistanceKey = key;
+  }
+
+  async function reloadModelFromSettings(): Promise<void> {
+    const captured = currentWorkspaceCapture();
+    if (!captured || modelLoading || modelUnloading || compositionActive || contextCompositionActive) return;
+    if (document?.summary.relative_path === '.mine.toml' && !await flushCurrentDocument()) return;
+    if (!workspaceRestoreIsCurrent(captured)) return;
+    const serial = ++templateSerial;
+    try {
+      const settings = await getWorkspaceTemplate(captured.projectId, captured.sessionId);
+      if (!workspaceRestoreIsCurrent(captured) || serial !== templateSerial) return;
+      acceptWorkspaceSettings(settings);
+      if (settings.error) throw new Error(settings.error);
+      const path = settings.model_path ?? currentModel?.model_path ?? selectedModelPath;
+      if (!path) throw new Error('Set model.path in .mine.toml or choose a local model first.');
+      await refreshModels(captured);
+      if (!workspaceRestoreIsCurrent(captured)) return;
+      const selected = models.find(model => model.model_path === path);
+      if (!selected) throw new Error('The configured model file is unavailable. Check model.path in .mine.toml.');
+      if (curatedModels.length === 0) await refreshCuratedModels();
+      if (!workspaceRestoreIsCurrent(captured)) return;
+      const catalogEntry = curatedModels.find(entry => legacyLocalCatalogMatch(entry, selected)) ?? null;
+      if (!await activateSuggestionWriter(selected, captured, catalogEntry) && modelSetupError) {
+        throw new Error(modelSetupError);
+      }
+    } catch (error) {
+      if (workspaceRestoreIsCurrent(captured)) recordFailure(error);
+    }
+  }
+
+  async function applySetup(choices: SetupChoices): Promise<void> {
+    if (!project || setupSaving) return;
+    const scope = { projectId: project.project_id, sessionId: project.session_id };
+    const serial = ++templateSerial;
+    setupSaving = true; setupError = '';
+    try {
+      const settings = await enableWorkspaceTemplate(scope.projectId, scope.sessionId, choices);
+      if (!terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return;
+      if (serial === templateSerial) acceptWorkspaceSettings(settings);
+      if (settings.error) throw new Error(settings.error);
+      if (settings.suggestions !== choices.suggestions || settings.config.panes.chat.visible !== choices.chat) {
+        throw new Error('A settings file already exists. Open it to adjust these choices.');
+      }
+      await refreshProjectFilesystemState();
+      if (!terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return;
+      // Setup does not replace the writing document with its settings file.
+      setupFlowOpen = false;
+      announce('Your space is configured');
+    } catch (error) {
+      if (terminalScopeIsCurrent(scope.projectId, scope.sessionId)) setupError = normalizeFailure(error).message;
+    } finally {
+      setupSaving = false;
+    }
+  }
+
   async function openPaneDocument(id: string): Promise<void> {
     const candidate = project?.documents.find(item => item.document_id === id);
     if (candidate) await selectDocument(candidate, true);
@@ -9149,9 +9285,7 @@
 
   function applyDeferredTemplate(): void {
     if (project?.session_id !== deferredTemplateSession) { deferredWorkspaceTemplate = null; return; }
-    if (!flushEditors()) return;
-    workspaceTemplate = deferredWorkspaceTemplate;
-    deferredWorkspaceTemplate = null;
+    if (deferredWorkspaceTemplate) acceptWorkspaceSettings(deferredWorkspaceTemplate);
   }
 
   function selectPane(position: string, id: string): void {
@@ -9292,6 +9426,9 @@
   {/if}
 
   {#if project}
+    {#if workspaceTemplate?.error}
+      <div class="error-banner" role="alert">{workspaceTemplate.error}<button type="button" class="bare-button compact" on:click={() => void refreshWorkspaceTemplate(true)}>Open settings file</button></div>
+    {/if}
     <div class:outline-open={outlineOpen} class:has-right-pane={paneSlots.some(slot => slot.position === 'right' && slot.selected)} class="workspace-grid">
       <aside
         id="project-outline"
@@ -9808,6 +9945,18 @@
       {/each}
 
     </div>
+      {#if setupFlowOpen}
+        {#key project.session_id}
+          <SetupFlow
+            status={setupDownloadStatus}
+            busy={setupSaving} error={setupError}
+            onApply={(choices) => void applySetup(choices)}
+            onSkip={() => { setupFlowOpen = false; announce('Setup skipped'); }}
+            onTransfers={openModelManager}
+            onSettings={() => { setupFlowOpen = false; void refreshWorkspaceTemplate(true); }}
+          />
+        {/key}
+      {/if}
       <TerminalPane
         bind:open={terminalOpen}
         bind:entry={terminalEntry}
