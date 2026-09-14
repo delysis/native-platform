@@ -45,6 +45,12 @@ const PREFIX = 'plugin:loom|';
 // its bounded critical sections, so renderer classification is an ordering and
 // latency optimization rather than a correctness boundary.
 const INDEPENDENT_COMMANDS = new Set([
+  'import_account_cancel',
+  'import_source_url',
+  'import_accounts',
+  'import_account_connect',
+  'import_account_disconnect',
+  'import_account_sync',
   'application_close_abort',
   'application_close_pending',
   'build_model_policy_get',
@@ -842,4 +848,35 @@ export function normalizeFailure(error: unknown): LoomFailure {
     message: 'Loom could not complete that command.',
     retryable: true
   };
+}
+
+export type ImportSource = 'gmail' | 'google_alerts' | 'linked_in' | 'drive';
+export interface ImportAccount { service: 'gmail' | 'drive'; email: string | null }
+export interface ImportBatch { imported: ContextAttachment[]; failures: { name: string; message: string }[]; next_page_token: string | null }
+export function importAccounts(projectId: string, sessionId: string): Promise<ImportAccount[]> {
+  return call('import_accounts', { projectId, sessionId });
+}
+export function connectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', clientId: string, clientSecret: string): Promise<ImportAccount> {
+  return call('import_account_connect', { projectId, sessionId, service, clientId, clientSecret });
+}
+export function disconnectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', accountEmail: string): Promise<void> {
+  return call('import_account_disconnect', { projectId, sessionId, service, accountEmail });
+}
+export function syncImportAccount(projectId: string, sessionId: string, source: ImportSource, accountEmail: string, query: string, pageToken: string | null): Promise<ImportBatch> {
+  return call('import_account_sync', { projectId, sessionId, source, accountEmail, query, pageToken });
+}
+export function chooseImportBatch(projectId: string, sessionId: string, folder: boolean): Promise<ImportBatch> {
+  return call('attachment_import_batch_choose', { projectId, sessionId, folder });
+}
+
+export function importSourceUrl(projectId: string, sessionId: string, url: string): Promise<ImportBatch> {
+  return call('import_source_url', { projectId, sessionId, url });
+}
+
+export function importPastedSources(projectId: string, sessionId: string, text: string, separator: string): Promise<ImportBatch> {
+  return call('import_text_sources', { projectId, sessionId, text, separator });
+}
+
+export function cancelImportAccount(projectId: string, sessionId: string): Promise<void> {
+  return call('import_account_cancel', { projectId, sessionId });
 }

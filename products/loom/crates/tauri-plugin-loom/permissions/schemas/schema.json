@@ -355,6 +355,18 @@
           "markdownDescription": "Denies the application_close_pending command without any pre-configured scope."
         },
         {
+          "description": "Enables the attachment_import_batch_choose command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-attachment-import-batch-choose",
+          "markdownDescription": "Enables the attachment_import_batch_choose command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the attachment_import_batch_choose command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-attachment-import-batch-choose",
+          "markdownDescription": "Denies the attachment_import_batch_choose command without any pre-configured scope."
+        },
+        {
           "description": "Enables the attachment_import_choose command without any pre-configured scope.",
           "type": "string",
           "const": "allow-attachment-import-choose",
@@ -763,6 +775,90 @@
           "markdownDescription": "Denies the generation_cancel command without any pre-configured scope."
         },
         {
+          "description": "Enables the import_account_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-import-account-cancel",
+          "markdownDescription": "Enables the import_account_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the import_account_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-import-account-cancel",
+          "markdownDescription": "Denies the import_account_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the import_account_connect command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-import-account-connect",
+          "markdownDescription": "Enables the import_account_connect command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the import_account_connect command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-import-account-connect",
+          "markdownDescription": "Denies the import_account_connect command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the import_account_disconnect command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-import-account-disconnect",
+          "markdownDescription": "Enables the import_account_disconnect command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the import_account_disconnect command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-import-account-disconnect",
+          "markdownDescription": "Denies the import_account_disconnect command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the import_account_sync command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-import-account-sync",
+          "markdownDescription": "Enables the import_account_sync command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the import_account_sync command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-import-account-sync",
+          "markdownDescription": "Denies the import_account_sync command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the import_accounts command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-import-accounts",
+          "markdownDescription": "Enables the import_accounts command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the import_accounts command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-import-accounts",
+          "markdownDescription": "Denies the import_accounts command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the import_source_url command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-import-source-url",
+          "markdownDescription": "Enables the import_source_url command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the import_source_url command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-import-source-url",
+          "markdownDescription": "Denies the import_source_url command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the import_text_sources command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-import-text-sources",
+          "markdownDescription": "Enables the import_text_sources command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the import_text_sources command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-import-text-sources",
+          "markdownDescription": "Denies the import_text_sources command without any pre-configured scope."
+        },
+        {
           "description": "Enables the model_catalog_list command without any pre-configured scope.",
           "type": "string",
           "const": "allow-model-catalog-list",
@@ -1075,10 +1171,16 @@
           "markdownDescription": "Denies the weave_status command without any pre-configured scope."
         },
         {
-          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
+          "description": "Explicit read-only account authorization and imports, with credentials in the OS credential store.",
+          "type": "string",
+          "const": "connected-import",
+          "markdownDescription": "Explicit read-only account authorization and imports, with credentials in the OS credential store."
+        },
+        {
+          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
+          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-choose-create`\n- `allow-project-choose-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
         }
       ]
     }

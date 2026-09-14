@@ -3188,7 +3188,9 @@ dependencies = [
 name = "information-native-acquire"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "fs2",
+ "getrandom 0.3.4",
  "hex",
  "information-native-types",
  "reqwest 0.12.28",
@@ -7066,6 +7068,8 @@ dependencies = [
  "hound",
  "http",
  "image",
+ "information-native-acquire",
+ "keyring",
  "libc",
  "llama-native-types",
  "loom-backend-llama",

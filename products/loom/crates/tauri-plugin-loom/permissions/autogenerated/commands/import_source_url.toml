@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-import-source-url"
+description = "Enables the import_source_url command without any pre-configured scope."
+commands.allow = ["import_source_url"]
+
+[[permission]]
+identifier = "deny-import-source-url"
+description = "Denies the import_source_url command without any pre-configured scope."
+commands.deny = ["import_source_url"]

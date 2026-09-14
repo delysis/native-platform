@@ -8,6 +8,7 @@
 
 mod budget;
 mod detect;
+mod mbox;
 mod mime_preflight;
 mod path;
 mod pdf;
@@ -275,6 +276,7 @@ impl InspectionState {
                         | DetectedFormat::IWorkKeynote
                         | DetectedFormat::Pdf
                         | DetectedFormat::Email
+                        | DetectedFormat::Mbox
                         | DetectedFormat::SevenZip
                 )
             ) && parser_input_bytes > self.policy.limits.max_parser_input_bytes
@@ -319,6 +321,7 @@ impl InspectionState {
                 Some(DetectedFormat::Zstd) => self.expand_zstd(&object_id, depth, &bytes),
                 Some(DetectedFormat::SevenZip) => self.expand_seven_zip(&object_id, depth, &bytes),
                 Some(DetectedFormat::Email) => self.expand_email(&object_id, depth, &bytes),
+                Some(DetectedFormat::Mbox) => self.expand_mbox(&object_id, depth, &bytes),
                 Some(DetectedFormat::Pdf) => self.expand_pdf(&object_id, depth, &bytes),
                 Some(DetectedFormat::Rar | DetectedFormat::OleCompound) => {
                     self.mark_unsupported_container(&object_id, format)
@@ -2596,6 +2599,7 @@ fn format_can_derive(format: DetectedFormat) -> bool {
             | DetectedFormat::Zstd
             | DetectedFormat::SevenZip
             | DetectedFormat::Email
+            | DetectedFormat::Mbox
             | DetectedFormat::Pdf
     )
 }

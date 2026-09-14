@@ -9,9 +9,11 @@
 //! processors consume the already-derived object graph, preserving the
 //! inspector's single monotonic decompression budget and provenance.
 
+mod exports;
 mod media;
 mod office;
 mod pdf;
+mod rtf;
 mod text;
 
 use attachment_native_types::{
@@ -230,8 +232,9 @@ impl DocumentCanonicalizer {
                         text::canonicalize_plain(bytes, format, &limits),
                     );
                 }
+                DetectedFormat::RichText => state.render_result(source, rtf::canonicalize(bytes, &limits, output_limit)),
                 DetectedFormat::Json => {
-                    state.render_result(source, text::canonicalize_json(bytes, &limits));
+                    state.render_result(source, text::canonicalize_json(bytes, &limits, output_limit));
                 }
                 DetectedFormat::Csv | DetectedFormat::Tsv => {
                     state.render_result(
