@@ -1,0 +1,228 @@
+Source revision: 1a0e5bdd7eadea6c99142ac4e77e8c1139537135
+Frontend suite/browser checks preceded final Rust integration; final type check and build include the latest renderer edits.
+
+=== Strict Clippy ===
+    Checking llama-native-types v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/native/crates/llama-native-types)
+    Checking loom-types v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-types)
+    Checking attachment-native-types v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/attachment/crates/attachment-native-types)
+   Compiling llama-native-engine v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/native/crates/llama-native-engine)
+    Checking desktop-context v0.0.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/desktop-context)
+    Checking information-native-types v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/information/crates/information-native-types)
+   Compiling getrandom v0.3.4
+   Compiling ppv-lite86 v0.2.21
+    Checking speech-native-backend-parakeet v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/speech/crates/speech-native-backend-parakeet)
+    Checking speech-native-platform v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/speech/crates/speech-native-platform)
+   Compiling tauri-plugin-loom v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/tauri-plugin-loom)
+   Compiling hex v0.4.3
+   Compiling clap_derive v4.6.4
+   Compiling mom-llama-app v0.0.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/mom/apps/mom-llama/src-tauri)
+    Checking desktop-model-discovery v0.0.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/desktop-model-discovery)
+    Checking workspace-document v0.0.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/workspace-document)
+   Compiling rand_core v0.9.5
+    Checking operation-lifecycle v0.0.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/operation-lifecycle)
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.5
+    Checking desktop-speech v0.0.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/desktop-speech)
+   Compiling ulid v1.2.1
+    Checking clap v4.6.6
+    Checking loom-document v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-document)
+    Checking loom-host v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-host)
+    Checking attachment-native-inspect v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/attachment/crates/attachment-native-inspect)
+    Checking attachment-native-plan v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/attachment/crates/attachment-native-plan)
+    Checking attachment-native-document v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/attachment/crates/attachment-native-document)
+    Checking loom-store v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-store)
+    Checking attachment-native-host v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/attachment/crates/attachment-native-host)
+    Checking information-native-retrieval v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/information/crates/information-native-retrieval)
+    Checking information-native-store v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/information/crates/information-native-store)
+    Checking information-native-catalog v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/information/crates/information-native-catalog)
+    Checking information-native-acquire v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/information/crates/information-native-acquire)
+    Checking information-native-backend-zim v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/information/crates/information-native-backend-zim)
+   Compiling loom-app v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/apps/loom/src-tauri)
+    Checking information-native-backend-scripture v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/information/crates/information-native-backend-scripture)
+    Checking information-native-backend-sqlite v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/information/crates/information-native-backend-sqlite)
+    Checking information-native-backend-community v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/information/crates/information-native-backend-community)
+    Checking information-native-backend-encyclopedia v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/information/crates/information-native-backend-encyclopedia)
+    Checking desktop-generation-policy v0.0.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/desktop-generation-policy)
+    Checking llama-native-cache v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/native/crates/llama-native-cache)
+    Checking information-native-attachment-bridge v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/information/crates/information-native-attachment-bridge)
+    Checking information-native-host v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/services/information/crates/information-native-host)
+    Checking loom-config v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-config)
+    Checking loom-cli v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-cli)
+    Checking llama-native-host v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/crates/native/crates/llama-native-host)
+    Checking loom-backend-llama v0.1.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/crates/loom-backend-llama)
+    Checking mom-llama-runtime v0.0.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/mom/crates/mom-llama-runtime)
+    Checking mom-llama-cli v0.0.0 (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/mom/crates/mom-llama-cli)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 23s
+
+=== Workspace policy ===
+    Blocking waiting for file lock on package cache
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.44s
+     Running `target/debug/xtask policy`
+native-platform policy: pass
+
+=== Rust formatting ===
+
+=== CI metadata selection ===
+✔ Cargo metadata supplies changed packages and the complete local reverse closure (49.463084ms)
+✔ a reverse-edge mutation deterministically changes the generated closure (0.489042ms)
+✔ resolved and declared local edges are conservatively unioned (0.393833ms)
+✔ explicit non-graph asset, workflow, platform, and documentation classes stay explicit (0.301042ms)
+✔ unknown additions and deletions fail closed to the complete workspace (3.393541ms)
+✔ metadata unavailability is an unconditional full-selection result (0.212167ms)
+✔ missing resolve evidence fails instead of silently dropping reverse edges (0.741ms)
+✔ every checked-in workspace package class is accepted by deterministic metadata (4.637334ms)
+✔ checked-in exceptions are narrow, evidenced, deterministic, and group-valid (1.090792ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 103.924792
+
+=== Current documentation validator ===
+{"schema":"delysis.current-service-surfaces.v1","surfaces":2,"documents":7,"current_paths":5,"retired_edges":2}
+
+=== Ignored-test registry ===
+{
+  "schema": "native-platform.ignored-tests.v2",
+  "registry_count": 44,
+  "source_ignored_count": 44,
+  "cargo_target_count": 16,
+  "cargo_config_count": 1,
+  "default_libtest_manifest_count": 58,
+  "reviewed_build_script_count": 7,
+  "guarded_source_count": 215,
+  "guarded_test_target_root_count": 71,
+  "workspace_proc_macro_count": 0,
+  "platform_counts": {
+    "linux": 43,
+    "macos": 44,
+    "windows": 40
+  },
+  "packages": [
+    "desktop-model-discovery",
+    "free-token-energy",
+    "fte-backend-llama",
+    "information-native-backend-community",
+    "information-native-backend-encyclopedia",
+    "information-native-backend-scripture",
+    "information-native-backend-sqlite",
+    "llama-native-engine",
+    "llama-native-host",
+    "loom-backend-llama",
+    "loom-store",
+    "mom-llama-cli",
+    "mom-llama-runtime",
+    "speech-native-backend-parakeet",
+    "speech-native-platform",
+    "tauri-plugin-loom"
+  ],
+  "evidence_classes": [
+    "historical-corpus-compatibility",
+    "large-file-runtime",
+    "private-local-format-exemplar-runtime",
+    "real-corpus-read-only",
+    "real-model-audio-runtime",
+    "real-model-discovery",
+    "real-model-metadata",
+    "real-model-runtime",
+    "real-model-tokenization",
+    "real-multimodal-model-runtime",
+    "real-os-credential-store",
+    "real-platform-tts-runtime",
+    "real-product-model-runtime"
+  ]
+}
+
+=== Frontend type check on final source ===
+$ svelte-check --tsconfig ./tsconfig.json
+Loading svelte-check in workspace: /Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/apps/loom
+Getting Svelte diagnostics...
+
+svelte-check found 0 errors and 0 warnings
+
+=== Frontend build on final source ===
+$ vite build
+9:13:21 AM [vite-plugin-svelte] no Svelte config found at /Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/apps/loom - using default configuration.
+vite v8.2.1 building client environment for production...
+[2K
+transforming...✓ 273 modules transformed.
+rendering chunks...
+computing gzip size...
+dist/index.html                   0.54 kB │ gzip:   0.31 kB
+dist/assets/index-XdKSatDG.css   50.00 kB │ gzip:  10.21 kB
+dist/assets/index-6fh24KQk.js   719.43 kB │ gzip: 235.81 kB
+
+✓ built in 5.58s
+[plugin builtin:vite-reporter]
+(!) Some chunks are larger than 500 kB after minification. Consider:
+- Using dynamic import() to code-split the application
+- Use build.rolldownOptions.output.codeSplitting to improve chunking: https://rolldown.rs/reference/OutputOptions.codeSplitting
+- Adjust chunk size limit for this warning via build.chunkSizeWarningLimit.
+[33m[PLUGIN_TIMINGS] [0mYour build spent 87% of 5.6s inside plugin hooks (4.9s).
+Measured inside the callback, so queue time is excluded and time the callback itself awaited is not:
+  - vite:build-html transform (78%, 4.4s, 1 call)
+  - vite-plugin-svelte:compile transform (78%, 4.3s, 8 calls)
+See https://rolldown.rs/reference/InputOptions.checks#plugintimings for more details.
+
+
+=== Component browser tests ===
+$ vitest run --config vitest.browser.config.ts src/lib/SetupFlow.browser.test.ts src/lib/WorkspacePane.browser.test.ts
+8:56:55 AM [vite-plugin-svelte] no Svelte config found at /Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/apps/loom - using default configuration.
+
+ RUN  v4.1.11 /Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/apps/loom
+
+8:56:55 AM [vite-plugin-svelte] no Svelte config found at /Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/apps/loom - using default configuration.
+
+ Test Files  2 passed (2)
+      Tests  13 passed (13)
+   Start at  08:56:55
+   Duration  13.67s (transform 0ms, setup 0ms, import 9.92s, tests 5.21s, environment 0ms)
+
+
+=== Frontend unit run - includes one compile timeout ===
+$ vitest run --maxWorkers=4 --exclude '**/*.browser.test.ts'
+8:56:55 AM [vite-plugin-svelte] no Svelte config found at /Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/apps/loom - using default configuration.
+
+ RUN  v4.1.11 /Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/apps/loom
+
+ ❯ src/lib/appReactivity.test.ts (29 tests | 1 failed) 6894ms
+     × tracks late branch hydration and caret changes in both ghost effects 6753ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/lib/appReactivity.test.ts > App ghost reactivity wiring > tracks late branch hydration and caret changes in both ghost effects
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ src/lib/appReactivity.test.ts:14:3
+     12|
+     13| describe('App ghost reactivity wiring', () => {
+     14|   it('tracks late branch hydration and caret changes in both ghost eff…
+       |   ^
+     15|     const source = readFileSync(new URL('../App.svelte', import.meta.u…
+     16|     const compiled = compile(source, {
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed | 62 passed (63)
+      Tests  1 failed | 455 passed (456)
+   Start at  08:56:55
+   Duration  18.14s (transform 8.90s, setup 0ms, import 15.80s, tests 9.71s, environment 32ms)
+
+/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/apps/loom:
+[ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL] @delysis/loom@0.1.0 test: `vitest run --maxWorkers=4 --exclude '**/*.browser.test.ts'`
+Exit status 1
+
+=== Isolated frontend retry - passes ===
+9:00:46 AM [vite-plugin-svelte] no Svelte config found at /Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/apps/loom - using default configuration.
+
+ RUN  v4.1.11 /Users/george/.codex/worktrees/native-platform-mom-loom-convergence/products/loom/apps/loom
+
+
+ Test Files  1 passed (1)
+      Tests  29 passed (29)
+   Start at  09:00:46
+   Duration  7.73s (transform 5.10s, setup 0ms, import 5.82s, tests 1.53s, environment 1ms)

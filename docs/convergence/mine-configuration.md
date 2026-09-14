@@ -44,7 +44,17 @@ Selected persona bytes are included as authored context, separately framed from 
 
 New Weave context evidence records the frozen profile and original request defaults. A replay reads those immutable records: later edits to the dotfile or removal of the source persona file cannot change a recorded run. Changing the request defaults under the same command ID remains a conflict even when an explicit profile value would override them. Earlier generation evidence without profiles continues to describe its original built-in defaults; it is neither rewritten nor reinterpreted using new settings. Terminal receipts similarly own the original frozen profile across every step.
 
-Workspace setup and explicit model loading consumers are separate integration commits. These source and fixture checks do not establish native UI acceptance or measured generation quality.
+## Setup during model download
+
+Starting the recommended model download opens an optional, two-step setup card while the verified model/projector transfers continue. The first choice is the writing page alone or chat beside it; the second is inline suggestions or assistance only when requested. The default is the page with suggestions. The card leaves the manuscript editable, reports the transfers started by this flow, and offers Back, Skip, and download details. Skip neither creates settings nor cancels a transfer. This is a fixed configuration flow, not an arbitrary script execution facility. Restarting the application does not resume the card.
+
+Finishing creates a commented `.mine.toml` from those choices. An existing file is adopted byte for byte, even when invalid, rather than overwritten. Missing settings keep the quiet writing layout. Invalid settings preserve the last valid layout and expose a repair action. The settings source always uses the plain source editor, including in configured panes, with automatic suggestions suppressed for that document.
+
+Command/Control-comma opens the actual file. Settings updates wait for active composition and draft flushes, and a stale asynchronous read cannot replace a newer snapshot. Explicit `[assistance]` values override the remembered per-project choice; omission inherits it.
+
+`[model]` settings are consumed by explicit loading through the existing native model owner. Command/Control-Shift-R rereads settings and reloads the selected verified writer with the requested configuration. A configured path is not silently replaced with another discovered model. Invalid candidates leave the previous resident intact; changing settings for the same GGUF retires only the exact old native configuration. Supported fields and admission limits are documented in `model-configuration-comparison.md`.
+
+These source and component-browser checks do not establish installed native UI acceptance, a real model download/reload, or measured generation quality.
 
 ## Reusable co-writers
 
