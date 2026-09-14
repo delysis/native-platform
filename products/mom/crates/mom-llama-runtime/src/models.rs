@@ -6,6 +6,10 @@ use crate::engine::{ValidationBlocker, validate_model_path};
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::RuntimeStore;
 use anyhow::{Result, anyhow};
+use desktop_model_discovery::{
+    GgufHeaderStatus, ModelDiscoveryOptions, ProjectorDiscoveryError, discover_gguf_models,
+    discover_unique_projector, is_model_gguf,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +21,7 @@ pub use desktop_model_defaults::hugging_face_hub_cache_dir;
 
 const MAX_DISCOVERED_MODELS: usize = 512;
 const MAX_CACHE_SCAN_DEPTH: usize = 8;
+const MAX_CACHE_SCAN_ENTRIES: usize = 20_000;
 const MAX_PROJECTOR_SIBLINGS: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +70,9 @@ pub struct ModelInfo {
     #[serde(default)]
     pub loaded: bool,
     pub size_bytes: Option<u64>,
+    /// Container magic inspection only; never native capability/readiness proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<GgufHeaderStatus>,
 }
 
 pub fn model_list(scope: &crate::OperationScope) -> Result<CommandResult<Vec<ModelInfo>>> {
@@ -85,18 +93,43 @@ pub fn model_list(scope: &crate::OperationScope) -> Result<CommandResult<Vec<Mod
         let selected = settings.model_path.as_ref() == Some(path);
         push_model(&mut models, &mut seen, path.clone(), selected);
     }
-    if let Some(cache_dir) = hugging_face_hub_cache_dir() {
-        let mut cached = Vec::new();
-        collect_cached_models(&cache_dir, 0, &mut cached);
-        cached.sort_by(|left, right| {
-            model_file_name(left)
-                .cmp(&model_file_name(right))
-                .then_with(|| left.cmp(right))
-        });
-        for path in cached {
-            let selected = settings.model_path.as_ref() == Some(&path);
-            push_model(&mut models, &mut seen, path, selected);
+    let report = discover_gguf_models(&ModelDiscoveryOptions {
+        hugging_face_cache_roots: hugging_face_hub_cache_dir().into_iter().collect(),
+        user_paths: settings
+            .model_path
+            .iter()
+            .cloned()
+            .chain(resident_paths.iter().cloned())
+            .collect(),
+        max_entries: MAX_CACHE_SCAN_ENTRIES,
+        max_depth: MAX_CACHE_SCAN_DEPTH,
+    })?;
+    let mut cached = report.models;
+    cached.sort_by(|left, right| {
+        model_file_name(&left.selected_path)
+            .cmp(&model_file_name(&right.selected_path))
+            .then_with(|| left.selected_path.cmp(&right.selected_path))
+    });
+    let mut omitted = false;
+    let mut inspected_headers = BTreeMap::new();
+    for candidate in cached {
+        if !is_model_gguf(&candidate.selected_path) {
+            continue;
         }
+        let selected = settings.model_path.as_ref() == Some(&candidate.selected_path);
+        if !seen.contains(&candidate.resolved_path) {
+            if models.len() >= MAX_DISCOVERED_MODELS {
+                omitted = true;
+                continue;
+            }
+            push_model(
+                &mut models,
+                &mut seen,
+                candidate.selected_path.clone(),
+                selected,
+            );
+        }
+        inspected_headers.insert(candidate.resolved_path, candidate.header);
     }
     let loaded = resident_paths
         .into_iter()
@@ -104,9 +137,11 @@ pub fn model_list(scope: &crate::OperationScope) -> Result<CommandResult<Vec<Mod
         .collect::<BTreeSet<_>>();
     for model in &mut models {
         let path = PathBuf::from(&model.path);
-        model.loaded = loaded.contains(&fs::canonicalize(&path).unwrap_or(path));
+        let identity = fs::canonicalize(&path).unwrap_or(path);
+        model.loaded = loaded.contains(&identity);
+        model.header = inspected_headers.remove(&identity);
     }
-    Ok(CommandResult::passed(
+    let mut result = CommandResult::passed(
         "mom_llama.model_list",
         "contracted",
         models,
@@ -114,34 +149,16 @@ pub fn model_list(scope: &crate::OperationScope) -> Result<CommandResult<Vec<Mod
         Vec::new(),
         false,
         false,
-    ))
-}
-
-fn collect_cached_models(directory: &Path, depth: usize, models: &mut Vec<PathBuf>) {
-    if depth > MAX_CACHE_SCAN_DEPTH || models.len() >= MAX_DISCOVERED_MODELS {
-        return;
+    );
+    if report.truncated || omitted {
+        result.receipt.next_actions.push(
+            "Model discovery is partial; choose an exact GGUF file if its entry is missing.".into(),
+        );
     }
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        if models.len() >= MAX_DISCOVERED_MODELS {
-            return;
-        }
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if file_type.is_dir() {
-            collect_cached_models(&path, depth + 1, models);
-        } else if (file_type.is_file()
-            || (file_type.is_symlink()
-                && fs::metadata(&path).is_ok_and(|metadata| metadata.is_file())))
-            && is_model_gguf(&path)
-        {
-            models.push(path);
-        }
+    if !report.warnings.is_empty() {
+        result.receipt.next_actions.push(format!("{} local discovery paths could not be completely inspected; choose an exact file to retry.", report.warnings.len()));
     }
+    Ok(result)
 }
 
 fn push_model(
@@ -167,6 +184,7 @@ fn push_model(
         selected,
         loaded: false,
         size_bytes: fs::metadata(&path).ok().map(|metadata| metadata.len()),
+        header: None,
     });
 }
 
@@ -175,14 +193,6 @@ fn model_file_name(path: &Path) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or("model.gguf")
         .to_string()
-}
-
-fn is_model_gguf(path: &Path) -> bool {
-    if !is_gguf(path) {
-        return false;
-    }
-    let name = model_file_name(path).to_ascii_lowercase();
-    !name.starts_with("mmproj-") && !name.contains("-mtp.")
 }
 
 pub fn model_select(
@@ -495,87 +505,19 @@ fn persist_default_model_selection(
 pub fn discover_projector_for_model(
     model_path: &Path,
 ) -> std::result::Result<Option<PathBuf>, ValidationBlocker> {
-    if model_path.as_os_str().is_empty() {
-        return Ok(None);
-    }
-    let Some(directory) = model_path.parent() else {
-        return Ok(None);
-    };
-    let Ok(entries) = fs::read_dir(directory) else {
-        return Ok(None);
-    };
-    let mut projectors = Vec::new();
-    for (index, entry) in entries.enumerate() {
-        if index >= MAX_PROJECTOR_SIBLINGS {
-            return Err(ValidationBlocker {
-                readiness: "blocked_projector_scan_bound".to_string(),
-                blocker: Blocker::new(
-                    "projector_directory_too_large",
-                    "This model folder contains too many files to pair a vision projector safely.",
-                    vec![
-                        "Move the model and its one matching projector into a smaller local folder."
-                            .to_string(),
-                    ],
-                ),
-            });
-        }
-        let Ok(entry) = entry else {
-            continue;
+    discover_unique_projector(model_path, MAX_PROJECTOR_SIBLINGS).map_err(|error| {
+        let (readiness, code) = match error {
+            ProjectorDiscoveryError::EntryLimit(_) => ("blocked_projector_scan_bound", "projector_directory_too_large"),
+            ProjectorDiscoveryError::Ambiguous(_) => ("blocked_ambiguous_projector", "mmproj_path_ambiguous"),
+            _ => ("blocked_projector_inspection", "projector_inspection_failed"),
         };
-        let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        let is_file = file_type.is_file()
-            || (file_type.is_symlink()
-                && fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()));
-        if is_file && is_projector_gguf(&path) {
-            projectors.push(path);
-        }
-    }
-    projectors.sort_by(|left, right| {
-        model_file_name(left)
-            .cmp(&model_file_name(right))
-            .then_with(|| left.cmp(right))
-    });
-    projectors.dedup();
-    match projectors.len() {
-        0 => Ok(None),
-        1 => Ok(projectors.pop()),
-        count => Err(ValidationBlocker {
-            readiness: "blocked_ambiguous_projector".to_string(),
-            blocker: Blocker::new(
-                "mmproj_path_ambiguous",
-                format!(
-                    "This model has {count} possible vision projectors, so Mom cannot safely choose one."
-                ),
-                vec![
-                    "Keep one matching projector beside the model, then choose the model again."
-                        .to_string(),
-                ],
-            ),
-        }),
-    }
-}
-
-fn is_projector_gguf(path: &Path) -> bool {
-    if !is_gguf(path) {
-        return false;
-    }
-    let name = model_file_name(path).to_ascii_lowercase();
-    name.contains("mmproj")
-}
-
-fn is_gguf(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        ValidationBlocker { readiness: readiness.into(), blocker: Blocker::new(code, error.to_string(),
+            vec!["Keep the model and one matching projector in a readable local folder, or choose the exact projector.".into()]) }
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use super::collect_cached_models;
     use super::{
         DefaultModelSelectionOrder, MAX_PROJECTOR_SIBLINGS, bind_model_pair,
         discover_projector_for_model, hugging_face_hub_cache_dir,
@@ -625,10 +567,23 @@ mod tests {
         )
         .expect("dangling model symlink");
 
-        let mut models = Vec::new();
-        collect_cached_models(&cache, 0, &mut models);
-
-        assert_eq!(models, vec![cache.join("linked-file.gguf")]);
+        let report = desktop_model_discovery::discover_gguf_models(
+            &desktop_model_discovery::ModelDiscoveryOptions {
+                hugging_face_cache_roots: vec![cache.clone()],
+                user_paths: Vec::new(),
+                max_entries: 32,
+                max_depth: 8,
+            },
+        )
+        .expect("bounded discovery");
+        assert_eq!(
+            report
+                .models
+                .iter()
+                .map(|model| &model.selected_path)
+                .collect::<Vec<_>>(),
+            vec![&cache.join("linked-file.gguf")]
+        );
         std::fs::remove_dir_all(&temporary).expect("remove temporary cache");
     }
 

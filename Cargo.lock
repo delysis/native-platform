@@ -1723,6 +1723,16 @@ name = "desktop-model-defaults"
 version = "0.0.0"
 
 [[package]]
+name = "desktop-model-discovery"
+version = "0.0.0"
+dependencies = [
+ "desktop-model-defaults",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "desktop-speech"
 version = "0.0.0"
 dependencies = [
@@ -4057,6 +4067,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
  "desktop-generation-policy",
+ "desktop-model-discovery",
  "fs4",
  "hex",
  "llama-native-engine",
@@ -4440,6 +4451,7 @@ dependencies = [
  "desktop-context",
  "desktop-generation-policy",
  "desktop-model-defaults",
+ "desktop-model-discovery",
  "fs2",
  "getrandom 0.3.4",
  "llama-native-cache",
@@ -7191,6 +7203,7 @@ dependencies = [
  "desktop-context",
  "desktop-generation-policy",
  "desktop-model-defaults",
+ "desktop-model-discovery",
  "desktop-speech",
  "hound",
  "http",

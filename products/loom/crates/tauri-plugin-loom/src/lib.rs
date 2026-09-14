@@ -5764,16 +5764,9 @@ fn sibling_catalog_artifact_path(
     selected_model_path: &Path,
     artifact_name: &str,
 ) -> Result<PathBuf, IpcFailure> {
-    selected_model_path
-        .parent()
-        .map(|parent| parent.join(artifact_name))
-        .ok_or_else(|| {
-            IpcFailure::new(
-                "catalog_projector_path_invalid",
-                "the catalog model has no model-library parent directory",
-                false,
-            )
-        })
+    desktop_model_discovery::sibling_artifact_path(selected_model_path, artifact_name).map_err(
+        |error| IpcFailure::new("catalog_projector_path_invalid", error.to_string(), false),
+    )
 }
 
 fn policy_writer_expectation(

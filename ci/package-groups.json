@@ -5,6 +5,7 @@
       "desktop-context",
       "desktop-generation-policy",
       "desktop-model-defaults",
+      "desktop-model-discovery",
       "desktop-speech",
       "operation-lifecycle",
       "workspace-document"
@@ -88,6 +89,7 @@
       "desktop-context",
       "desktop-generation-policy",
       "desktop-model-defaults",
+      "desktop-model-discovery",
       "fte-loopback",
       "fte-protocols",
       "fte-providers",

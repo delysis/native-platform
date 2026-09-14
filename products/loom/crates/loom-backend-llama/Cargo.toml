@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Direct in-process llama.cpp adapter for Loom"
 
 [dependencies]
+desktop-model-discovery.workspace = true
 desktop-generation-policy.workspace = true
 crossbeam-channel = "0.5.15"
 fs4.workspace = true

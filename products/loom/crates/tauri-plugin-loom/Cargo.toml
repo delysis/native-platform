@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 desktop-context.workspace = true
+desktop-model-discovery.workspace = true
 desktop-generation-policy.workspace = true
 desktop-speech.workspace = true
 desktop-model-defaults.workspace = true

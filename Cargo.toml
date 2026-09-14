@@ -5,6 +5,7 @@ members = [
     "crates/desktop-speech",
     "crates/operation-lifecycle",
     "crates/workspace-document",
+    "crates/desktop-model-discovery",
     "crates/desktop-generation-policy",
     "crates/native/crates/llama-native-cache",
     "crates/native/crates/llama-native-engine",
@@ -72,6 +73,7 @@ publish = false
 desktop-context = { path = "crates/desktop-context" }
 desktop-speech = { path = "crates/desktop-speech" }
 operation-lifecycle = { path = "crates/operation-lifecycle" }
+desktop-model-discovery = { path = "crates/desktop-model-discovery" }
 desktop-generation-policy = { path = "crates/desktop-generation-policy" }
 desktop-model-defaults = { path = "crates/desktop-model-defaults" }
 workspace-document = { path = "crates/workspace-document" }

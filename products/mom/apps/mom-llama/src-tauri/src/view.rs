@@ -3410,6 +3410,7 @@ fn model_picker(
             selected: true,
             loaded: false,
             size_bytes: None,
+            header: None,
         });
     let has_available = selected_external.is_some() || discovered.iter().any(|model| !model.loaded);
     let picker_state = if selected_discovered.is_some_and(|model| model.loaded) {
