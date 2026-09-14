@@ -237,3 +237,21 @@ tests and completed successfully. Clippy, formatting, and whitespace checks
 passed. Ignored tests include real-engine/desktop/legacy-fixture opt-in work;
 they were not promoted to acceptance. Root integration still needs to exercise
 the final combined tree and its Tauri consumers.
+
+Follow-up admission regression: a valid private snapshot sent to `../outside.md`
+previously failed destination validation after writing its complete source into
+the private blob directory. `put_blob` does not insert a database row, so database
+counts alone missed this retention. Snapshot evidence is now materialized through
+a deferred origin callback only after the common create-document path admits its
+destination, reason, existing-file state and projected content. Ordinary creation
+and generated/source document behavior retain their existing ordering.
+
+The regression covers unsafe paths, registered duplicates, existing visible
+files and overlong reasons; it checks both unchanged database counts and absence
+of the exact private evidence blob. This does not add filesystem rollback: a
+later I/O/transaction failure can leave unreachable immutable blobs under the
+existing store protocol, and a committed projection conflict retains its valid
+semantic revision and evidence for outbox recovery.
+
+Follow-up validation: `cargo test --locked -p loom-store --lib` passed **141/141**;
+`cargo clippy --locked -p loom-store --all-targets -- -D warnings` passed.

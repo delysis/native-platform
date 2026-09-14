@@ -307,7 +307,7 @@ impl ProjectStore {
             relative_path,
             content,
             reason,
-            DocumentOrigin::Human,
+            |_| Ok(DocumentOrigin::Human),
             |_| Ok(()),
         )
     }
@@ -327,7 +327,7 @@ impl ProjectStore {
             relative_path,
             content,
             reason,
-            DocumentOrigin::Generated { evidence_blob_id },
+            |_| Ok(DocumentOrigin::Generated { evidence_blob_id }),
             |_| Ok(()),
         )
     }
@@ -346,7 +346,7 @@ impl ProjectStore {
             relative_path,
             content,
             reason,
-            DocumentOrigin::Derived { evidence_blob_id },
+            |_| Ok(DocumentOrigin::Derived { evidence_blob_id }),
             |_| Ok(()),
         )
     }
@@ -378,12 +378,15 @@ impl ProjectStore {
         } else {
             document.text()
         };
-        let evidence_blob_id = self.put_blob(snapshot_json.as_bytes())?;
         self.create_document_if_absent_with_boundary(
             relative_path,
             DocumentContent::Prose(text),
             reason,
-            DocumentOrigin::DocumentSnapshot { evidence_blob_id },
+            |store| {
+                Ok(DocumentOrigin::DocumentSnapshot {
+                    evidence_blob_id: store.put_blob(snapshot_json.as_bytes())?,
+                })
+            },
             |_| Ok(()),
         )
     }
@@ -394,7 +397,7 @@ impl ProjectStore {
         relative_path: impl AsRef<Path>,
         content: DocumentContent,
         reason: impl Into<String>,
-        origin: DocumentOrigin,
+        prepare_origin: impl FnOnce(&Self) -> Result<DocumentOrigin>,
         before_projection_boundary: F,
     ) -> Result<SaveOutcome>
     where
@@ -425,6 +428,9 @@ impl ProjectStore {
                 max_bytes: MAX_DOCUMENT_BYTES,
             });
         }
+        // Destination, existing-file and content admission must precede any
+        // materialization of private imported snapshot evidence.
+        let origin = prepare_origin(self)?;
         let blob_id = self.put_blob(&projection.bytes)?;
         let document_id = DocumentId::new();
         let artifact_id = ArtifactId::new();
@@ -6522,7 +6528,7 @@ mod tests {
             "manuscript/new.md",
             DocumentContent::Prose(String::new()),
             "create empty document",
-            DocumentOrigin::Human,
+            |_| Ok(DocumentOrigin::Human),
             |visible| {
                 fs::write(visible, "appeared externally")?;
                 Ok(())

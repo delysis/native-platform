@@ -289,6 +289,53 @@ mod tests {
     }
 
     #[test]
+    fn refused_snapshot_destination_never_materializes_private_source_evidence() {
+        for (target, reason) in [
+            ("../outside.md", "import".to_owned()),
+            ("registered.md", "import".to_owned()),
+            ("visible.md", "import".to_owned()),
+            ("new.md", "x".repeat(4097)),
+        ] {
+            let dir = tempfile::tempdir().expect("snapshot store fixture");
+            let (mut store, _) =
+                ProjectStore::initialize(dir.path(), "Admission").expect("snapshot store fixture");
+            store
+                .create_document_if_absent(
+                    "registered.md",
+                    DocumentContent::Prose("existing writing".into()),
+                    "fixture",
+                )
+                .expect("registered fixture");
+            std::fs::write(dir.path().join("visible.md"), "external writing")
+                .expect("visible fixture");
+            let source = serde_json::to_string(&imported()).expect("snapshot fixture");
+            let source_id = loom_types::BlobId::digest(source.as_bytes());
+            let before = store.counts().expect("before counts");
+            assert!(
+                store
+                    .import_document_snapshot_if_absent(target, &source, reason)
+                    .is_err()
+            );
+            assert_eq!(store.counts().expect("after counts"), before);
+            assert!(
+                matches!(
+                    store.read_blob(source_id),
+                    Err(StoreError::MissingBlob { .. })
+                ),
+                "refused target {target} retained private source bytes"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("registered.md")).expect("original"),
+                "existing writing"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("visible.md")).expect("external"),
+                "external writing"
+            );
+        }
+    }
+
+    #[test]
     fn import_rendering_uses_typed_parts_instead_of_confusing_selection_with_content() {
         let dir = tempfile::tempdir().expect("snapshot store fixture");
         let (mut store, _) =
