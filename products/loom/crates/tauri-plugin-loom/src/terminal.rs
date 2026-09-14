@@ -865,7 +865,8 @@ impl Evaluator<'_> {
             PromptMode::RawCompletion,
             &result.context_binding,
             &model.descriptor,
-            self.media.len(),
+            // Terminal submits one continuation case, always at input index 0.
+            0,
         )
         .map_err(|error| IpcFailure::backend(&error))?;
         let evidence = self.with_store(|store| {

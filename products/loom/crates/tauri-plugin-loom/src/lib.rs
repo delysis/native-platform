@@ -6,6 +6,7 @@ mod co_writer;
 mod context_attachments;
 mod document_bindings;
 mod document_watcher;
+mod external_import;
 mod microphone_capture;
 mod model_catalog;
 mod model_download;
@@ -85,6 +86,7 @@ use crate::context_attachments::{
     set_document_context_snapshot,
 };
 use crate::document_watcher::DocumentFilesystemWatcher;
+use crate::external_import::document_import_external;
 use crate::model_catalog::{ModelCatalogSnapshot, catalog_model_identity, embedded_model_catalog};
 use crate::model_download::{
     ModelDownloadRegistry, ModelDownloadRegistryError, ModelDownloadSnapshot, ModelDownloadSpec,
@@ -1961,6 +1963,7 @@ impl Builder {
                 speech_input_status,
                 speech_input_cancel,
                 document_open,
+                document_import_external,
                 document_checkpoint,
                 document_export_choose,
                 document_reveal,

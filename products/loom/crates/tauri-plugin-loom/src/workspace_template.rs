@@ -262,7 +262,7 @@ fn config_fence(markdown: &str) -> Result<&str, String> {
     Ok(found.unwrap_or(""))
 }
 
-fn snapshot(store: &ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
+fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
     let document = store
         .list_documents()
         .map_err(IpcFailure::store)?
@@ -277,6 +277,9 @@ fn snapshot(store: &ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailur
             error: None,
         });
     };
+    store
+        .import_external_changes_if_uncontested(TEMPLATE_PATH, "Read external workspace settings")
+        .map_err(IpcFailure::store)?;
     let loaded = store
         .read_document(TEMPLATE_PATH)
         .map_err(IpcFailure::store)?;
@@ -334,6 +337,7 @@ pub(super) async fn workspace_template_get(
     session_id: String,
     state: State<'_, PluginState>,
 ) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
+    let _admission = lock_application_admission(&state, "workspace configuration")?;
     let mut session = lock_session(&state)?;
     snapshot(require_bound_store(&mut session, &project_id, &session_id)?)
 }
@@ -417,7 +421,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (mut store, _) =
             ProjectStore::initialize(directory.path().join("Writing"), "Writing").unwrap();
-        assert!(!snapshot(&store).unwrap().enabled);
+        assert!(!snapshot(&mut store).unwrap().enabled);
         assert!(!store.root().join(TEMPLATE_PATH).exists());
         let first = enable(&mut store).unwrap();
         assert!(first.enabled);
@@ -445,10 +449,56 @@ mod tests {
             ProjectStore::initialize(directory.path().join("Writing"), "Writing").unwrap();
         let text = "# Mine\r\n```loom-workspace\r\nunknown = true\r\n```\r\n";
         std::fs::write(store.root().join(TEMPLATE_PATH), text).unwrap();
-        assert!(!snapshot(&store).unwrap().enabled);
+        assert!(!snapshot(&mut store).unwrap().enabled);
         let result = enable(&mut store).unwrap();
         assert!(result.enabled && result.error.is_some() && result.document_id.is_some());
         assert_eq!(store.read_document(TEMPLATE_PATH).unwrap().text, text);
         assert_eq!(enable(&mut store).unwrap().revision_id, result.revision_id);
+    }
+    #[test]
+    fn external_template_refresh_imports_only_uncontested_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut store, _) =
+            ProjectStore::initialize(directory.path().join("Writing"), "Writing").unwrap();
+        let original = enable(&mut store).unwrap();
+        let external =
+            "# My settings\r\n```loom-workspace\r\n[panes.chat]\r\nvisible=false\r\n```\r\n";
+        std::fs::write(store.root().join(TEMPLATE_PATH), external).unwrap();
+        let refreshed = snapshot(&mut store).unwrap();
+        assert!(!refreshed.config.panes["chat"].visible);
+        assert_ne!(refreshed.revision_id, original.revision_id);
+        assert_eq!(store.read_document(TEMPLATE_PATH).unwrap().text, external);
+        assert_eq!(
+            std::fs::read_to_string(store.root().join(TEMPLATE_PATH)).unwrap(),
+            external
+        );
+        let stable = snapshot(&mut store).unwrap();
+        assert_eq!(stable.revision_id, refreshed.revision_id);
+        let base = store.read_document(TEMPLATE_PATH).unwrap();
+        store
+            .upsert_transient_draft(
+                TEMPLATE_PATH,
+                base.revision_id,
+                0,
+                DocumentContent::Prose("Distinct local writing".into()),
+            )
+            .unwrap();
+        std::fs::write(store.root().join(TEMPLATE_PATH), "A conflicting disk edit").unwrap();
+        assert!(snapshot(&mut store).is_err());
+        assert_eq!(
+            store
+                .load_transient_draft(TEMPLATE_PATH)
+                .unwrap()
+                .unwrap()
+                .text,
+            "Distinct local writing"
+        );
+        assert_eq!(
+            store
+                .reconciliation_snapshot(TEMPLATE_PATH)
+                .unwrap()
+                .active_revision_id,
+            base.revision_id
+        );
     }
 }

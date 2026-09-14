@@ -633,11 +633,6 @@ function ghostWidget(
       });
       fan.append(row);
     });
-    const hint = document.createElement('span');
-    hint.className = 'loom-ghost-fan-hint';
-    hint.setAttribute('aria-hidden', 'true');
-    hint.textContent = '↑↓ choose  ·  Tab insert  ·  click counter to pin';
-    fan.append(hint);
     container.append(fan);
   }
   container.classList.toggle('fan-visible', plan.fanVisible);

@@ -35,6 +35,7 @@ const COMMANDS: &[&str] = &[
     "speech_input_status",
     "speech_input_cancel",
     "document_open",
+    "document_import_external",
     "document_checkpoint",
     "document_export_choose",
     "document_reveal",

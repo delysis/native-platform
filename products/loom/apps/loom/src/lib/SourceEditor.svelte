@@ -962,6 +962,7 @@
 <div
   class:verse
   class:ghost-active={Boolean(plan)}
+  class:fan-visible={lensVisible}
   class="source-editor-shell"
   bind:this={shell}
 >
@@ -1044,7 +1045,6 @@
           <span class="loom-ghost-fan-index">{index + 1}</span><span>{alternative.text}</span>
         </button>
       {/each}
-      <div class="loom-ghost-fan-hint">↑↓ choose&nbsp; · &nbsp;Tab insert&nbsp; · &nbsp;click counter to pin</div>
     </div>
   {/if}
 </div>

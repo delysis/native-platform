@@ -577,3 +577,7 @@ button.document-row:hover { background: rgb(255 255 255 / 45%); }
 .workspace-pane-bottom { grid-column:2 / -1; height:240px; border-top:1px solid var(--line); }
 .workspace-pane-header { flex:none; display:flex; align-items:center; min-height:30px; padding:0 8px; }
 .workspace-pane-header select { max-width:100%; border:0; background:transparent; color:var(--muted); font-size:11px; }
+
+/* Alternatives appear only while the author invokes their keyboard lens. */
+.loom-completion-lens-trigger { visibility:hidden; }
+.fan-visible .loom-completion-lens-trigger { visibility:visible; }

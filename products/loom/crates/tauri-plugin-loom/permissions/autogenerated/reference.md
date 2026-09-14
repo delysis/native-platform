@@ -33,6 +33,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-speech-input-capabilities`
 - `allow-speech-input-status`
 - `allow-document-open`
+- `allow-document-import-external`
 - `allow-shader-preview`
 - `allow-document-checkpoint`
 - `allow-document-export-choose`
@@ -971,6 +972,32 @@ Enables the document_export_choose command without any pre-configured scope.
 <td>
 
 Denies the document_export_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-import-external`
+
+</td>
+<td>
+
+Enables the document_import_external command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-import-external`
+
+</td>
+<td>
+
+Denies the document_import_external command without any pre-configured scope.
 
 </td>
 </tr>

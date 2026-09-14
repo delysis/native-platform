@@ -58,11 +58,71 @@ impl ProjectStore {
         self.reconcile_external_with_boundary(command_id, request, |_| Ok(()))
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Import an external-only edit without rewriting its UTF-8 bytes. A local
+    /// draft with different content is left for explicit reconciliation.
+    pub fn import_external_changes_if_uncontested(
+        &mut self,
+        relative_path: impl AsRef<Path>,
+        reason: impl Into<String>,
+    ) -> Result<Option<ExternalReconciliationOutcome>> {
+        let snapshot = self.reconciliation_snapshot(relative_path)?;
+        if snapshot.visible_matches_active || snapshot.kind == loom_types::DocumentKind::Hybrid {
+            return Ok(None);
+        }
+        let Some(visible) = snapshot.visible else {
+            return Err(StoreError::ExternalVisibleFileDeleted(
+                snapshot.relative_path,
+            ));
+        };
+        if let Some(draft) = self.load_transient_draft(&snapshot.relative_path)? {
+            if draft.blob_id != snapshot.active_blob_id {
+                return Ok(None);
+            }
+            // These bytes remain in the immutable base even if the external
+            // file changes again before import. No distinct writing is lost.
+            self.clear_transient_draft(&snapshot.relative_path, draft.version)?;
+        }
+        let exact_bytes = visible.text.into_bytes();
+        let request = ExternalReconciliationRequest {
+            relative_path: snapshot.relative_path,
+            expected_active_revision_id: snapshot.active_revision_id,
+            expected_base_blob_id: snapshot.active_blob_id,
+            expected_visible_blob_id: visible.blob_id,
+            resolved_content: DocumentContent::from_visible(snapshot.kind, exact_bytes.clone())?,
+            reason: reason.into(),
+        };
+        self.reconcile_external_with_projection(
+            CommandId::new(),
+            request,
+            Some(exact_bytes),
+            |_| Ok(()),
+        )
+        .map(Some)
+    }
+
     fn reconcile_external_with_boundary<F>(
         &mut self,
         command_id: CommandId,
         request: ExternalReconciliationRequest,
+        before_projection_boundary: F,
+    ) -> Result<ExternalReconciliationOutcome>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
+        self.reconcile_external_with_projection(
+            command_id,
+            request,
+            None,
+            before_projection_boundary,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_external_with_projection<F>(
+        &mut self,
+        command_id: CommandId,
+        request: ExternalReconciliationRequest,
+        exact_external_bytes: Option<Vec<u8>>,
         before_projection_boundary: F,
     ) -> Result<ExternalReconciliationOutcome>
     where
@@ -84,8 +144,18 @@ impl ProjectStore {
             });
         }
         let document_kind = resolved_content.kind();
-        let projection = resolved_content.project_visible()?;
+        let mut projection = resolved_content.project_visible()?;
         drop(resolved_content);
+        if let Some(bytes) = exact_external_bytes {
+            let actual = BlobId::digest(&bytes);
+            if actual != expected_visible_blob_id {
+                return Err(StoreError::ExternalVisibleBlobMismatch {
+                    expected: expected_visible_blob_id,
+                    actual,
+                });
+            }
+            projection.bytes = bytes;
+        }
         ensure_bounded_document(&projection.bytes)?;
         let request_fingerprint = reconciliation_fingerprint(
             &relative_path,

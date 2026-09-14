@@ -3159,6 +3159,84 @@ mod tests {
     }
 
     #[test]
+    fn raw_media_receipt_case_index_is_independent_of_attachment_count() {
+        let mut request = request_with_two_cases();
+        request.cases.truncate(1);
+        request.prompt_recipe.mode = PromptMode::RawCompletion;
+        let bytes = b"audio payload for fixture receipt validation".to_vec();
+        request.media.push(MediaInput {
+            id: "recording".into(),
+            kind: MediaKind::Audio,
+            mime: "audio/wav".into(),
+            sha256: BlobId::digest(&bytes).to_string(),
+            bytes,
+        });
+        let expected_context =
+            continuation_context_binding("", &request.media).expect("input binding");
+        let output = native_output(&request, 0, GenerationState::Completed, true);
+        let runtime = fake_runtime(
+            &request,
+            vec![output],
+            native_events(&request),
+            true,
+            RuntimeEvidenceClass::TestFixture,
+        );
+        let backend = LlamaBackend::with_runtime(runtime, 64).expect("backend");
+        let owner = backend
+            .start_exact_continuation(request.clone())
+            .expect("admit raw media");
+        let result = owner
+            .wait_timeout(Duration::from_secs(2))
+            .expect("fixture result");
+        let candidate = &result.candidates[0];
+        let receipt: OwnedBackendReceipt =
+            serde_json::from_slice(&candidate.backend_receipt_bytes).expect("preserved receipt");
+        assert_eq!(
+            receipt.input_contract,
+            WriterInputContract::RawCompletionWithMediaPrefix
+        );
+        assert_eq!(receipt.output.input_index, 0);
+        validate_candidate_receipt_binding(
+            candidate,
+            &request.request_id,
+            request.prompt_recipe.exact_prompt_blob_id,
+            PromptMode::RawCompletion,
+            &expected_context,
+            &result.model,
+            0,
+        )
+        .expect("the sole case remains index zero with an attachment");
+        assert!(
+            validate_candidate_receipt_binding(
+                candidate,
+                &request.request_id,
+                request.prompt_recipe.exact_prompt_blob_id,
+                PromptMode::RawCompletion,
+                &expected_context,
+                &result.model,
+                request.media.len(),
+            )
+            .is_err(),
+            "attachment count must never be used as the output case index"
+        );
+        let mut wrong_context = expected_context;
+        wrong_context.media[0].sha256 = "0".repeat(64);
+        assert!(
+            validate_candidate_receipt_binding(
+                candidate,
+                &request.request_id,
+                request.prompt_recipe.exact_prompt_blob_id,
+                PromptMode::RawCompletion,
+                &wrong_context,
+                &result.model,
+                0,
+            )
+            .is_err(),
+            "correcting the case index must not weaken media identity checks"
+        );
+    }
+
+    #[test]
     fn instruction_model_media_stays_byte_exact_with_its_bound_chat_transport() {
         let mut request = request_with_two_cases();
         request.context_preamble = "Reference the attached sound and image.".to_owned();

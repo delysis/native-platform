@@ -65,6 +65,7 @@
     listModelDownloads,
     openDefaultProject,
     openDocument,
+    importExternalDocument,
     previewDocumentReconciliation,
     promoteCandidate,
     recoverProject,
@@ -403,7 +404,7 @@
     if (key !== templateKey) { templateKey = key; void refreshWorkspaceTemplate(); }
   } else { workspaceTemplate = null; deferredWorkspaceTemplate = null; templateKey = ''; }
   let outlineOpen = false;
-  let collapsedFolders = new Set<string>();
+  let collapsedFolders = new Set<string>(['Runs/']);
   let terminalOpen = false;
   let terminalEntry = '';
   let terminalRuns: TerminalRun[] = [];
@@ -1721,6 +1722,7 @@
       documentId: document.summary.document_id,
       target: speechTarget()
     };
+    const insertion = captureSpeechInsertionAnchor('manuscript');
     speechStarting = true;
     speechError = '';
     try {
@@ -1738,7 +1740,7 @@
         return;
       }
       speechRecording = recording;
-      speechInsertionAnchor = null;
+      speechInsertionAnchor = insertion;
       announce('Recording audio locally');
     } catch (error) {
       speechRecording = null;
@@ -1761,6 +1763,13 @@
       retainedRecording = captured;
       const snapshot = await addDocumentContexts(recording.project_id, recording.session_id, captured.document_id, [captured.attachment.id]);
       adoptAuthoritativeContext(snapshot, recording.project_id, recording.session_id, captured.document_id);
+      const markdown = captured.attachment.media_markdown;
+      const insertion = speechInsertionAnchor;
+      if (markdown && insertion && project?.project_id === recording.project_id && document?.summary.document_id === captured.document_id) {
+        if (insertion.kind === 'visual') visualEditor?.insertMarkdownAtAnchor(insertion.anchor, markdown);
+        else if (insertion.kind === 'source') sourceEditor?.insertTextAtAnchor(insertion.anchor, markdown);
+      }
+      speechInsertionAnchor = null;
       speechRecording = null;
       retainedRecording = null;
       speechError = '';
@@ -3021,6 +3030,10 @@
             const previewBoundary = captureProjectFilesystemRefreshBoundary(
               currentProjectFilesystemRefreshBoundary()
             );
+            if (editVersion === savedVersion && documentText === document.text) {
+              await selectDocument(current, true);
+              return;
+            }
             const preview = await requestReconciliationPreview(current, documentText, {
               projectId: refreshed.project_id,
               sessionId: refreshed.session_id,
@@ -3051,6 +3064,10 @@
             current.revision_id !== liveCurrent.revision_id ||
             current.active_blob_id !== liveCurrent.active_blob_id
           ) {
+            if (compositionActive || !flushEditors() || editVersion !== savedVersion) {
+              projectFilesystemRefreshQueued = true;
+              return;
+            }
             cancelSuggestionTimer();
             clearCompletionSession();
             detachDocumentForReconciliation();
@@ -3071,6 +3088,7 @@
         projectFilesystemRefreshQueued = !deleteDocumentUncertain;
         return;
       }
+      if (project?.session_id === boundProject.session_id) await refreshWorkspaceTemplate();
     } catch (error) {
       const failure = normalizeFailure(error);
       if (
@@ -6212,39 +6230,37 @@
     clearFailure();
     try {
       if (target.externallyModified) {
-        const preview = await requestReconciliationPreview({
-          document_id: target.documentId,
-          kind: target.kind,
-          revision_id: target.expectedRevisionId,
-          active_blob_id: target.expectedBlobId
-        }, null, source);
-        if (
-          applicationClosePhase !== 'running' ||
-          requestSerial !== navigationSerial ||
-          !navigationScopeIsCurrent(
-            project,
-            document,
-            documentEpoch,
-            editVersion,
-            workspaceRestoreSerial,
-            source
-          )
-        ) {
+        const imported = !targetWasCurrent || editVersion === savedVersion
+          ? await importExternalDocument(source.projectId, source.sessionId, target.documentId,
+              target.expectedRevisionId, target.expectedBlobId)
+          : null;
+        if (!projectNavigationIsCurrent() || requestSerial !== navigationSerial) return;
+        if (imported && project) {
+          const fresh = captureDocumentTarget(project, imported);
+          if (!fresh) throw new Error('External document returned an incomplete identity.');
+          target = fresh;
+          project = { ...project, documents: project.documents.map(item =>
+            item.document_id === imported.document_id ? imported : item) };
+        } else {
+          const preview = await requestReconciliationPreview({
+            document_id: target.documentId, kind: target.kind,
+            revision_id: target.expectedRevisionId, active_blob_id: target.expectedBlobId
+          }, targetWasCurrent ? documentText : null, source);
+          if (!projectNavigationIsCurrent() || requestSerial !== navigationSerial) return;
+          documentEpoch += 1;
+          document = null;
+          documentText = '';
+          sourceDisplayText = '';
+          verseCodec = null;
+          editVersion = 0;
+          savedVersion = 0;
+          draftVersion = '0';
+          draftSavedEditVersion = 0;
+          staleDraft = null;
+          uncertainDraft = null;
+          activateReconciliation(preview);
           return;
         }
-        documentEpoch += 1;
-        document = null;
-        documentText = '';
-        sourceDisplayText = '';
-        verseCodec = null;
-        editVersion = 0;
-        savedVersion = 0;
-        draftVersion = '0';
-        draftSavedEditVersion = 0;
-        staleDraft = null;
-        uncertainDraft = null;
-        activateReconciliation(preview);
-        return;
       }
       const opened = await openDocument(
         source.projectId,
@@ -7724,6 +7740,7 @@
       if (!terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return;
       if (run.run_id !== request.commandId) throw new Error('The result belongs to a different run.');
       terminalPendingRequest = null;
+      if (terminalEntry === expression) terminalEntry = '';
       terminalRefreshSerial += 1;
       terminalRuns = [run, ...terminalRuns.filter((previous) => previous.run_id !== run.run_id)];
       if (run.output_document_id) scheduleProjectFilesystemRefresh(0);
@@ -9141,7 +9158,8 @@
   }
 
   async function refreshWorkspaceTemplate(enable = false): Promise<void> {
-    if (!project) return;
+    if (!project || compositionActive || !flushEditors()) return;
+    if (document?.summary.relative_path === '.loom.md' && editVersion !== savedVersion) return;
     const scope = { projectId: project.project_id, sessionId: project.session_id };
     const serial = ++templateSerial;
     try {
@@ -9149,12 +9167,18 @@
       if (serial !== templateSerial || !terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return;
       if (!flushEditors()) { deferredTemplateSession = scope.sessionId; deferredWorkspaceTemplate = snapshot; return; }
       workspaceTemplate = snapshot;
+      const registered = project?.documents.find(item => item.document_id === snapshot.document_id);
+      if (snapshot.document_id && registered?.revision_id !== snapshot.revision_id) {
+        scheduleProjectFilesystemRefresh(0);
+      }
       if (enable && snapshot.document_id) {
         await refreshProjectFilesystemState();
         await openPaneDocument(snapshot.document_id);
         outlineOpen = true;
       }
-    } catch (error) { recordFailure(error); }
+    } catch (error) {
+      if (serial === templateSerial && terminalScopeIsCurrent(scope.projectId, scope.sessionId)) recordFailure(error);
+    }
   }
 
   async function openPaneDocument(id: string): Promise<void> {

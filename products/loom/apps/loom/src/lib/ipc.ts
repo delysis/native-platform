@@ -410,6 +410,15 @@ export async function getBuildModelPolicy(): Promise<BuildModelPolicySummary> {
   return decodeBuildModelPolicy(value);
 }
 
+export function importExternalDocument(
+  projectId: string, sessionId: string, documentId: string,
+  expectedRevisionId: string, expectedBlobId: string
+): Promise<DocumentSummary | null> {
+  return call('document_import_external', {
+    projectId, sessionId, documentId, expectedRevisionId, expectedBlobId
+  });
+}
+
 export function openDocument(
   projectId: string,
   sessionId: string,
