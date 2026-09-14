@@ -29,7 +29,9 @@ import type {
   LoomFailure,
   TransientDraftSnapshot,
   TransientDraftWriteReceipt,
-  WeaveStarted
+  WeaveStarted,
+  TerminalRun,
+  TerminalRunRequest
 } from './types';
 import { decodeBuildModelPolicy } from './buildModelPolicy';
 import type { ImageAttachmentReceipt } from './attachments';
@@ -48,6 +50,7 @@ const INDEPENDENT_COMMANDS = new Set([
   'application_close_abort',
   'application_close_pending',
   'build_model_policy_get',
+  'shader_preview',
   'model_catalog_list',
   'model_download_cancel',
   'model_download_list',
@@ -846,4 +849,20 @@ export function normalizeFailure(error: unknown): LoomFailure {
     message: 'Loom could not complete that command.',
     retryable: true
   };
+}
+
+export function runTerminal(request: TerminalRunRequest): Promise<TerminalRun> {
+  return call('terminal_run', { ...request });
+}
+
+export function listTerminalRuns(projectId: string, sessionId: string): Promise<TerminalRun[]> {
+  return call('terminal_list', { projectId, sessionId });
+}
+
+export function cancelTerminalRun(projectId: string, sessionId: string, runId: string): Promise<void> {
+  return call('terminal_cancel', { projectId, sessionId, runId });
+}
+
+export function compileShaderPreview(source: string): Promise<{ fragment: string }> {
+  return call('shader_preview', { source });
 }

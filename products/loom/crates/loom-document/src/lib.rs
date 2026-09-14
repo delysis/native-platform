@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod merge;
+pub mod neural_functions;
+
+pub use neural_functions::{
+    DocumentReference, NeuralCommand, NeuralExpression, NeuralSyntaxError, document_references,
+    parse_neural_command, render_base_function_prompt,
+};
 
 pub use merge::{
     DEFAULT_MERGE_BUDGET, MergeBudget, MergeBudgetMetric, MergeConflict, MergeConflictKind,

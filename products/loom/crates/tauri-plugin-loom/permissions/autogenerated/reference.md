@@ -31,6 +31,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-speech-input-capabilities`
 - `allow-speech-input-status`
 - `allow-document-open`
+- `allow-shader-preview`
 - `allow-document-checkpoint`
 - `allow-document-export-choose`
 - `allow-document-reveal`
@@ -1547,6 +1548,32 @@ Denies the project_recover command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-shader-preview`
+
+</td>
+<td>
+
+Enables the shader_preview command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-shader-preview`
+
+</td>
+<td>
+
+Denies the shader_preview command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-speech-input-cancel`
 
 </td>
@@ -1722,6 +1749,84 @@ Enables the suggestions_set command without any pre-configured scope.
 <td>
 
 Denies the suggestions_set command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-terminal-cancel`
+
+</td>
+<td>
+
+Enables the terminal_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-terminal-cancel`
+
+</td>
+<td>
+
+Denies the terminal_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-terminal-list`
+
+</td>
+<td>
+
+Enables the terminal_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-terminal-list`
+
+</td>
+<td>
+
+Denies the terminal_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-terminal-run`
+
+</td>
+<td>
+
+Enables the terminal_run command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-terminal-run`
+
+</td>
+<td>
+
+Denies the terminal_run command without any pre-configured scope.
 
 </td>
 </tr>

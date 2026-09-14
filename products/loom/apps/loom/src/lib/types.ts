@@ -545,3 +545,27 @@ export interface ReconciliationPreview {
   draft_version: string | null;
   outcome: MergeOutcome;
 }
+
+export interface TerminalRun {
+  run_id: string;
+  title?: string;
+  status: 'running' | 'completed' | 'cancelled' | 'failed';
+  expression: string;
+  output_document_id: string | null;
+  output_relative_path: string | null;
+  preview: string;
+  error: string | null;
+  created_at_ms: number;
+}
+
+export interface TerminalRunRequest {
+  projectId: string;
+  sessionId: string;
+  commandId: string;
+  documentId: string;
+  sourceRevisionId: string;
+  expectedVisibleBlobId: string;
+  sourceStartByte: number;
+  sourceEndByte: number;
+  expression: string;
+}

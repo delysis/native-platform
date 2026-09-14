@@ -534,3 +534,30 @@ button.document-row:hover { background: rgb(255 255 255 / 45%); }
 
 .inline-audio-card { display: inline-flex; flex-direction: column; width: min(360px, 100%); vertical-align: middle; padding: 8px; border: 1px solid var(--line); border-radius: 8px; }
 .inline-audio-card audio { width: 100%; height: 32px; }
+
+.retained-terminal { flex: 0 0 clamp(110px, 23vh, 220px); min-height: 0; max-height: 40vh; display: flex; flex-direction: column; border-top: 1px solid var(--line); background: var(--paper); }
+.terminal-command-row { display: flex; flex: none; align-items: center; gap: 6px; min-height: 34px; padding: 3px 8px; border-bottom: 1px solid var(--line-soft); }
+.terminal-prompt { color: var(--muted); font-size: 13px; }
+.terminal-heading { flex: 1; font-size: 11px; font-weight: 600; color: var(--muted); }
+.terminal-command-row textarea { flex: 1; min-width: 0; min-height: 26px; max-height: 80px; padding: 4px 5px; resize: vertical; border: 1px solid var(--line); border-radius: 5px; background: transparent; color: var(--ink); font: 12px/1.4 ui-monospace, monospace; }
+.terminal-action, .terminal-close { flex: none; min-height: 28px; padding: 3px 9px; border: 0; border-radius: 5px; background: var(--paper-deep); color: var(--ink); cursor: pointer; font-size: 11px; }
+.terminal-close { width: 28px; padding: 0; font-size: 20px; background: transparent; }
+.terminal-action:disabled { opacity: .45; cursor: default; }
+.terminal-results { flex: 1; min-height: 0; overflow: auto; padding: 0 8px; }
+.terminal-result { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 2px 8px; padding: 5px 0; border-bottom: 1px solid var(--line-soft); }
+.terminal-result > button { min-width: 0; padding: 2px 0; border: 0; background: transparent; color: var(--ink); cursor: pointer; font: inherit; font-size: 12px; text-align: left; }
+.terminal-result > button > span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-result > button:disabled { cursor: default; }
+.terminal-result > .terminal-preview { grid-column: 1 / -1; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.45 ui-monospace, monospace; }
+.terminal-run-status, .terminal-status { color: var(--muted); font-size: 10px; }
+.terminal-status { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-error, .terminal-run-error { flex: none; margin: 0; padding: 4px 8px; color: var(--danger); font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.terminal-run-error { grid-column: 1 / -1; padding: 0; }
+
+.retained-terminal.empty { flex-basis: auto; }
+.terminal-result > button { min-height: 24px; }
+
+.loom-shader-block > pre { margin-bottom: 4px; }
+.loom-shader-preview { display: block; width: 256px; max-width: 100%; height: auto; aspect-ratio: 1; margin-bottom: 8px; user-select: none; -webkit-user-select: none; }
+.loom-shader-preview[hidden], .loom-shader-error[hidden] { display: none; }
+.loom-shader-error { display: block; margin: 2px 0 8px; color: var(--danger); font: 11px/1.4 ui-monospace, monospace; overflow-wrap: anywhere; }

@@ -3,11 +3,16 @@
   import { convertFileSrc } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
+  import TerminalPane from './lib/TerminalPane.svelte';
+  import type { TerminalSourceRange } from './lib/terminalSelection';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
+    runTerminal,
+    listTerminalRuns,
+    cancelTerminalRun,
     addDocumentContexts,
     applyCoWriter,
     applicationClosePending,
@@ -338,7 +343,9 @@
     SpeechRecordingSnapshot,
     TransientDraftSnapshot,
     DocumentContextSnapshot,
-    WeaveStarted
+    WeaveStarted,
+    TerminalRun,
+    TerminalRunRequest
   } from './lib/types';
 
   type VisualTextInsertionAnchor = {
@@ -372,6 +379,16 @@
   let opening = false;
   let search = '';
   let outlineOpen = false;
+  let terminalOpen = false;
+  let terminalEntry = '';
+  let terminalRuns: TerminalRun[] = [];
+  let terminalDispatching = false;
+  let terminalCancelRequested = false;
+  let terminalPendingRequest: TerminalRunRequest | null = null;
+  let terminalError = '';
+  let terminalSessionKey = '';
+  let terminalRefreshSerial = 0;
+  let terminalPollTimer: number | undefined;
   let contextPaneOpen = false;
   let focusedSpeechTarget: SpeechInputTarget = 'manuscript';
   let contextPaneElement: HTMLDivElement | undefined;
@@ -611,6 +628,7 @@
   let compositionActive = false;
   let sourceComposing = false;
   let visualEditor: {
+    captureTerminalSourceRange: () => TerminalSourceRange | null;
     flushPending: () => boolean;
     focusAtDocumentEnd: () => boolean;
     focusCurrentSelection: () => boolean;
@@ -894,6 +912,22 @@
   $: unpresentableVisualGhostPresentationKeys = completionController.unpresentableVisualKeys;
   $: scheduledSuggestion = completionController.scheduled;
 
+  $: terminalBusy = terminalDispatching || terminalPendingRequest !== null || terminalRuns.some((run) => run.status === 'running');
+  $: if (terminalSessionKey !== `${project?.project_id ?? ''}:${project?.session_id ?? ''}`) {
+    terminalSessionKey = `${project?.project_id ?? ''}:${project?.session_id ?? ''}`;
+    terminalRefreshSerial += 1;
+    terminalRuns = [];
+    terminalEntry = '';
+    terminalError = '';
+    terminalDispatching = false;
+    terminalCancelRequested = false;
+    terminalPendingRequest = null;
+    terminalOpen = false;
+    if (terminalPollTimer !== undefined) window.clearTimeout(terminalPollTimer);
+    terminalPollTimer = undefined;
+    if (desktop && project) void refreshTerminalRuns();
+  }
+
   $: folderWarnings = project?.folder_warnings ?? [];
   $: visibleDocuments = project?.documents.filter((candidate) => {
     const query = search.trim().toLocaleLowerCase();
@@ -1174,7 +1208,7 @@
   }
   $: shuttleCandidate = shuttleEnabled ? selectedInlineSuggestion : activeGhostSuggestion;
   $: shuttleScheduleKey = completionShuttleScheduleKey(
-    shuttleEnabled,
+    shuttleEnabled && !terminalBusy,
     windowFocused,
     shuttleCandidate,
     boundCompletionSession?.acceptedChunks.length ?? 0,
@@ -2177,6 +2211,7 @@
     window.document.addEventListener('visibilitychange', handleRendererResume);
     return () => {
       componentMounted = false;
+      if (terminalPollTimer !== undefined) window.clearTimeout(terminalPollTimer);
       startupHeldForApplicationClose = false;
       workspaceRestoreSerial += 1;
       projectFilesystemRefreshSerial += 1;
@@ -6798,6 +6833,7 @@
       ? schedule.editVersion
       : schedule.ticket.editVersion;
     if (
+      terminalIsBusy() ||
       completionController.scheduled !== schedule ||
       targetEditVersion !== editVersion ||
       !completionAutomationEnabled() ||
@@ -7518,7 +7554,7 @@
     if (!key) return;
     shuttleTimer = window.setTimeout(() => {
       shuttleTimer = undefined;
-      if (shuttleTimerKey !== key || !windowFocused || !shuttleEnabled) return;
+      if (shuttleTimerKey !== key || !windowFocused || !shuttleEnabled || terminalIsBusy()) return;
       const accepted = mode === 'visual'
         ? visualEditor?.acceptGhostWord(false) ?? false
         : sourceEditor?.acceptGhostWord(false) ?? false;
@@ -7548,6 +7584,150 @@
     );
     completionController = dismissed.state;
     if (dismissed.authorized) announce('Suggestion dismissed');
+  }
+
+  function terminalIsBusy(): boolean {
+    return terminalDispatching || terminalPendingRequest !== null || terminalRuns.some((run) => run.status === 'running');
+  }
+
+  function terminalScopeIsCurrent(projectId: string, sessionId: string): boolean {
+    return componentMounted && project?.project_id === projectId && project.session_id === sessionId;
+  }
+
+  async function refreshTerminalRuns(): Promise<void> {
+    if (!project || !desktop || applicationClosePhase !== 'running') return;
+    const { project_id: projectId, session_id: sessionId } = project;
+    const refreshSerial = ++terminalRefreshSerial;
+    try {
+      const runs = await listTerminalRuns(projectId, sessionId);
+      if (!terminalScopeIsCurrent(projectId, sessionId) || refreshSerial !== terminalRefreshSerial) return;
+      const newlyRetained = runs.some((run) => run.output_document_id &&
+        !terminalRuns.some((previous) => previous.run_id === run.run_id && previous.output_document_id));
+      terminalRuns = runs;
+      if (terminalPendingRequest && (!terminalDispatching || runs.some((run) => run.run_id === terminalPendingRequest?.commandId))) {
+        terminalPendingRequest = null;
+      }
+      if (terminalCancelRequested) {
+        for (const run of runs.filter((candidate) => candidate.status === 'running')) {
+          await cancelTerminalRun(projectId, sessionId, run.run_id);
+        }
+      }
+      if (newlyRetained) scheduleProjectFilesystemRefresh(0);
+    } catch (error) {
+      if (terminalScopeIsCurrent(projectId, sessionId)) terminalError = normalizeFailure(error).message;
+    }
+    if (terminalScopeIsCurrent(projectId, sessionId) && terminalRuns.some((run) => run.status === 'running')) {
+      if (terminalPollTimer !== undefined) window.clearTimeout(terminalPollTimer);
+      terminalPollTimer = window.setTimeout(() => {
+        terminalPollTimer = undefined;
+        void refreshTerminalRuns();
+      }, 800);
+    }
+  }
+
+  function closeTerminal(): void {
+    terminalOpen = false;
+    if (mode === 'source') sourceEditor?.focusCurrentSelection();
+    else visualEditor?.focusCurrentSelection();
+  }
+
+  function captureTerminalRange(): TerminalSourceRange {
+    if (!document) throw new Error('Open a document first.');
+    if (mode === 'visual') {
+      const range = visualEditor?.captureTerminalSourceRange();
+      if (!range) throw new Error('This selection needs the Markdown editor before it can run.');
+      return range;
+    }
+    const anchor = sourceEditor?.captureTextInsertionAnchor();
+    if (!anchor) throw new Error('Finish editing the selection before running.');
+    const byteAt = (offset: number): number => {
+      const prefix = anchor.value.slice(0, offset);
+      if (document?.summary.kind === 'verse' && (!verseCodec || !verseCodec.editable)) {
+        throw new Error('This poem does not expose an exact source boundary.');
+      }
+      const canonical = document?.summary.kind === 'verse' && verseCodec
+        ? encodeVerseFromEditor(prefix, verseCodec) : prefix;
+      if (!documentText.startsWith(canonical)) throw new Error('The selection changed; try again.');
+      return utf8ByteOffset(canonical, canonical.length);
+    };
+    return { start: byteAt(anchor.start), end: byteAt(anchor.end) };
+  }
+
+  async function runRetainedOutput(expression: string): Promise<void> {
+    if (!project || !document || terminalIsBusy() || editorReadonly || compositionActive || applicationClosePhase !== 'running') return;
+    terminalOpen = true;
+    terminalError = '';
+    if (!expression && !currentModel?.completion) { terminalError = 'Load a local completion model to try this.'; return; }
+    if (!flushEditors()) return;
+    const scope = { projectId: project.project_id, sessionId: project.session_id };
+    const documentId = document.summary.document_id;
+    const text = documentText;
+    const epoch = documentEpoch;
+    terminalDispatching = true;
+    terminalCancelRequested = false;
+    cancelSuggestionTimer();
+    try {
+      const range = captureTerminalRange();
+      await cancelActiveBranches();
+      if (!(await flushCurrentDocument())) throw new Error('Finish saving this document before running.');
+      if (!terminalScopeIsCurrent(scope.projectId, scope.sessionId) ||
+        document?.summary.document_id !== documentId || documentEpoch !== epoch || documentText !== text || terminalCancelRequested) return;
+      const sourceRevisionId = document.summary.revision_id;
+      if (!sourceRevisionId) throw new Error('The document does not have a saved source revision.');
+      const request: TerminalRunRequest = {
+        ...scope, commandId: newUlid(), documentId, sourceRevisionId,
+        expectedVisibleBlobId: document.visible_blob_id,
+        sourceStartByte: range.start, sourceEndByte: range.end, expression
+      };
+      terminalPendingRequest = request;
+      const run = await runTerminal(request);
+      if (!terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return;
+      if (run.run_id !== request.commandId) throw new Error('The result belongs to a different run.');
+      terminalPendingRequest = null;
+      terminalRefreshSerial += 1;
+      terminalRuns = [run, ...terminalRuns.filter((previous) => previous.run_id !== run.run_id)];
+      if (run.output_document_id) scheduleProjectFilesystemRefresh(0);
+      void refreshTerminalRuns();
+    } catch (error) {
+      if (terminalScopeIsCurrent(scope.projectId, scope.sessionId)) {
+        terminalError = normalizeFailure(error).message;
+        terminalDispatching = false;
+        // A lost response never authorizes a second generation. Read retained
+        // native receipts before the author decides whether to try again.
+        await refreshTerminalRuns();
+      }
+    } finally {
+      if (terminalScopeIsCurrent(scope.projectId, scope.sessionId)) terminalDispatching = false;
+    }
+  }
+
+  async function stopTerminalRun(): Promise<void> {
+    if (!project) return;
+    terminalCancelRequested = true;
+    const { project_id: projectId, session_id: sessionId } = project;
+    try {
+      const runIds = new Set(terminalRuns.filter((run) => run.status === 'running').map((run) => run.run_id));
+      if (terminalPendingRequest) runIds.add(terminalPendingRequest.commandId);
+      for (const runId of runIds) await cancelTerminalRun(projectId, sessionId, runId);
+      if (terminalScopeIsCurrent(projectId, sessionId)) await refreshTerminalRuns();
+    } catch (error) {
+      if (terminalScopeIsCurrent(projectId, sessionId)) terminalError = normalizeFailure(error).message;
+    }
+  }
+
+  async function openTerminalOutput(run: TerminalRun): Promise<void> {
+    if (!project || !run.output_document_id) return;
+    const { project_id: projectId, session_id: sessionId } = project;
+    try {
+      const refreshed = await currentProjectSession();
+      if (!terminalScopeIsCurrent(projectId, sessionId)) return;
+      const output = refreshed.documents.find((candidate) => candidate.document_id === run.output_document_id);
+      if (!output) throw new Error('This retained output is no longer in the folder.');
+      project = refreshed;
+      await selectDocument(output, true);
+    } catch (error) {
+      if (terminalScopeIsCurrent(projectId, sessionId)) terminalError = normalizeFailure(error).message;
+    }
   }
 
   function handleGlobalKeydownCapture(event: KeyboardEvent): void {
@@ -7602,6 +7782,15 @@
       return;
     }
     const modifier = event.metaKey || event.ctrlKey;
+    if (modifier && event.key === 'Enter' && !event.altKey && !event.shiftKey && !event.isComposing) {
+      const target = event.target;
+      const inManuscript = target instanceof Element && Boolean(target.closest('.editor-stage'));
+      if (target === sourceTextarea || inManuscript) {
+        event.preventDefault();
+        void runRetainedOutput('');
+        return;
+      }
+    }
     if (modifier && event.key.toLocaleLowerCase() === 's') {
       event.preventDefault();
       if (reconciliation) {
@@ -7701,6 +7890,7 @@
 
   function weaveCaptureStillCurrent(captured: WeaveCapture): boolean {
     return Boolean(
+      !terminalIsBusy() &&
       project?.project_id === captured.projectId &&
       project.session_id === captured.sessionId &&
       document?.summary.document_id === captured.documentId &&
@@ -7824,7 +8014,7 @@
   }
 
   async function startAutomaticWeave(): Promise<boolean> {
-    if (weaveStarting || !project || !document || !currentModel) return false;
+    if (terminalIsBusy() || weaveStarting || !project || !document || !currentModel) return false;
     const startingEditVersion = editVersion;
     if (compositionActive || !flushEditors()) return false;
     if (editVersion !== startingEditVersion) {
@@ -9077,6 +9267,14 @@
           <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Uses the local microphone and local speech model')}</span>
         {/if}
         <button
+          class="titlebar-button try-output-button"
+          type="button"
+          aria-label="Try selection or paragraph"
+          title="Try"
+          disabled={!document || !currentModel?.completion || terminalBusy || editorReadonly}
+          on:click={() => void runRetainedOutput('')}
+        ><svg aria-hidden="true" viewBox="0 0 18 18"><path d="m6 3 9 6-9 6Z"/></svg></button>
+        <button
           class:active={suggestionsEnabled && Boolean(currentModel)}
           class:preparing={suggestionsEnabled && !currentModel && !quietModelLoadFailure && (modelLoading || preferredWriterEnsureInFlight !== null || preferredWriterPending !== null)}
           class:needs-attention={suggestionsEnabled && !currentModel && Boolean(quietModelLoadFailure)}
@@ -9628,6 +9826,22 @@
         {/if}
       </main>
     </div>
+      <TerminalPane
+        bind:open={terminalOpen}
+        bind:entry={terminalEntry}
+        runs={terminalRuns}
+        busy={terminalBusy}
+        disabled={applicationClosePhase !== 'running'}
+        runDisabled={!document || (!terminalEntry && !currentModel?.completion) || editorReadonly}
+        error={terminalError}
+        uncertain={terminalPendingRequest !== null}
+        onCheck={() => void refreshTerminalRuns()}
+        modelLabel={currentModel?.display_name ?? ''}
+        onRun={() => void runRetainedOutput(terminalEntry)}
+        onCancel={() => void stopTerminalRun()}
+        onOpen={(run) => void openTerminalOutput(run)}
+        onClose={closeTerminal}
+      />
   {:else}
     <main class="welcome" id="manuscript">
       <section class="welcome-note" aria-labelledby="welcome-title">

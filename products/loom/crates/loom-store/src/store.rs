@@ -41,6 +41,45 @@ const MAX_REASON_BYTES: usize = 4 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 pub const MAX_DOCUMENT_BYTES: u64 = 128 * 1024 * 1024;
 
+#[derive(Clone, Copy)]
+enum DocumentOrigin {
+    Human,
+    Generated { evidence_blob_id: BlobId },
+    Derived { evidence_blob_id: BlobId },
+}
+
+impl DocumentOrigin {
+    const fn artifact_kind(self) -> &'static str {
+        match self {
+            Self::Human => "human_contribution",
+            Self::Generated { .. } | Self::Derived { .. } => "text_blob",
+        }
+    }
+
+    const fn contribution_kind(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Generated { .. } => "generated",
+            Self::Derived { .. } => "source",
+        }
+    }
+
+    const fn operation_kind(self) -> &'static str {
+        match self {
+            Self::Human | Self::Derived { .. } => "import",
+            Self::Generated { .. } => "generate",
+        }
+    }
+
+    fn metadata(self, relative_path: &str, reason: &str) -> serde_json::Value {
+        let mut metadata = json!({ "relative_path": relative_path, "reason": reason });
+        if let Self::Generated { evidence_blob_id } | Self::Derived { evidence_blob_id } = self {
+            metadata["evidence_blob_id"] = json!(evidence_blob_id);
+        }
+        metadata
+    }
+}
+
 pub struct ProjectStore {
     pub(crate) root: PathBuf,
     pub(crate) manifest: ProjectManifest,
@@ -251,7 +290,52 @@ impl ProjectStore {
         content: DocumentContent,
         reason: impl Into<String>,
     ) -> Result<SaveOutcome> {
-        self.create_document_if_absent_with_boundary(relative_path, content, reason, |_| Ok(()))
+        self.create_document_if_absent_with_boundary(
+            relative_path,
+            content,
+            reason,
+            DocumentOrigin::Human,
+            |_| Ok(()),
+        )
+    }
+
+    /// Retain generated writing as a new ordinary document, without attributing
+    /// it to a human or promoting it into the active manuscript. The caller's
+    /// immutable evidence must already be present and pass its digest check.
+    pub fn create_generated_document_if_absent(
+        &mut self,
+        relative_path: impl AsRef<Path>,
+        content: DocumentContent,
+        reason: impl Into<String>,
+        evidence_blob_id: BlobId,
+    ) -> Result<SaveOutcome> {
+        self.read_blob(evidence_blob_id)?;
+        self.create_document_if_absent_with_boundary(
+            relative_path,
+            content,
+            reason,
+            DocumentOrigin::Generated { evidence_blob_id },
+            |_| Ok(()),
+        )
+    }
+
+    /// Retain a copied or deterministically derived value with its source
+    /// receipt. This does not claim that a model generated the writing.
+    pub fn create_derived_document_if_absent(
+        &mut self,
+        relative_path: impl AsRef<Path>,
+        content: DocumentContent,
+        reason: impl Into<String>,
+        evidence_blob_id: BlobId,
+    ) -> Result<SaveOutcome> {
+        self.read_blob(evidence_blob_id)?;
+        self.create_document_if_absent_with_boundary(
+            relative_path,
+            content,
+            reason,
+            DocumentOrigin::Derived { evidence_blob_id },
+            |_| Ok(()),
+        )
     }
 
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
@@ -260,6 +344,7 @@ impl ProjectStore {
         relative_path: impl AsRef<Path>,
         content: DocumentContent,
         reason: impl Into<String>,
+        origin: DocumentOrigin,
         before_projection_boundary: F,
     ) -> Result<SaveOutcome>
     where
@@ -336,28 +421,25 @@ impl ProjectStore {
         )?;
         transaction.execute(
             "INSERT INTO artifacts(artifact_id, blob_id, artifact_kind, media_type, metadata_json, created_at_ms)
-             VALUES (?1, ?2, 'human_contribution', ?3, ?4, ?5)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 artifact_id.to_string(),
                 blob_id.to_string(),
+                origin.artifact_kind(),
                 media_type(document_kind),
-                serde_json::to_string(&json!({
-                    "relative_path": relative_path,
-                    "reason": reason,
-                }))?,
+                serde_json::to_string(&origin.metadata(&relative_path, &reason))?,
                 created_at_ms,
             ],
         )?;
+        let mut operation_metadata = origin.metadata(&relative_path, &reason);
+        operation_metadata["create_if_absent"] = json!(true);
         transaction.execute(
             "INSERT INTO operations(operation_id, operation_kind, metadata_json, created_at_ms)
-             VALUES (?1, 'import', ?2, ?3)",
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 operation_id.to_string(),
-                serde_json::to_string(&json!({
-                    "relative_path": relative_path,
-                    "reason": reason,
-                    "create_if_absent": true,
-                }))?,
+                origin.operation_kind(),
+                serde_json::to_string(&operation_metadata)?,
                 created_at_ms,
             ],
         )?;
@@ -379,8 +461,8 @@ impl ProjectStore {
         if byte_len_i64 != 0 {
             transaction.execute(
                 "INSERT INTO revision_segments(revision_id, position, artifact_id, start_byte, end_byte, contribution_kind)
-                 VALUES (?1, 0, ?2, 0, ?3, 'human')",
-                params![revision_id.to_string(), artifact_id.to_string(), byte_len_i64],
+                 VALUES (?1, 0, ?2, 0, ?3, ?4)",
+                params![revision_id.to_string(), artifact_id.to_string(), byte_len_i64, origin.contribution_kind()],
             )?;
         }
         transaction.execute(
@@ -6345,6 +6427,7 @@ mod tests {
             "manuscript/new.md",
             DocumentContent::Prose(String::new()),
             "create empty document",
+            DocumentOrigin::Human,
             |visible| {
                 fs::write(visible, "appeared externally")?;
                 Ok(())
@@ -6360,6 +6443,97 @@ mod tests {
             "appeared externally"
         );
         assert_eq!(store.pending_outbox_count().expect("pending outbox"), 1);
+    }
+
+    #[test]
+    fn generated_document_retains_evidence_and_generated_authorship_after_reopen() {
+        let (_directory, mut store) = new_store();
+        let evidence = store
+            .store_provenance_blob(b"immutable inference receipt")
+            .unwrap();
+        let saved = store
+            .create_generated_document_if_absent(
+                "Results/first.md",
+                DocumentContent::Prose("model output".into()),
+                "terminal inference",
+                evidence,
+            )
+            .unwrap();
+        let root = store.root.clone();
+        drop(store);
+        let store = ProjectStore::open(root).unwrap();
+        let (kind, metadata): (String, String) = store
+            .connection
+            .query_row(
+                "SELECT artifact_kind, metadata_json FROM artifacts WHERE artifact_id = ?1",
+                [saved.artifact_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(kind, "text_blob");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&metadata).unwrap()["evidence_blob_id"],
+            json!(evidence)
+        );
+        assert_eq!(
+            store.read_blob(evidence).unwrap(),
+            b"immutable inference receipt"
+        );
+        let segments = store.load_revision_segments(saved.revision_id).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(
+            segments[0].contribution,
+            loom_types::ContributionKind::Generated
+        );
+        assert_eq!(
+            fs::read_to_string(store.root.join("Results/first.md")).unwrap(),
+            "model output"
+        );
+    }
+
+    #[test]
+    fn derived_document_is_source_material_without_claiming_model_generation() {
+        let (_directory, mut store) = new_store();
+        let evidence = store
+            .store_provenance_blob(b"resolved reference receipt")
+            .unwrap();
+        let saved = store
+            .create_derived_document_if_absent(
+                "Runs/copy.md",
+                DocumentContent::Prose("copied source".into()),
+                "reference",
+                evidence,
+            )
+            .unwrap();
+        assert_eq!(
+            store.load_revision_segments(saved.revision_id).unwrap()[0].contribution,
+            loom_types::ContributionKind::Source
+        );
+        let kind: String = store
+            .connection
+            .query_row(
+                "SELECT operation_kind FROM operations WHERE operation_id = ?1",
+                [saved.operation_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "import");
+    }
+
+    #[test]
+    fn generated_document_rejects_missing_evidence_without_creating_writing() {
+        let (_directory, mut store) = new_store();
+        let missing = BlobId::digest(b"missing receipt");
+        assert!(matches!(
+            store.create_generated_document_if_absent(
+                "Results/never.md",
+                DocumentContent::Prose("output".into()),
+                "terminal",
+                missing,
+            ),
+            Err(StoreError::MissingBlob { .. })
+        ));
+        assert!(!store.root.join("Results").exists());
     }
 
     #[test]

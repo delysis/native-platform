@@ -7,6 +7,8 @@
   import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
   import { onDestroy, onMount } from 'svelte';
+  import { visualTerminalRange, type TerminalSourceRange } from './terminalSelection';
+  import { shaderCodeBlockView } from './shaderCodeBlock';
   import {
     normalizeVisualMarkdownSource,
     parseVisualMarkdown,
@@ -477,6 +479,10 @@
     projectDocument();
     view.focus();
     return true;
+  }
+
+  export function captureTerminalSourceRange(): TerminalSourceRange | null {
+    return view && !readonly && !composing ? visualTerminalRange(view.state, lastEmitted) : null;
   }
 
   export function captureTextInsertionAnchor(): {
@@ -1020,7 +1026,7 @@
     lastEmitted = initialMarkdown;
     view = new EditorView(mount, {
       state: stateFor(initialMarkdown),
-      nodeViews: { image: imageNodeView },
+      nodeViews: { image: imageNodeView, code_block: (node) => shaderCodeBlockView(node) },
       editable: () => !readonly,
       attributes: editorAttributes(),
       dispatchTransaction(transaction) {

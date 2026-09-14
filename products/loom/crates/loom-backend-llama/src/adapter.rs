@@ -1350,6 +1350,7 @@ pub fn validate_candidate_receipt_binding(
     record: &CandidateProvenanceRecord,
     expected_request_id: &str,
     expected_prompt_blob_id: BlobId,
+    expected_prompt_mode: PromptMode,
     expected_context_binding: &ContinuationContextBinding,
     expected_model: &VerifiedModelDescriptor,
     expected_input_index: usize,
@@ -1381,8 +1382,11 @@ pub fn validate_candidate_receipt_binding(
         }
     };
     let output_blob_id = BlobId::digest(output.text.as_bytes());
-    let expected_input_contract =
-        writer_input_contract_for_media(!expected_context_binding.media.is_empty(), expected_model);
+    let expected_input_contract = writer_input_contract_for_mode(
+        expected_prompt_mode,
+        !expected_context_binding.media.is_empty(),
+        expected_model,
+    );
     let identities_match = receipt.exact_prompt_blob_id == expected_prompt_blob_id
         && receipt.model_environment_id == expected_model.model_environment_id
         && receipt.input_contract == expected_input_contract
@@ -1663,9 +1667,19 @@ fn validate_request(
         ));
     }
     let prompt_blob_id = BlobId::digest(request.exact_manuscript_prefix.as_bytes());
-    if request.prompt_recipe.mode != PromptMode::Completion {
+    if !matches!(
+        request.prompt_recipe.mode,
+        PromptMode::Completion | PromptMode::RawCompletion
+    ) {
         return Err(LlamaBackendError::InvalidRequest(
-            "raw continuation requires PromptMode::Completion".to_string(),
+            "continuation requires Completion or RawCompletion mode".to_string(),
+        ));
+    }
+    if request.prompt_recipe.mode == PromptMode::RawCompletion
+        && (!request.context_preamble.is_empty() || !request.media.is_empty())
+    {
+        return Err(LlamaBackendError::InvalidRequest(
+            "raw completion requires a self-contained text prompt without context preamble or media".to_string(),
         ));
     }
     if request.prompt_recipe.exact_prompt_blob_id != prompt_blob_id {
@@ -1820,7 +1834,19 @@ fn writer_input_contract_for_request(
     request: &ExactContinuationRequest,
     model: &VerifiedModelDescriptor,
 ) -> WriterInputContract {
-    writer_input_contract_for_media(!request.media.is_empty(), model)
+    writer_input_contract_for_mode(request.prompt_recipe.mode, !request.media.is_empty(), model)
+}
+
+fn writer_input_contract_for_mode(
+    mode: PromptMode,
+    has_media: bool,
+    model: &VerifiedModelDescriptor,
+) -> WriterInputContract {
+    if mode == PromptMode::RawCompletion {
+        WriterInputContract::RawCompletion
+    } else {
+        writer_input_contract_for_media(has_media, model)
+    }
 }
 
 fn writer_input_contract_for_media(
@@ -2452,6 +2478,7 @@ mod tests {
                 record,
                 &result.request_id,
                 result.exact_prompt_blob_id,
+                PromptMode::Completion,
                 &result.context_binding,
                 &result.model,
                 input_index,
@@ -3351,6 +3378,40 @@ mod tests {
             verify_model_inspection(&first_profile, mismatched),
             Err(ModelInspectionError::ModelPathMismatch)
         ));
+    }
+
+    #[test]
+    fn raw_completion_preserves_prompt_on_instruction_capable_models() {
+        let mut request = request_with_two_cases();
+        request.prompt_recipe.mode = PromptMode::RawCompletion;
+        let mut model =
+            verify_model_inspection(&request.model, model_inspection(&request.model)).unwrap();
+        model.architecture = Some("gemma4".into());
+        model.capabilities.chat = crate::model::CapabilitySupport::Supported;
+        assert_eq!(
+            writer_input_contract(&model),
+            WriterInputContract::Gemma4NonThinkingChat
+        );
+        validate_request(&request, &model, 64).unwrap();
+        let native = build_native_request(&request, &model);
+        for case in native.cases {
+            let llama_native_types::GenerationInput::Completion { prompts } = case.input else {
+                panic!("explicit raw completion must bypass chat templates");
+            };
+            let [
+                CompletionPrompt::Text {
+                    text,
+                    special_tokens,
+                },
+            ] = prompts.as_slice()
+            else {
+                panic!("expected the exact text prompt");
+            };
+            assert_eq!(text, &request.exact_manuscript_prefix);
+            assert_eq!(*special_tokens, SpecialTokenPolicy::AddBosParseSpecial);
+        }
+        request.context_preamble = "must not silently wrap this".into();
+        assert!(validate_request(&request, &model, 64).is_err());
     }
 
     #[test]

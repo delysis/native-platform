@@ -3,11 +3,15 @@
 mod attachments;
 mod co_writer;
 mod context_attachments;
+mod document_bindings;
 mod document_watcher;
 mod microphone_capture;
 mod model_catalog;
 mod model_download;
+mod shader_preview;
 mod speech_input;
+mod terminal;
+mod terminal_receipts;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, Metadata};
@@ -81,10 +85,12 @@ use crate::model_download::{
     ModelDownloadRegistry, ModelDownloadRegistryError, ModelDownloadSnapshot, ModelDownloadSpec,
     ModelLibraryError, ReservationOutcome, model_target_path, prepare_model_library,
 };
+use crate::shader_preview::shader_preview;
 use crate::speech_input::{
     SpeechInputError, SpeechInputService, SpeechInputSnapshot, SpeechInputTarget,
     SpeechRecordingSnapshot,
 };
+use crate::terminal::{terminal_cancel, terminal_list, terminal_run};
 use speech_native_host::SpeechHostStatus;
 
 const INITIAL_DOCUMENT: &str = "Untitled.md";
@@ -817,7 +823,8 @@ enum GenerationWorkerSlot {
 /// and registry lifecycle as the native owner.
 #[derive(Debug)]
 enum GenerationWorkerOwner {
-    Llama(LlamaGenerationHandle),
+    Llama(Box<LlamaGenerationHandle>),
+    Terminal(Arc<terminal::TerminalControl>),
     #[cfg(test)]
     Controlled(Arc<dyn ControlledGenerationWorkerCancellation>),
 }
@@ -830,6 +837,10 @@ trait ControlledGenerationWorkerCancellation: std::fmt::Debug + Send + Sync {
 #[derive(Debug)]
 enum GenerationBackendWorkerJoined {
     Llama(JoinedLlamaGeneration),
+    Terminal {
+        count: usize,
+        panicked: bool,
+    },
     #[cfg(test)]
     Controlled,
 }
@@ -1114,6 +1125,7 @@ impl GenerationWorkerOwner {
             Self::Llama(owner) => {
                 let _ = owner.cancel_all();
             }
+            Self::Terminal(control) => control.cancel(),
             #[cfg(test)]
             Self::Controlled(cancellation) => cancellation.cancel_all(),
         }
@@ -1126,6 +1138,10 @@ impl GenerationWorkerOwner {
     fn shutdown_joined(self) -> GenerationBackendWorkerJoined {
         match self {
             Self::Llama(owner) => GenerationBackendWorkerJoined::Llama(owner.shutdown_joined()),
+            Self::Terminal(control) => GenerationBackendWorkerJoined::Terminal {
+                count: control.joined_count(),
+                panicked: control.panicked(),
+            },
             #[cfg(test)]
             Self::Controlled(cancellation) => {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1146,6 +1162,7 @@ impl GenerationBackendWorkerJoined {
     const fn worker_panicked(&self) -> bool {
         match self {
             Self::Llama(joined) => joined.worker_panicked(),
+            Self::Terminal { panicked, .. } => *panicked,
             #[cfg(test)]
             Self::Controlled => false,
         }
@@ -1154,6 +1171,7 @@ impl GenerationBackendWorkerJoined {
     const fn joined_worker_count(&self) -> usize {
         match self {
             Self::Llama(joined) => joined.joined_worker_count(),
+            Self::Terminal { count, .. } => *count,
             #[cfg(test)]
             Self::Controlled => 0,
         }
@@ -1949,6 +1967,10 @@ impl Builder {
                 branch_body,
                 weave_status,
                 weave_start,
+                terminal_run,
+                terminal_list,
+                terminal_cancel,
+                shader_preview,
                 generation_cancel,
                 candidate_keep,
                 candidate_promote,
@@ -8130,7 +8152,7 @@ fn weave_start_inner<R: Runtime>(
         None => None,
     };
         let source_prefix = &loaded.text[..cursor];
-        let attachment_context = resolve_for_generation_with_budget(
+        let mut attachment_context = resolve_for_generation_with_budget(
             store.root(),
             &document_id.to_string(),
             source_prefix,
@@ -8139,6 +8161,13 @@ fn weave_start_inner<R: Runtime>(
             max_tokens,
         )
         .map_err(|error| IpcFailure::context_attachment(&error))?;
+        let document_context = document_bindings::context_for_markdown(store, &loaded.text)?;
+        if !document_context.is_empty() {
+            attachment_context.context_preamble.push_str("\n\n");
+            attachment_context
+                .context_preamble
+                .push_str(&document_context);
+        }
         let exact_prefix = attachment_context.manuscript_prompt.clone();
         if exact_prefix.is_empty()
             && attachment_context.context_preamble.is_empty()
@@ -8517,8 +8546,10 @@ fn weave_start_inner<R: Runtime>(
         failure,
         worker,
         owner,
-    }) = worker_reservation.attach(worker, GenerationWorkerOwner::Llama(generation_owner))
-    {
+    }) = worker_reservation.attach(
+        worker,
+        GenerationWorkerOwner::Llama(Box::new(generation_owner)),
+    ) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| owner.cancel_all()));
         worker_start.release();
         let desktop_panicked = worker.join().is_err();
@@ -9074,6 +9105,7 @@ fn persist_generation_result<R: Runtime>(
             &candidate,
             &identity.request_id,
             binding.exact_prompt_blob_id,
+            PromptMode::Completion,
             &binding.context_binding,
             &binding.model,
             input_index,

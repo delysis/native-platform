@@ -30,6 +30,7 @@ permissions = [
   "allow-speech-input-capabilities",
   "allow-speech-input-status",
   "allow-document-open",
+  "allow-shader-preview",
   "allow-document-checkpoint",
   "allow-document-export-choose",
   "allow-document-reveal",

@@ -43,6 +43,8 @@ pub struct AuthorityPolicy {
 #[serde(rename_all = "snake_case")]
 pub enum PromptMode {
     Completion,
+    /// Exact text continuation, independent of any model chat capability.
+    RawCompletion,
     FillInMiddle,
 }
 
