@@ -157,6 +157,47 @@ The current cabal store and signed document payload format is version 2. Older
 experimental stores are rejected without being rewritten. No compatibility
 layer is retained for the unreleased version 1 prototype.
 
+## Shared compute boundary
+
+The Rust networking service now has a separate authenticated whole-job protocol.
+It stays disabled until the local application configures an executor, and no
+peer can grant itself access. A local grant names one authenticated device, one
+cabal membership epoch, one exact model-configuration fingerprint, and limits
+for output tokens, elapsed time, and accepted jobs. Membership changes invalidate
+the old epoch's grants. Revoking a grant cannot be undone by replaying its ID.
+
+The current input contract accepts resolved text, a seed, and an output limit.
+It carries no expressions, document paths, implicit references, or local-tool
+authority. Images and audio need their own bounded input contract before they
+can use this protocol. The native model adapter and user controls remain to be
+implemented; this transport is not yet a usable model-sharing feature.
+
+An accepted job is committed before dispatch. Each authenticated caller owns its
+job IDs, and a retry must match the exact original input and grant. Status checks
+and cancellation never dispatch work. Completed replies survive restart; an
+unfinished job receives an interrupted receipt and is never automatically rerun.
+There is one active host job, no waiting model queue, eight incoming connections,
+and four outgoing requests. Text input and output each stop at 64 KiB, output at
+2,048 tokens, and a job's cancellation deadline at two minutes. A local adapter
+must enforce idle admission and the selected model's actual token limit.
+
+Cancellation, grant revocation, membership loss, deadlines, and shutdown retain
+ownership until the executor returns after joining its native worker. A job stays
+cancelling and occupies the slot while that join is pending. A failed ledger
+write stops admission, cancels the worker, and remains a reported shutdown
+failure after joining. Adapter panics produce a failed receipt.
+
+Receipts are immutable signed remote assertions with a distinct record kind.
+They bind the host, requesting device, job ID, exact input digest, grant, model
+claim, and result. Signatures authenticate the host's claim; they do not prove
+which model it executed and cannot mint local live-worker evidence. Only the
+requesting device can retrieve its result, including after its grant ends.
+
+The host ledger retains at most 64 grant identities, 256 jobs, and 64 MiB of
+payloads, reserving space for a maximum result before admission. A full ledger
+rejects new work instead of recycling identities or silently losing retry
+history. Archival and longer-lived retention remain product work.
+
 ## Build and licensing
 
 The main workspace and Signal worker use the root Rust 1.95.0 toolchain pin.

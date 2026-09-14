@@ -1,6 +1,7 @@
 //! Persistent, authenticated collaboration for Loom workspaces.
 #![forbid(unsafe_code)]
 
+pub mod compute;
 mod crypto;
 mod document;
 mod store;

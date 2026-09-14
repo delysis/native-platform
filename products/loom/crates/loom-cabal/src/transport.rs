@@ -18,6 +18,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::compute::{self, ComputeExecutor, ComputeHost, ComputeInput, ComputeReply};
 use crate::{Cabal, ChangeEnvelope, Error, Identity, Invitation, MAX_FRAME_BYTES, Result, Roster};
 
 const ALPN: &[u8] = b"app.delysis.loom/cabal/1";
@@ -42,6 +43,9 @@ pub struct PeerStatus {
 #[derive(Debug)]
 pub struct Network {
     router: Router,
+    identity: Identity,
+    compute: compute::Handler,
+    compute_outbound: Semaphore,
     cabals: Cabals,
     stop: CancellationToken,
     worker: tokio::sync::Mutex<Option<JoinHandle<()>>>,
@@ -62,7 +66,9 @@ impl Network {
             .await
             .map_err(network_error)?;
         let cabals = Arc::new(Mutex::new(BTreeMap::new()));
+        let compute = compute::Handler::new();
         let router = Router::builder(endpoint.clone())
+            .accept(compute::ALPN, compute.clone())
             .accept(
                 ALPN,
                 Handler {
@@ -80,6 +86,9 @@ impl Network {
         });
         Ok(Self {
             router,
+            identity: identity.clone(),
+            compute,
+            compute_outbound: Semaphore::new(4),
             cabals,
             stop,
             worker: tokio::sync::Mutex::new(Some(worker)),
@@ -158,18 +167,102 @@ impl Network {
         synchronize(self.router.endpoint(), cabal, peer).await
     }
 
+    /// Configures a local executor. No peer gains access until the host records
+    /// an explicit grant. Authority follows current signed cabal membership.
+    pub fn host_compute(
+        &self,
+        directory: &std::path::Path,
+        executor: Arc<dyn ComputeExecutor>,
+    ) -> Result<Arc<ComputeHost>> {
+        if self.stop.is_cancelled() {
+            return Err(Error::Invalid("Cabals are closing"));
+        }
+        let cabals = self.cabals.clone();
+        let me = self.address().id;
+        self.compute.configure(|| {
+            ComputeHost::open(
+                directory,
+                self.identity.clone(),
+                Arc::new(move |grant| {
+                    let cabal = cabals
+                        .lock()
+                        .ok()
+                        .and_then(|cabals| cabals.get(&grant.cabal).cloned());
+                    cabal
+                        .and_then(|cabal| {
+                            cabal.lock().ok().map(|cabal| {
+                                cabal.roster().payload.epoch == grant.epoch
+                                    && cabal.is_member(me)
+                                    && cabal.is_member(grant.peer)
+                            })
+                        })
+                        .unwrap_or(false)
+                }),
+                executor,
+            )
+        })
+    }
+
+    pub async fn compute_offers(&self, host: EndpointAddr, cabal: Uuid) -> Result<ComputeReply> {
+        self.request_compute(host, compute::Request::Offers { cabal })
+            .await
+    }
+
+    pub async fn compute_submit(
+        &self,
+        host: EndpointAddr,
+        job: Uuid,
+        grant: Uuid,
+        input: ComputeInput,
+    ) -> Result<ComputeReply> {
+        self.request_compute(host, compute::Request::Submit { job, grant, input })
+            .await
+    }
+
+    pub async fn compute_status(&self, host: EndpointAddr, job: Uuid) -> Result<ComputeReply> {
+        self.request_compute(host, compute::Request::Status { job })
+            .await
+    }
+
+    pub async fn compute_cancel(&self, host: EndpointAddr, job: Uuid) -> Result<ComputeReply> {
+        self.request_compute(host, compute::Request::Cancel { job })
+            .await
+    }
+
+    async fn request_compute(
+        &self,
+        host: EndpointAddr,
+        request: compute::Request,
+    ) -> Result<ComputeReply> {
+        if self.stop.is_cancelled() {
+            return Err(Error::Invalid("Cabals are closing"));
+        }
+        let _slot = self
+            .compute_outbound
+            .try_acquire()
+            .map_err(|_| Error::Invalid("Compute connections are busy"))?;
+        compute::request(self.router.endpoint(), host, request).await
+    }
+
     pub async fn shutdown(&self) -> Result<()> {
         self.stop.cancel();
-        if let Some(worker) = self.worker.lock().await.take() {
-            worker.await.map_err(network_error)?;
-        }
-        self.router.shutdown().await.map_err(network_error)
+        self.compute.stop();
+        let mut slot = self.worker.lock().await;
+        let worker = if let Some(worker) = slot.take() {
+            worker.await.map_err(network_error)
+        } else {
+            Ok(())
+        };
+        let compute = self.compute.shutdown().await;
+        let network = self.router.shutdown().await.map_err(network_error);
+        worker.and(compute).and(network)
     }
 }
 
 impl Drop for Network {
     fn drop(&mut self) {
         self.stop.cancel();
+        self.compute.stop();
     }
 }
 
