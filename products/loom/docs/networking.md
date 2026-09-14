@@ -39,6 +39,15 @@ prepares a message in the composer. Sending always requires a separate explicit
 action. A local model can propose a reply from quoted conversation context; Use
 draft copies that proposal into the composer. It never sends the proposal.
 
+Cmd/Ctrl+backtick toggles the terminal. Cmd/Ctrl+Return from a manuscript runs
+its selection; Loom captures this shortcut before the visual editor handles
+Return. Composition and chat shortcuts retain their own owners. Workspace
+commands remain available without a model, without a document, and while a
+shared manuscript is read-only. Pending document transitions still settle first.
+Read-only shared writing does not disable the document list: a removed member
+can open private recovery copies while the normal save and recovery barriers
+continue to protect unsent edits.
+
 Inviting or joining from a conversation remembers its workspace in the encrypted
 Signal account. Reopening the pane restores those bookmarks. The public link
 `loom://workspace/<cabal UUID>` opens an existing local cabal binding; it cannot
@@ -163,6 +172,39 @@ distributing it. The process boundary provides lifecycle and dependency isolatio
 it is not a declaration about the legal scope of the combined distribution.
 
 ## Remaining acceptance and implementation
+
+On 2026-09-14, two independently profiled native macOS applications exercised
+the real Iroh transport and ordinary Markdown projections on one Mac. The
+initial run used `b4d719f`; the repaired run used `2d1827d`, with the second bundle
+given a distinct test identity and ad-hoc signature. The observed checks were:
+
+* Create and join without a model; bidirectional editor changes and identical
+  saved Markdown files.
+* Graceful shutdown, an offline file edit, an independent live peer edit, and
+  convergence after restart and reopening the saved cabal binding, without
+  another invitation.
+* Local undo retaining a later remote edit; Unicode Markdown source/visual
+  switching; new shared documents and renaming the peer's open document.
+* Remote removal retaining open writing, private recovery, navigation into the
+  recovered copy, and edits to that copy remaining absent from the peer.
+* Live membership revocation, access to the former member's recovery copies,
+  and new owner changes remaining absent from that member's saved manuscripts.
+* Graceful exit of both application processes and the owned Signal worker.
+
+These checks exposed and reproduced a disabled-sidebar trap after remote removal
+and a visual editor consuming Cmd+Return. Both were repaired and rechecked in
+the native application. The keyboard regression also fails before the fix and
+passes in WebKit. The final frontend gate passed 473 tests, nine focused browser
+tests, and Svelte checking with zero errors or warnings.
+
+The packaged Signal worker reopened the encrypted vault created by the native
+test, served protocol version 2, rejected conversation requests while unlinked,
+and exited cleanly with its parent's stdin still open. Reopen, EOF shutdown,
+and a controlled vault-failure exit also passed. An older standalone fixture's
+Keychain lookup remained blocked; its credentials were not reset or bypassed.
+No phone was enrolled and no Signal message was sent. Neither these results nor
+synthetic browser composition tests establish a physical IME session or
+connectivity across separate Internet NATs.
 
 The feature is not complete until the following have concrete evidence:
 
