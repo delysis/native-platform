@@ -466,8 +466,8 @@ mod tests {
         assert_eq!(frozen.profile_name.as_deref(), Some("pad"));
         let sampling = frozen.resolve(SamplingOverrides::default()).unwrap();
         assert_eq!(sampling.max_tokens, 128);
-        assert_eq!(sampling.temperature, 0.4);
-        assert_eq!(sampling.min_p, 0.05);
+        assert_eq!(sampling.temperature.to_bits(), 0.4_f32.to_bits());
+        assert_eq!(sampling.min_p.to_bits(), 0.05_f32.to_bits());
         let replay: FrozenGenerationProfile =
             serde_json::from_slice(&serde_json::to_vec(&frozen).unwrap()).unwrap();
         assert_eq!(

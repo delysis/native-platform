@@ -1169,6 +1169,12 @@ fn run_generation_worker(
                         Err(error) => break 'worker Err(LlamaBackendError::Native(error)),
                     }
                 }
+                // The drained stream has already lost candidate authority.
+                // Reject before validating outputs or encoding and hashing
+                // potentially large provenance for a candidate we cannot use.
+                if let Some(error) = events.stream_failure() {
+                    break Err(LlamaBackendError::OutputContract(error));
+                }
                 break build_result(
                     &request,
                     identities,
@@ -1183,14 +1189,6 @@ fn run_generation_worker(
             Err(error) => break Err(LlamaBackendError::Native(error)),
         }
     };
-
-    let result = result.and_then(|materials| {
-        if let Some(error) = events.stream_failure() {
-            Err(LlamaBackendError::OutputContract(error))
-        } else {
-            Ok(materials)
-        }
-    });
 
     match result {
         Ok(materials) => {
@@ -2810,7 +2808,10 @@ mod tests {
                 },
             },
         ];
-        let outputs = vec![native_output(&request, 0, GenerationState::Completed, true)];
+        // A native output-count error must not mask the already-established
+        // stream overflow. Candidate validation must not run after authority
+        // was lost; the concurrent-drain test below covers valid outputs.
+        let outputs = Vec::new();
         let runtime = fake_runtime(
             &request,
             outputs,
@@ -2826,11 +2827,14 @@ mod tests {
         let error = handle
             .wait_timeout(Duration::from_secs(5))
             .expect_err("overflow cannot produce a completed candidate");
-        assert!(matches!(
-            error,
-            LlamaBackendError::OutputContract(message)
-                if message.starts_with("loom_text_stream_output_overflow:")
-        ));
+        assert!(
+            matches!(
+                &error,
+                LlamaBackendError::OutputContract(message)
+                    if message.starts_with("loom_text_stream_output_overflow:")
+            ),
+            "expected the stream overflow before candidate construction, observed {error:?}"
+        );
         let events = drain_events(&handle);
         let delivered_bytes = events
             .iter()
