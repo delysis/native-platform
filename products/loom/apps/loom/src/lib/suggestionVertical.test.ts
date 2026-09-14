@@ -145,7 +145,10 @@ describe('W1 model-free suggestion vertical', () => {
     let dismissed = '';
     let visible = true;
     const plugin = createGhostTextPlugin({
-      accept: (candidateId, presentationKey) => {
+      accept: () => false,
+      insert: (candidateId, presentationKey, text, action) => {
+        expect(text).toBe(',');
+        expect(action).toBe('inline_tab');
         accepted = candidateId;
         acceptedPresentation = presentationKey;
         return true;
@@ -179,7 +182,8 @@ describe('W1 model-free suggestion vertical', () => {
       presentationKey: disposition.suggestion.presentationKey,
       surfaceKey: 'w1-project:w1-document:w1-source-revision:visual',
       anchorByteOffset: disposition.suggestion.targetByte,
-      text: disposition.suggestion.text
+      text: disposition.suggestion.text,
+      insertsOnAccept: true
     });
     const decorations = plugin.props.decorations?.call(plugin, state);
     expect(decorations).toBeInstanceOf(DecorationSet);
@@ -189,7 +193,7 @@ describe('W1 model-free suggestion vertical', () => {
     expect(plugin.props.handleKeyDown?.call(plugin, view, key())).toBe(true);
     expect(accepted).toBe(primary.candidate_id);
     expect(acceptedPresentation).toBe(disposition.suggestion.presentationKey);
-    expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(manuscriptBefore);
+    expect(defaultMarkdownSerializer.serialize(state.doc)).toBe(`${manuscriptBefore},`);
     expect(ghostTextPluginKey.getState(state)).toBeNull();
 
     state = EditorState.create({

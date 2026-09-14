@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 42,
+  "expected_test_count": 44,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -182,7 +182,7 @@
     {
       "package": "tauri-plugin-loom",
       "src_path": "products/loom/crates/tauri-plugin-loom/build.rs",
-      "sha256": "d57604c38281d686e0784833f3fcac4c7ecd1d710d6a00ac494c88800c3e3aed"
+      "sha256": "3d3eb5ddc8abb9fc49ec718db86b6b90a60bc49708377c536aacbe836ffb494d"
     },
     {
       "package": "mom-llama-app",
@@ -191,6 +191,28 @@
     }
   ],
   "entries": [
+    {
+      "test_id": "tests::real_gemma4_control_token_retains_spelling_and_verifiable_output",
+      "package": "llama-native-engine",
+      "target": "lib",
+      "source": "crates/native/crates/llama-native-engine/src/lib.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing to a real Gemma 4 GGUF; loads vocabulary only",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this vocabulary test alone cannot promote inference quality, product, packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
+      "test_id": "terminal::integration_tests::real_native_terminal_retains_raw_inference_without_changing_source",
+      "package": "tauri-plugin-loom",
+      "target": "lib",
+      "source": "products/loom/crates/tauri-plugin-loom/src/terminal_tests.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and loads the real local model for retained terminal inference; project storage requires Unix",
+      "required_environment": ["MOM_LLAMA_MODEL_PATH"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this native command test alone cannot promote editor UX, packaged-app, cross-platform, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
     {
       "test_id": "controlled_runtime::tests::real_small_gguf_controlled_generation_proves_baseline_cfg_constraints_and_samplers",
       "package": "llama-native-engine",

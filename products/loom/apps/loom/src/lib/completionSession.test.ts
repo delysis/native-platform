@@ -3,6 +3,9 @@ import {
   advanceCompletionExhaustionLatch,
   acceptedCompletionText,
   completionPresentation,
+  compatibleCompletionPresentations,
+  mergeCompatibleCompletionCandidates,
+  consumeCompletionText,
   completionSessionContextKey,
   completionSessionMatchesPresentation,
   completionShouldRequestNextBatch,
@@ -26,6 +29,92 @@ const candidates: CompletionCandidate[] = [
 ];
 
 describe('cached completion session', () => {
+  it('keeps a compatible sibling and original undo when a fresh partial arrives after selected exhaustion', () => {
+    const original = [
+      { ...candidates[0], text: ' one' },
+      { ...candidates[1], text: ' one more words' }
+    ];
+    const consumed = consumeCompletionText(startCompletionSession('scope', original, 'run-a')!, ' one')!.session;
+    expect(remainingCompletionText(consumed)).toBe('');
+    const fresh = [{ ...candidates[0], runId: 'fresh', candidateId: 'fresh', presentationKey: 'fresh:1', text: ' new', targetByte: 9 }];
+    const retained = synchronizeCompletionCandidates(consumed, fresh, true)!;
+    expect(retained).toBe(consumed);
+    expect(compatibleCompletionPresentations(retained).map(candidate => candidate.text)).toEqual([' more words']);
+    expect(unconsumeCompletionWord(retained)?.text).toBe(' one');
+    const switched = cycleCompletionSession(retained, 0, true);
+    expect(switched.selectedRunId).toBe('run-b');
+    expect(consumeCompletionText(switched, ' more')?.text).toBe(' more');
+  });
+
+  it('admits late original siblings only when they preserve the exact accepted prefix and unique identities', () => {
+    const first = { ...candidates[0], text: ' one alpha' };
+    const frozen = consumeCompletionText(startCompletionSession('scope', [first], first.runId)!, ' one ')!.session;
+    const sibling = { ...candidates[1], text: ' one beta' };
+    const merged = mergeCompatibleCompletionCandidates(frozen, [
+      sibling,
+      { ...first, runId: 'wrong-target', candidateId: 'other1', presentationKey: 'other1', targetByte: 8 },
+      { ...first, runId: 'divergent', candidateId: 'other2', presentationKey: 'other2', text: ' two gamma' }
+    ]);
+    expect(compatibleCompletionPresentations(merged).map(candidate => candidate.text)).toEqual(['alpha', 'beta']);
+    expect(merged.acceptedChunks).toBe(frozen.acceptedChunks);
+    expect(merged.selectedRunId).toBe(frozen.selectedRunId);
+    expect(frozen.candidates).toEqual([first]);
+    expect(mergeCompatibleCompletionCandidates(merged, [sibling, sibling])).toBe(merged);
+    expect(mergeCompatibleCompletionCandidates(merged, [{ ...sibling, runId: 'spoof', presentationKey: 'spoof' }])).toBe(merged);
+    expect(mergeCompatibleCompletionCandidates(merged, [{ ...sibling, text: ' one rewrites', presentationKey: 'revision' }])).toBe(merged);
+    const grown = mergeCompatibleCompletionCandidates(merged, [{ ...sibling, text: ' one beta more', presentationKey: 'append' }]);
+    expect(grown.candidates[1].text).toBe(' one beta more');
+    const selected = cycleCompletionSession(grown, 1, true);
+    expect(unconsumeCompletionWord(selected)?.text).toBe(' one ');
+    expect(mergeCompatibleCompletionCandidates(grown, Array.from({ length: 257 }, () => sibling))).toBe(grown);
+  });
+
+  it('keeps exact shared-prefix alternatives selectable with Unicode byte offsets and reversible original chunks', () => {
+    const originals = [
+      { ...candidates[0], text: ' café ☕ first' },
+      { ...candidates[1], text: ' café ☕ second' },
+      { ...candidates[1], runId: 'divergent', text: ' cafe ☕ different' },
+      { ...candidates[1], runId: 'wrong-target', targetByte: 6, text: ' café ☕ elsewhere' }
+    ];
+    const initial = startCompletionSession('scope', originals, 'run-a')!;
+    const frozen = consumeCompletionText(initial, ' café ☕ ')!.session;
+    const suffixes = compatibleCompletionPresentations(frozen);
+    expect(suffixes.map(candidate => candidate.runId)).toEqual(['run-a', 'run-b']);
+    expect(suffixes.map(candidate => candidate.text)).toEqual(['first', 'second']);
+    expect(suffixes.every(candidate => candidate.targetByte === 5 + new TextEncoder().encode(' café ☕ ').length)).toBe(true);
+    expect(cycleCompletionSession(frozen, 1)).toBe(frozen);
+    const switched = cycleCompletionSession(frozen, 1, true);
+    expect(switched.selectedRunId).toBe('run-b');
+    expect(switched.candidates).toBe(frozen.candidates);
+    expect(completionSessionMatchesPresentation(switched, 'scope', suffixes[1])).toBe(true);
+    expect(completionSessionMatchesPresentation(switched, 'another-scope', suffixes[1])).toBe(false);
+    const second = consumeCompletionText(switched, 'second')!.session;
+    const undoSecond = unconsumeCompletionWord(second)!;
+    const undoShared = unconsumeCompletionWord(undoSecond.session)!;
+    expect(undoSecond.text).toBe('second');
+    expect(undoShared.text).toBe(' café ☕ ');
+    expect(remainingCompletionText(undoShared.session)).toBe(originals[1].text);
+    expect(initial.candidates).toEqual(originals);
+  });
+
+  it('extends frozen compatible tails only by strict append under a fresh presentation identity', () => {
+    const originals = [
+      { ...candidates[0], text: ' one alpha' },
+      { ...candidates[1], text: ' one beta' }
+    ];
+    const frozen = consumeCompletionText(startCompletionSession('scope', originals, 'run-a')!, ' one ')!.session;
+    expect(updateCompletionCandidate(frozen, 'run-b', ' one beta gamma', 'new')).toBe(frozen);
+    expect(updateCompletionCandidate(frozen, 'run-b', ' one BETA', 'new', true)).toBe(frozen);
+    expect(updateCompletionCandidate(frozen, 'run-b', ' one ', 'new', true)).toBe(frozen);
+    expect(updateCompletionCandidate(frozen, 'run-b', ' one beta gamma', originals[1].presentationKey, true)).toBe(frozen);
+    const grown = updateCompletionCandidate(frozen, 'run-b', ' one beta gamma', 'new', true)!;
+    expect(compatibleCompletionPresentations(grown)[1].text).toBe('beta gamma');
+    expect(grown.acceptedChunks).toBe(frozen.acceptedChunks);
+    expect(updateCompletionCandidate(grown, 'run-b', ' one beta gamma', 'newer', true)).toBe(grown);
+    expect(unconsumeCompletionWord(cycleCompletionSession(grown, 1, true))?.text).toBe(' one ');
+    expect(frozen.candidates[1].text).toBe(' one beta');
+  });
+
   it('forks a Loompad continuation only at its exact accepted boundary with fresh identities', () => {
     const started = startCompletionSession('doc:visual', candidates, 'run-a')!;
     const consumed = consumeCompletionWord(started)!.session;
@@ -33,10 +122,12 @@ describe('cached completion session', () => {
     expect(synchronizeCompletionCandidates(consumed, fresh)).toBe(consumed);
     expect(synchronizeCompletionCandidates(consumed, [{ ...fresh[0], targetByte: 9 }], true)).toBe(consumed);
     expect(synchronizeCompletionCandidates(consumed, [{ ...fresh[0], runId: 'run-a' }], true)).toBe(consumed);
-    const forked = synchronizeCompletionCandidates(consumed, fresh, true)!;
+    expect(synchronizeCompletionCandidates(consumed, fresh, true)).toBe(consumed);
+    const exhausted = consumeCompletionText(consumed, 'two')!.session;
+    const forked = synchronizeCompletionCandidates(exhausted, [{ ...fresh[0], targetByte: 13 }], true)!;
     expect(forked.acceptedChunks).toEqual([]);
     expect(forked.selectedRunId).toBe('new-run');
-    expect(completionPresentation(forked)?.targetByte).toBe(10);
+    expect(completionPresentation(forked)?.targetByte).toBe(13);
     expect(acceptedCompletionText(consumed)).toBe(' one ');
   });
 

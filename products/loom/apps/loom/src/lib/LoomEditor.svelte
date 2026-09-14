@@ -342,8 +342,8 @@
       // Once a word is consumed the session is locked to one candidate. Do
       // not hide its cached remainder behind a now-empty alternatives fan
       // while Option is still held.
-      fanVisible: snapshot.optionHeld && snapshot.alternatives.length > 1,
-      fanPinned: snapshot.lensPinned && snapshot.alternatives.length > 1
+      fanVisible: !snapshot.hidden && snapshot.optionHeld && snapshot.alternatives.length > 1,
+      fanPinned: !snapshot.hidden && snapshot.lensPinned && snapshot.alternatives.length > 1
     } : null;
     setGhostText(editorView, presentation, forceRender);
     reportCompletionAccessibility();

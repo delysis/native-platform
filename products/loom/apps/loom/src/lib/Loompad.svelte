@@ -12,9 +12,8 @@
   export let onChoose: (candidate: CompletionCandidate) => void = () => {};
   export let onAccept: (candidate: CompletionCandidate, length: LoompadLength) => void = () => {};
   export let onExit: () => void = () => {};
-  let element: HTMLElement;
   let chord = emptyLoompadChord();
-  let length: LoompadLength = 'sentence';
+  let modifierHeld = false;
   let slots: Array<CompletionCandidate | null> = [null, null, null, null];
   let page = 0;
   let previousScope: string | undefined;
@@ -25,12 +24,19 @@
       previousScope = nextScope;
       slots = [null, null, null, null];
       page = 0;
-      length = 'sentence';
-      reset();
+      chord = emptyLoompadChord();
     }
     const heldIndex = LOOMPAD_KEYS.indexOf(chord.choices.at(-1) as typeof LOOMPAD_KEYS[number]);
     const heldRun = heldIndex < 0 ? null : slots[page * 4 + heldIndex]?.runId;
-    const byRun = new Map(next.map(candidate => [candidate.runId, candidate]));
+    const incoming = new Map(next.map(candidate => [candidate.runId, candidate]));
+    const distinct = new Map<string, CompletionCandidate>();
+    // Keep a surviving representative on its key; full branches remain cached
+    // in the parent and can diverge again after this exact word is consumed.
+    for (const candidate of [...slots.flatMap(slot => slot && incoming.has(slot.runId) ? [incoming.get(slot.runId)!] : []), ...next]) {
+      const word = loompadPrefix(candidate.text, 'word', visual);
+      if (word && !distinct.has(word)) distinct.set(word, candidate);
+    }
+    const byRun = new Map([...distinct.values()].map(candidate => [candidate.runId, candidate]));
     const pageAnchor = slots.slice(page * 4, page * 4 + 4).find(slot => slot && byRun.has(slot.runId));
     const kept: Array<CompletionCandidate | null> = [];
     for (let offset = 0; offset < slots.length; offset += 4) {
@@ -46,21 +52,24 @@
     slots = kept.length ? kept : [null, null, null, null];
     const anchored = pageAnchor ? slots.findIndex(slot => slot?.runId === pageAnchor.runId) : -1;
     page = anchored >= 0 ? Math.floor(anchored / 4) : Math.min(page, slots.length / 4 - 1);
-    if (heldIndex >= 0 && heldRun !== slots[page * 4 + heldIndex]?.runId) reset();
+    if (heldIndex >= 0 && heldRun !== slots[page * 4 + heldIndex]?.runId) chord = emptyLoompadChord();
   }
   $: reconcile(choices, scope);
   $: visibleSlots = slots.slice(page * 4, page * 4 + 4);
   $: if (!focused || blocked) reset();
 
-  function reset(): void { chord = emptyLoompadChord(); }
+  function reset(): void { chord = emptyLoompadChord(); modifierHeld = false; }
   function keydown(event: KeyboardEvent): void {
     const target = event.target;
-    if (!focused || blocked || event.defaultPrevented || event.isComposing || event.metaKey || event.ctrlKey || event.altKey ||
+    if (!focused || blocked || event.defaultPrevented || event.isComposing || event.metaKey || event.ctrlKey ||
         !(target instanceof Element) || !target.closest('.editor-stage') || target.closest('input,button,select')) return;
+    if (event.key === 'Alt') { modifierHeld = true; return; }
+    if (!event.altKey) return;
+    modifierHeld = true;
     if (event.code === 'Space') {
       event.preventDefault(); event.stopPropagation();
       if (!event.repeat) {
-        reset();
+        chord = emptyLoompadChord();
         const pages = slots.length / 4;
         page = (page + (event.shiftKey ? pages - 1 : 1)) % pages;
       }
@@ -69,19 +78,15 @@
     if (event.key === 'Escape') {
       event.preventDefault(); event.stopPropagation(); reset(); onExit(); return;
     }
-    const result = loompadKey(chord, event.code, true, event.repeat);
+    const result = loompadKey(chord, event.code, true, event.repeat, event.altKey);
     if (!result.handled) return;
     event.preventDefault(); event.stopPropagation(); chord = result.state;
-    if (result.length) length = result.length;
     const candidate = result.choice === null ? null : visibleSlots[result.choice];
-    if (candidate && !event.repeat) {
-      if (result.accept && result.length) onAccept(candidate, result.length);
-      else onChoose(candidate);
-    }
+    if (candidate && result.accept) onAccept(candidate, 'word');
   }
   function keyup(event: KeyboardEvent): void {
-    const result = loompadKey(chord, event.code, false);
-    chord = result.state;
+    if (event.key === 'Alt' || !event.altKey) { reset(); return; }
+    chord = loompadKey(chord, event.code, false, false, event.altKey).state;
   }
   onMount(() => {
     window.addEventListener('keydown', keydown, true);
@@ -95,17 +100,20 @@
   });
 </script>
 
-<div class="loompad" bind:this={element} role="group" aria-label="Loompad">
+{#if modifierHeld && focused && !blocked && visibleSlots.some(Boolean)}
+<div class="loompad" role="group" aria-label="Loompad">
   {#each visibleSlots as candidate, index}
+    {#if candidate}
     <button class="loompad-choice" class:selected={candidate?.runId === selectedRunId}
       class:held={chord.choices.at(-1) === LOOMPAD_KEYS[index]}
       data-direction={LOOMPAD_KEYS[index].slice(3).toLowerCase()}
       type="button" disabled={!focused || blocked || !candidate?.text}
-      aria-label={`${LOOMPAD_KEYS[index].slice(3)}: ${candidate ? loompadPrefix(candidate.text, length, visual) ?? '' : 'Waiting'}`}
-      on:mousedown|preventDefault on:click={() => { if (candidate) onAccept(candidate, length); }}>
+      aria-label={`${LOOMPAD_KEYS[index].slice(3)}: ${candidate ? loompadPrefix(candidate.text, 'word', visual) ?? '' : 'Waiting'}`}
+      on:mouseenter={() => { if (candidate) onChoose(candidate); }} on:mousedown|preventDefault on:click={() => { if (candidate) onAccept(candidate, 'word'); }}>
       <kbd class="loompad-key">{LOOMPAD_KEYS[index].slice(3)}</kbd>
-      <span>{candidate ? loompadPrefix(candidate.text, length, visual) ?? '…' : '…'}</span>
+      <span>{candidate ? loompadPrefix(candidate.text, 'word', visual) ?? '…' : '…'}</span>
     </button>
+    {/if}
   {/each}
-  <span class="loompad-length" aria-label={`Length: ${length}`}>{length}</span>
 </div>
+{/if}

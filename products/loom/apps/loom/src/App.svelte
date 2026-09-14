@@ -201,6 +201,7 @@
   } from './lib/suggestionInteraction';
   import {
     acceptedCompletionText,
+    insertAtUtf8Boundary,
     completionPresentation as completionSessionPresentation,
     completionSessionContextKey,
     completionShouldRequestNextBatch,
@@ -277,6 +278,7 @@
     observeTextMutation,
     reconcileCompletionController,
     refreshCompletionCandidate,
+    refreshCompatibleCompletionFamily,
     rejectVisualPresentation,
     resetCompletionDiscovery,
     resetCompletionSurface,
@@ -858,6 +860,8 @@
     editVersion: number;
     intentEpoch: number;
     modelId: string;
+    sourceDocument: OpenDocument;
+    sourceMarkdown: string;
     speculation?: { sampleTarget: 4 | 16 | 64 | 256; offset: number; key: string };
   }
 
@@ -1114,10 +1118,11 @@
   $: completionView = completionControllerView(
     completionController,
     completionContextKey,
-    baseSuggestionFamily
+    baseSuggestionFamily,
+    loompadActive
   );
   $: boundCompletionSession = completionView.boundSession;
-  $: if (boundCompletionSession) {
+  $: if (boundCompletionSession && !loompadActive) {
     const selected = selectedCompletionCandidate(boundCompletionSession);
     const branch = selected
       ? branches.find((candidate) => candidate.run_id === selected.runId)
@@ -1151,6 +1156,32 @@
         text,
         projectedInlinePresentationKey(rawPresentationKey, rawText, text)
       );
+    }
+  }
+  $: if (loompadActive && boundCompletionSession && loompadReservoir) {
+    const captured = loompadReservoir.capture;
+    const selected = selectedCompletionCandidate(boundCompletionSession);
+    const familyRunIds = new Set(branches.filter(branch =>
+      loompadReservoir?.familyIds.includes(branch.weave_command_id ?? '') &&
+      branch.source_revision_id === captured.sourceRevisionId
+    ).map(branch => branch.run_id));
+    // Only the exact author-approved prefix may separate this document from
+    // the retained native snapshot. Manual edits/context changes revoke it.
+    if (selected && familyRunIds.has(selected.runId) &&
+        project?.project_id === captured.projectId && project.session_id === captured.sessionId &&
+        document?.summary.document_id === captured.documentId && documentEpoch === captured.epoch &&
+        contextEpoch === captured.contextEpoch && currentModel?.model_id === captured.modelId &&
+        insertAtUtf8Boundary(captured.sourceMarkdown, captured.cursorByte,
+          acceptedCompletionText(boundCompletionSession)) === documentText) {
+      const originals = inlineSuggestionFamily(captured.cursorByte, mode, {
+        branches, authoritativeFamilyIds: loompadReservoir.familyIds, requireExplicitFamily: true,
+        verifiedBodyByRun: verifiedBranchBodyByRun, liveTextByRun: liveBranchTextByRun,
+        liveTextSequenceByRun: liveBranchTextSequenceByRun, currentModel,
+        document: captured.sourceDocument, suggestionsEnabled: true, promotionReady: true,
+        dismissedCandidateIds, unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
+        manuscriptText: captured.sourceMarkdown, sourceNewline: sourceGhostNewline
+      });
+      refreshVisibleCompletionFamily(boundCompletionSession, originals);
     }
   }
   $: activeSuggestionFamily = completionView.activeFamily;
@@ -1271,7 +1302,7 @@
     activeGhostSuggestion.presentationKey !== announcedGhostPresentationKey
   ) {
     announcedGhostPresentationKey = activeGhostSuggestion.presentationKey;
-    announce('Suggestion available. Tab accepts all; Option Right accepts one word; Option Up or Down switches.');
+    announce('Suggestion available. Tab accepts one word; Option WASD chooses a word.');
   }
   $: shuttleCandidate = shuttleEnabled ? selectedInlineSuggestion : activeGhostSuggestion;
   $: shuttleScheduleKey = completionShuttleScheduleKey(
@@ -2267,6 +2298,8 @@
     systemDark = appearanceMedia.matches;
     const syncSystemAppearance = (event: MediaQueryListEvent): void => {
       systemDark = event.matches;
+      appearanceOverride = false;
+      appearance = 'system';
     };
     appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
@@ -2721,6 +2754,7 @@
       const unlisten = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
         windowFocused = focused;
         if (focused) {
+          resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
           resumeCompletionObservation();
           scheduleProjectFilesystemRefresh();
           // A hidden WKWebView may stay DOM-focused and emit neither browser
@@ -2746,6 +2780,7 @@
 
   function handleRendererResume(): void {
     if (window.document.visibilityState === 'hidden') return;
+    resumeScheduledAutomaticSuggestion(completionSchedulerWakeKey);
     resumeCompletionObservation();
     scheduleProjectFilesystemRefresh();
   }
@@ -4435,7 +4470,11 @@
   }
 
   function toggleAppearance(): void {
-    setAppearance(resolvedAppearance === 'dark' ? 'light' : 'dark');
+    if (appearanceOverride) {
+      appearanceOverride = false;
+      appearance = 'system';
+      announce('Appearance follows the system');
+    } else setAppearance(resolvedAppearance === 'dark' ? 'light' : 'dark');
   }
 
   function startTitlebarDrag(event: MouseEvent): void {
@@ -5431,9 +5470,9 @@
         : sourceEditor?.acceptLoompadText(candidate.candidateId, candidate.presentationKey, text);
       if (accepted) {
         await tick();
-        if (activeBranchCount > 0) await cancelActiveBranches();
-        // The cached remainder stays usable while new branches grow at this new caret.
-        if (loompadActive) scheduleAutomaticSuggestions(editVersion, 250, 'document_edit');
+        // Keep admitted tails growing; refill only after a pause or exhaustion.
+        if (loompadActive) scheduleAutomaticSuggestions(editVersion,
+          activeSuggestionFamily.length ? 5_000 : 250, 'document_edit');
       }
     } finally { loompadAccepting = false; }
   }
@@ -6896,6 +6935,7 @@
   function resumeScheduledAutomaticSuggestion(wakeKey: string): void {
     if (
       !wakeKey ||
+      loompadBackgroundPaused() ||
       suggestionWakeQueued ||
       suggestionsIdleTimer !== undefined ||
       !completionController.scheduled ||
@@ -6978,6 +7018,10 @@
     });
   }
 
+  function loompadBackgroundPaused(): boolean {
+    return loompadActive && (!windowFocused || window.document.visibilityState === 'hidden');
+  }
+
   async function tryStartAutomaticSuggestions(schedule: CompletionSchedule): Promise<void> {
     const targetEditVersion = schedule.kind === 'edit_pause'
       ? schedule.editVersion
@@ -6998,6 +7042,8 @@
       completionController = setCompletionSchedule(completionController, null);
       return;
     }
+    // Retain the schedule without polling while the writer is away.
+    if (loompadBackgroundPaused()) return;
     if (!canStartAutomaticSuggestions) {
       if (!retainsScheduledCompletion(completionLifecycle)) {
         completionController = setCompletionSchedule(completionController, null);
@@ -7472,6 +7518,14 @@
     if (reconciled !== completionController) completionController = reconciled;
   }
 
+  function refreshVisibleCompletionFamily(
+    expected: CompletionSession,
+    originals: readonly InlineGhostSuggestion[]
+  ): void {
+    const refreshed = refreshCompatibleCompletionFamily(completionController, expected, originals);
+    if (refreshed !== completionController) completionController = refreshed;
+  }
+
   function refreshVisibleCompletionCandidate(
     expected: CompletionSession,
     runId: string,
@@ -7601,7 +7655,8 @@
     const cycled = cycleCompletion(
       completionController,
       activeSuggestionFamily,
-      offset
+      offset,
+      loompadActive
     );
     if (cycled.state === completionController) return;
     completionController = cycled.state;
@@ -8205,7 +8260,7 @@
   }
 
   async function startAutomaticWeave(): Promise<boolean> {
-    if (terminalIsBusy() || weaveStarting || !project || !document || !currentModel) return false;
+    if (loompadBackgroundPaused() || terminalIsBusy() || weaveStarting || !project || !document || !currentModel) return false;
     const startingEditVersion = editVersion;
     if (compositionActive || !flushEditors()) return false;
     if (editVersion !== startingEditVersion) {
@@ -8238,7 +8293,9 @@
       cursorByte,
       editVersion,
       intentEpoch: completionController.intentEpoch,
-      modelId: currentModel.model_id
+      modelId: currentModel.model_id,
+      sourceDocument: document,
+      sourceMarkdown: documentText
     };
     if (loompadActive) {
       const key = JSON.stringify([captured.projectId, captured.sessionId, captured.documentId,
