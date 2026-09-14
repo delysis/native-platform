@@ -481,7 +481,7 @@ describe('App ghost reactivity wiring', () => {
       source.indexOf('function beginDocumentContextLongPress')
     );
     const readonly = source.slice(
-      source.indexOf('$: editorReadonly ='),
+      source.indexOf('$: editorNavigationLocked ='),
       source.indexOf('$: reconciliationResolutionLocked')
     );
 
@@ -574,7 +574,7 @@ describe('App ghost reactivity wiring', () => {
   it('keeps normal watcher refreshes editable and locks only the missing-document boundary', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const readonly = source.slice(
-      source.indexOf('$: editorReadonly ='),
+      source.indexOf('$: editorNavigationLocked ='),
       source.indexOf('$: reconciliationResolutionLocked')
     );
     const missingBoundary = source.slice(
@@ -588,6 +588,7 @@ describe('App ghost reactivity wiring', () => {
 
     expect(readonly).toContain('missingDocumentBoundaryInFlight');
     expect(readonly).toContain('missingDocumentCapturePending !== null');
+    expect(readonly).toContain('editorReadonly = editorNavigationLocked || cabalWriteBlocked');
     expect(readonly).not.toContain('projectFilesystemRefreshInFlight');
     expect(refresh).toContain('projectFilesystemRefreshInFlight = true');
     expect(missingBoundary).toContain('missingDocumentBoundaryInFlight = true');
@@ -723,8 +724,7 @@ describe('App ghost reactivity wiring', () => {
       source.indexOf('async function setMode'),
       source.indexOf('function announce')
     );
-    expect(source).toContain('disabled={editorReadonly}');
-    expect(source).not.toContain("disabled={editorReadonly || (mode === 'source' && !canUseVisual)}");
+    expect(source).toContain("if (key === 'm' && document) { event.preventDefault(); void setMode(");
     expect(mode.indexOf('flushEditors()')).toBeLessThan(mode.indexOf('canUseVisualMarkdown(documentText, false)'));
     expect(mode).toContain("'visual_markdown_not_exact'");
   });

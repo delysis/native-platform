@@ -4,6 +4,8 @@
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
   import TerminalPane from './lib/TerminalPane.svelte';
+  import { installManuscriptRunShortcut } from './lib/manuscriptShortcut';
+  import { workspaceCommand } from './lib/workspaceCommand';
   import PaneDivider from './lib/PaneDivider.svelte';
   import type { TerminalSourceRange } from './lib/terminalSelection';
   import { workspaceRows } from './lib/workspaceTree';
@@ -1356,7 +1358,8 @@
   $: showVisual = mode === 'visual';
   $: showSource = mode === 'source';
   $: exactTextSurface = document?.summary.kind === 'verse';
-  $: editorReadonly = cabalAttaching || cabalWriteBlocked || transition !== 'idle' || renameDocumentEditorLocked || deleteDocumentEditorLocked || missingDocumentBoundaryInFlight || missingDocumentCapturePending !== null || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
+  $: editorNavigationLocked = cabalAttaching || transition !== 'idle' || renameDocumentEditorLocked || deleteDocumentEditorLocked || missingDocumentBoundaryInFlight || missingDocumentCapturePending !== null || staleDraft !== null || staleDraftRestoring || uncertainDraft !== null || uncertainSave !== null || reconciliation !== null || promotionInFlight || uncertainPromotion !== null;
+  $: editorReadonly = editorNavigationLocked || cabalWriteBlocked;
   $: reconciliationResolutionLocked = reconciliationApplying || pendingReconciliationApply !== null;
   $: reconciliationResolutionIsExact = Boolean(
     reconciliation && (
@@ -2300,6 +2303,7 @@
       })();
     }
     window.addEventListener('keydown', handleGlobalKeydownCapture, true);
+    const stopManuscriptRunShortcut = installManuscriptRunShortcut(() => void runRetainedOutput(''));
     window.addEventListener('keydown', handleGlobalKeydown);
     window.addEventListener('pointerdown', handleGlobalPointerdown);
     window.addEventListener('pageshow', handleRendererResume);
@@ -2316,6 +2320,7 @@
       modelLoadSerial += 1;
       clearPreferredWriterRequest();
       window.removeEventListener('keydown', handleGlobalKeydownCapture, true);
+      stopManuscriptRunShortcut();
       window.removeEventListener('keydown', handleGlobalKeydown);
       window.removeEventListener('pointerdown', handleGlobalPointerdown);
       window.removeEventListener('pageshow', handleRendererResume);
@@ -7749,9 +7754,11 @@
   }
 
   async function runRetainedOutput(expression: string): Promise<void> {
-    if (expression.trim() === ':signal') { await toggleSignal(); terminalEntry = ''; return; }
-    if (expression.trim().startsWith(':join ')) { const invitation = expression.trim().slice(6).trim(); terminalEntry = ''; await doOpenProject(() => joinCabal(invitation)); return; }
-    if (expression.trim() === ':cabal') { cabalOpen = !cabalOpen; signalOpen = false; terminalEntry = ''; return; }
+    if (applicationClosePhase !== 'running' || editorNavigationLocked) return;
+    const command = workspaceCommand(expression);
+    if (command?.kind === 'signal') { await toggleSignal(); terminalEntry = ''; return; }
+    if (command?.kind === 'join') { terminalEntry = ''; await doOpenProject(() => joinCabal(command.invitation)); return; }
+    if (command?.kind === 'cabal') { cabalOpen = !cabalOpen; signalOpen = false; terminalEntry = ''; return; }
     if (!project || !document || terminalIsBusy() || editorReadonly || compositionActive || applicationClosePhase !== 'running') return;
     terminalOpen = true;
     terminalError = '';
@@ -7893,15 +7900,6 @@
       if (key === 'm' && document) { event.preventDefault(); void setMode(mode === 'visual' ? 'source' : 'visual'); return; }
       if (key === 'f' && formatMenu) { event.preventDefault(); formatMenu.toggleOpen(); return; }
       if (key === 'j') { event.preventDefault(); void toggleShuttleFromTitlebar(); return; }
-    }
-    if (modifier && event.key === 'Enter' && !event.altKey && !event.shiftKey && !event.isComposing) {
-      const target = event.target;
-      const inManuscript = target instanceof Element && Boolean(target.closest('.editor-stage'));
-      if (target === sourceTextarea || inManuscript) {
-        event.preventDefault();
-        void runRetainedOutput('');
-        return;
-      }
     }
     if (modifier && event.key.toLocaleLowerCase() === 's') {
       event.preventDefault();
@@ -9628,7 +9626,7 @@
                 class="document-row"
                 data-document-row={candidate.document_id}
                 type="button"
-                disabled={editorReadonly}
+                disabled={editorNavigationLocked}
                 aria-haspopup="menu"
                 aria-expanded={documentContextTarget?.documentId === candidate.document_id}
                 on:click={(event) => handleDocumentRowClick(event, candidate)}
@@ -10137,7 +10135,7 @@
         runs={terminalRuns}
         busy={terminalBusy}
         disabled={applicationClosePhase !== 'running'}
-        runDisabled={!document || (!terminalEntry && !currentModel?.completion) || editorReadonly}
+        runDisabled={editorNavigationLocked || (!workspaceCommand(terminalEntry) && (!document || (!terminalEntry && !currentModel?.completion) || editorReadonly))}
         error={terminalError}
         uncertain={terminalPendingRequest !== null}
         onCheck={() => void refreshTerminalRuns()}
