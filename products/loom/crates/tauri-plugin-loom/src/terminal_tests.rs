@@ -14,6 +14,10 @@ struct TerminalFixture {
 
 impl TerminalFixture {
     fn new() -> Self {
+        Self::with_model_discovery(true)
+    }
+
+    fn with_model_discovery(isolated: bool) -> Self {
         let directory = tempfile::tempdir().expect("temporary terminal project");
         let root = directory.path().join("Writing");
         let (mut store, _) = ProjectStore::initialize(&root, "Writing").expect("project store");
@@ -29,7 +33,7 @@ impl TerminalFixture {
         let session_id = CommandId::new();
         let state = PluginState::with_app_local_data_root(
             Some(directory.path().join("app-data")),
-            true,
+            isolated,
             BuildModelPolicy::default(),
         );
         {
@@ -79,7 +83,11 @@ impl TerminalFixture {
     }
 
     fn wait(&self, id: CommandId) -> TerminalRun {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        self.wait_for(id, Duration::from_secs(5))
+    }
+
+    fn wait_for(&self, id: CommandId, timeout: Duration) -> TerminalRun {
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some(run) = self
                 .list()
@@ -251,4 +259,67 @@ fn changed_source_is_rejected_before_reserving_a_run_or_creating_output() {
             "A newer idea.\n"
         );
     });
+}
+
+#[test]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH and loads the real local model for retained terminal inference"]
+fn real_native_terminal_retains_raw_inference_without_changing_source() {
+    let fixture = TerminalFixture::with_model_discovery(false);
+    let model_path = std::env::var("MOM_LLAMA_MODEL_PATH").expect("explicit real model path");
+    tauri::async_runtime::block_on(crate::model_load(
+        model_path,
+        fixture.app.handle().clone(),
+        fixture.app.state::<PluginState>(),
+    ))
+    .expect("load and verify the actual native model");
+    let prompt = "Word: rain\nImage: silver threads against the window.\nWord: dawn\nImage:";
+    let id = CommandId::new();
+    fixture.run(id, prompt).expect("start real raw inference");
+    let completed = fixture.wait_for(id, Duration::from_mins(2));
+    assert_eq!(completed.status, "completed", "{:?}", completed.error);
+    let receipt = read_receipt(&fixture.root(), &id.to_string(), true)
+        .expect("read immutable finished run")
+        .expect("finished run exists");
+    assert_eq!(receipt.steps.len(), 1);
+    let model = receipt.model.as_ref().expect("verified model identity");
+    let output_path = completed
+        .output_relative_path
+        .as_deref()
+        .expect("retained output file");
+    fixture.with_store(|store| {
+        let evidence: loom_backend_llama::ExactContinuationResult = serde_json::from_slice(
+            &store.read_blob(receipt.steps[0]).expect("durable native step evidence"),
+        ).expect("native result receipt");
+        assert_eq!(evidence.exact_manuscript_prefix, prompt);
+        assert_eq!(evidence.model.model_sha256, model.model_sha256);
+        assert_eq!(evidence.candidates.len(), 1);
+        let candidate = &evidence.candidates[0];
+        assert_eq!(candidate.terminal.status, GenerationTerminalStatus::Completed);
+        assert!(!candidate.token_trace.generated_token_ids.is_empty(), "real model must generate tokens");
+        assert!(!candidate.output_text.is_empty(), "real output must reach retained writing");
+        assert_eq!(candidate.token_trace.provenance.as_ref().expect("native provenance").evidence_kind,
+            loom_types::InferenceEvidenceKind::LiveInference);
+        let backend: serde_json::Value = serde_json::from_slice(&candidate.backend_receipt_bytes).expect("native backend receipt");
+        assert_eq!(backend["input_contract"], "raw_completion");
+        let output = store.read_document(output_path).expect("registered ordinary result document");
+        assert_eq!(output.text, loom_document::canonicalize_prose(&candidate.output_text));
+        assert_eq!(Some(output.document_id.to_string()), completed.output_document_id);
+        let provenance = store.revision_provenance(output.revision_id).expect("generated authorship");
+        assert_eq!(provenance.segments.len(), 1);
+        assert_eq!(provenance.segments[0].contribution, loom_types::ContributionKind::Generated);
+        let source = store.read_document("Draft.md").expect("source still opens");
+        assert_eq!(source.revision_id, fixture.source.revision_id);
+        assert_eq!(source.blob_id, fixture.source.blob_id);
+        assert_eq!(source.text, fixture.source.text);
+        eprintln!("Retained live raw inference: run={}, model_sha256={}, tokens={}, output={}, output_sha256={}",
+            id, model.model_sha256, candidate.token_trace.generated_token_ids.len(), output_path, output.blob_id);
+    });
+    // MockRuntime does not drive the desktop exit lifecycle. Exercise the
+    // actual unload command after joining the worker, so native resources are
+    // released before Metal's process-global device teardown.
+    let state = fixture.app.state::<PluginState>();
+    let _joined = state.join_desktop_workers_for_exit();
+    let unloaded = tauri::async_runtime::block_on(crate::model_unload(state))
+        .expect("release the real native model");
+    assert!(unloaded.resident_slot_released);
 }

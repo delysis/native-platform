@@ -772,7 +772,7 @@ impl Evaluator<'_> {
             title.trim()
         };
         let path = format!(
-            "Runs/{}/{} - {title}.md",
+            "Runs/{}/{}/{title}.md",
             self.receipt.run.run_id, self.step
         );
         let id = self.with_store(|store| {

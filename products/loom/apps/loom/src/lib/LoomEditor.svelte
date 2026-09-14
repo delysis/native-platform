@@ -2,7 +2,6 @@
   import { baseKeymap, setBlockType, toggleMark, wrapIn } from 'prosemirror-commands';
   import { history, redo, undo } from 'prosemirror-history';
   import { keymap } from 'prosemirror-keymap';
-  import { schema } from 'prosemirror-markdown';
   import type { Node as ProseMirrorNode } from 'prosemirror-model';
   import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
@@ -718,16 +717,18 @@
   }
 
   function stateFor(markdown: string): EditorState {
+    const doc = parse(markdown);
+    const schema = doc.type.schema;
     const paragraph = schema.nodes.paragraph;
     const heading = schema.nodes.heading;
     const blockquote = schema.nodes.blockquote;
     const strong = schema.marks.strong;
     const em = schema.marks.em;
     return EditorState.create({
-      doc: parse(markdown),
+      doc,
       plugins: [
         history(),
-        visualMarkdownInputRules(),
+        visualMarkdownInputRules(schema),
         keymap({
           'Mod-z': undo,
           'Shift-Mod-z': redo,
@@ -749,7 +750,7 @@
             editorView &&
             visibleGhostWidgetPresentationKey(editorView) === plan.presentationKey
           );
-        }),
+        }, schema),
         createGhostTextPlugin({
           accept: (candidateId, presentationKey) => onGhostAccept(candidateId, presentationKey),
           insert: authorizeCompletionInsertion,

@@ -1574,14 +1574,12 @@ fn execute_active_controls(
             if let Some(observation) = observation {
                 active.observations.push(observation);
             }
-            let bytes = model
-                .token_to_piece_bytes(token, 512, false, None)
-                .map_err(|error| {
-                    NativeError::new(
-                        NativeErrorCode::DecodeFailed,
-                        format!("failed to decode controlled token: {error}"),
-                    )
-                })?;
+            let bytes = super::generated_token_piece(model, token).map_err(|error| {
+                NativeError::new(
+                    NativeErrorCode::DecodeFailed,
+                    format!("failed to decode controlled token: {error}"),
+                )
+            })?;
             let mut piece = String::with_capacity(bytes.len());
             let _ = active.decoder.decode_to_string(&bytes, &mut piece, false);
             if active.first_token_ms.is_none() {

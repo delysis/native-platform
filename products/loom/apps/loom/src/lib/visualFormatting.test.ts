@@ -2,7 +2,7 @@ import { defaultMarkdownParser, defaultMarkdownSerializer } from 'prosemirror-ma
 import { AllSelection, EditorState, Selection, TextSelection } from 'prosemirror-state';
 import { describe, expect, it } from 'vitest';
 import { applyVisualFormat, visualFormatState, type VisualFormatAction } from './visualFormatting';
-import { parseVisualMarkdown } from './markdownSafety';
+import { parseVisualMarkdown, serializeVisualMarkdown } from './markdownSafety';
 
 function formatted(markdown: string, action: VisualFormatAction, href = ''): EditorState {
   const doc = defaultMarkdownParser.parse(markdown);
@@ -18,6 +18,17 @@ function formatted(markdown: string, action: VisualFormatAction, href = ''): Edi
 }
 
 describe('Markdown-safe visual formatting', () => {
+  it('retains source EOF bytes through structural formatting and reopening', () => {
+    const doc = parseVisualMarkdown('Words\r\n\r\n');
+    let state = EditorState.create({ doc, selection: TextSelection.create(doc, 1, 6) });
+    expect(applyVisualFormat(state, 'bullet_list', '', (transaction) => {
+      state = state.apply(transaction);
+    })).toBe(true);
+    const source = serializeVisualMarkdown(state.doc);
+    expect(source).toBe('* Words\r\n\r\n');
+    expect(parseVisualMarkdown(source).eq(state.doc)).toBe(true);
+  });
+
   it('maps Notes-like paragraph styles to exact Markdown headings', () => {
     expect(defaultMarkdownSerializer.serialize(formatted('Words\n', 'title').doc)).toBe('# Words');
     expect(defaultMarkdownSerializer.serialize(formatted('Words\n', 'heading').doc)).toBe('## Words');

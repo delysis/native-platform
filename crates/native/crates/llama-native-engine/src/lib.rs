@@ -47,13 +47,13 @@ use llama_native_types::{
     GenerationMetrics, GenerationOutput, GenerationOutputCapabilities, GenerationRequest,
     GenerationState, MAX_EMBEDDING_BATCH_INPUTS, MAX_EMBEDDING_BATCH_VALUES,
     MAX_EMBEDDING_DIMENSIONS, MAX_EMBEDDING_INPUT_TOKENS, MAX_EMBEDDING_VALUES_PER_OUTPUT,
-    MAX_GENERATED_OUTPUT_BYTES, MAX_PARALLEL_SEQUENCES, MediaInput, MediaInputCapability,
-    MediaKind, ModelCapabilities, ModelFingerprint, ModelRuntimeState, NativeDevice, NativeError,
-    NativeErrorCode, NativeEvidenceCapabilities, NativeModelConfig, NativeModelDescriptor,
-    NativeTransport, PreparedPrompt, ProjectorRequirement, PromptForm, PromptInputCapabilities,
-    PromptTokenPolicy, ResidentModelStatus, SamplerKind, SamplingConfig, SamplingParameter,
-    SequenceRestoreKind, SequenceStateBlob, SharedPrefixBatchRequest, SpecialTokenPolicy,
-    TokenizedPrompt, exact_token_batch_cell_budget,
+    MAX_GENERATED_OUTPUT_BYTES, MAX_PARALLEL_SEQUENCES, MAX_TOKEN_PIECE_BYTES, MediaInput,
+    MediaInputCapability, MediaKind, ModelCapabilities, ModelFingerprint, ModelRuntimeState,
+    NativeDevice, NativeError, NativeErrorCode, NativeEvidenceCapabilities, NativeModelConfig,
+    NativeModelDescriptor, NativeTransport, PreparedPrompt, ProjectorRequirement, PromptForm,
+    PromptInputCapabilities, PromptTokenPolicy, ResidentModelStatus, SamplerKind, SamplingConfig,
+    SamplingParameter, SequenceRestoreKind, SequenceStateBlob, SharedPrefixBatchRequest,
+    SpecialTokenPolicy, TokenizedPrompt, exact_token_batch_cell_budget,
 };
 use sha2::{Digest, Sha256};
 
@@ -3886,14 +3886,12 @@ fn generate_batch(
                 continue;
             }
             branch.generated_token_ids.push(token.0);
-            let bytes = model
-                .token_to_piece_bytes(token, 512, false, None)
-                .map_err(|error| {
-                    NativeError::new(
-                        NativeErrorCode::DecodeFailed,
-                        format!("failed to decode generated token: {error}"),
-                    )
-                })?;
+            let bytes = generated_token_piece(model, token).map_err(|error| {
+                NativeError::new(
+                    NativeErrorCode::DecodeFailed,
+                    format!("failed to decode generated token: {error}"),
+                )
+            })?;
             if let Some(trace) = &mut branch.token_piece_trace {
                 trace.push_piece(&bytes)?;
             }
@@ -4277,14 +4275,12 @@ fn generate_multimodal_batch(
                 continue;
             }
             branch.generated_token_ids.push(token.0);
-            let bytes = model
-                .token_to_piece_bytes(token, 512, false, None)
-                .map_err(|error| {
-                    NativeError::new(
-                        NativeErrorCode::DecodeFailed,
-                        format!("failed to decode generated token: {error}"),
-                    )
-                })?;
+            let bytes = generated_token_piece(model, token).map_err(|error| {
+                NativeError::new(
+                    NativeErrorCode::DecodeFailed,
+                    format!("failed to decode generated token: {error}"),
+                )
+            })?;
             if let Some(trace) = &mut branch.token_piece_trace {
                 trace.push_piece(&bytes)?;
             }
@@ -4592,9 +4588,8 @@ fn validate_live_token_piece_trace(
         let captured = trace.raw_piece_bytes.get(start..end).ok_or_else(|| {
             generation_verification_error("token-piece boundary falls outside captured bytes")
         })?;
-        let expected = model
-            .token_to_piece_bytes(LlamaToken::new(*token_id), 512, false, None)
-            .map_err(|error| {
+        let expected =
+            generated_token_piece(model, LlamaToken::new(*token_id)).map_err(|error| {
                 generation_verification_error(format!(
                     "failed to verify generated token piece {index}: {error}"
                 ))
@@ -4811,16 +4806,26 @@ where
     Ok(())
 }
 
+/// Preserve the spelling of every sampled non-EOG token, including controls.
+/// llama.cpp deliberately emits zero bytes for controls when `special` is
+/// false; the Rust binding reports that legitimate suppression as an unknown
+/// token type. Explicit rendering preserves both output and replay evidence.
+/// Actual unsupported tokens and oversized pieces still return their errors.
+fn generated_token_piece(
+    model: &LlamaModel,
+    token: LlamaToken,
+) -> Result<Vec<u8>, llama_cpp_2::TokenToStringError> {
+    model.token_to_piece_bytes(token, MAX_TOKEN_PIECE_BYTES, true, None)
+}
+
 fn decode_verified_token_text(model: &LlamaModel, token_ids: &[i32]) -> NativeResult<String> {
     let mut pieces = Vec::with_capacity(token_ids.len());
     for token_id in token_ids {
-        let bytes = model
-            .token_to_piece_bytes(LlamaToken::new(*token_id), 512, false, None)
-            .map_err(|error| {
-                generation_verification_error(format!(
-                    "failed to re-decode generated token evidence: {error}"
-                ))
-            })?;
+        let bytes = generated_token_piece(model, LlamaToken::new(*token_id)).map_err(|error| {
+            generation_verification_error(format!(
+                "failed to re-decode generated token evidence: {error}"
+            ))
+        })?;
         pieces.push(bytes);
     }
     strict_verified_utf8(&pieces)
@@ -5311,14 +5316,12 @@ fn generate_multimodal(
             break "end_of_generation".to_string();
         }
         generated_token_ids.push(token.0);
-        let bytes = model
-            .token_to_piece_bytes(token, 512, false, None)
-            .map_err(|error| {
-                NativeError::new(
-                    NativeErrorCode::DecodeFailed,
-                    format!("failed to decode generated token: {error}"),
-                )
-            })?;
+        let bytes = generated_token_piece(model, token).map_err(|error| {
+            NativeError::new(
+                NativeErrorCode::DecodeFailed,
+                format!("failed to decode generated token: {error}"),
+            )
+        })?;
         let piece = decode_generated_utf8_piece(&mut decoder, &bytes, false)?;
         if first_token_ms.is_none() {
             first_token_ms = Some(started.elapsed().as_millis());
@@ -10252,6 +10255,51 @@ mod tests {
         })
         .expect("cleared sequence");
         assert!(decoded);
+    }
+
+    #[test]
+    #[ignore = "requires MOM_LLAMA_MODEL_PATH pointing to a real Gemma 4 GGUF; loads vocabulary only"]
+    fn real_gemma4_control_token_retains_spelling_and_verifiable_output()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _guard = REAL_MODEL_TEST_LOCK.lock().expect("real-model lock");
+        let path = std::env::var("MOM_LLAMA_MODEL_PATH")?;
+        let params = LlamaModelParams::default()
+            .with_vocab_only(true)
+            .with_n_gpu_layers(0);
+        let model = LlamaModel::load_from_file(backend()?, path, &params)?;
+        use llama_cpp_2::token_type::LlamaTokenAttr;
+        for (marker, attribute) in [
+            ("<|turn>", LlamaTokenAttr::Control),
+            ("<|channel>", LlamaTokenAttr::UserDefined),
+        ] {
+            let tokens = model.str_to_token(marker, AddBos::Never)?;
+            assert_eq!(tokens.len(), 1, "Gemma marker must be one token: {marker}");
+            let token = tokens[0];
+            assert!(!model.is_eog_token(token));
+            assert!(
+                model.token_attr(token).contains(attribute),
+                "token class for {marker}"
+            );
+            if attribute != LlamaTokenAttr::UserDefined {
+                assert!(matches!(
+                    model.token_to_piece_bytes(token, 512, false, None),
+                    Err(llama_cpp_2::TokenToStringError::UnknownTokenType)
+                ));
+            }
+            let bytes = generated_token_piece(&model, token)?;
+            assert_eq!(bytes, marker.as_bytes());
+            let mut decoder = UTF_8.new_decoder();
+            let piece = decode_generated_utf8_piece(&mut decoder, &bytes, false)?;
+            assert_eq!(piece, marker);
+            assert_eq!(decode_verified_token_text(&model, &[token.0])?, marker);
+        }
+        let normal_tokens = model.str_to_token("Ordinary words.", AddBos::Never)?;
+        let ids = normal_tokens
+            .iter()
+            .map(|token| token.0)
+            .collect::<Vec<_>>();
+        assert_eq!(decode_verified_token_text(&model, &ids)?, "Ordinary words.");
+        Ok(())
     }
 
     #[test]

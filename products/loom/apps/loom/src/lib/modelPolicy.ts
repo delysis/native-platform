@@ -107,8 +107,8 @@ export function orderedLocalTextModels(
 ): ModelCapabilitySummary[] {
   const priority = (model: ModelCapabilitySummary): [number, number, string] => {
     if (model.model_path === rememberedPath) return [0, 0, model.model_path];
-    if (isOfficialGemma4CatalogHint(model)) return [1, 0, model.model_path];
-    if (model.policy_candidate) return [2, model.policy_candidate.rank, model.model_path];
+    if (model.policy_candidate) return [1, model.policy_candidate.rank, model.model_path];
+    if (isOfficialGemma4CatalogHint(model)) return [2, 0, model.model_path];
     return [3, 0, model.model_path];
   };
 
@@ -127,9 +127,9 @@ export function orderedLocalTextModels(
 }
 
 /**
- * A writer the author chose explicitly remains first. Otherwise the official
- * Gemma 4 12B QAT artifact is Loom's quiet product default, followed by older
- * exact build-policy candidates.
+ * A writer the author chose explicitly remains first. Otherwise prefer the
+ * exact base-model build policy; the local instruction model is a fallback
+ * when the base writer is unavailable.
  */
 export function startupWriterCandidates(
   models: readonly ModelCapabilitySummary[],
@@ -149,19 +149,18 @@ export function startupWriterCandidates(
           remembered: true
         }]
       : []),
-    ...(officialGemma && officialGemma.model_path !== rememberedPath
+    ...policyCandidates
+      .filter((candidate) => candidate.modelPath !== rememberedPath)
+      .map((candidate) => ({ ...candidate, remembered: false })),
+    ...(officialGemma && officialGemma.model_path !== rememberedPath &&
+      !policyCandidates.some((candidate) => candidate.modelPath === officialGemma.model_path)
       ? [{
           modelPath: officialGemma.model_path,
           profileId: null,
           policyRank: -1,
           remembered: false
         }]
-      : []),
-    ...policyCandidates
-      .filter((candidate) =>
-        candidate.modelPath !== rememberedPath &&
-        candidate.modelPath !== officialGemma?.model_path)
-      .map((candidate) => ({ ...candidate, remembered: false }))
+      : [])
   ];
 }
 

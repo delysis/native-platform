@@ -18,11 +18,11 @@ void main() {
 let view: EditorView | undefined;
 afterEach(() => { view?.destroy(); view = undefined; document.body.replaceChildren(); });
 
-function render(code: string, compiler: (source: string) => Promise<{ fragment: string }>, language = 'wgsl'): EditorView {
+function render(code: string, compiler: (source: string) => Promise<{ fragment: string }>, language = 'wgsl', suffix = ''): EditorView {
   const target = document.createElement('div');
   document.body.append(target);
   view = new EditorView(target, {
-    state: EditorState.create({ doc: parseVisualMarkdown('```' + language + '\n' + code + '\n```') }),
+    state: EditorState.create({ doc: parseVisualMarkdown('```' + language + '\n' + code + '\n```' + suffix) }),
     attributes: { role: 'textbox', 'aria-label': 'Code editor' },
     nodeViews: { code_block: (node) => shaderCodeBlockView(node, compiler) },
     dispatchTransaction(transaction) { view!.updateState(view!.state.apply(transaction)); }
@@ -39,18 +39,22 @@ function pixel(canvas: HTMLCanvasElement, x: number, y: number): number[] {
 describe('inline shader code block', () => {
   it('rasterizes compiler-provided GLSL and preserves real editing in contentDOM', async () => {
     const compiler = vi.fn(async () => ({ fragment: checkerFragment }));
-    const editor = render(source, compiler);
+    const editor = render(source, compiler, 'wgsl', '\n');
     const canvas = document.querySelector('canvas')!;
     await expect.poll(() => canvas.hidden).toBe(false);
     expect(pixel(canvas, 16, 239)).toEqual([0, 0, 255, 255]);
     expect(pixel(canvas, 48, 239)).toEqual([255, 0, 0, 255]);
-    expect(serializeVisualMarkdown(editor.state.doc)).toBe('```wgsl\n' + source + '\n```');
+    expect(serializeVisualMarkdown(editor.state.doc)).toBe('```wgsl\n' + source + '\n```\n');
     editor.dispatch(editor.state.tr.setSelection(TextSelection.create(editor.state.doc, 1)));
     editor.focus();
     await userEvent.keyboard('x');
     await expect.poll(() => editor.state.doc.firstChild!.textContent).toBe('x' + source);
     await expect.poll(() => compiler.mock.calls.length).toBe(2);
-    expect(serializeVisualMarkdown(editor.state.doc)).toBe('```wgsl\nx' + source + '\n```');
+    expect(serializeVisualMarkdown(editor.state.doc)).toBe('```wgsl\nx' + source + '\n```\n');
+    const reopened = parseVisualMarkdown(serializeVisualMarkdown(editor.state.doc));
+    expect(reopened.eq(editor.state.doc)).toBe(true);
+    editor.updateState(EditorState.create({ doc: reopened }));
+    expect(document.querySelector('pre > code')?.textContent).toBe('x' + source);
     expect(document.querySelector('pre > code')?.textContent).toBe('x' + source);
   });
 

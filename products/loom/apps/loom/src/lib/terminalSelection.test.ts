@@ -5,7 +5,7 @@ import { visualTerminalRange } from './terminalSelection';
 
 describe('terminal visual source capture', () => {
   it('captures exact UTF-8 selection boundaries without changing the document or selection', () => {
-    const doc = parseVisualMarkdown('A café, then another paragraph.');
+    const doc = parseVisualMarkdown('A café, then another paragraph.\r\n\r\n');
     const markdown = serializeVisualMarkdown(doc);
     const state = EditorState.create({ doc, selection: TextSelection.create(doc, 3, 7) });
     const range = visualTerminalRange(state, markdown);

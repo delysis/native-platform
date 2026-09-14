@@ -4,8 +4,8 @@ import {
   textblockTypeInputRule,
   wrappingInputRule
 } from 'prosemirror-inputrules';
-import { schema } from 'prosemirror-markdown';
-import type { Attrs, MarkType } from 'prosemirror-model';
+import { schema as markdownSchema } from 'prosemirror-markdown';
+import type { Attrs, MarkType, Schema } from 'prosemirror-model';
 
 function markedTextRule(
   pattern: RegExp,
@@ -23,12 +23,12 @@ function markedTextRule(
     return state.tr.replaceWith(
       start + wholeOffset,
       end,
-      schema.text(content, mark.addToSet(inherited))
+      state.schema.text(content, mark.addToSet(inherited))
     ).setStoredMarks(inherited);
   });
 }
 
-export function visualMarkdownInputRules() {
+export function visualMarkdownInputRules(schema: Schema = markdownSchema) {
   return inputRules({
     rules: [
       textblockTypeInputRule(/^(#{1,3})\s$/, schema.nodes.heading, (match) => ({

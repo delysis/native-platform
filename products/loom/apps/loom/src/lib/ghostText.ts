@@ -5,7 +5,7 @@ import {
   insertionPreservesExtendedGraphemeEdges,
   isExtendedGraphemeBoundary
 } from './graphemeBoundary';
-import { parseVisualMarkdown } from './markdownSafety';
+import { parseVisualMarkdown, serializeVisualMarkdown } from './markdownSafety';
 import {
   nextVisualSuggestionWord,
   type CompletionInsertionAction,
@@ -281,7 +281,7 @@ export function visualCaretBoundaryProof(
   }
 
   try {
-    const witnessed = defaultMarkdownSerializer.serialize(
+    const witnessed = serializeVisualMarkdown(
       state.tr.insertText(CARET_BOUNDARY_WITNESS).doc
     );
     const boundary = witnessed.indexOf(CARET_BOUNDARY_WITNESS);
@@ -415,8 +415,8 @@ export function visualGhostTextIsFaithfulAtSelection(
     const promotedMarkdown =
       canonicalMarkdown.slice(0, boundary) + text + canonicalMarkdown.slice(boundary);
     const literalDocument = state.tr.insertText(text).doc;
-    return defaultMarkdownSerializer.serialize(literalDocument) === promotedMarkdown &&
-      parseVisualMarkdown(promotedMarkdown).eq(literalDocument);
+    return serializeVisualMarkdown(literalDocument) === promotedMarkdown &&
+      parseVisualMarkdown(promotedMarkdown, state.schema).eq(literalDocument);
   } catch {
     return false;
   }
