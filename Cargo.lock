@@ -1701,6 +1701,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-context"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "desktop-model-defaults"
 version = "0.0.0"
 
@@ -4402,6 +4410,7 @@ dependencies = [
  "attachment-native-types",
  "chacha20poly1305",
  "crossbeam-channel",
+ "desktop-context",
  "desktop-model-defaults",
  "fs2",
  "getrandom 0.3.4",
@@ -7145,6 +7154,7 @@ dependencies = [
  "base64 0.22.1",
  "cpal",
  "crossbeam-channel",
+ "desktop-context",
  "desktop-model-defaults",
  "hound",
  "http",

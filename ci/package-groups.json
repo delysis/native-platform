@@ -2,6 +2,7 @@
   "schema_version": 1,
   "primary": {
     "desktop": [
+      "desktop-context",
       "desktop-model-defaults"
     ],
     "native": [
@@ -75,6 +76,7 @@
   },
   "secondary": {
     "portable": [
+      "desktop-context",
       "desktop-model-defaults",
       "attachment-native-document",
       "attachment-native-host",

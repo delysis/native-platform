@@ -12,6 +12,11 @@ use attachment_native_types::{
     AttachmentReceipt, AudioPreparationPolicy, Coverage, MediaFamily, PreparationPlan,
     PreparationPolicy, PreparedPart, TargetCapabilities,
 };
+use desktop_context::{
+    ContextExcerptEvidence, ContextSource, render_source, select_excerpts, trailing_utf8,
+};
+#[cfg(test)]
+use desktop_context::{EXCERPT_CHUNK_BYTES, excerpt_chunk_ranges};
 use llama_native_types::{MediaInput, MediaKind};
 use same_file::Handle as FileIdentityHandle;
 use serde::{Deserialize, Serialize};
@@ -27,7 +32,6 @@ const MAX_NATIVE_MEDIA_OBJECTS: usize = 32;
 const MAX_NATIVE_MEDIA_OBJECT_BYTES: u64 = MAX_ATTACHMENT_BYTES;
 const MAX_NATIVE_MEDIA_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 const CONTEXT_QUERY_BYTES: usize = 16 * 1024;
-const EXCERPT_CHUNK_BYTES: usize = 2 * 1024;
 const PROMPT_OVERHEAD_TOKENS: u32 = 1_024;
 const RETRIEVAL_REBALANCE_BYTES: usize = 16 * 1024;
 const PREAMBLE_CACHE_ENTRIES: usize = 8;
@@ -148,15 +152,6 @@ struct DocumentContexts {
     manual_text: BTreeMap<String, String>,
     #[serde(default)]
     text_imports: BTreeMap<String, Vec<ContextTextSourcePresentation>>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct ContextExcerptEvidence {
-    attachment_id: String,
-    source_text_sha256: String,
-    start_byte: u64,
-    end_byte: u64,
-    excerpt_sha256: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1445,30 +1440,25 @@ fn assemble_generation_context(
         let separator = usize::from(!rendered.is_empty()) * 2;
         let remaining = context_budget.saturating_sub(rendered.len() + separator);
         let remaining_sources = sources.len().saturating_sub(index).max(1);
-        let header = format!(
-            "[BEGIN UNTRUSTED ATTACHMENT EXCERPTS id={} name={:?} coverage={}]\n",
-            id,
-            attachment.file_name,
-            if attachment.coverage_complete {
-                "complete"
-            } else {
-                "partial"
-            }
-        );
-        let footer = format!("\n[END UNTRUSTED ATTACHMENT EXCERPTS id={id}]");
         let fair_share = remaining / remaining_sources;
-        let payload_budget = fair_share.saturating_sub(header.len() + footer.len());
-        let (selected, mut selected_evidence) =
-            select_excerpts(id, source_text, query, payload_budget);
+        let (selected, mut selected_evidence) = render_source(
+            ContextSource {
+                id,
+                name: &attachment.file_name,
+                root_sha256: &attachment.id,
+                complete: attachment.coverage_complete,
+                text: source_text,
+            },
+            query,
+            fair_share,
+        );
         if selected.is_empty() {
             continue;
         }
         if !rendered.is_empty() {
             rendered.push_str("\n\n");
         }
-        rendered.push_str(&header);
         rendered.push_str(&selected);
-        rendered.push_str(&footer);
         evidence.append(&mut selected_evidence);
     }
     debug_assert!(rendered.len() <= context_budget);
@@ -1500,193 +1490,6 @@ fn middle_out_manuscript(text: &str, budget: usize) -> (String, Option<(usize, u
     rendered.push_str(tail);
     (rendered, Some((head_end, tail_start)))
 }
-
-fn select_excerpts(
-    source_id: &str,
-    text: &str,
-    query: &str,
-    budget: usize,
-) -> (String, Vec<ContextExcerptEvidence>) {
-    if text.is_empty() || budget == 0 {
-        return (String::new(), Vec::new());
-    }
-    let source_text_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
-    if text.len() <= budget {
-        return (
-            text.to_owned(),
-            vec![excerpt_evidence(
-                source_id,
-                &source_text_sha256,
-                0,
-                text.len(),
-                text,
-            )],
-        );
-    }
-
-    let terms = query_terms(query);
-    let ranges = excerpt_chunk_ranges(text);
-    let mut ranked = ranges
-        .iter()
-        .copied()
-        .map(|(start, end)| {
-            let score = lexical_score(&text[start..end], &terms);
-            (score, start, end)
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    if let Some(first) = ranked.iter().position(|(_, start, _)| *start == 0) {
-        let front = ranked.remove(first);
-        ranked.insert(0, front);
-    }
-    if ranked.iter().all(|(score, _, _)| *score == 0)
-        && let Some(last) = ranges.last().copied()
-        && let Some(last_index) = ranked
-            .iter()
-            .position(|(_, start, end)| (*start, *end) == last)
-        && last_index > 1
-    {
-        let tail = ranked.remove(last_index);
-        ranked.insert(1.min(ranked.len()), tail);
-    }
-
-    let mut chosen = Vec::new();
-    let mut used = 0_usize;
-    for (_, start, end) in ranked {
-        let marker = excerpt_marker(start, end, text.len());
-        let addition = marker.len() + end.saturating_sub(start) + usize::from(!chosen.is_empty());
-        if used.saturating_add(addition) > budget {
-            continue;
-        }
-        used += addition;
-        chosen.push((start, end));
-    }
-    chosen.sort_unstable();
-
-    let mut rendered = String::with_capacity(used);
-    let mut evidence = Vec::with_capacity(chosen.len());
-    for (index, (start, end)) in chosen.into_iter().enumerate() {
-        if index > 0 {
-            rendered.push('\n');
-        }
-        rendered.push_str(&excerpt_marker(start, end, text.len()));
-        let excerpt = &text[start..end];
-        rendered.push_str(excerpt);
-        evidence.push(excerpt_evidence(
-            source_id,
-            &source_text_sha256,
-            start,
-            end,
-            excerpt,
-        ));
-    }
-    (rendered, evidence)
-}
-
-fn excerpt_evidence(
-    source_id: &str,
-    source_text_sha256: &str,
-    start: usize,
-    end: usize,
-    excerpt: &str,
-) -> ContextExcerptEvidence {
-    ContextExcerptEvidence {
-        attachment_id: source_id.to_owned(),
-        source_text_sha256: source_text_sha256.to_owned(),
-        start_byte: start as u64,
-        end_byte: end as u64,
-        excerpt_sha256: format!("{:x}", Sha256::digest(excerpt.as_bytes())),
-    }
-}
-
-fn excerpt_marker(start: usize, end: usize, total: usize) -> String {
-    format!("[EXCERPT bytes {start}..{end} of {total}]\n")
-}
-
-fn excerpt_chunk_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut start = 0_usize;
-    while start < text.len() {
-        let mut end = (start + EXCERPT_CHUNK_BYTES).min(text.len());
-        while end > start && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == start {
-            end = text[start..]
-                .char_indices()
-                .nth(1)
-                .map_or(text.len(), |(offset, _)| start + offset);
-        }
-        if end < text.len() {
-            let mut floor = start + (end - start) / 2;
-            while !text.is_char_boundary(floor) {
-                floor -= 1;
-            }
-            if let Some(relative) = text[floor..end].rfind("\n\n") {
-                let paragraph_end = floor + relative + 2;
-                if paragraph_end > start {
-                    end = paragraph_end;
-                }
-            } else if let Some(relative) = text[floor..end].rfind('\n') {
-                let line_end = floor + relative + 1;
-                if line_end > start {
-                    end = line_end;
-                }
-            }
-        }
-        ranges.push((start, end));
-        start = end;
-    }
-    ranges
-}
-
-fn query_terms(query: &str) -> BTreeSet<String> {
-    let mut terms = BTreeSet::new();
-    for word in query.rsplit(|character: char| !character.is_alphanumeric()) {
-        if word.chars().count() < 4 {
-            continue;
-        }
-        let word = word.to_lowercase();
-        if CONTEXT_STOP_WORDS.contains(&word.as_str()) {
-            continue;
-        }
-        terms.insert(word);
-        if terms.len() == 128 {
-            break;
-        }
-    }
-    terms
-}
-
-fn lexical_score(text: &str, terms: &BTreeSet<String>) -> usize {
-    if terms.is_empty() {
-        return 0;
-    }
-    text.split(|character: char| !character.is_alphanumeric())
-        .filter(|word| word.chars().count() >= 4)
-        .map(str::to_lowercase)
-        .filter(|word| terms.contains(word))
-        .collect::<BTreeSet<_>>()
-        .len()
-}
-
-fn trailing_utf8(text: &str, max_bytes: usize) -> &str {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let mut start = text.len() - max_bytes;
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    &text[start..]
-}
-
-const CONTEXT_STOP_WORDS: &[&str] = &[
-    "about", "after", "again", "also", "been", "before", "being", "between", "could", "from",
-    "have", "into", "just", "more", "most", "other", "over", "same", "some", "such", "than",
-    "that", "their", "them", "then", "there", "these", "they", "this", "those", "through", "under",
-    "very", "what", "when", "where", "which", "while", "with", "would", "your",
-];
 
 fn gemma_target() -> TargetCapabilities {
     TargetCapabilities {
@@ -2585,7 +2388,7 @@ mod tests {
         assert!(
             resolved
                 .context_preamble
-                .contains("[BEGIN UNTRUSTED ATTACHMENT EXCERPTS")
+                .contains("[BEGIN UNTRUSTED ATTACHMENT DATA")
         );
         assert!(!resolved.context_preamble.contains("AUTHOR STEERING"));
 
