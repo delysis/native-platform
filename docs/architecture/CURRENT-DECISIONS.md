@@ -22,6 +22,14 @@ decisions; their import checksum is historical provenance, not a live build seal
 | [ADR-014](adr/ADR-014-component-release-and-versioning.md) | Direction, not an existing-user compatibility promise. These products are unreleased. Review source and consumers together; do not add migration frameworks without a real use. |
 | [ADR-015](adr/ADR-015-local-first-macos-release-candidates.md) | Current qualification target. Packaged interaction, credentials, hardware, quit/join, and reopen need their own observed results on the tested build. Compilation and fixture tests do not establish them. |
 
+Mine is the destination for the Mama/Loom integration. New product behavior belongs
+to Loom; Mama is deprecated and retained as a reference and explicit export source
+until its useful capabilities have moved. A common document snapshot preserves
+roles, exact source bytes and lineage; it grants no execution authority. Project
+settings live in `.mine.toml`, with expert persona sources under `.mine/personas/`.
+The [integration review](../convergence/integration-review.md) records implemented
+consumers, the schema-16 boundary, and remaining live-chat/protection/tool work.
+
 See [CI policy](../CI-POLICY.md) for executable checks and the owning product
 contracts for behavior. Keep historical receipts attached to their original
 revision rather than treating them as acceptance of later changes.

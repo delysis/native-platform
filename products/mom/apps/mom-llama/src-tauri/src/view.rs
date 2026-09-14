@@ -5259,8 +5259,11 @@ mod tests {
         id: &str,
         title: &str,
         kind: ConversationKind,
-        messages: Vec<Message>,
+        mut messages: Vec<Message>,
     ) -> Conversation {
+        for message in &mut messages {
+            message.conversation_id = id.to_owned();
+        }
         Conversation {
             id: id.to_string(),
             title: title.to_string(),

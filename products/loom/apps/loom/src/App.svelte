@@ -1559,6 +1559,10 @@
   }
 
   async function removeCoWriter(profile: CoWriterSummary): Promise<void> {
+    if (profile.configured) {
+      coWriterError = 'Edit .mine.toml to remove this co-writer';
+      return;
+    }
     if (!project || coWriterBusy) return;
     const captured = { projectId: project.project_id, sessionId: project.session_id };
     const serial = ++coWriterOperationSerial;

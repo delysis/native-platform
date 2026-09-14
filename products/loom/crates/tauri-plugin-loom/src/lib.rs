@@ -1827,7 +1827,7 @@ enum PolicyModelLoadPlan {
         selected_path: PathBuf,
         canonical_path: PathBuf,
         profile: LocalModelProfile,
-        settings: ModelLoadSettings,
+        settings: Box<ModelLoadSettings>,
         expectation: PolicyWriterExpectation,
     },
 }
@@ -5622,7 +5622,7 @@ async fn model_load_exact_writer<R: Runtime>(
                 LoadedModel {
                     selected_path: worker_selected_path,
                     profile: worker_profile,
-                    requested_settings: settings,
+                    requested_settings: *settings,
                     descriptor,
                 },
             )
@@ -5798,7 +5798,7 @@ fn prepare_exact_model_load(
         selected_path,
         canonical_path: canonical_path.clone(),
         profile,
-        settings: settings.snapshot(),
+        settings: Box::new(settings.snapshot()),
         expectation,
     })
 }
