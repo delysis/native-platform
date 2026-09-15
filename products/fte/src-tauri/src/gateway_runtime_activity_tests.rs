@@ -95,6 +95,7 @@ impl GatewayBackend for FixtureBackend {
                 route: request.route,
                 output: vec![],
                 usage: GatewayUsage::default(),
+                output_groups: Vec::new(),
                 status: TerminalStatus::Completed,
                 previous_response_id: None,
             }))

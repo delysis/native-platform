@@ -801,6 +801,7 @@ impl GatewayBackend for LlamaNativeBackend {
             event_tx
                 .try_send(GatewayEvent::OutputItemAdded {
                     request_id: request_id.clone(),
+                    group_index: None,
                     output_index,
                     item,
                 })
@@ -1251,6 +1252,7 @@ fn build_response(
             })
             .collect(),
         usage,
+        output_groups: Vec::new(),
         status: if cancelled {
             TerminalStatus::Cancelled
         } else {

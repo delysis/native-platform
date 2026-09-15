@@ -2241,6 +2241,7 @@ dependencies = [
  "async-trait",
  "axum",
  "fte-protocols",
+ "fte-providers",
  "fte-router",
  "fte-store",
  "fte-types",
