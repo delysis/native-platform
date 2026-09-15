@@ -885,8 +885,10 @@ struct NativeModelInner {
     status: Arc<RwLock<ResidentModelStatus>>,
 }
 
-#[derive(Debug)]
-struct WorkerIdentity;
+#[derive(Debug, Default)]
+struct WorkerIdentity {
+    exports: state_buffer::LiveExports,
+}
 
 impl NativeModelInner {
     fn ensure_accepting(&self) -> NativeResult<()> {
@@ -1202,7 +1204,7 @@ impl NativeModelHandle {
             max_sequences: config.max_sequences,
         }));
         let worker_status = Arc::clone(&status);
-        let worker_identity = Arc::new(WorkerIdentity);
+        let worker_identity = Arc::new(WorkerIdentity::default());
         let owner_worker_identity = Arc::clone(&worker_identity);
         let worker_id = format!("llama-model-{}", config.model_id);
         let requests = Arc::new(RequestRegistry::with_external_worker(worker_id.clone()));
@@ -1278,6 +1280,19 @@ impl NativeModelHandle {
             }),
             worker,
         ))
+    }
+
+    /// Storage hint only: a live receipt can justify reading a same-worker spill.
+    /// Native import independently checks full bytes, binding, and worker identity.
+    #[must_use]
+    pub fn has_live_sequence_receipt(&self, receipt: &[u8; 32]) -> bool {
+        self.inner.ensure_accepting().is_ok()
+            && self
+                .inner
+                .worker_identity
+                .exports
+                .lock()
+                .is_ok_and(|exports| exports.contains(receipt))
     }
 
     pub fn status(&self) -> ResidentModelStatus {
@@ -2120,6 +2135,7 @@ fn run_worker(
     status: Arc<RwLock<ResidentModelStatus>>,
     worker_identity: Arc<WorkerIdentity>,
 ) {
+    let _export_lifetime = state_buffer::bind_worker_exports(&worker_identity.exports);
     let WorkerLanes {
         command_rx,
         speculative_rx,
@@ -7260,7 +7276,7 @@ mod tests {
         (
             NativeModelHandle {
                 inner: Arc::new(NativeModelInner {
-                    worker_identity: Arc::new(WorkerIdentity),
+                    worker_identity: Arc::new(WorkerIdentity::default()),
                     worker_id: "admission-test-worker".to_owned(),
                     command_tx,
                     speculative_tx,
@@ -7376,7 +7392,7 @@ mod tests {
             stopped.store(true, Ordering::Release);
         });
         let inner = Arc::new(NativeModelInner {
-            worker_identity: Arc::new(WorkerIdentity),
+            worker_identity: Arc::new(WorkerIdentity::default()),
             worker_id: worker_id.clone(),
             command_tx,
             speculative_tx,
@@ -7644,7 +7660,7 @@ mod tests {
             reject_queued_commands(&command_rx, &speculative_rx);
         });
         let inner = Arc::new(NativeModelInner {
-            worker_identity: Arc::new(WorkerIdentity),
+            worker_identity: Arc::new(WorkerIdentity::default()),
             worker_id,
             command_tx,
             speculative_tx,
@@ -7948,7 +7964,7 @@ mod tests {
             panic!("intentional owner-worker panic");
         });
         let inner = Arc::new(NativeModelInner {
-            worker_identity: Arc::new(WorkerIdentity),
+            worker_identity: Arc::new(WorkerIdentity::default()),
             worker_id: "panicking-owner-test-worker".to_owned(),
             command_tx,
             speculative_tx,
@@ -8005,7 +8021,7 @@ mod tests {
             worker_completed.store(true, Ordering::Release);
         });
         let inner = Arc::new(NativeModelInner {
-            worker_identity: Arc::new(WorkerIdentity),
+            worker_identity: Arc::new(WorkerIdentity::default()),
             worker_id: worker_id.clone(),
             command_tx,
             speculative_tx,
@@ -8923,7 +8939,7 @@ mod tests {
         request.cases[0].cached_prefix = Some(SequenceStateBlob {
             sequence_id: 0,
             token_count: 1,
-            bytes: vec![1, 2, 3],
+            bytes: (vec![1, 2, 3]).into(),
             token_ids: vec![1],
         });
         assert_rejected(
@@ -9278,7 +9294,7 @@ mod tests {
         cached.cases[0].cached_prefix = Some(SequenceStateBlob {
             sequence_id: 77,
             token_count: 1,
-            bytes: vec![0xde, 0xad, 0xbe, 0xef],
+            bytes: (vec![0xde, 0xad, 0xbe, 0xef]).into(),
             token_ids: vec![1],
         });
         assert!(is_exact_token_generation_batch(&cached));
@@ -9619,7 +9635,7 @@ mod tests {
             .expect("existing embedding request reserves");
         let handle = NativeModelHandle {
             inner: Arc::new(NativeModelInner {
-                worker_identity: Arc::new(WorkerIdentity),
+                worker_identity: Arc::new(WorkerIdentity::default()),
                 worker_id: "embedding-duplicate-test-worker".to_owned(),
                 command_tx,
                 speculative_tx: bounded(SPECULATIVE_COMMAND_CAPACITY).0,
@@ -10328,7 +10344,7 @@ mod tests {
 
     #[test]
     fn resident_prefix_reuse_is_token_exact_and_keeps_one_prompt_token_live() {
-        let worker = Arc::new(WorkerIdentity);
+        let worker = Arc::new(WorkerIdentity::default());
         let fingerprint = test_model_fingerprint("resident-model");
         let binding = ResidentTextPrefixBinding::new(&fingerprint, &worker);
         let mut cache = ResidentTextPrefixCache::new(binding.clone());
@@ -10352,7 +10368,7 @@ mod tests {
 
     #[test]
     fn resident_prefix_binding_and_invalidation_fail_closed() {
-        let worker = Arc::new(WorkerIdentity);
+        let worker = Arc::new(WorkerIdentity::default());
         let fingerprint = test_model_fingerprint("resident-model");
         let binding = ResidentTextPrefixBinding::new(&fingerprint, &worker);
         let mut cache = ResidentTextPrefixCache::new(binding.clone());
@@ -10364,7 +10380,7 @@ mod tests {
         let wrong_fingerprint = ResidentTextPrefixBinding::new(&other_fingerprint, &worker);
         assert_eq!(cache.reusable_tokens(&wrong_fingerprint, &tokens), 0);
 
-        let other_worker = Arc::new(WorkerIdentity);
+        let other_worker = Arc::new(WorkerIdentity::default());
         let wrong_worker = ResidentTextPrefixBinding::new(&binding.fingerprint, &other_worker);
         assert_eq!(cache.reusable_tokens(&wrong_worker, &tokens), 0);
 
@@ -10508,8 +10524,29 @@ mod tests {
             handle.restore_sequence(prefix.clone(), 0)?,
             SequenceRestoreKind::NativeState
         );
+        let export_receipt = prefix.export_receipt();
+        assert!(handle.has_live_sequence_receipt(&export_receipt));
+        let compact = prefix
+            .reconstruction()
+            .sequence(prefix.token_ids.clone())
+            .expect("reconstruction");
+        assert_eq!(
+            compact.bytes.len(),
+            llama_native_types::SEQUENCE_STATE_HEADER_BYTES
+        );
+        assert!(Arc::ptr_eq(&prefix.bytes, &prefix.clone().bytes));
+        assert_eq!(
+            handle.restore_sequence(compact.clone(), 0)?,
+            SequenceRestoreKind::TokenReplay
+        );
+        let serialized_live = serde_json::to_vec(&prefix)?;
+        let spilled: SequenceStateBlob = serde_json::from_slice(&serialized_live)?;
+        assert_eq!(
+            handle.restore_sequence(spilled, 0)?,
+            SequenceRestoreKind::NativeState
+        );
         let mut altered = prefix.clone();
-        altered.bytes.push(0xff);
+        Arc::make_mut(&mut altered.bytes).push(0xff);
         assert_eq!(
             handle.restore_sequence(altered, 0)?,
             SequenceRestoreKind::TokenReplay
@@ -10546,16 +10583,18 @@ mod tests {
             }
         };
         let mut late_invalid = family("late-invalid-prefix", &prefix);
-        late_invalid.cases[0]
-            .cached_prefix
-            .as_mut()
-            .expect("prefix")
-            .bytes
-            .push(0xff);
+        Arc::make_mut(
+            &mut late_invalid.cases[0]
+                .cached_prefix
+                .as_mut()
+                .expect("prefix")
+                .bytes,
+        )
+        .push(0xff);
         let mut second = late_invalid.cases[0].clone();
         second.case_id = "late-invalid-case".into();
         // Change only the fingerprint envelope: token preflight remains valid.
-        second.cached_prefix.as_mut().expect("prefix").bytes[16] ^= 1;
+        Arc::make_mut(&mut second.cached_prefix.as_mut().expect("prefix").bytes)[16] ^= 1;
         late_invalid.cases.push(second);
         let before_decodes = SAVED_PREFIX_REPLAY_DECODES.load(Ordering::SeqCst);
         let error = handle
@@ -10609,11 +10648,13 @@ mod tests {
             "failed mutation also retires old raw-import receipts"
         );
         assert_eq!(handle.snapshot_sequence(0)?.token_ids, prefix.token_ids);
-        let serialized = serde_json::to_vec(&prefix)?;
+        let serialized = serde_json::to_vec(&compact)?;
         owner.shutdown_joined()?;
+        assert!(!handle.has_live_sequence_receipt(&export_receipt));
         drop(handle);
         let owner = NativeModelOwner::load(config.clone())?;
         let handle = owner.handle();
+        assert!(!handle.has_live_sequence_receipt(&export_receipt));
         let durable: SequenceStateBlob = serde_json::from_slice(&serialized)?;
         assert_eq!(
             handle.restore_sequence(durable.clone(), 0)?,

@@ -6,23 +6,61 @@ use llama_native_types::{ModelFingerprint, NativeError, NativeErrorCode, Sequenc
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 const MAGIC: &[u8; 16] = b"native-seq-v1\0\0\0";
-const HEADER_BYTES: usize = MAGIC.len() + 32;
+const HEADER_BYTES: usize = llama_native_types::SEQUENCE_STATE_HEADER_BYTES;
 const MAX_LIVE_RECEIPTS: usize = 256;
 
-// Only the exporting worker can grant native-byte import authority. Receipts
-// are bounded, contain no state bytes, and disappear with that worker. Eviction
-// costs recomputation, never correctness. Persisted envelopes retain the full
-// configuration binding but are replayed from validated token IDs after restart.
+// Shared only for a cheap storage-mode query. The native importer still checks
+// the full exported bytes against this worker's receipt before parsing them.
+pub(crate) type LiveExports = Arc<Mutex<VecDeque<[u8; 32]>>>;
 thread_local! {
-    static LIVE_EXPORTS: RefCell<VecDeque<[u8; 32]>> = const { RefCell::new(VecDeque::new()) };
+    static LIVE_EXPORTS: RefCell<LiveExports> = RefCell::new(Arc::new(Mutex::new(VecDeque::new())));
 }
 
-/// A failed native mutation invalidates live acceleration authority as well as
-/// the resident KV contents. Saved token IDs remain eligible for fresh replay.
+pub(crate) struct WorkerExports(LiveExports);
+impl Drop for WorkerExports {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+
+pub(crate) fn bind_worker_exports(exports: &LiveExports) -> WorkerExports {
+    LIVE_EXPORTS.with_borrow_mut(|current| *current = Arc::clone(exports));
+    WorkerExports(Arc::clone(exports))
+}
+
 pub(crate) fn forget_live_exports() {
-    LIVE_EXPORTS.with_borrow_mut(VecDeque::clear);
+    LIVE_EXPORTS.with_borrow(|exports| {
+        exports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    });
+}
+
+fn remember_export(receipt: [u8; 32]) {
+    LIVE_EXPORTS.with_borrow(|exports| {
+        let mut receipts = exports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if receipts.len() == MAX_LIVE_RECEIPTS {
+            receipts.pop_front();
+        }
+        receipts.push_back(receipt);
+    });
+}
+
+fn has_live_export(receipt: &[u8; 32]) -> bool {
+    LIVE_EXPORTS.with_borrow(|exports| {
+        exports
+            .lock()
+            .is_ok_and(|receipts| receipts.contains(receipt))
+    })
 }
 
 fn incompatible(message: &str) -> NativeError {
@@ -36,16 +74,7 @@ fn fingerprint_digest(fingerprint: &ModelFingerprint) -> Result<[u8; 32], Native
 }
 
 fn receipt(state: &SequenceStateBlob) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"native-sequence-export-receipt-v1");
-    hash.update(state.sequence_id.to_le_bytes());
-    hash.update((state.token_count as u64).to_le_bytes());
-    hash.update((state.token_ids.len() as u64).to_le_bytes());
-    for token in &state.token_ids {
-        hash.update(token.to_le_bytes());
-    }
-    hash.update(&state.bytes);
-    hash.finalize().into()
+    state.export_receipt()
 }
 
 fn envelope(
@@ -62,7 +91,7 @@ fn envelope(
     Ok(SequenceStateBlob {
         sequence_id,
         token_count,
-        bytes,
+        bytes: bytes.into(),
         token_ids,
     })
 }
@@ -71,7 +100,7 @@ fn validated_payload<'a>(
     state: &'a SequenceStateBlob,
     fingerprint: &ModelFingerprint,
 ) -> Result<&'a [u8], NativeError> {
-    if state.bytes.len() <= HEADER_BYTES || !state.bytes.starts_with(MAGIC) {
+    if state.bytes.len() < HEADER_BYTES || !state.bytes.starts_with(MAGIC) {
         return Err(incompatible(
             "saved sequence has no supported context binding",
         ));
@@ -124,12 +153,7 @@ pub(crate) fn export_sequence(
         return Err(incompatible("llama.cpp sequence export size changed"));
     }
     let state = envelope(bytes, fingerprint, sequence_id, token_count, token_ids)?;
-    LIVE_EXPORTS.with_borrow_mut(|receipts| {
-        if receipts.len() == MAX_LIVE_RECEIPTS {
-            receipts.pop_front();
-        }
-        receipts.push_back(receipt(&state));
-    });
+    remember_export(receipt(&state));
     Ok(state)
 }
 
@@ -146,7 +170,7 @@ pub(crate) fn import_sequence(
         return Ok(false);
     }
     let raw = validated_payload(state, fingerprint)?;
-    if !LIVE_EXPORTS.with_borrow(|receipts| receipts.contains(&receipt(state))) {
+    if raw.is_empty() || !has_live_export(&receipt(state)) {
         return Ok(false);
     }
     // SAFETY: the full state and token metadata match a SHA-256 receipt created
@@ -207,8 +231,46 @@ mod tests {
             assert!(validated_payload(&state, &other).is_err(), "{field}");
         }
         let mut arbitrary = state;
-        arbitrary.bytes = vec![1, 2, 3];
+        arbitrary.bytes = vec![1, 2, 3].into();
         assert!(validated_payload(&arbitrary, &original).is_err());
+    }
+
+    #[test]
+    fn live_receipts_expire_with_worker_and_bounded_registry_without_losing_replay() {
+        let exports = LiveExports::default();
+        let lifetime = bind_worker_exports(&exports);
+        let state = envelope(vec![3; 4096], &fingerprint(), 0, 1, vec![7]).expect("state");
+        let original = receipt(&state);
+        remember_export(original);
+        assert!(has_live_export(&original));
+        let compact = state
+            .reconstruction()
+            .sequence(state.token_ids.clone())
+            .expect("replay");
+        assert_eq!(compact.bytes.len(), HEADER_BYTES);
+        assert_eq!(compact.token_ids, state.token_ids);
+        assert!(
+            validated_payload(&compact, &fingerprint())
+                .expect("binding")
+                .is_empty()
+        );
+        assert_ne!(receipt(&compact), original);
+        for index in 0..MAX_LIVE_RECEIPTS {
+            let mut next = [0; 32];
+            next[..8].copy_from_slice(&(index as u64).to_le_bytes());
+            remember_export(next);
+        }
+        assert!(!has_live_export(&original));
+        remember_export(original);
+        drop(lifetime);
+        assert!(exports.lock().expect("registry").is_empty());
+        let replacement = LiveExports::default();
+        let _replacement_lifetime = bind_worker_exports(&replacement);
+        assert!(!has_live_export(&original));
+        assert!(validated_payload(&compact, &fingerprint()).is_ok());
+        let mut changed = fingerprint();
+        changed.context_tokens += 1;
+        assert!(validated_payload(&compact, &changed).is_err());
     }
 
     #[test]
@@ -222,7 +284,7 @@ mod tests {
                 0 => altered.sequence_id = 1,
                 1 => altered.token_count = 2,
                 2 => altered.token_ids[0] = 8,
-                _ => altered.bytes[HEADER_BYTES] ^= 1,
+                _ => std::sync::Arc::make_mut(&mut altered.bytes)[HEADER_BYTES] ^= 1,
             }
             assert_ne!(original, receipt(&altered));
         }
@@ -230,6 +292,6 @@ mod tests {
         let persisted = serde_json::to_vec(&state).expect("serialize");
         let decoded: SequenceStateBlob = serde_json::from_slice(&persisted).expect("decode");
         assert_eq!(state, decoded);
-        assert!(!LIVE_EXPORTS.with_borrow(|receipts| receipts.contains(&receipt(&decoded))));
+        assert!(!has_live_export(&receipt(&decoded)));
     }
 }

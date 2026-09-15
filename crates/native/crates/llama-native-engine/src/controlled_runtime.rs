@@ -3787,7 +3787,7 @@ mod tests {
             .expect("existing request reserves");
         let handle = NativeModelHandle {
             inner: Arc::new(NativeModelInner {
-                worker_identity: Arc::new(WorkerIdentity),
+                worker_identity: Arc::new(WorkerIdentity::default()),
                 worker_id: "controlled-duplicate-test-worker".to_owned(),
                 command_tx,
                 speculative_tx,
@@ -3821,7 +3821,7 @@ mod tests {
         let (shutdown_tx, _shutdown_rx) = bounded(1);
         let handle = NativeModelHandle {
             inner: Arc::new(NativeModelInner {
-                worker_identity: Arc::new(WorkerIdentity),
+                worker_identity: Arc::new(WorkerIdentity::default()),
                 worker_id: "controlled-drop-test-worker".to_owned(),
                 command_tx,
                 speculative_tx,
@@ -4166,7 +4166,7 @@ mod tests {
             declaration,
         )
         .expect("batch output");
-        let worker_identity = Arc::new(WorkerIdentity);
+        let worker_identity = Arc::new(WorkerIdentity::default());
         let verified = ControlledGenerationCompletion::verified(
             output,
             ControlledGenerationEvidence {
@@ -4195,7 +4195,7 @@ mod tests {
         };
         let other = JoinedNativeModel {
             model_id: "model".to_string(),
-            worker_identity: Arc::new(WorkerIdentity),
+            worker_identity: Arc::new(WorkerIdentity::default()),
             expected_workers: 0,
             joined_workers: 0,
             expected_worker_ids: Vec::new(),
