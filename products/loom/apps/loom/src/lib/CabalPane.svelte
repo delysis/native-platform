@@ -54,7 +54,7 @@
     <label>Your name<input maxlength="64" autocomplete="nickname" bind:value={name} placeholder="What your friends call you" /></label>
     <button class="invite" type="button" disabled={busy || !name.trim()} on:click={() => void run(invite)}>Start this cabal</button>
   {/if}
-  {#if ticket}<div class="ticket"><label>One friend, one invitation<textarea readonly value={ticket} rows="4"></textarea></label><button type="button" on:click={() => void run(copy)}>Copy invitation</button><p class="quiet">Share this privately with your friend. They only need to join once.</p></div>{/if}
+  {#if ticket}<div class="ticket"><label>One friend, one invitation<textarea readonly value={ticket} rows="4"></textarea></label><button type="button" on:click={() => void run(copy)}>Copy invitation</button><p class="quiet">Share this privately with your friend. The invitation expires after 24 hours. Once joined, you reconnect automatically.</p></div>{/if}
   <details><summary>Join another cabal</summary><label>Invitation<textarea rows="3" bind:value={invitation} placeholder="loom://cabal/…"></textarea></label><label>Your name<input maxlength="64" bind:value={name} /></label><button type="button" disabled={busy || !name.trim() || !invitation.trim()} on:click={() => void run(() => onJoin(invitation.trim(), name.trim()))}>Join</button></details>
   {#if note}<p class="quiet" role="status">{note}</p>{/if}
   <CabalNetwork />

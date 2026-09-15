@@ -142,8 +142,13 @@ cannot edit membership through document operations or impersonate another
 author's Automerge actor.
 
 The initial owner admits members using a random, single-use invitation bound to
-the authenticated joining device. Repeating that device's interrupted join is
-idempotent. A person's name is a display label, never a password or identity
+the authenticated joining device. Links expire after 24 hours on the owner's
+clock. Repeating that device's interrupted join is idempotent until expiry;
+completed pairing and membership outlive the link. Creating or redeeming a link
+atomically removes expired invitations and retains the latest observed time, so
+clock rollback cannot revive them. At most 128 unexpired records are retained,
+including consumed links needed for exact retry. Expiry never removes writing
+or membership. A person's name is a display label, never a password or identity
 proof. Invitations are bearer capabilities: only send them to intended members.
 
 Revocation advances a signed epoch and seals accepted history. Previously
@@ -246,7 +251,7 @@ The storage cap currently stops new edits with an error. Long-lived history
 compaction must preserve signed provenance and offline recovery before that cap
 can be relaxed.
 
-The cabal store is version 3, the signed document payload is version 2, and the
+The cabal store is version 4, the signed document payload is version 2, and the
 workspace transport uses `app.delysis.loom/cabal/2`. Older experimental stores
 and protocols are rejected without rewriting saved data or retaining a
 compatibility layer.

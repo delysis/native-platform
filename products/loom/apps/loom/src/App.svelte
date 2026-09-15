@@ -9663,7 +9663,7 @@
     const workspace = await cabalWorkspace(captured.project_id, captured.session_id);
     if (!workspace || !terminalScopeIsCurrent(captured.project_id, captured.session_id)) throw new Error('The workspace changed.');
     await rememberSignalWorkspace(conversation.id, workspace);
-    return `Make something with me in ${workspace.title}:\n${invitation}\n\nWorkspace: loom://workspace/${workspace.id}`;
+    return `Make something with me in ${workspace.title}:\n${invitation}\n\nThis invitation expires after 24 hours. Once joined, we reconnect automatically.\n\nWorkspace: loom://workspace/${workspace.id}`;
   }
 
   async function openSignalWorkspace(conversation: SignalConversation, value: string, join = false): Promise<void> {

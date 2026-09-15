@@ -170,7 +170,9 @@ impl Network {
                 }
                 Ok(roster)
             }
-            _ => Err(Error::Invalid("The cabal could not accept this invitation")),
+            _ => Err(Error::Invalid(
+                "The cabal could not accept this invitation. Links expire after 24 hours; ask the owner for a new one.",
+            )),
         }
     }
 

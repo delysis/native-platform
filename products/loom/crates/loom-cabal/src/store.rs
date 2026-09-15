@@ -1,5 +1,7 @@
 mod assets;
+mod invitations;
 pub use assets::{ASSET_CHUNK_BYTES, AssetDescriptor, MAX_ASSET_BYTES};
+pub use invitations::Invitation;
 
 use automerge::{Automerge, Change, ReadDoc};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -11,7 +13,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
 };
-use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::{
@@ -19,7 +20,7 @@ use crate::{
     document::{self, Create, DocumentView, Edit, EditResult, MetadataEdit, TextKind},
 };
 
-const STORE_VERSION: i64 = 3;
+const STORE_VERSION: i64 = 4;
 const MAX_STORED_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,42 +58,6 @@ pub struct ChangePayload {
 }
 
 pub type ChangeEnvelope = Signed<ChangePayload>;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Invitation {
-    pub schema: u32,
-    pub cabal: Uuid,
-    pub owner: EndpointAddr,
-    pub token: String,
-}
-
-impl Invitation {
-    pub fn encode(&self) -> Result<String> {
-        Ok(format!(
-            "loom://cabal/{}",
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(self)?)
-        ))
-    }
-
-    pub fn decode(value: &str) -> Result<Self> {
-        if value.len() > 8192 {
-            return Err(Error::Invalid("Cabal invitation is too long"));
-        }
-        let encoded = value
-            .trim()
-            .strip_prefix("loom://cabal/")
-            .ok_or(Error::Invalid("Invalid cabal invitation"))?;
-        let bytes = URL_SAFE_NO_PAD
-            .decode(encoded)
-            .map_err(|_| Error::Invalid("Invalid cabal invitation"))?;
-        let invitation: Self = serde_json::from_slice(&bytes)?;
-        if invitation.schema != 1 || invitation.token.len() != 43 {
-            return Err(Error::Invalid("Unsupported cabal invitation"));
-        }
-        Ok(invitation)
-    }
-}
 
 pub struct Cabal {
     identity: Identity,
@@ -534,87 +499,6 @@ impl Cabal {
         Ok(true)
     }
 
-    pub fn invite(&mut self, address: EndpointAddr) -> Result<Invitation> {
-        self.require_owner()?;
-        if address.id != self.identity.public_key() {
-            return Err(Error::Invalid("Invitation endpoint does not match owner"));
-        }
-        let count: i64 =
-            self.database
-                .query_row("SELECT count(*) FROM invitations", [], |row| row.get(0))?;
-        if count >= 128 {
-            return Err(Error::Invalid("Too many open invitations"));
-        }
-        let mut token = [0_u8; 32];
-        getrandom::fill(&mut token).map_err(|_| Error::Invalid("OS randomness unavailable"))?;
-        let token = URL_SAFE_NO_PAD.encode(token);
-        let hash = hex::encode(Sha256::digest(token.as_bytes()));
-        self.database.execute(
-            "INSERT INTO invitations(hash, member) VALUES (?, NULL)",
-            [hash],
-        )?;
-        Ok(Invitation {
-            schema: 1,
-            cabal: self.id(),
-            owner: address,
-            token,
-        })
-    }
-
-    /// Bind each invitation to the authenticated transport key on first use.
-    /// A lost response can be retried by that same device, never by a new one.
-    pub fn admit(&mut self, token: &str, key: PublicKey, name: &str) -> Result<Roster> {
-        self.require_owner()?;
-        validate_name(name)?;
-        if token.len() != 43 {
-            return Err(Error::Invalid("Invalid cabal invitation"));
-        }
-        let hash = hex::encode(Sha256::digest(token.as_bytes()));
-        let mut statement = self
-            .database
-            .prepare("SELECT hash, member FROM invitations")?;
-        let candidates = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        drop(statement);
-        let Some((_, member)) = candidates
-            .into_iter()
-            .find(|(candidate, _)| bool::from(candidate.as_bytes().ct_eq(hash.as_bytes())))
-        else {
-            return Err(Error::Invalid("Invitation is unavailable"));
-        };
-        if let Some(member) = member {
-            if member == key.to_string() && self.is_member(key) {
-                return Ok(self.roster.clone());
-            }
-            return Err(Error::Invalid("Invitation was already used"));
-        }
-        let mut membership = self.roster.payload.clone();
-        if !self.is_member(key) {
-            membership.members.push(Member {
-                key,
-                name: name.into(),
-            });
-        }
-        membership.revision += 1;
-        let roster = self.identity.sign(membership)?;
-        validate_roster(&roster)?;
-        let transaction = self.database.transaction()?;
-        transaction.execute(
-            "UPDATE invitations SET member = ? WHERE hash = ?",
-            params![key.to_string(), hash],
-        )?;
-        transaction.execute(
-            "UPDATE metadata SET value = ? WHERE key = 'roster'",
-            [serde_json::to_string(&roster)?],
-        )?;
-        transaction.commit()?;
-        self.roster = roster;
-        Ok(self.roster.clone())
-    }
-
     pub fn revoke(&mut self, key: PublicKey) -> Result<()> {
         self.require_owner()?;
         if key == self.roster.payload.owner {
@@ -729,7 +613,7 @@ fn open_database(path: &Path) -> Result<Connection> {
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
     connection.pragma_update(None, "foreign_keys", true)?;
-    connection.execute_batch("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS changes(hash TEXT PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS orphaned(hash TEXT PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS invitations(hash TEXT PRIMARY KEY, member TEXT);")?;
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS changes(hash TEXT PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS orphaned(hash TEXT PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS invitations(hash TEXT PRIMARY KEY, member TEXT, expires_at INTEGER NOT NULL CHECK(expires_at > 0)) STRICT;")?;
     assets::initialize(&connection)?;
     connection.pragma_update(None, "user_version", STORE_VERSION)?;
     Ok(connection)
