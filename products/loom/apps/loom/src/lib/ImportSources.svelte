@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import { newUlid } from './ulid';
   import type { ContextAttachment } from './types';
   import { importAccounts, connectImportAccount, disconnectImportAccount, syncImportAccount, chooseImportBatch, importSourceUrl, importPastedSources, cancelImportAccount,
     type ImportAccount, type ImportBatch, type ImportSource } from './ipc';
@@ -21,6 +22,7 @@
   let clientSecret = '';
   let query = 'newer_than:30d';
   let busy = false;
+  let operationId = '';
   let message = '';
   let report: ImportBatch | null = null;
   let selected: string[] = [];
@@ -46,14 +48,15 @@
   onMount(() => { void refresh(); });
 
   async function connect(): Promise<void> {
-    busy = true; authorizing = true; message = 'Finish authorization in your browser. This request expires in five minutes.';
+    operationId = newUlid();
+    busy = true; authorizing = true; message = 'Finish authorization in your browser. This request expires in three minutes.';
     try {
-      const result = await connectImportAccount(projectId, sessionId, service, clientId.trim(), clientSecret);
+      const result = await connectImportAccount(projectId, sessionId, service, clientId.trim(), clientSecret, operationId);
       accounts = [...accounts.filter((item) => item.service !== result.service || item.email !== result.email), result];
       chosenEmail = result.email ?? ''; configuring = false; report = null; selected = [];
       message = `Connected ${result.email}. Sync runs only when you request it.`;
     } catch (error) { message = errorText(error); }
-    finally { clientSecret = ''; busy = false; authorizing = false; }
+    finally { clientSecret = ''; busy = false; authorizing = false; operationId = ''; }
   }
   async function disconnect(): Promise<void> {
     busy = true;
@@ -65,34 +68,38 @@
     finally { busy = false; }
   }
   async function sync(next = false): Promise<void> {
+    operationId = newUlid();
     busy = true; message = 'Importing up to 16 files. Large pages can take a few minutes.';
     try {
       const token = next && canNext ? report?.next_page_token : undefined;
-      report = await syncImportAccount(projectId, sessionId, source, account ?? '', query, token ?? null);
+      report = await syncImportAccount(projectId, sessionId, source, account ?? '', query, token ?? null, operationId);
       lastQuery = query; lastSource = source; lastAccount = account ?? ''; selected = [];
       message = `${report.imported.length} imported; ${report.failures.length} failed.${report.next_page_token ? ' More results are available.' : ' End of results.'}`;
     } catch (error) { message = errorText(error); }
-    finally { busy = false; }
+    finally { busy = false; operationId = ''; }
   }
   async function local(folder: boolean): Promise<void> {
+    operationId = newUlid();
     busy = true; message = 'Reading local sources…';
     try {
-      report = await chooseImportBatch(projectId, sessionId, folder); selected = [];
+      report = await chooseImportBatch(projectId, sessionId, folder, operationId); selected = [];
       message = `${report.imported.length} imported; ${report.failures.length} failed or skipped.`;
     } catch (error) { message = errorText(error); }
-    finally { busy = false; }
+    finally { busy = false; operationId = ''; }
   }
   async function web(): Promise<void> {
+    operationId = newUlid();
     busy = true; message = 'Importing the public web document…';
-    try { report = await importSourceUrl(projectId, sessionId, webUrl.trim()); selected = []; message = 'Web source imported locally. Select it below to add it to context.'; }
+    try { report = await importSourceUrl(projectId, sessionId, webUrl.trim(), operationId); selected = []; message = 'Web source imported locally. Select it below to add it to context.'; }
     catch (error) { message = errorText(error); }
-    finally { busy = false; }
+    finally { busy = false; operationId = ''; }
   }
   async function paste(): Promise<void> {
+    operationId = newUlid();
     busy = true;
-    try { report = await importPastedSources(projectId, sessionId, pasted, separator); selected = []; message = `${report.imported.length} pasted sources imported; ${report.failures.length} failed.`; }
+    try { report = await importPastedSources(projectId, sessionId, pasted, separator, operationId); selected = []; message = `${report.imported.length} pasted sources imported; ${report.failures.length} failed.`; }
     catch (error) { message = errorText(error); }
-    finally { busy = false; }
+    finally { busy = false; operationId = ''; }
   }
   async function useSelected(): Promise<void> {
     busy = true;
@@ -145,7 +152,7 @@
     {#if configuring}<button disabled={busy} on:click={() => configuring = false}>Back to accounts</button>{/if}
     <button disabled={busy || !clientId.trim()} on:click={() => void connect()}>Connect {service === 'drive' ? 'Drive' : 'Gmail'}</button>
   {/if}
-  {#if authorizing}<button on:click={() => { void cancelImportAccount(projectId, sessionId).catch((error) => message = errorText(error)); }}>Cancel connection</button>{/if}
+  {#if busy && operationId}<button on:click={() => { void cancelImportAccount(projectId, sessionId, operationId).then(() => { message = "Stopping… Completed sources remain available."; }).catch((error) => message = errorText(error)); }}>{authorizing ? "Cancel connection" : "Stop import"}</button>{/if}
   <p role="status">{message}</p>
   {#if report}
     <div class="results">

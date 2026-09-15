@@ -528,15 +528,27 @@ async fn anthropic_messages(
     let stream_requested = request.stream;
     let gateway_request = request.into_gateway(state.edge_defaults.clone())?;
     if stream_requested {
-        let usage = state.gateway.count_tokens(gateway_request.clone()).await?;
+        let (ticket, usage) = state
+            .gateway
+            .execute_with_exact_input_count(
+                gateway_request,
+                Arc::new(fte_types::RequestCancellation::default()),
+            )
+            .await?;
         let input_tokens = require_exact_input_tokens(&usage)?;
-        let ticket = state.gateway.execute(gateway_request).await?;
         Ok(anthropic_stream(ticket, state, input_tokens))
     } else {
         let ticket = state.gateway.execute(gateway_request).await?;
         let response = await_response(ticket).await?;
         require_exact_input_tokens(&response.usage)?;
         require_exact_output_tokens(&response.usage)?;
+        if response.output_groups.len() > 1 {
+            return Err(ApiError::simple(
+                StatusCode::BAD_GATEWAY,
+                "provider_multiple_candidates_unsupported",
+                "Anthropic Messages cannot represent alternative response candidates",
+            ));
+        }
         Ok(Json(anthropic_message_json(&response)).into_response())
     }
 }
@@ -597,7 +609,10 @@ async fn await_response(
         }
     }
     let response = ticket.final_response().await?;
-    if response.status != fte_types::TerminalStatus::Completed {
+    if !matches!(
+        response.status,
+        fte_types::TerminalStatus::Completed | fte_types::TerminalStatus::Incomplete
+    ) {
         return Err(GatewayError::unavailable(
             &response.request_id,
             "generation_incomplete",
@@ -672,7 +687,10 @@ fn legacy_completion_chunks(
     flavor: StreamFlavor,
     emitted: &HashMap<usize, String>,
 ) -> Result<Vec<Value>, &'static str> {
-    if response.status != fte_types::TerminalStatus::Completed {
+    if !matches!(
+        response.status,
+        fte_types::TerminalStatus::Completed | fte_types::TerminalStatus::Incomplete
+    ) {
         return Err("Generation did not complete successfully");
     }
     if response
@@ -697,10 +715,15 @@ fn legacy_completion_chunks(
     let choices = value["choices"]
         .as_array_mut()
         .ok_or("Missing output choices")?;
-    if emitted.keys().any(|index| *index >= choices.len()) {
+    if emitted.keys().any(|index| {
+        !choices
+            .iter()
+            .any(|choice| choice["index"].as_u64() == Some(*index as u64))
+    }) {
         return Err("Streamed output has no corresponding final choice");
     }
-    for (index, choice) in choices.iter_mut().enumerate() {
+    for choice in choices.iter_mut() {
+        let index = choice["index"].as_u64().ok_or("Missing choice index")? as usize;
         let final_text = match flavor {
             StreamFlavor::Chat => choice["message"]["content"].as_str(),
             StreamFlavor::Completion => choice["text"].as_str(),
@@ -712,7 +735,10 @@ fn legacy_completion_chunks(
             .to_string();
         match flavor {
             StreamFlavor::Chat => {
-                let mut delta = json!({"content":suffix});
+                let mut delta = json!({"role":"assistant","content":suffix});
+                if let Some(refusal) = choice["message"].get("refusal") {
+                    delta["refusal"] = refusal.clone();
+                }
                 if let Some(tools) = choice["message"]["tool_calls"].as_array() {
                     delta["tool_calls"] = json!(
                         tools
@@ -753,6 +779,8 @@ fn openai_stream_response(
         let started_at = Instant::now();
         let mut _registration = None;
         let mut emitted_text = HashMap::<usize, String>::new();
+        let mut output_groups = HashMap::<usize, usize>::new();
+        let mut response_identity = None;
         loop {
             let poll = next_stream_event(&mut ticket.events, started_at, idle_timeout, total_timeout).await;
             let event = match poll {
@@ -772,7 +800,8 @@ fn openai_stream_response(
                 break;
             }
             match event {
-                GatewayEvent::ResponseCreated { response_id, request_id, .. } => {
+                GatewayEvent::ResponseCreated { response_id, request_id, route } => {
+                    response_identity = Some((response_id.clone(), route.model_id));
                     match ResponseRegistration::register(&state, response_id.clone(), request_id) {
                         Ok(registration) => _registration = Some(registration),
                         Err(error) => {
@@ -780,29 +809,31 @@ fn openai_stream_response(
                             break;
                         }
                     }
-                    if matches!(flavor, StreamFlavor::Chat) {
-                        yield Ok::<Event, Infallible>(Event::default().data(json!({
-                            "id":format!("chatcmpl_{response_id}"),
-                            "object":"chat.completion.chunk",
-                            "choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":Value::Null}]
-                        }).to_string()));
-                    }
+                }
+                GatewayEvent::OutputItemAdded { output_index, group_index, .. } => {
+                    if let Some(group_index) = group_index { output_groups.insert(output_index, group_index); }
                 }
                 GatewayEvent::TextDelta { delta, output_index, content_index, .. } => {
-                    // Chat has one choice; later output items are flattened by
-                    // the final projector. Emit only its provable first prefix.
-                    if matches!(flavor, StreamFlavor::Chat) && (output_index != 0 || content_index != 0) {
-                        continue;
-                    }
-                    emitted_text.entry(output_index).or_default().push_str(&delta);
+                    let index = match output_groups.get(&output_index) {
+                        Some(index) => *index,
+                        None if matches!(flavor, StreamFlavor::Chat) && (output_index != 0 || content_index != 0) => continue,
+                        None => output_index,
+                    };
+                    emitted_text.entry(index).or_default().push_str(&delta);
+                    let Some((response_id, model)) = &response_identity else {
+                        yield Ok(Event::default().data(json!({"error":{"code":"stream_identity_missing","message":"Provider output preceded response identity"}}).to_string()));
+                        break;
+                    };
                     let value = match flavor {
                         StreamFlavor::Chat => json!({
+                            "id":format!("chatcmpl_{response_id}"), "model":model,
                             "object":"chat.completion.chunk",
-                            "choices":[{"index":output_index,"delta":{"content":delta},"finish_reason":Value::Null}]
+                            "choices":[{"index":index,"delta":{"role":"assistant","content":delta},"finish_reason":Value::Null}]
                         }),
                         StreamFlavor::Completion => json!({
+                            "id":format!("cmpl_{response_id}"), "model":model,
                             "object":"text_completion",
-                            "choices":[{"index":output_index,"text":delta,"finish_reason":Value::Null,"logprobs":Value::Null}]
+                            "choices":[{"index":index,"text":delta,"finish_reason":Value::Null,"logprobs":Value::Null}]
                         }),
                     };
                     yield Ok(Event::default().data(value.to_string()));
@@ -831,7 +862,7 @@ fn openai_stream_response(
                 }
                 // Identity/content boundary events are carried by the final
                 // legacy projector. Tool arguments are emitted atomically there.
-                GatewayEvent::OutputItemAdded { .. } | GatewayEvent::ContentPartAdded { .. }
+                GatewayEvent::ContentPartAdded { .. }
                 | GatewayEvent::ContentPartCompleted { .. } | GatewayEvent::OutputItemCompleted { .. }
                 | GatewayEvent::ReasoningSummaryDelta { .. } | GatewayEvent::FunctionArgumentsDelta { .. }
                 | GatewayEvent::UsageUpdated { .. } | GatewayEvent::Warning { .. } => {}
@@ -928,6 +959,10 @@ fn anthropic_stream(
             };
             if let Some(error) = stream_integrity_error(&event) {
                 yield Ok::<Event, Infallible>(Event::default().event("error").data(json!({"type":"error","error":error}).to_string()));
+                break;
+            }
+            if matches!(&event, GatewayEvent::Completed { response, .. } if response.output_groups.len() > 1) {
+                yield Ok::<Event, Infallible>(Event::default().event("error").data(json!({"type":"error","error":{"code":"provider_multiple_candidates_unsupported","message":"Anthropic Messages cannot represent alternative response candidates"}}).to_string()));
                 break;
             }
             for encoded in encoder.encode(&event) {
@@ -1212,6 +1247,9 @@ impl IntoResponse for ApiError {
 }
 
 #[cfg(test)]
+mod hosted_conformance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -1226,7 +1264,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::{mpsc, oneshot};
 
-    fn regression_state(store: Arc<dyn ResponseStore>) -> AppState {
+    pub(super) fn regression_state(store: Arc<dyn ResponseStore>) -> AppState {
         let gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
         gateway
             .register_backend(Arc::new(StreamingTestBackend("test-model")))
@@ -1247,7 +1285,7 @@ mod tests {
         }
     }
 
-    fn http_request(path: &str, body: Value) -> Request<Body> {
+    pub(super) fn http_request(path: &str, body: Value) -> Request<Body> {
         Request::builder()
             .method("POST")
             .uri(path)
@@ -1432,6 +1470,7 @@ mod tests {
             },
             output,
             usage: GatewayUsage::default(),
+            output_groups: Vec::new(),
             status: TerminalStatus::Completed,
             previous_response_id: None,
         }
@@ -1439,6 +1478,12 @@ mod tests {
 
     fn scripted_ticket(response: &GatewayResponse, progress: Vec<GatewayEvent>) -> GatewayTicket {
         let (tx, rx) = mpsc::channel(progress.len() + 2);
+        tx.try_send(GatewayEvent::ResponseCreated {
+            request_id: response.request_id.clone(),
+            response_id: response.id.clone(),
+            route: response.route.clone(),
+        })
+        .expect("response identity");
         for event in progress {
             tx.try_send(event).expect("scripted event");
         }
@@ -1459,7 +1504,7 @@ mod tests {
         )
     }
 
-    async fn response_body(response: Response) -> String {
+    pub(super) async fn response_body(response: Response) -> String {
         use http_body_util::BodyExt;
         String::from_utf8(
             response
@@ -1664,6 +1709,7 @@ mod tests {
                     real_local_inference: true,
                     ..GatewayUsage::default()
                 },
+                output_groups: Vec::new(),
                 status: TerminalStatus::Completed,
                 previous_response_id,
             };
@@ -1684,6 +1730,7 @@ mod tests {
                 let _ = event_tx
                     .send(GatewayEvent::OutputItemAdded {
                         request_id: request_id.clone(),
+                        group_index: None,
                         output_index: 0,
                         item: item.clone(),
                     })
@@ -1772,6 +1819,7 @@ mod tests {
                     selected_route: Some(route.clone()),
                     ..GatewayUsage::default()
                 },
+                output_groups: Vec::new(),
                 status: TerminalStatus::Completed,
                 previous_response_id: None,
             };
@@ -1789,6 +1837,7 @@ mod tests {
                     },
                     GatewayEvent::OutputItemAdded {
                         request_id: request_id.clone(),
+                        group_index: None,
                         output_index: 0,
                         item: item.clone(),
                     },

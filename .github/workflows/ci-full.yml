@@ -25,6 +25,8 @@ jobs:
       runner: macos-latest
 
   root:
+    if: ${{ !cancelled() }}
+    needs: [macos-required, frontend, policy-and-graphs]
     strategy:
       fail-fast: false
       matrix:
@@ -65,6 +67,8 @@ jobs:
       - run: cargo tree --locked -i libsqlite3-sys
 
   fuzz-build:
+    if: ${{ !cancelled() }}
+    needs: [macos-required, frontend, policy-and-graphs]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -83,6 +87,8 @@ jobs:
           if-no-files-found: ignore
 
   model-integration:
+    if: ${{ !cancelled() }}
+    needs: [macos-required, frontend, policy-and-graphs]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

@@ -967,7 +967,7 @@ mod tests {
         let output = make_output(execution.clone(), live_evidence(), [0.8, 0.6]);
         let request_sha256 = embedding_request_sha256(&request);
         let output_bits_sha256 = embedding_output_bits_sha256(&output);
-        let worker_identity = Arc::new(WorkerIdentity);
+        let worker_identity = Arc::new(WorkerIdentity::default());
         let evidence = VerifiedEmbeddingEvidence {
             request,
             resident_model_fingerprint: resident,
@@ -991,7 +991,7 @@ mod tests {
         };
         let other = JoinedNativeModel {
             model_id: "embedding-model".to_string(),
-            worker_identity: Arc::new(WorkerIdentity),
+            worker_identity: Arc::new(WorkerIdentity::default()),
             expected_workers: 0,
             joined_workers: 0,
             expected_worker_ids: Vec::new(),
@@ -1030,7 +1030,7 @@ mod tests {
             0,
             &[EmbeddingCompletionTerminal::Completed],
             &AtomicBool::new(false),
-            Arc::new(WorkerIdentity),
+            Arc::new(WorkerIdentity::default()),
             &artifacts,
         )
         .expect("unchanged artifact permits authority");
@@ -1048,7 +1048,7 @@ mod tests {
                 0,
                 &[EmbeddingCompletionTerminal::Completed],
                 &AtomicBool::new(false),
-                Arc::new(WorkerIdentity),
+                Arc::new(WorkerIdentity::default()),
                 &artifacts,
             )
             .is_err()

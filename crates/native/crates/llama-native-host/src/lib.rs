@@ -8,6 +8,7 @@
 
 use llama_native_cache::{
     CacheFingerprint, CacheOwnerScope, MemoryPrefixCache, PrefixCacheMetadata, PrefixCacheValue,
+    ValidatedPrefixCacheValue,
 };
 use llama_native_engine::{
     GenerationTicket, JoinedNativeModel, NativeModelHandle, NativeModelOwner,
@@ -65,6 +66,16 @@ pub trait PrefixCacheStore: Send + Sync {
         Ok(values)
     }
     fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError>;
+
+    /// Atomically compare the indexed identity and compact an expired spill to
+    /// reconstruction data without reading the opaque payload. A replaced or
+    /// revoked owner must return `None` rather than being republished.
+    fn load_reconstruction(
+        &self,
+        namespace: &str,
+        expected: &PrefixCacheMetadata,
+    ) -> Result<Option<PrefixCacheValue>, NativeError>;
+
     fn delete(&self, namespace: &str, id: &str) -> Result<(), NativeError>;
 
     /// Acquires the product-owned authority needed to expose one owner's
@@ -952,12 +963,16 @@ impl NativeHost {
             lease.validate().ok()?;
         }
         let now = self.clock.now_ms();
-        self.state.lock().ok()?.cache.lookup_in_scope(
+        let shared = self.state.lock().ok()?.cache.lookup_shared_in_scope(
             fingerprint,
             prompt_token_ids,
             owner_scope,
             now,
-        )
+        )?;
+        // Only Arc handles cross the host lock; any metadata/token copies happen here.
+        let mut value = (*shared).clone();
+        value.metadata.last_used_at_ms = now;
+        Some(value)
     }
 
     pub fn cache_lookup_for_owner(
@@ -973,10 +988,14 @@ impl NativeHost {
         )
     }
 
-    pub fn cache_insert(&self, value: PrefixCacheValue) -> Result<Vec<String>, NativeError> {
+    pub fn cache_insert(&self, mut value: PrefixCacheValue) -> Result<Vec<String>, NativeError> {
         if !self.config.cache_policy.allows_memory() {
             return Ok(Vec::new());
         }
+        if !value.is_valid() {
+            return Ok(Vec::new());
+        }
+        value.bind_reconstruction();
         let owner_generation = value.metadata.owner_id.as_deref().map(|owner_id| {
             self.state
                 .lock()
@@ -1006,14 +1025,17 @@ impl NativeHost {
         if let Some(lease) = &promotion_lease {
             lease.validate()?;
         }
+        let owner_id = value.metadata.owner_id.clone();
+        let Some(value) = ValidatedPrefixCacheValue::new(value) else {
+            return Ok(Vec::new());
+        };
         let mut state = self.state.lock().map_err(host_poisoned)?;
-        if let (Some(owner_id), Some(expected_generation)) =
-            (value.metadata.owner_id.as_deref(), owner_generation)
+        if let (Some(owner_id), Some(expected_generation)) = (owner_id.as_deref(), owner_generation)
             && cache_owner_generation(&state, owner_id) != expected_generation
         {
             return Ok(Vec::new());
         }
-        let evicted = state.cache.insert(value);
+        let evicted = state.cache.insert_validated(value);
         Ok(evicted)
     }
 
@@ -1062,23 +1084,58 @@ impl NativeHost {
                 }
                 None => None,
             };
-            let Some(value) = store.load_entry(&self.config.cache_namespace, &candidate.id)? else {
+            let live = candidate
+                .reconstruction
+                .as_ref()
+                .is_some_and(|reconstruction| {
+                    self.state.lock().is_ok_and(|state| {
+                        state.slots.values().any(|slot| {
+                            slot.owner
+                                .handle()
+                                .has_live_sequence_receipt(&reconstruction.export_receipt)
+                        })
+                    })
+                });
+            let value = if live {
+                let Some(value) = store.load_entry(&self.config.cache_namespace, &candidate.id)?
+                else {
+                    continue;
+                };
+                if value.metadata != candidate {
+                    continue;
+                }
+                value
+            } else {
+                // Storage also discards obsolete disposable entries that have no
+                // reconstruction metadata, under the same identity comparison.
+                let restored =
+                    store.load_reconstruction(&self.config.cache_namespace, &candidate)?;
+                let Some(expected) = candidate.replay_value() else {
+                    continue;
+                };
+                let Some(value) = restored else {
+                    continue;
+                };
+                if value.metadata != expected.metadata {
+                    continue;
+                }
+                value
+            };
+            let owner_id = value.metadata.owner_id.clone();
+            let Some(value) = ValidatedPrefixCacheValue::new(value) else {
                 continue;
             };
-            if !value.is_valid() || value.metadata != candidate {
-                continue;
-            }
             if let Some(lease) = &promotion_lease {
                 lease.validate()?;
             }
             let mut state = self.state.lock().map_err(host_poisoned)?;
             if let (Some(owner_id), Some(expected_generation)) =
-                (value.metadata.owner_id.as_deref(), owner_generation)
+                (owner_id.as_deref(), owner_generation)
                 && cache_owner_generation(&state, owner_id) != expected_generation
             {
                 continue;
             }
-            state.cache.insert(value);
+            state.cache.insert_validated(value);
             restored += 1;
         }
         Ok(restored)
@@ -1227,6 +1284,27 @@ mod tests {
     }
 
     impl PrefixCacheStore for TestPrefixStore {
+        fn load_reconstruction(
+            &self,
+            _namespace: &str,
+            expected: &PrefixCacheMetadata,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            let mut values = self.values.lock().expect("store lock");
+            let Some(current) = values
+                .iter_mut()
+                .find(|value| value.metadata.id == expected.id)
+            else {
+                return Ok(None);
+            };
+            if &current.metadata != expected {
+                return Ok(None);
+            }
+            let Some(value) = expected.replay_value() else {
+                return Ok(None);
+            };
+            *current = value.clone();
+            Ok(Some(value))
+        }
         fn list(&self, _namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
             Ok(self
                 .values
@@ -1270,6 +1348,13 @@ mod tests {
     struct RejectingPrefixStore;
 
     impl PrefixCacheStore for RejectingPrefixStore {
+        fn load_reconstruction(
+            &self,
+            _namespace: &str,
+            _expected: &PrefixCacheMetadata,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            Ok(None)
+        }
         fn list(&self, _namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
             Ok(Vec::new())
         }
@@ -1300,6 +1385,27 @@ mod tests {
     }
 
     impl PrefixCacheStore for BlockingSavePrefixStore {
+        fn load_reconstruction(
+            &self,
+            _namespace: &str,
+            expected: &PrefixCacheMetadata,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            let mut values = self.values.lock().expect("store lock");
+            let Some(current) = values
+                .iter_mut()
+                .find(|value| value.metadata.id == expected.id)
+            else {
+                return Ok(None);
+            };
+            if &current.metadata != expected {
+                return Ok(None);
+            }
+            let Some(value) = expected.replay_value() else {
+                return Ok(None);
+            };
+            *current = value.clone();
+            Ok(Some(value))
+        }
         fn list(&self, _namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
             Ok(self
                 .values
@@ -1350,6 +1456,29 @@ mod tests {
     }
 
     impl PrefixCacheStore for BlockingRestorePrefixStore {
+        fn load_reconstruction(
+            &self,
+            _namespace: &str,
+            expected: &PrefixCacheMetadata,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            self.authoritative_reload.wait();
+            self.release_reload.wait();
+            let mut values = self.values.lock().expect("store lock");
+            let Some(current) = values
+                .iter_mut()
+                .find(|value| value.metadata.id == expected.id)
+            else {
+                return Ok(None);
+            };
+            if &current.metadata != expected {
+                return Ok(None);
+            }
+            let Some(value) = expected.replay_value() else {
+                return Ok(None);
+            };
+            *current = value.clone();
+            Ok(Some(value))
+        }
         fn list(&self, _namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
             self.load_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self
@@ -1403,6 +1532,13 @@ mod tests {
         payload_bytes: AtomicUsize,
     }
     impl PrefixCacheStore for CountingPrefixStore {
+        fn load_reconstruction(
+            &self,
+            namespace: &str,
+            expected: &PrefixCacheMetadata,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            self.inner.load_reconstruction(namespace, expected)
+        }
         fn list(&self, namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
             self.lists.fetch_add(1, Ordering::Relaxed);
             self.inner.list(namespace)
@@ -1428,12 +1564,13 @@ mod tests {
     }
 
     #[test]
-    fn restore_enumerates_once_and_reads_each_payload_once() {
+    fn restore_compacts_expired_spills_without_reading_native_payloads() {
         let store = Arc::new(CountingPrefixStore::default());
-        let mut expected_bytes = 0;
         for index in 0..16 {
-            let value = cache_value(&format!("entry-{index}"), index + 1);
-            expected_bytes += value.sequence.bytes.len();
+            let mut value = cache_value(&format!("entry-{index}"), index + 1);
+            value.sequence.bytes = vec![7; 64 * 1024].into();
+            value.metadata.state_bytes = value.sequence.bytes.len();
+            value.bind_reconstruction();
             store.save("test", &value).expect("save");
         }
         let host = NativeHost::with_dependencies(
@@ -1446,7 +1583,25 @@ mod tests {
         );
         assert_eq!(host.restore_persistent_cache().expect("restore"), 16);
         assert_eq!(store.lists.load(Ordering::Relaxed), 1);
-        assert_eq!(store.payload_bytes.load(Ordering::Relaxed), expected_bytes);
+        assert_eq!(store.payload_bytes.load(Ordering::Relaxed), 0);
+        let entries = store.inner.list("test").expect("compact metadata");
+        assert_eq!(entries.len(), 16);
+        for entry in entries {
+            assert_eq!(
+                entry.state_bytes,
+                llama_native_types::SEQUENCE_STATE_HEADER_BYTES
+            );
+            let value = store
+                .inner
+                .load_entry("test", &entry.id)
+                .expect("stored")
+                .expect("entry");
+            assert_eq!(value.sequence.token_ids, entry.token_ids);
+            assert_eq!(
+                value.metadata.fingerprint,
+                cache_value("expected", 1).metadata.fingerprint
+            );
+        }
     }
 
     fn resident_test_config(expected_model_sha256: Option<&str>) -> NativeModelConfig {
@@ -1498,7 +1653,7 @@ mod tests {
             rope_config_sha256: "rope".to_string(),
             kv_layout_sha256: "kv".to_string(),
         };
-        PrefixCacheValue {
+        let mut value = PrefixCacheValue {
             metadata: PrefixCacheMetadata::new(
                 id,
                 CacheTier::SessionPersistent,
@@ -1510,10 +1665,12 @@ mod tests {
             sequence: SequenceStateBlob {
                 sequence_id: 0,
                 token_count: 1,
-                bytes: vec![token as u8; 8],
+                bytes: (vec![token as u8; 8]).into(),
                 token_ids: vec![token],
             },
-        }
+        };
+        value.bind_reconstruction();
+        value
     }
 
     #[test]
@@ -1898,7 +2055,7 @@ mod tests {
         owned.metadata.owner_id = Some("persona:archived:v7".to_owned());
         owned.sequence.token_ids.push(2);
         owned.sequence.token_count = 2;
-        owned.sequence.bytes.resize(16, 2);
+        Arc::make_mut(&mut owned.sequence.bytes).resize(16, 2);
 
         host.cache_insert(unowned).expect("insert unowned artifact");
         host.cache_insert(owned).expect("insert owned artifact");

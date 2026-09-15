@@ -2,9 +2,9 @@ use async_trait::async_trait;
 use fte_store::SecretResolver;
 use fte_types::{
     BackendDescriptor, BackendLocation, BackendReadiness, BackendRequest, CancelTarget,
-    CompletionPrompt, ErrorClass, GatewayBackend, GatewayError, GatewayEvent, GatewayResponse,
-    GatewayTicket, GatewayUsage, GenerationInput, ModelDescriptor, RequestId, ResolvedRoute,
-    TerminalStatus, TicketCancellation,
+    CompletionPrompt, ErrorClass, FinishReason, GatewayBackend, GatewayError, GatewayEvent,
+    GatewayResponse, GatewayTicket, GatewayUsage, GenerationInput, ModelDescriptor, OutputGroup,
+    RequestId, ResolvedRoute, TerminalStatus, TicketCancellation,
 };
 use futures::StreamExt;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
@@ -18,6 +18,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const MAX_ERROR_BODY_BYTES: usize = 32 * 1024;
+const MAX_PROVIDER_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_PROVIDER_RESULT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PROVIDER_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PROVIDER_OUTPUTS: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostedProtocol {
@@ -530,6 +534,11 @@ impl GatewayBackend for HostedProviderBackend {
                     ) => result,
                 }
             };
+            let result = result.map_err(|mut error| {
+                error.request_id = request_id_for_task.clone();
+                error.provider = Some(backend_id_for_task.clone());
+                error
+            });
             let terminal_event = terminal_event(&request_id_for_task, &result);
             enqueue_reserved_terminal(terminal_permit, terminal_event, &terminal_for_task);
             let _ = final_tx.send(result);
@@ -604,13 +613,13 @@ impl GatewayBackend for HostedProviderBackend {
                 error = map_http_error(&request_id, &self.config.id, response) => error,
             });
         }
-        let value = tokio::select! {
-            () = cancellation.cancelled() => {
-                return Err(cancelled_error(&request_id, &self.config.id));
-            }
-            value = response.json::<Value>() => value
-                .map_err(|error| map_transport_error(&request_id, &self.config.id, error))?,
-        };
+        let value = read_provider_json(response, &request_id, &self.config.id, &cancellation)
+            .await
+            .map_err(|mut error| {
+                error.request_id = request_id.clone();
+                error.provider = Some(self.config.id.clone());
+                error
+            })?;
         Ok(GatewayUsage {
             input_tokens: value
                 .get("input_tokens")
@@ -636,13 +645,32 @@ fn terminal_event(
     result: &Result<GatewayResponse, GatewayError>,
 ) -> GatewayEvent {
     match result {
-        Ok(response) if response.status == TerminalStatus::Completed => GatewayEvent::Completed {
-            request_id: request_id.clone(),
-            response: Box::new(response.clone()),
-        },
-        Ok(response) => GatewayEvent::Cancelled {
+        Ok(response)
+            if matches!(
+                response.status,
+                TerminalStatus::Completed | TerminalStatus::Incomplete
+            ) =>
+        {
+            GatewayEvent::Completed {
+                request_id: request_id.clone(),
+                response: Box::new(response.clone()),
+            }
+        }
+        Ok(response) if response.status == TerminalStatus::Cancelled => GatewayEvent::Cancelled {
             request_id: request_id.clone(),
             usage: response.usage.clone(),
+        },
+        Ok(response) => GatewayEvent::Failed {
+            request_id: request_id.clone(),
+            error: GatewayError {
+                code: "backend_response_failed".into(),
+                class: ErrorClass::Provider,
+                retryable: false,
+                http_status: 502,
+                request_id: request_id.clone(),
+                provider: Some(response.route.backend_id.clone()),
+                safe_detail: "the backend returned a failed response".into(),
+            },
         },
         Err(error) if error.class == ErrorClass::Cancelled => GatewayEvent::Cancelled {
             request_id: request_id.clone(),
@@ -1216,7 +1244,7 @@ fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
                 ..
             } => {
                 call_names.insert(call_id.clone(), name.clone());
-                let part = json!({"functionCall":{"name":name,"args":arguments}});
+                let part = json!({"functionCall":{"id":call_id,"name":name,"args":arguments}});
                 if !append_to_last_role(&mut contents, "model", "parts", part.clone()) {
                     contents.push(json!({"role":"model","parts":[part]}));
                 }
@@ -1234,7 +1262,7 @@ fn gemini_body(request: &BackendRequest) -> Result<Value, GatewayError> {
                 };
                 contents.push(json!({
                     "role":"user",
-                    "parts":[{"functionResponse":{"name":name,"response":{"content":content_text(output)}}}]
+                    "parts":[{"functionResponse":{"id":call_id,"name":name,"response":{"content":content_text(output)}}}]
                 }));
             }
             fte_types::InputItem::Reasoning {
@@ -2105,10 +2133,7 @@ async fn consume_provider_json(
         events,
         cancellation,
     } = request;
-    let value = response
-        .json::<Value>()
-        .await
-        .map_err(|error| map_transport_error(&request_id, &route.backend_id, error))?;
+    let value = read_provider_json(response, &request_id, &route.backend_id, &cancellation).await?;
     let response = parse_provider_response(
         protocol,
         &value,
@@ -2151,6 +2176,31 @@ async fn consume_provider_stream(
         events,
         cancellation,
     } = request;
+    if response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim() == "application/json")
+        })
+    {
+        return consume_provider_json(
+            response,
+            ProviderJsonRequest {
+                protocol,
+                request_id,
+                response_id,
+                route,
+                previous_response_id,
+                events,
+                cancellation,
+            },
+        )
+        .await;
+    }
     let mut bytes = response.bytes_stream();
     let mut parser = SseParser::default();
     let mut state = ProviderStreamState::new(
@@ -2210,9 +2260,13 @@ async fn consume_provider_stream(
     state.finish(&events).await
 }
 
+/// Strict UTF-8, bounded SSE framing. CRLF is a single line ending even
+/// when split across transport chunks. EOF never dispatches a partial frame.
 #[derive(Default)]
 struct SseParser {
     buffer: Vec<u8>,
+    after_cr: bool,
+    received: usize,
 }
 
 struct SseFrame {
@@ -2222,53 +2276,114 @@ struct SseFrame {
 
 impl SseParser {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<SseFrame>, GatewayError> {
-        self.buffer.extend_from_slice(bytes);
-        self.take(false)
-    }
-
-    fn finish(&mut self) -> Result<Vec<SseFrame>, GatewayError> {
-        self.take(true)
-    }
-
-    fn take(&mut self, finish: bool) -> Result<Vec<SseFrame>, GatewayError> {
-        let mut frames = Vec::new();
-        while let Some(index) = self.buffer.windows(2).position(|window| window == b"\n\n") {
-            let bytes = self.buffer.drain(..index + 2).collect::<Vec<_>>();
-            if let Some(frame) = parse_sse_frame(&bytes[..index])? {
-                frames.push(frame);
-            }
+        self.received = self.received.saturating_add(bytes.len());
+        if self.received > MAX_PROVIDER_STREAM_BYTES {
+            return Err(provider_limit_error("provider_stream_too_large"));
         }
-        if finish && !self.buffer.is_empty() {
-            let bytes = std::mem::take(&mut self.buffer);
-            if let Some(frame) = parse_sse_frame(&bytes)? {
-                frames.push(frame);
+        let mut frames = Vec::new();
+        for &byte in bytes {
+            if self.after_cr && byte == b'\n' {
+                self.after_cr = false;
+                continue;
+            }
+            self.after_cr = byte == b'\r';
+            if byte == b'\r' || byte == b'\n' {
+                if self.buffer.is_empty() || self.buffer.last() == Some(&b'\n') {
+                    if let Some(frame) = parse_sse_frame(&self.buffer)? {
+                        frames.push(frame);
+                    }
+                    self.buffer.clear();
+                } else {
+                    self.buffer.push(b'\n');
+                }
+            } else {
+                self.buffer.push(byte);
+            }
+            if self.buffer.len() > MAX_PROVIDER_FRAME_BYTES {
+                return Err(provider_limit_error("provider_frame_too_large"));
             }
         }
         Ok(frames)
+    }
+
+    fn finish(&mut self) -> Result<Vec<SseFrame>, GatewayError> {
+        // Validate even discarded trailing bytes; never repair malformed UTF-8.
+        std::str::from_utf8(&self.buffer)
+            .map_err(|_| provider_limit_error("provider_stream_invalid_utf8"))?;
+        self.buffer.clear();
+        Ok(Vec::new())
     }
 }
 
 fn parse_sse_frame(bytes: &[u8]) -> Result<Option<SseFrame>, GatewayError> {
     let text = std::str::from_utf8(bytes)
-        .map_err(|error| provider_request_error(&RequestId::new(), "provider", error))?;
+        .map_err(|_| provider_limit_error("provider_stream_invalid_utf8"))?;
     let mut event = None;
     let mut data = Vec::new();
-    for raw in text.lines() {
-        let line = raw.trim_end_matches('\r');
+    for line in text.split('\n') {
         if line.starts_with(':') {
             continue;
         }
-        if let Some(value) = line.strip_prefix("event:") {
-            event = Some(value.trim().to_string());
-        }
-        if let Some(value) = line.strip_prefix("data:") {
-            data.push(value.trim_start().to_string());
+        let (field, value) = line.split_once(':').unwrap_or((line, ""));
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        match field {
+            "event" => event = Some(value.to_owned()),
+            "data" => data.push(value),
+            _ => {}
         }
     }
     Ok((!data.is_empty()).then(|| SseFrame {
         event,
         data: data.join("\n"),
     }))
+}
+
+fn provider_limit_error(code: &str) -> GatewayError {
+    GatewayError {
+        code: code.into(),
+        class: ErrorClass::Provider,
+        retryable: false,
+        http_status: 502,
+        request_id: RequestId::new(),
+        provider: None,
+        safe_detail: "the hosted provider returned invalid or oversized output".into(),
+    }
+}
+
+async fn read_provider_json(
+    response: reqwest::Response,
+    request_id: &RequestId,
+    provider: &str,
+    cancellation: &CancellationToken,
+) -> Result<Value, GatewayError> {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            () = cancellation.cancelled() => return Err(cancelled_error(request_id, provider)),
+            chunk = stream.next() => chunk,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let chunk = chunk.map_err(|error| map_transport_error(request_id, provider, error))?;
+        if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_RESULT_BYTES {
+            return Err(provider_limit_error("provider_result_too_large"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| {
+        provider_response_error(request_id, provider, "the provider returned invalid JSON")
+    })
+}
+
+#[derive(Default)]
+struct StreamChoice {
+    outputs: Vec<usize>,
+    text_output: Option<usize>,
+    refusal: bool,
+    tools: BTreeMap<usize, usize>,
+    finish: Option<FinishReason>,
 }
 
 struct ProviderStreamState {
@@ -2287,6 +2402,10 @@ struct ProviderStreamState {
     gemini_function_outputs: HashMap<(usize, usize), usize>,
     usage: GatewayUsage,
     provider_terminal: Option<GatewayResponse>,
+    choices: BTreeMap<usize, StreamChoice>,
+    terminal_seen: bool,
+    decoded_bytes: usize,
+    announced_outputs: std::collections::BTreeSet<usize>,
     cancellation: CancellationToken,
 }
 
@@ -2315,6 +2434,10 @@ impl ProviderStreamState {
             gemini_function_outputs: HashMap::new(),
             usage: GatewayUsage::default(),
             provider_terminal: None,
+            choices: BTreeMap::new(),
+            terminal_seen: false,
+            decoded_bytes: 0,
+            announced_outputs: std::collections::BTreeSet::new(),
             cancellation,
         }
     }
@@ -2340,11 +2463,38 @@ impl ProviderStreamState {
         events: &mpsc::Sender<GatewayEvent>,
     ) -> Result<bool, GatewayError> {
         if frame.data == "[DONE]" {
+            if !matches!(
+                self.protocol,
+                WireProtocol::OpenAiChat | WireProtocol::OpenAiCompletion
+            ) {
+                return Err(provider_response_error(
+                    &self.request_id,
+                    &self.route.backend_id,
+                    "unexpected stream terminator",
+                ));
+            }
+            self.terminal_seen = true;
             return Ok(true);
         }
-        let value: Value = serde_json::from_str(&frame.data).map_err(|error| {
-            provider_request_error(&self.request_id, &self.route.backend_id, error)
+        self.decoded_bytes = self.decoded_bytes.saturating_add(frame.data.len());
+        if self.decoded_bytes > MAX_PROVIDER_RESULT_BYTES {
+            return Err(provider_limit_error("provider_result_too_large"));
+        }
+        let value: Value = serde_json::from_str(&frame.data).map_err(|_| {
+            provider_response_error(
+                &self.request_id,
+                &self.route.backend_id,
+                "the provider returned an invalid JSON event",
+            )
         })?;
+        validate_provider_shape(&value)?;
+        if value.get("error").is_some() {
+            return Err(provider_event_error(
+                &self.request_id,
+                &self.route.backend_id,
+                &value,
+            ));
+        }
         match self.protocol {
             WireProtocol::OpenAiResponses => {
                 self.consume_openai_responses_event(value, events).await
@@ -2380,6 +2530,7 @@ impl ProviderStreamState {
                         events,
                         GatewayEvent::OutputItemAdded {
                             request_id: self.request_id.clone(),
+                            group_index: Some(0),
                             output_index: index,
                             item,
                         },
@@ -2509,7 +2660,7 @@ impl ProviderStreamState {
                     return Ok(true);
                 }
             }
-            "error" => {
+            "error" | "response.failed" => {
                 return Err(provider_event_error(
                     &self.request_id,
                     &self.route.backend_id,
@@ -2526,36 +2677,170 @@ impl ProviderStreamState {
         value: Value,
         events: &mpsc::Sender<GatewayEvent>,
     ) -> Result<bool, GatewayError> {
-        if let Some(usage) = value.get("usage") {
+        if let Some(usage) = value.get("usage").filter(|v| !v.is_null()) {
             self.usage = usage_from_openai(usage, self.route.clone());
         }
         if let Some(choices) = value.get("choices").and_then(Value::as_array) {
             for choice in choices {
-                let index = choice
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .unwrap_or_default() as usize;
-                let delta = match self.protocol {
-                    WireProtocol::OpenAiChat => choice
-                        .get("delta")
-                        .and_then(|delta| delta.get("content"))
-                        .and_then(Value::as_str),
-                    _ => choice.get("text").and_then(Value::as_str),
+                let index = usize_field(choice, "index").unwrap_or_default();
+                if self
+                    .choices
+                    .get(&index)
+                    .is_some_and(|choice| choice.finish.is_some())
+                {
+                    return Err(provider_response_error(
+                        &self.request_id,
+                        &self.route.backend_id,
+                        "output arrived after its finish reason",
+                    ));
+                }
+                self.choices.entry(index).or_default();
+                let delta = choice.get("delta").unwrap_or(&Value::Null);
+                if delta.get("refusal").and_then(Value::as_str).is_some() {
+                    self.choices
+                        .get_mut(&index)
+                        .expect("registered choice")
+                        .refusal = true;
+                }
+                if delta.get("function_call").is_some() {
+                    return Err(provider_limit_error(
+                        "provider_legacy_function_call_unsupported",
+                    ));
+                }
+                let text = if matches!(self.protocol, WireProtocol::OpenAiChat) {
+                    delta
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .or_else(|| delta.get("refusal").and_then(Value::as_str))
+                } else {
+                    choice.get("text").and_then(Value::as_str)
                 };
-                if let Some(delta) = delta {
-                    self.text.entry(index).or_default().push_str(delta);
-                    self.emit(
-                        events,
-                        GatewayEvent::TextDelta {
-                            request_id: self.request_id.clone(),
-                            output_index: index,
-                            content_index: 0,
-                            delta: delta.to_string(),
-                        },
-                    )
-                    .await?;
+                if let Some(text) = text {
+                    let output_index = if let Some(index) = self.choices[&index].text_output {
+                        index
+                    } else {
+                        let output_index = self.outputs.len();
+                        let item = fte_types::OutputItem::Message {
+                            id: format!("msg_{}", Uuid::new_v4()),
+                            role: fte_types::MessageRole::Assistant,
+                            content: Vec::new(),
+                        };
+                        self.outputs.push(item.clone());
+                        let group = self.choices.get_mut(&index).expect("registered choice");
+                        group.text_output = Some(output_index);
+                        group.outputs.push(output_index);
+                        self.emit(
+                            events,
+                            GatewayEvent::OutputItemAdded {
+                                request_id: self.request_id.clone(),
+                                group_index: Some(index),
+                                output_index,
+                                item,
+                            },
+                        )
+                        .await?;
+                        output_index
+                    };
+                    self.text.entry(output_index).or_default().push_str(text);
+                    if !self.choices[&index].refusal {
+                        self.emit(
+                            events,
+                            GatewayEvent::TextDelta {
+                                request_id: self.request_id.clone(),
+                                output_index,
+                                content_index: 0,
+                                delta: text.into(),
+                            },
+                        )
+                        .await?;
+                    }
+                }
+                if let Some(tools) = delta.get("tool_calls").and_then(Value::as_array) {
+                    for tool in tools {
+                        let tool_index = usize_field(tool, "index").unwrap_or_default();
+                        let function = tool.get("function").unwrap_or(&Value::Null);
+                        let output_index = if let Some(index) =
+                            self.choices[&index].tools.get(&tool_index)
+                        {
+                            *index
+                        } else {
+                            let call_id = tool
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.is_empty())
+                                .ok_or_else(|| {
+                                    provider_response_error(
+                                        &self.request_id,
+                                        &self.route.backend_id,
+                                        "first tool delta lacks call identity",
+                                    )
+                                })?;
+                            let name = function
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .filter(|name| !name.is_empty())
+                                .ok_or_else(|| {
+                                    provider_response_error(
+                                        &self.request_id,
+                                        &self.route.backend_id,
+                                        "first tool delta lacks function name",
+                                    )
+                                })?;
+                            let item = fte_types::OutputItem::FunctionCall {
+                                id: format!("fc_{}", Uuid::new_v4()),
+                                call_id: call_id.into(),
+                                name: name.into(),
+                                arguments: json!({}),
+                            };
+                            let output_index = self.outputs.len();
+                            self.outputs.push(item.clone());
+                            let group = self.choices.get_mut(&index).expect("registered choice");
+                            group.tools.insert(tool_index, output_index);
+                            group.outputs.push(output_index);
+                            self.emit(
+                                events,
+                                GatewayEvent::OutputItemAdded {
+                                    request_id: self.request_id.clone(),
+                                    group_index: Some(index),
+                                    output_index,
+                                    item,
+                                },
+                            )
+                            .await?;
+                            output_index
+                        };
+                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                            self.function_arguments
+                                .entry(output_index)
+                                .or_default()
+                                .push_str(arguments);
+                            self.emit(
+                                events,
+                                GatewayEvent::FunctionArgumentsDelta {
+                                    request_id: self.request_id.clone(),
+                                    output_index,
+                                    delta: arguments.into(),
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                    let finish = if self.choices[&index].refusal {
+                        FinishReason::Refusal
+                    } else {
+                        openai_finish_reason(reason)?
+                    };
+                    self.choices
+                        .get_mut(&index)
+                        .expect("registered choice")
+                        .finish = Some(finish);
                 }
             }
+        }
+        if self.outputs.len() > MAX_PROVIDER_OUTPUTS {
+            return Err(provider_limit_error("provider_output_count_exceeded"));
         }
         Ok(false)
     }
@@ -2571,6 +2856,7 @@ impl ProviderStreamState {
             .unwrap_or_default()
         {
             "message_start" => {
+                self.choices.entry(0).or_default();
                 if let Some(usage) = value.pointer("/message/usage") {
                     self.usage = usage_from_anthropic(usage, self.route.clone());
                 }
@@ -2584,6 +2870,7 @@ impl ProviderStreamState {
                         events,
                         GatewayEvent::OutputItemAdded {
                             request_id: self.request_id.clone(),
+                            group_index: Some(0),
                             output_index: index,
                             item,
                         },
@@ -2649,12 +2936,21 @@ impl ProviderStreamState {
                 }
             }
             "message_delta" => {
+                if let Some(reason) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    self.choices.entry(0).or_default().finish = Some(anthropic_finish_reason(
+                        reason,
+                        value.pointer("/delta/stop_sequence"),
+                    )?);
+                }
                 if let Some(usage) = value.get("usage") {
                     merge_anthropic_usage(&mut self.usage, usage);
                 }
             }
-            "message_stop" => return Ok(true),
-            "error" => {
+            "message_stop" => {
+                self.terminal_seen = true;
+                return Ok(true);
+            }
+            "error" | "response.failed" => {
                 return Err(provider_event_error(
                     &self.request_id,
                     &self.route.backend_id,
@@ -2681,6 +2977,13 @@ impl ProviderStreamState {
             .flatten()
             .enumerate()
         {
+            let candidate_index = usize_field(candidate, "index").unwrap_or(candidate_index);
+            let before = self.outputs.len();
+            self.choices.entry(candidate_index).or_default();
+            if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
+                self.choices.entry(candidate_index).or_default().finish =
+                    Some(gemini_finish_reason(reason)?);
+            }
             let parts = candidate
                 .pointer("/content/parts")
                 .and_then(Value::as_array)
@@ -2701,6 +3004,8 @@ impl ProviderStreamState {
                                 });
                                 output_index
                             });
+                        self.announce_output(output_index, candidate_index, events)
+                            .await?;
                         self.reasoning
                             .entry(output_index)
                             .or_default()
@@ -2735,6 +3040,8 @@ impl ProviderStreamState {
                                 });
                                 output_index
                             });
+                        self.announce_output(output_index, candidate_index, events)
+                            .await?;
                         self.text.entry(output_index).or_default().push_str(text);
                         self.emit(
                             events,
@@ -2756,7 +3063,10 @@ impl ProviderStreamState {
                             let output_index = self.outputs.len();
                             self.outputs.push(fte_types::OutputItem::FunctionCall {
                                 id: format!("fc_{}", Uuid::new_v4()),
-                                call_id: format!("call_{}", Uuid::new_v4()),
+                                call_id: call.get("id").and_then(Value::as_str).map_or_else(
+                                    || format!("call_{}", Uuid::new_v4()),
+                                    ToString::to_string,
+                                ),
                                 name: call
                                     .get("name")
                                     .and_then(Value::as_str)
@@ -2766,6 +3076,8 @@ impl ProviderStreamState {
                             });
                             output_index
                         });
+                    self.announce_output(output_index, candidate_index, events)
+                        .await?;
                     let arguments = call
                         .get("args")
                         .cloned()
@@ -2787,8 +3099,39 @@ impl ProviderStreamState {
                     .await?;
                 }
             }
+            self.choices
+                .entry(candidate_index)
+                .or_default()
+                .outputs
+                .extend(before..self.outputs.len());
+        }
+        self.terminal_seen =
+            !self.choices.is_empty() && self.choices.values().all(|choice| choice.finish.is_some());
+        if self.outputs.len() > MAX_PROVIDER_OUTPUTS {
+            return Err(provider_limit_error("provider_output_count_exceeded"));
         }
         Ok(false)
+    }
+
+    async fn announce_output(
+        &mut self,
+        output_index: usize,
+        group_index: usize,
+        events: &mpsc::Sender<GatewayEvent>,
+    ) -> Result<(), GatewayError> {
+        if self.announced_outputs.insert(output_index) {
+            self.emit(
+                events,
+                GatewayEvent::OutputItemAdded {
+                    request_id: self.request_id.clone(),
+                    output_index,
+                    group_index: Some(group_index),
+                    item: self.outputs[output_index].clone(),
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn finish(
@@ -2797,6 +3140,20 @@ impl ProviderStreamState {
     ) -> Result<GatewayResponse, GatewayError> {
         if let Some(response) = self.provider_terminal.take() {
             return Ok(response);
+        }
+        if !self.terminal_seen
+            || self.choices.is_empty()
+            || self.choices.values().any(|choice| choice.finish.is_none())
+        {
+            return Err(GatewayError {
+                code: "provider_stream_incomplete".into(),
+                class: ErrorClass::Provider,
+                retryable: false,
+                http_status: 502,
+                request_id: self.request_id.clone(),
+                provider: Some(self.route.backend_id.clone()),
+                safe_detail: "the provider stream ended without a complete terminal record".into(),
+            });
         }
         if self.outputs.is_empty() {
             for (index, text) in &self.text {
@@ -2823,9 +3180,8 @@ impl ProviderStreamState {
                 arguments: stored, ..
             }) = self.outputs.get_mut(index)
             {
-                *stored = serde_json::from_str(&arguments).map_err(|error| {
-                    provider_request_error(&self.request_id, &self.route.backend_id, error)
-                })?;
+                *stored = serde_json::from_str(&arguments)
+                    .map_err(|_| provider_limit_error("provider_tool_arguments_invalid"))?;
             }
         }
         for (index, reasoning) in self.reasoning {
@@ -2848,6 +3204,34 @@ impl ProviderStreamState {
                 });
             }
         }
+        let mut output_groups = self
+            .choices
+            .into_iter()
+            .map(|(index, choice)| OutputGroup {
+                index,
+                output_indices: if matches!(self.protocol, WireProtocol::AnthropicMessages) {
+                    (0..self.outputs.len()).collect()
+                } else {
+                    choice.outputs
+                },
+                finish_reason: choice.finish.expect("terminal checked"),
+            })
+            .collect::<Vec<_>>();
+        if matches!(self.protocol, WireProtocol::GeminiGenerateContent) {
+            for group in &mut output_groups {
+                if group.finish_reason == FinishReason::Stop
+                    && group.output_indices.iter().any(|index| {
+                        matches!(
+                            self.outputs.get(*index),
+                            Some(fte_types::OutputItem::FunctionCall { .. })
+                        )
+                    })
+                {
+                    group.finish_reason = FinishReason::ToolCalls;
+                }
+            }
+        }
+        let status = groups_status(&output_groups);
         let response = GatewayResponse {
             id: self.response_id,
             request_id: self.request_id.clone(),
@@ -2855,9 +3239,11 @@ impl ProviderStreamState {
             route: self.route,
             output: self.outputs,
             usage: self.usage,
-            status: TerminalStatus::Completed,
+            output_groups,
+            status,
             previous_response_id: self.previous_response_id,
         };
+        validate_result_size(&response)?;
         emit_completed_lifecycle(
             events,
             &self.cancellation,
@@ -2870,6 +3256,126 @@ impl ProviderStreamState {
     }
 }
 
+fn openai_finish_reason(reason: &str) -> Result<FinishReason, GatewayError> {
+    match reason {
+        "stop" => Ok(FinishReason::Stop),
+        "length" => Ok(FinishReason::Length),
+        "tool_calls" => Ok(FinishReason::ToolCalls),
+        "content_filter" => Ok(FinishReason::ContentFilter),
+        _ => Err(provider_limit_error("provider_finish_reason_unsupported")),
+    }
+}
+
+fn anthropic_finish_reason(
+    reason: &str,
+    sequence: Option<&Value>,
+) -> Result<FinishReason, GatewayError> {
+    match reason {
+        "end_turn" => Ok(FinishReason::Stop),
+        "max_tokens" => Ok(FinishReason::Length),
+        "model_context_window_exceeded" => Ok(FinishReason::ContextLimit),
+        "tool_use" => Ok(FinishReason::ToolCalls),
+        "refusal" => Ok(FinishReason::Refusal),
+        "stop_sequence" => sequence
+            .and_then(Value::as_str)
+            .map(|sequence| FinishReason::StopSequence {
+                sequence: sequence.into(),
+            })
+            .ok_or_else(|| provider_limit_error("provider_stop_sequence_missing")),
+        _ => Err(provider_limit_error("provider_finish_reason_unsupported")),
+    }
+}
+
+fn gemini_finish_reason(reason: &str) -> Result<FinishReason, GatewayError> {
+    match reason {
+        "STOP" => Ok(FinishReason::Stop),
+        "MAX_TOKENS" => Ok(FinishReason::Length),
+        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" => {
+            Ok(FinishReason::ContentFilter)
+        }
+        _ => Err(provider_limit_error("provider_finish_reason_unsupported")),
+    }
+}
+
+fn groups_status(groups: &[OutputGroup]) -> TerminalStatus {
+    if groups
+        .iter()
+        .any(|group| group.finish_reason.is_incomplete())
+    {
+        TerminalStatus::Incomplete
+    } else {
+        TerminalStatus::Completed
+    }
+}
+
+fn validate_provider_shape(value: &Value) -> Result<(), GatewayError> {
+    match value {
+        Value::Array(items) => {
+            if items.len() > MAX_PROVIDER_OUTPUTS {
+                return Err(provider_limit_error("provider_output_count_exceeded"));
+            }
+            for item in items {
+                validate_provider_shape(item)?;
+            }
+        }
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if matches!(
+                    key.as_str(),
+                    "index" | "output_index" | "content_index" | "summary_index"
+                ) && value
+                    .as_u64()
+                    .is_none_or(|index| index >= MAX_PROVIDER_OUTPUTS as u64)
+                {
+                    return Err(provider_limit_error("provider_output_index_exceeded"));
+                }
+                if matches!(
+                    key.as_str(),
+                    "choices"
+                        | "candidates"
+                        | "output"
+                        | "content"
+                        | "parts"
+                        | "tool_calls"
+                        | "delta"
+                        | "response"
+                        | "item"
+                        | "content_block"
+                ) {
+                    validate_provider_shape(value)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_result_size(response: &GatewayResponse) -> Result<(), GatewayError> {
+    if response.output_groups.iter().any(|group| {
+        group.finish_reason == FinishReason::ToolCalls
+            && !group.output_indices.iter().any(|index| {
+                matches!(
+                    response.output.get(*index),
+                    Some(fte_types::OutputItem::FunctionCall { .. })
+                )
+            })
+    }) {
+        return Err(provider_limit_error("provider_tool_handoff_empty"));
+    }
+    if response.output.len() > MAX_PROVIDER_OUTPUTS
+        || serde_json::to_vec(&response.output)
+            .map_err(|error| {
+                provider_request_error(&response.request_id, &response.route.backend_id, error)
+            })?
+            .len()
+            > MAX_PROVIDER_RESULT_BYTES
+    {
+        return Err(provider_limit_error("provider_result_too_large"));
+    }
+    Ok(())
+}
+
 fn parse_provider_response(
     protocol: WireProtocol,
     value: &Value,
@@ -2878,7 +3384,8 @@ fn parse_provider_response(
     route: ResolvedRoute,
     previous: Option<String>,
 ) -> Result<GatewayResponse, GatewayError> {
-    match protocol {
+    validate_provider_shape(value)?;
+    let response = match protocol {
         WireProtocol::OpenAiResponses => {
             parse_openai_responses(value, request_id, response_id, route, previous)
         }
@@ -2894,7 +3401,28 @@ fn parse_provider_response(
         WireProtocol::GeminiGenerateContent => {
             parse_gemini(value, request_id, response_id, route, previous)
         }
+    }?;
+    validate_result_size(&response)?;
+    Ok(response)
+}
+
+fn validate_responses_tool_arguments(value: &Value) -> Result<(), GatewayError> {
+    for item in value
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .ok_or_else(|| provider_limit_error("provider_tool_arguments_missing"))?;
+            serde_json::from_str::<Value>(arguments)
+                .map_err(|_| provider_limit_error("provider_tool_arguments_invalid"))?;
+        }
     }
+    Ok(())
 }
 
 fn parse_openai_responses(
@@ -2904,6 +3432,7 @@ fn parse_openai_responses(
     route: ResolvedRoute,
     previous: Option<String>,
 ) -> Result<GatewayResponse, GatewayError> {
+    validate_responses_tool_arguments(value)?;
     let output = value
         .get("output")
         .and_then(Value::as_array)
@@ -2913,6 +3442,60 @@ fn parse_openai_responses(
         .iter()
         .map(parse_openai_output_item)
         .collect::<Result<Vec<_>, _>>()?;
+    let status = match value.get("status").and_then(Value::as_str) {
+        Some("completed") => TerminalStatus::Completed,
+        Some("incomplete") => TerminalStatus::Incomplete,
+        Some("cancelled") => TerminalStatus::Cancelled,
+        _ => {
+            return Err(provider_response_error(
+                request_id,
+                &route.backend_id,
+                "Responses result lacks a supported terminal status",
+            ));
+        }
+    };
+    let finish_reason = if status == TerminalStatus::Incomplete {
+        match value
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+        {
+            Some("max_output_tokens") => FinishReason::Length,
+            Some("content_filter") => FinishReason::ContentFilter,
+            _ => {
+                return Err(provider_response_error(
+                    request_id,
+                    &route.backend_id,
+                    "unsupported incomplete reason",
+                ));
+            }
+        }
+    } else if output
+        .iter()
+        .any(|item| matches!(item, fte_types::OutputItem::FunctionCall { .. }))
+    {
+        FinishReason::ToolCalls
+    } else if value
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|item| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|part| part.get("type").and_then(Value::as_str) == Some("refusal"))
+        })
+    {
+        FinishReason::Refusal
+    } else {
+        FinishReason::Stop
+    };
+    let output_groups = vec![OutputGroup {
+        index: 0,
+        output_indices: (0..output.len()).collect(),
+        finish_reason,
+    }];
     Ok(GatewayResponse {
         id: response_id.to_string(),
         request_id: request_id.clone(),
@@ -2924,11 +3507,8 @@ fn parse_openai_responses(
         route: route.clone(),
         output,
         usage: usage_from_openai(value.get("usage").unwrap_or(&Value::Null), route),
-        status: if value.get("status").and_then(Value::as_str) == Some("cancelled") {
-            TerminalStatus::Cancelled
-        } else {
-            TerminalStatus::Completed
-        },
+        status,
+        output_groups,
         previous_response_id: previous,
     })
 }
@@ -2940,34 +3520,7 @@ fn parse_openai_chat(
     route: ResolvedRoute,
     previous: Option<String>,
 ) -> Result<GatewayResponse, GatewayError> {
-    let choices = value
-        .get("choices")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            provider_response_error(request_id, &route.backend_id, "Chat choices are missing")
-        })?;
-    let output = choices
-        .iter()
-        .map(|choice| fte_types::OutputItem::Message {
-            id: format!("msg_{}", Uuid::new_v4()),
-            role: fte_types::MessageRole::Assistant,
-            content: vec![fte_types::ContentBlock::Text {
-                text: choice
-                    .pointer("/message/content")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            }],
-        })
-        .collect();
-    Ok(hosted_response(
-        value,
-        request_id,
-        response_id,
-        route,
-        previous,
-        output,
-    ))
+    parse_openai_choices(value, request_id, response_id, route, previous, true)
 }
 
 fn parse_openai_completion(
@@ -2977,38 +3530,126 @@ fn parse_openai_completion(
     route: ResolvedRoute,
     previous: Option<String>,
 ) -> Result<GatewayResponse, GatewayError> {
+    parse_openai_choices(value, request_id, response_id, route, previous, false)
+}
+
+fn parse_openai_choices(
+    value: &Value,
+    request_id: &RequestId,
+    response_id: &str,
+    route: ResolvedRoute,
+    previous: Option<String>,
+    chat: bool,
+) -> Result<GatewayResponse, GatewayError> {
     let choices = value
         .get("choices")
         .and_then(Value::as_array)
+        .filter(|choices| !choices.is_empty())
         .ok_or_else(|| {
             provider_response_error(
                 request_id,
                 &route.backend_id,
-                "Completion choices are missing",
+                "provider choices are missing",
             )
         })?;
-    let output = choices
-        .iter()
-        .map(|choice| fte_types::OutputItem::Message {
-            id: format!("msg_{}", Uuid::new_v4()),
-            role: fte_types::MessageRole::Assistant,
-            content: vec![fte_types::ContentBlock::Text {
-                text: choice
-                    .get("text")
+    let mut output = Vec::new();
+    let mut groups = Vec::new();
+    for (fallback_index, choice) in choices.iter().enumerate() {
+        let start = output.len();
+        let reason = choice
+            .get("finish_reason")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                provider_response_error(
+                    request_id,
+                    &route.backend_id,
+                    "choice lacks a finish reason",
+                )
+            })?;
+        let mut finish_reason = openai_finish_reason(reason)?;
+        let message = choice.get("message").unwrap_or(&Value::Null);
+        if chat
+            && (!message.is_object()
+                || message
+                    .get("content")
+                    .is_some_and(|value| !value.is_null() && !value.is_string())
+                || message.get("function_call").is_some())
+        {
+            return Err(provider_limit_error("provider_chat_message_unsupported"));
+        }
+        let text = if chat {
+            message.get("content").and_then(Value::as_str)
+        } else {
+            choice.get("text").and_then(Value::as_str)
+        };
+        let refusal = message.get("refusal").and_then(Value::as_str);
+        if refusal.is_some() {
+            finish_reason = FinishReason::Refusal;
+        }
+        if let Some(text) = text.or(refusal) {
+            output.push(fte_types::OutputItem::Message {
+                id: format!("msg_{}", Uuid::new_v4()),
+                role: fte_types::MessageRole::Assistant,
+                content: vec![fte_types::ContentBlock::Text { text: text.into() }],
+            });
+        }
+        if let Some(tools) = message.get("tool_calls").and_then(Value::as_array) {
+            for tool in tools {
+                let call_id = tool
+                    .get("id")
                     .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            }],
-        })
-        .collect();
-    Ok(hosted_response(
-        value,
-        request_id,
-        response_id,
-        route,
-        previous,
-        output,
-    ))
+                    .filter(|s| !s.is_empty());
+                let name = tool
+                    .pointer("/function/name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                let arguments = tool.pointer("/function/arguments").and_then(Value::as_str);
+                let (Some(call_id), Some(name), Some(arguments)) = (call_id, name, arguments)
+                else {
+                    return Err(provider_response_error(
+                        request_id,
+                        &route.backend_id,
+                        "function call lacks identity/name/arguments",
+                    ));
+                };
+                if tool.get("type").and_then(Value::as_str) != Some("function") {
+                    return Err(provider_response_error(
+                        request_id,
+                        &route.backend_id,
+                        "unsupported tool type",
+                    ));
+                }
+                output.push(fte_types::OutputItem::FunctionCall {
+                    id: format!("fc_{}", Uuid::new_v4()),
+                    call_id: call_id.into(),
+                    name: name.into(),
+                    arguments: serde_json::from_str(arguments)
+                        .map_err(|_| provider_limit_error("provider_tool_arguments_invalid"))?,
+                });
+            }
+        }
+        let index = usize_field(choice, "index").unwrap_or(fallback_index);
+        if groups
+            .iter()
+            .any(|group: &OutputGroup| group.index == index)
+        {
+            return Err(provider_response_error(
+                request_id,
+                &route.backend_id,
+                "duplicate choice index",
+            ));
+        }
+        groups.push(OutputGroup {
+            index,
+            output_indices: (start..output.len()).collect(),
+            finish_reason,
+        });
+    }
+    groups.sort_by_key(|group| group.index);
+    let mut response = hosted_response(value, request_id, response_id, route, previous, output);
+    response.status = groups_status(&groups);
+    response.output_groups = groups;
+    Ok(response)
 }
 
 fn hosted_response(
@@ -3030,6 +3671,7 @@ fn hosted_response(
         route: route.clone(),
         output,
         usage: usage_from_openai(value.get("usage").unwrap_or(&Value::Null), route),
+        output_groups: Vec::new(),
         status: TerminalStatus::Completed,
         previous_response_id: previous,
     }
@@ -3056,6 +3698,22 @@ fn parse_anthropic(
         .enumerate()
         .map(|(index, block)| parse_anthropic_output_item(block, index))
         .collect::<Result<Vec<_>, _>>()?;
+    let reason = value
+        .get("stop_reason")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            provider_response_error(
+                request_id,
+                &route.backend_id,
+                "Anthropic result lacks a stop reason",
+            )
+        })?;
+    let output_groups = vec![OutputGroup {
+        index: 0,
+        output_indices: (0..output.len()).collect(),
+        finish_reason: anthropic_finish_reason(reason, value.get("stop_sequence"))?,
+    }];
+    let status = groups_status(&output_groups);
     Ok(GatewayResponse {
         id: response_id.to_string(),
         request_id: request_id.clone(),
@@ -3067,7 +3725,8 @@ fn parse_anthropic(
         route: route.clone(),
         output,
         usage: usage_from_anthropic(value.get("usage").unwrap_or(&Value::Null), route),
-        status: TerminalStatus::Completed,
+        output_groups,
+        status,
         previous_response_id: previous,
     })
 }
@@ -3090,7 +3749,9 @@ fn parse_gemini(
             )
         })?;
     let mut output = Vec::new();
-    for candidate in candidates {
+    let mut output_groups = Vec::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let start = output.len();
         let mut text = String::new();
         for part in candidate
             .pointer("/content/parts")
@@ -3125,7 +3786,10 @@ fn parse_gemini(
             if let Some(call) = part.get("functionCall") {
                 output.push(fte_types::OutputItem::FunctionCall {
                     id: format!("fc_{}", Uuid::new_v4()),
-                    call_id: format!("call_{}", Uuid::new_v4()),
+                    call_id: call
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map_or_else(|| format!("call_{}", Uuid::new_v4()), ToString::to_string),
                     name: call
                         .get("name")
                         .and_then(Value::as_str)
@@ -3145,7 +3809,31 @@ fn parse_gemini(
                 content: vec![fte_types::ContentBlock::Text { text }],
             });
         }
+        let reason = candidate
+            .get("finishReason")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                provider_response_error(
+                    request_id,
+                    &route.backend_id,
+                    "Gemini candidate lacks finishReason",
+                )
+            })?;
+        output_groups.push(OutputGroup {
+            index: usize_field(candidate, "index").unwrap_or(index),
+            output_indices: (start..output.len()).collect(),
+            finish_reason: if reason == "STOP"
+                && output[start..]
+                    .iter()
+                    .any(|item| matches!(item, fte_types::OutputItem::FunctionCall { .. }))
+            {
+                FinishReason::ToolCalls
+            } else {
+                gemini_finish_reason(reason)?
+            },
+        });
     }
+    let status = groups_status(&output_groups);
     Ok(GatewayResponse {
         id: response_id.to_string(),
         request_id: request_id.clone(),
@@ -3153,7 +3841,8 @@ fn parse_gemini(
         route: route.clone(),
         output,
         usage: usage_from_gemini(value.get("usageMetadata").unwrap_or(&Value::Null), route),
-        status: TerminalStatus::Completed,
+        output_groups,
+        status,
         previous_response_id: previous,
     })
 }
@@ -3176,8 +3865,11 @@ fn parse_openai_output_item(value: &Value) -> Result<fte_types::OutputItem, Gate
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(parse_openai_content)
-                .collect(),
+                .map(|part| {
+                    parse_openai_content(part)
+                        .ok_or_else(|| provider_limit_error("provider_content_unsupported"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         }),
         "function_call" => Ok(fte_types::OutputItem::FunctionCall {
             id: value
@@ -3195,11 +3887,14 @@ fn parse_openai_output_item(value: &Value) -> Result<fte_types::OutputItem, Gate
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            arguments: value
-                .get("arguments")
-                .and_then(Value::as_str)
-                .and_then(|arguments| serde_json::from_str(arguments).ok())
-                .unwrap_or_else(|| json!({})),
+            arguments: match value.get("arguments").and_then(Value::as_str) {
+                // Empty arguments are legal only for an output_item.added
+                // notification. Terminal validation rejects this placeholder.
+                Some("") => json!({}),
+                Some(arguments) => serde_json::from_str(arguments)
+                    .map_err(|_| provider_limit_error("provider_tool_arguments_invalid"))?,
+                None => return Err(provider_limit_error("provider_tool_arguments_missing")),
+            },
         }),
         "reasoning" => Ok(fte_types::OutputItem::Reasoning {
             id: value
@@ -3230,6 +3925,9 @@ fn parse_openai_output_item(value: &Value) -> Result<fte_types::OutputItem, Gate
 
 fn parse_openai_content(value: &Value) -> Option<fte_types::ContentBlock> {
     match value.get("type").and_then(Value::as_str)? {
+        "refusal" => Some(fte_types::ContentBlock::Text {
+            text: value.get("refusal").and_then(Value::as_str)?.to_string(),
+        }),
         "output_text" => Some(fte_types::ContentBlock::Text {
             text: value
                 .get("text")
@@ -3320,6 +4018,15 @@ async fn emit_completed_lifecycle(
     provider: &str,
     response: &GatewayResponse,
 ) -> Result<(), GatewayError> {
+    // Refusals have a distinct terminal projection. Do not emit them as
+    // ordinary text before that semantic result is available.
+    if response
+        .output_groups
+        .iter()
+        .any(|group| group.finish_reason == FinishReason::Refusal)
+    {
+        return Ok(());
+    }
     for (output_index, item) in response.output.iter().enumerate() {
         send_provider_event(
             events,
@@ -3328,6 +4035,11 @@ async fn emit_completed_lifecycle(
             provider,
             GatewayEvent::OutputItemAdded {
                 request_id: request_id.clone(),
+                group_index: response
+                    .output_groups
+                    .iter()
+                    .find(|group| group.output_indices.contains(&output_index))
+                    .map(|group| group.index),
                 output_index,
                 item: item.clone(),
             },
@@ -3735,6 +4447,69 @@ mod tests {
         fn resolve(&self, _: &str) -> Result<Option<String>, GatewayError> {
             Ok(Some("synthetic-redirect-secret".to_string()))
         }
+    }
+
+    #[test]
+    fn provider_sse_framing_handles_one_byte_chunks_and_exact_line_endings() {
+        for ending in ["\n", "\r\n", "\r"] {
+            let bytes = format!(": comment{ending}event: delta{ending}data: café{ending}data:  second{ending}{ending}data: final{ending}{ending}").into_bytes();
+            let mut parser = SseParser::default();
+            let mut frames = Vec::new();
+            for byte in bytes {
+                frames.extend(parser.push(&[byte]).expect("valid SSE fixture"));
+            }
+            frames.extend(parser.finish().expect("valid SSE fixture"));
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames[0].event.as_deref(), Some("delta"));
+            assert_eq!(frames[0].data, "café\n second");
+            assert_eq!(frames[1].data, "final");
+        }
+        let mut parser = SseParser::default();
+        assert!(
+            parser
+                .push(b"data: partial\n")
+                .expect("valid SSE fixture")
+                .is_empty()
+        );
+        assert!(
+            parser.finish().expect("valid SSE fixture").is_empty(),
+            "EOF must not dispatch a partial event"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_oversized_count_preserves_request_and_provider_identity() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("count fixture listener");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("count fixture address")
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("count connection");
+            read_fixture_request(&mut socket).await;
+            let length = MAX_PROVIDER_RESULT_BYTES + 1;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").as_bytes()).await.expect("count headers");
+            // The client is allowed to close immediately after reaching its cap.
+            let _ = socket.write_all(&vec![b' '; length]).await;
+        });
+        let mut config =
+            HostedProviderConfig::anthropic("provider", "Fixture", "fixture", Vec::new());
+        config.endpoints.count_tokens = Some(endpoint);
+        let backend =
+            HostedProviderBackend::new(config, Arc::new(FixtureSecrets)).expect("hosted backend");
+        let request = request(GenerationInput::Chat { items: Vec::new() });
+        let request_id = request.request.request_id.clone();
+        let error = backend
+            .count_tokens(request)
+            .await
+            .expect_err("bounded count result");
+        assert_eq!(error.code, "provider_result_too_large");
+        assert_eq!(error.request_id, request_id);
+        assert_eq!(error.provider.as_deref(), Some("provider"));
+        backend.shutdown().await.expect("drain count owner");
+        server.await.expect("count fixture joined");
     }
 
     #[tokio::test]

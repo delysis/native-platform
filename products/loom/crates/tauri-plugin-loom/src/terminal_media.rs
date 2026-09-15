@@ -8,7 +8,7 @@ use llama_native_types::MediaInput;
 use loom_store::{LoadedDocument, ProjectStore};
 
 use super::IpcFailure;
-use super::context_attachments::resolve_for_generation_with_budget;
+use super::context_attachments::resolve_media_for_document;
 use super::document_bindings::ResolvedDocument;
 
 const MAX_MEDIA: usize = 32;
@@ -18,7 +18,7 @@ pub(super) fn resolve(
     store: &ProjectStore,
     source: &LoadedDocument,
     references: &[ResolvedDocument],
-    context_tokens: u32,
+    _context_tokens: u32,
 ) -> Result<Vec<MediaInput>, IpcFailure> {
     if references.len() > 32 {
         return Err(limit());
@@ -36,18 +36,11 @@ pub(super) fn resolve(
         if !seen_documents.insert(document_id) {
             continue;
         }
-        // Deliberately discard the contextual prose and manuscript window:
-        // terminal prompts already bind their complete explicit input bytes.
-        let resolved = resolve_for_generation_with_budget(
-            store.root(),
-            &document_id.to_string(),
-            text,
-            context_tokens,
-            1,
-            0,
-        )
-        .map_err(|error| IpcFailure::new("terminal_media_unavailable", error.to_string(), false))?;
-        for item in resolved.media {
+        let resolved = resolve_media_for_document(store.root(), &document_id.to_string(), text)
+            .map_err(|error| {
+                IpcFailure::new("terminal_media_unavailable", error.to_string(), false)
+            })?;
+        for item in resolved {
             if !seen.insert((item.kind, item.sha256.clone())) {
                 continue;
             }

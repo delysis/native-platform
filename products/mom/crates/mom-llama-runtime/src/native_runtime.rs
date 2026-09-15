@@ -183,6 +183,48 @@ pub(crate) fn invalidate_loaded_native_cache_owner(
 }
 
 impl PrefixCacheStore for ProductPrefixCacheStore {
+    fn load_reconstruction(
+        &self,
+        namespace: &str,
+        expected: &PrefixCacheMetadata,
+    ) -> Result<Option<PrefixCacheValue>, NativeError> {
+        self.store
+            .mutate_documents(
+                &Self::document(namespace),
+                Vec::<PrefixCacheMetadata>::new,
+                |entries, documents| {
+                    if let Some(owner_id) = expected.owner_id.as_deref()
+                        && crate::personas::persona_cache_owner_is_removed_from_documents(
+                            documents, owner_id,
+                        )?
+                    {
+                        return Ok(None);
+                    }
+                    let Some(current) = entries.iter_mut().find(|entry| entry.id == expected.id)
+                    else {
+                        return Ok(None);
+                    };
+                    if current != expected {
+                        return Ok(None);
+                    }
+                    let Some(value) = expected.replay_value() else {
+                        documents.delete(&Self::entry(namespace, &expected.id));
+                        entries.retain(|entry| entry.id != expected.id);
+                        return Ok(None);
+                    };
+                    if current.state_bytes != value.metadata.state_bytes {
+                        documents.put_bytes(
+                            &Self::entry(namespace, &expected.id),
+                            &serde_json::to_vec(&value)?,
+                        )?;
+                        *current = value.metadata.clone();
+                    }
+                    Ok(Some(value))
+                },
+            )
+            .map_err(prefix_store_error)
+    }
+
     fn list(&self, namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
         self.store
             .get_disposable_cache_with_members(
@@ -204,6 +246,11 @@ impl PrefixCacheStore for ProductPrefixCacheStore {
     }
 
     fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
+        let mut persisted = value.clone();
+        if persisted.metadata.reconstruction.is_none() {
+            persisted.bind_reconstruction();
+        }
+        let value = &persisted;
         if !value.is_valid() {
             return Err(NativeError::new(
                 NativeErrorCode::CacheIncompatible,
@@ -583,7 +630,7 @@ mod tests {
 
     fn cache_value() -> PrefixCacheValue {
         let token_ids = vec![1, 2, 3];
-        PrefixCacheValue {
+        let mut value = PrefixCacheValue {
             metadata: PrefixCacheMetadata::new(
                 "persistent-test",
                 CacheTier::SessionPersistent,
@@ -611,10 +658,12 @@ mod tests {
             sequence: SequenceStateBlob {
                 sequence_id: 0,
                 token_count: token_ids.len(),
-                bytes: vec![4, 5, 6],
+                bytes: (vec![4, 5, 6]).into(),
                 token_ids,
             },
-        }
+        };
+        value.bind_reconstruction();
+        value
     }
 
     #[test]
@@ -702,6 +751,61 @@ mod tests {
             snapshot().is_empty(),
             "clear atomically removes metadata and every payload"
         );
+        std::fs::remove_dir_all(dir).expect("cleanup");
+    }
+
+    #[test]
+    fn product_prefix_compaction_never_reads_expired_ciphertext_or_overwrites_replacement() {
+        let dir =
+            std::env::temp_dir().join(format!("mom-prefix-compaction-{}", uuid::Uuid::new_v4()));
+        let store = crate::store::RuntimeStore::open_with_key(&dir, [19; 32]).expect("store");
+        let connection = rusqlite::Connection::open(store.path()).expect("connection");
+        let cache = ProductPrefixCacheStore { store };
+        let mut value = cache_value();
+        value.sequence.bytes = vec![9; 64 * 1024].into();
+        value.metadata.state_bytes = value.sequence.bytes.len();
+        value.bind_reconstruction();
+        cache.save("compact", &value).expect("save");
+        connection
+            .execute(
+                "UPDATE encrypted_documents SET ciphertext = X'00' WHERE namespace = ?1",
+                [ProductPrefixCacheStore::entry(
+                    "compact",
+                    &value.metadata.id,
+                )],
+            )
+            .expect("corrupt only raw spill");
+        let replay = cache
+            .load_reconstruction("compact", &value.metadata)
+            .expect("no raw decrypt")
+            .expect("replay");
+        assert_eq!(
+            replay.sequence.bytes.len(),
+            llama_native_types::SEQUENCE_STATE_HEADER_BYTES
+        );
+        assert_eq!(
+            cache
+                .load_entry("compact", &value.metadata.id)
+                .expect("compacted read"),
+            Some(replay.clone())
+        );
+        let mut replacement = value.clone();
+        replacement.metadata.label = "replacement".into();
+        cache.save("compact", &replacement).expect("replace");
+        assert!(
+            cache
+                .load_reconstruction("compact", &replay.metadata)
+                .expect("stale compare")
+                .is_none()
+        );
+        assert_eq!(
+            cache
+                .load_entry("compact", &replacement.metadata.id)
+                .expect("replacement read"),
+            Some(replacement)
+        );
+        drop(connection);
+        drop(cache);
         std::fs::remove_dir_all(dir).expect("cleanup");
     }
 

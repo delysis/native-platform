@@ -4,10 +4,13 @@
 //! states, manages the bounded in-memory tier, and defines the complete
 //! fingerprint that encrypted persistent stores must bind.
 
-use llama_native_types::{PromptForm, PromptTokenPolicy, SequenceStateBlob};
+use llama_native_types::{
+    PromptForm, PromptTokenPolicy, SequenceReconstruction, SequenceStateBlob,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -104,6 +107,8 @@ pub struct PrefixCacheMetadata {
     pub created_at_ms: u128,
     pub last_used_at_ms: u128,
     pub state: CacheEntryState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconstruction: Option<SequenceReconstruction>,
 }
 
 impl PrefixCacheMetadata {
@@ -130,7 +135,23 @@ impl PrefixCacheMetadata {
             created_at_ms: now_ms,
             last_used_at_ms: now_ms,
             state: CacheEntryState::Ready,
+            reconstruction: None,
         }
+    }
+
+    /// Reconstruct without reading the potentially large native spill object.
+    #[must_use]
+    pub fn replay_value(&self) -> Option<PrefixCacheValue> {
+        if !self.is_valid() {
+            return None;
+        }
+        let sequence = self
+            .reconstruction
+            .as_ref()?
+            .sequence(self.token_ids.clone())?;
+        let mut metadata = self.clone();
+        metadata.state_bytes = sequence.bytes.len();
+        Some(PrefixCacheValue { metadata, sequence })
     }
 
     #[must_use]
@@ -161,6 +182,11 @@ pub struct PrefixCacheValue {
 }
 
 impl PrefixCacheValue {
+    /// Bind the small disk index to the exported snapshot once, at publication.
+    pub fn bind_reconstruction(&mut self) {
+        self.metadata.reconstruction = Some(self.sequence.reconstruction());
+    }
+
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.metadata.is_valid()
@@ -260,10 +286,24 @@ pub fn longest_compatible_prefix_for_scope(
 }
 
 #[derive(Debug)]
+struct CachedPrefix {
+    value: Arc<PrefixCacheValue>,
+    last_used_at_ms: u128,
+}
+
+/// Validation is performed before taking a host-wide state lock.
+pub struct ValidatedPrefixCacheValue(PrefixCacheValue);
+impl ValidatedPrefixCacheValue {
+    pub fn new(value: PrefixCacheValue) -> Option<Self> {
+        value.is_valid().then_some(Self(value))
+    }
+}
+
+#[derive(Debug)]
 pub struct MemoryPrefixCache {
     capacity_bytes: usize,
     used_bytes: usize,
-    values: HashMap<String, PrefixCacheValue>,
+    values: HashMap<String, CachedPrefix>,
     least_to_most_recent: VecDeque<String>,
 }
 
@@ -303,8 +343,16 @@ impl MemoryPrefixCache {
         self.values.contains_key(id)
     }
 
-    pub fn insert(&mut self, mut value: PrefixCacheValue) -> Vec<String> {
-        if !value.is_valid() || value.metadata.state_bytes > self.capacity_bytes {
+    pub fn insert(&mut self, value: PrefixCacheValue) -> Vec<String> {
+        let Some(value) = ValidatedPrefixCacheValue::new(value) else {
+            return Vec::new();
+        };
+        self.insert_validated(value)
+    }
+
+    pub fn insert_validated(&mut self, value: ValidatedPrefixCacheValue) -> Vec<String> {
+        let mut value = value.0;
+        if value.metadata.state_bytes > self.capacity_bytes {
             return Vec::new();
         }
         value.metadata.tier = CacheTier::MemoryLru;
@@ -312,11 +360,17 @@ impl MemoryPrefixCache {
         if let Some(previous) = self.values.remove(&id) {
             self.used_bytes = self
                 .used_bytes
-                .saturating_sub(previous.metadata.state_bytes);
+                .saturating_sub(previous.value.metadata.state_bytes);
             self.remove_from_order(&id);
         }
         self.used_bytes = self.used_bytes.saturating_add(value.metadata.state_bytes);
-        self.values.insert(id.clone(), value);
+        self.values.insert(
+            id.clone(),
+            CachedPrefix {
+                last_used_at_ms: value.metadata.last_used_at_ms,
+                value: Arc::new(value),
+            },
+        );
         self.least_to_most_recent.push_back(id);
 
         let mut evicted = Vec::new();
@@ -325,7 +379,9 @@ impl MemoryPrefixCache {
                 break;
             };
             if let Some(removed) = self.values.remove(&oldest) {
-                self.used_bytes = self.used_bytes.saturating_sub(removed.metadata.state_bytes);
+                self.used_bytes = self
+                    .used_bytes
+                    .saturating_sub(removed.value.metadata.state_bytes);
                 evicted.push(oldest);
             }
         }
@@ -373,12 +429,33 @@ impl MemoryPrefixCache {
         prompt_token_ids: &[i32],
         owner_scope: CacheOwnerScope<'_>,
     ) -> Option<CacheMatch> {
-        let metadata = self
-            .values
+        self.values
             .values()
-            .map(|value| value.metadata.clone())
-            .collect::<Vec<_>>();
-        longest_compatible_prefix_for_scope(&metadata, fingerprint, prompt_token_ids, owner_scope)
+            .filter(|cached| {
+                let entry = &cached.value.metadata;
+                &entry.fingerprint == fingerprint
+                    && owner_scope.matches(entry.owner_id.as_deref())
+                    && entry.token_ids.len() < prompt_token_ids.len()
+                    && prompt_token_ids.starts_with(&entry.token_ids)
+            })
+            .max_by(|left, right| {
+                left.value
+                    .metadata
+                    .token_ids
+                    .len()
+                    .cmp(&right.value.metadata.token_ids.len())
+                    .then_with(|| left.last_used_at_ms.cmp(&right.last_used_at_ms))
+                    .then_with(|| left.value.metadata.id.cmp(&right.value.metadata.id))
+            })
+            .map(|cached| {
+                let entry = &cached.value.metadata;
+                CacheMatch {
+                    id: entry.id.clone(),
+                    tier: entry.tier,
+                    matched_tokens: entry.token_ids.len(),
+                    exact: entry.token_ids.len().saturating_add(1) == prompt_token_ids.len(),
+                }
+            })
     }
 
     #[must_use]
@@ -396,21 +473,39 @@ impl MemoryPrefixCache {
     }
 
     pub fn get(&mut self, id: &str, now_ms: u128) -> Option<PrefixCacheValue> {
-        let mut value = self.values.get(id)?.clone();
+        let mut value = (*self.get_shared(id, now_ms)?).clone();
         value.metadata.last_used_at_ms = now_ms;
-        if let Some(stored) = self.values.get_mut(id) {
-            stored.metadata.last_used_at_ms = now_ms;
-        }
+        Some(value)
+    }
+
+    /// Returning shared immutable data does not confer owner/use authority.
+    pub fn get_shared(&mut self, id: &str, now_ms: u128) -> Option<Arc<PrefixCacheValue>> {
+        let stored = self.values.get_mut(id)?;
+        stored.last_used_at_ms = now_ms;
+        let value = Arc::clone(&stored.value);
         self.remove_from_order(id);
         self.least_to_most_recent.push_back(id.to_string());
         Some(value)
+    }
+
+    pub fn lookup_shared_in_scope(
+        &mut self,
+        fingerprint: &CacheFingerprint,
+        prompt_token_ids: &[i32],
+        owner_scope: CacheOwnerScope<'_>,
+        now_ms: u128,
+    ) -> Option<Arc<PrefixCacheValue>> {
+        let matched = self.best_match_in_scope(fingerprint, prompt_token_ids, owner_scope)?;
+        self.get_shared(&matched.id, now_ms)
     }
 
     pub fn invalidate(&mut self, id: &str) -> bool {
         let Some(value) = self.values.remove(id) else {
             return false;
         };
-        self.used_bytes = self.used_bytes.saturating_sub(value.metadata.state_bytes);
+        self.used_bytes = self
+            .used_bytes
+            .saturating_sub(value.value.metadata.state_bytes);
         self.remove_from_order(id);
         true
     }
@@ -419,8 +514,8 @@ impl MemoryPrefixCache {
         let ids = self
             .values
             .values()
-            .filter(|value| value.metadata.owner_id.as_deref() == Some(owner_id))
-            .map(|value| value.metadata.id.clone())
+            .filter(|value| value.value.metadata.owner_id.as_deref() == Some(owner_id))
+            .map(|value| value.value.metadata.id.clone())
             .collect::<Vec<_>>();
         for id in &ids {
             self.invalidate(id);
@@ -492,7 +587,7 @@ mod tests {
             sequence: SequenceStateBlob {
                 sequence_id: 0,
                 token_count: tokens.len(),
-                bytes: vec![7; bytes],
+                bytes: (vec![7; bytes]).into(),
                 token_ids: tokens.to_vec(),
             },
         }
@@ -508,6 +603,59 @@ mod tests {
         let mut value = value(id, CacheTier::PersonaPack, tokens, bytes, now_ms);
         value.metadata.owner_id = Some(owner_id.to_string());
         value
+    }
+
+    #[test]
+    fn shared_cache_hits_do_not_copy_payload_or_retain_owner_authority() {
+        for count in [1, 16] {
+            let mut cache = MemoryPrefixCache::new(count * 256 * 1024);
+            for index in 1..count {
+                cache.insert(owned_value(
+                    &format!("other-{index}"),
+                    "bob",
+                    &[1, 2],
+                    256 * 1024,
+                    1,
+                ));
+            }
+            let original = owned_value("owned", "alice", &[1, 2], 256 * 1024, 1);
+            let bytes = Arc::clone(&original.sequence.bytes);
+            cache.insert(original);
+            let first = cache
+                .lookup_shared_in_scope(
+                    &fingerprint(),
+                    &[1, 2, 3],
+                    CacheOwnerScope::Exact("alice"),
+                    2,
+                )
+                .expect("first");
+            let next = cache
+                .lookup_shared_in_scope(
+                    &fingerprint(),
+                    &[1, 2, 4],
+                    CacheOwnerScope::Exact("alice"),
+                    3,
+                )
+                .expect("next");
+            assert!(Arc::ptr_eq(&first, &next));
+            assert!(Arc::ptr_eq(&bytes, &next.sequence.bytes));
+            let mut caller_copy = first.as_ref().clone();
+            Arc::make_mut(&mut caller_copy.sequence.bytes)[0] = 99;
+            assert_eq!(next.sequence.bytes[0], 7);
+            assert_eq!(cache.invalidate_owner("alice"), vec!["owned"]);
+            assert!(
+                cache
+                    .lookup_shared_in_scope(
+                        &fingerprint(),
+                        &[1, 2, 3],
+                        CacheOwnerScope::Exact("alice"),
+                        4
+                    )
+                    .is_none()
+            );
+            assert_eq!(first.sequence.bytes.len(), 256 * 1024);
+            assert_eq!(cache.used_bytes(), (count - 1) * 256 * 1024);
+        }
     }
 
     #[test]

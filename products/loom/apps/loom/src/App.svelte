@@ -18,6 +18,8 @@
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
   import SourceEditor from './lib/SourceEditor.svelte';
   import ImportSources from './lib/ImportSources.svelte';
+  import MaterialExcerpt from './lib/MaterialExcerpt.svelte';
+  import DocumentMaterials from './lib/DocumentMaterials.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
@@ -330,7 +332,6 @@
     CommandReceipt,
     ContextAttachmentPresentation,
     ContextMediaPresentation,
-    ContextTextSourcePresentation,
     CuratedModelCatalogEntry,
     DesktopGenerationEnvelope,
     DocumentKind,
@@ -447,7 +448,6 @@
   let contextPaneElement: HTMLDivElement | undefined;
   let contextToggleElement: HTMLButtonElement | undefined;
   let contextAttachments: ContextAttachmentPresentation[] = [];
-  let contextTextSources: ContextTextSourcePresentation[] = [];
   let contextText = '';
   let persistedContextText = '';
   let contextTextSaveState: 'clean' | 'dirty' | 'saving' | 'error' = 'clean';
@@ -478,6 +478,7 @@
     selectionEmpty: true
   };
   let contextAttachmentBusy = false;
+  let contextLoadError = '';
   let contextDropActive = false;
   let contextDocumentId = '';
   let contextRefreshSerial = 0;
@@ -1398,7 +1399,7 @@
   $: if ((document?.summary.document_id ?? '') !== contextDocumentId) {
     contextDocumentId = document?.summary.document_id ?? '';
     contextAttachments = [];
-    contextTextSources = [];
+    contextLoadError = '';
     contextText = '';
     persistedContextText = '';
     contextTextSaveState = 'clean';
@@ -1470,14 +1471,14 @@
         }
       }
     } catch (error) {
-      if (serial === contextRefreshSerial) recordFailure(error);
+      if (serial === contextRefreshSerial) { contextLoadError = normalizeFailure(error).message; recordFailure(error); }
     }
   }
 
   function updateContextPresentation(snapshot: DocumentContextSnapshot): void {
     const fingerprint = JSON.stringify([contextDocumentId, snapshot]);
+    contextLoadError = '';
     contextAttachments = snapshot.attachments;
-    contextTextSources = snapshot.text_sources;
     if (fingerprint === contextPresentationFingerprint) return;
     contextPresentationFingerprint = fingerprint;
     authoritativeCompletionFamilyId = null;
@@ -2068,19 +2069,6 @@
     return true;
   }
 
-  async function normalizeImportedContext(previousText: string): Promise<void> {
-    // Source-mode author text is not part of import conversion. In visual mode
-    // the existing text already belongs to the admitted editor dialect.
-    if (!contextText.startsWith(previousText) || contextText === previousText) return;
-    const suffix = normalizeImportedMarkdown(contextText.slice(previousText.length).trimStart());
-    const combined = previousText ? `${previousText}\n\n${suffix}` : suffix;
-    const normalized = mode === 'visual' ? normalizeImportedMarkdown(combined) : combined;
-    if (normalized !== contextText) {
-      updateContextText(normalized);
-      await persistCurrentContextText();
-    }
-  }
-
   async function addContextAttachmentsFromPicker(): Promise<void> {
     if (!project || !document || contextAttachmentBusy) return;
     const captured = {
@@ -2096,8 +2084,9 @@
         project.session_id !== captured.sessionId ||
         document?.summary.document_id !== captured.documentId
       ) return;
-      const previousContextText = contextText;
-      const imported = await chooseAttachments(captured.projectId, captured.sessionId);
+      const report = await chooseAttachments(captured.projectId, captured.sessionId);
+      const imported = report.imported;
+      if (report.failures.length) recordFailure(new Error(report.failures.map((item) => `${item.name}: ${item.message}`).join("\n")));
       const snapshot = imported.length === 0
         ? null
         : await addDocumentContexts(
@@ -2113,7 +2102,6 @@
           captured.sessionId,
           captured.documentId
         )) return;
-        await normalizeImportedContext(previousContextText);
       }
       if (imported.length > 0) announce(`${imported.length} context attachment${imported.length === 1 ? '' : 's'} ready`);
     } catch (error) {
@@ -2136,12 +2124,26 @@
         document?.summary.document_id !== captured.documentId ||
         editorReadonly
       ) return false;
-      const previousText = contextText;
       const snapshot = await addDocumentContexts(captured.projectId, captured.sessionId, captured.documentId, [...new Set(items.map((item) => item.id))]);
       if (!adoptAuthoritativeContext(snapshot, captured.projectId, captured.sessionId, captured.documentId)) return false;
-      await normalizeImportedContext(previousText);
       return true;
     } finally { contextAttachmentBusy = false; }
+  }
+
+  async function saveMaterialExcerpt(attachmentId: string, sourceRevision: string, excerpt: string | null): Promise<boolean> {
+    if (!project || !document || contextAttachmentBusy || editorReadonly) return false;
+    const captured = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id };
+    contextAttachmentBusy = true;
+    try {
+      if (!await persistCurrentContextText()) return false;
+      if (project?.project_id !== captured.projectId || project.session_id !== captured.sessionId || document?.summary.document_id !== captured.documentId || editorReadonly) return false;
+      const material = contextAttachments.find(item => item.id === attachmentId && item.source_revision === sourceRevision);
+      if (!material) return false;
+      const materials = contextAttachments.map(item => ({ attachment_id: item.id, source_revision: item.source_revision, excerpt: item.id === attachmentId ? excerpt : item.excerpt }));
+      const snapshot = await setDocumentContextSnapshot(captured.projectId, captured.sessionId, captured.documentId, contextText, materials.map(item => item.attachment_id), materials);
+      return adoptAuthoritativeContext(snapshot, captured.projectId, captured.sessionId, captured.documentId);
+    } catch (error) { recordFailure(error); return false; }
+    finally { contextAttachmentBusy = false; }
   }
 
   async function removeContextAttachment(attachmentId: string): Promise<void> {
@@ -2211,8 +2213,10 @@
         project.session_id !== captured.sessionId ||
         document?.summary.document_id !== captured.documentId
       ) return;
-      const previousContextText = contextText;
-      const imported = await importAttachmentPaths(captured.projectId, captured.sessionId, paths);
+      const report = await importAttachmentPaths(captured.projectId, captured.sessionId, paths);
+      const imported = report.imported;
+      if (report.failures.length) recordFailure(new Error(report.failures.map((item) => `${item.name}: ${item.message}`).join("\n")));
+      if (!imported.length) return;
       if (project?.project_id !== captured.projectId || project.session_id !== captured.sessionId ||
           document?.summary.document_id !== captured.documentId || mode !== captured.mode ||
           (scope === 'inline' && documentText !== captured.markdown)) {
@@ -2231,7 +2235,6 @@
           captured.sessionId,
           captured.documentId
         )) return;
-        await normalizeImportedContext(previousContextText);
       } else {
         const markdown = imported.map(editableImportMarkdown).join('\n\n');
         const before = sourceAnchor?.value.slice(0, sourceAnchor.start) ?? '';
@@ -9665,6 +9668,11 @@
               <ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={document.summary.title} onUse={useImportedSources} />
             {/key}
           {/if}
+          {#if desktop && document}
+            {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
+              <DocumentMaterials title={document.summary.title} instructions={contextText} attachments={contextAttachments} disabled={editorReadonly || contextAttachmentBusy} error={contextLoadError} onInstructions={updateContextText} onFlush={flushContextText} onRemove={(id) => void removeContextAttachment(id)} onSave={saveMaterialExcerpt} />
+            {/key}
+          {/if}
         </nav>
         {#if folderWarnings.length > 0}
           <details class="folder-warnings">
@@ -9795,11 +9803,6 @@
                 </span>
               </div>
             </div>
-            {#if contextTextSources.length > 0}
-              <p class="context-source-note" title={contextTextSources.map((source) => source.file_name).join('\n')}>
-                {contextTextSources.length} imported text {contextTextSources.length === 1 ? 'source is' : 'sources are'} editable above
-              </p>
-            {/if}
             {#if contextAttachments.length > 0}
               <div class="completion-context-items">
                 {#each contextAttachments as attachment (attachment.id)}
@@ -9818,6 +9821,9 @@
                         on:click={() => void removeContextAttachment(attachment.id)}
                       >×</button>
                     </div>
+                    {#if attachment.text_bytes > 0}
+                      <MaterialExcerpt material={attachment} disabled={contextAttachmentBusy || editorReadonly} onSave={saveMaterialExcerpt} />
+                    {/if}
                     {#each attachment.media as media (media.sha256)}
                       {@const previewUrl = contextMediaUrl(media)}
                       <div class="context-media-preview">

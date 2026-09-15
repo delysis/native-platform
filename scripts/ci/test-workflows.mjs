@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 
 const root = path.resolve(import.meta.dirname, "../..");
 const prPath = path.join(root, ".github/workflows/ci-pr.yml");
@@ -683,7 +684,7 @@ test("Information changes run their portable tests on Windows without blocking m
   assert.ok(windows, "information-windows job block is missing");
   assert.match(
     windows,
-    /if: \$\{\{ needs\.plan\.outputs\.information == 'true' \|\| needs\.plan\.outputs\.full == 'true' \}\}/,
+    /if: \$\{\{ !cancelled\(\) && needs\.plan\.result == 'success' && \(needs\.plan\.outputs\.information == 'true' \|\| needs\.plan\.outputs\.full == 'true'\) \}\}/,
   );
   assert.match(windows, /runs-on: windows-latest/);
   assert.match(windows, /git config --global core\.longpaths true/);
@@ -701,7 +702,7 @@ test("Mom changes run their product tests on Windows without blocking merge", ()
   assert.ok(windows, "mom-windows job block is missing");
   assert.match(
     windows,
-    /if: \$\{\{ needs\.plan\.outputs\.mom_present == 'true' && \(needs\.plan\.outputs\.mom == 'true' \|\| needs\.plan\.outputs\.full == 'true'\) \}\}/,
+    /if: \$\{\{ !cancelled\(\) && needs\.plan\.result == 'success' && \(needs\.plan\.outputs\.mom_present == 'true' && \(needs\.plan\.outputs\.mom == 'true' \|\| needs\.plan\.outputs\.full == 'true'\)\) \}\}/,
   );
   assert.match(windows, /runs-on: windows-latest/);
   assert.match(windows, /git config --global core\.longpaths true/);
@@ -716,7 +717,7 @@ test("Loom changes run their product tests on Windows without blocking merge", (
   assert.ok(windows, "loom-windows job block is missing");
   assert.match(
     windows,
-    /if: \$\{\{ needs\.plan\.outputs\.loom_present == 'true' && \(needs\.plan\.outputs\.loom == 'true' \|\| needs\.plan\.outputs\.full == 'true'\) \}\}/,
+    /if: \$\{\{ !cancelled\(\) && needs\.plan\.result == 'success' && \(needs\.plan\.outputs\.loom_present == 'true' && \(needs\.plan\.outputs\.loom == 'true' \|\| needs\.plan\.outputs\.full == 'true'\)\) \}\}/,
   );
   assert.match(windows, /runs-on: windows-latest/);
   assert.match(windows, /git config --global core\.longpaths true/);
@@ -950,4 +951,74 @@ test("development gates do not depend on advisory platform completion", () => {
   assert.doesNotMatch(gate, /needs:[\s\S]*?\n      - root$/m);
   assert.match(full, /root-macos:[\s\S]*?uses: \.\/.github\/workflows\/ci-full-root.yml[\s\S]*?runner: macos-latest/);
   assert.match(full, /os: \[ubuntu-latest, windows-latest\]/);
+});
+
+function workflowJobs(source) {
+  return new Map([...source.matchAll(/^  ([a-z][a-z0-9-]+):\n([\s\S]*?)(?=^  [a-z][a-z0-9-]+:|$(?![\s\S]))/gm)]
+    .map((match) => [match[1], match[2]]));
+}
+
+function jobNeeds(job) {
+  const inline = job.match(/^    needs: (.+)$/m)?.[1];
+  if (inline) return inline.replace(/[\[\]]/g, "").split(",").map((value) => value.trim());
+  return [...(job.match(/^    needs:\n(?:      - [a-z-]+\n)+/m)?.[0] ?? "")
+    .matchAll(/- ([a-z-]+)/g)].map((match) => match[1]);
+}
+
+function assertAcyclicJobs(jobs) {
+  const completed = new Set();
+  function visit(id, active = new Set()) {
+    assert.ok(jobs.has(id), `unknown dependency ${id}`);
+    assert.ok(!active.has(id), `job dependency cycle through ${id}`);
+    if (completed.has(id)) return;
+    const ancestors = new Set(active).add(id);
+    for (const dependency of jobNeeds(jobs.get(id))) visit(dependency, ancestors);
+    completed.add(id);
+  }
+  for (const id of jobs.keys()) visit(id);
+}
+
+// These scheduling conditions use only string comparisons and boolean operators
+// shared by Actions expressions and JavaScript. Evaluate the actual expression.
+function scheduled(job, needs, cancelled = false) {
+  const expression = job.match(/^    if: \$\{\{ (.+) \}\}$/m)?.[1];
+  assert.ok(expression, "explicit scheduling condition is required");
+  return runInNewContext(expression, { needs, cancelled: () => cancelled });
+}
+
+test("PR advisory scheduling waits for the development gate without requiring its success", () => {
+  const jobs = workflowJobs(read(prPath));
+  assertAcyclicJobs(jobs);
+  const required = new Set(["plan", "policy", "frontend", "platform-macos", "ci-required"]);
+  for (const [id, job] of jobs) {
+    if (required.has(id)) continue;
+    assert.deepEqual(jobNeeds(job), ["plan", "ci-required"], id);
+    const outputs = Object.fromEntries([...job.matchAll(/needs\.plan\.outputs\.([a-z_]+)/g)]
+      .map((match) => [match[1], "true"]));
+    for (const gateResult of ["success", "failure", "skipped", "cancelled"]) {
+      const needs = { plan: { result: "success", outputs }, "ci-required": { result: gateResult } };
+      assert.equal(scheduled(job, needs), true, `${id}: ${gateResult}`);
+      assert.equal(scheduled(job, needs, true), false, `${id}: cancelled workflow`);
+      assert.equal(scheduled(job, { ...needs, plan: { result: "failure", outputs } }), false, `${id}: failed planner`);
+    }
+    const unselected = Object.fromEntries(Object.keys(outputs).map((key) => [key, key.endsWith("_present") ? "true" : "false"]));
+    assert.equal(scheduled(job, { plan: { result: "success", outputs: unselected }, "ci-required": { result: "success" } }), false, `${id}: not selected`);
+  }
+});
+
+test("full advisory scheduling reserves runners for macOS and fast checks first", () => {
+  const jobs = workflowJobs(read(fullPath));
+  assertAcyclicJobs(jobs);
+  for (const id of ["root", "fuzz-build", "model-integration"]) {
+    const job = jobs.get(id);
+    assert.deepEqual(jobNeeds(job), ["macos-required", "frontend", "policy-and-graphs"], id);
+    for (const result of ["success", "failure", "skipped", "cancelled"]) {
+      const needs = Object.fromEntries(jobNeeds(job).map((dependency) => [dependency, { result }]));
+      assert.equal(scheduled(job, needs), true, `${id}: ${result}`);
+      assert.equal(scheduled(job, needs, true), false, `${id}: cancelled workflow`);
+    }
+  }
+  for (const id of ["root-macos", "frontend", "policy-and-graphs"]) {
+    assert.deepEqual(jobNeeds(jobs.get(id)), [], id);
+  }
 });
