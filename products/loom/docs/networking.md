@@ -502,6 +502,19 @@ application processes exited, and the synthetic workspaces were preserved.
 These checks establish packaged behavior on one Mac, not physical Internet
 pairing, phone-linked Signal, IME, or every interruption/preemption case.
 
+The follow-up bundle at `f680168` retained delivery diagnostics across another
+native restart. Test identifiers `app.delysis.loom.deliveryf680168.host` and
+`app.delysis.loom.deliveryf680168.peer` used the same isolated profiles with the
+default Internet policy. With both previous processes gone, host PID 47317 and
+peer PID 47448 rediscovered one another without a new invitation. Check displayed
+the saved access-denied report and labelled the unresolved request a peer job;
+the host still held exactly three jobs. After a graceful requester exit, PID
+48161 reopened the saved workspace and restored the same report without another
+Check or Resume. The built asset was `index-CqIukfNR.js` (SHA-256
+`de9abb65f578217ccfa3aff2bed11386ef0a58fe3bdc1565c9c1ff6c4dc43787`).
+This verifies packaged recovery and same-machine rediscovery, not connectivity
+across physical networks or a new model execution.
+
 The feature is not complete until the following have concrete evidence:
 
 * Phone linking; real contact/group sync; receipt and explicit send; reconnect
