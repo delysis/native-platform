@@ -158,9 +158,9 @@ async fn real_quic_pairing_sync_and_invitation_retry_are_bound_to_device() -> Re
     let alice_key = Identity::generate()?;
     let bob_key = Identity::generate()?;
     let mallory_key = Identity::generate()?;
-    let alice_network = Network::start(&alice_key, NetworkMode::Local).await?;
-    let bob_network = Network::start(&bob_key, NetworkMode::Local).await?;
-    let mallory_network = Network::start(&mallory_key, NetworkMode::Local).await?;
+    let alice_network = Network::start(&alice_key, NetworkMode::Direct {}).await?;
+    let bob_network = Network::start(&bob_key, NetworkMode::Direct {}).await?;
+    let mallory_network = Network::start(&mallory_key, NetworkMode::Direct {}).await?;
     let alice = Arc::new(Mutex::new(Cabal::create(
         &directory.path().join("a.db"),
         alice_key.clone(),

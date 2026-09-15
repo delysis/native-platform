@@ -68,14 +68,14 @@ impl Pair {
         let id = host_cabal.id();
         let roster_hash = host_cabal.roster().hash().expect("membership");
         let host_cabal = Arc::new(Mutex::new(host_cabal));
-        let host_network = Network::start(&host_identity, NetworkMode::Local)
+        let host_network = Network::start(&host_identity, NetworkMode::Direct {})
             .await
             .expect("host network");
         host_network
             .add(host_cabal.clone())
             .expect("host membership");
         let network = Arc::new(
-            Network::start(&identity, NetworkMode::Local)
+            Network::start(&identity, NetworkMode::Direct {})
                 .await
                 .expect("caller network"),
         );

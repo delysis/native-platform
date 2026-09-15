@@ -188,17 +188,46 @@ Disappearing conversation content is excluded from retained AI drafts.
 
 ## Transport and bounds
 
-The native transport is Iroh QUIC. Its Internet preset supplies discovery,
-hole-punching, and relay fallback; local tests disable relays. Anti-entropy pulls
+The native transport is Iroh QUIC. Anti-entropy pulls
 missing signed changes after a fingerprint probe. Each member reconnects with
 bounded concurrency and backoff. A weak connection can delay convergence without
 changing the merge rule. No continuous WebRTC negotiation or bespoke crypto is
 implemented in Loom.
 
+The cabal pane's **Connections** disclosure reads device settings without
+creating an identity or starting networking. It offers three policies:
+
+* **Community relays** uses Iroh's Internet preset: direct connections, public
+  discovery, hole-punching, and community relay fallback. This is the default.
+* **Direct connections** disables relays and public discovery. Invitations and
+  saved peer addresses supply connection hints. If both devices' addresses change
+  while disconnected, fresh address hints may be needed; membership stays saved.
+* **Our own relays** uses one to four distinct HTTPS relay origins and disables
+  public discovery. Friends configure common relays, so a saved device identity
+  remains reachable after its IP address or port changes. Incoming invitations
+  and saved peer addresses cannot add a different relay to this configuration.
+
+Settings belong to the local device, outside shared documents. Saving compares
+the version that was reviewed and writes atomically under the profile lease.
+A lost save reply requires a fresh read before another save. Changes apply when
+the profile next starts; they never interrupt an active workspace or replace its
+identity. Invalid or unsupported settings stop profile startup and are preserved,
+without falling back to community infrastructure. The local settings format is
+version 1. HTTPS uses Iroh's normal certificate verification; there is no custom
+verifier or production option to disable it.
+
+An owned loopback TLS relay test disables direct UDP and trusts an explicit test
+CA. It transfers a document and attachment, restarts a peer with only stale
+direct addresses and an unselected relay hint, then merges offline and live edits
+using its saved membership and configured relay. It creates no second invitation.
+This establishes relay routing and recovery locally; it does not establish
+connectivity across two physical Internet networks.
+
 Gossip cannot itself traverse every NAT. Public Iroh infrastructure means Loom
 does not operate a paid TURN service, but that infrastructure has costs and
-availability constraints. A self-hosted relay configuration and explicit network
-policy remain product work; do not promise permanent free or serverless reachability.
+availability constraints. A self-hosted relay still needs a reachable server;
+see [Iroh's relay deployment guide](https://docs.iroh.computer/add-a-relay).
+Do not promise permanent free or serverless reachability.
 
 Current limits are 16 open cabals, 32 members per cabal, 64 documents, 1 MiB per
 document, 64 MiB of change storage, and 20,000 stored changes. Frames and batches

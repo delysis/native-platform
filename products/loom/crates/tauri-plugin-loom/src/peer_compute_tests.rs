@@ -235,7 +235,7 @@ fn real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript() 
         job.grant.cabal = cabal.id();
         job.input.prompt =
             "Word: rain\nImage: silver threads against the window.\nWord: dawn\nImage:".into();
-        let host_network = Network::start(&host_identity, NetworkMode::Local)
+        let host_network = Network::start(&host_identity, NetworkMode::Direct {})
             .await
             .expect("host endpoint");
         host_network
@@ -245,7 +245,7 @@ fn real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript() 
             .host_compute(&directory.path().join("ledger"), Arc::new(executor))
             .expect("native executor");
         host.grant(job.grant.clone()).expect("explicit grant");
-        let peer = Network::start(&peer_identity, NetworkMode::Local)
+        let peer = Network::start(&peer_identity, NetworkMode::Direct {})
             .await
             .expect("peer endpoint");
         let client_path = directory.path().join("caller");

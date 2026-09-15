@@ -80,10 +80,10 @@ use crate::attachments::{
 };
 use crate::audio_io::{audio_record_start, audio_record_stop, audio_synthesize};
 use crate::cabals::{
-    cabal_edit, cabal_join, cabal_open, cabal_recover, cabal_revoke, cabal_share, cabal_snapshot,
-    cabal_workspace, compute_grant, compute_host_snapshot, compute_job_cancel, compute_job_check,
-    compute_job_get, compute_job_prepare, compute_job_submit, compute_jobs, compute_peer_offers,
-    compute_revoke,
+    cabal_edit, cabal_join, cabal_network_get, cabal_network_set, cabal_open, cabal_recover,
+    cabal_revoke, cabal_share, cabal_snapshot, cabal_workspace, compute_grant,
+    compute_host_snapshot, compute_job_cancel, compute_job_check, compute_job_get,
+    compute_job_prepare, compute_job_submit, compute_jobs, compute_peer_offers, compute_revoke,
 };
 use crate::co_writer::{
     CoWriterError, CoWriterSummary, apply_to_document as apply_co_writer,
@@ -2062,6 +2062,8 @@ impl Builder {
             })
             .invoke_handler(tauri::generate_handler![
                 signal_request,
+                cabal_network_get,
+                cabal_network_set,
                 cabal_snapshot,
                 cabal_share,
                 cabal_join,

@@ -4,16 +4,18 @@
 pub mod compute;
 mod crypto;
 mod document;
+mod network_mode;
 mod store;
 mod transport;
 
 pub use crypto::{Identity, Signed};
 pub use document::{Create, DocumentView, Edit, EditResult, MetadataEdit, TextKind};
+pub use network_mode::NetworkMode;
 pub use store::{
     ASSET_CHUNK_BYTES, AssetDescriptor, Cabal, ChangeEnvelope, ChangePayload, Invitation,
     MAX_ASSET_BYTES, Member, Membership, Roster,
 };
-pub use transport::{Network, NetworkMode, PeerStatus};
+pub use transport::{Network, PeerStatus};
 
 pub const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 pub const MAX_CHANGE_BYTES: usize = 2 * 1024 * 1024;

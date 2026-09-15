@@ -26,6 +26,7 @@ tokio-util.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+iroh-relay = { version = "=1.2.0", default-features = false, features = ["server", "test-utils", "tls-ring"] }
 tempfile.workspace = true
 
 [lints]

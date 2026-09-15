@@ -139,9 +139,9 @@ impl Pair {
             jobs,
         };
         let cabal = Arc::new(Mutex::new(cabal));
-        let network = Arc::new(Network::start(&identity, NetworkMode::Local).await?);
+        let network = Arc::new(Network::start(&identity, NetworkMode::Direct {}).await?);
         network.add(cabal.clone())?;
-        let peer = Network::start(&peer_identity, NetworkMode::Local).await?;
+        let peer = Network::start(&peer_identity, NetworkMode::Direct {}).await?;
         let executor = Controlled::new(output.into());
         let host = network.host_compute(
             &directory.path().join("compute"),
@@ -355,7 +355,7 @@ async fn explicit_grant_and_authenticated_job_retries_run_once_over_quic() -> Re
         ComputeRejection::MismatchedRetry,
     );
     rejected(pair.submit(Uuid::new_v4()).await?, ComputeRejection::Busy);
-    let stranger = Network::start(&Identity::generate()?, NetworkMode::Local).await?;
+    let stranger = Network::start(&Identity::generate()?, NetworkMode::Direct {}).await?;
     rejected(
         stranger.compute_status(pair.network.address(), job).await?,
         ComputeRejection::Denied,
@@ -591,7 +591,7 @@ async fn completed_job_survives_host_restart_and_same_device_reconnect() -> Resu
     } = pair;
     drop(network);
     drop(host);
-    let restarted = Network::start(&identity, NetworkMode::Local).await?;
+    let restarted = Network::start(&identity, NetworkMode::Direct {}).await?;
     restarted.add(cabal)?;
     let host = restarted.host_compute(
         &directory.path().join("compute"),

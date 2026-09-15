@@ -2,8 +2,8 @@
 //! missing signed changes; disconnected devices catch up after rejoining.
 use base64::{Engine, engine::general_purpose::STANDARD};
 use iroh::{
-    Endpoint, EndpointAddr, PublicKey, RelayMode,
-    endpoint::{Connection, presets},
+    Endpoint, EndpointAddr, PublicKey,
+    endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -22,19 +22,13 @@ use uuid::Uuid;
 use crate::compute::{self, ComputeExecutor, ComputeHost, ComputeInput, ComputeReply};
 use crate::{
     ASSET_CHUNK_BYTES, AssetDescriptor, Cabal, ChangeEnvelope, Error, Identity, Invitation,
-    MAX_FRAME_BYTES, Result, Roster,
+    MAX_FRAME_BYTES, NetworkMode, Result, Roster,
 };
 
 const ALPN: &[u8] = b"app.delysis.loom/cabal/2";
 const MAX_CABALS: usize = 16;
 type SharedCabal = Arc<Mutex<Cabal>>;
 type Cabals = Arc<Mutex<BTreeMap<Uuid, SharedCabal>>>;
-
-#[derive(Clone, Copy, Debug)]
-pub enum NetworkMode {
-    Internet,
-    Local,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerStatus {
@@ -47,6 +41,7 @@ pub struct PeerStatus {
 #[derive(Debug)]
 pub struct Network {
     router: Router,
+    mode: NetworkMode,
     identity: Identity,
     compute: compute::Handler,
     compute_outbound: Semaphore,
@@ -58,17 +53,24 @@ pub struct Network {
 
 impl Network {
     pub async fn start(identity: &Identity, mode: NetworkMode) -> Result<Self> {
-        let builder = match mode {
-            NetworkMode::Internet => Endpoint::builder(presets::N0),
-            NetworkMode::Local => {
-                Endpoint::builder(presets::Minimal).relay_mode(RelayMode::Disabled)
-            }
-        };
+        let builder = mode.builder()?;
         let endpoint = builder
             .secret_key(identity.secret_key())
             .bind()
             .await
             .map_err(network_error)?;
+        Self::attach(identity, mode, endpoint)
+    }
+
+    pub(crate) fn attach(
+        identity: &Identity,
+        mode: NetworkMode,
+        endpoint: Endpoint,
+    ) -> Result<Self> {
+        mode.validate()?;
+        if endpoint.id() != identity.public_key() {
+            return Err(Error::Invalid("Network endpoint belongs to another device"));
+        }
         let cabals = Arc::new(Mutex::new(BTreeMap::new()));
         let compute = compute::Handler::new();
         let router = Router::builder(endpoint.clone())
@@ -85,11 +87,13 @@ impl Network {
         let (status_tx, status) = watch::channel(Vec::new());
         let worker_cabals = cabals.clone();
         let worker_stop = stop.clone();
+        let worker_mode = mode.clone();
         let worker = tokio::spawn(async move {
-            supervise(endpoint, worker_cabals, status_tx, worker_stop).await;
+            supervise(endpoint, worker_mode, worker_cabals, status_tx, worker_stop).await;
         });
         Ok(Self {
             router,
+            mode,
             identity: identity.clone(),
             compute,
             compute_outbound: Semaphore::new(4),
@@ -101,7 +105,10 @@ impl Network {
     }
 
     pub fn address(&self) -> EndpointAddr {
-        self.router.endpoint().addr()
+        self.mode.address(self.router.endpoint().addr())
+    }
+    pub fn mode(&self) -> &NetworkMode {
+        &self.mode
     }
     pub fn status(&self) -> watch::Receiver<Vec<PeerStatus>> {
         self.status.clone()
@@ -138,7 +145,7 @@ impl Network {
     pub async fn join(&self, invitation: &Invitation, name: &str) -> Result<Roster> {
         let reply = request(
             self.router.endpoint(),
-            invitation.owner.clone(),
+            self.mode.address(invitation.owner.clone()),
             &Request::Join {
                 cabal: invitation.cabal,
                 token: invitation.token.clone(),
@@ -168,7 +175,7 @@ impl Network {
     }
 
     pub async fn sync_now(&self, cabal: SharedCabal, peer: PublicKey) -> Result<bool> {
-        synchronize(self.router.endpoint(), cabal, peer).await
+        synchronize(self.router.endpoint(), &self.mode, cabal, peer).await
     }
 
     /// Configures a local executor. No peer gains access until the host records
@@ -251,7 +258,7 @@ impl Network {
             .compute_outbound
             .try_acquire()
             .map_err(|_| Error::Invalid("Compute connections are busy"))?;
-        compute::request(self.router.endpoint(), host, request).await
+        compute::request(self.router.endpoint(), self.mode.address(host), request).await
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -489,7 +496,12 @@ async fn request(endpoint: &Endpoint, address: EndpointAddr, value: &Request) ->
     .map_err(|_| Error::Invalid("Cabal peer did not respond in time"))?
 }
 
-async fn synchronize(endpoint: &Endpoint, cabal: SharedCabal, peer: PublicKey) -> Result<bool> {
+async fn synchronize(
+    endpoint: &Endpoint,
+    mode: &NetworkMode,
+    cabal: SharedCabal,
+    peer: PublicKey,
+) -> Result<bool> {
     let (probe_address, probe) = {
         let cabal = cabal
             .lock()
@@ -498,11 +510,11 @@ async fn synchronize(endpoint: &Endpoint, cabal: SharedCabal, peer: PublicKey) -
             return Err(Error::Invalid("Device is outside current cabal membership"));
         }
         (
-            cabal.peer_address(peer)?,
+            mode.address(cabal.peer_address(peer)?),
             Request::Probe {
                 cabal: cabal.id(),
                 fingerprint: cabal.fingerprint()?,
-                address: endpoint.addr(),
+                address: mode.address(endpoint.addr()),
             },
         )
     };
@@ -520,12 +532,12 @@ async fn synchronize(endpoint: &Endpoint, cabal: SharedCabal, peer: PublicKey) -
             return Err(Error::Invalid("Device is outside current cabal membership"));
         }
         (
-            cabal.peer_address(peer)?,
+            mode.address(cabal.peer_address(peer)?),
             Request::Sync {
                 cabal: cabal.id(),
                 roster: cabal.roster().clone(),
                 known: cabal.hashes()?,
-                address: endpoint.addr(),
+                address: mode.address(endpoint.addr()),
             },
         )
     };
@@ -547,7 +559,7 @@ async fn synchronize(endpoint: &Endpoint, cabal: SharedCabal, peer: PublicKey) -
             _ => return Err(Error::Invalid("Cabal peer rejected synchronization")),
         }
     };
-    Ok(synchronize_assets(endpoint, &cabal, peer, assets).await? || changed)
+    Ok(synchronize_assets(endpoint, mode, &cabal, peer, assets).await? || changed)
 }
 
 /// A pass transfers at most four MiB, yielding to document synchronization and
@@ -555,6 +567,7 @@ async fn synchronize(endpoint: &Endpoint, cabal: SharedCabal, peer: PublicKey) -
 /// partial prefixes remain in SQLite across disconnects and process restart.
 async fn synchronize_assets(
     endpoint: &Endpoint,
+    mode: &NetworkMode,
     cabal: &SharedCabal,
     peer: PublicKey,
     assets: Vec<AssetDescriptor>,
@@ -579,7 +592,7 @@ async fn synchronize_assets(
                     break;
                 };
                 (
-                    cabal.peer_address(peer)?,
+                    mode.address(cabal.peer_address(peer)?),
                     Request::Asset {
                         cabal: cabal.id(),
                         roster: cabal.roster().clone(),
@@ -626,6 +639,7 @@ async fn synchronize_assets(
 
 async fn supervise(
     endpoint: Endpoint,
+    mode: NetworkMode,
     cabals: Cabals,
     status: watch::Sender<Vec<PeerStatus>>,
     stop: CancellationToken,
@@ -673,7 +687,10 @@ async fn supervise(
                     break;
                 };
                 let endpoint = endpoint.clone();
-                running.spawn(async move { (id, peer, synchronize(&endpoint, cabal, peer).await) });
+                let mode = mode.clone();
+                running.spawn(async move {
+                    (id, peer, synchronize(&endpoint, &mode, cabal, peer).await)
+                });
             }
             let completed = tokio::select! {
                 () = stop.cancelled() => return,

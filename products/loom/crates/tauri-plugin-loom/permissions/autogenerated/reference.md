@@ -5,6 +5,8 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 #### This default permission set includes the following:
 
 - `allow-signal-request`
+- `allow-cabal-network-get`
+- `allow-cabal-network-set`
 - `allow-cabal-snapshot`
 - `allow-cabal-share`
 - `allow-cabal-join`
@@ -583,6 +585,58 @@ Enables the cabal_join command without any pre-configured scope.
 <td>
 
 Denies the cabal_join command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-network-get`
+
+</td>
+<td>
+
+Enables the cabal_network_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-network-get`
+
+</td>
+<td>
+
+Denies the cabal_network_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-network-set`
+
+</td>
+<td>
+
+Enables the cabal_network_set command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-network-set`
+
+</td>
+<td>
+
+Denies the cabal_network_set command without any pre-configured scope.
 
 </td>
 </tr>

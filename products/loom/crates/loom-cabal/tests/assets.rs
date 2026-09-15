@@ -169,8 +169,8 @@ async fn actual_quic_carries_chunked_assets_in_the_existing_cabal_sync() -> Resu
     let (mut alice, bob) = pair(directory.path())?;
     let bytes = vec![91; ASSET_CHUNK_BYTES + 53];
     let asset = alice.publish_asset("shared-image.png", &bytes)?;
-    let a = Network::start(alice.identity(), NetworkMode::Local).await?;
-    let b = Network::start(bob.identity(), NetworkMode::Local).await?;
+    let a = Network::start(alice.identity(), NetworkMode::Direct {}).await?;
+    let b = Network::start(bob.identity(), NetworkMode::Direct {}).await?;
     let alice_key = alice.identity().public_key();
     let alice = Arc::new(Mutex::new(alice));
     let bob = Arc::new(Mutex::new(bob));

@@ -2,6 +2,8 @@
 
 const COMMANDS: &[&str] = &[
     "signal_request",
+    "cabal_network_get",
+    "cabal_network_set",
     "cabal_snapshot",
     "cabal_share",
     "cabal_join",

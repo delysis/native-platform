@@ -2,13 +2,14 @@
 //! Projection attempts use the existing immutable save receipts to settle
 //! crashes between the CRDT commit and the visible file commit.
 use super::*;
-use fs2::FileExt;
+#[cfg(test)]
+use loom_cabal::NetworkMode;
 use loom_cabal::compute::{
     ComputeExecutor, ComputeGrant, ComputeGrantStatus, ComputeHost, ComputeModel,
 };
 use loom_cabal::{
     Cabal, Create, DocumentView, Edit, EditResult, Identity, Invitation, MetadataEdit, Network,
-    NetworkMode, PeerStatus, Roster, TextKind,
+    PeerStatus, Roster, TextKind,
 };
 use std::io::Write;
 use std::sync::OnceLock;
@@ -23,6 +24,10 @@ pub(crate) use requesting::{
 
 #[path = "cabal_assets.rs"]
 mod assets;
+
+#[path = "cabal_network.rs"]
+mod network_settings;
+pub(crate) use network_settings::{cabal_network_get, cabal_network_set};
 
 type Shared = Arc<Mutex<Cabal>>;
 
@@ -151,17 +156,8 @@ impl CabalService {
         if slot.is_some() {
             return Ok(());
         }
-        std::fs::create_dir_all(directory).map_err(failure)?;
-        let lease = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(directory.join("profile.lock"))
-            .map_err(failure)?;
-        lease
-            .try_lock_exclusive()
-            .map_err(|_| failure("Another Loom process owns this cabal profile"))?;
+        let lease = network_settings::lease(directory)?;
+        let mode = network_settings::read(directory)?;
         let identity = Identity::open(directory).map_err(failure)?;
         let bindings = match std::fs::read(directory.join("index.json")) {
             Ok(bytes) => {
@@ -188,11 +184,7 @@ impl CabalService {
             ));
             cabals.insert(*id, cabal);
         }
-        let network = Arc::new(
-            Network::start(&identity, NetworkMode::Internet)
-                .await
-                .map_err(failure)?,
-        );
+        let network = Arc::new(Network::start(&identity, mode).await.map_err(failure)?);
         for cabal in cabals.values() {
             if let Err(error) = network.add(cabal.clone()) {
                 let _ = network.shutdown().await;
@@ -1527,7 +1519,7 @@ mod tests {
         let id = cabal.id();
         let cabal = Arc::new(Mutex::new(cabal));
         let network = Arc::new(
-            Network::start(&identity, NetworkMode::Local)
+            Network::start(&identity, NetworkMode::Direct {})
                 .await
                 .expect("local endpoint"),
         );
@@ -1725,7 +1717,7 @@ mod tests {
         let root = store.root().to_owned();
         let identity = Identity::generate().expect("identity");
         let network = Arc::new(
-            Network::start(&identity, NetworkMode::Local)
+            Network::start(&identity, NetworkMode::Direct {})
                 .await
                 .expect("network"),
         );
