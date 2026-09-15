@@ -113,7 +113,7 @@
         <div class="terminal-command"><span aria-hidden="true">› </span>{run.presentation?.input ?? (run.expression || run.title || '')}</div>
         {#if outputs[run.run_id] !== undefined || run.preview}<pre>{outputs[run.run_id] ?? run.preview}</pre>{/if}
         {#if run.error}<p class="terminal-error">{run.error}</p>{/if}
-        {#if run.remote}<small class="terminal-status">{run.remote.model.name} · peer result</small>{/if}
+        {#if run.remote}<small class="terminal-status">{run.remote.model.name} · {run.status === 'completed' ? 'peer result' : 'peer job'}</small>{/if}
         {#if run.status === 'unconfirmed'}
           <div class="terminal-recovery">
             <button type="button" on:click={() => onRecover(run, 'check')} disabled={disabled || busy}>Check</button>

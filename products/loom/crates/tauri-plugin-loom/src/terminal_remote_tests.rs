@@ -253,6 +253,41 @@ async fn peer_terminal_uses_the_selected_host_without_a_local_model_and_preserve
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_jobs_retain_delivery_reports_across_reopen_without_inventing_a_terminal() {
+    let pair = Pair::new().await;
+    pair.host.revoke(pair.request.grant.id).unwrap();
+    let id = CommandId::new();
+    start(&pair, id, "This revoked grant must not run.").await;
+    let first = wait(&pair, id).await;
+    assert_eq!(first.status, "unconfirmed");
+    assert!(first.error.as_ref().unwrap().contains("access denied"));
+    let root = pair.temporary.path().join("writing");
+    let started = crate::terminal_receipts::read(&root, &id.to_string(), false).unwrap();
+    pair.reopen_requester().await;
+    assert_eq!(wait(&pair, id).await.error, first.error);
+    let checked = recover(&pair, id, RecoveryMode::Check).await;
+    assert_eq!(checked.status, "unconfirmed");
+    assert_eq!(
+        checked.error, first.error,
+        "unknown jobs also deny retrieval"
+    );
+    let resumed = recover(&pair, id, RecoveryMode::Resume).await;
+    assert_eq!(resumed.status, "unconfirmed");
+    assert!(resumed.error.unwrap().contains("access denied"));
+    assert_eq!(pair.executor.0.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        crate::terminal_receipts::read(&root, &id.to_string(), false).unwrap(),
+        started
+    );
+    assert!(
+        read_receipt(&root, &id.to_string(), true)
+            .unwrap()
+            .is_none()
+    );
+    pair.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn check_never_creates_a_later_step_and_resume_reuses_results_after_requester_reopen() {
     let pair = Pair::new().await;
     let id = interrupted_pipeline(&pair).await;

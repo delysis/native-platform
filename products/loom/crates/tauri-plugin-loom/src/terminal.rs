@@ -319,7 +319,11 @@ fn read_receipt(root: &Path, id: &str, finished: bool) -> Result<Option<RunRecei
     Ok(Some(receipt))
 }
 
-fn settle_interrupted(run: &mut TerminalRun, state: &PluginState) -> Result<(), IpcFailure> {
+fn settle_interrupted(
+    root: &Path,
+    run: &mut TerminalRun,
+    state: &PluginState,
+) -> Result<(), IpcFailure> {
     if run.status == "running"
         && state
             .generation_lifecycle
@@ -329,8 +333,16 @@ fn settle_interrupted(run: &mut TerminalRun, state: &PluginState) -> Result<(), 
     {
         if run.remote.is_some() {
             run.status = "unconfirmed".into();
-            run.error =
-                Some("The peer outcome is unconfirmed. Check saved jobs before resuming.".into());
+            run.error = Some(
+                match crate::terminal_receipts::observation(root, &run.run_id)? {
+                    Some(message) => {
+                        format!("Last saved report: {message} The final outcome is unconfirmed.")
+                    }
+                    None => {
+                        "The peer outcome is unconfirmed. Check saved jobs before resuming.".into()
+                    }
+                },
+            );
         } else {
             run.status = "failed".into();
             run.error = Some("Interrupted before completion; retained results are in Runs.".into());
@@ -460,7 +472,7 @@ fn terminal_start<R: Runtime>(
             ));
         }
         let mut result = read_receipt(&root, &command_id.to_string(), true)?.unwrap_or(receipt);
-        settle_interrupted(&mut result.run, state)?;
+        settle_interrupted(&root, &mut result.run, state)?;
         return Ok(result.run);
     }
     let document_id = document_id.parse::<DocumentId>().map_err(io_failure)?;
@@ -1207,7 +1219,11 @@ impl Evaluator<'_> {
                 // Neither an IPC timeout nor a lost process proves a peer outcome.
                 self.receipt.run.status = "unconfirmed".into();
                 self.receipt.run.error = Some(error.message.clone());
-                return Ok(());
+                return crate::terminal_receipts::save_observation(
+                    self.root,
+                    &self.receipt.run.run_id,
+                    &error.message,
+                );
             }
         }
         match outcome {
@@ -1274,7 +1290,7 @@ pub(super) async fn terminal_list(
         if let Some(receipt) = read_receipt(store.root(), &id, true)? {
             runs.push(receipt.run);
         } else if let Some(mut receipt) = read_receipt(store.root(), &id, false)? {
-            settle_interrupted(&mut receipt.run, &state)?;
+            settle_interrupted(store.root(), &mut receipt.run, &state)?;
             runs.push(receipt.run);
         }
     }

@@ -105,6 +105,13 @@ Outbound requests keep their session owner while leaving the local model free
 for a friend's incoming job. The local-generation permission cannot dispatch a
 peer terminal call; dispatch and recovery use the peer-compute permission.
 
+An interrupted run retains its last delivery report, including a refused grant,
+busy host, or exhausted budget. This bounded, atomically replaced diagnostic is
+separate from immutable execution receipts. It cannot establish completion or
+authorize another call; Check and Resume keep their existing meanings. Pending
+and unconfirmed calls are labelled peer jobs, with peer result reserved for a
+completed run.
+
 ## Ownership and authority
 
 * `loom-cabal` owns device identity, signed membership, Automerge documents,
@@ -469,6 +476,31 @@ manuscript stayed unchanged, both network owners joined, and the native model
 unloaded. This used a mock Tauri host, a synthetic image and a generated WAV tone;
 it establishes native image/audio execution and evidence binding, not packaged
 controls, response quality, or connectivity between physical networks.
+
+Packaged macOS applications built from `8599b36` then exercised the same path
+through native controls. The two ad-hoc-signed test copies used bundle identifiers
+`app.delysis.loom.media8599.host` and `app.delysis.loom.media8599.peer`, separate
+profiles, direct connections, and the built frontend asset `index-DBqFIDAq.js`
+(SHA-256 `75cee33abf0dd42290db1f106b5765b554b96cd7331750b2f3d2f9c7dba9e494`).
+Host PID 25022 granted the paired device four jobs, each limited to 32 tokens and
+120 seconds. Peer PID 27159 selected the advertised text/image/audio model,
+imported a synthetic PNG and WAV through the file picker, and completed text
+and mixed-media jobs without a local model. Both ledgers retained identical
+input bytes. The UI distinguished the generated outputs as peer results.
+
+Plain raw prompts produced repetitive output from this instruction-tuned model.
+Using the chat framing stored in its GGUF produced a description identifying
+the blue image and the tone. This is one observed answer, not a quality benchmark;
+instruction-model prompt templates remain explicit, without hidden chat wrapping.
+
+After graceful peer exit and restart as PID 32363, opening the saved cabal folder
+restored all three results and rediscovered the same model without another
+invitation. Revoking its remaining grant prevented a stale selected offer from
+adding a fourth host job. This exposed a generic unconfirmed message that hid
+the refusal; delivery diagnostics now retain the reason separately. Both test
+application processes exited, and the synthetic workspaces were preserved.
+These checks establish packaged behavior on one Mac, not physical Internet
+pairing, phone-linked Signal, IME, or every interruption/preemption case.
 
 The feature is not complete until the following have concrete evidence:
 

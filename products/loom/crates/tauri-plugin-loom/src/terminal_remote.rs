@@ -3,7 +3,8 @@
 use super::*;
 use crate::cabals::requesting::{JobDelivery, JobReply, find_job};
 use loom_cabal::compute::{
-    ClientJob, ClientRequest, ComputeGrant, ComputeInput, ComputeModel, ComputeStatus,
+    ClientJob, ClientRequest, ComputeGrant, ComputeInput, ComputeModel, ComputeRejection,
+    ComputeStatus,
 };
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
@@ -433,9 +434,23 @@ fn checked_reply(reply: JobReply) -> Result<ClientJob, IpcFailure> {
         return Ok(reply.job);
     }
     match reply.delivery {
-        JobDelivery::Rejected { reason } => Err(unconfirmed(format!(
-            "The peer could not confirm this step: {reason:?}."
-        ))),
+        JobDelivery::Rejected { reason } => Err(unconfirmed(match reason {
+            ComputeRejection::Denied => {
+                "The friend refused this request: access denied. Check the compute grant with them."
+            }
+            ComputeRejection::Busy => "The friend's model is busy. Resume when it is available.",
+            ComputeRejection::InvalidRequest => "The friend refused this input or its limits.",
+            ComputeRejection::MismatchedRetry => {
+                "The friend reported different saved input for this job. Its input cannot be replaced."
+            }
+            ComputeRejection::Exhausted => {
+                "The friend's compute grant or storage budget is exhausted."
+            }
+            ComputeRejection::Stopped => "The friend's compute service has stopped.",
+            ComputeRejection::Unavailable => {
+                "The friend could not return a saved result for this job."
+            }
+        })),
         JobDelivery::Unconfirmed { message } => Err(unconfirmed(message)),
         JobDelivery::Stored | JobDelivery::Receipt => Ok(reply.job),
     }

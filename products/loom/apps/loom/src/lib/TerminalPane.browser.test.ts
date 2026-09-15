@@ -97,6 +97,8 @@ it('keeps an unconfirmed peer result inert until Check, Resume, or Cancel is sel
   mounted = mount(TerminalPane, { target, props: { open: true, runs: [run], onRecover, onCancelRun, onRun,
     onCancel: vi.fn(), onOpen: vi.fn(), onClose: vi.fn(), onCheck: vi.fn() } });
   await expect.element(page.getByRole('button', { name: 'Check', exact: true })).toBeVisible();
+  expect(document.body.textContent).toContain('Shared Gemma · peer job');
+  expect(document.body.textContent).not.toContain('Shared Gemma · peer result');
   expect(onRecover).not.toHaveBeenCalled(); expect(onRun).not.toHaveBeenCalled();
   await page.getByRole('button', { name: 'Check', exact: true }).click();
   expect(onRecover.mock.calls).toEqual([[run, 'check']]);
