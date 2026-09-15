@@ -169,7 +169,7 @@ dispatch a new message. Authored drafts and pending-send identities are saved
 inside the encrypted database with optimistic versions and exact retry IDs.
 Workspace bookmarks use the same database, with versioned updates, exact retries,
 16 links per conversation, and bounded total storage. They contain no invitation
-tokens or group keys. The bundled frontend/native host and worker use IPC version 3;
+tokens or group keys. The bundled frontend/native host and worker use IPC version 4;
 an older worker is rejected instead of partially serving newer requests.
 
 Shutdown is a terminal stdin command: the reader forwards it in order and does
@@ -208,9 +208,56 @@ The storage cap currently stops new edits with an error. Long-lived history
 compaction must preserve signed provenance and offline recovery before that cap
 can be relaxed.
 
-The current cabal store and signed document payload format is version 2. Older
-experimental stores are rejected without being rewritten. No compatibility
-layer is retained for the unreleased version 1 prototype.
+The cabal store is version 3, the signed document payload is version 2, and the
+workspace transport uses `app.delysis.loom/cabal/2`. Older experimental stores
+and protocols are rejected without rewriting saved data or retaining a
+compatibility layer.
+
+## Portable attachments
+
+A locally authored attachment reference publishes the exact retained original
+into that cabal. Initial sharing captures attachments in the selected workspace;
+later edits publish only references added relative to the author's observed CRDT
+basis. Native file imports, recordings, and pasted/dropped image paths all use
+this boundary. A received document never authorizes reading a private file just
+because it names the file's content hash. Unrelated local edits do not convert
+peer-authored references into publication authority.
+
+The existing authenticated channel pulls one-MiB chunks, at most four per sync
+pass. Durable contiguous prefixes resume after disconnect or restart. Only the
+complete, SHA-256-verified original enters the advertised catalog or can be
+relayed. Peers must remain admitted when requesting and accepting each chunk.
+There are at most 256 originals, 128 MiB each, totaling 256 MiB; incomplete
+reservations consume that same quota. Invalid final hashes discard only the
+unverified transfer so another provider can retry it.
+
+Received files live in a separate per-cabal media cache. Shared inline references
+read that cache; private recovery documents and explicitly selected local context
+retain their local authority. Shared processing never reuses a private import's
+filename or acquisition receipt. A local preview or prompt inspects the retained
+original through Loom's existing bounded attachment pipeline. Receiving a file
+does not run its parser, and an unsupported file cannot prevent unrelated text
+from arriving. Extracted text, converted media, and processing receipts have a
+separate 256 MiB cache budget and bounded file count; filling it does not consume
+the space reserved for raw downloads. Cache entries are retained, not silently
+evicted or substituted.
+
+Cabal recovery copies retain the original shared media namespace. The recovery
+path is recorded before creating its file; the resulting document identity keeps
+that namespace across later renames. Recovery cannot turn peer-authored hashes
+into access to private imports. Revealing an original also requires its current
+document selection and uses that document's media namespace.
+
+Image preview tokens now bind project, session, document, and exact selected
+content. A relative image path remains ordinary Markdown; its in-app rendering
+cannot name another document's private image. Local prompt execution resolves
+shared images and audio as native model inputs, including media reached through
+explicit document references. Existing model/projector modality checks still
+apply. Local QUIC tests and native storage/protocol tests establish transfer,
+recovery, integrity, and isolation; current packaged two-device model execution
+with these attachments remains unverified. Peer model jobs still accept text
+only. Document-context settings remain local; they are not silently published
+with a manuscript.
 
 ## Shared compute boundary
 

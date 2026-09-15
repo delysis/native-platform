@@ -126,10 +126,11 @@ export function attachmentMarkdown(
 export function projectAssetProtocolToken(
   projectId: string,
   sessionId: string,
+  documentId: string,
   markdownPath: string
 ): string | null {
   const match = /^(?:\.\.\/)+assets\/([a-f0-9]{64}\.(?:png|jpg|gif|webp))$/u.exec(markdownPath);
   const canonicalUlid = /^[0-9A-HJKMNP-TV-Z]{26}$/u;
-  if (!match || !canonicalUlid.test(projectId) || !canonicalUlid.test(sessionId)) return null;
-  return `v1-${projectId}-${sessionId}-${match[1]}`;
+  if (!match || !canonicalUlid.test(projectId) || !canonicalUlid.test(sessionId) || !canonicalUlid.test(documentId)) return null;
+  return `v3-${projectId}-${sessionId}-${documentId}-${match[1]}`;
 }

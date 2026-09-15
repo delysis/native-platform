@@ -243,7 +243,7 @@ pub(crate) fn encode_heads(document: &Automerge) -> Vec<String> {
         .collect()
 }
 
-fn decode_heads(heads: &[String]) -> Result<Vec<ChangeHash>> {
+pub(crate) fn decode_heads(heads: &[String]) -> Result<Vec<ChangeHash>> {
     if heads.len() > 256 {
         return Err(Error::Invalid("Too many document heads"));
     }

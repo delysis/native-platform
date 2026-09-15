@@ -1,5 +1,6 @@
 //! Authenticated pull-based anti-entropy. Every admitted device exchanges its
 //! missing signed changes; disconnected devices catch up after rejoining.
+use base64::{Engine, engine::general_purpose::STANDARD};
 use iroh::{
     Endpoint, EndpointAddr, PublicKey, RelayMode,
     endpoint::{Connection, presets},
@@ -19,9 +20,12 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::compute::{self, ComputeExecutor, ComputeHost, ComputeInput, ComputeReply};
-use crate::{Cabal, ChangeEnvelope, Error, Identity, Invitation, MAX_FRAME_BYTES, Result, Roster};
+use crate::{
+    ASSET_CHUNK_BYTES, AssetDescriptor, Cabal, ChangeEnvelope, Error, Identity, Invitation,
+    MAX_FRAME_BYTES, Result, Roster,
+};
 
-const ALPN: &[u8] = b"app.delysis.loom/cabal/1";
+const ALPN: &[u8] = b"app.delysis.loom/cabal/2";
 const MAX_CABALS: usize = 16;
 type SharedCabal = Arc<Mutex<Cabal>>;
 type Cabals = Arc<Mutex<BTreeMap<Uuid, SharedCabal>>>;
@@ -286,6 +290,12 @@ enum Request {
         name: String,
         address: EndpointAddr,
     },
+    Asset {
+        cabal: Uuid,
+        roster: Roster,
+        sha256: String,
+        offset: u64,
+    },
     Sync {
         cabal: Uuid,
         roster: Roster,
@@ -302,9 +312,15 @@ enum Response {
     Joined {
         roster: Roster,
     },
+    Asset {
+        sha256: String,
+        offset: u64,
+        bytes: String,
+    },
     Sync {
         roster: Roster,
         changes: Vec<ChangeEnvelope>,
+        assets: Vec<AssetDescriptor>,
     },
     Revoked {
         roster: Roster,
@@ -350,6 +366,7 @@ impl Handler {
     fn respond(&self, peer: PublicKey, request: Request) -> Result<Response> {
         let id = match &request {
             Request::Probe { cabal, .. }
+            | Request::Asset { cabal, .. }
             | Request::Join { cabal, .. }
             | Request::Sync { cabal, .. } => *cabal,
         };
@@ -364,6 +381,20 @@ impl Handler {
             .lock()
             .map_err(|_| Error::Invalid("Cabal owner stopped"))?;
         match request {
+            Request::Asset {
+                roster,
+                sha256,
+                offset,
+                ..
+            } => {
+                cabal.accept_roster(roster)?;
+                let bytes = cabal.asset_chunk_for(peer, &sha256, offset)?;
+                Ok(Response::Asset {
+                    sha256,
+                    offset,
+                    bytes: STANDARD.encode(bytes),
+                })
+            }
             Request::Probe {
                 fingerprint,
                 address,
@@ -425,6 +456,7 @@ impl Handler {
                 Ok(Response::Sync {
                     roster: cabal.roster().clone(),
                     changes: cabal.missing(&known)?,
+                    assets: cabal.assets()?,
                 })
             }
         }
@@ -498,17 +530,98 @@ async fn synchronize(endpoint: &Endpoint, cabal: SharedCabal, peer: PublicKey) -
         )
     };
     let response = request(endpoint, address, &request_value).await?;
-    let mut cabal = cabal
-        .lock()
-        .map_err(|_| Error::Invalid("Cabal owner stopped"))?;
-    match response {
-        Response::Sync { roster, changes } => {
-            let changed = cabal.accept_roster(roster)?;
-            Ok(cabal.apply(changes)? || changed)
+    let (changed, assets) = {
+        let mut cabal = cabal
+            .lock()
+            .map_err(|_| Error::Invalid("Cabal owner stopped"))?;
+        match response {
+            Response::Sync {
+                roster,
+                changes,
+                assets,
+            } => {
+                let changed = cabal.accept_roster(roster)?;
+                (cabal.apply(changes)? || changed, assets)
+            }
+            Response::Revoked { roster } => return cabal.accept_roster(roster),
+            _ => return Err(Error::Invalid("Cabal peer rejected synchronization")),
         }
-        Response::Revoked { roster } => cabal.accept_roster(roster),
-        _ => Err(Error::Invalid("Cabal peer rejected synchronization")),
+    };
+    Ok(synchronize_assets(endpoint, &cabal, peer, assets).await? || changed)
+}
+
+/// A pass transfers at most four MiB, yielding to document synchronization and
+/// other peers. Completed hashes converge with the normal probe fingerprint;
+/// partial prefixes remain in SQLite across disconnects and process restart.
+async fn synchronize_assets(
+    endpoint: &Endpoint,
+    cabal: &SharedCabal,
+    peer: PublicKey,
+    assets: Vec<AssetDescriptor>,
+) -> Result<bool> {
+    if assets.len() > 256 {
+        return Err(Error::Invalid(
+            "Shared attachment catalog exceeds its limit",
+        ));
     }
+    let mut changed = false;
+    let mut chunks = 0;
+    for descriptor in assets {
+        loop {
+            let (address, value, offset) = {
+                let mut cabal = cabal
+                    .lock()
+                    .map_err(|_| Error::Invalid("Cabal owner stopped"))?;
+                if !cabal.is_member(peer) {
+                    return Err(Error::Invalid("Attachment provider left the cabal"));
+                }
+                let Some(offset) = cabal.begin_asset(&descriptor)? else {
+                    break;
+                };
+                (
+                    cabal.peer_address(peer)?,
+                    Request::Asset {
+                        cabal: cabal.id(),
+                        roster: cabal.roster().clone(),
+                        sha256: descriptor.sha256.clone(),
+                        offset,
+                    },
+                    offset,
+                )
+            };
+            let Response::Asset {
+                sha256,
+                offset: actual_offset,
+                bytes,
+            } = request(endpoint, address, &value).await?
+            else {
+                return Err(Error::Invalid(
+                    "Shared attachment is unavailable from this peer",
+                ));
+            };
+            if sha256 != descriptor.sha256
+                || actual_offset != offset
+                || bytes.len() > ASSET_CHUNK_BYTES * 4 / 3 + 4
+            {
+                return Err(Error::Invalid("Unrelated shared attachment chunk"));
+            }
+            let bytes = STANDARD
+                .decode(bytes)
+                .map_err(|_| Error::Invalid("Invalid attachment encoding"))?;
+            let mut cabal = cabal
+                .lock()
+                .map_err(|_| Error::Invalid("Cabal owner stopped"))?;
+            if !cabal.is_member(peer) {
+                return Err(Error::Invalid("Attachment provider left the cabal"));
+            }
+            changed |= cabal.accept_asset_chunk(&descriptor, offset, &bytes)?;
+            chunks += 1;
+            if chunks >= 4 {
+                return Ok(changed);
+            }
+        }
+    }
+    Ok(changed)
 }
 
 async fn supervise(

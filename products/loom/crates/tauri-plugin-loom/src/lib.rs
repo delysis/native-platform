@@ -76,7 +76,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::attachments::{
     AttachmentStoreError, LoadedImageAsset, StoredImageAsset, is_canonical_image_asset_file_name,
-    read_image_asset, store_image_asset,
+    store_image_asset,
 };
 use crate::audio_io::{audio_record_start, audio_record_stop, audio_synthesize};
 use crate::cabals::{
@@ -133,7 +133,7 @@ pub const FILE_SAVE_MENU_ID: &str = "loom.file.save";
 pub const FILE_EXPORT_COPY_MENU_ID: &str = "loom.file.export-copy";
 pub const FILE_COMMAND_EVENT: &str = "loom://file-command";
 const LOOM_ASSET_SCHEME: &str = "loom-asset";
-const LOOM_ASSET_TOKEN_VERSION: &str = "v1";
+const LOOM_ASSET_TOKEN_VERSION: &str = "v3";
 const LOOM_CONTEXT_MEDIA_TOKEN_VERSION: &str = "v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -4168,6 +4168,7 @@ fn ingest_image_attachment_for_session(
 struct LoomAssetRequest {
     project_id: ProjectId,
     session_id: CommandId,
+    document_id: DocumentId,
     file_name: String,
 }
 
@@ -4202,13 +4203,14 @@ enum LoomAssetReadFailure {
 fn loom_asset_token(
     project_id: ProjectId,
     session_id: CommandId,
+    document_id: DocumentId,
     file_name: &str,
 ) -> Option<String> {
     if !is_canonical_image_asset_file_name(file_name) {
         return None;
     }
     Some(format!(
-        "{LOOM_ASSET_TOKEN_VERSION}-{project_id}-{session_id}-{file_name}"
+        "{LOOM_ASSET_TOKEN_VERSION}-{project_id}-{session_id}-{document_id}-{file_name}"
     ))
 }
 
@@ -4294,9 +4296,11 @@ fn parse_loom_asset_uri(uri: &http::Uri) -> Option<LoomAssetRequest> {
     if token.is_empty() || token.contains('/') || !token.is_ascii() || token.contains('%') {
         return None;
     }
-    let identity = token.strip_prefix("v1-")?;
+    let identity = token.strip_prefix("v3-")?;
     let (project_id_text, remainder) = identity.split_once('-')?;
-    let (session_id_text, file_name) = remainder.split_once('-')?;
+    let (session_id_text, remainder) = remainder.split_once('-')?;
+    let (document_id_text, file_name) = remainder.split_once('-')?;
+    let document_id = document_id_text.parse::<DocumentId>().ok()?;
     if file_name.contains('-') {
         return None;
     }
@@ -4305,13 +4309,14 @@ fn parse_loom_asset_uri(uri: &http::Uri) -> Option<LoomAssetRequest> {
     if project_id.to_string() != project_id_text || session_id.to_string() != session_id_text {
         return None;
     }
-    let canonical_token = loom_asset_token(project_id, session_id, file_name)?;
+    let canonical_token = loom_asset_token(project_id, session_id, document_id, file_name)?;
     if canonical_token != token {
         return None;
     }
     Some(LoomAssetRequest {
         project_id,
         session_id,
+        document_id,
         file_name: file_name.to_owned(),
     })
 }
@@ -4320,25 +4325,54 @@ fn read_authorized_loom_asset(
     state: &PluginState,
     request: &LoomAssetRequest,
 ) -> Result<LoadedProtocolAsset, LoomAssetReadFailure> {
-    read_authorized_loom_asset_with(state, request, read_image_asset).map(|asset| {
-        LoadedProtocolAsset {
+    read_authorized_loom_asset_with(state, request, context_attachments::shared::read_image).map(
+        |asset| LoadedProtocolAsset {
             bytes: asset.bytes,
             media_type: asset.media_type.to_owned(),
-        }
-    })
+        },
+    )
 }
 
 fn read_authorized_loom_asset_with(
     state: &PluginState,
     request: &LoomAssetRequest,
-    reader: impl FnOnce(&Path, &str) -> Result<LoadedImageAsset, AttachmentStoreError>,
+    reader: impl FnOnce(&Path, &str) -> Result<LoadedImageAsset, ContextAttachmentError>,
 ) -> Result<LoadedImageAsset, LoomAssetReadFailure> {
     let authority = capture_loom_asset_authority(state, request)?;
+    {
+        let session = state
+            .session
+            .lock()
+            .map_err(|_| LoomAssetReadFailure::Unavailable)?;
+        let store = session
+            .store
+            .as_ref()
+            .ok_or(LoomAssetReadFailure::NotFound)?;
+        if session.active_session_id != Some(request.session_id)
+            || store.manifest().project_id != request.project_id
+        {
+            return Err(LoomAssetReadFailure::NotFound);
+        }
+        let registered = store
+            .registered_document(request.document_id)
+            .map_err(|_| LoomAssetReadFailure::NotFound)?
+            .ok_or(LoomAssetReadFailure::NotFound)?;
+        let document = store
+            .read_document(&registered.relative_path)
+            .map_err(|_| LoomAssetReadFailure::NotFound)?;
+        if !crate::attachments::inline_image_assets(&document.text).contains(&request.file_name) {
+            return Err(LoomAssetReadFailure::NotFound);
+        }
+    }
+    let root = context_attachments::shared::inline_root(
+        &authority.project_root,
+        &request.document_id.to_string(),
+    )
+    .map_err(|_| LoomAssetReadFailure::NotFound)?;
     // Hashing and structural image decode are bounded, but still substantially
     // slower than an in-memory authority check. Never serialize unrelated
     // session work behind that filesystem and decoder latency.
-    let asset = reader(&authority.project_root, &request.file_name)
-        .map_err(|_| LoomAssetReadFailure::NotFound)?;
+    let asset = reader(&root, &request.file_name).map_err(|_| LoomAssetReadFailure::NotFound)?;
     if !loom_asset_authority_is_current(state, &authority)? {
         return Err(LoomAssetReadFailure::NotFound);
     }
@@ -4436,12 +4470,17 @@ fn read_authorized_context_media(
     if !selected && !selected_inline {
         return Err(LoomAssetReadFailure::NotFound);
     }
-    let media = read_context_media(
-        &authority.project_root,
-        &request.attachment_id,
-        &request.media_sha256,
-    )
-    .map_err(|_| LoomAssetReadFailure::NotFound)?;
+    let media_root = if selected {
+        authority.project_root.clone()
+    } else {
+        context_attachments::shared::inline_root(
+            &authority.project_root,
+            &request.document_id.to_string(),
+        )
+        .map_err(|_| LoomAssetReadFailure::NotFound)?
+    };
+    let media = read_context_media(&media_root, &request.attachment_id, &request.media_sha256)
+        .map_err(|_| LoomAssetReadFailure::NotFound)?;
     if !loom_asset_authority_is_current(state, &authority)? {
         return Err(LoomAssetReadFailure::NotFound);
     }
@@ -4717,6 +4756,7 @@ async fn document_export_choose<R: Runtime>(
 async fn attachment_reveal_original(
     project_id: String,
     session_id: String,
+    document_id: String,
     attachment_id: String,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
@@ -4724,8 +4764,23 @@ async fn attachment_reveal_original(
     let path = {
         let mut session = lock_session(&state)?;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;
-        context_attachments::original_path(store.root(), &attachment_id)
-            .map_err(|error| IpcFailure::context_attachment(&error))?
+        let document_id = document_id
+            .parse::<DocumentId>()
+            .map_err(|_| stale_document_action_failure())?;
+        let registered = store
+            .registered_document(document_id)
+            .map_err(IpcFailure::store)?
+            .ok_or_else(stale_document_action_failure)?;
+        let document = store
+            .read_document(&registered.relative_path)
+            .map_err(IpcFailure::store)?;
+        context_attachments::shared::original_for_document(
+            store.root(),
+            &document_id.to_string(),
+            &document.text,
+            &attachment_id,
+        )
+        .map_err(|error| IpcFailure::context_attachment(&error))?
     };
     tauri_plugin_opener::reveal_item_in_dir(path)
         .map_err(|error| IpcFailure::new("attachment_reveal_failed", error.to_string(), false))
@@ -14806,8 +14861,16 @@ mod tests {
     fn asset_read_releases_session_lock_and_revalidates_authority() {
         let temporary = tempfile::tempdir().expect("temporary parent");
         let root = temporary.path().join("Asset Read Authority");
-        let store =
+        let mut store =
             initialize_project(&root, "Asset Read Authority".to_owned()).expect("initialize");
+        store
+            .create_document_if_absent(
+                "picture.md",
+                DocumentContent::Prose(format!("![Image](../assets/{}.png)", "a".repeat(64))),
+                "fixture",
+            )
+            .unwrap();
+        let document_id = store.read_document("picture.md").unwrap().document_id;
         let project_id = store.manifest().project_id;
         let expected_root = store.root().to_path_buf();
         let session_id = CommandId::new();
@@ -14821,6 +14884,7 @@ mod tests {
         let request = LoomAssetRequest {
             project_id,
             session_id,
+            document_id,
             file_name: format!("{}.png", "a".repeat(64)),
         };
 
@@ -14898,7 +14962,20 @@ mod tests {
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .expect("asset file name");
-        let token_a = loom_asset_token(project_a, session_a, file_name).expect("asset token");
+        let document_id = {
+            let mut session = state.session.lock().unwrap();
+            let store = session.store.as_mut().unwrap();
+            store
+                .create_document_if_absent(
+                    "picture.md",
+                    DocumentContent::Prose(format!("![Image]({})", stored.markdown_path)),
+                    "fixture",
+                )
+                .unwrap();
+            store.read_document("picture.md").unwrap().document_id
+        };
+        let token_a =
+            loom_asset_token(project_a, session_a, document_id, file_name).expect("asset token");
         let mac_uri_a = format!("loom-asset://localhost/{token_a}");
         let windows_uri_a = format!("http://loom-asset.localhost/{token_a}");
 
@@ -15018,7 +15095,8 @@ mod tests {
             http::StatusCode::NOT_FOUND,
             "the old project A session token stays revoked after reopen"
         );
-        let token_a2 = loom_asset_token(project_a, session_a2, file_name).expect("reopen token");
+        let token_a2 =
+            loom_asset_token(project_a, session_a2, document_id, file_name).expect("reopen token");
         let reopened_response = loom_asset_protocol_response(
             &relaunched_state,
             "main",
@@ -15035,8 +15113,10 @@ mod tests {
     fn asset_protocol_parser_rejects_noncanonical_tokens_origins_and_paths() {
         let project_id = ProjectId::new();
         let session_id = CommandId::new();
+        let document_id = DocumentId::new();
         let file_name = format!("{}.png", "a".repeat(64));
-        let token = loom_asset_token(project_id, session_id, &file_name).expect("canonical token");
+        let token = loom_asset_token(project_id, session_id, document_id, &file_name)
+            .expect("canonical token");
         let mac_uri = format!("loom-asset://localhost/{token}")
             .parse::<http::Uri>()
             .expect("mac URI");
@@ -15055,7 +15135,7 @@ mod tests {
             format!("loom-asset://localhost/%25{token}"),
             format!("loom-asset://localhost/{project_id}/{session_id}/{file_name}"),
             format!("loom-asset://localhost/v1-{project_id}-{session_id}-../{file_name}"),
-            format!("loom-asset://localhost/V1-{project_id}-{session_id}-{file_name}"),
+            format!("loom-asset://localhost/V3-{project_id}-{session_id}-{file_name}"),
             format!(
                 "loom-asset://localhost/v1-{}-{session_id}-{file_name}",
                 project_id.to_string().to_ascii_lowercase()

@@ -9,7 +9,10 @@ mod transport;
 
 pub use crypto::{Identity, Signed};
 pub use document::{Create, DocumentView, Edit, EditResult, MetadataEdit, TextKind};
-pub use store::{Cabal, ChangeEnvelope, ChangePayload, Invitation, Member, Membership, Roster};
+pub use store::{
+    ASSET_CHUNK_BYTES, AssetDescriptor, Cabal, ChangeEnvelope, ChangePayload, Invitation,
+    MAX_ASSET_BYTES, Member, Membership, Roster,
+};
 pub use transport::{Network, NetworkMode, PeerStatus};
 
 pub const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;

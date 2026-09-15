@@ -222,8 +222,8 @@ export function importAttachmentPaths(
   return call('attachment_import_paths', { projectId, sessionId, paths: [...paths] });
 }
 
-export function revealAttachmentOriginal(projectId: string, sessionId: string, attachmentId: string): Promise<void> {
-  return call('attachment_reveal_original', { projectId, sessionId, attachmentId });
+export function revealAttachmentOriginal(projectId: string, sessionId: string, documentId: string, attachmentId: string): Promise<void> {
+  return call('attachment_reveal_original', { projectId, sessionId, documentId, attachmentId });
 }
 
 export function chooseAttachments(

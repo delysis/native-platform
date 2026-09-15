@@ -1,3 +1,5 @@
+pub(crate) mod shared;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Cursor;
@@ -330,10 +332,18 @@ pub(crate) fn import_recorded_wav(
 
 // Account downloads, folder imports, recordings, and native file grants share
 // one parser and persistence path. Callers provide bytes, never URLs to the parser.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn import_provided(
     project_root: &Path,
     provided: ProvidedAttachment,
+) -> Result<StoredAttachment, ContextAttachmentError> {
+    import_provided_using(project_root, provided, install_immutable)
+}
+
+#[allow(clippy::too_many_lines)]
+fn import_provided_using(
+    project_root: &Path,
+    provided: ProvidedAttachment,
+    mut retain: impl FnMut(&Path, &[u8]) -> Result<(), ContextAttachmentError>,
 ) -> Result<StoredAttachment, ContextAttachmentError> {
     let mut file_name = provided.display_name.clone();
     let byte_count = provided.bytes.len() as u64;
@@ -408,7 +418,7 @@ pub(crate) fn import_provided(
                 if format!("{:x}", Sha256::digest(bytes)) != blob.sha256 {
                     return Err(ContextAttachmentError::ContextInvalid);
                 }
-                install_object(project_root, &blob.sha256, bytes)?;
+                retain_object(project_root, &blob.sha256, bytes, &mut retain)?;
                 media_kinds.insert(match kind {
                     MediaKind::Image => "image".to_owned(),
                     MediaKind::Audio => "audio".to_owned(),
@@ -444,7 +454,7 @@ pub(crate) fn import_provided(
         match image_as_png(&original) {
             Ok(bytes) => {
                 let sha256 = format!("{:x}", Sha256::digest(&bytes));
-                install_object(project_root, &sha256, &bytes)?;
+                retain_object(project_root, &sha256, &bytes, &mut retain)?;
                 media_kinds.insert("image".to_owned());
                 stored_media.push(StoredMedia {
                     id: sha256.clone(),
@@ -478,7 +488,7 @@ pub(crate) fn import_provided(
     }
     // Retaining an original does not assert extraction or model support.
     // Identity is the root's content hash, shared with its immutable receipt.
-    install_object(project_root, &id, &original)?;
+    retain_object(project_root, &id, &original, &mut retain)?;
     if canonical_text.is_empty() && stored_media.is_empty() {
         warnings.push(
             "Original file retained. No supported text or native media was extracted; this file is not sent to the model.".to_owned(),
@@ -508,7 +518,7 @@ pub(crate) fn import_provided(
     let canonical_text_sha256 = (!canonical_text.is_empty())
         .then(|| format!("{:x}", Sha256::digest(canonical_text.as_bytes())));
     if let Some(sha256) = canonical_text_sha256.as_deref() {
-        install_object(project_root, sha256, canonical_text.as_bytes())?;
+        retain_object(project_root, sha256, canonical_text.as_bytes(), &mut retain)?;
     }
     let inline_markdown = inline_attachment_markdown(&id, &file_name);
     let attachment = StoredAttachment {
@@ -560,7 +570,7 @@ pub(crate) fn import_provided(
         result.editable_markdown = (!canonical_text.is_empty()).then_some(canonical_text);
         return Ok(result);
     }
-    write_manifest(project_root, &manifest)?;
+    write_manifest(project_root, &manifest, retain)?;
     let mut result = attachment;
     result.media_markdown = editor_media_markdown(&result, &manifest.media);
     result.editable_markdown = (!canonical_text.is_empty()).then_some(canonical_text);
@@ -1164,6 +1174,16 @@ pub(crate) fn resolve_for_generation_with_budget(
 ) -> Result<ResolvedContext, ContextAttachmentError> {
     let contexts = read_contexts(project_root)?;
     let mut ordered_ids = authoritative_context_ids(&contexts, document_id);
+    let author_context_ids: BTreeSet<_> = ordered_ids.iter().cloned().collect();
+    let inline_root = shared::inline_root(project_root, document_id)?;
+    shared::prepare_inline_images(&inline_root, manuscript_prefix)?;
+    let source_root = |id: &str| {
+        if author_context_ids.contains(id) {
+            project_root
+        } else {
+            inline_root.as_path()
+        }
+    };
     let internal_manual_text = effective_context_text(project_root, &contexts, document_id)?;
     let visible_context_text = strip_inline_attachment_markers(&internal_manual_text);
     let imports = contexts
@@ -1210,7 +1230,9 @@ pub(crate) fn resolve_for_generation_with_budget(
     let rebalance_epoch = (stable_query_end / RETRIEVAL_REBALANCE_BYTES) as u64;
     let manifests = ordered_ids
         .iter()
-        .map(|id| read_manifest_metadata(project_root, id).map(|manifest| (id.clone(), manifest)))
+        .map(|id| {
+            read_manifest_metadata(source_root(id), id).map(|manifest| (id.clone(), manifest))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     preflight_native_media(&manifests)?;
     let cache_key = PreambleCacheKey {
@@ -1244,7 +1266,7 @@ pub(crate) fn resolve_for_generation_with_budget(
             ));
         } else {
             for (id, manifest) in &manifests {
-                let canonical_text = read_canonical_text(project_root, manifest)?;
+                let canonical_text = read_canonical_text(source_root(id), manifest)?;
                 if !canonical_text.is_empty() {
                     sources.push((id.clone(), manifest.attachment.clone(), canonical_text));
                 }
@@ -1264,7 +1286,7 @@ pub(crate) fn resolve_for_generation_with_budget(
     let mut media = Vec::new();
     for (id, manifest) in manifests {
         for item in manifest.media {
-            let bytes = read_object(project_root, &item.sha256, item.byte_count)?;
+            let bytes = read_object(source_root(&id), &item.sha256, item.byte_count)?;
             media.push(MediaInput {
                 id: format!("{id}:{}", item.id),
                 kind: item.kind,
@@ -1956,7 +1978,14 @@ fn inline_markdown_with_scheme(id: &str, file_name: &str, scheme: &str) -> Strin
 }
 
 fn inline_attachment_ids(markdown: &str) -> Vec<String> {
-    inline_ids_with_scheme(markdown, "loom-attachment")
+    let mut ids = inline_ids_with_scheme(markdown, "loom-attachment");
+    for name in crate::attachments::inline_image_assets(markdown) {
+        let id = &name[..64];
+        if !ids.iter().any(|item| item == id) {
+            ids.push(id.to_owned());
+        }
+    }
+    ids
 }
 
 fn inline_media_ids(markdown: &str) -> Vec<String> {
@@ -2049,12 +2078,21 @@ fn install_object(
     sha256: &str,
     bytes: &[u8],
 ) -> Result<(), ContextAttachmentError> {
+    retain_object(project_root, sha256, bytes, install_immutable)
+}
+
+fn retain_object(
+    project_root: &Path,
+    sha256: &str,
+    bytes: &[u8],
+    mut retain: impl FnMut(&Path, &[u8]) -> Result<(), ContextAttachmentError>,
+) -> Result<(), ContextAttachmentError> {
     if !is_sha256(sha256) || format!("{:x}", Sha256::digest(bytes)) != sha256 {
         return Err(ContextAttachmentError::ContextInvalid);
     }
     let root = attachment_root(project_root)?;
     let path = root.join("objects").join(sha256);
-    install_immutable(&path, bytes)
+    retain(&path, bytes)
 }
 
 fn read_object(
@@ -2097,12 +2135,13 @@ pub(crate) fn original_path(
 fn write_manifest(
     project_root: &Path,
     manifest: &AttachmentManifest,
+    mut retain: impl FnMut(&Path, &[u8]) -> Result<(), ContextAttachmentError>,
 ) -> Result<(), ContextAttachmentError> {
     let path = attachment_root(project_root)?
         .join("manifests")
         .join(format!("{}.json", manifest.attachment.id));
     let bytes = serde_json::to_vec_pretty(manifest)?;
-    install_immutable(&path, &bytes)
+    retain(&path, &bytes)
 }
 
 /// Acquisition provenance is separate from the offline processing receipt.
@@ -2111,12 +2150,20 @@ pub(crate) fn record_import_origin(
     project_root: &Path,
     origin: &impl Serialize,
 ) -> Result<(), ContextAttachmentError> {
+    record_import_origin_using(project_root, origin, install_immutable)
+}
+
+fn record_import_origin_using(
+    project_root: &Path,
+    origin: &impl Serialize,
+    mut retain: impl FnMut(&Path, &[u8]) -> Result<(), ContextAttachmentError>,
+) -> Result<(), ContextAttachmentError> {
     let bytes = serde_json::to_vec_pretty(origin)?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
     let path = attachment_root(project_root)?
         .join("manifests")
         .join(format!("source-{hash}.json"));
-    install_immutable(&path, &bytes)
+    retain(&path, &bytes)
 }
 
 fn read_manifest(
@@ -2132,12 +2179,17 @@ fn read_manifest_metadata(
     project_root: &Path,
     id: &str,
 ) -> Result<AttachmentManifest, ContextAttachmentError> {
-    read_manifest_if_present(project_root, id)?.ok_or_else(|| {
-        ContextAttachmentError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "attachment manifest does not exist",
-        ))
-    })
+    if let Some(manifest) = read_manifest_if_present(project_root, id)? {
+        return Ok(manifest);
+    }
+    if shared::inspect_published(project_root, id)? {
+        return read_manifest_if_present(project_root, id)?
+            .ok_or(ContextAttachmentError::ContextInvalid);
+    }
+    Err(ContextAttachmentError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "attachment is unavailable or still downloading",
+    )))
 }
 
 fn read_manifest_if_present(

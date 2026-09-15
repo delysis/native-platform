@@ -212,13 +212,25 @@ pub(crate) fn read_image_asset(
     project_root: &Path,
     file_name: &str,
 ) -> Result<LoadedImageAsset, AttachmentStoreError> {
-    let (expected_digest, expected_kind) =
-        parse_asset_file_name(file_name).ok_or(AttachmentStoreError::UnsafeAssetPath)?;
+    parse_asset_file_name(file_name).ok_or(AttachmentStoreError::UnsafeAssetPath)?;
     let assets = verified_asset_directory(project_root)?;
     let path = assets.join(file_name);
     let mut file = BoundedAssetFile::open(&path, ATTACHMENT_LIMITS.image_bytes)?;
     let bytes = file.read()?;
     file.ensure_path_binding()?;
+
+    validate_image_asset(file_name, bytes)
+}
+
+pub(crate) fn validate_image_asset(
+    file_name: &str,
+    bytes: Vec<u8>,
+) -> Result<LoadedImageAsset, AttachmentStoreError> {
+    let (expected_digest, expected_kind) =
+        parse_asset_file_name(file_name).ok_or(AttachmentStoreError::UnsafeAssetPath)?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(AttachmentStoreError::TooLarge);
+    }
 
     if format!("{:x}", Sha256::digest(&bytes)) != expected_digest {
         return Err(AttachmentStoreError::DigestCollision);
@@ -233,6 +245,31 @@ pub(crate) fn read_image_asset(
         bytes,
         media_type: actual_kind.media_type,
     })
+}
+
+/// Recognize only the exact relative, content-addressed image paths emitted
+/// by Loom. No arbitrary path or URL is resolved from document text.
+pub(crate) fn inline_image_assets(markdown: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    for suffix in markdown.split("](").skip(1) {
+        let Some((address, _)) = suffix.split_once(')') else {
+            continue;
+        };
+        let mut path = address;
+        if !path.starts_with("../") {
+            continue;
+        }
+        while let Some(rest) = path.strip_prefix("../") {
+            path = rest;
+        }
+        let Some(name) = path.strip_prefix("assets/") else {
+            continue;
+        };
+        if is_canonical_image_asset_file_name(name) && !result.iter().any(|item| item == name) {
+            result.push(name.to_owned());
+        }
+    }
+    result
 }
 
 pub(crate) fn verified_asset_directory(

@@ -6811,7 +6811,7 @@
   }
 
   function resolveImageAssetUrl(markdownPath: string): string | null {
-    if (!project) return null;
+    if (!project || !document) return null;
     const media = /^loom-attachment:([a-f0-9]{64})\/([a-f0-9]{64})$/.exec(markdownPath);
     if (media && document) {
       return convertFileSrc(`v2-${project.project_id}-${project.session_id}-${document.summary.document_id}-${media[1]}-${media[2]}`, 'loom-asset');
@@ -6819,6 +6819,7 @@
     const token = projectAssetProtocolToken(
       project.project_id,
       project.session_id,
+      document.summary.document_id,
       markdownPath
     );
     return token ? convertFileSrc(token, 'loom-asset') : null;
@@ -8030,7 +8031,8 @@
     if (!link) return;
     event.preventDefault(); event.stopPropagation();
     const id = link.getAttribute('href')?.match(/^loom-attachment:([a-f0-9]{64})$/u)?.[1];
-    if (project && id) void revealAttachmentOriginal(project.project_id, project.session_id, id).catch(recordFailure);
+    const sourceId = link.closest('[data-loom-document]')?.getAttribute('data-loom-document') ?? document?.summary.document_id;
+    if (project && sourceId && id) void revealAttachmentOriginal(project.project_id, project.session_id, sourceId, id).catch(recordFailure);
   }
 
   function handleGlobalKeydownCapture(event: KeyboardEvent): void {

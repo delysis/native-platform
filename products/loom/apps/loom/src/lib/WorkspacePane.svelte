@@ -282,7 +282,7 @@
 </script>
 
 {#if config.visible}
-<section data-workspace-pane={paneId} class="workspace-pane" class:browser={config.kind === 'browser'} aria-label={config.title ?? config.kind} aria-busy={busy}>
+<section data-workspace-pane={paneId} data-loom-document={source?.summary.document_id} class="workspace-pane" class:browser={config.kind === 'browser'} aria-label={config.title ?? config.kind} aria-busy={busy}>
   {#if error && config.kind !== 'terminal'}<p class="error" role="alert">{error}{#if pending}<button on:click={() => void refresh()}>Check result</button>{/if}</p>{/if}
   {#if config.kind === 'editor'}
     {#if source && editingCurrent}

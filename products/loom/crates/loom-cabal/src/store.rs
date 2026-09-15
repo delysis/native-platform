@@ -1,3 +1,6 @@
+mod assets;
+pub use assets::{ASSET_CHUNK_BYTES, AssetDescriptor, MAX_ASSET_BYTES};
+
 use automerge::{Automerge, Change, ReadDoc};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use iroh::{EndpointAddr, PublicKey};
@@ -16,7 +19,7 @@ use crate::{
     document::{self, Create, DocumentView, Edit, EditResult, MetadataEdit, TextKind},
 };
 
-const STORE_VERSION: i64 = 2;
+const STORE_VERSION: i64 = 3;
 const MAX_STORED_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -242,6 +245,20 @@ impl Cabal {
         document::view(document, id)
     }
 
+    /// Read exactly the caller's observed basis before deciding which media
+    /// references the caller introduced, excluding unseen remote references.
+    pub fn view_at(&self, id: Uuid, heads: &[String]) -> Result<DocumentView> {
+        let document = self
+            .documents
+            .get(&id)
+            .ok_or(Error::Invalid("Unknown shared document"))?;
+        let heads = document::decode_heads(heads)?;
+        if heads.is_empty() {
+            return Err(Error::Invalid("An edit needs its document basis"));
+        }
+        document::view(&document.fork_at(&heads)?, id)
+    }
+
     pub fn create_document(&mut self, name: &str, text: &str) -> Result<DocumentView> {
         self.create_document_with_kind(name, text, TextKind::Prose)
     }
@@ -362,6 +379,10 @@ impl Cabal {
         for hash in self.hashes()? {
             digest.update(hash.as_bytes());
         }
+        digest.update(b"\0assets\0");
+        for asset in self.assets()? {
+            digest.update(asset.sha256.as_bytes());
+        }
         Ok(hex::encode(digest.finalize()))
     }
 
@@ -416,7 +437,11 @@ impl Cabal {
         let mut result = Vec::new();
         let mut bytes = 0;
         let budget = crate::MAX_FRAME_BYTES
-            .saturating_sub(serde_json::to_vec(&self.roster)?.len() + 1024)
+            .saturating_sub(
+                serde_json::to_vec(&self.roster)?.len()
+                    + serde_json::to_vec(&self.assets()?)?.len()
+                    + 1024,
+            )
             .min(3 * 1024 * 1024);
         let mut statement = self
             .database
@@ -703,7 +728,9 @@ fn open_database(path: &Path) -> Result<Connection> {
     }
     connection.pragma_update(None, "journal_mode", "WAL")?;
     connection.pragma_update(None, "synchronous", "FULL")?;
+    connection.pragma_update(None, "foreign_keys", true)?;
     connection.execute_batch("CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE IF NOT EXISTS changes(hash TEXT PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS orphaned(hash TEXT PRIMARY KEY, body TEXT NOT NULL); CREATE TABLE IF NOT EXISTS invitations(hash TEXT PRIMARY KEY, member TEXT);")?;
+    assets::initialize(&connection)?;
     connection.pragma_update(None, "user_version", STORE_VERSION)?;
     Ok(connection)
 }

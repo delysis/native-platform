@@ -33,7 +33,17 @@ async fn wait(pair: &Pair, id: CommandId) -> TerminalRun {
             .into_iter()
             .find(|run| run.run_id == id.to_string())
             .unwrap();
-        if run.status != "running" {
+        let state = pair.app.state::<PluginState>();
+        // Persistence precedes releasing the owned session. A saved result
+        // alone does not establish that the worker has finished settlement.
+        if run.status != "running"
+            && state.generations.active_branch_count().unwrap() == 0
+            && state
+                .generation_lifecycle
+                .current_lease(&format!("terminal-{id}"))
+                .unwrap()
+                .is_none()
+        {
             return run;
         }
         assert!(
@@ -179,7 +189,7 @@ async fn peer_terminal_uses_the_selected_host_without_a_local_model_and_preserve
     assert_eq!(pair.executor.0.load(Ordering::SeqCst), 1);
     {
         let state = pair.app.state::<PluginState>();
-        assert_eq!(state.generations.active_branch_count().unwrap(), 0);
+        assert_eq!(state.generations.active_local_branch_count().unwrap(), 0);
         assert!(loaded_model(&state).is_err());
         let mut session = state.session.lock().unwrap();
         let store = session.store.as_mut().unwrap();

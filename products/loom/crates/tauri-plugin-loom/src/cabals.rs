@@ -21,6 +21,9 @@ pub(crate) use requesting::{
     compute_job_submit, compute_jobs, compute_peer_offers,
 };
 
+#[path = "cabal_assets.rs"]
+mod assets;
+
 type Shared = Arc<Mutex<Cabal>>;
 
 #[derive(Debug, Default)]
@@ -621,6 +624,10 @@ pub(crate) async fn cabal_share(
         profile.save_index()?;
         cabal
     };
+    {
+        let cabal = cabal.lock().map_err(|_| failure("Cabal owner stopped"))?;
+        assets::prepare_project(store, &cabal)?;
+    }
     cabal
         .lock()
         .map_err(|_| failure("Cabal owner stopped"))?
@@ -725,6 +732,8 @@ pub(crate) async fn cabal_edit(
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
     let mut cabal = cabal.lock().map_err(|_| failure("Cabal owner stopped"))?;
+    let basis = cabal.view_at(edit.document, &edit.basis).map_err(failure)?;
+    assets::publish_added(store, &mut cabal, &basis.text, &edit.text)?;
     let EditResult {
         local_heads,
         merged,
@@ -800,6 +809,7 @@ fn recover_documents(
     cabal: &Cabal,
     edit: Option<Edit>,
 ) -> Result<Vec<String>, IpcFailure> {
+    assets::prepare_project(store, cabal)?;
     let mut views = cabal.orphaned_documents().map_err(failure)?;
     views.extend(
         cabal
@@ -841,6 +851,8 @@ fn recover_documents(
     let mut paths = BTreeSet::new();
     for view in views {
         let path = recovery_path(view.id, &view.text);
+        crate::context_attachments::shared::reserve_recovery(store.root(), path.clone())
+            .map_err(|error| IpcFailure::context_attachment(&error))?;
         if let Some(existing) = store
             .list_documents()
             .map_err(IpcFailure::store)?
@@ -868,6 +880,7 @@ fn recover_documents(
         }
         paths.insert(path);
     }
+    assets::prepare_project(store, cabal)?;
     Ok(paths.into_iter().collect())
 }
 
@@ -940,6 +953,7 @@ fn capture_document(
         cabal.set_local_record(&key, &create).map_err(failure)?;
         create
     };
+    assets::publish_added(store, cabal, "", &create.text)?;
     let result = cabal.create_document_idempotent(&create).map_err(failure)?;
     if cabal
         .local_record::<Projection>(&projection_key(create.document))
@@ -1118,6 +1132,7 @@ fn project_workspace(
         .reconcile_document_lifecycle()
         .map_err(IpcFailure::store)?;
     store.discover_documents().map_err(IpcFailure::store)?;
+    assets::prepare_project(store, cabal)?;
     let mut problems = Vec::new();
     let mut blocked = BTreeSet::new();
     let mut claimed = BTreeSet::new();
@@ -1253,6 +1268,7 @@ fn project_document(
     cabal: &mut Cabal,
     id: Uuid,
 ) -> Result<SharedDocument, IpcFailure> {
+    assets::prepare_project(store, cabal)?;
     let paths = namespace(&cabal.views().map_err(failure)?)?;
     project_document_at(store, cabal, id, &paths[&id], true)?
         .ok_or_else(|| failure("This shared document was removed"))
@@ -1380,6 +1396,7 @@ fn project_document_at(
         .read_document(&registered.relative_path)
         .map_err(IpcFailure::store)?;
     if loaded.text != projection.base.text && loaded.text != view.text {
+        assets::publish_added(store, cabal, &projection.base.text, &loaded.text)?;
         let result = cabal
             .edit(&Edit {
                 document: id,
