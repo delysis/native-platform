@@ -92,7 +92,7 @@ it('keeps an unconfirmed peer result inert until Check, Resume, or Cancel is sel
   const target = document.createElement('div'); document.body.append(target);
   const onRecover = vi.fn(), onCancelRun = vi.fn(), onRun = vi.fn();
   const run = { run_id: 'peer-run', status: 'unconfirmed' as const, expression: '=@Polish(@Draft)',
-    remote: { host: 'bob', model: { name: 'Shared Gemma', fingerprint: 'model' } },
+    remote: { host: 'bob', model: { media: [], name: 'Shared Gemma', fingerprint: 'model' } },
     output_document_id: null, output_relative_path: null, preview: '', error: 'The peer outcome is unconfirmed.', created_at_ms: 1 };
   mounted = mount(TerminalPane, { target, props: { open: true, runs: [run], onRecover, onCancelRun, onRun,
     onCancel: vi.fn(), onOpen: vi.fn(), onClose: vi.fn(), onCheck: vi.fn() } });

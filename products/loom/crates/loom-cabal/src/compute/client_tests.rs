@@ -53,6 +53,7 @@ mod supported {
                     epoch: 1,
                     peer,
                     model: ComputeModel {
+                        media: Vec::new(),
                         name: "Remote model claim".into(),
                         fingerprint: "ab".repeat(32),
                     },
@@ -61,6 +62,7 @@ mod supported {
                     jobs: 2,
                 },
                 input: ComputeInput {
+                    media: Vec::new(),
                     prompt: "Exact 🌱 @document =function() input".into(),
                     max_output_tokens: 16,
                     seed: 42,
@@ -90,6 +92,30 @@ mod supported {
                 status,
             })
         }
+    }
+
+    #[test]
+    fn media_and_cancel_intent_reopen_exactly_without_following_later_bytes() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        fixture.request.grant.model.media = vec![ComputeModality::Image];
+        fixture.request.input.media = vec![ComputeMedia::new(
+            ComputeMediaFormat::Png,
+            &vec![19; 1024 * 1024],
+        )?];
+        let mut client = fixture.open()?;
+        client.prepare(fixture.request.clone())?;
+        client.request_cancel(fixture.request.id)?;
+        drop(client);
+        let mut client = fixture.open()?;
+        let saved = client.get(fixture.request.id)?.expect("retained request");
+        assert_eq!(saved.request, fixture.request);
+        assert!(saved.cancel_requested);
+        assert!(saved.receipt.is_none());
+        let mut changed = fixture.request.clone();
+        changed.input.media[0] =
+            ComputeMedia::new(ComputeMediaFormat::Png, b"later file contents")?;
+        assert!(client.prepare(changed).is_err());
+        Ok(())
     }
 
     #[test]
@@ -304,7 +330,7 @@ mod supported {
                 .get::<_, String>(0))?,
             body
         );
-        database.pragma_update(None, "user_version", 1)?;
+        database.pragma_update(None, "user_version", 2)?;
         drop(database);
         assert!(
             ComputeClient::open(fixture.directory.path(), Identity::generate()?.public_key())

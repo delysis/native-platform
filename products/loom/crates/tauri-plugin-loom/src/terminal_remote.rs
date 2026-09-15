@@ -1,4 +1,4 @@
-//! A peer owns one raw-text call at a time. The requesting terminal owns the
+//! A peer owns one native completion at a time. The requesting terminal owns the
 //! expression, immutable context, deterministic job IDs, and explicit recovery.
 use super::*;
 use crate::cabals::requesting::{JobDelivery, JobReply, find_job};
@@ -169,6 +169,32 @@ pub(crate) async fn terminal_recover<R: Runtime>(
     )
     .map_err(io_failure)?;
     let root = store.root().to_owned();
+    if receipt.media.len() > loom_cabal::compute::MAX_COMPUTE_MEDIA_OBJECTS {
+        return Err(failure("Saved peer media exceeds its object limit."));
+    }
+    let mut media_bytes = 0_usize;
+    let media = receipt
+        .media
+        .iter()
+        .map(|item| {
+            let bytes = store
+                .read_blob(item.bytes_blob_id)
+                .map_err(IpcFailure::store)?;
+            media_bytes = media_bytes
+                .checked_add(bytes.len())
+                .ok_or_else(|| failure("Saved peer media exceeds its byte limit."))?;
+            if media_bytes > loom_cabal::compute::MAX_COMPUTE_MEDIA_BYTES {
+                return Err(failure("Saved peer media exceeds its byte limit."));
+            }
+            Ok(llama_native_types::MediaInput {
+                id: item.id.clone(),
+                kind: item.kind,
+                mime: item.mime.clone(),
+                sha256: item.bytes_blob_id.to_string(),
+                bytes,
+            })
+        })
+        .collect::<Result<Vec<_>, IpcFailure>>()?;
     spawn_worker(
         app,
         &state,
@@ -180,7 +206,7 @@ pub(crate) async fn terminal_recover<R: Runtime>(
             command,
             source: None,
             model: None,
-            media: Vec::new(),
+            media,
             recovery: mode,
         },
         &admission,
@@ -280,6 +306,7 @@ impl Evaluator<'_> {
             host: target.host.parse().map_err(io_failure)?,
             grant: target.grant.clone(),
             input: ComputeInput {
+                media: crate::peer_media::encode(&self.media, &target.grant.model)?,
                 prompt,
                 max_output_tokens: 512.min(target.grant.max_output_tokens),
                 seed: terminal_sampling(

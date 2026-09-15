@@ -100,6 +100,7 @@ impl Pair {
             epoch: 0,
             peer: identity.public_key(),
             model: ComputeModel {
+                media: Vec::new(),
                 fingerprint: "ab".repeat(32),
                 name: "Fixture model".into(),
             },
@@ -115,6 +116,7 @@ impl Pair {
             host: host_identity.public_key(),
             grant,
             input: ComputeInput {
+                media: Vec::new(),
                 prompt: "A garden 🌱 @literal".into(),
                 seed: 3,
                 max_output_tokens: 16,

@@ -629,6 +629,10 @@ test("the only platform-limited tests match their source cfg gates", () => {
       "peer_compute::tests::real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript",
       ["linux", "macos"],
     ],
+    [
+      "peer_compute::tests::real_native_gemma4_image_and_audio_job_crosses_quic_with_exact_media_evidence",
+      ["linux", "macos"],
+    ],
   ]);
 });
 

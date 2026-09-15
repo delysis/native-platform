@@ -588,28 +588,23 @@ fn terminal_start<R: Runtime>(
         }
         bindings.insert(name, bounded(text)?);
     }
-    let media = if let Some(model) = &model
-        && !literal
-    {
+    let media = if !literal && (model.is_some() || remote_target.is_some()) {
         let media = crate::terminal_media::resolve(
             store,
             &source,
             &sources,
-            resident_context_tokens(model),
+            model.as_ref().map_or(2048, resident_context_tokens),
         )?;
-        validate_media_against_resident_model(&media, &model.descriptor)?;
+        if let Some(model) = &model {
+            validate_media_against_resident_model(&media, &model.descriptor)?;
+        }
+        if let Some(target) = &remote_target {
+            crate::peer_media::encode(&media, &target.grant.model)?;
+        }
         media
     } else {
         Vec::new()
     };
-    if remote_target.is_some()
-        && !literal
-        && !crate::terminal_media::resolve(store, &source, &sources, 2048)?.is_empty()
-    {
-        return Err(failure(
-            "Peer jobs currently accept text. Choose a local model for attached images or audio.",
-        ));
-    }
     let media_evidence = media
         .iter()
         .map(|item| {

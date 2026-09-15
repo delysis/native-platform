@@ -19,6 +19,7 @@ fn input_job(model: ComputeModel) -> HostComputeJob {
             jobs: 1,
         },
         input: ComputeInput {
+            media: Vec::new(),
             prompt: "@Private =function() stays literal. 🌱".into(),
             max_output_tokens: 16,
             seed: 42,
@@ -156,6 +157,107 @@ fn peer_input_is_literal_derived_writing_with_private_provenance_and_no_duplicat
     assert_eq!(store.list_documents().expect("documents").len(), 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn peer_images_and_audio_bind_native_bytes_and_reject_malformed_or_unclaimed_inputs() {
+    use loom_backend_llama::{VerifiedMediaCapability, VerifiedMediaKind};
+    use loom_cabal::compute::{ComputeMedia, ComputeMediaFormat, ComputeModality};
+    use std::io::Cursor;
+    let mut png = Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("PNG");
+    let png = png.into_inner();
+    let mut wav = Cursor::new(Vec::new());
+    let mut writer = hound::WavWriter::new(
+        &mut wav,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .expect("WAV");
+    writer.write_sample(42_i16).expect("sample");
+    writer.finalize().expect("finalize");
+    let wav = wav.into_inner();
+    let mut model =
+        crate::tests::test_loaded_model(Path::new("media-fixture.gguf"), "media-fixture");
+    assert!(
+        model_claim(&model).unwrap().media.is_empty(),
+        "a base model alone proves no media support"
+    );
+    for kind in [VerifiedMediaKind::Image, VerifiedMediaKind::Audio] {
+        model
+            .descriptor
+            .capabilities
+            .media
+            .push(VerifiedMediaCapability {
+                kind,
+                projector_required: true,
+                accepted_mime_types: None,
+                max_objects_per_request: Some(1),
+                max_bytes_per_object: Some(1024),
+                max_total_bytes_per_request: Some(1024),
+            });
+    }
+    let mut job = input_job(model_claim(&model).unwrap());
+    assert_eq!(
+        job.grant.model.media,
+        [ComputeModality::Image, ComputeModality::Audio]
+    );
+    job.input.media = vec![
+        ComputeMedia::new(ComputeMediaFormat::Png, &png).unwrap(),
+        ComputeMedia::new(ComputeMediaFormat::Wav, &wav).unwrap(),
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let mut store = private_store(directory.path()).unwrap();
+    let prepared = prepare(&mut store, &model, &job).expect("native prepared input");
+    assert_eq!(prepared.request.media[0].bytes, png);
+    assert_eq!(prepared.request.media[1].bytes, wav);
+    assert_eq!(
+        prepared.request.media[0].kind,
+        llama_native_types::MediaKind::Image
+    );
+    assert_eq!(
+        prepared.request.media[1].kind,
+        llama_native_types::MediaKind::Audio
+    );
+    assert_eq!(prepared.request.exact_manuscript_prefix, job.input.prompt);
+    let roundtrip = crate::peer_media::encode(&prepared.request.media, &job.grant.model).unwrap();
+    assert_eq!(roundtrip, job.input.media);
+    job.id = Uuid::new_v4();
+    job.input.media[0].format = ComputeMediaFormat::Jpeg;
+    assert!(matches!(
+        prepare(&mut store, &model, &job),
+        Err(ComputeFailure::InputUnsupported)
+    ));
+    job.input.media[0].format = ComputeMediaFormat::Png;
+    job.input.media[1] = ComputeMedia::new(ComputeMediaFormat::Wav, &wav[..wav.len() - 1]).unwrap();
+    assert!(matches!(
+        prepare(&mut store, &model, &job),
+        Err(ComputeFailure::InputUnsupported)
+    ));
+    job.input.media[1] = ComputeMedia::new(ComputeMediaFormat::Wav, &wav).unwrap();
+    job.grant.model.media = vec![ComputeModality::Image];
+    assert!(matches!(
+        prepare(&mut store, &model, &job),
+        Err(ComputeFailure::InputUnsupported)
+    ));
+    job.grant.model = model_claim(&model).unwrap();
+    model.descriptor.capabilities.media[0].max_bytes_per_object = Some(1);
+    assert!(matches!(
+        prepare(&mut store, &model, &job),
+        Err(ComputeFailure::InputUnsupported)
+    ));
+    assert_eq!(
+        store.list_documents().unwrap().len(),
+        1,
+        "bad input never reached the private manuscript store"
+    );
+}
+
 #[cfg(not(unix))]
 #[test]
 fn unsupported_private_storage_fails_before_creating_received_writing() {
@@ -171,8 +273,20 @@ fn unsupported_private_storage_fails_before_creating_received_writing() {
 #[cfg(unix)]
 #[test]
 #[ignore = "requires MOM_LLAMA_MODEL_PATH and executes a real local model through authenticated peer compute"]
-#[allow(clippy::too_many_lines)]
 fn real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript() {
+    real_native_model_job(false);
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires MOM_LLAMA_MODEL_PATH pointing at the pinned Gemma 4 catalog model with its projector; executes real image and audio inference through peer compute"]
+fn real_native_gemma4_image_and_audio_job_crosses_quic_with_exact_media_evidence() {
+    real_native_model_job(true);
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)]
+fn real_native_model_job(with_media: bool) {
     let directory = tempfile::tempdir().expect("native peer fixture");
     let writing = directory.path().join("Writing");
     let (mut store, _) = ProjectStore::initialize(&writing, "My writing").expect("project");
@@ -197,12 +311,23 @@ fn real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript() 
     }
     let app = tauri::test::mock_app();
     assert!(app.manage(state));
-    tauri::async_runtime::block_on(crate::model_load(
-        std::env::var("MOM_LLAMA_MODEL_PATH").expect("explicit native model path"),
-        app.handle().clone(),
-        app.state::<PluginState>(),
-    ))
-    .expect("load verified native model");
+    let model_path = std::env::var("MOM_LLAMA_MODEL_PATH").expect("explicit native model path");
+    if with_media {
+        tauri::async_runtime::block_on(crate::model_load_catalog_candidate(
+            "google.gemma-4-12b-it-qat-q4_0".into(),
+            model_path,
+            app.handle().clone(),
+            app.state::<PluginState>(),
+        ))
+        .expect("load pinned Gemma 4 model and projector");
+    } else {
+        tauri::async_runtime::block_on(crate::model_load(
+            model_path,
+            app.handle().clone(),
+            app.state::<PluginState>(),
+        ))
+        .expect("load verified native model");
+    }
     let state = app.state::<PluginState>();
     let model = loaded_model_for_state(&state).expect("verified model");
     let executor = NativeExecutor::from_state(&state);
@@ -235,6 +360,48 @@ fn real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript() 
         job.grant.cabal = cabal.id();
         job.input.prompt =
             "Word: rain\nImage: silver threads against the window.\nWord: dawn\nImage:".into();
+        if with_media {
+            assert!(model.descriptor.projector_sha256.is_some());
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                64,
+                64,
+                image::Rgb([20, 80, 220]),
+            ))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .expect("image fixture");
+            job.input.media.push(
+                loom_cabal::compute::ComputeMedia::new(
+                    loom_cabal::compute::ComputeMediaFormat::Png,
+                    png.get_ref(),
+                )
+                .expect("exact image input"),
+            );
+            let mut wav = std::io::Cursor::new(Vec::new());
+            let mut writer = hound::WavWriter::new(
+                &mut wav,
+                hound::WavSpec {
+                    channels: 1,
+                    sample_rate: 16_000,
+                    bits_per_sample: 16,
+                    sample_format: hound::SampleFormat::Int,
+                },
+            )
+            .expect("audio fixture");
+            for index in 0..16_000 {
+                let amplitude: i16 = if index % 40 < 20 { 1_000 } else { -1_000 };
+                writer.write_sample(amplitude).expect("audio sample");
+            }
+            writer.finalize().expect("audio complete");
+            job.input.media.push(
+                loom_cabal::compute::ComputeMedia::new(
+                    loom_cabal::compute::ComputeMediaFormat::Wav,
+                    wav.get_ref(),
+                )
+                .expect("exact audio input"),
+            );
+            job.input.prompt = "Describe the image and the sound:".into();
+        }
         let host_network = Network::start(&host_identity, NetworkMode::Direct {})
             .await
             .expect("host endpoint");
@@ -382,7 +549,23 @@ fn real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript() 
         );
         let backend: serde_json::Value =
             serde_json::from_slice(&native.backend_receipt_bytes).expect("native backend receipt");
-        assert_eq!(backend["input_contract"], "raw_completion");
+        assert_eq!(
+            backend["input_contract"],
+            if with_media {
+                "raw_completion_with_media_prefix"
+            } else {
+                "raw_completion"
+            }
+        );
+        assert_eq!(evidence.context_binding.media.len(), job.input.media.len());
+        for (binding, input) in evidence.context_binding.media.iter().zip(&job.input.media) {
+            assert_eq!(binding.sha256, input.sha256);
+            assert_eq!(
+                binding.byte_count,
+                u64::try_from(input.decode().unwrap().len()).unwrap()
+            );
+            assert_eq!(binding.mime, input.format.mime());
+        }
         assert_eq!(
             private
                 .list_documents()
@@ -417,9 +600,11 @@ fn real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript() 
             assert_eq!(original_after, original);
         }
         eprintln!(
-            "Real peer model job: job={}, model_sha256={}, output_sha256={}, bytes={}",
+            "Real peer model job: job={}, model_sha256={}, projector_sha256={:?}, media={}, output_sha256={}, bytes={}",
             job.id,
             model.descriptor.model_sha256,
+            model.descriptor.projector_sha256,
+            evidence.context_binding.media.len(),
             output.blob_id,
             text.len()
         );

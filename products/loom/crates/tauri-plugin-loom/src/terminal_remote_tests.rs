@@ -97,6 +97,13 @@ async fn recover(pair: &Pair, id: CommandId, mode: RecoveryMode) -> TerminalRun 
 // Capture an immutable two-call expression at the exact interruption boundary:
 // the first remote result exists, but the pipeline owner has not finished it.
 async fn interrupted_pipeline(pair: &Pair) -> CommandId {
+    interrupted_pipeline_with_media(pair, Vec::new()).await
+}
+
+async fn interrupted_pipeline_with_media(
+    pair: &Pair,
+    media: Vec<llama_native_types::MediaInput>,
+) -> CommandId {
     let id = CommandId::new();
     let source = source(pair);
     let root = pair.temporary.path().join("writing");
@@ -111,6 +118,20 @@ async fn interrupted_pipeline(pair: &Pair) -> CommandId {
         .unwrap()
         .store_provenance_blob(source.text.as_bytes())
         .unwrap();
+    let media_evidence = {
+        let state = pair.app.state::<PluginState>();
+        let mut session = state.session.lock().unwrap();
+        let store = session.store.as_mut().unwrap();
+        media
+            .iter()
+            .map(|item| TerminalMediaEvidence {
+                id: item.id.clone(),
+                kind: item.kind,
+                mime: item.mime.clone(),
+                bytes_blob_id: store.store_provenance_blob(&item.bytes).unwrap(),
+            })
+            .collect()
+    };
     let receipt = RunReceipt {
         remote: Some(target(pair)),
         literal_input: false,
@@ -134,7 +155,7 @@ async fn interrupted_pipeline(pair: &Pair) -> CommandId {
         source_revision_id: source.revision_id,
         input_blob_id,
         context_references: None,
-        media: Vec::new(),
+        media: media_evidence,
         model: None,
         bindings: BTreeMap::from([
             ("Polish".into(), "Polish these words.".into()),
@@ -162,7 +183,7 @@ async fn interrupted_pipeline(pair: &Pair) -> CommandId {
             root: &root,
             input: source.text,
             receipt,
-            media: Vec::new(),
+            media,
             step: 0,
             recovery: RecoveryMode::Resume,
         };
@@ -328,5 +349,127 @@ async fn cancelling_an_interrupted_pipeline_persists_across_reopen_and_blocks_la
             .count(),
         1
     );
+    pair.close().await;
+}
+
+fn media_fixture() -> llama_native_types::MediaInput {
+    let mut output = std::io::Cursor::new(Vec::new());
+    let mut writer = hound::WavWriter::new(
+        &mut output,
+        hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        },
+    )
+    .unwrap();
+    writer.write_sample(123_i16).unwrap();
+    writer.finalize().unwrap();
+    let bytes = output.into_inner();
+    llama_native_types::MediaInput {
+        id: "private-local-label".into(),
+        kind: llama_native_types::MediaKind::Audio,
+        mime: "audio/wav".into(),
+        sha256: BlobId::digest(&bytes).to_string(),
+        bytes,
+    }
+}
+
+fn grant_audio(pair: &mut Pair) {
+    pair.request.grant.id = uuid::Uuid::new_v4();
+    pair.request.grant.model.media = vec![loom_cabal::compute::ComputeModality::Audio];
+    pair.host.grant(pair.request.grant.clone()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_resolves_selected_audio_without_a_local_model_and_omits_private_labels() {
+    let mut pair = Pair::new().await;
+    grant_audio(&mut pair);
+    let media = media_fixture();
+    let document_id = source(&pair).document_id;
+    {
+        let state = pair.app.state::<PluginState>();
+        let session = state.session.lock().unwrap();
+        let store = session.store.as_ref().unwrap();
+        let imported = crate::context_attachments::import_recorded_wav(
+            store.root(),
+            "Private recording title.wav".into(),
+            &media.bytes,
+        )
+        .unwrap();
+        crate::context_attachments::add_document_context_snapshot(
+            store.root(),
+            &document_id.to_string(),
+            &[imported.id],
+        )
+        .unwrap();
+    }
+    let id = CommandId::new();
+    start(&pair, id, "Listen to this").await;
+    let run = wait(&pair, id).await;
+    assert_eq!(run.status, "completed", "{:?}", run.error);
+    let saved = find_job(
+        &pair.project,
+        &pair.session,
+        job_id(&id.to_string(), 1),
+        &pair.app.state(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(saved.request.input.media.len(), 1);
+    assert_eq!(saved.request.input.media[0].decode().unwrap(), media.bytes);
+    assert!(
+        !serde_json::to_string(&saved.request.input)
+            .unwrap()
+            .contains("Private recording title")
+    );
+    assert!(loaded_model(&pair.app.state()).is_err());
+    pair.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupted_media_pipeline_reopens_exact_bytes_and_check_cannot_dispatch_the_next_step() {
+    let mut pair = Pair::new().await;
+    grant_audio(&mut pair);
+    let media = media_fixture();
+    let id = interrupted_pipeline_with_media(&pair, vec![media.clone()]).await;
+    pair.reopen_requester().await;
+    std::fs::write(
+        pair.temporary.path().join("writing/Draft.md"),
+        "Later writing with no media",
+    )
+    .unwrap();
+    assert_eq!(
+        recover(&pair, id, RecoveryMode::Check).await.status,
+        "unconfirmed"
+    );
+    assert_eq!(pair.executor.0.load(Ordering::SeqCst), 1);
+    assert!(
+        find_job(
+            &pair.project,
+            &pair.session,
+            job_id(&id.to_string(), 2),
+            &pair.app.state()
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    let resumed = recover(&pair, id, RecoveryMode::Resume).await;
+    assert_eq!(resumed.status, "completed", "{:?}", resumed.error);
+    let saved = find_job(
+        &pair.project,
+        &pair.session,
+        job_id(&id.to_string(), 2),
+        &pair.app.state(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(saved.request.input.media.len(), 1);
+    assert_eq!(saved.request.input.media[0].decode().unwrap(), media.bytes);
+    assert_eq!(pair.executor.0.load(Ordering::SeqCst), 2);
     pair.close().await;
 }

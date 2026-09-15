@@ -2,7 +2,7 @@ import { mount, unmount } from 'svelte';
 import { afterEach, expect, it, vi } from 'vitest';
 import { page } from 'vitest/browser';
 import ComputeHostControls from './ComputeHostControls.svelte';
-import { ComputeSharing, type ComputeGrant, type ComputeGrantRequest, type ComputeHostSnapshot, type ComputeScope } from './compute';
+import { ComputeSharing, type ComputeGrant, type ComputeGrantRequest, type ComputeHostSnapshot, type ComputeScope, type ComputeModel } from './compute';
 import type { CabalSnapshot } from './cabal';
 import '../app.css';
 
@@ -14,19 +14,19 @@ const cabal: CabalSnapshot = {
   roster: { payload: { owner: 'alice', epoch: 1, members: [{ key: 'alice', name: 'Alice' }, { key: 'bob', name: 'Bob' }] } },
   peers: [], documents: [], deleted_document_ids: [], problems: [], read_only: false, orphaned_changes: 0, removed_documents: 0,
 };
-function fixture() {
-  let host: ComputeHostSnapshot = { model: { name: 'Little model', fingerprint: 'model' }, idle: true, grants: [], problem: null };
+function fixture(media: ComputeModel['media'] = []) {
+  let host: ComputeHostSnapshot = { model: { media, name: 'Little model', fingerprint: 'model' }, idle: true, grants: [], problem: null };
   const api = {
     snapshot: vi.fn(async () => ({ ...host })),
     grant: vi.fn(async (_scope: ComputeScope, request: ComputeGrantRequest): Promise<ComputeGrant> => {
       const grant = { id: request.id, cabal: 'cabal', epoch: 1, peer: request.member_key,
-        model: { name: 'Little model', fingerprint: request.model_fingerprint }, jobs: request.jobs,
+        model: { media, name: 'Little model', fingerprint: request.model_fingerprint }, jobs: request.jobs,
         max_output_tokens: request.max_output_tokens, max_seconds: request.max_seconds };
       host = { ...host, grants: [{ grant, jobs_remaining: grant.jobs, current: true }] }; return grant;
     }),
     revoke: vi.fn(async (_scope: ComputeScope, id: string) => { host = { ...host, grants: host.grants.filter(item => item.grant.id !== id) }; }),
   };
-  return { api, sharing: new ComputeSharing(api), changeModel: () => { host = { ...host, model: { name: 'Different model', fingerprint: 'new-model' } }; } };
+  return { api, sharing: new ComputeSharing(api), changeModel: () => { host = { ...host, model: { media: [], name: 'Different model', fingerprint: 'new-model' } }; } };
 }
 async function open(sharing: ComputeSharing) {
   const target = document.createElement('div'); target.style.width = '250px'; document.body.append(target);
@@ -41,9 +41,10 @@ async function review() {
 }
 
 it('reviews one friend and exact limits before granting, then shows the budget and revokes it', async () => {
-  const { api, sharing } = fixture(); const target = await open(sharing); await review();
+  const { api, sharing } = fixture(['image', 'audio']); const target = await open(sharing); await review();
   expect(api.grant).not.toHaveBeenCalled();
   await expect.element(page.getByLabelText('Review compute grant')).toHaveTextContent('3 jobs, each up to 256 tokens and 30s');
+  await expect.element(page.getByLabelText('Review compute grant')).toHaveTextContent('Inputs: text · images · audio.');
   await page.getByRole('button', { name: 'Share with Bob' }).click();
   await expect.element(page.getByRole('list', { name: 'Compute grants' })).toHaveTextContent('3 of 3 jobs left');
   expect(api.grant).toHaveBeenCalledTimes(1);

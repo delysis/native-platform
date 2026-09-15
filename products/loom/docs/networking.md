@@ -87,10 +87,12 @@ another conversation. Local proposals belong to the workspace that started them
 and disappear on a workspace switch; a delayed proposal never replaces the draft.
 
 The terminal can explicitly select a friend's shared model. Only the resolved
-text for each call crosses that connection; raw expressions and document paths
-stay on the requesting device. Text-only peer calls use the same document
-functions and nested pipelines as local calls. Attached images/audio and chat
-stop sequences still require the local model path.
+text and explicitly resolved native media for each call cross that connection;
+raw expressions, document paths, and private attachment labels stay on the
+requesting device. Peer calls use the same document functions and nested
+pipelines as local calls. Model offers and grant reviews show the modalities
+reported by the host's verified model/projector. Chat stop sequences still
+require the local model path.
 
 Every peer step is saved before transmission. A lost connection leaves the run
 unconfirmed. **Check** retrieves existing jobs without preparing or submitting a
@@ -284,8 +286,8 @@ shared images and audio as native model inputs, including media reached through
 explicit document references. Existing model/projector modality checks still
 apply. Local QUIC tests and native storage/protocol tests establish transfer,
 recovery, integrity, and isolation; current packaged two-device model execution
-with these attachments remains unverified. Peer model jobs still accept text
-only. Document-context settings remain local; they are not silently published
+with these attachments remains unverified. Peer model jobs retain and transmit
+the exact selected native media. Document-context settings remain local; they are not silently published
 with a manuscript.
 
 ## Shared compute boundary
@@ -297,10 +299,29 @@ cabal membership epoch, one exact model-configuration fingerprint, and limits
 for output tokens, elapsed time, and accepted jobs. Membership changes invalidate
 the old epoch's grants. Revoking a grant cannot be undone by replaying its ID.
 
-The current input contract accepts resolved text, a seed, and an output limit.
-It carries no expressions, document paths, implicit references, or local-tool
-authority. Images and audio need their own bounded input contract before they
-can use this protocol. The native adapter uses the loaded, verified model and
+The input contract accepts resolved text, a seed, an output limit, and up to
+eight PNG, JPEG, GIF or WAV inputs totaling eight MiB. Media includes its format,
+SHA-256 digest and canonical base64 bytes; it carries no filename, path, implicit
+reference, or local-tool authority. The host checks the explicit grant and its
+model modalities before decoding a new job's media. Unsupported modalities spend
+no grant. The native adapter validates image dimensions and decode budgets using
+the local import decoder, and checks WAV structure, finite samples, sample rate,
+channels, and a two-minute per-recording bound. It checks the actual resident
+projector's MIME, object and byte limits before native submission. Malformed input
+produces a failed receipt without invoking the model; audio is never silently
+transcribed into a text-only substitute.
+
+Media bytes are retained in the requesting ledger before transmission and bound
+into the signed job fingerprint in order. Retry cannot substitute different
+bytes, formats, or ordering. Terminal recovery reads its immutable media blobs,
+without rereading source attachments or following later document edits. Check
+cannot create a later pipeline step; Resume uses the original bytes. The host
+retains exact native media evidence privately; its public result remains a signed
+remote assertion. Media storage consumes the existing 64 MiB ledgers, and space
+for the terminal receipt is reserved before admission. Compute frames stop at
+12 MiB, independently of the smaller workspace synchronization frame bound.
+
+The native adapter uses the loaded, verified model and
 reserves an independent job owner after two seconds without local model work.
 Foreground generation, model changes, and shutdown cancel and drain that owner
 before taking over the model. Received prompts and actual native execution
@@ -328,13 +349,15 @@ only exact already-saved requests remain recoverable after membership changes.
 Status rejection or a lost connection leaves the latest signed receipt intact
 and reports delivery separately. A persisted cancellation wins over a later
 submission; terminal results are returned from storage without dispatching again.
-The app history returns bounded previews. Remote terminal calls remain text-only;
-packaged two-device model selection and result recovery still need acceptance.
+The app history returns bounded previews. Packaged two-device model selection,
+native media execution, and result recovery still need acceptance.
 
 An accepted job is committed before dispatch. Each authenticated caller owns its
 job IDs, and a retry must match the exact original input and grant. Status checks
 and cancellation never dispatch model work. The current compute protocol is
-version 2: cancellation carries the exact grant and input, so even cancellation
+version 3 (`app.delysis.loom/compute/3`); host and requesting ledgers are version 2.
+Earlier experimental ledgers are preserved and rejected without migration.
+Cancellation carries the exact grant and input, so even cancellation
 that arrives before submission receives a durable terminal receipt. This spends
 one job from the reviewed budget and prevents any delayed exact submission from
 executing. Completed replies survive restart; an
@@ -436,6 +459,16 @@ WebKit exercised the compute grant review and revocation controls, refusal of a
 review after the selected model changed, and closing/reopening a pane with an
 uncertain grant. These browser checks use explicit IPC fixtures and do not
 establish a packaged two-device model-sharing interaction.
+
+On 2026-09-15, the native peer adapter sent real image and mixed image/audio jobs over authenticated
+local QUIC to the catalog's Gemma 4 12B QAT Q4_0 model and pinned projector on
+Metal. It checked each input's digest, byte count and MIME in the retained native
+evidence, reopened the requesting ledger after a lost admission reply, recovered
+the signed result, and returned that same result for an exact retry. The active
+manuscript stayed unchanged, both network owners joined, and the native model
+unloaded. This used a mock Tauri host, a synthetic image and a generated WAV tone;
+it establishes native image/audio execution and evidence binding, not packaged
+controls, response quality, or connectivity between physical networks.
 
 The feature is not complete until the following have concrete evidence:
 

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import type { CabalSnapshot } from './cabal';
-  import { ComputeSharing, type ComputeScope, type ComputeHostSnapshot, type ComputeGrantReview, type PendingComputeGrant } from './compute';
+  import { ComputeSharing, modelModalities, type ComputeScope, type ComputeHostSnapshot, type ComputeGrantReview, type PendingComputeGrant } from './compute';
   import { normalizeFailure } from './ipc';
   export let cabal: CabalSnapshot;
   export let scope: ComputeScope;
@@ -42,7 +42,7 @@
     const member = members.find(item => item.key === memberKey), model = snapshot?.model;
     if (!member || !model || cabal.read_only || ![jobs, tokens, seconds].every(Number.isInteger)
       || jobs < 1 || jobs > 256 || tokens < 1 || tokens > 2048 || seconds < 1 || seconds > 120) return;
-    review = { memberName: member.name, modelName: model.name, epoch: cabal.roster.payload.epoch,
+    review = { memberName: member.name, modelName: model.name, modalities: modelModalities(model), epoch: cabal.roster.payload.epoch,
       request: { id: crypto.randomUUID(), member_key: member.key, roster_hash: cabal.roster_hash,
         model_fingerprint: model.fingerprint, jobs, max_output_tokens: tokens, max_seconds: seconds } };
   }
@@ -57,7 +57,7 @@
   <summary>Share idle compute</summary>
   <p class="quiet">Lend your model a little. Your own writing and model work take priority.</p>
   {#if snapshot?.problem}<p role="alert" class="error">{snapshot.problem}</p>{/if}
-  {#if snapshot?.model}<p class="model"><strong>{snapshot.model.name}</strong><small>{snapshot.idle ? 'Idle · available for granted jobs' : 'Busy · no new peer jobs'}</small></p>
+  {#if snapshot?.model}<p class="model"><strong>{snapshot.model.name}</strong><small>{modelModalities(snapshot.model)}<br />{snapshot.idle ? 'Idle · available for granted jobs' : 'Busy · no new peer jobs'}</small></p>
   {:else}<p class="quiet">Load a text-completion model to share it.</p>{/if}
   {#if snapshot?.grants.length}
     <ul aria-label="Compute grants">
@@ -72,14 +72,14 @@
     </ul>
   {/if}
   {#if pending}
-    <div class="review" aria-label="Pending compute grant"><p>{pending.memberName} · {pending.modelName}<br />{pending.request.jobs} jobs · {pending.request.max_output_tokens} tokens · {pending.request.max_seconds}s</p>
+    <div class="review" aria-label="Pending compute grant"><p>{pending.memberName} · {pending.modelName}<br />{pending.modalities}<br />{pending.request.jobs} jobs · {pending.request.max_output_tokens} tokens · {pending.request.max_seconds}s</p>
       <p class="quiet">{busy ? 'Saving this grant…' : 'This grant has not been confirmed. Check it or retry the same grant.'}</p>
       <button type="button" disabled={busy || refreshing} on:click={() => void refresh()}>Check grant</button>
       <button type="button" disabled={busy} on:click={() => void change(() => sharing.grant(scope))}>Retry grant</button>
       <button type="button" disabled={busy} on:click={() => void change(() => sharing.revoke(scope, pending!.request.id))}>Revoke pending grant</button>
     </div>
   {:else if review}
-    <div class="review" aria-label="Review compute grant"><p><strong>{review.memberName}</strong> may use <strong>{review.modelName}</strong> for {review.request.jobs} jobs, each up to {review.request.max_output_tokens} tokens and {review.request.max_seconds}s.</p>
+    <div class="review" aria-label="Review compute grant"><p><strong>{review.memberName}</strong> may use <strong>{review.modelName}</strong> for {review.request.jobs} jobs, each up to {review.request.max_output_tokens} tokens and {review.request.max_seconds}s.<br />Inputs: {review.modalities}.</p>
       <p class="quiet">The grant resumes after restarting Loom when this model is loaded. You can revoke it here at any time.</p>
       {#if !reviewCurrent}<p class="error">The model or membership changed. Review a new grant.</p>{/if}
       <button type="button" disabled={busy || !reviewCurrent} on:click={() => void change(() => sharing.grant(scope, review!))}>Share with {review.memberName}</button>

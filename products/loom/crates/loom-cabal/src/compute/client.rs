@@ -7,7 +7,7 @@ use std::fs::{File, OpenOptions};
 
 const MAX_JOBS: i64 = 256;
 const MAX_BYTES: i64 = 64 * 1024 * 1024;
-const MAX_RECORD_BYTES: usize = 512 * 1024;
+const MAX_RECORD_BYTES: usize = MAX_COMPUTE_FRAME_BYTES;
 // A job has at most four receipts, with text only in a successful terminal.
 // Reserve its terminal before dispatch, even when several peers are offline.
 const RECEIPT_RESERVE: i64 = 1024 * 1024;
@@ -24,7 +24,7 @@ pub struct ClientRequest {
 impl ClientRequest {
     fn validate(&self, peer: PublicKey) -> Result<()> {
         self.grant.validate()?;
-        self.input.validate()?;
+        self.input.validate_for_model(&self.grant.model)?;
         if self.id.is_nil()
             || self.host == peer
             || self.grant.peer != peer
@@ -129,7 +129,7 @@ impl ComputeClient {
         let database = Connection::open_with_flags(&database_path, flags)?;
         let version: i64 = database.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if exists {
-            if version != 1 {
+            if version != 2 {
                 return Err(Error::Invalid(
                     "Unsupported compute requests; they were preserved",
                 ));
@@ -151,7 +151,7 @@ impl ComputeClient {
                 CREATE TABLE receipts (job TEXT NOT NULL REFERENCES requests(id), revision INTEGER NOT NULL,
                     terminal INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(job, revision));")?;
             database.execute("INSERT INTO owner(key) VALUES (?)", [peer.to_string()])?;
-            database.pragma_update(None, "user_version", 1)?;
+            database.pragma_update(None, "user_version", 2)?;
             File::open(directory)?.sync_all()?;
         }
         let client = Self {

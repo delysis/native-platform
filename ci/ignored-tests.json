@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 45,
+  "expected_test_count": 46,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -1034,6 +1034,22 @@
       "target": "lib",
       "source": "products/loom/crates/tauri-plugin-loom/src/peer_compute_tests.rs",
       "prerequisite": "requires MOM_LLAMA_MODEL_PATH and executes a real local model through authenticated peer compute; private project storage requires Unix",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local model and QUIC test cannot promote native sharing UI, Signal linking, Internet NAT traversal, or release acceptance.",
+      "platforms": [
+        "linux",
+        "macos"
+      ]
+    },
+    {
+      "test_id": "peer_compute::tests::real_native_gemma4_image_and_audio_job_crosses_quic_with_exact_media_evidence",
+      "package": "tauri-plugin-loom",
+      "target": "lib",
+      "source": "products/loom/crates/tauri-plugin-loom/src/peer_compute_tests.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at the pinned Gemma 4 catalog model with its projector; executes real image and audio inference through peer compute; private project storage requires Unix",
       "required_environment": [
         "MOM_LLAMA_MODEL_PATH"
       ],

@@ -359,6 +359,22 @@ pub(crate) fn is_canonical_image_asset_file_name(file_name: &str) -> bool {
     parse_asset_file_name(file_name).is_some()
 }
 
+/// Validate peer-provided model input through the same bounded decoder used
+/// by local image imports, without granting filesystem publication authority.
+pub(crate) fn validate_image_payload(bytes: &[u8], mime: &str) -> Result<(), AttachmentStoreError> {
+    if bytes.is_empty() {
+        return Err(AttachmentStoreError::Empty);
+    }
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(AttachmentStoreError::TooLarge);
+    }
+    let kind = detected_image_kind(bytes).ok_or(AttachmentStoreError::UnsupportedImage)?;
+    if kind.media_type != mime {
+        return Err(AttachmentStoreError::MediaTypeMismatch);
+    }
+    validate_image(bytes, kind, ATTACHMENT_LIMITS)
+}
+
 fn validate_image(
     bytes: &[u8],
     kind: ImageKind,

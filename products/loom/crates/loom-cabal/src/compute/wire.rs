@@ -107,7 +107,7 @@ impl ProtocolHandler for Handler {
         let handle = async {
             let (mut send, mut receive) = connection.accept_bi().await.map_err(network_error)?;
             let bytes = receive
-                .read_to_end(crate::MAX_FRAME_BYTES)
+                .read_to_end(MAX_COMPUTE_FRAME_BYTES)
                 .await
                 .map_err(network_error)?;
             let incoming: Request = serde_json::from_slice(&bytes)?;
@@ -164,7 +164,7 @@ pub(crate) async fn request(
             send.write_all(&bytes).await.map_err(network_error)?;
             send.finish().map_err(network_error)?;
             let bytes = receive
-                .read_to_end(crate::MAX_FRAME_BYTES)
+                .read_to_end(MAX_COMPUTE_FRAME_BYTES)
                 .await
                 .map_err(network_error)?;
             let response = serde_json::from_slice(&bytes)?;
@@ -230,7 +230,7 @@ fn validate_response(
 
 fn encode(value: &impl Serialize) -> Result<Vec<u8>> {
     let bytes = serde_json::to_vec(value)?;
-    if bytes.len() > crate::MAX_FRAME_BYTES {
+    if bytes.len() > MAX_COMPUTE_FRAME_BYTES {
         return Err(Error::Invalid("Compute frame exceeds limit"));
     }
     Ok(bytes)
@@ -260,6 +260,7 @@ mod tests {
         let host = Identity::generate()?;
         let peer = Identity::generate()?.public_key();
         let input = ComputeInput {
+            media: Vec::new(),
             prompt: "My words".into(),
             max_output_tokens: 10,
             seed: 42,
@@ -278,6 +279,7 @@ mod tests {
             grant,
             request_fingerprint: input.fingerprint(grant)?,
             model: ComputeModel {
+                media: Vec::new(),
                 fingerprint: "ab".repeat(32),
                 name: "An assertion from the host".into(),
             },

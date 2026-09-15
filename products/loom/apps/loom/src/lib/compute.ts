@@ -1,6 +1,10 @@
 import { invoke } from '@tauri-apps/api/core';
 
-export interface ComputeModel { fingerprint: string; name: string }
+export interface ComputeModel { fingerprint: string; name: string; media: ('image' | 'audio')[] }
+
+export function modelModalities(model: ComputeModel): string {
+  return ['text', ...model.media.map(kind => kind === 'image' ? 'images' : 'audio')].join(' · ');
+}
 export interface ComputeGrant {
   id: string; cabal: string; epoch: number; peer: string; model: ComputeModel;
   max_output_tokens: number; max_seconds: number; jobs: number;
@@ -15,7 +19,7 @@ export interface ComputeGrantRequest {
   max_output_tokens: number; max_seconds: number; jobs: number;
 }
 export interface ComputeGrantReview {
-  request: ComputeGrantRequest; epoch: number; modelName: string; memberName: string;
+  request: ComputeGrantRequest; epoch: number; modelName: string; memberName: string; modalities: string;
 }
 export interface PendingComputeGrant extends ComputeGrantReview { projectId: string; cabalId: string }
 

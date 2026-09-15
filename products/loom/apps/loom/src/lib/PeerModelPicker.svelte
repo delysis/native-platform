@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
-  import { peerOffers, type PeerOffers, type PeerTarget } from './compute';
+  import { peerOffers, modelModalities, type PeerOffers, type PeerTarget } from './compute';
   import type { CabalSnapshot } from './cabal';
   import { normalizeFailure } from './ipc';
   export let projectId: string;
@@ -58,11 +58,11 @@
     {#if offers?.grants.length}
       <select aria-label="Friend’s model" value={target?.grant.id ?? ''} on:change={choose} disabled={disabled || loading || stale}>
         <option value="">Choose a model</option>
-        {#each offers.grants as grant}<option value={grant.id}>{grant.model.name} · up to {Math.min(512, grant.max_output_tokens)} tokens</option>{/each}
+        {#each offers.grants as grant}<option value={grant.id}>{grant.model.name} · {modelModalities(grant.model)} · up to {Math.min(512, grant.max_output_tokens)} tokens</option>{/each}
       </select>
     {:else if target}<span>{target.grant.model.name}</span>{/if}
     <button type="button" on:click={() => void discover()} disabled={disabled || loading}>{loading ? 'Checking…' : 'Check models'}</button>
-    {#if target}<small>Resolved text goes to this friend.</small>{/if}
+    {#if target}<small>Prompt text and attached images/audio go to this friend.</small>{/if}
     {#if error || stale}<span role="status" aria-label="Peer model status">{stale ? 'Membership changed. Check models again.' : error}</span>{/if}
   {/if}
 </div>

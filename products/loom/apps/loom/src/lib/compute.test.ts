@@ -3,14 +3,14 @@ import { ComputeSharing, type ComputeGrant, type ComputeGrantReview, type Comput
 
 const scope: ComputeScope = { projectId: 'project', sessionId: 'session', cabalId: 'cabal' };
 function review(): ComputeGrantReview {
-  return { epoch: 2, modelName: 'My model', memberName: 'Bob', request: {
+  return { epoch: 2, modelName: 'My model', modalities: 'text', memberName: 'Bob', request: {
     id: 'grant', member_key: 'bob', roster_hash: 'roster', model_fingerprint: 'model',
     jobs: 16, max_output_tokens: 256, max_seconds: 30,
   } };
 }
 function grant(value = review()): ComputeGrant {
   return { id: value.request.id, cabal: scope.cabalId, epoch: value.epoch, peer: value.request.member_key,
-    model: { name: value.modelName, fingerprint: value.request.model_fingerprint }, jobs: value.request.jobs,
+    model: { media: [], name: value.modelName, fingerprint: value.request.model_fingerprint }, jobs: value.request.jobs,
     max_output_tokens: value.request.max_output_tokens, max_seconds: value.request.max_seconds };
 }
 function snapshot(grants: ComputeGrant[] = []): ComputeHostSnapshot {

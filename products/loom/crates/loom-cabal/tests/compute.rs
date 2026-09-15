@@ -27,6 +27,7 @@ struct Controlled {
     cancelled: Notify,
     release: Semaphore,
     output: String,
+    inputs: Mutex<Vec<ComputeInput>>,
 }
 
 impl Controlled {
@@ -38,6 +39,7 @@ impl Controlled {
             cancelled: Notify::new(),
             release: Semaphore::new(0),
             output,
+            inputs: Mutex::new(Vec::new()),
         })
     }
 }
@@ -54,6 +56,11 @@ impl ComputeExecutor for Executor {
         let owner = self.0.clone();
         Box::pin(async move {
             owner.calls.fetch_add(1, Ordering::SeqCst);
+            owner
+                .inputs
+                .lock()
+                .expect("record fixture input")
+                .push(job.input.clone());
             owner.started.notify_one();
             assert!(
                 !owner.panic.load(Ordering::SeqCst),
@@ -131,6 +138,7 @@ impl Pair {
             epoch: cabal.roster().payload.epoch,
             peer: peer_identity.public_key(),
             model: ComputeModel {
+                media: Vec::new(),
                 fingerprint: "ab".repeat(32),
                 name: "Host test model".into(),
             },
@@ -191,10 +199,83 @@ impl Pair {
 
 fn input() -> ComputeInput {
     ComputeInput {
+        media: Vec::new(),
         prompt: "A small garden 🌱".into(),
         max_output_tokens: 128,
         seed: 4,
     }
+}
+
+#[tokio::test]
+async fn media_crosses_quic_with_exact_retries_and_unsupported_modalities_spend_no_grant()
+-> Result<()> {
+    use loom_cabal::compute::{ComputeMedia, ComputeMediaFormat, ComputeModality};
+    let mut pair = Pair::new("opaque media transport fixture", 2, 10).await?;
+    pair.host.grant(pair.grant.clone())?;
+    let mut media_input = input();
+    // Opaque bytes deliberately exercise the wire/storage bound, not decoding.
+    // Native image/audio validation is covered by the product adapter tests.
+    media_input.media = vec![ComputeMedia::new(
+        ComputeMediaFormat::Png,
+        &vec![42; 4 * 1024 * 1024],
+    )?];
+    let id = Uuid::new_v4();
+    rejected(
+        pair.peer
+            .compute_submit(
+                pair.network.address(),
+                id,
+                pair.grant.id,
+                media_input.clone(),
+            )
+            .await?,
+        ComputeRejection::InvalidRequest,
+    );
+    assert_eq!(pair.executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(pair.host.grant_statuses()?[0].jobs_remaining, 2);
+    pair.grant.id = Uuid::new_v4();
+    pair.grant.model.media = vec![ComputeModality::Image];
+    pair.host.grant(pair.grant.clone())?;
+    pair.executor.release.add_permits(1);
+    receipt(
+        pair.peer
+            .compute_submit(
+                pair.network.address(),
+                id,
+                pair.grant.id,
+                media_input.clone(),
+            )
+            .await?,
+    );
+    let terminal = pair.wait_terminal(id).await?;
+    assert_eq!(
+        pair.executor
+            .inputs
+            .lock()
+            .expect("received input")
+            .as_slice(),
+        &[media_input.clone()]
+    );
+    let retry = receipt(
+        pair.peer
+            .compute_submit(
+                pair.network.address(),
+                id,
+                pair.grant.id,
+                media_input.clone(),
+            )
+            .await?,
+    );
+    assert_eq!(retry.hash()?, terminal.hash()?);
+    media_input.media[0] = ComputeMedia::new(ComputeMediaFormat::Png, b"different input")?;
+    rejected(
+        pair.peer
+            .compute_submit(pair.network.address(), id, pair.grant.id, media_input)
+            .await?,
+        ComputeRejection::MismatchedRetry,
+    );
+    assert_eq!(pair.executor.calls.load(Ordering::SeqCst), 1);
+    pair.close().await
 }
 
 fn receipt(reply: ComputeReply) -> RemoteJobReceipt {

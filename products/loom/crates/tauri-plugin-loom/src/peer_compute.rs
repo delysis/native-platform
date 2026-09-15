@@ -234,7 +234,7 @@ pub(super) fn model_claim(model: &LoadedModel) -> Result<ComputeModel, ComputeFa
     {
         return Err(ComputeFailure::ModelUnavailable);
     }
-    let bytes = serde_json::to_vec(&("loom_peer_model_v1", &model.descriptor, &model.profile))
+    let bytes = serde_json::to_vec(&("loom_peer_model_v2", &model.descriptor, &model.profile))
         .map_err(|_| ComputeFailure::ModelUnavailable)?;
     let mut name: String = model
         .descriptor
@@ -249,6 +249,22 @@ pub(super) fn model_claim(model: &LoadedModel) -> Result<ComputeModel, ComputeFa
         name = "Local model".into();
     }
     Ok(ComputeModel {
+        media: model
+            .descriptor
+            .capabilities
+            .media
+            .iter()
+            .map(|capability| match capability.kind {
+                loom_backend_llama::VerifiedMediaKind::Image => {
+                    loom_cabal::compute::ComputeModality::Image
+                }
+                loom_backend_llama::VerifiedMediaKind::Audio => {
+                    loom_cabal::compute::ComputeModality::Audio
+                }
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         fingerprint: BlobId::digest(&bytes).to_string(),
         name,
     })
@@ -387,6 +403,9 @@ fn prepare(
     model: &LoadedModel,
     job: &HostComputeJob,
 ) -> Result<Prepared, ComputeFailure> {
+    let media = crate::peer_media::decode(&job.input, &job.grant.model)?;
+    validate_media_against_resident_model(&media, &model.descriptor)
+        .map_err(|_| ComputeFailure::InputUnsupported)?;
     let path = format!("Requests/{}/{}.md", job.peer, job.id);
     if store.document_path_is_reserved(&path).map_err(failed)? || store.root().join(&path).exists()
     {
@@ -468,7 +487,7 @@ fn prepare(
             model: model.profile.clone(),
             exact_manuscript_prefix: job.input.prompt.clone(),
             context_preamble: String::new(),
-            media: Vec::new(),
+            media,
             prompt_recipe: recipe,
             cases: vec![case],
         },

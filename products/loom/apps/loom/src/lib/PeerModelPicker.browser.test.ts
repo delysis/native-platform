@@ -13,7 +13,7 @@ const cabal: CabalSnapshot = {
 };
 const offer: PeerOffers = {
   host: 'bob', roster_hash: 'roster', grants: [{ id: 'grant', cabal: 'cabal', epoch: 1, peer: 'alice',
-    model: { name: 'Shared Gemma', fingerprint: 'fingerprint' }, max_output_tokens: 256, max_seconds: 30, jobs: 8 }],
+    model: { media: ['image', 'audio'], name: 'Shared Gemma', fingerprint: 'fingerprint' }, max_output_tokens: 256, max_seconds: 30, jobs: 8 }],
 };
 let mounted: ReturnType<typeof mount> | undefined;
 afterEach(async () => { if (mounted) await unmount(mounted); mounted = undefined; document.body.replaceChildren(); vi.resetAllMocks(); });
@@ -27,6 +27,7 @@ it('uses local by default, discovers only the selected friend, and binds the exa
   expect(api.invoke).not.toHaveBeenCalled();
   await page.getByRole('combobox', { name: 'Run on' }).selectOptions('bob');
   await expect.element(page.getByRole('combobox', { name: 'Friend’s model' })).toBeVisible();
+  await expect.element(page.getByRole('combobox', { name: 'Friend’s model' })).toHaveTextContent('text · images · audio');
   expect(api.invoke.mock.calls).toEqual([['plugin:loom|compute_peer_offers', { projectId: 'project', sessionId: 'session', host: 'bob' }]]);
   await expect.element(page.getByLabelText('Selected peer')).toHaveTextContent('"host":"bob","target":null');
   await page.getByRole('combobox', { name: 'Friend’s model' }).selectOptions('grant');

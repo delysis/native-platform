@@ -6,9 +6,9 @@ use std::fs::{File, OpenOptions};
 const MAX_JOBS: i64 = 256;
 const MAX_GRANTS: i64 = 64;
 const MAX_STORED_BYTES: i64 = 64 * 1024 * 1024;
-// JSON can expand one text byte to six bytes. Reserve space for the accepted
-// input, maximum output, and all transition receipts before dispatching work.
-const JOB_STORAGE_RESERVE: i64 = 1024 * 1024;
+// Input storage is measured separately. JSON can expand an output text byte
+// sixfold; reserve its maximum and all transition receipts before dispatch.
+const RECEIPT_STORAGE_RESERVE: i64 = 1024 * 1024;
 
 pub(super) struct Ledger {
     database: Connection,
@@ -52,7 +52,7 @@ impl Ledger {
         let exists = database_path.exists();
         let database = Connection::open(&database_path)?;
         let version: i64 = database.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if exists && version != 1 {
+        if exists && version != 2 {
             return Err(Error::Invalid(
                 "Unsupported compute ledger; it was preserved",
             ));
@@ -77,7 +77,7 @@ impl Ledger {
                 "INSERT INTO owner(key) VALUES (?)",
                 [identity.public_key().to_string()],
             )?;
-            database.pragma_update(None, "user_version", 1)?;
+            database.pragma_update(None, "user_version", 2)?;
         }
         let owner: String = database.query_row("SELECT key FROM owner", [], |row| row.get(0))?;
         if owner != identity.public_key().to_string() {
@@ -203,7 +203,7 @@ impl Ledger {
         Ok(self.grants()?.into_iter().find(|grant| grant.id == id))
     }
 
-    pub fn has_capacity(&self, grant: &ComputeGrant) -> Result<bool> {
+    pub fn has_capacity(&self, grant: &ComputeGrant, input: Option<&ComputeInput>) -> Result<bool> {
         let total: i64 = self
             .database
             .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))?;
@@ -215,7 +215,16 @@ impl Ledger {
         )?;
         Ok(total < MAX_JOBS
             && self.remaining_jobs(grant)? > 0
-            && bytes <= MAX_STORED_BYTES - JOB_STORAGE_RESERVE)
+            && bytes
+                <= MAX_STORED_BYTES
+                    - RECEIPT_STORAGE_RESERVE
+                    - i64::try_from(
+                        input
+                            .map(serde_json::to_vec)
+                            .transpose()?
+                            .map_or(0, |bytes| bytes.len()),
+                    )
+                    .map_err(|_| Error::Invalid("Compute input exceeds storage limit"))?)
     }
 
     pub fn accept(
@@ -392,6 +401,7 @@ mod tests {
                 epoch: 0,
                 peer: identity.public_key(),
                 model: ComputeModel {
+                    media: Vec::new(),
                     fingerprint: "ab".repeat(32),
                     name: "Model".into(),
                 },
@@ -400,6 +410,7 @@ mod tests {
                 jobs: 1,
             },
             input: ComputeInput {
+                media: Vec::new(),
                 prompt: "Preserved input".into(),
                 max_output_tokens: 10,
                 seed: 1,
@@ -434,7 +445,7 @@ mod tests {
                 accepted.payload.request_fingerprint
             );
             assert!(
-                !reopened.has_capacity(&job.grant)?,
+                !reopened.has_capacity(&job.grant, Some(&job.input))?,
                 "restart cannot restore a consumed budget"
             );
             let original: String = reopened.database.query_row(
@@ -535,11 +546,11 @@ mod tests {
         ledger.grant(job.grant.clone())?;
         for _ in 0..MAX_JOBS {
             job.id = Uuid::new_v4();
-            assert!(ledger.has_capacity(&job.grant)?);
+            assert!(ledger.has_capacity(&job.grant, Some(&job.input))?);
             ledger.accept(&job, job.input.fingerprint(job.grant.id)?)?;
             ledger.transition(job.peer, job.id, ComputeStatus::Interrupted)?;
         }
-        assert!(!ledger.has_capacity(&job.grant)?);
+        assert!(!ledger.has_capacity(&job.grant, Some(&job.input))?);
         for _ in 1..MAX_GRANTS {
             job.grant.id = Uuid::new_v4();
             ledger.grant(job.grant.clone())?;
@@ -549,6 +560,52 @@ mod tests {
         assert!(
             ledger.grant(job.grant).is_err(),
             "revocation must not recycle identity tombstones"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn large_media_reserves_its_full_input_and_the_terminal_before_admission() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let identity = Identity::generate()?;
+        let mut ledger = Ledger::open(directory.path(), identity.clone())?;
+        let mut job = job(&identity);
+        job.grant.jobs = 256;
+        job.grant.model.media = vec![ComputeModality::Image];
+        job.input.media = vec![ComputeMedia::new(
+            ComputeMediaFormat::Png,
+            &vec![42; MAX_COMPUTE_MEDIA_BYTES],
+        )?];
+        ledger.grant(job.grant.clone())?;
+        let mut accepted = 0;
+        while ledger.has_capacity(&job.grant, Some(&job.input))? {
+            job.id = Uuid::new_v4();
+            ledger.accept(&job, job.input.fingerprint(job.grant.id)?)?;
+            ledger.transition(job.peer, job.id, ComputeStatus::Running)?;
+            ledger.transition(
+                job.peer,
+                job.id,
+                ComputeStatus::Completed {
+                    text: "\0".repeat(MAX_COMPUTE_TEXT_BYTES),
+                },
+            )?;
+            accepted += 1;
+        }
+        assert_eq!(
+            accepted, 5,
+            "six full inputs would exceed the 64 MiB ledger"
+        );
+        let bytes: i64 = ledger.database.query_row(
+            "SELECT (SELECT sum(length(CAST(input AS BLOB))) FROM jobs) + (SELECT sum(length(CAST(body AS BLOB))) FROM receipts)", [], |row| row.get(0),
+        )?;
+        assert!(bytes <= MAX_STORED_BYTES);
+        assert!(
+            ledger
+                .get(job.peer, job.id)?
+                .expect("the last admitted job retains its terminal receipt")
+                .payload
+                .status
+                .is_terminal()
         );
         Ok(())
     }

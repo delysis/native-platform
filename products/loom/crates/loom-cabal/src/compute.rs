@@ -1,6 +1,7 @@
 //! Whole, explicitly granted model jobs. These receipts are remote assertions;
 //! a signature authenticates the host, not its model or execution environment.
 mod client;
+mod media;
 mod store;
 mod wire;
 
@@ -23,9 +24,13 @@ use crate::{Error, Identity, Result, Signed};
 use store::Ledger;
 
 pub use client::{ClientJob, ClientRequest, ComputeClient};
+pub use media::{
+    ComputeMedia, ComputeMediaFormat, ComputeModality, MAX_COMPUTE_FRAME_BYTES,
+    MAX_COMPUTE_MEDIA_BYTES, MAX_COMPUTE_MEDIA_OBJECTS,
+};
 pub use wire::Response as ComputeReply;
 pub(crate) use wire::{Handler, Request, Response, request};
-pub(crate) const ALPN: &[u8] = b"app.delysis.loom/compute/2";
+pub(crate) const ALPN: &[u8] = b"app.delysis.loom/compute/3";
 pub const MAX_COMPUTE_TEXT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_TOKENS: u32 = 2048;
 const MAX_JOB_SECONDS: u32 = 120;
@@ -37,6 +42,9 @@ pub struct ComputeModel {
     /// Digest of the host's exact verified model configuration. Never a path.
     pub fingerprint: String,
     pub name: String,
+    /// Modalities attested by the host's verified model and loaded projector.
+    /// Text completion is required for every offer.
+    pub media: Vec<ComputeModality>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +81,8 @@ impl ComputeGrant {
             || self.model.name.is_empty()
             || self.model.name.len() > 160
             || self.model.name.chars().any(char::is_control)
+            || self.model.media.len() > 2
+            || self.model.media.windows(2).any(|pair| pair[0] >= pair[1])
             || !(1..=MAX_OUTPUT_TOKENS).contains(&self.max_output_tokens)
             || !(1..=MAX_JOB_SECONDS).contains(&self.max_seconds)
             || !(1..=MAX_GRANT_JOBS).contains(&self.jobs)
@@ -83,15 +93,15 @@ impl ComputeGrant {
     }
 }
 
-/// Text-only completion, with all document references already resolved by the
-/// requesting device. No expression, filename, or local-tool authority crosses
-/// this boundary. Additional modalities need their own bounded input contract.
+/// Completion with references resolved and exact media retained by the requester.
+/// No expression, filename, or local-tool authority crosses this boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComputeInput {
     pub prompt: String,
     pub max_output_tokens: u32,
     pub seed: u32,
+    pub media: Vec<ComputeMedia>,
 }
 
 impl ComputeInput {
@@ -101,13 +111,26 @@ impl ComputeInput {
         {
             return Err(Error::Invalid("Compute input exceeds limits"));
         }
-        Ok(())
+        media::validate(&self.media)
+    }
+
+    pub fn validate_for_model(&self, model: &ComputeModel) -> Result<()> {
+        if self
+            .media
+            .iter()
+            .any(|item| !model.media.contains(&item.format.modality()))
+        {
+            return Err(Error::Invalid(
+                "The friend's model does not accept every image or audio input",
+            ));
+        }
+        self.validate()
     }
 
     pub fn fingerprint(&self, grant: Uuid) -> Result<String> {
         self.validate()?;
         Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
-            "loom_compute_input_v1",
+            "loom_compute_input_v2",
             grant,
             self,
         ))?)))
@@ -387,7 +410,7 @@ impl ComputeHost {
                         && grant.cabal == cabal
                         && (self.authority)(&grant)
                         && self.executor.available(&grant.model)
-                        && state.ledger.has_capacity(&grant)?
+                        && state.ledger.has_capacity(&grant, None)?
                     {
                         grants.push(grant);
                     }
@@ -396,11 +419,13 @@ impl ComputeHost {
             }
             Request::Submit { job, grant, input } | Request::Cancel { job, grant, input } => {
                 let reject = |reason| Ok(Response::Rejected { reason });
-                if job.is_nil() || input.validate().is_err() {
+                if job.is_nil() {
                     return reject(ComputeRejection::InvalidRequest);
                 }
-                let fingerprint = input.fingerprint(grant)?;
                 if let Some(existing) = state.ledger.get(peer, job)? {
+                    let Ok(fingerprint) = input.fingerprint(grant) else {
+                        return reject(ComputeRejection::InvalidRequest);
+                    };
                     return if existing.payload.request_fingerprint == fingerprint {
                         Ok(receipt_response(if cancel {
                             state
@@ -422,13 +447,16 @@ impl ComputeHost {
                 if grant.peer != peer || !(self.authority)(&grant) {
                     return reject(ComputeRejection::Denied);
                 }
-                if input.max_output_tokens > grant.max_output_tokens {
+                if input.max_output_tokens > grant.max_output_tokens
+                    || input.validate_for_model(&grant.model).is_err()
+                {
                     return reject(ComputeRejection::InvalidRequest);
                 }
+                let fingerprint = input.fingerprint(grant.id)?;
                 if !cancel && (state.active.is_some() || !self.executor.available(&grant.model)) {
                     return reject(ComputeRejection::Busy);
                 }
-                if !state.ledger.has_capacity(&grant)? {
+                if !state.ledger.has_capacity(&grant, Some(&input))? {
                     return reject(ComputeRejection::Exhausted);
                 }
                 let pending = HostComputeJob {

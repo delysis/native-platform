@@ -108,7 +108,7 @@ describe('session IPC admission', () => {
       projectId: 'project', sessionId: 'session', commandId: 'run', documentId: 'document',
       sourceRevisionId: 'revision', expectedVisibleBlobId: 'blob', sourceStartByte: 0, sourceEndByte: 0, expression: 'A shared garden',
       remoteTarget: { host: 'bob', roster_hash: 'roster', grant: { id: 'grant', cabal: 'cabal', epoch: 1, peer: 'alice',
-        model: { name: 'Shared Gemma', fingerprint: 'model' }, max_output_tokens: 256, max_seconds: 30, jobs: 8 } }
+        model: { media: [], name: 'Shared Gemma', fingerprint: 'model' }, max_output_tokens: 256, max_seconds: 30, jobs: 8 } }
     };
     mocks.invoke.mockRejectedValue(new Error('Lost reply'));
     await expect(runTerminal(request)).rejects.toThrow('Lost reply');

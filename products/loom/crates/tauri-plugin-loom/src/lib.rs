@@ -14,6 +14,7 @@ mod microphone_capture;
 mod model_catalog;
 mod model_download;
 mod peer_compute;
+mod peer_media;
 mod shader_preview;
 mod signal;
 mod speech_input;
