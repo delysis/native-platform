@@ -443,6 +443,8 @@ export interface ContextMediaPresentation {
 }
 
 export interface ContextAttachmentPresentation {
+  source_revision: string;
+  excerpt: string | null;
   id: string;
   file_name: string;
   detected_format: string;
@@ -453,20 +455,17 @@ export interface ContextAttachmentPresentation {
   warnings: string[];
 }
 
-export interface ContextTextSourcePresentation {
+export interface ContextMaterial {
   attachment_id: string;
-  file_name: string;
-  source_sha256: string;
-  source_bytes: number;
-  inserted_sha256: string;
-  inserted_bytes: number;
-  complete_projection: boolean;
+  source_revision: string;
+  excerpt: string | null;
 }
 
 export interface DocumentContextSnapshot {
   markdown: string;
   attachments: ContextAttachmentPresentation[];
-  text_sources: ContextTextSourcePresentation[];
+  materials: ContextMaterial[];
+  revision: string;
 }
 
 export interface CoWriterSummary {

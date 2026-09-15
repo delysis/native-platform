@@ -23,7 +23,6 @@ const MAX_ATTACHMENT_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CONTEXT_ATTACHMENTS: usize = 32;
 const MAX_CANONICAL_TEXT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MANUAL_CONTEXT_BYTES: usize = 256 * 1024;
-const MAX_TEXT_IMPORT_RECEIPTS: usize = 256;
 const MAX_NATIVE_MEDIA_OBJECTS: usize = 32;
 const MAX_NATIVE_MEDIA_OBJECT_BYTES: u64 = MAX_ATTACHMENT_BYTES;
 const MAX_NATIVE_MEDIA_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
@@ -33,13 +32,9 @@ const PROMPT_OVERHEAD_TOKENS: u32 = 1_024;
 const RETRIEVAL_REBALANCE_BYTES: usize = 16 * 1024;
 const PREAMBLE_CACHE_ENTRIES: usize = 8;
 const PREAMBLE_CACHE_BYTES: usize = 8 * 1024 * 1024;
-const MANIFEST_SCHEMA_V2: &str = "loom.context-attachment.v2";
 const MANIFEST_SCHEMA: &str = "loom.context-attachment.v3";
-const CONTEXT_SCHEMA_V1: &str = "loom.document-context.v1";
-const CONTEXT_SCHEMA_V2: &str = "loom.document-context.v2";
-const CONTEXT_SCHEMA: &str = "loom.document-context.v3";
-const RETRIEVAL_SCHEMA: &str = "loom.context-retrieval.v3";
-const LEGACY_TARGET_FINGERPRINT: &str = "loom:gemma-4-12b-it:native-image-audio:v1";
+const CONTEXT_SCHEMA: &str = "loom.document-context.v4";
+const RETRIEVAL_SCHEMA: &str = "loom.context-retrieval.v4";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static CONTEXT_WRITE_LOCK: Mutex<()> = Mutex::new(());
 static PREAMBLE_CACHE: OnceLock<Mutex<PreambleCache>> = OnceLock::new();
@@ -92,24 +87,27 @@ pub(crate) struct ContextAttachmentPresentation {
     pub(crate) presentation_kind: ContextAttachmentPresentationKind,
     pub(crate) media: Vec<ContextMediaPresentation>,
     pub(crate) warnings: Vec<String>,
+    pub(crate) source_revision: String,
+    pub(crate) excerpt: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct DocumentContextSnapshot {
+    /// Authored instructions only. Imported prose never enters this field.
     pub(crate) markdown: String,
     pub(crate) attachments: Vec<ContextAttachmentPresentation>,
-    pub(crate) text_sources: Vec<ContextTextSourcePresentation>,
+    pub(crate) materials: Vec<ContextMaterial>,
+    pub(crate) revision: String,
 }
 
+/// A selected immutable source version, optionally with an authored excerpt.
+/// Editing its excerpt never turns source material into author instructions.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct ContextTextSourcePresentation {
+#[serde(deny_unknown_fields)]
+pub(crate) struct ContextMaterial {
     pub(crate) attachment_id: String,
-    pub(crate) file_name: String,
-    pub(crate) source_sha256: String,
-    pub(crate) source_bytes: u64,
-    pub(crate) inserted_sha256: String,
-    pub(crate) inserted_bytes: u64,
-    pub(crate) complete_projection: bool,
+    pub(crate) source_revision: String,
+    pub(crate) excerpt: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -153,11 +151,14 @@ struct AttachmentManifest {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct DocumentContexts {
     schema: String,
-    documents: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    manual_text: BTreeMap<String, String>,
-    #[serde(default)]
-    text_imports: BTreeMap<String, Vec<ContextTextSourcePresentation>>,
+    documents: BTreeMap<String, DocumentContext>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DocumentContext {
+    instructions: String,
+    materials: Vec<ContextMaterial>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -172,6 +173,8 @@ pub(crate) struct ContextExcerptEvidence {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ContextRetrievalEvidence {
     schema: String,
+    context_revision: String,
+    materials: Vec<ContextMaterial>,
     manuscript_prefix_sha256: String,
     manuscript_window_start_byte: u64,
     manuscript_window_end_byte: u64,
@@ -191,10 +194,12 @@ pub(crate) struct ContextRetrievalEvidence {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PreambleCacheKey {
     project_root: PathBuf,
+    document_id: String,
+    policy: &'static str,
     attachment_ids: Vec<String>,
     attachment_text_fingerprints: Vec<String>,
     manual_text_sha256: Option<String>,
-    visible_context_sha256: Option<String>,
+    context_revision: String,
     manuscript_query_sha256: String,
     retrieval_rebalance_epoch: u64,
     context_budget: usize,
@@ -235,31 +240,32 @@ pub(crate) enum ContextAttachmentError {
     ContextLimit,
     #[error("pasted context exceeds Loom's 256 KB saved-text limit")]
     ManualTextLimit,
-    #[error("the document already contains Loom's 256 text-import receipt limit")]
-    TextImportLimit,
     #[error("the attachment context is corrupt or no longer matches its content identity")]
     ContextInvalid,
+    #[error(
+        "saved context uses an earlier mixed-text format; its unchanged file is .loom/attachments/document-context.json. Move that file aside to retain it, then select materials afresh. Your manuscript is still editable"
+    )]
+    ContextFormat,
     #[error("attachment storage failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("attachment metadata failed: {0}")]
     Json(#[from] serde_json::Error),
 }
 
-// This is deliberately one linear grant -> inspect -> canonicalize -> persist
-// authority boundary; keeping those checks adjacent makes their order auditable.
-#[allow(clippy::too_many_lines)]
+#[cfg(test)]
 pub(crate) fn import_path(
     project_root: &Path,
     source_path: &Path,
 ) -> Result<StoredAttachment, ContextAttachmentError> {
-    import_path_bounded(project_root, source_path, MAX_ATTACHMENT_BYTES)
+    prepare_path_bounded(project_root, source_path, MAX_ATTACHMENT_BYTES)?.publish()
 }
 
-pub(crate) fn import_path_bounded(
+// Keep grant validation adjacent to bounded source reading and conversion.
+pub(crate) fn prepare_path_bounded(
     project_root: &Path,
     source_path: &Path,
     max_bytes: u64,
-) -> Result<StoredAttachment, ContextAttachmentError> {
+) -> Result<PreparedAttachment, ContextAttachmentError> {
     let max_bytes = max_bytes.min(MAX_ATTACHMENT_BYTES);
     let file_name = source_path
         .file_name()
@@ -299,12 +305,12 @@ pub(crate) fn import_path_bounded(
         return Err(ContextAttachmentError::UnsafeSource);
     }
 
-    let attachment = import_provided(project_root, provided)?;
+    let attachment = prepare_provided(project_root, provided)?;
     record_import_origin(
         project_root,
         &serde_json::json!({
             "schema": "loom.file-import.v1", "source_path": source_path,
-            "source_sha256": attachment.id, "source_bytes": attachment.byte_count,
+            "source_sha256": attachment.attachment.id, "source_bytes": attachment.attachment.byte_count,
             "network_used": false, "human_reviewed": false,
         }),
     )?;
@@ -330,11 +336,49 @@ pub(crate) fn import_recorded_wav(
 
 // Account downloads, folder imports, recordings, and native file grants share
 // one parser and persistence path. Callers provide bytes, never URLs to the parser.
-#[allow(clippy::too_many_lines)]
 pub(crate) fn import_provided(
     project_root: &Path,
     provided: ProvidedAttachment,
 ) -> Result<StoredAttachment, ContextAttachmentError> {
+    prepare_provided(project_root, provided)?.publish()
+}
+
+/// Conversion and immutable object staging happen before publication authority
+/// is reacquired. Only the final manifest link makes an attachment selectable.
+#[derive(Debug)]
+pub(crate) struct PreparedAttachment {
+    pub(crate) attachment: StoredAttachment,
+    staged_manifest: Option<StagedManifest>,
+}
+
+#[derive(Debug)]
+struct StagedManifest {
+    temporary: PathBuf,
+    destination: PathBuf,
+}
+
+impl Drop for StagedManifest {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temporary);
+    }
+}
+
+impl PreparedAttachment {
+    pub(crate) fn publish(self) -> Result<StoredAttachment, ContextAttachmentError> {
+        if let Some(staged) = &self.staged_manifest {
+            // No conversion, serialization, hashing, or payload copying here.
+            // A concurrent conflicting publisher must be retried, never replaced.
+            fs::hard_link(&staged.temporary, &staged.destination)?;
+        }
+        Ok(self.attachment)
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn prepare_provided(
+    project_root: &Path,
+    provided: ProvidedAttachment,
+) -> Result<PreparedAttachment, ContextAttachmentError> {
     let mut file_name = provided.display_name.clone();
     let byte_count = provided.bytes.len() as u64;
     if byte_count == 0 || byte_count > MAX_ATTACHMENT_BYTES {
@@ -558,13 +602,31 @@ pub(crate) fn import_provided(
         let mut result = existing.attachment;
         result.media_markdown = editor_media_markdown(&result, &existing.media);
         result.editable_markdown = (!canonical_text.is_empty()).then_some(canonical_text);
-        return Ok(result);
+        return Ok(PreparedAttachment {
+            attachment: result,
+            staged_manifest: None,
+        });
     }
-    write_manifest(project_root, &manifest)?;
+    let destination = attachment_root(project_root)?
+        .join("manifests")
+        .join(format!("{}.json", manifest.attachment.id));
+    let staged = StagedManifest {
+        temporary: temporary_sibling(&destination),
+        destination,
+    };
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged.temporary)?;
+    serde_json::to_writer_pretty(&mut file, &manifest)?;
+    file.sync_all()?;
     let mut result = attachment;
     result.media_markdown = editor_media_markdown(&result, &manifest.media);
     result.editable_markdown = (!canonical_text.is_empty()).then_some(canonical_text);
-    Ok(result)
+    Ok(PreparedAttachment {
+        attachment: result,
+        staged_manifest: Some(staged),
+    })
 }
 
 #[cfg(test)]
@@ -573,8 +635,10 @@ fn document_context(
     document_id: &str,
 ) -> Result<Vec<StoredAttachment>, ContextAttachmentError> {
     let contexts = read_contexts(project_root)?;
-    let ids = authoritative_context_ids(&contexts, document_id);
-    attachments_for_ids(project_root, &ids)
+    attachments_for_ids(
+        project_root,
+        &authoritative_context_ids(&contexts, document_id),
+    )
 }
 
 #[cfg(test)]
@@ -583,15 +647,17 @@ fn document_context_text(
     document_id: &str,
 ) -> Result<String, ContextAttachmentError> {
     let contexts = read_contexts(project_root)?;
-    effective_context_text(project_root, &contexts, document_id)
+    Ok(contexts
+        .documents
+        .get(document_id)
+        .map_or_else(String::new, |context| context.instructions.clone()))
 }
 
 pub(crate) fn document_context_snapshot(
     project_root: &Path,
     document_id: &str,
 ) -> Result<DocumentContextSnapshot, ContextAttachmentError> {
-    let contexts = read_contexts(project_root)?;
-    snapshot_from_contexts(project_root, &contexts, document_id)
+    snapshot_from_contexts(project_root, &read_contexts(project_root)?, document_id)
 }
 
 pub(crate) fn set_document_context_snapshot(
@@ -600,7 +666,7 @@ pub(crate) fn set_document_context_snapshot(
     markdown: &str,
     attachment_ids: &[String],
 ) -> Result<DocumentContextSnapshot, ContextAttachmentError> {
-    set_document_context_snapshot_with_sources(
+    set_document_context_snapshot_with_materials(
         project_root,
         document_id,
         markdown,
@@ -609,67 +675,69 @@ pub(crate) fn set_document_context_snapshot(
     )
 }
 
-pub(crate) fn set_document_context_snapshot_with_sources(
+pub(crate) fn set_document_context_snapshot_with_materials(
     project_root: &Path,
     document_id: &str,
     markdown: &str,
     attachment_ids: &[String],
-    text_sources: Option<&[ContextTextSourcePresentation]>,
+    materials: Option<&[ContextMaterial]>,
 ) -> Result<DocumentContextSnapshot, ContextAttachmentError> {
-    if markdown.contains("(loom-attachment:") || markdown.contains("(loom-media:") {
-        return Err(ContextAttachmentError::ContextInvalid);
-    }
-    let ids = ordered_unique_attachment_ids(attachment_ids)?;
-    let manifests = card_manifest_metadata_for_ids(project_root, &ids)?;
-    let internal = encode_context_markdown(markdown, &manifests);
-    if internal.len() > MAX_MANUAL_CONTEXT_BYTES {
+    if markdown.len() > MAX_MANUAL_CONTEXT_BYTES {
         return Err(ContextAttachmentError::ManualTextLimit);
     }
+    let ids = ordered_unique_attachment_ids(attachment_ids)?;
+    let manifests = manifest_metadata_for_ids(project_root, &ids)?;
     let _guard = CONTEXT_WRITE_LOCK
         .lock()
         .map_err(|_| ContextAttachmentError::ContextInvalid)?;
     let mut contexts = read_contexts(project_root)?;
-    if let Some(text_sources) = text_sources {
-        validate_text_source_receipts(project_root, markdown, text_sources)?;
-        if text_sources.is_empty() {
-            contexts.text_imports.remove(document_id);
-        } else {
-            contexts
-                .text_imports
-                .insert(document_id.to_owned(), text_sources.to_vec());
-        }
-    } else if markdown.is_empty() {
-        contexts.text_imports.remove(document_id);
+    let previous = contexts
+        .documents
+        .get(document_id)
+        .cloned()
+        .unwrap_or_default();
+    let supplied = materials.unwrap_or(&previous.materials);
+    if materials.is_some()
+        && supplied
+            .iter()
+            .map(|material| &material.attachment_id)
+            .collect::<Vec<_>>()
+            != ids.iter().collect::<Vec<_>>()
+    {
+        return Err(ContextAttachmentError::ContextInvalid);
     }
-    set_authoritative_context(&mut contexts, document_id, internal, ids);
+    let mut selected = Vec::with_capacity(manifests.len());
+    for (id, manifest) in manifests {
+        let material = supplied
+            .iter()
+            .find(|material| material.attachment_id == id)
+            .cloned()
+            .unwrap_or(ContextMaterial {
+                attachment_id: id,
+                source_revision: manifest_revision(&manifest)?,
+                excerpt: None,
+            });
+        validate_material(&material, &manifest)?;
+        selected.push(material);
+    }
+    if selected
+        .iter()
+        .filter_map(|material| material.excerpt.as_ref())
+        .map(String::len)
+        .sum::<usize>()
+        > MAX_MANUAL_CONTEXT_BYTES
+    {
+        return Err(ContextAttachmentError::ManualTextLimit);
+    }
+    contexts.documents.insert(
+        document_id.to_owned(),
+        DocumentContext {
+            instructions: markdown.to_owned(),
+            materials: selected,
+        },
+    );
     write_contexts(project_root, &contexts)?;
     snapshot_from_contexts(project_root, &contexts, document_id)
-}
-
-fn validate_text_source_receipts(
-    project_root: &Path,
-    _markdown: &str,
-    receipts: &[ContextTextSourcePresentation],
-) -> Result<(), ContextAttachmentError> {
-    if receipts.len() > MAX_TEXT_IMPORT_RECEIPTS {
-        return Err(ContextAttachmentError::TextImportLimit);
-    }
-    for receipt in receipts {
-        let manifest = read_manifest(project_root, &receipt.attachment_id)?;
-        let canonical = read_canonical_text(project_root, &manifest)?;
-        let projection_bytes = usize::try_from(receipt.inserted_bytes)
-            .map_err(|_| ContextAttachmentError::ContextInvalid)?;
-        let projection = middle_out_manuscript(&canonical, projection_bytes).0;
-        if receipt.file_name != manifest.attachment.file_name
-            || receipt.source_bytes != u64::try_from(canonical.len()).unwrap_or(u64::MAX)
-            || receipt.source_sha256 != format!("{:x}", Sha256::digest(canonical.as_bytes()))
-            || receipt.inserted_sha256 != format!("{:x}", Sha256::digest(projection.as_bytes()))
-            || projection.len() != projection_bytes
-        {
-            return Err(ContextAttachmentError::ContextInvalid);
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn add_document_context_snapshot(
@@ -677,100 +745,68 @@ pub(crate) fn add_document_context_snapshot(
     document_id: &str,
     attachment_ids: &[String],
 ) -> Result<DocumentContextSnapshot, ContextAttachmentError> {
-    let requested_ids = ordered_unique_attachment_ids(attachment_ids)?;
-    let requested = manifests_for_ids(project_root, &requested_ids)?;
+    let requested = manifest_metadata_for_ids(
+        project_root,
+        &ordered_unique_attachment_ids(attachment_ids)?,
+    )?;
     let _guard = CONTEXT_WRITE_LOCK
         .lock()
         .map_err(|_| ContextAttachmentError::ContextInvalid)?;
     let mut contexts = read_contexts(project_root)?;
-    let current_internal = effective_context_text(project_root, &contexts, document_id)?;
-    let mut selected_ids = card_attachment_ids(
-        project_root,
-        &authoritative_context_ids(&contexts, document_id),
-    )?;
-    let mut markdown = strip_inline_attachment_markers(&current_internal);
+    let context = contexts
+        .documents
+        .entry(document_id.to_owned())
+        .or_default();
     for (id, manifest) in requested {
-        let already_selected = selected_ids.iter().any(|candidate| candidate == &id);
-        if already_selected && manifest.attachment.text_bytes == 0 {
-            continue;
-        }
-        if has_attachment_card(&manifest) && !already_selected {
-            selected_ids.push(id.clone());
-        }
-        let canonical = read_canonical_text(project_root, &manifest)?;
-        let source_sha256 = format!("{:x}", Sha256::digest(canonical.as_bytes()));
-        let prior_receipt = contexts
-            .text_imports
-            .get(document_id)
-            .and_then(|imports| {
-                imports.iter().find(|receipt| {
-                    receipt.attachment_id == id && receipt.source_sha256 == source_sha256
-                })
-            })
-            .cloned();
-        let already_projected = prior_receipt.as_ref().is_some_and(|receipt| {
-            usize::try_from(receipt.inserted_bytes)
-                .ok()
-                .map(|bytes| middle_out_manuscript(&canonical, bytes).0)
-                .is_some_and(|projection| {
-                    format!("{:x}", Sha256::digest(projection.as_bytes()))
-                        == receipt.inserted_sha256
-                        && markdown.contains(&projection)
-                })
-        });
-        if canonical.is_empty() || already_projected {
-            continue;
-        }
-        if prior_receipt.is_some()
-            && let Some(imports) = contexts.text_imports.get_mut(document_id)
+        if let Some(existing) = context
+            .materials
+            .iter()
+            .find(|material| material.attachment_id == id)
         {
-            imports.retain(|receipt| {
-                receipt.attachment_id != id || receipt.source_sha256 != source_sha256
-            });
+            validate_material(existing, &manifest)?;
+            continue;
         }
-        let selected = card_manifest_metadata_for_ids(project_root, &selected_ids)?;
-        let marker_bytes = encoded_marker_bytes(&markdown, &selected);
-        let separator_bytes = usize::from(!markdown.is_empty()) * 2;
-        let available = MAX_MANUAL_CONTEXT_BYTES
-            .saturating_sub(marker_bytes)
-            .saturating_sub(markdown.len())
-            .saturating_sub(separator_bytes);
-        if !markdown.contains(&canonical) {
-            if available == 0 {
-                return Err(ContextAttachmentError::ManualTextLimit);
-            }
-            let (projection, _) = middle_out_manuscript(&canonical, available);
-            if !markdown.is_empty() {
-                markdown.push_str("\n\n");
-            }
-            markdown.push_str(&projection);
-            let receipt = ContextTextSourcePresentation {
-                attachment_id: id,
-                file_name: manifest.attachment.file_name,
-                source_sha256,
-                source_bytes: u64::try_from(canonical.len()).unwrap_or(u64::MAX),
-                inserted_sha256: format!("{:x}", Sha256::digest(projection.as_bytes())),
-                inserted_bytes: u64::try_from(projection.len()).unwrap_or(u64::MAX),
-                complete_projection: projection.len() == canonical.len(),
-            };
-            let imports = contexts
-                .text_imports
-                .entry(document_id.to_owned())
-                .or_default();
-            if imports.len() >= MAX_TEXT_IMPORT_RECEIPTS {
-                return Err(ContextAttachmentError::TextImportLimit);
-            }
-            imports.push(receipt);
+        if context.materials.len() >= MAX_CONTEXT_ATTACHMENTS {
+            return Err(ContextAttachmentError::ContextLimit);
         }
+        context.materials.push(ContextMaterial {
+            attachment_id: id,
+            source_revision: manifest_revision(&manifest)?,
+            excerpt: None,
+        });
     }
-    let selected = card_manifest_metadata_for_ids(project_root, &selected_ids)?;
-    let internal = encode_context_markdown(&markdown, &selected);
-    if internal.len() > MAX_MANUAL_CONTEXT_BYTES {
-        return Err(ContextAttachmentError::ManualTextLimit);
-    }
-    set_authoritative_context(&mut contexts, document_id, internal, selected_ids);
     write_contexts(project_root, &contexts)?;
     snapshot_from_contexts(project_root, &contexts, document_id)
+}
+
+#[cfg(test)]
+fn set_material_excerpt(
+    project_root: &Path,
+    document_id: &str,
+    attachment_id: &str,
+    source_revision: &str,
+    excerpt: Option<String>,
+) -> Result<DocumentContextSnapshot, ContextAttachmentError> {
+    let snapshot = document_context_snapshot(project_root, document_id)?;
+    let mut materials = snapshot.materials;
+    let material = materials
+        .iter_mut()
+        .find(|material| {
+            material.attachment_id == attachment_id && material.source_revision == source_revision
+        })
+        .ok_or(ContextAttachmentError::ContextInvalid)?;
+    material.excerpt = excerpt;
+    let ids = materials
+        .iter()
+        .map(|material| material.attachment_id.clone())
+        .collect::<Vec<_>>();
+    set_document_context_snapshot_with_materials(
+        project_root,
+        document_id,
+        &snapshot.markdown,
+        &ids,
+        Some(&materials),
+    )
 }
 
 pub(crate) fn remove_document_context_snapshot(
@@ -782,20 +818,35 @@ pub(crate) fn remove_document_context_snapshot(
         .lock()
         .map_err(|_| ContextAttachmentError::ContextInvalid)?;
     let mut contexts = read_contexts(project_root)?;
-    let internal = effective_context_text(project_root, &contexts, document_id)?;
-    let markdown = strip_inline_attachment_markers(&internal);
-    let ids = card_attachment_ids(
-        project_root,
-        &authoritative_context_ids(&contexts, document_id),
-    )?
-    .into_iter()
-    .filter(|id| id != attachment_id)
-    .collect::<Vec<_>>();
-    let manifests = manifest_metadata_for_ids(project_root, &ids)?;
-    let internal = encode_context_markdown(&markdown, &manifests);
-    set_authoritative_context(&mut contexts, document_id, internal, ids);
+    if let Some(context) = contexts.documents.get_mut(document_id) {
+        context
+            .materials
+            .retain(|material| material.attachment_id != attachment_id);
+    }
     write_contexts(project_root, &contexts)?;
     snapshot_from_contexts(project_root, &contexts, document_id)
+}
+
+fn manifest_revision(manifest: &AttachmentManifest) -> Result<String, ContextAttachmentError> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(manifest)?)
+    ))
+}
+
+fn validate_material(
+    material: &ContextMaterial,
+    manifest: &AttachmentManifest,
+) -> Result<(), ContextAttachmentError> {
+    if material.attachment_id != manifest.attachment.id
+        || material.source_revision != manifest_revision(manifest)?
+        || material.excerpt.as_ref().is_some_and(|text| {
+            manifest.attachment.text_bytes == 0 || text.len() > MAX_MANUAL_CONTEXT_BYTES
+        })
+    {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    Ok(())
 }
 
 pub(crate) fn read_context_media(
@@ -816,36 +867,6 @@ pub(crate) fn read_context_media(
 }
 
 #[cfg(test)]
-fn set_document_context_text(
-    project_root: &Path,
-    document_id: &str,
-    text: String,
-) -> Result<String, ContextAttachmentError> {
-    if text.len() > MAX_MANUAL_CONTEXT_BYTES {
-        return Err(ContextAttachmentError::ManualTextLimit);
-    }
-    let ids = inline_attachment_ids(&text);
-    if ids.len() > MAX_CONTEXT_ATTACHMENTS {
-        return Err(ContextAttachmentError::ContextLimit);
-    }
-    let _ = attachments_for_ids(project_root, &ids)?;
-    let _guard = CONTEXT_WRITE_LOCK
-        .lock()
-        .map_err(|_| ContextAttachmentError::ContextInvalid)?;
-    let mut contexts = read_contexts(project_root)?;
-    let unchanged_text = contexts.manual_text.get(document_id) == Some(&text)
-        || (text.is_empty() && !contexts.manual_text.contains_key(document_id));
-    let unchanged_ids = contexts.documents.get(document_id).map(Vec::as_slice)
-        == (!ids.is_empty()).then_some(ids.as_slice());
-    if unchanged_text && unchanged_ids {
-        return Ok(text);
-    }
-    set_authoritative_context(&mut contexts, document_id, text.clone(), ids);
-    write_contexts(project_root, &contexts)?;
-    Ok(text)
-}
-
-#[cfg(test)]
 fn add_document_context(
     project_root: &Path,
     document_id: &str,
@@ -860,34 +881,8 @@ fn add_document_contexts(
     document_id: &str,
     attachment_ids: &[String],
 ) -> Result<Vec<StoredAttachment>, ContextAttachmentError> {
-    let manifests = attachment_ids
-        .iter()
-        .map(|id| read_manifest(project_root, id))
-        .collect::<Result<Vec<_>, _>>()?;
-    let _guard = CONTEXT_WRITE_LOCK
-        .lock()
-        .map_err(|_| ContextAttachmentError::ContextInvalid)?;
-    let mut contexts = read_contexts(project_root)?;
-    let mut text = effective_context_text(project_root, &contexts, document_id)?;
-    for manifest in &manifests {
-        if !inline_attachment_ids(&text).contains(&manifest.attachment.id) {
-            if !text.is_empty() {
-                text.push_str("\n\n");
-            }
-            text.push_str(&manifest.attachment.inline_markdown);
-        }
-    }
-    if text.len() > MAX_MANUAL_CONTEXT_BYTES {
-        return Err(ContextAttachmentError::ManualTextLimit);
-    }
-    let ids = inline_attachment_ids(&text);
-    if ids.len() > MAX_CONTEXT_ATTACHMENTS {
-        return Err(ContextAttachmentError::ContextLimit);
-    }
-    let attachments = attachments_for_ids(project_root, &ids)?;
-    set_authoritative_context(&mut contexts, document_id, text, ids);
-    write_contexts(project_root, &contexts)?;
-    Ok(attachments)
+    add_document_context_snapshot(project_root, document_id, attachment_ids)?;
+    document_context(project_root, document_id)
 }
 
 #[cfg(test)]
@@ -896,63 +891,22 @@ fn remove_document_context(
     document_id: &str,
     attachment_id: &str,
 ) -> Result<Vec<StoredAttachment>, ContextAttachmentError> {
-    let _guard = CONTEXT_WRITE_LOCK
-        .lock()
-        .map_err(|_| ContextAttachmentError::ContextInvalid)?;
-    let mut contexts = read_contexts(project_root)?;
-    let text = effective_context_text(project_root, &contexts, document_id)?;
-    let text = remove_inline_attachment_markers(&text, attachment_id);
-    let ids = inline_attachment_ids(&text);
-    let attachments = attachments_for_ids(project_root, &ids)?;
-    set_authoritative_context(&mut contexts, document_id, text, ids);
-    write_contexts(project_root, &contexts)?;
-    Ok(attachments)
+    remove_document_context_snapshot(project_root, document_id, attachment_id)?;
+    document_context(project_root, document_id)
 }
 
 fn authoritative_context_ids(contexts: &DocumentContexts, document_id: &str) -> Vec<String> {
-    let mut ids = contexts
+    contexts
         .documents
         .get(document_id)
-        .cloned()
-        .unwrap_or_default();
-    if let Some(text) = contexts.manual_text.get(document_id) {
-        for id in inline_attachment_ids(text)
-            .into_iter()
-            .chain(inline_media_ids(text))
-        {
-            if !ids.iter().any(|candidate| candidate == &id) {
-                ids.push(id);
-            }
-        }
-    }
-    if let Some(imports) = contexts.text_imports.get(document_id) {
-        for receipt in imports {
-            if !ids
+        .map(|context| {
+            context
+                .materials
                 .iter()
-                .any(|candidate| candidate == &receipt.attachment_id)
-            {
-                ids.push(receipt.attachment_id.clone());
-            }
-        }
-    }
-    ids
-}
-
-fn effective_context_text(
-    project_root: &Path,
-    contexts: &DocumentContexts,
-    document_id: &str,
-) -> Result<String, ContextAttachmentError> {
-    if let Some(text) = contexts.manual_text.get(document_id) {
-        return Ok(text.clone());
-    }
-    authoritative_context_ids(contexts, document_id)
-        .iter()
-        .map(|id| {
-            read_manifest(project_root, id).map(|manifest| manifest.attachment.inline_markdown)
+                .map(|material| material.attachment_id.clone())
+                .collect()
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(|markers| markers.join("\n\n"))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -965,34 +919,6 @@ fn attachments_for_ids(
         .collect()
 }
 
-fn set_authoritative_context(
-    contexts: &mut DocumentContexts,
-    document_id: &str,
-    text: String,
-    mut ids: Vec<String>,
-) {
-    if text.is_empty() {
-        contexts.manual_text.remove(document_id);
-    } else {
-        contexts.manual_text.insert(document_id.to_owned(), text);
-    }
-    if let Some(imports) = contexts.text_imports.get(document_id) {
-        for receipt in imports {
-            if !ids
-                .iter()
-                .any(|candidate| candidate == &receipt.attachment_id)
-            {
-                ids.push(receipt.attachment_id.clone());
-            }
-        }
-    }
-    if ids.is_empty() {
-        contexts.documents.remove(document_id);
-    } else {
-        contexts.documents.insert(document_id.to_owned(), ids);
-    }
-}
-
 fn ordered_unique_attachment_ids(
     attachment_ids: &[String],
 ) -> Result<Vec<String>, ContextAttachmentError> {
@@ -1001,7 +927,7 @@ fn ordered_unique_attachment_ids(
         if !is_sha256(id) {
             return Err(ContextAttachmentError::ContextInvalid);
         }
-        if !ids.iter().any(|candidate| candidate == id) {
+        if !ids.contains(id) {
             ids.push(id.clone());
         }
     }
@@ -1009,15 +935,6 @@ fn ordered_unique_attachment_ids(
         return Err(ContextAttachmentError::ContextLimit);
     }
     Ok(ids)
-}
-
-fn manifests_for_ids(
-    project_root: &Path,
-    ids: &[String],
-) -> Result<Vec<(String, AttachmentManifest)>, ContextAttachmentError> {
-    ids.iter()
-        .map(|id| read_manifest(project_root, id).map(|manifest| (id.clone(), manifest)))
-        .collect()
 }
 
 fn manifest_metadata_for_ids(
@@ -1029,58 +946,40 @@ fn manifest_metadata_for_ids(
         .collect()
 }
 
-fn card_manifest_metadata_for_ids(
-    project_root: &Path,
-    ids: &[String],
-) -> Result<Vec<(String, AttachmentManifest)>, ContextAttachmentError> {
-    let manifests = manifest_metadata_for_ids(project_root, ids)?;
-    if manifests
-        .iter()
-        .any(|(_, manifest)| !has_attachment_card(manifest))
-    {
-        return Err(ContextAttachmentError::ContextInvalid);
-    }
-    Ok(manifests)
-}
-
-fn card_attachment_ids(
-    project_root: &Path,
-    ids: &[String],
-) -> Result<Vec<String>, ContextAttachmentError> {
-    manifest_metadata_for_ids(project_root, ids).map(|manifests| {
-        manifests
-            .into_iter()
-            .filter_map(|(id, manifest)| has_attachment_card(&manifest).then_some(id))
-            .collect()
-    })
-}
-
 fn snapshot_from_contexts(
     project_root: &Path,
     contexts: &DocumentContexts,
     document_id: &str,
 ) -> Result<DocumentContextSnapshot, ContextAttachmentError> {
-    let internal = effective_context_text(project_root, contexts, document_id)?;
-    let ids = authoritative_context_ids(contexts, document_id);
-    let manifests = manifest_metadata_for_ids(project_root, &ids)?;
+    let context = contexts
+        .documents
+        .get(document_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut attachments = Vec::with_capacity(context.materials.len());
+    for material in &context.materials {
+        let manifest = read_manifest_metadata(project_root, &material.attachment_id)?;
+        validate_material(material, &manifest)?;
+        let mut presentation = attachment_presentation(manifest);
+        presentation
+            .source_revision
+            .clone_from(&material.source_revision);
+        presentation.excerpt.clone_from(&material.excerpt);
+        attachments.push(presentation);
+    }
     Ok(DocumentContextSnapshot {
-        markdown: strip_inline_attachment_markers(&internal),
-        attachments: manifests
-            .into_iter()
-            .filter_map(|(_, manifest)| {
-                has_attachment_card(&manifest).then(|| attachment_presentation(manifest))
-            })
-            .collect(),
-        text_sources: contexts
-            .text_imports
-            .get(document_id)
-            .cloned()
-            .unwrap_or_default(),
+        revision: context_revision(&context)?,
+        markdown: context.instructions,
+        attachments,
+        materials: context.materials,
     })
 }
 
-fn has_attachment_card(manifest: &AttachmentManifest) -> bool {
-    !manifest.media.is_empty() || manifest.attachment.text_bytes == 0
+fn context_revision(context: &DocumentContext) -> Result<String, ContextAttachmentError> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(context)?)
+    ))
 }
 
 fn attachment_presentation(manifest: AttachmentManifest) -> ContextAttachmentPresentation {
@@ -1101,6 +1000,8 @@ fn attachment_presentation(manifest: AttachmentManifest) -> ContextAttachmentPre
         _ => ContextAttachmentPresentationKind::Mixed,
     };
     ContextAttachmentPresentation {
+        source_revision: String::new(),
+        excerpt: None,
         id: manifest.attachment.id,
         file_name: manifest.attachment.file_name,
         detected_format: manifest.attachment.detected_format,
@@ -1124,35 +1025,6 @@ fn attachment_presentation(manifest: AttachmentManifest) -> ContextAttachmentPre
     }
 }
 
-fn encode_context_markdown(markdown: &str, manifests: &[(String, AttachmentManifest)]) -> String {
-    let mut internal = markdown.to_owned();
-    for (_, manifest) in manifests {
-        if !internal.is_empty() {
-            internal.push_str("\n\n");
-        }
-        internal.push_str(&inline_media_markdown(
-            &manifest.attachment.id,
-            &manifest.attachment.file_name,
-        ));
-    }
-    internal
-}
-
-fn encoded_marker_bytes(markdown: &str, manifests: &[(String, AttachmentManifest)]) -> usize {
-    encode_context_markdown(markdown, manifests)
-        .len()
-        .saturating_sub(markdown.len())
-}
-
-fn strip_inline_attachment_markers(markdown: &str) -> String {
-    let mut ids = inline_attachment_ids(markdown);
-    ids.extend(inline_media_ids(markdown));
-    ids.iter().fold(markdown.to_owned(), |text, id| {
-        let text = remove_inline_attachment_markers(&text, id);
-        remove_inline_media_markers(&text, id)
-    })
-}
-
 #[allow(clippy::too_many_lines)]
 pub(crate) fn resolve_for_generation_with_budget(
     project_root: &Path,
@@ -1162,25 +1034,12 @@ pub(crate) fn resolve_for_generation_with_budget(
     branch_count: u32,
     max_generated_tokens: u32,
 ) -> Result<ResolvedContext, ContextAttachmentError> {
-    let contexts = read_contexts(project_root)?;
-    let mut ordered_ids = authoritative_context_ids(&contexts, document_id);
-    let internal_manual_text = effective_context_text(project_root, &contexts, document_id)?;
-    let visible_context_text = strip_inline_attachment_markers(&internal_manual_text);
-    let imports = contexts
-        .text_imports
-        .get(document_id)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let (manual_text, imported_boundary_stale) =
-        author_steering_without_imported_text(project_root, &visible_context_text, imports)?;
-    for id in inline_attachment_ids(manuscript_prefix) {
-        if !ordered_ids.iter().any(|candidate| candidate == &id) {
-            ordered_ids.push(id);
-        }
-    }
-    if ordered_ids.len() > MAX_CONTEXT_ATTACHMENTS {
-        return Err(ContextAttachmentError::ContextLimit);
-    }
+    let (context, manifests) = admit_context(project_root, document_id, manuscript_prefix)?;
+    let ordered_ids = manifests
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    let manual_text = &context.instructions;
     let generated_cells = branch_count.saturating_mul(max_generated_tokens);
     let prompt_byte_budget = usize::try_from(
         context_window_tokens
@@ -1205,23 +1064,18 @@ pub(crate) fn resolve_for_generation_with_budget(
     let query_sha256 = format!("{:x}", Sha256::digest(query.as_bytes()));
     let manual_text_sha256 =
         (!manual_text.is_empty()).then(|| format!("{:x}", Sha256::digest(manual_text.as_bytes())));
-    let visible_context_sha256 = (!visible_context_text.is_empty())
-        .then(|| format!("{:x}", Sha256::digest(visible_context_text.as_bytes())));
     let rebalance_epoch = (stable_query_end / RETRIEVAL_REBALANCE_BYTES) as u64;
-    let manifests = ordered_ids
-        .iter()
-        .map(|id| read_manifest_metadata(project_root, id).map(|manifest| (id.clone(), manifest)))
-        .collect::<Result<Vec<_>, _>>()?;
-    preflight_native_media(&manifests)?;
     let cache_key = PreambleCacheKey {
         project_root: project_root.to_path_buf(),
+        document_id: document_id.to_owned(),
+        policy: RETRIEVAL_SCHEMA,
         attachment_ids: ordered_ids.clone(),
         attachment_text_fingerprints: manifests
             .iter()
             .map(|(id, manifest)| attachment_text_fingerprint(id, manifest))
             .collect(),
         manual_text_sha256: manual_text_sha256.clone(),
-        visible_context_sha256,
+        context_revision: context_revision(&context)?,
         manuscript_query_sha256: query_sha256.clone(),
         retrieval_rebalance_epoch: rebalance_epoch,
         context_budget,
@@ -1230,28 +1084,22 @@ pub(crate) fn resolve_for_generation_with_budget(
         (cached.text, cached.excerpts)
     } else {
         let mut sources = Vec::new();
-        if imported_boundary_stale && !visible_context_text.is_empty() {
-            let mut presentation = manifests
+        for (id, manifest) in &manifests {
+            let canonical_text = match context
+                .materials
                 .iter()
-                .find(|(id, _)| imports.iter().any(|item| item.attachment_id == *id))
-                .map(|(_, manifest)| manifest.attachment.clone())
-                .ok_or(ContextAttachmentError::ContextInvalid)?;
-            "edited context containing imported material".clone_into(&mut presentation.file_name);
-            sources.push((
-                "edited-imported-context".to_owned(),
-                presentation,
-                visible_context_text.clone(),
-            ));
-        } else {
-            for (id, manifest) in &manifests {
-                let canonical_text = read_canonical_text(project_root, manifest)?;
-                if !canonical_text.is_empty() {
-                    sources.push((id.clone(), manifest.attachment.clone(), canonical_text));
-                }
+                .find(|material| material.attachment_id == *id)
+                .and_then(|material| material.excerpt.as_ref())
+            {
+                Some(excerpt) => excerpt.clone(),
+                None => read_canonical_text(project_root, manifest)?,
+            };
+            if !canonical_text.is_empty() {
+                sources.push((id.clone(), manifest.attachment.clone(), canonical_text));
             }
         }
         let (text, excerpts) =
-            assemble_generation_context(&manual_text, &sources, query, context_budget);
+            assemble_generation_context(manual_text, &sources, query, context_budget);
         cache_preamble(
             cache_key,
             PreambleCacheValue {
@@ -1261,19 +1109,7 @@ pub(crate) fn resolve_for_generation_with_budget(
         );
         (text, excerpts)
     };
-    let mut media = Vec::new();
-    for (id, manifest) in manifests {
-        for item in manifest.media {
-            let bytes = read_object(project_root, &item.sha256, item.byte_count)?;
-            media.push(MediaInput {
-                id: format!("{id}:{}", item.id),
-                kind: item.kind,
-                mime: item.mime,
-                sha256: item.sha256,
-                bytes,
-            });
-        }
-    }
+    let media = load_admitted_media(project_root, manifests)?;
     let manuscript_budget = prompt_byte_budget.saturating_sub(text.len());
     let (manuscript_prompt, omitted) = middle_out_manuscript(manuscript_prefix, manuscript_budget);
     let retained_head_end = omitted.map_or(manuscript_prefix.len(), |(start, _)| start);
@@ -1298,6 +1134,8 @@ pub(crate) fn resolve_for_generation_with_budget(
         attachment_ids: ordered_ids,
         retrieval_evidence: ContextRetrievalEvidence {
             schema: RETRIEVAL_SCHEMA.to_owned(),
+            context_revision: context_revision(&context)?,
+            materials: context.materials,
             manuscript_prefix_sha256: format!("{:x}", Sha256::digest(manuscript_prefix.as_bytes())),
             manuscript_window_start_byte: manuscript_window_start as u64,
             manuscript_window_end_byte: manuscript_window_end as u64,
@@ -1316,57 +1154,102 @@ pub(crate) fn resolve_for_generation_with_budget(
     })
 }
 
-fn author_steering_without_imported_text(
+/// Admission uses current selected source revisions, never a cached selection.
+/// Cached text is an immutable derivative of previously hash-verified bytes:
+/// disk changes cannot modify it. A cache miss always verifies source bytes.
+fn admit_context(
     project_root: &Path,
-    visible_text: &str,
-    imports: &[ContextTextSourcePresentation],
-) -> Result<(String, bool), ContextAttachmentError> {
-    if imports.is_empty() {
-        return Ok((visible_text.to_owned(), false));
+    document_id: &str,
+    manuscript: &str,
+) -> Result<(DocumentContext, Vec<(String, AttachmentManifest)>), ContextAttachmentError> {
+    let contexts = read_contexts(project_root)?;
+    let context = contexts
+        .documents
+        .get(document_id)
+        .cloned()
+        .unwrap_or_default();
+    let mut ids = authoritative_context_ids(&contexts, document_id);
+    for id in inline_attachment_ids(manuscript) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
     }
-    let mut ranges = Vec::with_capacity(imports.len());
-    for receipt in imports {
-        let manifest = read_manifest(project_root, &receipt.attachment_id)?;
-        let canonical = read_canonical_text(project_root, &manifest)?;
-        let inserted_bytes = usize::try_from(receipt.inserted_bytes)
-            .map_err(|_| ContextAttachmentError::ContextInvalid)?;
-        let projection = middle_out_manuscript(&canonical, inserted_bytes).0;
-        if receipt.file_name != manifest.attachment.file_name
-            || receipt.source_bytes != u64::try_from(canonical.len()).unwrap_or(u64::MAX)
-            || receipt.source_sha256 != format!("{:x}", Sha256::digest(canonical.as_bytes()))
-            || receipt.inserted_sha256 != format!("{:x}", Sha256::digest(projection.as_bytes()))
-            || projection.len() != inserted_bytes
+    let ids = ordered_unique_attachment_ids(&ids)?;
+    let manifests = manifest_metadata_for_ids(project_root, &ids)?;
+    for (id, manifest) in &manifests {
+        if let Some(material) = context
+            .materials
+            .iter()
+            .find(|material| material.attachment_id == *id)
         {
-            return Err(ContextAttachmentError::ContextInvalid);
+            validate_material(material, manifest)?;
         }
-        let Some(start) = visible_text
-            .match_indices(&projection)
-            .find_map(|(start, _)| {
-                let end = start + projection.len();
-                ranges
-                    .iter()
-                    .all(|(prior_start, prior_end)| end <= *prior_start || start >= *prior_end)
-                    .then_some(start)
-            })
-        else {
-            // Once an imported region is edited, its exact range is no longer
-            // provable. Fail closed by treating the whole pane as untrusted.
-            return Ok((String::new(), true));
-        };
-        ranges.push((start, start + projection.len()));
-    }
-    ranges.sort_unstable();
-    let mut author = String::new();
-    let mut cursor = 0;
-    for (start, end) in ranges {
-        if start > cursor {
-            author.push_str(&visible_text[cursor..start]);
+        // Existence and shape checks establish current availability, not content
+        // integrity. Only verified retained derivatives may skip payload reads.
+        check_object_metadata(project_root, id, manifest.attachment.byte_count)?;
+        if let Some(hash) = &manifest.canonical_text_sha256 {
+            check_object_metadata(project_root, hash, manifest.attachment.text_bytes)?;
         }
-        cursor = end;
     }
-    author.push_str(&visible_text[cursor..]);
-    Ok((author.trim().to_owned(), false))
+    preflight_native_media(&manifests)?;
+    Ok((context, manifests))
 }
+
+pub(crate) fn resolve_media_for_document(
+    project_root: &Path,
+    document_id: &str,
+    manuscript: &str,
+) -> Result<Vec<MediaInput>, ContextAttachmentError> {
+    let (_, manifests) = admit_context(project_root, document_id, manuscript)?;
+    load_admitted_media(project_root, manifests)
+}
+
+fn load_admitted_media(
+    project_root: &Path,
+    manifests: Vec<(String, AttachmentManifest)>,
+) -> Result<Vec<MediaInput>, ContextAttachmentError> {
+    let mut media = Vec::new();
+    for (id, manifest) in manifests {
+        for item in manifest.media {
+            let bytes = read_object(project_root, &item.sha256, item.byte_count)?;
+            media.push(MediaInput {
+                id: format!("{id}:{}", item.id),
+                kind: item.kind,
+                mime: item.mime,
+                sha256: item.sha256,
+                bytes,
+            });
+        }
+    }
+    Ok(media)
+}
+
+fn check_object_metadata(
+    project_root: &Path,
+    sha256: &str,
+    expected_bytes: u64,
+) -> Result<(), ContextAttachmentError> {
+    if !is_sha256(sha256) || expected_bytes > MAX_ATTACHMENT_BYTES {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    let metadata =
+        fs::symlink_metadata(attachment_root(project_root)?.join("objects").join(sha256))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != expected_bytes
+    {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct SourceWork {
+    read: usize,
+    hashed: usize,
+    prepared_copied: usize,
+}
+#[cfg(test)]
+thread_local! { static SOURCE_WORK: std::cell::Cell<SourceWork> = const { std::cell::Cell::new(SourceWork { read: 0, hashed: 0, prepared_copied: 0 }) }; }
 
 fn preflight_native_media(
     manifests: &[(String, AttachmentManifest)],
@@ -1444,8 +1327,6 @@ fn attachment_text_fingerprint(id: &str, manifest: &AttachmentManifest) -> Strin
     digest.update([u8::from(manifest.attachment.coverage_complete)]);
     if let Some(sha256) = manifest.canonical_text_sha256.as_deref() {
         digest.update(sha256.as_bytes());
-    } else if let Some(text) = manifest.canonical_text.as_deref() {
-        digest.update(Sha256::digest(text.as_bytes()));
     }
     format!("{:x}", digest.finalize())
 }
@@ -1462,6 +1343,12 @@ fn cached_preamble(key: &PreambleCacheKey) -> Option<PreambleCacheValue> {
         .position(|(candidate, _)| candidate == key)?;
     let entry = cache.entries.remove(index)?;
     let value = entry.1.clone();
+    #[cfg(test)]
+    SOURCE_WORK.with(|counter| {
+        let mut work = counter.get();
+        work.prepared_copied += value.text.len();
+        counter.set(work);
+    });
     cache.entries.push_back(entry);
     Some(value)
 }
@@ -1611,6 +1498,14 @@ fn select_excerpts(
 ) -> (String, Vec<ContextExcerptEvidence>) {
     if text.is_empty() || budget == 0 {
         return (String::new(), Vec::new());
+    }
+    #[cfg(test)]
+    if source_id != "manual" {
+        SOURCE_WORK.with(|counter| {
+            let mut work = counter.get();
+            work.hashed += text.len();
+            counter.set(work);
+        });
     }
     let source_text_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
     if text.len() <= budget {
@@ -1935,39 +1830,11 @@ pub(crate) fn manuscript_selects_attachment(markdown: &str, id: &str) -> bool {
         .any(|selected| selected == id)
 }
 
-fn inline_media_markdown(id: &str, file_name: &str) -> String {
-    inline_markdown_with_scheme(id, file_name, "loom-media")
-}
-
-fn inline_markdown_with_scheme(id: &str, file_name: &str, scheme: &str) -> String {
-    let label = file_name
-        .replace(['[', ']', '\\'], " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "[Media: {}]({scheme}:{id})",
-        if label.is_empty() {
-            "Attachment"
-        } else {
-            &label
-        }
-    )
-}
-
 fn inline_attachment_ids(markdown: &str) -> Vec<String> {
-    inline_ids_with_scheme(markdown, "loom-attachment")
-}
-
-fn inline_media_ids(markdown: &str) -> Vec<String> {
-    inline_ids_with_scheme(markdown, "loom-media")
-}
-
-fn inline_ids_with_scheme(markdown: &str, scheme: &str) -> Vec<String> {
     let mut ids = Vec::new();
-    let marker = format!("({scheme}:");
+    let marker = "(loom-attachment:";
     let mut rest = markdown;
-    while let Some(start) = rest.find(&marker) {
+    while let Some(start) = rest.find(marker) {
         rest = &rest[start + marker.len()..];
         let Some(end) = rest.find(')') else { break };
         let address = rest[..end].split_whitespace().next().unwrap_or_default();
@@ -1986,46 +1853,6 @@ fn inline_ids_with_scheme(markdown: &str, scheme: &str) -> Vec<String> {
         rest = &rest[end + 1..];
     }
     ids
-}
-
-fn remove_inline_attachment_markers(markdown: &str, attachment_id: &str) -> String {
-    remove_inline_markers_with_scheme(markdown, attachment_id, "loom-attachment")
-}
-
-fn remove_inline_media_markers(markdown: &str, attachment_id: &str) -> String {
-    remove_inline_markers_with_scheme(markdown, attachment_id, "loom-media")
-}
-
-fn remove_inline_markers_with_scheme(markdown: &str, attachment_id: &str, scheme: &str) -> String {
-    if !is_sha256(attachment_id) {
-        return markdown.to_owned();
-    }
-    let needle = format!("]({scheme}:{attachment_id})");
-    let mut remaining = markdown;
-    let mut rendered = String::with_capacity(markdown.len());
-    while let Some(marker_end) = remaining.find(&needle) {
-        let prefix = &remaining[..marker_end];
-        let Some(label_start) = prefix.rfind('[') else {
-            rendered.push_str(&remaining[..marker_end + needle.len()]);
-            remaining = &remaining[marker_end + needle.len()..];
-            continue;
-        };
-        let mut retained_prefix_end = label_start;
-        let mut retained_suffix = &remaining[marker_end + needle.len()..];
-        if let Some(suffix) = retained_suffix.strip_prefix("\n\n") {
-            retained_suffix = suffix;
-        } else if prefix[..label_start].ends_with("\n\n") {
-            retained_prefix_end -= 2;
-        }
-        rendered.push_str(&prefix[..retained_prefix_end]);
-        remaining = retained_suffix;
-    }
-    rendered.push_str(remaining);
-    if rendered.trim().is_empty() {
-        String::new()
-    } else {
-        rendered
-    }
 }
 
 fn attachment_root(project_root: &Path) -> Result<PathBuf, ContextAttachmentError> {
@@ -2094,17 +1921,6 @@ pub(crate) fn original_path(
     Ok(attachment_root(project_root)?.join("objects").join(id))
 }
 
-fn write_manifest(
-    project_root: &Path,
-    manifest: &AttachmentManifest,
-) -> Result<(), ContextAttachmentError> {
-    let path = attachment_root(project_root)?
-        .join("manifests")
-        .join(format!("{}.json", manifest.attachment.id));
-    let bytes = serde_json::to_vec_pretty(manifest)?;
-    install_immutable(&path, &bytes)
-}
-
 /// Acquisition provenance is separate from the offline processing receipt.
 /// The receipt is immutable and contains no OAuth credential material.
 pub(crate) fn record_import_origin(
@@ -2119,6 +1935,7 @@ pub(crate) fn record_import_origin(
     install_immutable(&path, &bytes)
 }
 
+#[cfg(test)]
 fn read_manifest(
     project_root: &Path,
     id: &str,
@@ -2179,20 +1996,10 @@ fn read_manifest_if_present(
                     _ => false,
                 }
         }
-        MANIFEST_SCHEMA_V2 => {
-            manifest.canonical_text_sha256.is_none()
-                && (manifest.canonical_text.as_ref().is_some_and(|text| {
-                    text.len() as u64 == manifest.attachment.text_bytes
-                        && text.len() <= MAX_CANONICAL_TEXT_BYTES
-                }) || (manifest.canonical_text.is_none()
-                    && manifest.attachment.text_bytes == 0))
-        }
         _ => false,
     };
-    let target_fingerprint_is_valid = manifest.preparation_plan.target_fingerprint
-        == gemma_target().fingerprint
-        || (manifest.schema == MANIFEST_SCHEMA_V2
-            && manifest.preparation_plan.target_fingerprint == LEGACY_TARGET_FINGERPRINT);
+    let target_fingerprint_is_valid =
+        manifest.preparation_plan.target_fingerprint == gemma_target().fingerprint;
     if !text_representation_is_valid
         || manifest.attachment.id != id
         || manifest.attachment.media_kinds != expected_media_kinds
@@ -2250,9 +2057,15 @@ fn read_canonical_text(
         manifest.canonical_text.as_deref(),
         manifest.canonical_text_sha256.as_deref(),
     ) {
-        (Some(text), None) if manifest.schema == MANIFEST_SCHEMA_V2 => Ok(text.to_owned()),
         (None, Some(sha256)) if manifest.schema == MANIFEST_SCHEMA => {
             let bytes = read_object(project_root, sha256, manifest.attachment.text_bytes)?;
+            #[cfg(test)]
+            SOURCE_WORK.with(|counter| {
+                let mut work = counter.get();
+                work.read += bytes.len();
+                work.hashed += bytes.len();
+                counter.set(work);
+            });
             String::from_utf8(bytes).map_err(|_| ContextAttachmentError::ContextInvalid)
         }
         (None, None) if manifest.attachment.text_bytes == 0 => Ok(String::new()),
@@ -2261,48 +2074,58 @@ fn read_canonical_text(
 }
 
 fn read_contexts(project_root: &Path) -> Result<DocumentContexts, ContextAttachmentError> {
-    let path = attachment_root(project_root)?.join("document-context.json");
-    match fs::read(path) {
-        Ok(bytes) => {
-            let contexts: DocumentContexts = serde_json::from_slice(&bytes)?;
-            if contexts.schema != CONTEXT_SCHEMA
-                && contexts.schema != CONTEXT_SCHEMA_V2
-                && contexts.schema != CONTEXT_SCHEMA_V1
-            {
-                return Err(ContextAttachmentError::ContextInvalid);
-            }
-            if contexts
-                .documents
-                .values()
-                .any(|ids| ids.len() > MAX_CONTEXT_ATTACHMENTS)
-                || contexts
-                    .manual_text
-                    .values()
-                    .any(|text| text.len() > MAX_MANUAL_CONTEXT_BYTES)
-                || contexts.text_imports.values().any(|imports| {
-                    imports.len() > MAX_TEXT_IMPORT_RECEIPTS
-                        || imports.iter().any(|import| {
-                            !is_sha256(&import.attachment_id)
-                                || !is_sha256(&import.source_sha256)
-                                || !is_sha256(&import.inserted_sha256)
-                        })
-                })
-            {
-                return Err(ContextAttachmentError::ContextInvalid);
-            }
-            Ok(DocumentContexts {
-                schema: CONTEXT_SCHEMA.to_owned(),
-                ..contexts
-            })
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DocumentContexts {
-            schema: CONTEXT_SCHEMA.to_owned(),
-            documents: BTreeMap::new(),
-            manual_text: BTreeMap::new(),
-            text_imports: BTreeMap::new(),
-        }),
-        Err(error) => Err(error.into()),
+    #[derive(Deserialize)]
+    struct Header {
+        schema: String,
     }
+    let path = attachment_root(project_root)?.join("document-context.json");
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DocumentContexts {
+                schema: CONTEXT_SCHEMA.to_owned(),
+                documents: BTreeMap::new(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    // Mixed-text historical formats cannot prove which bytes were instructions.
+    // Reject without rewriting or promoting any existing source material.
+    if serde_json::from_slice::<Header>(&bytes)?.schema != CONTEXT_SCHEMA {
+        return Err(ContextAttachmentError::ContextFormat);
+    }
+    let contexts: DocumentContexts = serde_json::from_slice(&bytes)?;
+    if contexts.schema != CONTEXT_SCHEMA
+        || contexts.documents.values().any(|context| {
+            context.instructions.len() > MAX_MANUAL_CONTEXT_BYTES
+                || context
+                    .materials
+                    .iter()
+                    .filter_map(|material| material.excerpt.as_ref())
+                    .map(String::len)
+                    .sum::<usize>()
+                    > MAX_MANUAL_CONTEXT_BYTES
+                || context.materials.len() > MAX_CONTEXT_ATTACHMENTS
+                || context.materials.iter().any(|material| {
+                    !is_sha256(&material.attachment_id)
+                        || !is_sha256(&material.source_revision)
+                        || material
+                            .excerpt
+                            .as_ref()
+                            .is_some_and(|text| text.len() > MAX_MANUAL_CONTEXT_BYTES)
+                })
+                || context
+                    .materials
+                    .iter()
+                    .map(|material| &material.attachment_id)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != context.materials.len()
+        })
+    {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    Ok(contexts)
 }
 
 fn write_contexts(
@@ -2377,6 +2200,198 @@ fn is_sha256(value: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn explicit_material_edits_preserve_instructions_and_exact_source_identity() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("source.md");
+        let shared = "Même phrase 🖋\r\n";
+        fs::write(&path, shared).unwrap();
+        let attachment = import_path(project.path(), &path).unwrap();
+        let instructions = format!("{shared}Keep my instructions unchanged.");
+        let initial = set_document_context_snapshot(
+            project.path(),
+            "doc",
+            &instructions,
+            std::slice::from_ref(&attachment.id),
+        )
+        .unwrap();
+        let revision = initial.materials[0].source_revision.clone();
+        let edited = set_material_excerpt(
+            project.path(),
+            "doc",
+            &attachment.id,
+            &revision,
+            Some(format!("{shared}Edited source, not instructions.")),
+        )
+        .unwrap();
+        assert_eq!(edited.markdown, instructions);
+        assert_ne!(edited.revision, initial.revision);
+        let result = resolve_for_generation(project.path(), "doc", "").unwrap();
+        assert!(
+            result
+                .context_preamble
+                .contains(&format!("[BEGIN AUTHOR STEERING CONTEXT]\n{instructions}"))
+        );
+        assert!(
+            result
+                .context_preamble
+                .contains("Edited source, not instructions.")
+        );
+        assert_eq!(result.retrieval_evidence.materials, edited.materials);
+        assert_eq!(result.retrieval_evidence.context_revision, edited.revision);
+        assert_eq!(result.attachment_ids, vec![attachment.id.clone()]);
+        let removed =
+            remove_document_context_snapshot(project.path(), "doc", &attachment.id).unwrap();
+        assert_eq!(removed.markdown, instructions);
+        assert!(removed.materials.is_empty());
+        let result = resolve_for_generation(project.path(), "doc", "").unwrap();
+        assert!(!result.context_preamble.contains("Edited source"));
+        assert!(
+            set_material_excerpt(
+                project.path(),
+                "doc",
+                &attachment.id,
+                &revision,
+                Some("late edit".into())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn removing_mixed_material_revokes_both_text_and_media() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("image.png");
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        fs::write(&path, bytes.into_inner()).unwrap();
+        let attachment = import_path(project.path(), &path).unwrap();
+        let mut manifest = read_manifest_metadata(project.path(), &attachment.id).unwrap();
+        let text = "Description retained alongside the picture.";
+        let hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+        install_object(project.path(), &hash, text.as_bytes()).unwrap();
+        manifest.canonical_text_sha256 = Some(hash);
+        manifest.attachment.text_bytes = text.len() as u64;
+        let manifest_path = attachment_root(project.path())
+            .unwrap()
+            .join("manifests")
+            .join(format!("{}.json", attachment.id));
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        add_document_context_snapshot(project.path(), "doc", std::slice::from_ref(&attachment.id))
+            .unwrap();
+        let before = resolve_for_generation(project.path(), "doc", "").unwrap();
+        assert_eq!(before.media.len(), 1);
+        assert!(before.context_preamble.contains(text));
+        remove_document_context_snapshot(project.path(), "doc", &attachment.id).unwrap();
+        let after = resolve_for_generation(project.path(), "doc", "").unwrap();
+        assert!(after.media.is_empty());
+        assert!(after.context_preamble.is_empty());
+    }
+
+    #[test]
+    fn warm_context_reads_no_source_payload_and_only_copies_bounded_prepared_text() {
+        for size in [4096, 65_536, 1_048_576] {
+            let project = tempfile::tempdir().unwrap();
+            let path = project.path().join("source.md");
+            fs::write(&path, "Source words.\n".repeat(size / 14 + 1)).unwrap();
+            let attachment = import_path(project.path(), &path).unwrap();
+            add_document_context_snapshot(
+                project.path(),
+                "doc",
+                std::slice::from_ref(&attachment.id),
+            )
+            .unwrap();
+            SOURCE_WORK.with(|counter| counter.set(SourceWork::default()));
+            let cold =
+                resolve_for_generation_with_budget(project.path(), "doc", "Source", 8192, 1, 128)
+                    .unwrap();
+            let cold_work = SOURCE_WORK.with(std::cell::Cell::get);
+            SOURCE_WORK.with(|counter| counter.set(SourceWork::default()));
+            let warm =
+                resolve_for_generation_with_budget(project.path(), "doc", "Source", 8192, 1, 128)
+                    .unwrap();
+            let warm_work = SOURCE_WORK.with(std::cell::Cell::get);
+            assert_eq!(cold, warm);
+            assert!(cold_work.read >= size);
+            assert_eq!(warm_work.read, 0);
+            assert_eq!(warm_work.hashed, 0);
+            assert_eq!(warm_work.prepared_copied, warm.context_preamble.len());
+            assert!(warm_work.prepared_copied <= 8192);
+            eprintln!("source={size} cold={cold_work:?} warm={warm_work:?}");
+            SOURCE_WORK.with(|counter| counter.set(SourceWork::default()));
+            assert!(
+                resolve_media_for_document(project.path(), "doc", "")
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(SOURCE_WORK.with(std::cell::Cell::get).read, 0);
+        }
+    }
+
+    #[test]
+    fn warm_context_rejects_replaced_source_metadata_before_cache_reuse() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("source.md");
+        fs::write(&path, "Original verified source.").unwrap();
+        let attachment = import_path(project.path(), &path).unwrap();
+        add_document_context_snapshot(project.path(), "doc", std::slice::from_ref(&attachment.id))
+            .unwrap();
+        resolve_for_generation(project.path(), "doc", "").unwrap();
+        let mut manifest = read_manifest_metadata(project.path(), &attachment.id).unwrap();
+        manifest.attachment.file_name = "Changed source.md".into();
+        manifest.attachment.inline_markdown =
+            inline_attachment_markdown(&attachment.id, &manifest.attachment.file_name);
+        let manifest_path = attachment_root(project.path())
+            .unwrap()
+            .join("manifests")
+            .join(format!("{}.json", attachment.id));
+        fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(document_context_snapshot(project.path(), "doc").is_err());
+        assert!(resolve_for_generation(project.path(), "doc", "").is_err());
+        remove_document_context_snapshot(project.path(), "doc", &attachment.id).unwrap();
+        assert!(
+            resolve_for_generation(project.path(), "doc", "")
+                .unwrap()
+                .attachment_ids
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn warm_material_revalidates_selection_and_never_uses_replaced_payload_bytes() {
+        let project = tempfile::tempdir().unwrap();
+        let path = project.path().join("source.md");
+        fs::write(&path, "Verified source text.").unwrap();
+        let attachment = import_path(project.path(), &path).unwrap();
+        add_document_context_snapshot(project.path(), "doc", std::slice::from_ref(&attachment.id))
+            .unwrap();
+        let cold = resolve_for_generation(project.path(), "doc", "").unwrap();
+        let manifest = read_manifest_metadata(project.path(), &attachment.id).unwrap();
+        let object = attachment_root(project.path())
+            .unwrap()
+            .join("objects")
+            .join(manifest.canonical_text_sha256.as_ref().unwrap());
+        fs::write(
+            &object,
+            vec![b'X'; usize::try_from(manifest.attachment.text_bytes).unwrap()],
+        )
+        .unwrap();
+        let warm = resolve_for_generation(project.path(), "doc", "").unwrap();
+        assert_eq!(warm.context_preamble, cold.context_preamble); // Already verified immutable derivative.
+        assert!(resolve_for_generation(project.path(), "doc", "new query misses cache").is_err());
+        fs::remove_file(object).unwrap();
+        assert!(resolve_for_generation(project.path(), "doc", "").is_err());
+        remove_document_context_snapshot(project.path(), "doc", &attachment.id).unwrap();
+        assert!(
+            resolve_for_generation(project.path(), "doc", "")
+                .unwrap()
+                .attachment_ids
+                .is_empty()
+        );
+    }
 
     #[test]
     fn source_only_files_retain_originals_without_inventing_model_content() {
@@ -2536,9 +2551,15 @@ mod tests {
                 let snapshot =
                     add_document_context_snapshot(project.path(), extension, &[attachment.id])
                         .expect(extension);
-                assert!(snapshot.markdown.contains("Loom editable fixture"));
-                assert!(!snapshot.text_sources.is_empty());
-                assert!(snapshot.attachments.is_empty());
+                assert!(snapshot.markdown.is_empty());
+                assert_eq!(snapshot.materials.len(), 1);
+                assert_eq!(snapshot.attachments.len(), 1);
+                assert!(
+                    resolve_for_generation(project.path(), extension, "")
+                        .unwrap()
+                        .context_preamble
+                        .contains("Loom editable fixture")
+                );
             }
         }
     }
@@ -2574,42 +2595,16 @@ mod tests {
     }
 
     #[test]
-    fn legacy_document_selection_is_synthesized_then_markers_become_authoritative() {
-        let project = tempfile::tempdir().expect("project fixture");
-        let path = project.path().join("legacy.md");
-        fs::write(&path, "Legacy context body.").expect("write fixture");
-        let attachment = import_path(project.path(), &path).expect("import fixture");
-        write_contexts(
-            project.path(),
-            &DocumentContexts {
-                schema: CONTEXT_SCHEMA_V1.to_owned(),
-                documents: BTreeMap::from([("doc".to_owned(), vec![attachment.id.clone()])]),
-                manual_text: BTreeMap::new(),
-                text_imports: BTreeMap::new(),
-            },
-        )
-        .expect("write legacy selection");
-
-        assert_eq!(
-            document_context_text(project.path(), "doc").expect("synthesize legacy markers"),
-            attachment.inline_markdown
-        );
-        set_document_context_text(project.path(), "doc", "Only this prose remains.".to_owned())
-            .expect("replace legacy selection");
-        assert!(
-            document_context(project.path(), "doc")
-                .expect("read authoritative selection")
-                .is_empty()
-        );
-        let resolved =
-            resolve_for_generation(project.path(), "doc", "").expect("resolve marker-free context");
-        assert!(resolved.attachment_ids.is_empty());
-        assert!(
-            resolved
-                .context_preamble
-                .contains("Only this prose remains.")
-        );
-        assert!(!resolved.context_preamble.contains("Legacy context body."));
+    fn ambiguous_context_is_rejected_without_rewriting_saved_bytes() {
+        let project = tempfile::tempdir().unwrap();
+        let path = attachment_root(project.path())
+            .unwrap()
+            .join("document-context.json");
+        let bytes = br#"{"schema":"loom.document-context.v3","documents":{},"manual_text":{"doc":"Author words mixed with imported words"},"text_imports":{}}"#;
+        fs::write(&path, bytes).unwrap();
+        assert!(document_context_snapshot(project.path(), "doc").is_err());
+        assert!(set_document_context_snapshot(project.path(), "doc", "new", &[]).is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
     #[test]
@@ -2618,13 +2613,13 @@ mod tests {
         let path = project.path().join("guide.md");
         fs::write(&path, "Attached guide body.").expect("write fixture");
         let attachment = import_path(project.path(), &path).expect("import fixture");
-        set_document_context_text(project.path(), "doc", "Opening note.".to_owned())
+        set_document_context_snapshot(project.path(), "doc", "Opening note.", &[])
             .expect("persist note");
 
         add_document_context(project.path(), "doc", &attachment.id).expect("add attachment");
         let added = document_context_text(project.path(), "doc").expect("read added marker");
         assert!(added.starts_with("Opening note."));
-        assert!(added.contains(&attachment.inline_markdown));
+        assert_eq!(added, "Opening note.");
         assert_eq!(
             document_context(project.path(), "doc")
                 .expect("read added selection")
@@ -2681,7 +2676,7 @@ mod tests {
     fn pasted_context_is_persisted_and_bounded_for_generation() {
         let project = tempfile::tempdir().expect("project fixture");
         let pasted = "Keep the narration close and concrete. ".repeat(2_000);
-        set_document_context_text(project.path(), "doc", pasted.clone())
+        set_document_context_snapshot(project.path(), "doc", &pasted, &[])
             .expect("persist pasted context");
         assert_eq!(
             document_context_text(project.path(), "doc").expect("read pasted context"),
@@ -2754,13 +2749,13 @@ mod tests {
     }
 
     #[test]
-    fn context_markers_and_retrieval_query_are_stable_between_growth_rebalances() {
+    fn selected_material_and_retrieval_query_are_stable_between_growth_rebalances() {
         let project = tempfile::tempdir().expect("project fixture");
         let path = project.path().join("reference.md");
         fs::write(&path, "A stable attached reference.").expect("write reference");
         let attachment = import_path(project.path(), &path).expect("import reference");
-        set_document_context_text(project.path(), "doc", attachment.inline_markdown.clone())
-            .expect("persist context document marker");
+        add_document_context_snapshot(project.path(), "doc", std::slice::from_ref(&attachment.id))
+            .expect("select context material");
 
         let first_prefix = format!("{}tail one", "stable manuscript. ".repeat(1_100));
         let second_prefix = format!("{first_prefix} and a little more");
@@ -2831,11 +2826,13 @@ mod tests {
         let text = import_path(project.path(), &text_path).expect("import text");
         let image = import_path(project.path(), &png_path).expect("import image");
         let audio = import_path(project.path(), &wav_path).expect("import audio");
-        let context = format!(
-            "Author direction.\n\n{}\n\n{}\n\n{}",
-            text.inline_markdown, image.inline_markdown, audio.inline_markdown
-        );
-        set_document_context_text(project.path(), "doc", context).expect("persist context");
+        set_document_context_snapshot(
+            project.path(),
+            "doc",
+            "Author direction.",
+            &[text.id.clone(), image.id.clone(), audio.id.clone()],
+        )
+        .expect("persist instructions and selected materials");
 
         let resolved =
             resolve_for_generation(project.path(), "doc", "").expect("resolve empty manuscript");
@@ -2858,7 +2855,7 @@ mod tests {
     }
 
     #[test]
-    fn projected_text_is_editable_idempotent_and_never_hidden_twice() {
+    fn selected_text_is_separate_idempotent_and_never_hidden_twice() {
         let project = tempfile::tempdir().expect("project fixture");
         let text_path = project.path().join("voice.md");
         let canonical = "Keep the voice exact and quiet.";
@@ -2871,9 +2868,9 @@ mod tests {
             std::slice::from_ref(&attachment.id),
         )
         .expect("project text into editable context");
-        assert_eq!(first.markdown, canonical);
-        assert!(first.attachments.is_empty());
-        assert_eq!(first.text_sources.len(), 1);
+        assert!(first.markdown.is_empty());
+        assert_eq!(first.attachments.len(), 1);
+        assert_eq!(first.materials.len(), 1);
 
         let second = add_document_context_snapshot(
             project.path(),
@@ -2901,8 +2898,8 @@ mod tests {
             std::slice::from_ref(&attachment.id),
         )
         .expect("re-add deleted projection");
-        assert_eq!(restored.markdown, canonical);
-        assert_eq!(restored.text_sources.len(), 1);
+        assert!(restored.markdown.is_empty());
+        assert_eq!(restored.materials.len(), 1);
     }
 
     #[test]

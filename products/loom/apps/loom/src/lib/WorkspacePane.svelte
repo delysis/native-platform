@@ -97,7 +97,10 @@
     try {
       if (!await beforeAttachmentImport()) return;
       if (!current()) throw new Error('The pane changed before import. Drop the files again at the intended location.');
-      const imported = await importAttachmentPaths(captured.projectId, captured.sessionId, paths);
+      const report = await importAttachmentPaths(captured.projectId, captured.sessionId, paths);
+      const imported = report.imported;
+      error = report.failures.map((item) => `${item.name}: ${item.message}`).join("\n");
+      if (!imported.length) return;
       if (!current()) throw new Error('The pane changed during import. The files are retained; drop them again at the intended location.');
       const markdown = imported.map(editableImportMarkdown).join('\n\n');
       if (captured.kind === 'editor') {

@@ -9,6 +9,7 @@ mod document_bindings;
 mod document_watcher;
 mod external_import;
 mod import_batch;
+mod import_jobs;
 mod microphone_capture;
 mod model_catalog;
 mod model_download;
@@ -80,12 +81,12 @@ use crate::co_writer::{
     CoWriterError, CoWriterSummary, apply_to_document as apply_co_writer,
     delete as delete_co_writer, list as list_co_writers, save_from_document as save_co_writer,
 };
+#[cfg(test)]
+use crate::context_attachments::import_path as import_context_attachment_path;
 use crate::context_attachments::{
-    ContextAttachmentError, DocumentContextSnapshot, StoredAttachment,
-    add_document_context_snapshot, document_context_snapshot,
-    import_path as import_context_attachment_path, read_context_media,
-    remove_document_context_snapshot, resolve_for_generation_with_budget,
-    set_document_context_snapshot,
+    ContextAttachmentError, DocumentContextSnapshot, add_document_context_snapshot,
+    document_context_snapshot, read_context_media, remove_document_context_snapshot,
+    resolve_for_generation_with_budget, set_document_context_snapshot,
 };
 use crate::document_watcher::DocumentFilesystemWatcher;
 use crate::external_import::document_import_external;
@@ -462,6 +463,7 @@ pub struct PluginState {
     session: Mutex<Session>,
     prepared_project: Mutex<Option<PreparedProject>>,
     folder_picker_open: AtomicBool,
+    imports: Arc<import_jobs::ImportJobs>,
     native_runtime: Arc<NativeHostRuntime>,
     backend: Arc<LlamaBackend>,
     model: Mutex<ModelRegistry>,
@@ -508,6 +510,7 @@ impl PluginState {
             session: Mutex::new(Session::default()),
             prepared_project: Mutex::new(None),
             folder_picker_open: AtomicBool::new(false),
+            imports: Arc::default(),
             native_runtime,
             backend,
             model: Mutex::new(ModelRegistry::default()),
@@ -2259,8 +2262,8 @@ impl IpcFailure {
             ContextAttachmentError::NoRepresentation => "attachment_no_model_representation",
             ContextAttachmentError::ContextLimit => "attachment_context_limit",
             ContextAttachmentError::ManualTextLimit => "attachment_context_text_limit",
-            ContextAttachmentError::TextImportLimit => "attachment_text_import_limit",
             ContextAttachmentError::ContextInvalid => "attachment_context_invalid",
+            ContextAttachmentError::ContextFormat => "attachment_context_format",
             ContextAttachmentError::Io(_) => "attachment_storage_failed",
             ContextAttachmentError::Json(_) => "attachment_metadata_invalid",
         };
@@ -3406,6 +3409,8 @@ fn close_project_with_wait(
         (typed_project_id, typed_session_id)
     };
 
+    state.imports.revoke_session(&session_id);
+
     // Project close removes command authority before waiting for inference.
     // A slow or failed drain must never leave a promotion nonce usable.
     state
@@ -3427,6 +3432,7 @@ fn close_project_with_wait(
         generation_wait,
     )?;
 
+    state.imports.drain_session(&session_id)?;
     let mut session = lock_session_internal(state)?;
     if session.phase == SessionPhase::Closed {
         if let Some(receipt) = &session.last_close
@@ -3671,19 +3677,25 @@ async fn attachment_ingest(
 async fn attachment_import_paths(
     project_id: String,
     session_id: String,
+    operation_id: String,
     paths: Vec<String>,
     state: State<'_, PluginState>,
-) -> Result<Vec<StoredAttachment>, IpcFailure> {
-    import_context_attachment_paths_for_session(&state, &project_id, &session_id, paths)
+) -> Result<import_batch::ImportBatch, IpcFailure> {
+    let operation =
+        import_jobs::ImportOperation::reserve(&state, &project_id, &session_id, &operation_id)?;
+    import_batch::import_paths(&operation, &state, paths).await
 }
 
 #[tauri::command]
 async fn attachment_import_choose<R: Runtime>(
     project_id: String,
     session_id: String,
+    operation_id: String,
     app: AppHandle<R>,
     state: State<'_, PluginState>,
-) -> Result<Vec<StoredAttachment>, IpcFailure> {
+) -> Result<import_batch::ImportBatch, IpcFailure> {
+    let operation =
+        import_jobs::ImportOperation::reserve(&state, &project_id, &session_id, &operation_id)?;
     let selected = app
         .dialog()
         .file()
@@ -3692,42 +3704,15 @@ async fn attachment_import_choose<R: Runtime>(
     let paths = selected
         .into_iter()
         .map(|selected| {
-            selected.into_path().map_err(|error| {
-                IpcFailure::new(
-                    "selected_attachment_unavailable",
-                    format!("the selected attachment is not a local filesystem path: {error}"),
-                    false,
-                )
-            })
+            selected
+                .into_path()
+                .map(|path| path.to_string_lossy().into_owned())
+                .map_err(|error| {
+                    IpcFailure::new("selected_attachment_unavailable", error.to_string(), false)
+                })
         })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect();
-    import_context_attachment_paths_for_session(&state, &project_id, &session_id, paths)
-}
-
-fn import_context_attachment_paths_for_session(
-    state: &PluginState,
-    project_id: &str,
-    session_id: &str,
-    paths: Vec<String>,
-) -> Result<Vec<StoredAttachment>, IpcFailure> {
-    if paths.len() > 16 {
-        return Err(IpcFailure::new(
-            "attachment_transfer_limit",
-            "attach at most 16 files at once",
-            false,
-        ));
-    }
-    let _application_admission = lock_application_admission(state, "attachment import")?;
-    let mut session = lock_session(state)?;
-    let store = require_bound_store(&mut session, project_id, session_id)?;
-    paths
-        .into_iter()
-        .map(|path| import_context_attachment_path(store.root(), Path::new(&path)))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| IpcFailure::context_attachment(&error))
+        .collect::<Result<Vec<_>, _>>()?;
+    import_batch::import_paths(&operation, &state, paths).await
 }
 
 fn bind_context_media_tokens(
@@ -3900,6 +3885,7 @@ async fn document_context_snapshot_set(
     document_id: String,
     markdown: String,
     attachment_ids: Vec<String>,
+    materials: Option<Vec<context_attachments::ContextMaterial>>,
     state: State<'_, PluginState>,
 ) -> Result<DocumentContextSnapshot, IpcFailure> {
     let _ = document_id
@@ -3908,9 +3894,14 @@ async fn document_context_snapshot_set(
     let _application_admission = lock_application_admission(&state, "document context update")?;
     let mut session = lock_session(&state)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    let snapshot =
-        set_document_context_snapshot(store.root(), &document_id, &markdown, &attachment_ids)
-            .map_err(|error| IpcFailure::context_attachment(&error))?;
+    let snapshot = context_attachments::set_document_context_snapshot_with_materials(
+        store.root(),
+        &document_id,
+        &markdown,
+        &attachment_ids,
+        materials.as_deref(),
+    )
+    .map_err(|error| IpcFailure::context_attachment(&error))?;
     bind_context_media_tokens(snapshot, &project_id, &session_id, &document_id)
 }
 
@@ -10246,6 +10237,7 @@ impl DesktopWorkersJoined {
 
 impl PluginState {
     fn join_desktop_workers(&self) -> Result<DesktopWorkersJoined, IpcFailure> {
+        self.imports.shutdown()?;
         let model_loads = self.model_loads.close_and_drain();
         self.downloads
             .cancel_all_active(now_unix_ms())
@@ -10286,6 +10278,9 @@ impl PluginState {
     /// removed under a poison-recovering registry lock, cancelled, and joined
     /// before the returned exact-registry facts are assembled.
     fn join_desktop_workers_for_exit(&self) -> DesktopWorkersJoined {
+        if let Err(error) = self.imports.shutdown() {
+            eprintln!("Loom import drain: {}", error.message);
+        }
         let model_loads = self.model_loads.close_and_drain();
         // Running worker slots retain the authoritative cancellation handles.
         // Avoid fallible semantic registries at this unpreventable boundary.

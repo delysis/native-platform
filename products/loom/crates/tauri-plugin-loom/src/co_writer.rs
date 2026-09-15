@@ -12,11 +12,11 @@ use thiserror::Error;
 #[cfg(test)]
 use crate::context_attachments::set_document_context_snapshot;
 use crate::context_attachments::{
-    ContextAttachmentError, ContextTextSourcePresentation, DocumentContextSnapshot,
-    document_context_snapshot, set_document_context_snapshot_with_sources,
+    ContextAttachmentError, ContextMaterial, DocumentContextSnapshot, document_context_snapshot,
+    set_document_context_snapshot_with_materials,
 };
 
-const PROFILE_SCHEMA: &str = "loom.co-writer-profiles.v1";
+const PROFILE_SCHEMA: &str = "loom.co-writer-profiles.v2";
 const MAX_PROFILES: usize = 64;
 const MAX_NAME_BYTES: usize = 96;
 const MAX_MARKDOWN_BYTES: usize = 256 * 1024;
@@ -30,7 +30,7 @@ struct StoredCoWriterProfile {
     markdown: String,
     attachment_ids: Vec<String>,
     #[serde(default)]
-    text_sources: Vec<ContextTextSourcePresentation>,
+    materials: Vec<ContextMaterial>,
     created_at_unix_ms: i64,
     updated_at_unix_ms: i64,
 }
@@ -105,7 +105,7 @@ pub(crate) fn save_from_document(
         .profiles
         .get(&id)
         .map_or(now_unix_ms, |profile| profile.created_at_unix_ms);
-    let text_sources = snapshot.text_sources;
+    let materials = snapshot.materials;
     let attachment_ids = snapshot
         .attachments
         .into_iter()
@@ -117,7 +117,7 @@ pub(crate) fn save_from_document(
         source_document_id: document_id.to_owned(),
         markdown: snapshot.markdown,
         attachment_ids,
-        text_sources,
+        materials,
         created_at_unix_ms,
         updated_at_unix_ms: now_unix_ms,
     };
@@ -137,12 +137,12 @@ pub(crate) fn apply_to_document(
         .get(profile_id)
         .cloned()
         .ok_or(CoWriterError::NotFound)?;
-    set_document_context_snapshot_with_sources(
+    set_document_context_snapshot_with_materials(
         project_root,
         document_id,
         &profile.markdown,
         &profile.attachment_ids,
-        Some(&profile.text_sources),
+        Some(&profile.materials),
     )
     .map_err(Into::into)
 }
