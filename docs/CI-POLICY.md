@@ -48,9 +48,17 @@ fuzz run is not proof that arbitrary inputs are safe.
 
 `ci-required` gates pull requests on the planner, fast policy/frontend checks,
 and selected macOS jobs. Linux, Windows, fuzzing, and cross-platform inventory
-remain scheduled and report failures, but do not delay this development gate.
+remain scheduled and report failures. They start after `ci-required` finishes,
+so they cannot consume runner capacity ahead of the same run's development
+gate. Other workflow runs can still share runner capacity. The
+planner's existing selection still applies; a failed gate does not suppress
+selected advisory checks. Cancelled or superseded workflow runs start no more
+advisory work.
 
 `macos-required` reports main's macOS acceptance independently of other platforms.
+Each full CI run starts macOS, frontend, and policy checks first. Linux/Windows workspace,
+fuzz, and model-integration work waits for those checks and the macOS report to
+finish, then runs even if they failed, unless the workflow was cancelled.
 `full-summary` remains a complete report: any failed, cancelled, or unexpectedly
 skipped job makes it fail. It is advisory for macOS development. Repair failures
 in scoped follow-up changes; never make a failing test silently pass or remove
