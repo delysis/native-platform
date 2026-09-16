@@ -61,17 +61,38 @@ fn signatures_do_not_make_malformed_compute_records_valid() -> Result<()> {
     valid.payload.validate()?;
     let record = valid.payload;
     for invalid in [
-        RemoteJobRecord { job: Uuid::nil(), ..record.clone() },
-        RemoteJobRecord { grant: Uuid::nil(), ..record.clone() },
-        RemoteJobRecord { revision: 0, ..record.clone() },
-        RemoteJobRecord { recorded_at_ms: 0, ..record.clone() },
-        RemoteJobRecord { request_fingerprint: "not a digest".into(), ..record.clone() },
         RemoteJobRecord {
-            model: ComputeModel { fingerprint: "AB".repeat(32), ..record.model.clone() },
+            job: Uuid::nil(),
             ..record.clone()
         },
         RemoteJobRecord {
-            model: ComputeModel { name: "hidden\ncontrol".into(), ..record.model.clone() },
+            grant: Uuid::nil(),
+            ..record.clone()
+        },
+        RemoteJobRecord {
+            revision: 0,
+            ..record.clone()
+        },
+        RemoteJobRecord {
+            recorded_at_ms: 0,
+            ..record.clone()
+        },
+        RemoteJobRecord {
+            request_fingerprint: "not a digest".into(),
+            ..record.clone()
+        },
+        RemoteJobRecord {
+            model: ComputeModel {
+                fingerprint: "AB".repeat(32),
+                ..record.model.clone()
+            },
+            ..record.clone()
+        },
+        RemoteJobRecord {
+            model: ComputeModel {
+                name: "hidden\ncontrol".into(),
+                ..record.model.clone()
+            },
             ..record.clone()
         },
         RemoteJobRecord {
@@ -82,7 +103,9 @@ fn signatures_do_not_make_malformed_compute_records_valid() -> Result<()> {
             ..record.clone()
         },
         RemoteJobRecord {
-            status: ComputeStatus::Completed { text: "x".repeat(MAX_COMPUTE_TEXT_BYTES + 1) },
+            status: ComputeStatus::Completed {
+                text: "x".repeat(MAX_COMPUTE_TEXT_BYTES + 1),
+            },
             ..record.clone()
         },
     ] {
@@ -101,12 +124,37 @@ fn every_supported_receipt_shape_is_accepted() -> Result<()> {
     for (status, revision) in [
         (ComputeStatus::Accepted, 0),
         (ComputeStatus::Running, 1),
-        (ComputeStatus::Cancelling { reason: ComputeCancellation::Requested }, 1),
-        (ComputeStatus::Cancelling { reason: ComputeCancellation::Requested }, 2),
-        (ComputeStatus::Cancelled { reason: ComputeCancellation::Requested }, 2),
-        (ComputeStatus::Cancelled { reason: ComputeCancellation::Requested }, 3),
+        (
+            ComputeStatus::Cancelling {
+                reason: ComputeCancellation::Requested,
+            },
+            1,
+        ),
+        (
+            ComputeStatus::Cancelling {
+                reason: ComputeCancellation::Requested,
+            },
+            2,
+        ),
+        (
+            ComputeStatus::Cancelled {
+                reason: ComputeCancellation::Requested,
+            },
+            2,
+        ),
+        (
+            ComputeStatus::Cancelled {
+                reason: ComputeCancellation::Requested,
+            },
+            3,
+        ),
         (ComputeStatus::Completed { text: "ok".into() }, 2),
-        (ComputeStatus::Failed { failure: ComputeFailure::ExecutionFailed }, 2),
+        (
+            ComputeStatus::Failed {
+                failure: ComputeFailure::ExecutionFailed,
+            },
+            2,
+        ),
         (ComputeStatus::Interrupted, 1),
         (ComputeStatus::Interrupted, 2),
         (ComputeStatus::Interrupted, 3),
@@ -123,21 +171,37 @@ fn skipped_observations_must_still_have_a_reachable_revision_path() -> Result<()
     let accepted = receipt(&host, &request, ComputeStatus::Accepted, 0)?;
     let running = receipt(&host, &request, ComputeStatus::Running, 1)?;
     let early_cancel = receipt(
-        &host, &request,
-        ComputeStatus::Cancelling { reason: ComputeCancellation::Requested }, 1,
+        &host,
+        &request,
+        ComputeStatus::Cancelling {
+            reason: ComputeCancellation::Requested,
+        },
+        1,
     )?;
     let cancelled_before_dispatch = receipt(
-        &host, &request,
-        ComputeStatus::Cancelled { reason: ComputeCancellation::Requested }, 2,
+        &host,
+        &request,
+        ComputeStatus::Cancelled {
+            reason: ComputeCancellation::Requested,
+        },
+        2,
     )?;
     let cancelled_after_dispatch = receipt(
-        &host, &request,
-        ComputeStatus::Cancelled { reason: ComputeCancellation::Requested }, 3,
+        &host,
+        &request,
+        ComputeStatus::Cancelled {
+            reason: ComputeCancellation::Requested,
+        },
+        3,
     )?;
     let interrupted = receipt(&host, &request, ComputeStatus::Interrupted, 3)?;
     for value in [
-        &accepted, &running, &early_cancel, &cancelled_before_dispatch,
-        &cancelled_after_dispatch, &interrupted,
+        &accepted,
+        &running,
+        &early_cancel,
+        &cancelled_before_dispatch,
+        &cancelled_after_dispatch,
+        &interrupted,
     ] {
         client::validate_receipt(&request, value)?;
     }
