@@ -9930,7 +9930,7 @@
           {#each visibleMaterials as item (item.id)}
             <button class="folder-row material-row" class:active={activeMaterial?.id === item.id} type="button" title={item.name}
               on:click={() => openMaterial(item)}>
-              <svg aria-hidden="true" viewBox="0 0 16 16">{#if item.kind === 'library'}<path d="M2 4h4l1.5 1.5H14v7H2Z"/>{:else}<path d="M4 2h5l3 3v9H4Z M9 2v4h3"/>{/if}</svg>
+              <svg aria-hidden="true" viewBox="0 0 16 16">{#if item.kind === 'library' || item.kind === 'collection'}<path d="M2 4h4l1.5 1.5H14v7H2Z"/>{:else}<path d="M4 2h5l3 3v9H4Z M9 2v4h3"/>{/if}</svg>
               <span>{item.name}</span>{#if item.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}
             </button>
           {/each}

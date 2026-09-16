@@ -6,6 +6,9 @@ export default defineConfig({
   plugins: [svelte()],
   test: {
     include: ['src/**/*.browser.test.ts'],
+    // WebKit processes and Vite transforms share the development machine with
+    // native builds. Bound their fan-out instead of inflating test timeouts.
+    maxWorkers: 2,
     browser: {
       enabled: true,
       headless: true,
