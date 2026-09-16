@@ -498,7 +498,7 @@ mod tests {
         assert!(Service::read(dir.path()).is_err());
         let path = dir.path().join(".loom.toml");
         let mut source = "version = 1\n#".to_owned();
-        source.push_str(&"x".repeat(MAX_CONFIG_BYTES as usize - source.len()));
+        source.push_str(&"x".repeat(usize::try_from(MAX_CONFIG_BYTES).unwrap() - source.len()));
         std::fs::write(&path, &source).unwrap();
         assert!(Service::read(&path).unwrap().unwrap().scope(true).is_none());
         source.push('x');
