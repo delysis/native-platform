@@ -15,6 +15,8 @@ pub use memory_estimate::{
 };
 mod residual_training;
 mod residual_training_math;
+mod residual_evaluation;
+pub use residual_evaluation::{ResidualEvaluationTicket, VerifiedResidualEvaluation};
 pub use residual_training::{ResidualTrainingTicket, VerifiedResidualTraining};
 mod state_buffer;
 
@@ -1103,6 +1105,12 @@ impl NativeModelInner {
 
 #[derive(Debug)]
 enum WorkerCommand {
+    EvaluateResidual {
+        request: llama_native_types::ResidualEvaluationRequest,
+        result: Sender<NativeResult<VerifiedResidualEvaluation>>,
+        cancellation: Arc<AtomicBool>,
+        request_lease: RequestLease,
+    },
     TrainResidual {
         request: llama_native_types::ResidualTrainingRequest,
         result: Sender<NativeResult<VerifiedResidualTraining>>,
@@ -1662,8 +1670,18 @@ impl NativeModelHandle {
             (RequestClass::Generation | RequestClass::ControlledGeneration, None) => {
                 active.cancel_all()
             }
-            (RequestClass::Embedding | RequestClass::ResidualTraining, None) => active.cancel_all(),
-            (RequestClass::Embedding | RequestClass::ResidualTraining, Some(_)) => 0,
+            (
+                RequestClass::Embedding
+                | RequestClass::ResidualTraining
+                | RequestClass::ResidualEvaluation,
+                None,
+            ) => active.cancel_all(),
+            (
+                RequestClass::Embedding
+                | RequestClass::ResidualTraining
+                | RequestClass::ResidualEvaluation,
+                Some(_),
+            ) => 0,
         }
     }
 
@@ -2427,6 +2445,46 @@ fn run_worker(
             continue;
         }
         match command {
+            WorkerCommand::EvaluateResidual {
+                request,
+                result,
+                cancellation,
+                request_lease,
+            } => {
+                if let Err(error) = request_lease.running() {
+                    let _ = result.send(Err(error));
+                    continue;
+                }
+                set_status_state(&status, ModelRuntimeState::Ready, 1);
+                let evaluated = artifacts
+                    .verify_strict_unchanged(&fingerprint)
+                    .and_then(|()| {
+                        residual_evaluation::execute(
+                            &config,
+                            backend,
+                            &model,
+                            &fingerprint,
+                            &request,
+                            &cancellation,
+                        )
+                    })
+                    .and_then(|output| {
+                        artifacts.verify_strict_unchanged(&fingerprint)?;
+                        if cancellation.load(Ordering::Acquire) {
+                            return Err(NativeError::new(
+                                NativeErrorCode::Cancelled,
+                                "residual evaluation cancelled before completion",
+                            ));
+                        }
+                        Ok(VerifiedResidualEvaluation::from_worker(
+                            output,
+                            Arc::clone(&worker_identity),
+                        ))
+                    });
+                set_status_state(&status, ModelRuntimeState::Ready, 0);
+                let _ = request_lease.completed_or_failed(evaluated.is_ok());
+                let _ = result.send(evaluated);
+            }
             WorkerCommand::TrainResidual {
                 request,
                 result,
@@ -3091,6 +3149,16 @@ fn reject_queued_command(command: WorkerCommand) {
         )
     };
     match command {
+        WorkerCommand::EvaluateResidual {
+            result,
+            cancellation,
+            request_lease,
+            ..
+        } => {
+            cancellation.store(true, Ordering::Release);
+            let _ = request_lease.cancel_queued();
+            let _ = result.send(Err(cancelled()));
+        }
         WorkerCommand::TrainResidual {
             result,
             cancellation,

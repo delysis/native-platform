@@ -61,6 +61,12 @@ This is contrast-subspace fitting, not autograd or weight fine-tuning. A success
 fit does not authorize controlled generation or establish generalization.
 See [the algorithm, experiment card, and limits](docs/RESIDUAL_TRAINING.md).
 
+`NativeModelHandle::evaluate_residual` independently evaluates norm-bounded
+multi-profile compositions using same-history full-vocabulary KL, continuation
+likelihood and greedy generation. It preserves resident generation state and
+does not promote supplied profiles to deployment controls. See the
+[evaluation contract](docs/RESIDUAL_EVALUATION.md).
+
 ## Workspace
 
 - `llama-native-types`: stable public DTOs.

@@ -14,6 +14,7 @@ pub(crate) enum RequestClass {
     ControlledGeneration,
     Embedding,
     ResidualTraining,
+    ResidualEvaluation,
 }
 
 #[derive(Debug)]
@@ -31,6 +32,9 @@ pub(crate) enum RequestControls {
     ResidualTraining {
         cancellation: Arc<AtomicBool>,
     },
+    ResidualEvaluation {
+        cancellation: Arc<AtomicBool>,
+    },
 }
 
 impl RequestControls {
@@ -40,7 +44,9 @@ impl RequestControls {
             | Self::ControlledGeneration { cancellations } => {
                 set_all(cancellations.iter().map(|(_, flag)| flag))
             }
-            Self::Embedding { cancellation } | Self::ResidualTraining { cancellation } => {
+            Self::Embedding { cancellation }
+            | Self::ResidualTraining { cancellation }
+            | Self::ResidualEvaluation { cancellation } => {
                 cancellation.store(true, Ordering::Release);
                 1
             }
@@ -51,7 +57,9 @@ impl RequestControls {
         match self {
             Self::Generation { cancellations, .. }
             | Self::ControlledGeneration { cancellations } => set_named(cancellations, name),
-            Self::Embedding { .. } | Self::ResidualTraining { .. } => false,
+            Self::Embedding { .. }
+            | Self::ResidualTraining { .. }
+            | Self::ResidualEvaluation { .. } => false,
         }
     }
 
@@ -62,6 +70,7 @@ impl RequestControls {
             } => set_named(reasoning_forces, name),
             Self::ControlledGeneration { .. }
             | Self::Embedding { .. }
+            | Self::ResidualEvaluation { .. }
             | Self::ResidualTraining { .. } => false,
         }
     }
@@ -73,6 +82,7 @@ impl RequestControls {
             } => set_all(reasoning_forces.iter().map(|(_, flag)| flag)),
             Self::ControlledGeneration { .. }
             | Self::Embedding { .. }
+            | Self::ResidualEvaluation { .. }
             | Self::ResidualTraining { .. } => 0,
         }
     }
@@ -83,9 +93,9 @@ impl RequestControls {
             | Self::ControlledGeneration { cancellations } => cancellations
                 .iter()
                 .any(|(_, flag)| flag.load(Ordering::Acquire)),
-            Self::Embedding { cancellation } | Self::ResidualTraining { cancellation } => {
-                cancellation.load(Ordering::Acquire)
-            }
+            Self::Embedding { cancellation }
+            | Self::ResidualTraining { cancellation }
+            | Self::ResidualEvaluation { cancellation } => cancellation.load(Ordering::Acquire),
         }
     }
 }
@@ -844,6 +854,30 @@ mod tests {
         assert!(!cancellation.load(Ordering::Acquire));
         registry.begin_quiesce_and_cancel_all();
         assert!(cancellation.load(Ordering::Acquire));
+        drop(control);
+        assert_eq!(registry.active_count(), 1);
+        drop(lease);
+        registry.wait_until_drained();
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn residual_evaluation_cancellation_survives_ticket_drop_until_executor_release() {
+        let registry = Arc::new(RequestRegistry::new());
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (control, lease) = registry
+            .reserve(
+                "evaluation",
+                RequestClass::ResidualEvaluation,
+                RequestControls::ResidualEvaluation {
+                    cancellation: Arc::clone(&cancellation),
+                },
+            )
+            .expect("evaluation reserves");
+        assert!(!control.cancel_named("case"));
+        assert!(!control.force_reasoning_exit("case"));
+        assert_eq!(control.cancel_all(), 1);
+        assert!(control.controls.cancellation_requested());
         drop(control);
         assert_eq!(registry.active_count(), 1);
         drop(lease);

@@ -5,12 +5,14 @@ mod controlled_generation;
 mod exact_token_budget;
 mod first_word_choices;
 pub mod media_identity;
+mod residual_evaluation;
 mod residual_training;
 mod sampling_fingerprint;
 
 pub use controlled_generation::*;
 pub use exact_token_budget::*;
 pub use first_word_choices::*;
+pub use residual_evaluation::*;
 pub use residual_training::*;
 pub use sampling_fingerprint::{SAMPLING_CONFIG_FINGERPRINT_DOMAIN, SamplingConfigFingerprint};
 
