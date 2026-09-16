@@ -56,6 +56,27 @@ pub(super) fn resolve(
     Ok(media)
 }
 
+/// Apply the same aggregate budget after combining independently resolved inputs.
+pub(super) fn merge(
+    first: Vec<MediaInput>,
+    second: Vec<MediaInput>,
+) -> Result<Vec<MediaInput>, IpcFailure> {
+    let mut seen = HashSet::new();
+    let mut bytes = 0_usize;
+    let mut result = Vec::new();
+    for item in first.into_iter().chain(second) {
+        if !seen.insert((item.kind, item.sha256.clone())) {
+            continue;
+        }
+        bytes = bytes.checked_add(item.bytes.len()).ok_or_else(limit)?;
+        if result.len() >= MAX_MEDIA || bytes > MAX_MEDIA_BYTES {
+            return Err(limit());
+        }
+        result.push(item);
+    }
+    Ok(result)
+}
+
 fn limit() -> IpcFailure {
     IpcFailure::new(
         "terminal_media_limit",

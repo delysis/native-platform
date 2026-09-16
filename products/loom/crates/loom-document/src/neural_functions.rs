@@ -1,8 +1,9 @@
 //! A small expression language over ordinary documents.
 //!
-//! References are values; only calls perform inference. Pipelines are syntax
-//! sugar for calls, with the preceding value supplied as the first argument.
-//! Resolution and execution belong to the caller, never to the parser.
+//! References are values; document calls perform inference, while `find`
+//! requests bounded host retrieval. Pipelines are syntax sugar for document
+//! calls, with the preceding value supplied as the first argument. Resolution
+//! and execution belong to the caller, never to the parser.
 
 use std::{collections::HashMap, ops::Range};
 
@@ -33,6 +34,11 @@ pub enum NeuralExpression {
     Call {
         function: String,
         arguments: Vec<Self>,
+    },
+    /// Host retrieval, distinct from a document function named `find`.
+    Find {
+        source: Box<Self>,
+        query: Box<Self>,
     },
 }
 
@@ -74,8 +80,9 @@ pub fn parse_neural_command(source: &str) -> Result<NeuralCommand, NeuralSyntaxE
     Ok(NeuralCommand::Expression(expression))
 }
 
-/// Find explicit mentions in Markdown prose, excluding escapes, email-like
-/// words, fenced/indented code, and inline code spans. Repeated mentions retain
+/// Find explicit mentions and retained-identity links in Markdown prose,
+/// excluding escapes, email-like words, images, other links, quoted source
+/// lines, fenced/indented code, and inline code spans. Repeated mentions retain
 /// their source ranges; the resolver decides how to deduplicate identities.
 pub fn document_references(source: &str) -> Result<Vec<DocumentReference>, NeuralSyntaxError> {
     check_size(source, MAX_NEURAL_DOCUMENT_BYTES)?;
@@ -110,10 +117,12 @@ pub fn document_references(source: &str) -> Result<Vec<DocumentReference>, Neura
             line_start += line.len();
             continue;
         }
-        if inline_ticks == 0 && (indent >= 4 || line.starts_with('\t')) {
+        if inline_ticks == 0 && (indent >= 4 || line.starts_with('\t') || trimmed.starts_with('>'))
+        {
             line_start += line.len();
             continue;
         }
+        let delimiters = matching_link_delimiters(line);
         let mut offset = 0;
         while offset < line.len() {
             let rest = &line[offset..];
@@ -137,31 +146,33 @@ pub fn document_references(source: &str) -> Result<Vec<DocumentReference>, Neura
                 continue;
             }
             if character == '\\' {
-                offset += character.len_utf8();
-                if let Some(escaped) = line[offset..].chars().next() {
-                    offset += escaped.len_utf8();
+                offset += rest.chars().take(2).map(char::len_utf8).sum::<usize>();
+                continue;
+            }
+            if matches!(character, '[' | '!')
+                && let Some((end, name)) = reference_link_at(line, offset, &delimiters)
+            {
+                if let Some(name) = name {
+                    push_reference(
+                        &mut references,
+                        DocumentReference {
+                            name,
+                            range: line_start + offset..line_start + end,
+                        },
+                    )?;
                 }
+                offset = end;
                 continue;
             }
             let previous = line[..offset].chars().next_back();
-            if character != '@'
-                || previous.is_some_and(|c| {
-                    c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '@' | '-')
-                })
-            {
+            if !starts_reference(character, previous) {
                 offset += character.len_utf8();
                 continue;
             }
             let start = line_start + offset;
             if let Some(reference) = reference_at(source, start) {
-                if references.len() == MAX_NEURAL_NODES {
-                    return Err(NeuralSyntaxError {
-                        offset: start,
-                        message: "too many document references",
-                    });
-                }
                 offset = reference.range.end - line_start;
-                references.push(reference);
+                push_reference(&mut references, reference)?;
             } else {
                 offset += character.len_utf8();
             }
@@ -169,6 +180,96 @@ pub fn document_references(source: &str) -> Result<Vec<DocumentReference>, Neura
         line_start += line.len();
     }
     Ok(references)
+}
+
+fn starts_reference(character: char, previous: Option<char>) -> bool {
+    character == '@'
+        && !previous
+            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '/' | '@' | '-'))
+}
+
+fn push_reference(
+    references: &mut Vec<DocumentReference>,
+    reference: DocumentReference,
+) -> Result<(), NeuralSyntaxError> {
+    if references.len() == MAX_NEURAL_NODES {
+        return Err(NeuralSyntaxError {
+            offset: reference.range.start,
+            message: "too many document references",
+        });
+    }
+    references.push(reference);
+    Ok(())
+}
+
+// Precompute matching delimiters once, avoiding quadratic rescanning of nested
+// or unfinished labels. Escaped brackets/parentheses are literal label bytes.
+fn matching_link_delimiters(line: &str) -> HashMap<usize, usize> {
+    let mut brackets = Vec::new();
+    let mut parentheses = Vec::new();
+    let mut matches = HashMap::new();
+    let mut characters = line.char_indices();
+    while let Some((offset, character)) = characters.next() {
+        match character {
+            '\\' => {
+                characters.next();
+            }
+            '[' => brackets.push(offset),
+            '(' => parentheses.push(offset),
+            ']' => {
+                if let Some(start) = brackets.pop() {
+                    matches.insert(start, offset);
+                }
+            }
+            ')' => {
+                if let Some(start) = parentheses.pop() {
+                    matches.insert(start, offset);
+                }
+            }
+            _ => {}
+        }
+    }
+    matches
+}
+
+/// Recognize only the app's retained-identity links. A malformed identity must
+/// not fall back to resolving its friendly label as a different document.
+/// Image labels and destinations are never document-context references.
+fn reference_link_at(
+    line: &str,
+    start: usize,
+    delimiters: &HashMap<usize, usize>,
+) -> Option<(usize, Option<String>)> {
+    let image = line.as_bytes().get(start) == Some(&b'!');
+    let label_start = start + usize::from(image);
+    if line.as_bytes().get(label_start) != Some(&b'[') {
+        return None;
+    }
+    let label_end = *delimiters.get(&label_start)?;
+    let target_start = label_end + 1;
+    if line.as_bytes().get(target_start) != Some(&b'(') {
+        return None;
+    }
+    let target_end = delimiters.get(&target_start).copied();
+    let end = target_end.map_or(line.len(), |end| end + 1);
+    if image {
+        return Some((end, None));
+    }
+    let target = &line[target_start + 1..target_end.unwrap_or(line.len())];
+    let (hash, prefix) = if let Some(value) = target.strip_prefix("loom-material:") {
+        (value.strip_prefix("material-").unwrap_or(""), "material-")
+    } else if let Some(value) = target.strip_prefix("loom-evidence:") {
+        (value, "evidence/")
+    } else {
+        return Some((end, None));
+    };
+    let valid = target_end.is_some()
+        && line.as_bytes().get(label_start + 1) == Some(&b'@')
+        && hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    Some((end, valid.then(|| format!("{prefix}{hash}"))))
 }
 
 fn reference_at(source: &str, start: usize) -> Option<DocumentReference> {
@@ -259,6 +360,9 @@ fn expression_depth(expression: &NeuralExpression) -> usize {
         NeuralExpression::Call { arguments, .. } => {
             1 + arguments.iter().map(expression_depth).max().unwrap_or(0)
         }
+        NeuralExpression::Find { source, query } => {
+            1 + expression_depth(source).max(expression_depth(query))
+        }
         _ => 1,
     }
 }
@@ -347,8 +451,21 @@ impl Parser<'_> {
             Ok(NeuralExpression::Literal {
                 text: self.quoted()?,
             })
+        } else if self.take("find") {
+            self.whitespace();
+            if !self.take("(") {
+                return Err(self.error("expected ( after find"));
+            }
+            let arguments = self.arguments(depth)?;
+            let [source, query]: [NeuralExpression; 2] = arguments
+                .try_into()
+                .map_err(|_| self.error("find requires a source and a query"))?;
+            Ok(NeuralExpression::Find {
+                source: Box::new(source),
+                query: Box::new(query),
+            })
         } else {
-            Err(self.error("expected @document, @function(...), or quoted text"))
+            Err(self.error("expected @document, @function(...), find(...), or quoted text"))
         }
     }
 
@@ -482,6 +599,82 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_composes_with_document_functions_without_claiming_their_names() {
+        let retrieval = NeuralExpression::Find {
+            source: Box::new(reference("Research")),
+            query: Box::new(NeuralExpression::Literal {
+                text: "contradictions in café accounts".into(),
+            }),
+        };
+        assert_eq!(
+            parse_neural_command(
+                "=find (@Research, \"contradictions in café accounts\") |> @Compare(@Voice)"
+            )
+            .unwrap(),
+            NeuralCommand::Expression(call("Compare", vec![retrieval, reference("Voice")]))
+        );
+        assert_eq!(
+            parse_neural_command("=find(@Research, @Question(@Draft)) |> @Compare"),
+            parse_neural_command("=@Compare(find(@Research, @Question(@Draft)))")
+        );
+        assert_eq!(
+            parse_neural_command("=@find(@Research, @Question)").unwrap(),
+            NeuralCommand::Expression(call(
+                "find",
+                vec![reference("Research"), reference("Question")]
+            ))
+        );
+        let plain = "find(@Research, \"moon\")";
+        assert_eq!(
+            parse_neural_command(plain).unwrap(),
+            NeuralCommand::Prompt(plain.into())
+        );
+    }
+
+    #[test]
+    fn retrieval_requires_exactly_two_arguments_and_a_complete_call() {
+        for source in [
+            "=find()",
+            "=find(@Research)",
+            "=find(@Research, \"moon\", @Extra)",
+            "=find(@Research,)",
+            "=find(@Research, \"moon\"",
+            "=find(@Research, \"moon\") trailing",
+            "=findings(@Research, \"moon\")",
+            "=@Research |> find(\"moon\")",
+        ] {
+            assert!(parse_neural_command(source).is_err(), "accepted {source}");
+        }
+    }
+
+    #[test]
+    fn retrieval_operands_count_toward_depth_and_node_limits() {
+        // A find node and both its operands count, including nested queries.
+        let deepest = format!(
+            "={}\"moon\"{}",
+            "find(@Research, ".repeat(MAX_NEURAL_DEPTH - 1),
+            ")".repeat(MAX_NEURAL_DEPTH - 1)
+        );
+        assert!(parse_neural_command(&deepest).is_ok());
+        let deeper = format!("=find(@Research, {})", &deepest[1..]);
+        assert!(parse_neural_command(&deeper).is_err());
+        let pipeline = format!("{deepest} |> @Compare");
+        assert!(parse_neural_command(&pipeline).is_err());
+
+        let capacity = (MAX_NEURAL_NODES - 1) / 3;
+        let wide = format!(
+            "=@Compare({})",
+            vec!["find(@Research, \"moon\")"; capacity].join(",")
+        );
+        assert!(parse_neural_command(&wide).is_ok());
+        let wider = format!(
+            "=@Compare({})",
+            vec!["find(@Research, \"moon\")"; capacity + 1].join(",")
+        );
+        assert!(parse_neural_command(&wider).is_err());
+    }
+
+    #[test]
     fn quoted_names_paths_unicode_and_literal_arguments_round_trip() {
         let parsed =
             parse_neural_command("=@\"Précis and polish\"(@研究/étude#résumé, \"one\\ntwo\\\"\")")
@@ -543,6 +736,84 @@ mod tests {
             .map(|reference| reference.name)
             .collect::<Vec<_>>();
         assert_eq!(names, ["Voice", "研究", "cafe\u{301}", "🌿 notes"]);
+    }
+
+    #[test]
+    fn retained_links_use_identity_not_label_and_keep_the_complete_source_range() {
+        let hash = "0123456789abcdef".repeat(4);
+        let material = format!(r"[@Research \[old\] \\ notes](loom-material:material-{hash})");
+        let evidence = format!("[@Research](loom-evidence:{hash})");
+        let markdown = format!("α {material} and {evidence}, then @Draft.");
+        let references = document_references(&markdown).unwrap();
+        assert_eq!(
+            references
+                .iter()
+                .map(|reference| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                format!("material-{hash}"),
+                format!("evidence/{hash}"),
+                "Draft".into()
+            ]
+        );
+        assert_eq!(
+            references
+                .iter()
+                .map(|reference| &markdown[reference.range.clone()])
+                .collect::<Vec<_>>(),
+            [material.as_str(), evidence.as_str(), "@Draft"]
+        );
+    }
+
+    #[test]
+    fn invalid_retained_links_and_images_never_rebind_the_friendly_label() {
+        let hash = "a".repeat(64);
+        for link in [
+            "[@Secret](loom-material:material-short)".to_owned(),
+            format!("[@Secret](loom-material:{hash})"),
+            format!("[@Secret](loom-material:material-{})", "A".repeat(64)),
+            format!("[@Secret](loom-evidence:{hash}/extra)"),
+            "[@Secret](loom-evidence:../secret)".to_owned(),
+            format!("[@Secret](loom-evidence:{hash}"),
+            "[@Secret](file:///private/secret)".to_owned(),
+            "[@Secret](https://example.com/@Other)".to_owned(),
+            format!("![@Secret](loom-material:material-{hash})"),
+            format!("![@Secret [@Nested]](loom-evidence:{hash})"),
+        ] {
+            assert!(
+                document_references(&link).unwrap().is_empty(),
+                "resolved {link}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_links_obey_markdown_code_and_escape_boundaries_and_reference_limits() {
+        let hash = "b".repeat(64);
+        let link = format!("[@Research](loom-material:material-{hash})");
+        let markdown = format!("`{link}`\n```md\n{link}\n```\n    {link}\n\\!{link}");
+        let references = document_references(&markdown).unwrap();
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].name, format!("material-{hash}"));
+        assert_eq!(&markdown[references[0].range.clone()], link);
+        assert!(document_references(&format!("{link} ").repeat(MAX_NEURAL_NODES + 1)).is_err());
+    }
+
+    #[test]
+    fn quoted_source_mentions_and_links_do_not_acquire_context_authority() {
+        let hash = "c".repeat(64);
+        let evidence = format!("[@Research](loom-evidence:{hash})");
+        let markdown = format!(
+            "> @Private\n >> @Nested\n   >{evidence}\n> =@Execute(@Secret)\n\n{evidence}\n\\> @Draft\nText > @Voice"
+        );
+        let references = document_references(&markdown).unwrap();
+        assert_eq!(
+            references
+                .iter()
+                .map(|reference| reference.name.clone())
+                .collect::<Vec<_>>(),
+            [format!("evidence/{hash}"), "Draft".into(), "Voice".into()]
+        );
     }
 
     #[test]

@@ -2,7 +2,6 @@
 //! arbitrary filesystem paths or recursively evaluate other documents.
 
 use std::collections::HashSet;
-use std::fmt::Write as _;
 
 use loom_store::{DocumentSummary, ProjectStore};
 use loom_types::{ArtifactId, BlobId, DocumentId, RevisionId};
@@ -89,38 +88,6 @@ pub(super) fn resolve_references(
         });
     }
     Ok(resolved)
-}
-
-pub(super) fn context_for_markdown(
-    store: &ProjectStore,
-    markdown: &str,
-) -> Result<String, IpcFailure> {
-    let names = loom_document::document_references(markdown)
-        .map_err(|error| IpcFailure::new("document_reference_syntax", error.to_string(), false))?
-        .into_iter()
-        .map(|reference| reference.name)
-        .collect::<Vec<_>>();
-    let documents = resolve_references(store, &names)?;
-    if documents.is_empty() {
-        return Ok(String::new());
-    }
-    let mut context = String::from("Referenced documents (context for the current request):\n");
-    for document in documents {
-        // Debug string quoting keeps a title/path from forging a header line.
-        let _ = write!(
-            context,
-            "\n--- Document {:?}; path {:?} ---\n",
-            document.name, document.path
-        );
-        context.push_str(&document.text);
-        context.push_str("\n--- End document ---\n");
-        if context.len() > MAX_CONTEXT_BYTES {
-            return Err(limit_failure(
-                "Document context including its labels exceeds 64 KiB. Choose fewer or smaller documents.",
-            ));
-        }
-    }
-    Ok(context)
 }
 
 fn select_document<'a>(
@@ -336,14 +303,19 @@ mod tests {
             "notes.md",
             "Source text with @unresolved embedded.",
         );
-        let context =
-            context_for_markdown(&store, "Use @notes. `@missing`\n```\n@also-missing\n```\n")
-                .expect("explicit references only");
+        let context = crate::material_context::markdown_plan(
+            &store,
+            "Use @notes. `@missing`\n```\n@also-missing\n```\n",
+            "Source",
+        )
+        .expect("explicit references only")
+        .text;
         assert!(context.contains("Source text with @unresolved embedded."));
-        assert_eq!(context.matches("--- Document ").count(), 1);
+        assert_eq!(context.matches("--- Referenced material ").count(), 1);
         assert!(
-            context_for_markdown(&store, "Only `@notes`.")
+            crate::material_context::markdown_plan(&store, "Only `@notes`.", "Source")
                 .expect("no references")
+                .text
                 .is_empty()
         );
     }
