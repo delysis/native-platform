@@ -241,7 +241,7 @@ fn missing_origin_or_unpublished_source_never_advances_membership() {
 
 #[test]
 fn local_context_freezes_membership_and_retains_evidence_after_disconnect_and_removal() {
-    use crate::{materials, workspace_template};
+    use crate::{material_context, materials, workspace_template};
     let (_temporary, mut store, definition, private) = fixture();
     workspace_template::upsert_collection(&mut store, None, &definition).unwrap();
     let identity = identity(&definition, PRINCIPAL).unwrap();
@@ -260,12 +260,25 @@ fn local_context_freezes_membership_and_retains_evidence_after_disconnect_and_re
         finish_refresh(store, &head, RefreshPhase::Complete).unwrap()
     };
     let first = publish(&store, b"Moon orchids bloom in silver light.\r\n");
+    let context_value = material_context::resolve(&store, "Research").unwrap();
+    assert!(material_context::exact(&context_value).is_err());
     let frozen =
         materials::collections::freeze(&store, materials::resolve(&store, "Research").unwrap())
             .unwrap();
     let second = publish(&store, b"Moon gardens bloom in golden light.\r\n");
     assert_ne!(first.snapshot_id, second.snapshot_id);
     revoke_grant(&store, &private, &definition.id).unwrap();
+    let evidence_value = material_context::search(&store, &context_value, "orchids").unwrap();
+    assert!(
+        material_context::exact(&evidence_value)
+            .unwrap()
+            .contains("silver")
+    );
+    assert!(
+        material_context::native_media(&store, [&context_value])
+            .unwrap()
+            .is_empty()
+    );
     let budget = materials::FolderScanBudget::default();
     let old =
         materials::collections::search(&store, &frozen, "orchids", &budget, &|| false).unwrap();
