@@ -521,7 +521,8 @@ fn response_text(
     Ok(text)
 }
 
-#[cfg(test)]
+// These integration fixtures require the supported private project store.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use axum::{

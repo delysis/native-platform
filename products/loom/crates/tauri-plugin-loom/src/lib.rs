@@ -3323,6 +3323,7 @@ fn initialize_project(path: &Path, title: String) -> Result<ProjectStore, IpcFai
 }
 
 fn open_or_initialize_default_project(path: &Path) -> Result<ProjectStore, IpcFailure> {
+    loom_store::ensure_private_storage_supported().map_err(IpcFailure::store)?;
     if !path.join(".loom").try_exists().map_err(|error| {
         IpcFailure::new("default_project_inspection_failed", error.to_string(), true)
     })? {
@@ -13976,6 +13977,42 @@ mod tests {
         )
         .expect_err("symlinked acceptance model library must be rejected");
         assert_eq!(error.code, "isolated_model_library_unavailable");
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn unsupported_project_storage_returns_typed_ipc_failure_without_mutation() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let missing = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let existing = temporary.path().join("existing");
+        std::fs::create_dir(&existing).expect("existing writing folder");
+        let manuscript = existing.join(INITIAL_DOCUMENT);
+        std::fs::write(&manuscript, b"Keep this exact prose.\r\n").expect("existing manuscript");
+
+        for path in [&missing, &existing] {
+            let error = open_or_initialize_default_project(path)
+                .expect_err("default opening must reject unsupported storage");
+            assert_eq!(error.code, "private_storage_unsupported");
+            assert!(!error.retryable);
+            let error = initialize_project(path, "Writing".into())
+                .expect_err("initialization must reject unsupported storage");
+            assert_eq!(error.code, "private_storage_unsupported");
+            assert!(!error.retryable);
+        }
+        assert!(
+            !missing.exists(),
+            "rejection must not create the writing folder"
+        );
+        assert_eq!(
+            std::fs::read(&manuscript).expect("preserved manuscript"),
+            b"Keep this exact prose.\r\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(&existing)
+                .expect("unchanged folder")
+                .count(),
+            1
+        );
     }
 
     #[test]
