@@ -12,6 +12,13 @@ Every input names its downstream consumers and purpose. Adaptations live in the
 owning Rust crate, never inside the reference snapshot. Upstream version numbers
 and catalog entries do not establish provider or local-model qualification.
 
+The same manifest owns a small runtime patch queue in `patches/`. Each patch
+records its purpose, exact digest and before/after digests for every changed
+file. These patches repair the upstream `omp-ai` runtime for qualification;
+they do not add a second inference runtime to Loom or bypass FTE authority.
+Keep patches in ordinary Git diff format so maintainers can review, rebase,
+reverse and submit them upstream without a custom patch language.
+
 The root `xtask policy` gate checks the complete inventory and SHA-256 values.
 Snapshots are never refreshed at application startup, build time or from Loom.
 An upstream update cannot silently add a provider, discover credentials, enable
@@ -33,7 +40,8 @@ network access or alter the author's configured route.
   destinations, endpoint defaults, route permissions or accounting semantics.
 - Keep one atomic commit for each accepted source pin plus its consumer changes
   and regression fixtures. Ordinary `git revert` restores the previous pin,
-  adapters and fixtures together. No user-store migration is part of an import.
+  adapters, patch queue and fixtures together. No user-store migration is part
+  of an import. Do not edit a reference snapshot to hide a downstream correction.
 
 ## Reproducible import procedure
 
@@ -58,6 +66,15 @@ the candidate to descend from that pin, and creates a new directory containing:
 - `baseline/` and `candidate/`: original and proposed byte-exact inputs;
 - `import.patch`: the proposed source snapshot and manifest update;
 - `REVIEW.txt`: the concrete apply and validation commands.
+
+The review also attempts the maintained patch series against the candidate in
+an isolated checkout. It reports a clean apply, exact changes already present,
+or a conflict. A clean apply is not semantic acceptance. Review the new code,
+refresh the patch baseline/result hashes, and run the runtime gate. Retire a
+patch only after its regression passes against upstream without that patch.
+On conflict, stop pin promotion and rebase explicitly; never drop a hunk or
+silently continue without a correction. Candidate review executes no upstream
+code, including build scripts or hooks.
 
 Review the surrounding upstream diff as well as imported files. Port relevant
 behavior into the consumers named in the manifest. Review new files, renamed
@@ -130,14 +147,59 @@ source tampering, unlisted files, deleted inputs and malformed paths/revisions.
 The source snapshot patch alone does not prove semantic synchronization: the PR
 must explain each relevant upstream change and its downstream disposition.
 
+## Maintained runtime qualification
+
+Prepare a fresh checkout at the manifest's immutable pin and apply the verified
+patch series. The command reads Git objects, ignores uncommitted upstream edits,
+checks every result hash and rejects unlisted changed files. It never modifies
+the supplied upstream checkout. An incomplete output is removed on failure.
+
+```sh
+cargo run --locked -p xtask -- omp2 prepare /tmp/omp2-upstream /tmp/omp2-qualified-UNIQUE
+cd /tmp/omp2-qualified-UNIQUE
+just fmt-check-rust
+just test-pkg omp-ai
+just clippy-pkg omp-ai
+```
+
+Use upstream's pinned nightly and components. `just test-pkg` includes nextest
+and doctests. On macOS hosts without upstream's machine-specific linker path,
+set `RUSTFLAGS='-Z threads=8'` to use the system linker; `omp-ai` does not need
+the embedded Python application setup. The dedicated `omp2-runtime.yml` job
+runs the same patched crate gate on macOS for changes to the manifest, patches,
+importer or workflow, and again on main. It executes the reviewed pinned code;
+the weekly candidate review remains read-only and does not execute new upstream
+code. Live hosted credentials and model downloads are not part of this gate.
+
+The maintained corrections cover:
+
+- The misspelled AWS test attribute that blocked compilation of the normal suite.
+- Admission ownership through response streams and realtime sessions, including
+  completion, errors, dropped futures/bodies and bounded cancelled waiters.
+- One aggregate accounting reservation per request, retained until terminal
+  usage, failure or cancellation. Request allowance is reserved atomically;
+  scopes with finite measured resource ceilings serialize outstanding work.
+  Unknown interrupted token/cost usage closes that scope's finite allowance.
+  These are admission ceilings: one admitted request can exceed a remaining
+  token/cost allowance before its final measurement blocks the next request.
+- Cumulative decompressed-output limits at the output sink for gzip, deflate,
+  Brotli and Zstd, on both success and error bodies. Truncation is explicit and
+  codec history windows are bounded. The output limit is not a total process
+  memory ceiling; codec workspace, HTTP and frame buffers have separate bounds.
+
+These regressions must remain in the patched upstream suite after an upstream
+rebase. They cover real local HTTP transport as well as controlled service
+lifetimes; they do not establish live hosted availability or native Gemma support.
+
 ## Deliberate exclusions and reassessment
 
 Do not import OMP's agent loop, terminal UI, configuration command system,
 automatic environment credential discovery, default native audio, stream
-admission or aggregate budget ledger. The audited pin releases admission at
-handshake, charges usage before stream completion and checks decompression bounds
-after allocation. Watch these areas for upstream fixes, then evaluate them
-against our existing full-lifetime tests before replacing local authority.
+admission or aggregate budget ledger into FTE. The original upstream pin releases
+admission at handshake, charges usage before stream completion and checks
+decompression bounds after allocation. The maintained patch queue repairs these
+paths and keeps their regressions executable. Passing it does not transfer
+FTE/native-kit authority to upstream or establish wholesale replacement parity.
 
 Loom's exact-prefix native generation does not become chat message generation.
 OMP model/provider metadata supplies no invented free quota, live availability

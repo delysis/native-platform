@@ -83,10 +83,86 @@
   "watch_paths": [
     "LICENSE",
     "crates/catalog",
-    "crates/ai/src/codec",
-    "crates/ai/src/auth",
-    "crates/ai/src/layer",
-    "crates/ai/src/transport",
-    "fixtures/llm-oracle"
+    "crates/ai",
+    "fixtures/llm-oracle",
+    "justfile",
+    "rust-toolchain.toml",
+    "Cargo.toml",
+    "Cargo.lock",
+    ".cargo"
+  ],
+  "patches": [
+    {
+      "path": "0001-repair-inference-resource-boundaries.patch",
+      "sha256": "4e6879e5774956e67a93b4db1ee3c0405b62ee1d869cd8e4019f6b8889e734c1",
+      "purpose": "Restore the omp-ai test gate; retain stream/session admission and final accounting; bound decompressed output before allocation, with cancellation and real HTTP regressions.",
+      "files": [
+        {
+          "path": "crates/ai/README.md",
+          "before_sha256": "add09694fdde4859a512c434e369681dabd90992ff85933853a445c1ebfa5b1f",
+          "after_sha256": "18db4f2532b4728f98b048d25eda7806e54fca7ff4930f55fd7a5bf2079f4133"
+        },
+        {
+          "path": "crates/ai/src/answer.rs",
+          "before_sha256": "f999cecafc142bcb1ed027ddabe3c0947c0f65324b9dbbead2244d1e40153ac6",
+          "after_sha256": "3005df6ddc6bc9e0f60cfe9f219a8ad3dff89417cb99b2df57d197cd39c0f430"
+        },
+        {
+          "path": "crates/ai/src/auth/aws.rs",
+          "before_sha256": "0ccb7d654375cd97a54d3202c14bb9441ffdc453bafc90387d790b9017b10254",
+          "after_sha256": "a28446616966118d0a6b282273b7305afa823b19d5cc4d94ee3280d2b2b19fb4"
+        },
+        {
+          "path": "crates/ai/src/layer/admission.rs",
+          "before_sha256": "5dbc8ed1a1b8e712c9253e502eaa64b2e599d82a719ca5e5d79bafc93eff42ab",
+          "after_sha256": "2223739b110ea3998cee79d76f6fd13fa7bdedc6fcdfa1e725e371199b0b8ec7"
+        },
+        {
+          "path": "crates/ai/src/layer/answer.rs",
+          "before_sha256": "14824713eb0876f5590314e42aa08e3788134a72fc2adbb5ca884cb1c2349cce",
+          "after_sha256": "602214c22a821bee0476a5c9baf0c576a28946fa09e8948f4e6bd60751f00851"
+        },
+        {
+          "path": "crates/ai/src/layer/budget.rs",
+          "before_sha256": "6ddae67d04e16ab0adf14196a0ba6b58ea8bc6ef9c782ed1d30c64f31c81de6a",
+          "after_sha256": "f9722e92bf8e6b9eeb522bea645d81c40da8a6cf3b259377ed3e29c5251a3586"
+        },
+        {
+          "path": "crates/ai/src/operation/realtime.rs",
+          "before_sha256": "9e2f51943164b483fab9d105407e43bc237e91d100303fb1e34e84f0b2b9967a",
+          "after_sha256": "cffb732e7f214a74487cf9adcb98971ed048d994a03bfbb529176df4873fd871"
+        },
+        {
+          "path": "crates/ai/src/registry.rs",
+          "before_sha256": "5683f5ae2f29cebac393e82a946de776a6fd428dde34f8da4af8cc3a550d083c",
+          "after_sha256": "f41fef4042a4f36260e4759ef1bdc679bdac71c4e3121ff5531423c59c565b77"
+        },
+        {
+          "path": "crates/ai/src/settings.rs",
+          "before_sha256": "6d43142c801dfe501d3f62c28ba8d8b4711b78d843bd8be6d7c276948803c36e",
+          "after_sha256": "da425a9b88b73ad928a795069501d9bb54f39d91bda1b759e5231d58c8caa747"
+        },
+        {
+          "path": "crates/ai/src/transport/encoding.rs",
+          "before_sha256": "77140baad4695bd37b2a03ed706b2c5897024755cfde3eccdf66f20ec48147fd",
+          "after_sha256": "324a0341a0956aa5e8e9c6befa9ee784f6ebb278696338040c3c5f47a059d2f9"
+        },
+        {
+          "path": "crates/ai/src/transport/http.rs",
+          "before_sha256": "4e2c3f305bbb0f3017defe243be13e04dd69b5bebfc5d3a9e7e905dc5d8d67f5",
+          "after_sha256": "ca03e9c926e95c6d5529a92af9ca2c16efa32e3f92bae17150c69158e998171f"
+        },
+        {
+          "path": "crates/ai/src/transport/tests.rs",
+          "before_sha256": "f34cb52d105e9f3ed8d4a5d70c68884271c3f325f91bd6c7d202309fc01cff37",
+          "after_sha256": "df4a110fd3ef2c5a1efda242fad7fc2fbfcb718c212a0a95e9613924d463c804"
+        },
+        {
+          "path": "justfile",
+          "before_sha256": "cee1c970151111b71dd2fd1f175666b23fc30f9c122b949f54167a7ea34db7fc",
+          "after_sha256": "5b8fe91e952cf9d171d6a3225aa7188893f5eacde5eab83d4bf7dc95c1fe7617"
+        }
+      ]
+    }
   ]
 }

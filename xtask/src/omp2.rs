@@ -1,4 +1,5 @@
 //! Reviewable OMP² imports. Never executes upstream code or changes the live pin.
+mod patches;
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -22,6 +23,7 @@ struct Import {
     revision: String,
     files: Vec<Source>,
     watch_paths: Vec<String>,
+    patches: Vec<patches::Patch>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -39,8 +41,11 @@ pub fn run(root: &Path, args: &[String]) -> Result<()> {
         [command, checkout, revision, output] if command == "review" => {
             review(root, Path::new(checkout), revision, Path::new(output))
         }
+        [command, checkout, output] if command == "prepare" => {
+            patches::prepare(root, Path::new(checkout), Path::new(output))
+        }
         _ => bail!(
-            "usage: cargo run --locked -p xtask -- omp2 verify | omp2 review <checkout> <full-commit-sha> <new-output-directory>"
+            "usage: cargo run --locked -p xtask -- omp2 verify | omp2 review <checkout> <full-commit-sha> <new-output-directory> | omp2 prepare <checkout> <new-output-directory>"
         ),
     }
 }
@@ -147,6 +152,7 @@ pub fn verify(root: &Path) -> Result<()> {
             source.path
         );
     }
+    patches::verify(root, &import)?;
     println!(
         "OMP² source verified: {} ({} files)",
         import.revision,
@@ -298,11 +304,15 @@ fn review(root: &Path, checkout: &Path, revision: &str, output: &Path) -> Result
         "could not construct import patch"
     );
     fs::write(output.join("import.patch"), patch.stdout)?;
+    let patch_review = patches::review(root, checkout, revision, output, &import)?;
     let summary = format!(
         "OMP² candidate {} -> {revision}\n\nReview upstream.diff, including changes outside the imported files.\nReview every consumer listed in candidate/{LOCK}.\nThe snapshot patch alone does not port changed behavior.\nAfter adapting consumers, from the native-platform workspace:\n  git apply --check -p2 <review-directory>/import.patch\n  git apply -p2 <review-directory>/import.patch\n  cargo run --locked -p xtask -- omp2 verify\nRun the gates in products/fte/docs/OMP2-MAINTENANCE.md before committing.\nNo live pin or consumer was changed by this command.\n",
         import.revision
     );
-    fs::write(output.join("REVIEW.txt"), summary)?;
+    fs::write(
+        output.join("REVIEW.txt"),
+        format!("{summary}\n{patch_review}"),
+    )?;
     println!("OMP² review bundle: {}", output.display());
     Ok(())
 }
@@ -315,7 +325,7 @@ mod tests {
         sync::atomic::{AtomicUsize, Ordering},
     };
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-    struct Fixture(PathBuf);
+    pub(super) struct Fixture(pub(super) PathBuf);
     impl Fixture {
         fn new() -> Self {
             let root = std::env::temp_dir().join(format!(
@@ -332,13 +342,13 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    fn command(root: &Path, args: &[&str]) -> String {
+    pub(super) fn command(root: &Path, args: &[&str]) -> String {
         String::from_utf8(checked(root, args).expect("valid test fixture"))
             .expect("valid test fixture")
             .trim()
             .to_owned()
     }
-    fn setup() -> (Fixture, PathBuf, PathBuf, String) {
+    pub(super) fn setup() -> (Fixture, PathBuf, PathBuf, String) {
         let fixture = Fixture::new();
         let upstream = fixture.0.join("upstream");
         let downstream = fixture.0.join("downstream");
@@ -382,6 +392,7 @@ mod tests {
             revision: revision.clone(),
             files,
             watch_paths: vec!["codec.rs".into()],
+            patches: Vec::new(),
         };
         write(
             &downstream,
@@ -478,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn upstream_snapshot_bytes_survive_crlf_enabled_checkout() {
+    fn pinned_source_and_patch_bytes_survive_crlf_enabled_checkout() {
         let (fixture, _, downstream, _) = setup();
         fs::write(
             downstream.join(".gitattributes"),
@@ -486,7 +497,14 @@ mod tests {
         )
         .expect("copy real checkout attributes");
         let path = format!("{DIRECTORY}/upstream/codec.rs");
-        command(&downstream, &["add", ".gitattributes", &path]);
+        let patch = format!("{DIRECTORY}/patches/runtime.patch");
+        write(
+            &downstream,
+            Path::new(&patch),
+            b"patch line one\npatch line two\n",
+        )
+        .expect("fixture patch");
+        command(&downstream, &["add", ".gitattributes", &path, &patch]);
         let output = fixture.0.join("crlf-checkout");
         let prefix = format!("--prefix={}/", output.display()).replace('\\', "/");
         command(
@@ -498,11 +516,16 @@ mod tests {
                 &prefix,
                 "--",
                 &path,
+                &patch,
             ],
         );
         assert_eq!(
             fs::read(output.join(&path)).expect("checked-out source"),
             fs::read(downstream.join(path)).expect("original source")
+        );
+        assert_eq!(
+            fs::read(output.join(&patch)).expect("checked-out patch"),
+            fs::read(downstream.join(patch)).expect("original patch")
         );
     }
 }

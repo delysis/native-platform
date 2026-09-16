@@ -2,8 +2,8 @@
 
 mod macos_smoke_support;
 mod model_check;
-mod omp2;
 mod no_python;
+mod omp2;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
