@@ -66,7 +66,7 @@
       <p>This context already has a shared document. Its later edits are kept there.</p>
     {:else}
       <p>{review.started ? 'Finish publishing the previously approved context' : 'Share this context'} with {review.members.join(', ')}.</p>
-      <p class="quiet">It becomes an ordinary document, with these selected files. Your manuscript and private scratch context stay as they are.</p>
+      <p class="quiet">It becomes an ordinary document with quoted material excerpts. The listed files are shared in full. Your manuscript and private scratch context stay as they are.</p>
       <pre aria-label="Context to share">{review.material.markdown}</pre>
       {#if review.material.files.length}
         <ul aria-label="Files to share">{#each review.material.files as file (file.id)}<li>{file.name} · {size(file.byte_count)}</li>{/each}</ul>

@@ -64,26 +64,39 @@ async fn reviewed_context_crosses_quic_as_editable_markdown_with_only_selected_m
         &audio_bytes,
     )
     .unwrap();
-    add_document_context_snapshot(
+    let mut selected = add_document_context_snapshot(
         store.root(),
         &source.to_string(),
         &[private.id.clone(), audio.id.clone()],
     )
     .unwrap();
-    set_document_context_snapshot(
+    selected.materials[0].excerpt = Some("The corrected excerpt to share.".into());
+    context_attachments::set_document_context_snapshot_with_materials(
         store.root(),
         &source.to_string(),
-        "The corrected excerpt to share.",
-        std::slice::from_ref(&audio.id),
+        "Keep the prose simple.",
+        &[private.id.clone(), audio.id.clone()],
+        Some(&selected.materials),
     )
     .unwrap();
     let review = prepare(&store, &cabal, source).unwrap();
     let serialized = serde_json::to_string(&review).unwrap();
     assert!(!serialized.contains("PRIVATE ORIGINAL ENDING"));
-    assert!(!serialized.contains("private-research.txt"));
-    assert!(!serialized.contains("text_sources"));
+    assert!(
+        review
+            .material
+            .markdown
+            .contains("> Material: private-research.txt")
+    );
+    assert!(
+        review
+            .material
+            .markdown
+            .contains("> The corrected excerpt to share.")
+    );
     assert_eq!(review.material.files.len(), 1);
     assert_eq!(review.material.files[0].id, audio.id);
+    assert!(review.material.files[0].markdown.starts_with("![Audio:"));
     assert!(
         cabal.assets().unwrap().is_empty(),
         "review does not share files"
@@ -95,11 +108,10 @@ async fn reviewed_context_crosses_quic_as_editable_markdown_with_only_selected_m
     assert_eq!(cabal.assets().unwrap().len(), 1);
     let private_context =
         context_attachments::document_context_snapshot(store.root(), &source.to_string()).unwrap();
-    assert_eq!(private_context.markdown, "The corrected excerpt to share.");
+    assert_eq!(private_context.markdown, "Keep the prose simple.");
     assert_eq!(
-        private_context.text_sources.len(),
-        1,
-        "private receipts are preserved"
+        private_context.materials, selected.materials,
+        "private source versions and excerpts are preserved"
     );
 
     let owner_network = Network::start(cabal.identity(), NetworkMode::Direct {})

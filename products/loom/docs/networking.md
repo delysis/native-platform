@@ -304,12 +304,14 @@ not silently published with a manuscript.
 
 The context pane of a shared document offers **Share context as a document**.
 The native review names the current cabal members and shows the exact visible
-text and selected files. Publication creates an ordinary Markdown document under
+authored instructions, quoted source excerpts, and selected files. Publication
+creates an ordinary Markdown document under
 `Context/`, which can be edited concurrently, recovered offline, and referenced
 with its quoted `@"path"`. The source manuscript and private scratch context stay
-unchanged. A text import contributes the author's current excerpt, without its
-private original or acquisition receipt. Selected file cards contribute their
-explicitly reviewed original bytes through the existing bounded asset channel.
+unchanged. A text-only material contributes the author's current excerpt, or its
+canonical text when no excerpt was edited, without its private original or
+acquisition receipt. Image/audio and source-only cards contribute their explicitly
+reviewed original bytes in full through the existing bounded asset channel.
 
 The review fingerprint binds the source, publication identity, destination,
 membership roster, text, and files. Changes before publication require another

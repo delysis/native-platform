@@ -6,11 +6,11 @@
 
 use fte_types::{
     CacheMode, CachePolicy, CacheRequirement, CompletionPrompt, ContentBlock, DeadlinePolicy,
-    GatewayError, GatewayEvent, GatewayRequest, GatewayResponse, GatewayUsage, GenerationInput,
-    InputItem, MessageRole, ModelSelector, OutputItem, PrivacyPolicy, ProviderCacheBreakpoint,
-    ProviderCacheTtl, RequestId, ResponseFormat, RouteProfile, RoutingPolicy, SamplingOptions,
-    StoragePolicy, StreamPolicy, ToolDefinition, ToolExecutionPolicy, ToolOwner, ToolPolicy,
-    UsageProvenance,
+    FinishReason, GatewayError, GatewayEvent, GatewayRequest, GatewayResponse, GatewayUsage,
+    GenerationInput, InputItem, MessageRole, ModelSelector, OutputGroup, OutputItem, PrivacyPolicy,
+    ProviderCacheBreakpoint, ProviderCacheTtl, RequestId, ResponseFormat, RouteProfile,
+    RoutingPolicy, SamplingOptions, StoragePolicy, StreamPolicy, TerminalStatus, ToolDefinition,
+    ToolExecutionPolicy, ToolOwner, ToolPolicy, UsageProvenance,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1373,12 +1373,25 @@ pub fn openai_responses_json(response: &GatewayResponse) -> Value {
         "object": "response",
         "status": match response.status {
             fte_types::TerminalStatus::Completed => "completed",
+            fte_types::TerminalStatus::Incomplete => "incomplete",
             fte_types::TerminalStatus::Cancelled => "cancelled",
             fte_types::TerminalStatus::Failed => "failed",
         },
+        "incomplete_details": response.output_groups.iter().find_map(|group| match group.finish_reason {
+            FinishReason::Length | FinishReason::ContextLimit => Some(json!({"reason":"max_output_tokens"})),
+            FinishReason::ContentFilter => Some(json!({"reason":"content_filter"})),
+            _ => None,
+        }),
         "model": response.model,
         "previous_response_id": response.previous_response_id,
-        "output": response.output.iter().map(openai_output_item).collect::<Vec<_>>(),
+        "output": response.output.iter().enumerate().map(|(index, item)| {
+            let mut value = openai_output_item(item);
+            if response.output_groups.iter().any(|group| group.finish_reason == FinishReason::Refusal && group.output_indices.contains(&index))
+                && matches!(item, OutputItem::Message { .. }) {
+                value["content"] = json!([{"type":"refusal","refusal":output_item_text(item)}]);
+            }
+            value
+        }).collect::<Vec<_>>(),
         "usage": openai_usage(&response.usage),
         "x_free_token_energy": {
             "backend": response.route.backend_id,
@@ -1547,9 +1560,14 @@ impl OpenAiResponsesStreamEncoder {
             }
             GatewayEvent::Completed { response, .. } => {
                 self.terminal = true;
+                let kind = if response.status == TerminalStatus::Incomplete {
+                    "response.incomplete"
+                } else {
+                    "response.completed"
+                };
                 (
-                    "response.completed".to_string(),
-                    json!({"type":"response.completed","response":openai_responses_json(response)}),
+                    kind.to_string(),
+                    json!({"type":kind,"response":openai_responses_json(response)}),
                 )
             }
             GatewayEvent::Cancelled { request_id, usage } => {
@@ -1595,64 +1613,104 @@ fn output_item_id(item: &OutputItem) -> &str {
     }
 }
 
+fn output_groups(response: &GatewayResponse, completion: bool) -> Vec<OutputGroup> {
+    if !response.output_groups.is_empty() {
+        return response.output_groups.clone();
+    }
+    if completion {
+        return response
+            .output
+            .iter()
+            .enumerate()
+            .map(|(index, _)| OutputGroup {
+                index,
+                output_indices: vec![index],
+                finish_reason: FinishReason::Stop,
+            })
+            .collect();
+    }
+    vec![OutputGroup {
+        index: 0,
+        output_indices: (0..response.output.len()).collect(),
+        finish_reason: if response
+            .output
+            .iter()
+            .any(|item| matches!(item, OutputItem::FunctionCall { .. }))
+        {
+            FinishReason::ToolCalls
+        } else {
+            FinishReason::Stop
+        },
+    }]
+}
+
+fn openai_finish(reason: &FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Length | FinishReason::ContextLimit => "length",
+        FinishReason::ToolCalls => "tool_calls",
+        FinishReason::ContentFilter => "content_filter",
+        FinishReason::Stop | FinishReason::StopSequence { .. } | FinishReason::Refusal => "stop",
+    }
+}
+
 #[must_use]
 pub fn openai_chat_json(response: &GatewayResponse) -> Value {
-    let text = response_text(response);
-    let tool_calls = response
-        .output
-        .iter()
-        .filter_map(|item| match item {
-            OutputItem::FunctionCall {
-                call_id,
-                name,
-                arguments,
-                ..
-            } => Some(json!({
-                "id":call_id,
-                "type":"function",
-                "function":{
-                    "name":name,
-                    "arguments":arguments.to_string(),
-                }
+    let choices = output_groups(response, false).into_iter().map(|group| {
+        let items = group.output_indices.iter().filter_map(|index| response.output.get(*index)).collect::<Vec<_>>();
+        let text = items.iter().map(|item| output_item_text(item)).collect::<String>();
+        let tool_calls = items.iter().filter_map(|item| match item {
+            OutputItem::FunctionCall { call_id, name, arguments, .. } => Some(json!({
+                "id":call_id, "type":"function", "function":{"name":name,"arguments":arguments.to_string()}
             })),
-            OutputItem::Message { .. } | OutputItem::Reasoning { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    let mut message = json!({"role":"assistant","content":text});
-    if !tool_calls.is_empty() {
-        message["tool_calls"] = Value::Array(tool_calls);
-    }
-    let finish_reason = if message.get("tool_calls").is_some() {
-        "tool_calls"
-    } else {
-        "stop"
-    };
+            _ => None,
+        }).collect::<Vec<_>>();
+        let mut message = json!({"role":"assistant","content":text});
+        if !tool_calls.is_empty() { message["tool_calls"] = json!(tool_calls); }
+        if group.finish_reason == FinishReason::Refusal {
+            message["refusal"] = message["content"].take();
+        }
+        json!({"index":group.index,"message":message,"finish_reason":openai_finish(&group.finish_reason)})
+    }).collect::<Vec<_>>();
     json!({
-        "id": format!("chatcmpl_{}", response.id),
-        "object": "chat.completion",
-        "model": response.model,
-        "choices": [{"index":0,"message":message,"finish_reason":finish_reason}],
-        "usage": openai_legacy_usage(&response.usage),
-        "x_free_token_energy": {"backend":response.route.backend_id}
+        "id":format!("chatcmpl_{}", response.id), "object":"chat.completion", "model":response.model,
+        "choices":choices, "usage":openai_legacy_usage(&response.usage),
+        "x_free_token_energy":{"backend":response.route.backend_id}
     })
 }
 
 #[must_use]
 pub fn openai_completion_json(response: &GatewayResponse) -> Value {
-    let choices = response
-        .output
-        .iter()
-        .enumerate()
-        .map(|(index, item)| json!({"index":index,"text":output_item_text(item),"finish_reason":"stop","logprobs":Value::Null}))
-        .collect::<Vec<_>>();
+    let choices = output_groups(response, true).into_iter().map(|group| {
+        let text = group.output_indices.iter().filter_map(|index| response.output.get(*index)).map(output_item_text).collect::<String>();
+        json!({"index":group.index,"text":text,"finish_reason":openai_finish(&group.finish_reason),"logprobs":Value::Null})
+    }).collect::<Vec<_>>();
     json!({
-        "id": format!("cmpl_{}", response.id),
-        "object":"text_completion",
-        "model":response.model,
-        "choices":choices,
-        "usage":openai_legacy_usage(&response.usage),
+        "id":format!("cmpl_{}", response.id), "object":"text_completion", "model":response.model,
+        "choices":choices, "usage":openai_legacy_usage(&response.usage),
         "x_free_token_energy":{"backend":response.route.backend_id}
     })
+}
+
+fn anthropic_stop(response: &GatewayResponse) -> (&'static str, Option<&str>) {
+    match response
+        .output_groups
+        .first()
+        .map(|group| &group.finish_reason)
+    {
+        Some(FinishReason::Length) => ("max_tokens", None),
+        Some(FinishReason::ContextLimit) => ("model_context_window_exceeded", None),
+        Some(FinishReason::ContentFilter | FinishReason::Refusal) => ("refusal", None),
+        Some(FinishReason::StopSequence { sequence }) => ("stop_sequence", Some(sequence.as_str())),
+        Some(FinishReason::ToolCalls) => ("tool_use", None),
+        _ if response
+            .output
+            .iter()
+            .any(|item| matches!(item, OutputItem::FunctionCall { .. })) =>
+        {
+            ("tool_use", None)
+        }
+        _ => ("end_turn", None),
+    }
 }
 
 #[must_use]
@@ -1662,17 +1720,7 @@ pub fn anthropic_message_json(response: &GatewayResponse) -> Value {
         .iter()
         .flat_map(anthropic_output_blocks)
         .collect::<Vec<_>>();
-    let stop_reason = if response
-        .output
-        .iter()
-        .any(|item| matches!(item, OutputItem::FunctionCall { .. }))
-    {
-        "tool_use"
-    } else if response.status == fte_types::TerminalStatus::Completed {
-        "end_turn"
-    } else {
-        "stop_sequence"
-    };
+    let (stop_reason, stop_sequence) = anthropic_stop(response);
     json!({
         "id": format!("msg_{}", response.id),
         "type":"message",
@@ -1680,7 +1728,7 @@ pub fn anthropic_message_json(response: &GatewayResponse) -> Value {
         "model":response.model,
         "content":content,
         "stop_reason":stop_reason,
-        "stop_sequence":Value::Null,
+        "stop_sequence":stop_sequence,
         "usage":anthropic_usage(&response.usage),
         "x_free_token_energy":{"backend":response.route.backend_id}
     })
@@ -1742,7 +1790,6 @@ pub struct AnthropicStreamEncoder {
     stopped_blocks: BTreeSet<usize>,
     delta_blocks: BTreeSet<usize>,
     items: BTreeMap<usize, OutputItem>,
-    tool_use: bool,
     terminal: bool,
 }
 
@@ -1756,7 +1803,6 @@ impl AnthropicStreamEncoder {
             stopped_blocks: BTreeSet::new(),
             delta_blocks: BTreeSet::new(),
             items: BTreeMap::new(),
-            tool_use: false,
             terminal: false,
         }
     }
@@ -1781,7 +1827,6 @@ impl AnthropicStreamEncoder {
                 self.items.insert(*output_index, item.clone());
                 match item {
                     OutputItem::FunctionCall { call_id, name, .. } => {
-                        self.tool_use = true;
                         self.ensure_block(
                             AnthropicBlockKey::Item(*output_index),
                             json!({"type":"tool_use","id":call_id,"name":name,"input":{}}),
@@ -1860,7 +1905,6 @@ impl AnthropicStreamEncoder {
                         _ => None,
                     })
                     .unwrap_or_else(|| json!({"type":"tool_use","id":"","name":"","input":{}}));
-                self.tool_use = true;
                 let index =
                     self.ensure_block(AnthropicBlockKey::Item(*output_index), block, &mut events);
                 self.delta_blocks.insert(index);
@@ -1884,9 +1928,10 @@ impl AnthropicStreamEncoder {
             } => self.complete_output_item(*output_index, item, &mut events),
             GatewayEvent::Completed { response, .. } => {
                 self.finish_content_blocks(&mut events);
+                let (stop_reason, stop_sequence) = anthropic_stop(response);
                 events.push(SseEvent {
                     event: "message_delta".to_string(),
-                    data: json!({"type":"message_delta","delta":{"stop_reason":if self.tool_use {"tool_use"} else {"end_turn"},"stop_sequence":Value::Null},"usage":anthropic_usage(&response.usage)}),
+                    data: json!({"type":"message_delta","delta":{"stop_reason":stop_reason,"stop_sequence":stop_sequence},"usage":anthropic_usage(&response.usage)}),
                 });
                 events.push(SseEvent {
                     event: "message_stop".to_string(),
@@ -1992,7 +2037,6 @@ impl AnthropicStreamEncoder {
                 arguments,
                 ..
             } => {
-                self.tool_use = true;
                 let index = self.ensure_block(
                     AnthropicBlockKey::Item(output_index),
                     json!({"type":"tool_use","id":call_id,"name":name,"input":{}}),
@@ -2053,15 +2097,6 @@ fn anthropic_content_block_start(part: &ContentBlock) -> Option<Value> {
             None
         }
     }
-}
-
-fn response_text(response: &GatewayResponse) -> String {
-    response
-        .output
-        .iter()
-        .map(output_item_text)
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 fn output_item_text(item: &OutputItem) -> String {
@@ -2147,6 +2182,7 @@ mod tests {
                 provenance: UsageProvenance::Exact,
                 ..GatewayUsage::default()
             },
+            output_groups: Vec::new(),
             status: fte_types::TerminalStatus::Completed,
             previous_response_id: None,
         };
@@ -2245,6 +2281,7 @@ mod tests {
                 },
             ],
             usage: GatewayUsage::default(),
+            output_groups: Vec::new(),
             status: fte_types::TerminalStatus::Completed,
             previous_response_id: None,
         };
@@ -2416,6 +2453,7 @@ mod tests {
             route,
             output: vec![],
             usage: GatewayUsage::default(),
+            output_groups: Vec::new(),
             status: fte_types::TerminalStatus::Completed,
             previous_response_id: None,
         };
@@ -2474,6 +2512,7 @@ mod tests {
                 provenance: UsageProvenance::Exact,
                 ..GatewayUsage::default()
             },
+            output_groups: Vec::new(),
             status: fte_types::TerminalStatus::Completed,
             previous_response_id: None,
         };
@@ -2486,6 +2525,7 @@ mod tests {
             },
             GatewayEvent::OutputItemAdded {
                 request_id: request_id.clone(),
+                group_index: None,
                 output_index: 0,
                 item: reasoning.clone(),
             },
@@ -2502,6 +2542,7 @@ mod tests {
             },
             GatewayEvent::OutputItemAdded {
                 request_id: request_id.clone(),
+                group_index: None,
                 output_index: 1,
                 item: function.clone(),
             },
@@ -2569,6 +2610,7 @@ mod tests {
             route: route.clone(),
             output: vec![item.clone()],
             usage: GatewayUsage::default(),
+            output_groups: Vec::new(),
             status: fte_types::TerminalStatus::Completed,
             previous_response_id: None,
         };
@@ -2580,6 +2622,7 @@ mod tests {
             },
             GatewayEvent::OutputItemAdded {
                 request_id: request_id.clone(),
+                group_index: None,
                 output_index: 0,
                 item: item.clone(),
             },

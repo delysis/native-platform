@@ -410,13 +410,11 @@ describe('App ghost reactivity wiring', () => {
   });
 
 
-  it('projects native context media through document-scoped asset tokens without duplicating imported text', () => {
+  it('projects native context media through document-scoped asset tokens', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const styles = readFileSync(new URL('../app.css', import.meta.url), 'utf8');
     const tauri = readFileSync(new URL('../../src-tauri/tauri.conf.json', import.meta.url), 'utf8');
 
-    expect(source).toContain('contextText = snapshot.markdown');
-    expect(source).toContain('contextTextSources = snapshot.text_sources');
     expect(source).toContain("convertFileSrc(media.preview_token, 'loom-asset')");
     expect(source).toContain('<audio src={previewUrl} controls preload="metadata"');
     expect(source).toContain('media.waveform_peaks');

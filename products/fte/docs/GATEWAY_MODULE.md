@@ -89,11 +89,13 @@ from `/v1/models`. Only the documented `local-only`, `hosted-only`,
 `prefer-local`, and `auto` names select routing profiles. Canonical Rust callers
 can separately select an exact backend and model through `ModelSelector`.
 
-Anthropic streaming obtains an exact token count from the selected route
-before emitting `message_start`. If that route cannot supply an exact count,
-the request fails with a typed capability error instead of fabricating zero
-usage. Non-streaming Messages responses likewise require exact authoritative
-input and output usage.
+Anthropic streaming counts and starts generation under one route admission
+before emitting `message_start`. An opted-in pre-output fallback obtains a new
+exact count on its own route; it never reuses the preceding route's count.
+Cancellation and the request deadline cover both phases. If the serving route
+cannot supply an exact count, the request fails with a typed capability error.
+Non-streaming Messages responses likewise require exact authoritative input
+and output usage.
 
 Stored Responses retain exact backend/model affinity across process restarts.
 `previous_response_id` restores that affinity from SQLite before routing; an
@@ -108,6 +110,60 @@ response continuations, gateway-owned tool requests, non-retryable failures,
 and any request that has already received a ticket are never rerouted. Three
 consecutive retryable setup failures open that backend's circuit for 30
 seconds, without weakening privacy or capability filtering.
+
+## Hosted response and stream contract
+
+Hosted HTTP responses are parsed before entering the canonical Gateway. Chat
+function calls retain their call IDs, names, and complete JSON arguments;
+streamed argument fragments assemble into the same authoritative call. Responses,
+Anthropic, and Gemini tools use that same typed output. Invalid or truncated
+terminal tool JSON fails explicitly; it is never replaced with an empty object.
+Gateway-owned tool execution remains separate from returning a client tool call.
+
+Alternative choices retain their group index through text progress and final
+projection. `GatewayResponse.output_groups` connects each alternative to its
+Items and stop reason. `OutputItemAdded.group_index` supplies the corresponding
+progress identity. Backends with one implicit result can omit group metadata.
+The public Chat codec still rejects requested `n` values other than one.
+
+The canonical result distinguishes ordinary stop, an exact stop sequence,
+output-token/context limits, client tool handoff, content filtering, and refusal.
+Token/context-limited results retain their output and have `Incomplete` status;
+Chat/Completion clients receive `length`, Responses clients receive
+`response.incomplete`, and Anthropic clients retain the relevant stop reason.
+`GatewayEvent::Completed` delivers an authoritative result, whose status may be
+`Incomplete`; it does not imply an ordinary model stop. Refusals retain their
+text and refusal classification. Unknown provider stop states and malformed
+results fail explicitly instead of becoming success. A single Anthropic message
+cannot represent alternative candidates.
+
+OpenAI Chat/Completion SSE requires `[DONE]` and a finish reason for every
+observed choice. Responses requires an explicit terminal response, Anthropic
+requires its stop reason and `message_stop`, and Gemini requires a finish reason
+for every observed candidate. Ordinary EOF after partial output is an upstream
+failure. Cancellation remains cancellation, including while waiting for a frame
+delimiter or token-count response.
+
+The incremental SSE decoder accepts LF, CRLF, and CR, including line endings and
+UTF-8 characters split between transport chunks. It preserves multiline `data`
+and ignores comments. Invalid UTF-8 and unterminated final events are rejected
+or discarded according to the strict framing contract; neither can manufacture
+a successful terminal. Bounds are 1 MiB per normalized frame, 8 MiB of aggregate
+decoded event data, 16 MiB of transport data, and 256 output entries/indices.
+Authoritative output and successful ordinary JSON (including a JSON response to
+a streaming request and token-count responses) are independently bounded to
+8 MiB. Oversized text or arguments fail explicitly rather than being truncated.
+
+Local HTTP fixtures exercise the actual hosted backend, routing, and public
+codecs without provider credentials or paid requests. They cover tools,
+interleaved alternatives, incomplete/refused outcomes, premature EOF, framing,
+size limits, cancellation, route changes, and recounted fallback. These are
+transport conformance checks, not live-provider acceptance or model measurements.
+The framing and stop mappings follow the
+[WHATWG SSE contract](https://html.spec.whatwg.org/multipage/server-sent-events.html),
+[OpenAI Chat reference](https://platform.openai.com/docs/api-reference/chat),
+[Anthropic stop reasons](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons),
+and [Gemini candidate contract](https://ai.google.dev/api/generate-content).
 
 ## Local execution and cache hierarchy
 

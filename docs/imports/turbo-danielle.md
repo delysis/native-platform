@@ -1,6 +1,6 @@
 # Importing sources into native-kit and Loom
 
-Loom's **Import sources** panel sits beneath the document's context editor.
+Loom's **Import sources** panel sits in the document sidebar.
 Choose files or a folder, paste one or more sources, import a public HTTPS
 URL, or explicitly sync a connected account. Imported files are retained in
 the project. Select results and choose **Add selected to context** to use them
@@ -70,7 +70,31 @@ References: [Google desktop OAuth](https://developers.google.com/identity/protoc
 - Folder batches are bounded; hidden entries are skipped and symlinks/special files are rejected. Parser failures consume their source-byte grant. Each file's nested expansion and MIME members use Attachment's existing monotonic graph budget.
 - RTF currently supports ANSI Windows-1252 and Unicode text. Unsupported encodings, malformed groups, or malformed Unicode fail explicitly. Hidden destinations, field instructions, and embedded objects are omitted with partial coverage, never executed.
 - Slack/Claude files and URLs referenced inside imported material are not fetched automatically. A non-text export block is retained as inert metadata, not treated as a successfully imported media object.
-- Large sources retain their full bounded canonical text on disk. Loom's existing context budget selects a bounded middle-out projection and records whether insertion was complete; promotion fails when no context space remains.
+- Large sources retain their full bounded canonical text on disk. Selected material identities and optional edited excerpts remain separate from authored instructions; preparation selects a bounded excerpt without rewriting either source. See [materials and preparation](../context/materials-and-preparation.md).
+
+## Operation lifetime
+
+Each import carries a renderer-created operation ID before the request is sent.
+Stop latches that exact ID even if it arrives before admission. Cancellation
+records remain bounded and are never evicted while the same session can still
+admit a delayed request.
+
+Admission captures the project, session, and directory identity under short
+coordinator locks. Registered workers perform network acquisition, conversion,
+hashing, and immutable object/manifest staging outside those locks. Publication
+rechecks the captured authority and links the staged manifest while serialized
+with cancellation. Until that link exists, staged bytes cannot be selected as
+an attachment. Abandoned staging may leave reusable immutable objects, never
+an automatically selected source or manuscript edit.
+
+The application retains worker handles even if the calling RPC is abandoned.
+Project close revokes the session, cancels requests, and joins workers before
+releasing the store. Async account requests drop on cancellation; bounded
+synchronous conversion and public-URL downloads drain to their next boundary
+(the URL request timeout is 45 seconds). Stop therefore prevents publication
+immediately, but is not a claim of instant interruption inside a converter.
+Direct drops and connected batches report every published item separately
+from later failures. Retrying the same source reuses its content identity.
 
 ## Verification
 

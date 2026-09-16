@@ -344,7 +344,7 @@ mod tests {
         cached.cached_prefix = Some(SequenceStateBlob {
             sequence_id: 0,
             token_count: 2,
-            bytes: vec![1],
+            bytes: (vec![1]).into(),
             token_ids: vec![1, 2],
         });
         let budget = exact_token_batch_cell_budget(&request(vec![
@@ -381,7 +381,7 @@ mod tests {
         invalid_cache.cached_prefix = Some(SequenceStateBlob {
             sequence_id: 0,
             token_count: 2,
-            bytes: vec![1],
+            bytes: (vec![1]).into(),
             token_ids: vec![1, 2],
         });
         assert!(matches!(

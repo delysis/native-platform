@@ -8,7 +8,7 @@ use llama_native_types::MediaInput;
 use loom_store::{LoadedDocument, ProjectStore};
 
 use super::IpcFailure;
-use super::context_attachments::{resolve_for_generation_with_budget, resolve_inline_media};
+use super::context_attachments::{resolve_inline_media, resolve_media_for_document};
 use super::document_bindings::ResolvedDocument;
 
 const MAX_MEDIA: usize = 32;
@@ -18,21 +18,16 @@ pub(super) fn resolve(
     store: &ProjectStore,
     source: &LoadedDocument,
     references: &[ResolvedDocument],
-    context_tokens: u32,
+    _context_tokens: u32,
 ) -> Result<Vec<MediaInput>, IpcFailure> {
     if references.len() > 32 {
         return Err(limit());
     }
-    let mut media = resolve_for_generation_with_budget(
-        store.root(),
-        &source.document_id.to_string(),
-        &source.text,
-        context_tokens,
-        1,
-        0,
-    )
-    .map_err(|error| IpcFailure::new("terminal_media_unavailable", error.to_string(), false))?
-    .media;
+    let mut media =
+        resolve_media_for_document(store.root(), &source.document_id.to_string(), &source.text)
+            .map_err(|error| {
+                IpcFailure::new("terminal_media_unavailable", error.to_string(), false)
+            })?;
     // Source context is explicitly selected for this run. Referenced documents
     // contribute their visible media only, without their private scratch cards.
     let mut seen = HashSet::new();

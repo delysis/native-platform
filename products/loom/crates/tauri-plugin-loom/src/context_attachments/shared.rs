@@ -162,13 +162,9 @@ pub(crate) fn locally_added(
     before: &str,
     after: &str,
 ) -> Result<Vec<(String, Vec<u8>)>, ContextAttachmentError> {
-    let old: BTreeSet<_> = inline_attachment_ids(before)
-        .into_iter()
-        .chain(inline_media_ids(before))
-        .collect();
+    let old: BTreeSet<_> = inline_attachment_ids(before).into_iter().collect();
     let added: BTreeSet<_> = inline_attachment_ids(after)
         .into_iter()
-        .chain(inline_media_ids(after))
         .filter(|id| !old.contains(id))
         .collect();
     if added.len() > MAX_CONTEXT_ATTACHMENTS {

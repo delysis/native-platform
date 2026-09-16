@@ -575,9 +575,42 @@ pub struct GatewayResponse {
     pub model: String,
     pub route: ResolvedRoute,
     pub output: Vec<OutputItem>,
+    /// Alternative outputs and their stop conditions. Empty for a single
+    /// backend response whose ordinary stop/tool handoff is implied by Items.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_groups: Vec<OutputGroup>,
     pub usage: GatewayUsage,
     pub status: TerminalStatus,
     pub previous_response_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutputGroup {
+    pub index: usize,
+    pub output_indices: Vec<usize>,
+    pub finish_reason: FinishReason,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FinishReason {
+    Stop,
+    StopSequence { sequence: String },
+    Length,
+    ContextLimit,
+    ToolCalls,
+    ContentFilter,
+    Refusal,
+}
+
+impl FinishReason {
+    #[must_use]
+    pub const fn is_incomplete(&self) -> bool {
+        matches!(
+            self,
+            Self::Length | Self::ContextLimit | Self::ContentFilter
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -612,6 +645,10 @@ pub enum GatewayEvent {
     OutputItemAdded {
         request_id: RequestId,
         output_index: usize,
+        /// Alternative containing this Item; absent when the backend has one
+        /// implicit response. This keeps progress aligned with final groups.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_index: Option<usize>,
         item: OutputItem,
     },
     ContentPartAdded {
@@ -740,6 +777,7 @@ pub enum CacheOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum TerminalStatus {
     Completed,
+    Incomplete,
     Cancelled,
     Failed,
 }
@@ -1416,13 +1454,32 @@ fn terminal_event_from_result(
     result: &Result<GatewayResponse, GatewayError>,
 ) -> GatewayEvent {
     match result {
-        Ok(response) if response.status == TerminalStatus::Completed => GatewayEvent::Completed {
-            request_id: request_id.clone(),
-            response: Box::new(response.clone()),
-        },
-        Ok(response) => GatewayEvent::Cancelled {
+        Ok(response)
+            if matches!(
+                response.status,
+                TerminalStatus::Completed | TerminalStatus::Incomplete
+            ) =>
+        {
+            GatewayEvent::Completed {
+                request_id: request_id.clone(),
+                response: Box::new(response.clone()),
+            }
+        }
+        Ok(response) if response.status == TerminalStatus::Cancelled => GatewayEvent::Cancelled {
             request_id: request_id.clone(),
             usage: response.usage.clone(),
+        },
+        Ok(response) => GatewayEvent::Failed {
+            request_id: request_id.clone(),
+            error: GatewayError {
+                code: "backend_response_failed".into(),
+                class: ErrorClass::Provider,
+                retryable: false,
+                http_status: 502,
+                request_id: request_id.clone(),
+                provider: Some(response.route.backend_id.clone()),
+                safe_detail: "the backend returned a failed response".into(),
+            },
         },
         Err(error) if error.class == ErrorClass::Cancelled => GatewayEvent::Cancelled {
             request_id: request_id.clone(),
@@ -1793,6 +1850,7 @@ mod tests {
             route,
             output: Vec::new(),
             usage: GatewayUsage::default(),
+            output_groups: Vec::new(),
             status: TerminalStatus::Completed,
             previous_response_id: None,
         };
@@ -1854,6 +1912,7 @@ mod tests {
                 route,
                 output: Vec::new(),
                 usage: GatewayUsage::default(),
+                output_groups: Vec::new(),
                 status: TerminalStatus::Completed,
                 previous_response_id: None,
             };
@@ -1937,6 +1996,7 @@ mod tests {
             route,
             output: Vec::new(),
             usage: GatewayUsage::default(),
+            output_groups: Vec::new(),
             status: TerminalStatus::Completed,
             previous_response_id: None,
         };

@@ -71,8 +71,8 @@ jobs:
       - run: cargo run --locked -p xtask -- policy
 
   root-linux:
-    if: ${{ needs.plan.outputs.root == 'true' || needs.plan.outputs.full == 'true' }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.root == 'true' || needs.plan.outputs.full == 'true') }}
+    needs: [plan, ci-required]
     name: root-linux (${{ matrix.command }})
     runs-on: ubuntu-latest
     strategy:
@@ -107,8 +107,8 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
   native-linux:
-    if: ${{ needs.plan.outputs.native == 'true' || needs.plan.outputs.full == 'true' }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.native == 'true' || needs.plan.outputs.full == 'true') }}
+    needs: [plan, ci-required]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -124,8 +124,8 @@ jobs:
       - run: ./crates/native/scripts/check-architecture.sh
 
   gateway-linux:
-    if: ${{ needs.plan.outputs.gateway == 'true' || needs.plan.outputs.full == 'true' }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.gateway == 'true' || needs.plan.outputs.full == 'true') }}
+    needs: [plan, ci-required]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -141,8 +141,8 @@ jobs:
       - run: node scripts/ci/cargo-group.mjs clippy gateway
 
   attachment-linux:
-    if: ${{ needs.plan.outputs.attachment == 'true' || needs.plan.outputs.full == 'true' }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.attachment == 'true' || needs.plan.outputs.full == 'true') }}
+    needs: [plan, ci-required]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -159,8 +159,8 @@ jobs:
       - run: node scripts/ci/cargo-group.mjs clippy service-attachment
 
   information-linux:
-    if: ${{ needs.plan.outputs.information == 'true' || needs.plan.outputs.full == 'true' }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.information == 'true' || needs.plan.outputs.full == 'true') }}
+    needs: [plan, ci-required]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -185,8 +185,8 @@ jobs:
       - run: node scripts/ci/cargo-group.mjs clippy service-information
 
   information-windows:
-    if: ${{ needs.plan.outputs.information == 'true' || needs.plan.outputs.full == 'true' }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.information == 'true' || needs.plan.outputs.full == 'true') }}
+    needs: [plan, ci-required]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -201,8 +201,8 @@ jobs:
       - run: node scripts/ci/cargo-group.mjs test service-information
 
   speech-linux:
-    if: ${{ needs.plan.outputs.speech == 'true' || needs.plan.outputs.full == 'true' }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.speech == 'true' || needs.plan.outputs.full == 'true') }}
+    needs: [plan, ci-required]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -227,8 +227,8 @@ jobs:
       - run: node scripts/ci/cargo-group.mjs clippy service-speech
 
   mom-linux:
-    if: ${{ needs.plan.outputs.mom_present == 'true' && (needs.plan.outputs.mom == 'true' || needs.plan.outputs.full == 'true') }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.mom_present == 'true' && (needs.plan.outputs.mom == 'true' || needs.plan.outputs.full == 'true')) }}
+    needs: [plan, ci-required]
     name: mom-linux (${{ matrix.command }})
     runs-on: ubuntu-latest
     strategy:
@@ -258,8 +258,8 @@ jobs:
         run: node scripts/ci/cargo-group.mjs clippy product-mom
 
   mom-windows:
-    if: ${{ needs.plan.outputs.mom_present == 'true' && (needs.plan.outputs.mom == 'true' || needs.plan.outputs.full == 'true') }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.mom_present == 'true' && (needs.plan.outputs.mom == 'true' || needs.plan.outputs.full == 'true')) }}
+    needs: [plan, ci-required]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -275,8 +275,8 @@ jobs:
       - run: node scripts/ci/cargo-group.mjs test product-mom
 
   loom-linux:
-    if: ${{ needs.plan.outputs.loom_present == 'true' && (needs.plan.outputs.loom == 'true' || needs.plan.outputs.full == 'true') }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.loom_present == 'true' && (needs.plan.outputs.loom == 'true' || needs.plan.outputs.full == 'true')) }}
+    needs: [plan, ci-required]
     name: loom-linux (${{ matrix.command }})
     runs-on: ubuntu-latest
     strategy:
@@ -309,8 +309,8 @@ jobs:
         run: node scripts/ci/cargo-group.mjs clippy product-loom
 
   loom-windows:
-    if: ${{ needs.plan.outputs.loom_present == 'true' && (needs.plan.outputs.loom == 'true' || needs.plan.outputs.full == 'true') }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.loom_present == 'true' && (needs.plan.outputs.loom == 'true' || needs.plan.outputs.full == 'true')) }}
+    needs: [plan, ci-required]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -422,8 +422,8 @@ jobs:
           pnpm --filter @delysis/loom exec tauri build --debug
 
   dependency-graph:
-    if: ${{ needs.plan.outputs.dependency_graph == 'true' || needs.plan.outputs.full == 'true' }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.dependency_graph == 'true' || needs.plan.outputs.full == 'true') }}
+    needs: [plan, ci-required]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -435,8 +435,8 @@ jobs:
       - run: cargo tree --locked -i libsqlite3-sys
 
   ignored-tests:
-    if: ${{ needs.plan.outputs.ignored_tests == 'true' || needs.plan.outputs.full == 'true' }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.ignored_tests == 'true' || needs.plan.outputs.full == 'true') }}
+    needs: [plan, ci-required]
     name: ignored-tests (${{ matrix.os }})
     strategy:
       fail-fast: false
@@ -471,8 +471,8 @@ jobs:
         run: ./scripts/ci/inspect-windows-linkage.ps1
 
   fuzz-build:
-    if: ${{ needs.plan.outputs.fuzz == 'true' || needs.plan.outputs.full == 'true' }}
-    needs: plan
+    if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.fuzz == 'true' || needs.plan.outputs.full == 'true') }}
+    needs: [plan, ci-required]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683

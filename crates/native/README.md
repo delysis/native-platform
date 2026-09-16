@@ -29,6 +29,22 @@ observations are optional and probability records carry an explicit
 unsupported observations absent. Exact inspected capabilities are published
 alongside the legacy summary fields for a compatibility window.
 
+## Saved prefix lifetime
+
+Native sequence payloads use shared immutable storage, so branching and cache
+hits do not copy opaque KV bytes. Memory lookup borrows already validated token
+metadata; products still enforce owner leases and invalidation independently of
+payload ownership.
+
+A raw snapshot can accelerate disk spill only while its exporting worker retains
+its bounded receipt. Persistent indexes also hold exact tokens and the small
+model/context binding envelope. On worker replacement, shutdown, or receipt
+eviction, stores reconstruct from that metadata and atomically compact the
+expired spill without reading its raw bytes. Replay still checks the model and
+context binding. A live receipt is only a storage hint: the native importer
+independently verifies every byte and token against the worker's receipt before
+calling the native state parser.
+
 ## Workspace
 
 - `llama-native-types`: stable public DTOs.

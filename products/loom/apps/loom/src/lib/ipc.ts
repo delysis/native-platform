@@ -1,3 +1,4 @@
+import { newUlid } from './ulid';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
@@ -217,9 +218,10 @@ export function ingestImageAttachment(
 export function importAttachmentPaths(
   projectId: string,
   sessionId: string,
-  paths: readonly string[]
-): Promise<ContextAttachment[]> {
-  return call('attachment_import_paths', { projectId, sessionId, paths: [...paths] });
+  paths: readonly string[],
+  operationId = newUlid()
+): Promise<ImportBatch> {
+  return call('attachment_import_paths', { projectId, sessionId, paths: [...paths], operationId });
 }
 
 export function revealAttachmentOriginal(projectId: string, sessionId: string, documentId: string, attachmentId: string): Promise<void> {
@@ -228,9 +230,10 @@ export function revealAttachmentOriginal(projectId: string, sessionId: string, d
 
 export function chooseAttachments(
   projectId: string,
-  sessionId: string
-): Promise<ContextAttachment[]> {
-  return call('attachment_import_choose', { projectId, sessionId });
+  sessionId: string,
+  operationId = newUlid()
+): Promise<ImportBatch> {
+  return call('attachment_import_choose', { projectId, sessionId, operationId });
 }
 
 export function listDocumentContext(
@@ -295,14 +298,16 @@ export function setDocumentContextSnapshot(
   sessionId: string,
   documentId: string,
   markdown: string,
-  attachmentIds: readonly string[]
+  attachmentIds: readonly string[],
+  materials?: readonly import('./types').ContextMaterial[]
 ): Promise<DocumentContextSnapshot> {
   return call('document_context_snapshot_set', {
     projectId,
     sessionId,
     documentId,
     markdown,
-    attachmentIds: [...attachmentIds]
+    attachmentIds: [...attachmentIds],
+    ...(materials ? { materials: [...materials] } : {})
   });
 }
 
@@ -960,27 +965,27 @@ export interface ImportBatch { imported: ContextAttachment[]; failures: { name: 
 export function importAccounts(projectId: string, sessionId: string): Promise<ImportAccount[]> {
   return call('import_accounts', { projectId, sessionId });
 }
-export function connectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', clientId: string, clientSecret: string): Promise<ImportAccount> {
-  return call('import_account_connect', { projectId, sessionId, service, clientId, clientSecret });
+export function connectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', clientId: string, clientSecret: string, operationId: string = newUlid()): Promise<ImportAccount> {
+  return call('import_account_connect', { projectId, sessionId, service, clientId, clientSecret, operationId });
 }
 export function disconnectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', accountEmail: string): Promise<void> {
   return call('import_account_disconnect', { projectId, sessionId, service, accountEmail });
 }
-export function syncImportAccount(projectId: string, sessionId: string, source: ImportSource, accountEmail: string, query: string, pageToken: string | null): Promise<ImportBatch> {
-  return call('import_account_sync', { projectId, sessionId, source, accountEmail, query, pageToken });
+export function syncImportAccount(projectId: string, sessionId: string, source: ImportSource, accountEmail: string, query: string, pageToken: string | null, operationId: string = newUlid()): Promise<ImportBatch> {
+  return call('import_account_sync', { projectId, sessionId, source, accountEmail, query, pageToken, operationId });
 }
-export function chooseImportBatch(projectId: string, sessionId: string, folder: boolean): Promise<ImportBatch> {
-  return call('attachment_import_batch_choose', { projectId, sessionId, folder });
-}
-
-export function importSourceUrl(projectId: string, sessionId: string, url: string): Promise<ImportBatch> {
-  return call('import_source_url', { projectId, sessionId, url });
+export function chooseImportBatch(projectId: string, sessionId: string, folder: boolean, operationId: string = newUlid()): Promise<ImportBatch> {
+  return call('attachment_import_batch_choose', { projectId, sessionId, folder, operationId });
 }
 
-export function importPastedSources(projectId: string, sessionId: string, text: string, separator: string): Promise<ImportBatch> {
-  return call('import_text_sources', { projectId, sessionId, text, separator });
+export function importSourceUrl(projectId: string, sessionId: string, url: string, operationId: string = newUlid()): Promise<ImportBatch> {
+  return call('import_source_url', { projectId, sessionId, url, operationId });
 }
 
-export function cancelImportAccount(projectId: string, sessionId: string): Promise<void> {
-  return call('import_account_cancel', { projectId, sessionId });
+export function importPastedSources(projectId: string, sessionId: string, text: string, separator: string, operationId: string = newUlid()): Promise<ImportBatch> {
+  return call('import_text_sources', { projectId, sessionId, text, separator, operationId });
+}
+
+export function cancelImportAccount(projectId: string, sessionId: string, operationId: string): Promise<void> {
+  return call('import_account_cancel', { projectId, sessionId, operationId });
 }

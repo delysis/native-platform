@@ -1,5 +1,5 @@
-//! Export only the visible scratch text and explicitly selected file cards.
-//! Text-import receipts and their unselected original files stay private.
+//! Export authored instructions, quoted material excerpts and reviewed files.
+//! Text-only originals and private acquisition receipts are never published.
 use super::*;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -25,10 +25,36 @@ pub(crate) fn material(root: &Path, document_id: &str) -> Result<Material, Conte
         .iter()
         .map(|file| file.id.clone())
         .collect::<Vec<_>>();
-    let manifests = card_manifest_metadata_for_ids(root, &ids)?;
+    let manifests = manifest_metadata_for_ids(root, &ids)?;
     let mut total = 0_u64;
+    let mut markdown = snapshot.markdown;
     let mut files = Vec::new();
     for (id, manifest) in manifests {
+        let selected = snapshot
+            .materials
+            .iter()
+            .find(|item| item.attachment_id == id)
+            .ok_or(ContextAttachmentError::ContextInvalid)?;
+        validate_material(selected, &manifest)?;
+        if manifest.attachment.text_bytes > 0 {
+            let excerpt = match &selected.excerpt {
+                Some(text) => text.clone(),
+                None => read_canonical_text(root, &manifest)?,
+            };
+            if !markdown.is_empty() {
+                markdown.push_str("\n\n");
+            }
+            markdown.push_str("> Material: ");
+            markdown.push_str(&manifest.attachment.file_name.replace('\n', "\n> "));
+            markdown.push_str("\n>\n> ");
+            markdown.push_str(&excerpt.replace('\n', "\n> "));
+            if markdown.len() > MAX_MANUAL_CONTEXT_BYTES {
+                return Err(ContextAttachmentError::ManualTextLimit);
+            }
+            if manifest.media.is_empty() {
+                continue;
+            }
+        }
         loom_cabal::AssetDescriptor {
             sha256: id.clone(),
             name: manifest.attachment.file_name.clone(),
@@ -42,20 +68,16 @@ pub(crate) fn material(root: &Path, document_id: &str) -> Result<Material, Conte
         if total > MAX_ATTACHMENT_BYTES {
             return Err(ContextAttachmentError::SourceSize);
         }
+        let file_markdown = editor_media_markdown(&manifest.attachment, &manifest.media)
+            .unwrap_or_else(|| manifest.attachment.inline_markdown.clone());
         files.push(FileReview {
             id,
             name: manifest.attachment.file_name,
             byte_count: manifest.attachment.byte_count,
-            markdown: manifest
-                .attachment
-                .media_markdown
-                .unwrap_or(manifest.attachment.inline_markdown),
+            markdown: file_markdown,
         });
     }
-    let material = Material {
-        markdown: snapshot.markdown,
-        files,
-    };
+    let material = Material { markdown, files };
     if document(&material).len() > MAX_MANUAL_CONTEXT_BYTES {
         return Err(ContextAttachmentError::ManualTextLimit);
     }

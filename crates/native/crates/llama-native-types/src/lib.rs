@@ -2766,9 +2766,61 @@ pub enum SequenceRestoreKind {
 pub struct SequenceStateBlob {
     pub sequence_id: i32,
     pub token_count: usize,
-    pub bytes: Vec<u8>,
+    pub bytes: std::sync::Arc<Vec<u8>>,
     #[serde(default)]
     pub token_ids: Vec<i32>,
+}
+
+/// The fixed configuration envelope is sufficient for checked token replay.
+/// The opaque native payload remains useful only to its exporting worker.
+pub const SEQUENCE_STATE_HEADER_BYTES: usize = 48;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SequenceReconstruction {
+    pub sequence_id: i32,
+    pub header: Vec<u8>,
+    pub export_receipt: [u8; 32],
+}
+
+impl SequenceStateBlob {
+    #[must_use]
+    pub fn export_receipt(&self) -> [u8; 32] {
+        use sha2::{Digest as _, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"native-sequence-export-receipt-v1");
+        hash.update(self.sequence_id.to_le_bytes());
+        hash.update((self.token_count as u64).to_le_bytes());
+        hash.update((self.token_ids.len() as u64).to_le_bytes());
+        for token in &self.token_ids {
+            hash.update(token.to_le_bytes());
+        }
+        hash.update(self.bytes.as_slice());
+        hash.finalize().into()
+    }
+
+    #[must_use]
+    pub fn reconstruction(&self) -> SequenceReconstruction {
+        SequenceReconstruction {
+            sequence_id: self.sequence_id,
+            header: self.bytes[..self.bytes.len().min(SEQUENCE_STATE_HEADER_BYTES)].to_vec(),
+            export_receipt: self.export_receipt(),
+        }
+    }
+}
+
+impl SequenceReconstruction {
+    #[must_use]
+    pub fn sequence(&self, token_ids: Vec<i32>) -> Option<SequenceStateBlob> {
+        if self.header.is_empty() || self.header.len() > SEQUENCE_STATE_HEADER_BYTES {
+            return None;
+        }
+        Some(SequenceStateBlob {
+            sequence_id: self.sequence_id,
+            token_count: token_ids.len(),
+            bytes: self.header.clone().into(),
+            token_ids,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

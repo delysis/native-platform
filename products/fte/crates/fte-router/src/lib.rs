@@ -405,7 +405,7 @@ fn observe_gateway_outcome(
                 .zip(response.usage.output_tokens)
                 .map(|(input, output)| input.saturating_add(output)),
             match response.status {
-                TerminalStatus::Completed => 200,
+                TerminalStatus::Completed | TerminalStatus::Incomplete => 200,
                 TerminalStatus::Cancelled => 499,
                 TerminalStatus::Failed => 500,
             },
@@ -573,11 +573,48 @@ impl Gateway {
         request: GatewayRequest,
         cancellation: Arc<fte_types::RequestCancellation>,
     ) -> Result<GatewayTicket, GatewayError> {
+        self.execute_with_preflight(request, cancellation, false)
+            .await
+            .map(|(ticket, _)| ticket)
+    }
+
+    /// Counts and executes under one route admission. A permitted pre-output
+    /// fallback must obtain its own exact count before returning a ticket.
+    pub async fn execute_with_exact_input_count(
+        &self,
+        request: GatewayRequest,
+        cancellation: Arc<fte_types::RequestCancellation>,
+    ) -> Result<(GatewayTicket, GatewayUsage), GatewayError> {
+        let request_id = request.request_id.clone();
+        let (ticket, usage) = self
+            .execute_with_preflight(request, cancellation, true)
+            .await?;
+        let usage = usage.ok_or_else(|| {
+            GatewayError::unavailable(
+                &request_id,
+                "exact_input_usage_unavailable",
+                "the execution route returned no exact input count",
+            )
+        })?;
+        Ok((ticket, usage))
+    }
+
+    async fn execute_with_preflight(
+        &self,
+        request: GatewayRequest,
+        cancellation: Arc<fte_types::RequestCancellation>,
+        exact_input_count: bool,
+    ) -> Result<(GatewayTicket, Option<GatewayUsage>), GatewayError> {
         let started = Instant::now();
         let request_id = request.request_id.clone();
         let mut selected_route = None;
         let result = self
-            .execute_inner(request, Arc::clone(&cancellation), &mut selected_route)
+            .execute_inner(
+                request,
+                Arc::clone(&cancellation),
+                &mut selected_route,
+                exact_input_count,
+            )
             .await;
         if let Err(error) = &result
             && let Some(observer) = self.observer.as_ref()
@@ -598,7 +635,8 @@ impl Gateway {
         request: GatewayRequest,
         cancellation: Arc<fte_types::RequestCancellation>,
         selected_route: &mut Option<ResolvedRoute>,
-    ) -> Result<GatewayTicket, GatewayError> {
+        exact_input_count: bool,
+    ) -> Result<(GatewayTicket, Option<GatewayUsage>), GatewayError> {
         let started_at = Instant::now();
         if cancellation.is_cancelled() {
             return Err(request_cancelled(&request.request_id));
@@ -655,10 +693,44 @@ impl Gateway {
                 lease.finish_error(&error)?;
                 return Err(error);
             }
-            let execution = backend.execute(BackendRequest {
-                request: request.clone(),
-                route,
-            });
+            let execution = async {
+                let usage = if exact_input_count {
+                    let mut usage = backend
+                        .count_tokens(BackendRequest {
+                            request: request.clone(),
+                            route: route.clone(),
+                        })
+                        .await?;
+                    if usage.provenance != fte_types::UsageProvenance::Exact
+                        || usage.input_tokens.is_none()
+                    {
+                        return Err(GatewayError {
+                            code: "exact_input_usage_unavailable".into(),
+                            class: ErrorClass::Capability,
+                            retryable: false,
+                            http_status: 422,
+                            request_id: request_id.clone(),
+                            provider: Some(backend_id.clone()),
+                            safe_detail: "the execution route cannot supply exact input usage"
+                                .into(),
+                        });
+                    }
+                    usage.selected_route = Some(route.clone());
+                    Some(usage)
+                } else {
+                    None
+                };
+                if cancellation.is_cancelled() {
+                    return Err(request_cancelled(&request_id));
+                }
+                let ticket = backend
+                    .execute(BackendRequest {
+                        request: request.clone(),
+                        route,
+                    })
+                    .await?;
+                Ok((ticket, usage))
+            };
             let execution = async {
                 let mut execution = std::pin::pin!(execution);
                 // Production backends register their cancellation owner before
@@ -689,7 +761,7 @@ impl Gateway {
                 execution.await
             };
             match result {
-                Ok(ticket) => {
+                Ok((ticket, usage)) => {
                     if let Err(error) = self.record_backend_success(&backend_id) {
                         lease.finish_error(&error)?;
                         return Err(error);
@@ -709,15 +781,18 @@ impl Gateway {
                             },
                         ) as fte_types::GatewayTerminalObserver
                     });
-                    return Ok(ticket.with_admission_lease_deadlines_and_hooks(
-                        Box::new(lease),
-                        deadline,
-                        started_at.elapsed(),
-                        event_capacity,
-                        fte_types::GatewayExecutionHooks {
-                            cancellation: Some(Arc::clone(&cancellation)),
-                            observer,
-                        },
+                    return Ok((
+                        ticket.with_admission_lease_deadlines_and_hooks(
+                            Box::new(lease),
+                            deadline,
+                            started_at.elapsed(),
+                            event_capacity,
+                            fte_types::GatewayExecutionHooks {
+                                cancellation: Some(Arc::clone(&cancellation)),
+                                observer,
+                            },
+                        ),
+                        usage,
                     ));
                 }
                 Err(error) => {
@@ -1302,7 +1377,9 @@ impl TicketLifecycleLease for AdmissionLease {
     ) -> Result<(), GatewayError> {
         let terminal = match result {
             Ok(response) => match response.status {
-                TerminalStatus::Completed => operation_lifecycle::TerminalClass::Completed,
+                TerminalStatus::Completed | TerminalStatus::Incomplete => {
+                    operation_lifecycle::TerminalClass::Completed
+                }
                 TerminalStatus::Cancelled => operation_lifecycle::TerminalClass::Cancelled,
                 TerminalStatus::Failed => operation_lifecycle::TerminalClass::Failed,
             },
@@ -1328,7 +1405,9 @@ impl TicketLifecycleLease for AdmissionLease {
     ) -> Result<(), GatewayError> {
         let terminal = match result {
             Ok(response) => match response.status {
-                TerminalStatus::Completed => operation_lifecycle::TerminalClass::Completed,
+                TerminalStatus::Completed | TerminalStatus::Incomplete => {
+                    operation_lifecycle::TerminalClass::Completed
+                }
                 TerminalStatus::Cancelled => operation_lifecycle::TerminalClass::Cancelled,
                 TerminalStatus::Failed => operation_lifecycle::TerminalClass::Failed,
             },
@@ -2015,6 +2094,7 @@ mod tests {
             },
             output: Vec::new(),
             usage: fte_types::GatewayUsage::default(),
+            output_groups: Vec::new(),
             status: TerminalStatus::Completed,
             previous_response_id: None,
         }
