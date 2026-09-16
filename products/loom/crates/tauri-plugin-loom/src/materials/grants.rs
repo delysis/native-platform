@@ -1,6 +1,7 @@
 //! Native application-owned source grants. This file is deliberately outside
 //! the workspace: a downloaded workspace cannot authorize reads on this host.
 use super::*;
+use atomic_write_file::AtomicWriteFile;
 
 const GRANT_SCHEMA: &str = "loom.local-material-grants.v1";
 static GRANT_WRITE_LOCK: Mutex<()> = Mutex::new(());
@@ -157,7 +158,7 @@ pub(crate) fn persist_selected_grant(store: &ProjectStore, root: &Path, id: &str
     );
     save(store, root, &approved)
 }
-pub(crate) fn restore_selected_grants(store: &ProjectStore, root: &Path) -> Result<()> {
+pub(crate) fn restore_selected_grants(store: &mut ProjectStore, root: &Path) -> Result<()> {
     let approved = load(store, root)?;
     let bindings = read_bindings(store)?;
     for binding in &bindings.items {
@@ -208,13 +209,13 @@ mod tests {
     fn failed_private_grant_write_rolls_back_binding_and_capability() {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
-        let (store, _) = ProjectStore::initialize(root.join("Writing"), "Writing").unwrap();
+        let (mut store, _) = ProjectStore::initialize(root.join("Writing"), "Writing").unwrap();
         let path = root.join("library.sqlite3");
         super::super::tests::database(&path);
         let before = fs::read(&path).unwrap();
         let bad_root = root.join("grants");
         fs::write(&bad_root, b"not a directory").unwrap();
-        assert!(add_library_persisted(&store, &path, Some(&bad_root)).is_err());
+        assert!(add_library_persisted(&mut store, &path, Some(&bad_root)).is_err());
         assert!(list(&store).unwrap().is_empty());
         let id = binding_id(&Source::Library { path: path.clone() }).unwrap();
         assert!(
@@ -231,26 +232,28 @@ mod tests {
         // macOS temp paths may traverse /var -> /private/var; the application
         // grants root itself must be canonical and ordinary.
         let temp_root = fs::canonicalize(temp.path()).unwrap();
-        let (store, _) = ProjectStore::initialize(temp_root.join("Writing"), "Writing").unwrap();
+        let (mut store, _) =
+            ProjectStore::initialize(temp_root.join("Writing"), "Writing").unwrap();
         let path = temp_root.join("library.sqlite3");
         super::super::tests::database(&path);
         let root = temp_root.join("grants");
-        let entry = add_library(&store, &path, None).unwrap();
+        let entry = add_library(&mut store, &path, None).unwrap();
         persist_selected_grant(&store, &root, &entry.id).unwrap();
         grants()
             .lock()
             .unwrap()
             .remove(&grant_key(&store, &entry.id));
-        restore_selected_grants(&store, &root).unwrap();
+        restore_selected_grants(&mut store, &root).unwrap();
         assert!(list(&store).unwrap()[0].available);
         forget_selected_grant(&store, &root, &entry.id).unwrap();
         grants()
             .lock()
             .unwrap()
             .remove(&grant_key(&store, &entry.id));
-        restore_selected_grants(&store, &root).unwrap();
+        restore_selected_grants(&mut store, &root).unwrap();
         assert!(!list(&store).unwrap()[0].available);
         assert!(persist_selected_grant(&store, &root, &entry.id).is_err());
-        assert!(restore_selected_grants(&store, &store.root().join("untrusted-grants")).is_err());
+        let untrusted = store.root().join("untrusted-grants");
+        assert!(restore_selected_grants(&mut store, &untrusted).is_err());
     }
 }

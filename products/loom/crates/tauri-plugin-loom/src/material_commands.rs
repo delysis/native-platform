@@ -16,7 +16,11 @@ fn grant_root(state: &PluginState) -> Result<Option<PathBuf>, IpcFailure> {
         .transpose()
 }
 
-pub(super) fn restore_grants(state: &PluginState, store: &ProjectStore) -> Result<(), IpcFailure> {
+pub(super) fn restore_grants(
+    state: &PluginState,
+    store: &mut ProjectStore,
+) -> Result<(), IpcFailure> {
+    crate::workspace_template::materials::prepare(store)?;
     let sources = materials::list(store)?;
     if !sources
         .iter()

@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use atomic_write_file::AtomicWriteFile;
 use information_native_backend_sqlite::{AlexandriaBackend, AlexandriaBackendConfig};
 use information_native_retrieval::{ReadRequest, ResourceBackend};
 use information_native_types::{
@@ -90,9 +89,9 @@ pub(crate) struct MaterialEntry {
     pub(crate) workspace_path: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct Binding {
+pub(crate) struct Binding {
     id: String,
     name: String,
     pinned: bool,
@@ -100,7 +99,7 @@ struct Binding {
     #[serde(default)]
     workspace_path: Option<String>,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Source {
     Attachment { attachment_id: String },
@@ -111,6 +110,8 @@ enum Source {
 struct Bindings {
     schema: String,
     items: Vec<Binding>,
+    #[serde(skip)]
+    revision: Option<loom_types::RevisionId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -252,7 +253,7 @@ fn entry(store: &ProjectStore, binding: &Binding) -> Result<MaterialEntry> {
             MaterialKind::Attachment,
             None,
             Some(attachment_id.clone()),
-            true,
+            context_attachments::describe_source(store.root(), attachment_id).is_ok(),
         ),
         Source::Library { path } => (
             MaterialKind::Library,
@@ -343,7 +344,7 @@ fn binding(store: &ProjectStore, id: &str) -> Result<Binding> {
         .find(|binding| binding.id == id)
         .ok_or_else(|| MaterialError::NotFound(id.into()))
 }
-fn save_binding(store: &ProjectStore, source: Source, name: &str) -> Result<Binding> {
+fn save_binding(store: &mut ProjectStore, source: Source, name: &str) -> Result<Binding> {
     save_binding_at_path(store, source, name, None)
 }
 
@@ -370,7 +371,7 @@ fn binding_identity(source: &Source, workspace_path: Option<&str>) -> Result<Str
 }
 
 fn save_binding_at_path(
-    store: &ProjectStore,
+    store: &mut ProjectStore,
     source: Source,
     name: &str,
     workspace_path: Option<&str>,
@@ -379,6 +380,7 @@ fn save_binding_at_path(
     let _lock = WRITE_LOCK
         .lock()
         .map_err(|_| invalid("material write lock poisoned"))?;
+    crate::workspace_template::materials::prepare(store).map_err(|error| invalid(error.message))?;
     let mut bindings = read_bindings(store)?;
     let id = binding_identity(&source, workspace_path)?;
     if let Some(existing) = bindings.items.iter().find(|binding| binding.id == id) {
@@ -399,7 +401,7 @@ fn save_binding_at_path(
     Ok(binding)
 }
 pub(crate) fn bind_attachment(
-    store: &ProjectStore,
+    store: &mut ProjectStore,
     attachment_id: &str,
     name: Option<&str>,
 ) -> Result<MaterialEntry> {
@@ -416,7 +418,7 @@ pub(crate) fn bind_attachment(
 
 /// Each workspace placement has its own binding while retaining shared bytes.
 pub(crate) fn bind_workspace_attachment(
-    store: &ProjectStore,
+    store: &mut ProjectStore,
     attachment_id: &str,
     relative_path: &str,
 ) -> Result<MaterialEntry> {
@@ -452,7 +454,7 @@ fn validate_workspace_path(path: &str) -> Result<()> {
 /// Only call after a native file selection (or a separately authenticated
 /// application-owned grant). Workspace JSON paths never call this function.
 pub(crate) fn add_library(
-    store: &ProjectStore,
+    store: &mut ProjectStore,
     selected_path: &Path,
     name: Option<&str>,
 ) -> Result<MaterialEntry> {
@@ -509,7 +511,7 @@ pub(crate) fn add_library(
 /// Register an explicitly selected source and save native access together. A
 /// failed private-state write rolls back the newly exposed binding/capability.
 pub(crate) fn add_library_persisted(
-    store: &ProjectStore,
+    store: &mut ProjectStore,
     selected: &Path,
     grant_root: Option<&Path>,
 ) -> Result<MaterialEntry> {
@@ -547,10 +549,15 @@ pub(crate) fn add_library_persisted(
     Ok(entry)
 }
 
-pub(crate) fn set_pinned(store: &ProjectStore, id: &str, pinned: bool) -> Result<MaterialEntry> {
+pub(crate) fn set_pinned(
+    store: &mut ProjectStore,
+    id: &str,
+    pinned: bool,
+) -> Result<MaterialEntry> {
     let _lock = WRITE_LOCK
         .lock()
         .map_err(|_| invalid("material write lock poisoned"))?;
+    crate::workspace_template::materials::prepare(store).map_err(|error| invalid(error.message))?;
     let mut bindings = read_bindings(store)?;
     let binding = bindings
         .items
@@ -562,10 +569,11 @@ pub(crate) fn set_pinned(store: &ProjectStore, id: &str, pinned: bool) -> Result
     write_bindings(store, &bindings)?;
     Ok(result)
 }
-pub(crate) fn remove(store: &ProjectStore, id: &str) -> Result<()> {
+pub(crate) fn remove(store: &mut ProjectStore, id: &str) -> Result<()> {
     let _lock = WRITE_LOCK
         .lock()
         .map_err(|_| invalid("material write lock poisoned"))?;
+    crate::workspace_template::materials::prepare(store).map_err(|error| invalid(error.message))?;
     let mut bindings = read_bindings(store)?;
     let previous = bindings.items.len();
     bindings.items.retain(|b| b.id != id);
@@ -1005,23 +1013,58 @@ fn read_safe(path: &Path, max: u64) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 fn read_bindings(store: &ProjectStore) -> Result<Bindings> {
+    let (revision, configured) = crate::workspace_template::materials::current(store)
+        .map_err(|error| invalid(error.message))?;
+    let items = match configured {
+        Some(items) => items,
+        None => unconfigured_bindings(store)?.unwrap_or_default(),
+    };
+    validate_bindings(&items)?;
+    Ok(Bindings {
+        schema: SCHEMA.into(),
+        items,
+        revision,
+    })
+}
+
+pub(crate) fn unconfigured_bindings(store: &ProjectStore) -> Result<Option<Vec<Binding>>> {
     let path = storage(store)?.join("bindings.json");
     let bytes = match read_safe(&path, MAX_STATE_BYTES) {
         Ok(bytes) => bytes,
-        Err(MaterialError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Bindings {
-                schema: SCHEMA.into(),
-                items: Vec::new(),
-            });
+        Err(MaterialError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
         }
-        Err(e) => return Err(e),
+        Err(error) => return Err(error),
     };
     let bindings: Bindings = serde_json::from_slice(&bytes)?;
-    if bindings.schema != SCHEMA || bindings.items.len() > MAX_BINDINGS {
+    if bindings.schema != SCHEMA {
         return Err(invalid("unsupported material bindings"));
     }
+    validate_bindings(&bindings.items)?;
+    Ok(Some(bindings.items))
+}
+
+pub(crate) fn preserve_previous_bindings(store: &ProjectStore) -> Result<()> {
+    let root = storage(store)?;
+    let path = root.join("bindings.json");
+    let bytes = read_safe(&path, MAX_STATE_BYTES)?;
+    install_evidence(
+        &root.join(format!("bindings-{}.json", digest(&bytes))),
+        &bytes,
+    )?;
+    if read_safe(&path, MAX_STATE_BYTES)? != bytes {
+        return Err(invalid("material bindings changed while being preserved"));
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+pub(crate) fn validate_bindings(items: &[Binding]) -> Result<()> {
+    if items.len() > MAX_BINDINGS {
+        return Err(invalid("workspace material limit reached"));
+    }
     let mut ids = std::collections::BTreeSet::new();
-    for binding in &bindings.items {
+    for binding in items {
         validate_name(&binding.name)?;
         if binding.id != binding_identity(&binding.source, binding.workspace_path.as_deref())?
             || !ids.insert(&binding.id)
@@ -1038,23 +1081,12 @@ fn read_bindings(store: &ProjectStore) -> Result<Bindings> {
             _ => {}
         }
     }
-    Ok(bindings)
-}
-fn write_bindings(store: &ProjectStore, bindings: &Bindings) -> Result<()> {
-    let bytes = serde_json::to_vec(bindings)?;
-    if bytes.len() as u64 > MAX_STATE_BYTES {
-        return Err(invalid("workspace material metadata limit reached"));
-    }
-    let path = storage(store)?.join("bindings.json");
-    if let Ok(metadata) = fs::symlink_metadata(&path)
-        && (!metadata.is_file() || metadata.file_type().is_symlink())
-    {
-        return Err(invalid("unsafe material bindings file"));
-    }
-    let mut file = AtomicWriteFile::open(&path)?;
-    file.write_all(&bytes)?;
-    file.commit()?;
     Ok(())
+}
+
+fn write_bindings(store: &mut ProjectStore, bindings: &Bindings) -> Result<()> {
+    crate::workspace_template::materials::save(store, bindings.revision, &bindings.items)
+        .map_err(|error| invalid(error.message))
 }
 
 // A registration pins the local file identity, not a claim of a whole-file
@@ -1139,7 +1171,7 @@ mod tests {
             .execute_batch(include_str!("materials/alexandria-fixture.sql"))
             .unwrap();
     }
-    fn source(store: &ProjectStore, text: &str, name: &str) -> MaterialEntry {
+    fn source(store: &mut ProjectStore, text: &str, name: &str) -> MaterialEntry {
         let path = store.root().join("fixture.txt");
         fs::write(&path, text).unwrap();
         let source = context_attachments::import_path(store.root(), &path).unwrap();
@@ -1148,12 +1180,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn workspace_copies_preserve_distinct_placements_and_shared_original_identity() {
-        let (_temp, store) = project();
-        let original = source(&store, "One shared original.", "Original");
+        let (_temp, mut store) = project();
+        let original = source(&mut store, "One shared original.", "Original");
         let attachment_id = original.attachment_id.as_deref().unwrap();
         let first =
-            bind_workspace_attachment(&store, attachment_id, "Research/source.txt").unwrap();
-        let second = bind_workspace_attachment(&store, attachment_id, "Drafts/source.txt").unwrap();
+            bind_workspace_attachment(&mut store, attachment_id, "Research/source.txt").unwrap();
+        let second =
+            bind_workspace_attachment(&mut store, attachment_id, "Drafts/source.txt").unwrap();
         assert_ne!(first.id, second.id);
         assert_ne!(first.id, original.id);
         assert_eq!(first.attachment_id, second.attachment_id);
@@ -1162,7 +1195,7 @@ mod tests {
         assert_eq!(resolve(&store, "Research/source.txt").unwrap().id, first.id);
         assert_eq!(resolve(&store, "Drafts/source.txt").unwrap().id, second.id);
         assert_eq!(
-            bind_workspace_attachment(&store, attachment_id, "Research/source.txt")
+            bind_workspace_attachment(&mut store, attachment_id, "Research/source.txt")
                 .unwrap()
                 .id,
             first.id
@@ -1177,15 +1210,15 @@ mod tests {
             "Notes\\source.txt",
         ] {
             assert!(
-                bind_workspace_attachment(&store, attachment_id, path).is_err(),
+                bind_workspace_attachment(&mut store, attachment_id, path).is_err(),
                 "accepted {path}"
             );
         }
     }
     #[test]
     fn admitting_large_source_does_not_publish_or_load_a_full_text_value() {
-        let (_temp, store) = project();
-        let entry = source(&store, &"words ".repeat(20_000), "Book");
+        let (_temp, mut store) = project();
+        let entry = source(&mut store, &"words ".repeat(20_000), "Book");
         let admission = admit(&store, &entry.id, 65_536).unwrap();
         assert!(admission.text.is_none());
         assert!(admission.complete);
@@ -1195,7 +1228,7 @@ mod tests {
                 .next()
                 .is_none()
         );
-        let small = source(&store, "Short text.", "Note");
+        let small = source(&mut store, "Short text.", "Note");
         assert!(
             admit(&store, &small.id, 65_536)
                 .unwrap()
@@ -1206,10 +1239,10 @@ mod tests {
     }
     #[test]
     fn names_fail_on_ambiguity_qualified_names_remain_exact() {
-        let (_temp, store) = project();
+        let (_temp, mut store) = project();
         assert!(list(&store).unwrap().is_empty());
-        let first = source(&store, "First source", "Research");
-        let second = source(&store, "Second source", "Research");
+        let first = source(&mut store, "First source", "Research");
+        let second = source(&mut store, "Second source", "Research");
         assert!(matches!(
             resolve(&store, "Research"),
             Err(MaterialError::Ambiguous(_))
@@ -1221,13 +1254,17 @@ mod tests {
     }
     #[test]
     fn removing_binding_preserves_source_and_exact_retained_evidence() {
-        let (_temp, store) = project();
-        let entry = source(&store, "A line with café 🦉.\r\nSecond line.\n", "Notes");
+        let (_temp, mut store) = project();
+        let entry = source(
+            &mut store,
+            "A line with café 🦉.\r\nSecond line.\n",
+            "Notes",
+        );
         let read = read(&store, &entry.id).unwrap();
         let before = read.evidence[0].clone();
-        set_pinned(&store, &entry.id, true).unwrap();
+        set_pinned(&mut store, &entry.id, true).unwrap();
         assert!(list(&store).unwrap()[0].pinned);
-        remove(&store, &entry.id).unwrap();
+        remove(&mut store, &entry.id).unwrap();
         assert!(list(&store).unwrap().is_empty());
         assert_eq!(
             read_evidence(&store, &entry.id, &before.id).unwrap().text,
@@ -1244,11 +1281,11 @@ mod tests {
     }
     #[test]
     fn sqlite_search_preserves_source_and_retains_evidence_after_source_change() {
-        let (temp, store) = project();
+        let (temp, mut store) = project();
         let path = temp.path().join("library.sqlite3");
         database(&path);
         let original = fs::read(&path).unwrap();
-        let entry = add_library(&store, &path, Some("Library")).unwrap();
+        let entry = add_library(&mut store, &path, Some("Library")).unwrap();
         let result = search(&store, &entry.id, "prayer").unwrap();
         assert!(!result.hits.is_empty());
         let hit = &result.hits[0];
@@ -1277,10 +1314,10 @@ mod tests {
     }
     #[test]
     fn workspace_metadata_cannot_replay_local_file_authority() {
-        let (temp, store) = project();
+        let (temp, mut store) = project();
         let path = temp.path().join("library.sqlite3");
         database(&path);
-        let entry = add_library(&store, &path, None).unwrap();
+        let entry = add_library(&mut store, &path, None).unwrap();
         grants()
             .lock()
             .unwrap()
@@ -1290,22 +1327,22 @@ mod tests {
             search(&store, &entry.id, "prayer"),
             Err(MaterialError::NeedsAuthorization(_))
         ));
-        assert!(add_library(&store, &path, None).unwrap().available);
+        assert!(add_library(&mut store, &path, None).unwrap().available);
     }
     #[test]
     fn nonempty_wal_is_rejected_without_creating_a_binding() {
-        let (temp, store) = project();
+        let (temp, mut store) = project();
         let path = temp.path().join("library.sqlite3");
         database(&path);
         fs::write(path.with_extension("sqlite3-wal"), b"uncheckpointed").unwrap();
-        assert!(add_library(&store, &path, None).is_err());
+        assert!(add_library(&mut store, &path, None).is_err());
         assert!(list(&store).unwrap().is_empty());
     }
     #[test]
     fn attachment_search_preserves_unicode_offsets_across_chunk_boundaries() {
-        let (_temp, store) = project();
+        let (_temp, mut store) = project();
         let text = format!("{}Kelvin \u{212a}elvin café 🦉 finish", "x".repeat(2045));
-        let entry = source(&store, &text, "Unicode");
+        let entry = source(&mut store, &text, "Unicode");
         let result = search(&store, &entry.id, "kelvin").unwrap();
         assert_eq!(result.hits.len(), 1);
         let hit = &result.hits[0];
@@ -1318,8 +1355,8 @@ mod tests {
     }
     #[test]
     fn retained_evidence_tampering_is_not_reinterpreted_as_source() {
-        let (_temp, store) = project();
-        let entry = source(&store, "Unchanged original", "Notes");
+        let (_temp, mut store) = project();
+        let entry = source(&mut store, "Unchanged original", "Notes");
         let evidence = read(&store, &entry.id).unwrap().evidence.remove(0);
         fs::write(
             storage(&store)

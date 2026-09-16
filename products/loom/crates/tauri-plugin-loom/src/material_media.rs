@@ -369,10 +369,11 @@ mod tests {
     #[cfg(unix)]
     fn preview_is_revoked_by_removal_and_cannot_cross_sessions() {
         let temp = tempfile::tempdir().unwrap();
-        let (store, _) = ProjectStore::initialize(temp.path().join("Writing"), "Writing").unwrap();
+        let (mut store, _) =
+            ProjectStore::initialize(temp.path().join("Writing"), "Writing").unwrap();
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native.png");
         let attachment = context_attachments::import_path(store.root(), &path).unwrap();
-        let entry = materials::bind_attachment(&store, &attachment.id, None).unwrap();
+        let entry = materials::bind_attachment(&mut store, &attachment.id, None).unwrap();
         let project = store.manifest().project_id;
         let session_id = CommandId::new();
         let source = bind_tokens(
@@ -417,8 +418,8 @@ mod tests {
             .is_none()
         );
         {
-            let session = state.session.lock().unwrap();
-            materials::remove(session.store.as_ref().unwrap(), &entry.id).unwrap();
+            let mut session = state.session.lock().unwrap();
+            materials::remove(session.store.as_mut().unwrap(), &entry.id).unwrap();
         }
         assert_eq!(read(&state, &request), Err(LoomAssetReadFailure::NotFound));
     }

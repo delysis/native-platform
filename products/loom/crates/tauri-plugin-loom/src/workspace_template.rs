@@ -5,6 +5,8 @@ use super::*;
 
 #[path = "workspace_collections.rs"]
 mod collections;
+#[path = "workspace_materials.rs"]
+pub(crate) mod materials;
 pub(super) use collections::{
     CollectionDefinition, CollectionScope, collection_definition, collection_definitions,
     collection_definitions_current, remove_collection, upsert_collection,
@@ -212,6 +214,7 @@ struct WorkspaceOverrides {
     theme: WorkspaceTheme,
     panes: BTreeMap<String, PaneOverrides>,
     collections: Vec<CollectionDefinition>,
+    materials: Vec<crate::materials::Binding>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -307,6 +310,7 @@ fn parse_config(markdown: &str) -> Result<WorkspaceConfig, String> {
     let overrides: WorkspaceOverrides = toml::from_str(config_fence(markdown)?)
         .map_err(|error| format!("Workspace settings: {error}"))?;
     collections::validate_definitions(&overrides.collections).map_err(|error| error.message)?;
+    crate::materials::validate_bindings(&overrides.materials).map_err(|error| error.to_string())?;
     let mut config = WorkspaceConfig {
         panes_enabled: overrides.panes_enabled.unwrap_or(true),
         collections: overrides.collections,

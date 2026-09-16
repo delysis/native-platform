@@ -189,7 +189,7 @@ pub(crate) fn collection_definition(
         .find(|definition| definition.id == id))
 }
 
-fn checked_base(
+pub(super) fn checked_base(
     store: &mut ProjectStore,
     expected_revision: Option<RevisionId>,
 ) -> Result<Option<LoadedDocument>, IpcFailure> {
@@ -222,7 +222,7 @@ fn reject_pending_draft(store: &ProjectStore, loaded: &LoadedDocument) -> Result
 }
 
 /// Edit only the authoritative fence; Markdown and all unrelated TOML stay intact.
-fn edit_config(
+pub(super) fn edit_config(
     markdown: &str,
     edit: impl FnOnce(&mut DocumentMut) -> Result<(), IpcFailure>,
 ) -> Result<String, IpcFailure> {
@@ -256,7 +256,7 @@ fn edit_config(
     Ok(output)
 }
 
-fn save_config(
+pub(super) fn save_config(
     store: &mut ProjectStore,
     loaded: Option<&LoadedDocument>,
     text: String,
@@ -269,7 +269,7 @@ fn save_config(
                 .save_document_if_source(
                     TEMPLATE_PATH,
                     DocumentContent::Prose(text),
-                    "Update workspace collections",
+                    "Update workspace configuration",
                     loaded.revision_id,
                     loaded.blob_id,
                 )
@@ -280,7 +280,7 @@ fn save_config(
                 .create_document_if_absent(
                     TEMPLATE_PATH,
                     DocumentContent::Prose(text),
-                    "Create workspace collection configuration",
+                    "Create workspace configuration",
                 )
                 .map_err(IpcFailure::store)?;
         }
@@ -314,7 +314,7 @@ fn serialized_table(definition: &CollectionDefinition) -> Result<Table, IpcFailu
     Ok(table)
 }
 
-fn set_owned_field(table: &mut Table, key: &str, mut value: Item) {
+pub(super) fn set_owned_field(table: &mut Table, key: &str, mut value: Item) {
     if let (Some(old), Some(new)) = (
         table.get(key).and_then(Item::as_value),
         value.as_value_mut(),
