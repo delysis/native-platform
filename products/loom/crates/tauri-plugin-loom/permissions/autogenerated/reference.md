@@ -30,6 +30,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-attachment-ingest`
 - `allow-attachment-import-choose`
 - `allow-attachment-import-paths`
+- `allow-workspace-copy-files`
 - `allow-attachment-reveal-original`
 - `allow-import-text-sources`
 - `allow-attachment-import-batch-choose`
@@ -2520,6 +2521,32 @@ Enables the weave_status command without any pre-configured scope.
 <td>
 
 Denies the weave_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-copy-files`
+
+</td>
+<td>
+
+Enables the workspace_copy_files command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-copy-files`
+
+</td>
+<td>
+
+Denies the workspace_copy_files command without any pre-configured scope.
 
 </td>
 </tr>

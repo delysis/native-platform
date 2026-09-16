@@ -648,6 +648,24 @@ mod tests {
     }
 
     #[test]
+    fn retrieval_accepts_literal_and_quoted_folder_references() {
+        for (source, name) in [
+            ("=find(@Notes/, \"rain\")", "Notes/"),
+            ("=find(@\"Travel notes/\", \"rain\")", "Travel notes/"),
+        ] {
+            assert_eq!(
+                parse_neural_command(source).unwrap(),
+                NeuralCommand::Expression(NeuralExpression::Find {
+                    source: Box::new(reference(name)),
+                    query: Box::new(NeuralExpression::Literal {
+                        text: "rain".into()
+                    })
+                })
+            );
+        }
+    }
+
+    #[test]
     fn retrieval_operands_count_toward_depth_and_node_limits() {
         // A find node and both its operands count, including nested queries.
         let deepest = format!(

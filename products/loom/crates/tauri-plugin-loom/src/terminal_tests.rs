@@ -153,6 +153,72 @@ fn imported_source(fixture: &TerminalFixture, text: &str) -> crate::materials::M
 }
 
 #[test]
+fn live_terminal_stop_latches_while_store_is_locked_and_rejects_stale_scope() {
+    let fixture = TerminalFixture::new();
+    let state = fixture.app.state::<PluginState>();
+    let command = CommandId::new();
+    let request = format!("terminal-{command}");
+    let native_run = GenerationRunId::new();
+    let control = Arc::new(TerminalControl::default());
+    state
+        .generations
+        .reserve(
+            GenerationFamilyIdentity {
+                request_id: request.clone(),
+                project_id: fixture.project_id.parse().unwrap(),
+                session_id: fixture.session_id.parse().unwrap(),
+                document_id: fixture.source.document_id,
+            },
+            vec![(native_run, BranchId::new())],
+        )
+        .unwrap();
+    state
+        .generations
+        .attach_cancellation(&request, control.clone())
+        .unwrap();
+    for (project, session) in [
+        (fixture.project_id.clone(), CommandId::new().to_string()),
+        (ProjectId::new().to_string(), fixture.session_id.clone()),
+    ] {
+        assert!(
+            tauri::async_runtime::block_on(terminal_cancel(
+                project,
+                session,
+                command.to_string(),
+                fixture.app.state::<PluginState>()
+            ))
+            .is_err()
+        );
+        assert!(!control.cancelled.load(Ordering::Acquire));
+    }
+    let held = state.session.lock().unwrap();
+    let app = fixture.app.handle().clone();
+    let project = fixture.project_id.clone();
+    let session = fixture.session_id.clone();
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let result = tauri::async_runtime::block_on(terminal_cancel(
+            project,
+            session,
+            command.to_string(),
+            app.state::<PluginState>(),
+        ));
+        send.send(result).unwrap();
+    });
+    let completed = receive.recv_timeout(Duration::from_secs(1));
+    let latched_while_locked = control.cancelled.load(Ordering::Acquire);
+    drop(held); // Release before joining even when the regression reappears.
+    worker.join().unwrap();
+    state.generations.complete_family(&request).unwrap();
+    assert!(
+        completed
+            .expect("Stop must not wait for the store lock")
+            .is_ok()
+    );
+    assert!(latched_while_locked);
+}
+
+#[test]
 fn find_run_needs_no_model_and_replays_retained_evidence_after_source_removal() {
     let fixture = TerminalFixture::new();
     let material = imported_source(&fixture, "The nightjar sings. @Missing stays source text.");
@@ -325,6 +391,7 @@ fn final_evidence_replaces_an_intermediate_generation_in_run_output() {
         receipt,
         media: Vec::new(),
         step: 1,
+        folder_scan_budget: material_context::FolderScanBudget::default(),
     };
     // Exercise retention after a preceding inference step without pretending
     // that a fixture executed a model. The retrieval below uses the real store.
@@ -404,6 +471,7 @@ fn evaluator_consultation_budgets_evidence_without_shortening_exact_values() {
         receipt,
         media: Vec::new(),
         step: 0,
+        folder_scan_budget: material_context::FolderScanBudget::default(),
     };
     let value = fixture.with_store(|store| material_context::resolve(store, &material.id).unwrap());
     let exact_before = material_context::exact(&value).unwrap();

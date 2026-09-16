@@ -759,6 +759,34 @@ impl GenerationRegistry {
         Ok(routes)
     }
 
+    /// Observe a live request without acquiring a document-store lock. Scope is
+    /// checked against the admitted family, including pre-worker reservations.
+    pub fn active_routes_for_request(
+        &self,
+        project_id: ProjectId,
+        session_id: CommandId,
+        request_id: &str,
+    ) -> Result<Vec<ActiveGenerationRoute>, GenerationRegistryError> {
+        let state = self.lock()?;
+        let Some(family) = state.families.get(request_id) else {
+            return Ok(Vec::new());
+        };
+        if family.identity.project_id != project_id || family.identity.session_id != session_id {
+            return Err(GenerationRegistryError::SessionMismatch);
+        }
+        family
+            .branches
+            .iter()
+            .map(|(run_id, branch_id)| {
+                let route = route_for_branch_locked(&state, *branch_id)?;
+                if route.run_id != *run_id || route.identity != family.identity {
+                    return Err(GenerationRegistryError::CorruptRegistry);
+                }
+                Ok(route)
+            })
+            .collect()
+    }
+
     pub fn cancel_run(
         &self,
         project_id: ProjectId,
@@ -1705,6 +1733,27 @@ mod tests {
             registry
                 .active_routes_for_document(project_id, CommandId::new(), document_id)
                 .expect("observe stale session")
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .active_routes_for_request(project_id, session_id, "scoped-family")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(matches!(
+            registry.active_routes_for_request(project_id, CommandId::new(), "scoped-family"),
+            Err(GenerationRegistryError::SessionMismatch)
+        ));
+        assert!(matches!(
+            registry.active_routes_for_request(ProjectId::new(), session_id, "scoped-family"),
+            Err(GenerationRegistryError::SessionMismatch)
+        ));
+        assert!(
+            registry
+                .active_routes_for_request(project_id, session_id, "missing")
+                .unwrap()
                 .is_empty()
         );
     }

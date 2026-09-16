@@ -11,7 +11,7 @@
   import type { CompletionCandidate } from './lib/completionSession';
   import type { TerminalSourceRange } from './lib/terminalSelection';
   import { visibleWorkspaceDocuments, readPinnedOutputs, rememberPinnedOutputs } from './lib/workspaceRetention';
-  import { workspaceRows } from './lib/workspaceTree';
+  import { workspaceRows, workspaceCopyDestination } from './lib/workspaceTree';
   import { readWorkspaceFolders, rememberWorkspaceFolder, type WorkspaceFolder } from './lib/workspaceFolders';
   import WorkspacePane from './lib/WorkspacePane.svelte';
   import MaterialView from './lib/MaterialView.svelte';
@@ -61,6 +61,7 @@
     getWeaveStatus,
     ingestImageAttachment,
     importAttachmentPaths,
+    copyWorkspaceFiles,
     revealAttachmentOriginal,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
@@ -394,6 +395,7 @@
   let workspaceRootExpanded = true;
   let workspaceDocuments: Record<string, string> = {};
   let workspaceDropActive = false;
+  let workspaceDropFolder: string | null = null;
   let outlineElement: HTMLElement | undefined;
   $: visibleWorkspaceFolders = project && !workspaceFolders.some(folder => folder.root === project?.root)
     ? [...workspaceFolders, { root: project.root, title: project.title }] : workspaceFolders;
@@ -479,7 +481,7 @@
     void refreshMaterials();
   }
   $: if (!project) { materialScope = ''; materialEntries = []; activeMaterial = null; materialOrigin = null; }
-  $: visibleMaterials = materialEntries.filter(item => !search.trim() || item.name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()))
+  $: visibleMaterials = materialEntries.filter(item => !item.workspace_path && (!search.trim() || item.name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())))
     .sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.name.localeCompare(b.name));
 
   async function refreshMaterials(): Promise<void> {
@@ -1136,7 +1138,7 @@
   }
 
   $: folderWarnings = project?.folder_warnings ?? [];
-  $: fileRows = workspaceRows(visibleWorkspaceDocuments(project?.documents ?? [], project?.retained_output_document_ids ?? [], pinnedOutputs), collapsedFolders, search);
+  $: fileRows = workspaceRows(visibleWorkspaceDocuments(project?.documents ?? [], project?.retained_output_document_ids ?? [], pinnedOutputs), collapsedFolders, search, materialEntries);
   $: loadedModel = models.find((model) => model.loaded) ?? null;
   $: currentModel = workspaceWriterModel(models, buildModelPolicy, curatedModels, workspaceTemplate, workspaceTemplateScope === `${project?.project_id}/${project?.session_id}`);
   $: suggestionSetupNeeded = Boolean(
@@ -2414,9 +2416,23 @@
     }
   }
 
+  function workspaceFolderAt(point: { x: number; y: number }): string | null {
+    return workspaceCopyDestination(window.document.elementFromPoint(point.x, point.y), outlineElement);
+  }
+
+  async function openMaterialWriting(id: string): Promise<void> {
+    const candidate = project?.documents.find(item => item.document_id === id);
+    if (!candidate) throw new Error('This writing is no longer in the folder.');
+    await selectDocument(candidate, true);
+    if (document?.summary.document_id === id) closeMaterial();
+  }
+
   async function handleNativeDrop(paths: string[], point: { x: number; y: number }): Promise<void> {
     if (fileCommandInFlight || opening || !paths.length) return;
     const captured = { session: project?.session_id, document: document?.summary.document_id, markdown: documentText, mode };
+    const outline = outlineElement?.getBoundingClientRect();
+    const inOutline = Boolean(outlineOpen && outline && point.x >= outline.left && point.x < outline.right && point.y >= outline.top && point.y < outline.bottom);
+    const destination = inOutline ? workspaceFolderAt(point) : null;
     try {
       const directories = await projectDropDirectories(paths);
       if (!componentMounted || applicationClosePhase !== 'running' || fileCommandInFlight || opening ||
@@ -2426,22 +2442,25 @@
         await openDroppedFolders(directories);
       } else {
         if (!project) return;
-        const outline = outlineElement?.getBoundingClientRect();
-        const inOutline = outlineOpen && outline && point.x >= outline.left && point.x < outline.right && point.y >= outline.top && point.y < outline.bottom;
         if (inOutline) {
+          if (destination === null) return;
+          const projectId = project.project_id;
+          const sessionId = project.session_id;
           for (const path of paths.filter(isDatabasePath)) {
-            const item = await addLibraryMaterialPath(project.project_id, project.session_id, path);
-            if (project?.session_id !== captured.session) return;
-            materialChanged(item);
+            const library = await addLibraryMaterialPath(projectId, sessionId, path);
+            if (project?.session_id !== sessionId) return;
+            materialChanged(library);
           }
           const files = paths.filter(path => !isDatabasePath(path));
-          const report = files.length ? await importAttachmentPaths(project.project_id, project.session_id, files) : { imported: [], failures: [] };
-          for (const item of report.imported) {
-            const bound = await bindAttachmentMaterial(project.project_id, project.session_id, item.id);
-            if (project?.session_id !== captured.session) return;
-            materialChanged(bound);
-          }
+          if (!files.length) return;
+          const report = await copyWorkspaceFiles(projectId, sessionId, destination, files);
+          if (project?.session_id !== sessionId) return;
+          report.materials.forEach(materialChanged);
+          const refreshed = await currentProjectSession();
+          if (project?.session_id !== sessionId) return;
+          project = refreshed;
           if (report.failures.length) recordFailure(new Error(report.failures.map(item => `${item.name}: ${item.message}`).join('\n')));
+          if (report.copied.length) announce(`Copied ${report.copied.length} file${report.copied.length === 1 ? '' : 's'}`);
           return;
         }
         const pane = Array.from(window.document.querySelectorAll<HTMLElement>('[data-workspace-pane]')).find(element => {
@@ -2468,15 +2487,18 @@
       if (payload.type === 'leave') {
         contextDropActive = false;
         workspaceDropActive = false;
+        workspaceDropFolder = null;
         return;
       }
       const point = nativeDropPoint(payload.position);
       const outline = outlineElement?.getBoundingClientRect();
       const inOutline = Boolean(outlineOpen && outline && point.x >= outline.left && point.x < outline.right && point.y >= outline.top && point.y < outline.bottom);
-      workspaceDropActive = inOutline;
+      workspaceDropFolder = inOutline ? workspaceFolderAt(point) : null;
+      workspaceDropActive = inOutline && workspaceDropFolder !== null;
       if (payload.type === 'drop') {
         workspaceDropActive = false;
         contextDropActive = false;
+        workspaceDropFolder = null;
         void handleNativeDrop(payload.paths, point);
         return;
       }
@@ -8131,7 +8153,7 @@
       void readMaterialEvidence(captured.projectId, captured.sessionId, '', evidenceId).then(evidence => {
         if (project?.session_id !== captured.sessionId) return;
         const item = materialEntries.find(entry => entry.id === evidence.material_id) ?? {
-          id: evidence.material_id, name: evidence.title, reference: evidence.reference, kind: 'attachment' as const,
+          id: evidence.material_id, name: evidence.title, reference: evidence.reference, kind: evidence.material_id.startsWith('folder-') ? 'folder' as const : 'attachment' as const,
           pinned: false, available: false, source_path: null, attachment_id: null
         };
         openMaterial(item); activeMaterialEvidence = evidence;
@@ -9815,7 +9837,7 @@
         <nav class="document-list" aria-label="Workspace folders">
           {#each visibleWorkspaceFolders as folder (folder.root)}
             {@const active = folder.root === project.root}
-            <button class="folder-row workspace-root" class:active type="button" title={folder.root}
+            <button class="folder-row workspace-root" class:active class:drop-target={active && workspaceDropFolder === ''} data-copy-folder={active ? '' : undefined} type="button" title={folder.root}
               aria-label={`${active && workspaceRootExpanded ? 'Collapse' : 'Open'} folder ${folder.title}`}
               aria-expanded={active && workspaceRootExpanded} disabled={fileCommandInFlight || opening}
               on:click={() => { if (active) workspaceRootExpanded = !workspaceRootExpanded; else void doOpenProject(folder.root); }}>
@@ -9825,8 +9847,13 @@
             <div class="workspace-root-documents">
           {#each fileRows as row (row.path)}
             {#if row.folder}
-              <button class="folder-row" type="button" style={`padding-left: ${8 + row.depth * 14}px`} aria-expanded={!collapsedFolders.has(row.path) || Boolean(search.trim())} on:click={() => { const next = new Set(collapsedFolders); if (next.has(row.path)) next.delete(row.path); else next.add(row.path); collapsedFolders = next; }}>
+              <button class="folder-row" class:drop-target={workspaceDropFolder === row.path} data-copy-folder={row.path} type="button" style={`padding-left: ${8 + row.depth * 14}px`} aria-expanded={!collapsedFolders.has(row.path) || Boolean(search.trim())} on:click={() => { const next = new Set(collapsedFolders); if (next.has(row.path)) next.delete(row.path); else next.add(row.path); collapsedFolders = next; }}>
                 <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{row.title}</span>
+              </button>
+            {:else if 'material' in row}
+              <button class="folder-row material-row" class:active={activeMaterial?.id === row.material.id} type="button" title={row.path}
+                style={`padding-left: ${8 + row.depth * 14}px`} on:click={() => openMaterial(row.material)}>
+                <span>{row.material.name}</span>{#if row.material.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}
               </button>
             {:else}
             {@const candidate = row.document}
@@ -9973,7 +10000,7 @@
         {#if activeMaterial}
           {#key `${project.session_id}/${activeMaterial.id}/${activeMaterialEvidence?.id ?? ""}`}
             <MaterialView projectId={project.project_id} sessionId={project.session_id} material={activeMaterial}
-              initialEvidence={activeMaterialEvidence} originTitle={materialOrigin?.title ?? null} onClose={closeMaterial} onUse={useMaterialReference}
+              initialEvidence={activeMaterialEvidence} originTitle={materialOrigin?.title ?? null} onClose={closeMaterial} onUse={useMaterialReference} onOpenDocument={openMaterialWriting}
               removable={materialEntries.some(item => item.id === activeMaterial?.id)} onRemoved={materialRemoved} onChanged={materialChanged} onReopen={() => void chooseMaterialLibrary()} />
           {/key}
         {:else if materialsOpen}

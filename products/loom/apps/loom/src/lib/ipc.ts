@@ -226,6 +226,14 @@ export function revealAttachmentOriginal(projectId: string, sessionId: string, a
   return call('attachment_reveal_original', { projectId, sessionId, attachmentId });
 }
 
+export function copyWorkspaceFiles(projectId: string, sessionId: string, destination: string, paths: readonly string[]): Promise<{
+  copied: string[];
+  materials: import('./materials').MaterialEntry[];
+  failures: { name: string; message: string }[];
+}> {
+  return call('workspace_copy_files', { projectId, sessionId, destination, paths: [...paths], operationId: newUlid() });
+}
+
 export function chooseAttachments(
   projectId: string,
   sessionId: string,
