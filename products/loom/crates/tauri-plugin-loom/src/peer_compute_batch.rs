@@ -261,3 +261,7 @@ impl CompletedBatch<'_> {
 #[cfg(test)]
 #[path = "peer_compute_batch_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "peer_compute_batch_qualification.rs"]
+mod native_qualification;
