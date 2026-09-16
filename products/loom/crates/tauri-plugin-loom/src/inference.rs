@@ -26,15 +26,14 @@ const KEYCHAIN_SERVICE: &str = "org.loom.inference";
 #[serde(deny_unknown_fields)]
 struct Dotfile {
     version: u32,
+    #[serde(default)]
     inference: InferenceConfig,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct InferenceConfig {
-    #[serde(default)]
     suggestions: Vec<String>,
-    #[serde(default)]
     weave: Vec<String>,
     servers: BTreeMap<String, Server>,
 }
@@ -132,10 +131,8 @@ fn invalid(message: &str) -> IpcFailure {
 impl InferenceConfig {
     fn validate(&self) -> Result<(), IpcFailure> {
         let config = self;
-        if config.servers.is_empty() || config.servers.len() > 16 {
-            return Err(invalid(
-                "configure between one and sixteen inference servers",
-            ));
+        if config.servers.len() > 16 {
+            return Err(invalid("configure at most sixteen inference servers"));
         }
         for list in [&config.suggestions, &config.weave] {
             if list.len() > 16
@@ -231,8 +228,24 @@ impl Service {
         let source =
             std::str::from_utf8(bytes).map_err(|_| invalid("~/.loom.toml must be UTF-8"))?;
         // Parser errors may contain source lines (including accidental secrets).
-        let file: Dotfile =
-            toml::from_str(source).map_err(|_| invalid("invalid ~/.loom.toml schema or syntax"))?;
+        let file: Dotfile = toml::from_str(source).map_err(|error: toml::de::Error| {
+            if let Some(span) = error.span()
+                && let Some(prefix) = source.get(..span.start)
+            {
+                let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                let column = prefix
+                    .rsplit('\n')
+                    .next()
+                    .unwrap_or_default()
+                    .chars()
+                    .count()
+                    + 1;
+                return invalid(&format!(
+                    "invalid ~/.loom.toml schema or syntax at line {line}, column {column}"
+                ));
+            }
+            invalid("invalid ~/.loom.toml schema or syntax")
+        })?;
         if file.version != 1 {
             return Err(invalid("unsupported ~/.loom.toml version"));
         }
@@ -407,5 +420,89 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn omitted_or_empty_scopes_keep_native_inference() {
+        for source in [
+            "version = 1".to_owned(),
+            "version = 1\n[inference]".to_owned(),
+            "version = 1\n[inference]\nsuggestions = []\nweave = []".to_owned(),
+            config("").replace("suggestions = ['desk']", "# suggestions = ['desk']"),
+            config("").replace("['desk']", "[]"),
+        ] {
+            let service = parse(&source).unwrap();
+            assert!(service.scope(true).is_none());
+            assert!(service.scope(false).is_none());
+            assert!(service.status().suggestions.is_none());
+            assert!(service.status().weave.is_none());
+        }
+        assert!(parse("version = 1\n[inference]\nsuggestions = ['absent']").is_err());
+    }
+
+    #[test]
+    fn manual_scope_does_not_authorize_suggestions() {
+        let service = parse(&config("").replace("suggestions =", "weave =")).unwrap();
+        assert!(service.scope(true).is_none());
+        assert_eq!(service.scope(false).unwrap().routes[0].backend_id, "desk");
+    }
+
+    #[test]
+    fn documented_toml_examples_are_valid_without_secret_reads() {
+        let documentation = include_str!("../../../docs/inference-dotfile.md");
+        let mut examples = 0;
+        for block in documentation.split("```toml\n").skip(1) {
+            let source = block.split_once("```").unwrap().0;
+            let service = parse(source).unwrap();
+            assert!(service.scope(true).is_some());
+            examples += 1;
+        }
+        assert_eq!(examples, 2);
+    }
+
+    #[test]
+    fn syntax_diagnostics_locate_errors_without_exposing_source() {
+        let error =
+            parse("version = 1\n[inference]\nprivate_secret = 'never-log-this'").unwrap_err();
+        assert_eq!(
+            error.message,
+            "invalid ~/.loom.toml schema or syntax at line 3, column 1"
+        );
+    }
+
+    #[test]
+    fn typos_and_out_of_bounds_settings_fail_closed() {
+        for source in [
+            config("").replace("version = 1", "version = 2"),
+            config("").replace("suggestions =", "suggestion ="),
+            config("").replace("['desk']", "['desk', 'desk']"),
+            config("timeout_seconds = 0"),
+            config("timeout_seconds = 601"),
+            config("").replace("context_tokens = 4096", "context_tokens = 0"),
+            config("[inference.servers.desk.quota]\nrequest_per_minute = 10"),
+            config("[inference.servers.desk.quota]\nrequests_per_minute = -1"),
+        ] {
+            assert!(parse(&source).is_err(), "invalid configuration accepted");
+        }
+        assert!(
+            parse(&config(
+                "[inference.servers.desk.quota]\nrequests_per_minute = 0"
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn dotfile_read_enforces_size_and_regular_file_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Service::read(dir.path()).is_err());
+        let path = dir.path().join(".loom.toml");
+        let mut source = "version = 1\n#".to_owned();
+        source.push_str(&"x".repeat(MAX_CONFIG_BYTES as usize - source.len()));
+        std::fs::write(&path, &source).unwrap();
+        assert!(Service::read(&path).unwrap().unwrap().scope(true).is_none());
+        source.push('x');
+        std::fs::write(&path, &source).unwrap();
+        assert!(Service::read(&path).is_err());
     }
 }

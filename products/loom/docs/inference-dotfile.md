@@ -4,7 +4,39 @@ Loom works without configuration. Its normal local model discovery, inference,
 editing, and storage paths remain in process. Power users can opt into inference
 servers with **`~/.loom.toml`**. There are no new settings panels or server controls.
 Restart Loom after changing the file. A missing or invalid file leaves the native
-path available; invalid files produce one diagnostic in the application log.
+path available; invalid files produce one diagnostic in the application log,
+with a line and column for syntax errors and without echoing source or credentials.
+
+This is the same TOML syntax used inside the workspace `.loom.md` file's
+`loom-workspace` block: named tables, snake_case keys, quoted strings, arrays, and
+`#` comments. The separate home-directory file grants server and credential
+authority; opening someone else's workspace must not grant that authority.
+The feature is included in every desktop build and needs no feature flag,
+plugin installation, setup screen, button, or menu.
+
+For a single local server, create `~/.loom.toml` with:
+
+```toml
+version = 1
+
+[inference]
+suggestions = ["desk"]
+
+[inference.servers.desk]
+endpoint = "http://127.0.0.1:8080/v1/completions"
+model = "my-writer"
+context_tokens = 8192
+auth = "none"
+```
+
+Change the endpoint, model, and context size to match your server. Restart Loom;
+its ordinary suggestions now use that route. Add `weave = ["desk"]` under
+`[inference]` to use it for manual weaving too. Comment out either scope or set
+it to `[]` to restore native inference for that scope. Server definitions alone
+activate nothing. Removing all inference settings, leaving only `version = 1`,
+is also valid. Timeout and quota settings are optional.
+
+For ordered fallback and a credentialed server:
 
 ```toml
 version = 1
