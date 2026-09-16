@@ -2567,6 +2567,7 @@ pub struct ProjectSnapshot {
     root: String,
     schema_version: u32,
     documents: Vec<DocumentSummary>,
+    directories: Vec<String>,
     retained_output_document_ids: Vec<String>,
     folder_warnings: Vec<String>,
     pending_recovery: u64,
@@ -10725,6 +10726,7 @@ fn snapshot_for(
         root,
         schema_version: store.manifest().schema_version,
         documents,
+        directories: store.folder_directories().to_vec(),
         retained_output_document_ids: ["retained experiment", "retained expression"]
             .into_iter()
             .map(|reason| store.document_ids_created_with_reason(reason))

@@ -40,6 +40,7 @@ export interface ProjectSnapshot {
   root: string;
   schema_version: number;
   documents: DocumentSummary[];
+  directories?: string[];
   retained_output_document_ids?: string[];
   folder_warnings?: string[];
   pending_recovery: number;

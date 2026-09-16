@@ -1147,7 +1147,7 @@
   }
 
   $: folderWarnings = project?.folder_warnings ?? [];
-  $: fileRows = workspaceRows(visibleWorkspaceDocuments(project?.documents ?? [], project?.retained_output_document_ids ?? [], pinnedOutputs), collapsedFolders, search, materialEntries);
+  $: fileRows = workspaceRows(visibleWorkspaceDocuments(project?.documents ?? [], project?.retained_output_document_ids ?? [], pinnedOutputs), collapsedFolders, search, materialEntries, project?.directories ?? []);
   $: loadedModel = models.find((model) => model.loaded) ?? null;
   $: currentModel = workspaceWriterModel(models, buildModelPolicy, curatedModels, workspaceTemplate, workspaceTemplateScope === `${project?.project_id}/${project?.session_id}`);
   let configuredWriter: { model_id: string; completion: boolean } | null = null;
