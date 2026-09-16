@@ -11,6 +11,8 @@ use crate::import_batch::ImportFailure;
 use crate::import_jobs::ImportOperation;
 use crate::{IpcFailure, PluginState, materials};
 
+pub(crate) mod directory;
+
 #[derive(Debug, Serialize)]
 pub(crate) struct CopyReport {
     copied: Vec<String>,
@@ -34,6 +36,13 @@ fn prepare(
         .ok_or_else(|| failure("The source has no filename."))?;
     let path = Path::new(destination).join(name);
     let file = PreparedWorkspaceCopy::read(source, &path, limit).map_err(IpcFailure::store)?;
+    prepare_file(root, file)
+}
+
+fn prepare_file(root: &Path, file: PreparedWorkspaceCopy) -> Result<PreparedCopy, IpcFailure> {
+    let name = Path::new(file.relative_path())
+        .file_name()
+        .ok_or_else(|| failure("The source has no filename."))?;
     let attachment = if file.is_writing() {
         None
     } else {

@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+cap-std = "=4.0.2"
+cap-fs-ext = "=4.0.2"
 desktop-model-defaults.workspace = true
 fte-types = { path = "../../../fte/crates/fte-types" }
 fte-router = { path = "../../../fte/crates/fte-router" }

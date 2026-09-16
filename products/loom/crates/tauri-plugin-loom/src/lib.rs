@@ -2114,6 +2114,7 @@ impl Builder {
                 import_batch::import_text_sources,
                 import_batch::attachment_import_batch_choose,
                 workspace_copy::workspace_copy_files,
+                workspace_copy::directory::workspace_copy_folder_choose,
                 connected_imports::import_account_cancel,
                 connected_imports::import_source_url,
                 connected_imports::import_accounts,

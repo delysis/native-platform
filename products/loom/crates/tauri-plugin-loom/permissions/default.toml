@@ -31,6 +31,7 @@ permissions = [
   "allow-attachment-import-choose",
   "allow-attachment-import-paths",
   "allow-workspace-copy-files",
+  "allow-workspace-copy-folder-choose",
   "allow-attachment-reveal-original",
   "allow-import-text-sources",
   "allow-attachment-import-batch-choose",

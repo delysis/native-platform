@@ -229,12 +229,18 @@ export function revealAttachmentOriginal(projectId: string, sessionId: string, a
   return call('attachment_reveal_original', { projectId, sessionId, attachmentId });
 }
 
-export function copyWorkspaceFiles(projectId: string, sessionId: string, destination: string, paths: readonly string[]): Promise<{
+export interface WorkspaceCopyReport {
   copied: string[];
   materials: import('./materials').MaterialEntry[];
   failures: { name: string; message: string }[];
-}> {
+}
+
+export function copyWorkspaceFiles(projectId: string, sessionId: string, destination: string, paths: readonly string[]): Promise<WorkspaceCopyReport> {
   return call('workspace_copy_files', { projectId, sessionId, destination, paths: [...paths], operationId: newUlid() });
+}
+
+export function copyWorkspaceFolder(projectId: string, sessionId: string, destination: string, operationId = newUlid()): Promise<WorkspaceCopyReport | null> {
+  return call('workspace_copy_folder_choose', { projectId, sessionId, destination, operationId });
 }
 
 export function chooseAttachments(

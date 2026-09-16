@@ -2,6 +2,8 @@
   import { onMount, tick } from 'svelte';
   import { convertFileSrc } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
+  import { Menu } from '@tauri-apps/api/menu';
+  import { LogicalPosition } from '@tauri-apps/api/dpi';
   import LoomEditor from './lib/LoomEditor.svelte';
   import TerminalPane from './lib/TerminalPane.svelte';
   import PaneDivider from './lib/PaneDivider.svelte';
@@ -63,6 +65,8 @@
     ingestImageAttachment,
     importAttachmentPaths,
     copyWorkspaceFiles,
+    copyWorkspaceFolder,
+    cancelImportAccount,
     revealAttachmentOriginal,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
@@ -615,6 +619,7 @@
     selectionEmpty: true
   };
   let contextAttachmentBusy = false;
+  let copyingFolder: { projectId: string; sessionId: string; destination: string; operationId: string } | null = null;
   let contextLoadError = '';
   let contextDropActive = false;
   let contextDocumentId = '';
@@ -2426,6 +2431,55 @@
 
   function workspaceFolderAt(point: { x: number; y: number }): string | null {
     return workspaceCopyDestination(window.document.elementFromPoint(point.x, point.y), outlineElement);
+  }
+
+  async function copyFolderHere(projectId: string, sessionId: string, destination: string): Promise<void> {
+    if (project?.project_id !== projectId || project.session_id !== sessionId ||
+        fileCommandInFlight || opening || contextAttachmentBusy || copyingFolder) return;
+    const copy = { projectId, sessionId, destination, operationId: newUlid() };
+    copyingFolder = copy;
+    try {
+      const report = await copyWorkspaceFolder(projectId, sessionId, destination, copy.operationId);
+      if (!report || project?.session_id !== sessionId) return;
+      report.materials.forEach(materialChanged);
+      if (report.failures.length) recordFailure(new Error(report.failures.map(item => `${item.name}: ${item.message}`).join('\n')));
+      announce(`Copied ${report.copied.length} file${report.copied.length === 1 ? '' : 's'}`);
+    } catch (error) {
+      recordFailure(error);
+    } finally {
+      if (copyingFolder === copy) copyingFolder = null;
+      if (project?.session_id === sessionId) {
+        await refreshProjectFilesystemState();
+        await refreshMaterials();
+      }
+    }
+  }
+
+  async function showFolderActions(event: MouseEvent | KeyboardEvent, destination: string): Promise<void> {
+    if (event instanceof KeyboardEvent && !isDocumentContextTriggerKey(event)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (!project || fileCommandInFlight || opening || contextAttachmentBusy) return;
+    const { project_id: projectId, session_id: sessionId } = project;
+    const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect();
+    const at = event instanceof MouseEvent
+      ? new LogicalPosition(event.clientX, event.clientY)
+      : new LogicalPosition(bounds.left + 12, bounds.bottom);
+    let menu: Menu | undefined;
+    try {
+      const copy = copyingFolder;
+      menu = await Menu.new({ items: copy?.sessionId === sessionId && copy.destination === destination
+        ? [{ id: 'stop-folder-copy', text: 'Stop Copying', action: () => {
+            void cancelImportAccount(copy.projectId, copy.sessionId, copy.operationId).catch(recordFailure);
+          } }]
+        : [{ id: 'copy-folder-here', text: 'Copy Folder Here…', enabled: !copy,
+          action: () => { void copyFolderHere(projectId, sessionId, destination).catch(recordFailure); } }] });
+      await menu.popup(at);
+    } catch (error) {
+      recordFailure(error);
+    } finally {
+      await menu?.close().catch(recordFailure);
+    }
   }
 
   async function openMaterialWriting(id: string): Promise<void> {
@@ -9849,15 +9903,17 @@
             <button class="folder-row workspace-root" class:active class:drop-target={active && workspaceDropFolder === ''} data-copy-folder={active ? '' : undefined} type="button" title={folder.root}
               aria-label={`${active && workspaceRootExpanded ? 'Collapse' : 'Open'} folder ${folder.title}`}
               aria-expanded={active && workspaceRootExpanded} disabled={fileCommandInFlight || opening}
+              on:contextmenu={(event) => { if (active) void showFolderActions(event, ''); }}
+              on:keydown={(event) => { if (active) void showFolderActions(event, ''); }}
               on:click={() => { if (active) workspaceRootExpanded = !workspaceRootExpanded; else void doOpenProject(folder.root); }}>
-              <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{folder.title}</span>
+              <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{folder.title}</span>{#if active && copyingFolder?.sessionId === project.session_id && copyingFolder.destination === ''}<span aria-label="Copying">…</span>{/if}
             </button>
             {#if active && workspaceRootExpanded}
             <div class="workspace-root-documents">
           {#each fileRows as row (row.path)}
             {#if row.folder}
-              <button class="folder-row" class:drop-target={workspaceDropFolder === row.path} data-copy-folder={row.path} type="button" style={`padding-left: ${8 + row.depth * 14}px`} aria-expanded={!collapsedFolders.has(row.path) || Boolean(search.trim())} on:click={() => { const next = new Set(collapsedFolders); if (next.has(row.path)) next.delete(row.path); else next.add(row.path); collapsedFolders = next; }}>
-                <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{row.title}</span>
+              <button class="folder-row" class:drop-target={workspaceDropFolder === row.path} data-copy-folder={row.path} type="button" style={`padding-left: ${8 + row.depth * 14}px`} aria-expanded={!collapsedFolders.has(row.path) || Boolean(search.trim())} on:contextmenu={(event) => void showFolderActions(event, row.path)} on:keydown={(event) => void showFolderActions(event, row.path)} on:click={() => { const next = new Set(collapsedFolders); if (next.has(row.path)) next.delete(row.path); else next.add(row.path); collapsedFolders = next; }}>
+                <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{row.title}</span>{#if copyingFolder?.sessionId === project.session_id && copyingFolder.destination === row.path}<span aria-label="Copying">…</span>{/if}
               </button>
             {:else if 'material' in row}
               <button class="folder-row material-row" class:active={activeMaterial?.id === row.material.id} type="button" title={row.path}
