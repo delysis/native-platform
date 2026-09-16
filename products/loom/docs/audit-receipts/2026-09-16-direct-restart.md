@@ -74,7 +74,86 @@ for that target also passed.
 
 ## Boundaries
 
-Post-repair packaged native convergence, native archived-history acceptance,
-phone-linked Signal, physical Internet peers, physical simultaneous typing/IME
-and lost-owner-key recovery remain separate acceptance work. This run did not
-link a Signal account, send a message or edit a real group.
+The following native receipt closes same-Mac archived-history, direct restart,
+ownership handoff and successor revocation acceptance for this revision.
+Phone-linked Signal, physical Internet peers, physical simultaneous typing/IME
+and lost-owner-key recovery remain separate work. This run did not link a Signal
+account, send a message or edit a real group. These local checks do not establish
+connectivity across separate physical networks or complete feature acceptance.
+
+## Optimized release and native archived late join
+
+The complete candidate script passed at
+`dc08fcd21c0d2806d2440fe4bd14582e604c3d46`, including the exact promotion and
+shutdown gates, 491 frontend tests, optimized native build, worker/source
+packaging, frozen offline dependency resolution and ad-hoc signing. The log is
+`/tmp/loom-release-dc08fcd.log`. Independent extraction verified executable,
+resource, corresponding-source and signature identities in
+`/tmp/loom-release-restart-artifact-check.json`. The packaged worker bytes are
+unchanged from the previously exercised encrypted-store/shutdown worker; that
+exact component receipt is reused, without claiming another worker run.
+
+Artifacts are under
+`dist/macos/loom-v0.1.0-dc08fcd21c0d-20260916T103524Z/`:
+
+* ZIP: `d730aa6c2b6e23061f9fe71f24440f217a095a1ef63f28ff6376727bcdf09587`.
+* Signed app executable:
+  `e5e80840215c016f7642c5304202f7c9fb5d92e209a36f79938209bafe1763dd`.
+* Worker: `748c26f4f0f4bff9de5bd4378ccfff1fea22d090acb44c84805ed1171a260722`.
+* Signal source archive:
+  `ce2785d6c55213b424e6741b02bc47164f4934b48ddb9fa272bc9df66fd12206`.
+
+Two isolated copies use `app.delysis.loom.restartdc08fcd.owner` and
+`app.delysis.loom.restartdc08fcd.peer`. The native owner created Garden and an
+invitation, then quit. An isolated Rust helper, holding the profile lease, used
+the production cabal library to add 1,100 synthetic edits. This prepares deep
+history; it is not a claim that a person typed those edits in the application.
+There were 1,101 signed envelopes, including 513 archived rows.
+
+The native owner reopened that history and projected **Archive entry 1100** into
+the editor. The peer then joined using the invitation created before the owner
+quit. Both ordinary Markdown files matched, and both databases retained the
+same 1,101 exact envelope hashes. Their archive layouts differed normally (513
+and 589 archived rows); each compressed or uncompressed row decoded to its exact
+original envelope hash. No replacement invitation or refreshed address was
+provided. Exact profile, bundle, executable, PID and state evidence is in
+`/tmp/loom-native-direct-restart.json`.
+
+## Native offline restart and successor revocation
+
+Fern opened the caught-up Garden document in the native editor. Sage reviewed
+Fern's exact device key and confirmed **Give Fern the keys**. Sage's invitation
+and ownership controls disappeared; Fern displayed **Owner · You** and gained
+those controls. Both copies retained the archived document.
+
+Fern quit. Sage changed the first paragraph to **Pond with lilies**, saved, and
+quit. Fern restarted and changed the second paragraph to **Willow with
+lanterns**, while Sage remained stopped. Read-only file and database inspection
+confirmed genuinely separate versions, each holding 1,102 changes. Fern's
+ownership remained intact after restart.
+
+Sage restarted and reopened Garden. Without a new invitation, manual sync,
+changed connection setting or injected address, both native editors displayed
+both changed paragraphs and **Archive entry 1100**. Their ordinary Markdown
+files were byte-identical (SHA-256
+`8bb787725615cf0d34de909dfd8ce4ee03c75246033a4f4438d74d2409c12f05`).
+All 1,101 prepared envelopes remained present. Both stores held the same 1,103
+exact envelope hashes, whose sorted-list digest was
+`3550391a8d5a2b59899a3457a74aa813fc6961caae112d0d1b98099491b80457`.
+Their IPv4 and IPv6 listen-port records were unchanged from initial pairing.
+
+Fern then reviewed and confirmed **Remove Sage**. Sage received the successor's
+signed revocation and displayed **This device is no longer a member. Your
+existing text remains here.** The native editor became read-only, document
+creation and recording were disabled, and **Recover my copies** remained
+available. Both stores contained the same signed roster, with one delegation,
+Fern as owner and Sage absent. The Markdown and complete signed history were
+unchanged by removal. This verifies preservation of accepted writing; it does
+not claim a new native orphan-recovery interaction.
+
+Both owned apps quit, and their exact executable paths had no remaining process.
+No model was loaded. The completed machine-readable native receipt is
+`/tmp/loom-native-direct-restart.json`, SHA-256
+`7b9f2ba62ba542145f03ff972819e6904a93f348c79e6dce8998460748f0bea3`.
+Native UI access was coordinated with the audit task; its Materials Check app
+was left untouched.
