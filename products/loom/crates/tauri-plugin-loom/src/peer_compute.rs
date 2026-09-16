@@ -1,9 +1,15 @@
 //! A peer can spend an explicit model grant, never the active manuscript's
-//! authority. Local model work preempts this single, separately owned job.
+//! authority. Local model work preempts one separately owned job or static batch.
 use super::*;
-use loom_cabal::compute::{ComputeExecutor, ComputeFailure, ComputeModel, HostComputeJob};
+use loom_cabal::compute::{
+    ComputeBatchFuture, ComputeBatchJob, ComputeBatchOutput, ComputeExecutor, ComputeFailure,
+    ComputeModel, HostComputeJob, MAX_COMPUTE_BATCH_JOBS,
+};
 use std::{future::Future, pin::Pin};
 use tokio_util::sync::CancellationToken;
+
+#[path = "peer_compute_batch.rs"]
+mod batch;
 
 const IDLE_DELAY: Duration = Duration::from_secs(2);
 
@@ -143,6 +149,7 @@ impl Drop for IdleJob {
 #[derive(Clone, Debug)]
 pub(super) struct NativeExecutor {
     backend: Arc<LlamaBackend>,
+    native_runtime: Arc<NativeHostRuntime>,
     close_requested: Arc<AtomicBool>,
     application: Arc<Mutex<ApplicationPhase>>,
     model: Arc<Mutex<ModelRegistry>>,
@@ -156,6 +163,7 @@ impl NativeExecutor {
     pub fn from_state(state: &PluginState) -> Self {
         Self {
             backend: state.backend.clone(),
+            native_runtime: state.native_runtime.clone(),
             close_requested: state.close_requested.clone(),
             application: state.application.clone(),
             model: state.model.clone(),
@@ -204,6 +212,35 @@ impl ComputeExecutor for NativeExecutor {
                 .selected()
                 .and_then(|loaded| model_claim(&loaded))
                 .is_ok_and(|claim| claim == *model)
+    }
+
+    fn batch_limit(&self) -> usize {
+        self.selected().map_or(1, |model| {
+            (model.profile.max_parallel_cases as usize)
+                .min(model.descriptor.capabilities.max_cases as usize)
+                .clamp(1, MAX_COMPUTE_BATCH_JOBS)
+        })
+    }
+
+    fn batch_compatible(&self, first: &HostComputeJob, next: &HostComputeJob) -> bool {
+        batch::compatible(first, next)
+    }
+
+    fn execute_batch(&self, mut jobs: Vec<ComputeBatchJob>) -> ComputeBatchFuture {
+        if jobs.len() == 1 {
+            let item = jobs.remove(0);
+            let peer = item.job.peer;
+            let job = item.job.id;
+            let work = self.execute(item.job, item.cancel);
+            return Box::pin(async move {
+                vec![ComputeBatchOutput {
+                    peer,
+                    job,
+                    result: work.await,
+                }]
+            });
+        }
+        batch::execute(self.clone(), jobs)
     }
 
     fn execute(
