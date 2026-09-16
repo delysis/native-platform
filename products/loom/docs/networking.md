@@ -442,6 +442,22 @@ upstream notices, pinned dependency lockfile, and corresponding source when
 distributing it. The process boundary provides lifecycle and dependency isolation;
 it is not a declaration about the legal scope of the combined distribution.
 
+The app bundles the worker and modified Presage license texts and upstream notices
+under `Contents/Resources/licenses/loom-signal`. The macOS release script checks
+those files against source, then places `loom-signal-source-<revision>.tar.gz` and
+`loom-signal-source.json` beside the app archive. The release receipt binds the
+signed worker, source receipt, and source archive by SHA-256. Distribute these
+artifacts together; a temporary CI artifact is not permanent source hosting.
+
+`cargo run --locked -p xtask -- signal-source <output-directory>` creates the source
+distribution from a clean checkout. It archives only tracked files at the exact
+commit, preserves the worker's path patches and notices, and vendors the locked
+Cargo dependencies. It verifies dependency resolution with an empty Cargo home
+and `--frozen` before writing its receipt. This proves offline resolution, not a
+full build on every platform; platform compilers and the prerequisites above are
+still needed. The extracted worker builds with `cargo build --frozen --release`
+from `products/loom/signal`. Existing output is never overwritten.
+
 The worker vendors the pinned Presage and SQLite store crates with four changed
 source files: public identity and group operations, an owned-pool constructor,
 monotonic group caching, and unsafe-code prohibitions. Each crate carries its upstream revision, original

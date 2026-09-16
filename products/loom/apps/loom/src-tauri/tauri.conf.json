@@ -32,6 +32,14 @@
   "bundle": {
     "active": true,
     "externalBin": ["binaries/loom-signal"],
+    "resources": {
+      "../../../signal/NOTICE.md": "licenses/loom-signal/NOTICE.md",
+      "../../../signal/LICENSE.md": "licenses/loom-signal/LICENSE.md",
+      "../../../signal/vendor/presage/LICENSE.md": "licenses/loom-signal/presage/LICENSE.md",
+      "../../../signal/vendor/presage/UPSTREAM.json": "licenses/loom-signal/presage/UPSTREAM.json",
+      "../../../signal/vendor/presage-store-sqlite/LICENSE.md": "licenses/loom-signal/presage-store-sqlite/LICENSE.md",
+      "../../../signal/vendor/presage-store-sqlite/UPSTREAM.json": "licenses/loom-signal/presage-store-sqlite/UPSTREAM.json"
+    },
     "targets": ["app"],
     "category": "Productivity",
     "shortDescription": "Local-first writing with private model branches",

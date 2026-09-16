@@ -2,6 +2,7 @@
 
 mod macos_smoke_support;
 mod model_check;
+mod signal_source;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -28,7 +29,8 @@ fn main() -> Result<()> {
         "macos-smoke-support" => {
             macos_smoke_support::run(&workspace_root(), &arguments.collect::<Vec<_>>())
         }
-        _ => bail!("usage: cargo xtask <policy|model-check|macos-smoke-support>"),
+        "signal-source" => signal_source::run(&workspace_root(), &arguments.collect::<Vec<_>>()),
+        _ => bail!("usage: cargo xtask <policy|model-check|macos-smoke-support|signal-source>"),
     }
 }
 
