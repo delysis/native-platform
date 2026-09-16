@@ -3,6 +3,7 @@
 mod macos_smoke_support;
 mod model_check;
 mod omp2;
+mod no_python;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -42,6 +43,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn check_policy(root: &Path) -> Result<()> {
+    no_python::check(root)?;
     check_workspace(root)?;
     omp2::verify(root)?;
     println!("native-platform policy: pass");

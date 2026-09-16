@@ -9,6 +9,8 @@
   export let sessionId: string;
   export let documentTitle: string;
   export let onUse: (items: ContextAttachment[]) => Promise<boolean>;
+  export let onImported: () => void = () => {};
+  function publishImported(): void { onImported(); }
   let accounts: ImportAccount[] = [];
   let service: 'gmail' | 'drive' = 'gmail';
   let webUrl = '';
@@ -73,6 +75,7 @@
     try {
       const token = next && canNext ? report?.next_page_token : undefined;
       report = await syncImportAccount(projectId, sessionId, source, account ?? '', query, token ?? null, operationId);
+      publishImported();
       lastQuery = query; lastSource = source; lastAccount = account ?? ''; selected = [];
       message = `${report.imported.length} imported; ${report.failures.length} failed.${report.next_page_token ? ' More results are available.' : ' End of results.'}`;
     } catch (error) { message = errorText(error); }
@@ -82,7 +85,7 @@
     operationId = newUlid();
     busy = true; message = 'Reading local sources…';
     try {
-      report = await chooseImportBatch(projectId, sessionId, folder, operationId); selected = [];
+      report = await chooseImportBatch(projectId, sessionId, folder, operationId); selected = []; publishImported();
       message = `${report.imported.length} imported; ${report.failures.length} failed or skipped.`;
     } catch (error) { message = errorText(error); }
     finally { busy = false; operationId = ''; }
@@ -90,14 +93,14 @@
   async function web(): Promise<void> {
     operationId = newUlid();
     busy = true; message = 'Importing the public web document…';
-    try { report = await importSourceUrl(projectId, sessionId, webUrl.trim(), operationId); selected = []; message = 'Web source imported locally. Select it below to add it to context.'; }
+    try { report = await importSourceUrl(projectId, sessionId, webUrl.trim(), operationId); selected = []; publishImported(); message = 'Source retained. Select it below to reference it.'; }
     catch (error) { message = errorText(error); }
     finally { busy = false; operationId = ''; }
   }
   async function paste(): Promise<void> {
     operationId = newUlid();
     busy = true;
-    try { report = await importPastedSources(projectId, sessionId, pasted, separator, operationId); selected = []; message = `${report.imported.length} pasted sources imported; ${report.failures.length} failed.`; }
+    try { report = await importPastedSources(projectId, sessionId, pasted, separator, operationId); selected = []; publishImported(); message = `${report.imported.length} pasted sources imported; ${report.failures.length} failed.`; }
     catch (error) { message = errorText(error); }
     finally { busy = false; operationId = ''; }
   }
@@ -105,16 +108,15 @@
     busy = true;
     try {
       if (await onUse(report?.imported.filter((item) => selected.includes(item.id)) ?? [])) {
-        message = 'Selected sources added to this document’s context.'; selected = [];
+        message = 'References inserted.'; selected = [];
       }
     } catch (error) { message = errorText(error); }
     finally { busy = false; }
   }
 </script>
 
-<details class="import-sources">
-  <summary>Import sources</summary>
-  <p>Selected sources become context for <strong>{documentTitle}</strong>.</p>
+<section class="import-sources">
+  <p>Use here inserts references in <strong>{documentTitle}</strong>.</p>
   <p>Bring documents, Slack archives, Claude conversations, LinkedIn exports, and mailboxes into this project.</p>
   <div class="actions">
     <button disabled={busy} on:click={() => void local(false)}>Choose files</button>
@@ -164,9 +166,9 @@
       {/each}
       {#each report.failures as item}<p class="failure">{item.name}: {item.message}</p>{/each}
     </div>
-    {#if report.imported.length > 0}<button disabled={busy || selected.length === 0 || selected.length > 16} on:click={() => void useSelected()}>Add selected to context ({selected.length}/16)</button>{/if}
+    {#if report.imported.length > 0}<button disabled={busy || selected.length === 0 || selected.length > 16} on:click={() => void useSelected()}>Use here ({selected.length}/16)</button>{/if}
   {/if}
-</details>
+</section>
 
 <style>
   .import-sources { min-width: 0; margin: 0; color: var(--ink); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }

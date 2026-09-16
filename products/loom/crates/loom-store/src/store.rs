@@ -1163,6 +1163,23 @@ impl ProjectStore {
         Ok(documents)
     }
 
+    /// Live documents whose initial revision has this creation reason. Later
+    /// edits and renames preserve membership; paths never imply provenance.
+    pub fn document_ids_created_with_reason(&self, reason: &str) -> Result<Vec<DocumentId>> {
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT d.document_id
+             FROM documents d JOIN revisions r ON r.document_id = d.document_id
+             WHERE r.parent_revision_id IS NULL AND r.reason = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM document_deletions deletion
+                   WHERE deletion.document_id = d.document_id
+               )
+             ORDER BY d.document_id",
+        )?;
+        let rows = statement.query_map([reason], |row| row.get::<_, String>(0))?;
+        rows.map(|row| parse_id(&row?, "document_id")).collect()
+    }
+
     /// Atomically captures the exact ordinary manuscript into private state,
     /// installs it at the new no-clobber path, and commits that path and title
     /// as the final fallible step. No visible pathname is ever unlinked.
@@ -6492,6 +6509,106 @@ mod tests {
             "appeared externally"
         );
         assert_eq!(store.pending_outbox_count().expect("pending outbox"), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creation_reason_selects_all_live_outputs_after_rename_and_edit() {
+        let (_directory, mut store) = new_store();
+        let evidence = store
+            .store_provenance_blob(b"retention test evidence")
+            .unwrap();
+        store
+            .create_document_if_absent(
+                "Runs/My writing.md",
+                DocumentContent::Prose("Writer's own document".into()),
+                "new document",
+            )
+            .unwrap();
+        store
+            .save_document(
+                "Runs/My writing.md",
+                DocumentContent::Prose("Still the writer's document".into()),
+                "retained experiment",
+            )
+            .unwrap();
+        let mut expected = Vec::new();
+        // Include more than the terminal's bounded history page, with every
+        // intermediate result retaining its own creation identity.
+        for step in 0..70 {
+            let path = format!("Runs/session/{step}.md");
+            store
+                .create_generated_document_if_absent(
+                    &path,
+                    DocumentContent::Prose(format!("Intermediate result {step}")),
+                    "retained experiment",
+                    evidence,
+                )
+                .unwrap();
+            expected.push(store.read_document(&path).unwrap().document_id);
+        }
+        let mut authority = store.open_document_file("Runs/session/0.md").unwrap();
+        let renamed = store
+            .rename_document(&mut authority, "A new title")
+            .unwrap();
+        assert_eq!(renamed.document_id, expected[0]);
+        store
+            .save_document(
+                &renamed.relative_path,
+                DocumentContent::Prose("Edited result".into()),
+                "human edit",
+            )
+            .unwrap();
+        let deleted = store.read_document("Runs/session/1.md").unwrap();
+        store
+            .delete_document_file_idempotent(
+                CommandId::new(),
+                deleted.document_id,
+                deleted.revision_id,
+                deleted.blob_id,
+            )
+            .unwrap();
+        expected.retain(|id| *id != deleted.document_id);
+        expected.sort();
+        assert_eq!(
+            store
+                .document_ids_created_with_reason("retained experiment")
+                .unwrap(),
+            expected
+        );
+        store
+            .create_derived_document_if_absent(
+                "Runs/session/result.md",
+                DocumentContent::Prose("Retained source evidence".into()),
+                "retained expression",
+                evidence,
+            )
+            .unwrap();
+        let derived = store
+            .read_document("Runs/session/result.md")
+            .unwrap()
+            .document_id;
+        assert_eq!(
+            store
+                .document_ids_created_with_reason("retained expression")
+                .unwrap(),
+            [derived]
+        );
+        let root = store.root().to_path_buf();
+        drop(store);
+        let reopened = ProjectStore::open(root).unwrap();
+        assert_eq!(
+            reopened
+                .document_ids_created_with_reason("retained experiment")
+                .unwrap(),
+            expected
+        );
+        assert!(
+            reopened
+                .document_ids_created_with_reason("not a creation reason")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]

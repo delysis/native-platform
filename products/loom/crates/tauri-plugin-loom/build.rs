@@ -1,4 +1,13 @@
 const COMMANDS: &[&str] = &[
+    "material_list",
+    "material_read",
+    "material_search",
+    "material_read_evidence",
+    "material_bind_attachment",
+    "material_set_pinned",
+    "material_remove",
+    "material_add_library",
+    "material_add_library_path",
     "project_open_default",
     "project_prepare_open",
     "project_prepare_open_path",
