@@ -62,6 +62,48 @@ validation and diff checks passed. Logs are
 `/tmp/loom-compute-retention-final-gate.log` and
 `/tmp/loom-retention-grant-settlement.log`.
 
-This is storage and integration evidence. Native acceptance of the new format,
-collaborative-document archival, owner-device recovery/transfer, phone-linked
-Signal and physical Internet peers remain separate unfinished work.
+## Native acceptance of format 3
+
+Two separately identified, ad-hoc-signed macOS apps built from clean
+`476c6f8b9b9582a493ec2017dc24dc7b032050ff` exercised the new stores. Their bundle
+identifiers were `app.delysis.loom.retention476c6f8.owner` and
+`app.delysis.loom.retention476c6f8.peer`. Executable SHA-256 values were
+`c61fb21bacaedca1070704fa27cf0cc2800a24f7ab3a396107021e3011617749` and
+`51111af34ab6f6548470e0bbb5b01a0bd1785c296048c958bfbd7103d887872d`.
+The receipt binds the frontend assets, fresh isolated profiles and process IDs.
+Earlier acceptance profiles and their author edits were preserved.
+
+Sage admitted Loom through the native invitation flow and granted three Gemma 4
+jobs, each limited to 512 tokens and 120 seconds. The host loaded the real local
+Gemma 4 12B model and projector; the requester had no model files.
+
+| Job | Native interaction | Retained outcome |
+| --- | --- | --- |
+| `91db2f35-d356-4de4-e172-f83cd9f20fa3` | Submitted a framed moonlit-pond prompt | Completed; 15 generated tokens; the requester displayed the host's sentence |
+| `63704168-81db-aa1a-7ee0-b65c743f940b` | Ctrl+C during a counting response, then Check | Signed cancellation recovered after initial uncertainty; native worker stopped after 71 tokens |
+| `69eafb9c-d93e-cd0e-2067-cfb0cbb22b1d` | Quit host during another counting response | HostBusy after the native worker stopped at 78 tokens; requester displayed the plain-language shutdown message |
+
+Both ledgers retained identical signed receipt chains, with settlement and exact
+encoded byte totals agreeing: zero active jobs/bytes, 7,974 retained host bytes
+and 9,489 retained requester bytes. Native inference evidence hashes were
+`2682909b9c15d86321c1af2504db3bb1565bd13e337b8804cad1566633c065e7`,
+`2dcc7c8d5bf217cc012d97b6573c605d302b37d4ed21fcd8dfdfb46dc6b25b2b` and
+`73a4ed45746cf80f9821f138924b9167eb4de6506bd9dc7ed404a09b328eeabe`, respectively.
+
+Restarting both apps and reopening their saved workspaces restored all three
+terminal outcomes and automatic membership reconnection without another
+invitation. Exact input rows, receipt hashes and job counts were unchanged;
+the host showed zero of three jobs remaining. No new execution occurred.
+Both manuscript copies kept SHA-256
+`1c01e6b776ff0bf8c8a1c808762d9be4873c0fc8bea29f8911563949bcc0c762`.
+The exhausted synthetic grant was revoked, both apps quit, and their final
+processes (60950 and 61048) were absent.
+
+Detailed local receipt: `/tmp/loom-native-compute-retention.json`, SHA-256
+`9d66f2c596d70443c8ab39bcc396ca9ef152ba7c49b897deb8e2e70ce8882299`.
+Required macOS CI and dependency checks passed at `476c6f8`; advisory platforms
+were still running when inspected. This is actual same-Mac UI and inference
+evidence, not hundreds of native jobs or physical Internet acceptance.
+
+Collaborative-document archival, owner-device recovery/transfer, phone-linked
+Signal, physical Internet peers and final release acceptance remain unfinished.
