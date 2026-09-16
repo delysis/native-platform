@@ -9949,7 +9949,14 @@
           {/if}
           {#if desktop && document}
             {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
-              <DocumentMaterials title={document.summary.title} instructions={contextText} attachments={contextAttachments} disabled={editorReadonly || contextAttachmentBusy} error={contextLoadError} onInstructions={updateContextText} onFlush={flushContextText} onRemove={(id) => void removeContextAttachment(id)} onSave={saveMaterialExcerpt} />
+              <DocumentMaterials title={document.summary.title} instructions={contextText} attachments={contextAttachments} disabled={editorReadonly || contextAttachmentBusy} error={contextLoadError} onInstructions={updateContextText} onFlush={flushContextText} onRemove={(id) => void removeContextAttachment(id)} onSave={saveMaterialExcerpt}>
+                {#if cabal?.documents.some(item => item.local.summary.document_id === document?.summary.document_id)}
+                  <ShareContext scope={{ projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id }}
+                    readonly={editorReadonly || contextAttachmentBusy || Boolean(cabal?.read_only)}
+                    beforeReview={persistCurrentContextText}
+                    onOpen={(published) => openSharedContextDocument(published.document_id)} />
+                {/if}
+              </DocumentMaterials>
             {/key}
           {/if}
         </nav>
@@ -10082,14 +10089,6 @@
                 </span>
               </div>
             </div>
-            {#if project && cabal?.documents.some(item => item.local.summary.document_id === document?.summary.document_id)}
-              {#key `${project.project_id}/${project.session_id}/${document.summary.document_id}`}
-                <ShareContext scope={{ projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id }}
-                  readonly={editorReadonly || contextAttachmentBusy || Boolean(cabal?.read_only)}
-                  beforeReview={persistCurrentContextText}
-                  onOpen={(published) => openSharedContextDocument(published.document_id)} />
-              {/key}
-            {/if}
             {#if contextAttachments.length > 0}
               <div class="completion-context-items">
                 {#each contextAttachments as attachment (attachment.id)}

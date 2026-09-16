@@ -302,7 +302,7 @@ with these attachments remains unverified. Peer model jobs retain and transmit
 the exact selected native media. Document-context settings remain local; they are
 not silently published with a manuscript.
 
-The context pane of a shared document offers **Share context as a document**.
+The Materials sidebar of a shared document offers **Share context as a document**.
 The native review names the current cabal members and shows the exact visible
 authored instructions, quoted source excerpts, and selected files. Publication
 creates an ordinary Markdown document under
