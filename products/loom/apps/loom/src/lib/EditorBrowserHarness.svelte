@@ -40,6 +40,10 @@
   let markdown = initialValue;
   let pendingMarkdown: string | null = null;
   let editor: LoomEditor;
+  export function insertSourceQuotation(reference: Element, quotation: string): boolean {
+    const anchor = editor.captureTextInsertionAnchor(reference);
+    return Boolean(anchor && editor.insertMarkdownAtAnchor(anchor, quotation));
+  }
   const completionContextKey = completionSessionContextKey(
     'browser-session',
     'browser-document',

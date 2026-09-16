@@ -488,18 +488,23 @@
     return view && !readonly && !composing ? visualTerminalRange(view.state, lastEmitted) : null;
   }
 
-  export function captureTextInsertionAnchor(): {
+  export function captureTextInsertionAnchor(openedReference?: Element): {
     surfaceKey: string;
     markdown: string;
     from: number;
     to: number;
   } | null {
     if (!view || readonly || composing) return null;
+    // Clicking a source places the browser caret inside its label. Derivations
+    // from that source belong after the intact reference, not inside its name.
+    const afterReference = openedReference && view.dom.contains(openedReference)
+      ? view.posAtDOM(openedReference, openedReference.childNodes.length)
+      : null;
     return {
       surfaceKey,
       markdown: lastEmitted,
-      from: view.state.selection.from,
-      to: view.state.selection.to
+      from: afterReference ?? view.state.selection.from,
+      to: afterReference ?? view.state.selection.to
     };
   }
 

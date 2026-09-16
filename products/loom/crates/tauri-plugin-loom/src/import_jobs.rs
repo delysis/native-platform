@@ -18,6 +18,7 @@ use std::{
 pub(super) struct ImportJobs {
     inner: Mutex<Registry>,
     drain: Mutex<()>,
+    join_workers: Mutex<()>,
 }
 
 #[derive(Debug, Default)]
@@ -28,6 +29,7 @@ struct Registry {
     revoked_session: Option<String>,
     active: Option<ActiveImport>,
     workers: Vec<JoinHandle<()>>,
+    coordinators: Vec<JoinHandle<()>>,
 }
 
 #[derive(Debug)]
@@ -57,6 +59,21 @@ fn validate_operation_id(id: &str) -> Result<(), IpcFailure> {
     id.parse::<crate::CommandId>()
         .map(|_| ())
         .map_err(|_| failure("The import operation ID is invalid."))
+}
+
+fn reap_finished(workers: &mut Vec<JoinHandle<()>>) -> Result<(), IpcFailure> {
+    let mut index = 0;
+    while index < workers.len() {
+        if workers[index].is_finished() {
+            workers
+                .swap_remove(index)
+                .join()
+                .map_err(|_| failure("An import worker stopped unexpectedly."))?;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
 }
 
 impl ImportJobs {
@@ -123,10 +140,10 @@ impl ImportJobs {
     }
 
     fn finish_worker(&self, id: ThreadId) -> Result<(), IpcFailure> {
-        // Sending a result does not finish a thread. Join before reporting
-        // completion, and share drain ownership so close cannot miss this join.
-        let _drain = self
-            .drain
+        // Close must wait for this join, but a coordinator must never wait for
+        // the close lock: close joins the coordinator itself.
+        let _join = self
+            .join_workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let worker = {
@@ -155,7 +172,7 @@ impl ImportJobs {
             .drain
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let workers = {
+        let coordinators = {
             let mut registry = self
                 .inner
                 .lock()
@@ -169,12 +186,31 @@ impl ImportJobs {
                 active.cancel.store(true, Ordering::Release);
                 active.signal.send_replace(true);
             }
-            std::mem::take(&mut registry.workers)
+            std::mem::take(&mut registry.coordinators)
         };
-        let count = workers.len();
+        let mut count = coordinators.len();
         let mut panicked = false;
-        for worker in workers {
-            panicked |= worker.join().is_err();
+        {
+            let _join = self
+                .join_workers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let workers = std::mem::take(
+                &mut self
+                    .inner
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .workers,
+            );
+            count += workers.len();
+            for worker in workers {
+                panicked |= worker.join().is_err();
+            }
+        }
+        // Coordinators may still be returning from compute. Release the
+        // worker-join lock before waiting for them to finish.
+        for coordinator in coordinators {
+            panicked |= coordinator.join().is_err();
         }
         if panicked {
             Err(failure("An import worker stopped unexpectedly."))
@@ -212,7 +248,7 @@ impl ImportOperation {
                     }
                 })
                 .map_err(|error| failure(error.to_string()))?;
-            registry.workers.push(worker);
+            registry.coordinators.push(worker);
         }
         sender
             .send((self, work))
@@ -253,12 +289,19 @@ impl ImportOperation {
         {
             return Err(failure("Import stopped before it began."));
         }
-        if registry.active.is_some() || registry.workers.iter().any(|worker| !worker.is_finished())
+        if registry.active.is_some()
+            || registry
+                .workers
+                .iter()
+                .chain(&registry.coordinators)
+                .any(|worker| !worker.is_finished())
         {
             return Err(failure(
                 "Another import is running. Stop it or wait for it to finish.",
             ));
         }
+        reap_finished(&mut registry.workers)?;
+        reap_finished(&mut registry.coordinators)?;
         let cancel = Arc::new(AtomicBool::new(false));
         let (signal, _) = tokio::sync::watch::channel(false);
         registry.active = Some(ActiveImport {
@@ -310,18 +353,7 @@ impl ImportOperation {
                 return Err(failure("Loom is closing."));
             }
             // Reap completed handles without waiting for any running worker.
-            let mut index = 0;
-            while index < registry.workers.len() {
-                if registry.workers[index].is_finished() {
-                    registry
-                        .workers
-                        .swap_remove(index)
-                        .join()
-                        .map_err(|_| failure("An import worker stopped unexpectedly."))?;
-                } else {
-                    index += 1;
-                }
-            }
+            reap_finished(&mut registry.workers)?;
             let cancel = Arc::clone(&self.cancel);
             let worker = std::thread::Builder::new()
                 .name("loom-import".into())
@@ -478,9 +510,12 @@ mod tests {
         operation
             .dispatch(move |operation| {
                 tauri::async_runtime::block_on(async {
-                    started.send(()).unwrap();
-                    let result: Result<(), IpcFailure> =
-                        operation.network(std::future::pending()).await;
+                    let result: Result<(), IpcFailure> = operation
+                        .network(async move {
+                            started.send(()).unwrap();
+                            std::future::pending().await
+                        })
+                        .await;
                     assert!(result.is_err());
                 });
                 finished.send(()).unwrap();
@@ -492,7 +527,14 @@ mod tests {
             ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
                 .is_err()
         );
-        state.imports.shutdown().unwrap();
+        let jobs = Arc::clone(&state.imports);
+        let (closed, observed_close) = mpsc::channel();
+        let close = std::thread::spawn(move || closed.send(jobs.shutdown()).unwrap());
+        observed_close
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown must not hold a lock needed by the coordinator")
+            .unwrap();
+        close.join().unwrap();
         observed_finish
             .recv_timeout(Duration::from_secs(5))
             .unwrap();
@@ -828,9 +870,10 @@ mod tests {
     #[test]
     fn direct_import_reports_partial_success_and_retry_reuses_identity() {
         let temporary = tempfile::tempdir().unwrap();
+        let sources = tempfile::tempdir().unwrap();
         let (state, project, session) = opened(temporary.path());
         tauri::async_runtime::block_on(async {
-            let source = temporary.path().join("source.txt");
+            let source = sources.path().join("source.txt");
             std::fs::write(&source, "Exact source.\r\n").unwrap();
             let operation_id = CommandId::new().to_string();
             let operation =

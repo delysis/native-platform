@@ -99,11 +99,11 @@
   }
 
   /** Keep the initiating pane and exact selection while a source takes focus. */
-  export function captureReferenceInsertion(): ((markdown: string) => boolean) | null {
+  export function captureReferenceInsertion(openedReference?: Element): ((markdown: string) => boolean) | null {
     if (!mounted || readonly || composing || busy || !source || !flush() || (config.kind === 'editor' && !editingCurrent)) return null;
     const captured = { scope, kind: config.kind, documentId: source.summary.document_id, value, entry, visual,
       start: entryArea?.selectionStart ?? entry.length, end: entryArea?.selectionEnd ?? entry.length };
-    const visualAnchor = visual && config.kind === 'editor' ? editor?.captureTextInsertionAnchor() : null;
+    const visualAnchor = visual && config.kind === 'editor' ? editor?.captureTextInsertionAnchor(openedReference) : null;
     const sourceAnchor = !visual && config.kind === 'editor' ? sourceEditor?.captureTextInsertionAnchor() : null;
     return markdown => {
       if (!mounted || readonly || composing || busy || scope !== captured.scope || config.kind !== captured.kind ||

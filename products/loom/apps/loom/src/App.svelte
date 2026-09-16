@@ -504,22 +504,22 @@
       if (project?.project_id === captured.projectId && project.session_id === captured.sessionId) materialEntries = entries;
     } catch (error) { if (project?.session_id === captured.sessionId) recordFailure(error); }
   }
-  function captureMaterialOrigin(): void {
+  function captureMaterialOrigin(openedReference?: Element): void {
     if (!project || !document || editorReadonly || compositionActive || !flushEditors()) { materialOrigin = null; return; }
-    const paneInsert = materialOriginPane ? paneEditors[materialOriginPane]?.captureReferenceInsertion() ?? null : null;
+    const paneInsert = materialOriginPane ? paneEditors[materialOriginPane]?.captureReferenceInsertion(openedReference) ?? null : null;
     if (materialOriginPane && !paneInsert) { materialOrigin = null; return; }
     materialOrigin = {
       paneInsert, paneId: materialOriginPane,
       projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id,
       title: document.summary.title, markdown: documentText, mode,
-      visualAnchor: mode === 'visual' ? visualEditor?.captureTextInsertionAnchor() ?? null : null,
+      visualAnchor: mode === 'visual' ? visualEditor?.captureTextInsertionAnchor(openedReference) ?? null : null,
       sourceAnchor: mode === 'source' ? sourceEditor?.captureTextInsertionAnchor() ?? null : null
     };
   }
-  function openMaterial(item: MaterialEntry): void {
+  function openMaterial(item: MaterialEntry, openedReference?: Element): void {
     if (compositionActive || !flushEditors()) return;
     showMainPane();
-    if (!activeMaterial && !materialsOpen) captureMaterialOrigin();
+    if (!activeMaterial && !materialsOpen) captureMaterialOrigin(openedReference);
     activeMaterialEvidence = null; activeMaterial = item; materialsOpen = false; addMenuOpen = false;
     clearSuggestionTimerHandle();
   }
@@ -608,7 +608,7 @@
     applyFormatting: (action: VisualFormatAction, href?: string) => boolean;
     formattingDiagnostic: () => string;
     insertTextAtSelection: (text: string) => boolean;
-    captureTextInsertionAnchor: () => VisualTextInsertionAnchor | null;
+    captureTextInsertionAnchor: (openedReference?: Element) => VisualTextInsertionAnchor | null;
     insertTextAtAnchor: (anchor: VisualTextInsertionAnchor, text: string) => boolean;
   } | null = null;
   let contextSourceTextarea: HTMLTextAreaElement | undefined;
@@ -856,7 +856,7 @@
     captureAttachmentAnchor: (x: number, y: number) => VisualTextInsertionAnchor | null;
     insertMarkdownAtAnchor: (anchor: VisualTextInsertionAnchor, markdown: string) => boolean;
     insertTextAtSelection: (text: string) => boolean;
-    captureTextInsertionAnchor: () => VisualTextInsertionAnchor | null;
+    captureTextInsertionAnchor: (openedReference?: Element) => VisualTextInsertionAnchor | null;
     insertTextAtAnchor: (anchor: VisualTextInsertionAnchor, text: string) => boolean;
   } | null = null;
   let sourceEditor: {
@@ -8221,21 +8221,21 @@
     const evidenceId = href.match(/^loom-evidence:([a-f0-9]{64})$/u)?.[1];
     if (evidenceId) {
       const captured = { projectId: project.project_id, sessionId: project.session_id };
-      captureMaterialOrigin();
+      captureMaterialOrigin(link);
       void readMaterialEvidence(captured.projectId, captured.sessionId, '', evidenceId).then(evidence => {
         if (project?.session_id !== captured.sessionId) return;
         const item = materialEntries.find(entry => entry.id === evidence.material_id) ?? {
           id: evidence.material_id, name: evidence.title, reference: evidence.reference, kind: evidence.material_id.startsWith('folder-') ? 'folder' as const : 'attachment' as const,
           pinned: false, available: false, source_path: null, attachment_id: null
         };
-        openMaterial(item); activeMaterialEvidence = evidence;
+        openMaterial(item, link); activeMaterialEvidence = evidence;
       }).catch(recordFailure);
       return;
     }
     const materialId = href.match(/^loom-material:(material-[a-f0-9]{64})$/u)?.[1];
     if (materialId) {
       const item = materialEntries.find(entry => entry.id === materialId);
-      if (item) openMaterial(item);
+      if (item) openMaterial(item, link);
       else recordFailure(new Error('This source is no longer available in this workspace.'));
       return;
     }
@@ -8244,7 +8244,7 @@
       const captured = { projectId: project.project_id, sessionId: project.session_id };
       void bindAttachmentMaterial(captured.projectId, captured.sessionId, attachmentId).then(item => {
         if (project?.session_id !== captured.sessionId) return;
-        materialChanged(item); openMaterial(item);
+        materialChanged(item); openMaterial(item, link);
       }).catch(recordFailure);
     }
   }
