@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { convertFileSrc } from '@tauri-apps/api/core';
-  import { readMaterial, searchMaterial, readMaterialEvidence, revealAttachmentOriginal, normalizeFailure, pinMaterial } from './ipc';
+  import { readMaterial, searchMaterial, readMaterialEvidence, revealAttachmentOriginal, normalizeFailure, pinMaterial, removeMaterial } from './ipc';
   import { materialLocatorLabel, materialReferenceMarkdown, evidenceReferenceMarkdown, type MaterialEntry, type MaterialRead, type MaterialEvidence, type MaterialSearch } from './materials';
 
   export let projectId: string;
@@ -11,6 +11,8 @@
   export let originTitle: string | null = null;
   export let onClose: () => void;
   export let onUse: (reference: string, text: string | null) => Promise<boolean>;
+  export let removable = true;
+  export let onRemoved: (id: string, session: string) => void = () => {};
   export let onChanged: (entry: MaterialEntry) => void;
   export let onReopen: () => void;
 
@@ -77,6 +79,18 @@
     catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
     finally { if (mounted) busy = false; }
   }
+  async function remove(): Promise<void> {
+    if (busy || !removable) return;
+    const id = material.id, session = sessionId;
+    busy = true; error = '';
+    try {
+      await removeMaterial(projectId, session, id);
+      // The removal may settle after the view closes. Its owner checks the
+      // originating session before updating navigation, even after unmount.
+      onRemoved(id, session);
+    } catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
+    finally { if (mounted) busy = false; }
+  }
   async function original(): Promise<void> {
     if (!material.attachment_id) return;
     try { await revealAttachmentOriginal(projectId, sessionId, material.attachment_id); }
@@ -99,6 +113,7 @@
       {#if text && originTitle}<button disabled={busy} on:mousedown|preventDefault on:click={() => void use(true)}>Insert quotation</button>{/if}
       {#if material.attachment_id}<button on:click={() => void original()}>Open original</button>{/if}
       {#if material.available}<button disabled={busy} on:click={() => void pin()}>{material.pinned ? 'Unpin' : 'Pin'}</button>{/if}
+      {#if removable}<button disabled={busy} on:click={() => void remove()}>Remove from workspace</button>{/if}
     </div></details>
   </header>
   {#if error}<p class="error" role="alert">{error}</p>{/if}

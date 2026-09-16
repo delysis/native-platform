@@ -524,6 +524,11 @@
     if (inserted) closeMaterial();
     return inserted;
   }
+  function materialRemoved(id: string, sessionId: string): void {
+    if (project?.session_id !== sessionId) return;
+    materialEntries = materialEntries.filter(item => item.id !== id);
+    if (activeMaterial?.id === id) closeMaterial();
+  }
   function materialChanged(item: MaterialEntry): void {
     materialEntries = [...materialEntries.filter(existing => existing.id !== item.id), item];
     if (activeMaterial?.id === item.id) activeMaterial = item;
@@ -9929,7 +9934,7 @@
           {#key `${project.session_id}/${activeMaterial.id}/${activeMaterialEvidence?.id ?? ""}`}
             <MaterialView projectId={project.project_id} sessionId={project.session_id} material={activeMaterial}
               initialEvidence={activeMaterialEvidence} originTitle={materialOrigin?.title ?? null} onClose={closeMaterial} onUse={useMaterialReference}
-              onChanged={materialChanged} onReopen={() => void chooseMaterialLibrary()} />
+              removable={materialEntries.some(item => item.id === activeMaterial?.id)} onRemoved={materialRemoved} onChanged={materialChanged} onReopen={() => void chooseMaterialLibrary()} />
           {/key}
         {:else if materialsOpen}
           <section class="material-connect-view" aria-label="Add sources">

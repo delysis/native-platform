@@ -1009,3 +1009,7 @@ export function addLibraryMaterialPath(projectId: string, sessionId: string, pat
 export function pinMaterial(projectId: string, sessionId: string, materialId: string, pinned: boolean): Promise<import('./materials').MaterialEntry> {
   return call('material_set_pinned', { projectId, sessionId, id: materialId, pinned });
 }
+
+export function removeMaterial(projectId: string, sessionId: string, materialId: string): Promise<void> {
+  return call('material_remove', { projectId, sessionId, id: materialId });
+}
