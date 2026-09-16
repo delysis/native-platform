@@ -581,7 +581,7 @@ mod tests {
             start.send(()).unwrap();
             completion.recv_timeout(Duration::from_secs(5)).unwrap();
 
-            let (finished, finishes) = mpsc::channel();
+            let (finished, notifications) = mpsc::channel();
             let close = || {
                 let jobs = Arc::clone(&state.imports);
                 let finished = finished.clone();
@@ -623,7 +623,7 @@ mod tests {
             }
             assert!(
                 matches!(
-                    finishes.recv_timeout(Duration::from_millis(50)),
+                    notifications.recv_timeout(Duration::from_millis(50)),
                     Err(mpsc::RecvTimeoutError::Timeout)
                 ),
                 "both closes must wait for the original worker to exit"
