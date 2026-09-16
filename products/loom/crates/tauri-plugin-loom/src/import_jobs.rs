@@ -199,14 +199,23 @@ impl ImportOperation {
         session_id: &str,
         operation_id: &str,
     ) -> Result<Self, IpcFailure> {
+        Self::reserve_in(state, &state.imports, project_id, session_id, operation_id)
+    }
+
+    pub(super) fn reserve_in(
+        state: &PluginState,
+        jobs: &Arc<ImportJobs>,
+        project_id: &str,
+        session_id: &str,
+        operation_id: &str,
+    ) -> Result<Self, IpcFailure> {
         validate_operation_id(operation_id)?;
         let _admission = lock_application_admission(state, "an import")?;
         let mut session = lock_session(state)?;
         let store = require_bound_store(&mut session, project_id, session_id)?;
         let root = store.root().to_owned();
         let root_identity = Handle::from_path(&root).map_err(|error| failure(error.to_string()))?;
-        let mut registry = state
-            .imports
+        let mut registry = jobs
             .inner
             .lock()
             .map_err(|_| failure("Import state is unavailable."))?;
@@ -233,7 +242,7 @@ impl ImportOperation {
             signal: signal.clone(),
         });
         Ok(Self {
-            jobs: Arc::clone(&state.imports),
+            jobs: Arc::clone(jobs),
             cancel,
             signal,
             root,
@@ -562,12 +571,27 @@ mod tests {
 
     #[test]
     fn project_close_joins_conversion_and_revokes_original_session() {
+        check_project_close(false);
+    }
+
+    #[test]
+    fn project_close_joins_preview_and_revokes_original_session() {
+        check_project_close(true);
+    }
+
+    fn check_project_close(preview: bool) {
         let temporary = tempfile::tempdir().unwrap();
         let (state, project, session) = opened(temporary.path());
+        let jobs = if preview {
+            &state.previews
+        } else {
+            &state.imports
+        };
         tauri::async_runtime::block_on(async {
             let operation_id = CommandId::new().to_string();
             let operation =
-                ImportOperation::reserve(&state, &project, &session, &operation_id).unwrap();
+                ImportOperation::reserve_in(&state, jobs, &project, &session, &operation_id)
+                    .unwrap();
             let mut cancelled = operation.signal.subscribe();
             let (entered, started) = tokio::sync::oneshot::channel();
             let (release, blocked) = mpsc::channel();
@@ -608,8 +632,9 @@ mod tests {
                 .unwrap();
             assert_ne!(next_snapshot.session_id, session);
             assert!(
-                ImportOperation::reserve(
+                ImportOperation::reserve_in(
                     &state,
+                    jobs,
                     &next_snapshot.project_id,
                     &next_snapshot.session_id,
                     &CommandId::new().to_string()

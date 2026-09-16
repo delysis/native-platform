@@ -482,6 +482,7 @@ pub struct PluginState {
     prepared_project: Mutex<Option<PreparedProject>>,
     folder_picker_open: AtomicBool,
     imports: Arc<import_jobs::ImportJobs>,
+    previews: Arc<import_jobs::ImportJobs>,
     inference: Option<Arc<inference::Service>>,
     native_runtime: Arc<NativeHostRuntime>,
     backend: Arc<LlamaBackend>,
@@ -543,6 +544,7 @@ impl PluginState {
             prepared_project: Mutex::new(None),
             folder_picker_open: AtomicBool::new(false),
             imports: Arc::default(),
+            previews: Arc::default(),
             inference: None,
             native_runtime,
             backend,
@@ -2097,6 +2099,7 @@ impl Builder {
                 document_create,
                 material_commands::material_list,
                 material_commands::material_read,
+                material_media::pdf::material_pdf_page,
                 material_commands::material_search,
                 material_commands::material_read_evidence,
                 material_commands::material_bind_attachment,
@@ -3504,6 +3507,7 @@ fn close_project_with_wait(
     };
 
     state.imports.revoke_session(&session_id);
+    state.previews.revoke_session(&session_id);
 
     // Project close removes command authority before waiting for inference.
     // A slow or failed drain must never leave a promotion nonce usable.
@@ -3527,6 +3531,7 @@ fn close_project_with_wait(
     )?;
 
     state.imports.drain_session(&session_id)?;
+    state.previews.drain_session(&session_id)?;
     let mut session = lock_session_internal(state)?;
     if session.phase == SessionPhase::Closed {
         if let Some(receipt) = &session.last_close
@@ -10394,6 +10399,7 @@ impl DesktopWorkersJoined {
 impl PluginState {
     fn join_desktop_workers(&self) -> Result<DesktopWorkersJoined, IpcFailure> {
         self.imports.shutdown()?;
+        self.previews.shutdown()?;
         let model_loads = self.model_loads.close_and_drain();
         self.downloads
             .cancel_all_active(now_unix_ms())
@@ -10436,6 +10442,9 @@ impl PluginState {
     fn join_desktop_workers_for_exit(&self) -> DesktopWorkersJoined {
         if let Err(error) = self.imports.shutdown() {
             eprintln!("Loom import drain: {}", error.message);
+        }
+        if let Err(error) = self.previews.shutdown() {
+            eprintln!("Loom preview drain: {}", error.message);
         }
         let model_loads = self.model_loads.close_and_drain();
         // Running worker slots retain the authoritative cancellation handles.

@@ -1,6 +1,9 @@
 //! Session- and binding-scoped previews of named retained media.
 use super::*;
 
+#[path = "material_pdf.rs"]
+pub(super) mod pdf;
+
 const VERSION: &str = "m1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +115,22 @@ pub(super) fn bind_tokens(
         })
     });
     if let Some(presentation) = &mut source.presentation {
+        if presentation.detected_format == "pdf" {
+            presentation.pdf_preview_token = token(&Request {
+                project_id,
+                session_id,
+                material_id: source.material.id.clone(),
+                media_sha256: presentation.id.clone(),
+                member: member.clone(),
+            });
+            if presentation.pdf_preview_token.is_none() {
+                return Err(IpcFailure::new(
+                    "material_media_invalid",
+                    "The PDF identity is invalid.",
+                    false,
+                ));
+            }
+        }
         for media in &mut presentation.media {
             media.preview_token = token(&Request {
                 project_id,
@@ -153,6 +172,12 @@ fn selected_attachment(
                 && store.root() == authority.project_root
         })
         .ok_or(LoomAssetReadFailure::NotFound)?;
+    attachment_in_store(store, request)
+}
+fn attachment_in_store(
+    store: &ProjectStore,
+    request: &Request,
+) -> Result<String, LoomAssetReadFailure> {
     let material = materials::resolve(store, &request.material_id)
         .map_err(|_| LoomAssetReadFailure::NotFound)?;
     if let Some(member) = &request.member {

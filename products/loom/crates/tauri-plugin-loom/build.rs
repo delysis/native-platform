@@ -1,6 +1,7 @@
 const COMMANDS: &[&str] = &[
     "material_list",
     "material_read",
+    "material_pdf_page",
     "material_search",
     "material_read_evidence",
     "material_bind_attachment",

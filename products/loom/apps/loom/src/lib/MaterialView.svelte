@@ -2,9 +2,9 @@
   import { onMount } from 'svelte';
   import CollectionProgress from './CollectionProgress.svelte';
   import CollectionMembers from './CollectionMembers.svelte';
-  import type { CollectionMember } from './types';
+  import type { CollectionMember, MaterialPdfPage } from './types';
   import { convertFileSrc } from '@tauri-apps/api/core';
-  import { readMaterial, readCollectionMember, searchMaterial, readMaterialEvidence, revealAttachmentOriginal, normalizeFailure, pinMaterial, removeMaterial } from './ipc';
+  import { readMaterialPdfPage, readMaterial, readCollectionMember, searchMaterial, readMaterialEvidence, revealAttachmentOriginal, normalizeFailure, pinMaterial, removeMaterial } from './ipc';
   import { materialLocatorLabel, materialLocatorPage, materialPdfPageText, materialWritingDocument, materialReferenceMarkdown, evidenceReferenceMarkdown, type MaterialEntry, type MaterialRead, type MaterialEvidence, type MaterialSearch } from './materials';
 
   export let projectId: string;
@@ -33,9 +33,26 @@
   let sourceTextElement: HTMLDivElement | undefined;
   let contentElement: HTMLDivElement | undefined;
   let pageIndex = 0;
+  let pdfImage: MaterialPdfPage | null = null;
+  let pdfCount = 0;
+  let pdfCountToken = '';
+  let pdfText = false;
+  let pdfLoading = false;
+  let pdfError = '';
+  let pdfRequestKey = '';
+  let pdfSerial = 0;
+  let pdfAbort: AbortController | undefined;
+  $: pdfToken = source?.presentation?.pdf_preview_token ?? '';
   $: pdfPages = source?.presentation?.pdf_pages ?? [];
   $: pdfBytes = pdfPages.length && source ? new TextEncoder().encode(source.text) : null;
-  $: currentPage = pdfPages[pageIndex];
+  $: pageNumber = pdfToken ? pageIndex + 1 : pdfPages[pageIndex]?.number ?? 1;
+  $: pageNumbers = pdfToken ? (pdfCountToken === pdfToken && pdfCount ? Array.from({ length: pdfCount }, (_, i) => i + 1) : [pageNumber]) : pdfPages.map(page => page.number);
+  $: currentPage = pdfPages.find(page => page.number === pageNumber);
+  $: previewKey = mounted && pdfToken && !selected && !results && !pdfText ? pdfToken + ':' + pageNumber : '';
+  $: if (previewKey !== pdfRequestKey) {
+    pdfRequestKey = previewKey;
+    void drawPdf(previewKey, pdfToken, pageNumber);
+  }
   $: pageText = pdfBytes && currentPage ? materialPdfPageText(pdfBytes, currentPage) : null;
   $: isPdf = source?.presentation?.detected_format.toLowerCase() === 'pdf';
   $: selectedPage = materialLocatorPage(selected?.locator);
@@ -43,9 +60,21 @@
   $: originalId = source?.material.attachment_id ?? (typeof selectedLocation?.attachment_id === 'string' ? selectedLocation.attachment_id : material.attachment_id);
   $: reference = selected ? evidenceReferenceMarkdown(selected) : memberOpen && source?.evidence[0] ? evidenceReferenceMarkdown(source.evidence[0]) : material.kind === 'folder' ? material.reference : materialReferenceMarkdown(material);
   $: writingDocumentId = materialWritingDocument(selected?.locator, projectId);
-  $: text = selected?.text ?? pageText ?? source?.text ?? '';
+  $: text = selected?.text ?? (pdfToken && pdfPages.length ? pageText ?? '' : pageText ?? source?.text ?? '');
   $: warnings = [...new Set([...(source?.warnings ?? []), ...(results?.warnings ?? []), ...(selected?.warnings ?? [])])];
 
+  async function drawPdf(key: string, token: string, number: number): Promise<void> {
+    const request = ++pdfSerial;
+    pdfAbort?.abort();
+    pdfAbort = new AbortController();
+    pdfImage = null; pdfError = ''; pdfLoading = !!key;
+    if (!key) return;
+    try {
+      const image = await readMaterialPdfPage(token, number, pdfAbort.signal);
+      if (mounted && request === pdfSerial) { pdfImage = image; pdfCount = image.page_count; pdfCountToken = token; }
+    } catch (failure) { if (mounted && request === pdfSerial) pdfError = normalizeFailure(failure).message; }
+    finally { if (mounted && request === pdfSerial) pdfLoading = false; }
+  }
   async function load(): Promise<void> {
     const request = ++serial; busy = true; error = '';
     try { const value = await readMaterial(projectId, sessionId, material.id); if (mounted && serial === request) source = value; }
@@ -76,7 +105,7 @@
   }
   function backToCollection(): void { ++serial; busy = false; selected = null; source = null; results = null; memberOpen = false; pageIndex = 0; }
   function changePage(index: number): void {
-    if (busy || !Number.isInteger(index) || index < 0 || index >= pdfPages.length) return;
+    if (busy || pdfLoading || !Number.isInteger(index) || index < 0 || index >= (pdfToken ? pdfCount : pdfPages.length)) return;
     pageIndex = index;
     contentElement?.scrollTo(0, 0);
   }
@@ -91,11 +120,11 @@
         : await readMaterial(projectId, sessionId, material.id));
       if (!mounted || serial !== request) return;
       const index = value.presentation?.pdf_pages?.findIndex(page => page.number === number) ?? -1;
-      if (index < 0 || value.source_revision !== selected?.source_revision) {
+      if ((!value.presentation?.pdf_preview_token && index < 0) || value.source_revision !== selected?.source_revision) {
         error = 'This retained passage has no matching extracted page in the available source.';
         return;
       }
-      source = value; memberOpen = material.kind === 'collection'; pageIndex = index; selected = null; results = null;
+      source = value; memberOpen = material.kind === 'collection'; pageIndex = value.presentation?.pdf_preview_token ? number - 1 : index; pdfText = false; selected = null; results = null;
       contentElement?.scrollTo(0, 0);
     } catch (failure) { if (mounted && serial === request) error = normalizeFailure(failure).message; }
     finally { if (mounted && serial === request) busy = false; }
@@ -159,28 +188,29 @@
     catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
     finally { if (mounted) busy = false; }
   }
-  onMount(() => { mounted = true; if (material.available && material.kind !== 'folder' && !initialEvidence) void load(); return () => { mounted = false; serial += 1; }; });
+  onMount(() => { mounted = true; if (material.available && material.kind !== 'folder' && !initialEvidence) void load(); return () => { mounted = false; serial += 1; pdfSerial += 1; pdfAbort?.abort(); }; });
 </script>
 
 <section class="material-view" aria-label={material.name} aria-busy={busy}>
   <header>
     {#if material.kind === 'collection' && (selected || memberOpen || results)}<button on:click={backToCollection} aria-label="Back to collection">‹</button>{/if}
     <h1>{selected?.title ?? (memberOpen ? source?.material.name : material.name)}</h1>
-    {#if !selected && !results && pdfPages.length}
-      <nav class="pages" aria-label="Extracted PDF pages">
-        <button disabled={busy || pageIndex === 0} aria-label="Previous page" on:click={() => changePage(pageIndex - 1)}>‹</button>
-        <select aria-label="Page" value={pageIndex} disabled={busy} on:change={event => changePage(Number(event.currentTarget.value))}>
-          {#each pdfPages as pdfPage, index}<option value={index}>Page {pdfPage.number}</option>{/each}
+    {#if !selected && !results && (pdfToken || pdfPages.length)}
+      <nav class="pages" aria-label={pdfToken ? "PDF pages" : "Extracted PDF pages"}>
+        <button disabled={busy || pdfLoading || pageIndex === 0} aria-label="Previous page" on:click={() => changePage(pageIndex - 1)}>‹</button>
+        <select aria-label="Page" value={pageIndex} disabled={busy || pdfLoading} on:change={event => changePage(Number(event.currentTarget.value))}>
+          {#each pageNumbers as number, index}<option value={pdfToken ? number - 1 : index}>Page {number}</option>{/each}
         </select>
-        <button disabled={busy || pageIndex >= pdfPages.length - 1} aria-label="Next page" on:click={() => changePage(pageIndex + 1)}>›</button>
+        <button disabled={busy || pdfLoading || pageIndex >= (pdfToken ? pdfCount : pdfPages.length) - 1} aria-label="Next page" on:click={() => changePage(pageIndex + 1)}>›</button>
       </nav>
     {/if}
     <details class="actions"><summary aria-label="Source actions" on:mousedown|preventDefault>•••</summary><div class="action-menu">
       {#if originTitle}<button disabled={busy || (!material.available && !selected)} on:click={() => void use()}>Insert reference</button>{/if}
       <button on:click={() => void copyReference()}>Copy reference</button>
-      {#if text && originTitle}<button disabled={busy} on:mousedown|preventDefault on:click={() => void use(true)}>Insert quotation</button>{/if}
+      {#if text && originTitle && (!pdfToken || pdfText || selected)}<button disabled={busy} on:mousedown|preventDefault on:click={() => void use(true)}>Insert quotation</button>{/if}
       {#if writingDocumentId && onOpenDocument}<button disabled={busy} on:click={() => void openWriting()}>Open current writing</button>{/if}
       {#if selectedPage && material.available && originalId}<button disabled={busy} on:click={() => void openSourcePage()}>Open page {selectedPage}</button>{/if}
+      {#if pdfToken && !selected && !results}<button on:click={() => pdfText = !pdfText}>{pdfText ? "Show original page" : "Show extracted text"}</button>{/if}
       {#if originalId}<button on:click={() => void original()}>Reveal original</button>{/if}
       {#if material.available && material.kind !== 'folder'}<button disabled={busy} on:click={() => void pin()}>{material.pinned ? 'Unpin' : 'Pin'}</button>{/if}
       {#if removable && material.kind !== 'folder'}<button disabled={busy} on:click={() => void remove()}>Remove from workspace</button>{/if}
@@ -222,15 +252,26 @@
       {:else if material.kind === 'collection' && !memberOpen}
         <CollectionMembers {projectId} {sessionId} collectionId={material.id} revision={collectionRevision} onOpenMember={member => void openMember(member)} />
       {:else if source}
-        {#if isPdf && (!pdfPages.length || pageText === null)}<p class="notice">Page navigation is unavailable for this copy. The extracted text and original are retained.</p>{/if}
+        {#if isPdf && !pdfToken && (!pdfPages.length || pageText === null)}<p class="notice">Page navigation is unavailable for this copy. The extracted text and original are retained.</p>{/if}
+        {#if pdfToken && !pdfText}
+          {#if pdfLoading}<p class="notice" role="status">Opening page…</p>
+          {:else if pdfError}<p class="error" role="alert">{pdfError}</p><button on:click={() => void drawPdf(previewKey, pdfToken, pageNumber)}>Try again</button>
+          {:else if pdfImage}
+            {#if pdfImage.incomplete}<p class="notice">Some page content could not be drawn. The original is retained.</p>{/if}
+            <img class="pdf-page" src={'data:image/png;base64,' + pdfImage.png_base64} width={pdfImage.width} height={pdfImage.height} alt={source.material.name + ', page ' + pdfImage.page} />
+          {/if}
+        {:else}
+        {#if pdfToken && !pdfPages.length && source.text}<p class="notice">The extracted text has no page mapping. Showing the whole document.</p>{/if}
         {#each source.presentation?.media ?? [] as media (media.sha256)}
           {#if media.preview_token}
             {#if media.kind === 'image'}<img src={convertFileSrc(media.preview_token, 'loom-asset')} alt={material.name} />
             {:else}<audio controls preload="metadata" src={convertFileSrc(media.preview_token, 'loom-asset')} aria-label={`Play ${material.name}`}></audio>{/if}
           {/if}
         {/each}
-        {#if source.text}<div class="source-text" bind:this={sourceTextElement}>{text}</div>
+        {#if text}<div class="source-text" bind:this={sourceTextElement}>{text}</div>
+        {:else if pdfToken}<p class="notice">No text was extracted from this page.</p>
         {:else if material.kind === 'attachment' && !source.presentation?.media.length}<p class="notice">The original is retained. No readable text is available.</p>{/if}
+        {/if}
       {:else if busy}<p class="notice" role="status">Opening…</p>{/if}
     </div>
   {/if}
@@ -270,5 +311,6 @@
   .error { margin:8px 12px; color:var(--danger,#b64238); white-space:pre-wrap; }
   .return-results,.reopen { align-self:flex-start; margin:8px 12px; }
   img { max-width:100%; height:auto; }
+  .pdf-page { display:block; margin:0 auto; object-fit:contain; }
   audio { width:100%; max-width:520px; }
 </style>

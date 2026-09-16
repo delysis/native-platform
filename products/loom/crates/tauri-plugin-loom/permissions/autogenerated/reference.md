@@ -6,6 +6,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 
 - `allow-material-list`
 - `allow-material-read`
+- `allow-material-pdf-page`
 - `allow-material-search`
 - `allow-material-read-evidence`
 - `allow-material-bind-attachment`
@@ -1717,6 +1718,32 @@ Enables the material_list command without any pre-configured scope.
 <td>
 
 Denies the material_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-material-pdf-page`
+
+</td>
+<td>
+
+Enables the material_pdf_page command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-pdf-page`
+
+</td>
+<td>
+
+Denies the material_pdf_page command without any pre-configured scope.
 
 </td>
 </tr>

@@ -48,6 +48,7 @@ const PREFIX = 'plugin:loom|';
 // its bounded critical sections, so renderer classification is an ordering and
 // latency optimization rather than a correctness boundary.
 const INDEPENDENT_COMMANDS = new Set([
+  'material_pdf_page',
   'import_account_cancel',
   'collection_cancel',
   'collection_status',
@@ -1011,6 +1012,19 @@ export function bindAttachmentMaterial(projectId: string, sessionId: string, att
 }
 export function readMaterial(projectId: string, sessionId: string, materialId: string): Promise<import('./materials').MaterialRead> {
   return call('material_read', { projectId, sessionId, id: materialId });
+}
+
+// Page requests share a separate lane: they neither delay edits nor race one
+// another for the native preview worker. Authority is rechecked natively.
+let pdfPageTail: Promise<unknown> = Promise.resolve();
+export function readMaterialPdfPage(token: string, page: number, signal?: AbortSignal): Promise<import('./types').MaterialPdfPage> {
+  const operationId = newUlid();
+  const result = pdfPageTail.then(() => {
+    signal?.throwIfAborted();
+    return call<import('./types').MaterialPdfPage>('material_pdf_page', { token, page, operationId });
+  });
+  pdfPageTail = result.catch(() => undefined);
+  return result;
 }
 export function searchMaterial(projectId: string, sessionId: string, materialId: string, query: string): Promise<import('./materials').MaterialSearch> {
   return call('material_search', { projectId, sessionId, id: materialId, query });

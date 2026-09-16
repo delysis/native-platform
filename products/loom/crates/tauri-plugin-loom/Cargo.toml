@@ -29,6 +29,7 @@ base64.workspace = true
 cpal = "=0.16.0"
 crossbeam-channel.workspace = true
 hound.workspace = true
+hayro = "=0.7.1"
 http.workspace = true
 image = { version = "0.25.9", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 loom-document = { path = "../loom-document" }

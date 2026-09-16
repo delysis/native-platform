@@ -92,6 +92,8 @@ pub(crate) struct ContextAttachmentPresentation {
     pub(crate) excerpt: Option<String>,
     #[serde(default)]
     pub(crate) pdf_pages: Vec<PdfPageLocation>,
+    #[serde(default)]
+    pub(crate) pdf_preview_token: Option<String>,
 }
 
 /// An extracted PDF page's exact byte span in the retained canonical text.
@@ -1106,6 +1108,7 @@ fn attachment_presentation(manifest: AttachmentManifest) -> ContextAttachmentPre
         source_revision: String::new(),
         excerpt: None,
         pdf_pages: manifest.pdf_pages,
+        pdf_preview_token: None,
         id: manifest.attachment.id,
         file_name: manifest.attachment.file_name,
         detected_format: manifest.attachment.detected_format,
@@ -2077,6 +2080,17 @@ pub(crate) fn original_path(
     let manifest = read_manifest_metadata(project_root, id)?;
     let _ = read_object(project_root, id, manifest.attachment.byte_count)?;
     Ok(attachment_root(project_root)?.join("objects").join(id))
+}
+
+pub(crate) fn read_pdf_original(
+    project_root: &Path,
+    id: &str,
+) -> Result<Vec<u8>, ContextAttachmentError> {
+    let manifest = read_manifest_metadata(project_root, id)?;
+    if manifest.attachment.detected_format != "pdf" {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    read_object(project_root, id, manifest.attachment.byte_count)
 }
 
 /// Acquisition provenance is separate from the offline processing receipt.

@@ -456,6 +456,16 @@ export interface ContextAttachmentPresentation {
   warnings: string[];
   /** Exact extracted page ranges in canonical UTF-8 text; absent pages are not inferred. */
   pdf_pages?: Array<{ number: number; start_byte: number; end_byte: number }>;
+  pdf_preview_token?: string | null;
+}
+
+export interface MaterialPdfPage {
+  page: number;
+  page_count: number;
+  width: number;
+  height: number;
+  png_base64: string;
+  incomplete: boolean;
 }
 
 export interface ContextMaterial {

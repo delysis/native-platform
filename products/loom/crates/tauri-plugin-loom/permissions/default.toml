@@ -5,6 +5,7 @@ description = "Open and edit Loom's app-owned default project or a user-selected
 permissions = [
   "allow-material-list",
   "allow-material-read",
+  "allow-material-pdf-page",
   "allow-material-search",
   "allow-material-read-evidence",
   "allow-material-bind-attachment",
