@@ -30,10 +30,48 @@ pub const MAX_RESIDUAL_NO_OP_LOGPROB_DELTA: f64 = 1e-5;
 /// computational acceptance floor, not statistical confidence or a guarantee
 /// that every runtime evaluation's numerical error is bounded by the no-op probe.
 pub const MIN_RESIDUAL_LOSS_IMPROVEMENT: f64 = 4.0 * MAX_RESIDUAL_NO_OP_LOGPROB_DELTA;
+/// Existing terminal-token V2 specification; not the span-mean method.
 pub const RESIDUAL_TRAINING_METHOD: &str =
     "paired_mean_direction_bounded_coordinate_search_prefix_batches_max64_v2";
+pub const RESIDUAL_SPAN_MEAN_TRAINING_METHOD: &str =
+    "paired_response_span_mean_direction_bounded_coordinate_search_prefix_batches_max64_v3";
+pub const RESIDUAL_MATCHED_TERMINAL_TRAINING_METHOD: &str =
+    "paired_terminal_token_matched_direction_bounded_coordinate_search_prefix_batches_max64_v3";
 pub const RESIDUAL_INTERVENTION_SEMANTICS: &str =
     "signed_post_block_residual_addition_from_last_prefix_token_v1";
+
+/// Extraction only; likelihood scoring and gain optimization are unchanged.
+/// Required on requests and receipts: legacy JSON is not silently upgraded.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResidualPooling {
+    /// One post-block state after decoding the final pole token (V2 reference).
+    TerminalToken,
+    /// V3 ablation: capture/validate every pole singleton, retain only the last.
+    /// Prefix prefill and all decode/capture calls match `ResponseSpanMean`.
+    TerminalTokenMatched,
+    /// Arithmetic mean of post-block states after each pole token, no prefix.
+    ResponseSpanMean,
+}
+
+impl ResidualPooling {
+    #[must_use]
+    pub const fn training_method(self) -> &'static str {
+        match self {
+            Self::TerminalToken => RESIDUAL_TRAINING_METHOD,
+            Self::TerminalTokenMatched => RESIDUAL_MATCHED_TERMINAL_TRAINING_METHOD,
+            Self::ResponseSpanMean => RESIDUAL_SPAN_MEAN_TRAINING_METHOD,
+        }
+    }
+
+    const fn hash_tag(self) -> u8 {
+        match self {
+            Self::TerminalToken => 0,
+            Self::TerminalTokenMatched => 2,
+            Self::ResponseSpanMean => 1,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -74,6 +112,7 @@ impl ResidualTrainingPair {
 pub struct ResidualTrainingRequest {
     pub request_id: String,
     pub model_id: String,
+    pub pooling: ResidualPooling,
     /// Zero-based post-block indices. Only `1..=n_layers - 2` is supported.
     /// Order is preserved and defines the coordinate-search order.
     pub layers: Vec<u32>,
@@ -162,8 +201,10 @@ impl ResidualTrainingRequest {
     }
 
     /// Live owner-side memory admission: dense cvec storage is at most 64 MiB
-    /// and one selected-layer f32 capture is at most 4 MiB. Accumulate paired
-    /// means in f64 incrementally instead of retaining all training captures.
+    /// and one selected-layer f32 capture is at most 4 MiB. Pole and pair means
+    /// are accumulated incrementally in at most three selected-layer f64 buffers
+    /// (8 MiB each), never all training-token captures. Context/backend RAM and
+    /// the wrapper's own f32 snapshot storage are additional.
     pub fn validate_control_vector_shape(
         &self,
         n_layers: u32,
@@ -237,7 +278,8 @@ impl ResidualTrainingRequest {
     pub fn sha256(&self) -> Result<String, NativeError> {
         self.validate()?;
         let mut hash = Sha256::new();
-        hash.update(b"llama-native.residual-training-request.v1\0");
+        hash.update(b"llama-native.residual-training-request.v2\0");
+        hash.update([self.pooling.hash_tag()]);
         hash_bytes(&mut hash, self.request_id.as_bytes());
         hash_bytes(&mut hash, self.model_id.as_bytes());
         hash.update((self.layers.len() as u64).to_le_bytes());
@@ -342,6 +384,8 @@ impl ResidualTrainingStep {
 #[serde(deny_unknown_fields)]
 pub struct ResidualTrainingOutput {
     pub request_sha256: String,
+    /// Bound to both the request digest and the mode-specific method label.
+    pub pooling: ResidualPooling,
     pub model_fingerprint: ModelFingerprint,
     /// Actual temporary execution context, distinct from resident model config.
     pub execution_fingerprint: ModelFingerprint,
@@ -352,8 +396,8 @@ pub struct ResidualTrainingOutput {
     pub training_method: String,
     pub intervention_semantics: String,
     pub layers: Vec<u32>,
-    /// Unit axes from the mean paired difference of training-only complete-pole
-    /// final-token residual states, captured with zero control.
+    /// Unit axes from equal-weight paired differences of training-only pole
+    /// representations under `pooling`, captured with control disabled.
     pub directions: Vec<Vec<f32>>,
     pub gains: Vec<f32>,
     pub history: Vec<ResidualTrainingStep>,
@@ -428,7 +472,7 @@ impl ResidualTrainingOutput {
                 "residual execution identity or zero-control equivalence check failed",
             ));
         }
-        if self.training_method != RESIDUAL_TRAINING_METHOD
+        if self.training_method != self.pooling.training_method()
             || self.intervention_semantics != RESIDUAL_INTERVENTION_SEMANTICS
         {
             return Err(invalid_config(
@@ -514,6 +558,7 @@ impl ResidualTrainingOutput {
     ) -> Result<(), NativeError> {
         self.validate()?;
         if self.request_sha256 != request.sha256()?
+            || self.pooling != request.pooling
             || self.layers != request.layers
             || self.model_fingerprint.model_id != request.model_id
             || self.train_baseline.pair_count as usize != request.train.len()
@@ -603,6 +648,7 @@ mod tests {
         ResidualTrainingRequest {
             request_id: "request".into(),
             model_id: "model".into(),
+            pooling: ResidualPooling::TerminalToken,
             layers: vec![1, 2],
             train: vec![
                 ResidualTrainingPair {
@@ -759,6 +805,89 @@ mod tests {
     }
 
     #[test]
+    fn pooling_is_required_and_bound_to_request_and_receipt() {
+        let terminal = request();
+        let mut span = terminal.clone();
+        span.pooling = ResidualPooling::ResponseSpanMean;
+        let mut matched = terminal.clone();
+        matched.pooling = ResidualPooling::TerminalTokenMatched;
+        let digests: BTreeSet<_> = [&terminal, &matched, &span]
+            .into_iter()
+            .map(|r| r.sha256().expect("hash"))
+            .collect();
+        assert_eq!(
+            digests.len(),
+            3,
+            "all pooling modes must have distinct hashes"
+        );
+        assert_ne!(
+            matched.pooling.training_method(),
+            span.pooling.training_method()
+        );
+        assert_ne!(
+            terminal.sha256().expect("terminal hash"),
+            span.sha256().expect("span hash")
+        );
+        assert_eq!(
+            terminal.estimated_token_evaluations().expect("cost"),
+            span.estimated_token_evaluations().expect("cost")
+        );
+        for request in [&terminal, &matched, &span] {
+            let encoded = serde_json::to_value(request).expect("encode");
+            let roundtrip: ResidualTrainingRequest =
+                serde_json::from_value(encoded.clone()).expect("explicit mode");
+            assert_eq!(&roundtrip, request);
+            let mut missing = encoded.clone();
+            missing.as_object_mut().expect("object").remove("pooling");
+            assert!(serde_json::from_value::<ResidualTrainingRequest>(missing).is_err());
+            let mut unknown = encoded;
+            unknown["pooling"] = serde_json::json!("all_sequence_mean");
+            assert!(serde_json::from_value::<ResidualTrainingRequest>(unknown).is_err());
+            let mut receipt = output();
+            receipt.pooling = request.pooling;
+            receipt.training_method = request.pooling.training_method().into();
+            receipt.request_sha256 = request.sha256().expect("request hash");
+            receipt
+                .validate_for_request(request)
+                .expect("matching mode receipt");
+            for other in [&terminal, &matched, &span] {
+                if other.pooling != request.pooling {
+                    assert!(receipt.validate_for_request(other).is_err());
+                }
+            }
+        }
+        let original = output();
+        let mut changed = original.clone();
+        changed.pooling = span.pooling;
+        assert!(
+            changed.validate().is_err(),
+            "terminal method cannot describe span pooling"
+        );
+        changed.training_method = span.pooling.training_method().into();
+        assert!(
+            changed.validate_for_request(&terminal).is_err(),
+            "mode mismatch despite original request hash"
+        );
+        assert!(
+            changed.validate_for_request(&span).is_err(),
+            "request hash still bound to terminal mode"
+        );
+        changed.request_sha256 = span.sha256().expect("span hash");
+        changed
+            .validate_for_request(&span)
+            .expect("consistent span receipt");
+        let mut missing = serde_json::to_value(&original).expect("encode");
+        missing.as_object_mut().expect("object").remove("pooling");
+        assert!(serde_json::from_value::<ResidualTrainingOutput>(missing).is_err());
+        let mut legacy_method = original;
+        legacy_method.training_method = "paired_mean_direction_bounded_coordinate_search_v1".into();
+        assert!(
+            legacy_method.validate().is_err(),
+            "V1 evidence is not current V2 execution"
+        );
+    }
+
+    #[test]
     fn workload_and_live_width_are_bounded() {
         let mut value = request();
         value
@@ -816,6 +945,7 @@ mod tests {
         };
         ResidualTrainingOutput {
             request_sha256: request.sha256().expect("hash"),
+            pooling: request.pooling,
             model_fingerprint: fingerprint.clone(),
             execution_fingerprint: fingerprint,
             no_op_max_logprob_delta: 0.0,

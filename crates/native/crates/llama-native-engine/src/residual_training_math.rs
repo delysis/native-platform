@@ -1,13 +1,14 @@
 //! Pure residual-axis fitting and bounded derivative-free scalar gain search.
 //! No model weights are updated; this is not autograd or full-model training.
-//! The owner supplies final-token hidden states from complete training poles
+//! The owner supplies explicitly pooled hidden states from training poles
 //! and teacher-forced mean token log-probabilities. Validation data must never
 //! enter direction fitting or the search evaluator.
 
 use llama_native_types::{
-    MAX_RESIDUAL_TRAINING_DIMENSIONS, MAX_RESIDUAL_TRAINING_LAYERS, MAX_RESIDUAL_TRAINING_NORM,
-    MAX_RESIDUAL_TRAINING_PAIRS, MAX_RESIDUAL_TRAINING_VOCABULARY, MIN_RESIDUAL_LOSS_IMPROVEMENT,
-    NativeError, NativeErrorCode, ResidualTrainingMetrics, ResidualTrainingStep,
+    MAX_RESIDUAL_CAPTURE_VALUES, MAX_RESIDUAL_TRAINING_DIMENSIONS, MAX_RESIDUAL_TRAINING_LAYERS,
+    MAX_RESIDUAL_TRAINING_NORM, MAX_RESIDUAL_TRAINING_PAIRS, MAX_RESIDUAL_TRAINING_SEQUENCE_TOKENS,
+    MAX_RESIDUAL_TRAINING_VOCABULARY, MIN_RESIDUAL_LOSS_IMPROVEMENT, NativeError, NativeErrorCode,
+    ResidualPooling, ResidualTrainingMetrics, ResidualTrainingStep,
     validate_residual_objective_parameters, validate_residual_search_parameters,
 };
 
@@ -17,6 +18,83 @@ pub const RESIDUAL_IMPROVEMENT_TOLERANCE: f64 = 1e-12;
 
 fn invalid(message: &str) -> NativeError {
     NativeError::new(NativeErrorCode::InvalidConfig, message)
+}
+
+/// One bounded pole accumulator, independent of pole length in retained memory.
+/// All captures share shape/finiteness/count validation. Mean mode sums raw f32
+/// states in f64 then divides by token count; terminal modes retain only the last
+/// state. Unit normalization happens only after equal-weight pair averaging.
+pub(super) struct PoleAccumulator {
+    sums: Vec<Vec<f64>>,
+    expected_tokens: usize,
+    tokens: usize,
+    pooling: ResidualPooling,
+}
+
+impl PoleAccumulator {
+    pub(super) fn new(
+        layers: usize,
+        width: usize,
+        expected_tokens: usize,
+        pooling: ResidualPooling,
+    ) -> Result<Self, NativeError> {
+        if !(1..=MAX_RESIDUAL_TRAINING_LAYERS).contains(&layers)
+            || !(1..=MAX_RESIDUAL_TRAINING_DIMENSIONS).contains(&width)
+            || !(1..=MAX_RESIDUAL_TRAINING_SEQUENCE_TOKENS).contains(&expected_tokens)
+            || (pooling == ResidualPooling::TerminalToken && expected_tokens != 1)
+            || width
+                .checked_mul(layers)
+                .is_none_or(|n| n > MAX_RESIDUAL_CAPTURE_VALUES)
+        {
+            return Err(invalid(
+                "invalid residual pole mean dimensions or token count",
+            ));
+        }
+        Ok(Self {
+            sums: vec![vec![0.0; width]; layers],
+            expected_tokens,
+            tokens: 0,
+            pooling,
+        })
+    }
+
+    pub(super) fn push(&mut self, states: &[Vec<f32>]) -> Result<(), NativeError> {
+        if self.tokens >= self.expected_tokens
+            || states.len() != self.sums.len()
+            || states.iter().zip(&self.sums).any(|(state, sum)| {
+                state.len() != sum.len() || state.iter().any(|v| !v.is_finite())
+            })
+        {
+            return Err(invalid(
+                "invalid residual pole capture shape, values, or count",
+            ));
+        }
+        for (sum, state) in self.sums.iter_mut().zip(states) {
+            for (sum, &value) in sum.iter_mut().zip(state) {
+                match self.pooling {
+                    ResidualPooling::ResponseSpanMean => *sum += f64::from(value),
+                    ResidualPooling::TerminalToken | ResidualPooling::TerminalTokenMatched => {
+                        *sum = f64::from(value)
+                    }
+                }
+            }
+        }
+        // At most 4096 finite f32 terms cannot overflow f64.
+        self.tokens += 1;
+        Ok(())
+    }
+
+    pub(super) fn finish(mut self) -> Result<Vec<Vec<f64>>, NativeError> {
+        if self.tokens != self.expected_tokens {
+            return Err(invalid("incomplete residual pole captures"));
+        }
+        if self.pooling == ResidualPooling::ResponseSpanMean {
+            for value in self.sums.iter_mut().flatten() {
+                *value /= self.tokens as f64;
+            }
+        }
+        Ok(self.sums)
+    }
 }
 
 /// Stable raw-model selected-token log-softmax. The expected vocabulary must
@@ -313,6 +391,99 @@ mod tests {
             polarity_agreement: 0.0,
             pair_count: 2,
         }
+    }
+
+    #[test]
+    fn pole_mean_is_raw_f64_arithmetic_not_per_token_normalization() {
+        let mut mean =
+            PoleAccumulator::new(2, 2, 3, ResidualPooling::ResponseSpanMean).expect("shape");
+        for states in [
+            vec![vec![16_777_216.0, 6.0], vec![3.0, 0.0]],
+            vec![vec![1.0, 0.0], vec![0.0, 6.0]],
+            vec![vec![-16_777_216.0, 0.0], vec![0.0, 0.0]],
+        ] {
+            mean.push(&states).expect("capture");
+        }
+        let mean = mean.finish().expect("complete");
+        assert_eq!(mean, [vec![1.0 / 3.0, 2.0], vec![1.0, 2.0]]);
+        let state = vec![vec![f32::MAX, -f32::MAX, f32::MIN_POSITIVE]];
+        let mut one =
+            PoleAccumulator::new(1, 3, 1, ResidualPooling::ResponseSpanMean).expect("single");
+        one.push(&state).expect("finite extremes");
+        assert_eq!(
+            one.finish().expect("mean")[0],
+            state[0].iter().copied().map(f64::from).collect::<Vec<_>>()
+        );
+        let mut many = PoleAccumulator::new(
+            1,
+            1,
+            MAX_RESIDUAL_TRAINING_SEQUENCE_TOKENS,
+            ResidualPooling::ResponseSpanMean,
+        )
+        .expect("bounded");
+        for _ in 0..MAX_RESIDUAL_TRAINING_SEQUENCE_TOKENS {
+            many.push(&[vec![f32::MAX]]).expect("capture");
+        }
+        assert_eq!(
+            many.finish().expect("finite sum"),
+            [vec![f64::from(f32::MAX)]]
+        );
+    }
+
+    #[test]
+    fn pole_mean_rejects_missing_extra_nonfinite_or_misshapen_states() {
+        for (layers, width, count) in [
+            (0, 1, 1),
+            (1, 0, 1),
+            (17, 1, 1),
+            (1, 1, 0),
+            (1, 1, 4097),
+            (1, usize::MAX, 1),
+        ] {
+            assert!(
+                PoleAccumulator::new(layers, width, count, ResidualPooling::ResponseSpanMean)
+                    .is_err()
+            );
+        }
+        assert!(
+            PoleAccumulator::new(1, 1, 1, ResidualPooling::ResponseSpanMean)
+                .expect("valid")
+                .finish()
+                .is_err()
+        );
+        let mut mean =
+            PoleAccumulator::new(1, 2, 1, ResidualPooling::ResponseSpanMean).expect("shape");
+        for states in [
+            vec![],
+            vec![vec![1.0]],
+            vec![vec![1.0, 2.0]; 2],
+            vec![vec![f32::NAN, 1.0]],
+            vec![vec![1.0, f32::INFINITY]],
+        ] {
+            assert!(mean.push(&states).is_err());
+        }
+        mean.push(&[vec![2.0, 4.0]])
+            .expect("bad states did not change mean");
+        assert!(mean.push(&[vec![2.0, 4.0]]).is_err());
+        assert_eq!(mean.finish().expect("one token"), [vec![2.0, 4.0]]);
+    }
+
+    #[test]
+    fn matched_terminal_validates_discarded_states_and_retains_only_last() {
+        let mut accumulator =
+            PoleAccumulator::new(1, 2, 2, ResidualPooling::TerminalTokenMatched).expect("shape");
+        assert!(accumulator.push(&[vec![f32::NAN, 1.0]]).is_err());
+        assert!(accumulator.push(&[vec![1.0]]).is_err());
+        accumulator
+            .push(&[vec![f32::MAX, -f32::MAX]])
+            .expect("first");
+        accumulator.push(&[vec![3.0, 4.0]]).expect("last");
+        assert_eq!(accumulator.finish().expect("terminal"), [vec![3.0, 4.0]]);
+        assert!(PoleAccumulator::new(1, 1, 2, ResidualPooling::TerminalToken).is_err());
+        let mut incomplete =
+            PoleAccumulator::new(1, 1, 2, ResidualPooling::TerminalTokenMatched).expect("shape");
+        incomplete.push(&[vec![1.0]]).expect("first");
+        assert!(incomplete.finish().is_err());
     }
 
     #[test]

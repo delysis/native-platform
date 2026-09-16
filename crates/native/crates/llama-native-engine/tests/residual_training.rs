@@ -1,13 +1,249 @@
 //! Opt-in end-to-end training evidence. Uses only an explicitly supplied local
 //! GGUF and authored non-personal contrasts; never downloads models or text.
-use llama_native_engine::{NativeModelHandle, NativeModelOwner};
+use llama_native_engine::{NativeModelHandle, NativeModelOwner, WaitOutcome};
 use llama_native_types::{
     CompletionPrompt, GenerationInput, GenerationRequest, NativeErrorCode, NativeModelConfig,
-    ResidualControlProfile, ResidualEvaluationCase, ResidualEvaluationRequest,
+    ResidualControlProfile, ResidualEvaluationCase, ResidualEvaluationRequest, ResidualPooling,
     ResidualTrainingPair, ResidualTrainingRequest, SamplingConfig, SpecialTokenPolicy,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+fn write_pooling_json(
+    dir: &std::path::Path,
+    name: &str,
+    value: &impl serde::Serialize,
+) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Write;
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join(name))?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    Ok(format!("{:x}", Sha256::digest(&bytes)))
+}
+
+fn compare_directions(
+    left: &llama_native_types::ResidualTrainingOutput,
+    right: &llama_native_types::ResidualTrainingOutput,
+) -> Result<serde_json::Value> {
+    if left.layers != right.layers || left.directions.len() != right.directions.len() {
+        return Err("pooling comparison shape differs".into());
+    }
+    let mut rows = Vec::new();
+    for ((&layer, left), right) in left
+        .layers
+        .iter()
+        .zip(&left.directions)
+        .zip(&right.directions)
+    {
+        if left.len() != right.len() {
+            return Err("pooling comparison width differs".into());
+        }
+        let dot: f64 = left
+            .iter()
+            .zip(right)
+            .map(|(&a, &b)| f64::from(a) * f64::from(b))
+            .sum();
+        let norm = |v: &[f32]| v.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>().sqrt();
+        let cosine = dot / (norm(left) * norm(right));
+        if !cosine.is_finite() {
+            return Err("nonfinite direction comparison".into());
+        }
+        let max_delta = left
+            .iter()
+            .zip(right)
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
+            .fold(0.0_f64, f64::max);
+        rows.push(
+            serde_json::json!({"layer": layer, "cosine": cosine, "max_absolute_delta": max_delta}),
+        );
+    }
+    Ok(serde_json::json!(rows))
+}
+
+/// Eight zero-search fits, no generation or residual evaluation grid. The two
+/// original smoke training pairs are exposed development data, not confirmation.
+#[test]
+#[ignore = "requires LLAMA_RESIDUAL_MODEL and LLAMA_RESIDUAL_POOLING_OUTPUT_DIR"]
+fn local_pooling_matched_schedule_and_single_token() -> Result<()> {
+    let path = std::env::var("LLAMA_RESIDUAL_MODEL")?;
+    let out = std::path::PathBuf::from(std::env::var("LLAMA_RESIDUAL_POOLING_OUTPUT_DIR")?);
+    let timeout_seconds: u64 = std::env::var("LLAMA_RESIDUAL_POOLING_TIMEOUT_SECONDS")
+        .unwrap_or_else(|_| "300".into())
+        .parse()?;
+    if !(1..=3600).contains(&timeout_seconds) {
+        return Err("invalid pooling timeout".into());
+    }
+    let layer: u32 = std::env::var("LLAMA_RESIDUAL_LAYER")
+        .unwrap_or_else(|_| "20".into())
+        .parse()?;
+    let mut config = NativeModelConfig::local(path.into());
+    config.model_id = "residual-pooling-test".into();
+    config.context_tokens = 512;
+    config.batch_tokens = 64;
+    config.max_sequences = 1;
+    config.gpu_layers = -1;
+    std::fs::create_dir(&out)?;
+    let mut hashes = std::collections::BTreeMap::new();
+    hashes.insert(
+        "config.json".to_string(),
+        write_pooling_json(
+            &out,
+            "config.json",
+            &serde_json::json!({
+                "config": config, "timeout_seconds_per_fit": timeout_seconds, "fit_count": 8,
+                "search_steps": 0, "role": "exposed_smoke_runtime_only_not_controller_evidence"
+            }),
+        )?,
+    );
+    let owner = NativeModelOwner::load(config)?;
+    let handle = owner.handle();
+    let work = (|| -> Result<_> {
+        let base = ResidualTrainingRequest {
+            request_id: "pooling".into(),
+            model_id: "residual-pooling-test".into(),
+            pooling: ResidualPooling::TerminalToken,
+            layers: vec![layer],
+            train: vec![
+                pair(
+                    &handle,
+                    "train-gathering",
+                    "At the gathering, she starts conversations with several visitors.",
+                    "At the gathering, she quietly watches from a corner.",
+                )?,
+                pair(
+                    &handle,
+                    "train-lunch",
+                    "During lunch, she invites colleagues to share her table.",
+                    "During lunch, she chooses a table where she sits alone.",
+                )?,
+            ],
+            validation: vec![pair(
+                &handle,
+                "heldout-weekend",
+                "On weekends, she often joins group activities.",
+                "On weekends, she often chooses solitary activities.",
+            )?],
+            search_steps: 0,
+            initial_step: 0.25,
+            maximum_norm: 0.5,
+            l2_penalty: 0.001,
+            margin: 0.1,
+        };
+        let changed_holdout = pair(
+            &handle,
+            "heldout-break",
+            "During breaks, she seeks lively conversation with coworkers.",
+            "During breaks, she seeks a quiet place away from coworkers.",
+        )?;
+        let modes = [
+            ("terminal", ResidualPooling::TerminalToken),
+            ("matched", ResidualPooling::TerminalTokenMatched),
+            ("mean", ResidualPooling::ResponseSpanMean),
+        ];
+        let mut completed = Vec::new();
+        for variant in ["full", "single", "holdout"] {
+            for (name, mode) in modes {
+                if variant == "holdout" && mode == ResidualPooling::TerminalToken {
+                    continue;
+                }
+                let mut request = base.clone();
+                request.request_id = format!("pooling-{variant}-{name}");
+                request.pooling = mode;
+                if variant == "single" {
+                    for pair in request.train.iter_mut().chain(&mut request.validation) {
+                        pair.positive.truncate(1);
+                        pair.negative.truncate(1);
+                    }
+                } else if variant == "holdout" {
+                    request.validation = vec![changed_holdout.clone()];
+                }
+                request.validate()?;
+                if request
+                    .train
+                    .iter()
+                    .chain(&request.validation)
+                    .any(|p| p.prefix.len() + p.positive.len().max(p.negative.len()) > 64)
+                {
+                    return Err("pooling smoke sequence exceeds fixed 64-token budget".into());
+                }
+                let request_name = format!("{variant}-{name}-request.json");
+                hashes.insert(
+                    request_name.clone(),
+                    write_pooling_json(&out, &request_name, &request)?,
+                );
+                let ticket = handle.train_residual(request.clone())?;
+                let verified =
+                    match ticket.wait_timeout(std::time::Duration::from_secs(timeout_seconds))? {
+                        WaitOutcome::Ready(value) => value,
+                        WaitOutcome::TimedOut(pending) => {
+                            pending.cancel();
+                            return Err("pooling fit timed out; cancellation requested".into());
+                        }
+                    };
+                let output = verified.output();
+                output.validate_for_request(&request)?;
+                if output.gains.iter().any(|&v| v != 0.0)
+                    || output.train_baseline != output.train_final
+                    || output.validation_baseline != output.validation_final
+                {
+                    return Err("zero-search pooling fit changed its baseline".into());
+                }
+                let output_name = format!("{variant}-{name}-output.json");
+                hashes.insert(
+                    output_name.clone(),
+                    write_pooling_json(&out, &output_name, output)?,
+                );
+                eprintln!(
+                    "pooling smoke completed {variant}-{name}; token budget {}",
+                    request.estimated_token_evaluations()?
+                );
+                completed.push(verified);
+            }
+        }
+        for other in [4, 5] {
+            if completed[3].output().directions != completed[other].output().directions {
+                return Err("single-token pooling directions differ across schedules".into());
+            }
+        }
+        for (original, changed) in [(1, 6), (2, 7)] {
+            let (original, changed) = (completed[original].output(), completed[changed].output());
+            if original.directions != changed.directions
+                || original.gains != changed.gains
+                || original.history != changed.history
+            {
+                return Err("holdout changed fitted pooling results".into());
+            }
+        }
+        Ok(completed)
+    })();
+    // Join on ordinary work errors as well as success. Timeout is cooperative;
+    // model loading and worker joining do not have a hard wall-clock deadline.
+    let joined = owner.shutdown_joined()?;
+    let completed = work?;
+    if joined.expected_worker_count() != joined.joined_worker_count()
+        || completed
+            .iter()
+            .any(|v| !v.belongs_to_joined_model(&joined))
+    {
+        return Err("pooling owner join verification failed".into());
+    }
+    let comparison = serde_json::json!({
+        "role": "audit_only_exposed_smoke_not_controller_qualification", "fit_count": completed.len(),
+        "matched_vs_mean": compare_directions(completed[1].output(), completed[2].output())?,
+        "reference_v2_vs_matched_v3": compare_directions(completed[0].output(), completed[1].output())?,
+        "single_token_directions_exactly_equal_all_modes": true, "holdout_isolation_matched_and_mean": true,
+        "joined_owner_verified": true, "expected_workers": joined.expected_worker_count(), "joined_workers": joined.joined_worker_count(),
+        "artifact_sha256": hashes
+    });
+    let comparison_hash = write_pooling_json(&out, "comparison.json", &comparison)?;
+    eprintln!("pooling smoke passed; comparison SHA-256 {comparison_hash}");
+    Ok(())
+}
 
 fn tokens(handle: &NativeModelHandle, text: &str) -> Result<Vec<i32>> {
     let prepared = handle.prepare_input(GenerationInput::Completion {
@@ -79,6 +315,16 @@ fn ordinary_generation(handle: &NativeModelHandle, request_id: &str) -> Result<V
 #[test]
 #[ignore = "requires LLAMA_RESIDUAL_MODEL pointing to a local GGUF"]
 fn local_training_holdout_isolation_and_join() -> Result<()> {
+    // The test's reference default is explicit in the constructed request.
+    // Unknown values fail before any model is loaded.
+    let pooling = match std::env::var("LLAMA_RESIDUAL_POOLING").as_deref() {
+        Ok("terminal_token") | Err(std::env::VarError::NotPresent) => {
+            ResidualPooling::TerminalToken
+        }
+        Ok("response_span_mean") => ResidualPooling::ResponseSpanMean,
+        Ok("terminal_token_matched") => ResidualPooling::TerminalTokenMatched,
+        _ => return Err("invalid LLAMA_RESIDUAL_POOLING".into()),
+    };
     let path = std::env::var("LLAMA_RESIDUAL_MODEL")?;
     let mut config = NativeModelConfig::local(path.into());
     config.model_id = "residual-test".into();
@@ -96,6 +342,7 @@ fn local_training_holdout_isolation_and_join() -> Result<()> {
     let request = ResidualTrainingRequest {
         request_id: "native-residual-fit".into(),
         model_id: "residual-test".into(),
+        pooling,
         layers: vec![layer],
         train: vec![
             pair(
@@ -139,7 +386,8 @@ fn local_training_holdout_isolation_and_join() -> Result<()> {
         serde_json::to_writer_pretty(file, &request)?;
     }
     let trained = handle.train_residual(request.clone())?.wait()?;
-    trained.output().validate()?;
+    trained.output().validate_for_request(&request)?;
+    assert_eq!(trained.output().pooling, pooling);
     assert!(trained.output().train_final.loss <= trained.output().train_baseline.loss);
     assert_eq!(trained.output().history.len(), 2);
 
@@ -402,7 +650,8 @@ fn local_training_holdout_isolation_and_join() -> Result<()> {
         serde_json::to_writer_pretty(file, evaluated.output())?;
     }
     eprintln!(
-        "native residual training: train loss {} -> {}; heldout loss {} -> {}; gains {:?}; no-op delta {}; holdout invariance, resident isolation, cancellation, and owner join verified",
+        "native residual training ({:?}): train loss {} -> {}; heldout loss {} -> {}; gains {:?}; no-op delta {}; holdout invariance, resident isolation, cancellation, and owner join verified",
+        pooling,
         trained.output().train_baseline.loss,
         trained.output().train_final.loss,
         trained.output().validation_baseline.loss,
