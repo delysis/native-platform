@@ -128,7 +128,7 @@
       {/if}
     </div>
     {#if !status.refresh_authorized}
-      <p class="muted">{status.local_readable ? 'Retained sources are available. Reconnect to refresh.' : 'Reconnect to add sources.'}</p>
+      <p class="muted">{status.local_readable && status.retained_count > 0 ? 'Retained sources are available. Reconnect to refresh.' : 'Reconnect to add sources.'}</p>
       {#if choosingAccount}
         <p class="muted">{status.scope.kind === 'drive_folder' ? `Drive folder: ${status.scope.id}` : `Mail: ${status.scope.query}`}</p>
         {#if accounts.length}
