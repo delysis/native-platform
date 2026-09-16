@@ -66,6 +66,12 @@ describe('visual Markdown safety gate', () => {
     expect(parseVisualMarkdown(serializeVisualMarkdown(edited)).eq(edited)).toBe(true);
   });
 
+  it('keeps prose spaces when an audio attachment follows the paragraph on reopen', () => {
+    const source = 'The quiet moon.  @Missing\n\n@“Notes.md” \n\n![Audio](loom-attachment:recording "loom-waveform:0000")\n';
+    expect(canUseVisualMarkdown(source, false)).toBe(true);
+    expect(serializeVisualMarkdown(parseVisualMarkdown(source))).toBe(source);
+  });
+
   it.each(['\n', '\n\n', '\r\n', '\r\n\r\n'])(
     'retains terminal %j through fenced-code editing, undo, and reopen', (suffix) => {
       const source = '```wgsl\nfn shade() {}\n```' + suffix;
