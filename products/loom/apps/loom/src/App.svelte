@@ -16,6 +16,7 @@
   import WorkspacePane from './lib/WorkspacePane.svelte';
   import SignalPane from './lib/SignalPane.svelte';
   import CabalPane from './lib/CabalPane.svelte';
+  import ShareContext from './lib/ShareContext.svelte';
   import { ComputeSharing, type PeerTarget } from './lib/compute';
   import PeerModelPicker from './lib/PeerModelPicker.svelte';
   import { SignalDraftEditor } from './lib/signalDraft';
@@ -9489,6 +9490,16 @@
     if (candidate) await selectDocument(candidate, true);
   }
 
+  async function openSharedContextDocument(id: string): Promise<void> {
+    const scope = currentCabalScope();
+    const refreshed = await currentProjectSession();
+    if (!componentMounted || currentCabalScope() !== scope || !project ||
+        refreshed?.project_id !== project.project_id || refreshed.session_id !== project.session_id) return;
+    const target = refreshed.documents.find(item => item.document_id === id);
+    if (!target) throw new Error('The shared context document was removed. Open the cabal to recover its saved copy.');
+    await selectDocument(target, true);
+  }
+
   function applyDeferredTemplate(): void {
     if (project?.session_id !== deferredTemplateSession) { deferredWorkspaceTemplate = null; return; }
     if (!flushEditors()) return;
@@ -10063,6 +10074,14 @@
                 </span>
               </div>
             </div>
+            {#if project && cabal?.documents.some(item => item.local.summary.document_id === document?.summary.document_id)}
+              {#key `${project.project_id}/${project.session_id}/${document.summary.document_id}`}
+                <ShareContext scope={{ projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id }}
+                  readonly={editorReadonly || contextAttachmentBusy || Boolean(cabal?.read_only)}
+                  beforeReview={persistCurrentContextText}
+                  onOpen={(published) => openSharedContextDocument(published.document_id)} />
+              {/key}
+            {/if}
             {#if contextTextSources.length > 0}
               <p class="context-source-note" title={contextTextSources.map((source) => source.file_name).join('\n')}>
                 {contextTextSources.length} imported text {contextTextSources.length === 1 ? 'source is' : 'sources are'} editable above

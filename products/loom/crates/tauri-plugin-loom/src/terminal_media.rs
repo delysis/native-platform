@@ -8,7 +8,7 @@ use llama_native_types::MediaInput;
 use loom_store::{LoadedDocument, ProjectStore};
 
 use super::IpcFailure;
-use super::context_attachments::resolve_for_generation_with_budget;
+use super::context_attachments::{resolve_for_generation_with_budget, resolve_inline_media};
 use super::document_bindings::ResolvedDocument;
 
 const MAX_MEDIA: usize = 32;
@@ -23,31 +23,52 @@ pub(super) fn resolve(
     if references.len() > 32 {
         return Err(limit());
     }
-    let documents = std::iter::once((source.document_id, source.text.as_str())).chain(
-        references
-            .iter()
-            .map(|document| (document.document_id, document.text.as_str())),
-    );
-    let mut media = Vec::new();
-    let mut seen_documents = HashSet::new();
+    let mut media = resolve_for_generation_with_budget(
+        store.root(),
+        &source.document_id.to_string(),
+        &source.text,
+        context_tokens,
+        1,
+        0,
+    )
+    .map_err(|error| IpcFailure::new("terminal_media_unavailable", error.to_string(), false))?
+    .media;
+    // Source context is explicitly selected for this run. Referenced documents
+    // contribute their visible media only, without their private scratch cards.
     let mut seen = HashSet::new();
-    let mut total_bytes = 0_usize;
-    for (document_id, text) in documents {
-        if !seen_documents.insert(document_id) {
+    media.retain(|item| seen.insert((item.kind, item.sha256.clone())));
+    append_references(store, references, &mut media)?;
+    Ok(media)
+}
+
+pub(super) fn append_references(
+    store: &ProjectStore,
+    references: &[ResolvedDocument],
+    media: &mut Vec<MediaInput>,
+) -> Result<(), IpcFailure> {
+    if references.len() > 32 {
+        return Err(limit());
+    }
+    let mut seen_documents = HashSet::new();
+    let mut seen = media
+        .iter()
+        .map(|item| (item.kind, item.sha256.clone()))
+        .collect::<HashSet<_>>();
+    let mut total_bytes = media.iter().map(|item| item.bytes.len()).sum::<usize>();
+    if media.len() > MAX_MEDIA || total_bytes > MAX_MEDIA_BYTES {
+        return Err(limit());
+    }
+    for document in references {
+        if !seen_documents.insert(document.document_id) {
             continue;
         }
-        // Deliberately discard the contextual prose and manuscript window:
-        // terminal prompts already bind their complete explicit input bytes.
-        let resolved = resolve_for_generation_with_budget(
+        let resolved = resolve_inline_media(
             store.root(),
-            &document_id.to_string(),
-            text,
-            context_tokens,
-            1,
-            0,
+            &document.document_id.to_string(),
+            &document.text,
         )
         .map_err(|error| IpcFailure::new("terminal_media_unavailable", error.to_string(), false))?;
-        for item in resolved.media {
+        for item in resolved {
             if !seen.insert((item.kind, item.sha256.clone())) {
                 continue;
             }
@@ -60,7 +81,7 @@ pub(super) fn resolve(
             media.push(item);
         }
     }
-    Ok(media)
+    Ok(())
 }
 
 fn limit() -> IpcFailure {
@@ -78,7 +99,7 @@ mod tests {
     use loom_document::DocumentContent;
 
     use super::*;
-    use crate::context_attachments::import_recorded_wav;
+    use crate::context_attachments::{import_recorded_wav, set_document_context_snapshot};
     use crate::document_bindings::resolve_references;
 
     fn wav(sample: i16) -> Vec<u8> {
@@ -133,6 +154,15 @@ mod tests {
         let source = store.read_document("source.md").expect("source");
         let references =
             resolve_references(&store, &["reference".into()]).expect("explicit reference");
+        let private = import_recorded_wav(store.root(), "private.wav".into(), &wav(7))
+            .expect("private scratch audio");
+        set_document_context_snapshot(
+            store.root(),
+            &references[0].document_id.to_string(),
+            "Private scratch context is not part of this reference.",
+            &[private.id],
+        )
+        .expect("private referenced context");
         let media = resolve(&store, &source, &references, 32_768).expect("native media");
         assert_eq!(media.len(), 2);
         assert_eq!(media[0].bytes, first_bytes);

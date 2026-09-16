@@ -6,6 +6,8 @@ const COMMANDS: &[&str] = &[
     "cabal_network_set",
     "cabal_snapshot",
     "cabal_share",
+    "cabal_context_review",
+    "cabal_context_publish",
     "cabal_join",
     "cabal_open",
     "cabal_workspace",

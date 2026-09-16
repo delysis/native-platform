@@ -22,7 +22,7 @@ pub struct AssetDescriptor {
 }
 
 impl AssetDescriptor {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self.sha256.len() != 64
             || !self
                 .sha256

@@ -299,8 +299,31 @@ explicit document references. Existing model/projector modality checks still
 apply. Local QUIC tests and native storage/protocol tests establish transfer,
 recovery, integrity, and isolation; current packaged two-device model execution
 with these attachments remains unverified. Peer model jobs retain and transmit
-the exact selected native media. Document-context settings remain local; they are not silently published
-with a manuscript.
+the exact selected native media. Document-context settings remain local; they are
+not silently published with a manuscript.
+
+The context pane of a shared document offers **Share context as a document**.
+The native review names the current cabal members and shows the exact visible
+text and selected files. Publication creates an ordinary Markdown document under
+`Context/`, which can be edited concurrently, recovered offline, and referenced
+with its quoted `@"path"`. The source manuscript and private scratch context stay
+unchanged. A text import contributes the author's current excerpt, without its
+private original or acquisition receipt. Selected file cards contribute their
+explicitly reviewed original bytes through the existing bounded asset channel.
+
+The review fingerprint binds the source, publication identity, destination,
+membership roster, text, and files. Changes before publication require another
+review. A durable private intent precedes asset publication; interrupted retries
+reuse the same approved bytes and document identity. Membership changes require
+renewed review of a pending publication. Reopening a completed publication keeps
+later collaborative edits, rather than replacing them with scratch text. Each
+source has one saved publication; further changes happen in that shared document.
+
+Both writer completions and terminal prompts resolve native media from explicitly
+referenced documents. References include visible document content, excluding that
+document's private scratch attachments. Media already selected by the current
+document is not added a second time. Existing namespace isolation, modality
+checks, and aggregate media limits apply.
 
 ## Shared compute boundary
 

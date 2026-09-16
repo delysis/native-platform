@@ -25,6 +25,10 @@ pub(crate) use requesting::{
 #[path = "cabal_assets.rs"]
 mod assets;
 
+#[path = "cabal_context.rs"]
+mod context;
+pub(crate) use context::{cabal_context_publish, cabal_context_review};
+
 #[path = "cabal_network.rs"]
 mod network_settings;
 pub(crate) use network_settings::{cabal_network_get, cabal_network_set};

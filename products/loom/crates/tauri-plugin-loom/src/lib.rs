@@ -81,10 +81,11 @@ use crate::attachments::{
 };
 use crate::audio_io::{audio_record_start, audio_record_stop, audio_synthesize};
 use crate::cabals::{
-    cabal_edit, cabal_join, cabal_network_get, cabal_network_set, cabal_open, cabal_recover,
-    cabal_revoke, cabal_share, cabal_snapshot, cabal_workspace, compute_grant,
-    compute_host_snapshot, compute_job_cancel, compute_job_check, compute_job_get,
-    compute_job_prepare, compute_job_submit, compute_jobs, compute_peer_offers, compute_revoke,
+    cabal_context_publish, cabal_context_review, cabal_edit, cabal_join, cabal_network_get,
+    cabal_network_set, cabal_open, cabal_recover, cabal_revoke, cabal_share, cabal_snapshot,
+    cabal_workspace, compute_grant, compute_host_snapshot, compute_job_cancel, compute_job_check,
+    compute_job_get, compute_job_prepare, compute_job_submit, compute_jobs, compute_peer_offers,
+    compute_revoke,
 };
 use crate::co_writer::{
     CoWriterError, CoWriterSummary, apply_to_document as apply_co_writer,
@@ -2067,6 +2068,8 @@ impl Builder {
                 cabal_network_set,
                 cabal_snapshot,
                 cabal_share,
+                cabal_context_review,
+                cabal_context_publish,
                 cabal_join,
                 cabal_open,
                 cabal_workspace,
@@ -8556,13 +8559,7 @@ fn weave_start_inner<R: Runtime>(
             max_tokens,
         )
         .map_err(|error| IpcFailure::context_attachment(&error))?;
-        let document_context = document_bindings::context_for_markdown(store, &loaded.text)?;
-        if !document_context.is_empty() {
-            attachment_context.context_preamble.push_str("\n\n");
-            attachment_context
-                .context_preamble
-                .push_str(&document_context);
-        }
+        document_bindings::append_completion_context(store, &loaded.text, &mut attachment_context)?;
         let exact_prefix = attachment_context.manuscript_prompt.clone();
         if exact_prefix.is_empty()
             && attachment_context.context_preamble.is_empty()

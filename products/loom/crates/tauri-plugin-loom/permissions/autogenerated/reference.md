@@ -9,6 +9,8 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-cabal-network-set`
 - `allow-cabal-snapshot`
 - `allow-cabal-share`
+- `allow-cabal-context-review`
+- `allow-cabal-context-publish`
 - `allow-cabal-join`
 - `allow-cabal-open`
 - `allow-cabal-workspace`
@@ -533,6 +535,58 @@ Enables the build_model_policy_get command without any pre-configured scope.
 <td>
 
 Denies the build_model_policy_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-context-publish`
+
+</td>
+<td>
+
+Enables the cabal_context_publish command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-context-publish`
+
+</td>
+<td>
+
+Denies the cabal_context_publish command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-context-review`
+
+</td>
+<td>
+
+Enables the cabal_context_review command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-context-review`
+
+</td>
+<td>
+
+Denies the cabal_context_review command without any pre-configured scope.
 
 </td>
 </tr>

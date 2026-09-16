@@ -91,16 +91,42 @@ pub(super) fn resolve_references(
     Ok(resolved)
 }
 
+#[cfg(all(test, unix))]
 pub(super) fn context_for_markdown(
     store: &ProjectStore,
     markdown: &str,
 ) -> Result<String, IpcFailure> {
+    render_context(&references_for_markdown(store, markdown)?)
+}
+
+pub(super) fn append_completion_context(
+    store: &ProjectStore,
+    markdown: &str,
+    context: &mut super::context_attachments::ResolvedContext,
+) -> Result<(), IpcFailure> {
+    let documents = references_for_markdown(store, markdown)?;
+    let text = render_context(&documents)?;
+    super::terminal_media::append_references(store, &documents, &mut context.media)?;
+    if !text.is_empty() {
+        context.context_preamble.push_str("\n\n");
+        context.context_preamble.push_str(&text);
+    }
+    Ok(())
+}
+
+fn references_for_markdown(
+    store: &ProjectStore,
+    markdown: &str,
+) -> Result<Vec<ResolvedDocument>, IpcFailure> {
     let names = loom_document::document_references(markdown)
         .map_err(|error| IpcFailure::new("document_reference_syntax", error.to_string(), false))?
         .into_iter()
         .map(|reference| reference.name)
         .collect::<Vec<_>>();
-    let documents = resolve_references(store, &names)?;
+    resolve_references(store, &names)
+}
+
+fn render_context(documents: &[ResolvedDocument]) -> Result<String, IpcFailure> {
     if documents.is_empty() {
         return Ok(String::new());
     }

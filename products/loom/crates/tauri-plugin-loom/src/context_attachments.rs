@@ -1,3 +1,4 @@
+pub(crate) mod publication;
 pub(crate) mod shared;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -1161,6 +1162,39 @@ fn strip_inline_attachment_markers(markdown: &str) -> String {
         let text = remove_inline_attachment_markers(&text, id);
         remove_inline_media_markers(&text, id)
     })
+}
+
+/// An explicit document reference authorizes only media in its visible text.
+/// Its private scratch context is not part of the referenced document.
+pub(crate) fn resolve_inline_media(
+    project_root: &Path,
+    document_id: &str,
+    markdown: &str,
+) -> Result<Vec<MediaInput>, ContextAttachmentError> {
+    let root = shared::inline_root(project_root, document_id)?;
+    shared::prepare_inline_images(&root, markdown)?;
+    let ids = inline_attachment_ids(markdown);
+    if ids.len() > MAX_CONTEXT_ATTACHMENTS {
+        return Err(ContextAttachmentError::ContextLimit);
+    }
+    let manifests = ids
+        .into_iter()
+        .map(|id| read_manifest_metadata(&root, &id).map(|manifest| (id, manifest)))
+        .collect::<Result<Vec<_>, _>>()?;
+    preflight_native_media(&manifests)?;
+    let mut media = Vec::new();
+    for (id, manifest) in manifests {
+        for item in manifest.media {
+            media.push(MediaInput {
+                id: format!("{id}:{}", item.id),
+                bytes: read_object(&root, &item.sha256, item.byte_count)?,
+                kind: item.kind,
+                mime: item.mime,
+                sha256: item.sha256,
+            });
+        }
+    }
+    Ok(media)
 }
 
 #[allow(clippy::too_many_lines)]

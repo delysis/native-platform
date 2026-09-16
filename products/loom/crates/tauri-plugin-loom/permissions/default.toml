@@ -8,6 +8,8 @@ permissions = [
   "allow-cabal-network-set",
   "allow-cabal-snapshot",
   "allow-cabal-share",
+  "allow-cabal-context-review",
+  "allow-cabal-context-publish",
   "allow-cabal-join",
   "allow-cabal-open",
   "allow-cabal-workspace",
