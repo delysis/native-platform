@@ -1612,7 +1612,8 @@ describe('real WebKit editor interactions', () => {
     await expect.poll(() => document.querySelector('.loom-visual-ghost')?.textContent).toBe('');
   });
 
-  it('keeps the selected MD remainder visible across its value echo and a stable rerender, then reverses it', async () => {
+  it.each(['{Alt>}{ArrowLeft}{/Alt}', '{Meta>}z{/Meta}'])(
+    'keeps the selected MD remainder visible, then reverses it with %s', async (undoKey) => {
     const keyboard = userEvent.setup();
     renderSource('hello', [
       { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
@@ -1632,7 +1633,7 @@ describe('real WebKit editor interactions', () => {
     await expect.element(page.getByRole('status', { name: 'Source Generation Requests' }))
       .toHaveTextContent('0');
 
-    await keyboard.keyboard('{Alt>}{ArrowLeft}{/Alt}');
+    await keyboard.keyboard(undoKey);
     await expect.element(page.getByRole('status', { name: 'Source Markdown' }))
       .toHaveTextContent('hello');
     await expect.element(page.getByText(' there', { exact: true }).first()).toBeVisible();

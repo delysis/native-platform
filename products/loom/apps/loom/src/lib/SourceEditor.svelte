@@ -575,10 +575,8 @@
     if (
       candidate &&
       ghostUnconsumeText &&
-      event.altKey &&
-      !event.metaKey &&
-      !event.ctrlKey &&
-      event.key === 'ArrowLeft' &&
+      ((event.altKey && !event.metaKey && !event.ctrlKey && event.key === 'ArrowLeft') ||
+        (!event.altKey && !event.shiftKey && (event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'z')) &&
       element &&
       element.selectionStart === element.selectionEnd &&
       element.value.slice(0, element.selectionStart).endsWith(ghostUnconsumeText) &&
