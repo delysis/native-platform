@@ -1213,7 +1213,8 @@ run_once() {
       "$loom_database" \
       'SELECT count(*) FROM generation_runs;')
     RUN_1_EDITOR_CORE_SENTINEL='Loom native smoke: editor persistence.'
-    RUN_1_EDITOR_INPUT_SENTINEL="$RUN_1_EDITOR_CORE_SENTINEL "
+    # A missing authored reference must not disable the real writing loop.
+    RUN_1_EDITOR_INPUT_SENTINEL="$RUN_1_EDITOR_CORE_SENTINEL @Missing. The quiet moon "
     RUN_1_EDITOR_SENTINEL=$RUN_1_EDITOR_INPUT_SENTINEL
     if ! RUN_1_EDITOR_EVIDENCE=$(type_into_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_INPUT_SENTINEL"); then
       echo "could not drive the exact app's accessible manuscript editor" >&2

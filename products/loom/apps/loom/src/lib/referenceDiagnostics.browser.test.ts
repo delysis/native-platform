@@ -11,6 +11,17 @@ let mounted: ReturnType<typeof mount> | undefined;
 afterEach(async () => { if (mounted) await unmount(mounted); mounted = undefined; document.body.replaceChildren(); vi.resetAllMocks(); });
 const referenceScope = { projectId: 'project', sessionId: 'session', revision: 'one' };
 
+it('marks the original writing even when visual serialization normalizes whitespace', async () => {
+  const value = 'The quiet moon.  @Missing\n\n@“Notes.md” ';
+  const target = document.createElement('div'); document.body.append(target);
+  const onChange = vi.fn();
+  read.mockResolvedValue([{ start: value.indexOf('@Missing'), end: value.indexOf('@Missing') + 8, message: 'Source missing' }]);
+  mounted = mount(LoomEditor, { target, props: { value, referenceScope, onChange, onGhostPresentationRejected: () => {} } });
+  await expect.element(page.getByTitle('Source missing')).toBeVisible();
+  expect(page.getByTitle('Source missing').element().textContent).toBe('@Missing');
+  expect(onChange).not.toHaveBeenCalled();
+});
+
 it('underlines the missing link in the live visual editor without changing bytes, selection or surrounding layout', async () => {
   const value = 'Before [@Lost](loom-material:missing) after.';
   const target = document.createElement('div'); document.body.append(target);

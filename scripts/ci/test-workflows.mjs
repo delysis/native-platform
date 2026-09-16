@@ -288,7 +288,7 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
     "real completion smoke must type with autocomplete off and enable it only afterward",
   );
   assert.match(smoke, /RUN_1_EDITOR_CORE_SENTINEL='Loom native smoke: editor persistence\.'/);
-  assert.match(smoke, /RUN_1_EDITOR_INPUT_SENTINEL="\$RUN_1_EDITOR_CORE_SENTINEL "/);
+  assert.match(smoke, /RUN_1_EDITOR_INPUT_SENTINEL="\$RUN_1_EDITOR_CORE_SENTINEL @Missing\. The quiet moon "/);
   assert.match(smoke, /pressed_exactly_once/);
   assert.match(smoke, /"require-press"/);
   assert.match(smoke, /observed === expected/);

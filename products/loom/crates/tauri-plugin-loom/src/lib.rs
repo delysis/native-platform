@@ -8561,6 +8561,11 @@ fn weave_start_inner<R: Runtime>(
             &loaded.text,
             source_prefix,
             material_budget,
+            if authorized_model.is_automatic() {
+                material_context::ReferenceRequirement::AvailableForWriting
+            } else {
+                material_context::ReferenceRequirement::All
+            },
         )?;
         attachment_context.media = terminal_media::merge(
             attachment_context.media,

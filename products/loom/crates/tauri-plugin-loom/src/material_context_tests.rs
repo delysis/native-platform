@@ -24,6 +24,52 @@ fn attachment(store: &mut ProjectStore, name: &str, text: &str) -> MaterialEntry
 }
 
 #[test]
+fn writing_continues_with_recorded_missing_references_and_smart_quoted_context() {
+    let (_directory, mut store) = project();
+    document(&mut store, "Notes.md", "A known source.");
+    document(&mut store, "left/Ambiguous.md", "Left source");
+    document(&mut store, "right/Ambiguous.md", "Right source");
+    let manuscript = "The quiet moon.  @Missing\n\n@“Notes.md” @Ambiguous ";
+    let plan = markdown_plan_with_budget(
+        &store,
+        manuscript,
+        manuscript,
+        4000,
+        ReferenceRequirement::AvailableForWriting,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.bindings.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["Notes.md"]
+    );
+    assert!(plan.text.contains("A known source."));
+    assert_eq!(
+        plan.unresolved_references
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["Ambiguous", "Missing"]
+    );
+    let receipt = serde_json::to_value(&plan).unwrap();
+    assert!(
+        receipt["unresolved_references"]["Missing"]
+            .as_str()
+            .unwrap()
+            .contains("Missing")
+    );
+    assert_eq!(
+        markdown_plan(&store, manuscript, manuscript)
+            .unwrap_err()
+            .code,
+        "document_reference_missing"
+    );
+    assert_eq!(
+        std::fs::read_to_string(store.root().join("Notes.md")).unwrap(),
+        "A known source."
+    );
+}
+
+#[test]
 fn document_and_material_aliases_cannot_silently_choose_one_another() {
     let (_directory, mut store) = project();
     document(&mut store, "left/Research.md", "First document");
@@ -237,7 +283,14 @@ fn small_context_retrieves_whole_pdf_passages_without_shortening_exact_arguments
     let all_hits = materials::search(&store, &source.id, "nightjar").unwrap();
     assert!(all_hits.hits.len() > 1);
     let markdown = format!("Use [@PDF source](loom-material:{}).", source.id);
-    let plan = markdown_plan_with_budget(&store, &markdown, "nightjar", 2800).unwrap();
+    let plan = markdown_plan_with_budget(
+        &store,
+        &markdown,
+        "nightjar",
+        2800,
+        ReferenceRequirement::All,
+    )
+    .unwrap();
     assert!(plan.text.len() <= 2800);
     assert!(!plan.evidence.is_empty());
     assert!(plan.evidence.len() < all_hits.hits.len());
@@ -266,15 +319,30 @@ fn small_context_retrieves_whole_pdf_passages_without_shortening_exact_arguments
         all_hits.hits.len()
     );
     assert_eq!(exact(&value).unwrap(), whole);
-    assert!(markdown_plan_with_budget(&store, &markdown, "nightjar", 100).is_err());
+    assert!(
+        markdown_plan_with_budget(
+            &store,
+            &markdown,
+            "nightjar",
+            100,
+            ReferenceRequirement::All
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn ordinary_budgeted_consultation_reports_zero_matches_explicitly() {
     let (_directory, mut store) = project();
     let source = attachment(&mut store, "Research", &"Quiet prose. ".repeat(1000));
-    let plan =
-        markdown_plan_with_budget(&store, &format!("@{}", source.id), "nightjar", 1000).unwrap();
+    let plan = markdown_plan_with_budget(
+        &store,
+        &format!("@{}", source.id),
+        "nightjar",
+        1000,
+        ReferenceRequirement::All,
+    )
+    .unwrap();
     assert!(plan.evidence.is_empty());
     assert!(
         plan.text

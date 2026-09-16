@@ -90,6 +90,13 @@ pub(super) struct ContextPlan {
     pub evidence: Vec<MaterialEvidence>,
     pub byte_budget: usize,
     pub omitted_evidence: BTreeMap<String, Vec<String>>,
+    pub unresolved_references: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ReferenceRequirement {
+    All,
+    AvailableForWriting,
 }
 
 /// Shared operation bound: overlapping folders cannot multiply admission work.
@@ -347,7 +354,7 @@ pub(super) fn markdown_plan(
     markdown: &str,
     query: &str,
 ) -> Result<ContextPlan, IpcFailure> {
-    markdown_plan_with_budget(store, markdown, query, MAX_BYTES)
+    markdown_plan_with_budget(store, markdown, query, MAX_BYTES, ReferenceRequirement::All)
 }
 
 #[cfg(all(test, unix))]
@@ -448,6 +455,7 @@ pub(super) fn markdown_plan_with_budget(
     markdown: &str,
     query: &str,
     byte_budget: usize,
+    requirement: ReferenceRequirement,
 ) -> Result<ContextPlan, IpcFailure> {
     let references =
         loom_document::document_references(markdown).map_err(|error| failure(error.to_string()))?;
@@ -462,7 +470,23 @@ pub(super) fn markdown_plan_with_budget(
         if !seen.insert(reference.name.clone()) {
             continue;
         }
-        let value = resolve(store, &reference.name)?;
+        let value = match resolve(store, &reference.name) {
+            Ok(value) => value,
+            Err(error)
+                if matches!(requirement, ReferenceRequirement::AvailableForWriting)
+                    && matches!(
+                        error.code,
+                        "document_reference_missing" | "document_reference_ambiguous"
+                    ) =>
+            {
+                // A typo must not turn off writing. Keep the omission in the
+                // shared family receipt; explicit calls still require every input.
+                plan.unresolved_references
+                    .insert(reference.name, error.message);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         folder_budget.admit(&value)?;
         let header = format!("\n--- Referenced material {:?} ---\n", reference.name);
         let footer = "\n--- End material ---\n";

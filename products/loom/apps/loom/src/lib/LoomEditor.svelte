@@ -1199,7 +1199,7 @@
   });
 
   $: referenceDiagnostics.update(referenceScope, value, (items) => {
-    if (view && serializeVisualMarkdown(view.state.doc) === value) {
+    if (view) {
       view.dispatch(view.state.tr.setMeta(referenceDiagnosticKey, visualReferenceDecorations(view.state.doc, value, items)).setMeta('addToHistory', false));
     }
   });

@@ -282,7 +282,7 @@ fn reference_at(source: &str, start: usize) -> Option<DocumentReference> {
     let mut end = parser.offset;
     // A sentence's final full stop is prose punctuation. Quote a name ending
     // in a full stop to refer to it literally.
-    if source.as_bytes().get(start + 1) != Some(&b'"') {
+    if !source[start + 1..].starts_with(['"', '“']) {
         let bare_len = name.trim_end_matches('.').len();
         end -= name.len() - bare_len;
         name.truncate(bare_len);
@@ -488,7 +488,7 @@ impl Parser<'_> {
     }
 
     fn name(&mut self) -> Result<String, NeuralSyntaxError> {
-        if self.source[self.offset..].starts_with('"') {
+        if self.source[self.offset..].starts_with(['"', '“']) {
             let name = self.quoted()?;
             if name.trim().is_empty() {
                 return Err(self.error("document name is empty"));
@@ -513,12 +513,17 @@ impl Parser<'_> {
     }
 
     fn quoted(&mut self) -> Result<String, NeuralSyntaxError> {
-        self.take("\"");
+        let closing = if self.take("“") {
+            '”'
+        } else {
+            self.take("\"");
+            '"'
+        };
         let mut text = String::new();
         while let Some(character) = self.source[self.offset..].chars().next() {
             self.offset += character.len_utf8();
             match character {
-                '"' => return Ok(text),
+                character if character == closing => return Ok(text),
                 '\\' => {
                     let escaped = self.source[self.offset..]
                         .chars()
@@ -548,6 +553,24 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn smart_quoted_reference_names_preserve_original_byte_ranges() {
+        let source = "🌙 @Missing @“Notes.md” @“A title.”";
+        let refs = document_references(source).unwrap();
+        assert_eq!(
+            refs.iter()
+                .map(|reference| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Missing", "Notes.md", "A title."]
+        );
+        assert_eq!(
+            refs.iter()
+                .map(|reference| &source[reference.range.clone()])
+                .collect::<Vec<_>>(),
+            ["@Missing", "@“Notes.md”", "@“A title.”"]
+        );
+    }
 
     fn reference(name: &str) -> NeuralExpression {
         NeuralExpression::Reference {
