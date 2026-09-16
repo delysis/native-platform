@@ -194,6 +194,8 @@ struct RunReceipt {
     source_document_id: DocumentId,
     source_revision_id: RevisionId,
     input_blob_id: BlobId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    function_recipe: Option<crate::workspace_template::FunctionRecipe>,
     #[serde(default)]
     context_references: Option<Vec<String>>,
     #[serde(default)]
@@ -485,7 +487,6 @@ pub(super) async fn terminal_run<R: Runtime>(
     if let Some(boundary) = turn_boundary {
         fingerprint_bytes.extend(serde_json::to_vec(&boundary).map_err(io_failure)?);
     }
-    let fingerprint = BlobId::digest(&fingerprint_bytes);
     let admission = lock_application_admission(&state, "an experiment")?;
     let model_guard = lock_model_lifecycle(&state)?;
     let mut session = lock_session(&state)?;
@@ -496,6 +497,12 @@ pub(super) async fn terminal_run<R: Runtime>(
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
     let root = store.root().to_owned();
     if let Some(receipt) = read_receipt(&root, &command_id.to_string(), false)? {
+        // A replay uses the admitted configuration, even when the live dotfile
+        // changed afterwards. A new command captures the new revision instead.
+        if let Some(recipe) = &receipt.function_recipe {
+            fingerprint_bytes.extend(serde_json::to_vec(recipe).map_err(io_failure)?);
+        }
+        let fingerprint = BlobId::digest(&fingerprint_bytes);
         if receipt.request_fingerprint != fingerprint {
             return Err(failure(
                 "This run identifier belongs to a different experiment",
@@ -572,6 +579,15 @@ pub(super) async fn terminal_run<R: Runtime>(
     if let NeuralCommand::Expression(expression) = &command {
         function_names(expression, &mut functions);
     }
+    let function_recipe = if functions.is_empty() {
+        None
+    } else {
+        Some(crate::workspace_template::function_recipe(store)?)
+    };
+    if let Some(recipe) = &function_recipe {
+        fingerprint_bytes.extend(serde_json::to_vec(recipe).map_err(io_failure)?);
+    }
+    let fingerprint = BlobId::digest(&fingerprint_bytes);
     let mut all_names = names.into_iter().collect::<BTreeSet<_>>();
     for function in functions {
         if function.ends_with('/') {
@@ -670,6 +686,7 @@ pub(super) async fn terminal_run<R: Runtime>(
         source_document_id: document_id,
         source_revision_id: source.revision_id,
         input_blob_id,
+        function_recipe,
         context_references,
         media: media_evidence,
         model: model.as_ref().map(|model| model.descriptor.clone()),
@@ -856,7 +873,8 @@ impl Evaluator<'_> {
                     self.append_context(&mut prefix, &name, &value, &query, text.len())?;
                 }
                 prefix.push_str(text);
-                self.complete(bounded(prefix)?).map(Value::Text)
+                self.complete(bounded(prefix)?, PromptMode::RawCompletion)
+                    .map(Value::Text)
             }
             NeuralCommand::Expression(expression) => self.evaluate(expression),
         }
@@ -914,7 +932,16 @@ impl Evaluator<'_> {
                 contextual_function.push_str(&function);
                 let prompt = render_base_function_prompt(&contextual_function, &input_refs)
                     .map_err(io_failure)?;
-                self.complete(bounded(prompt)?).map(Value::Text)
+                let mode = match self
+                    .receipt
+                    .function_recipe
+                    .as_ref()
+                    .map(|recipe| recipe.format)
+                {
+                    Some(crate::workspace_template::FunctionFormat::Model) => PromptMode::Function,
+                    _ => PromptMode::RawCompletion,
+                };
+                self.complete(bounded(prompt)?, mode).map(Value::Text)
             }
         }
     }
@@ -989,7 +1016,7 @@ impl Evaluator<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn complete(&mut self, prompt: String) -> Result<String, IpcFailure> {
+    fn complete(&mut self, prompt: String, mode: PromptMode) -> Result<String, IpcFailure> {
         if self.control.cancelled.load(Ordering::Acquire) {
             return Err(failure("Cancelled"));
         }
@@ -1009,10 +1036,18 @@ impl Evaluator<'_> {
                 .map_err(IpcFailure::store)?;
             let mut inputs = vec![self.source.artifact_id];
             inputs.extend(self.receipt.sources.iter().map(|source| source.artifact_id));
+            if let Some(configuration) = self
+                .receipt
+                .function_recipe
+                .as_ref()
+                .and_then(|recipe| recipe.configuration.as_ref())
+            {
+                inputs.push(configuration.artifact_id);
+            }
             inputs.sort();
             inputs.dedup();
             let recipe = PromptRecipe {
-                mode: PromptMode::RawCompletion,
+                mode,
                 exact_prompt_blob_id: prompt_blob,
                 exact_prompt_token_ids: None,
                 ordered_input_artifact_ids: inputs.clone(),
@@ -1118,7 +1153,7 @@ impl Evaluator<'_> {
             candidate,
             &request_id,
             recipe.exact_prompt_blob_id,
-            PromptMode::RawCompletion,
+            mode,
             &result.context_binding,
             &model.descriptor,
             // Terminal submits one continuation case, always at input index 0.
