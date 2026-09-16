@@ -232,6 +232,7 @@ async fn interrupted_pipeline_with_source(
             media,
             step: 0,
             recovery: RecoveryMode::Resume,
+            folder_scan_budget: material_context::FolderScanBudget::default(),
         };
         evaluator
             .evaluate_command(&parse_neural_command(&first_expression).unwrap())

@@ -17,6 +17,7 @@ env:
 jobs:
   root:
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -40,7 +41,8 @@ jobs:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
-          shared-key: full-root-${{ runner.os }}
+          shared-key: workspace-${{ runner.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
           cache-directories: ${{ runner.os == 'macOS' && '~/Library/Caches/ort.pyke.io/dfbin' || runner.os == 'Windows' && '~/AppData/Local/ort.pyke.io/dfbin' || '' }}
       - uses: ./.github/actions/loom-signal

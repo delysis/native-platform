@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { convertFileSrc } from '@tauri-apps/api/core';
   import { readMaterial, searchMaterial, readMaterialEvidence, revealMaterialOriginal, normalizeFailure, pinMaterial, removeMaterial } from './ipc';
-  import { materialLocatorLabel, materialReferenceMarkdown, evidenceReferenceMarkdown, type MaterialEntry, type MaterialRead, type MaterialEvidence, type MaterialSearch } from './materials';
+  import { materialLocatorLabel, materialLocatorPage, materialPdfPageText, materialWritingDocument, materialReferenceMarkdown, evidenceReferenceMarkdown, type MaterialEntry, type MaterialRead, type MaterialEvidence, type MaterialSearch } from './materials';
 
   export let projectId: string;
   export let sessionId: string;
@@ -15,6 +15,7 @@
   export let onRemoved: (id: string, session: string) => void = () => {};
   export let onChanged: (entry: MaterialEntry) => void;
   export let onReopen: () => void;
+  export let onOpenDocument: ((id: string) => Promise<void>) | undefined = undefined;
 
   let source: MaterialRead | null = null;
   let results: MaterialSearch | null = null;
@@ -25,8 +26,17 @@
   let serial = 0;
   let mounted = false;
   let sourceTextElement: HTMLDivElement | undefined;
-  $: reference = selected ? evidenceReferenceMarkdown(selected) : materialReferenceMarkdown(material);
-  $: text = selected?.text ?? source?.text ?? '';
+  let contentElement: HTMLDivElement | undefined;
+  let pageIndex = 0;
+  $: pdfPages = source?.presentation?.pdf_pages ?? [];
+  $: pdfBytes = pdfPages.length && source ? new TextEncoder().encode(source.text) : null;
+  $: currentPage = pdfPages[pageIndex];
+  $: pageText = pdfBytes && currentPage ? materialPdfPageText(pdfBytes, currentPage) : null;
+  $: isPdf = source?.presentation?.detected_format.toLowerCase() === 'pdf';
+  $: selectedPage = materialLocatorPage(selected?.locator);
+  $: reference = selected ? evidenceReferenceMarkdown(selected) : material.kind === 'folder' ? material.reference : materialReferenceMarkdown(material);
+  $: writingDocumentId = materialWritingDocument(selected?.locator, projectId);
+  $: text = selected?.text ?? pageText ?? source?.text ?? '';
   $: warnings = [...new Set([...(source?.warnings ?? []), ...(results?.warnings ?? []), ...(selected?.warnings ?? [])])];
 
   async function load(): Promise<void> {
@@ -46,6 +56,28 @@
     const request = ++serial; busy = true; error = '';
     try { const value = await readMaterialEvidence(projectId, sessionId, material.id, hit.id); if (mounted && serial === request) selected = value; }
     catch (failure) { if (mounted && serial === request) error = normalizeFailure(failure).message; }
+    finally { if (mounted && serial === request) busy = false; }
+  }
+  function changePage(index: number): void {
+    if (busy || !Number.isInteger(index) || index < 0 || index >= pdfPages.length) return;
+    pageIndex = index;
+    contentElement?.scrollTo(0, 0);
+  }
+  async function openSourcePage(): Promise<void> {
+    if (!selectedPage || busy || !material.available || !material.attachment_id) return;
+    const number = selectedPage;
+    const request = ++serial; busy = true; error = '';
+    try {
+      const value = source ?? await readMaterial(projectId, sessionId, material.id);
+      if (!mounted || serial !== request) return;
+      const index = value.presentation?.pdf_pages?.findIndex(page => page.number === number) ?? -1;
+      if (index < 0 || value.source_revision !== selected?.source_revision) {
+        error = 'This retained passage has no matching extracted page in the available source.';
+        return;
+      }
+      source = value; pageIndex = index; selected = null; results = null;
+      contentElement?.scrollTo(0, 0);
+    } catch (failure) { if (mounted && serial === request) error = normalizeFailure(failure).message; }
     finally { if (mounted && serial === request) busy = false; }
   }
   function quotationText(): string {
@@ -100,24 +132,42 @@
     try { await navigator.clipboard.writeText(reference); }
     catch { error = 'The reference could not be copied.'; }
   }
-  onMount(() => { mounted = true; if (material.available && !initialEvidence) void load(); return () => { mounted = false; serial += 1; }; });
+  async function openWriting(): Promise<void> {
+    if (!writingDocumentId || !onOpenDocument || busy) return;
+    busy = true; error = '';
+    try { await onOpenDocument(writingDocumentId); }
+    catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
+    finally { if (mounted) busy = false; }
+  }
+  onMount(() => { mounted = true; if (material.available && material.kind !== 'folder' && !initialEvidence) void load(); return () => { mounted = false; serial += 1; }; });
 </script>
 
 <section class="material-view" aria-label={material.name} aria-busy={busy}>
   <header>
     <h1>{selected?.title ?? material.name}</h1>
+    {#if !selected && !results && pdfPages.length}
+      <nav class="pages" aria-label="Extracted PDF pages">
+        <button disabled={busy || pageIndex === 0} aria-label="Previous page" on:click={() => changePage(pageIndex - 1)}>‹</button>
+        <select aria-label="Page" value={pageIndex} disabled={busy} on:change={event => changePage(Number(event.currentTarget.value))}>
+          {#each pdfPages as pdfPage, index}<option value={index}>Page {pdfPage.number}</option>{/each}
+        </select>
+        <button disabled={busy || pageIndex >= pdfPages.length - 1} aria-label="Next page" on:click={() => changePage(pageIndex + 1)}>›</button>
+      </nav>
+    {/if}
     <details class="actions"><summary aria-label="Source actions" on:mousedown|preventDefault>•••</summary><div class="action-menu">
       {#if originTitle}<button disabled={busy || (!material.available && !selected)} on:click={() => void use()}>Insert reference</button>{/if}
       <button on:click={() => void copyReference()}>Copy reference</button>
       {#if text && originTitle}<button disabled={busy} on:mousedown|preventDefault on:click={() => void use(true)}>Insert quotation</button>{/if}
-      {#if material.attachment_id}<button on:click={() => void original()}>Open original</button>{/if}
-      {#if material.available}<button disabled={busy} on:click={() => void pin()}>{material.pinned ? 'Unpin' : 'Pin'}</button>{/if}
-      {#if removable}<button disabled={busy} on:click={() => void remove()}>Remove from workspace</button>{/if}
+      {#if writingDocumentId && onOpenDocument}<button disabled={busy} on:click={() => void openWriting()}>Open current writing</button>{/if}
+      {#if selectedPage && material.available && material.attachment_id}<button disabled={busy} on:click={() => void openSourcePage()}>Open page {selectedPage}</button>{/if}
+      {#if material.attachment_id}<button on:click={() => void original()}>Reveal original</button>{/if}
+      {#if material.available && material.kind !== 'folder'}<button disabled={busy} on:click={() => void pin()}>{material.pinned ? 'Unpin' : 'Pin'}</button>{/if}
+      {#if removable && material.kind !== 'folder'}<button disabled={busy} on:click={() => void remove()}>Remove from workspace</button>{/if}
     </div></details>
     <button class="close" on:click={onClose} aria-label="Close source" title="Close source"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="m4 4 8 8M12 4l-8 8" /></svg></button>
   </header>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
-  {#if !material.available && !selected}
+  {#if material.kind === 'library' && !material.available && !selected}
     <p class="notice">Choose this library again to open it on this device.</p>
     <button class="reopen" on:click={onReopen}>Choose library…</button>
   {:else}
@@ -133,7 +183,7 @@
         {#each warnings as warning}<p>{warning}</p>{/each}
       </details>
     {/if}
-    <div class="content">
+    <div class="content" bind:this={contentElement}>
       {#if selected}
         <p class="location">{materialLocatorLabel(selected.locator)}</p>
         <div class="source-text" bind:this={sourceTextElement}>{selected.text}</div>
@@ -146,13 +196,14 @@
           </button>
         {/each}
       {:else if source}
+        {#if isPdf && (!pdfPages.length || pageText === null)}<p class="notice">Page navigation is unavailable for this copy. The extracted text and original are retained.</p>{/if}
         {#each source.presentation?.media ?? [] as media (media.sha256)}
           {#if media.preview_token}
             {#if media.kind === 'image'}<img src={convertFileSrc(media.preview_token, 'loom-asset')} alt={material.name} />
             {:else}<audio controls preload="metadata" src={convertFileSrc(media.preview_token, 'loom-asset')} aria-label={`Play ${material.name}`}></audio>{/if}
           {/if}
         {/each}
-        {#if source.text}<div class="source-text" bind:this={sourceTextElement}>{source.text}</div>
+        {#if source.text}<div class="source-text" bind:this={sourceTextElement}>{text}</div>
         {:else if material.kind === 'attachment' && !source.presentation?.media.length}<p class="notice">The original is retained. No readable text is available.</p>{/if}
       {:else if busy}<p class="notice" role="status">Opening…</p>{/if}
     </div>
@@ -163,7 +214,10 @@
   .material-view { display:flex; flex-direction:column; min-width:0; min-height:0; height:100%; color:inherit; }
   header { display:flex; gap:8px; align-items:center; padding:6px 10px; border-bottom:1px solid #8883; }
   h1 { margin:0; flex:1; min-width:0; font:inherit; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  button,input,summary { font:inherit; color:inherit; }
+  button,input,select,summary { font:inherit; color:inherit; }
+  .pages { display:flex; align-items:center; gap:2px; }
+  .pages button { border:0; padding:2px 5px; }
+  .pages select { background:transparent; border:0; max-width:100px; }
   button { cursor:pointer; border:1px solid #8883; border-radius:5px; background:transparent; padding:4px 8px; min-height:28px; }
   button:disabled { opacity:.5; cursor:default; }
   .close { display:grid; place-items:center; width:28px; min-width:28px; border:0; padding:4px; }

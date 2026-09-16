@@ -28,6 +28,7 @@ mod speech_input;
 mod terminal;
 mod terminal_media;
 mod terminal_receipts;
+mod workspace_copy;
 mod workspace_preview;
 mod workspace_template;
 
@@ -2163,6 +2164,7 @@ impl Builder {
                 document_delete,
                 import_batch::import_text_sources,
                 import_batch::attachment_import_batch_choose,
+                workspace_copy::workspace_copy_files,
                 connected_imports::import_account_cancel,
                 connected_imports::import_source_url,
                 connected_imports::import_accounts,
@@ -8696,6 +8698,8 @@ fn weave_start_inner<R: Runtime>(
                 "session": active_session_id, "document": document_id, "revision": source_revision_id,
                 "cursor": cursor_byte, "prompt": BlobId::digest(exact_prefix.as_bytes()),
                 "context": context, "model": model_environment,
+                "materials": BlobId::digest(&serde_json::to_vec(&material_plan)
+                    .map_err(|error| IpcFailure::new("speculation_identity_failed", error.to_string(), false))?),
             })).map_err(|error| IpcFailure::new("speculation_identity_failed", error.to_string(), false))?;
             Ok::<_, IpcFailure>(LoompadBatch { snapshot_id: BlobId::digest(&identity).to_string(), sample_target, batch_offset })
         }).transpose()?;
@@ -8725,11 +8729,21 @@ fn weave_start_inner<R: Runtime>(
         let environment_artifact = store
             .record_model_environment(&model_environment)
             .map_err(IpcFailure::store)?;
+        let mut context_inputs = material_context::evidence_artifact_ids(&material_plan.evidence)?;
+        for value in material_plan.bindings.values() {
+            if let material_context::Value::Documents { documents } = value {
+                context_inputs.extend(documents.iter().map(|document| document.artifact_id));
+            }
+        }
+        context_inputs.sort();
+        context_inputs.dedup();
+        let mut prompt_inputs = vec![loaded.artifact_id];
+        prompt_inputs.extend(context_inputs.iter().copied());
         let prompt_recipe = PromptRecipe {
             mode: PromptMode::Completion,
             exact_prompt_blob_id,
             exact_prompt_token_ids: None,
-            ordered_input_artifact_ids: vec![loaded.artifact_id],
+            ordered_input_artifact_ids: prompt_inputs,
             prompt_token_count: None,
         };
         let prompt_artifact = store
@@ -8752,7 +8766,7 @@ fn weave_start_inner<R: Runtime>(
         let context_artifact = store
             .record_context_recipe(&ContextRecipe {
                 source_revision_id,
-                ordered_source_artifact_ids: Vec::new(),
+                ordered_source_artifact_ids: context_inputs,
                 token_budget: u64::from(authorized_model.context_tokens()),
                 retrieval_evidence_blob_id,
             })
@@ -11347,22 +11361,32 @@ mod tests {
     #[test]
     fn native_exit_recording_never_blocks_on_an_owned_application_admission_boundary() {
         let state = Arc::new(PluginState::default());
-        let admission =
-            lock_application_admission(&state, "fixture work").expect("admit fixture work");
-        let (sent, received) = std::sync::mpsc::channel();
+        let (admitted, ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
         let worker_state = Arc::clone(&state);
         let worker = std::thread::spawn(move || {
-            sent.send(record_application_exit_request(&worker_state))
-                .expect("send exit disposition");
+            let admission = lock_application_admission(&worker_state, "fixture work")
+                .expect("admit fixture work");
+            admitted.send(()).expect("signal owned admission");
+            // Release the guard even if a regression blocks the caller. The
+            // assertion below checks ordering, not thread-start latency.
+            let release = released.recv_timeout(Duration::from_secs(5));
+            assert_eq!(*admission, ApplicationPhase::Running);
+            drop(admission);
+            release
         });
 
-        assert!(
-            !received
-                .recv_timeout(Duration::from_millis(20))
-                .expect("event-thread exit recording must be nonblocking")
-        );
-        worker.join().expect("join exit-request worker");
-        drop(admission);
+        ready
+            .recv()
+            .expect("admission is held before recording exit");
+        let may_exit = record_application_exit_request(&state);
+        let release_sent = release.send(());
+        worker
+            .join()
+            .expect("join admission worker")
+            .expect("exit recording must finish before admission is released");
+        release_sent.expect("release admission after recording exit");
+        assert!(!may_exit);
         assert_eq!(
             *state.application.lock().expect("application phase"),
             ApplicationPhase::Running

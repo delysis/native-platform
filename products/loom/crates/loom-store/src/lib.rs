@@ -10,6 +10,9 @@ mod provenance;
 mod reconciliation;
 mod schema;
 mod store;
+mod workspace_copy;
+
+pub use workspace_copy::{PreparedWorkspaceCopy, WorkspaceCopyOutcome};
 
 pub use draft::{TransientDraft, TransientDraftClaim, TransientDraftWriteOutcome};
 pub use error::{Result, StoreError};

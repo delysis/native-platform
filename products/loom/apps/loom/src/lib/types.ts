@@ -454,6 +454,8 @@ export interface ContextAttachmentPresentation {
   presentation_kind: 'text' | 'image' | 'audio' | 'mixed' | 'file';
   media: ContextMediaPresentation[];
   warnings: string[];
+  /** Exact extracted page ranges in canonical UTF-8 text; absent pages are not inferred. */
+  pdf_pages?: Array<{ number: number; start_byte: number; end_byte: number }>;
 }
 
 export interface ContextMaterial {

@@ -24,7 +24,9 @@ use thiserror::Error;
 
 use crate::context_attachments::{self, ContextAttachmentPresentation};
 
+mod folders;
 mod grants;
+pub(crate) use folders::{FolderRetrieval, FolderScanBudget, search_folder};
 pub(crate) use grants::{forget_selected_grant, persist_selected_grant, restore_selected_grants};
 
 const SCHEMA: &str = "loom.materials.v1";
@@ -68,6 +70,7 @@ type Result<T> = std::result::Result<T, MaterialError>;
 pub(crate) enum MaterialKind {
     Attachment,
     Library,
+    Folder,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -81,6 +84,8 @@ pub(crate) struct MaterialEntry {
     pub(crate) available: bool,
     pub(crate) source_path: Option<String>,
     pub(crate) attachment_id: Option<String>,
+    #[serde(default)]
+    pub(crate) workspace_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -90,6 +95,8 @@ struct Binding {
     name: String,
     pinned: bool,
     source: Source,
+    #[serde(default)]
+    workspace_path: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -193,6 +200,8 @@ pub(crate) struct MaterialSearch {
     /// Completeness of this bounded retrieval, never a claim of corpus coverage.
     pub(crate) complete: bool,
     pub(crate) warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) folder: Option<FolderRetrieval>,
 }
 
 fn grant_key(store: &ProjectStore, id: &str) -> (PathBuf, String, String) {
@@ -260,6 +269,7 @@ fn entry(store: &ProjectStore, binding: &Binding) -> Result<MaterialEntry> {
         available,
         source_path,
         attachment_id,
+        workspace_path: binding.workspace_path.clone(),
     })
 }
 
@@ -298,6 +308,13 @@ pub(crate) fn resolve(store: &ProjectStore, name: &str) -> Result<MaterialEntry>
         .filter(|binding| binding.id == name || qualified(binding) == name)
         .collect();
     if matches.is_empty() {
+        matches = bindings
+            .items
+            .iter()
+            .filter(|binding| binding.workspace_path.as_deref() == Some(name))
+            .collect();
+    }
+    if matches.is_empty() {
         matches = bindings.items.iter().filter(|binding| matches!(&binding.source, Source::Library { path } if path.to_str() == Some(name))).collect();
     }
     if matches.is_empty() {
@@ -322,12 +339,43 @@ fn binding(store: &ProjectStore, id: &str) -> Result<Binding> {
         .ok_or_else(|| MaterialError::NotFound(id.into()))
 }
 fn save_binding(store: &ProjectStore, source: Source, name: &str) -> Result<Binding> {
+    save_binding_at_path(store, source, name, None)
+}
+
+fn binding_identity(source: &Source, workspace_path: Option<&str>) -> Result<String> {
+    match workspace_path {
+        None => binding_id(source),
+        Some(path) => {
+            validate_workspace_path(path)?;
+            if !matches!(source, Source::Attachment { .. }) {
+                return Err(invalid(
+                    "Only copied attachments have workspace placements.",
+                ));
+            }
+            Ok(format!(
+                "material-{}",
+                digest(&serde_json::to_vec(&(
+                    "loom.workspace-source.v1",
+                    source,
+                    path
+                ))?)
+            ))
+        }
+    }
+}
+
+fn save_binding_at_path(
+    store: &ProjectStore,
+    source: Source,
+    name: &str,
+    workspace_path: Option<&str>,
+) -> Result<Binding> {
     validate_name(name)?;
     let _lock = WRITE_LOCK
         .lock()
         .map_err(|_| invalid("material write lock poisoned"))?;
     let mut bindings = read_bindings(store)?;
-    let id = binding_id(&source)?;
+    let id = binding_identity(&source, workspace_path)?;
     if let Some(existing) = bindings.items.iter().find(|binding| binding.id == id) {
         return Ok(existing.clone());
     }
@@ -339,6 +387,7 @@ fn save_binding(store: &ProjectStore, source: Source, name: &str) -> Result<Bind
         name: name.to_owned(),
         pinned: false,
         source,
+        workspace_path: workspace_path.map(str::to_owned),
     };
     bindings.items.push(binding.clone());
     write_bindings(store, &bindings)?;
@@ -402,6 +451,41 @@ pub(crate) fn bind_attachment(
         name.unwrap_or(&source.file_name),
     )?;
     entry(store, &binding)
+}
+
+/// Each workspace placement has its own binding while retaining shared bytes.
+pub(crate) fn bind_workspace_attachment(
+    store: &ProjectStore,
+    attachment_id: &str,
+    relative_path: &str,
+) -> Result<MaterialEntry> {
+    validate_workspace_path(relative_path)?;
+    context_attachments::describe_source(store.root(), attachment_id)?;
+    let binding = save_binding_at_path(
+        store,
+        Source::Attachment {
+            attachment_id: attachment_id.into(),
+        },
+        relative_path.rsplit('/').next().unwrap_or(relative_path),
+        Some(relative_path),
+    )?;
+    entry(store, &binding)
+}
+
+fn validate_workspace_path(path: &str) -> Result<()> {
+    if path.is_empty()
+        || path.len() > 4096
+        || path.contains('\\')
+        || path.chars().any(char::is_control)
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.'))
+    {
+        return Err(invalid(
+            "Use an ordinary project-relative workspace file path.",
+        ));
+    }
+    Ok(())
 }
 
 /// Only call after a native file selection (or a separately authenticated
@@ -569,7 +653,7 @@ pub(crate) fn read(store: &ProjectStore, id: &str) -> Result<MaterialRead> {
                     text_sha256: digest(text.as_bytes()),
                     text: text.clone(),
                     source_revision: presentation.source_revision.clone(),
-                    locator: json!({"kind":"attachment_text", "attachment_id": attachment_id, "start_byte":0, "end_byte":text.len()}),
+                    locator: json!({"kind":"attachment_text", "attachment_id": attachment_id, "start_byte":0, "end_byte":text.len(), "pdf_pages":presentation.pdf_pages}),
                     source_evidence: None,
                 },
             )?;
@@ -723,6 +807,7 @@ fn search_library(
         hits,
         complete: result.complete,
         warnings: result.warnings,
+        folder: None,
     })
 }
 fn search_attachment(
@@ -732,15 +817,69 @@ fn search_attachment(
     query: &str,
 ) -> Result<MaterialSearch> {
     let (presentation, source) = context_attachments::read_source(store.root(), attachment_id)?;
-    let terms: Vec<_> = query
+    let selection = select_passages(
+        &source,
+        query,
+        MAX_HITS as usize,
+        MAX_CONTEXT_CHARS as usize,
+    );
+    let complete = presentation.coverage_complete && selection.complete;
+    let mut hits = Vec::new();
+    for passage in selection.passages {
+        let text = &source[passage.range.clone()];
+        hits.push(retain_evidence(store, MaterialEvidence {
+            complete: presentation.coverage_complete && passage.complete,
+            warnings: if passage.complete { presentation.warnings.clone() } else { vec!["This is a bounded passage from the source.".into()] },
+            id: String::new(), reference: String::new(), material_id: material.id.clone(), title: material.name.clone(),
+            text: text.into(), text_sha256: digest(text.as_bytes()), source_revision: presentation.source_revision.clone(),
+            locator: json!({"kind":"attachment_text", "attachment_id":attachment_id,"start_byte":passage.range.start,"end_byte":passage.range.end,
+                "pdf_pages":presentation.pdf_pages.iter().filter(|page| page.start_byte < passage.range.end && page.end_byte > passage.range.start).collect::<Vec<_>>() }), source_evidence: None,
+        })?);
+    }
+    let mut warnings = presentation.warnings;
+    if !complete {
+        warnings.push("The result contains bounded passages, not the complete source.".into());
+    }
+    Ok(MaterialSearch {
+        source_revision: presentation.source_revision,
+        material,
+        query: query.into(),
+        complete,
+        hits,
+        warnings,
+        folder: None,
+    })
+}
+
+struct TextPassage {
+    range: std::ops::Range<usize>,
+    complete: bool,
+}
+
+struct PassageSelection {
+    passages: Vec<TextPassage>,
+    complete: bool,
+    result_limit_reached: bool,
+}
+
+/// Literal UTF-8 slices shared by imported-source and registered-folder search.
+fn select_passages(
+    source: &str,
+    query: &str,
+    max_hits: usize,
+    mut remaining: usize,
+) -> PassageSelection {
+    let terms = query
         .split_whitespace()
         .take(64)
         .map(str::to_lowercase)
-        .collect();
-    let mut hits = Vec::new();
+        .collect::<Vec<_>>();
+    let mut selection = PassageSelection {
+        passages: Vec::new(),
+        complete: true,
+        result_limit_reached: false,
+    };
     let mut offset = 0;
-    let mut remaining = usize::try_from(MAX_CONTEXT_CHARS).unwrap_or(24_000);
-    let mut complete = presentation.coverage_complete;
     for line in source.split_inclusive('\n') {
         let folded = line.to_lowercase();
         let found = terms
@@ -748,13 +887,11 @@ fn search_attachment(
             .filter_map(|term| folded.find(term).map(|at| (at, term.len())))
             .min_by_key(|(at, _)| *at);
         if let Some((at, term_bytes)) = found {
-            if hits.len() >= MAX_HITS as usize || remaining == 0 {
-                complete = false;
+            if selection.passages.len() == max_hits || remaining == 0 {
+                selection.complete = false;
+                selection.result_limit_reached = true;
                 break;
             }
-            // Translate the lowercase match offset back to original UTF-8.
-            // Lowercasing can expand characters, so folded byte offsets are
-            // never used directly as source locators.
             let mut folded_offset = 0;
             let original_at = line
                 .char_indices()
@@ -776,31 +913,22 @@ fn search_attachment(
             while !line.is_char_boundary(end) {
                 end -= 1;
             }
-            let text = &line[start..end];
-            complete &= start == 0 && end == line.len();
-            remaining = remaining.saturating_sub(text.len());
-            hits.push(retain_evidence(store, MaterialEvidence {
-                complete: presentation.coverage_complete && start == 0 && end == line.len(),
-                warnings: if start == 0 && end == line.len() { presentation.warnings.clone() } else { vec!["This is a bounded passage from the source.".into()] },
-                id: String::new(), reference: String::new(), material_id: material.id.clone(), title: material.name.clone(),
-                text: text.into(), text_sha256: digest(text.as_bytes()), source_revision: presentation.source_revision.clone(),
-                locator: json!({"kind":"attachment_text", "attachment_id":attachment_id,"start_byte":offset + start,"end_byte":offset + end}), source_evidence: None,
-            })?);
+            if end <= original_at {
+                selection.complete = false;
+                selection.result_limit_reached = true;
+                break;
+            }
+            let complete = start == 0 && end == line.len();
+            selection.complete &= complete;
+            remaining -= end - start;
+            selection.passages.push(TextPassage {
+                range: offset + start..offset + end,
+                complete,
+            });
         }
         offset += line.len();
     }
-    let mut warnings = presentation.warnings;
-    if !complete {
-        warnings.push("The result contains bounded passages, not the complete source.".into());
-    }
-    Ok(MaterialSearch {
-        source_revision: presentation.source_revision,
-        material,
-        query: query.into(),
-        complete,
-        hits,
-        warnings,
-    })
+    selection
 }
 
 fn evidence_payload(evidence: &MaterialEvidence) -> Result<Vec<u8>> {
@@ -916,7 +1044,9 @@ fn read_bindings(store: &ProjectStore) -> Result<Bindings> {
     let mut ids = std::collections::BTreeSet::new();
     for binding in &bindings.items {
         validate_name(&binding.name)?;
-        if binding.id != binding_id(&binding.source)? || !ids.insert(&binding.id) {
+        if binding.id != binding_identity(&binding.source, binding.workspace_path.as_deref())?
+            || !ids.insert(&binding.id)
+        {
             return Err(invalid("material binding identity mismatch"));
         }
         match &binding.source {
@@ -1035,6 +1165,43 @@ mod tests {
         fs::write(&path, text).unwrap();
         let source = context_attachments::import_path(store.root(), &path).unwrap();
         bind_attachment(store, &source.id, Some(name)).unwrap()
+    }
+    #[cfg(unix)]
+    #[test]
+    fn workspace_copies_preserve_distinct_placements_and_shared_original_identity() {
+        let (_temp, store) = project();
+        let original = source(&store, "One shared original.", "Original");
+        let attachment_id = original.attachment_id.as_deref().unwrap();
+        let first =
+            bind_workspace_attachment(&store, attachment_id, "Research/source.txt").unwrap();
+        let second = bind_workspace_attachment(&store, attachment_id, "Drafts/source.txt").unwrap();
+        assert_ne!(first.id, second.id);
+        assert_ne!(first.id, original.id);
+        assert_eq!(first.attachment_id, second.attachment_id);
+        assert_eq!(first.workspace_path.as_deref(), Some("Research/source.txt"));
+        assert_eq!(second.workspace_path.as_deref(), Some("Drafts/source.txt"));
+        assert_eq!(resolve(&store, "Research/source.txt").unwrap().id, first.id);
+        assert_eq!(resolve(&store, "Drafts/source.txt").unwrap().id, second.id);
+        assert_eq!(
+            bind_workspace_attachment(&store, attachment_id, "Research/source.txt")
+                .unwrap()
+                .id,
+            first.id
+        );
+        assert_eq!(list(&store).unwrap().len(), 3);
+        for path in [
+            "../source.txt",
+            "/source.txt",
+            ".loom/source.txt",
+            "Notes/.hidden",
+            "Notes//source.txt",
+            "Notes\\source.txt",
+        ] {
+            assert!(
+                bind_workspace_attachment(&store, attachment_id, path).is_err(),
+                "accepted {path}"
+            );
+        }
     }
     #[test]
     fn admitting_large_source_does_not_publish_or_load_a_full_text_value() {

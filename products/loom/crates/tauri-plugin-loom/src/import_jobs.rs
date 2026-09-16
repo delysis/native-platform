@@ -305,9 +305,19 @@ impl ImportOperation {
         // Join off the async executor, including channel closure after panic.
         // Abandoning this await leaves the registry's owner intact. Shutdown
         // either performs this same join or waits for its completed outcome.
-        tauri::async_runtime::spawn_blocking(move || worker.join())
+        let joining = Arc::clone(&worker);
+        let joined = tauri::async_runtime::spawn_blocking(move || joining.join())
             .await
-            .map_err(|_| failure("An import worker stopped unexpectedly."))??;
+            .map_err(|_| failure("An import worker stopped unexpectedly."))?;
+        // Only reap after the shared join has finished. A dropped waiter leaves
+        // ownership in the registry; concurrent shutdown may have drained it.
+        self.jobs
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .workers
+            .retain(|registered| !Arc::ptr_eq(registered, &worker));
+        joined?;
         let result = result.map_err(|_| failure("An import worker stopped unexpectedly."))?;
         self.check()?;
         result
@@ -353,6 +363,14 @@ impl ImportOperation {
         state: &PluginState,
         commit: impl FnOnce() -> Result<T, IpcFailure>,
     ) -> Result<T, IpcFailure> {
+        self.publish_to_store(state, |_| commit())
+    }
+
+    pub(super) fn publish_to_store<T>(
+        &self,
+        state: &PluginState,
+        commit: impl FnOnce(&mut loom_store::ProjectStore) -> Result<T, IpcFailure>,
+    ) -> Result<T, IpcFailure> {
         self.check()?;
         let _admission = lock_application_admission(state, "publishing an import")?;
         let mut session = lock_session(state)?;
@@ -371,7 +389,7 @@ impl ImportOperation {
         {
             return Err(failure("The import destination changed."));
         }
-        commit()
+        commit(store)
     }
 }
 
@@ -522,16 +540,7 @@ mod tests {
                     "An import worker stopped unexpectedly."
                 ),
             }
-            assert!(
-                state
-                    .imports
-                    .inner
-                    .lock()
-                    .unwrap()
-                    .workers
-                    .iter()
-                    .all(|worker| worker.is_finished())
-            );
+            assert!(state.imports.inner.lock().unwrap().workers.is_empty());
             drop(operation);
             // This is the failed folder-import boundary, not a retry loop.
             let next =
@@ -642,6 +651,71 @@ mod tests {
                 .unwrap();
         assert!(next.check().is_ok());
         assert_eq!(published_count(temporary.path()), 0);
+    }
+
+    #[test]
+    fn compute_waits_for_worker_exit_before_returning_success_or_failure() {
+        struct ExitGate {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Drop for ExitGate {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+            }
+        }
+        thread_local! {
+            static EXIT_GATE: std::cell::RefCell<Option<ExitGate>> = const {
+                std::cell::RefCell::new(None)
+            };
+        }
+        for succeeds in [true, false] {
+            let temporary = tempfile::tempdir().unwrap();
+            let (state, project, session) = opened(temporary.path());
+            let operation =
+                ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
+                    .unwrap();
+            let (entered, exiting) = mpsc::channel();
+            let (release, blocked) = mpsc::channel();
+            let (completed, completion) = mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let result = tauri::async_runtime::block_on(operation.compute(move || {
+                    EXIT_GATE.with(|gate| {
+                        *gate.borrow_mut() = Some(ExitGate {
+                            entered,
+                            release: blocked,
+                        });
+                    });
+                    if succeeds {
+                        Ok(())
+                    } else {
+                        Err(failure("conversion failed"))
+                    }
+                }));
+                drop(operation);
+                completed.send(()).unwrap();
+                result
+            });
+            // Thread-local cleanup begins after the result is sent. Hold that
+            // exact race window open, then always release it before asserting.
+            exiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            let premature = completion.recv_timeout(Duration::from_millis(50));
+            release.send(()).unwrap();
+            let result = waiter.join().unwrap();
+            assert!(
+                premature.is_err(),
+                "compute returned before its worker exited"
+            );
+            assert_eq!(result.is_ok(), succeeds);
+            if let Err(error) = result {
+                assert_eq!(error.message, "conversion failed");
+            }
+            let next =
+                ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
+                    .expect("completed imports must immediately release admission");
+            drop(next);
+        }
     }
 
     #[test]
@@ -871,7 +945,7 @@ mod tests {
                     .unwrap()
                     .is_err()
             );
-            assert_eq!(state.imports.shutdown().unwrap(), 1);
+            assert_eq!(state.imports.shutdown().unwrap(), 0);
         });
     }
 

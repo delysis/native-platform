@@ -738,8 +738,10 @@ fn terminal_start<R: Runtime>(
     let mut bindings = BTreeMap::new();
     let mut sources = Vec::new();
     let mut seen_documents = BTreeSet::new();
+    let mut folder_budget = material_context::FolderAdmissionBudget::default();
     for name in all_names {
         let value = material_context::resolve(store, &name)?;
+        folder_budget.admit(&value)?;
         if let Value::Documents { documents } = &value {
             for document in documents {
                 if seen_documents.insert(document.document_id) {
@@ -985,6 +987,7 @@ fn spawn_worker<R: Runtime>(
                 receipt,
                 media,
                 step: 0,
+                folder_scan_budget: material_context::FolderScanBudget::default(),
             };
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 evaluator.evaluate_command(&command)
@@ -1054,6 +1057,7 @@ struct Evaluator<'a> {
     receipt: RunReceipt,
     media: Vec<llama_native_types::MediaInput>,
     step: u32,
+    folder_scan_budget: material_context::FolderScanBudget,
 }
 
 impl Evaluator<'_> {
@@ -1177,7 +1181,7 @@ impl Evaluator<'_> {
                             .eq(search.hits.iter().map(|hit| &hit.id))
                 })
             {
-                self.receipt.searches.push(search.clone());
+                self.receipt.searches.push(search.as_ref().clone());
             }
             for hit in evidence {
                 if !self.receipt.evidence.iter().any(|prior| prior.id == hit.id) {
@@ -1232,10 +1236,22 @@ impl Evaluator<'_> {
     ) -> Result<(Value, Vec<String>), IpcFailure> {
         let resolve = || {
             self.with_store(|store| match budget {
-                Some(budget) => material_context::consult_with_budget(store, value, query, budget),
-                None => {
-                    material_context::search(store, value, query).map(|value| (value, Vec::new()))
-                }
+                Some(budget) => material_context::consult_with_budget_and_cancel(
+                    store,
+                    value,
+                    query,
+                    budget,
+                    &self.folder_scan_budget,
+                    &|| self.control.cancelled.load(Ordering::Acquire),
+                ),
+                None => material_context::search_with_cancel(
+                    store,
+                    value,
+                    query,
+                    &self.folder_scan_budget,
+                    &|| self.control.cancelled.load(Ordering::Acquire),
+                )
+                .map(|value| (value, Vec::new())),
             })
         };
         if self.receipt.remote.is_none() {
@@ -1308,6 +1324,9 @@ impl Evaluator<'_> {
                 .map_err(IpcFailure::store)?;
             let mut inputs = vec![source.artifact_id];
             inputs.extend(self.receipt.sources.iter().map(|source| source.artifact_id));
+            inputs.extend(material_context::evidence_artifact_ids(
+                &self.receipt.evidence,
+            )?);
             if let Some(configuration) = self
                 .receipt
                 .function_recipe
@@ -1643,6 +1662,31 @@ pub(super) async fn terminal_cancel(
     run_id: String,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
+    let request_id = format!("terminal-{}", parse_command_id(&run_id)?);
+    let routes = state
+        .generations
+        .active_routes_for_request(
+            project_id.parse::<ProjectId>().map_err(io_failure)?,
+            parse_command_id(&session_id)?,
+            &request_id,
+        )
+        .map_err(|error| IpcFailure::generation_registry(&error))?;
+    if !routes.is_empty() {
+        // The admitted route owns cancellation authority independently of the
+        // store. A retrieval worker may currently hold the session lock.
+        for route in routes {
+            match state.generations.cancel_run(
+                route.identity.project_id,
+                route.identity.session_id,
+                route.run_id,
+            ) {
+                Ok(_) | Err(loom_host::GenerationRegistryError::RunNotActive(_)) => {}
+                Err(error) => return Err(IpcFailure::generation_registry(&error)),
+            }
+        }
+        return Ok(());
+    }
+    // Recheck the receipt and route after any concurrent admission settles.
     let (receipt, project) = {
         let mut session = lock_session(&state)?;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;

@@ -33,7 +33,9 @@ fn main() -> Result<()> {
             macos_smoke_support::run(&workspace_root(), &arguments.collect::<Vec<_>>())
         }
         "signal-source" => signal_source::run(&workspace_root(), &arguments.collect::<Vec<_>>()),
-        _ => bail!("usage: cargo xtask <policy|model-check|macos-smoke-support|omp2|signal-source>"),
+        _ => {
+            bail!("usage: cargo xtask <policy|model-check|macos-smoke-support|omp2|signal-source>")
+        }
     }
 }
 
