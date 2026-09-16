@@ -3,6 +3,7 @@
   import { normalizeFailure } from './ipc';
   import ComputeHostControls from './ComputeHostControls.svelte';
   import CabalNetwork from './CabalNetwork.svelte';
+  import CabalOwnership from './CabalOwnership.svelte';
   import type { ComputeSharing } from './compute';
   export let cabal: CabalSnapshot | null;
   export let projectName: string;
@@ -14,6 +15,7 @@
   export let onInvite: (name: string) => Promise<string>;
   export let onJoin: (invitation: string, name: string) => Promise<void>;
   export let onRemove: (member: string, rosterHash: string) => Promise<void>;
+  export let onTransfer: (member: string, rosterHash: string) => Promise<void>;
   export let onRecover: () => Promise<string[]>;
   let name = '';
   let invitation = '';
@@ -37,7 +39,7 @@
   {#if cabal}
     <ul aria-label="Cabal members">
       {#each cabal.roster.payload.members as member (member.key)}
-        <li><div><strong>{member.name}</strong><small>{member.key === cabal.my_key ? 'You' : cabal.peers.some(peer => peer.cabal === cabal?.id && peer.key === member.key && peer.connected) ? 'Connected' : 'Away · changes will catch up'}</small></div>
+        <li><div><strong>{member.name}</strong><small>{member.key === cabal.roster.payload.owner ? 'Owner · ' : ''}{member.key === cabal.my_key ? 'You' : cabal.peers.some(peer => peer.cabal === cabal?.id && peer.key === member.key && peer.connected) ? 'Connected' : 'Away · changes will catch up'}</small></div>
           {#if owner && member.key !== cabal.my_key}<button type="button" aria-label={`Remove ${member.name}`} disabled={busy} on:click={() => removing = member.key}>−</button>{/if}
         </li>
         {#if removing === member.key}<li class="removal"><p>{member.name} will stop receiving new changes. Their existing copies remain theirs.</p><button type="button" disabled={busy} on:click={() => void run(async () => { if (cabal) await onRemove(member.key, cabal.roster_hash); removing = ''; })}>Remove member</button><button type="button" on:click={() => removing = ''}>Keep</button></li>{/if}
@@ -48,6 +50,7 @@
     {#if cabal.documents.some(item => item.shared.deleted)}<p class="quiet">An open document was removed from this cabal. Its text stays here until you leave it.</p>{/if}
     {#if unsaved || cabal.read_only || cabal.orphaned_changes || cabal.removed_documents}<div class="recovery"><p>Unsent edits and removed writing can be kept in private recovery copies.</p><button type="button" disabled={busy} on:click={() => void run(async () => { const paths = await onRecover(); note = `${paths.length} recovery ${paths.length === 1 ? 'copy' : 'copies'} in the workspace`; })}>Recover my copies</button></div>{/if}
     {#if owner}<button class="invite" type="button" disabled={busy} on:click={() => void run(invite)}>Invite someone</button>{/if}
+    {#if owner}{#key cabal.id}<CabalOwnership {cabal} {onTransfer} />{/key}{/if}
     {#key cabal.id}<ComputeHostControls {cabal} scope={{ projectId, sessionId, cabalId: cabal.id }} sharing={computeSharing} />{/key}
   {:else}
     <p class="intro">A little shared mind. Make this workspace a place your people can write together.</p>

@@ -32,6 +32,7 @@ struct RawFrontier {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SyncState {
+    pub roster_hash: String,
     pub documents: BTreeMap<Uuid, SyncDocument>,
 }
 
@@ -42,14 +43,22 @@ pub struct SyncDocument {
     pub heads: BTreeSet<String>,
     /// All missing direct dependencies and missing owner-sealed heads.
     pub need: BTreeSet<String>,
+    /// Stored sealed roots, in the matching roster's canonical set order.
+    pub sealed: Vec<bool>,
 }
 
 impl SyncState {
     pub(super) fn validate(&self) -> Result<()> {
+        if !(self.roster_hash.is_empty() && self.documents.is_empty()) {
+            validate_hashes(&BTreeSet::from([self.roster_hash.clone()]))?;
+        }
         if self.documents.len() > MAX_DOCUMENTS {
             return Err(Error::Invalid("Too many advertised documents"));
         }
         for document in self.documents.values() {
+            if document.sealed.len() > MAX_FRONTIER {
+                return Err(Error::Invalid("Too many advertised sealed roots"));
+            }
             validate_hashes(&document.heads)?;
             validate_hashes(&document.need)?;
             if !document.heads.is_disjoint(&document.need) {
@@ -180,13 +189,17 @@ impl Frontier {
         index: &ChangeIndex,
         incoming: &ChangeIndex,
     ) -> Result<SyncState> {
-        let mut result = SyncState::default();
+        let mut result = SyncState {
+            roster_hash: roster.hash()?,
+            documents: BTreeMap::new(),
+        };
         for (id, document) in &self.0 {
             result.documents.insert(
                 *id,
                 SyncDocument {
                     heads: document.heads.iter().map(ToString::to_string).collect(),
                     need: document.need.iter().map(ToString::to_string).collect(),
+                    sealed: Vec::new(),
                 },
             );
         }
@@ -198,7 +211,10 @@ impl Frontier {
                 let hash = head
                     .parse()
                     .map_err(|_| Error::Invalid("Invalid sealed head"))?;
-                if !index.contains_key(&(*id, hash)) && !incoming.contains_key(&(*id, hash)) {
+                let stored =
+                    index.contains_key(&(*id, hash)) || incoming.contains_key(&(*id, hash));
+                document.sealed.push(stored);
+                if !stored {
                     document.need.insert(head.clone());
                 }
             }
@@ -261,6 +277,22 @@ impl Cabal {
         let mut have = BTreeSet::new();
         for (id, document) in &known.documents {
             let mut queue = document.heads.iter().cloned().collect::<Vec<_>>();
+            if known.roster_hash == local.roster_hash {
+                let sealed = self.roster.payload.sealed.get(id);
+                if document.sealed.len() != sealed.map_or(0, BTreeSet::len) {
+                    return Err(Error::Invalid("Sealed inventory does not match its roster"));
+                }
+                for (head, stored) in sealed.into_iter().flatten().zip(&document.sealed) {
+                    if *stored {
+                        if document.need.contains(head) {
+                            return Err(Error::Invalid(
+                                "A stored sealed root cannot also be missing",
+                            ));
+                        }
+                        queue.push(head.clone());
+                    }
+                }
+            }
             while let Some(hash) = queue.pop() {
                 if document.need.contains(&hash) {
                     continue;

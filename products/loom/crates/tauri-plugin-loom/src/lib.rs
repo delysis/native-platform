@@ -84,9 +84,9 @@ use crate::audio_io::{audio_record_start, audio_record_stop, audio_synthesize};
 use crate::cabals::{
     cabal_context_publish, cabal_context_review, cabal_edit, cabal_join, cabal_network_get,
     cabal_network_set, cabal_open, cabal_recover, cabal_revoke, cabal_share, cabal_snapshot,
-    cabal_workspace, compute_grant, compute_host_snapshot, compute_job_cancel, compute_job_check,
-    compute_job_get, compute_job_prepare, compute_job_submit, compute_jobs, compute_peer_offers,
-    compute_revoke,
+    cabal_transfer_owner, cabal_workspace, compute_grant, compute_host_snapshot,
+    compute_job_cancel, compute_job_check, compute_job_get, compute_job_prepare,
+    compute_job_submit, compute_jobs, compute_peer_offers, compute_revoke,
 };
 use crate::co_writer::{
     CoWriterError, CoWriterSummary, apply_to_document as apply_co_writer,
@@ -2078,6 +2078,7 @@ impl Builder {
                 cabal_workspace,
                 cabal_edit,
                 cabal_revoke,
+                cabal_transfer_owner,
                 cabal_recover,
                 compute_host_snapshot,
                 compute_grant,

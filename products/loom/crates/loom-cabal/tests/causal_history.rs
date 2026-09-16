@@ -23,7 +23,7 @@ fn catch_up(source: &Cabal, destination: &mut Cabal) -> Result<usize> {
         let changes = source.missing_causal(&destination.sync_state()?)?;
         assert!(changes.len() <= 128);
         if changes.is_empty() {
-            assert_eq!(source.sync_state()?, destination.sync_state()?);
+            assert_eq!(source.hashes()?, destination.hashes()?);
             return Ok(page);
         }
         assert!(destination.apply(changes)?);
@@ -198,9 +198,11 @@ fn inventory_limits_and_holes_are_checked_before_building_a_reply() -> Result<()
     let document = owner.create_document("Garden.md", "Shared")?;
     let head = document.heads[0].clone();
     let overlap = SyncState {
+        roster_hash: owner.roster().hash()?,
         documents: BTreeMap::from([(
             document.id,
             SyncDocument {
+                sealed: Vec::new(),
                 heads: BTreeSet::from([head.clone()]),
                 need: BTreeSet::from([head]),
             },
@@ -208,9 +210,11 @@ fn inventory_limits_and_holes_are_checked_before_building_a_reply() -> Result<()
     };
     assert!(owner.missing_causal(&overlap).is_err());
     let oversized = SyncState {
+        roster_hash: owner.roster().hash()?,
         documents: BTreeMap::from([(
             document.id,
             SyncDocument {
+                sealed: Vec::new(),
                 heads: (0..257).map(|number| format!("{number:064x}")).collect(),
                 need: BTreeSet::new(),
             },
@@ -225,6 +229,26 @@ fn inventory_limits_and_holes_are_checked_before_building_a_reply() -> Result<()
         .need
         .insert("not a hash".into());
     assert!(owner.missing_causal(&malformed).is_err());
+    let removed = admit(&mut owner, &directory.path().join("removed.db"), "Moss")?;
+    owner.revoke(removed.identity().public_key())?;
+    let mut wrong_width = owner.sync_state()?;
+    wrong_width
+        .documents
+        .get_mut(&document.id)
+        .expect("document")
+        .sealed
+        .push(false);
+    assert!(owner.missing_causal(&wrong_width).is_err());
+    let mut contradiction = owner.sync_state()?;
+    let claimed = contradiction
+        .documents
+        .get_mut(&document.id)
+        .expect("document");
+    claimed.heads.clear();
+    claimed
+        .need
+        .insert(owner.view(document.id)?.heads[0].clone());
+    assert!(owner.missing_causal(&contradiction).is_err());
     Ok(())
 }
 
@@ -397,6 +421,60 @@ async fn quic_pages_a_sealed_history_to_a_new_member() -> Result<()> {
     assert_eq!(
         reader.lock().expect("reader lock").view(document.id)?.text,
         "A pond, revision 149."
+    );
+    Ok(())
+}
+
+#[test]
+fn sealed_history_does_not_starve_two_peers_diverging_offline() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let mut owner = Cabal::create(
+        &directory.path().join("owner.db"),
+        Identity::generate()?,
+        "Garden",
+        "Sage",
+    )?;
+    let mut peer = admit(&mut owner, &directory.path().join("peer.db"), "Fern")?;
+    let removed = admit(&mut owner, &directory.path().join("removed.db"), "Moss")?;
+    let document = owner.create_document("Garden.md", "Pond\n\nWillow\n")?;
+    let client = Uuid::new_v4();
+    for index in 0..150 {
+        owner.edit(&Edit {
+            document: document.id,
+            client,
+            basis: owner.view(document.id)?.heads,
+            text: format!("Pond\n\nWillow {index}\n"),
+        })?;
+    }
+    catch_up(&owner, &mut peer)?;
+    owner.revoke(removed.identity().public_key())?;
+    peer.accept_roster(owner.roster().clone())?;
+    owner.edit(&Edit {
+        document: document.id,
+        client,
+        basis: owner.view(document.id)?.heads,
+        text: "Pond with lilies\n\nWillow 149\n".into(),
+    })?;
+    peer.edit(&Edit {
+        document: document.id,
+        client: Uuid::new_v4(),
+        basis: peer.view(document.id)?.heads,
+        text: "Pond\n\nWillow 149 and reeds\n".into(),
+    })?;
+    for _ in 0..8 {
+        let to_owner = peer.missing_causal(&owner.sync_state()?)?;
+        let to_peer = owner.missing_causal(&peer.sync_state()?)?;
+        owner.apply(to_owner)?;
+        peer.apply(to_peer)?;
+    }
+    assert_eq!(
+        owner.hashes()?,
+        peer.hashes()?,
+        "Old sealed pages must not starve new offline edits"
+    );
+    assert_eq!(
+        owner.view(document.id)?.text,
+        "Pond with lilies\n\nWillow 149 and reeds\n"
     );
     Ok(())
 }

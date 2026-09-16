@@ -38,6 +38,9 @@ export function editCabal(projectId: string, sessionId: string, edit: CabalEdit)
 export function revokeCabalMember(projectId: string, sessionId: string, memberKey: string, rosterHash: string): Promise<void> {
   return invoke('plugin:loom|cabal_revoke', { projectId, sessionId, memberKey, rosterHash });
 }
+export function transferCabalOwner(projectId: string, sessionId: string, memberKey: string, rosterHash: string): Promise<void> {
+  return invoke('plugin:loom|cabal_transfer_owner', { projectId, sessionId, memberKey, rosterHash });
+}
 export function recoverCabalEdits(projectId: string, sessionId: string, edit: CabalEdit | null = null): Promise<{ paths: string[]; draft_path: string | null }> {
   return invoke('plugin:loom|cabal_recover', { projectId, sessionId, edit });
 }

@@ -13,6 +13,7 @@ const COMMANDS: &[&str] = &[
     "cabal_workspace",
     "cabal_edit",
     "cabal_revoke",
+    "cabal_transfer_owner",
     "cabal_recover",
     "compute_host_snapshot",
     "compute_grant",

@@ -25,7 +25,7 @@ use crate::{
     MAX_FRAME_BYTES, NetworkMode, Result, Roster, SyncState,
 };
 
-const ALPN: &[u8] = b"app.delysis.loom/cabal/3";
+const ALPN: &[u8] = b"app.delysis.loom/cabal/4";
 const MAX_CABALS: usize = 16;
 type SharedCabal = Arc<Mutex<Cabal>>;
 type Cabals = Arc<Mutex<BTreeMap<Uuid, SharedCabal>>>;
@@ -156,7 +156,7 @@ impl Network {
         .await?;
         match reply {
             Response::Joined { roster } => {
-                roster.verify()?;
+                crate::store::validate_roster(&roster)?;
                 if roster.signer != invitation.owner.id
                     || roster.payload.owner != invitation.owner.id
                     || roster.payload.cabal != invitation.cabal
@@ -441,9 +441,7 @@ impl Handler {
                 if address.id != peer {
                     return Err(Error::Invalid("Peer address identity mismatch"));
                 }
-                roster.verify()?;
-                let was_member = roster.payload.owner == cabal.roster().payload.owner
-                    && roster.payload.cabal == cabal.id()
+                let was_member = cabal.recognizes_roster(&roster)?
                     && roster
                         .payload
                         .members

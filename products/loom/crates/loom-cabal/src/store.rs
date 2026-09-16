@@ -1,9 +1,11 @@
 mod assets;
 mod history;
 mod invitations;
+mod ownership;
 mod sync;
 pub use assets::{ASSET_CHUNK_BYTES, AssetDescriptor, MAX_ASSET_BYTES};
 pub use invitations::Invitation;
+pub use ownership::OwnershipGrant;
 use sync::{ChangeIndex, ChangeKey, Frontier};
 pub use sync::{SyncDocument, SyncState};
 
@@ -24,7 +26,7 @@ use crate::{
     document::{self, Create, DocumentView, Edit, EditResult, MetadataEdit, TextKind},
 };
 
-const STORE_VERSION: i64 = 6;
+const STORE_VERSION: i64 = 7;
 const MAX_LOCAL_RECORD_KEYS: usize = 65_536;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,6 +42,7 @@ pub struct Membership {
     pub schema: u32,
     pub cabal: Uuid,
     pub owner: PublicKey,
+    pub authority: Vec<Signed<OwnershipGrant>>,
     pub name: String,
     pub revision: u64,
     pub epoch: u64,
@@ -104,9 +107,10 @@ impl Cabal {
         validate_name(name)?;
         validate_name(member_name)?;
         let roster = identity.sign(Membership {
-            schema: 2,
+            schema: 3,
             cabal: Uuid::new_v4(),
             owner: identity.public_key(),
+            authority: Vec::new(),
             name: name.into(),
             revision: 0,
             epoch: 0,
@@ -215,6 +219,27 @@ impl Cabal {
     pub fn roster(&self) -> &Roster {
         &self.roster
     }
+    pub(crate) fn recognizes_roster(&self, roster: &Roster) -> Result<bool> {
+        validate_roster(roster)?;
+        if ownership::origin(roster) != ownership::origin(&self.roster)
+            || roster.payload.cabal != self.id()
+        {
+            return Ok(false);
+        }
+        for (known, offered) in self
+            .roster
+            .payload
+            .authority
+            .iter()
+            .zip(&roster.payload.authority)
+        {
+            if known.hash()? != offered.hash()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn is_member(&self, key: PublicKey) -> bool {
         self.roster
             .payload
@@ -641,8 +666,14 @@ impl Cabal {
         }
         let mut membership = self.roster.payload.clone();
         membership.members.retain(|member| member.key != key);
-        membership.revision += 1;
-        membership.epoch += 1;
+        membership.revision = membership
+            .revision
+            .checked_add(1)
+            .ok_or(Error::Invalid("Cabal revision exceeds limit"))?;
+        membership.epoch = membership
+            .epoch
+            .checked_add(1)
+            .ok_or(Error::Invalid("Cabal epoch exceeds limit"))?;
         membership.sealed = sync::seal_frontier(&self.roster, &self.documents, &BTreeMap::new())?;
         self.accept_roster(self.identity.sign(membership)?)?;
         Ok(())
@@ -650,8 +681,8 @@ impl Cabal {
 
     pub fn accept_roster(&mut self, roster: Roster) -> Result<bool> {
         validate_roster(&roster)?;
-        if roster.payload.owner != self.roster.payload.owner || roster.payload.cabal != self.id() {
-            return Err(Error::Invalid("Membership belongs to another cabal"));
+        if !ownership::advances(&self.roster, &roster)? {
+            return Ok(false);
         }
         if roster.payload.revision < self.roster.payload.revision {
             return Ok(false);
@@ -729,7 +760,7 @@ impl Cabal {
     fn require_owner(&self) -> Result<()> {
         if self.identity.public_key() != self.roster.payload.owner {
             return Err(Error::Invalid(
-                "Only the cabal founder can admit or remove devices",
+                "Only the current cabal owner can admit or remove devices",
             ));
         }
         Ok(())
@@ -780,12 +811,12 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_roster(roster: &Roster) -> Result<()> {
+pub(crate) fn validate_roster(roster: &Roster) -> Result<()> {
     roster.verify()?;
+    ownership::validate(roster)?;
     let value = &roster.payload;
     validate_name(&value.name)?;
-    if value.schema != 2
-        || value.owner != roster.signer
+    if value.schema != 3
         || value.members.is_empty()
         || value.members.len() > MAX_MEMBERS
         || value.sealed.len() > MAX_DOCUMENTS

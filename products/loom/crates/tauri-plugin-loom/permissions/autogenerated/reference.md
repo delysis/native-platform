@@ -16,6 +16,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-cabal-workspace`
 - `allow-cabal-edit`
 - `allow-cabal-revoke`
+- `allow-cabal-transfer-owner`
 - `allow-cabal-recover`
 - `allow-project-open-default`
 - `allow-project-prepare-open`
@@ -821,6 +822,32 @@ Enables the cabal_snapshot command without any pre-configured scope.
 <td>
 
 Denies the cabal_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-transfer-owner`
+
+</td>
+<td>
+
+Enables the cabal_transfer_owner command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-transfer-owner`
+
+</td>
+<td>
+
+Denies the cabal_transfer_owner command without any pre-configured scope.
 
 </td>
 </tr>

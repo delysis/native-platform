@@ -155,7 +155,10 @@ impl Cabal {
                 name: name.into(),
             });
         }
-        membership.revision += 1;
+        membership.revision = membership
+            .revision
+            .checked_add(1)
+            .ok_or(Error::Invalid("Cabal revision exceeds limit"))?;
         let roster = self.identity.sign(membership)?;
         validate_roster(&roster)?;
         let transaction = self.database.transaction()?;

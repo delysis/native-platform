@@ -158,8 +158,23 @@ hashes commit to the accepted causal history. Every envelope still needs a
 valid author signature, matching actor/document/cabal, and a non-future epoch.
 A current member cannot authorize an unsealed old change by depending on it.
 Unmerged local edits remain recoverable as orphaned history. Removal
-cannot erase prose that a former member already received. Owner-device loss and
-transfer need an explicit recovery design before this can be called complete.
+cannot erase prose that a former member already received.
+
+The current owner can open **Hand over the keys** and review an existing member
+as the next owner. The review names the exact device and membership state. A
+changed membership requires a fresh review; a lost reply never repeats the
+mutation automatically. The old owner signs a delegation bound to the exact
+initial handoff. Thereafter only the new owner can issue membership decisions.
+Existing members keep their pairing, writing and membership epoch, including
+offline edits. The former owner remains a writer until explicitly removed.
+
+Every peer pins its known delegation chain. Older prefixes cannot reclaim
+ownership with a higher revision, conflicting branches are refused, and a late
+peer can verify multiple handoffs from its original trust root. The chain is
+bounded at 64 handoffs. Restart keeps the new authority; a removed former owner
+can still receive the current signed revocation. Losing the sole owner's key
+before a handoff remains a separate recovery problem; no stale backup or
+self-signed replacement is allowed to invent ownership.
 
 History catch-up sends sealed heads before their ancestors in bounded pages.
 A partial page is durable across restart, but an incomplete document is not
@@ -267,6 +282,10 @@ before their unbounded upstream decoder. Sync advertises per-document graph
 heads and missing dependencies, each bounded at 256. Replies contain at most
 128 signed changes within the four-MiB frame budget. The owner's revocation
 seal has at most 256 heads per document, independent of history length.
+A roster-bound Boolean inventory also acknowledges which sealed roots a peer
+stores, in canonical order. This lets divergent offline peers skip common
+sealed ancestors and exchange new edits. Bits from another roster are ignored;
+incorrect widths or claims that a stored root is also missing are rejected.
 
 Local history archives exact signed envelopes independently in SQLite. Crossing
 1,024 recent changes or 8 MiB archives the oldest rows until at most 512 changes
@@ -291,9 +310,9 @@ admission advances a small causal frontier and stages newly sealed ancestors;
 it does not enumerate every historical envelope or clone the lifetime seal.
 Matching peer inventories return immediately without walking historical ancestors.
 
-The cabal store is version 6, the membership payload is version 2, the signed
+The cabal store is version 7, the membership payload is version 3, the signed
 document payload is version 2, and the workspace transport uses
-`app.delysis.loom/cabal/3`. Older experimental stores
+`app.delysis.loom/cabal/4`. Older experimental stores
 and protocols are rejected without rewriting saved data or retaining a
 compatibility layer.
 

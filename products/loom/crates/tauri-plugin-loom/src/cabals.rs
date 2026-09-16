@@ -772,6 +772,30 @@ pub(crate) async fn cabal_revoke(
 }
 
 #[tauri::command]
+pub(crate) async fn cabal_transfer_owner(
+    project_id: String,
+    session_id: String,
+    member_key: String,
+    roster_hash: String,
+    state: State<'_, PluginState>,
+) -> Result<(), IpcFailure> {
+    ensure_application_running(&state, "cabal ownership")?;
+    let root = root_for(&state, &project_id, &session_id)?;
+    let (shared, _) = state
+        .cabals
+        .bound(&directory(&state)?, &root)
+        .await?
+        .ok_or_else(|| failure("This workspace is not a cabal"))?;
+    let mut session = lock_session(&state)?;
+    require_bound_store(&mut session, &project_id, &session_id)?;
+    let mut cabal = shared.lock().map_err(|_| failure("Cabal owner stopped"))?;
+    let key = member_key
+        .parse()
+        .map_err(|_| failure("Invalid member key"))?;
+    cabal.transfer_owner(key, &roster_hash).map_err(failure)
+}
+
+#[tauri::command]
 pub(crate) async fn cabal_recover(
     project_id: String,
     session_id: String,

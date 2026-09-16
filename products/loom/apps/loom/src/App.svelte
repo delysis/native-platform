@@ -20,7 +20,7 @@
   import { ComputeSharing, type PeerTarget } from './lib/compute';
   import PeerModelPicker from './lib/PeerModelPicker.svelte';
   import { SignalDraftEditor } from './lib/signalDraft';
-  import { CabalEditor, cabalSnapshot, cabalWorkspace, openCabal, editCabal, shareCabal, joinCabal, recoverCabalEdits, revokeCabalMember, type CabalSnapshot, type SharedDocument } from './lib/cabal';
+  import { CabalEditor, cabalSnapshot, cabalWorkspace, openCabal, editCabal, shareCabal, joinCabal, recoverCabalEdits, revokeCabalMember, transferCabalOwner, type CabalSnapshot, type SharedDocument } from './lib/cabal';
   import { rememberSignalWorkspace, type SignalConversation } from './lib/signal';
   import { RetainedOutputLoader } from './lib/retainedOutput';
   import { workspaceWriterCandidates, workspaceWriterModel, type WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
@@ -9652,6 +9652,16 @@
     await refreshCabal(currentCabalScope());
   }
 
+  async function handOffCabalOwner(member: string, rosterHash: string): Promise<void> {
+    const captured = project;
+    if (!captured || compositionActive || !flushEditors() || !await flushCurrentDocument()
+      || !terminalScopeIsCurrent(captured.project_id, captured.session_id)) {
+      throw new Error('Finish saving this workspace before handing over the keys.');
+    }
+    await transferCabalOwner(captured.project_id, captured.session_id, member, rosterHash);
+    if (terminalScopeIsCurrent(captured.project_id, captured.session_id)) await refreshCabal(currentCabalScope());
+  }
+
   async function recoverCabalCopies(): Promise<string[]> {
     if (!project) throw new Error('Open the cabal workspace first.');
     if (!flushEditors()) throw new Error('Finish composing before recovering this writing.');
@@ -10425,7 +10435,7 @@
               projectId={project.project_id} sessionId={project.session_id} {computeSharing}
               onClose={() => cabalOpen = false} onInvite={inviteCabal}
               onJoin={async (invitation, name) => { await doOpenProject(() => joinCabal(invitation, name)); }}
-              onRemove={removeCabalMember} onRecover={recoverCabalCopies} />
+              onRemove={removeCabalMember} onTransfer={handOffCabalOwner} onRecover={recoverCabalCopies} />
           {/key}
         </aside>
       {/if}
