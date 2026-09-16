@@ -7,7 +7,7 @@ use super::residual_training_math as math;
 use super::*;
 use llama_cpp_2::context::hidden_states::HiddenStateCaptureConfig;
 use llama_native_types::{
-    MAX_RESIDUAL_NO_OP_LOGPROB_DELTA, RESIDUAL_INTERVENTION_SEMANTICS, RESIDUAL_TRAINING_METHOD,
+    MAX_RESIDUAL_NO_OP_LOGPROB_DELTA, RESIDUAL_INTERVENTION_SEMANTICS, ResidualPooling,
     ResidualTrainingMetrics, ResidualTrainingOutput, ResidualTrainingPair, ResidualTrainingRequest,
 };
 
@@ -202,12 +202,35 @@ pub(super) fn decode_unmodified_prefix(
     check_cancelled(cancellation)
 }
 
+fn capture_start(
+    pooling: ResidualPooling,
+    prefix_len: usize,
+    pole_len: usize,
+) -> NativeResult<usize> {
+    let total = prefix_len
+        .checked_add(pole_len)
+        .ok_or_else(|| invalid("capture length overflow"))?;
+    if prefix_len == 0
+        || pole_len == 0
+        || total > llama_native_types::MAX_RESIDUAL_TRAINING_SEQUENCE_TOKENS
+    {
+        return Err(invalid("invalid capture prefix or pole length"));
+    }
+    Ok(match pooling {
+        ResidualPooling::TerminalToken => total - 1,
+        ResidualPooling::ResponseSpanMean | ResidualPooling::TerminalTokenMatched => prefix_len,
+    })
+}
+
 fn capture_pole(
     context: &mut LlamaContext<'_>,
     prefix: &[i32],
     pole: &[i32],
+    pooling: ResidualPooling,
+    layers: &[u32],
+    width: usize,
     cancellation: &AtomicBool,
-) -> NativeResult<Vec<Vec<f32>>> {
+) -> NativeResult<Vec<Vec<f64>>> {
     context
         .control_vector_clear()
         .map_err(|error| invalid(format!("clear residual control: {error}")))?;
@@ -215,17 +238,99 @@ fn capture_pole(
     context
         .set_hidden_state_capture_enabled(false)
         .map_err(|error| invalid(format!("disable capture: {error}")))?;
+    // Preserve V2 terminal decode shape exactly. Both V3 modes prefill only
+    // the neutral prefix and capture/validate every singleton pole token.
     let tokens: Vec<_> = prefix.iter().chain(pole).copied().collect();
-    let last = tokens.len() - 1;
-    decode_unmodified_prefix(context, &tokens[..last], cancellation)?;
+    let capture_start = capture_start(pooling, prefix.len(), pole.len())?;
+    decode_unmodified_prefix(context, &tokens[..capture_start], cancellation)?;
     context
         .set_hidden_state_capture_enabled(true)
-        .map_err(|error| invalid(format!("enable final-token capture: {error}")))?;
-    decode_token(context, tokens[last], last, cancellation)?;
-    let states = context
-        .take_hidden_states()
-        .map_err(|error| invalid(format!("capture residual states: {error}")))?;
-    Ok(states.into_iter().map(|state| state.values).collect())
+        .map_err(|error| invalid(format!("enable pole capture: {error}")))?;
+    pool_captured_tokens(
+        &tokens[capture_start..],
+        capture_start,
+        layers.len(),
+        width,
+        pooling,
+        cancellation,
+        |token, position| {
+            decode_token(context, token, position, cancellation)?;
+            let states = context
+                .take_hidden_states()
+                .map_err(|error| invalid(format!("capture residual states: {error}")))?;
+            if states.len() != layers.len()
+                || states
+                    .iter()
+                    .zip(layers)
+                    .any(|(state, layer)| state.layer != *layer)
+            {
+                return Err(invalid("captured layer identity or order mismatch"));
+            }
+            Ok(states.into_iter().map(|state| state.values).collect())
+        },
+    )
+}
+
+fn pool_captured_tokens(
+    tokens: &[i32],
+    start_position: usize,
+    layers: usize,
+    width: usize,
+    pooling: ResidualPooling,
+    cancellation: &AtomicBool,
+    mut capture: impl FnMut(i32, usize) -> NativeResult<Vec<Vec<f32>>>,
+) -> NativeResult<Vec<Vec<f64>>> {
+    let mut accumulator = math::PoleAccumulator::new(layers, width, tokens.len(), pooling)?;
+    for (offset, &token) in tokens.iter().enumerate() {
+        check_cancelled(cancellation)?;
+        let position = start_position
+            .checked_add(offset)
+            .ok_or_else(|| invalid("capture position overflow"))?;
+        let states = capture(token, position)?;
+        check_cancelled(cancellation)?;
+        accumulator.push(&states)?;
+    }
+    accumulator.finish()
+}
+
+// The callback has no holdout input. Only training representations contribute
+// to axes, and each pole mean and each pair has equal weight.
+fn fit_directions(
+    request: &ResidualTrainingRequest,
+    width: usize,
+    mut capture: impl FnMut(&[i32], &[i32], ResidualPooling) -> NativeResult<Vec<Vec<f64>>>,
+) -> NativeResult<Vec<Vec<f32>>> {
+    request.validate()?;
+    if !(1..=llama_native_types::MAX_RESIDUAL_TRAINING_DIMENSIONS).contains(&width)
+        || width
+            .checked_mul(request.layers.len())
+            .is_none_or(|n| n > llama_native_types::MAX_RESIDUAL_CAPTURE_VALUES)
+    {
+        return Err(invalid("invalid direction accumulator width"));
+    }
+    let mut means = vec![vec![0.0_f64; width]; request.layers.len()];
+    for pair in &request.train {
+        let positive = capture(&pair.prefix, &pair.positive, request.pooling)?;
+        let negative = capture(&pair.prefix, &pair.negative, request.pooling)?;
+        if positive.len() != means.len() || negative.len() != means.len() {
+            return Err(invalid("captured layer count mismatch"));
+        }
+        for ((mean, pos), neg) in means.iter_mut().zip(positive).zip(negative) {
+            if pos.len() != width
+                || neg.len() != width
+                || pos.iter().chain(&neg).any(|v| !v.is_finite())
+            {
+                return Err(invalid("captured width or finite-value mismatch"));
+            }
+            for ((sum, pos), neg) in mean.iter_mut().zip(pos).zip(neg) {
+                *sum += (pos - neg) / request.train.len() as f64;
+            }
+        }
+    }
+    means
+        .iter()
+        .map(|mean| math::normalize_direction(mean))
+        .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -494,27 +599,18 @@ pub(super) fn execute(
             HiddenStateCaptureConfig::new(request.layers.clone()),
         )
         .map_err(|error| invalid(format!("create residual capture context: {error}")))?;
-    let mut means = vec![vec![0.0_f64; width]; request.layers.len()];
-    for pair in &request.train {
-        let positive = capture_pole(&mut capture, &pair.prefix, &pair.positive, cancellation)?;
-        let negative = capture_pole(&mut capture, &pair.prefix, &pair.negative, cancellation)?;
-        if positive.len() != means.len() || negative.len() != means.len() {
-            return Err(invalid("captured layer count mismatch"));
-        }
-        for ((mean, pos), neg) in means.iter_mut().zip(positive).zip(negative) {
-            if pos.len() != width || neg.len() != width {
-                return Err(invalid("captured width mismatch"));
-            }
-            for ((sum, pos), neg) in mean.iter_mut().zip(pos).zip(neg) {
-                *sum += (f64::from(pos) - f64::from(neg)) / request.train.len() as f64;
-            }
-        }
-    }
+    let directions = fit_directions(request, width, |prefix, pole, pooling| {
+        capture_pole(
+            &mut capture,
+            prefix,
+            pole,
+            pooling,
+            &request.layers,
+            width,
+            cancellation,
+        )
+    })?;
     drop(capture);
-    let directions = means
-        .iter()
-        .map(|mean| math::normalize_direction(mean))
-        .collect::<NativeResult<Vec<_>>>()?;
     let mut objective = Objective {
         context: &mut context,
         request,
@@ -537,16 +633,17 @@ pub(super) fn execute(
         .ok_or_else(|| invalid("training history is empty"))?;
     let gains = last.gains.clone();
     let best = last.metrics;
-    // Holdout reads start only after directions, gains, and history are frozen.
+    // Holdout scoring starts only after directions, gains, and history are frozen.
     let validation_baseline = objective.evaluate(&request.validation, &vec![0.0; gains.len()])?;
     let validation_final = objective.evaluate(&request.validation, &gains)?;
     check_cancelled(cancellation)?;
     let output = ResidualTrainingOutput {
         request_sha256: request.sha256()?,
+        pooling: request.pooling,
         model_fingerprint: fingerprint.clone(),
         execution_fingerprint,
         no_op_max_logprob_delta,
-        training_method: RESIDUAL_TRAINING_METHOD.into(),
+        training_method: request.pooling.training_method().into(),
         intervention_semantics: RESIDUAL_INTERVENTION_SEMANTICS.into(),
         layers: request.layers.clone(),
         directions,
@@ -564,6 +661,219 @@ pub(super) fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn span_schedule_excludes_prefix_and_single_token_matches_terminal() {
+        let cancel = AtomicBool::new(false);
+        let prefix = [999, 998, 997];
+        for pole in [vec![10], vec![10, 20]] {
+            let tokens: Vec<_> = prefix.iter().chain(&pole).copied().collect();
+            let mut schedules = Vec::new();
+            for pooling in [
+                ResidualPooling::TerminalToken,
+                ResidualPooling::TerminalTokenMatched,
+                ResidualPooling::ResponseSpanMean,
+            ] {
+                let start = capture_start(pooling, prefix.len(), pole.len()).expect("boundary");
+                let mut calls = Vec::new();
+                let result = pool_captured_tokens(
+                    &tokens[start..],
+                    start,
+                    1,
+                    1,
+                    pooling,
+                    &cancel,
+                    |token, position| {
+                        assert!(position >= prefix.len());
+                        assert!(token < 100, "prefix states must never be captured");
+                        calls.push((token, position));
+                        Ok(vec![vec![token as f32]])
+                    },
+                )
+                .expect("mean");
+                let expected = match pooling {
+                    ResidualPooling::TerminalToken | ResidualPooling::TerminalTokenMatched => {
+                        f64::from(*pole.last().expect("pole"))
+                    }
+                    ResidualPooling::ResponseSpanMean => {
+                        pole.iter().map(|&v| f64::from(v)).sum::<f64>() / pole.len() as f64
+                    }
+                };
+                assert_eq!(result, [vec![expected]]);
+                assert_eq!(
+                    calls,
+                    tokens[start..]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &t)| (t, start + i))
+                        .collect::<Vec<_>>()
+                );
+                if pole.len() == 1 {
+                    assert_eq!(result, [vec![10.0]]);
+                }
+                schedules.push((tokens[..start].to_vec(), calls));
+            }
+            assert_eq!(
+                schedules[1], schedules[2],
+                "matched and mean share exact prefill and every capture call"
+            );
+            if pole.len() == 1 {
+                assert_eq!(schedules[0], schedules[1]);
+            }
+        }
+        for (prefix, pole) in [(0, 1), (1, 0), (usize::MAX, 1), (4096, 1)] {
+            assert!(capture_start(ResidualPooling::ResponseSpanMean, prefix, pole).is_err());
+        }
+    }
+
+    #[test]
+    fn pole_stream_checks_cancellation_and_propagates_capture_failure() {
+        let cancel = AtomicBool::new(true);
+        let mut calls = 0;
+        let error = pool_captured_tokens(
+            &[10, 20],
+            3,
+            1,
+            1,
+            ResidualPooling::ResponseSpanMean,
+            &cancel,
+            |_, _| {
+                calls += 1;
+                Ok(vec![vec![1.0]])
+            },
+        )
+        .expect_err("cancel before capture");
+        assert_eq!(error.code, NativeErrorCode::Cancelled);
+        assert_eq!(calls, 0);
+        cancel.store(false, Ordering::Release);
+        let error = pool_captured_tokens(
+            &[10, 20],
+            3,
+            1,
+            1,
+            ResidualPooling::TerminalTokenMatched,
+            &cancel,
+            |_, _| {
+                calls += 1;
+                cancel.store(true, Ordering::Release);
+                Ok(vec![vec![1.0]])
+            },
+        )
+        .expect_err("cancel during capture");
+        assert_eq!(error.code, NativeErrorCode::Cancelled);
+        assert_eq!(calls, 1);
+        cancel.store(false, Ordering::Release);
+        assert!(
+            pool_captured_tokens(
+                &[10, 20],
+                3,
+                1,
+                1,
+                ResidualPooling::TerminalTokenMatched,
+                &cancel,
+                |_, _| Err(invalid("capture failed"))
+            )
+            .is_err()
+        );
+        assert!(
+            pool_captured_tokens(
+                &[10, 20],
+                usize::MAX,
+                1,
+                1,
+                ResidualPooling::ResponseSpanMean,
+                &cancel,
+                |_, _| Ok(vec![vec![1.0]])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fitting_weights_poles_and_pairs_equally_and_never_captures_holdout() {
+        let mut request = ResidualTrainingRequest {
+            request_id: "fit".into(),
+            model_id: "model".into(),
+            pooling: ResidualPooling::ResponseSpanMean,
+            layers: vec![1],
+            train: vec![
+                ResidualTrainingPair {
+                    id: "a".into(),
+                    prefix: vec![1],
+                    positive: vec![10, 10],
+                    negative: vec![20],
+                },
+                ResidualTrainingPair {
+                    id: "b".into(),
+                    prefix: vec![2],
+                    positive: vec![30],
+                    negative: vec![40, 40, 40],
+                },
+            ],
+            validation: vec![ResidualTrainingPair {
+                id: "holdout".into(),
+                prefix: vec![99],
+                positive: vec![50],
+                negative: vec![60],
+            }],
+            search_steps: 0,
+            initial_step: 0.25,
+            maximum_norm: 1.0,
+            l2_penalty: 0.0,
+            margin: 1.0,
+        };
+        let cancel = AtomicBool::new(false);
+        let run = |request: &ResidualTrainingRequest| {
+            let mut calls = Vec::new();
+            let directions = fit_directions(request, 2, |prefix, pole, pooling| {
+                assert!(prefix[0] < 99, "holdout cannot enter fitting");
+                calls.push((prefix.to_vec(), pole.to_vec(), pooling));
+                let start = capture_start(pooling, prefix.len(), pole.len())?;
+                let tokens: Vec<_> = prefix.iter().chain(pole).copied().collect();
+                pool_captured_tokens(
+                    &tokens[start..],
+                    start,
+                    1,
+                    2,
+                    pooling,
+                    &cancel,
+                    |token, _| {
+                        let state = match token {
+                            10 => vec![6.0, 0.0],
+                            20 => vec![0.0, 2.0],
+                            30 => vec![0.0, 6.0],
+                            40 => vec![2.0, 0.0],
+                            _ => panic!("unexpected captured token"),
+                        };
+                        Ok(vec![state])
+                    },
+                )
+            })
+            .expect("directions");
+            (directions, calls)
+        };
+        for pooling in [
+            ResidualPooling::TerminalToken,
+            ResidualPooling::TerminalTokenMatched,
+            ResidualPooling::ResponseSpanMean,
+        ] {
+            request.pooling = pooling;
+            let (directions, calls) = run(&request);
+            assert_eq!(calls.len(), 4);
+            // Pair differences are [6,-2] and [-2,6], not token-length weights
+            // or unit pole vectors. Equal pair averaging gives [2,2].
+            let expected = std::f32::consts::FRAC_1_SQRT_2;
+            assert_eq!(directions, [vec![expected, expected]]);
+            let mut changed = request.clone();
+            changed.validation[0].prefix = vec![100; 3];
+            changed.validation[0].positive = vec![70; 4];
+            assert_ne!(
+                request.sha256().expect("hash"),
+                changed.sha256().expect("changed hash")
+            );
+            assert_eq!((directions, calls), run(&changed));
+        }
+    }
 
     #[test]
     fn trainer_rejects_unqualified_and_stateless_architectures() {

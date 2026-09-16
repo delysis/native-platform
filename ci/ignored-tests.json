@@ -446,6 +446,17 @@
       ]
     },
     {
+      "test_id": "local_pooling_matched_schedule_and_single_token",
+      "package": "llama-native-engine",
+      "target": "test:residual_training",
+      "source": "crates/native/crates/llama-native-engine/tests/residual_training.rs",
+      "prerequisite": "requires LLAMA_RESIDUAL_MODEL and LLAMA_RESIDUAL_POOLING_OUTPUT_DIR",
+      "required_environment": ["LLAMA_RESIDUAL_MODEL", "LLAMA_RESIDUAL_POOLING_OUTPUT_DIR"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Exposed smoke pairs and zero-search pooling checks do not establish behavioral transfer, scientific validity, cross-model qualification, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
+    },
+    {
       "test_id": "local_training_holdout_isolation_and_join",
       "package": "llama-native-engine",
       "target": "test:residual_training",
