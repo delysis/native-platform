@@ -157,6 +157,7 @@ impl LoopbackServer {
         store: Arc<dyn ResponseStore>,
         config: LoopbackConfig,
     ) -> Result<Self, GatewayError> {
+        gateway.bind_response_store(Arc::clone(&store))?;
         let token_value = load_or_create_token(&config.token_path)?;
         let token = Arc::new(RwLock::new(token_value));
         let state = AppState {
@@ -442,14 +443,11 @@ async fn responses(
 ) -> Result<Response, ApiError> {
     let stream_requested = request.stream;
     let gateway_request = request.into_gateway(state.edge_defaults.clone())?;
-    restore_previous_response_affinity(&state, &gateway_request)?;
-    let should_store = gateway_request.storage.store_response;
     let ticket = state.gateway.execute(gateway_request).await?;
     if stream_requested {
-        Ok(openai_responses_stream(ticket, state, should_store))
+        Ok(openai_responses_stream(ticket, state))
     } else {
         let response = await_response(ticket).await?;
-        persist_response(&state, &response, should_store)?;
         Ok(Json(openai_responses_json(&response)).into_response())
     }
 }
@@ -479,6 +477,7 @@ async fn delete_response(
             "Stored response not found",
         ));
     }
+    state.gateway.forget_response_affinity(&id)?;
     Ok(Json(
         json!({"id":id,"object":"response.deleted","deleted":true}),
     ))
@@ -874,11 +873,7 @@ fn openai_stream_response(
         .into_response()
 }
 
-fn openai_responses_stream(
-    mut ticket: fte_types::GatewayTicket,
-    state: AppState,
-    should_store: bool,
-) -> Response {
+fn openai_responses_stream(mut ticket: fte_types::GatewayTicket, state: AppState) -> Response {
     let keep_alive = state.keep_alive;
     let idle_timeout = state.stream_idle_timeout;
     let total_timeout = state.stream_total_timeout;
@@ -912,12 +907,6 @@ fn openai_responses_stream(
                         break;
                     }
                 }
-            }
-            if let GatewayEvent::Completed { response, .. } = &event
-                && let Err(error) = persist_response(&state, response, should_store)
-            {
-                yield Ok::<Event, Infallible>(Event::default().event("error").data(json!({"type":"error","code":error.code,"message":error.safe_detail}).to_string()));
-                break;
             }
             if let Some(encoded) = encoder.encode(&event) {
                 yield Ok::<Event, Infallible>(Event::default().event(encoded.event).data(encoded.data.to_string()));
@@ -976,41 +965,6 @@ fn anthropic_stream(
     Sse::new(event_stream)
         .keep_alive(KeepAlive::new().interval(keep_alive))
         .into_response()
-}
-
-fn persist_response(
-    state: &AppState,
-    response: &GatewayResponse,
-    should_store: bool,
-) -> Result<(), GatewayError> {
-    if should_store {
-        state.store.put(response)?;
-    }
-    if let Err(error) = state
-        .gateway
-        .record_response_affinity(&response.id, &response.route)
-    {
-        if should_store {
-            state.store.delete(&response.id)?;
-        }
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn restore_previous_response_affinity(
-    state: &AppState,
-    request: &fte_types::GatewayRequest,
-) -> Result<(), GatewayError> {
-    let Some(previous_response_id) = request.storage.previous_response_id.as_deref() else {
-        return Ok(());
-    };
-    if let Some(previous) = state.store.get(previous_response_id)? {
-        state
-            .gateway
-            .record_response_affinity(previous_response_id, &previous.route)?;
-    }
-    Ok(())
 }
 
 fn authenticated(headers: &HeaderMap, expected: &str) -> bool {
@@ -1269,6 +1223,9 @@ mod tests {
         gateway
             .register_backend(Arc::new(StreamingTestBackend("test-model")))
             .expect("backend");
+        gateway
+            .bind_response_store(Arc::clone(&store))
+            .expect("bind shared response store");
         AppState {
             gateway,
             store,
@@ -1303,6 +1260,10 @@ mod tests {
         for model_id in ["local/default", "organization/family/model"] {
             let mut state = regression_state(Arc::new(SqliteStore::in_memory().expect("store")));
             state.gateway = Arc::new(Gateway::new(fte_router::GatewayDefaults::default()));
+            state
+                .gateway
+                .bind_response_store(Arc::clone(&state.store))
+                .expect("bind shared response store");
             state
                 .gateway
                 .register_backend(Arc::new(StreamingTestBackend(model_id)))
@@ -1551,7 +1512,7 @@ mod tests {
             let http = match edge {
                 0 => openai_stream_response(ticket, StreamFlavor::Chat, state),
                 1 => openai_stream_response(ticket, StreamFlavor::Completion, state),
-                2 => openai_responses_stream(ticket, state, false),
+                2 => openai_responses_stream(ticket, state),
                 _ => anthropic_stream(ticket, state, 1),
             };
             let text = response_body(http).await;
@@ -1660,7 +1621,7 @@ mod tests {
                     location: BackendLocation::LocalEmbedded,
                     capabilities: ModelCapabilities {
                         prompt_forms: vec![PromptForm::Chat, PromptForm::Completion],
-                        modalities: vec![],
+                        modalities: vec![fte_types::Modality::Text],
                         tools: false,
                         structured_output: false,
                         reasoning: false,
@@ -1669,6 +1630,7 @@ mod tests {
                     },
                     context_tokens: Some(4096),
                     max_output_tokens: Some(512),
+                    quota: fte_types::QuotaLimits::default(),
                     observed: RouteObservations::default(),
                 }],
             }

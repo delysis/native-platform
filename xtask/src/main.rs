@@ -3,6 +3,7 @@
 mod macos_smoke_support;
 mod model_check;
 mod no_python;
+mod omp2;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -26,10 +27,11 @@ fn main() -> Result<()> {
     match command.as_str() {
         "policy" => check_policy(&workspace_root()),
         "model-check" => model_check::run(&workspace_root(), &arguments.collect::<Vec<_>>()),
+        "omp2" => omp2::run(&workspace_root(), &arguments.collect::<Vec<_>>()),
         "macos-smoke-support" => {
             macos_smoke_support::run(&workspace_root(), &arguments.collect::<Vec<_>>())
         }
-        _ => bail!("usage: cargo xtask <policy|model-check|macos-smoke-support>"),
+        _ => bail!("usage: cargo xtask <policy|model-check|macos-smoke-support|omp2>"),
     }
 }
 
@@ -43,6 +45,7 @@ fn workspace_root() -> PathBuf {
 fn check_policy(root: &Path) -> Result<()> {
     no_python::check(root)?;
     check_workspace(root)?;
+    omp2::verify(root)?;
     println!("native-platform policy: pass");
     Ok(())
 }

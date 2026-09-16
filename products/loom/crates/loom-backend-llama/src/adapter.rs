@@ -2099,8 +2099,8 @@ pub fn model_environment_from_verified(
     Ok(ModelEnvironment {
         environment_id: model.model_environment_id,
         model_identifier: model.stable_model_id.clone(),
-        model_fingerprint: BlobId::from_str(&model.model_sha256)?,
-        tokenizer_fingerprint: BlobId::from_str(&model.tokenizer_sha256)?,
+        model_fingerprint: Some(BlobId::from_str(&model.model_sha256)?),
+        tokenizer_fingerprint: Some(BlobId::from_str(&model.tokenizer_sha256)?),
         backend_identifier: model.build_id.clone(),
         capabilities: serde_json::to_value(&model.capabilities)?,
     })
@@ -2920,11 +2920,14 @@ mod tests {
         let error = handle
             .wait_timeout(Duration::from_secs(5))
             .expect_err("overflow cannot produce a completed candidate");
-        assert!(matches!(
-            error,
-            LlamaBackendError::OutputContract(message)
-                if message.starts_with("loom_text_stream_output_overflow:")
-        ));
+        assert!(
+            matches!(
+                &error,
+                LlamaBackendError::OutputContract(message)
+                    if message.starts_with("loom_text_stream_output_overflow:")
+            ),
+            "expected native text output overflow, got {error:?}"
+        );
         let events = drain_events(&handle);
         let delivered_bytes = events
             .iter()
@@ -3034,11 +3037,14 @@ mod tests {
         let error = handle
             .wait_timeout(Duration::from_secs(5))
             .expect_err("a drained stream cannot reuse its cumulative byte allowance");
-        assert!(matches!(
-            error,
-            LlamaBackendError::OutputContract(message)
-                if message.starts_with("loom_text_stream_output_overflow:")
-        ));
+        assert!(
+            matches!(
+                &error,
+                LlamaBackendError::OutputContract(message)
+                    if message.starts_with("loom_text_stream_output_overflow:")
+            ),
+            "expected native text output overflow, got {error:?}"
+        );
         delivered.extend(drain_events(&handle));
         assert_failed_contiguous_text_delivery(&delivered, MAX_GENERATED_OUTPUT_BYTES);
     }

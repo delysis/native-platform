@@ -2,7 +2,10 @@
 
 Loom Native is an early, local-first desktop writing environment for prose and poetry. Active manuscripts remain ordinary UTF-8 files; a hidden `.loom/` sidecar holds revisions, provenance, transient crash-recovery drafts, branch records, and visible-file recovery state.
 
-This repository is an executable development foundation, not a finished release. Editing, storage, model inspection, and private local suggestions are implemented; the former research engine is archived. The desktop ingests bounded project images and has a separate completion-context path: text-bearing files are canonicalized locally, while fully decoded PNG, JPEG, GIF, and WAV payloads are retained byte-for-byte for direct Gemma 4 image/audio input. WebP, BMP, and TIFF use bounded first-frame PNG derivatives with source provenance. Originals are retained even when extraction is unavailable; source-only cards contribute no invented model input. The historical verification snapshot records a real Gemma 4 E2B base Q8 Metal suggestion, caret-ghost acceptance, durable promotion, loaded-model quit, and immediate-relaunch exercise; that receipt does not certify every later build. There are no signed installers, hosted-provider adapters, or release-certified platform backends. Local dictation uses the sibling Speech service; its lifecycle is separate from native image/audio completion context.
+This repository is an executable development foundation, not a finished release. Editing, storage, model inspection, and private local suggestions are implemented; the former research engine is archived. The desktop ingests bounded project images and has a separate completion-context path: text-bearing files are canonicalized locally, while fully decoded PNG, JPEG, GIF, and WAV payloads are retained byte-for-byte for direct Gemma 4 image/audio input. WebP, BMP, and TIFF use bounded first-frame PNG derivatives with source provenance. Originals are retained even when extraction is unavailable; source-only cards contribute no invented model input. The historical verification snapshot records a real Gemma 4 E2B base Q8 Metal suggestion, caret-ghost acceptance, durable promotion, loaded-model quit, and immediate-relaunch exercise; that receipt does not certify every later build. There are no signed installers or release-certified platform backends. Local dictation uses the sibling Speech service; its lifecycle is separate from native image/audio completion context.
+
+Optional inference servers can be configured in `~/.loom.toml` with ordered routes for suggestions and manual weaving. See [Inference dotfile](docs/inference-dotfile.md). This opt-in adds no server settings UI.
+
 
 See [Implementation status](docs/implementation-status.md) for the exact verified/deferred boundary and current schema policy. [Project format v1](docs/format-v1.md) records the format rationale.
 
@@ -111,7 +114,7 @@ That test passed locally on CPU. A companion real-model test in the pinned nativ
 | `crates/loom-cli` | Storage, recovery, and external-reconciliation command-line oracle |
 | `apps/loom` | Quiet Svelte 5/ProseMirror authoring shell, completion lens, attachment context UI, automatic private-suggestion interaction, and Tauri 2 application |
 
-There is no `loom-backend-fte` crate yet. Generic speech processing, general source indexing, and hosted-provider composition are not implemented Loom product paths. Completion attachments deliberately use Gemma 4's native image/audio inputs where the local inspector can prove a complete payload decode; Loom does not OCR or transcribe them. W9 retired the unowned, unqualified research engine; the protected W8 HOME tag preserves it for archaeology or a future explicitly owned experiment.
+Configured text-completion servers use FTE routing inside the Loom plugin; the native `llama-native-kit` adapter remains Loom-owned. Completion attachments deliberately use Gemma 4's native image/audio inputs where the local inspector can prove a complete payload decode; Loom does not OCR or transcribe them. W9 retired the unowned, unqualified research engine; the protected W8 HOME tag preserves it for archaeology or a future explicitly owned experiment.
 
 ## Project layout
 
@@ -134,7 +137,7 @@ Visible files are authoritative for the active manuscript. `.loom/` is authorita
 ## Safety and privacy boundary
 
 - Project-owned Rust crates use `#![forbid(unsafe_code)]`. Native inference still depends on external FFI-bearing dependencies outside that unsafe-code boundary.
-- Editing and inference are local and require no credentials. The model manager contacts the network only for an explicitly submitted HTTPS download with an author-supplied digest and limit. There is no hosted-inference fallback or telemetry path in this tree.
+- Editing and default inference are local and require no credentials. Only explicitly named scopes in the optional global `~/.loom.toml` authorize server inference; there is no automatic hosted fallback or telemetry. The model manager downloads only on an explicit HTTPS request with an author-supplied digest and limit.
 - Tauri exposes an allowlisted plugin command set under a restrictive CSP. Session, project, document, revision, blob, draft-version, and command identities are checked at write boundaries.
 - Project-relative path traversal and document symlinks are refused. External file changes are not overwritten silently.
 - Newly created Unix sidecar directories/files request owner-only `0700`/`0600` modes while visible manuscript and pre-existing user permissions are preserved.

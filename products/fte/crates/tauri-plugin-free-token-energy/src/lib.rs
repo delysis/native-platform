@@ -48,10 +48,9 @@ impl Builder {
         }
     }
 
-    #[must_use]
-    pub fn with_defaults(mut self, defaults: GatewayDefaults) -> Self {
-        self.gateway = Arc::new(Gateway::new(defaults));
-        self
+    pub fn with_defaults(self, defaults: GatewayDefaults) -> Result<Self, GatewayError> {
+        self.gateway.set_defaults(defaults)?;
+        Ok(self)
     }
 
     #[must_use]
@@ -67,7 +66,7 @@ impl Builder {
     }
 
     /// Supplies the application-owned hosted credential boundary. Provider
-    /// secrets are resolved once by provider adapters and never exposed over
+    /// secrets are resolved per operation by provider adapters and never exposed over
     /// Tauri IPC or loopback.
     #[must_use]
     pub fn with_secret_resolver(mut self, resolver: Arc<dyn SecretResolver>) -> Self {
@@ -176,6 +175,7 @@ impl Builder {
                     Some(store) => store,
                     None => Arc::new(SqliteStore::open(app_data_dir.join("gateway-v2.db"))?),
                 };
+                gateway.bind_response_store(Arc::clone(&store))?;
                 let loopback_config = loopback_config.or_else(|| {
                     default_loopback
                         .then(|| LoopbackConfig::app_private(app_data_dir.join("loopback-token")))
@@ -638,6 +638,20 @@ fn plugin_quiescing_error(request_id: &RequestId) -> GatewayError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn defaults_preserve_the_injected_gateway() {
+        let gateway = std::sync::Arc::new(fte_router::Gateway::new(
+            fte_router::GatewayDefaults::default(),
+        ));
+        let builder = super::Builder::new()
+            .with_gateway(gateway.clone())
+            .with_defaults(fte_router::GatewayDefaults {
+                catalog_version: "updated".into(),
+            })
+            .expect("update gateway defaults");
+        assert!(std::sync::Arc::ptr_eq(&gateway, &builder.gateway));
+    }
+
     use super::*;
 
     #[test]

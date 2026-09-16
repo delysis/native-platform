@@ -57,7 +57,7 @@ impl GatewayBackend for FixtureBackend {
                 location: BackendLocation::Hosted,
                 capabilities: ModelCapabilities {
                     prompt_forms: vec![PromptForm::Chat, PromptForm::Completion],
-                    modalities: vec![],
+                    modalities: vec![fte_types::Modality::Text],
                     tools: false,
                     structured_output: false,
                     reasoning: false,
@@ -66,6 +66,7 @@ impl GatewayBackend for FixtureBackend {
                 },
                 context_tokens: Some(4096),
                 max_output_tokens: Some(512),
+                quota: Default::default(),
                 observed: RouteObservations::default(),
             }],
         }

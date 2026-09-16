@@ -66,6 +66,7 @@ const INDEPENDENT_COMMANDS = new Set([
   'model_download_list',
   'model_download_start',
   'model_download_status',
+  'inference_status',
   'model_list',
   'model_load',
   'model_load_catalog_candidate',
@@ -620,6 +621,10 @@ export function closeProject(
   commandId: string
 ): Promise<ProjectCloseReceipt> {
   return call('project_close', { projectId, sessionId, commandId });
+}
+
+export function getInferenceStatus(): Promise<{ suggestions: { model_id: string; completion: boolean } | null }> {
+  return call('inference_status');
 }
 
 export function listModels(): Promise<ModelCapabilitySummary[]> {
