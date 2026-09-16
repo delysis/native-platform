@@ -20,6 +20,10 @@ editing, then one consolidated gate on the final revision. Reuse build outputs
 and prune stale generated caches proactively; do not repeat expensive builds
 without a changed input or unresolved failure. See CONTRIBUTING.md for commands.
 
+Batch related edits after focused local checks before pushing a CI revision.
+Dispatch full cross-platform qualification once the revision is settled; reuse
+the existing PR and main workflows instead of launching overlapping full runs.
+
 macOS is the development acceptance platform. Gate progress on macOS and fast
 platform-independent checks. Keep Linux and Windows tests running, but repair
 their failures asynchronously without holding up macOS development.

@@ -90,7 +90,7 @@ function makeRepo() {
   return { repo, base };
 }
 
-function plan(repo, base, head, outputPath, metadataPath = writeMetadataFixture(repo)) {
+function plan(repo, base, head, outputPath, metadataPath = writeMetadataFixture(repo), environment = {}) {
   const result = spawnSync(process.execPath, [planner], {
     cwd: repo,
     encoding: "utf8",
@@ -102,6 +102,7 @@ function plan(repo, base, head, outputPath, metadataPath = writeMetadataFixture(
       CI_CARGO_METADATA_PATH: metadataPath,
       CARGO: "/fixture/cargo-must-not-be-probed",
       ...(outputPath ? { GITHUB_OUTPUT: outputPath } : {}),
+      ...environment,
     },
   });
   assert.equal(result.status, 0, result.stderr);
@@ -139,6 +140,46 @@ test("docs-only changes require policy and nothing else", () => {
   assert.equal(result.risk, "docs");
   assert.deepEqual(result.jobs, ["policy"]);
   assert.deepEqual(result.macos_matrix, []);
+});
+
+test("full push selection preserves code changes since the last qualified revision", () => {
+  const { repo, base } = makeRepo();
+  fs.writeFileSync(path.join(repo, ".git/info/exclude"), ".ci-cargo-metadata.json\n");
+  write(repo, "new-unknown-input", "code input\n");
+  const code = commit(repo, "code awaiting qualification");
+  write(repo, "docs/architecture.md", "documentation\n");
+  const docs = commit(repo, "docs after code");
+  const full = (baseline, head, extra = {}) => plan(repo, baseline, head, undefined,
+    writeMetadataFixture(repo), { CI_FULL_RUN: "true", GITHUB_EVENT_NAME: "push", ...extra });
+  assert.equal(full(base, docs).full_required, true, "an interrupted code run must be replaced");
+  assert.equal(full(code, docs).full_required, false, "qualified code needs only docs/policy checks");
+  for (const event of ["schedule", "workflow_dispatch"]) {
+    assert.equal(full(code, docs, { GITHUB_EVENT_NAME: event }).full_required, true);
+  }
+  assert.equal(full("", docs).full_required, true, "no successful baseline means full coverage");
+  assert.equal(full("unavailable-object", docs).full_required, true, "missing Git history means full coverage");
+  const unavailable = plan(repo, code, docs, undefined, path.join(repo, "missing-metadata"),
+    { CI_FULL_RUN: "true", GITHUB_EVENT_NAME: "push" });
+  assert.equal(unavailable.full_required, true);
+  fs.unlinkSync(path.join(repo, "docs/architecture.md"));
+  const deletedDocs = commit(repo, "delete docs");
+  assert.equal(full(docs, deletedDocs).full_required, false);
+  fs.unlinkSync(path.join(repo, "new-unknown-input"));
+  write(repo, "docs/architecture.md");
+  const mixed = commit(repo, "delete code and edit docs");
+  assert.equal(full(deletedDocs, mixed).full_required, true);
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+test("Linux inventory moves only to a selected complete workspace build", () => {
+  for (const input of ["Cargo.toml", "crates/native/crates/llama-native-types/src/lib.rs", "products/loom/crates/loom-types/src/lib.rs"]) {
+    const { result } = fixture(input);
+    const inRoot = result.flags.root || result.flags.full;
+    assert.deepEqual(result.ignored_matrix,
+      inRoot ? ["macos-latest", "windows-latest"] : ["ubuntu-latest", "macos-latest", "windows-latest"]);
+    assert.equal(result.jobs.includes("root-linux"), inRoot);
+    assert.ok(result.flags.ignored_tests);
+  }
 });
 
 test("CI policy changes use root Linux and macOS without expanding to full", () => {
