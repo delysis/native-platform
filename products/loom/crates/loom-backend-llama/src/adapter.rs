@@ -3623,7 +3623,8 @@ mod tests {
                         "unrelated prompt".into();
                 }
                 "template" => {
-                    altered["function_input"]["model_chat_template_sha256"] = "00".repeat(32).into();
+                    altered["function_input"]["model_chat_template_sha256"] =
+                        "00".repeat(32).into();
                 }
                 _ => altered["function_input"] = serde_json::Value::Null,
             }
