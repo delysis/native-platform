@@ -414,7 +414,9 @@ impl ComputeHost {
         grant.validate()?;
         let mut state = self.lock()?;
         if state.closed || self.stop.is_cancelled() || !(self.authority)(&grant) {
-            return Err(Error::Invalid("Compute grant is outside current membership"));
+            return Err(Error::Invalid(
+                "Compute grant is outside current membership",
+            ));
         }
         state.ledger.grant(grant)
     }
@@ -426,8 +428,15 @@ impl ComputeHost {
         let result = (|| {
             let mut state = self.lock()?;
             state.ledger.revoke(grant)?;
-            for job in state.active.clone().into_iter().filter(|job| job.grant.id == grant) {
-                state.ledger.cancel(job.peer, job.id, ComputeCancellation::GrantRevoked)?;
+            for job in state
+                .active
+                .clone()
+                .into_iter()
+                .filter(|job| job.grant.id == grant)
+            {
+                state
+                    .ledger
+                    .cancel(job.peer, job.id, ComputeCancellation::GrantRevoked)?;
             }
             Ok(())
         })();
@@ -443,13 +452,18 @@ impl ComputeHost {
 
     pub fn grant_statuses(&self) -> Result<Vec<ComputeGrantStatus>> {
         let state = self.lock()?;
-        state.ledger.grants()?.into_iter().map(|grant| {
-            Ok(ComputeGrantStatus {
-                jobs_remaining: state.ledger.remaining_jobs(&grant)?,
-                current: (self.authority)(&grant),
-                grant,
+        state
+            .ledger
+            .grants()?
+            .into_iter()
+            .map(|grant| {
+                Ok(ComputeGrantStatus {
+                    jobs_remaining: state.ledger.remaining_jobs(&grant)?,
+                    current: (self.authority)(&grant),
+                    grant,
+                })
             })
-        }).collect()
+            .collect()
     }
 
     pub fn stop(&self) {
@@ -465,7 +479,8 @@ impl ComputeHost {
         // Retain the handle across an abandoned or timed-out shutdown future.
         let mut slot = self.worker.lock().await;
         if let Some(worker) = slot.as_mut() {
-            let result = worker.await
+            let result = worker
+                .await
                 .map_err(|_| Error::Invalid("Compute supervisor stopped unexpectedly"))
                 .and_then(|result| result);
             *slot = None;
@@ -480,7 +495,9 @@ impl ComputeHost {
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, HostState>> {
-        self.state.lock().map_err(|_| Error::Invalid("Compute owner stopped"))
+        self.state
+            .lock()
+            .map_err(|_| Error::Invalid("Compute owner stopped"))
     }
 
     fn respond(&self, peer: PublicKey, request: Request) -> Result<Response> {
@@ -491,7 +508,9 @@ impl ComputeHost {
             Request::Status { job } => Ok(receipt_response(state.ledger.get(peer, job)?)),
             Request::Offers { cabal } => {
                 if state.closed || self.stop.is_cancelled() {
-                    return Ok(Response::Rejected { reason: ComputeRejection::Stopped });
+                    return Ok(Response::Rejected {
+                        reason: ComputeRejection::Stopped,
+                    });
                 }
                 let mut grants = Vec::new();
                 for grant in state.ledger.grants()? {
@@ -517,7 +536,9 @@ impl ComputeHost {
                     };
                     return if existing.payload.request_fingerprint == fingerprint {
                         Ok(receipt_response(if cancel {
-                            state.ledger.cancel(peer, job, ComputeCancellation::Requested)?
+                            state
+                                .ledger
+                                .cancel(peer, job, ComputeCancellation::Requested)?
                         } else {
                             Some(existing)
                         }))
@@ -540,7 +561,12 @@ impl ComputeHost {
                     return reject(ComputeRejection::InvalidRequest);
                 }
                 let fingerprint = input.fingerprint(grant.id)?;
-                let pending = HostComputeJob { id: job, peer, grant, input };
+                let pending = HostComputeJob {
+                    id: job,
+                    peer,
+                    grant,
+                    input,
+                };
                 if !cancel {
                     let limit = self.executor.batch_limit().clamp(1, MAX_COMPUTE_BATCH_JOBS);
                     let compatible = state.active.first().is_none_or(|first| {
@@ -558,30 +584,52 @@ impl ComputeHost {
                         return reject(ComputeRejection::Busy);
                     }
                 }
-                if !state.ledger.has_capacity(&pending.grant, Some(&pending.input))? {
+                if !state
+                    .ledger
+                    .has_capacity(&pending.grant, Some(&pending.input))?
+                {
                     return reject(ComputeRejection::Exhausted);
                 }
                 let admitted_at = tokio::time::Instant::now();
                 let receipt = state.ledger.accept(&pending, fingerprint)?;
                 if cancel {
-                    state.ledger.cancel(peer, job, ComputeCancellation::Requested)?;
-                    let receipt = state.ledger.transition(peer, job, ComputeStatus::Cancelled {
-                        reason: ComputeCancellation::Requested,
-                    })?;
-                    return Ok(Response::Receipt { receipt: Box::new(receipt) });
+                    state
+                        .ledger
+                        .cancel(peer, job, ComputeCancellation::Requested)?;
+                    let receipt = state.ledger.transition(
+                        peer,
+                        job,
+                        ComputeStatus::Cancelled {
+                            reason: ComputeCancellation::Requested,
+                        },
+                    )?;
+                    return Ok(Response::Receipt {
+                        receipt: Box::new(receipt),
+                    });
                 }
                 if state.active.is_empty() {
                     state.collecting = true;
                 }
                 state.active.push(pending.clone());
-                if self.pending.try_send(PendingComputeJob { job: pending, admitted_at }).is_err() {
+                if self
+                    .pending
+                    .try_send(PendingComputeJob {
+                        job: pending,
+                        admitted_at,
+                    })
+                    .is_err()
+                {
                     state.closed = true;
                     self.stop.cancel();
-                    state.ledger.transition(peer, job, ComputeStatus::Interrupted)?;
+                    state
+                        .ledger
+                        .transition(peer, job, ComputeStatus::Interrupted)?;
                     state.active.retain(|item| item.peer != peer || item.id != job);
                     return reject(ComputeRejection::Unavailable);
                 }
-                Ok(Response::Receipt { receipt: Box::new(receipt) })
+                Ok(Response::Receipt {
+                    receipt: Box::new(receipt),
+                })
             }
         }
     }
@@ -595,8 +643,12 @@ impl Drop for ComputeHost {
 
 fn receipt_response(receipt: Option<RemoteJobReceipt>) -> Response {
     receipt.map_or(
-        Response::Rejected { reason: ComputeRejection::Denied },
-        |receipt| Response::Receipt { receipt: Box::new(receipt) },
+        Response::Rejected {
+            reason: ComputeRejection::Denied,
+        },
+        |receipt| Response::Receipt {
+            receipt: Box::new(receipt),
+        },
     )
 }
 
