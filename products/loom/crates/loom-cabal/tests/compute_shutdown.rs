@@ -136,13 +136,15 @@ async fn abandoned_shutdown_cannot_detach_the_worker_or_make_retry_report_draine
     observed(&executor.exited).await;
     if retained_ownership {
         let response = peer.compute_status(network.address(), job).await?;
-        assert!(matches!(
-            response,
-            ComputeReply::Receipt { receipt }
-                if receipt.payload.status == ComputeStatus::Cancelled {
-                    reason: ComputeCancellation::HostStopping,
-                }
-        ));
+        let ComputeReply::Receipt { receipt } = response else {
+            panic!("expected the durable shutdown receipt");
+        };
+        assert_eq!(
+            receipt.payload.status,
+            ComputeStatus::Cancelled {
+                reason: ComputeCancellation::HostStopping,
+            }
+        );
         // Completed shutdown remains idempotent, including its durable outcome.
         host.shutdown().await?;
     }
