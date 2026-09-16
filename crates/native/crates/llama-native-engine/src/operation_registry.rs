@@ -13,6 +13,7 @@ pub(crate) enum RequestClass {
     Generation,
     ControlledGeneration,
     Embedding,
+    ResidualTraining,
 }
 
 #[derive(Debug)]
@@ -27,6 +28,9 @@ pub(crate) enum RequestControls {
     Embedding {
         cancellation: Arc<AtomicBool>,
     },
+    ResidualTraining {
+        cancellation: Arc<AtomicBool>,
+    },
 }
 
 impl RequestControls {
@@ -36,7 +40,7 @@ impl RequestControls {
             | Self::ControlledGeneration { cancellations } => {
                 set_all(cancellations.iter().map(|(_, flag)| flag))
             }
-            Self::Embedding { cancellation } => {
+            Self::Embedding { cancellation } | Self::ResidualTraining { cancellation } => {
                 cancellation.store(true, Ordering::Release);
                 1
             }
@@ -47,7 +51,7 @@ impl RequestControls {
         match self {
             Self::Generation { cancellations, .. }
             | Self::ControlledGeneration { cancellations } => set_named(cancellations, name),
-            Self::Embedding { .. } => false,
+            Self::Embedding { .. } | Self::ResidualTraining { .. } => false,
         }
     }
 
@@ -56,7 +60,9 @@ impl RequestControls {
             Self::Generation {
                 reasoning_forces, ..
             } => set_named(reasoning_forces, name),
-            Self::ControlledGeneration { .. } | Self::Embedding { .. } => false,
+            Self::ControlledGeneration { .. }
+            | Self::Embedding { .. }
+            | Self::ResidualTraining { .. } => false,
         }
     }
 
@@ -65,7 +71,9 @@ impl RequestControls {
             Self::Generation {
                 reasoning_forces, ..
             } => set_all(reasoning_forces.iter().map(|(_, flag)| flag)),
-            Self::ControlledGeneration { .. } | Self::Embedding { .. } => 0,
+            Self::ControlledGeneration { .. }
+            | Self::Embedding { .. }
+            | Self::ResidualTraining { .. } => 0,
         }
     }
 
@@ -75,7 +83,9 @@ impl RequestControls {
             | Self::ControlledGeneration { cancellations } => cancellations
                 .iter()
                 .any(|(_, flag)| flag.load(Ordering::Acquire)),
-            Self::Embedding { cancellation } => cancellation.load(Ordering::Acquire),
+            Self::Embedding { cancellation } | Self::ResidualTraining { cancellation } => {
+                cancellation.load(Ordering::Acquire)
+            }
         }
     }
 }
@@ -810,6 +820,32 @@ mod tests {
                 .reserve("other", RequestClass::Generation, controls())
                 .is_err()
         );
+        drop(lease);
+        registry.wait_until_drained();
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    #[test]
+    fn residual_training_has_request_wide_cancellation_and_executor_lease() {
+        let registry = Arc::new(RequestRegistry::new());
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let (control, lease) = registry
+            .reserve(
+                "training",
+                RequestClass::ResidualTraining,
+                RequestControls::ResidualTraining {
+                    cancellation: Arc::clone(&cancellation),
+                },
+            )
+            .expect("training reserves");
+        assert!(!control.cancel_named("pair"));
+        assert!(!control.force_reasoning_exit("pair"));
+        assert_eq!(control.force_all_reasoning_exits(), 0);
+        assert!(!cancellation.load(Ordering::Acquire));
+        registry.begin_quiesce_and_cancel_all();
+        assert!(cancellation.load(Ordering::Acquire));
+        drop(control);
+        assert_eq!(registry.active_count(), 1);
         drop(lease);
         registry.wait_until_drained();
         assert_eq!(registry.active_count(), 0);

@@ -48,6 +48,19 @@ context binding. A live receipt is only a storage hint: the native importer
 independently verifies every byte and token against the worker's receipt before
 calling the native state parser.
 
+## Residual training
+
+`NativeModelHandle::train_residual` learns frozen-model hidden-state contrast
+directions and bounded layer gains in-process. It accepts exact-token training
+and held-out pairs, executes on the existing owner worker with isolated contexts,
+and supports cancellation and joined-owner verification. Gemma 4 is the initial
+supported architecture. Output includes model/execution fingerprints, a hashed
+request, fitted directions, an optimization trace, and held-out metrics.
+
+This is contrast-subspace fitting, not autograd or weight fine-tuning. A successful
+fit does not authorize controlled generation or establish generalization.
+See [the algorithm, experiment card, and limits](docs/RESIDUAL_TRAINING.md).
+
 ## Workspace
 
 - `llama-native-types`: stable public DTOs.
