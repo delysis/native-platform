@@ -171,6 +171,37 @@ pub(super) fn decode_token(
         .map_err(|error| native_decode_error("residual training", error))
 }
 
+/// Prefix logits are unused. Keep the intervention/capture boundary out of
+/// these batches, and bound submitted chunk size independently of resident
+/// batch capacity. Cancellation is cooperative, not a wall-clock guarantee.
+/// Zero outputs is the same convention as native KV prefill.
+pub(super) fn decode_unmodified_prefix(
+    context: &mut LlamaContext<'_>,
+    tokens: &[i32],
+    cancellation: &AtomicBool,
+) -> NativeResult<()> {
+    let chunk_size = (context.n_batch().max(1) as usize).min(64);
+    for (index, chunk) in tokens.chunks(chunk_size).enumerate() {
+        check_cancelled(cancellation)?;
+        let mut batch = LlamaBatch::new(chunk.len(), 1);
+        for (offset, &token) in chunk.iter().enumerate() {
+            batch
+                .add(
+                    LlamaToken(token),
+                    i32::try_from(index * chunk_size + offset)
+                        .map_err(|_| invalid("position overflow"))?,
+                    &[0],
+                    false,
+                )
+                .map_err(|error| invalid(format!("invalid residual prefix batch: {error}")))?;
+        }
+        context
+            .decode(&mut batch)
+            .map_err(|error| native_decode_error("residual prefix", error))?;
+    }
+    check_cancelled(cancellation)
+}
+
 fn capture_pole(
     context: &mut LlamaContext<'_>,
     prefix: &[i32],
@@ -184,15 +215,13 @@ fn capture_pole(
     context
         .set_hidden_state_capture_enabled(false)
         .map_err(|error| invalid(format!("disable capture: {error}")))?;
-    let last = prefix.len() + pole.len() - 1;
-    for (position, token) in prefix.iter().chain(pole).enumerate() {
-        if position == last {
-            context
-                .set_hidden_state_capture_enabled(true)
-                .map_err(|error| invalid(format!("enable final-token capture: {error}")))?;
-        }
-        decode_token(context, *token, position, cancellation)?;
-    }
+    let tokens: Vec<_> = prefix.iter().chain(pole).copied().collect();
+    let last = tokens.len() - 1;
+    decode_unmodified_prefix(context, &tokens[..last], cancellation)?;
+    context
+        .set_hidden_state_capture_enabled(true)
+        .map_err(|error| invalid(format!("enable final-token capture: {error}")))?;
+    decode_token(context, tokens[last], last, cancellation)?;
     let states = context
         .take_hidden_states()
         .map_err(|error| invalid(format!("capture residual states: {error}")))?;
@@ -232,9 +261,7 @@ fn score_tokens(
         .map_err(|error| invalid(format!("clear residual control: {error}")))?;
     context.clear_kv_cache();
     let last = prefix.len() - 1;
-    for (position, &token) in prefix[..last].iter().enumerate() {
-        decode_token(context, token, position, cancellation)?;
-    }
+    decode_unmodified_prefix(context, &prefix[..last], cancellation)?;
     // All cached prefix tokens precede the intervention. From the final prefix
     // token onward singleton decode makes the intervention position explicit.
     if let Some(control) = control {

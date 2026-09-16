@@ -83,7 +83,9 @@ fn local_training_holdout_isolation_and_join() -> Result<()> {
     let mut config = NativeModelConfig::local(path.into());
     config.model_id = "residual-test".into();
     config.context_tokens = 512;
-    config.batch_tokens = 64;
+    config.batch_tokens = std::env::var("LLAMA_RESIDUAL_BATCH")
+        .unwrap_or_else(|_| "64".into())
+        .parse()?;
     config.max_sequences = 1;
     let owner = NativeModelOwner::load(config)?;
     let handle = owner.handle();
@@ -245,6 +247,69 @@ fn local_training_holdout_isolation_and_join() -> Result<()> {
         forced.output().cases[0].mean_reference_kl,
         evaluated.output().cases[1].mean_reference_kl
     );
+    let long_prefix = tokens(
+        &handle,
+        &"The archivist copied the same sentence into the notebook. ".repeat(18),
+    )?;
+    assert!(long_prefix.len() > 129 && long_prefix.len() + heldout.positive.len() < 512);
+    let mut chunk_boundary = evaluation.clone();
+    chunk_boundary.request_id = "multi-chunk-prefix".into();
+    chunk_boundary.cases = vec![
+        chunk_boundary.cases[0].clone(),
+        chunk_boundary.cases[3].clone(),
+    ];
+    for case in &mut chunk_boundary.cases {
+        case.prefix = long_prefix.clone();
+    }
+    let chunked = handle.evaluate_residual(chunk_boundary)?.wait()?;
+    assert_eq!(chunked.output().cases[0].mean_reference_kl, Some(0.0));
+    assert_eq!(
+        chunked.output().cases[0].generated_token_ids,
+        chunked.output().cases[1].generated_token_ids
+    );
+    assert_eq!(
+        chunked.output().cases[0].mean_continuation_logprob,
+        chunked.output().cases[1].mean_continuation_logprob
+    );
+    let mut capture_boundaries = request.clone();
+    capture_boundaries.request_id = "multi-chunk-capture".into();
+    capture_boundaries.search_steps = 0;
+    let context_a = "The archivist copied a line from the notebook. ".repeat(14);
+    let context_b = "The archivist copied a line from the notebook. ".repeat(20);
+    capture_boundaries.train = vec![
+        pair(
+            &handle,
+            "capture-long-a",
+            &format!("{context_a}At lunch, she joins a table of coworkers."),
+            &format!("{context_a}At lunch, she finds a table away from coworkers."),
+        )?,
+        pair(
+            &handle,
+            "capture-long-b",
+            &format!("{context_b}At the party, she starts a conversation."),
+            &format!("{context_b}At the party, she waits for a conversation."),
+        )?,
+    ];
+    assert!(
+        capture_boundaries
+            .train
+            .iter()
+            .all(|pair| pair.prefix.len() > 129)
+    );
+    assert_ne!(
+        capture_boundaries.train[0].prefix.len(),
+        capture_boundaries.train[1].prefix.len()
+    );
+    let captured = handle.train_residual(capture_boundaries)?.wait()?;
+    captured.output().validate()?;
+    assert!(
+        captured
+            .output()
+            .directions
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    );
     let mut wrong_model = evaluation.clone();
     wrong_model.request_id = "wrong-model-evaluation".into();
     wrong_model.expected_model_sha256 = "0".repeat(64);
@@ -319,6 +384,8 @@ fn local_training_holdout_isolation_and_join() -> Result<()> {
     assert!(evaluated.belongs_to_joined_model(&joined));
     assert!(replay.belongs_to_joined_model(&joined));
     assert!(forced.belongs_to_joined_model(&joined));
+    assert!(chunked.belongs_to_joined_model(&joined));
+    assert!(captured.belongs_to_joined_model(&joined));
     assert_eq!(joined.expected_worker_count(), joined.joined_worker_count());
     if let Ok(path) = std::env::var("LLAMA_RESIDUAL_TEST_OUTPUT") {
         let file = std::fs::OpenOptions::new()
