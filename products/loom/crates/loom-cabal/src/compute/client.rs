@@ -418,30 +418,17 @@ fn encode(value: &impl Serialize) -> Result<String> {
 pub(super) fn validate_receipt(request: &ClientRequest, receipt: &RemoteJobReceipt) -> Result<()> {
     receipt.verify()?;
     let value = &receipt.payload;
+    value.validate()?;
     if receipt.signer != request.host
         || value.peer != request.grant.peer
         || value.job != request.id
         || value.grant != request.grant.id
         || value.model != request.grant.model
         || value.request_fingerprint != request.input.fingerprint(request.grant.id)?
-        || value.created_at_ms > value.recorded_at_ms
     {
         return Err(Error::Invalid(
             "Remote compute receipt does not match the saved request",
         ));
-    }
-    let revision_valid = match value.status {
-        ComputeStatus::Accepted => value.revision == 0,
-        ComputeStatus::Running => value.revision == 1,
-        ComputeStatus::Cancelling { .. } => (1..=2).contains(&value.revision),
-        ComputeStatus::Cancelled { .. } => (2..=3).contains(&value.revision),
-        ComputeStatus::Completed { .. } | ComputeStatus::Failed { .. } => value.revision == 2,
-        ComputeStatus::Interrupted => (1..=3).contains(&value.revision),
-    };
-    if !revision_valid
-        || matches!(&value.status, ComputeStatus::Completed { text } if text.len() > MAX_COMPUTE_TEXT_BYTES)
-    {
-        return Err(Error::Invalid("Invalid remote compute result"));
     }
     Ok(())
 }
@@ -449,24 +436,35 @@ pub(super) fn validate_receipt(request: &ClientRequest, receipt: &RemoteJobRecei
 pub(super) fn validate_advance(old: &RemoteJobReceipt, next: &RemoteJobReceipt) -> Result<()> {
     let before = &old.payload;
     let after = &next.payload;
+    before.validate()?;
+    after.validate()?;
+    let consecutive = before.revision.checked_add(1) == Some(after.revision);
     let valid = match (&before.status, &after.status) {
         (ComputeStatus::Accepted, ComputeStatus::Accepted) => false,
         (ComputeStatus::Accepted, _) => true,
+        // Running is revision 1. Cancellation must first append Cancelling at
+        // revision 2, even when the requester did not observe that reply.
+        (ComputeStatus::Running, ComputeStatus::Cancelled { .. }) => after.revision == 3,
         (
             ComputeStatus::Running,
             ComputeStatus::Cancelling { .. }
-            | ComputeStatus::Cancelled { .. }
             | ComputeStatus::Completed { .. }
             | ComputeStatus::Failed { .. }
             | ComputeStatus::Interrupted,
         ) => true,
         (ComputeStatus::Cancelling { reason: old }, ComputeStatus::Cancelled { reason: new }) => {
-            old == new
+            old == new && consecutive
         }
-        (ComputeStatus::Cancelling { .. }, ComputeStatus::Interrupted) => true,
+        (ComputeStatus::Cancelling { .. }, ComputeStatus::Interrupted) => consecutive,
         _ => false,
     };
     if !valid
+        || old.signer != next.signer
+        || after.job != before.job
+        || after.peer != before.peer
+        || after.grant != before.grant
+        || after.model != before.model
+        || after.request_fingerprint != before.request_fingerprint
         || after.revision <= before.revision
         || after.created_at_ms != before.created_at_ms
         || after.recorded_at_ms < before.recorded_at_ms
