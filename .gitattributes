@@ -12,3 +12,8 @@
 *.rs.in text eol=lf
 *.yaml text eol=lf
 *.yml text eol=lf
+
+# Pinned upstream bytes must survive checkout unchanged on every platform.
+third-party/omp2/upstream/** -text
+# SSE's final empty line is a protocol delimiter, not stray whitespace.
+third-party/omp2/upstream/**/*.sse whitespace=-blank-at-eof

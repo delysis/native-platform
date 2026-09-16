@@ -476,4 +476,33 @@ mod tests {
             assert!(!hexadecimal(revision, 40));
         }
     }
+
+    #[test]
+    fn upstream_snapshot_bytes_survive_crlf_enabled_checkout() {
+        let (fixture, _, downstream, _) = setup();
+        fs::write(
+            downstream.join(".gitattributes"),
+            include_bytes!("../../.gitattributes"),
+        )
+        .expect("copy real checkout attributes");
+        let path = format!("{DIRECTORY}/upstream/codec.rs");
+        command(&downstream, &["add", ".gitattributes", &path]);
+        let output = fixture.0.join("crlf-checkout");
+        let prefix = format!("--prefix={}/", output.display()).replace('\\', "/");
+        command(
+            &downstream,
+            &[
+                "-c",
+                "core.autocrlf=true",
+                "checkout-index",
+                &prefix,
+                "--",
+                &path,
+            ],
+        );
+        assert_eq!(
+            fs::read(output.join(&path)).expect("checked-out source"),
+            fs::read(downstream.join(path)).expect("original source")
+        );
+    }
 }
