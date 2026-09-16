@@ -446,7 +446,7 @@ mod tests {
             .count()
     }
 
-    /// Suspend the actual import thread inside oneshot::Sender::send (or its
+    /// Suspend the actual import thread inside `oneshot::Sender::send` (or its
     /// panic-time drop), after the receiver becomes ready but before thread exit.
     /// No production hooks or scheduler timing are involved.
     struct CompletionWake {

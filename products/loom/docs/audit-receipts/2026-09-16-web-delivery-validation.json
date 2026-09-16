@@ -1,0 +1,141 @@
+{
+  "schema": "loom.web-delivery-validation.v1",
+  "recorded_at": "2026-09-16T19:54:58.202951+00:00",
+  "source": {
+    "delivery_directory": "/Users/george/Downloads/loom-integration-delivery",
+    "files": {
+      "SHA256SUMS": "ea5f0dfe19d253b5d9b5cc00952a07ac9041f7bf61046a2463a8cdf96c664451",
+      "provenance.json": "e65702c48aa5f28eb015933986b454df8cf78c9b052c505e2b9e48606c37aba7",
+      "loom-import-lifecycle.patch": "fcad3923597aeeb18fd9e4abd788b8ff0e05c4ba5fea8df68f2dc6ff7ea4b5ea",
+      "loom-feature-to-result.patch": "355b90cb6d5484918f9c70887923074f6be71ea1f27da60aa06837a3f205b3bd"
+    },
+    "feature": "cd79b47a0fd8f10adbcf9d641544544bbd00930f",
+    "delivered_main": "68ae9d40f4010e86afe1eecb9dc156433f3edc92",
+    "integrated_main": "c0bcc42d8e274c9f428d3e19508709d7fa6e23ae",
+    "validated_source": "20b8312bc005641d216cb493441ded1ef6f1e51d",
+    "validated_tree": "9cead059520452a8d40be875148e56f77c17b57f"
+  },
+  "platform": "macOS aarch64",
+  "log_directory": "/Users/george/Downloads/loom-integration-validation-2026-09-16",
+  "checks": [
+    {
+      "log": "red-import-lifecycle.log",
+      "command": "cargo test --offline --locked -p tauri-plugin-loom compute_completion_waits_for_thread_exit_on_every_outcome -- --nocapture",
+      "exit_code": 101,
+      "observation": "Expected regression reproduced on original feature plus tests-only patch",
+      "sha256": "1a4b987b309451e26bde5e85780f5d29d9ab3431539ed0d2d82fbc420e499ed0"
+    },
+    {
+      "log": "green-import-lifecycle.log",
+      "command": "cargo test --offline --locked -p tauri-plugin-loom import_jobs::tests -- --nocapture",
+      "exit_code": 0,
+      "observation": "9 passed on focused repair",
+      "sha256": "6bdbd1ff29753bc61e38908cfde1133fa1c947653d1f5ccf0846005e22947963"
+    },
+    {
+      "log": "loom-native-group-final.log",
+      "command": "node scripts/ci/cargo-group.mjs test product-loom",
+      "exit_code": 0,
+      "observation": "733 passed; 11 opt-in ignored",
+      "sha256": "31852b68bd2ee7eeb425e24dc23fa2d485dbedf2c74a030d048b54e28e2f0136"
+    },
+    {
+      "log": "loom-clippy-clean.log",
+      "command": "node scripts/ci/cargo-group.mjs clippy product-loom",
+      "exit_code": 0,
+      "observation": "All-target strict Clippy passed; documentation-backtick correction applied",
+      "sha256": "7aed498c1b696975ab9c823f2ed62a180c88b7212b54359c446c33b330ce8f7f"
+    },
+    {
+      "log": "policy.log",
+      "command": "cargo run --locked -p xtask -- policy",
+      "exit_code": 0,
+      "observation": "Policy and OMP2 source verification passed",
+      "sha256": "e163439ebc81b5dbac5c6a228d65006127898047856aea341c43cfbc3cba3160"
+    },
+    {
+      "log": "xtask-tests.log",
+      "command": "cargo test --locked -p xtask",
+      "exit_code": 0,
+      "observation": "26 passed",
+      "sha256": "37b1beca9fa326b294bd773f281256ec2577451aa05c3afb26791c6bf79a96c9"
+    },
+    {
+      "log": "loom-check.log",
+      "command": "pnpm --filter @delysis/loom check",
+      "exit_code": 0,
+      "observation": "No diagnostics",
+      "sha256": "896d9ebf5f08cbb93e84dee3fbc2632a8d32fb786c250ea33fda52ea2b5904d0"
+    },
+    {
+      "log": "loom-unit-tests.log",
+      "command": "pnpm --filter @delysis/loom test",
+      "exit_code": 0,
+      "observation": "515 passed",
+      "sha256": "42523a8f4129f7ae37a4446d6a86558a25b4c5f78a041ce2f0c9013486d01b54"
+    },
+    {
+      "log": "loom-build.log",
+      "command": "pnpm --filter @delysis/loom build",
+      "exit_code": 0,
+      "observation": "Production assets built",
+      "sha256": "ee9f793ccffa70d15bebb1610cdfba3fd1120ab709b19897ac930f885ab6338b"
+    },
+    {
+      "log": "loom-browser-tests.log",
+      "command": "pnpm --filter @delysis/loom test:browser",
+      "exit_code": 1,
+      "observation": "178 passed; 1 stale-label failure",
+      "sha256": "1ca0323ee8f3038aff1e5c5c583a040556436bf425166f4733cf570f410e5348"
+    },
+    {
+      "log": "material-browser-tests.log",
+      "command": "pnpm --filter @delysis/loom test:browser src/lib/MaterialView.browser.test.ts",
+      "exit_code": 0,
+      "observation": "All 14 passed after matching Reveal original label; includes the previously failing case",
+      "sha256": "46bd109a075bf49a83923f3e0340046e0403a75ea511d0dd49292db3474f0af8"
+    },
+    {
+      "log": "ci-tests.log",
+      "command": "node --test scripts/ci/test-current-docs.mjs scripts/ci/test-ci-metadata-selection.mjs scripts/ci/test-ci-plan.mjs scripts/ci/test-ci-required.mjs scripts/ci/test-ignored-tests.mjs scripts/ci/test-product-state-backup.mjs scripts/ci/test-workflows.mjs",
+      "exit_code": 0,
+      "observation": "140 passed",
+      "sha256": "efdfaa509675ffbec4255582e83f116311592bdec7dd85d991134b3520bf0369"
+    },
+    {
+      "log": "signal-build-tests.log",
+      "command": "node --test scripts/ci/test-loom-signal-build.mjs",
+      "exit_code": 0,
+      "observation": "4 passed",
+      "sha256": "250f20423f526590a9bfdcfa040fe2c114a495f66b47949a6cf602205d854a94"
+    },
+    {
+      "log": "current-docs.log",
+      "command": "node scripts/ci/validate-current-docs.mjs",
+      "exit_code": 0,
+      "observation": "Current documentation valid",
+      "sha256": "e942726045e905f1c06f178bf167641edd51536fe3298018034399d665cafc50"
+    },
+    {
+      "log": "ignored-tests.log",
+      "command": "node scripts/ci/validate-ignored-tests.mjs",
+      "exit_code": 0,
+      "observation": "46 ignored tests accounted for; metadata/source validation, not full --cargo-list",
+      "sha256": "f936d3f4dbbbab0059d043eea199abd7b686a71f25360a1d610870ca48c26e8a"
+    },
+    {
+      "log": "rustfmt.log",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "observation": "Formatting passed",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ],
+  "limits": [
+    "Browser passing observations span one full run and the focused rerun; do not add overlapping counts.",
+    "The final Rust code change after the native test source is a documentation-backtick correction only.",
+    "No current packaged app, linked phone, real Signal messaging or physical Internet peer acceptance.",
+    "No fresh isolated Signal worker build; unchanged-source worker reused.",
+    "Remote CI is separate from these local results."
+  ]
+}
