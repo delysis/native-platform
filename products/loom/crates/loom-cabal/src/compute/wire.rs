@@ -206,6 +206,7 @@ fn validate_response(
             Request::Submit { job, .. } | Request::Status { job } | Request::Cancel { job, .. },
         ) => {
             receipt.verify()?;
+            receipt.payload.validate()?;
             if receipt.signer != host || receipt.payload.peer != peer || receipt.payload.job != *job
             {
                 return Err(Error::Invalid("Remote compute receipt identity mismatch"));
@@ -216,11 +217,6 @@ fn validate_response(
                     || receipt.payload.request_fingerprint != input.fingerprint(*grant)?)
             {
                 return Err(Error::Invalid("Remote compute receipt input mismatch"));
-            }
-            if let ComputeStatus::Completed { text } = &receipt.payload.status
-                && text.len() > MAX_COMPUTE_TEXT_BYTES
-            {
-                return Err(Error::Invalid("Remote compute output exceeds limit"));
             }
             Ok(())
         }
@@ -355,6 +351,36 @@ mod tests {
                 receipt: Box::new(host.sign(altered)?),
             };
             assert!(validate_response(&response, &request, host.public_key(), peer).is_err());
+        }
+        // A correctly signed response still has to describe a possible record,
+        // including when Status has no input against which to check it.
+        for malformed in [
+            RemoteJobRecord {
+                revision: 0,
+                ..record.clone()
+            },
+            RemoteJobRecord {
+                recorded_at_ms: 0,
+                ..record.clone()
+            },
+            RemoteJobRecord {
+                grant: Uuid::nil(),
+                ..record.clone()
+            },
+            RemoteJobRecord {
+                model: ComputeModel {
+                    fingerprint: "not a model digest".into(),
+                    ..record.model.clone()
+                },
+                ..record.clone()
+            },
+        ] {
+            let response = Response::Receipt {
+                receipt: Box::new(host.sign(malformed)?),
+            };
+            for request in [&request, &Request::Status { job }] {
+                assert!(validate_response(&response, request, host.public_key(), peer).is_err());
+            }
         }
         let mut forged = host.sign(record)?;
         forged.payload.status = ComputeStatus::Completed {
