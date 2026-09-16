@@ -13,15 +13,16 @@ function dependencyThunkFor(compiled: string, assignment: string): string {
 describe('App ghost reactivity wiring', () => {
   const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
   let compiled: string;
-  // Compiling the full app is fixture preparation, with the runner's bounded
-  // setup timeout. The behavior assertions retain their normal test timeout.
+  // Compiling the full app is fixture preparation. On a busy native build host
+  // it can exceed the runner's default ten seconds; keep a separate bounded
+  // setup budget without changing the behavior assertions' normal timeout.
   beforeAll(() => {
     compiled = compile(source, {
       filename: 'App.svelte',
       generate: 'client',
       dev: false
     }).js.code;
-  });
+  }, 60_000);
 
   it('tracks late branch hydration and caret changes in both ghost effects', () => {
     const visual = dependencyThunkFor(compiled, '$.set(visualAutocompleteDisposition');
