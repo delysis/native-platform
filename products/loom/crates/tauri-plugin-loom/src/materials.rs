@@ -1015,6 +1015,7 @@ fn install_evidence(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
+// These integration fixtures require the supported private project store.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

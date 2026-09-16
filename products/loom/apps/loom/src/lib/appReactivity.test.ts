@@ -46,7 +46,7 @@ describe('App ghost reactivity wiring', () => {
     expect(visualFamily).toContain('verifiedBranchBodyByRun');
     expect(visualFamily).toContain('liveBranchTextByRun');
     expect(visualFamily).toContain('liveBranchTextSequenceByRun');
-    expect(visualFamily).toContain('currentModel');
+    expect(visualFamily).toContain('currentWriter');
     expect(visualFamily).toContain('branchPromotionReady');
     expect(visualFamily).toContain('documentText');
 

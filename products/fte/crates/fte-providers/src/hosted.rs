@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 const MAX_ERROR_BODY_BYTES: usize = 32 * 1024;
 const MAX_PROVIDER_FRAME_BYTES: usize = 1024 * 1024;
@@ -33,8 +34,13 @@ pub enum HostedProtocol {
 
 #[derive(Debug, Clone)]
 pub enum HostedAuth {
+    /// Explicitly configured inference servers may not require a credential.
+    None,
     Bearer,
-    Header { name: String, prefix: String },
+    Header {
+        name: String,
+        prefix: String,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -55,6 +61,7 @@ pub struct HostedProviderConfig {
     pub auth: HostedAuth,
     pub endpoints: HostedEndpoints,
     pub static_headers: BTreeMap<String, String>,
+    pub chat_compatibility: BTreeMap<String, crate::OpenAiChatCompatibility>,
     pub models: Vec<ModelDescriptor>,
     pub catalog_version: String,
     pub connect_timeout: Duration,
@@ -84,6 +91,7 @@ impl HostedProviderConfig {
             },
             static_headers: BTreeMap::new(),
             models,
+            chat_compatibility: BTreeMap::new(),
             catalog_version: "configured".to_string(),
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_mins(10),
@@ -117,6 +125,7 @@ impl HostedProviderConfig {
             },
             static_headers,
             models,
+            chat_compatibility: BTreeMap::new(),
             catalog_version: "configured".to_string(),
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_mins(10),
@@ -143,6 +152,7 @@ impl HostedProviderConfig {
             },
             static_headers: BTreeMap::new(),
             models,
+            chat_compatibility: BTreeMap::new(),
             catalog_version: "configured".to_string(),
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_mins(10),
@@ -172,6 +182,7 @@ impl HostedProviderConfig {
             },
             static_headers: BTreeMap::new(),
             models,
+            chat_compatibility: BTreeMap::new(),
             catalog_version: "configured".to_string(),
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_mins(10),
@@ -183,7 +194,6 @@ pub struct HostedProviderBackend {
     config: HostedProviderConfig,
     client: reqwest::Client,
     secrets: Arc<dyn SecretResolver>,
-    credential: Mutex<Option<String>>,
     activity: Arc<HostedActivity>,
 }
 
@@ -324,21 +334,13 @@ impl HostedProviderBackend {
             config,
             client,
             secrets,
-            credential: Mutex::new(None),
             activity: Arc::new(HostedActivity::default()),
         })
     }
 
-    fn credential(&self, request_id: &RequestId) -> Result<String, GatewayError> {
-        if let Some(secret) = self
-            .credential
-            .lock()
-            .map_err(|error| {
-                provider_internal(&self.config.id, "provider_credential_state_failed", error)
-            })?
-            .clone()
-        {
-            return Ok(secret);
+    fn credential(&self, request_id: &RequestId) -> Result<Zeroizing<String>, GatewayError> {
+        if matches!(self.config.auth, HostedAuth::None) {
+            return Ok(Zeroizing::new(String::new()));
         }
         let secret = self
             .secrets
@@ -356,10 +358,9 @@ impl HostedProviderBackend {
                     self.config.display_name
                 ),
             })?;
-        *self.credential.lock().map_err(|error| {
-            provider_internal(&self.config.id, "provider_credential_state_failed", error)
-        })? = Some(secret.clone());
-        Ok(secret)
+        // Resolve for each new operation. Replacing/deleting the store entry
+        // affects the next request; only already admitted work retains a key.
+        Ok(Zeroizing::new(secret))
     }
 
     fn headers(
@@ -371,19 +372,19 @@ impl HostedProviderBackend {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         match &self.config.auth {
+            HostedAuth::None => {}
             HostedAuth::Bearer => {
-                headers.insert(
-                    AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {secret}")).map_err(|error| {
-                        provider_request_error(request_id, &self.config.id, error)
-                    })?,
-                );
+                let mut value = HeaderValue::from_str(&format!("Bearer {secret}"))
+                    .map_err(|error| provider_request_error(request_id, &self.config.id, error))?;
+                value.set_sensitive(true);
+                headers.insert(AUTHORIZATION, value);
             }
             HostedAuth::Header { name, prefix } => {
                 let name = HeaderName::from_bytes(name.as_bytes())
                     .map_err(|error| provider_request_error(request_id, &self.config.id, error))?;
-                let value = HeaderValue::from_str(&format!("{prefix}{secret}"))
+                let mut value = HeaderValue::from_str(&format!("{prefix}{secret}"))
                     .map_err(|error| provider_request_error(request_id, &self.config.id, error))?;
+                value.set_sensitive(true);
                 headers.insert(name, value);
             }
         }
@@ -402,6 +403,16 @@ impl HostedProviderBackend {
     }
 
     fn prepare(&self, request: &BackendRequest) -> Result<PreparedHostedRequest, GatewayError> {
+        if request.request.storage.previous_response_id.is_some()
+            && self.config.protocol != HostedProtocol::OpenAi
+        {
+            return Err(capability_error(
+                &request.request.request_id,
+                &self.config.id,
+                "provider_continuation_unsupported",
+                "this protocol requires explicit conversation items; response IDs cannot restore its context",
+            ));
+        }
         match self.config.protocol {
             HostedProtocol::OpenAi => prepare_openai(&self.config, request),
             HostedProtocol::OpenAiCompatible => prepare_openai_compatible(&self.config, request),
@@ -774,7 +785,7 @@ fn prepare_openai_compatible(
                 config.endpoints.chat_completions.as_deref(),
                 "Chat Completions",
             )?,
-            body: openai_chat_body(request)?,
+            body: crate::omp2::chat_body(config, request, openai_chat_body(request)?)?,
             protocol: WireProtocol::OpenAiChat,
             streaming: request.request.stream.enabled,
         }),
@@ -2397,6 +2408,8 @@ struct ProviderStreamState {
     function_arguments: BTreeMap<usize, String>,
     reasoning: BTreeMap<usize, String>,
     gemini_signatures: BTreeMap<usize, Value>,
+    anthropic_usage: Map<String, Value>,
+    anthropic_signatures: BTreeMap<usize, String>,
     gemini_text_outputs: HashMap<usize, usize>,
     gemini_reasoning_outputs: HashMap<usize, usize>,
     gemini_function_outputs: HashMap<(usize, usize), usize>,
@@ -2429,6 +2442,8 @@ impl ProviderStreamState {
             function_arguments: BTreeMap::new(),
             reasoning: BTreeMap::new(),
             gemini_signatures: BTreeMap::new(),
+            anthropic_usage: Map::new(),
+            anthropic_signatures: BTreeMap::new(),
             gemini_text_outputs: HashMap::new(),
             gemini_reasoning_outputs: HashMap::new(),
             gemini_function_outputs: HashMap::new(),
@@ -2678,7 +2693,7 @@ impl ProviderStreamState {
         events: &mpsc::Sender<GatewayEvent>,
     ) -> Result<bool, GatewayError> {
         if let Some(usage) = value.get("usage").filter(|v| !v.is_null()) {
-            self.usage = usage_from_openai(usage, self.route.clone());
+            crate::omp2::merge_usage(&mut self.usage, usage, self.route.clone());
         }
         if let Some(choices) = value.get("choices").and_then(Value::as_array) {
             for choice in choices {
@@ -2845,6 +2860,23 @@ impl ProviderStreamState {
         Ok(false)
     }
 
+    fn merge_anthropic_usage(&mut self, value: &Value) {
+        for key in [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ] {
+            if let Some(count) = value.get(key).and_then(Value::as_u64) {
+                self.anthropic_usage.insert(key.into(), json!(count));
+            }
+        }
+        self.usage = usage_from_anthropic(
+            &Value::Object(self.anthropic_usage.clone()),
+            self.route.clone(),
+        );
+    }
+
     async fn consume_anthropic_event(
         &mut self,
         event: Option<&str>,
@@ -2858,13 +2890,31 @@ impl ProviderStreamState {
             "message_start" => {
                 self.choices.entry(0).or_default();
                 if let Some(usage) = value.pointer("/message/usage") {
-                    self.usage = usage_from_anthropic(usage, self.route.clone());
+                    self.merge_anthropic_usage(usage);
                 }
             }
             "content_block_start" => {
                 let index = usize_field(&value, "index").unwrap_or_default();
                 if let Some(block) = value.get("content_block") {
                     let item = parse_anthropic_output_item(block, index)?;
+                    if block.get("type").and_then(Value::as_str) == Some("thinking") {
+                        self.reasoning.insert(
+                            index,
+                            block
+                                .get("thinking")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .into(),
+                        );
+                        self.anthropic_signatures.insert(
+                            index,
+                            block
+                                .get("signature")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .into(),
+                        );
+                    }
                     ensure_output(&mut self.outputs, index, item.clone());
                     self.emit(
                         events,
@@ -2903,6 +2953,7 @@ impl ProviderStreamState {
                     }
                     "thinking_delta" => {
                         if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                            self.reasoning.entry(index).or_default().push_str(text);
                             self.emit(
                                 events,
                                 GatewayEvent::ReasoningSummaryDelta {
@@ -2913,6 +2964,14 @@ impl ProviderStreamState {
                                 },
                             )
                             .await?;
+                        }
+                    }
+                    "signature_delta" => {
+                        if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                            self.anthropic_signatures
+                                .entry(index)
+                                .or_default()
+                                .push_str(signature);
                         }
                     }
                     "input_json_delta" => {
@@ -2943,7 +3002,7 @@ impl ProviderStreamState {
                     )?);
                 }
                 if let Some(usage) = value.get("usage") {
-                    merge_anthropic_usage(&mut self.usage, usage);
+                    self.merge_anthropic_usage(usage);
                 }
             }
             "message_stop" => {
@@ -3192,6 +3251,14 @@ impl ProviderStreamState {
             }) = self.outputs.get_mut(index)
             {
                 *summary = vec![reasoning.clone()];
+                if matches!(self.protocol, WireProtocol::AnthropicMessages) {
+                    *opaque_continuation = self
+                        .anthropic_signatures
+                        .get(&index)
+                        .filter(|signature| !signature.is_empty())
+                        .map(|signature| json!({"thinking":reasoning,"signature":signature}));
+                    continue;
+                }
                 *opaque_continuation = self.gemini_signatures.get(&index).map(|signature| {
                     json!({
                         "role":"model",
@@ -4124,62 +4191,25 @@ fn usize_field(value: &Value, name: &str) -> Option<usize> {
 }
 
 fn usage_from_openai(value: &Value, route: ResolvedRoute) -> GatewayUsage {
-    let input = value
-        .get("input_tokens")
-        .or_else(|| value.get("prompt_tokens"))
-        .and_then(Value::as_u64);
-    let output = value
-        .get("output_tokens")
-        .or_else(|| value.get("completion_tokens"))
-        .and_then(Value::as_u64);
-    let cached = value
-        .pointer("/input_tokens_details/cached_tokens")
-        .and_then(Value::as_u64);
-    GatewayUsage {
-        input_tokens: input,
-        output_tokens: output,
-        reasoning_tokens: value
-            .pointer("/output_tokens_details/reasoning_tokens")
-            .and_then(Value::as_u64),
-        cache_read_tokens: cached,
-        cache_write_tokens: None,
-        provenance: fte_types::UsageProvenance::Exact,
-        selected_route: Some(route),
-        cache: Some(fte_types::CacheReceipt {
-            tier: fte_types::CacheTier::ProviderNative,
-            outcome: if cached.unwrap_or_default() > 0 {
-                fte_types::CacheOutcome::Hit
-            } else {
-                fte_types::CacheOutcome::Miss
-            },
-            reason: None,
-        }),
-        ..GatewayUsage::default()
-    }
+    crate::omp2::usage(value, route)
 }
 
+// OMP² Messages usage splits uncached input, cache reads and cache writes.
+// FTE reports their inclusive total, retaining absent counters as unknown.
 fn usage_from_anthropic(value: &Value, route: ResolvedRoute) -> GatewayUsage {
-    let cached = value.get("cache_read_input_tokens").and_then(Value::as_u64);
-    GatewayUsage {
-        input_tokens: value.get("input_tokens").and_then(Value::as_u64),
-        output_tokens: value.get("output_tokens").and_then(Value::as_u64),
-        cache_read_tokens: cached,
-        cache_write_tokens: value
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_u64),
-        provenance: fte_types::UsageProvenance::Exact,
-        selected_route: Some(route),
-        cache: Some(fte_types::CacheReceipt {
-            tier: fte_types::CacheTier::ProviderNative,
-            outcome: if cached.unwrap_or_default() > 0 {
-                fte_types::CacheOutcome::Hit
-            } else {
-                fte_types::CacheOutcome::Miss
-            },
-            reason: None,
-        }),
-        ..GatewayUsage::default()
-    }
+    let read = value.get("cache_read_input_tokens").and_then(Value::as_u64);
+    let written = value
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64);
+    let input = value
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .and_then(|count| count.checked_add(read.unwrap_or_default()))
+        .and_then(|count| count.checked_add(written.unwrap_or_default()));
+    let projected = json!({"input_tokens": input,
+        "output_tokens": value.get("output_tokens"),
+        "input_tokens_details": {"cached_tokens": read,"cache_write_tokens": written}});
+    crate::omp2::usage(&projected, route)
 }
 
 fn usage_from_gemini(value: &Value, route: ResolvedRoute) -> GatewayUsage {
@@ -4196,15 +4226,6 @@ fn usage_from_gemini(value: &Value, route: ResolvedRoute) -> GatewayUsage {
         selected_route: Some(route),
         cache: None,
         ..GatewayUsage::default()
-    }
-}
-
-fn merge_anthropic_usage(usage: &mut GatewayUsage, value: &Value) {
-    if let Some(output) = value.get("output_tokens").and_then(Value::as_u64) {
-        usage.output_tokens = Some(output);
-    }
-    if let Some(input) = value.get("input_tokens").and_then(Value::as_u64) {
-        usage.input_tokens = Some(input);
     }
 }
 
@@ -4419,6 +4440,216 @@ mod tests {
 
     struct FixtureSecrets;
 
+    #[test]
+    fn omp2_credential_headers_are_sensitive_and_redacted() {
+        for id in ["openai", "anthropic", "gemini"] {
+            let config = HostedProviderConfig::from_omp2(id, "Fixture", "fixture", Vec::new())
+                .expect("valid hosted fixture");
+            let name = match &config.auth {
+                HostedAuth::None => panic!("catalog profiles require credentials"),
+                HostedAuth::Bearer => "authorization".to_owned(),
+                HostedAuth::Header { name, .. } => name.clone(),
+            };
+            let backend = HostedProviderBackend::new(config, Arc::new(FixtureSecrets))
+                .expect("valid hosted fixture");
+            let headers = backend
+                .headers(
+                    "never-log-this-secret",
+                    &request(GenerationInput::Chat { items: Vec::new() }).request,
+                )
+                .expect("valid hosted fixture");
+            assert!(
+                headers
+                    .get(&name)
+                    .expect("valid hosted fixture")
+                    .is_sensitive()
+            );
+            assert!(!format!("{headers:?}").contains("never-log-this-secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn omp2_tool_stream_preserves_authoritative_cache_usage() {
+        let body = include_str!(
+            "../../../../../third-party/omp2/upstream/fixtures/llm-oracle/openai/chat/stream.tool_reasoning_usage.sse"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("valid hosted fixture");
+        let address = listener.local_addr().expect("valid hosted fixture");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("valid hosted fixture");
+            read_fixture_request(&mut socket).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("valid hosted fixture");
+            // Chunk boundaries split both protocol fields and Zürich's UTF-8.
+            for chunk in body.as_bytes().chunks(7) {
+                socket.write_all(chunk).await.expect("valid hosted fixture");
+                tokio::task::yield_now().await;
+            }
+        });
+        let config = HostedProviderConfig::openai_compatible(
+            "provider",
+            "Fixture",
+            "fixture",
+            format!("http://{address}/chat"),
+            Vec::new(),
+        );
+        let backend = HostedProviderBackend::new(config, Arc::new(FixtureSecrets))
+            .expect("valid hosted fixture");
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut request = request(GenerationInput::Chat { items: Vec::new() });
+            request.request.stream.enabled = true;
+            backend
+                .execute(request)
+                .await
+                .expect("valid hosted fixture")
+                .final_response()
+                .await
+                .expect("valid hosted fixture")
+        })
+        .await
+        .expect("valid hosted fixture");
+        backend.shutdown().await.expect("valid hosted fixture");
+        server.await.expect("valid hosted fixture");
+        assert_eq!(response.usage.input_tokens, Some(20));
+        assert_eq!(response.usage.output_tokens, Some(9));
+        assert_eq!(response.usage.cache_read_tokens, Some(12));
+        assert!(response.output.iter().any(|item| matches!(item, fte_types::OutputItem::FunctionCall { name, arguments, .. } if name == "lookup_weather" && arguments["city"] == "Zürich")));
+    }
+
+    #[tokio::test]
+    async fn omp2_anthropic_stream_retains_thinking_signature_tools_and_usage() {
+        let body = include_str!(
+            "../../../../../third-party/omp2/upstream/fixtures/llm-oracle/anthropic/legacy/stream.thinking_tool_usage.sse"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("valid hosted fixture");
+        let address = listener.local_addr().expect("valid hosted fixture");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("valid hosted fixture");
+            read_fixture_request(&mut socket).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("valid hosted fixture");
+            // Chunk boundaries split both protocol fields and Montréal's UTF-8.
+            for chunk in body.as_bytes().chunks(7) {
+                socket.write_all(chunk).await.expect("valid hosted fixture");
+                tokio::task::yield_now().await;
+            }
+        });
+        let mut config =
+            HostedProviderConfig::anthropic("provider", "Fixture", "fixture", Vec::new());
+        config.endpoints.messages = Some(format!("http://{address}/messages"));
+        let backend = HostedProviderBackend::new(config, Arc::new(FixtureSecrets))
+            .expect("valid hosted fixture");
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut request = request(GenerationInput::Chat { items: Vec::new() });
+            request.request.stream.enabled = true;
+            backend
+                .execute(request)
+                .await
+                .expect("valid hosted fixture")
+                .final_response()
+                .await
+                .expect("valid hosted fixture")
+        })
+        .await
+        .expect("valid hosted fixture");
+        backend.shutdown().await.expect("valid hosted fixture");
+        server.await.expect("valid hosted fixture");
+        assert_eq!(response.usage.input_tokens, Some(21));
+        assert_eq!(response.usage.output_tokens, Some(18));
+        assert_eq!(response.usage.cache_read_tokens, Some(7));
+        assert_eq!(response.usage.cache_write_tokens, Some(3));
+        assert!(response.output.iter().any(|item| matches!(item, fte_types::OutputItem::Reasoning { summary, opaque_continuation: Some(opaque), .. } if summary == &["Check the weather."] && opaque["thinking"] == "Check the weather." && opaque["signature"] == "sig_REDACTED")));
+        assert!(response.output.iter().any(|item| matches!(item, fte_types::OutputItem::FunctionCall { name, arguments, .. } if name == "lookup_weather" && arguments["city"] == "Montréal")));
+    }
+
+    #[test]
+    fn anthropic_partial_usage_keeps_raw_dimensions_and_absence() {
+        let request = request(GenerationInput::Chat { items: Vec::new() });
+        let mut state = ProviderStreamState::new(
+            WireProtocol::AnthropicMessages,
+            request.request.request_id,
+            "response".into(),
+            request.route.clone(),
+            None,
+            CancellationToken::new(),
+        );
+        assert_eq!(
+            usage_from_anthropic(&Value::Null, request.route).provenance,
+            fte_types::UsageProvenance::Unknown
+        );
+        state.merge_anthropic_usage(&json!({"input_tokens":11,"cache_read_input_tokens":7,"cache_creation_input_tokens":3,"output_tokens":1}));
+        state.merge_anthropic_usage(&json!({"output_tokens":18}));
+        assert_eq!(state.usage.input_tokens, Some(21));
+        state.merge_anthropic_usage(&json!({"cache_creation_input_tokens":0}));
+        assert_eq!(state.usage.input_tokens, Some(18));
+        assert_eq!(state.usage.output_tokens, Some(18));
+    }
+
+    #[test]
+    fn pinned_chat_profiles_shape_wire_without_changing_custom_endpoints() {
+        let model = |id: &str, provider: &str| fte_types::ModelDescriptor {
+            id: id.into(),
+            aliases: Vec::new(),
+            display_name: "Fixture".into(),
+            backend_id: provider.into(),
+            location: BackendLocation::Hosted,
+            capabilities: Default::default(),
+            context_tokens: None,
+            max_output_tokens: None,
+            quota: Default::default(),
+            observed: Default::default(),
+        };
+        let config = |id, model_id| {
+            HostedProviderConfig::from_omp2(id, "Fixture", "fixture", vec![model(model_id, id)])
+                .expect("reviewed profile")
+        };
+        let mut request = request(GenerationInput::Chat { items: Vec::new() });
+        request.request.stream.enabled = true;
+        request.request.sampling.max_output_tokens = Some(42);
+        let cerebras = config("cerebras", "model");
+        let prepared = prepare_openai_compatible(&cerebras, &request).expect("supported request");
+        assert!(prepared.body.get("stream_options").is_none());
+        assert_eq!(prepared.body["max_completion_tokens"], 42);
+        request.request.sampling.frequency_penalty = Some(0.5);
+        assert!(prepare_openai_compatible(&cerebras, &request).is_err());
+        request.request.sampling.frequency_penalty = None;
+        let mistral = config("mistral", "model");
+        let prepared = prepare_openai_compatible(&mistral, &request).expect("supported request");
+        assert_eq!(prepared.body["max_tokens"], 42);
+        assert_eq!(prepared.body["stream_options"]["include_usage"], true);
+        let openrouter = config("openrouter", "amazon/nova-lite-v1");
+        request.route.model_id = "amazon/nova-lite-v1".into();
+        let body = json!({"tool_choice":"required"});
+        assert!(crate::omp2::chat_body(&openrouter, &request, body.clone()).is_err());
+        let custom = HostedProviderConfig::openai_compatible(
+            "openrouter",
+            "Custom",
+            "fixture",
+            "https://example.com/chat",
+            Vec::new(),
+        );
+        assert_eq!(
+            crate::omp2::chat_body(&custom, &request, body.clone()).expect("custom profile"),
+            body
+        );
+    }
+
     async fn read_fixture_request(socket: &mut tokio::net::TcpStream) {
         let mut request = Vec::new();
         loop {
@@ -4587,6 +4818,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    struct NoSecrets;
+    impl SecretResolver for NoSecrets {
+        fn resolve(&self, _: &str) -> Result<Option<String>, GatewayError> {
+            panic!("this operation must not access credentials")
+        }
+    }
+
+    #[test]
+    fn authentication_is_sensitive_and_unsupported_continuations_are_explicit() {
+        let mut config = HostedProviderConfig::openai_compatible(
+            "fixture",
+            "fixture",
+            "key",
+            "https://example.com/chat",
+            vec![],
+        );
+        config.auth = HostedAuth::Header {
+            name: "x-api-key".into(),
+            prefix: String::new(),
+        };
+        let backend = HostedProviderBackend::new(config, Arc::new(NoSecrets))
+            .expect("valid synthetic provider fixture");
+        let mut request = request(GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Text {
+                text: "Once".into(),
+                add_bos: false,
+            }],
+        });
+        let headers = backend
+            .headers("private-fixture", &request.request)
+            .expect("valid synthetic provider fixture");
+        assert!(headers["x-api-key"].is_sensitive());
+        request.request.storage.previous_response_id = Some("prior".into());
+        let error = match backend.prepare(&request) {
+            Ok(_) => panic!("unsupported continuation accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, "provider_continuation_unsupported");
     }
 
     fn request(input: GenerationInput) -> BackendRequest {

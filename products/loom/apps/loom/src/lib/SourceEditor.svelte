@@ -653,7 +653,7 @@
       // The parent must consume the exact visibility witness before this
       // component clears it. Its boolean result is the authority to promote.
       const word = nextSuggestionWord(visible.text);
-      const accepted = word && (ghostInsertsOnAccept
+      const accepted = word && (ghostInsertsOnAccept || word !== visible.text
         ? insertVisibleGhostText(visible, word, 'inline_tab')
         : word === visible.text && onGhostAccept(visible.candidateId, visible.presentationKey));
       suppressCurrentGhost();

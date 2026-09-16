@@ -6,6 +6,11 @@ These products are unreleased. Remove unused compatibility and migration code;
 accept current formats and reject incompatible data without silently rewriting it.
 Avoid speculative abstractions and duplicate sources of truth.
 
+Use `docs/browser-development.md` for the browser-chat and GitHub CI workflow.
+Keep substantial research and implementation in browser chats; reserve unattended
+Codex calls for small evidenced CI repairs. Preserve the distinction between
+model/specification, production binding, component checks and real product acceptance.
+
 Prioritize working content in every product layout. Avoid oversized chrome,
 permanent shortcut hints, and empty padding; retain comfortable click targets,
 accessible controls, and native window resizing.

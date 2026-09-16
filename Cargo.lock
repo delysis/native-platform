@@ -2628,7 +2628,9 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2636,10 +2638,16 @@ name = "fte-router"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
+ "fte-protocols",
+ "fte-providers",
+ "fte-store",
  "fte-types",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -8565,11 +8573,16 @@ dependencies = [
  "atomic-write-file",
  "attachment-native-host",
  "attachment-native-types",
+ "axum",
  "base64 0.22.1",
  "cpal",
  "crossbeam-channel",
  "desktop-model-defaults",
  "fs2",
+ "fte-providers",
+ "fte-router",
+ "fte-store",
+ "fte-types",
  "hound",
  "http",
  "image",
@@ -8608,6 +8621,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml 0.9.12+spec-1.1.0",
+ "url",
  "uuid",
  "windows-sys 0.61.2",
 ]

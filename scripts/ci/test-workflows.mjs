@@ -31,6 +31,57 @@ function read(file) {
   return fs.readFileSync(file, "utf8");
 }
 
+test("Loom's command registry and generated ACLs agree without merging authority", () => {
+  const plugin = path.join(root, "products/loom/crates/tauri-plugin-loom");
+  const schemaRoot = path.join(root, "products/loom/apps/loom/src-tauri/gen/schemas");
+  const commands = [...read(path.join(plugin, "build.rs"))
+    .match(/const COMMANDS: &[\s\S]*?= &\[([\s\S]*?)\];/)[1]
+    .matchAll(/"([a-z_]+)"/g)].map((match) => match[1]);
+  const handlers = read(path.join(plugin, "src/lib.rs"))
+    .match(/tauri::generate_handler!\[([\s\S]*?)\]/)[1]
+    .split(",").map((handler) => handler.trim().split("::").at(-1)).filter(Boolean);
+  assert.equal(new Set(commands).size, commands.length);
+  assert.deepEqual([...commands].sort(), [...handlers].sort());
+
+  const acl = JSON.parse(read(path.join(schemaRoot, "acl-manifests.json"))).loom;
+  const permissionKinds = JSON.parse(read(path.join(plugin, "permissions/schemas/schema.json")))
+    .definitions.PermissionKind.oneOf;
+  const kinds = new Set(permissionKinds.map((entry) => entry.const));
+  for (const command of commands) {
+    for (const effect of ["allow", "deny"]) {
+      const id = `${effect}-${command.replaceAll("_", "-")}`;
+      assert.deepEqual(acl.permissions[id].commands[effect], [command], id);
+      assert.deepEqual(acl.permissions[id].commands[effect === "allow" ? "deny" : "allow"], [], id);
+      assert.ok(kinds.has(id), id);
+    }
+  }
+  const defaults = [...read(path.join(plugin, "permissions/default.toml"))
+    .match(/permissions = \[([\s\S]*?)\]/)[1]
+    .matchAll(/"([a-z-]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(acl.default_permission.permissions, defaults);
+  assert.ok(defaults.includes("allow-signal-request"));
+  assert.ok(defaults.includes("allow-inference-status"));
+  const local = acl.permission_sets["local-generation"].permissions;
+  const peer = acl.permission_sets["peer-compute"].permissions;
+  for (const command of commands.filter((command) => command.startsWith("compute_") || command === "terminal_run_peer")) {
+    const id = `allow-${command.replaceAll("_", "-")}`;
+    assert.ok(peer.includes(id), id);
+    assert.ok(!defaults.includes(id), id);
+    assert.ok(!local.includes(id), id);
+  }
+  const expected = new Set(["default", ...Object.keys(acl.permissions), ...Object.keys(acl.permission_sets)]);
+  assert.deepEqual(kinds, expected);
+  for (const file of ["desktop-schema.json", "macOS-schema.json"]) {
+    const entries = JSON.parse(read(path.join(schemaRoot, file))).definitions.Identifier.oneOf;
+    const loomEntries = entries.filter((entry) => entry.const?.startsWith("loom:"));
+    assert.deepEqual(new Set(loomEntries.map((entry) => entry.const.slice(5))), expected, file);
+    assert.equal(loomEntries.length, expected.size, "duplicate Loom permission identifiers");
+    const defaultEntry = loomEntries.find((entry) => entry.const === "loom:default");
+    const described = [...defaultEntry.markdownDescription.matchAll(/^- `([^`]+)`$/gm)].map((match) => match[1]);
+    assert.deepEqual(described, defaults, `${file}: default description must not authorize a stale set`);
+  }
+});
+
 function workflowJobIds(source) {
   const jobs = source.slice(source.indexOf("\njobs:\n") + "\njobs:\n".length);
   return [...jobs.matchAll(/^  ([a-z][a-z0-9-]+):$/gm)].map((match) => match[1]);

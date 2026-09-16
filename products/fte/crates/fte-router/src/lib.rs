@@ -1,6 +1,7 @@
 //! Privacy-first route planning and backend orchestration.
 
 pub mod operation_lifecycle;
+mod quota;
 
 use fte_types::{
     BackendDescriptor, BackendLocation, BackendRequest, CancelTarget, ErrorClass, GatewayBackend,
@@ -9,15 +10,16 @@ use fte_types::{
     RouteProfile, TerminalStatus, TicketLifecycleLease,
 };
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 
 const DEFAULT_BACKEND_CONCURRENCY: usize = 4;
 const DEFAULT_QUEUE_MS: u64 = 30_000;
+const MAX_ADMITTED_REQUESTS: usize = 256;
 const CIRCUIT_FAILURE_THRESHOLD: u32 = 3;
 const CIRCUIT_OPEN_DURATION: Duration = Duration::from_secs(30);
 const NEUTRAL_ROUTE_SIGNAL: f64 = 0.5;
@@ -44,9 +46,12 @@ impl Default for GatewayDefaults {
 struct GatewayState {
     backends: BTreeMap<String, Arc<dyn GatewayBackend>>,
     backend_admission: BTreeMap<String, Arc<Semaphore>>,
-    all_admission: Vec<Arc<Semaphore>>,
+    all_admission: Vec<Weak<Semaphore>>,
     backend_circuits: BTreeMap<String, BackendCircuit>,
     response_affinity: BTreeMap<String, (String, String)>,
+    response_store: Option<Arc<dyn fte_types::ResponseStore>>,
+    response_order: VecDeque<String>,
+    quotas: BTreeMap<(String, String), Arc<quota::Quota>>,
 }
 
 #[derive(Debug, Default)]
@@ -134,15 +139,23 @@ impl LifecycleControl {
         if state.phase != GatewayLifecycle::Running {
             return Err(gateway_closed_error(request_id, state.phase));
         }
+        if self
+            .operations
+            .active_count()
+            .map_err(|error| operation_registry_error(request_id, error))?
+            >= MAX_ADMITTED_REQUESTS
+        {
+            return Err(queue_timeout(
+                request_id,
+                "the gateway request queue is full",
+            ));
+        }
         let (guard, lease) = self
             .operations
-            .reserve_with_capacity(&request_id.0, progress_capacity)
+            .reserve_with_capacity(&request_id.0, progress_capacity.min(4096))
             .map_err(|error| operation_registry_error(request_id, error))?;
         lease
             .queue()
-            .map_err(|error| operation_registry_error(request_id, error))?;
-        lease
-            .start()
             .map_err(|error| operation_registry_error(request_id, error))?;
         guard.disarm();
         Ok(lease)
@@ -444,9 +457,9 @@ fn request_cancelled(request_id: &RequestId) -> GatewayError {
 }
 
 pub struct Gateway {
-    defaults: GatewayDefaults,
+    defaults: RwLock<GatewayDefaults>,
+    state: Arc<RwLock<GatewayState>>,
     observer: Option<Arc<dyn GatewayOutcomeObserver>>,
-    state: RwLock<GatewayState>,
     lifecycle: Arc<LifecycleControl>,
 }
 
@@ -463,9 +476,9 @@ impl Gateway {
     #[must_use]
     pub fn new(defaults: GatewayDefaults) -> Self {
         Self {
-            defaults,
+            defaults: RwLock::new(defaults),
+            state: Arc::new(RwLock::new(GatewayState::default())),
             observer: None,
-            state: RwLock::new(GatewayState::default()),
             lifecycle: Arc::new(LifecycleControl::default()),
         }
     }
@@ -474,6 +487,20 @@ impl Gateway {
     pub fn with_outcome_observer(mut self, observer: Arc<dyn GatewayOutcomeObserver>) -> Self {
         self.observer = Some(observer);
         self
+    }
+
+    /// Updates route metadata without discarding registered backends or stores.
+    pub fn set_defaults(&self, defaults: GatewayDefaults) -> Result<(), GatewayError> {
+        self.lifecycle.while_running(&RequestId::new(), || {
+            *self.defaults.write().map_err(|_| {
+                GatewayError::unavailable(
+                    &RequestId::new(),
+                    "gateway_defaults_poisoned",
+                    "gateway defaults are unavailable",
+                )
+            })? = defaults;
+            Ok(())
+        })
     }
 
     pub fn register_backend(&self, backend: Arc<dyn GatewayBackend>) -> Result<(), GatewayError> {
@@ -496,6 +523,17 @@ impl Gateway {
                 "every model descriptor must name its owning backend",
             ));
         }
+        if descriptor
+            .models
+            .iter()
+            .any(|model| model.location != descriptor.location)
+        {
+            return Err(GatewayError::invalid_request(
+                &RequestId::new(),
+                "backend_model_location_mismatch",
+                "model location must match its backend's transport boundary",
+            ));
+        }
         self.lifecycle.while_running(&RequestId::new(), || {
             let mut state = self.state.write().map_err(|_| {
                 GatewayError::unavailable(
@@ -515,11 +553,46 @@ impl Gateway {
             state
                 .backend_admission
                 .insert(descriptor.id.clone(), Arc::clone(&admission));
-            state.all_admission.push(admission);
+            state.all_admission.retain(|entry| entry.strong_count() > 0);
+            state.all_admission.push(Arc::downgrade(&admission));
             state
                 .backend_circuits
                 .insert(descriptor.id.clone(), BackendCircuit::default());
+            for model in &descriptor.models {
+                if model.quota != fte_types::QuotaLimits::default() {
+                    state.quotas.insert(
+                        (descriptor.id.clone(), model.id.clone()),
+                        quota::Quota::new(model.quota),
+                    );
+                }
+            }
             state.backends.insert(descriptor.id, backend);
+            Ok(())
+        })
+    }
+
+    /// Bind one application-owned store before serving persisted responses.
+    /// Repeated binding of the same store by protocol edges is idempotent.
+    pub fn bind_response_store(
+        &self,
+        store: Arc<dyn fte_types::ResponseStore>,
+    ) -> Result<(), GatewayError> {
+        self.lifecycle.while_running(&RequestId::new(), || {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| lifecycle_state_poisoned(&RequestId::new()))?;
+            if let Some(current) = &state.response_store {
+                if Arc::ptr_eq(current, &store) {
+                    return Ok(());
+                }
+                return Err(GatewayError::invalid_request(
+                    &RequestId::new(),
+                    "response_store_already_bound",
+                    "the gateway already has an application-owned response store",
+                ));
+            }
+            state.response_store = Some(store);
             Ok(())
         })
     }
@@ -532,11 +605,11 @@ impl Gateway {
         backend_id: &str,
         limit: usize,
     ) -> Result<(), GatewayError> {
-        if limit == 0 {
+        if limit == 0 || limit > MAX_ADMITTED_REQUESTS {
             return Err(GatewayError::invalid_request(
                 &RequestId::new(),
                 "backend_concurrency_invalid",
-                "backend concurrency must be greater than zero",
+                "backend concurrency must be between 1 and 256",
             ));
         }
         self.lifecycle.while_running(&RequestId::new(), || {
@@ -558,7 +631,8 @@ impl Gateway {
             state
                 .backend_admission
                 .insert(backend_id.to_string(), Arc::clone(&admission));
-            state.all_admission.push(admission);
+            state.all_admission.retain(|entry| entry.strong_count() > 0);
+            state.all_admission.push(Arc::downgrade(&admission));
             Ok(())
         })
     }
@@ -649,6 +723,8 @@ impl Gateway {
             .stream
             .event_capacity
             .unwrap_or(fte_types::DEFAULT_EVENT_CAPACITY);
+        let mut lease = self.reserve_request(&request)?;
+        self.restore_response_affinity(&request)?;
         let candidates = self.resolve_candidates(&request)?;
         let fallback_allowed = request_fallback_allowed(&request);
         let mut last_error = None;
@@ -661,15 +737,24 @@ impl Gateway {
             let admission = tokio::select! {
                 biased;
                 () = cancellation.cancelled() => Err(request_cancelled(&request_id)),
-                result = self.admit(&request_id, &request, admission, started_at.elapsed()) => result,
+                result = self.admit(&request_id, &request, admission, started_at.elapsed(), &mut lease) => result,
             };
-            let lease = match admission {
-                Ok(lease) => lease,
+            match admission {
+                Ok(()) => {}
                 Err(error) if retryable_setup_failure(fallback_allowed, &error) => {
                     last_error = Some(error);
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => return lease.finish_result(Err(error)),
+            }
+            lease.quota = match self.reserve_quota(&route, &request) {
+                Ok(quota) => quota,
+                Err(error) if retryable_setup_failure(fallback_allowed, &error) => {
+                    lease._permit = None;
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return lease.finish_result(Err(error)),
             };
             let startup_ms = match route.location {
                 BackendLocation::LocalEmbedded => deadline.model_load_ms,
@@ -751,14 +836,24 @@ impl Gateway {
                     result = &mut execution => result,
                 }
             };
-            let result = if let Some(startup_limit) = startup_limit {
-                match tokio::time::timeout(startup_limit, execution).await {
-                    Ok(result) => result,
-                    Err(_) if total_is_limit => Err(total_timeout(&request_id)),
-                    Err(_) => Err(startup_timeout(&request_id, &backend_id)),
+            let setup = async {
+                if let Some(startup_limit) = startup_limit {
+                    match tokio::time::timeout(startup_limit, execution).await {
+                        Ok(result) => result,
+                        Err(_) if total_is_limit => Err(total_timeout(&request_id)),
+                        Err(_) => Err(startup_timeout(&request_id, &backend_id)),
+                    }
+                } else {
+                    execution.await
                 }
-            } else {
-                execution.await
+            };
+            let result = tokio::select! {
+                biased;
+                () = lease.cancellation.cancelled() => {
+                    backend.cancel(&request_id, CancelTarget::Request);
+                    Err(request_cancelled(&request_id))
+                }
+                result = setup => result,
             };
             match result {
                 Ok((ticket, usage)) => {
@@ -804,23 +899,24 @@ impl Gateway {
                         lease.finish_error(&state_error)?;
                         return Err(state_error);
                     }
-                    lease.finish_error(&error)?;
                     if retry {
+                        lease._permit = None;
+                        lease.quota = None;
                         last_error = Some(error);
                     } else {
-                        return Err(error);
+                        return lease.finish_result(Err(error));
                     }
                 }
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
+        lease.finish_result(Err(last_error.unwrap_or_else(|| {
             GatewayError::unavailable(
                 &request_id,
                 "route_attempts_exhausted",
                 "all eligible routes failed before producing output",
             )
-        }))
+        })))
     }
 
     pub async fn count_tokens(
@@ -830,15 +926,16 @@ impl Gateway {
         let started_at = Instant::now();
         request.validate()?;
         self.lifecycle.ensure_running(&request.request_id)?;
+        let mut lease = self.reserve_request(&request)?;
         let (backend, route, admission) = self.resolve(&request)?;
-        let lease = self
-            .admit(
-                &request.request_id,
-                &request,
-                admission,
-                started_at.elapsed(),
-            )
-            .await?;
+        self.admit(
+            &request.request_id,
+            &request,
+            admission,
+            started_at.elapsed(),
+            &mut lease,
+        )
+        .await?;
         let stage_ms = match route.location {
             BackendLocation::LocalEmbedded => request.deadline.model_load_ms,
             BackendLocation::Hosted => request.deadline.connect_ms,
@@ -856,23 +953,46 @@ impl Gateway {
             Err(error) => return lease.finish_result(Err(error)),
         };
         let count = backend.count_tokens(BackendRequest { request, route });
-        let result = if let Some(limit) = limit {
-            match tokio::time::timeout(limit, count).await {
-                Ok(result) => result,
-                Err(_) => Err(if total_is_limit {
-                    total_timeout(&request_id)
-                } else {
-                    startup_timeout(&request_id, &backend_id)
-                }),
+        let counting = async {
+            if let Some(limit) = limit {
+                match tokio::time::timeout(limit, count).await {
+                    Ok(result) => result,
+                    Err(_) => Err(if total_is_limit {
+                        total_timeout(&request_id)
+                    } else {
+                        startup_timeout(&request_id, &backend_id)
+                    }),
+                }
+            } else {
+                count.await
             }
-        } else {
-            count.await
+        };
+        let result = tokio::select! {
+            biased;
+            () = lease.cancellation.cancelled() => {
+                backend.cancel(&request_id, CancelTarget::Request);
+                Err(request_cancelled(&request_id))
+            }
+            result = counting => result,
         };
         lease.finish_result(result)
     }
 
     pub fn cancel(&self, request_id: &RequestId, target: CancelTarget) -> usize {
-        self.state
+        let cancelled = if target == CancelTarget::Request {
+            self.lifecycle
+                .operations
+                .current_lease(&request_id.0)
+                .ok()
+                .flatten()
+                .is_some_and(|lease| {
+                    !lease.cancellation().is_cancelled() && lease.request_cancel().is_ok()
+                })
+        } else {
+            false
+        };
+        let backend_cancelled: usize = self
+            .state
             .read()
             .map(|state| {
                 state
@@ -881,7 +1001,8 @@ impl Gateway {
                     .map(|backend| backend.cancel(request_id, target))
                     .sum()
             })
-            .unwrap_or_default()
+            .unwrap_or_default();
+        backend_cancelled.max(usize::from(cancelled))
     }
 
     pub async fn shutdown(&self) -> Result<(), GatewayError> {
@@ -914,7 +1035,11 @@ impl Gateway {
                                 )
                             })
                             .collect::<Vec<_>>(),
-                        state.all_admission.clone(),
+                        state
+                            .all_admission
+                            .iter()
+                            .filter_map(Weak::upgrade)
+                            .collect::<Vec<_>>(),
                         None,
                     ),
                     Err(poisoned) => {
@@ -934,7 +1059,11 @@ impl Gateway {
                                     )
                                 })
                                 .collect::<Vec<_>>(),
-                            state.all_admission.clone(),
+                            state
+                                .all_admission
+                                .iter()
+                                .filter_map(Weak::upgrade)
+                                .collect::<Vec<_>>(),
                             Some(GatewayError::unavailable(
                                 &RequestId::new(),
                                 "gateway_state_poisoned",
@@ -1078,21 +1207,80 @@ impl Gateway {
         response_id: &str,
         route: &ResolvedRoute,
     ) -> Result<(), GatewayError> {
-        self.state
+        let mut state = self
+            .state
             .write()
-            .map_err(|_| {
-                GatewayError::unavailable(
-                    &RequestId::new(),
-                    "gateway_state_poisoned",
-                    "gateway state is unavailable",
-                )
-            })?
-            .response_affinity
-            .insert(
-                response_id.to_string(),
-                (route.backend_id.clone(), route.model_id.clone()),
-            );
+            .map_err(|_| lifecycle_state_poisoned(&RequestId::new()))?;
+        record_affinity(&mut state, response_id, route);
         Ok(())
+    }
+
+    pub fn forget_response_affinity(&self, response_id: &str) -> Result<(), GatewayError> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| lifecycle_state_poisoned(&RequestId::new()))?;
+        state.response_affinity.remove(response_id);
+        state.response_order.retain(|id| id != response_id);
+        Ok(())
+    }
+
+    fn restore_response_affinity(&self, request: &GatewayRequest) -> Result<(), GatewayError> {
+        let store = self
+            .state
+            .read()
+            .map_err(|_| lifecycle_state_poisoned(&request.request_id))?
+            .response_store
+            .clone();
+        if request.storage.store_response && store.is_none() {
+            return Err(GatewayError::invalid_request(
+                &request.request_id,
+                "response_store_unavailable",
+                "response storage was requested but the application has not supplied a store",
+            ));
+        }
+        if let (Some(store), Some(id)) = (store, &request.storage.previous_response_id)
+            && let Some(previous) = store.get(id)?
+        {
+            self.record_response_affinity(id, &previous.route)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_quota(
+        &self,
+        route: &ResolvedRoute,
+        request: &GatewayRequest,
+    ) -> Result<Option<quota::Reservation>, GatewayError> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| lifecycle_state_poisoned(&request.request_id))?;
+        state
+            .quotas
+            .get(&(route.backend_id.clone(), route.model_id.clone()))
+            .map(|quota| quota.reserve(&request.request_id, request.sampling.max_output_tokens))
+            .transpose()
+    }
+
+    fn reserve_request(&self, request: &GatewayRequest) -> Result<AdmissionLease, GatewayError> {
+        let operation = self.lifecycle.register_request(
+            &request.request_id,
+            request
+                .stream
+                .event_capacity
+                .unwrap_or(fte_types::DEFAULT_EVENT_CAPACITY),
+        )?;
+        Ok(AdmissionLease {
+            _permit: None,
+            cancellation: operation.cancellation(),
+            started: false,
+            response_state: Arc::clone(&self.state),
+            store_response: request.storage.store_response,
+            quota: None,
+            operation: Mutex::new(Some(operation)),
+            lifecycle: Arc::clone(&self.lifecycle),
+        })
     }
 
     async fn admit(
@@ -1101,7 +1289,33 @@ impl Gateway {
         request: &GatewayRequest,
         admission: Arc<Semaphore>,
         elapsed: Duration,
-    ) -> Result<AdmissionLease, GatewayError> {
+        lease: &mut AdmissionLease,
+    ) -> Result<(), GatewayError> {
+        // Every retry must still have the same live operation authority.
+        // A poisoned or terminalized registry cannot authorize another route.
+        let operation = lease
+            .operation
+            .lock()
+            .map_err(|_| lifecycle_state_poisoned(request_id))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| lifecycle_state_poisoned(request_id))?;
+        let snapshot = operation
+            .snapshot()
+            .map_err(|error| operation_registry_error(request_id, error))?;
+        if !snapshot.is_some_and(|snapshot| {
+            matches!(
+                snapshot.phase,
+                operation_lifecycle::OperationPhase::Queued
+                    | operation_lifecycle::OperationPhase::Running
+            )
+        }) {
+            return Err(operation_registry_error(
+                request_id,
+                operation_lifecycle::RegistryError::InvalidTransition,
+            ));
+        }
+        self.lifecycle.ensure_running(request_id)?;
         let queue_ms = request.deadline.queue_ms.unwrap_or(DEFAULT_QUEUE_MS);
         let total_remaining = request
             .deadline
@@ -1110,50 +1324,59 @@ impl Gateway {
         if total_remaining.is_some_and(|remaining| remaining.is_zero()) {
             return Err(total_timeout(request_id));
         }
-        let permit = if queue_ms == 0 {
-            Arc::clone(&admission).try_acquire_owned().map_err(|_| {
-                queue_timeout(
-                    request_id,
-                    "the selected backend has no immediately available slot",
-                )
-            })?
-        } else {
-            let queue_duration = Duration::from_millis(queue_ms);
-            let (wait, total_is_limit) = total_remaining
-                .map(|total| (queue_duration.min(total), total <= queue_duration))
-                .unwrap_or((queue_duration, false));
-            tokio::time::timeout(wait, Arc::clone(&admission).acquire_owned())
-                .await
-                .map_err(|_| {
-                    if total_is_limit {
-                        total_timeout(request_id)
-                    } else {
-                        queue_timeout(
-                            request_id,
-                            "the request exceeded its queue deadline before backend admission",
-                        )
-                    }
-                })?
-                .map_err(|_| {
-                    GatewayError::unavailable(
+        let acquire = async {
+            if queue_ms == 0 {
+                Arc::clone(&admission).try_acquire_owned().map_err(|_| {
+                    queue_timeout(
                         request_id,
-                        "backend_admission_closed",
-                        "the selected backend stopped accepting requests",
+                        "the selected backend has no immediately available slot",
                     )
-                })?
+                })
+            } else {
+                let queue_duration = Duration::from_millis(queue_ms);
+                let (wait, total_is_limit) = total_remaining
+                    .map(|total| (queue_duration.min(total), total <= queue_duration))
+                    .unwrap_or((queue_duration, false));
+                tokio::time::timeout(wait, Arc::clone(&admission).acquire_owned())
+                    .await
+                    .map_err(|_| {
+                        if total_is_limit {
+                            total_timeout(request_id)
+                        } else {
+                            queue_timeout(
+                                request_id,
+                                "the request exceeded its queue deadline before backend admission",
+                            )
+                        }
+                    })?
+                    .map_err(|_| {
+                        GatewayError::unavailable(
+                            request_id,
+                            "backend_admission_closed",
+                            "the selected backend stopped accepting requests",
+                        )
+                    })
+            }
         };
-        let progress_capacity = request
-            .stream
-            .event_capacity
-            .unwrap_or(fte_types::DEFAULT_EVENT_CAPACITY);
-        let operation = self
-            .lifecycle
-            .register_request(request_id, progress_capacity)?;
-        Ok(AdmissionLease {
-            _permit: permit,
-            operation: Mutex::new(Some(operation)),
-            lifecycle: Arc::clone(&self.lifecycle),
-        })
+        let permit = tokio::select! {
+            biased;
+            () = lease.cancellation.cancelled() => return Err(request_cancelled(request_id)),
+            permit = acquire => permit?,
+        };
+        if !lease.started {
+            let operation = lease
+                .operation
+                .lock()
+                .map_err(|_| lifecycle_state_poisoned(request_id))?;
+            operation
+                .as_ref()
+                .ok_or_else(|| lifecycle_state_poisoned(request_id))?
+                .start()
+                .map_err(|error| operation_registry_error(request_id, error))?;
+            lease.started = true;
+        }
+        lease._permit = Some(permit);
+        Ok(())
     }
 
     fn record_backend_success(&self, backend_id: &str) -> Result<(), GatewayError> {
@@ -1243,7 +1466,8 @@ impl Gateway {
                 .get(&descriptor.id)
                 .is_some_and(|circuit| circuit.is_available(now));
             for model in &descriptor.models {
-                match candidate_allowed(request, &descriptor, model, pinned.as_ref()) {
+                let model = routing_model(&state, model.clone());
+                match candidate_allowed(request, &descriptor, &model, pinned.as_ref()) {
                     Ok(()) if !backend.readiness().is_ready() => {
                         rejection_codes.push("backend_not_ready");
                     }
@@ -1282,6 +1506,14 @@ impl Gateway {
             });
         }
         eligible.sort_by(|left, right| {
+            if let ModelSelector::Priority { routes } = &request.model {
+                let rank = |model: &ModelDescriptor| {
+                    routes.iter().position(|route| {
+                        route.backend_id == model.backend_id && route.model_id == model.id
+                    })
+                };
+                return rank(&left.2).cmp(&rank(&right.2));
+            }
             route_score(request, &right.2)
                 .partial_cmp(&route_score(request, &left.2))
                 .unwrap_or(Ordering::Equal)
@@ -1296,7 +1528,18 @@ impl Gateway {
                     model_id: model.id,
                     display_name: model.display_name,
                     location: model.location,
-                    catalog_version: self.defaults.catalog_version.clone(),
+                    catalog_version: self
+                        .defaults
+                        .read()
+                        .map_err(|_| {
+                            GatewayError::unavailable(
+                                &request.request_id,
+                                "gateway_defaults_poisoned",
+                                "gateway defaults are unavailable",
+                            )
+                        })?
+                        .catalog_version
+                        .clone(),
                 };
                 let admission = state
                     .backend_admission
@@ -1316,12 +1559,46 @@ impl Gateway {
 }
 
 struct AdmissionLease {
-    _permit: OwnedSemaphorePermit,
+    _permit: Option<OwnedSemaphorePermit>,
+    cancellation: tokio_util::sync::CancellationToken,
+    started: bool,
+    response_state: Arc<RwLock<GatewayState>>,
+    store_response: bool,
+    quota: Option<quota::Reservation>,
     operation: Mutex<Option<operation_lifecycle::OperationLease>>,
     lifecycle: Arc<LifecycleControl>,
 }
 
 impl AdmissionLease {
+    fn publish_response(
+        &self,
+        result: &Result<fte_types::GatewayResponse, GatewayError>,
+    ) -> Result<(), GatewayError> {
+        if let Ok(response) = result {
+            if self.store_response {
+                let store = self
+                    .response_state
+                    .read()
+                    .map_err(|_| lifecycle_state_poisoned(&response.request_id))?
+                    .response_store
+                    .clone()
+                    .ok_or_else(|| {
+                        GatewayError::unavailable(
+                            &response.request_id,
+                            "response_store_unavailable",
+                            "the response store is unavailable",
+                        )
+                    })?;
+                store.put(response)?;
+            }
+            let mut state = self
+                .response_state
+                .write()
+                .map_err(|_| lifecycle_state_poisoned(&response.request_id))?;
+            record_affinity(&mut state, &response.id, &response.route);
+        }
+        Ok(())
+    }
     fn terminal_for_result<T>(
         result: &Result<T, GatewayError>,
     ) -> operation_lifecycle::TerminalClass {
@@ -1388,6 +1665,15 @@ impl TicketLifecycleLease for AdmissionLease {
             }
             Err(_) => operation_lifecycle::TerminalClass::Failed,
         };
+        if let Some(quota) = &self.quota {
+            quota.finish(result);
+        }
+        let publication = self.publish_response(result);
+        let terminal = if publication.is_err() {
+            operation_lifecycle::TerminalClass::Failed
+        } else {
+            terminal
+        };
         let operation = self
             .operation
             .lock()
@@ -1396,7 +1682,8 @@ impl TicketLifecycleLease for AdmissionLease {
             return Ok(());
         };
         self.lifecycle
-            .finish_request_for_publication(operation, terminal)
+            .finish_request_for_publication(operation, terminal)?;
+        publication
     }
 
     fn terminal(
@@ -1436,6 +1723,37 @@ impl TicketLifecycleLease for AdmissionLease {
         };
         self.lifecycle.release_terminalized_request(&operation)
     }
+}
+
+// Local admission headroom only narrows routing. Public inventory preserves
+// provider observations, including unknowns, and never substitutes local allowance.
+fn routing_model(state: &GatewayState, mut model: ModelDescriptor) -> ModelDescriptor {
+    if let Some(quota) = state
+        .quotas
+        .get(&(model.backend_id.clone(), model.id.clone()))
+    {
+        model.observed.quota_headroom = match (model.observed.quota_headroom, quota.headroom()) {
+            (Some(observed), Some(local)) => Some(observed.min(local)),
+            (observed, local) => observed.or(local),
+        };
+    }
+    model
+}
+
+fn record_affinity(state: &mut GatewayState, id: &str, route: &ResolvedRoute) {
+    const MAX_VOLATILE_RESPONSES: usize = 4096;
+    if !state.response_affinity.contains_key(id) {
+        if state.response_order.len() == MAX_VOLATILE_RESPONSES
+            && let Some(expired) = state.response_order.pop_front()
+        {
+            state.response_affinity.remove(&expired);
+        }
+        state.response_order.push_back(id.to_owned());
+    }
+    state.response_affinity.insert(
+        id.to_owned(),
+        (route.backend_id.clone(), route.model_id.clone()),
+    );
 }
 
 fn failed_shutdown_report(error: GatewayError) -> GatewayShutdownReport {
@@ -1595,6 +1913,23 @@ fn candidate_allowed(
         {
             return Err("profile_unknown");
         }
+        ModelSelector::Priority { routes }
+            if !routes
+                .iter()
+                .any(|route| route.backend_id == backend.id && route.model_id == model.id) =>
+        {
+            return Err("priority_route_mismatch");
+        }
+        ModelSelector::Profile { name }
+            if name == "local-only" && model.location != BackendLocation::LocalEmbedded =>
+        {
+            return Err("privacy_local_only");
+        }
+        ModelSelector::Profile { name }
+            if name == "hosted-only" && model.location != BackendLocation::Hosted =>
+        {
+            return Err("privacy_hosted_only");
+        }
         _ => {}
     }
     if request.routing.privacy == PrivacyPolicy::LocalOnly
@@ -1628,6 +1963,21 @@ fn candidate_allowed(
     {
         return Err("capability_unsupported");
     }
+    if request
+        .input
+        .required_modalities()
+        .iter()
+        .any(|modality| !model.capabilities.modalities.contains(modality))
+    {
+        return Err("capability_unsupported");
+    }
+    if model
+        .observed
+        .quota_headroom
+        .is_some_and(|headroom| headroom <= 0.0)
+    {
+        return Err("quota_exhausted");
+    }
     if request.cache.requirement == fte_types::CacheRequirement::Required
         && request.cache.mode == fte_types::CacheMode::ProviderNative
         && !model.capabilities.provider_cache
@@ -1639,7 +1989,10 @@ fn candidate_allowed(
 
 fn request_fallback_allowed(request: &GatewayRequest) -> bool {
     request.routing.retry_before_output
-        && matches!(request.model, ModelSelector::Profile { .. })
+        && matches!(
+            request.model,
+            ModelSelector::Profile { .. } | ModelSelector::Priority { .. }
+        )
         && request.storage.previous_response_id.is_none()
         && !request
             .tools
@@ -1660,9 +2013,9 @@ fn route_score(request: &GatewayRequest, model: &ModelDescriptor) -> f64 {
         .unwrap_or(NEUTRAL_ROUTE_SIGNAL);
     let headroom = observations.quota_headroom.unwrap_or(NEUTRAL_ROUTE_SIGNAL);
     let capability = capability_breadth(model);
-    let local_preference = if request.routing.profile == RouteProfile::PreferLocal
-        && model.location == BackendLocation::LocalEmbedded
-    {
+    let prefer_local = request.routing.profile == RouteProfile::PreferLocal
+        || matches!(&request.model, ModelSelector::Profile { name } if name == "prefer-local");
+    let local_preference = if prefer_local && model.location == BackendLocation::LocalEmbedded {
         100.0
     } else {
         0.0
@@ -1842,7 +2195,7 @@ mod tests {
                 location,
                 capabilities: ModelCapabilities {
                     prompt_forms: vec![PromptForm::Chat],
-                    modalities: vec![],
+                    modalities: vec![fte_types::Modality::Text],
                     tools: false,
                     structured_output: false,
                     reasoning: false,
@@ -1851,6 +2204,7 @@ mod tests {
                 },
                 context_tokens: Some(4096),
                 max_output_tokens: Some(512),
+                quota: fte_types::QuotaLimits::default(),
                 observed: RouteObservations::default(),
             }],
         }
@@ -2504,6 +2858,7 @@ mod tests {
             .lifecycle
             .register_request(&request_id, 1)
             .expect("register operation");
+        operation.start().expect("start operation");
         let retained_operation = operation.clone();
         let attempt = operation.start_attempt().expect("start active attempt");
         let permit = Arc::new(Semaphore::new(1))
@@ -2511,7 +2866,12 @@ mod tests {
             .await
             .expect("admission permit");
         let lease = AdmissionLease {
-            _permit: permit,
+            _permit: Some(permit),
+            cancellation: operation.cancellation(),
+            started: true,
+            response_state: Arc::clone(&gateway.state),
+            store_response: false,
+            quota: None,
             operation: Mutex::new(Some(operation)),
             lifecycle: Arc::clone(&gateway.lifecycle),
         };

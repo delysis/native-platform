@@ -9,6 +9,11 @@ repository.workspace = true
 
 [dependencies]
 desktop-model-defaults.workspace = true
+fte-types = { path = "../../../fte/crates/fte-types" }
+fte-router = { path = "../../../fte/crates/fte-router" }
+fte-providers = { path = "../../../fte/crates/fte-providers" }
+fte-store = { path = "../../../fte/crates/fte-store" }
+url = "2.5.8"
 information-native-acquire.workspace = true
 information-native-backend-sqlite.workspace = true
 information-native-retrieval.workspace = true
@@ -64,6 +69,7 @@ tauri-plugin = { version = "2.5.4", features = ["build"] }
 [dev-dependencies]
 rusqlite.workspace = true
 async-trait.workspace = true
+axum = "0.8.9"
 loom-host = { path = "../loom-host", features = ["test-fixtures"] }
 tauri = { version = "2.11.5", default-features = false, features = ["test"] }
 tempfile.workspace = true

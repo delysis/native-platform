@@ -22,6 +22,7 @@ pub use generation::{
     StoredGenerationTerminalEvidence, TerminalCandidateInput, TerminalCandidateOutcome,
     TerminalEvidenceInput, TerminalGenerationInput, TerminalGenerationOutcome,
 };
+pub use paths::ensure_private_storage_supported;
 pub use provenance::{
     IdempotentSaveOutcome, MAX_EDIT_DIFF_WINDOW_BYTES, MAX_EDIT_DIFF_WINDOW_CHARACTERS,
     MAX_EDIT_DIFF_WORK, MAX_REVISION_SEGMENTS, ProvenanceSegment, RevisionProvenance,
