@@ -30,7 +30,8 @@ pub const MAX_RESIDUAL_NO_OP_LOGPROB_DELTA: f64 = 1e-5;
 /// computational acceptance floor, not statistical confidence or a guarantee
 /// that every runtime evaluation's numerical error is bounded by the no-op probe.
 pub const MIN_RESIDUAL_LOSS_IMPROVEMENT: f64 = 4.0 * MAX_RESIDUAL_NO_OP_LOGPROB_DELTA;
-pub const RESIDUAL_TRAINING_METHOD: &str = "paired_mean_direction_bounded_coordinate_search_v1";
+pub const RESIDUAL_TRAINING_METHOD: &str =
+    "paired_mean_direction_bounded_coordinate_search_prefix_batches_max64_v2";
 pub const RESIDUAL_INTERVENTION_SEMANTICS: &str =
     "signed_post_block_residual_addition_from_last_prefix_token_v1";
 

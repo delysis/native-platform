@@ -26,7 +26,10 @@ serializable DTO is audit evidence, not transferable live authority.
 
 Teacher forcing and generation independently restart at the case prefix. The
 control starts at its last token and persists through decoding. Prefix tokens
-before that boundary are unmodified. Empty continuation skips teacher forcing;
+before that boundary are unmodified and decoded in no-logit chunks of at most
+`min(n_batch,64)`. The V2 evaluation semantics and engine build distinguish this
+execution mode from V1 singleton-prefix processing; numerical equivalence is not
+assumed. Empty continuation skips teacher forcing;
 zero new-token limit skips generation. At least one operation is required.
 
 Teacher forcing returns mean continuation log probability and full-vocabulary
@@ -51,7 +54,8 @@ Inputs are validated before context allocation, including model vocabulary, laye
 indices, direction widths and the actual norm of every case.
 
 Dropping/cancelling a ticket requests cooperative cancellation. Decode operations
-themselves are not interruptible; cancellation is checked between token steps.
+themselves are not interruptible; cancellation is checked between bounded prefix
+chunks and controlled token steps, not inside a kernel or on a hard deadline.
 Timeout is not an OS hard deadline. Owner shutdown cancels active and queued work
 and joins the worker. Failed or cancelled evaluation returns no partial success DTO.
 
@@ -73,7 +77,7 @@ No model downloads occur. A passed runtime test is not behavioral qualification.
 
 ## Local Runtime Evidence, 2026-09-16
 
-On macOS/Metal, the authored integration probe passed with E4B-it Q8_0
+With V1 singleton prefixes on macOS/Metal, the authored integration probe passed with E4B-it Q8_0
 (`fb8f0c032de00b18c710824af3c7e5777c71e5fb60b13f13575f0a9e92ddecd0`)
 and 31B base Q8_0
 (`2b739f4d97c7559d0354bd87901b1571e839525108fc5c9747415982fc57400f`).
@@ -96,3 +100,11 @@ evaluation's exact-zero composition deliberately takes the disabled path.
 Neither tiny probe establishes semantic control, useful dose ranges or composition
 generalization. EOG/gapped-layer live coverage and strict-artifact mutation during
 evaluation remain additional integration cases, not claimed as exercised here.
+
+The separate V2 E4B-it checks at batch limits 16 and 64 produced identical saved
+four-case evaluation outputs, including zero/cancelled-sum KL of zero and signed
+dose-0.25 KL of 0.0000693284 and 0.0000682605. Zero-control mean continuation log
+probability was -2.6222056911, versus -2.6223809416 in V1: batch-shape changes are
+observable. The longer-prefix zero/cancelled-sum cases also passed; they do not
+establish nonzero-control behavior at every chunk boundary. These checks retain
+the same research-only scope. See the training document for V2 coverage limits.

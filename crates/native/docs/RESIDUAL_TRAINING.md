@@ -34,8 +34,8 @@ Gemma 4 31B base Q8_0, with layer 20 and the same search hyperparameters. This
 second model is an implementation check, not a replication of a personality claim.
 
 Before fitting, the first training pair is scored with no control and explicit
-zero control twice, followed by cleared-control replay, using identical singleton
-batches. Maximum per-token log-probability
+zero control twice, followed by cleared-control replay, using the same execution
+mode in all comparisons. Maximum per-token log-probability
 drift must not exceed `1e-5`; token errors cannot cancel in a mean. Gain updates
 require more than `4e-5` absolute loss improvement, a computational noise floor,
 not statistical confidence. Zero gains always use disabled-control semantics,
@@ -64,6 +64,26 @@ of a larger resident chat context. Extraction temporarily holds both capture and
 scoring contexts; callers must allow additional KV/compute memory. The API bounds
 vector allocation and token work, not elapsed time or total model/backend RAM.
 
+The V2 method batches those unmodified prefix tokens into chunks no larger than
+`min(n_batch,64)` without requesting unused logits. Capture is disabled until the
+final pole token; that token and the intervention boundary remain singleton
+decodes. Controlled teacher forcing also remains singleton. The V1 singleton
+reference is immutable commit `9218348`; changing batch size to one in V2 does
+not recreate V1 because V2 suppresses unused prefix logits. Batch-shape changes
+can change numerical outputs, so V2 has a distinct method label and build identity.
+
+Local V2 E4B-it Q8_0 checks on 2026-09-16 passed at resident batch limits 16
+and 64. Saved smoke directions, gains, losses and evaluation cases matched across
+those two runs. Against V1, direction cosine was 0.9999993713 and the selected
+gain remained 0.25, but heldout final loss moved from 0.9419453407 to 0.9418227574.
+No-op drift was zero. These are numerical receipts on two authored contrasts,
+not an equivalence guarantee or trait replication. The batch-16 test additionally
+exercised capture with two different prefixes longer than 129 tokens. Both tests
+exercised multi-chunk zero/cancelled-sum evaluation. Timings were contended with
+another model run and the test workload changed; no speedup is established.
+Exact chunk-edge sweeps, cancellation during prefill, and V2 31B-base execution
+remain additional live checks. V1's 31B receipt is not V2 acceptance.
+
 ## API And Data Contract
 
 `ResidualTrainingRequest` contains model/request identities, unique interior
@@ -85,7 +105,8 @@ artifacts and may encode information from the source data.
 record, not a rehydratable execution credential. After `owner.shutdown_joined()`,
 `belongs_to_joined_model` checks exact worker-instance identity. Dropping a ticket
 requests cancellation; request IDs stay reserved until the executor releases
-them. Cancellation is checked at token boundaries, not inside a native kernel.
+them. Cancellation is checked between bounded prefix chunks and controlled token
+steps, not inside a native kernel; chunk limits do not bound wall-clock latency.
 
 No file, network, dataset, or personality-label authority is added to the runtime.
 Applications enforce input byte limits before deserializing, retain their own

@@ -32,7 +32,7 @@ pub const MAX_RESIDUAL_EVALUATION_NORM: f32 = 100.0;
 pub const MAX_RESIDUAL_EVALUATION_ABS_COEFFICIENT: f32 = 100.0;
 pub const RESIDUAL_EVALUATION_SAMPLING: &str = "greedy_argmax_lowest_token_id_tie_v1";
 pub const RESIDUAL_EVALUATION_INTERVENTION: &str =
-    "composed_post_block_residual_addition_from_last_prefix_token_v1";
+    "composed_post_block_from_last_prefix_token_with_unmodified_prefix_batches_max64_v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]

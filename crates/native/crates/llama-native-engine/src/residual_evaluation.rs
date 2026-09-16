@@ -1,7 +1,7 @@
 //! Research-only interventions, isolated from the resident generation context.
 //! An evaluated control is not a promoted deployment control or a trait claim.
 
-use super::residual_training::{decode_token, validate_architecture};
+use super::residual_training::{decode_token, decode_unmodified_prefix, validate_architecture};
 use super::*;
 use llama_native_types::{
     RESIDUAL_EVALUATION_INTERVENTION, RESIDUAL_EVALUATION_SAMPLING, ResidualEvaluationCaseOutput,
@@ -158,9 +158,7 @@ fn prepare_prefix(
         .map_err(|_| invalid("clear evaluation control failed"))?;
     context.clear_kv_cache();
     let last = prefix.len() - 1;
-    for (position, &token) in prefix[..last].iter().enumerate() {
-        decode_token(context, token, position, cancellation)?;
-    }
+    decode_unmodified_prefix(context, &prefix[..last], cancellation)?;
     if let Some((values, first, last)) = control {
         context
             .control_vector_set(values, first, last)
