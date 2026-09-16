@@ -1477,17 +1477,6 @@ fn build_candidate_material(
         &request.model.model_id,
         runtime_evidence,
     )?;
-    if obviously_incompatible_numeric_continuation(&request.exact_manuscript_prefix, &output.text) {
-        #[cfg(test)]
-        eprintln!(
-            "rejected numeric continuation for case {}: {:?}",
-            identity.input_index, output.text
-        );
-        return Err(LlamaBackendError::OutputContract(
-            "generated continuation is numeric degeneration incompatible with the manuscript prefix"
-                .to_string(),
-        ));
-    }
     if output.token_observations.is_some() {
         return Err(LlamaBackendError::OutputContract(
             "native probability observations cannot be relabeled as Loom logprobs".to_string(),
@@ -1552,30 +1541,6 @@ fn build_candidate_material(
         raw_event_stream_bytes,
         backend_receipt_bytes,
     })
-}
-
-fn obviously_incompatible_numeric_continuation(prefix: &str, continuation: &str) -> bool {
-    let prefix_letters = prefix
-        .chars()
-        .rev()
-        .take(256)
-        .filter(|character| character.is_alphabetic())
-        .count();
-    if prefix_letters < 12 {
-        return false;
-    }
-    let visible = continuation
-        .chars()
-        .filter(|character| !character.is_whitespace())
-        .collect::<Vec<_>>();
-    if visible.len() < 8 {
-        return false;
-    }
-    let digits = visible
-        .iter()
-        .filter(|character| character.is_numeric())
-        .count();
-    digits.saturating_mul(5) >= visible.len().saturating_mul(4)
 }
 
 fn checked_token_ids(
@@ -3277,23 +3242,94 @@ mod tests {
     }
 
     #[test]
-    fn prose_prefix_rejects_numeric_model_collapse_without_banning_numeric_writing() {
-        assert!(obviously_incompatible_numeric_continuation(
-            "I am trying to break your heart.",
-            "100%01587316716161616116161166666611666161616616"
-        ));
-        assert!(obviously_incompatible_numeric_continuation(
-            "Mara pressed her palm to the cold brass, and",
-            " the cold1234434343434343434343434343434343434343434343"
-        ));
-        assert!(!obviously_incompatible_numeric_continuation(
-            "The code on the brass plate was",
-            " 1984, and below it someone had scratched a name."
-        ));
-        assert!(!obviously_incompatible_numeric_continuation(
-            "1234567890",
-            "1111111111111111"
-        ));
+    fn numeric_continuations_retain_exact_output_and_provenance() {
+        for mode in [PromptMode::RawCompletion, PromptMode::Completion] {
+            let mut request = request_with_two_cases();
+            request.exact_manuscript_prefix = "Return pi to ten decimal places:".to_owned();
+            request.prompt_recipe.mode = mode;
+            request.prompt_recipe.exact_prompt_blob_id =
+                BlobId::digest(request.exact_manuscript_prefix.as_bytes());
+            // The second sample is deliberately unhelpful. Content quality is not
+            // a transport invariant, and even a bad sample needs exact evidence.
+            let texts = ["3.1415926535", "1111111111111111"];
+            let outputs = texts
+                .iter()
+                .enumerate()
+                .map(|(index, text)| {
+                    let mut output =
+                        native_output(&request, index, GenerationState::Completed, true);
+                    output.text = (*text).to_owned();
+                    output
+                })
+                .collect();
+            let mut events = native_events(&request);
+            for event in &mut events {
+                if let NativeEventKind::Delta { text } = &mut event.event {
+                    *text = texts[event.input_index].to_owned();
+                }
+            }
+            let runtime = fake_runtime(
+                &request,
+                outputs,
+                events,
+                true,
+                RuntimeEvidenceClass::TestFixture,
+            );
+            let backend = LlamaBackend::with_runtime(runtime, 64).expect("fixture backend");
+            let handle = backend
+                .start_exact_continuation(request.clone())
+                .expect("start batch");
+            let result = handle
+                .wait_timeout(Duration::from_secs(2))
+                .expect("numeric batch result");
+            assert_eq!(result.candidates.len(), texts.len());
+            let events = drain_events(&handle);
+            for (index, record) in result.candidates.iter().enumerate() {
+                assert_eq!(record.output_text, texts[index]);
+                assert_eq!(
+                    record.candidate.output_blob_id,
+                    BlobId::digest(texts[index].as_bytes())
+                );
+                assert_eq!(record.terminal.status, GenerationTerminalStatus::Completed);
+                assert_eq!(record.token_trace.generated_token_ids, vec![101, 102]);
+                let provenance = record.token_trace.provenance.as_ref().expect("provenance");
+                assert_eq!(provenance.evidence_kind, InferenceEvidenceKind::Fixture);
+                assert_eq!(
+                    provenance.backend_receipt_blob_id,
+                    Some(BlobId::digest(&record.backend_receipt_bytes))
+                );
+                assert_eq!(
+                    record.token_trace.raw_event_stream_blob_id,
+                    BlobId::digest(&record.raw_event_stream_bytes)
+                );
+                let receipt: OwnedBackendReceipt =
+                    serde_json::from_slice(&record.backend_receipt_bytes)
+                        .expect("retained native receipt");
+                assert_eq!(receipt.output.text, texts[index]);
+                validate_candidate_receipt_binding(
+                    record,
+                    &result.request_id,
+                    result.exact_prompt_blob_id,
+                    mode,
+                    &result.context_binding,
+                    &result.model,
+                    index,
+                )
+                .expect("numeric output remains bound to its exact request and token evidence");
+                let streamed = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        LoomEvent::Generation(GenerationEvent {
+                            branch_id,
+                            kind: GenerationEventKind::TextDelta { text },
+                            ..
+                        }) if *branch_id == record.generation.branch_id => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>();
+                assert_eq!(streamed, texts[index]);
+            }
+        }
     }
 
     #[test]
