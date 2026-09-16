@@ -2,7 +2,12 @@
 use super::{DIRECTORY, Import, checked, digest, hexadecimal, inventory, relative, source};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::Path,
+    process::{Command, Output},
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +83,10 @@ fn checkout(source_root: &Path, revision: &str, output: &Path) -> Result<()> {
         "OMP² output already exists; use a fresh directory"
     );
     let source_root = source_root.canonicalize()?;
+    // Rust's canonical Windows paths use a verbatim prefix that Git can
+    // misread as an SSH host. A file URL also escapes spaces and URL delimiters.
+    let source_url = url::Url::from_directory_path(&source_root)
+        .map_err(|()| anyhow::anyhow!("cannot represent the local checkout as a file URL"))?;
     checked(
         &source_root,
         &["cat-file", "-e", &format!("{revision}^{{commit}}")],
@@ -98,7 +107,7 @@ fn checkout(source_root: &Path, revision: &str, output: &Path) -> Result<()> {
             "--no-tags",
             "--depth=1",
             "--",
-            source_root.to_str().context("non-UTF8 checkout")?,
+            source_url.as_str(),
             revision,
         ],
     )?;
@@ -120,31 +129,30 @@ fn check_file(root: &Path, file: &File, expected: &str) -> Result<()> {
     Ok(())
 }
 
+fn apply_command(output: &Path, patch: &Path, args: &[&str]) -> Result<Output> {
+    // Let Rust open the file: Git's patch reader cannot handle canonical
+    // Windows verbatim paths. File-backed stdin needs no pipe or temporary copy.
+    Command::new("git")
+        .arg("apply")
+        .args(args)
+        .arg("-")
+        .current_dir(output)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(fs::File::open(patch).context("open OMP² patch")?)
+        .output()
+        .context("execute git apply for OMP² review")
+}
+
 fn apply(root: &Path, output: &Path, patch: &Patch) -> Result<()> {
-    let path = root
-        .join(DIRECTORY)
-        .join("patches")
-        .join(&patch.path)
-        .canonicalize()?;
-    checked(
-        output,
-        &[
-            "apply",
-            "--check",
-            "--index",
-            "--",
-            path.to_str().context("non-UTF8 patch")?,
-        ],
-    )?;
-    checked(
-        output,
-        &[
-            "apply",
-            "--index",
-            "--",
-            path.to_str().context("non-UTF8 patch")?,
-        ],
-    )?;
+    let path = root.join(DIRECTORY).join("patches").join(&patch.path);
+    for args in [&["--check", "--index"][..], &["--index"][..]] {
+        let result = apply_command(output, &path, args)?;
+        ensure!(
+            result.status.success(),
+            "git apply failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
     Ok(())
 }
 
@@ -220,13 +228,8 @@ pub(super) fn review(
         let mut report =
             String::from("Maintained runtime patch queue (no upstream code executed):\n");
         for patch in &import.patches {
-            let path = root
-                .join(DIRECTORY)
-                .join("patches")
-                .join(&patch.path)
-                .canonicalize()?;
-            let path = path.to_str().context("non-UTF8 patch")?;
-            if super::git(&scratch, &["apply", "--check", "--index", "--", path])?
+            let path = root.join(DIRECTORY).join("patches").join(&patch.path);
+            if apply_command(&scratch, &path, &["--check", "--index"])?
                 .status
                 .success()
             {
@@ -235,12 +238,9 @@ pub(super) fn review(
                     "  {}: applies; review changed baselines and rerun the runtime gate.\n",
                     patch.path
                 ));
-            } else if super::git(
-                &scratch,
-                &["apply", "--reverse", "--check", "--index", "--", path],
-            )?
-            .status
-            .success()
+            } else if apply_command(&scratch, &path, &["--reverse", "--check", "--index"])?
+                .status
+                .success()
             {
                 report.push_str(&format!(
                     "  {}: exact changes already present; test before retiring this patch.\n",
