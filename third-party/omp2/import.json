@@ -25,9 +25,10 @@
       "path": "fixtures/llm-oracle/catalog-policy/compat-profiles.json",
       "sha256": "813731312a7bf7624bbc6c331c1d28f4e4c4d1a375e0b599155e2df7fb6afb54",
       "consumers": [
-        "products/fte/docs/OMP2-MAINTENANCE.md"
+        "products/fte/crates/fte-providers/src/omp2.rs",
+        "products/fte/crates/fte-providers/src/hosted.rs"
       ],
-      "purpose": "Compatibility review and selected provider wire policy"
+      "purpose": "Reviewed Chat usage, penalties, token-field and strict-tool policy; selected model usage/tool-choice overrides"
     },
     {
       "path": "crates/ai/src/codec/openai_chat.rs",
@@ -58,9 +59,9 @@
       "path": "fixtures/llm-oracle/openai/chat/stream.parity.sse",
       "sha256": "433524801a3ab2b275435229d0a2c637414298e4ecaf967bb1a02cb5b5870f1e",
       "consumers": [
-        "products/fte/crates/fte-providers/src/hosted.rs"
+        "products/fte/crates/fte-providers/src/omp2.rs"
       ],
-      "purpose": "Split usage, alternatives and stop-state regression input"
+      "purpose": "Split usage and cache-alias regression input; fixture EOF does not qualify strict whole-stream framing"
     },
     {
       "path": "fixtures/llm-oracle/openai/chat/stream.tool_reasoning_usage.sse",

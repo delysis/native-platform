@@ -11,6 +11,82 @@ use serde_json::Value;
 const PROVIDERS: &str = include_str!(
     "../../../../../third-party/omp2/upstream/fixtures/llm-oracle/catalog/providers.toml"
 );
+const COMPAT: &str = include_str!(
+    "../../../../../third-party/omp2/upstream/fixtures/llm-oracle/catalog-policy/compat-profiles.json"
+);
+
+/// Reviewed Chat wire constraints. Only the pinned catalog factory populates
+/// these profiles; a user-chosen provider name does not select upstream policy.
+#[derive(Debug, Clone)]
+pub struct OpenAiChatCompatibility {
+    usage_in_streaming: bool,
+    penalties: bool,
+    tool_choice: bool,
+    tool_strict_mode: String,
+    max_tokens_field: String,
+}
+
+pub(crate) fn chat_body(
+    config: &HostedProviderConfig,
+    request: &fte_types::BackendRequest,
+    mut body: Value,
+) -> Result<Value, GatewayError> {
+    let Some(profile) = config.chat_compatibility.get(&request.route.model_id) else {
+        return Ok(body);
+    };
+    let unsupported = |detail| GatewayError {
+        code: "omp2_wire_feature_unsupported".into(),
+        class: fte_types::ErrorClass::Capability,
+        retryable: false,
+        http_status: 422,
+        request_id: request.request.request_id.clone(),
+        provider: Some(config.id.clone()),
+        safe_detail: detail,
+    };
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| unsupported("invalid chat body".into()))?;
+    if !profile.usage_in_streaming {
+        object.remove("stream_options");
+    }
+    if !profile.penalties
+        && (object.contains_key("frequency_penalty") || object.contains_key("presence_penalty"))
+    {
+        return Err(unsupported(
+            "the reviewed provider profile does not support penalties".into(),
+        ));
+    }
+    if !profile.tool_choice && object.contains_key("tool_choice") {
+        return Err(unsupported(
+            "the reviewed model profile does not support tool choice".into(),
+        ));
+    }
+    if let Some(tools) = object.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools {
+            let strict = tool
+                .pointer("/function/strict")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if (profile.tool_strict_mode == "none" && strict)
+                || (profile.tool_strict_mode == "all_strict" && !strict)
+            {
+                return Err(unsupported(
+                    "tool strictness does not match the reviewed provider contract".into(),
+                ));
+            }
+            if profile.tool_strict_mode == "none"
+                && let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut)
+            {
+                function.remove("strict");
+            }
+        }
+    }
+    if let Some(tokens) = object.remove("max_tokens") {
+        object.insert(profile.max_tokens_field.clone(), tokens);
+    }
+    Ok(body)
+}
+
 const IMPORT: &str = include_str!("../../../../../third-party/omp2/import.json");
 
 /// Immutable source identity for embedding applications' route receipts.
@@ -154,6 +230,72 @@ impl HostedProviderConfig {
             }
             _ => return Err(error()),
         };
+        if transport == "open-ai-chat" {
+            let profiles: Value = serde_json::from_str(COMPAT).map_err(|_| error())?;
+            let profiles = profiles
+                .get("profiles")
+                .and_then(Value::as_array)
+                .ok_or_else(error)?;
+            let compat = profile.get("compat");
+            let flag = |name| {
+                compat
+                    .and_then(|c| c.get(name))
+                    .and_then(toml::Value::as_bool)
+                    .unwrap_or(true)
+            };
+            let field = |name, default: &str| {
+                compat
+                    .and_then(|c| c.get(name))
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or(default)
+                    .to_owned()
+            };
+            for model in &config.models {
+                let mut wire = OpenAiChatCompatibility {
+                    usage_in_streaming: flag("usage_in_streaming"),
+                    penalties: flag("penalties"),
+                    tool_choice: true,
+                    tool_strict_mode: field("tool_strict_mode", "optional"),
+                    max_tokens_field: field("max_tokens_field", "max_completion_tokens"),
+                };
+                if !matches!(
+                    wire.max_tokens_field.as_str(),
+                    "max_tokens" | "max_completion_tokens"
+                ) || !matches!(
+                    wire.tool_strict_mode.as_str(),
+                    "optional" | "none" | "all_strict"
+                ) {
+                    return Err(error());
+                }
+                let qualified = format!("{source_id}/{}", model.id);
+                for profile in profiles {
+                    if profile
+                        .get("models")
+                        .and_then(Value::as_array)
+                        .is_some_and(|models| {
+                            models
+                                .iter()
+                                .any(|model| model.as_str() == Some(&qualified))
+                        })
+                    {
+                        let shape = profile.get("shape").ok_or_else(error)?;
+                        if let Some(value) = shape
+                            .get("wire/supports_usage_in_streaming")
+                            .and_then(Value::as_bool)
+                        {
+                            wire.usage_in_streaming = value;
+                        }
+                        if let Some(value) = shape
+                            .get("wire/supports_tool_choice")
+                            .and_then(Value::as_bool)
+                        {
+                            wire.tool_choice = value;
+                        }
+                    }
+                }
+                config.chat_compatibility.insert(model.id.clone(), wire);
+            }
+        }
         config.catalog_version = omp2_catalog_version()?;
         Ok(config)
     }

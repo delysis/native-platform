@@ -99,6 +99,31 @@ are excluded. Existing raw-completion endpoints are local contracts and are not
 inferred from upstream chat support. The reviewed profile allowlist does not grow
 when the upstream registry adds providers.
 
+Selected Chat compatibility is applied only by `from_omp2`, per explicitly
+registered model. Provider defaults select the output-token field and streaming
+usage option; unsupported penalties or tool strictness fail before dispatch.
+The pinned model profiles contribute streaming-usage and tool-choice overrides.
+Other upstream fields (reasoning dialects, replay healing, tool-ID rewriting,
+provider cache annotations and model discovery) remain review inputs, not support
+claims. Adding one requires an adapter regression and a documented disposition.
+Custom endpoints do not inherit these policies from their caller-chosen IDs.
+
+The imported Messages stream exercises thinking text plus its opaque signature,
+split tool arguments and inclusive input/cache accounting through the actual HTTP
+adapter. Partial usage frames retain the raw dimensions before normalization,
+so a later frame cannot double count caches. The OpenAI parity fixture currently
+qualifies usage-row merging only: its terminal EOF is not accepted as a complete
+strictly delimited SSE stream. The other two imported streams exercise full HTTP
+transport. No fixture establishes live provider availability.
+
+Loom reads its optional global `.loom.toml` once per launch. Only named suggestion
+or manual-weave scopes authorize server execution. The gateway is in process;
+it starts no listener, dashboard or extra response database. Missing/invalid
+configuration leaves ordinary native operation available. See
+[`inference-dotfile.md`](../../loom/docs/inference-dotfile.md) for the versioned
+contract and keychain references. Server output retains `server_response`
+evidence, with unknown weights/tokenizer identity; native receipts remain native.
+
 The import tool's integration tests create real Git histories, generate and
 apply an update, verify it, reverse it, and verify rollback. They also reject
 source tampering, unlisted files, deleted inputs and malformed paths/revisions.

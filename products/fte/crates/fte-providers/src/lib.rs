@@ -12,4 +12,4 @@ pub use fte_types::GatewayBackend;
 pub use hosted::{
     HostedAuth, HostedEndpoints, HostedProtocol, HostedProviderBackend, HostedProviderConfig,
 };
-pub use omp2::omp2_catalog_version;
+pub use omp2::{OpenAiChatCompatibility, omp2_catalog_version};

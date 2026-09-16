@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OperationIdentity {
@@ -64,6 +65,7 @@ struct OperationRecord {
     identity: OperationIdentity,
     phase: OperationPhase,
     cancellation_requested: bool,
+    cancellation: CancellationToken,
     terminal: Option<TerminalClass>,
     progress: VecDeque<u64>,
     progress_capacity: usize,
@@ -77,6 +79,7 @@ pub struct OperationLease {
     registry: OperationRegistry,
     identity: OperationIdentity,
     released: Arc<Mutex<Option<OperationSnapshot>>>,
+    cancellation: CancellationToken,
 }
 
 pub struct ConsumerGuard {
@@ -126,12 +129,14 @@ impl OperationRegistry {
             sequence,
         };
         let released = Arc::new(Mutex::new(None));
+        let cancellation = CancellationToken::new();
         state.operations.insert(
             operation_id.to_owned(),
             OperationRecord {
                 identity: identity.clone(),
                 phase: OperationPhase::Reserved,
                 cancellation_requested: false,
+                cancellation: cancellation.clone(),
                 terminal: None,
                 progress: VecDeque::with_capacity(progress_capacity),
                 progress_capacity,
@@ -144,6 +149,7 @@ impl OperationRegistry {
             registry: self.clone(),
             identity,
             released,
+            cancellation,
         };
         Ok((
             ConsumerGuard {
@@ -172,11 +178,13 @@ impl OperationRegistry {
         };
         let identity = record.identity.clone();
         let released = Arc::clone(&record.released);
+        let cancellation = record.cancellation.clone();
         drop(state);
         Ok(Some(OperationLease {
             registry: self.clone(),
             identity,
             released,
+            cancellation,
         }))
     }
 
@@ -185,6 +193,7 @@ impl OperationRegistry {
         let ids = state.operations.keys().cloned().collect::<Vec<_>>();
         for record in state.operations.values_mut() {
             record.cancellation_requested = true;
+            record.cancellation.cancel();
         }
         Ok(ids)
     }
@@ -198,6 +207,7 @@ impl OperationRegistry {
                 let ids = state.operations.keys().cloned().collect::<Vec<_>>();
                 for record in state.operations.values_mut() {
                     record.cancellation_requested = true;
+                    record.cancellation.cancel();
                 }
                 (ids, None)
             }
@@ -206,6 +216,7 @@ impl OperationRegistry {
                 let ids = state.operations.keys().cloned().collect::<Vec<_>>();
                 for record in state.operations.values_mut() {
                     record.cancellation_requested = true;
+                    record.cancellation.cancel();
                 }
                 (ids, Some(RegistryError::Poisoned))
             }
@@ -255,6 +266,9 @@ impl Default for OperationRegistry {
 }
 
 impl OperationLease {
+    pub(crate) fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
     pub fn identity(&self) -> OperationIdentity {
         self.identity.clone()
     }
@@ -319,7 +333,10 @@ impl OperationLease {
         let mut state = self.registry.lock()?;
         let mut released_slot = self.released.lock().map_err(|_| RegistryError::Poisoned)?;
         let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
-        if record.phase != OperationPhase::Running
+        if !matches!(
+            record.phase,
+            OperationPhase::Queued | OperationPhase::Running
+        ) || (record.phase == OperationPhase::Queued && terminal == TerminalClass::Completed)
             || record.terminal.is_some()
             || !record.attempts.is_empty()
         {
@@ -349,7 +366,9 @@ impl OperationLease {
 
     pub fn request_cancel(&self) -> Result<(), RegistryError> {
         let mut state = self.registry.lock()?;
-        OperationRegistry::record_mut(&mut state, &self.identity)?.cancellation_requested = true;
+        let record = OperationRegistry::record_mut(&mut state, &self.identity)?;
+        record.cancellation_requested = true;
+        record.cancellation.cancel();
         Ok(())
     }
 

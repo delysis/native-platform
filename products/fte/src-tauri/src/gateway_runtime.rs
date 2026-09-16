@@ -1316,6 +1316,7 @@ fn descriptors(
                 },
                 context_tokens: None,
                 max_output_tokens: None,
+                quota: entry.quota.gateway_limits(),
                 observed: RouteObservations::default(),
             }
         })

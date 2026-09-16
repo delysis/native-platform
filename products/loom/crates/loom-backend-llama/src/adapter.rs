@@ -2005,8 +2005,8 @@ pub fn model_environment_from_verified(
     Ok(ModelEnvironment {
         environment_id: model.model_environment_id,
         model_identifier: model.stable_model_id.clone(),
-        model_fingerprint: BlobId::from_str(&model.model_sha256)?,
-        tokenizer_fingerprint: BlobId::from_str(&model.tokenizer_sha256)?,
+        model_fingerprint: Some(BlobId::from_str(&model.model_sha256)?),
+        tokenizer_fingerprint: Some(BlobId::from_str(&model.tokenizer_sha256)?),
         backend_identifier: model.build_id.clone(),
         capabilities: serde_json::to_value(&model.capabilities)?,
     })
