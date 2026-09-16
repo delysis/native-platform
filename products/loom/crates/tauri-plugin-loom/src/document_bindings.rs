@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use loom_store::{DocumentSummary, ProjectStore};
-use loom_types::{ArtifactId, BlobId, DocumentId, RevisionId};
+use loom_types::{ArtifactId, BlobId, DocumentId, ProjectId, RevisionId};
 use serde::{Deserialize, Serialize};
 
 use super::{IpcFailure, title_for_path};
@@ -12,6 +12,137 @@ use super::{IpcFailure, title_for_path};
 const MAX_REFERENCES: usize = 256;
 const MAX_DOCUMENTS: usize = 32;
 const MAX_CONTEXT_BYTES: usize = 65_536;
+pub(super) const MAX_FOLDER_DOCUMENTS: usize = 1_024;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct FolderSnapshot {
+    pub project_id: ProjectId,
+    pub prefix: String,
+    pub source_revision: String,
+    pub members: Vec<FolderMember>,
+    pub excluded: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct FolderMember {
+    pub document_id: DocumentId,
+    pub revision_id: RevisionId,
+    pub path: String,
+    pub title: String,
+}
+
+impl FolderSnapshot {
+    fn identity_bytes(&self) -> Result<Vec<u8>, IpcFailure> {
+        serde_json::to_vec(&(
+            "loom.folder.snapshot.v1",
+            self.project_id,
+            &self.prefix,
+            &self.members,
+            self.excluded,
+        ))
+        .map_err(|error| limit_failure(&error.to_string()))
+    }
+
+    pub(crate) fn validate(&self, store: &ProjectStore) -> Result<(), IpcFailure> {
+        validate_name(&self.prefix)?;
+        if self.project_id != store.manifest().project_id
+            || !self.prefix.ends_with('/')
+            || self.members.is_empty()
+            || self.members.len() > MAX_FOLDER_DOCUMENTS
+        {
+            return Err(limit_failure("Invalid folder snapshot membership."));
+        }
+        let mut ids = HashSet::new();
+        let mut previous = None;
+        for member in &self.members {
+            if !member.path.starts_with(&self.prefix)
+                || !ids.insert(member.document_id)
+                || previous.is_some_and(|path: &str| path >= member.path.as_str())
+            {
+                return Err(limit_failure(
+                    "Folder snapshot members must be unique and path-sorted.",
+                ));
+            }
+            previous = Some(member.path.as_str());
+        }
+        let bytes = self.identity_bytes()?;
+        if bytes.len() > 1024 * 1024 || BlobId::digest(&bytes).to_string() != self.source_revision {
+            return Err(limit_failure("Folder snapshot identity mismatch."));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn snapshot_folder(
+    store: &ProjectStore,
+    name: &str,
+) -> Result<FolderSnapshot, IpcFailure> {
+    validate_name(name)?;
+    if !name.ends_with('/') {
+        return Err(missing_reference(name));
+    }
+    let registry = store
+        .list_documents_under(name, MAX_FOLDER_DOCUMENTS + 1)
+        .map_err(IpcFailure::store)?;
+    if registry.len() > MAX_FOLDER_DOCUMENTS {
+        return Err(limit_failure(
+            "A folder reference supports at most 1,024 registered documents. Choose a smaller folder.",
+        ));
+    }
+    let mut members = Vec::new();
+    let mut excluded = 0;
+    for document in registry {
+        let reason = store
+            .document_creation_reason(document.document_id)
+            .map_err(IpcFailure::store)?;
+        if document
+            .relative_path
+            .split('/')
+            .any(|part| part.starts_with('.'))
+            || matches!(
+                reason.as_deref(),
+                Some("retained experiment" | "retained expression")
+            )
+        {
+            excluded += 1;
+            continue;
+        }
+        members.push(FolderMember {
+            document_id: document.document_id,
+            revision_id: document
+                .active_revision_id
+                .ok_or_else(|| missing_reference(name))?,
+            title: document
+                .display_title
+                .unwrap_or_else(|| title_for_path(&document.relative_path)),
+            path: document.relative_path,
+        });
+    }
+    if members.is_empty() {
+        return Err(missing_reference(name));
+    }
+    let project_id = store.manifest().project_id;
+    let bytes = serde_json::to_vec(&(
+        "loom.folder.snapshot.v1",
+        project_id,
+        name,
+        &members,
+        excluded,
+    ))
+    .map_err(|error| limit_failure(&error.to_string()))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(limit_failure(
+            "The folder membership exceeds the 1 MiB snapshot limit.",
+        ));
+    }
+    Ok(FolderSnapshot {
+        project_id,
+        prefix: name.into(),
+        source_revision: BlobId::digest(&bytes).to_string(),
+        members,
+        excluded,
+    })
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct ResolvedDocument {

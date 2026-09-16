@@ -24,6 +24,7 @@ mod speech_input;
 mod terminal;
 mod terminal_media;
 mod terminal_receipts;
+mod workspace_copy;
 mod workspace_preview;
 mod workspace_template;
 
@@ -2111,6 +2112,7 @@ impl Builder {
                 document_delete,
                 import_batch::import_text_sources,
                 import_batch::attachment_import_batch_choose,
+                workspace_copy::workspace_copy_files,
                 connected_imports::import_account_cancel,
                 connected_imports::import_source_url,
                 connected_imports::import_accounts,
@@ -8577,6 +8579,8 @@ fn weave_start_inner<R: Runtime>(
                 "session": active_session_id, "document": document_id, "revision": source_revision_id,
                 "cursor": cursor_byte, "prompt": BlobId::digest(exact_prefix.as_bytes()),
                 "context": context, "model": model_environment,
+                "materials": BlobId::digest(&serde_json::to_vec(&material_plan)
+                    .map_err(|error| IpcFailure::new("speculation_identity_failed", error.to_string(), false))?),
             })).map_err(|error| IpcFailure::new("speculation_identity_failed", error.to_string(), false))?;
             Ok::<_, IpcFailure>(LoompadBatch { snapshot_id: BlobId::digest(&identity).to_string(), sample_target, batch_offset })
         }).transpose()?;
@@ -8606,11 +8610,21 @@ fn weave_start_inner<R: Runtime>(
         let environment_artifact = store
             .record_model_environment(&model_environment)
             .map_err(IpcFailure::store)?;
+        let mut context_inputs = material_context::evidence_artifact_ids(&material_plan.evidence)?;
+        for value in material_plan.bindings.values() {
+            if let material_context::Value::Documents { documents } = value {
+                context_inputs.extend(documents.iter().map(|document| document.artifact_id));
+            }
+        }
+        context_inputs.sort();
+        context_inputs.dedup();
+        let mut prompt_inputs = vec![loaded.artifact_id];
+        prompt_inputs.extend(context_inputs.iter().copied());
         let prompt_recipe = PromptRecipe {
             mode: PromptMode::Completion,
             exact_prompt_blob_id,
             exact_prompt_token_ids: None,
-            ordered_input_artifact_ids: vec![loaded.artifact_id],
+            ordered_input_artifact_ids: prompt_inputs,
             prompt_token_count: None,
         };
         let prompt_artifact = store
@@ -8633,7 +8647,7 @@ fn weave_start_inner<R: Runtime>(
         let context_artifact = store
             .record_context_recipe(&ContextRecipe {
                 source_revision_id,
-                ordered_source_artifact_ids: Vec::new(),
+                ordered_source_artifact_ids: context_inputs,
                 token_budget: u64::from(authorized_model.context_tokens()),
                 retrieval_evidence_blob_id,
             })

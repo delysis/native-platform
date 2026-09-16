@@ -30,6 +30,7 @@ permissions = [
   "allow-attachment-ingest",
   "allow-attachment-import-choose",
   "allow-attachment-import-paths",
+  "allow-workspace-copy-files",
   "allow-attachment-reveal-original",
   "allow-import-text-sources",
   "allow-attachment-import-batch-choose",

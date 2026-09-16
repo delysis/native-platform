@@ -1126,17 +1126,34 @@ impl ProjectStore {
     }
 
     pub fn list_documents(&self) -> Result<Vec<DocumentSummary>> {
+        self.list_documents_matching_prefix(None, -1)
+    }
+
+    /// Bounded registry membership, without opening or discovering disk files.
+    /// A literal prefix is used: SQL wildcard characters have no special meaning.
+    pub fn list_documents_under(&self, prefix: &str, limit: usize) -> Result<Vec<DocumentSummary>> {
+        let normalized = normalize_document_path(Path::new(prefix.trim_end_matches('/')))?;
+        let prefix = format!("{normalized}/");
+        self.list_documents_matching_prefix(Some(&prefix), i64::try_from(limit).unwrap_or(i64::MAX))
+    }
+
+    fn list_documents_matching_prefix(
+        &self,
+        prefix: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<DocumentSummary>> {
         let mut statement = self.connection.prepare(
             "SELECT d.document_id, d.relative_path, d.display_title, d.document_kind,
                     (SELECT r.revision_id FROM revisions r WHERE r.document_id = d.document_id ORDER BY r.created_at_ms DESC, r.revision_id DESC LIMIT 1)
              FROM documents d
-             WHERE NOT EXISTS (
+             WHERE (?1 IS NULL OR substr(d.relative_path, 1, length(?1)) = ?1)
+             AND NOT EXISTS (
                  SELECT 1 FROM document_deletions deletion
                  WHERE deletion.document_id = d.document_id
              )
-             ORDER BY d.relative_path",
+             ORDER BY d.relative_path LIMIT ?2",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map(params![prefix, limit], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1161,6 +1178,14 @@ impl ProjectStore {
             });
         }
         Ok(documents)
+    }
+
+    /// The initial revision's reason follows identity across edits and renames.
+    pub fn document_creation_reason(&self, document_id: DocumentId) -> Result<Option<String>> {
+        Ok(self.connection.query_row(
+            "SELECT reason FROM revisions WHERE document_id = ?1 AND parent_revision_id IS NULL ORDER BY created_at_ms, revision_id LIMIT 1",
+            [document_id.to_string()], |row| row.get(0),
+        ).optional()?)
     }
 
     /// Live documents whose initial revision has this creation reason. Later
@@ -2416,14 +2441,32 @@ impl ProjectStore {
         self.open_document_file(relative_path)?.into_document()
     }
 
+    /// Uses the same current-revision/no-follow authority with a smaller read cap.
+    pub fn read_document_bounded(
+        &self,
+        relative_path: impl AsRef<Path>,
+        max_bytes: u64,
+    ) -> Result<LoadedDocument> {
+        self.open_document_file_bounded(relative_path.as_ref(), max_bytes.min(MAX_DOCUMENT_BYTES))?
+            .into_document()
+    }
+
     /// Opens one no-follow descriptor and binds its exact UTF-8 bytes to the
     /// store's current document, revision, artifact, and blob identity.
     pub fn open_document_file(
         &self,
         relative_path: impl AsRef<Path>,
     ) -> Result<DocumentFileAuthority> {
+        self.open_document_file_bounded(relative_path.as_ref(), MAX_DOCUMENT_BYTES)
+    }
+
+    fn open_document_file_bounded(
+        &self,
+        relative_path: &Path,
+        max_bytes: u64,
+    ) -> Result<DocumentFileAuthority> {
         self.reconcile_document_lifecycle()?;
-        let normalized = normalize_document_path(relative_path.as_ref())?;
+        let normalized = normalize_document_path(relative_path)?;
         let document = self
             .document_by_path(&normalized)?
             .ok_or_else(|| StoreError::NoActiveRevision(normalized.clone()))?;
@@ -2431,7 +2474,7 @@ impl ProjectStore {
             .active_revision(document.id)?
             .ok_or_else(|| StoreError::NoActiveRevision(normalized.clone()))?;
         let visible_path = inspect_document_path(&self.root, &normalized)?;
-        let mut file = match BoundedNoFollowFile::open(&visible_path, MAX_DOCUMENT_BYTES) {
+        let mut file = match BoundedNoFollowFile::open(&visible_path, max_bytes) {
             Ok(file) => file,
             Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Err(StoreError::ExternalVisibleFileDeleted(normalized));
@@ -6509,6 +6552,44 @@ mod tests {
             "appeared externally"
         );
         assert_eq!(store.pending_outbox_count().expect("pending outbox"), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_folder_listing_and_read_preserve_literal_prefix_and_revision_authority() {
+        let (_directory, mut store) = new_store();
+        for path in ["Notes_/a.md", "Notes_/b.md", "Notes-other/c.md"] {
+            store
+                .create_document_if_absent(
+                    path,
+                    DocumentContent::Prose("Original bytes\n".into()),
+                    "writing",
+                )
+                .unwrap();
+        }
+        let limited = store.list_documents_under("Notes_/", 1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].relative_path, "Notes_/a.md");
+        assert_eq!(store.list_documents_under("Notes_/", 10).unwrap().len(), 2);
+        assert_eq!(
+            store
+                .document_creation_reason(limited[0].document_id)
+                .unwrap()
+                .as_deref(),
+            Some("writing")
+        );
+        assert!(matches!(
+            store.read_document_bounded("Notes_/a.md", 4),
+            Err(StoreError::DocumentTooLarge { max_bytes: 4, .. })
+        ));
+        let read = store.read_document_bounded("Notes_/a.md", 32).unwrap();
+        assert_eq!(read.text, "Original bytes\n");
+        assert_eq!(Some(read.revision_id), limited[0].active_revision_id);
+        fs::write(store.root().join("Notes_/a.md"), "external edit").unwrap();
+        assert!(matches!(
+            store.read_document_bounded("Notes_/a.md", 32),
+            Err(StoreError::UncheckpointedVisibleChange(_))
+        ));
     }
 
     #[cfg(unix)]

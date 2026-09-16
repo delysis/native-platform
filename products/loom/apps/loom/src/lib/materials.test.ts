@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { materialReferenceMarkdown, evidenceReferenceMarkdown, importedMaterialMarkdown, materialQuotationMarkdown, materialLocatorLabel } from './materials';
+import { materialReferenceMarkdown, evidenceReferenceMarkdown, importedMaterialMarkdown, materialQuotationMarkdown, materialLocatorLabel, materialWritingDocument, materialPdfPageText } from './materials';
 import { parseVisualMarkdown, serializeVisualMarkdown } from './markdownSafety';
 import type { MaterialEntry } from './materials';
 import type { ContextAttachment } from './types';
@@ -33,8 +33,26 @@ describe('retained source references', () => {
     expect(materialLocatorLabel({ ...locator, location_path: 'D09A34582350094985c267ccb' })).toBe('Passage 1777');
     expect(materialLocatorLabel({ doc_id: locator.doc_id, kind: 'sqlite_block', byte_start: 10 })).toBe('');
     expect(materialLocatorLabel({ page_start: 4, page_end: 7 })).toBe('Pages 4–7');
+    expect(materialLocatorLabel({ pdf_pages: [{ number: 1 }, { number: 3 }] })).toBe('Pages 1, 3');
   });
   it('retains passage identity separately from collection identity', () => {
     expect(evidenceReferenceMarkdown({ id: 'b'.repeat(64), title: 'Chapter 2' })).toBe(`[@Chapter 2](loom-evidence:${'b'.repeat(64)})`);
+  });
+  it('labels retained writing by path and only offers current navigation within the same project', () => {
+    const locator = { kind: 'document_revision', project_id: 'project-a', document_id: 'document-a', revision_id: 'old-revision', path: 'Notes/rain.md', start_byte: 13 };
+    expect(materialLocatorLabel(locator)).toBe('Notes/rain.md');
+    expect(materialWritingDocument(locator, 'project-a')).toBe('document-a');
+    expect(materialWritingDocument(locator, 'project-b')).toBeNull();
+    expect(materialWritingDocument({ ...locator, kind: 'sqlite_block' }, 'project-a')).toBeNull();
+  });
+  it('reads PDF page ranges as exact UTF-8 and refuses split code points or invalid ranges', () => {
+    const prefix = 'Page one.\n';
+    const text = '\uFEFFcafé 🖋\r\n';
+    const bytes = new TextEncoder().encode(prefix + text);
+    const page = { number: 3, start_byte: new TextEncoder().encode(prefix).length, end_byte: bytes.length };
+    expect(materialPdfPageText(bytes, page)).toBe(text);
+    expect(materialPdfPageText(bytes, { ...page, start_byte: page.start_byte + 1 })).toBeNull();
+    expect(materialPdfPageText(bytes, { ...page, end_byte: bytes.length + 1 })).toBeNull();
+    expect(materialPdfPageText(bytes, { ...page, number: 0 })).toBeNull();
   });
 });
