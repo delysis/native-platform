@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { compile } from 'svelte/compiler';
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 
 function dependencyThunkFor(compiled: string, assignment: string): string {
   const assignmentIndex = compiled.indexOf(assignment);
@@ -11,14 +11,19 @@ function dependencyThunkFor(compiled: string, assignment: string): string {
 }
 
 describe('App ghost reactivity wiring', () => {
-  it('tracks late branch hydration and caret changes in both ghost effects', () => {
-    const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
-    const compiled = compile(source, {
+  const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+  let compiled: string;
+  // Compiling the full app is fixture preparation, with the runner's bounded
+  // setup timeout. The behavior assertions retain their normal test timeout.
+  beforeAll(() => {
+    compiled = compile(source, {
       filename: 'App.svelte',
       generate: 'client',
       dev: false
     }).js.code;
+  });
 
+  it('tracks late branch hydration and caret changes in both ghost effects', () => {
     const visual = dependencyThunkFor(compiled, '$.set(visualAutocompleteDisposition');
     expect(visual).toContain('verifiedBranchBodyByRun');
     expect(visual).toContain('currentReadyBranches');
@@ -479,7 +484,7 @@ describe('App ghost reactivity wiring', () => {
       source.indexOf('function beginDocumentContextLongPress')
     );
     const readonly = source.slice(
-      source.indexOf('$: editorReadonly ='),
+      source.indexOf('$: editorNavigationLocked ='),
       source.indexOf('$: reconciliationResolutionLocked')
     );
 
@@ -572,7 +577,7 @@ describe('App ghost reactivity wiring', () => {
   it('keeps normal watcher refreshes editable and locks only the missing-document boundary', () => {
     const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
     const readonly = source.slice(
-      source.indexOf('$: editorReadonly ='),
+      source.indexOf('$: editorNavigationLocked ='),
       source.indexOf('$: reconciliationResolutionLocked')
     );
     const missingBoundary = source.slice(
@@ -586,6 +591,7 @@ describe('App ghost reactivity wiring', () => {
 
     expect(readonly).toContain('missingDocumentBoundaryInFlight');
     expect(readonly).toContain('missingDocumentCapturePending !== null');
+    expect(readonly).toContain('editorReadonly = editorNavigationLocked || cabalWriteBlocked');
     expect(readonly).not.toContain('projectFilesystemRefreshInFlight');
     expect(refresh).toContain('projectFilesystemRefreshInFlight = true');
     expect(missingBoundary).toContain('missingDocumentBoundaryInFlight = true');
@@ -721,8 +727,7 @@ describe('App ghost reactivity wiring', () => {
       source.indexOf('async function setMode'),
       source.indexOf('function announce')
     );
-    expect(source).toContain('disabled={editorReadonly}');
-    expect(source).not.toContain("disabled={editorReadonly || (mode === 'source' && !canUseVisual)}");
+    expect(source).toContain("if (key === 'm' && document) { event.preventDefault(); void setMode(");
     expect(mode.indexOf('flushEditors()')).toBeLessThan(mode.indexOf('canUseVisualMarkdown(documentText, false)'));
     expect(mode).toContain("'visual_markdown_not_exact'");
   });

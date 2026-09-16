@@ -24,6 +24,23 @@ ignore = true
 name = "libfuzzer-sys"
 allow = ["NCSA"]
 
+# Iroh's WebAssembly transport dependencies. Reviewed the published LICENSE
+# files for async_io_stream/ws_stream_wasm and pharos's manifest/README.
+[[licenses.exceptions]]
+name = "async_io_stream"
+version = "=0.3.3"
+allow = ["Unlicense"]
+
+[[licenses.exceptions]]
+name = "pharos"
+version = "=0.5.3"
+allow = ["Unlicense"]
+
+[[licenses.exceptions]]
+name = "ws_stream_wasm"
+version = "=0.7.5"
+allow = ["Unlicense"]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

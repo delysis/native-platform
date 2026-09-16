@@ -1,0 +1,21 @@
+{
+  "repository": "https://github.com/whisperfish/presage",
+  "revision": "3a45e915520348cbd93fc13de47c482b8e855c99",
+  "files": {
+    "Cargo.toml": "c1f6dd85ea5e8391e85e7e1d7d9d27027e90c9a89c7760769f7a169a2a17c1c8",
+    "src/errors.rs": "741d745ecd02455a3eb43c78ab9e090de8617a26a589a9d2bde2c0537ad332c9",
+    "src/lib.rs": "93c7f70b8c22444aaf33e02e1e05c752c912d6bb6cc6bd11efc56af537940065",
+    "src/manager/confirmation.rs": "c3e1eb1bcc778ef816868f2caf75348edac2ebd3bdf4e22176b4fb10a9646e2c",
+    "src/manager/linking.rs": "685578fa0d5f350311647c9382932e0fd42684d6e11835e67df3fe3887c7433e",
+    "src/manager/mod.rs": "f9bb7cc607a532dd16ff578bc534ccd769fe73af9ab9f3a4d6fc6ea533af3954",
+    "src/manager/registered.rs": "7b9c267cf3ae784ded133e7398dddd44d2ffc92820d909dbc774fe5f19fd5d18",
+    "src/manager/registration.rs": "713944cad10f63315e3a12dde4092f584b3c46d1a9fb1eebfc85d43081b92795",
+    "src/model/contacts.rs": "7f99a350691da6676ade18f6a342d89bf07b1ee6a24e0d60d78ef15b995b0125",
+    "src/model/groups.rs": "bc64c9283a2425a91f51c50473ff38efed1c5231d15c362711a16cf8a12f8219",
+    "src/model/identity.rs": "8abc5052ece6a4f70b491ac6508c305cdf037f310a5bbf4acc5f6d5c6c3f977f",
+    "src/model/messages.rs": "95f4e46c8ff34ff41ea883af26de42dc6b27c94f109113080028421cbcba9882",
+    "src/model/mod.rs": "b529a180c6027d0cdb52cd25b909e8eb9250850ffcd646e68a28ab1e32f83131",
+    "src/serde.rs": "5997267a847ac6348d40ff93ec5acbd86411a06ec3f8df0abe25e6e605e8247f",
+    "src/store.rs": "ec5edf85dc2c8a3ee396440462180594665e6f81a48153fb73933f3af27f1266"
+  }
+}

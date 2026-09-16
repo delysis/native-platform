@@ -299,6 +299,63 @@ impl ProjectStore {
         )
     }
 
+    /// Retains one exact creation receipt across a lost response or restart.
+    /// Replaying it settles the original outbox without creating another file.
+    pub fn create_document_idempotent(
+        &mut self,
+        command_id: CommandId,
+        relative_path: &str,
+        content: DocumentContent,
+        reason: &str,
+    ) -> Result<crate::IdempotentSaveOutcome> {
+        self.create_document_idempotent_with_boundary(
+            command_id,
+            relative_path,
+            content,
+            reason,
+            |_| Ok(()),
+        )
+    }
+
+    fn create_document_idempotent_with_boundary<F>(
+        &mut self,
+        command_id: CommandId,
+        relative_path: &str,
+        content: DocumentContent,
+        reason: &str,
+        before_projection: F,
+    ) -> Result<crate::IdempotentSaveOutcome>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
+        let path = normalize_document_path(Path::new(relative_path))?;
+        let projection = content.project_visible()?;
+        let fingerprint = BlobId::digest(&serde_json::to_vec(&(
+            "loom:document-create:v1",
+            &path,
+            content.kind(),
+            BlobId::digest(&projection.bytes),
+            reason,
+        ))?);
+        if let Some(outcome) = self.replay_idempotent_save(command_id, fingerprint)? {
+            return Ok(outcome);
+        }
+        let save = self.create_document_with_identity(
+            &path,
+            content,
+            reason,
+            DocumentOrigin::Human,
+            Some((command_id, fingerprint)),
+            before_projection,
+        )?;
+        Ok(crate::IdempotentSaveOutcome {
+            save,
+            visible_projection: VisibleProjectionState::Applied,
+            request_fingerprint: fingerprint,
+            replayed: false,
+        })
+    }
+
     /// Retain generated writing as a new ordinary document, without attributing
     /// it to a human or promoting it into the active manuscript. The caller's
     /// immutable evidence must already be present and pass its digest check.
@@ -338,6 +395,44 @@ impl ProjectStore {
         )
     }
 
+    /// Retain one derived result across restart without rewriting its file or
+    /// claiming local inference. Both exact content and provenance bind a retry.
+    pub fn create_derived_document_idempotent(
+        &mut self,
+        command_id: CommandId,
+        relative_path: &str,
+        content: DocumentContent,
+        evidence_blob_id: BlobId,
+    ) -> Result<crate::IdempotentSaveOutcome> {
+        self.read_blob(evidence_blob_id)?;
+        let path = normalize_document_path(Path::new(relative_path))?;
+        let projection = content.project_visible()?;
+        let fingerprint = BlobId::digest(&serde_json::to_vec(&(
+            "loom:derived-document-create:v1",
+            &path,
+            content.kind(),
+            BlobId::digest(&projection.bytes),
+            evidence_blob_id,
+        ))?);
+        if let Some(outcome) = self.replay_idempotent_save(command_id, fingerprint)? {
+            return Ok(outcome);
+        }
+        let save = self.create_document_with_identity(
+            &path,
+            content,
+            "retained remote experiment",
+            DocumentOrigin::Derived { evidence_blob_id },
+            Some((command_id, fingerprint)),
+            |_| Ok(()),
+        )?;
+        Ok(crate::IdempotentSaveOutcome {
+            save,
+            visible_projection: VisibleProjectionState::Applied,
+            request_fingerprint: fingerprint,
+            replayed: false,
+        })
+    }
+
     #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
     fn create_document_if_absent_with_boundary<F>(
         &mut self,
@@ -345,6 +440,29 @@ impl ProjectStore {
         content: DocumentContent,
         reason: impl Into<String>,
         origin: DocumentOrigin,
+        before_projection_boundary: F,
+    ) -> Result<SaveOutcome>
+    where
+        F: FnOnce(&Path) -> Result<()>,
+    {
+        self.create_document_with_identity(
+            relative_path,
+            content,
+            reason,
+            origin,
+            None,
+            before_projection_boundary,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn create_document_with_identity<F>(
+        &mut self,
+        relative_path: impl AsRef<Path>,
+        content: DocumentContent,
+        reason: impl Into<String>,
+        origin: DocumentOrigin,
+        identity: Option<(CommandId, BlobId)>,
         before_projection_boundary: F,
     ) -> Result<SaveOutcome>
     where
@@ -380,7 +498,7 @@ impl ProjectStore {
         let artifact_id = ArtifactId::new();
         let operation_id = OperationId::new();
         let revision_id = RevisionId::new();
-        let command_id = CommandId::new();
+        let command_id = identity.map_or_else(CommandId::new, |(id, _)| id);
         let created_at_ms = now_unix_ms();
         let receipt = CommandReceipt {
             command_id,
@@ -477,6 +595,12 @@ impl ProjectStore {
         )?;
         let outbox_id = transaction.last_insert_rowid();
         persist_receipt_in(&transaction, &receipt)?;
+        if let Some((command, fingerprint)) = identity {
+            transaction.execute(
+                "INSERT INTO command_requests(command_id, request_fingerprint, command_kind, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+                params![command.to_string(), fingerprint.to_string(), CommandKind::CreateDocument.as_str(), created_at_ms],
+            )?;
+        }
         transaction.commit()?;
 
         match self.process_outbox_entry_with_boundary(outbox_id, before_projection_boundary)? {
@@ -1095,6 +1219,27 @@ impl ProjectStore {
         document_path_conflicts_in(&self.connection, &relative_path, owner)
     }
 
+    /// Recovers the current registration from an immutable creation/save receipt.
+    pub fn document_for_revision(&self, revision_id: RevisionId) -> Result<DocumentSummary> {
+        let encoded: String = self.connection.query_row(
+            "SELECT document_id FROM revisions WHERE revision_id = ?1",
+            [revision_id.to_string()],
+            |row| row.get(0),
+        )?;
+        let id = parse_id(&encoded, "revision document_id")?;
+        self.registered_document(id)?.ok_or_else(|| {
+            StoreError::CorruptDatabase("Revision lost its registered document".into())
+        })
+    }
+
+    pub fn document_is_deleted(&self, document_id: DocumentId) -> Result<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM document_deletions WHERE document_id = ?1)",
+            [document_id.to_string()],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Resolves one registered document through the primary-key index.
     ///
     /// This is the bounded authority lookup for commands that capture a
@@ -1171,6 +1316,19 @@ impl ProjectStore {
         authority: &mut DocumentFileAuthority,
         requested_title: &str,
     ) -> Result<DocumentSummary> {
+        let display_title = normalize_document_display_title(requested_title)?;
+        let target = document_path_for_title(&authority.document().relative_path, &display_title)?;
+        self.rename_document_to_path(authority, &target, &display_title)
+    }
+
+    /// Applies a shared namespace change through the same no-clobber,
+    /// crash-recoverable path transition as an ordinary document rename.
+    pub fn rename_document_to_path(
+        &mut self,
+        authority: &mut DocumentFileAuthority,
+        target: &str,
+        requested_title: &str,
+    ) -> Result<DocumentSummary> {
         self.recover_document_rename_operations()?;
         if authority.project_id != self.manifest.project_id {
             return Err(StoreError::DocumentFileAuthorityMismatch);
@@ -1178,7 +1336,7 @@ impl ProjectStore {
         let display_title = normalize_document_display_title(requested_title)?;
         authority.revalidate()?;
         let source = authority.document().clone();
-        let target_relative_path = document_path_for_title(&source.relative_path, &display_title)?;
+        let target_relative_path = normalize_document_path(Path::new(target))?;
         ensure_no_pending_document_outbox_in(&self.connection, source.document_id)?;
         self.rename_document_at_lifecycle_boundary(
             authority,
@@ -3594,7 +3752,7 @@ fn normalize_document_display_title(requested: &str) -> Result<String> {
     Ok(title.to_owned())
 }
 
-fn document_path_reservation_key(path: &str) -> String {
+pub fn document_path_reservation_key(path: &str) -> String {
     let normalized = path.nfc().collect::<String>();
     unicase::UniCase::unicode(normalized)
         .to_folded_case()
@@ -3807,6 +3965,96 @@ pub(crate) enum OutboxResult {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_creation_replays_the_original_outbox_then_survives_a_rename() {
+        let directory = tempdir().expect("directory");
+        let (mut store, _) =
+            ProjectStore::initialize(directory.path().join("writing"), "Writing").expect("project");
+        let command = CommandId::new();
+        let text = "An exact first line.\r\n";
+        let result = store.create_document_idempotent_with_boundary(
+            command,
+            "First.md",
+            DocumentContent::Verse(text.into()),
+            "shared document",
+            |_| {
+                Err(StoreError::Io(std::io::Error::other(
+                    "power loss before visible write",
+                )))
+            },
+        );
+        assert!(result.is_err());
+        assert!(!store.root().join("First.md").exists());
+        let root = store.root().to_path_buf();
+        drop(store);
+        let mut store = ProjectStore::open(root).expect("reopen");
+        let replay = store
+            .create_document_idempotent(
+                command,
+                "First.md",
+                DocumentContent::Verse(text.into()),
+                "shared document",
+            )
+            .expect("exact retry");
+        assert!(replay.replayed);
+        assert_eq!(replay.visible_projection, VisibleProjectionState::Applied);
+        let original = store.read_document("First.md").expect("created file");
+        assert_eq!(original.text, text);
+        let mut authority = store.open_document_file("First.md").expect("authority");
+        store
+            .rename_document_to_path(&mut authority, "Poems/Second.md", "Second")
+            .expect("move");
+        store
+            .save_document(
+                "Poems/Second.md",
+                DocumentContent::Verse("A later line.\n".into()),
+                "later human edit",
+            )
+            .expect("later edit");
+        let replay = store
+            .create_document_idempotent(
+                command,
+                "First.md",
+                DocumentContent::Verse(text.into()),
+                "shared document",
+            )
+            .expect("lost old reply after rename");
+        assert!(replay.replayed);
+        assert_eq!(
+            store
+                .document_for_revision(replay.save.revision_id)
+                .expect("current identity")
+                .document_id,
+            original.document_id
+        );
+        assert_eq!(
+            store
+                .read_document("Poems/Second.md")
+                .expect("later file")
+                .text,
+            "A later line.\n"
+        );
+        assert!(!store.root().join("First.md").exists());
+        assert!(
+            store
+                .create_document_idempotent(
+                    command,
+                    "Other.md",
+                    DocumentContent::Verse(text.into()),
+                    "shared document"
+                )
+                .is_err()
+        );
+        assert!(!store.root().join("Other.md").exists());
+        assert_eq!(
+            store
+                .reconstruct_revision(original.revision_id)
+                .expect("immutable source"),
+            text.as_bytes()
+        );
+    }
 
     #[cfg(not(unix))]
     #[test]
@@ -6569,6 +6817,59 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kind, "import");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn derived_creation_replays_exact_evidence_and_preserves_later_writing() {
+        let (_directory, mut store) = new_store();
+        let command = CommandId::new();
+        let evidence = store
+            .store_provenance_blob(b"signed remote assertion")
+            .unwrap();
+        let first = store
+            .create_derived_document_idempotent(
+                command,
+                "Runs/peer.md",
+                DocumentContent::Prose("Remote text".into()),
+                evidence,
+            )
+            .unwrap();
+        std::fs::write(store.root().join("Runs/peer.md"), "My revision").unwrap();
+        let replay = store
+            .create_derived_document_idempotent(
+                command,
+                "Runs/peer.md",
+                DocumentContent::Prose("Remote text".into()),
+                evidence,
+            )
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(first.save, replay.save);
+        let different = store.store_provenance_blob(b"different assertion").unwrap();
+        assert!(matches!(
+            store.create_derived_document_idempotent(
+                command,
+                "Runs/peer.md",
+                DocumentContent::Prose("Remote text".into()),
+                different,
+            ),
+            Err(StoreError::IdempotencyConflict { .. })
+        ));
+        assert!(matches!(
+            store.create_derived_document_idempotent(
+                command,
+                "Runs/peer.md",
+                DocumentContent::Prose("Different text".into()),
+                evidence,
+            ),
+            Err(StoreError::IdempotencyConflict { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(store.root().join("Runs/peer.md")).unwrap(),
+            "My revision"
+        );
+        assert_eq!(store.list_documents().unwrap().len(), 1);
     }
 
     #[cfg(unix)]

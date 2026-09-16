@@ -1,3 +1,6 @@
+pub(crate) mod publication;
+pub(crate) mod shared;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Cursor;
@@ -374,10 +377,26 @@ impl PreparedAttachment {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn prepare_provided(
     project_root: &Path,
     provided: ProvidedAttachment,
+) -> Result<PreparedAttachment, ContextAttachmentError> {
+    prepare_provided_using(project_root, provided, install_immutable)
+}
+
+fn import_provided_using(
+    project_root: &Path,
+    provided: ProvidedAttachment,
+    retain: impl FnMut(&Path, &[u8]) -> Result<(), ContextAttachmentError>,
+) -> Result<StoredAttachment, ContextAttachmentError> {
+    prepare_provided_using(project_root, provided, retain)?.publish()
+}
+
+#[allow(clippy::too_many_lines)]
+fn prepare_provided_using(
+    project_root: &Path,
+    provided: ProvidedAttachment,
+    mut retain: impl FnMut(&Path, &[u8]) -> Result<(), ContextAttachmentError>,
 ) -> Result<PreparedAttachment, ContextAttachmentError> {
     let mut file_name = provided.display_name.clone();
     let byte_count = provided.bytes.len() as u64;
@@ -452,7 +471,7 @@ pub(crate) fn prepare_provided(
                 if format!("{:x}", Sha256::digest(bytes)) != blob.sha256 {
                     return Err(ContextAttachmentError::ContextInvalid);
                 }
-                install_object(project_root, &blob.sha256, bytes)?;
+                retain_object(project_root, &blob.sha256, bytes, &mut retain)?;
                 media_kinds.insert(match kind {
                     MediaKind::Image => "image".to_owned(),
                     MediaKind::Audio => "audio".to_owned(),
@@ -488,7 +507,7 @@ pub(crate) fn prepare_provided(
         match image_as_png(&original) {
             Ok(bytes) => {
                 let sha256 = format!("{:x}", Sha256::digest(&bytes));
-                install_object(project_root, &sha256, &bytes)?;
+                retain_object(project_root, &sha256, &bytes, &mut retain)?;
                 media_kinds.insert("image".to_owned());
                 stored_media.push(StoredMedia {
                     id: sha256.clone(),
@@ -522,7 +541,7 @@ pub(crate) fn prepare_provided(
     }
     // Retaining an original does not assert extraction or model support.
     // Identity is the root's content hash, shared with its immutable receipt.
-    install_object(project_root, &id, &original)?;
+    retain_object(project_root, &id, &original, &mut retain)?;
     if canonical_text.is_empty() && stored_media.is_empty() {
         warnings.push(
             "Original file retained. No supported text or native media was extracted; this file is not sent to the model.".to_owned(),
@@ -552,7 +571,7 @@ pub(crate) fn prepare_provided(
     let canonical_text_sha256 = (!canonical_text.is_empty())
         .then(|| format!("{:x}", Sha256::digest(canonical_text.as_bytes())));
     if let Some(sha256) = canonical_text_sha256.as_deref() {
-        install_object(project_root, sha256, canonical_text.as_bytes())?;
+        retain_object(project_root, sha256, canonical_text.as_bytes(), &mut retain)?;
     }
     let inline_markdown = inline_attachment_markdown(&id, &file_name);
     let attachment = StoredAttachment {
@@ -614,12 +633,9 @@ pub(crate) fn prepare_provided(
         temporary: temporary_sibling(&destination),
         destination,
     };
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staged.temporary)?;
-    serde_json::to_writer_pretty(&mut file, &manifest)?;
-    file.sync_all()?;
+    // Shared inspection charges its staging bytes to the same cache budget.
+    // Publication only links this already-retained manifest into place.
+    retain(&staged.temporary, &serde_json::to_vec_pretty(&manifest)?)?;
     let mut result = attachment;
     result.media_markdown = editor_media_markdown(&result, &manifest.media);
     result.editable_markdown = (!canonical_text.is_empty()).then_some(canonical_text);
@@ -1034,7 +1050,9 @@ pub(crate) fn resolve_for_generation_with_budget(
     branch_count: u32,
     max_generated_tokens: u32,
 ) -> Result<ResolvedContext, ContextAttachmentError> {
-    let (context, manifests) = admit_context(project_root, document_id, manuscript_prefix)?;
+    let admitted = admit_context(project_root, document_id, manuscript_prefix)?;
+    let context = &admitted.context;
+    let manifests = &admitted.manifests;
     let ordered_ids = manifests
         .iter()
         .map(|(id, _)| id.clone())
@@ -1075,7 +1093,7 @@ pub(crate) fn resolve_for_generation_with_budget(
             .map(|(id, manifest)| attachment_text_fingerprint(id, manifest))
             .collect(),
         manual_text_sha256: manual_text_sha256.clone(),
-        context_revision: context_revision(&context)?,
+        context_revision: context_revision(context)?,
         manuscript_query_sha256: query_sha256.clone(),
         retrieval_rebalance_epoch: rebalance_epoch,
         context_budget,
@@ -1084,7 +1102,7 @@ pub(crate) fn resolve_for_generation_with_budget(
         (cached.text, cached.excerpts)
     } else {
         let mut sources = Vec::new();
-        for (id, manifest) in &manifests {
+        for (id, manifest) in manifests {
             let canonical_text = match context
                 .materials
                 .iter()
@@ -1092,7 +1110,7 @@ pub(crate) fn resolve_for_generation_with_budget(
                 .and_then(|material| material.excerpt.as_ref())
             {
                 Some(excerpt) => excerpt.clone(),
-                None => read_canonical_text(project_root, manifest)?,
+                None => read_canonical_text(admitted.source_root(project_root, id), manifest)?,
             };
             if !canonical_text.is_empty() {
                 sources.push((id.clone(), manifest.attachment.clone(), canonical_text));
@@ -1109,7 +1127,7 @@ pub(crate) fn resolve_for_generation_with_budget(
         );
         (text, excerpts)
     };
-    let media = load_admitted_media(project_root, manifests)?;
+    let media = load_admitted_media(project_root, &admitted)?;
     let manuscript_budget = prompt_byte_budget.saturating_sub(text.len());
     let (manuscript_prompt, omitted) = middle_out_manuscript(manuscript_prefix, manuscript_budget);
     let retained_head_end = omitted.map_or(manuscript_prefix.len(), |(start, _)| start);
@@ -1134,8 +1152,8 @@ pub(crate) fn resolve_for_generation_with_budget(
         attachment_ids: ordered_ids,
         retrieval_evidence: ContextRetrievalEvidence {
             schema: RETRIEVAL_SCHEMA.to_owned(),
-            context_revision: context_revision(&context)?,
-            materials: context.materials,
+            context_revision: context_revision(context)?,
+            materials: context.materials.clone(),
             manuscript_prefix_sha256: format!("{:x}", Sha256::digest(manuscript_prefix.as_bytes())),
             manuscript_window_start_byte: manuscript_window_start as u64,
             manuscript_window_end_byte: manuscript_window_end as u64,
@@ -1157,17 +1175,40 @@ pub(crate) fn resolve_for_generation_with_budget(
 /// Admission uses current selected source revisions, never a cached selection.
 /// Cached text is an immutable derivative of previously hash-verified bytes:
 /// disk changes cannot modify it. A cache miss always verifies source bytes.
+struct AdmittedContext {
+    context: DocumentContext,
+    manifests: Vec<(String, AttachmentManifest)>,
+    inline_root: PathBuf,
+}
+
+impl AdmittedContext {
+    fn source_root<'a>(&'a self, project_root: &'a Path, id: &str) -> &'a Path {
+        if self
+            .context
+            .materials
+            .iter()
+            .any(|material| material.attachment_id == id)
+        {
+            project_root
+        } else {
+            &self.inline_root
+        }
+    }
+}
+
 fn admit_context(
     project_root: &Path,
     document_id: &str,
     manuscript: &str,
-) -> Result<(DocumentContext, Vec<(String, AttachmentManifest)>), ContextAttachmentError> {
+) -> Result<AdmittedContext, ContextAttachmentError> {
     let contexts = read_contexts(project_root)?;
     let context = contexts
         .documents
         .get(document_id)
         .cloned()
         .unwrap_or_default();
+    let inline_root = shared::inline_root(project_root, document_id)?;
+    shared::prepare_inline_images(&inline_root, manuscript)?;
     let mut ids = authoritative_context_ids(&contexts, document_id);
     for id in inline_attachment_ids(manuscript) {
         if !ids.contains(&id) {
@@ -1175,24 +1216,32 @@ fn admit_context(
         }
     }
     let ids = ordered_unique_attachment_ids(&ids)?;
-    let manifests = manifest_metadata_for_ids(project_root, &ids)?;
-    for (id, manifest) in &manifests {
-        if let Some(material) = context
+    let mut admitted = AdmittedContext {
+        context,
+        manifests: Vec::with_capacity(ids.len()),
+        inline_root,
+    };
+    for id in ids {
+        let source_root = admitted.source_root(project_root, &id);
+        let manifest = read_manifest_metadata(source_root, &id)?;
+        if let Some(material) = admitted
+            .context
             .materials
             .iter()
-            .find(|material| material.attachment_id == *id)
+            .find(|material| material.attachment_id == id)
         {
-            validate_material(material, manifest)?;
+            validate_material(material, &manifest)?;
         }
         // Existence and shape checks establish current availability, not content
         // integrity. Only verified retained derivatives may skip payload reads.
-        check_object_metadata(project_root, id, manifest.attachment.byte_count)?;
+        check_object_metadata(source_root, &id, manifest.attachment.byte_count)?;
         if let Some(hash) = &manifest.canonical_text_sha256 {
-            check_object_metadata(project_root, hash, manifest.attachment.text_bytes)?;
+            check_object_metadata(source_root, hash, manifest.attachment.text_bytes)?;
         }
+        admitted.manifests.push((id, manifest));
     }
-    preflight_native_media(&manifests)?;
-    Ok((context, manifests))
+    preflight_native_media(&admitted.manifests)?;
+    Ok(admitted)
 }
 
 pub(crate) fn resolve_media_for_document(
@@ -1200,23 +1249,48 @@ pub(crate) fn resolve_media_for_document(
     document_id: &str,
     manuscript: &str,
 ) -> Result<Vec<MediaInput>, ContextAttachmentError> {
-    let (_, manifests) = admit_context(project_root, document_id, manuscript)?;
-    load_admitted_media(project_root, manifests)
+    let admitted = admit_context(project_root, document_id, manuscript)?;
+    load_admitted_media(project_root, &admitted)
+}
+
+/// References authorize media in visible document text, never its private context.
+pub(crate) fn resolve_inline_media(
+    project_root: &Path,
+    document_id: &str,
+    markdown: &str,
+) -> Result<Vec<MediaInput>, ContextAttachmentError> {
+    let inline_root = shared::inline_root(project_root, document_id)?;
+    shared::prepare_inline_images(&inline_root, markdown)?;
+    let ids = ordered_unique_attachment_ids(&inline_attachment_ids(markdown))?;
+    let manifests = manifest_metadata_for_ids(&inline_root, &ids)?;
+    preflight_native_media(&manifests)?;
+    load_admitted_media(
+        project_root,
+        &AdmittedContext {
+            context: DocumentContext::default(),
+            manifests,
+            inline_root,
+        },
+    )
 }
 
 fn load_admitted_media(
     project_root: &Path,
-    manifests: Vec<(String, AttachmentManifest)>,
+    admitted: &AdmittedContext,
 ) -> Result<Vec<MediaInput>, ContextAttachmentError> {
     let mut media = Vec::new();
-    for (id, manifest) in manifests {
-        for item in manifest.media {
-            let bytes = read_object(project_root, &item.sha256, item.byte_count)?;
+    for (id, manifest) in &admitted.manifests {
+        for item in &manifest.media {
+            let bytes = read_object(
+                admitted.source_root(project_root, id),
+                &item.sha256,
+                item.byte_count,
+            )?;
             media.push(MediaInput {
                 id: format!("{id}:{}", item.id),
                 kind: item.kind,
-                mime: item.mime,
-                sha256: item.sha256,
+                mime: item.mime.clone(),
+                sha256: item.sha256.clone(),
                 bytes,
             });
         }
@@ -1852,6 +1926,12 @@ fn inline_attachment_ids(markdown: &str) -> Vec<String> {
         }
         rest = &rest[end + 1..];
     }
+    for name in crate::attachments::inline_image_assets(markdown) {
+        let id = &name[..64];
+        if !ids.iter().any(|item| item == id) {
+            ids.push(id.to_owned());
+        }
+    }
     ids
 }
 
@@ -1876,12 +1956,21 @@ fn install_object(
     sha256: &str,
     bytes: &[u8],
 ) -> Result<(), ContextAttachmentError> {
+    retain_object(project_root, sha256, bytes, install_immutable)
+}
+
+fn retain_object(
+    project_root: &Path,
+    sha256: &str,
+    bytes: &[u8],
+    mut retain: impl FnMut(&Path, &[u8]) -> Result<(), ContextAttachmentError>,
+) -> Result<(), ContextAttachmentError> {
     if !is_sha256(sha256) || format!("{:x}", Sha256::digest(bytes)) != sha256 {
         return Err(ContextAttachmentError::ContextInvalid);
     }
     let root = attachment_root(project_root)?;
     let path = root.join("objects").join(sha256);
-    install_immutable(&path, bytes)
+    retain(&path, bytes)
 }
 
 fn read_object(
@@ -1927,12 +2016,20 @@ pub(crate) fn record_import_origin(
     project_root: &Path,
     origin: &impl Serialize,
 ) -> Result<(), ContextAttachmentError> {
+    record_import_origin_using(project_root, origin, install_immutable)
+}
+
+fn record_import_origin_using(
+    project_root: &Path,
+    origin: &impl Serialize,
+    mut retain: impl FnMut(&Path, &[u8]) -> Result<(), ContextAttachmentError>,
+) -> Result<(), ContextAttachmentError> {
     let bytes = serde_json::to_vec_pretty(origin)?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
     let path = attachment_root(project_root)?
         .join("manifests")
         .join(format!("source-{hash}.json"));
-    install_immutable(&path, &bytes)
+    retain(&path, &bytes)
 }
 
 #[cfg(test)]
@@ -1949,12 +2046,17 @@ fn read_manifest_metadata(
     project_root: &Path,
     id: &str,
 ) -> Result<AttachmentManifest, ContextAttachmentError> {
-    read_manifest_if_present(project_root, id)?.ok_or_else(|| {
-        ContextAttachmentError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "attachment manifest does not exist",
-        ))
-    })
+    if let Some(manifest) = read_manifest_if_present(project_root, id)? {
+        return Ok(manifest);
+    }
+    if shared::inspect_published(project_root, id)? {
+        return read_manifest_if_present(project_root, id)?
+            .ok_or(ContextAttachmentError::ContextInvalid);
+    }
+    Err(ContextAttachmentError::Io(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "attachment is unavailable or still downloading",
+    )))
 }
 
 fn read_manifest_if_present(

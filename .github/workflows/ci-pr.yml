@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUSTUP_TOOLCHAIN: "1.92.0"
+  RUSTUP_TOOLCHAIN: "1.95.0"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -44,7 +44,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
       - id: plan
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -60,7 +60,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           cache-on-failure: true
@@ -91,13 +91,14 @@ jobs:
             librsvg2-dev libwebkit2gtk-4.1-dev patchelf pkg-config
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
           components: ${{ matrix.command == 'test' && 'rustfmt' || 'clippy' }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           cache-on-failure: true
           shared-key: root-linux
           save-if: ${{ matrix.command == 'test' }}
+      - uses: ./.github/actions/loom-signal
       - if: ${{ matrix.command == 'test' }}
         run: cargo fmt --all -- --check
       - if: ${{ matrix.command == 'test' }}
@@ -115,7 +116,7 @@ jobs:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           cache-on-failure: true
@@ -130,7 +131,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
@@ -147,7 +148,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
@@ -173,7 +174,7 @@ jobs:
             librsvg2-dev libwebkit2gtk-4.1-dev patchelf pkg-config
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
@@ -192,7 +193,7 @@ jobs:
       - run: git config --global core.longpaths true
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           cache-on-failure: true
@@ -215,7 +216,7 @@ jobs:
             librsvg2-dev libwebkit2gtk-4.1-dev patchelf pkg-config
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
@@ -244,7 +245,7 @@ jobs:
             librsvg2-dev libwebkit2gtk-4.1-dev patchelf pkg-config
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
@@ -265,7 +266,7 @@ jobs:
       - run: git config --global core.longpaths true
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           cache-on-failure: true
@@ -292,13 +293,14 @@ jobs:
             librsvg2-dev libwebkit2gtk-4.1-dev patchelf pkg-config
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           cache-on-failure: true
           shared-key: loom-linux
           save-if: ${{ matrix.command == 'test' }}
+      - uses: ./.github/actions/loom-signal
       - if: ${{ matrix.command == 'test' }}
         run: node scripts/ci/cargo-group.mjs fmt product-loom
       - if: ${{ matrix.command == 'test' }}
@@ -315,12 +317,13 @@ jobs:
       - run: git config --global core.longpaths true
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           cache-on-failure: true
           shared-key: loom-windows
           cache-directories: ~/AppData/Local/ort.pyke.io/dfbin
+      - uses: ./.github/actions/loom-signal
       - run: node scripts/ci/cargo-group.mjs test product-loom
 
       - name: Inspect Windows native loader failure
@@ -370,7 +373,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           cache-on-failure: true
@@ -393,6 +396,9 @@ jobs:
         if: ${{ matrix.component == 'release' }}
         run: cargo run --locked -p xtask -- macos-smoke-support target/macos-smoke-support
       - name: Root platform graph
+        if: ${{ matrix.component == 'root' || matrix.component == 'loom' }}
+        uses: ./.github/actions/loom-signal
+      - name: Check root platform graph
         if: ${{ matrix.component == 'root' }}
         run: cargo check --locked --workspace --all-targets
       - name: Mom macOS parity
@@ -423,7 +429,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
       - run: cargo metadata --locked --no-deps
       - run: cargo tree -d
       - run: cargo tree --locked -i libsqlite3-sys
@@ -450,12 +456,13 @@ jobs:
             librsvg2-dev libwebkit2gtk-4.1-dev patchelf pkg-config
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
-          toolchain: "1.92.0"
+          toolchain: "1.95.0"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           cache-on-failure: true
           shared-key: ignored-tests-${{ runner.os }}
           cache-directories: ${{ runner.os == 'macOS' && '~/Library/Caches/ort.pyke.io/dfbin' || runner.os == 'Windows' && '~/AppData/Local/ort.pyke.io/dfbin' || '' }}
+      - uses: ./.github/actions/loom-signal
       - name: Reconcile exact ignored-test inventory with guarded list arguments
         run: node scripts/ci/validate-ignored-tests.mjs --cargo-list
       - name: Inspect Windows native loader failure

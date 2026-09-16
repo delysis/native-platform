@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 44,
+  "expected_test_count": 46,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -272,7 +272,7 @@
     {
       "package": "tauri-plugin-loom",
       "src_path": "products/loom/crates/tauri-plugin-loom/build.rs",
-      "sha256": "5cf4d092fc78b4c40b43da7975f936c71fcab079c9f516a76832ebc8683cdbbe"
+      "sha256": "b03fce2289c0a3b78986ee36cfdee7cf55e932b00afbedd40cfc7b290e65f103"
     },
     {
       "package": "mom-llama-app",
@@ -290,8 +290,8 @@
       "required_environment": [
         "MOM_LLAMA_MODEL_PATH"
       ],
-      "evidence_class": "real-model-runtime",
-      "promotion_prohibition": "Passing this vocabulary test alone cannot promote inference quality, product, packaged-app, cross-platform, or release readiness.",
+      "evidence_class": "real-model-metadata",
+      "promotion_prohibition": "Passing vocabulary decoding cannot promote live inference, product, packaged-app, cross-platform, or release readiness.",
       "platforms": [
         "linux",
         "macos",
@@ -1023,6 +1023,38 @@
       ],
       "evidence_class": "real-product-model-runtime",
       "promotion_prohibition": "Passing this runtime test cannot promote device-wide memory safety, visible model UX, packaged-app, or release readiness.",
+      "platforms": [
+        "linux",
+        "macos"
+      ]
+    },
+    {
+      "test_id": "peer_compute::tests::real_native_model_job_crosses_quic_without_borrowing_the_active_manuscript",
+      "package": "tauri-plugin-loom",
+      "target": "lib",
+      "source": "products/loom/crates/tauri-plugin-loom/src/peer_compute_tests.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH and executes a real local model through authenticated peer compute; private project storage requires Unix",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local model and QUIC test cannot promote native sharing UI, Signal linking, Internet NAT traversal, or release acceptance.",
+      "platforms": [
+        "linux",
+        "macos"
+      ]
+    },
+    {
+      "test_id": "peer_compute::tests::real_native_gemma4_image_and_audio_job_crosses_quic_with_exact_media_evidence",
+      "package": "tauri-plugin-loom",
+      "target": "lib",
+      "source": "products/loom/crates/tauri-plugin-loom/src/peer_compute_tests.rs",
+      "prerequisite": "requires MOM_LLAMA_MODEL_PATH pointing at the pinned Gemma 4 catalog model with its projector; executes real image and audio inference through peer compute; private project storage requires Unix",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this local model and QUIC test cannot promote native sharing UI, Signal linking, Internet NAT traversal, or release acceptance.",
       "platforms": [
         "linux",
         "macos"

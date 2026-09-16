@@ -538,10 +538,17 @@ pub struct GenerationPersistenceFailure {
 #[derive(Debug)]
 struct ActiveFamily {
     identity: GenerationFamilyIdentity,
+    resource: GenerationResource,
     branches: Vec<(GenerationRunId, BranchId)>,
     cancellation: Option<Arc<dyn BranchCancellation>>,
     pending_cancellations: BTreeSet<BranchId>,
     terminal_persistence_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerationResource {
+    LocalModel,
+    RemoteModel,
 }
 
 #[derive(Debug, Default)]
@@ -592,6 +599,7 @@ impl GenerationRegistry {
             registration.identity,
             registration.branches,
             Some(registration.cancellation),
+            GenerationResource::LocalModel,
         )
     }
 
@@ -605,7 +613,17 @@ impl GenerationRegistry {
         identity: GenerationFamilyIdentity,
         branches: Vec<(GenerationRunId, BranchId)>,
     ) -> Result<(), GenerationRegistryError> {
-        self.insert_family(identity, branches, None)
+        self.insert_family(identity, branches, None, GenerationResource::LocalModel)
+    }
+
+    /// Remote work still belongs to its session and participates in cancellation
+    /// and shutdown, but it cannot reserve this device's native model.
+    pub fn reserve_remote(
+        &self,
+        identity: GenerationFamilyIdentity,
+        branches: Vec<(GenerationRunId, BranchId)>,
+    ) -> Result<(), GenerationRegistryError> {
+        self.insert_family(identity, branches, None, GenerationResource::RemoteModel)
     }
 
     pub fn attach_cancellation(
@@ -653,6 +671,7 @@ impl GenerationRegistry {
         identity: GenerationFamilyIdentity,
         branches: Vec<(GenerationRunId, BranchId)>,
         cancellation: Option<Arc<dyn BranchCancellation>>,
+        resource: GenerationResource,
     ) -> Result<(), GenerationRegistryError> {
         if identity.request_id.trim().is_empty() {
             return Err(GenerationRegistryError::EmptyRequestId);
@@ -711,6 +730,7 @@ impl GenerationRegistry {
             request_id,
             ActiveFamily {
                 identity,
+                resource,
                 branches,
                 cancellation,
                 pending_cancellations: BTreeSet::new(),
@@ -809,6 +829,16 @@ impl GenerationRegistry {
 
     pub fn active_branch_count(&self) -> Result<usize, GenerationRegistryError> {
         Ok(self.lock()?.branch_requests.len())
+    }
+
+    pub fn active_local_branch_count(&self) -> Result<usize, GenerationRegistryError> {
+        Ok(self
+            .lock()?
+            .families
+            .values()
+            .filter(|family| family.resource == GenerationResource::LocalModel)
+            .map(|family| family.branches.len())
+            .sum())
     }
 
     pub fn mark_terminal_persistence_failure(
@@ -1622,6 +1652,70 @@ mod tests {
         assert_eq!(
             gate.admit_automation(),
             Err(AgencyAdmissionError::AutomationDisabled)
+        );
+    }
+
+    #[test]
+    fn remote_work_keeps_session_cancellation_without_claiming_a_local_model() {
+        let registry = GenerationRegistry::new(2).expect("registry");
+        let project = ProjectId::new();
+        let session = CommandId::new();
+        let run = GenerationRunId::new();
+        let branch = BranchId::new();
+        let cancellation = Arc::new(FakeCancellation::default());
+        let registration = family(
+            "remote",
+            project,
+            session,
+            vec![(run, branch)],
+            cancellation.clone(),
+        );
+        registry
+            .reserve_remote(registration.identity, registration.branches)
+            .expect("remote reservation");
+        assert_eq!(registry.active_branch_count().expect("all resources"), 1);
+        assert_eq!(
+            registry
+                .active_local_branch_count()
+                .expect("local resource"),
+            0
+        );
+        assert!(
+            registry
+                .has_active_session(project, session)
+                .expect("session still owned")
+        );
+        registry
+            .cancel_run(project, session, run)
+            .expect("cancel before attachment");
+        registry
+            .attach_cancellation("remote", cancellation.clone())
+            .expect("route cancellation");
+        assert_eq!(
+            *cancellation.branches.lock().expect("cancelled"),
+            vec![branch]
+        );
+        let local = family(
+            "local",
+            project,
+            session,
+            vec![(GenerationRunId::new(), BranchId::new())],
+            cancellation,
+        );
+        registry.register(local).expect("local work may coexist");
+        assert_eq!(
+            registry
+                .active_local_branch_count()
+                .expect("local resource"),
+            1
+        );
+        registry.complete_family("remote").expect("remote joined");
+        assert_eq!(registry.active_branch_count().expect("local remains"), 1);
+        registry.complete_family("local").expect("local joined");
+        assert!(
+            !registry
+                .has_active_session(project, session)
+                .expect("session free")
         );
     }
 

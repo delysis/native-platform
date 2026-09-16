@@ -14,6 +14,8 @@ vi.mock('@tauri-apps/api/core', () => ({
 
 import {
   applicationClosePending,
+  cancelTerminalRun,
+  runTerminal,
   closeProject,
   currentProjectSession,
   exportDocumentCopy,
@@ -88,6 +90,29 @@ describe('session IPC admission', () => {
 
     projectRead.reject(new Error('done'));
     await expect(page).rejects.toThrow('done');
+  });
+
+  it('does not hold the editing lane while a peer cancellation reply is missing', async () => {
+    installDesktopRuntime();
+    const cancellation = deferred<void>();
+    mocks.invoke.mockImplementation((command: string) => command === 'plugin:loom|terminal_cancel' ? cancellation.promise : Promise.resolve(null));
+    const stopping = cancelTerminalRun('project', 'session', 'run');
+    await expect(currentProjectSession()).resolves.toBeNull();
+    expect(mocks.invoke.mock.calls.map(([command]) => command)).toEqual(['plugin:loom|terminal_cancel', 'plugin:loom|project_current']);
+    cancellation.resolve(); await stopping;
+  });
+
+  it('dispatches an explicit peer target through peer authority and never falls back on a lost reply', async () => {
+    installDesktopRuntime();
+    const request = {
+      projectId: 'project', sessionId: 'session', commandId: 'run', documentId: 'document',
+      sourceRevisionId: 'revision', expectedVisibleBlobId: 'blob', sourceStartByte: 0, sourceEndByte: 0, expression: 'A shared garden',
+      remoteTarget: { host: 'bob', roster_hash: 'roster', grant: { id: 'grant', cabal: 'cabal', epoch: 1, peer: 'alice',
+        model: { media: [], name: 'Shared Gemma', fingerprint: 'model' }, max_output_tokens: 256, max_seconds: 30, jobs: 8 } }
+    };
+    mocks.invoke.mockRejectedValue(new Error('Lost reply'));
+    await expect(runTerminal(request)).rejects.toThrow('Lost reply');
+    expect(mocks.invoke.mock.calls).toEqual([['plugin:loom|terminal_run_peer', { request }]]);
   });
 
   it('starts session-bound commands in FIFO order and continues after a failure', async () => {

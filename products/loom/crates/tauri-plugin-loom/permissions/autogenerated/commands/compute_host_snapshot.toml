@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-compute-host-snapshot"
+description = "Enables the compute_host_snapshot command without any pre-configured scope."
+commands.allow = ["compute_host_snapshot"]
+
+[[permission]]
+identifier = "deny-compute-host-snapshot"
+description = "Denies the compute_host_snapshot command without any pre-configured scope."
+commands.deny = ["compute_host_snapshot"]

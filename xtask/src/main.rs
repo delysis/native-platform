@@ -2,6 +2,7 @@
 
 mod macos_smoke_support;
 mod model_check;
+mod signal_source;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -28,7 +29,8 @@ fn main() -> Result<()> {
         "macos-smoke-support" => {
             macos_smoke_support::run(&workspace_root(), &arguments.collect::<Vec<_>>())
         }
-        _ => bail!("usage: cargo xtask <policy|model-check|macos-smoke-support>"),
+        "signal-source" => signal_source::run(&workspace_root(), &arguments.collect::<Vec<_>>()),
+        _ => bail!("usage: cargo xtask <policy|model-check|macos-smoke-support|signal-source>"),
     }
 }
 
@@ -50,7 +52,7 @@ fn check_workspace(root: &Path) -> Result<()> {
     let cargo: toml::Value = toml::from_str(&cargo_text).context("parse root Cargo.toml")?;
     ensure!(cargo["workspace"]["resolver"].as_str() == Some("3"));
     ensure!(cargo["workspace"]["package"]["edition"].as_str() == Some("2024"));
-    ensure!(cargo["workspace"]["package"]["rust-version"].as_str() == Some("1.92"));
+    ensure!(cargo["workspace"]["package"]["rust-version"].as_str() == Some("1.95"));
     ensure!(
         cargo["workspace"]["exclude"]
             .as_array()
@@ -61,11 +63,12 @@ fn check_workspace(root: &Path) -> Result<()> {
                     .collect::<BTreeSet<_>>()
                     == BTreeSet::from([
                         "crates/services/attachment/fuzz",
+                        "products/loom/signal",
                         "vendor/glib",
                         "vendor/ort-sys",
                     ])
             }),
-        "only the Attachment fuzz workspace and patched external GLib/ort-sys crates may be excluded"
+        "only Attachment fuzzing, the Signal SQLCipher worker, and patched external GLib/ort-sys may be excluded"
     );
 
     let output = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
@@ -123,6 +126,7 @@ fn check_workspace(root: &Path) -> Result<()> {
             == BTreeSet::from([
                 root.join("Cargo.toml"),
                 root.join("crates/services/attachment/fuzz/Cargo.toml"),
+                root.join("products/loom/signal/Cargo.toml"),
             ]),
         "unknown nested Cargo workspace"
     );
@@ -131,6 +135,7 @@ fn check_workspace(root: &Path) -> Result<()> {
             == BTreeSet::from([
                 root.join("Cargo.lock"),
                 root.join("crates/services/attachment/fuzz/Cargo.lock"),
+                root.join("products/loom/signal/Cargo.lock"),
                 // Published dependency source; the root lock resolves this patch.
                 root.join("vendor/ort-sys/Cargo.lock"),
             ]),
@@ -255,16 +260,28 @@ fn check_git_dependencies(value: &toml::Value, manifest: &Path) -> Result<()> {
         }
         toml::Value::Table(table) => {
             if let Some(repository) = table.get("git").and_then(toml::Value::as_str) {
+                let revision = match repository.trim_end_matches(".git") {
+                    "https://github.com/delysis/llama-cpp-rs" => {
+                        "eb0e47b57c2fba97ed13e8fe5e949d11798232cb"
+                    }
+                    "https://github.com/whisperfish/presage"
+                        if manifest.ends_with("products/loom/signal/Cargo.toml") =>
+                    {
+                        "3a45e915520348cbd93fc13de47c482b8e855c99"
+                    }
+                    "https://github.com/whisperfish/libsignal-service-rs"
+                        if manifest.ends_with("products/loom/signal/vendor/presage/Cargo.toml") =>
+                    {
+                        "9e6c08b8e6d413391831dc49065e5b05490d6c82"
+                    }
+                    _ => anyhow::bail!(
+                        "forbidden Git dependency in {}: {repository}",
+                        manifest.display()
+                    ),
+                };
                 ensure!(
-                    repository.trim_end_matches(".git")
-                        == "https://github.com/delysis/llama-cpp-rs",
-                    "forbidden Git dependency in {}: {repository}",
-                    manifest.display()
-                );
-                ensure!(
-                    table.get("rev").and_then(toml::Value::as_str)
-                        == Some("eb0e47b57c2fba97ed13e8fe5e949d11798232cb"),
-                    "unsealed llama-cpp-rs dependency: {}",
+                    table.get("rev").and_then(toml::Value::as_str) == Some(revision),
+                    "unsealed Git dependency: {}",
                     manifest.display()
                 );
             }
@@ -426,10 +443,37 @@ mod tests {
         .expect("test manifest parses");
         let error = check_git_dependencies(&manifest, Path::new("Cargo.toml"))
             .expect_err("moving external revision must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("unsealed llama-cpp-rs dependency")
-        );
+        assert!(error.to_string().contains("unsealed Git dependency"));
+    }
+
+    #[test]
+    fn signal_git_dependency_is_confined_to_its_worker_and_exact_revision() {
+        let mut manifest: toml::Value = toml::from_str(
+            r#"dependency = { git = "https://github.com/whisperfish/presage", rev = "3a45e915520348cbd93fc13de47c482b8e855c99" }"#,
+        )
+        .expect("test manifest parses");
+        let worker = Path::new("products/loom/signal/Cargo.toml");
+        check_git_dependencies(&manifest, worker).expect("pinned isolated client");
+        assert!(check_git_dependencies(&manifest, Path::new("Cargo.toml")).is_err());
+        manifest["dependency"]["rev"] = toml::Value::String("main".into());
+        assert!(check_git_dependencies(&manifest, worker).is_err());
+    }
+
+    #[test]
+    fn vendored_signal_client_keeps_its_existing_service_pin_isolated() {
+        let mut dependency: toml::Value = toml::from_str(
+            r#"dependency = { git = "https://github.com/whisperfish/libsignal-service-rs", rev = "9e6c08b8e6d413391831dc49065e5b05490d6c82" }"#,
+        ).expect("manifest");
+        let vendored = Path::new("products/loom/signal/vendor/presage/Cargo.toml");
+        check_git_dependencies(&dependency, vendored).expect("unchanged upstream pin");
+        for other in [
+            "Cargo.toml",
+            "products/loom/signal/Cargo.toml",
+            "vendor/presage/Cargo.toml",
+        ] {
+            assert!(check_git_dependencies(&dependency, Path::new(other)).is_err());
+        }
+        dependency["dependency"]["rev"] = toml::Value::String("main".into());
+        assert!(check_git_dependencies(&dependency, vendored).is_err());
     }
 }

@@ -6,6 +6,10 @@ This repository is an executable development foundation, not a finished release.
 
 See [Implementation status](docs/implementation-status.md) for the exact verified/deferred boundary and current schema policy. [Project format v1](docs/format-v1.md) records the format rationale.
 
+The cabals feature adds explicitly shared workspaces and a linked Signal pane.
+[Networking](docs/networking.md) records its authority boundaries, build requirements,
+current implementation limits, and outstanding runtime acceptance.
+
 Project storage currently requires Unix private permissions and directory sync.
 Other platforms return `private_storage_unsupported` before creating or opening
 a project. The unreleased database accepts only its current schema; old stores
@@ -38,10 +42,11 @@ Loom uses root-workspace path dependencies in `crates/native`. The root `Cargo.l
 
 ## Build and test
 
-The root workspace pins Rust 1.92.0. Node.js and pnpm are also required. From the monorepo root:
+The root workspace pins Rust 1.95.0. Node.js and pnpm are also required. From the monorepo root:
 
 ```sh
 pnpm install --frozen-lockfile
+node scripts/build-loom-signal.mjs
 
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings

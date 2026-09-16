@@ -143,6 +143,28 @@ test("only the targeted PR, full, and asynchronous release workflows remain acti
   assert.equal(fs.existsSync(releasePath), true);
 });
 
+test("dependency auditing covers every owned Cargo lock with its license policy", () => {
+  const workflow = read(path.join(root, ".github/workflows/dependencies.yml"));
+  for (const command of [
+    "cargo deny --locked check advisories licenses sources",
+    "cargo deny --manifest-path crates/services/attachment/fuzz/Cargo.toml --locked --config deny.toml check advisories licenses sources",
+    "cargo deny --manifest-path products/loom/signal/Cargo.toml --locked --config products/loom/signal/deny.toml check advisories licenses sources",
+  ]) {
+    assert.ok(workflow.includes(command), `missing dependency audit: ${command}`);
+  }
+  assert.ok(workflow.includes("'**/deny.toml'"), "worker policy edits must trigger an audit");
+});
+
+test("Signal checks establish both lint components and precede full inventory compilation", () => {
+  const action = read(path.join(root, ".github/actions/loom-signal/action.yml"));
+  const setup = action.indexOf("run: rustup component add rustfmt clippy");
+  assert.ok(setup >= 0 && setup < action.indexOf("cargo fmt --manifest-path"));
+  const inventory = read(prPath).match(/^  ignored-tests:[\s\S]*?(?=^  fuzz-build:)/m)?.[0];
+  assert.ok(inventory);
+  const worker = inventory.indexOf("uses: ./.github/actions/loom-signal");
+  assert.ok(worker >= 0 && worker < inventory.indexOf("node scripts/ci/validate-ignored-tests.mjs --cargo-list"));
+});
+
 test("Mom retains the Windows resource icon required by Tauri builds", () => {
   const icon = fs.readFileSync(momWindowsIconPath);
   assert.deepEqual([...icon.subarray(0, 4)], [0, 0, 1, 0]);

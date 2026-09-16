@@ -274,7 +274,7 @@ impl ImportOperation {
                     return Err(failure("Import stopped."));
                 }
                 tokio::select! {
-                    result = tokio::time::timeout(std::time::Duration::from_secs(180), work) =>
+                    result = tokio::time::timeout(std::time::Duration::from_mins(3), work) =>
                         result.map_err(|_| failure("The import reached its three-minute limit."))?,
                     _ = signal.changed() => Err(failure("Import stopped.")),
                 }

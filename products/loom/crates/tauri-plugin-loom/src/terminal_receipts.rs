@@ -1,10 +1,54 @@
-//! Immutable JSON receipts, published only after their complete bytes are durable.
+//! Immutable JSON receipts and a separate replaceable last-observation note.
+//! Observations explain interrupted delivery; they never establish a peer outcome.
 
 use std::path::{Path, PathBuf};
 
 use super::IpcFailure;
 
 const MAX_BYTES: usize = 512 * 1024;
+const MAX_OBSERVATION_BYTES: usize = 4096;
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct Observation {
+    run_id: String,
+    message: String,
+}
+
+fn observation_name(id: &str) -> Result<String, IpcFailure> {
+    file_name(id, false)?;
+    Ok(format!("{id}.last-observation.json"))
+}
+
+pub(super) fn observation(root: &Path, id: &str) -> Result<Option<String>, IpcFailure> {
+    let Some(bytes) = read_named(root, &observation_name(id)?)? else {
+        return Ok(None);
+    };
+    let note: Observation = serde_json::from_slice(&bytes)
+        .map_err(|_| failure("The saved delivery observation is invalid."))?;
+    if note.run_id != id || note.message.len() > MAX_OBSERVATION_BYTES {
+        return Err(failure("The saved delivery observation is invalid."));
+    }
+    Ok(Some(note.message))
+}
+
+pub(super) fn save_observation(root: &Path, id: &str, message: &str) -> Result<(), IpcFailure> {
+    // Preserve incompatible notes instead of silently replacing them.
+    observation(root, id)?;
+    let name = observation_name(id)?;
+    let bytes = serde_json::to_vec(&Observation {
+        run_id: id.to_owned(),
+        message: message[..message.floor_char_boundary(MAX_OBSERVATION_BYTES)].to_owned(),
+    })
+    .map_err(|_| failure("The delivery observation could not be encoded."))?;
+    #[cfg(all(unix, not(any(target_os = "redox", target_os = "espidf"))))]
+    return unix::replace_observation(root, &name, &bytes, || Ok(()));
+    #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "espidf")))))]
+    {
+        let _ = (root, name, bytes);
+        Err(failure("Receipt storage is unsupported on this platform."))
+    }
+}
 
 pub(super) fn directory(root: &Path) -> Result<PathBuf, IpcFailure> {
     #[cfg(all(unix, not(any(target_os = "redox", target_os = "espidf"))))]
@@ -17,10 +61,13 @@ pub(super) fn directory(root: &Path) -> Result<PathBuf, IpcFailure> {
 }
 
 pub(super) fn write(root: &Path, id: &str, finished: bool, bytes: &[u8]) -> Result<(), IpcFailure> {
-    let name = file_name(id, finished)?;
+    write_named(root, &file_name(id, finished)?, bytes)
+}
+
+fn write_named(root: &Path, name: &str, bytes: &[u8]) -> Result<(), IpcFailure> {
     validate_bytes(bytes)?;
     #[cfg(all(unix, not(any(target_os = "redox", target_os = "espidf"))))]
-    return unix::write(root, &name, bytes, || Ok(()));
+    return unix::write(root, name, bytes, || Ok(()));
     #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "espidf")))))]
     {
         let _ = (root, name);
@@ -29,14 +76,36 @@ pub(super) fn write(root: &Path, id: &str, finished: bool, bytes: &[u8]) -> Resu
 }
 
 pub(super) fn read(root: &Path, id: &str, finished: bool) -> Result<Option<Vec<u8>>, IpcFailure> {
-    let name = file_name(id, finished)?;
+    read_named(root, &file_name(id, finished)?)
+}
+
+fn read_named(root: &Path, name: &str) -> Result<Option<Vec<u8>>, IpcFailure> {
     #[cfg(all(unix, not(any(target_os = "redox", target_os = "espidf"))))]
-    return unix::Directory::open(root)?.read(&name);
+    return unix::Directory::open(root)?.read(name);
     #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "espidf")))))]
     {
         let _ = (root, name);
         Err(failure("Receipt storage is unsupported on this platform."))
     }
+}
+
+const CANCEL_INTENT: &[u8] = br#"{"cancel_requested":true}"#;
+
+pub(super) fn request_cancel(root: &Path, id: &str) -> Result<(), IpcFailure> {
+    write_named(root, &cancel_name(id)?, CANCEL_INTENT)
+}
+
+pub(super) fn cancel_requested(root: &Path, id: &str) -> Result<bool, IpcFailure> {
+    match read_named(root, &cancel_name(id)?)? {
+        None => Ok(false),
+        Some(bytes) if bytes == CANCEL_INTENT => Ok(true),
+        Some(_) => Err(failure("The cancellation receipt has different bytes.")),
+    }
+}
+
+fn cancel_name(id: &str) -> Result<String, IpcFailure> {
+    file_name(id, false)?;
+    Ok(format!("{id}.cancel-requested.json"))
 }
 
 fn file_name(id: &str, finished: bool) -> Result<String, IpcFailure> {
@@ -76,7 +145,7 @@ mod unix {
     use std::io::{Read as _, Write as _};
     use std::os::unix::fs::MetadataExt as _;
 
-    use rustix::fs::{AtFlags, Mode, OFlags, linkat, mkdirat, open, openat, unlinkat};
+    use rustix::fs::{AtFlags, Mode, OFlags, linkat, mkdirat, open, openat, renameat, unlinkat};
     use rustix::io::Errno;
 
     use super::{IpcFailure, MAX_BYTES, Path, PathBuf, failure, validate_bytes};
@@ -176,8 +245,29 @@ mod unix {
         bytes: &[u8],
         before_publish: impl FnOnce() -> Result<(), IpcFailure>,
     ) -> Result<(), IpcFailure> {
+        publish(root, name, bytes, false, before_publish)
+    }
+
+    pub(super) fn replace_observation(
+        root: &Path,
+        name: &str,
+        bytes: &[u8],
+        before_publish: impl FnOnce() -> Result<(), IpcFailure>,
+    ) -> Result<(), IpcFailure> {
+        publish(root, name, bytes, true, before_publish)
+    }
+
+    fn publish(
+        root: &Path,
+        name: &str,
+        bytes: &[u8],
+        replace: bool,
+        before_publish: impl FnOnce() -> Result<(), IpcFailure>,
+    ) -> Result<(), IpcFailure> {
         let directory = Directory::open(root)?;
-        if let Some(existing) = directory.read(name)? {
+        if let Some(existing) = directory.read(name)?
+            && !replace
+        {
             return verify_collision(&directory, &existing, bytes);
         }
         let temporary = format!(".pending-{}", loom_types::CommandId::new());
@@ -197,6 +287,10 @@ mod unix {
             file.sync_all().map_err(io_failure)?;
             before_publish()?;
             directory.ensure_binding()?;
+            if replace {
+                return renameat(&directory.runs, temporary.as_str(), &directory.runs, name)
+                    .map_err(io_failure);
+            }
             match linkat(
                 &directory.runs,
                 temporary.as_str(),
@@ -283,6 +377,61 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn cancellation_is_durable_idempotent_and_refuses_a_replaced_marker() {
+        let root = fixture();
+        let id = loom_types::CommandId::new().to_string();
+        assert!(!cancel_requested(root.path(), &id).unwrap());
+        request_cancel(root.path(), &id).unwrap();
+        request_cancel(root.path(), &id).unwrap();
+        assert!(cancel_requested(root.path(), &id).unwrap());
+        let marker = directory(root.path())
+            .unwrap()
+            .join(cancel_name(&id).unwrap());
+        fs::write(marker, br#"{"cancel_requested":false}"#).unwrap();
+        assert!(cancel_requested(root.path(), &id).is_err());
+        assert!(request_cancel(root.path(), &id).is_err());
+    }
+
+    #[test]
+    fn observations_replace_atomically_without_rewriting_receipts_or_following_links() {
+        let root = fixture();
+        let id = loom_types::CommandId::new().to_string();
+        let started = br#"{"status":"running"}"#;
+        write(root.path(), &id, false, started).unwrap();
+        save_observation(root.path(), &id, "Access denied.").unwrap();
+        let name = observation_name(&id).unwrap();
+        let interrupted = unix::replace_observation(root.path(), &name, b"{}", || {
+            Err(failure("injected publication failure"))
+        });
+        assert!(interrupted.is_err());
+        assert_eq!(
+            observation(root.path(), &id).unwrap().as_deref(),
+            Some("Access denied.")
+        );
+        save_observation(root.path(), &id, "The host is unavailable.").unwrap();
+        assert_eq!(
+            observation(root.path(), &id).unwrap().as_deref(),
+            Some("The host is unavailable.")
+        );
+        assert_eq!(
+            read(root.path(), &id, false).unwrap().as_deref(),
+            Some(started.as_slice())
+        );
+        assert!(read(root.path(), &id, true).unwrap().is_none());
+        let path = directory(root.path()).unwrap().join(&name);
+        let outside = root.path().join("outside.json");
+        fs::rename(&path, &outside).unwrap();
+        let original = fs::read(&outside).unwrap();
+        symlink(&outside, &path).unwrap();
+        assert!(save_observation(root.path(), &id, "Must not follow.").is_err());
+        assert_eq!(fs::read(&outside).unwrap(), original);
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, br#"{"incompatible":true}"#).unwrap();
+        assert!(save_observation(root.path(), &id, "Must not replace.").is_err());
+        assert_eq!(fs::read(path).unwrap(), br#"{"incompatible":true}"#);
     }
 
     #[test]

@@ -32,4 +32,5 @@ pub use store::{
     DocumentFileAuthority, DocumentReconciliationSnapshot, DocumentSummary, LoadedDocument,
     MAX_DOCUMENT_BYTES, MAX_DOCUMENT_TITLE_BYTES, ProjectStore, RecoveryConflict, RecoveryReport,
     SaveOutcome, StoreCounts, VisibleDocumentSnapshot, VisibleProjectionState,
+    document_path_reservation_key,
 };

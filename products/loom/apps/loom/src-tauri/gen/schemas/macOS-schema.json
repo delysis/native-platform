@@ -2259,10 +2259,10 @@
           "markdownDescription": "Denies the save command without any pre-configured scope."
         },
         {
-          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-prepare-open-path`\n- `allow-project-drop-directories`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-attachment-reveal-original`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
+          "description": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-signal-request`\n- `allow-cabal-network-get`\n- `allow-cabal-network-set`\n- `allow-cabal-snapshot`\n- `allow-cabal-share`\n- `allow-cabal-context-review`\n- `allow-cabal-context-publish`\n- `allow-cabal-join`\n- `allow-cabal-open`\n- `allow-cabal-workspace`\n- `allow-cabal-edit`\n- `allow-cabal-revoke`\n- `allow-cabal-recover`\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-prepare-open-path`\n- `allow-project-drop-directories`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-attachment-reveal-original`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`",
           "type": "string",
           "const": "loom:default",
-          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-prepare-open-path`\n- `allow-project-drop-directories`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-attachment-reveal-original`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
+          "markdownDescription": "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions.\n#### This default permission set includes:\n\n- `allow-signal-request`\n- `allow-cabal-network-get`\n- `allow-cabal-network-set`\n- `allow-cabal-snapshot`\n- `allow-cabal-share`\n- `allow-cabal-context-review`\n- `allow-cabal-context-publish`\n- `allow-cabal-join`\n- `allow-cabal-open`\n- `allow-cabal-workspace`\n- `allow-cabal-edit`\n- `allow-cabal-revoke`\n- `allow-cabal-recover`\n- `allow-project-open-default`\n- `allow-project-prepare-open`\n- `allow-project-prepare-open-path`\n- `allow-project-drop-directories`\n- `allow-project-commit-open`\n- `allow-project-discard-open`\n- `allow-project-close`\n- `allow-project-current`\n- `allow-project-recover`\n- `allow-document-create`\n- `allow-workspace-template-get`\n- `allow-workspace-template-enable`\n- `allow-document-rename`\n- `allow-document-delete`\n- `allow-attachment-ingest`\n- `allow-attachment-import-choose`\n- `allow-attachment-import-paths`\n- `allow-attachment-reveal-original`\n- `allow-import-text-sources`\n- `allow-attachment-import-batch-choose`\n- `allow-document-context-list`\n- `allow-document-context-add`\n- `allow-document-context-add-many`\n- `allow-document-context-remove`\n- `allow-document-context-text-get`\n- `allow-document-context-text-set`\n- `allow-document-context-snapshot-set`\n- `allow-co-writer-list`\n- `allow-co-writer-save`\n- `allow-co-writer-apply`\n- `allow-co-writer-delete`\n- `allow-speech-input-capabilities`\n- `allow-speech-input-status`\n- `allow-document-open`\n- `allow-document-import-external`\n- `allow-shader-preview`\n- `allow-document-checkpoint`\n- `allow-document-export-choose`\n- `allow-document-reveal`\n- `allow-document-draft-upsert`\n- `allow-document-draft-clear`\n- `allow-document-reconciliation-preview`\n- `allow-document-reconcile-apply`\n- `allow-build-model-policy-get`\n- `allow-model-catalog-list`\n- `allow-model-list`\n- `allow-model-choose`\n- `allow-model-download-status`\n- `allow-model-download-list`\n- `allow-completion-snapshot`\n- `allow-branch-page`\n- `allow-branch-get`\n- `allow-branch-body`\n- `allow-weave-status`\n- `allow-application-close`\n- `allow-application-close-abort`\n- `allow-application-close-pending`"
         },
         {
           "description": "Load a local model and create, cancel, or retain private generation branches. This cannot promote model text into the active manuscript.\n#### This permission set includes:\n\n- `allow-model-load`\n- `allow-audio-synthesize`\n- `allow-model-load-catalog-candidate`\n- `allow-model-load-policy-candidate`\n- `allow-model-unload`\n- `allow-weave-start`\n- `allow-terminal-run`\n- `allow-terminal-list`\n- `allow-terminal-cancel`\n- `allow-generation-cancel`\n- `allow-candidate-keep`\n- `allow-suggestions-set`\n- `allow-focus-mode-set`",
@@ -2281,6 +2281,12 @@
           "type": "string",
           "const": "loom:microphone-capture",
           "markdownDescription": "Start, stop, or cancel a user-requested local microphone recording and its local speech-recognition request.\n#### This permission set includes:\n\n- `allow-speech-input-record-start`\n- `allow-audio-record-start`\n- `allow-audio-record-stop`\n- `allow-speech-input-record-stop`\n- `allow-speech-input-record-cancel`\n- `allow-speech-input-cancel`"
+        },
+        {
+          "description": "Review device-specific idle model grants and explicitly prepare, submit, check, or cancel exact peer jobs. Grants bind the verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`\n- `allow-compute-peer-offers`\n- `allow-compute-job-prepare`\n- `allow-compute-job-get`\n- `allow-compute-jobs`\n- `allow-compute-job-submit`\n- `allow-compute-job-check`\n- `allow-compute-job-cancel`\n- `allow-terminal-recover`\n- `allow-terminal-run-peer`",
+          "type": "string",
+          "const": "loom:peer-compute",
+          "markdownDescription": "Review device-specific idle model grants and explicitly prepare, submit, check, or cancel exact peer jobs. Grants bind the verified model and current cabal membership. This does not grant manuscript or local-tool authority.\n#### This permission set includes:\n\n- `allow-compute-host-snapshot`\n- `allow-compute-grant`\n- `allow-compute-revoke`\n- `allow-compute-peer-offers`\n- `allow-compute-job-prepare`\n- `allow-compute-job-get`\n- `allow-compute-jobs`\n- `allow-compute-job-submit`\n- `allow-compute-job-check`\n- `allow-compute-job-cancel`\n- `allow-terminal-recover`\n- `allow-terminal-run-peer`"
         },
         {
           "description": "Download an explicitly requested GGUF over HTTPS into Loom's private model library. Every request requires an expected SHA-256 digest and a hard byte ceiling.\n#### This permission set includes:\n\n- `allow-model-download-start`\n- `allow-model-download-cancel`",
@@ -2379,6 +2385,78 @@
           "markdownDescription": "Enables the build_model_policy_get command without any pre-configured scope."
         },
         {
+          "description": "Enables the cabal_context_publish command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-context-publish",
+          "markdownDescription": "Enables the cabal_context_publish command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_context_review command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-context-review",
+          "markdownDescription": "Enables the cabal_context_review command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_edit command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-edit",
+          "markdownDescription": "Enables the cabal_edit command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_join command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-join",
+          "markdownDescription": "Enables the cabal_join command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_network_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-network-get",
+          "markdownDescription": "Enables the cabal_network_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_network_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-network-set",
+          "markdownDescription": "Enables the cabal_network_set command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-open",
+          "markdownDescription": "Enables the cabal_open command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_recover command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-recover",
+          "markdownDescription": "Enables the cabal_recover command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_revoke command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-revoke",
+          "markdownDescription": "Enables the cabal_revoke command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_share command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-share",
+          "markdownDescription": "Enables the cabal_share command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-snapshot",
+          "markdownDescription": "Enables the cabal_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the cabal_workspace command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-cabal-workspace",
+          "markdownDescription": "Enables the cabal_workspace command without any pre-configured scope."
+        },
+        {
           "description": "Enables the candidate_keep command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-candidate-keep",
@@ -2419,6 +2497,66 @@
           "type": "string",
           "const": "loom:allow-completion-snapshot",
           "markdownDescription": "Enables the completion_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_grant command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-grant",
+          "markdownDescription": "Enables the compute_grant command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_host_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-host-snapshot",
+          "markdownDescription": "Enables the compute_host_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_job_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-job-cancel",
+          "markdownDescription": "Enables the compute_job_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_job_check command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-job-check",
+          "markdownDescription": "Enables the compute_job_check command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_job_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-job-get",
+          "markdownDescription": "Enables the compute_job_get command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_job_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-job-prepare",
+          "markdownDescription": "Enables the compute_job_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_job_submit command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-job-submit",
+          "markdownDescription": "Enables the compute_job_submit command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_jobs command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-jobs",
+          "markdownDescription": "Enables the compute_jobs command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_peer_offers command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-peer-offers",
+          "markdownDescription": "Enables the compute_peer_offers command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the compute_revoke command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-compute-revoke",
+          "markdownDescription": "Enables the compute_revoke command without any pre-configured scope."
         },
         {
           "description": "Enables the document_checkpoint command without any pre-configured scope.",
@@ -2715,6 +2853,12 @@
           "markdownDescription": "Enables the shader_preview command without any pre-configured scope."
         },
         {
+          "description": "Enables the signal_request command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-signal-request",
+          "markdownDescription": "Enables the signal_request command without any pre-configured scope."
+        },
+        {
           "description": "Enables the speech_input_cancel command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-speech-input-cancel",
@@ -2769,10 +2913,22 @@
           "markdownDescription": "Enables the terminal_list command without any pre-configured scope."
         },
         {
+          "description": "Enables the terminal_recover command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-terminal-recover",
+          "markdownDescription": "Enables the terminal_recover command without any pre-configured scope."
+        },
+        {
           "description": "Enables the terminal_run command without any pre-configured scope.",
           "type": "string",
           "const": "loom:allow-terminal-run",
           "markdownDescription": "Enables the terminal_run command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the terminal_run_peer command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:allow-terminal-run-peer",
+          "markdownDescription": "Enables the terminal_run_peer command without any pre-configured scope."
         },
         {
           "description": "Enables the weave_start command without any pre-configured scope.",
@@ -2895,6 +3051,78 @@
           "markdownDescription": "Denies the build_model_policy_get command without any pre-configured scope."
         },
         {
+          "description": "Denies the cabal_context_publish command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-context-publish",
+          "markdownDescription": "Denies the cabal_context_publish command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_context_review command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-context-review",
+          "markdownDescription": "Denies the cabal_context_review command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_edit command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-edit",
+          "markdownDescription": "Denies the cabal_edit command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_join command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-join",
+          "markdownDescription": "Denies the cabal_join command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_network_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-network-get",
+          "markdownDescription": "Denies the cabal_network_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_network_set command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-network-set",
+          "markdownDescription": "Denies the cabal_network_set command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_open command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-open",
+          "markdownDescription": "Denies the cabal_open command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_recover command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-recover",
+          "markdownDescription": "Denies the cabal_recover command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_revoke command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-revoke",
+          "markdownDescription": "Denies the cabal_revoke command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_share command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-share",
+          "markdownDescription": "Denies the cabal_share command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-snapshot",
+          "markdownDescription": "Denies the cabal_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the cabal_workspace command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-cabal-workspace",
+          "markdownDescription": "Denies the cabal_workspace command without any pre-configured scope."
+        },
+        {
           "description": "Denies the candidate_keep command without any pre-configured scope.",
           "type": "string",
           "const": "loom:deny-candidate-keep",
@@ -2935,6 +3163,66 @@
           "type": "string",
           "const": "loom:deny-completion-snapshot",
           "markdownDescription": "Denies the completion_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_grant command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-grant",
+          "markdownDescription": "Denies the compute_grant command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_host_snapshot command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-host-snapshot",
+          "markdownDescription": "Denies the compute_host_snapshot command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_job_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-job-cancel",
+          "markdownDescription": "Denies the compute_job_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_job_check command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-job-check",
+          "markdownDescription": "Denies the compute_job_check command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_job_get command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-job-get",
+          "markdownDescription": "Denies the compute_job_get command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_job_prepare command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-job-prepare",
+          "markdownDescription": "Denies the compute_job_prepare command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_job_submit command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-job-submit",
+          "markdownDescription": "Denies the compute_job_submit command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_jobs command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-jobs",
+          "markdownDescription": "Denies the compute_jobs command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_peer_offers command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-peer-offers",
+          "markdownDescription": "Denies the compute_peer_offers command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the compute_revoke command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-compute-revoke",
+          "markdownDescription": "Denies the compute_revoke command without any pre-configured scope."
         },
         {
           "description": "Denies the document_checkpoint command without any pre-configured scope.",
@@ -3231,6 +3519,12 @@
           "markdownDescription": "Denies the shader_preview command without any pre-configured scope."
         },
         {
+          "description": "Denies the signal_request command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-signal-request",
+          "markdownDescription": "Denies the signal_request command without any pre-configured scope."
+        },
+        {
           "description": "Denies the speech_input_cancel command without any pre-configured scope.",
           "type": "string",
           "const": "loom:deny-speech-input-cancel",
@@ -3285,10 +3579,22 @@
           "markdownDescription": "Denies the terminal_list command without any pre-configured scope."
         },
         {
+          "description": "Denies the terminal_recover command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-terminal-recover",
+          "markdownDescription": "Denies the terminal_recover command without any pre-configured scope."
+        },
+        {
           "description": "Denies the terminal_run command without any pre-configured scope.",
           "type": "string",
           "const": "loom:deny-terminal-run",
           "markdownDescription": "Denies the terminal_run command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the terminal_run_peer command without any pre-configured scope.",
+          "type": "string",
+          "const": "loom:deny-terminal-run-peer",
+          "markdownDescription": "Denies the terminal_run_peer command without any pre-configured scope."
         },
         {
           "description": "Denies the weave_start command without any pre-configured scope.",

@@ -1,0 +1,35 @@
+name: Loom Signal worker
+description: Build and check the isolated Signal client with the root Rust toolchain before compiling Loom
+runs:
+  using: composite
+  steps:
+    # Callers may install only the compiler or one lint component. This action
+    # runs both checks, so establish its own prerequisites on the pinned toolchain.
+    - shell: bash
+      run: rustup component add rustfmt clippy
+    - shell: bash
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes protobuf-compiler libssl-dev pkg-config
+    - shell: bash
+      if: runner.os == 'macOS'
+      run: brew list protobuf >/dev/null 2>&1 || brew install protobuf
+    - shell: pwsh
+      if: runner.os == 'Windows'
+      run: |
+        choco install protoc strawberryperl --no-progress --yes
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        # Git Bash's Perl cannot configure the MSVC OpenSSL build. Pin the
+        # native interpreter even when later Cargo commands run under Bash.
+        $signalPerl = Join-Path $env:SystemDrive 'Strawberry\perl\bin\perl.exe'
+        if (-not (Test-Path $signalPerl -PathType Leaf)) { throw 'Native Strawberry Perl is missing.' }
+        & $signalPerl -MLocale::Maketext::Simple -MIPC::Cmd -e 'print "$^O\n"'
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        "OPENSSL_SRC_PERL=$signalPerl" >> $env:GITHUB_ENV
+    - shell: bash
+      run: |
+        cargo fmt --manifest-path products/loom/signal/Cargo.toml -- --check
+        cargo test --locked --manifest-path products/loom/signal/Cargo.toml
+        cargo clippy --locked --manifest-path products/loom/signal/Cargo.toml --all-targets -- -D warnings
+        node scripts/build-loom-signal.mjs

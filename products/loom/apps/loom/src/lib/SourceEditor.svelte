@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
+  import { mapRemoteOffset } from './remoteEditor';
   import { completionOptionAccessibleLabel } from './ghostText';
   import { allocateCompletionPopupDomIds, placeCompletionPopup } from './completionPopup';
   import {
@@ -42,6 +43,17 @@
 
   export let element: HTMLTextAreaElement | undefined;
   export let value = '';
+  export function applyRemoteValue(next: string): void {
+    if (!element || composing) return;
+    const previous = element.value;
+    const start = mapRemoteOffset(previous, next, element.selectionStart);
+    const end = mapRemoteOffset(previous, next, element.selectionEnd);
+    const direction = element.selectionDirection;
+    value = next;
+    element.value = next;
+    element.setSelectionRange(start, end, direction);
+    readSelection(true, true);
+  }
   export let readonly = false;
   export let verse = false;
   export let verseNewline: VerseNewlineKind | null = null;

@@ -37,6 +37,7 @@
         {/each}
       </article>
     {/each}
+    <slot />
   {/if}
 </details>
 

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-cabal-context-publish"
+description = "Enables the cabal_context_publish command without any pre-configured scope."
+commands.allow = ["cabal_context_publish"]
+
+[[permission]]
+identifier = "deny-cabal-context-publish"
+description = "Denies the cabal_context_publish command without any pre-configured scope."
+commands.deny = ["cabal_context_publish"]

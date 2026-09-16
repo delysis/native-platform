@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-compute-revoke"
+description = "Enables the compute_revoke command without any pre-configured scope."
+commands.allow = ["compute_revoke"]
+
+[[permission]]
+identifier = "deny-compute-revoke"
+description = "Denies the compute_revoke command without any pre-configured scope."
+commands.deny = ["compute_revoke"]

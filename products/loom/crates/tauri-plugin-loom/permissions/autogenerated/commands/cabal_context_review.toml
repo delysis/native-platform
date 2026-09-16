@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-cabal-context-review"
+description = "Enables the cabal_context_review command without any pre-configured scope."
+commands.allow = ["cabal_context_review"]
+
+[[permission]]
+identifier = "deny-cabal-context-review"
+description = "Denies the cabal_context_review command without any pre-configured scope."
+commands.deny = ["cabal_context_review"]

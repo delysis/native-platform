@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-cabal-recover"
+description = "Enables the cabal_recover command without any pre-configured scope."
+commands.allow = ["cabal_recover"]
+
+[[permission]]
+identifier = "deny-cabal-recover"
+description = "Denies the cabal_recover command without any pre-configured scope."
+commands.deny = ["cabal_recover"]

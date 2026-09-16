@@ -12,6 +12,7 @@
     "loom:default",
     "loom:connected-import",
     "loom:local-generation",
+    "loom:peer-compute",
     "loom:microphone-capture",
     "loom:verified-model-download",
     "loom:manuscript-promotion"

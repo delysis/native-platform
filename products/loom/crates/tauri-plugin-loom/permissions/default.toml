@@ -3,6 +3,19 @@
 [default]
 description = "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions."
 permissions = [
+  "allow-signal-request",
+  "allow-cabal-network-get",
+  "allow-cabal-network-set",
+  "allow-cabal-snapshot",
+  "allow-cabal-share",
+  "allow-cabal-context-review",
+  "allow-cabal-context-publish",
+  "allow-cabal-join",
+  "allow-cabal-open",
+  "allow-cabal-workspace",
+  "allow-cabal-edit",
+  "allow-cabal-revoke",
+  "allow-cabal-recover",
   "allow-project-open-default",
   "allow-project-prepare-open",
   "allow-project-prepare-open-path",

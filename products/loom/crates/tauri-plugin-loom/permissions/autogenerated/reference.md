@@ -4,6 +4,19 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 
 #### This default permission set includes the following:
 
+- `allow-signal-request`
+- `allow-cabal-network-get`
+- `allow-cabal-network-set`
+- `allow-cabal-snapshot`
+- `allow-cabal-share`
+- `allow-cabal-context-review`
+- `allow-cabal-context-publish`
+- `allow-cabal-join`
+- `allow-cabal-open`
+- `allow-cabal-workspace`
+- `allow-cabal-edit`
+- `allow-cabal-revoke`
+- `allow-cabal-recover`
 - `allow-project-open-default`
 - `allow-project-prepare-open`
 - `allow-project-prepare-open-path`
@@ -70,6 +83,19 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 <th>Description</th>
 </tr>
 
+
+<tr>
+<td>
+
+`loom:peer-compute`
+
+</td>
+<td>
+
+Review device-specific idle model grants and explicitly prepare, submit, check, or cancel exact peer jobs. Grants bind the verified model and current cabal membership. This does not grant manuscript or local-tool authority.
+
+</td>
+</tr>
 
 <tr>
 <td>
@@ -516,6 +542,318 @@ Denies the build_model_policy_get command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-cabal-context-publish`
+
+</td>
+<td>
+
+Enables the cabal_context_publish command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-context-publish`
+
+</td>
+<td>
+
+Denies the cabal_context_publish command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-context-review`
+
+</td>
+<td>
+
+Enables the cabal_context_review command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-context-review`
+
+</td>
+<td>
+
+Denies the cabal_context_review command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-edit`
+
+</td>
+<td>
+
+Enables the cabal_edit command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-edit`
+
+</td>
+<td>
+
+Denies the cabal_edit command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-join`
+
+</td>
+<td>
+
+Enables the cabal_join command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-join`
+
+</td>
+<td>
+
+Denies the cabal_join command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-network-get`
+
+</td>
+<td>
+
+Enables the cabal_network_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-network-get`
+
+</td>
+<td>
+
+Denies the cabal_network_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-network-set`
+
+</td>
+<td>
+
+Enables the cabal_network_set command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-network-set`
+
+</td>
+<td>
+
+Denies the cabal_network_set command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-open`
+
+</td>
+<td>
+
+Enables the cabal_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-open`
+
+</td>
+<td>
+
+Denies the cabal_open command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-recover`
+
+</td>
+<td>
+
+Enables the cabal_recover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-recover`
+
+</td>
+<td>
+
+Denies the cabal_recover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-revoke`
+
+</td>
+<td>
+
+Enables the cabal_revoke command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-revoke`
+
+</td>
+<td>
+
+Denies the cabal_revoke command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-share`
+
+</td>
+<td>
+
+Enables the cabal_share command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-share`
+
+</td>
+<td>
+
+Denies the cabal_share command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-snapshot`
+
+</td>
+<td>
+
+Enables the cabal_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-snapshot`
+
+</td>
+<td>
+
+Denies the cabal_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-cabal-workspace`
+
+</td>
+<td>
+
+Enables the cabal_workspace command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-cabal-workspace`
+
+</td>
+<td>
+
+Denies the cabal_workspace command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-candidate-keep`
 
 </td>
@@ -691,6 +1029,266 @@ Enables the completion_snapshot command without any pre-configured scope.
 <td>
 
 Denies the completion_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-grant`
+
+</td>
+<td>
+
+Enables the compute_grant command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-grant`
+
+</td>
+<td>
+
+Denies the compute_grant command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-host-snapshot`
+
+</td>
+<td>
+
+Enables the compute_host_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-host-snapshot`
+
+</td>
+<td>
+
+Denies the compute_host_snapshot command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-job-cancel`
+
+</td>
+<td>
+
+Enables the compute_job_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-job-cancel`
+
+</td>
+<td>
+
+Denies the compute_job_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-job-check`
+
+</td>
+<td>
+
+Enables the compute_job_check command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-job-check`
+
+</td>
+<td>
+
+Denies the compute_job_check command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-job-get`
+
+</td>
+<td>
+
+Enables the compute_job_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-job-get`
+
+</td>
+<td>
+
+Denies the compute_job_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-job-prepare`
+
+</td>
+<td>
+
+Enables the compute_job_prepare command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-job-prepare`
+
+</td>
+<td>
+
+Denies the compute_job_prepare command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-job-submit`
+
+</td>
+<td>
+
+Enables the compute_job_submit command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-job-submit`
+
+</td>
+<td>
+
+Denies the compute_job_submit command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-jobs`
+
+</td>
+<td>
+
+Enables the compute_jobs command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-jobs`
+
+</td>
+<td>
+
+Denies the compute_jobs command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-peer-offers`
+
+</td>
+<td>
+
+Enables the compute_peer_offers command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-peer-offers`
+
+</td>
+<td>
+
+Denies the compute_peer_offers command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-compute-revoke`
+
+</td>
+<td>
+
+Enables the compute_revoke command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-compute-revoke`
+
+</td>
+<td>
+
+Denies the compute_revoke command without any pre-configured scope.
 
 </td>
 </tr>
@@ -1972,6 +2570,32 @@ Denies the shader_preview command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-signal-request`
+
+</td>
+<td>
+
+Enables the signal_request command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-signal-request`
+
+</td>
+<td>
+
+Denies the signal_request command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-speech-input-cancel`
 
 </td>
@@ -2206,6 +2830,32 @@ Denies the terminal_list command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-terminal-recover`
+
+</td>
+<td>
+
+Enables the terminal_recover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-terminal-recover`
+
+</td>
+<td>
+
+Denies the terminal_recover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-terminal-run`
 
 </td>
@@ -2225,6 +2875,32 @@ Enables the terminal_run command without any pre-configured scope.
 <td>
 
 Denies the terminal_run command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-terminal-run-peer`
+
+</td>
+<td>
+
+Enables the terminal_run_peer command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-terminal-run-peer`
+
+</td>
+<td>
+
+Denies the terminal_run_peer command without any pre-configured scope.
 
 </td>
 </tr>
