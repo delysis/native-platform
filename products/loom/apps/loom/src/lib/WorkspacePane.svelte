@@ -136,14 +136,14 @@
       if (!current()) throw new Error('The pane changed before import. Drop the files again at the intended location.');
       const files = paths.filter(path => !isDatabasePath(path));
       const libraries = await Promise.all(paths.filter(isDatabasePath).map(path => addLibraryMaterialPath(captured.projectId, captured.sessionId, path)));
-      const report = files.length ? await importAttachmentPaths(captured.projectId, captured.sessionId, files) : { imported: [], failures: [] };
+      const report = files.length ? await importAttachmentPaths(captured.projectId, captured.sessionId, files) : { imported: [], references: [], failures: [] };
       const imported = report.imported;
       error = report.failures.map((item) => `${item.name}: ${item.message}`).join("\n");
-      if (!imported.length && !libraries.length) return;
+      if (!imported.length && !libraries.length && !report.references?.length) return;
       if (!current()) throw new Error('The pane changed during import. The files are retained; drop them again at the intended location.');
       const materials = await Promise.all(imported.map(item => bindAttachmentMaterial(captured.projectId, captured.sessionId, item.id)));
       if (!current()) throw new Error('The pane changed. Your sources are retained in this workspace.');
-      const markdown = [...libraries.map(materialReferenceMarkdown), ...imported.map((item, index) => importedMaterialMarkdown(item, materials[index]))].join('\n\n');
+      const markdown = [...libraries.map(materialReferenceMarkdown), ...(report.references ?? []), ...imported.map((item, index) => importedMaterialMarkdown(item, materials[index]))].join('\n\n');
       if (captured.kind === 'editor') {
         const before = sourceAnchor?.value.slice(0, sourceAnchor.start) ?? '';
         const after = sourceAnchor?.value.slice(sourceAnchor.end) ?? '';

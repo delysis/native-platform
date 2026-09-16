@@ -2235,6 +2235,11 @@
       ) return;
       const report = await chooseAttachments(captured.projectId, captured.sessionId);
       const imported = report.imported;
+      if (project?.project_id !== captured.projectId || project.session_id !== captured.sessionId || document?.summary.document_id !== captured.documentId) return;
+      if (report.references?.length) {
+        updateContextText([contextText, ...report.references].filter(Boolean).join('\n\n'));
+        if (!await persistCurrentContextText()) return;
+      }
       if (report.failures.length) recordFailure(new Error(report.failures.map((item) => `${item.name}: ${item.message}`).join("\n")));
       const snapshot = imported.length === 0
         ? null
@@ -2252,7 +2257,7 @@
           captured.documentId
         )) return;
       }
-      if (imported.length > 0) announce(`${imported.length} context attachment${imported.length === 1 ? '' : 's'} ready`);
+      if (imported.length || report.references?.length) announce('Sources ready');
     } catch (error) {
       recordFailure(error);
       announce('Loom could not add that context attachment');
@@ -2368,20 +2373,20 @@
       ) return;
       const filePaths = paths.filter(path => !isDatabasePath(path));
       const libraries = await Promise.all(paths.filter(isDatabasePath).map(path => addLibraryMaterialPath(captured.projectId, captured.sessionId, path)));
-      const report = filePaths.length ? await importAttachmentPaths(captured.projectId, captured.sessionId, filePaths) : { imported: [], failures: [] };
+      const report = filePaths.length ? await importAttachmentPaths(captured.projectId, captured.sessionId, filePaths) : { imported: [], references: [], failures: [] };
       if (project?.session_id !== captured.sessionId) return;
       libraries.forEach(materialChanged);
       const imported = report.imported;
       if (report.failures.length) recordFailure(new Error(report.failures.map((item) => `${item.name}: ${item.message}`).join("\n")));
-      if (!imported.length && !libraries.length) return;
+      if (!imported.length && !libraries.length && !report.references?.length) return;
       if (project?.project_id !== captured.projectId || project.session_id !== captured.sessionId ||
           document?.summary.document_id !== captured.documentId || mode !== captured.mode ||
           (scope === 'inline' && documentText !== captured.markdown)) {
         throw new Error('The editor changed during import. The file is stored; drop it again at the intended location.');
       }
       if (scope === 'context') {
-        if (libraries.length) {
-          updateContextText([contextText, ...libraries.map(materialReferenceMarkdown)].filter(Boolean).join('\n\n'));
+        if (libraries.length || report.references?.length) {
+          updateContextText([contextText, ...libraries.map(materialReferenceMarkdown), ...(report.references ?? [])].filter(Boolean).join('\n\n'));
           if (!await persistCurrentContextText()) return;
         }
         const snapshot = await addDocumentContexts(
@@ -2400,7 +2405,7 @@
         const bound = await Promise.all(imported.map(item => bindAttachmentMaterial(captured.projectId, captured.sessionId, item.id)));
         if (project?.project_id !== captured.projectId || project.session_id !== captured.sessionId || document?.summary.document_id !== captured.documentId || mode !== captured.mode || documentText !== captured.markdown) throw new Error('The writing changed. Your files are retained in this workspace.');
         bound.forEach(materialChanged);
-        const markdown = [...libraries.map(materialReferenceMarkdown), ...imported.map((item, index) => importedMaterialMarkdown(item, bound[index]))].join('\n\n');
+        const markdown = [...libraries.map(materialReferenceMarkdown), ...(report.references ?? []), ...imported.map((item, index) => importedMaterialMarkdown(item, bound[index]))].join('\n\n');
         const before = sourceAnchor?.value.slice(0, sourceAnchor.start) ?? '';
         const after = sourceAnchor?.value.slice(sourceAnchor.end) ?? '';
         const prefix = before && !before.endsWith('\n\n') ? (before.endsWith('\n') ? '\n' : '\n\n') : '';
@@ -2410,7 +2415,7 @@
           : sourceAnchor && sourceEditor?.insertTextAtAnchor(sourceAnchor, `${prefix}${markdown}${suffix}`);
         if (!inserted) throw new Error('The attachment was stored, but the current editor could not insert its card.');
       }
-      announce(`${imported.length} attachment${imported.length === 1 ? '' : 's'} added`);
+      announce('Sources added');
     } catch (error) {
       recordFailure(error);
       announce('Loom could not attach those files');

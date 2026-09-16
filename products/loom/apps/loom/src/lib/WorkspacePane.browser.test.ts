@@ -6,10 +6,11 @@ import type { OpenDocument, TerminalRun } from './types';
 import '../app.css';
 
 vi.mock('@tauri-apps/api/core', async (original) => ({ ...await original<typeof import('@tauri-apps/api/core')>(), convertFileSrc: (path: string, protocol: string) => `${protocol}://localhost/${path}` }));
-const ipc = vi.hoisted(() => ({ list: vi.fn(), run: vi.fn(), cancel: vi.fn(), open: vi.fn() }));
+const ipc = vi.hoisted(() => ({ list: vi.fn(), run: vi.fn(), cancel: vi.fn(), open: vi.fn(), import: vi.fn(), bind: vi.fn() }));
 vi.mock('./ipc', async (original) => ({
   ...await original<typeof import('./ipc')>(),
   listTerminalRuns: ipc.list, runTerminal: ipc.run, cancelTerminalRun: ipc.cancel, openDocument: ipc.open,
+  importAttachmentPaths: ipc.import, bindAttachmentMaterial: ipc.bind,
   normalizeFailure: (error: unknown) => ({ message: error instanceof Error ? error.message : String(error) })
 }));
 let mounted: ReturnType<typeof mount> | undefined;
@@ -40,6 +41,34 @@ async function render(config: Partial<WorkspacePaneConfig> = {}, value = source.
 }
 
 describe('workspace panes', () => {
+  it('drops existing workspace writing as a reference without creating an attachment or starting inference', async () => {
+    const { onChange } = await render();
+    const input = page.getByRole('textbox', { name: 'Message' });
+    await input.fill('Consider this');
+    ipc.import.mockResolvedValue({ imported: [], references: ['@"Inside Notes.md"'], failures: [], next_page_token: null });
+    await (mounted as unknown as WorkspacePane).importDroppedPaths(['/workspace/Inside Notes.md'], { x: 0, y: 0 });
+    await expect.element(input).toHaveValue('Consider this\n\n@"Inside Notes.md"');
+    expect(ipc.import).toHaveBeenCalledWith('project', 'session', ['/workspace/Inside Notes.md']);
+    expect(ipc.bind).not.toHaveBeenCalled();
+    expect(ipc.run).not.toHaveBeenCalled();
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('keeps an edited composer intact when a document reference arrives after the edit', async () => {
+    await render();
+    let complete!: (report: unknown) => void;
+    ipc.import.mockImplementation(() => new Promise(resolve => { complete = resolve; }));
+    const pending = (mounted as unknown as WorkspacePane).importDroppedPaths(['/workspace/Inside Notes.md'], { x: 0, y: 0 });
+    await expect.poll(() => ipc.import.mock.calls.length).toBe(1);
+    const input = page.getByRole('textbox', { name: 'Message' });
+    await input.fill('New thought');
+    complete({ imported: [], references: ['@"Inside Notes.md"'], failures: [], next_page_token: null });
+    await pending;
+    await expect.element(input).toHaveValue('New thought');
+    expect(ipc.bind).not.toHaveBeenCalled();
+    expect(ipc.run).not.toHaveBeenCalled();
+  });
+
   it('restores only this pane history and submits one retained raw prompt with explicit context and full prior output', async () => {
     const { beforeRun, onOpenDocument } = await render({ context: ['@document', '@"Voice notes"'], document: '@Draft' });
     await expect.poll(() => document.querySelector('.output')?.textContent).toBe(fullAnswer);

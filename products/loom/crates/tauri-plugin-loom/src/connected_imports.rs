@@ -212,6 +212,7 @@ pub(crate) async fn import_source_url(
     let attachment = operation.publish(&state, prepared)?;
     Ok(SyncReport {
         imported: vec![attachment],
+        references: Vec::new(),
         failures: Vec::new(),
         next_page_token: None,
     })

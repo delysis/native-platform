@@ -977,7 +977,7 @@ export function enableWorkspaceTemplate(projectId: string, sessionId: string): P
 
 export type ImportSource = 'gmail' | 'google_alerts' | 'linked_in' | 'drive';
 export interface ImportAccount { service: 'gmail' | 'drive'; email: string | null }
-export interface ImportBatch { imported: ContextAttachment[]; failures: { name: string; message: string }[]; next_page_token: string | null }
+export interface ImportBatch { imported: ContextAttachment[]; references?: string[]; failures: { name: string; message: string }[]; next_page_token: string | null }
 export function importAccounts(projectId: string, sessionId: string): Promise<ImportAccount[]> {
   return call('import_accounts', { projectId, sessionId });
 }
