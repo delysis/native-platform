@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "repository": "https://github.com/can1357/oh-my-pi.git",
+  "branch": "omp2",
+  "revision": "2f92f3b5aa2035d21c9f016f9ff6350795e5685a",
+  "files": [
+    {
+      "path": "LICENSE",
+      "sha256": "048c9ebb09976a1c2e895d23f91dbe9114bd7858bfd7ff3b6a8f957feccbdfeb",
+      "consumers": [
+        "products/fte/docs/OMP2-MAINTENANCE.md"
+      ],
+      "purpose": "MIT attribution for imported source and fixtures"
+    },
+    {
+      "path": "fixtures/llm-oracle/catalog/providers.toml",
+      "sha256": "fdaf688fe55ca76297c550d43504b597bb7f944f82bb641f64cd8a819f012c31",
+      "consumers": [
+        "products/fte/crates/fte-providers/src/omp2.rs",
+        "products/fte/crates/fte-providers/src/hosted.rs"
+      ],
+      "purpose": "Reviewed providers base_url/transport/auth projected by HostedProviderConfig::from_omp2; env discovery, OAuth and branding excluded"
+    },
+    {
+      "path": "fixtures/llm-oracle/catalog-policy/compat-profiles.json",
+      "sha256": "813731312a7bf7624bbc6c331c1d28f4e4c4d1a375e0b599155e2df7fb6afb54",
+      "consumers": [
+        "products/fte/docs/OMP2-MAINTENANCE.md"
+      ],
+      "purpose": "Compatibility review and selected provider wire policy"
+    },
+    {
+      "path": "crates/ai/src/codec/openai_chat.rs",
+      "sha256": "86d2d3d8ada7b837e660da1a48aebde609e613219602b863413eefc519eea140",
+      "consumers": [
+        "products/fte/crates/fte-providers/src/omp2.rs",
+        "products/fte/crates/fte-providers/src/hosted.rs"
+      ],
+      "purpose": "WireUsage::canonical and merge_usage adapted into omp2::usage/merge_usage, retaining inclusive FTE input totals and optional counters"
+    },
+    {
+      "path": "crates/ai/src/codec/anthropic.rs",
+      "sha256": "a68f1c0c85f3954c41f4149ab83199d4a0c5746a206377308d93b743928fd176",
+      "consumers": [
+        "products/fte/crates/fte-providers/src/hosted.rs"
+      ],
+      "purpose": "Adapt selected Messages wire and usage behavior"
+    },
+    {
+      "path": "crates/ai/src/auth/lease.rs",
+      "sha256": "8ad2ccef95e5af6064f87218126a97ceda80b0874e23c4a1829d18dd378c433c",
+      "consumers": [
+        "products/fte/crates/fte-providers/src/hosted.rs"
+      ],
+      "purpose": "Credential header sensitivity adapted into HostedProviderBackend::headers; secret ownership remains with the injected FTE resolver"
+    },
+    {
+      "path": "fixtures/llm-oracle/openai/chat/stream.parity.sse",
+      "sha256": "433524801a3ab2b275435229d0a2c637414298e4ecaf967bb1a02cb5b5870f1e",
+      "consumers": [
+        "products/fte/crates/fte-providers/src/hosted.rs"
+      ],
+      "purpose": "Split usage, alternatives and stop-state regression input"
+    },
+    {
+      "path": "fixtures/llm-oracle/openai/chat/stream.tool_reasoning_usage.sse",
+      "sha256": "6247f532ac980406c89f151a97df3553be93e17b7d6aab6eb23e0de7b5f7c27b",
+      "consumers": [
+        "products/fte/crates/fte-providers/src/hosted.rs"
+      ],
+      "purpose": "Streamed tools and cache accounting regression input"
+    },
+    {
+      "path": "fixtures/llm-oracle/anthropic/legacy/stream.thinking_tool_usage.sse",
+      "sha256": "b4a3b3848f7b1be65124c17c3d4d85393be4eada8cf07969fd4e9870ea5a47f9",
+      "consumers": [
+        "products/fte/crates/fte-providers/src/hosted.rs"
+      ],
+      "purpose": "Messages usage and tool stream regression input"
+    }
+  ],
+  "watch_paths": [
+    "LICENSE",
+    "crates/catalog",
+    "crates/ai/src/codec",
+    "crates/ai/src/auth",
+    "crates/ai/src/layer",
+    "crates/ai/src/transport",
+    "fixtures/llm-oracle"
+  ]
+}

@@ -372,18 +372,17 @@ impl HostedProviderBackend {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         match &self.config.auth {
             HostedAuth::Bearer => {
-                headers.insert(
-                    AUTHORIZATION,
-                    HeaderValue::from_str(&format!("Bearer {secret}")).map_err(|error| {
-                        provider_request_error(request_id, &self.config.id, error)
-                    })?,
-                );
+                let mut value = HeaderValue::from_str(&format!("Bearer {secret}"))
+                    .map_err(|error| provider_request_error(request_id, &self.config.id, error))?;
+                value.set_sensitive(true);
+                headers.insert(AUTHORIZATION, value);
             }
             HostedAuth::Header { name, prefix } => {
                 let name = HeaderName::from_bytes(name.as_bytes())
                     .map_err(|error| provider_request_error(request_id, &self.config.id, error))?;
-                let value = HeaderValue::from_str(&format!("{prefix}{secret}"))
+                let mut value = HeaderValue::from_str(&format!("{prefix}{secret}"))
                     .map_err(|error| provider_request_error(request_id, &self.config.id, error))?;
+                value.set_sensitive(true);
                 headers.insert(name, value);
             }
         }
@@ -2678,7 +2677,7 @@ impl ProviderStreamState {
         events: &mpsc::Sender<GatewayEvent>,
     ) -> Result<bool, GatewayError> {
         if let Some(usage) = value.get("usage").filter(|v| !v.is_null()) {
-            self.usage = usage_from_openai(usage, self.route.clone());
+            crate::omp2::merge_usage(&mut self.usage, usage, self.route.clone());
         }
         if let Some(choices) = value.get("choices").and_then(Value::as_array) {
             for choice in choices {
@@ -4124,38 +4123,7 @@ fn usize_field(value: &Value, name: &str) -> Option<usize> {
 }
 
 fn usage_from_openai(value: &Value, route: ResolvedRoute) -> GatewayUsage {
-    let input = value
-        .get("input_tokens")
-        .or_else(|| value.get("prompt_tokens"))
-        .and_then(Value::as_u64);
-    let output = value
-        .get("output_tokens")
-        .or_else(|| value.get("completion_tokens"))
-        .and_then(Value::as_u64);
-    let cached = value
-        .pointer("/input_tokens_details/cached_tokens")
-        .and_then(Value::as_u64);
-    GatewayUsage {
-        input_tokens: input,
-        output_tokens: output,
-        reasoning_tokens: value
-            .pointer("/output_tokens_details/reasoning_tokens")
-            .and_then(Value::as_u64),
-        cache_read_tokens: cached,
-        cache_write_tokens: None,
-        provenance: fte_types::UsageProvenance::Exact,
-        selected_route: Some(route),
-        cache: Some(fte_types::CacheReceipt {
-            tier: fte_types::CacheTier::ProviderNative,
-            outcome: if cached.unwrap_or_default() > 0 {
-                fte_types::CacheOutcome::Hit
-            } else {
-                fte_types::CacheOutcome::Miss
-            },
-            reason: None,
-        }),
-        ..GatewayUsage::default()
-    }
+    crate::omp2::usage(value, route)
 }
 
 fn usage_from_anthropic(value: &Value, route: ResolvedRoute) -> GatewayUsage {
@@ -4418,6 +4386,89 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct FixtureSecrets;
+
+    #[test]
+    fn omp2_credential_headers_are_sensitive_and_redacted() {
+        for id in ["openai", "anthropic", "gemini"] {
+            let config = HostedProviderConfig::from_omp2(id, "Fixture", "fixture", Vec::new())
+                .expect("valid hosted fixture");
+            let name = match &config.auth {
+                HostedAuth::Bearer => "authorization".to_owned(),
+                HostedAuth::Header { name, .. } => name.clone(),
+            };
+            let backend = HostedProviderBackend::new(config, Arc::new(FixtureSecrets))
+                .expect("valid hosted fixture");
+            let headers = backend
+                .headers(
+                    "never-log-this-secret",
+                    &request(GenerationInput::Chat { items: Vec::new() }).request,
+                )
+                .expect("valid hosted fixture");
+            assert!(
+                headers
+                    .get(&name)
+                    .expect("valid hosted fixture")
+                    .is_sensitive()
+            );
+            assert!(!format!("{headers:?}").contains("never-log-this-secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn omp2_tool_stream_preserves_authoritative_cache_usage() {
+        let body = include_str!(
+            "../../../../../third-party/omp2/upstream/fixtures/llm-oracle/openai/chat/stream.tool_reasoning_usage.sse"
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("valid hosted fixture");
+        let address = listener.local_addr().expect("valid hosted fixture");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("valid hosted fixture");
+            read_fixture_request(&mut socket).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("valid hosted fixture");
+            // Chunk boundaries split both protocol fields and Zürich's UTF-8.
+            for chunk in body.as_bytes().chunks(7) {
+                socket.write_all(chunk).await.expect("valid hosted fixture");
+                tokio::task::yield_now().await;
+            }
+        });
+        let config = HostedProviderConfig::openai_compatible(
+            "provider",
+            "Fixture",
+            "fixture",
+            format!("http://{address}/chat"),
+            Vec::new(),
+        );
+        let backend = HostedProviderBackend::new(config, Arc::new(FixtureSecrets))
+            .expect("valid hosted fixture");
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut request = request(GenerationInput::Chat { items: Vec::new() });
+            request.request.stream.enabled = true;
+            backend
+                .execute(request)
+                .await
+                .expect("valid hosted fixture")
+                .final_response()
+                .await
+                .expect("valid hosted fixture")
+        })
+        .await
+        .expect("valid hosted fixture");
+        backend.shutdown().await.expect("valid hosted fixture");
+        server.await.expect("valid hosted fixture");
+        assert_eq!(response.usage.input_tokens, Some(20));
+        assert_eq!(response.usage.output_tokens, Some(9));
+        assert_eq!(response.usage.cache_read_tokens, Some(12));
+        assert!(response.output.iter().any(|item| matches!(item, fte_types::OutputItem::FunctionCall { name, arguments, .. } if name == "lookup_weather" && arguments["city"] == "Zürich")));
+    }
 
     async fn read_fixture_request(socket: &mut tokio::net::TcpStream) {
         let mut request = Vec::new();

@@ -2,6 +2,13 @@
   "schema": "native-platform.ci-path-exceptions.v2",
   "rules": [
     {
+      "prefix": "third-party/omp2",
+      "kind": "asset",
+      "primary_groups": ["gateway", "diagnostic"],
+      "effects": ["force_full"],
+      "evidence": "upstream source imports require all consumer gates; include_str inputs have no Cargo dependency edge"
+    },
+    {
       "prefix": "products/fte/src",
       "kind": "asset",
       "primary_groups": ["product-fte"],
