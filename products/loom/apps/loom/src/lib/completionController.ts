@@ -198,17 +198,18 @@ export function reconcileCompletionController(
   }
   if (contextKey) {
     if (!session && family.length > 0) {
-      session = startCompletionSession(contextKey, family, family[0].runId);
+      const selected = family.find(candidate => candidate.runId === state.activeRunId) ?? family[0];
+      session = startCompletionSession(contextKey, family, selected.runId);
     } else if (session) {
       session = synchronizeCompletionCandidates(session, family, forkAtCurrentCaret && pendingText === null);
       if (!session) pendingText = null;
     }
   }
   const activeFamily = completionActiveFamily(session, pendingText, family, forkAtCurrentCaret);
-  const activeRunId = activeFamily.length > 0 &&
+  const activeRunId = session?.selectedRunId ?? (activeFamily.length > 0 &&
       !activeFamily.some((candidate) => candidate.runId === state.activeRunId)
     ? activeFamily[0].runId
-    : state.activeRunId;
+    : state.activeRunId);
   if (
     session === state.session &&
     pendingText === state.pendingText &&
