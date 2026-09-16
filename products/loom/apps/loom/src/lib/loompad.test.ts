@@ -1,7 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { emptyLoompadChord, loompadKey, loompadPrefix } from './loompad';
+import { emptyLoompadChord, loompadKey, loompadPrefix, loompadWordKey } from './loompad';
 
 describe('Loompad input authority', () => {
+  it('groups the next word without altering its exact acceptance bytes', () => {
+    for (const text of [' The meadow', 'the river', '“THE,” she said']) {
+      expect(loompadWordKey(text)).toBe('the');
+    }
+    expect(loompadWordKey(' cafe\u0301 next')).toBe(loompadWordKey('café! other'));
+    expect(loompadWordKey(' there ')).not.toBe(loompadWordKey('the '));
+    expect(loompadWordKey('  ')).toBeNull();
+    expect(loompadPrefix(' “THE,” she said', 'word', true)).toBe(' “THE,”');
+  });
   it('requires Option and accepts one word exactly once per press', () => {
     const initial = emptyLoompadChord();
     expect(loompadKey(initial, 'KeyW', true)).toMatchObject({ handled: false, accept: false });

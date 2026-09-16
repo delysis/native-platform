@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import type { CompletionCandidate } from './completionSession';
-  import { emptyLoompadChord, LOOMPAD_KEYS, loompadKey, loompadPrefix, type LoompadLength } from './loompad';
+  import { emptyLoompadChord, LOOMPAD_KEYS, loompadKey, loompadPrefix, loompadWordKey, type LoompadLength } from './loompad';
 
   export let choices: readonly CompletionCandidate[] = [];
   export let selectedRunId = '';
@@ -28,16 +28,25 @@
     }
     const heldIndex = LOOMPAD_KEYS.indexOf(chord.choices.at(-1) as typeof LOOMPAD_KEYS[number]);
     const heldRun = heldIndex < 0 ? null : slots[page * 4 + heldIndex]?.runId;
-    // Sample identity owns the key, even when several runs share a first word.
+    // Retain a stable representative for each next word. The owner keeps every
+    // sampled tail, so accepting a shared prefix can reveal all its branches.
     const byRun = new Map(next.map(candidate => [candidate.runId, candidate]));
+    const words = new Set<string>();
+    const keepWord = (candidate: CompletionCandidate | undefined): CompletionCandidate | null => {
+      const word = candidate && loompadWordKey(candidate.text);
+      if (!candidate || !word || words.has(word)) return null;
+      words.add(word);
+      return candidate;
+    };
     const pageAnchor = slots.slice(page * 4, page * 4 + 4).find(slot => slot && byRun.has(slot.runId));
     const kept: Array<CompletionCandidate | null> = [];
     for (let offset = 0; offset < slots.length; offset += 4) {
-      const group = slots.slice(offset, offset + 4).map(slot => slot ? byRun.get(slot.runId) ?? null : null);
+      const group = slots.slice(offset, offset + 4).map(slot => slot ? keepWord(byRun.get(slot.runId)) : null);
       if (group.some(Boolean)) kept.push(...group);
     }
     for (const candidate of byRun.values()) {
       if (kept.some(slot => slot?.runId === candidate.runId)) continue;
+      if (!keepWord(candidate)) continue;
       let empty = kept.indexOf(null);
       if (empty < 0) { empty = kept.length; kept.push(null, null, null, null); }
       kept[empty] = candidate;
