@@ -1,7 +1,17 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 44,
+  "expected_test_count": 45,
   "cargo_targets": [
+    {
+      "package": "llama-native-engine",
+      "selector": "test:residual_training",
+      "name": "residual_training",
+      "kinds": ["test"],
+      "src_path": "crates/native/crates/llama-native-engine/tests/residual_training.rs",
+      "manifest_path": "crates/native/crates/llama-native-engine/Cargo.toml",
+      "platforms": ["linux", "macos", "windows"],
+      "harness": "libtest"
+    },
     {
       "package": "llama-native-engine",
       "selector": "lib",
@@ -247,7 +257,7 @@
     {
       "package": "llama-native-engine",
       "src_path": "crates/native/crates/llama-native-engine/build.rs",
-      "sha256": "0089f0cac17064ed852d78b6c0502c285c2fb4242c483147e8836248154a9954"
+      "sha256": "30443d155b4ea8b96b3a23e74ca1d97fe0d94f7a7aa3b7b97c712eeffb2776dd"
     },
     {
       "package": "speech-native-platform",
@@ -434,6 +444,17 @@
         "macos",
         "windows"
       ]
+    },
+    {
+      "test_id": "local_training_holdout_isolation_and_join",
+      "package": "llama-native-engine",
+      "target": "test:residual_training",
+      "source": "crates/native/crates/llama-native-engine/tests/residual_training.rs",
+      "prerequisite": "requires LLAMA_RESIDUAL_MODEL pointing to a local GGUF",
+      "required_environment": ["LLAMA_RESIDUAL_MODEL"],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this authored-contrast runtime check cannot promote scientific validity, personality construct validity, steering generalization, cross-platform support, or release readiness.",
+      "platforms": ["linux", "macos", "windows"]
     },
     {
       "test_id": "tests::real_per_token_embeddings_preserve_generation_context",

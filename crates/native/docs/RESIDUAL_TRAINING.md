@@ -143,3 +143,21 @@ The initial all-layer zero-control attempt failed before fitting. A subsequent
 run passed all runtime assertions but failed only its optional receipt write
 because a relative output path resolved from the crate directory. The recorded
 successful run used new absolute output paths; no prior artifacts were replaced.
+
+The same fixed protocol also passed on Gemma 4 31B **base** Q8_0
+(`2b739f4d97c7559d0354bd87901b1571e839525108fc5c9747415982fc57400f`):
+
+- Layer 20 gain `0.25`; train loss `0.891889243 -> 0.889376915`.
+- Held-out loss `0.936247198 -> 0.934714370`; signed utility `0.003061191`.
+- Both-sign polarity agreement again remains **zero**. Neither smoke fit is
+  evidence of a usable, independently replicated personality faculty.
+- No-op/replay maximum target-token delta `0`; all holdout mutation, no-op,
+  generation isolation, cancellation, and joined-owner assertions passed.
+- Output-file SHA-256:
+  `9216edbd3c04bb32e04ea25e7546e670ba0624b44363e8f987def43e355ef192`.
+
+Local native gates passed 224 package tests and 19 doctests, native-group strict
+Clippy and formatting, architecture checks, and diff checks. The opt-in test is
+registered separately in `ci/ignored-tests.json`; ordinary green CI does not
+stand in for model execution. That registry also records the reviewed build-script
+digest after the immutable binding revision update.
