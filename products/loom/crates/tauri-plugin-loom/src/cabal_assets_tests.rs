@@ -37,7 +37,7 @@ fn pair(path: &Path) -> (Cabal, Cabal) {
 }
 fn copy(alice: &Cabal, bob: &mut Cabal) {
     bob.accept_roster(alice.roster().clone()).unwrap();
-    bob.apply(alice.missing(&bob.hashes().unwrap()).unwrap())
+    bob.apply(alice.missing_causal(&bob.sync_state().unwrap()).unwrap())
         .unwrap();
     for asset in alice.assets().unwrap() {
         while let Some(offset) = bob.begin_asset(&asset).unwrap() {

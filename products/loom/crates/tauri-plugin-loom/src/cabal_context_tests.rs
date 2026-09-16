@@ -222,7 +222,7 @@ fn lost_reply_reopen_and_retry_keep_one_document_and_later_collaborative_edits()
         .unwrap();
     let review = prepare(&store, &cabal, source).unwrap();
     let published = publish(&mut store, &mut cabal, &review.request).unwrap();
-    peer.apply(cabal.missing(&peer.hashes().unwrap()).unwrap())
+    peer.apply(cabal.missing_causal(&peer.sync_state().unwrap()).unwrap())
         .unwrap();
     let view = peer.view(review.request.publication).unwrap();
     peer.edit(&Edit {
@@ -233,7 +233,7 @@ fn lost_reply_reopen_and_retry_keep_one_document_and_later_collaborative_edits()
     })
     .unwrap();
     cabal
-        .apply(peer.missing(&cabal.hashes().unwrap()).unwrap())
+        .apply(peer.missing_causal(&cabal.sync_state().unwrap()).unwrap())
         .unwrap();
     set_document_context_snapshot(
         store.root(),
@@ -351,7 +351,7 @@ fn failed_intent_persistence_cannot_publish_files_or_create_a_document() {
 fn a_removed_member_cannot_publish_previously_reviewed_context() {
     let directory = tempfile::tempdir().unwrap();
     let (_, mut owner, mut peer, _) = fixture(directory.path());
-    peer.apply(owner.missing(&peer.hashes().unwrap()).unwrap())
+    peer.apply(owner.missing_causal(&peer.sync_state().unwrap()).unwrap())
         .unwrap();
     let (mut store, _) =
         ProjectStore::initialize(directory.path().join("PeerWriting"), "Garden").unwrap();

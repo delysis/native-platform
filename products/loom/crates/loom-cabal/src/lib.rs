@@ -13,7 +13,7 @@ pub use document::{Create, DocumentView, Edit, EditResult, MetadataEdit, TextKin
 pub use network_mode::NetworkMode;
 pub use store::{
     ASSET_CHUNK_BYTES, AssetDescriptor, Cabal, ChangeEnvelope, ChangePayload, Invitation,
-    MAX_ASSET_BYTES, Member, Membership, Roster,
+    MAX_ASSET_BYTES, Member, Membership, Roster, SyncDocument, SyncState,
 };
 pub use transport::{Network, PeerStatus};
 

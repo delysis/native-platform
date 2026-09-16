@@ -1,7 +1,10 @@
 mod assets;
 mod invitations;
+mod sync;
 pub use assets::{ASSET_CHUNK_BYTES, AssetDescriptor, MAX_ASSET_BYTES};
 pub use invitations::Invitation;
+use sync::{ChangeIndex, ChangeKey};
+pub use sync::{SyncDocument, SyncState};
 
 use automerge::{Automerge, Change, ReadDoc};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -20,8 +23,9 @@ use crate::{
     document::{self, Create, DocumentView, Edit, EditResult, MetadataEdit, TextKind},
 };
 
-const STORE_VERSION: i64 = 4;
+const STORE_VERSION: i64 = 5;
 const MAX_STORED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_LOCAL_RECORD_KEYS: usize = 65_536;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,7 +46,7 @@ pub struct Membership {
     pub members: Vec<Member>,
     /// At revocation, the owner seals accepted history. Unknown changes from
     /// an earlier epoch cannot be backdated by a removed device.
-    pub sealed: BTreeSet<String>,
+    pub sealed: BTreeMap<Uuid, BTreeSet<String>>,
 }
 
 pub type Roster = Signed<Membership>;
@@ -65,6 +69,8 @@ pub struct Cabal {
     roster: Roster,
     documents: BTreeMap<Uuid, Automerge>,
     stored_bytes: usize,
+    change_index: ChangeIndex,
+    sealed_history: BTreeSet<ChangeKey>,
 }
 
 impl std::fmt::Debug for Cabal {
@@ -82,7 +88,7 @@ impl Cabal {
         validate_name(name)?;
         validate_name(member_name)?;
         let roster = identity.sign(Membership {
-            schema: 1,
+            schema: 2,
             cabal: Uuid::new_v4(),
             owner: identity.public_key(),
             name: name.into(),
@@ -92,7 +98,7 @@ impl Cabal {
                 key: identity.public_key(),
                 name: member_name.into(),
             }],
-            sealed: BTreeSet::new(),
+            sealed: BTreeMap::new(),
         })?;
         Self::import(path, identity, roster)
     }
@@ -107,12 +113,15 @@ impl Cabal {
             "INSERT INTO metadata(key, value) VALUES ('roster', ?)",
             [serde_json::to_string(&roster)?],
         )?;
+        let sealed_history = sync::sealed_history(&roster, &ChangeIndex::new())?;
         Ok(Self {
             identity,
             database,
             roster,
             documents: BTreeMap::new(),
             stored_bytes: 0,
+            change_index: ChangeIndex::new(),
+            sealed_history,
         })
     }
 
@@ -128,6 +137,11 @@ impl Cabal {
         )?;
         let roster: Roster = serde_json::from_str(&encoded)?;
         validate_roster(&roster)?;
+        let count: i64 =
+            database.query_row("SELECT count(*) FROM changes", [], |row| row.get(0))?;
+        if count > MAX_CHANGES as i64 {
+            return Err(Error::Invalid("Cabal change limit reached"));
+        }
         let stored_bytes: i64 = database.query_row(
             "SELECT coalesce(sum(length(CAST(body AS BLOB))), 0) FROM changes",
             [],
@@ -144,12 +158,22 @@ impl Cabal {
             roster,
             documents: BTreeMap::new(),
             stored_bytes,
+            change_index: ChangeIndex::new(),
+            sealed_history: BTreeSet::new(),
         };
         let envelopes = cabal.envelopes()?;
         for envelope in &envelopes {
-            validate_envelope(envelope, &cabal.roster)?;
+            let change = validate_envelope(envelope, cabal.id())?;
+            sync::index_change(&mut cabal.change_index, envelope, &change)?;
         }
+        cabal.sealed_history = sync::sealed_history(&cabal.roster, &cabal.change_index)?;
+        for envelope in &envelopes {
+            let change = validate_envelope(envelope, cabal.id())?;
+            authorize_envelope(envelope, &change, &cabal.roster, &cabal.sealed_history)?;
+        }
+        cabal.sync_state()?;
         cabal.documents = build_documents(&envelopes)?;
+        sync::seal_frontier(&cabal.roster, &cabal.documents, &BTreeMap::new())?;
         Ok(cabal)
     }
 
@@ -341,14 +365,39 @@ impl Cabal {
     pub fn fingerprint(&self) -> Result<String> {
         let mut digest = Sha256::new();
         digest.update(self.roster.hash()?.as_bytes());
-        for hash in self.hashes()? {
-            digest.update(hash.as_bytes());
-        }
+        digest.update(serde_json::to_vec(&self.sync_state()?)?);
         digest.update(b"\0assets\0");
         for asset in self.assets()? {
             digest.update(asset.sha256.as_bytes());
         }
         Ok(hex::encode(digest.finalize()))
+    }
+
+    /// Private projection bookkeeping. These records are never synchronized.
+    pub fn local_record_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        if prefix.is_empty() || prefix.len() > 128 {
+            return Err(Error::Invalid("Invalid local record prefix"));
+        }
+        let prefix = format!("local:{prefix}");
+        let mut statement = self.database.prepare(
+            "SELECT key FROM metadata WHERE substr(key, 1, length(?1)) = ?1 ORDER BY key LIMIT ?2",
+        )?;
+        let keys = statement
+            .query_map(params![prefix, MAX_LOCAL_RECORD_KEYS as i64 + 1], |row| {
+                row.get::<_, String>(0)
+            })?
+            .map(|row| {
+                let key = row?;
+                Ok(key
+                    .strip_prefix("local:")
+                    .ok_or(Error::Invalid("Invalid local record key"))?
+                    .to_owned())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if keys.len() > MAX_LOCAL_RECORD_KEYS {
+            return Err(Error::Invalid("Too many local cabal records"));
+        }
+        Ok(keys)
     }
 
     /// Private projection bookkeeping. These records are never synchronized.
@@ -390,52 +439,31 @@ impl Cabal {
         }
         build_documents(&all)?
             .into_iter()
-            .filter(|(id, _)| affected.contains(id))
+            .filter(|(id, document)| {
+                affected.contains(id) && document.get_missing_deps(&[]).is_empty()
+            })
             .map(|(id, document)| document::view(&document, id))
             .collect()
-    }
-
-    pub fn missing(&self, known: &BTreeSet<String>) -> Result<Vec<ChangeEnvelope>> {
-        if known.len() > MAX_CHANGES {
-            return Err(Error::Invalid("Too many advertised changes"));
-        }
-        let mut result = Vec::new();
-        let mut bytes = 0;
-        let budget = crate::MAX_FRAME_BYTES
-            .saturating_sub(
-                serde_json::to_vec(&self.roster)?.len()
-                    + serde_json::to_vec(&self.assets()?)?.len()
-                    + 1024,
-            )
-            .min(3 * 1024 * 1024);
-        let mut statement = self
-            .database
-            .prepare("SELECT hash, body FROM changes ORDER BY rowid")?;
-        let mut rows = statement.query([])?;
-        while let Some(row) = rows.next()? {
-            if known.contains(&row.get::<_, String>(0)?) {
-                continue;
-            }
-            let body: String = row.get(1)?;
-            let size = body.len();
-            if !result.is_empty() && bytes + size > budget {
-                break;
-            }
-            bytes += size;
-            result.push(serde_json::from_str(&body)?);
-            if result.len() == 128 {
-                break;
-            }
-        }
-        Ok(result)
     }
 
     fn envelopes(&self) -> Result<Vec<ChangeEnvelope>> {
         let mut statement = self
             .database
-            .prepare("SELECT body FROM changes ORDER BY rowid")?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+            .prepare("SELECT hash, body FROM changes ORDER BY rowid")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (hash, body) = row?;
+            let envelope: ChangeEnvelope = serde_json::from_str(&body)?;
+            if envelope.hash()? != hash {
+                return Err(Error::Invalid(
+                    "Cabal change index does not match its signed history",
+                ));
+            }
+            Ok(envelope)
+        })
+        .collect()
     }
 
     pub fn apply(&mut self, envelopes: Vec<ChangeEnvelope>) -> Result<bool> {
@@ -444,18 +472,32 @@ impl Cabal {
         }
         let known = self.hashes()?;
         let mut pending = BTreeMap::new();
+        let mut incoming_index = ChangeIndex::new();
         for envelope in envelopes {
             let hash = envelope.hash()?;
             if known.contains(&hash) {
                 continue;
             }
-            let change = validate_envelope(&envelope, &self.roster)?;
+            let change = validate_envelope(&envelope, self.id())?;
+            let key = (envelope.payload.document, change.hash());
+            if self.change_index.contains_key(&key) {
+                return Err(Error::Invalid(
+                    "A causal change has conflicting signed envelopes",
+                ));
+            }
+            sync::index_change(&mut incoming_index, &envelope, &change)?;
             let body = serde_json::to_string(&envelope)?;
             pending.insert(hash, (envelope, change, body));
         }
         if pending.is_empty() {
             return Ok(false);
         }
+        let mut sealed_history = self.sealed_history.clone();
+        sync::extend_sealed(&mut sealed_history, &incoming_index);
+        for (envelope, change, _) in pending.values() {
+            authorize_envelope(envelope, change, &self.roster, &sealed_history)?;
+        }
+        sync::state(&self.roster, &self.change_index, &incoming_index)?;
         if known.len() + pending.len() > MAX_CHANGES {
             return Err(Error::Invalid("Cabal change limit reached"));
         }
@@ -486,15 +528,22 @@ impl Cabal {
                 document::view(value, *id)?;
             }
         }
+        sync::seal_frontier(&self.roster, &self.documents, &documents)?;
         let transaction = self.database.transaction()?;
         for (hash, (_, _, body)) in pending {
             transaction.execute(
                 "INSERT INTO changes(hash, body) VALUES (?, ?)",
                 params![hash, body],
             )?;
+            // A later sealed descendant can prove that a quarantined change
+            // belongs to accepted history. Keep its original bytes, and clear
+            // only the now-obsolete quarantine entry in this transaction.
+            transaction.execute("DELETE FROM orphaned WHERE hash = ?", [hash])?;
         }
         transaction.commit()?;
         self.documents.extend(documents);
+        self.change_index.extend(incoming_index);
+        self.sealed_history = sealed_history;
         self.stored_bytes += bytes;
         Ok(true)
     }
@@ -511,7 +560,7 @@ impl Cabal {
         membership.members.retain(|member| member.key != key);
         membership.revision += 1;
         membership.epoch += 1;
-        membership.sealed = self.hashes()?;
+        membership.sealed = sync::seal_frontier(&self.roster, &self.documents, &BTreeMap::new())?;
         self.accept_roster(self.identity.sign(membership)?)?;
         Ok(())
     }
@@ -533,16 +582,22 @@ impl Cabal {
         if roster.payload.epoch < self.roster.payload.epoch {
             return Err(Error::Invalid("Cabal epoch moved backwards"));
         }
+        let sealed_history = sync::sealed_history(&roster, &self.change_index)?;
+        let mut change_index = ChangeIndex::new();
         let mut accepted = Vec::new();
         let mut orphaned = Vec::new();
         for envelope in self.envelopes()? {
-            if validate_envelope(&envelope, &roster).is_ok() {
+            let change = validate_envelope(&envelope, self.id())?;
+            if authorize_envelope(&envelope, &change, &roster, &sealed_history).is_ok() {
+                sync::index_change(&mut change_index, &envelope, &change)?;
                 accepted.push(envelope);
             } else {
                 orphaned.push(envelope);
             }
         }
         let documents = build_documents(&accepted)?;
+        sync::seal_frontier(&roster, &documents, &BTreeMap::new())?;
+        sync::state(&roster, &change_index, &ChangeIndex::new())?;
         let transaction = self.database.transaction()?;
         for envelope in orphaned {
             let hash = envelope.hash()?;
@@ -559,6 +614,8 @@ impl Cabal {
         transaction.commit()?;
         self.roster = roster;
         self.documents = documents;
+        self.change_index = change_index;
+        self.sealed_history = sealed_history;
         self.stored_bytes = accepted
             .iter()
             .map(|envelope| serde_json::to_vec(envelope).map(|bytes| bytes.len()))
@@ -632,14 +689,20 @@ fn validate_roster(roster: &Roster) -> Result<()> {
     roster.verify()?;
     let value = &roster.payload;
     validate_name(&value.name)?;
-    if value.schema != 1
+    if value.schema != 2
         || value.owner != roster.signer
         || value.members.is_empty()
         || value.members.len() > MAX_MEMBERS
-        || value.sealed.len() > MAX_CHANGES
+        || value.sealed.len() > MAX_DOCUMENTS
         || !value.members.iter().any(|member| member.key == value.owner)
     {
         return Err(Error::Invalid("Invalid cabal membership"));
+    }
+    for heads in value.sealed.values() {
+        sync::validate_hashes(heads)?;
+        if heads.is_empty() {
+            return Err(Error::Invalid("An owner seal needs a document head"));
+        }
     }
     let mut keys = BTreeSet::new();
     for member in &value.members {
@@ -651,25 +714,14 @@ fn validate_roster(roster: &Roster) -> Result<()> {
     Ok(())
 }
 
-fn validate_envelope(envelope: &ChangeEnvelope, roster: &Roster) -> Result<Change> {
+fn validate_envelope(envelope: &ChangeEnvelope, cabal: Uuid) -> Result<Change> {
     if envelope.payload.change.len() > MAX_CHANGE_BYTES * 4 / 3 + 4 {
         return Err(Error::Invalid("CRDT change exceeds limit"));
     }
     envelope.verify()?;
     let payload = &envelope.payload;
-    if payload.schema != 2 || payload.cabal != roster.payload.cabal {
+    if payload.schema != 2 || payload.cabal != cabal {
         return Err(Error::Invalid("Change belongs to another cabal"));
-    }
-    let sealed = roster.payload.sealed.contains(&envelope.hash()?);
-    if !sealed
-        && (payload.epoch != roster.payload.epoch
-            || !roster
-                .payload
-                .members
-                .iter()
-                .any(|member| member.key == envelope.signer))
-    {
-        return Err(Error::Invalid("Change is outside current cabal membership"));
     }
     let bytes = URL_SAFE_NO_PAD
         .decode(&payload.change)
@@ -688,6 +740,28 @@ fn validate_envelope(envelope: &ChangeEnvelope, roster: &Roster) -> Result<Chang
         return Err(Error::Invalid("CRDT actor does not belong to its signer"));
     }
     Ok(change)
+}
+
+fn authorize_envelope(
+    envelope: &ChangeEnvelope,
+    change: &Change,
+    roster: &Roster,
+    sealed: &BTreeSet<ChangeKey>,
+) -> Result<()> {
+    let payload = &envelope.payload;
+    let committed = sealed.contains(&(payload.document, change.hash()));
+    if payload.epoch > roster.payload.epoch
+        || (!committed
+            && (payload.epoch != roster.payload.epoch
+                || !roster
+                    .payload
+                    .members
+                    .iter()
+                    .any(|member| member.key == envelope.signer)))
+    {
+        return Err(Error::Invalid("Change is outside current cabal membership"));
+    }
+    Ok(())
 }
 
 fn build_documents(envelopes: &[ChangeEnvelope]) -> Result<BTreeMap<Uuid, Automerge>> {

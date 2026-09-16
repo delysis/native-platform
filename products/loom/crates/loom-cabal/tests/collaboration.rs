@@ -1,8 +1,5 @@
 use loom_cabal::{Cabal, Edit, Identity, Network, NetworkMode, Result};
-use std::{
-    collections::BTreeSet,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 fn pair(directory: &std::path::Path) -> Result<(Cabal, Cabal)> {
@@ -24,8 +21,8 @@ fn sync(left: &mut Cabal, right: &mut Cabal) -> Result<()> {
     right.accept_roster(left.roster().clone())?;
     left.accept_roster(right.roster().clone())?;
     for _ in 0..10 {
-        let to_right = left.missing(&right.hashes()?)?;
-        let to_left = right.missing(&left.hashes()?)?;
+        let to_right = left.missing_causal(&right.sync_state()?)?;
+        let to_left = right.missing_causal(&left.sync_state()?)?;
         if to_right.is_empty() && to_left.is_empty() {
             return Ok(());
         }
@@ -108,7 +105,7 @@ fn signatures_and_membership_are_not_editable_document_data() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let (mut alice, mut bob) = pair(directory.path())?;
     alice.create_document("spell.md", "Honest words")?;
-    let mut envelopes = alice.missing(&BTreeSet::new())?;
+    let mut envelopes = alice.missing_causal(&loom_cabal::SyncState::default())?;
     envelopes[0].payload.document = Uuid::new_v4();
     assert!(bob.apply(envelopes).is_err());
     assert!(bob.views()?.is_empty());
@@ -134,7 +131,7 @@ fn revocation_seals_history_and_preserves_unmerged_edits_as_orphans() -> Result<
         basis: old_basis,
         text: "Together, edited offline".into(),
     })?;
-    let offline_changes = bob.missing(&alice.hashes()?)?;
+    let offline_changes = bob.missing_causal(&alice.sync_state()?)?;
     alice.revoke(bob.identity().public_key())?;
     assert!(alice.apply(offline_changes).is_err());
     bob.accept_roster(alice.roster().clone())?;

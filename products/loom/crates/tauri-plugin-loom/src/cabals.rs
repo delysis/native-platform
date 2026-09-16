@@ -800,39 +800,48 @@ fn recovery_path(id: Uuid, text: &str) -> String {
     format!("Recovery/Cabal-{id}-{digest}.md")
 }
 
-fn recover_documents(
-    store: &mut ProjectStore,
+fn recovery_views(
+    store: &ProjectStore,
     cabal: &Cabal,
     edit: Option<Edit>,
-) -> Result<Vec<String>, IpcFailure> {
-    assets::prepare_project(store, cabal)?;
+) -> Result<Vec<DocumentView>, IpcFailure> {
     let mut views = cabal.orphaned_documents().map_err(failure)?;
-    views.extend(
-        cabal
-            .views()
-            .map_err(failure)?
-            .into_iter()
-            .filter(|view| view.deleted),
-    );
-    if !cabal.is_member(cabal.identity().public_key()) {
-        for mut view in cabal.views().map_err(failure)? {
-            if let Some(projection) = cabal
-                .local_record::<Projection>(&projection_key(view.id))
-                .map_err(failure)?
-                && let Some(id) = projection.local_id
-                && !store.document_is_deleted(id).map_err(IpcFailure::store)?
-                && let Some(registered) =
-                    store.registered_document(id).map_err(IpcFailure::store)?
-            {
-                let snapshot = store
-                    .reconciliation_snapshot(&registered.relative_path)
-                    .map_err(IpcFailure::store)?;
-                view.text = snapshot
-                    .visible
-                    .map_or(snapshot.base_text, |visible| visible.text);
-            }
+    let current = cabal.views().map_err(failure)?;
+    views.extend(current.iter().filter(|view| view.deleted).cloned());
+    let member = cabal.is_member(cabal.identity().public_key());
+    let mut copied_files = BTreeSet::new();
+    for key in cabal.local_record_keys("projection:").map_err(failure)? {
+        let Some(projection) = cabal.local_record::<Projection>(&key).map_err(failure)? else {
+            continue;
+        };
+        // A complete current view is handled by ordinary orphan/deletion
+        // recovery. A partial graph still has an independently owned file and
+        // editor basis, which explicit recovery must be able to preserve.
+        if member && current.iter().any(|view| view.id == projection.base.id) {
+            continue;
+        }
+        if let Some(id) = projection.local_id
+            && !store.document_is_deleted(id).map_err(IpcFailure::store)?
+            && let Some(registered) = store.registered_document(id).map_err(IpcFailure::store)?
+        {
+            let snapshot = store
+                .reconciliation_snapshot(&registered.relative_path)
+                .map_err(IpcFailure::store)?;
+            let mut view = projection.base;
+            view.text = snapshot
+                .visible
+                .map_or(snapshot.base_text, |visible| visible.text);
+            copied_files.insert(view.id);
             views.push(view);
         }
+    }
+    if !member {
+        views.extend(
+            current
+                .iter()
+                .filter(|view| !copied_files.contains(&view.id))
+                .cloned(),
+        );
     }
     if let Some(edit) = edit {
         if u64::try_from(edit.text.len()).map_err(failure)? > loom_store::MAX_DOCUMENT_BYTES {
@@ -840,10 +849,32 @@ fn recover_documents(
                 "The recovery copy exceeds the manuscript size limit",
             ));
         }
-        let mut view = cabal.view(edit.document).map_err(failure)?;
+        let mut view = cabal
+            .local_record::<Projection>(&projection_key(edit.document))
+            .map_err(failure)?
+            .map(|projection| projection.base)
+            .or_else(|| {
+                views
+                    .iter()
+                    .chain(current.iter())
+                    .find(|view| view.id == edit.document)
+                    .cloned()
+            })
+            .filter(|view| view.id == edit.document)
+            .ok_or_else(|| failure("Unknown shared document for draft recovery"))?;
         view.text = edit.text;
         views.push(view);
     }
+    Ok(views)
+}
+
+fn recover_documents(
+    store: &mut ProjectStore,
+    cabal: &Cabal,
+    edit: Option<Edit>,
+) -> Result<Vec<String>, IpcFailure> {
+    assets::prepare_project(store, cabal)?;
+    let views = recovery_views(store, cabal, edit)?;
     let mut paths = BTreeSet::new();
     for view in views {
         let path = recovery_path(view.id, &view.text);
@@ -1133,6 +1164,16 @@ fn project_workspace(
     let mut blocked = BTreeSet::new();
     let mut claimed = BTreeSet::new();
     let member = cabal.is_member(cabal.identity().public_key());
+    if member {
+        // Incomplete and quarantined documents may have no current view. Their
+        // existing files still belong to the saved projection; absence from a
+        // partial network page must never become a new publication identity.
+        for key in cabal.local_record_keys("projection:").map_err(failure)? {
+            if let Some(projection) = cabal.local_record::<Projection>(&key).map_err(failure)? {
+                claimed.extend(projection.local_id);
+            }
+        }
+    }
     for view in cabal.views().map_err(failure)? {
         let projection = cabal
             .local_record::<Projection>(&projection_key(view.id))
@@ -1776,8 +1817,12 @@ mod tests {
             .expect("admit");
         let mut bob =
             Cabal::import(&directory.path().join("bob.db"), bob_key, roster).expect("Bob's cabal");
-        bob.apply(alice.missing(&BTreeSet::new()).expect("changes"))
-            .expect("initial sync");
+        bob.apply(
+            alice
+                .missing_causal(&loom_cabal::SyncState::default())
+                .expect("changes"),
+        )
+        .expect("initial sync");
         let (mut store, _) =
             ProjectStore::initialize(directory.path().join("bob-writing"), "Bob").expect("project");
         project_workspace(&mut store, &mut bob, None).expect("initial files");
@@ -2049,6 +2094,201 @@ mod tests {
             .expect("document");
         project_document(&mut store, &mut cabal, view.id).expect("first projection");
         (store, cabal, view)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn partial_history_keeps_the_existing_file_bound_and_merges_later_local_edits() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let (mut store, mut local, view) = fixture(directory.path());
+        let initial = store.read_document(&view.name).expect("original");
+        let remote_identity = Identity::generate().expect("friend");
+        let invitation = local
+            .invite(local.identity().public_key().into())
+            .expect("invite");
+        let roster = local
+            .admit(&invitation.token, remote_identity.public_key(), "Fern")
+            .expect("admit");
+        let mut remote =
+            Cabal::import(&directory.path().join("remote.db"), remote_identity, roster)
+                .expect("remote cabal");
+        remote
+            .apply(
+                local
+                    .missing_causal(&remote.sync_state().expect("state"))
+                    .expect("initial page"),
+            )
+            .expect("initial sync");
+        let client = Uuid::new_v4();
+        for index in 0..140 {
+            remote
+                .edit(&Edit {
+                    document: view.id,
+                    client,
+                    basis: remote.view(view.id).expect("view").heads,
+                    text: format!("First, remote {index}\n\nLast\n"),
+                })
+                .expect("remote edit");
+        }
+        let page = remote
+            .missing_causal(&local.sync_state().expect("state"))
+            .expect("page");
+        assert_eq!(page.len(), 128);
+        local.apply(page).expect("partial history");
+        assert!(local.views().expect("views").is_empty());
+        let identity = local.identity().clone();
+        drop(local);
+        let mut local = Cabal::open(&directory.path().join("cabal.db"), identity)
+            .expect("restart partial history");
+        let before = local.hashes().expect("before");
+        let (documents, deleted, problems) =
+            project_workspace(&mut store, &mut local, None).expect("unchanged partial projection");
+        assert!(
+            documents.is_empty(),
+            "A partial page must not create a replacement shared document"
+        );
+        assert!(deleted.is_empty());
+        assert!(
+            problems.is_empty(),
+            "{}",
+            serde_json::to_string(&problems).expect("problems")
+        );
+        assert_eq!(local.hashes().expect("after unchanged projection"), before);
+        let authored = "First\n\nLast, edited locally\n";
+        std::fs::write(store.root().join(&view.name), authored).expect("local writing");
+        let (documents, deleted, problems) =
+            project_workspace(&mut store, &mut local, None).expect("partial projection");
+        assert!(documents.is_empty());
+        assert!(deleted.is_empty());
+        assert!(problems.is_empty());
+        assert_eq!(
+            local.hashes().expect("after"),
+            before,
+            "Catch-up must not republish an existing file under a new document identity"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.root().join(&view.name)).expect("writing"),
+            authored
+        );
+        for _ in 0..4 {
+            let page = remote
+                .missing_causal(&local.sync_state().expect("state"))
+                .expect("remaining page");
+            if page.is_empty() {
+                break;
+            }
+            local.apply(page).expect("catch up");
+        }
+        let (documents, deleted, problems) =
+            project_workspace(&mut store, &mut local, None).expect("complete projection");
+        assert_eq!(documents.len(), 1);
+        assert!(deleted.is_empty());
+        assert!(problems.is_empty());
+        let merged = store.read_document(&view.name).expect("merged");
+        assert_eq!(merged.document_id, initial.document_id);
+        assert_eq!(merged.text, "First, remote 139\n\nLast, edited locally\n");
+        assert_eq!(local.views().expect("one shared document").len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn partial_history_recovery_keeps_the_visible_file_and_unsent_draft_private() {
+        let directory = tempfile::tempdir().expect("fixture");
+        let (_, mut owner, view) = fixture(directory.path());
+        let key = Identity::generate().expect("reader");
+        let invitation = owner
+            .invite(owner.identity().public_key().into())
+            .expect("invite");
+        let roster = owner
+            .admit(&invitation.token, key.public_key(), "Fern")
+            .expect("admit");
+        let mut reader =
+            Cabal::import(&directory.path().join("reader.db"), key, roster).expect("reader");
+        reader
+            .apply(
+                owner
+                    .missing_causal(&reader.sync_state().expect("state"))
+                    .expect("page"),
+            )
+            .expect("initial sync");
+        let (mut store, _) =
+            ProjectStore::initialize(directory.path().join("reader-writing"), "Fern")
+                .expect("project");
+        project_workspace(&mut store, &mut reader, None).expect("initial projection");
+        let removed = Identity::generate().expect("other member");
+        let invitation = owner
+            .invite(owner.identity().public_key().into())
+            .expect("invite");
+        owner
+            .admit(&invitation.token, removed.public_key(), "Other")
+            .expect("admit other");
+        let client = Uuid::new_v4();
+        for index in 0..140 {
+            owner
+                .edit(&Edit {
+                    document: view.id,
+                    client,
+                    basis: owner.view(view.id).expect("view").heads,
+                    text: format!("First, revision {index}\n\nLast\n"),
+                })
+                .expect("edit");
+        }
+        owner
+            .revoke(removed.public_key())
+            .expect("remove other member");
+        reader
+            .accept_roster(owner.roster().clone())
+            .expect("latest membership");
+        reader
+            .apply(
+                owner
+                    .missing_causal(&reader.sync_state().expect("state"))
+                    .expect("partial page"),
+            )
+            .expect("partial sync");
+        assert!(reader.views().expect("incomplete views").is_empty());
+        assert!(
+            reader
+                .orphaned_documents()
+                .expect("incomplete recovery graph")
+                .is_empty()
+        );
+        let visible = "First\n\nLast, outside the editor\n";
+        std::fs::write(store.root().join(&view.name), visible).expect("visible edit");
+        let draft = "First\n\nLast, unsent in the editor\n";
+        let before = reader.hashes().expect("before");
+        let paths = recover_documents(
+            &mut store,
+            &reader,
+            Some(Edit {
+                document: view.id,
+                client: Uuid::new_v4(),
+                basis: view.heads,
+                text: draft.into(),
+            }),
+        )
+        .expect("private recovery while catching up");
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().all(|path| path.starts_with("Recovery/")));
+        assert_eq!(
+            store
+                .read_document(recovery_path(view.id, visible))
+                .expect("file copy")
+                .text,
+            visible
+        );
+        assert_eq!(
+            store
+                .read_document(recovery_path(view.id, draft))
+                .expect("draft copy")
+                .text,
+            draft
+        );
+        assert_eq!(reader.hashes().expect("no publication"), before);
+        assert_eq!(
+            std::fs::read_to_string(store.root().join(&view.name)).expect("original file"),
+            visible
+        );
     }
 
     #[test]

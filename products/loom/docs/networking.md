@@ -153,9 +153,26 @@ proof. Invitations are bearer capabilities: only send them to intended members.
 
 Revocation advances a signed epoch and seals accepted history. Previously
 unknown changes from older epochs cannot be smuggled back into the active
-workspace. Unmerged local edits remain recoverable as orphaned history. Removal
+workspace. The seal names each document's Automerge heads: their dependency
+hashes commit to the accepted causal history. Every envelope still needs a
+valid author signature, matching actor/document/cabal, and a non-future epoch.
+A current member cannot authorize an unsealed old change by depending on it.
+Unmerged local edits remain recoverable as orphaned history. Removal
 cannot erase prose that a former member already received. Owner-device loss and
 transfer need an explicit recovery design before this can be called complete.
+
+History catch-up sends sealed heads before their ancestors in bounded pages.
+A partial page is durable across restart, but an incomplete document is not
+projected as a new manuscript. Its saved local file binding remains claimed,
+including across restart: catch-up cannot recapture that file as another shared
+document. Explicit recovery can still save the visible file and an unsent editor
+draft privately while the graph is incomplete. Later projection merges local
+writing from its saved basis into the completed history.
+When a later descendant proves a quarantined
+ancestor was sealed, the exact original envelope returns to active history;
+unsealed offline edits stay in recovery. An owner can still remove a device
+while catching up: earlier sealed roots remain authorized, while unresolved new
+work is quarantined rather than granting authority to unknown dependencies.
 
 Signal uses pinned Presage and libsignal implementations. Its database key lives
 in the OS credential vault; an unavailable vault never falls back to plaintext.
@@ -247,12 +264,17 @@ Current limits are 16 open cabals, 32 members per cabal, 64 documents, 1 MiB per
 document, 64 MiB of change storage, and 20,000 stored changes. Frames and batches
 are bounded before decoding. Raw Automerge change blocks are accepted;
 compressed change blocks are rejected before their unbounded upstream decoder.
+Sync advertises per-document graph heads and missing dependencies, each bounded
+at 256, instead of every historical envelope hash. Replies contain at most 128
+signed changes and respect the four-MiB frame budget. The owner's revocation
+seal has at most 256 heads per document, independent of its history length.
 The storage cap currently stops new edits with an error. Long-lived history
 compaction must preserve signed provenance and offline recovery before that cap
 can be relaxed.
 
-The cabal store is version 4, the signed document payload is version 2, and the
-workspace transport uses `app.delysis.loom/cabal/2`. Older experimental stores
+The cabal store is version 5, the membership payload is version 2, the signed
+document payload is version 2, and the workspace transport uses
+`app.delysis.loom/cabal/3`. Older experimental stores
 and protocols are rejected without rewriting saved data or retaining a
 compatibility layer.
 

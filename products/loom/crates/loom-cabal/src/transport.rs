@@ -22,10 +22,10 @@ use uuid::Uuid;
 use crate::compute::{self, ComputeExecutor, ComputeHost, ComputeInput, ComputeReply};
 use crate::{
     ASSET_CHUNK_BYTES, AssetDescriptor, Cabal, ChangeEnvelope, Error, Identity, Invitation,
-    MAX_FRAME_BYTES, NetworkMode, Result, Roster,
+    MAX_FRAME_BYTES, NetworkMode, Result, Roster, SyncState,
 };
 
-const ALPN: &[u8] = b"app.delysis.loom/cabal/2";
+const ALPN: &[u8] = b"app.delysis.loom/cabal/3";
 const MAX_CABALS: usize = 16;
 type SharedCabal = Arc<Mutex<Cabal>>;
 type Cabals = Arc<Mutex<BTreeMap<Uuid, SharedCabal>>>;
@@ -308,7 +308,7 @@ enum Request {
     Sync {
         cabal: Uuid,
         roster: Roster,
-        known: BTreeSet<String>,
+        known: SyncState,
         address: EndpointAddr,
     },
 }
@@ -464,7 +464,7 @@ impl Handler {
                 cabal.remember_peer(&address)?;
                 Ok(Response::Sync {
                     roster: cabal.roster().clone(),
-                    changes: cabal.missing(&known)?,
+                    changes: cabal.missing_causal(&known)?,
                     assets: cabal.assets()?,
                 })
             }
@@ -538,7 +538,7 @@ async fn synchronize(
             Request::Sync {
                 cabal: cabal.id(),
                 roster: cabal.roster().clone(),
-                known: cabal.hashes()?,
+                known: cabal.sync_state()?,
                 address: mode.address(endpoint.addr()),
             },
         )
