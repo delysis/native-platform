@@ -27,6 +27,7 @@ use crate::{
 
 const ALPN: &[u8] = b"app.delysis.loom/cabal/4";
 const MAX_CABALS: usize = 16;
+mod listen;
 type SharedCabal = Arc<Mutex<Cabal>>;
 type Cabals = Arc<Mutex<BTreeMap<Uuid, SharedCabal>>>;
 
@@ -52,6 +53,21 @@ pub struct Network {
 }
 
 impl Network {
+    /// Start a device profile while its caller holds the exclusive profile lease.
+    /// Direct mode persists local ports before advertising an address. Internet
+    /// and chosen-relay modes use their existing address discovery instead.
+    pub async fn start_persistent(
+        identity: &Identity,
+        mode: NetworkMode,
+        directory: &std::path::Path,
+    ) -> Result<Self> {
+        if mode != (NetworkMode::Direct {}) {
+            return Self::start(identity, mode).await;
+        }
+        let endpoint = listen::bind(identity, directory).await?;
+        Self::attach(identity, mode, endpoint)
+    }
+
     pub async fn start(identity: &Identity, mode: NetworkMode) -> Result<Self> {
         let builder = mode.builder()?;
         let endpoint = builder

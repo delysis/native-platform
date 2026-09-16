@@ -188,7 +188,11 @@ impl CabalService {
             ));
             cabals.insert(*id, cabal);
         }
-        let network = Arc::new(Network::start(&identity, mode).await.map_err(failure)?);
+        let network = Arc::new(
+            Network::start_persistent(&identity, mode, directory)
+                .await
+                .map_err(failure)?,
+        );
         for cabal in cabals.values() {
             if let Err(error) = network.add(cabal.clone()) {
                 let _ = network.shutdown().await;

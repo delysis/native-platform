@@ -246,8 +246,10 @@ creating an identity or starting networking. It offers three policies:
 * **Community relays** uses Iroh's Internet preset: direct connections, public
   discovery, hole-punching, and community relay fallback. This is the default.
 * **Direct connections** disables relays and public discovery. Invitations and
-  saved peer addresses supply connection hints. If both devices' addresses change
-  while disconnected, fresh address hints may be needed; membership stays saved.
+  saved peer addresses supply connection hints. Each device keeps its local UDP
+  ports across process restarts, so restarting both apps on the same network
+  does not invalidate their saved addresses. Changed IP addresses or NAT mappings
+  may still need fresh address hints; membership stays saved.
 * **Our own relays** uses one to four distinct HTTPS relay origins and disables
   public discovery. Friends configure common relays, so a saved device identity
   remains reachable after its IP address or port changes. Incoming invitations
@@ -261,6 +263,14 @@ identity. Invalid or unsupported settings stop profile startup and are preserved
 without falling back to community infrastructure. The local settings format is
 version 1. HTTPS uses Iroh's normal certificate verification; there is no custom
 verifier or production option to disable it.
+
+Direct listen ports are separate device-local state, atomically saved before
+the network serves a cabal. The caller holds the profile lease. A busy saved IPv4
+port stops startup instead of silently selecting an unreachable replacement;
+retry after that port becomes available. IPv6 remains optional, with its saved
+port retained when the address family is temporarily unavailable. Corrupt,
+unsupported, symbolic or wrong-device records are preserved and refused.
+This does not add discovery, relays, or new membership authority to direct mode.
 
 An owned loopback TLS relay test disables direct UDP and trusts an explicit test
 CA. It transfers a document and attachment, restarts a peer with only stale

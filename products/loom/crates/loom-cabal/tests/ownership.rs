@@ -236,13 +236,18 @@ async fn a_removed_original_owner_receives_the_current_authority_over_quic() -> 
     )?;
     stale.remember_peer(&network.address())?;
     let stale = Arc::new(Mutex::new(stale));
-    let peer_key = peer.identity().public_key();
     network.add(Arc::new(Mutex::new(peer)))?;
     old_network.add(stale.clone())?;
-    let result = tokio::time::timeout(
-        Duration::from_secs(10),
-        old_network.sync_now(stale.clone(), peer_key),
-    )
+    // Observe the supervisor's delivery. A competing manual sync can begin
+    // after revocation is already committed and correctly refuse membership.
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if stale.lock().expect("old owner lock").roster().hash()? == expected {
+                return Ok::<(), loom_cabal::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
     .await;
     old_network.shutdown().await?;
     network.shutdown().await?;
