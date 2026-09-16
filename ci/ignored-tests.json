@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 45,
+  "expected_test_count": 46,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -453,7 +453,7 @@
       "prerequisite": "requires LLAMA_RESIDUAL_MODEL and LLAMA_RESIDUAL_POOLING_OUTPUT_DIR",
       "required_environment": ["LLAMA_RESIDUAL_MODEL", "LLAMA_RESIDUAL_POOLING_OUTPUT_DIR"],
       "evidence_class": "real-model-runtime",
-      "promotion_prohibition": "Exposed smoke pairs and zero-search pooling checks do not establish behavioral transfer, scientific validity, cross-model qualification, or release readiness.",
+      "promotion_prohibition": "Passing these exposed smoke pairs and zero-search pooling checks cannot promote behavioral-transfer claims, scientific validity, cross-model qualification, or release readiness.",
       "platforms": ["linux", "macos", "windows"]
     },
     {
