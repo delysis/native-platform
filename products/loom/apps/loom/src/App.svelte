@@ -10391,7 +10391,7 @@
                 {promotionInFlight ? 'Checking authoritative state…' : 'Check promotion result'}
               </button>
             {:else}
-              <h1>No notes.</h1>
+              <h1>{project.documents.length > 0 ? 'Choose a note.' : 'No notes.'}</h1>
             {/if}
           </section>
         {/if}

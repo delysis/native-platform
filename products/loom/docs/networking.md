@@ -568,6 +568,25 @@ connection cleanup detached and reproduced a crash during process exit.
 
 ## Remaining acceptance and implementation
 
+The current acceptance map preserves the full feature scope. Evidence below is
+limited to the recorded revision and environment; a local check does not establish
+a phone-linked session or connectivity across physical networks.
+
+| Requirement | Verified evidence | Still open |
+| --- | --- | --- |
+| Durable pairing, shared writing, archived history and ownership | [Optimized two-app acceptance](audit-receipts/2026-09-16-direct-restart.md): archived late join, exact-device handoff, independently edited paragraphs, both processes restarted, automatic direct reconnection, identical ordinary Markdown and all 1,103 signed changes, successor revocation and graceful shutdown. Earlier native runs below cover rename, removal, undo, source/visual switching and private recovery. | Physical simultaneous typing and IME; peers on separate Internet networks. |
+| Portable prompts, document functions and native media | Native Gemma 4 text/image/audio peer execution below; [context publication](audit-receipts/2026-09-15-context-publication-and-signal-source.md) keeps private scratch local and publishes explicit excerpts/media with collaborative edits preserved. | Exercise the same workflows with the physical peer; prompts remain explicit and modality compatibility must be checked for each model. |
+| Revocable idle compute with durable results | [Lifecycle acceptance](audit-receipts/2026-09-15-native-compute-lifecycle.md) and [retention acceptance](audit-receipts/2026-09-15-compute-retention.md): real Gemma 4 execution, local priority, cancellation, shutdown/restart, signed results, immutable inputs, spent-budget retention and revoked grants. | Physical host/requester acceptance across their network boundary. |
+| Signal relationships and persistent workspace/chat association | Pinned Presage/libsignal worker; encrypted unlinked vault, process ownership, restart/shutdown and exact packaged-source checks. Local tests cover drafts, uncertain sends, receipts, expiry, bookmarks and changed identities. | Phone linking, real contacts/groups, explicit send and receipt, process restart/reconnect, changed-identity review, disappearance and draft recovery, workspace association in a real conversation. |
+| Signal group workspace description and notification | Local permission/revision checks, encrypted journal, verified signed service responses, exact review UI and separate notification receipts. | Explicitly authorized real group publication and notification, preserving current description, permissions and disappearing-message settings. |
+| Owner loss and recovery authority | [Signed ownership handoff](audit-receipts/2026-09-16-ownership-handoff.md) and native successor revocation above. Stale file backups cannot invent authority or reset spent compute. | Choice of recovery policy after loss of the sole owner's key; handoff alone does not recover a lost key. |
+| Release and merge | [Optimized candidate](audit-receipts/2026-09-16-direct-restart.md), exact source/worker receipts and required macOS CI at `dc08fcd`; upstream main `fb3a1b2` incorporated. | Final head/current upstream checks, remaining live acceptance above, and merge of draft PR #49. |
+
+The archived late join also exposed misleading empty-editor copy: a received
+note appeared in the sidebar while the editor still said **No notes.** The
+editor now says **Choose a note.** when documents exist and none is selected;
+it preserves explicit navigation and keeps **No notes.** for an empty workspace.
+
 The [context publication and Signal source receipt](audit-receipts/2026-09-15-context-publication-and-signal-source.md)
 records native publication of a curated excerpt and exact WAV, reconnect without
 another invitation, peer receipt, and edits converging in both directions. The
@@ -670,22 +689,9 @@ Check or Resume. The built asset was `index-CqIukfNR.js` (SHA-256
 This verifies packaged recovery and same-machine rediscovery, not connectivity
 across physical networks or a new model execution.
 
-The feature is not complete until the following have concrete evidence:
-
-* Phone linking; real contact/group sync; receipt and explicit send; reconnect
-  after process restart; changed-identity handling; expiry and draft recovery.
-* Two actual editors typing concurrently, offline/restart convergence, IME,
-  source/visual switching, undo, navigation, and joined application shutdown.
-* Cabal membership controls, orphan recovery, coherent new/renamed/deleted
-  documents, and persistent workspace/chat association in real paired sessions.
-* Portable attachment sharing and prompt modality requirements.
-* Explicit, revocable idle-compute grants; host-owned whole model jobs; durable
-  job identities; cancellation and resource limits; correctly attributed remote
-  results. Remote assertions must never masquerade as local live-worker evidence.
-* Physical Signal group-description publication and member notification, with
-  existing permissions and disappearing-message settings preserved. Offline
-  faults, encrypted persistence, signed-response validation, and review UI are
-  covered locally; no account has been linked and no real group has been edited.
+The open checks in the acceptance map above remain required for completion.
+Remote compute assertions must never masquerade as local live-worker evidence.
+No Signal account has been linked and no real group has been edited.
 
 Presage's current linking path does not import historical conversation backups.
 The pane currently displays text and attachment counts, not attachment contents.
