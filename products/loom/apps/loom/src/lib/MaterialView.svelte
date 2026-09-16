@@ -1,7 +1,10 @@
 <script lang="ts">
   import { onMount } from 'svelte';
+  import CollectionProgress from './CollectionProgress.svelte';
+  import CollectionMembers from './CollectionMembers.svelte';
+  import type { CollectionMember } from './types';
   import { convertFileSrc } from '@tauri-apps/api/core';
-  import { readMaterial, searchMaterial, readMaterialEvidence, revealAttachmentOriginal, normalizeFailure, pinMaterial, removeMaterial } from './ipc';
+  import { readMaterial, readCollectionMember, searchMaterial, readMaterialEvidence, revealAttachmentOriginal, normalizeFailure, pinMaterial, removeMaterial } from './ipc';
   import { materialLocatorLabel, materialLocatorPage, materialPdfPageText, materialWritingDocument, materialReferenceMarkdown, evidenceReferenceMarkdown, type MaterialEntry, type MaterialRead, type MaterialEvidence, type MaterialSearch } from './materials';
 
   export let projectId: string;
@@ -20,6 +23,8 @@
   let source: MaterialRead | null = null;
   let results: MaterialSearch | null = null;
   let selected: MaterialEvidence | null = initialEvidence;
+  let memberOpen = false;
+  let collectionRevision = '';
   let query = '';
   let error = '';
   let busy = false;
@@ -34,7 +39,9 @@
   $: pageText = pdfBytes && currentPage ? materialPdfPageText(pdfBytes, currentPage) : null;
   $: isPdf = source?.presentation?.detected_format.toLowerCase() === 'pdf';
   $: selectedPage = materialLocatorPage(selected?.locator);
-  $: reference = selected ? evidenceReferenceMarkdown(selected) : material.kind === 'folder' ? material.reference : materialReferenceMarkdown(material);
+  $: selectedLocation = selected?.locator && typeof selected.locator === 'object' ? selected.locator as Record<string, unknown> : null;
+  $: originalId = source?.material.attachment_id ?? (typeof selectedLocation?.attachment_id === 'string' ? selectedLocation.attachment_id : material.attachment_id);
+  $: reference = selected ? evidenceReferenceMarkdown(selected) : memberOpen && source?.evidence[0] ? evidenceReferenceMarkdown(source.evidence[0]) : material.kind === 'folder' ? material.reference : materialReferenceMarkdown(material);
   $: writingDocumentId = materialWritingDocument(selected?.locator, projectId);
   $: text = selected?.text ?? pageText ?? source?.text ?? '';
   $: warnings = [...new Set([...(source?.warnings ?? []), ...(results?.warnings ?? []), ...(selected?.warnings ?? [])])];
@@ -48,6 +55,7 @@
   async function search(): Promise<void> {
     if (!query.trim() || busy) return;
     const request = ++serial; busy = true; error = ''; selected = null;
+    if (material.kind === 'collection') { source = null; memberOpen = false; }
     try { const value = await searchMaterial(projectId, sessionId, material.id, query.trim()); if (mounted && serial === request) results = value; }
     catch (failure) { if (mounted && serial === request) error = normalizeFailure(failure).message; }
     finally { if (mounted && serial === request) busy = false; }
@@ -58,24 +66,36 @@
     catch (failure) { if (mounted && serial === request) error = normalizeFailure(failure).message; }
     finally { if (mounted && serial === request) busy = false; }
   }
+  async function openMember(member: CollectionMember): Promise<void> {
+    const request = ++serial; busy = true; error = '';
+    try {
+      const value = await readCollectionMember(projectId, sessionId, material.id, member.occurrence_id, member.snapshot_id);
+      if (mounted && request === serial) { source = value; selected = null; results = null; memberOpen = true; pageIndex = 0; }
+    } catch (failure) { if (mounted && request === serial) error = normalizeFailure(failure).message; }
+    finally { if (mounted && request === serial) busy = false; }
+  }
+  function backToCollection(): void { ++serial; busy = false; selected = null; source = null; results = null; memberOpen = false; pageIndex = 0; }
   function changePage(index: number): void {
     if (busy || !Number.isInteger(index) || index < 0 || index >= pdfPages.length) return;
     pageIndex = index;
     contentElement?.scrollTo(0, 0);
   }
   async function openSourcePage(): Promise<void> {
-    if (!selectedPage || busy || !material.available || !material.attachment_id) return;
+    if (!selectedPage || busy || !material.available || !originalId) return;
     const number = selectedPage;
     const request = ++serial; busy = true; error = '';
     try {
-      const value = source ?? await readMaterial(projectId, sessionId, material.id);
+      const location = selectedLocation;
+      const value = source ?? (material.kind === 'collection' && typeof location?.collection_snapshot === 'string' && typeof location?.occurrence_id === 'string'
+        ? await readCollectionMember(projectId, sessionId, material.id, location.occurrence_id, location.collection_snapshot)
+        : await readMaterial(projectId, sessionId, material.id));
       if (!mounted || serial !== request) return;
       const index = value.presentation?.pdf_pages?.findIndex(page => page.number === number) ?? -1;
       if (index < 0 || value.source_revision !== selected?.source_revision) {
         error = 'This retained passage has no matching extracted page in the available source.';
         return;
       }
-      source = value; pageIndex = index; selected = null; results = null;
+      source = value; memberOpen = material.kind === 'collection'; pageIndex = index; selected = null; results = null;
       contentElement?.scrollTo(0, 0);
     } catch (failure) { if (mounted && serial === request) error = normalizeFailure(failure).message; }
     finally { if (mounted && serial === request) busy = false; }
@@ -124,8 +144,8 @@
     finally { if (mounted) busy = false; }
   }
   async function original(): Promise<void> {
-    if (!material.attachment_id) return;
-    try { await revealAttachmentOriginal(projectId, sessionId, material.attachment_id); }
+    if (!originalId) return;
+    try { await revealAttachmentOriginal(projectId, sessionId, originalId); }
     catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
   }
   async function copyReference(): Promise<void> {
@@ -144,7 +164,8 @@
 
 <section class="material-view" aria-label={material.name} aria-busy={busy}>
   <header>
-    <h1>{selected?.title ?? material.name}</h1>
+    {#if material.kind === 'collection' && (selected || memberOpen || results)}<button on:click={backToCollection} aria-label="Back to collection">‹</button>{/if}
+    <h1>{selected?.title ?? (memberOpen ? source?.material.name : material.name)}</h1>
     {#if !selected && !results && pdfPages.length}
       <nav class="pages" aria-label="Extracted PDF pages">
         <button disabled={busy || pageIndex === 0} aria-label="Previous page" on:click={() => changePage(pageIndex - 1)}>‹</button>
@@ -159,8 +180,8 @@
       <button on:click={() => void copyReference()}>Copy reference</button>
       {#if text && originTitle}<button disabled={busy} on:mousedown|preventDefault on:click={() => void use(true)}>Insert quotation</button>{/if}
       {#if writingDocumentId && onOpenDocument}<button disabled={busy} on:click={() => void openWriting()}>Open current writing</button>{/if}
-      {#if selectedPage && material.available && material.attachment_id}<button disabled={busy} on:click={() => void openSourcePage()}>Open page {selectedPage}</button>{/if}
-      {#if material.attachment_id}<button on:click={() => void original()}>Reveal original</button>{/if}
+      {#if selectedPage && material.available && originalId}<button disabled={busy} on:click={() => void openSourcePage()}>Open page {selectedPage}</button>{/if}
+      {#if originalId}<button on:click={() => void original()}>Reveal original</button>{/if}
       {#if material.available && material.kind !== 'folder'}<button disabled={busy} on:click={() => void pin()}>{material.pinned ? 'Unpin' : 'Pin'}</button>{/if}
       {#if removable && material.kind !== 'folder'}<button disabled={busy} on:click={() => void remove()}>Remove from workspace</button>{/if}
     </div></details>
@@ -171,15 +192,18 @@
     <p class="notice">Choose this library again to open it on this device.</p>
     <button class="reopen" on:click={onReopen}>Choose library…</button>
   {:else}
-    {#if material.kind === 'library' && !selected}
+    {#if (material.kind === 'library' || material.kind === 'collection') && !selected && !memberOpen}
       <form class="search" on:submit|preventDefault={() => void search()}>
         <input type="search" bind:value={query} aria-label={`Search ${material.name}`} placeholder={`Search ${material.name}`} />
         <button disabled={busy || !query.trim()}>Search</button>
       </form>
     {/if}
+    {#if material.kind === 'collection' && !selected && !memberOpen}
+      <div class="collection-state"><CollectionProgress {projectId} {sessionId} collectionId={material.id} onChanged={status => collectionRevision = `${status.retained_count}:${status.phase}`} /></div>
+    {/if}
     {#if selected && results}<button class="return-results" on:click={() => selected = null}>‹ Results</button>{/if}
-    {#if warnings.length || (material.kind === 'attachment' && source?.complete === false) || results?.complete === false || selected?.complete === false}
-      <details class="coverage"><summary>{(material.kind === 'attachment' && source?.complete === false) || selected?.complete === false ? 'Only part of this source is readable' : results?.complete === false ? 'Partial results' : 'Source notes'}</summary>
+    {#if warnings.length || ((material.kind === 'attachment' || memberOpen) && source?.complete === false) || results?.complete === false || selected?.complete === false}
+      <details class="coverage"><summary>{((material.kind === 'attachment' || memberOpen) && source?.complete === false) || selected?.complete === false ? 'Only part of this source is readable' : results?.complete === false ? 'Partial results' : 'Source notes'}</summary>
         {#each warnings as warning}<p>{warning}</p>{/each}
       </details>
     {/if}
@@ -195,6 +219,8 @@
             <span class="excerpt">{hit.text}</span>
           </button>
         {/each}
+      {:else if material.kind === 'collection' && !memberOpen}
+        <CollectionMembers {projectId} {sessionId} collectionId={material.id} revision={collectionRevision} onOpenMember={member => void openMember(member)} />
       {:else if source}
         {#if isPdf && (!pdfPages.length || pageText === null)}<p class="notice">Page navigation is unavailable for this copy. The extracted text and original are retained.</p>{/if}
         {#each source.presentation?.media ?? [] as media (media.sha256)}
@@ -211,6 +237,7 @@
 </section>
 
 <style>
+  .collection-state { margin:6px 12px; font-size:.85rem; }
   .material-view { display:flex; flex-direction:column; min-width:0; min-height:0; height:100%; color:inherit; }
   header { display:flex; gap:8px; align-items:center; padding:6px 10px; border-bottom:1px solid #8883; }
   h1 { margin:0; flex:1; min-width:0; font:inherit; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }

@@ -272,7 +272,7 @@
     {
       "package": "tauri-plugin-loom",
       "src_path": "products/loom/crates/tauri-plugin-loom/build.rs",
-      "sha256": "847cefe718a99542f757a42968d3e343753449e7fd8e1d536723b4e2eb24c77b"
+      "sha256": "80df75be57f2415b46ac70675fff069e0c8e790155b84ee083089fdae366929b"
     },
     {
       "package": "mom-llama-app",

@@ -571,6 +571,90 @@
           "markdownDescription": "Denies the co_writer_save command without any pre-configured scope."
         },
         {
+          "description": "Enables the collection_add command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-collection-add",
+          "markdownDescription": "Enables the collection_add command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_add command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-collection-add",
+          "markdownDescription": "Denies the collection_add command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the collection_authorize command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-collection-authorize",
+          "markdownDescription": "Enables the collection_authorize command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_authorize command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-collection-authorize",
+          "markdownDescription": "Denies the collection_authorize command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the collection_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-collection-cancel",
+          "markdownDescription": "Enables the collection_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_cancel command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-collection-cancel",
+          "markdownDescription": "Denies the collection_cancel command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the collection_members command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-collection-members",
+          "markdownDescription": "Enables the collection_members command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_members command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-collection-members",
+          "markdownDescription": "Denies the collection_members command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the collection_read_member command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-collection-read-member",
+          "markdownDescription": "Enables the collection_read_member command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_read_member command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-collection-read-member",
+          "markdownDescription": "Denies the collection_read_member command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the collection_refresh command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-collection-refresh",
+          "markdownDescription": "Enables the collection_refresh command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_refresh command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-collection-refresh",
+          "markdownDescription": "Denies the collection_refresh command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the collection_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-collection-status",
+          "markdownDescription": "Enables the collection_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the collection_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-collection-status",
+          "markdownDescription": "Denies the collection_status command without any pre-configured scope."
+        },
+        {
           "description": "Enables the completion_snapshot command without any pre-configured scope.",
           "type": "string",
           "const": "allow-completion-snapshot",
@@ -869,18 +953,6 @@
           "type": "string",
           "const": "deny-import-account-disconnect",
           "markdownDescription": "Denies the import_account_disconnect command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the import_account_sync command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-import-account-sync",
-          "markdownDescription": "Enables the import_account_sync command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the import_account_sync command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-import-account-sync",
-          "markdownDescription": "Denies the import_account_sync command without any pre-configured scope."
         },
         {
           "description": "Enables the import_accounts command without any pre-configured scope.",

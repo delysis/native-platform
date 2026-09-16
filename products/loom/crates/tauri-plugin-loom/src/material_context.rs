@@ -40,6 +40,9 @@ pub(super) enum Value {
     Folder {
         folder: document_bindings::FolderSnapshot,
     },
+    Collection {
+        collection: materials::collections::FrozenCollection,
+    },
     Material {
         material: MaterialValue,
     },
@@ -167,6 +170,11 @@ pub(super) fn resolve(store: &ProjectStore, name: &str) -> Result<Value, IpcFail
     if name.starts_with("materials/") || materials::is_material_id(name) {
         let material = materials::resolve_optional(store, name)?;
         let entry = material.ok_or_else(|| failure(format!("Material @{name} is unavailable.")))?;
+        if entry.kind == MaterialKind::Collection {
+            return Ok(Value::Collection {
+                collection: materials::collections::freeze(store, entry)?,
+            });
+        }
         return Ok(Value::Material {
             material: materials::admit(store, &entry.id, MAX_BYTES)?.into(),
         });
@@ -188,6 +196,11 @@ pub(super) fn resolve(store: &ProjectStore, name: &str) -> Result<Value, IpcFail
         }
         (Ok(documents), _) => Ok(Value::Documents { documents }),
         (Err(error), Some(entry)) if error.code == "document_reference_missing" => {
+            if entry.kind == MaterialKind::Collection {
+                return Ok(Value::Collection {
+                    collection: materials::collections::freeze(store, entry)?,
+                });
+            }
             Ok(Value::Material {
                 material: materials::admit(store, &entry.id, MAX_BYTES)?.into(),
             })
@@ -216,6 +229,9 @@ fn evidence_passage(hit: &MaterialEvidence) -> String {
 
 pub(super) fn exact(value: &Value) -> Result<String, IpcFailure> {
     match value {
+        Value::Collection { .. } => Err(failure(
+            "A collection is not an exact text argument. Use find() to select source passages.",
+        )),
         Value::Folder { .. } => Err(failure(
             "A folder is a collection, not an exact text argument. Use find(@Folder/, \"query\") to select evidence.",
         )),
@@ -261,6 +277,14 @@ pub(super) fn search_with_cancel(
     scan_budget: &FolderScanBudget,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Value, IpcFailure> {
+    if let Value::Collection { collection } = source {
+        let result =
+            materials::collections::search(store, collection, query, scan_budget, cancelled)?;
+        return Ok(Value::Evidence {
+            evidence: result.hits.clone(),
+            retrieval: Some(Box::new(result)),
+        });
+    }
     if let Value::Folder { folder } = source {
         let result = materials::search_folder(store, folder, query, scan_budget, cancelled)?;
         return Ok(Value::Evidence {
@@ -303,7 +327,9 @@ pub(super) fn consult(
     query: &str,
 ) -> Result<Value, IpcFailure> {
     match value {
-        Value::Folder { .. } => search(store, value, query_window(query)),
+        Value::Folder { .. } | Value::Collection { .. } => {
+            search(store, value, query_window(query))
+        }
         Value::Material { material }
             if material.material.kind == MaterialKind::Library
                 || material.text.is_none()
@@ -350,7 +376,7 @@ pub(super) fn consult_with_budget_and_cancel(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<(Value, Vec<String>), IpcFailure> {
     let consulted = match value {
-        Value::Folder { .. } => {
+        Value::Folder { .. } | Value::Collection { .. } => {
             search_with_cancel(store, value, query_window(query), scan_budget, cancelled)?
         }
         Value::Material { material }
@@ -492,7 +518,10 @@ pub(super) fn native_media<'a>(
                     );
                 }
             }
-            Value::Text(_) | Value::Evidence { .. } | Value::Folder { .. } => {}
+            Value::Text(_)
+            | Value::Evidence { .. }
+            | Value::Folder { .. }
+            | Value::Collection { .. } => {}
         }
     }
     crate::terminal_media::merge(Vec::new(), media)

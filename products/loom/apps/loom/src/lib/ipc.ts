@@ -49,11 +49,13 @@ const PREFIX = 'plugin:loom|';
 // latency optimization rather than a correctness boundary.
 const INDEPENDENT_COMMANDS = new Set([
   'import_account_cancel',
+  'collection_cancel',
+  'collection_status',
+  'collection_refresh',
   'import_source_url',
   'import_accounts',
   'import_account_connect',
   'import_account_disconnect',
-  'import_account_sync',
   'application_close_abort',
   'application_close_pending',
   'audio_synthesize',
@@ -973,9 +975,6 @@ export function connectImportAccount(projectId: string, sessionId: string, servi
 export function disconnectImportAccount(projectId: string, sessionId: string, service: 'gmail' | 'drive', accountEmail: string): Promise<void> {
   return call('import_account_disconnect', { projectId, sessionId, service, accountEmail });
 }
-export function syncImportAccount(projectId: string, sessionId: string, source: ImportSource, accountEmail: string, query: string, pageToken: string | null, operationId: string = newUlid()): Promise<ImportBatch> {
-  return call('import_account_sync', { projectId, sessionId, source, accountEmail, query, pageToken, operationId });
-}
 export function chooseImportBatch(projectId: string, sessionId: string, folder: boolean, operationId: string = newUlid()): Promise<ImportBatch> {
   return call('attachment_import_batch_choose', { projectId, sessionId, folder, operationId });
 }
@@ -1020,4 +1019,26 @@ export function pinMaterial(projectId: string, sessionId: string, materialId: st
 
 export function removeMaterial(projectId: string, sessionId: string, materialId: string): Promise<void> {
   return call('material_remove', { projectId, sessionId, id: materialId });
+}
+
+export function addCollection(projectId: string, sessionId: string, name: string, scope: import('./types').CollectionScope, accountEmail: string, operationId: string = newUlid()): Promise<import('./materials').MaterialEntry> {
+  return call('collection_add', { projectId, sessionId, operationId, name, scope, accountEmail });
+}
+export function refreshCollection(projectId: string, sessionId: string, id: string, mode: 'fresh' | 'resume'): Promise<import('./types').CollectionStatus> {
+  return call('collection_refresh', { projectId, sessionId, id, mode });
+}
+export function authorizeCollection(projectId: string, sessionId: string, id: string, definitionFingerprint: string, accountEmail: string): Promise<import('./types').CollectionStatus> {
+  return call('collection_authorize', { projectId, sessionId, id, definitionFingerprint, accountEmail });
+}
+export function collectionStatus(projectId: string, sessionId: string, id: string): Promise<import('./types').CollectionStatus> {
+  return call('collection_status', { projectId, sessionId, id });
+}
+export function cancelCollection(projectId: string, sessionId: string, id: string, jobId: string): Promise<import('./types').CollectionStatus> {
+  return call('collection_cancel', { projectId, sessionId, id, jobId });
+}
+export function collectionMembers(projectId: string, sessionId: string, id: string, offset = 0, snapshotId: string | null = null): Promise<import('./types').CollectionMemberPage> {
+  return call('collection_members', { projectId, sessionId, id, offset, snapshotId });
+}
+export function readCollectionMember(projectId: string, sessionId: string, id: string, occurrenceId: string, snapshotId: string): Promise<import('./materials').MaterialRead> {
+  return call('collection_read_member', { projectId, sessionId, id, occurrenceId, snapshotId });
 }

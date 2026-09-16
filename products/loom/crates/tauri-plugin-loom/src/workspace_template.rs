@@ -3,6 +3,13 @@
 
 use super::*;
 
+#[path = "workspace_collections.rs"]
+mod collections;
+pub(super) use collections::{
+    CollectionDefinition, CollectionScope, collection_definition, collection_definitions,
+    collection_definitions_current, remove_collection, upsert_collection,
+};
+
 const TEMPLATE_PATH: &str = ".loom.md";
 const MAX_TEMPLATE_BYTES: usize = 65_536;
 const MAX_PANES: usize = 8;
@@ -167,15 +174,18 @@ impl WorkspaceTheme {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct WorkspaceConfig {
+    panes_enabled: bool,
     model: Option<WorkspaceModel>,
     functions: FunctionSettings,
     theme: WorkspaceTheme,
     panes: BTreeMap<String, PaneConfig>,
+    collections: Vec<CollectionDefinition>,
 }
 
 impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
+            panes_enabled: true,
             model: None,
             functions: FunctionSettings::default(),
             theme: WorkspaceTheme::default(),
@@ -188,6 +198,7 @@ impl Default for WorkspaceConfig {
             .into_iter()
             .map(|(name, kind)| (name.into(), PaneConfig::new(kind)))
             .collect(),
+            collections: Vec::new(),
         }
     }
 }
@@ -195,10 +206,12 @@ impl Default for WorkspaceConfig {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct WorkspaceOverrides {
+    panes_enabled: Option<bool>,
     model: Option<WorkspaceModel>,
     functions: FunctionSettings,
     theme: WorkspaceTheme,
     panes: BTreeMap<String, PaneOverrides>,
+    collections: Vec<CollectionDefinition>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -293,7 +306,12 @@ fn parse_config(markdown: &str) -> Result<WorkspaceConfig, String> {
     }
     let overrides: WorkspaceOverrides = toml::from_str(config_fence(markdown)?)
         .map_err(|error| format!("Workspace settings: {error}"))?;
-    let mut config = WorkspaceConfig::default();
+    collections::validate_definitions(&overrides.collections).map_err(|error| error.message)?;
+    let mut config = WorkspaceConfig {
+        panes_enabled: overrides.panes_enabled.unwrap_or(true),
+        collections: overrides.collections,
+        ..WorkspaceConfig::default()
+    };
     if let Some(model) = overrides.model {
         model.validate()?;
         config.model = Some(model);
@@ -365,6 +383,10 @@ fn parse_config(markdown: &str) -> Result<WorkspaceConfig, String> {
 /// Ignore configuration-looking text inside other Markdown fences. Only one
 /// complete, top-level `loom-workspace` fence is authoritative.
 fn config_fence(markdown: &str) -> Result<&str, String> {
+    Ok(config_fence_range(markdown)?.map_or("", |range| &markdown[range]))
+}
+
+fn config_fence_range(markdown: &str) -> Result<Option<std::ops::Range<usize>>, String> {
     let mut open: Option<(u8, usize, bool, usize)> = None;
     let mut found = None;
     let mut offset = 0;
@@ -379,7 +401,7 @@ fn config_fence(markdown: &str) -> Result<&str, String> {
                 if let Some((opening_marker, opening_count, selected, start)) = open {
                     if marker == opening_marker && count >= opening_count && suffix.is_empty() {
                         if selected {
-                            found = Some(&markdown[start..offset]);
+                            found = Some(start..offset);
                         }
                         open = None;
                     }
@@ -397,7 +419,7 @@ fn config_fence(markdown: &str) -> Result<&str, String> {
     if matches!(open, Some((_, _, true, _))) {
         return Err("Close the loom-workspace settings fence.".into());
     }
-    Ok(found.unwrap_or(""))
+    Ok(found)
 }
 
 fn load_template(store: &mut ProjectStore) -> Result<Option<LoadedDocument>, IpcFailure> {
@@ -433,7 +455,7 @@ fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFa
         Err(error) => (WorkspaceConfig::default(), Some(error)),
     };
     Ok(WorkspaceTemplateSnapshot {
-        enabled: true,
+        enabled: config.panes_enabled,
         document_id: Some(loaded.document_id.to_string()),
         revision_id: Some(loaded.revision_id.to_string()),
         config,
@@ -445,6 +467,10 @@ fn enable(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFail
     let current = snapshot(store)?;
     if current.enabled {
         return Ok(current);
+    }
+    if let Some(loaded) = load_template(store)? {
+        collections::enable_panes(store, &loaded)?;
+        return snapshot(store);
     }
     match std::fs::symlink_metadata(store.root().join(TEMPLATE_PATH)) {
         Ok(_) => {

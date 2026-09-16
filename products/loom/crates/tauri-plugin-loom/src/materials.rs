@@ -24,6 +24,7 @@ use thiserror::Error;
 
 use crate::context_attachments::{self, ContextAttachmentPresentation};
 
+pub(crate) mod collections;
 mod folders;
 mod grants;
 pub(crate) use folders::{FolderRetrieval, FolderScanBudget, search_folder};
@@ -71,6 +72,7 @@ pub(crate) enum MaterialKind {
     Attachment,
     Library,
     Folder,
+    Collection,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -202,6 +204,8 @@ pub(crate) struct MaterialSearch {
     pub(crate) warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) folder: Option<FolderRetrieval>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) collection: Option<collections::CollectionRetrieval>,
 }
 
 fn grant_key(store: &ProjectStore, id: &str) -> (PathBuf, String, String) {
@@ -274,11 +278,20 @@ fn entry(store: &ProjectStore, binding: &Binding) -> Result<MaterialEntry> {
 }
 
 pub(crate) fn list(store: &ProjectStore) -> Result<Vec<MaterialEntry>> {
-    read_bindings(store)?
+    let mut entries = read_bindings(store)?
         .items
         .iter()
         .map(|binding| entry(store, binding))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    for definition in collections::definitions(store)? {
+        if entries.iter().any(|entry| entry.id == definition.id) {
+            return Err(invalid(
+                "A collection identity conflicts with an existing source.",
+            ));
+        }
+        entries.push(collections::entry(store, &definition)?);
+    }
+    Ok(entries)
 }
 pub(crate) fn is_material_id(name: &str) -> bool {
     name.strip_prefix("material-").is_some_and(valid_hash)
@@ -291,42 +304,34 @@ pub(crate) fn resolve_optional(store: &ProjectStore, name: &str) -> Result<Optio
     }
 }
 pub(crate) fn resolve(store: &ProjectStore, name: &str) -> Result<MaterialEntry> {
-    let bindings = read_bindings(store)?;
+    let entries = list(store)?;
     if is_material_id(name) {
-        return bindings
-            .items
-            .iter()
-            .find(|binding| binding.id == name)
-            .map(|binding| entry(store, binding))
-            .transpose()?
+        return entries
+            .into_iter()
+            .find(|entry| entry.id == name)
             .ok_or_else(|| MaterialError::NotFound(name.into()));
     }
-
-    let mut matches: Vec<_> = bindings
-        .items
+    let mut matches: Vec<_> = entries
         .iter()
-        .filter(|binding| binding.id == name || qualified(binding) == name)
+        .filter(|entry| format!("materials/{}#{}", entry.name, &entry.id[9..21]) == name)
         .collect();
     if matches.is_empty() {
-        matches = bindings
-            .items
+        matches = entries
             .iter()
-            .filter(|binding| binding.workspace_path.as_deref() == Some(name))
+            .filter(|entry| entry.workspace_path.as_deref() == Some(name))
             .collect();
     }
     if matches.is_empty() {
-        matches = bindings.items.iter().filter(|binding| matches!(&binding.source, Source::Library { path } if path.to_str() == Some(name))).collect();
-    }
-    if matches.is_empty() {
-        matches = bindings
-            .items
+        matches = entries
             .iter()
-            .filter(|binding| binding.name == name)
+            .filter(|entry| entry.source_path.as_deref() == Some(name))
             .collect();
     }
-
+    if matches.is_empty() {
+        matches = entries.iter().filter(|entry| entry.name == name).collect();
+    }
     match matches.as_slice() {
-        [binding] => entry(store, binding),
+        [entry] => Ok((*entry).clone()),
         [] => Err(MaterialError::NotFound(name.into())),
         _ => Err(MaterialError::Ambiguous(name.into())),
     }
@@ -577,6 +582,10 @@ pub(crate) fn remove(store: &ProjectStore, id: &str) -> Result<()> {
 }
 
 pub(crate) fn read(store: &ProjectStore, id: &str) -> Result<MaterialRead> {
+    let material = resolve(store, id)?;
+    if material.kind == MaterialKind::Collection {
+        return collections::read(store, material);
+    }
     let binding = binding(store, id)?;
     let material = entry(store, &binding)?;
     match binding.source {
@@ -630,6 +639,9 @@ pub(crate) fn native_media(
     store: &ProjectStore,
     id: &str,
 ) -> Result<Vec<llama_native_types::MediaInput>> {
+    if resolve(store, id)?.kind == MaterialKind::Collection {
+        return Ok(Vec::new());
+    }
     match binding(store, id)?.source {
         Source::Attachment { attachment_id } => Ok(context_attachments::source_native_media(
             store.root(),
@@ -643,8 +655,17 @@ pub(crate) fn search(store: &ProjectStore, id: &str, query: &str) -> Result<Mate
     if query.trim().is_empty() || query.len() > MAX_QUERY_BYTES {
         return Err(invalid("search needs 1–4096 bytes of text"));
     }
+    let material = resolve(store, id)?;
+    if material.kind == MaterialKind::Collection {
+        return collections::search(
+            store,
+            &collections::freeze(store, material)?,
+            query,
+            &FolderScanBudget::default(),
+            &|| false,
+        );
+    }
     let binding = binding(store, id)?;
-    let material = entry(store, &binding)?;
     match binding.source {
         Source::Library { .. } => search_library(store, material, query),
         Source::Attachment { attachment_id } => {
@@ -764,6 +785,7 @@ fn search_library(
         complete: result.complete,
         warnings: result.warnings,
         folder: None,
+        collection: None,
     })
 }
 fn search_attachment(
@@ -804,6 +826,7 @@ fn search_attachment(
         hits,
         warnings,
         folder: None,
+        collection: None,
     })
 }
 

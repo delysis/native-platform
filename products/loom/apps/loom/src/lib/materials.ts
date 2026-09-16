@@ -5,7 +5,7 @@ export interface MaterialEntry {
   id: string;
   name: string;
   reference: string;
-  kind: 'attachment' | 'library' | 'folder';
+  kind: 'attachment' | 'library' | 'folder' | 'collection';
   pinned: boolean;
   available: boolean;
   source_path: string | null;

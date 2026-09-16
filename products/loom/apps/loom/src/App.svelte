@@ -10006,7 +10006,9 @@
         {:else if materialsOpen}
           <section class="material-connect-view" aria-label="Add sources">
             <PaneHeader title="Add sources" onCollapse={closeMaterial} />
-            {#if document}{#key project.session_id}<ImportSources projectId={project.project_id} sessionId={project.session_id} onOpen={openImportedSource} onImported={addImportedSources} />{/key}{/if}
+            {#if document}{#key project.session_id}<ImportSources projectId={project.project_id} sessionId={project.session_id} onOpen={openImportedSource} onImported={addImportedSources}
+              onCollectionAdded={async (item, projectId, sessionId) => { if (project?.project_id === projectId && project.session_id === sessionId) { materialChanged(item); const refreshed = await currentProjectSession(); if (project?.session_id === sessionId) project = refreshed; } }}
+              onOpenCollection={async (item, projectId, sessionId) => { if (project?.project_id === projectId && project.session_id === sessionId) openMaterial(item); }} />{/key}{/if}
           </section>
         {/if}
         <div class="writing-content" class:material-covered={Boolean(activeMaterial) || materialsOpen} inert={Boolean(activeMaterial) || materialsOpen}>

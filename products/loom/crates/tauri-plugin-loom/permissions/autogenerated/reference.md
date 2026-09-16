@@ -682,6 +682,188 @@ Denies the co_writer_save command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-collection-add`
+
+</td>
+<td>
+
+Enables the collection_add command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-add`
+
+</td>
+<td>
+
+Denies the collection_add command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-collection-authorize`
+
+</td>
+<td>
+
+Enables the collection_authorize command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-authorize`
+
+</td>
+<td>
+
+Denies the collection_authorize command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-collection-cancel`
+
+</td>
+<td>
+
+Enables the collection_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-cancel`
+
+</td>
+<td>
+
+Denies the collection_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-collection-members`
+
+</td>
+<td>
+
+Enables the collection_members command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-members`
+
+</td>
+<td>
+
+Denies the collection_members command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-collection-read-member`
+
+</td>
+<td>
+
+Enables the collection_read_member command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-read-member`
+
+</td>
+<td>
+
+Denies the collection_read_member command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-collection-refresh`
+
+</td>
+<td>
+
+Enables the collection_refresh command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-refresh`
+
+</td>
+<td>
+
+Denies the collection_refresh command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-collection-status`
+
+</td>
+<td>
+
+Enables the collection_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-collection-status`
+
+</td>
+<td>
+
+Denies the collection_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-completion-snapshot`
 
 </td>
@@ -1325,32 +1507,6 @@ Enables the import_account_disconnect command without any pre-configured scope.
 <td>
 
 Denies the import_account_disconnect command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`loom:allow-import-account-sync`
-
-</td>
-<td>
-
-Enables the import_account_sync command without any pre-configured scope.
-
-</td>
-</tr>
-
-<tr>
-<td>
-
-`loom:deny-import-account-sync`
-
-</td>
-<td>
-
-Denies the import_account_sync command without any pre-configured scope.
 
 </td>
 </tr>

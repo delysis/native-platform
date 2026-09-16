@@ -60,6 +60,19 @@ fn validate_operation_id(id: &str) -> Result<(), IpcFailure> {
 }
 
 impl ImportJobs {
+    pub(super) fn is_running(&self, session_id: &str, operation_id: &str) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active
+            .as_ref()
+            .is_some_and(|active| {
+                active.session_id == session_id
+                    && active.operation_id == operation_id
+                    && !active.cancel.load(Ordering::Acquire)
+            })
+    }
+
     pub(super) fn cancel(&self, session_id: &str, operation_id: &str) -> Result<(), IpcFailure> {
         validate_operation_id(operation_id)?;
         let mut registry = self
@@ -146,6 +159,40 @@ impl ImportJobs {
 }
 
 impl ImportOperation {
+    /// Own the coordinator as well as its download/conversion workers. A view
+    /// can detach without abandoning the job; shutdown cancels and joins it.
+    pub(super) fn dispatch<F: FnOnce(Self) + Send + 'static>(
+        self,
+        work: F,
+    ) -> Result<(), IpcFailure> {
+        let jobs = Arc::clone(&self.jobs);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<(Self, F)>(1);
+        {
+            let mut registry = jobs
+                .inner
+                .lock()
+                .map_err(|_| failure("Import state is unavailable."))?;
+            self.check()?;
+            if registry.closed {
+                return Err(failure("Loom is closing."));
+            }
+            // Transfer the operation only after releasing the registry lock:
+            // dropping an operation (including spawn failure) locks it too.
+            let worker = std::thread::Builder::new()
+                .name("loom-collection".into())
+                .spawn(move || {
+                    if let Ok((operation, work)) = receiver.recv() {
+                        work(operation);
+                    }
+                })
+                .map_err(|error| failure(error.to_string()))?;
+            registry.workers.push(worker);
+        }
+        sender
+            .send((self, work))
+            .map_err(|_| failure("The collection worker stopped before starting."))
+    }
+
     pub(super) fn reserve(
         state: &PluginState,
         project_id: &str,
@@ -382,6 +429,38 @@ mod tests {
                 })
             })
             .count()
+    }
+
+    #[test]
+    fn detached_coordinator_keeps_its_reservation_and_shutdown_joins_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (state, project, session) = opened(temporary.path());
+        let id = CommandId::new().to_string();
+        let operation = ImportOperation::reserve(&state, &project, &session, &id).unwrap();
+        let (started, observed_start) = mpsc::channel();
+        let (finished, observed_finish) = mpsc::channel();
+        operation
+            .dispatch(move |operation| {
+                tauri::async_runtime::block_on(async {
+                    started.send(()).unwrap();
+                    let result: Result<(), IpcFailure> =
+                        operation.network(std::future::pending()).await;
+                    assert!(result.is_err());
+                });
+                finished.send(()).unwrap();
+            })
+            .unwrap();
+        observed_start.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(state.imports.is_running(&session, &id));
+        assert!(
+            ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
+                .is_err()
+        );
+        state.imports.shutdown().unwrap();
+        observed_finish
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(!state.imports.is_running(&session, &id));
     }
 
     #[test]

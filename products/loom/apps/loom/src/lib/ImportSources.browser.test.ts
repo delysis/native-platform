@@ -74,6 +74,7 @@ describe('source import cancellation', () => {
       expect(page.getByRole('button', { name: 'Stop import', exact: true }).query()).toBeNull();
       opened.resolve();
       await expect.element(page.getByRole('status')).toHaveTextContent('1 imported; 1 failed or skipped.');
+      await page.getByRole('combobox', { name: 'Account', exact: true }).selectOptions('writer@example.test');
       await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
       await vi.waitFor(() => expect(native.invoke).toHaveBeenCalledWith('plugin:loom|import_account_disconnect', {
         projectId: 'project-a', sessionId: 'session-a', service: 'gmail', accountEmail: 'writer@example.test'

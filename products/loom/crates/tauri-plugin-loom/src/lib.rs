@@ -3,6 +3,7 @@
 mod attachments;
 mod audio_io;
 mod co_writer;
+mod connected_collections;
 mod connected_imports;
 mod context_attachments;
 mod document_bindings;
@@ -2077,7 +2078,13 @@ impl Builder {
                 connected_imports::import_accounts,
                 connected_imports::import_account_connect,
                 connected_imports::import_account_disconnect,
-                connected_imports::import_account_sync,
+                connected_imports::collections::collection_add,
+                connected_imports::collections::collection_authorize,
+                connected_imports::collections::collection_refresh,
+                connected_imports::collections::collection_status,
+                connected_imports::collections::collection_cancel,
+                connected_imports::collections::collection_members,
+                connected_imports::collections::collection_read_member,
                 attachment_ingest,
                 attachment_import_choose,
                 attachment_import_paths,

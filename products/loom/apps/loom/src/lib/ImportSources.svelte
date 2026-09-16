@@ -2,13 +2,20 @@
   import { onMount } from 'svelte';
   import { newUlid } from './ulid';
   import type { ContextAttachment } from './types';
-  import { importAccounts, connectImportAccount, disconnectImportAccount, syncImportAccount, chooseImportBatch, importSourceUrl, importPastedSources, cancelImportAccount,
+  import { importAccounts, connectImportAccount, disconnectImportAccount, addCollection, refreshCollection, chooseImportBatch, importSourceUrl, importPastedSources, cancelImportAccount,
     type ImportAccount, type ImportBatch, type ImportSource } from './ipc';
+
+  import CollectionProgress from './CollectionProgress.svelte';
+  import { connectedScope } from './collections';
+  import type { MaterialEntry } from './materials';
 
   export let projectId: string;
   export let sessionId: string;
   export let onOpen: (item: ContextAttachment, projectId: string, sessionId: string) => Promise<void>;
   export let onImported: (items: ContextAttachment[], projectId: string, sessionId: string) => Promise<void>;
+  export let onCollectionAdded: (entry: MaterialEntry, projectId: string, sessionId: string) => Promise<void> = async () => {};
+  export let onOpenCollection: (entry: MaterialEntry, projectId: string, sessionId: string) => Promise<void> = async () => {};
+  let collection: MaterialEntry | null = null;
   async function publishImported(): Promise<void> {
     if (report?.imported.length) await onImported(report.imported, projectId, sessionId);
   }
@@ -23,18 +30,17 @@
   let source: ImportSource = 'gmail';
   let clientId = '';
   let clientSecret = '';
-  let query = 'newer_than:30d';
+  let query = '';
+  let collectionName = '';
   let busy = false;
   let operationId = '';
   let message = '';
   let report: ImportBatch | null = null;
-  let lastQuery = '';
-  let lastSource: ImportSource = 'gmail';
-  let lastAccount = '';
   $: service = source === 'drive' ? 'drive' : 'gmail';
   $: availableAccounts = accounts.filter((item) => item.service === service && item.email);
-  $: account = availableAccounts.find((item) => item.email === chosenEmail)?.email ?? availableAccounts[0]?.email;
-  $: canNext = Boolean(report?.next_page_token && lastQuery === query && lastSource === source && lastAccount === account);
+  $: account = availableAccounts.find((item) => item.email === chosenEmail)?.email;
+  $: selectedScope = connectedScope(source, query);
+  $: canAddCollection = Boolean(account && collectionName.trim() && selectedScope);
 
   function errorText(error: unknown): string {
     if (error && typeof error === 'object') {
@@ -56,7 +62,7 @@
       const result = await connectImportAccount(projectId, sessionId, service, clientId.trim(), clientSecret, operationId);
       accounts = [...accounts.filter((item) => item.service !== result.service || item.email !== result.email), result];
       chosenEmail = result.email ?? ''; configuring = false; report = null;
-      message = `Connected ${result.email}. Sync runs only when you request it.`;
+      message = `Connected ${result.email}. Choose the sources to add.`;
     } catch (error) { message = errorText(error); }
     finally { clientSecret = ''; busy = false; authorizing = false; operationId = ''; }
   }
@@ -69,17 +75,31 @@
     } catch (error) { message = errorText(error); }
     finally { busy = false; }
   }
-  async function sync(next = false): Promise<void> {
-    operationId = newUlid();
-    busy = true; message = 'Importing up to 16 files. Large pages can take a few minutes.';
+  async function addConnectedCollection(): Promise<void> {
+    if (!canAddCollection || !selectedScope || !account || busy) return;
+    const scope = { projectId, sessionId };
+    busy = true; message = 'Adding collection…';
+    let added: MaterialEntry | null = null;
     try {
-      const token = next && canNext ? report?.next_page_token : undefined;
-      report = await syncImportAccount(projectId, sessionId, source, account ?? '', query, token ?? null, operationId);
-      await publishImported();
-      lastQuery = query; lastSource = source; lastAccount = account ?? '';
-      message = `${report.imported.length} imported; ${report.failures.length} failed.${report.next_page_token ? ' More results are available.' : ' End of results.'}`;
+      added = await addCollection(scope.projectId, scope.sessionId, collectionName.trim(), selectedScope, account);
+      await refreshCollection(scope.projectId, scope.sessionId, added.id, 'fresh');
+      message = '';
     } catch (error) { message = errorText(error); }
-    finally { busy = false; operationId = ''; }
+    finally {
+      if (added) {
+        collection = added;
+        try { await onCollectionAdded(added, scope.projectId, scope.sessionId); }
+        catch (error) { message = errorText(error); }
+      }
+      busy = false;
+    }
+  }
+  async function openCollection(): Promise<void> {
+    if (!collection || busy) return;
+    busy = true;
+    try { await onOpenCollection(collection, projectId, sessionId); }
+    catch (error) { message = errorText(error); }
+    finally { busy = false; }
   }
   async function local(folder: boolean): Promise<void> {
     operationId = newUlid();
@@ -126,30 +146,38 @@
   </details>
   <label>Public document URL <input type="url" bind:value={webUrl} disabled={busy} placeholder="https://…" maxlength="4096" /></label>
   <button disabled={busy || !webUrl.trim()} on:click={() => void web()}>Import URL</button>
+  {#if collection}
+    <div class="connected-collection">
+      <button class="source-link" disabled={busy} on:click={() => void openCollection()}>{collection.name}</button>
+      <CollectionProgress {projectId} {sessionId} collectionId={collection.id} />
+      <button disabled={busy} on:click={() => { collection = null; collectionName = ''; query = ''; message = ''; }}>Add another collection</button>
+    </div>
+  {:else}
   <label>Connected source
-    <select bind:value={source} disabled={busy} on:change={() => { query = source === 'drive' ? '' : 'newer_than:30d'; report = null; }}>
+    <select bind:value={source} disabled={busy} on:change={() => { query = ''; chosenEmail = ''; report = null; }}>
       <option value="gmail">Gmail</option><option value="google_alerts">Google Alerts in Gmail</option>
       <option value="linked_in">LinkedIn notifications in Gmail</option><option value="drive">Google Drive</option>
     </select>
   </label>
-  {#if account && !configuring}
+  {#if availableAccounts.length && !configuring}
     <label>Account <select bind:value={chosenEmail} disabled={busy} on:change={() => { report = null; }}>
-      <option value="">Choose account (default: {availableAccounts[0]?.email})</option>
+      <option value="">Choose account</option>
       {#each availableAccounts as item}<option value={item.email ?? ''}>{item.email}</option>{/each}
     </select></label>
     <button disabled={busy} on:click={() => configuring = true}>Connect another account</button>
-    <p>Connected: {account} <button disabled={busy} on:click={() => void disconnect()}>Disconnect</button></p>
-    <label>{source === 'drive' ? 'Drive folder ID (empty searches the account)' : 'Gmail search'}
+    {#if account}<p>Connected: {account} <button disabled={busy} on:click={() => void disconnect()}>Disconnect</button></p>{/if}
+    <label>Name <input bind:value={collectionName} maxlength="160" disabled={busy} placeholder="Research" /></label>
+    <label>{source === 'drive' ? 'Drive folder ID' : 'Gmail search'}
       <input bind:value={query} maxlength="2048" disabled={busy} placeholder={source === 'drive' ? 'Folder ID' : 'label:Research newer_than:30d'} />
     </label>
-    <div class="actions"><button disabled={busy} on:click={() => void sync()}>Sync now</button>
-      {#if canNext}<button disabled={busy} on:click={() => void sync(true)}>Next page</button>{/if}</div>
+    <button disabled={busy || !canAddCollection} on:click={() => void addConnectedCollection()}>Add collection</button>
   {:else}
     <p>Connect with a Google Desktop app OAuth client. Loom requests read-only access and saves credentials in your system credential store.</p>
     <label>Client ID <input bind:value={clientId} disabled={busy} autocomplete="off" maxlength="512" /></label>
     <label>Client secret <input type="password" bind:value={clientSecret} disabled={busy} autocomplete="off" maxlength="1024" /></label>
     {#if configuring}<button disabled={busy} on:click={() => configuring = false}>Back to accounts</button>{/if}
     <button disabled={busy || !clientId.trim()} on:click={() => void connect()}>Connect {service === 'drive' ? 'Drive' : 'Gmail'}</button>
+  {/if}
   {/if}
   {#if busy && operationId}<button on:click={() => { void cancelImportAccount(projectId, sessionId, operationId).then(() => { message = "Stopping… Completed sources remain available."; }).catch((error) => message = errorText(error)); }}>{authorizing ? "Cancel connection" : "Stop import"}</button>{/if}
   <p role="status">{message}</p>

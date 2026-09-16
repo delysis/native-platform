@@ -1161,6 +1161,15 @@ pub(crate) fn describe_source(
     Ok(presentation)
 }
 
+pub(crate) fn source_byte_count(
+    project_root: &Path,
+    attachment_id: &str,
+) -> Result<u64, ContextAttachmentError> {
+    Ok(read_manifest_metadata(project_root, attachment_id)?
+        .attachment
+        .byte_count)
+}
+
 /// A named material reference explicitly selects this retained source alone.
 pub(crate) fn source_native_media(
     project_root: &Path,
@@ -2075,13 +2084,47 @@ pub(crate) fn original_path(
 pub(crate) fn record_import_origin(
     project_root: &Path,
     origin: &impl Serialize,
-) -> Result<(), ContextAttachmentError> {
+) -> Result<String, ContextAttachmentError> {
     let bytes = serde_json::to_vec_pretty(origin)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
     let hash = format!("{:x}", Sha256::digest(&bytes));
+    let id = format!("source-{hash}");
     let path = attachment_root(project_root)?
         .join("manifests")
-        .join(format!("source-{hash}.json"));
-    install_immutable(&path, &bytes)
+        .join(format!("{id}.json"));
+    install_immutable(&path, &bytes)?;
+    Ok(id)
+}
+
+pub(crate) fn read_import_origin(
+    project_root: &Path,
+    id: &str,
+) -> Result<serde_json::Value, ContextAttachmentError> {
+    let hash = id
+        .strip_prefix("source-")
+        .filter(|hash| is_sha256(hash))
+        .ok_or(ContextAttachmentError::ContextInvalid)?;
+    let path = attachment_root(project_root)?
+        .join("manifests")
+        .join(format!("{id}.json"));
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    let file = File::open(&path)?;
+    let identity = FileIdentityHandle::from_file(file.try_clone()?)?;
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024
+        || FileIdentityHandle::from_path(&path)? != identity
+        || fs::symlink_metadata(&path)?.file_type().is_symlink()
+        || format!("{:x}", Sha256::digest(&bytes)) != hash
+    {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 #[cfg(test)]

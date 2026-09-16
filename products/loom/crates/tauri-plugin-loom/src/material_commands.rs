@@ -37,7 +37,7 @@ fn with_store<T>(
     state: &PluginState,
     project: &str,
     session_id: &str,
-    action: impl FnOnce(&ProjectStore) -> Result<T, materials::MaterialError>,
+    action: impl FnOnce(&mut ProjectStore) -> Result<T, materials::MaterialError>,
 ) -> Result<T, IpcFailure> {
     let _admission = lock_application_admission(state, "material access")?;
     let mut session = lock_session(state)?;
@@ -121,6 +121,22 @@ pub(super) async fn material_set_pinned(
     state: State<'_, PluginState>,
 ) -> Result<MaterialEntry, IpcFailure> {
     with_store(&state, &project_id, &session_id, |store| {
+        let configuration = crate::workspace_template::collection_definitions(store)
+            .map_err(|error| materials::MaterialError::Invalid(error.message))?;
+        if let Some(mut definition) = configuration
+            .collections
+            .into_iter()
+            .find(|item| item.id == id)
+        {
+            definition.pinned = pinned;
+            crate::workspace_template::upsert_collection(
+                store,
+                configuration.revision_id,
+                &definition,
+            )
+            .map_err(|error| materials::MaterialError::Invalid(error.message))?;
+            return materials::resolve(store, &id);
+        }
         materials::set_pinned(store, &id, pinned)
     })
 }
@@ -133,6 +149,11 @@ pub(super) async fn material_remove(
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
     with_store(&state, &project_id, &session_id, |store| {
+        if crate::connected_imports::collections::remove_binding(&state, store, &session_id, &id)
+            .map_err(|error| materials::MaterialError::Invalid(error.message))?
+        {
+            return Ok(());
+        }
         if let Some(root) =
             grant_root(&state).map_err(|error| materials::MaterialError::Invalid(error.message))?
         {
