@@ -1015,7 +1015,7 @@ fn install_evidence(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     fn project() -> (tempfile::TempDir, ProjectStore) {
