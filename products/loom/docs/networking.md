@@ -260,19 +260,38 @@ availability constraints. A self-hosted relay still needs a reachable server;
 see [Iroh's relay deployment guide](https://docs.iroh.computer/add-a-relay).
 Do not promise permanent free or serverless reachability.
 
-Current limits are 16 open cabals, 32 members per cabal, 64 documents, 1 MiB per
-document, 64 MiB of change storage, and 20,000 stored changes. Frames and batches
-are bounded before decoding. Raw Automerge change blocks are accepted;
-compressed change blocks are rejected before their unbounded upstream decoder.
-Sync advertises per-document graph heads and missing dependencies, each bounded
-at 256, instead of every historical envelope hash. Replies contain at most 128
-signed changes and respect the four-MiB frame budget. The owner's revocation
-seal has at most 256 heads per document, independent of its history length.
-The storage cap currently stops new edits with an error. Long-lived history
-compaction must preserve signed provenance and offline recovery before that cap
-can be relaxed.
+Current limits are 16 open cabals, 32 members per cabal, 64 retained documents
+and 1 MiB per document. Frames and batches are bounded before decoding. Raw
+Automerge change blocks are accepted; compressed wire changes are rejected
+before their unbounded upstream decoder. Sync advertises per-document graph
+heads and missing dependencies, each bounded at 256. Replies contain at most
+128 signed changes within the four-MiB frame budget. The owner's revocation
+seal has at most 256 heads per document, independent of history length.
 
-The cabal store is version 5, the membership payload is version 2, the signed
+Local history archives exact signed envelopes independently in SQLite. Crossing
+1,024 recent changes or 8 MiB archives the oldest rows until at most 512 changes
+and 4 MiB remain recent. Compression keeps original envelope hashes, signatures,
+causal identities and bytes recoverable; an incompressible small change retains
+its original bytes in cold storage. Admission and archival commit atomically.
+A failed archive never removes an old row or publishes a new in-memory state.
+
+Retained history, including quarantined writing, is bounded at 250,000 changes,
+512 MiB of exact encoded envelopes and 384 MiB of raw Automerge changes. A 1-GiB
+SQLite page ceiling also covers indexes, private metadata and the existing
+256-MiB shared-asset budget. Reaching a limit refuses new work without pruning
+writing or resetting history. Removing a member does not reset these budgets.
+
+Startup, membership changes, recovery and transmission read and verify one
+stored envelope at a time. Decompression has a fixed per-envelope output bound
+and requires a complete stream without trailing bytes; every read verifies the
+original hash, signature, sizes, cabal, document and causal index. Only original
+bounded raw changes cross the network. The same Automerge graph remains in
+memory, so old offline bases still work after archival and restart. Routine
+admission advances a small causal frontier and stages newly sealed ancestors;
+it does not enumerate every historical envelope or clone the lifetime seal.
+Matching peer inventories return immediately without walking historical ancestors.
+
+The cabal store is version 6, the membership payload is version 2, the signed
 document payload is version 2, and the workspace transport uses
 `app.delysis.loom/cabal/3`. Older experimental stores
 and protocols are rejected without rewriting saved data or retaining a

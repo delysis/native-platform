@@ -16,6 +16,17 @@ pub(super) type ChangeIndex = BTreeMap<ChangeKey, IndexedChange>;
 pub(super) struct IndexedChange {
     pub envelope: String,
     pub dependencies: Vec<ChangeHash>,
+    pub epoch: u64,
+    pub signer: iroh::PublicKey,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct Frontier(BTreeMap<Uuid, RawFrontier>);
+
+#[derive(Clone, Default)]
+struct RawFrontier {
+    heads: BTreeSet<ChangeHash>,
+    need: BTreeSet<ChangeHash>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -84,6 +95,8 @@ pub(super) fn index_change(
         IndexedChange {
             envelope: hash,
             dependencies: change.deps().to_vec(),
+            epoch: envelope.payload.epoch,
+            signer: envelope.signer,
         },
     );
     Ok(())
@@ -102,13 +115,18 @@ pub(super) fn sealed_history(roster: &Roster, index: &ChangeIndex) -> Result<BTr
             ));
         }
     }
-    extend_sealed(&mut sealed, index);
+    sealed.extend(sealed_additions(&sealed, &ChangeIndex::new(), index));
     Ok(sealed)
 }
 
-/// New arrivals may fill a hole in the sealed graph. Already-present ancestors
-/// were expanded when admitted; only this batch's edges need to be followed.
-pub(super) fn extend_sealed(sealed: &mut BTreeSet<ChangeKey>, incoming: &ChangeIndex) {
+/// New arrivals may fill a hole in the sealed graph. Previously sealed ancestors
+/// were already expanded; stage only newly reached history until commit.
+pub(super) fn sealed_additions(
+    sealed: &BTreeSet<ChangeKey>,
+    index: &ChangeIndex,
+    incoming: &ChangeIndex,
+) -> BTreeSet<ChangeKey> {
+    let mut additions = BTreeSet::new();
     let mut queue: Vec<_> = incoming
         .keys()
         .filter(|key| sealed.contains(key))
@@ -119,54 +137,75 @@ pub(super) fn extend_sealed(sealed: &mut BTreeSet<ChangeKey>, incoming: &ChangeI
         if !visited.insert(key) {
             continue;
         }
-        if let Some(change) = incoming.get(&key) {
+        if let Some(change) = incoming.get(&key).or_else(|| index.get(&key)) {
             for dependency in &change.dependencies {
                 let parent = (key.0, *dependency);
-                sealed.insert(parent);
-                queue.push(parent);
+                if (!sealed.contains(&parent) && additions.insert(parent))
+                    || incoming.contains_key(&parent)
+                {
+                    queue.push(parent);
+                }
             }
         }
     }
+    additions
 }
 
-pub(super) fn state(
-    roster: &Roster,
-    index: &ChangeIndex,
-    incoming: &ChangeIndex,
-) -> Result<SyncState> {
-    let mut result = SyncState::default();
-    for &(id, hash) in index.keys().chain(incoming.keys()) {
-        result
-            .documents
-            .entry(id)
-            .or_default()
-            .heads
-            .insert(hash.to_string());
-    }
-    for ((id, _), change) in index.iter().chain(incoming.iter()) {
-        let document = result.documents.entry(*id).or_default();
-        for dependency in &change.dependencies {
-            document.heads.remove(&dependency.to_string());
-            if !index.contains_key(&(*id, *dependency))
-                && !incoming.contains_key(&(*id, *dependency))
-            {
-                document.need.insert(dependency.to_string());
+impl Frontier {
+    pub(super) fn advance(&self, index: &ChangeIndex, incoming: &ChangeIndex) -> Self {
+        let mut next = self.clone();
+        for &(id, hash) in incoming.keys() {
+            let document = next.0.entry(id).or_default();
+            if !document.need.remove(&hash) {
+                document.heads.insert(hash);
             }
         }
-    }
-    for (id, heads) in &roster.payload.sealed {
-        let document = result.documents.entry(*id).or_default();
-        for head in heads {
-            let hash = head
-                .parse()
-                .map_err(|_| Error::Invalid("Invalid sealed head"))?;
-            if !index.contains_key(&(*id, hash)) && !incoming.contains_key(&(*id, hash)) {
-                document.need.insert(head.clone());
+        for ((id, _), change) in incoming {
+            let document = next.0.entry(*id).or_default();
+            for dependency in &change.dependencies {
+                document.heads.remove(dependency);
+                if !index.contains_key(&(*id, *dependency))
+                    && !incoming.contains_key(&(*id, *dependency))
+                {
+                    document.need.insert(*dependency);
+                }
             }
         }
+        next
     }
-    result.validate()?;
-    Ok(result)
+
+    pub(super) fn state(
+        &self,
+        roster: &Roster,
+        index: &ChangeIndex,
+        incoming: &ChangeIndex,
+    ) -> Result<SyncState> {
+        let mut result = SyncState::default();
+        for (id, document) in &self.0 {
+            result.documents.insert(
+                *id,
+                SyncDocument {
+                    heads: document.heads.iter().map(ToString::to_string).collect(),
+                    need: document.need.iter().map(ToString::to_string).collect(),
+                },
+            );
+        }
+        // Owner-sealed holes are authority, not graph edges. Keeping them out
+        // of the raw frontier lets an arriving sealed root become a graph tip.
+        for (id, heads) in &roster.payload.sealed {
+            let document = result.documents.entry(*id).or_default();
+            for head in heads {
+                let hash = head
+                    .parse()
+                    .map_err(|_| Error::Invalid("Invalid sealed head"))?;
+                if !index.contains_key(&(*id, hash)) && !incoming.contains_key(&(*id, hash)) {
+                    document.need.insert(head.clone());
+                }
+            }
+        }
+        result.validate()?;
+        Ok(result)
+    }
 }
 
 /// Seal complete causal history, retaining any earlier sealed roots that have
@@ -206,7 +245,8 @@ pub(super) fn seal_frontier(
 
 impl Cabal {
     pub fn sync_state(&self) -> Result<SyncState> {
-        state(&self.roster, &self.change_index, &ChangeIndex::new())
+        self.frontier
+            .state(&self.roster, &self.change_index, &ChangeIndex::new())
     }
 
     /// Send children before their dependencies. The recipient can then verify
@@ -214,6 +254,10 @@ impl Cabal {
     /// at a time, even when it joined after the original author was removed.
     pub fn missing_causal(&self, known: &SyncState) -> Result<Vec<ChangeEnvelope>> {
         known.validate()?;
+        let local = self.sync_state()?;
+        if *known == local {
+            return Ok(Vec::new());
+        }
         let mut have = BTreeSet::new();
         for (id, document) in &known.documents {
             let mut queue = document.heads.iter().cloned().collect::<Vec<_>>();
@@ -233,7 +277,6 @@ impl Cabal {
                 }
             }
         }
-        let local = self.sync_state()?;
         let mut roots = Vec::new();
         // Seals come first: they are the authority for old-epoch dependencies.
         for (id, heads) in &self.roster.payload.sealed {
@@ -265,11 +308,11 @@ impl Cabal {
                 let Some(change) = self.change_index.get(&key) else {
                     continue;
                 };
-                let body: String = self.database.query_row(
-                    "SELECT body FROM changes WHERE hash = ?",
-                    [&change.envelope],
-                    |row| row.get(0),
-                )?;
+                let stored = super::history::read(&self.database, self.id(), &change.envelope)?;
+                if stored.orphaned {
+                    return Err(Error::Invalid("Quarantined change in active inventory"));
+                }
+                let body = serde_json::to_vec(&stored.envelope)?;
                 if bytes + body.len() + 1 > budget {
                     if result.is_empty() {
                         return Err(Error::Invalid(
@@ -279,7 +322,7 @@ impl Cabal {
                     return Ok(result);
                 }
                 bytes += body.len() + 1;
-                result.push(serde_json::from_str(&body)?);
+                result.push(stored.envelope);
                 if result.len() == 128 {
                     return Ok(result);
                 }

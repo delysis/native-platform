@@ -21,7 +21,7 @@ pub const MAX_DOCUMENT_BYTES: usize = 1024 * 1024;
 pub const MAX_CHANGE_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_DOCUMENTS: usize = 64;
 pub const MAX_MEMBERS: usize = 32;
-pub const MAX_CHANGES: usize = 20000;
+pub const MAX_CHANGES: usize = 250_000;
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]

@@ -4704,6 +4704,7 @@ dependencies = [
  "atomic-write-file",
  "automerge",
  "base64 0.22.1",
+ "flate2",
  "fs2",
  "getrandom 0.3.4",
  "hex",
