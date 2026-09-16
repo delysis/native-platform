@@ -5,6 +5,7 @@ import '../app.css';
 import EditorBrowserHarness from './EditorBrowserHarness.svelte';
 import SourceEditorBrowserHarness from './SourceEditorBrowserHarness.svelte';
 import type { CompletionCandidate } from './completionSession';
+import type { VisualSelectionAccessibilityWitness } from './completionAccessibility';
 
 let mounted: ReturnType<typeof mount> | null = null;
 
@@ -26,6 +27,7 @@ function render(
     onImageAttachmentsCommitted?: (count: number) => void;
     onImageAttachmentError?: (message: string) => void;
     resolveImageAssetUrl?: (markdownPath: string) => string | null;
+    onSelectionWitness?: (witness: VisualSelectionAccessibilityWitness, markdown: string) => void;
   } = {}
 ): void {
   const target = document.createElement('div');
@@ -248,15 +250,19 @@ describe('real WebKit editor interactions', () => {
   });
 
   it('withdraws stale selection evidence until typed document state settles', async () => {
-    render('Something');
+    const changes: { witness: VisualSelectionAccessibilityWitness; markdown: string }[] = [];
+    render('Something', [], { onSelectionWitness: (witness, markdown) => changes.push({ witness, markdown }) });
     const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
     const witness = () => JSON.parse(
       page.getByRole('status', { name: 'Visual Selection Witness' }).element().textContent ?? '{}'
     );
     await editor.click();
+    changes.length = 0;
     await userEvent.keyboard('{Meta>}a{/Meta}Replacement');
 
-    expect(witness()).toMatchObject({ available: false });
+    // Keyboard automation can finish after projection has settled. Observe the
+    // actual callback boundary instead of racing the editor's debounce timer.
+    expect(changes.some(({ witness, markdown }) => !witness.available && markdown !== 'Replacement')).toBe(true);
     await expect.poll(serializedMarkdown).toBe('Replacement');
     await expect.poll(witness).toMatchObject({
       available: true,
