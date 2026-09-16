@@ -324,7 +324,7 @@ pub(super) fn markdown_plan(
     markdown_plan_with_budget(store, markdown, query, MAX_BYTES)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn consult_with_budget(
     store: &ProjectStore,
     value: &Value,
