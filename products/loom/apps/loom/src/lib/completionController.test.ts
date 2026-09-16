@@ -69,10 +69,10 @@ function insert(
 }
 
 describe('pure completion controller', () => {
-  it('switches compatible cached Loompad suffixes through the same insertion witness without fresh generation', () => {
+  it('cycles compatible cached ghost suffixes in both directions without changing prior prose', () => {
     const shared = [suggestion('run-a', 'a', ' one alpha'), suggestion('run-b', 'b', ' one beta'), suggestion('run-c', 'c', ' other')];
     let state = reconcileCompletionController(initialCompletionControllerState(), contextKey, shared);
-    let view = completionControllerView(state, contextKey, shared, true);
+    let view = completionControllerView(state, contextKey, shared);
     const first = authorizeCompletionInsertion(state, {
       contextKey, family: view.activeFamily, eligible: view.selected,
       candidateId: view.selected!.candidateId, presentationKey: view.selected!.presentationKey,
@@ -81,11 +81,17 @@ describe('pure completion controller', () => {
     expect(first.authorized).toBe(true);
     state = observeTextMutation(first.state, 'Hello one ', manuscript, false).state;
     expect(completionControllerView(state, contextKey, [], false).activeFamily).toHaveLength(1);
-    view = completionControllerView(state, contextKey, [], true);
+    view = completionControllerView(state, contextKey, []);
     expect(view.activeFamily.map(candidate => candidate.text)).toEqual(['alpha', 'beta']);
-    state = cycleCompletion(state, view.activeFamily, 1, true).state;
-    view = completionControllerView(state, contextKey, [], true);
+    state = cycleCompletion(state, view.activeFamily, 1).state;
+    view = completionControllerView(state, contextKey, []);
     expect(view.selected?.runId).toBe('run-b');
+    const reverse = cycleCompletion(state, view.activeFamily, -1).state;
+    expect(completionControllerView(reverse, contextKey, []).selected?.runId).toBe('run-a');
+    expect(reverse.pendingText).toBeNull();
+    expect(reverse.session?.acceptedChunks).toEqual([' one ']);
+    expect(reverse.session?.candidates).toBe(state.session?.candidates);
+    state = cycleCompletion(reverse, view.activeFamily, 1).state;
     const second = authorizeCompletionInsertion(state, {
       contextKey, family: view.activeFamily, eligible: view.selected,
       candidateId: view.selected!.candidateId, presentationKey: view.selected!.presentationKey,

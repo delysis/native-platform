@@ -113,7 +113,7 @@ export function unconsumeCompletionWord(session: CompletionSession): CompletionS
 export function cycleCompletionSession(
   session: CompletionSession,
   offset: number,
-  sharedPrefixAlternatives = false
+  sharedPrefixAlternatives = true
 ): CompletionSession {
   if (session.acceptedChunks.length > 0 && !sharedPrefixAlternatives) return session;
   const candidates = session.acceptedChunks.length > 0
@@ -163,7 +163,7 @@ export function updateCompletionCandidate(
 export function synchronizeCompletionCandidates(
   session: CompletionSession,
   candidates: readonly CompletionCandidate[],
-  forkAtCurrentCaret = false
+  forkAtCurrentCaret = true
 ): CompletionSession | null {
   // An empty authoritative family means an unconsumed presentation was
   // dismissed or became ineligible. Only an already-authorized insertion may

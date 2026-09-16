@@ -1117,12 +1117,12 @@
     : mode === 'source'
       ? sourceSuggestionFamily
       : [];
-  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, loompadActive);
+  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, true);
   $: completionView = completionControllerView(
     completionController,
     completionContextKey,
     baseSuggestionFamily,
-    loompadActive
+    true
   );
   $: boundCompletionSession = completionView.boundSession;
   $: if (boundCompletionSession && !loompadActive) {
@@ -7681,7 +7681,7 @@
       completionController,
       activeSuggestionFamily,
       offset,
-      loompadActive
+      true
     );
     if (cycled.state === completionController) return;
     completionController = cycled.state;

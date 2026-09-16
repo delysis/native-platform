@@ -37,7 +37,7 @@ describe('Option word choices', () => {
     expect(document.querySelector('.loompad')).toBeNull();
     expect(bounds()).toEqual(before);
   });
-  it('pages unique words and preserves surviving slots across cached branch changes', async () => {
+  it('pages sampled runs and preserves surviving slots across cached branch changes', async () => {
     const { onAccept } = await open();
     await userEvent.keyboard('{Alt>} ');
     expect(label('w')).toBe('W: Choice5');
@@ -51,10 +51,41 @@ describe('Option word choices', () => {
     harness!.update({ choices: [remainder, candidate(10, 'Remaining different branch.'), candidate(11, 'Another branch.')] });
     await tick();
     expect(label('w')).toBe('W: Remaining');
-    expect(label('a')).toBe('A: Another');
-    expect(label('s')).toBeUndefined();
-    await userEvent.keyboard('[KeyA]{/Alt}');
+    expect(label('a')).toBe('A: Remaining');
+    expect(label('s')).toBe('S: Another');
+    expect(label('d')).toBe('D: Unavailable');
+    await userEvent.keyboard('[KeyS]{/Alt}');
     expect(onAccept).toHaveBeenLastCalledWith(candidate(11, 'Another branch.'), 'word');
+  });
+  it('keeps four sampled runs on their keys while shared-prefix continuations grow', async () => {
+    const { onAccept } = await open(4);
+    const samples = [
+      candidate(1, 'The meadow'), candidate(2, 'The river'),
+      candidate(3, 'The road'), candidate(4, 'The shore')
+    ];
+    harness!.update({ choices: samples }); await tick();
+    await userEvent.keyboard('{Alt>}');
+    const buttons = [...document.querySelectorAll<HTMLButtonElement>('.loompad-choice')];
+    expect(buttons).toHaveLength(4);
+    expect(buttons.map(button => button.getAttribute('aria-label'))).toEqual(['W: The', 'A: The', 'S: The', 'D: The']);
+    await userEvent.keyboard('[KeyW][KeyA][KeyS][KeyD]');
+    expect(onAccept.mock.calls.map(([choice]) => choice.runId)).toEqual(['run-1', 'run-2', 'run-3', 'run-4']);
+
+    const growing = samples.map((sample, index) => ({ ...sample, text: `${sample.text} continued ${'farther '.repeat(index + 1)}` }));
+    harness!.update({ choices: [growing[3], growing[1], growing[0], growing[2]] }); await tick();
+    expect([...document.querySelectorAll('.loompad-choice')].every((button, index) => button === buttons[index])).toBe(true);
+    await userEvent.keyboard('[KeyW][KeyA][KeyS][KeyD]');
+    expect(onAccept.mock.calls.slice(-4).map(([choice]) => choice)).toEqual(growing);
+
+    // After accepting a prefix, incompatible branches leave disabled positions;
+    // the remaining cached runs keep their original physical keys.
+    const remaining = [candidate(4, 'shore remained.'), candidate(2, 'river remained.')];
+    harness!.update({ choices: remaining }); await tick();
+    expect([...document.querySelectorAll<HTMLButtonElement>('.loompad-choice')].map(button => button.disabled)).toEqual([true, false, true, false]);
+    expect(['w', 'a', 's', 'd'].map(label)).toEqual(['W: Unavailable', 'A: river', 'S: Unavailable', 'D: shore']);
+    const before = onAccept.mock.calls.length;
+    await userEvent.keyboard('[KeyW][KeyA][KeyS][KeyD]{/Alt}');
+    expect(onAccept.mock.calls.slice(before).map(([choice]) => choice.runId)).toEqual(['run-2', 'run-4']);
   });
   it('hides on focus loss and rejects an old repeated key after scope replacement', async () => {
     const { onAccept } = await open();

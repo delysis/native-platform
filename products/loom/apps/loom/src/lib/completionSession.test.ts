@@ -82,8 +82,11 @@ describe('cached completion session', () => {
     expect(suffixes.map(candidate => candidate.runId)).toEqual(['run-a', 'run-b']);
     expect(suffixes.map(candidate => candidate.text)).toEqual(['first', 'second']);
     expect(suffixes.every(candidate => candidate.targetByte === 5 + new TextEncoder().encode(' café ☕ ').length)).toBe(true);
-    expect(cycleCompletionSession(frozen, 1)).toBe(frozen);
-    const switched = cycleCompletionSession(frozen, 1, true);
+    expect(cycleCompletionSession(frozen, 1, false)).toBe(frozen);
+    const switched = cycleCompletionSession(frozen, 1);
+    expect(cycleCompletionSession(switched, -1)).toEqual(frozen);
+    expect(switched.candidates).toBe(frozen.candidates);
+    expect(switched.acceptedChunks).toBe(frozen.acceptedChunks);
     expect(switched.selectedRunId).toBe('run-b');
     expect(switched.candidates).toBe(frozen.candidates);
     expect(completionSessionMatchesPresentation(switched, 'scope', suffixes[1])).toBe(true);
@@ -158,7 +161,7 @@ describe('cached completion session', () => {
     expect(remainingCompletionText(reversed!.session)).toBe(' one two');
   });
 
-  it('locks cycling after consumption and restores it after reversal', () => {
+  it('excludes incompatible alternatives after consumption and restores them after reversal', () => {
     const started = startCompletionSession('doc:source', candidates, 'run-a')!;
     const cycled = cycleCompletionSession(started, 1);
     expect(cycled.selectedRunId).toBe('run-b');
