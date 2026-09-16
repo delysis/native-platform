@@ -150,7 +150,7 @@ fn check_cancelled(cancellation: &AtomicBool) -> NativeResult<()> {
     }
 }
 
-fn decode_token(
+pub(super) fn decode_token(
     context: &mut LlamaContext<'_>,
     token: i32,
     position: usize,
@@ -272,7 +272,7 @@ fn score_pole(
     Ok(scores.iter().sum::<f64>() / scores.len() as f64)
 }
 
-fn validate_architecture(architecture: &str) -> NativeResult<()> {
+pub(super) fn validate_architecture(architecture: &str) -> NativeResult<()> {
     // Decoder flags alone also admit diffusion models whose decode falls back
     // to stateless encode. Expand only after validating causal KV semantics.
     if architecture != "gemma4" {
