@@ -166,7 +166,6 @@ case "$COMPONENT" in
     ;;
   loom)
     run_exact_test loom-store lib unused generation::tests::exact_boundary_suggestion_promotion_survives_store_reopen
-    run_exact_test loom-store lib unused generation::tests::exact_boundary_suggestion_promotion_survives_store_reopen
     run_exact_test tauri-plugin-loom lib unused tests::close_cancels_active_family_waits_for_terminal_release_and_replays
     run pnpm --dir "$PRODUCT_DIR" test
     record_check "@delysis/loom::frontend-tests"
@@ -218,8 +217,14 @@ if [ "$COMPONENT" = loom ]; then
   node - "$CONFIG" "$BUNDLE" <<'NODE'
 const fs = require("node:fs");
 const path = require("node:path");
+const { execFileSync } = require("node:child_process");
 const [configPath, bundle] = process.argv.slice(2);
 const resources = JSON.parse(fs.readFileSync(configPath, "utf8")).bundle.resources;
+const target = /^host: (.+)$/m.exec(execFileSync("rustc", ["-vV"], { encoding: "utf8" }))?.[1];
+if (!target) throw new Error("Signal build target is unavailable");
+const releaseWorker = fs.readFileSync(path.resolve(path.dirname(configPath), "../../../signal/target/release/loom-signal"));
+const stagedWorker = fs.readFileSync(path.join(path.dirname(configPath), "binaries", `loom-signal-${target}`));
+if (!releaseWorker.equals(stagedWorker)) throw new Error("Signal sidecar must be the release-profile worker");
 if (!fs.statSync(path.join(bundle, "Contents/MacOS/loom-signal")).isFile()) {
   throw new Error("packaged Signal worker is missing");
 }
@@ -229,6 +234,7 @@ for (const [source, destination] of Object.entries(resources)) {
   if (!original.equals(packaged)) throw new Error(`packaged notice mismatch: ${destination}`);
 }
 NODE
+  record_check "$PACKAGE::signal-release-profile"
   record_check "$PACKAGE::signal-notices"
 fi
 
@@ -371,6 +377,7 @@ if (e.DELYSIS_RECEIPT_SIGNAL_SOURCE) {
     throw new Error("Signal source receipt does not match this release");
   }
   signal = {
+    build_profile: "release",
     executable_sha256: digest(fs.readFileSync(e.DELYSIS_RECEIPT_SIGNAL_EXECUTABLE)),
     source_receipt: "loom-signal-source.json",
     source_receipt_sha256: digest(bytes),

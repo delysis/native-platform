@@ -434,8 +434,10 @@ Git Bash's Perl is not the native MSVC build interpreter. CI sets
 Tauri dev/build hooks invoke it; plain Cargo workspace builds need this step first.
 The sidecar follows Tauri's debug/release build profile, so a development bundle
 reuses the worker tested by CI. Direct script calls default to debug; `--release`
-selects an optimized worker. Tauri supplies its profile through
-[`TAURI_ENV_DEBUG`](https://v2.tauri.app/reference/environment-variables/).
+selects an optimized worker. The build hook passes `--tauri-build`: the pinned
+[Tauri CLI sets `TAURI_ENV_DEBUG` only for debug builds](https://github.com/tauri-apps/tauri/blob/tauri-cli-v2.11.4/crates/tauri-cli/src/helpers/mod.rs#L32-L44),
+so an unset flag selects release in that hook. The release script also checks the
+staged sidecar against the optimized worker before signing and writing a receipt.
 
 Presage and the Signal worker are AGPL-3.0-only. Preserve the worker's license,
 upstream notices, pinned dependency lockfile, and corresponding source when
@@ -470,9 +472,10 @@ connection cleanup detached and reproduced a crash during process exit.
 ## Remaining acceptance and implementation
 
 The [context publication and Signal source receipt](audit-receipts/2026-09-15-context-publication-and-signal-source.md)
-records native owner-side publication of a curated excerpt and exact WAV, with
-the original text absent from shared assets. Its peer window remained in use, so
-that run did not establish peer receipt or collaborative editing. The same receipt
+records native publication of a curated excerpt and exact WAV, reconnect without
+another invitation, peer receipt, and edits converging in both directions. The
+original text and later private scratch remained local. Reopening the publication
+preserved collaborative edits. The same receipt
 records an actual offline build from the distributed Signal sources and exact
 packaged license/notice resources, with revision-specific limits.
 

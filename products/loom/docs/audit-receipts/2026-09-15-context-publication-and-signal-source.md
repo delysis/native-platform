@@ -34,11 +34,26 @@ A read-only check of the cabal asset database confirmed:
 | Original text | `b1f2bc871583bd248d81ccd79e6b4f83b0f98489264807a96330485605a4da11` | Absent from shared assets |
 | Synthetic WAV | `13f720e7bd01cf20167cd10866e8e1dbbbd17ef8d361179a78c31539e8848a0c` | Complete; stored chunks equal the original bytes |
 
-The peer bundle (`app.delysis.loom.context11898f4.peer`, PID 94397) was launched,
-but its saved cabal was not reopened before the user resumed interacting with
-the window. Peer receipt, collaborative editing of this publication, and restart
-recovery are therefore **not established by this run**. No real Signal account,
-message, group, or physical second network was used.
+The same bundles later restarted as owner PID 99424 and peer PID 99410. Their
+separate profile locks and cabal database handles were checked. Opening the
+saved cabal folders restored the connection without another invitation. The
+peer received and opened the published document and its one-second audio control.
+Its stored WAV chunks equalled the original bytes; the text original remained
+absent from the peer's shared assets.
+
+The peer added `Fern adds a lantern.` through its native editor. On the owner,
+adding `Later private scratch stays here.` to the source document's Instructions
+and using **Find shared context** reopened the same publication without replacing
+that peer edit. The owner then added `Moss adds a bridge.` to the shared document;
+the peer's native editor showed both edits. Both Markdown files were byte-identical,
+SHA-256 `6f3d938fe7ded147f2e264b0071b554eecda7fab7ce97eb78aec8c385fdd8557`.
+The original source manuscript remained unchanged. The later private note and
+excluded original text were absent from the shared document; opening the source's
+Materials on the peer showed empty Instructions and no private source cards.
+Both application processes exited after native Quit commands, verified without
+relaunching them. No real Signal account, message, group, or physical second
+network was used. This proves the packaged interaction on one Mac, not physical
+Internet connectivity or simultaneous hardware input.
 
 ## Signal distribution
 
@@ -79,6 +94,22 @@ It also rejected dirty source and existing output. Notice tests rejected altered
 license text and a different Git pin. The release workflow checks passed 46 tests.
 The context-command build-script review hash was refreshed after inspection;
 all 25 ignored-test policy checks passed.
+
+The first complete candidate run at `200df70` built and signed the release app,
+checked notices, produced source and app archives, and wrote its release receipt.
+Inspection rejected that candidate: its Tauri hook had compiled the Signal worker
+in the development profile. An actual installed-CLI hook probe confirmed that
+Tauri 2.11.4 leaves `TAURI_ENV_DEBUG` unset for release and sets it to `true` for
+debug. The old helper incorrectly expected `false` for release. The rejection
+is recorded alongside that candidate rather than changing its immutable receipt.
+
+The repaired hook explicitly selects Tauri build mode; direct helper calls still
+default to development. The release script also compares the staged sidecar with
+the release worker before signing and records its profile. A process-boundary
+fixture verifies both compiler arguments and copied artifacts: its unset-flag
+release case failed before the fix and all four cases passed afterward. Combined
+with the workflow checks, 50 tests passed. Complete candidate execution after this
+repair remains pending until its own receipt is inspected.
 
 Local detailed receipts are `/tmp/loom-context-acceptance.json` and
 `/tmp/loom-signal-packaging-acceptance.json`. Generated build caches and extracted

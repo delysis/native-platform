@@ -15,7 +15,11 @@ if (compiler.status !== 0) throw new Error('Install the root toolchain with rust
 const compilerPath = compiler.stdout.trim();
 const env = { ...process.env, RUSTUP_TOOLCHAIN: toolchain, CARGO_TARGET_DIR: join(worker, 'target'),
   RUSTC: compilerPath, PATH: `${dirname(compilerPath)}${delimiter}${process.env.PATH ?? ''}` };
-const release = process.argv.includes('--release') || process.env.TAURI_ENV_DEBUG === 'false';
+// Tauri sets this variable only for debug builds. The explicit hook flag keeps
+// an ordinary direct invocation in development mode when it is also unset.
+const release = process.argv.includes('--release')
+  || (process.argv.includes('--tauri-build') && process.env.TAURI_ENV_DEBUG !== 'true');
+console.log(`Building Loom Signal worker in ${release ? 'release' : 'development'} mode`);
 const hostResult = spawnSync(compilerPath, ['-vV'], { cwd: worker, env, encoding: 'utf8' });
 if (hostResult.status !== 0) throw new Error('The pinned Signal Rust toolchain is unavailable.');
 const host = /^host: (.+)$/m.exec(hostResult.stdout)?.[1];
