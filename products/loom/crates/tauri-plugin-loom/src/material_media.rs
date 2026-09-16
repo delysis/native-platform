@@ -149,7 +149,34 @@ pub(super) fn read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
+    fn preview_tokens_preserve_identity_and_reject_altered_urls() {
+        let request = Request {
+            project_id: ProjectId::new(),
+            session_id: CommandId::new(),
+            material_id: format!("material-{}", "a".repeat(64)),
+            media_sha256: "b".repeat(64),
+        };
+        let encoded = token(&request).unwrap();
+        for origin in ["loom-asset://localhost", "http://loom-asset.localhost"] {
+            let uri: http::Uri = format!("{origin}/{encoded}").parse().unwrap();
+            assert_eq!(parse(&uri), Some(request.clone()));
+            for suffix in ["?bypass=1", "/extra", "-extra", "%2f"] {
+                assert!(parse(&format!("{origin}/{encoded}{suffix}").parse().unwrap()).is_none());
+            }
+        }
+        for origin in [
+            "https://loom-asset.localhost",
+            "loom-asset://other",
+            "http://localhost",
+        ] {
+            assert!(parse(&format!("{origin}/{encoded}").parse().unwrap()).is_none());
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn preview_is_revoked_by_removal_and_cannot_cross_sessions() {
         let temp = tempfile::tempdir().unwrap();
         let (store, _) = ProjectStore::initialize(temp.path().join("Writing"), "Writing").unwrap();
