@@ -188,3 +188,105 @@ fn source_contents_are_literal_not_recursive_reference_or_function_execution() {
         assert!(!plan.bindings.contains_key("Missing"));
     }
 }
+
+fn pdf_source(store: &ProjectStore, text: &str) -> MaterialEntry {
+    use std::fmt::Write as _;
+    let mut stream = String::from("BT /F1 12 Tf 14 TL 10 180 Td\n");
+    for line in text.lines() {
+        writeln!(stream, "({line}) Tj T*").unwrap();
+    }
+    stream.push_str("ET\n");
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".into(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 200] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>".into(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".into(),
+        format!("<< /Length {} >>\nstream\n{stream}endstream", stream.len()),
+    ];
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        writeln!(pdf, "{} 0 obj\n{object}\nendobj", index + 1).unwrap();
+    }
+    let xref = pdf.len();
+    pdf.push_str("xref\n0 6\n0000000000 65535 f \n");
+    for offset in offsets {
+        writeln!(pdf, "{offset:010} 00000 n ").unwrap();
+    }
+    writeln!(
+        pdf,
+        "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF"
+    )
+    .unwrap();
+    let path = store.root().join("long-source.pdf");
+    fs::write(&path, pdf.as_bytes()).unwrap();
+    let prepared = crate::context_attachments::import_path(store.root(), &path).unwrap();
+    assert_eq!(fs::read(path).unwrap(), pdf.as_bytes());
+    materials::bind_attachment(store, &prepared.id, Some("PDF source")).unwrap()
+}
+
+#[test]
+fn small_context_retrieves_whole_pdf_passages_without_shortening_exact_arguments() {
+    let (_directory, store) = project();
+    let paragraphs = format!("{}\n", "The nightjar sings in moonlight. ".repeat(100)).repeat(3);
+    let source = pdf_source(&store, &paragraphs);
+    let value = resolve(&store, &source.id).unwrap();
+    let whole = exact(&value).unwrap();
+    assert!((3000..MAX_BYTES).contains(&whole.len()));
+    let all_hits = materials::search(&store, &source.id, "nightjar").unwrap();
+    assert!(all_hits.hits.len() > 1);
+    let markdown = format!("Use [@PDF source](loom-material:{}).", source.id);
+    let plan = markdown_plan_with_budget(&store, &markdown, "nightjar", 2800).unwrap();
+    assert!(plan.text.len() <= 2800);
+    assert!(!plan.evidence.is_empty());
+    assert!(plan.evidence.len() < all_hits.hits.len());
+    assert_eq!(plan.evidence[0].text, all_hits.hits[0].text);
+    assert_eq!(plan.evidence[0].id, all_hits.hits[0].id);
+    let hit = &plan.evidence[0];
+    let start = usize::try_from(hit.locator["start_byte"].as_u64().unwrap()).unwrap();
+    let end = usize::try_from(hit.locator["end_byte"].as_u64().unwrap()).unwrap();
+    assert_eq!(&whole[start..end], hit.text);
+    let Value::Evidence {
+        retrieval: Some(retrieval),
+        ..
+    } = &plan.bindings[&source.id]
+    else {
+        panic!("frozen retrieval")
+    };
+    assert!(!retrieval.complete);
+    assert!(
+        retrieval
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("context budget"))
+    );
+    assert_eq!(
+        plan.omitted_evidence[&source.id].len() + plan.evidence.len(),
+        all_hits.hits.len()
+    );
+    assert_eq!(exact(&value).unwrap(), whole);
+    assert!(markdown_plan_with_budget(&store, &markdown, "nightjar", 100).is_err());
+}
+
+#[test]
+fn ordinary_budgeted_consultation_reports_zero_matches_explicitly() {
+    let (_directory, store) = project();
+    let source = attachment(&store, "Research", &"Quiet prose. ".repeat(1000));
+    let plan =
+        markdown_plan_with_budget(&store, &format!("@{}", source.id), "nightjar", 1000).unwrap();
+    assert!(plan.evidence.is_empty());
+    assert!(
+        plan.text
+            .contains("No matching source passages were found.")
+    );
+    let Value::Evidence {
+        retrieval: Some(retrieval),
+        ..
+    } = &plan.bindings[&source.id]
+    else {
+        panic!("frozen empty retrieval")
+    };
+    assert_eq!(retrieval.query, "nightjar");
+    assert!(retrieval.hits.is_empty());
+}

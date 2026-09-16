@@ -146,10 +146,7 @@ pub fn document_references(source: &str) -> Result<Vec<DocumentReference>, Neura
                 continue;
             }
             if character == '\\' {
-                offset += character.len_utf8();
-                if let Some(escaped) = line[offset..].chars().next() {
-                    offset += escaped.len_utf8();
-                }
+                offset += rest.chars().take(2).map(char::len_utf8).sum::<usize>();
                 continue;
             }
             if matches!(character, '[' | '!')

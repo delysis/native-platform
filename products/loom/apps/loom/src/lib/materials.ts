@@ -61,11 +61,27 @@ export function isDatabasePath(path: string): boolean {
 }
 
 export function materialLocatorLabel(locator: unknown): string {
-  if (typeof locator === 'string') return locator;
   if (!locator || typeof locator !== 'object') return '';
   const fields = locator as Record<string, unknown>;
-  return Object.entries(fields).filter(([, value]) => typeof value === 'string' || typeof value === 'number')
-    .map(([key, value]) => `${key.replaceAll('_', ' ')}: ${value}`).join(' · ');
+  const page = fields.page_number ?? fields.page ?? fields.page_start;
+  const lastPage = fields.page_end;
+  if (typeof page === 'number' && Number.isSafeInteger(page) && page > 0) {
+    return typeof lastPage === 'number' && Number.isSafeInteger(lastPage) && lastPage > page
+      ? `Pages ${page}–${lastPage}` : `Page ${page}`;
+  }
+  // Location metadata is retained in full, but opaque identities and paragraph
+  // dumps are not useful navigation labels in a writing surface.
+  for (const field of ['heading', 'section', 'location_path']) {
+    const value = fields[field];
+    if (typeof value !== 'string') continue;
+    const heading = value.trim();
+    if (heading && heading.length <= 72 && !/[\r\n]/u.test(heading) && heading.split(/\s+/u).length <= 10 &&
+        !/[.!?]$/u.test(heading) && !heading.startsWith('/') && !/^[a-z]+:\/\//iu.test(heading) &&
+        !/^[a-z0-9_-]{16,}$/iu.test(heading)) return heading;
+  }
+  const index = fields.block_index;
+  return typeof index === 'number' && Number.isSafeInteger(index) && index >= 0 && index < Number.MAX_SAFE_INTEGER
+    ? `Passage ${index + 1}` : '';
 }
 
 /** A deliberately inserted source stays distinguishable from the writer's instructions. */

@@ -43,6 +43,34 @@ describe('named material viewing', () => {
     expect(onUse).toHaveBeenCalledWith(`[@A source](loom-evidence:${evidence.id})`, evidence.text);
     expect(ipc.read).not.toHaveBeenCalled();
   });
+  it('quotes only an exact selected source range while retaining the source evidence reference', async () => {
+    const exact = { ...evidence, text: 'Before.\n  café 🖋 @Another\nAfter.' };
+    const { onUse } = render({ initialEvidence: exact });
+    await expect.element(page.getByText(exact.text, { exact: true })).toBeVisible();
+    const source = document.querySelector('.source-text')!;
+    const range = document.createRange();
+    const excerpt = '  café 🖋 @Another\n';
+    const start = exact.text.indexOf(excerpt);
+    range.setStart(source.firstChild!, start);
+    range.setEnd(source.firstChild!, start + excerpt.length);
+    window.getSelection()!.removeAllRanges(); window.getSelection()!.addRange(range);
+    await page.getByText('•••', { exact: true }).click();
+    await page.getByRole('button', { name: 'Insert quotation' }).click();
+    expect(onUse).toHaveBeenCalledWith(`[@A source](loom-evidence:${evidence.id})`, excerpt);
+  });
+  it.each(['elsewhere', 'crossing'])('ignores a %s selection rather than inserting unrelated page text', async scope => {
+    const { onUse } = render({ initialEvidence: evidence });
+    await expect.element(page.getByText(evidence.text, { exact: true })).toBeVisible();
+    const location = document.querySelector('.location')!;
+    const source = document.querySelector('.source-text')!;
+    const range = document.createRange();
+    range.selectNodeContents(location);
+    if (scope === 'crossing') range.setEnd(source.firstChild!, 5);
+    window.getSelection()!.removeAllRanges(); window.getSelection()!.addRange(range);
+    await page.getByText('•••', { exact: true }).click();
+    await page.getByRole('button', { name: 'Insert quotation' }).click();
+    expect(onUse).toHaveBeenCalledWith(`[@A source](loom-evidence:${evidence.id})`, evidence.text);
+  });
   it('reads retained evidence after the live library is unavailable without reopening it', async () => {
     const { onUse } = render({ material: { ...material, available: false }, initialEvidence: evidence });
     await expect.element(page.getByText('Exact café evidence.\nSecond line.', { exact: true })).toBeVisible();

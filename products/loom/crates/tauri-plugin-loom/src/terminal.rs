@@ -7,12 +7,22 @@ use loom_document::{
     NeuralCommand, NeuralExpression, document_references, parse_neural_command,
     render_base_function_prompt,
 };
-use std::fmt::Write as _;
 use std::sync::atomic::AtomicUsize;
 
 const MAX_CALLS: usize = 8;
 const MAX_PROMPT_BYTES: usize = 65_536;
 const MAX_HISTORY: usize = 64;
+const TERMINAL_GENERATION_TOKENS: u32 = 512;
+
+fn remaining_context_bytes(context_tokens: u32, used_bytes: usize) -> usize {
+    usize::try_from(
+        context_tokens
+            .saturating_sub(TERMINAL_GENERATION_TOKENS)
+            .saturating_sub(1_024),
+    )
+    .unwrap_or(usize::MAX)
+    .saturating_sub(used_bytes)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct TerminalRun {
@@ -55,7 +65,13 @@ fn terminal_sampling(
     step: u32,
     boundary: Option<TerminalTurnBoundary>,
 ) -> SamplingConfig {
-    let mut sampling = sampling_for_weave_case(command_id, step, 512, 0.8, WeavePreset::ManualV2);
+    let mut sampling = sampling_for_weave_case(
+        command_id,
+        step,
+        TERMINAL_GENERATION_TOKENS,
+        0.8,
+        WeavePreset::ManualV2,
+    );
     if let Some(TerminalTurnBoundary::Chat) = boundary {
         sampling.stop = vec!["\nUser:".into(), "\nAssistant:".into()];
     }
@@ -87,6 +103,8 @@ struct RunReceipt {
     evidence: Vec<crate::materials::MaterialEvidence>,
     #[serde(default)]
     searches: Vec<crate::materials::MaterialSearch>,
+    #[serde(default)]
+    omitted_evidence: BTreeSet<String>,
     sources: Vec<crate::document_bindings::ResolvedDocument>,
     steps: Vec<BlobId>,
 }
@@ -556,6 +574,7 @@ pub(super) async fn terminal_run<R: Runtime>(
         bindings,
         evidence: Vec::new(),
         searches: Vec::new(),
+        omitted_evidence: BTreeSet::new(),
         sources,
         steps: Vec::new(),
     };
@@ -732,12 +751,7 @@ impl Evaluator<'_> {
                     .map_or(text.as_str(), |presentation| presentation.input.as_str());
                 let query = query.to_owned();
                 for (name, value) in self.receipt.bindings.clone() {
-                    let value = self.consult(&value, &query)?;
-                    let _ = write!(
-                        prefix,
-                        "# {name:?}\n\n{}\n\n",
-                        material_context::exact(&value)?
-                    );
+                    self.append_context(&mut prefix, &name, &value, &query, text.len())?;
                 }
                 prefix.push_str(text);
                 self.complete(bounded(prefix)?).map(Value::Text)
@@ -776,6 +790,10 @@ impl Evaluator<'_> {
                     inputs.push(self.input.clone());
                 }
                 let query = bounded(inputs.join("\n\n"))?;
+                let input_refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
+                let base_prompt_bytes = render_base_function_prompt(&function, &input_refs)
+                    .map_err(io_failure)?
+                    .len();
                 let mut contextual_function = String::new();
                 let mut seen_context = BTreeSet::new();
                 for reference in document_references(&function).map_err(io_failure)? {
@@ -783,20 +801,17 @@ impl Evaluator<'_> {
                         continue;
                     }
                     let value = self.binding(&reference.name)?;
-                    let context = self.consult(&value, &query)?;
-                    let _ = write!(
-                        contextual_function,
-                        "# {:?}\n\n{}\n\n",
-                        reference.name,
-                        material_context::exact(&context)?
-                    );
+                    self.append_context(
+                        &mut contextual_function,
+                        &reference.name,
+                        &value,
+                        &query,
+                        base_prompt_bytes,
+                    )?;
                 }
                 contextual_function.push_str(&function);
-                let prompt = render_base_function_prompt(
-                    &contextual_function,
-                    &inputs.iter().map(String::as_str).collect::<Vec<_>>(),
-                )
-                .map_err(io_failure)?;
+                let prompt = render_base_function_prompt(&contextual_function, &input_refs)
+                    .map_err(io_failure)?;
                 self.complete(bounded(prompt)?).map(Value::Text)
             }
         }
@@ -830,8 +845,35 @@ impl Evaluator<'_> {
         }
     }
 
-    fn consult(&mut self, value: &Value, query: &str) -> Result<Value, IpcFailure> {
-        let consulted = self.with_store(|store| material_context::consult(store, value, query))?;
+    fn append_context(
+        &mut self,
+        prefix: &mut String,
+        name: &str,
+        value: &Value,
+        query: &str,
+        base_bytes: usize,
+    ) -> Result<(), IpcFailure> {
+        let model = self
+            .model
+            .ok_or_else(|| failure("Choose a local model before trying this idea."))?;
+        let label = format!("# {name:?}\n\n");
+        let used = base_bytes
+            .saturating_add(prefix.len())
+            .saturating_add(label.len())
+            .saturating_add(2);
+        let budget = remaining_context_bytes(resident_context_tokens(model), used);
+        let consulted = self.consult(value, query, budget)?;
+        prefix.push_str(&label);
+        prefix.push_str(&material_context::exact(&consulted)?);
+        prefix.push_str("\n\n");
+        Ok(())
+    }
+
+    fn consult(&mut self, value: &Value, query: &str, budget: usize) -> Result<Value, IpcFailure> {
+        let (consulted, omitted) = self.with_store(|store| {
+            material_context::consult_with_budget(store, value, query, budget)
+        })?;
+        self.receipt.omitted_evidence.extend(omitted);
         self.record_evidence(&consulted);
         Ok(consulted)
     }
@@ -882,6 +924,7 @@ impl Evaluator<'_> {
                         &self.receipt.evidence,
                         &self.receipt.searches,
                         &self.receipt.bindings,
+                        &self.receipt.omitted_evidence,
                     ))
                     .map_err(io_failure)?,
                 )

@@ -8463,7 +8463,22 @@ fn weave_start_inner<R: Runtime>(
         {
             material_commands::restore_grants(state, store)?;
         }
-        let material_plan = material_context::markdown_plan(store, &loaded.text, source_prefix)?;
+        // Match the attachment planner's conservative byte-per-token envelope;
+        // every branch's generation and the runtime scaffold keep their reserve.
+        let context_bytes = resident_context_tokens(loaded_model)
+            .saturating_sub(branch_count.saturating_mul(max_tokens))
+            .saturating_sub(1_024);
+        let material_budget = usize::try_from(context_bytes)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(attachment_context.manuscript_prompt.len())
+            .saturating_sub(attachment_context.context_preamble.len())
+            .saturating_sub(2);
+        let material_plan = material_context::markdown_plan_with_budget(
+            store,
+            &loaded.text,
+            source_prefix,
+            material_budget,
+        )?;
         attachment_context.media = terminal_media::merge(
             attachment_context.media,
             material_context::native_media(store, material_plan.bindings.values())?,

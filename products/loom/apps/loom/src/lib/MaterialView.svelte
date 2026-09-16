@@ -22,6 +22,7 @@
   let busy = false;
   let serial = 0;
   let mounted = false;
+  let sourceTextElement: HTMLDivElement | undefined;
   $: reference = selected ? evidenceReferenceMarkdown(selected) : materialReferenceMarkdown(material);
   $: text = selected?.text ?? source?.text ?? '';
   $: warnings = [...new Set([...(source?.warnings ?? []), ...(results?.warnings ?? []), ...(selected?.warnings ?? [])])];
@@ -45,12 +46,28 @@
     catch (failure) { if (mounted && serial === request) error = normalizeFailure(failure).message; }
     finally { if (mounted && serial === request) busy = false; }
   }
+  function quotationText(): string {
+    const selection = window.getSelection();
+    if (!sourceTextElement || sourceTextElement.textContent !== text || !selection ||
+        selection.isCollapsed || selection.rangeCount !== 1) return text;
+    const range = selection.getRangeAt(0);
+    if (!sourceTextElement.contains(range.startContainer) || !sourceTextElement.contains(range.endContainer)) return text;
+    // Derive offsets from DOM ranges, then slice the canonical source itself.
+    // In particular, retain whitespace and Unicode exactly; selection elsewhere
+    // (including a range crossing out of this source) never becomes an excerpt.
+    const prefix = document.createRange();
+    prefix.selectNodeContents(sourceTextElement);
+    prefix.setEnd(range.startContainer, range.startOffset);
+    const start = prefix.toString().length;
+    return text.slice(start, start + range.toString().length);
+  }
+
   async function use(contents = false): Promise<void> {
     if (busy || !originTitle) return;
     busy = true; error = '';
     try {
       const capturedReference = contents && !selected && source?.evidence[0] ? evidenceReferenceMarkdown(source.evidence[0]) : reference;
-      if (!await onUse(capturedReference, contents ? text : null)) error = 'The writing changed. Return to your document and choose a new insertion point.'; }
+      if (!await onUse(capturedReference, contents ? quotationText() : null)) error = 'The writing changed. Return to your document and choose a new insertion point.'; }
     catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
     finally { if (mounted) busy = false; }
   }
@@ -77,9 +94,9 @@
     <button class="back" on:click={onClose} aria-label="Back to writing">‹</button>
     <h1>{selected?.title ?? material.name}</h1>
     {#if originTitle}<button class="use" disabled={busy || (!material.available && !selected)} on:click={() => void use()} title={`Reference in ${originTitle}`}>Use here</button>{/if}
-    <details class="actions"><summary aria-label="Source actions">•••</summary><div class="action-menu">
+    <details class="actions"><summary aria-label="Source actions" on:mousedown|preventDefault>•••</summary><div class="action-menu">
       <button on:click={() => void copyReference()}>Copy reference</button>
-      {#if text && originTitle}<button disabled={busy} on:click={() => void use(true)}>Insert quotation</button>{/if}
+      {#if text && originTitle}<button disabled={busy} on:mousedown|preventDefault on:click={() => void use(true)}>Insert quotation</button>{/if}
       {#if material.attachment_id}<button on:click={() => void original()}>Open original</button>{/if}
       {#if material.available}<button disabled={busy} on:click={() => void pin()}>{material.pinned ? 'Unpin' : 'Pin'}</button>{/if}
     </div></details>
@@ -104,7 +121,7 @@
     <div class="content">
       {#if selected}
         <p class="location">{materialLocatorLabel(selected.locator)}</p>
-        <div class="source-text">{selected.text}</div>
+        <div class="source-text" bind:this={sourceTextElement}>{selected.text}</div>
       {:else if results}
         <p class="result-count">{results.hits.length} matching {results.hits.length === 1 ? 'passage' : 'passages'}</p>
         {#each results.hits as hit (hit.id)}
@@ -120,8 +137,8 @@
             {:else}<audio controls preload="metadata" src={convertFileSrc(media.preview_token, 'loom-asset')} aria-label={`Play ${material.name}`}></audio>{/if}
           {/if}
         {/each}
-        {#if source.text}<div class="source-text">{source.text}</div>
-        {:else if material.kind === 'attachment'}<p class="notice">The original is retained. No readable text is available.</p>{/if}
+        {#if source.text}<div class="source-text" bind:this={sourceTextElement}>{source.text}</div>
+        {:else if material.kind === 'attachment' && !source.presentation?.media.length}<p class="notice">The original is retained. No readable text is available.</p>{/if}
       {:else if busy}<p class="notice" role="status">Opening…</p>{/if}
     </div>
   {/if}

@@ -2,7 +2,6 @@
 //! Reading a reference never executes its contents or follows its references.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Write as _;
 
 use loom_store::ProjectStore;
 use serde::{Deserialize, Serialize};
@@ -26,6 +25,9 @@ impl From<materials::MaterialError> for IpcFailure {
 }
 
 const MAX_BYTES: usize = 65_536;
+const EVIDENCE_HEADER: &str =
+    "Selected source passages; these are not a claim of complete corpus coverage.\n";
+const EMPTY_EVIDENCE: &str = "No matching source passages were found.\n";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -79,6 +81,8 @@ pub(super) struct ContextPlan {
     pub text: String,
     pub bindings: BTreeMap<String, Value>,
     pub evidence: Vec<MaterialEvidence>,
+    pub byte_budget: usize,
+    pub omitted_evidence: BTreeMap<String, Vec<String>>,
 }
 
 fn failure(message: impl Into<String>) -> IpcFailure {
@@ -134,19 +138,21 @@ pub(super) fn resolve(store: &ProjectStore, name: &str) -> Result<Value, IpcFail
 }
 
 pub(super) fn evidence_text(evidence: &[MaterialEvidence]) -> Result<String, IpcFailure> {
-    let mut text = String::from(
-        "Selected source passages; these are not a claim of complete corpus coverage.\n",
-    );
+    if evidence.is_empty() {
+        return Ok(EMPTY_EVIDENCE.into());
+    }
+    let mut text = String::from(EVIDENCE_HEADER);
     for hit in evidence {
-        let _ = writeln!(
-            text,
-            "\n--- Source {:?}; reference {} ---",
-            hit.title, hit.reference
-        );
-        text.push_str(&hit.text);
-        text.push_str("\n--- End source ---\n");
+        text.push_str(&evidence_passage(hit));
     }
     bounded(text)
+}
+
+fn evidence_passage(hit: &MaterialEvidence) -> String {
+    format!(
+        "\n--- Source {:?}; reference {} ---\n{}\n--- End source ---\n",
+        hit.title, hit.reference, hit.text
+    )
 }
 
 pub(super) fn exact(value: &Value) -> Result<String, IpcFailure> {
@@ -227,34 +233,128 @@ pub(super) fn consult(
     }
 }
 
+#[cfg(test)]
 pub(super) fn markdown_plan(
     store: &ProjectStore,
     markdown: &str,
     query: &str,
 ) -> Result<ContextPlan, IpcFailure> {
+    markdown_plan_with_budget(store, markdown, query, MAX_BYTES)
+}
+
+pub(super) fn consult_with_budget(
+    store: &ProjectStore,
+    value: &Value,
+    query: &str,
+    budget: usize,
+) -> Result<(Value, Vec<String>), IpcFailure> {
+    let consulted = match value {
+        Value::Material { material }
+            if material
+                .text
+                .as_ref()
+                .is_some_and(|text| text.len() > budget) =>
+        {
+            search(store, value, query_window(query))?
+        }
+        _ => consult(store, value, query)?,
+    };
+    let Value::Evidence {
+        evidence,
+        mut retrieval,
+    } = consulted
+    else {
+        if exact(&consulted)?.len() > budget {
+            return Err(failure(
+                "The referenced document does not fit the remaining context. Select a smaller passage.",
+            ));
+        }
+        return Ok((consulted, Vec::new()));
+    };
+    let mut used = if evidence.is_empty() {
+        EMPTY_EVIDENCE.len()
+    } else {
+        EVIDENCE_HEADER.len()
+    };
+    let mut selected = Vec::new();
+    let mut omitted = Vec::new();
+    for hit in evidence {
+        let size = evidence_passage(&hit).len();
+        if used.saturating_add(size) <= budget {
+            used += size;
+            selected.push(hit);
+        } else {
+            omitted.push(hit.id);
+        }
+    }
+    if used > budget || (selected.is_empty() && !omitted.is_empty()) {
+        return Err(failure(
+            "No whole source passage fits the remaining context. Select a smaller passage or shorten the writing prefix.",
+        ));
+    }
+    if !omitted.is_empty()
+        && let Some(search) = &mut retrieval
+    {
+        search.hits.clone_from(&selected);
+        search.complete = false;
+        search.warnings.push(format!(
+            "{} retrieved passages omitted to fit the context budget.",
+            omitted.len()
+        ));
+    }
+    Ok((
+        Value::Evidence {
+            evidence: selected,
+            retrieval,
+        },
+        omitted,
+    ))
+}
+
+/// Pack ordinary context using whole retained passages. Exact function values
+/// keep their independent semantics and are never shortened by this planner.
+pub(super) fn markdown_plan_with_budget(
+    store: &ProjectStore,
+    markdown: &str,
+    query: &str,
+    byte_budget: usize,
+) -> Result<ContextPlan, IpcFailure> {
     let references =
         loom_document::document_references(markdown).map_err(|error| failure(error.to_string()))?;
-    let mut plan = ContextPlan::default();
+    let mut plan = ContextPlan {
+        byte_budget: byte_budget.min(MAX_BYTES),
+        ..ContextPlan::default()
+    };
     let mut seen = BTreeSet::new();
     for reference in references {
         if !seen.insert(reference.name.clone()) {
             continue;
         }
         let value = resolve(store, &reference.name)?;
-        let consulted = consult(store, &value, query)?;
+        let header = format!("\n--- Referenced material {:?} ---\n", reference.name);
+        let footer = "\n--- End material ---\n";
+        let remaining = plan
+            .byte_budget
+            .saturating_sub(plan.text.len() + header.len() + footer.len());
+        let (consulted, omitted) = consult_with_budget(store, &value, query, remaining)?;
+        if !omitted.is_empty() {
+            plan.omitted_evidence
+                .insert(reference.name.clone(), omitted);
+        }
         if let Value::Evidence { evidence, .. } = &consulted {
             plan.evidence.extend(evidence.iter().cloned());
         }
-        let _ = writeln!(
-            plan.text,
-            "\n--- Referenced material {:?} ---",
-            reference.name
-        );
+        plan.text.push_str(&header);
         plan.text.push_str(&exact(&consulted)?);
-        plan.text.push_str("\n--- End material ---\n");
+        plan.text.push_str(footer);
         plan.bindings.insert(reference.name, consulted);
     }
     plan.text = bounded(plan.text)?;
+    if plan.text.len() > plan.byte_budget {
+        return Err(failure(
+            "The source labels exceed the remaining context budget.",
+        ));
+    }
     Ok(plan)
 }
 

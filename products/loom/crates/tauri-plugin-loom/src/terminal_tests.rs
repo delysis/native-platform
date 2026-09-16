@@ -310,6 +310,52 @@ fn final_evidence_replaces_an_intermediate_generation_in_run_output() {
 }
 
 #[test]
+fn evaluator_consultation_budgets_evidence_without_shortening_exact_values() {
+    let fixture = TerminalFixture::new();
+    let paragraphs = format!("{}\n", "The nightjar sings in moonlight. ".repeat(100)).repeat(3);
+    let material = imported_source(&fixture, &paragraphs);
+    let id = CommandId::new();
+    fixture.run(id, "=@Draft").unwrap();
+    fixture.wait(id);
+    let receipt = read_receipt(&fixture.root(), &id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    let state = fixture.app.state::<PluginState>();
+    let identity = GenerationFamilyIdentity {
+        request_id: format!("terminal-{id}"),
+        project_id: fixture.project_id.parse().unwrap(),
+        session_id: fixture.session_id.parse().unwrap(),
+        document_id: fixture.source.document_id,
+    };
+    let control = TerminalControl::default();
+    let mut evaluator = Evaluator {
+        state: &state,
+        identity: &identity,
+        model: None,
+        control: &control,
+        source: &fixture.source,
+        input: String::new(),
+        receipt,
+        media: Vec::new(),
+        step: 0,
+    };
+    let value = fixture.with_store(|store| material_context::resolve(store, &material.id).unwrap());
+    let exact_before = material_context::exact(&value).unwrap();
+    let budget = remaining_context_bytes(4096, 160);
+    let consulted = evaluator.consult(&value, "nightjar", budget).unwrap();
+    assert!(material_context::exact(&consulted).unwrap().len() <= budget);
+    assert!(!evaluator.receipt.omitted_evidence.is_empty());
+    assert!(!evaluator.receipt.evidence.is_empty());
+    assert!(!evaluator.receipt.searches[0].complete);
+    assert_eq!(material_context::exact(&value).unwrap(), exact_before);
+    assert_eq!(evaluator.step, 0, "consultation performs no inference");
+    let frozen: RunReceipt =
+        serde_json::from_slice(&serde_json::to_vec(&evaluator.receipt).unwrap()).unwrap();
+    assert_eq!(frozen.omitted_evidence, evaluator.receipt.omitted_evidence);
+    assert_eq!(remaining_context_bytes(4096, usize::MAX), 0);
+}
+
+#[test]
 fn reference_run_retains_source_value_and_replays_without_duplicate_writing() {
     let fixture = TerminalFixture::new();
     let id = CommandId::new();
