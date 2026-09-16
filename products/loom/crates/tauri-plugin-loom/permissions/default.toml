@@ -3,6 +3,7 @@
 [default]
 description = "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions."
 permissions = [
+  "allow-document-reference-diagnostics",
   "allow-material-list",
   "allow-material-read",
   "allow-material-pdf-page",

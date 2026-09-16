@@ -4,6 +4,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 
 #### This default permission set includes the following:
 
+- `allow-document-reference-diagnostics`
 - `allow-material-list`
 - `allow-material-read`
 - `allow-material-pdf-page`
@@ -1328,6 +1329,32 @@ Enables the document_reconciliation_preview command without any pre-configured s
 <td>
 
 Denies the document_reconciliation_preview command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-document-reference-diagnostics`
+
+</td>
+<td>
+
+Enables the document_reference_diagnostics command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-document-reference-diagnostics`
+
+</td>
+<td>
+
+Denies the document_reference_diagnostics command without any pre-configured scope.
 
 </td>
 </tr>

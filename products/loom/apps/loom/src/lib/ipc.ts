@@ -42,6 +42,10 @@ export type { DocumentFilesystemHint } from './documentFilesystemHint';
 
 const PREFIX = 'plugin:loom|';
 
+export function documentReferenceDiagnostics(projectId: string, sessionId: string, text: string): Promise<import('./referenceDiagnostics').ReferenceDiagnostic[]> {
+  return call('document_reference_diagnostics', { projectId, sessionId, text });
+}
+
 // Project commands share one renderer-side ordering lane. Classify by the
 // smaller, fail-safe exception set: an unrecognized future command is queued.
 // Native session admission is authoritative across renderers and blocks for

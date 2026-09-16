@@ -14,6 +14,7 @@ mod import_jobs;
 mod inference;
 mod material_commands;
 mod material_context;
+mod reference_diagnostics;
 mod material_media;
 mod materials;
 mod microphone_capture;
@@ -2098,6 +2099,7 @@ impl Builder {
                 project_recover,
                 document_create,
                 material_commands::material_list,
+                reference_diagnostics::document_reference_diagnostics,
                 material_commands::material_read,
                 material_media::pdf::material_pdf_page,
                 material_commands::material_search,

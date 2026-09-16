@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
+  import ReferenceText from './ReferenceText.svelte';
+  import { ReferenceDiagnostics, type ReferenceDiagnostic, type ReferenceScope } from './referenceDiagnostics';
   import { completionOptionAccessibleLabel } from './ghostText';
   import { allocateCompletionPopupDomIds, placeCompletionPopup } from './completionPopup';
   import {
@@ -42,6 +44,11 @@
 
   export let element: HTMLTextAreaElement | undefined;
   export let value = '';
+  export let referenceScope: ReferenceScope | null = null;
+  const referenceDiagnostics = new ReferenceDiagnostics();
+  let referenceIssues: ReferenceDiagnostic[] = [];
+  $: referenceDiagnostics.update(referenceScope, value, items => referenceIssues = items);
+  $: referenceDescription = referenceIssues.find(item => item.start <= selectionStart && item.end >= selectionStart)?.message;
   export let readonly = false;
   export let verse = false;
   export let verseNewline: VerseNewlineKind | null = null;
@@ -305,7 +312,7 @@
     const previousKey = plan?.presentationKey ?? '';
     plan = next;
     if (!next) {
-      if (viewport) viewport.hidden = true;
+      if (viewport) viewport.hidden = !referenceIssues.length || !exactGeometry;
       shell?.classList.remove('ghost-active');
       reportVisiblePresentationKey('');
       return;
@@ -956,6 +963,7 @@
   }
 
   onDestroy(() => {
+    referenceDiagnostics.dispose();
     resizeObserver?.disconnect();
     if (geometryFrame !== undefined) window.cancelAnimationFrame(geometryFrame);
     if (fanPlacementFrame !== undefined) window.cancelAnimationFrame(fanPlacementFrame);
@@ -976,14 +984,18 @@
   class="source-editor-shell"
   bind:this={shell}
 >
-  <div class="source-ghost-viewport" aria-hidden="true" hidden={!plan} bind:this={viewport}>
+  <div class="source-ghost-viewport" aria-hidden="true" hidden={!plan && (!referenceIssues.length || !exactGeometry)} bind:this={viewport}>
     <div class="source-ghost-mirror" bind:this={mirror}>
       {#if plan}
-        <span>{plan.prefix}</span><span class:ghost-text-hidden={ghostHidden} class="loom-source-ghost-text" bind:this={ghostSpan}>{ghostHidden ? '' : nextSuggestionWord(plan.text)?.trimEnd() ?? ''}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
+        {#if referenceIssues.length}<ReferenceText value={plan.prefix} diagnostics={referenceIssues} />{:else}<span>{plan.prefix}</span>{/if}<span class:ghost-text-hidden={ghostHidden} class="loom-source-ghost-text" bind:this={ghostSpan}>{ghostHidden ? '' : nextSuggestionWord(plan.text)?.trimEnd() ?? ''}</span>{#if referenceIssues.length}<ReferenceText value={plan.suffix} offset={plan.prefix.length} diagnostics={referenceIssues} />{:else}<span>{plan.suffix}</span>{/if}<span class="source-ghost-sentinel">&#8203;</span>
+      {:else}
+        <ReferenceText {value} diagnostics={referenceIssues} /><span class="source-ghost-sentinel">&#8203;</span>
       {/if}
     </div>
   </div>
+  <span class="sr-only" id={`${completionPopupDomIds.listboxId}-reference`}>{referenceDescription ?? ''}</span>
   <textarea
+    aria-describedby={referenceDescription ? `${completionPopupDomIds.listboxId}-reference` : undefined}
     bind:this={element}
     class:verse
     {value}

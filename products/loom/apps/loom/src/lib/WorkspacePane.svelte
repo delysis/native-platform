@@ -31,6 +31,7 @@
   export let documents: DocumentSummary[] = [];
   export let source: OpenDocument | null = null;
   export let value = '';
+  export let referenceScope: import('./referenceDiagnostics').ReferenceScope | null = null;
   export let readonly = false;
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onChange: (value: string) => void = () => {};
@@ -328,9 +329,9 @@
       <div class="editor">
         {#key editorKey}
           {#if visual}
-            <LoomEditor bind:this={editor} {value} {readonly} {onChange} onCompositionChange={setComposing} acceptImageAttachments={false} label={config.title ?? 'Pane editor'} onGhostPresentationRejected={() => {}} />
+            <LoomEditor {referenceScope} bind:this={editor} {value} {readonly} {onChange} onCompositionChange={setComposing} acceptImageAttachments={false} label={config.title ?? 'Pane editor'} onGhostPresentationRejected={() => {}} />
           {:else}
-            <SourceEditor bind:this={sourceEditor} element={undefined} value={sourceDecoded.display} readonly={readonly || !sourceDecoded.codec.editable} verseNewline={sourceDecoded.codec.newline} label={config.title ?? 'Pane editor'} onValueInput={(area) => onChange(encodeSourceFromEditor(area.value, sourceDecoded.codec))} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} />
+            <SourceEditor {referenceScope} bind:this={sourceEditor} element={undefined} value={sourceDecoded.display} readonly={readonly || !sourceDecoded.codec.editable} verseNewline={sourceDecoded.codec.newline} label={config.title ?? 'Pane editor'} onValueInput={(area) => onChange(encodeSourceFromEditor(area.value, sourceDecoded.codec))} onCompositionStart={() => setComposing(true)} onCompositionEnd={() => setComposing(false)} />
           {/if}
         {/key}
       </div>

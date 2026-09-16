@@ -234,6 +234,7 @@ button.document-row:hover { background: var(--chrome-hover); }
 .source-ghost-viewport { position: absolute; z-index: 1; overflow: hidden; pointer-events: none; user-select: none; -webkit-user-select: none; }
 .source-ghost-mirror { position: absolute; top: 0; left: 0; margin: 0; border: 0; color: inherit; background: transparent; pointer-events: none; user-select: none; -webkit-user-select: none; white-space: pre-wrap; }
 .source-editor-shell.verse .source-ghost-mirror { white-space: pre; }
+.source-editor-shell:not(.ghost-active) .source-ghost-mirror { color: transparent; }
 .loom-source-ghost-text { color: var(--ghost-ink); -webkit-text-fill-color: var(--ghost-ink); }
 .loom-source-ghost-text.ghost-text-hidden { visibility: hidden; }
 .source-ghost-sentinel { color: transparent; -webkit-text-fill-color: transparent; }
@@ -242,6 +243,7 @@ button.document-row:hover { background: var(--chrome-hover); }
 .loom-completion-lens-trigger { position: fixed; z-index: 23; top: 12px; left: calc(100vw - 56px); min-width: 34px; height: 22px; padding: 0 6px; border: 1px solid color-mix(in srgb, var(--moss) 38%, var(--line)); border-radius: 999px; color: var(--quiet); background: color-mix(in srgb, var(--paper) 92%, transparent); box-shadow: 0 3px 12px rgb(30 28 24 / 8%); font: 650 9px/1 Inter, sans-serif; letter-spacing: .02em; cursor: pointer; pointer-events: auto; backdrop-filter: blur(10px); }
 .loom-completion-lens-trigger:hover, .loom-completion-lens-trigger.pinned { border-color: var(--moss); color: var(--moss); background: var(--moss-soft); }
 .loom-editor-shell { position: relative; min-height: 100%; }
+.reference-unavailable { text-decoration: underline wavy var(--clay); text-underline-offset: .18em; text-decoration-thickness: 1px; }
 .visual-pane > .loom-editor-shell, .visual-pane > .loom-editor-shell > .editor-mount { height: 100%; }
 .editor-mount { position: relative; z-index: 2; min-height: 100%; }
 .loom-prosemirror { --writing-gutter: clamp(16px, 2vw, 28px); width: 100%; min-height: 100%; box-sizing: border-box; margin: 0; padding-block: 18px 64px; padding-inline: var(--writing-gutter); outline: 0; color: var(--ink); font: 18px/1.6 Iowan Old Style, Palatino, Georgia, serif; caret-color: var(--clay); cursor: text; }

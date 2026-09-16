@@ -5,6 +5,7 @@
   import type { Node as ProseMirrorNode } from 'prosemirror-model';
   import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
+  import { ReferenceDiagnostics, referenceDiagnosticKey, referenceDiagnosticPlugin, visualReferenceDecorations, type ReferenceScope } from './referenceDiagnostics';
   import { onDestroy, onMount } from 'svelte';
   import { visualTerminalRange, type TerminalSourceRange } from './terminalSelection';
   import { flushMediaObjectDrafts, mediaObjectView } from './mediaObjectView';
@@ -83,6 +84,8 @@
   }
 
   export let value = '';
+  export let referenceScope: ReferenceScope | null = null;
+  const referenceDiagnostics = new ReferenceDiagnostics();
   export let label = 'Manuscript editor';
   export let readonly = false;
   export let autofocus = false;
@@ -738,6 +741,7 @@
     return EditorState.create({
       doc,
       plugins: [
+        referenceDiagnosticPlugin(),
         history(),
         objectNavigation(),
         visualMarkdownInputRules(schema),
@@ -1193,6 +1197,13 @@
     scrollViewport?.addEventListener('scroll', reportGhostVisibility, { passive: true });
     if (autofocus) view.focus();
   });
+
+  $: referenceDiagnostics.update(referenceScope, value, (items) => {
+    if (view && serializeVisualMarkdown(view.state.doc) === value) {
+      view.dispatch(view.state.tr.setMeta(referenceDiagnosticKey, visualReferenceDecorations(view.state.doc, value, items)).setMeta('addToHistory', false));
+    }
+  });
+  onDestroy(() => referenceDiagnostics.dispose());
 
   $: if (view && value !== lastEmitted && !composing && !localDocumentChanged) {
     const normalized = normalizeVisualMarkdownSource(value);

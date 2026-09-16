@@ -474,6 +474,10 @@
   let materialsOpen = false;
   let addMenuOpen = false;
   let materialEntries: MaterialEntry[] = [];
+  $: referenceScope = project ? {
+    projectId: project.project_id, sessionId: project.session_id,
+    revision: JSON.stringify([project.documents.map(item => [item.document_id, item.revision_id, item.relative_path, item.title, item.externally_modified]), materialEntries.map(item => [item.id, item.name, item.available])])
+  } : null;
   let materialScope = '';
   let activeMaterial: MaterialEntry | null = null;
   let activeMaterialEvidence: MaterialEvidence | null = null;
@@ -10107,7 +10111,7 @@
             <div class="context-composer">
               <div class="context-editor-surface" on:focusout={flushContextEditorProjection}>
                 {#if mode === 'visual' && canUseVisualMarkdown(contextText, true)}
-                  <LoomEditor
+                  <LoomEditor {referenceScope}
                     bind:this={contextVisualEditor}
                     value={contextText}
                     label="Steering context"
@@ -10120,7 +10124,7 @@
                     onGhostPresentationRejected={() => {}}
                   />
                 {:else}
-                  <SourceEditor
+                  <SourceEditor {referenceScope}
                     bind:element={contextSourceTextarea}
                     label="Steering context Markdown"
                     value={contextText}
@@ -10311,7 +10315,7 @@
                   <div class="verse-notice">Verse stays in the exact-whitespace source surface.</div>
                 {:else}
                   {#if canUseVisual}
-                    <LoomEditor
+                    <LoomEditor {referenceScope}
                       bind:this={visualEditor}
                       value={documentText}
                       label={`${document.summary.title}, manuscript editor`}
@@ -10368,7 +10372,7 @@
                 {#if document.summary.kind === 'hybrid'}
                   <div class="verse-notice" role="alert">Hybrid source editing is locked until its prose/verse block manifest can cross the IPC boundary losslessly.</div>
                 {/if}
-                <SourceEditor
+                <SourceEditor {referenceScope}
                   bind:this={sourceEditor}
                   bind:element={sourceTextarea}
                   value={sourceDisplayText}
@@ -10449,7 +10453,7 @@
               selectionDisabled={busyPaneSlots.has(slot.position)} onSelect={(id) => selectPane(slot.position, id)} onCollapse={() => togglePane(slot.position)} />
             {#each slot.choices as [paneId, paneConfig] (paneId)}
               <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
-            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
+            <WorkspacePane {referenceScope} bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
               </div>
             {/each}
           </aside>
