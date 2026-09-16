@@ -4,7 +4,7 @@
 use super::*;
 use loom_cabal::compute::{
     ClientRequest, ComputeCancellation, ComputeClient, ComputeGrant, ComputeHost, ComputeInput,
-    ComputeReply, ComputeStatus, RemoteJobReceipt,
+    ComputeReply, ComputeStatus, MAX_COMPUTE_BATCH_JOBS, RemoteJobReceipt,
 };
 use loom_cabal::{Cabal, Identity, Network, NetworkMode};
 use serde::Deserialize;
@@ -67,7 +67,9 @@ impl Peers {
         let owner = Identity::generate()?;
         let first = Identity::generate()?;
         let second = Identity::generate()?;
-        let mut cabal = Cabal::create(&output.join("cabal.db"), owner.clone(), "Batch gate", "Host")?;
+        let mut cabal = Cabal::create(
+            &output.join("cabal.db"), owner.clone(), "Batch gate", "Host",
+        )?;
         for (peer, name) in [(&first, "First requester"), (&second, "Second requester")] {
             let invitation = cabal.invite(owner.public_key().into())?;
             cabal.admit(&invitation.token, peer.public_key(), name)?;
@@ -170,6 +172,9 @@ impl Peers {
                 || mapping.request_id.is_empty()
                 || mapping.members.is_empty()
                 || mapping.members.len() > MAX_COMPUTE_BATCH_JOBS
+                || mapping.members.iter().any(|member| {
+                    member.request_id.is_empty() || member.case_id.is_empty()
+                })
                 || mapping.members.iter().map(|item| &item.request_id).collect::<BTreeSet<_>>().len()
                     != mapping.members.len()
                 || mapping.members.iter().map(|item| &item.case_id).collect::<BTreeSet<_>>().len()
@@ -239,6 +244,39 @@ impl Peers {
         Ok(outcomes)
     }
 
+    fn verify_sources(
+        &self,
+        store: &ProjectStore,
+        selection: &Selection,
+        evidence: &serde_json::Value,
+    ) -> Outcome<()> {
+        let mapping_blob: BlobId = serde_json::from_value(evidence["batch_mapping_blob"].clone())?;
+        let mapping: serde_json::Value = serde_json::from_slice(&store.read_blob(mapping_blob)?)?;
+        let members = mapping["members"].as_array().ok_or("missing durable batch mapping")?;
+        if members.len() != 2 {
+            return Err("durable batch mapping lost an owner".into());
+        }
+        let mut source_ids = BTreeSet::new();
+        for (index, grant) in self.grants.iter().enumerate() {
+            let member = members.iter().find(|item| item["peer"] == serde_json::json!(grant.peer))
+                .ok_or("missing original requester in batch mapping")?;
+            let generation: GenerationStart = serde_json::from_value(member["generation"].clone())?;
+            let source = store.read_document(format!("Requests/{}/{}.md", grant.peer, self.job))?;
+            if generation.document_id != source.document_id
+                || generation.source_revision_id != source.revision_id
+                || generation.branch_id.to_string() != selection.cases[index]
+                || source.text != self.inputs[index].prompt
+                || member["job"] != serde_json::json!(self.job)
+                || member["grant"] != serde_json::json!(grant.id)
+                || member["request_fingerprint"] != self.inputs[index].fingerprint(grant.id)?
+                || !source_ids.insert(source.document_id.to_string())
+            {
+                return Err("the native batch borrowed another request's source or identity".into());
+            }
+        }
+        Ok(())
+    }
+
     fn verify_native(
         &self,
         selection: &Selection,
@@ -257,17 +295,26 @@ impl Peers {
         let store = ProjectStore::open(&writing)?;
         let result = store.read_document(format!("Results/{}/{}.md", self.grants[1].peer, self.job))?;
         if result.text != *text || writing.join(format!("Results/{}/{}.md", self.grants[0].peer, self.job)).exists() {
-            return Err("production result retention disagrees with cancellation or signed output".into());
+            return Err("production retention disagrees with cancellation or signed output".into());
         }
-        let metadata: String = store.connection().query_row(
-            "SELECT metadata_json FROM artifacts WHERE artifact_id = ?1",
-            [result.artifact_id.to_string()], |row| row.get(0),
+        let provenance = store.revision_provenance(result.revision_id)?;
+        let artifact = provenance.segments.first().ok_or("generated result has no provenance")?;
+        if artifact.contribution != loom_types::ContributionKind::Generated {
+            return Err("peer result lost its generated provenance".into());
+        }
+        let database = rusqlite::Connection::open_with_flags(
+            store.root().join(".loom/loom.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let metadata: String = database.query_row(
+            "SELECT metadata_json FROM artifacts WHERE artifact_id = ?",
+            [artifact.artifact_id.to_string()], |row| row.get(0),
         )?;
         let metadata: serde_json::Value = serde_json::from_str(&metadata)?;
-        let evidence: BlobId = serde_json::from_value(metadata["provenance_blob_id"].clone())?;
-        let evidence: serde_json::Value = serde_json::from_str(&store.read_blob_text(evidence)?)?;
+        let evidence_blob: BlobId = serde_json::from_value(metadata["evidence_blob_id"].clone())?;
+        let evidence: serde_json::Value = serde_json::from_slice(&store.read_blob(evidence_blob)?)?;
         let native_blob: BlobId = serde_json::from_value(evidence["native_execution_blob"].clone())?;
-        let native: serde_json::Value = serde_json::from_str(&store.read_blob_text(native_blob)?)?;
+        let native: serde_json::Value = serde_json::from_slice(&store.read_blob(native_blob)?)?;
         let outputs: Vec<llama_native_types::GenerationOutput> = serde_json::from_value(native["native_outputs"].clone())?;
         let first = outputs.iter().find(|output| output.branch_id == selection.cases[0])
             .ok_or("cancelled native case is missing")?;
@@ -283,29 +330,15 @@ impl Peers {
             || native["model_fingerprint"] != *fingerprint
             || native["evidence_class"] != "operational_native"
             || evidence["kind"] != "loom_peer_batched_result_v1"
+            || evidence["native_output"] != serde_json::to_value(second)?
+            || evidence["native_input_index"] != serde_json::json!(second.input_index)
+            || evidence["peer"] != serde_json::json!(self.grants[1].peer)
+            || evidence["job"] != serde_json::json!(self.job)
+            || evidence["request_fingerprint"] != self.inputs[1].fingerprint(self.grants[1].id)?
         {
             return Err("actual native provenance and signed peer outcomes disagree".into());
         }
-        let mapping_blob: BlobId = serde_json::from_value(evidence["batch_mapping_blob"].clone())?;
-        let mapping: serde_json::Value = serde_json::from_str(&store.read_blob_text(mapping_blob)?)?;
-        let members = mapping["members"].as_array().ok_or("missing durable batch mapping")?;
-        if members.len() != 2 {
-            return Err("durable batch mapping lost an owner".into());
-        }
-        for (index, grant) in self.grants.iter().enumerate() {
-            let member = members.iter().find(|item| item["peer"] == serde_json::json!(grant.peer))
-                .ok_or("missing original requester in batch mapping")?;
-            let generation: GenerationStart = serde_json::from_value(member["generation"].clone())?;
-            let source = store.read_document(format!("Requests/{}/{}.md", grant.peer, self.job))?;
-            if generation.document_id != source.document_id
-                || generation.source_revision_id != source.revision_id
-                || generation.branch_id.to_string() != selection.cases[index]
-                || member["job"] != serde_json::json!(self.job)
-                || member["request_fingerprint"] != self.inputs[index].fingerprint(grant.id)?
-            {
-                return Err("the native batch borrowed another request's source or identity".into());
-            }
-        }
+        self.verify_sources(&store, selection, &evidence)?;
         Ok(trace::verify(
             &complete_lines(&self.decode_path, 8 * 1024 * 1024)?,
             &selection.batch, &selection.cases[0], &selection.cases[1],
@@ -377,9 +410,13 @@ fn receipt(reply: ComputeReply) -> Outcome<RemoteJobReceipt> {
 }
 
 fn required_path(name: &str) -> Outcome<PathBuf> {
-    Ok(PathBuf::from(std::env::var_os(name).ok_or_else(|| {
+    let path = PathBuf::from(std::env::var_os(name).ok_or_else(|| {
         format!("{name} is required; run scripts/qualify-peer-native.mjs")
-    })?))
+    })?);
+    if !path.is_absolute() {
+        return Err(format!("{name} must be an absolute path").into());
+    }
+    Ok(path)
 }
 
 fn complete_lines(path: &Path, limit: u64) -> Outcome<String> {
@@ -398,18 +435,26 @@ fn complete_lines(path: &Path, limit: u64) -> Outcome<String> {
 fn independent_peers_share_native_decode() -> Outcome<()> {
     let model_path = required_path("MOM_LLAMA_MODEL_PATH")?;
     let output = required_path("LOOM_NATIVE_BATCH_OUTPUT_PATH")?;
-    let mut writing = ProjectStore::initialize(output.join("writing"), "Unchanged source")?.0;
-    let original = writing.write_document("draft.md", "The original manuscript.\n")?;
+    let (mut writing, _) = ProjectStore::initialize(output.join("writing"), "Unchanged source")?;
+    writing.create_document_if_absent(
+        "Draft.md", DocumentContent::Prose("The original manuscript.\n".into()), "source",
+    )?;
+    let original = writing.read_document("Draft.md")?;
     let device = output.join("device");
+    let state = PluginState::with_app_local_data_root(
+        Some(device), false, BuildModelPolicy::default(),
+    );
+    {
+        let mut session = state.session.lock().map_err(|_| "session lock failed")?;
+        session.store = Some(writing);
+        session.phase = SessionPhase::Open;
+        session.active_session_id = Some(CommandId::new());
+    }
     let app = tauri::test::mock_app();
-    app.manage(PluginState::with_app_local_data_root(
-        Some(device.clone()), true, BuildModelPolicy::default(),
-    ));
+    assert!(app.manage(state));
     tauri::async_runtime::block_on(crate::model_load(
-        app.handle().clone(), app.state::<PluginState>(), ModelLoadRequest {
-            path: model_path.to_string_lossy().into_owned(),
-            projector_path: None, projector_kind: None,
-        },
+        model_path.to_str().ok_or("model path is not UTF-8")?.to_owned(),
+        app.handle().clone(), app.state::<PluginState>(),
     )).map_err(|error| format!("load qualification model: {error:?}"))?;
     let state = app.state::<PluginState>();
     let model = loaded_model_for_state(&state).map_err(|error| format!("loaded model: {error:?}"))?;
@@ -430,20 +475,25 @@ fn independent_peers_share_native_decode() -> Outcome<()> {
     };
     drop(before);
     // Cleanup precedes every final observation or passing receipt.
-    let unloaded = tauri::async_runtime::block_on(crate::model_unload(
-        app.handle().clone(), app.state::<PluginState>(),
-    )).map_err(|error| format!("unload qualification model: {error:?}"));
+    let unloaded = tauri::async_runtime::block_on(crate::model_unload(app.state::<PluginState>()))
+        .map_err(|error| format!("unload qualification model: {error:?}"));
     let closed = state.native_runtime.shutdown_joined();
     let _joined = closed?;
     let unloaded = unloaded?;
     let mut evidence = result?;
-    if !same_worker? || !unloaded.resident_slot_released || !state.peer_compute.idle() {
+    let drained = state.peer_compute.state.lock().is_ok_and(|owner| {
+        owner.active.is_none() && owner.foreground == 0
+    });
+    if !same_worker? || !unloaded.resident_slot_released || !drained {
         return Err("native model ownership or final drain did not qualify".into());
     }
-    let unchanged = writing.read_document("draft.md")?;
-    if unchanged.revision_id != original.revision_id || unchanged.text != original.text {
+    let session = state.session.lock().map_err(|_| "session lock failed")?;
+    let unchanged = session.store.as_ref().ok_or("active manuscript store disappeared")?
+        .read_document("Draft.md")?;
+    if unchanged != original {
         return Err("peer inference modified the original manuscript".into());
     }
+    drop(session);
     evidence["same_resident_worker"] = serde_json::json!(true);
     evidence["original_manuscript_unchanged"] = serde_json::json!(true);
     evidence["native_model_released"] = serde_json::json!(true);
