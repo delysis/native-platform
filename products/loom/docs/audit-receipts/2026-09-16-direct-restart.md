@@ -157,3 +157,56 @@ No model was loaded. The completed machine-readable native receipt is
 `7b9f2ba62ba542145f03ff972819e6904a93f348c79e6dce8998460748f0bea3`.
 Native UI access was coordinated with the audit task; its Materials Check app
 was left untouched.
+
+## Successor invitation and live Signal provisioning at 999b23a
+
+The native late join above initially left the editor saying **No notes.** while
+Garden was already listed. At `999b23a2b64c81e951b6c141e214ff100e5801dd`, the
+empty editor instead says **Choose a note.** when documents exist. Explicit
+navigation is preserved. Svelte checking passed with zero errors or warnings,
+and the frontend build passed in `/tmp/loom-late-join-label-check.log`.
+
+The complete optimized candidate script then passed, including its exact native
+gates, 491 frontend tests, source packaging and signature checks. Its log is
+`/tmp/loom-release-999b23a.log`. The independently verified artifacts are under
+`dist/macos/loom-v0.1.0-999b23a2b64c-20260916T110856Z/`:
+
+* ZIP: `e22e7675fffefef1f2ecdc1f81d4e4df9a88bab1bae80cf8e141c89c8d1936b5`.
+* Signed app executable:
+  `d608f8b18f7eac5f789b563d2e1aff8b0d8986f1f26f6e81d4df8427a8522802`.
+* Signal source archive:
+  `1cebed5e9f798ee33a763d775366bb64771f50302b5ff78e60f575af1853e4bb`.
+
+The worker hash remains
+`748c26f4f0f4bff9de5bd4378ccfff1fea22d090acb44c84805ed1171a260722`.
+Independent artifact verification is recorded separately in
+`/tmp/loom-release-successor-artifact-check.json`; earlier receipts were retained.
+
+Two exact native copies used bundle identifiers
+`app.delysis.loom.successor999b23a.host` and
+`app.delysis.loom.successor999b23a.guest`, PIDs 87029 and 87346. The host reopened
+Fern's existing profile; the guest used a fresh isolated profile. Fern retained
+ownership and issued an invitation after the original owner had been removed.
+Juniper joined that invitation through the native pane. Both stores held the
+same signed roster with one delegation and only Fern and Juniper as members.
+
+The guest received all 1,103 exact signed envelopes, including sealed archived
+writing by the removed original owner. The stores had 589 and 591 archived rows,
+respectively, and retained the unchanged envelope-list and manuscript digests
+recorded above. The native guest showed **Choose a note.** alongside Garden;
+opening Garden displayed both edited paragraphs and **Archive entry 1100**.
+
+The guest then opened Signal, showed **unlinked**, and selected **Link Signal**.
+The packaged worker used Presage's production provisioning service and returned
+a link QR, visibly rendered in the native pane under **linking**. **Cancel**
+returned the pane to **unlinked** with **Link Signal** enabled. No account was
+linked, conversation imported or message sent. This establishes
+live provisioning and cancellation, not authenticated account acceptance.
+Worker PID 87748 was owned by guest PID 87346 and matched the exact worker hash.
+
+Both apps and the owned worker quit; their exact executable paths had no
+remaining processes. No model was loaded. The completed receipt is
+`/tmp/loom-native-successor-invitation.json`, SHA-256
+`97279ec734e9cb15c543ffdcfa34606530e3f0e21327401574d9c67af440f958`.
+The desktop interval was released back to the audit task without touching its
+Materials Check app or user writing.
