@@ -37,7 +37,7 @@ index 5cd46fe6b51cc9396051fe50af42bf19d4b9a4e3..c64654c0de0341a88dd931a4ed465601
  
  The optional local TTS backend runs Kokoro-82M text-to-speech inference on [candle](https://github.com/huggingface/candle), with Metal acceleration on macOS. Its model pipeline combines an ALBERT text encoder, duration and prosody predictors with bidirectional LSTMs, and an iSTFTNet vocoder. It performs pure inference without downloading models or accessing the network: callers provide checkpoint weights and voice embeddings as candle tensors. The implementation is derived from Kyle Kelley's MIT-licensed `voice-kokoro` crate and includes modifications by Stencil Labs; see [NOTICE](NOTICE) and the retained [license](src/local/tts/kokoro/LICENSE).
 diff --git a/crates/ai/src/answer.rs b/crates/ai/src/answer.rs
-index c89f0cd36ff809bc4774bb79a9f1ed9836ff75f8..e9bfac17f9388db186a31199a326d81c8f2131c9 100644
+index c89f0cd36ff809bc4774bb79a9f1ed9836ff75f8..401bc2f0d06aff277f33ed4d491a90ef6d8b4fbe 100644
 --- a/crates/ai/src/answer.rs
 +++ b/crates/ai/src/answer.rs
 @@ -44,6 +44,88 @@ use crate::{
@@ -153,10 +153,10 @@ index c89f0cd36ff809bc4774bb79a9f1ed9836ff75f8..e9bfac17f9388db186a31199a326d81c
 +			),
 +			Self::Images(events) => retain_stream_guard(events, guard, observe_generation, false),
 +			Self::Video(session) => {
-+				retain_stream_guard(&mut session.events, guard, observe_generation, false)
++				retain_stream_guard(&mut session.events, guard, observe_generation, false);
 +			},
 +			Self::Speech(events) => {
-+				retain_stream_guard(events, guard, |event, _| event.final_chunk, false)
++				retain_stream_guard(events, guard, |event, _| event.final_chunk, false);
 +			},
 +			Self::Transcript(events) => retain_stream_guard(
 +				events,
@@ -174,7 +174,7 @@ index c89f0cd36ff809bc4774bb79a9f1ed9836ff75f8..e9bfac17f9388db186a31199a326d81c
 +			Self::Realtime(session) => session.retain_guard(guard),
 +			Self::Native(response) => match &mut response.body {
 +				NativeResponseBody::Stream(events) => {
-+					retain_stream_guard(events, guard, |_, _| false, true)
++					retain_stream_guard(events, guard, |_, _| false, true);
 +				},
 +				NativeResponseBody::Json(_) | NativeResponseBody::Bytes(_) => guard.complete(),
 +			},
@@ -298,12 +298,12 @@ index c89f0cd36ff809bc4774bb79a9f1ed9836ff75f8..e9bfac17f9388db186a31199a326d81c
 +			match event {
 +				Some(Err(error)) => guard.receipt(error.receipt()),
 +				Some(Ok(RealtimeEvent::Chat(ChatEvent::Completed(completion)))) => {
-+					guard.response(completion)
++					guard.response(completion);
 +				},
 +				Some(Ok(RealtimeEvent::CloseReceipt(receipt)))
 +					if receipt.reason == RealtimeCloseReason::Completed && !incomplete_response =>
 +				{
-+					guard.complete()
++					guard.complete();
 +				},
 +				_ => {},
 +			}
@@ -572,7 +572,7 @@ index 242a804151c1389a2b0bebb1ae32ba7693ba8599..c26c0aa1c650edcc2057ca721325fd6b
  		let environment = FakeEnvironment::default()
  			.with("AWS_ACCESS_KEY_ID", "AKIAENV")
 diff --git a/crates/ai/src/layer/admission.rs b/crates/ai/src/layer/admission.rs
-index d222df998c99c7ca6a2e8a2157ebf3d2a24a42b0..8abd8ff5998de3005f4a1c3bbabca8b50298fb94 100644
+index d222df998c99c7ca6a2e8a2157ebf3d2a24a42b0..b3dce026ed0a7d3d6b6ba198c26a29ce6c608c55 100644
 --- a/crates/ai/src/layer/admission.rs
 +++ b/crates/ai/src/layer/admission.rs
 @@ -1,5 +1,6 @@
@@ -853,7 +853,7 @@ index d222df998c99c7ca6a2e8a2157ebf3d2a24a42b0..8abd8ff5998de3005f4a1c3bbabca8b5
 +	}
 +}
 +
-+fn has_live_body(body: &AnswerBody) -> bool {
++const fn has_live_body(body: &AnswerBody) -> bool {
 +	matches!(
 +		body,
 +		AnswerBody::Chat(_)
@@ -1050,7 +1050,7 @@ index d222df998c99c7ca6a2e8a2157ebf3d2a24a42b0..8abd8ff5998de3005f4a1c3bbabca8b5
 +	#[test]
 +	fn dropped_ready_service_and_waiter_release_their_reservations() {
 +		let controller = AdmissionController::new(1, 1);
-+		let mut service = AdmissionLayer::new(controller.clone()).layer(ReadyChecked::default());
++		let mut service = AdmissionLayer::new(controller).layer(ReadyChecked::default());
 +		assert!(service.poll_ready(&mut cx()).is_ready());
 +		let mut queued = service.clone();
 +		for _ in 0..1000 {
@@ -1471,7 +1471,7 @@ index 6508f20bf83879647052c513e667a7739f4c1934..fc02621a0ec3d14aaf3fd0835315bc2b
 +	}
  }
 diff --git a/crates/ai/src/layer/budget.rs b/crates/ai/src/layer/budget.rs
-index 9e321aa8a8df08ed3b5147035877f33f459e5efd..eb15161aa23f19430c9c4e0311fe37d4046be68f 100644
+index 9e321aa8a8df08ed3b5147035877f33f459e5efd..7ead3051c68a09ba2bc0eb860ddc82502ad2f2ab 100644
 --- a/crates/ai/src/layer/budget.rs
 +++ b/crates/ai/src/layer/budget.rs
 @@ -1,32 +1,38 @@
@@ -1939,7 +1939,7 @@ index 9e321aa8a8df08ed3b5147035877f33f459e5efd..eb15161aa23f19430c9c4e0311fe37d4
  		});
  		let mut service = OverallBudgetLayer::new(ledger.clone()).layer(inner);
  		service.call(call()).await.unwrap();
-@@ -415,4 +593,543 @@ mod tests {
+@@ -415,4 +593,540 @@ mod tests {
  			.expect_err("2000 billed output tokens must exhaust a 1500 token budget");
  		assert_eq!(error.kind, ErrorKind::BudgetExhausted);
  	}
@@ -2036,17 +2036,15 @@ index 9e321aa8a8df08ed3b5147035877f33f459e5efd..eb15161aa23f19430c9c4e0311fe37d4
 +			per_session: InferenceBudget::default(),
 +		});
 +		let barrier = Arc::new(std::sync::Barrier::new(8));
-+		let threads: Vec<_> = (0..8)
-+			.map(|_| {
-+				let ledger = ledger.clone();
-+				let barrier = barrier.clone();
-+				std::thread::spawn(move || {
-+					let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
-+					barrier.wait();
-+					ledger.admit(&call(), &context).ok()
-+				})
++		let threads: [_; 8] = std::array::from_fn(|_| {
++			let ledger = ledger.clone();
++			let barrier = barrier.clone();
++			std::thread::spawn(move || {
++				let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++				barrier.wait();
++				ledger.admit(&call(), &context).ok()
 +			})
-+			.collect();
++		});
 +		let reservations: Vec<_> = threads
 +			.into_iter()
 +			.filter_map(|thread| thread.join().unwrap())
@@ -2102,7 +2100,7 @@ index 9e321aa8a8df08ed3b5147035877f33f459e5efd..eb15161aa23f19430c9c4e0311fe37d4
 +			receipt.usage.source = crate::receipt::UsageSource::Provider;
 +		});
 +		second
-+			.finish(Ok(unary_answer(&LayerCall { payload: call(), context: second_context.clone() })))
++			.finish(Ok(unary_answer(&LayerCall { payload: call(), context: second_context })))
 +			.unwrap();
 +		assert!(
 +			ledger
@@ -2421,8 +2419,7 @@ index 9e321aa8a8df08ed3b5147035877f33f459e5efd..eb15161aa23f19430c9c4e0311fe37d4
 +					source: crate::receipt::UsageSource::Provider,
 +					..Usage::default()
 +				};
-+				let mut receipt = crate::receipt::ExecutionReceipt::default();
-+				receipt.usage = usage;
++				let receipt = crate::receipt::ExecutionReceipt { usage, ..Default::default() };
 +				endpoint
 +					.send(Ok(crate::answer::RealtimeEvent::Chat(crate::event::ChatEvent::Completed(
 +						crate::event::Completion {
@@ -2484,7 +2481,7 @@ index 9e321aa8a8df08ed3b5147035877f33f459e5efd..eb15161aa23f19430c9c4e0311fe37d4
 +	}
  }
 diff --git a/crates/ai/src/operation/realtime.rs b/crates/ai/src/operation/realtime.rs
-index 15fe62de9c70b044cca25e52248177bf240495f9..63a11bcda3bdd03d554013736df0707b9fab5400 100644
+index 15fe62de9c70b044cca25e52248177bf240495f9..389e5d609fd5df623ec8249e73668fbec0f276d2 100644
 --- a/crates/ai/src/operation/realtime.rs
 +++ b/crates/ai/src/operation/realtime.rs
 @@ -161,6 +161,7 @@ impl RealtimeSession {
@@ -2503,7 +2500,7 @@ index 15fe62de9c70b044cca25e52248177bf240495f9..63a11bcda3bdd03d554013736df0707b
  		if self.outbound.send_async(input).await.is_err() {
  			if kind == RealtimeInputKind::Close {
  				self.closed.store(false, Ordering::Release);
-@@ -207,11 +209,15 @@ impl RealtimeSession {
+@@ -207,11 +209,12 @@ impl RealtimeSession {
  
  	/// Receives the next provider event without buffering it elsewhere.
  	pub async fn recv(&self) -> Result<Result<RealtimeEvent, Error>, RealtimeSessionError> {
@@ -2513,19 +2510,16 @@ index 15fe62de9c70b044cca25e52248177bf240495f9..63a11bcda3bdd03d554013736df0707b
 -			.await
 -			.map_err(|_| RealtimeSessionError::InboundClosed)?;
 +		let _receive = self.receive.lock().await;
-+		let event = match self.inbound.recv_async().await {
-+			Ok(event) => event,
-+			Err(_) => {
-+				self.observe_guard_event(None);
-+				return Err(RealtimeSessionError::InboundClosed);
-+			},
++		let Ok(event) = self.inbound.recv_async().await else {
++			self.observe_guard_event(None);
++			return Err(RealtimeSessionError::InboundClosed);
 +		};
 +		self.observe_guard_event(Some(&event));
  		if matches!(&event, Ok(RealtimeEvent::CloseReceipt(_) | RealtimeEvent::Closed) | Err(_)) {
  			self.closed.store(true, Ordering::Release);
  		}
 diff --git a/crates/ai/src/registry.rs b/crates/ai/src/registry.rs
-index 4cefead8591d0c128d642bec9fb8567f1be6e5ac..9723f151ee86840eead5686b09ed15a2e7137273 100644
+index 4cefead8591d0c128d642bec9fb8567f1be6e5ac..60d3102031c7a20e3bf89435df8c94bd0fbe43b4 100644
 --- a/crates/ai/src/registry.rs
 +++ b/crates/ai/src/registry.rs
 @@ -597,20 +597,13 @@ impl Service<LayerCall<Call>> for LiveRegistryDispatch {
@@ -2551,7 +2545,7 @@ index 4cefead8591d0c128d642bec9fb8567f1be6e5ac..9723f151ee86840eead5686b09ed15a2
  		})
  	}
  }
-@@ -1281,4 +1274,152 @@ mod tests {
+@@ -1281,4 +1274,154 @@ mod tests {
  		assert_eq!(wire_calls.load(Ordering::Relaxed), 0);
  		let _ = fs::remove_file(store_path);
  	}
@@ -2579,8 +2573,10 @@ index 4cefead8591d0c128d642bec9fb8567f1be6e5ac..9723f151ee86840eead5686b09ed15a2
 +				async move {
 +					let receipt = call.context.receipt();
 +					let events = Box::pin(async_stream::stream! {
-+						let mut final_receipt = ExecutionReceipt::default();
-+						final_receipt.usage = Usage { output_tokens: 1000, reasoning_tokens: 800, source: crate::receipt::UsageSource::Provider, ..Usage::default() };
++						let final_receipt = ExecutionReceipt {
++							usage: Usage { output_tokens: 1000, reasoning_tokens: 800, source: crate::receipt::UsageSource::Provider, ..Usage::default() },
++							..Default::default()
++						};
 +						yield Ok(crate::event::ChatEvent::Completed(crate::event::Completion {
 +							reason: crate::event::FinishReason::Stop,
 +							blocks: 0,
@@ -3518,10 +3514,82 @@ index c3e9faae69d3d2c89594ed6417edf8d5662c1e0b..29ff01f3457a853ef9b107c22187ea60
  					Ok(frames) => frames,
  					Err(error) => {
 diff --git a/crates/ai/src/transport/tests.rs b/crates/ai/src/transport/tests.rs
-index 7e60af6a4407617788a5070cfc6e4c51e8a5477c..a01b846e85571ef37d623a6e47287033645447f5 100644
+index 7e60af6a4407617788a5070cfc6e4c51e8a5477c..5c773a2041ba60b5e549f3a45ea5257252a6ab07 100644
 --- a/crates/ai/src/transport/tests.rs
 +++ b/crates/ai/src/transport/tests.rs
-@@ -1392,6 +1392,147 @@ async fn gzip_encoded_anthropic_stream_decodes_to_a_completion() {
+@@ -2,7 +2,7 @@ use std::{
+ 	future,
+ 	num::NonZeroUsize,
+ 	sync::{
+-		Arc, Mutex as StdMutex,
++		Arc,
+ 		atomic::{AtomicUsize, Ordering},
+ 	},
+ };
+@@ -11,6 +11,7 @@ use bytes::Bytes;
+ use futures::{FutureExt as _, StreamExt as _, stream};
+ use omp_catalog::{OperationKind, ProviderId, RouteId};
+ use omp_core::{Str, sf};
++use parking_lot::Mutex;
+ use tokio::{
+ 	io::{AsyncReadExt as _, AsyncWriteExt as _},
+ 	net::TcpListener,
+@@ -45,7 +46,7 @@ use crate::{
+ #[derive(Default)]
+ struct ResponseObserver {
+ 	subscribed: bool,
+-	observed:   StdMutex<Vec<ProviderResponseObservation>>,
++	observed:   Mutex<Vec<ProviderResponseObservation>>,
+ }
+ 
+ impl crate::codec::ProviderHookObserver for ResponseObserver {}
+@@ -56,11 +57,7 @@ impl ProviderResponseObserver for ResponseObserver {
+ 	}
+ 
+ 	fn observe(&self, observation: ProviderResponseObservation) {
+-		self
+-			.observed
+-			.lock()
+-			.expect("observer lock")
+-			.push(observation);
++		self.observed.lock().push(observation);
+ 	}
+ }
+ 
+@@ -249,7 +246,7 @@ async fn provider_response_hook_is_bitmap_gated_and_fires_for_each_attempt() {
+ 		}
+ 	});
+ 	let observer =
+-		Arc::new(ResponseObserver { subscribed: true, observed: StdMutex::new(Vec::new()) });
++		Arc::new(ResponseObserver { subscribed: true, observed: Mutex::new(Vec::new()) });
+ 	let mut service = HttpTransport::new();
+ 	for attempt in 0..2 {
+ 		let mut call = request(
+@@ -291,7 +288,7 @@ async fn provider_response_hook_is_bitmap_gated_and_fires_for_each_attempt() {
+ 	);
+ 	server.await.expect("response fixture");
+ 
+-	let observed = observer.observed.lock().expect("observer lock");
++	let observed = observer.observed.lock();
+ 	assert_eq!(observed.len(), 2);
+ 	assert_eq!((observed[0].status, observed[1].status), (503, 200));
+ 	assert_eq!(observed[0].request_id.as_deref(), Some("req-1"));
+@@ -319,13 +316,7 @@ async fn provider_response_hook_is_bitmap_gated_and_fires_for_each_attempt() {
+ 	assert!(observed[1].headers.iter().any(|(name, value)| {
+ 		name.as_str() == "anthropic-ratelimit-requests-remaining" && value.as_str() == "3"
+ 	}));
+-	assert!(
+-		unsubscribed
+-			.observed
+-			.lock()
+-			.expect("observer lock")
+-			.is_empty()
+-	);
++	assert!(unsubscribed.observed.lock().is_empty());
+ }
+ 
+ fn attempt(
+@@ -1392,6 +1383,147 @@ async fn gzip_encoded_anthropic_stream_decodes_to_a_completion() {
  	server.await.expect("fixture server");
  }
  
@@ -3670,10 +3738,10 @@ index 7e60af6a4407617788a5070cfc6e4c51e8a5477c..a01b846e85571ef37d623a6e47287033
  async fn unsupported_content_encoding_fails_closed_without_retry() {
  	let listener = TcpListener::bind("127.0.0.1:0")
 diff --git a/justfile b/justfile
-index d890796678f43a37797707201c1a7f9417b508aa..bdccc1c8a3fba9c7c1ee3bf975904143bd5e9214 100644
+index d890796678f43a37797707201c1a7f9417b508aa..90d54551250b1ea0cbb97387b2bad174cb35a0b3 100644
 --- a/justfile
 +++ b/justfile
-@@ -43,6 +43,11 @@ fmt-check: fmt-check-rust proto-fmt-check
+@@ -43,6 +43,16 @@ fmt-check: fmt-check-rust proto-fmt-check
  fmt-check-rust:
      cargo fmt --all -- --check
  
@@ -3682,10 +3750,15 @@ index d890796678f43a37797707201c1a7f9417b508aa..bdccc1c8a3fba9c7c1ee3bf975904143
 +fmt-check-pkg pkg:
 +    cargo fmt -p {{ pkg }} -- --check
 +
++# Format one crate while preserving unrelated workspace edits.
++[group('format & lint')]
++fmt-pkg pkg:
++    cargo fmt -p {{ pkg }}
++
  # Format every `.proto` schema under crates/proto in place (buf.yaml).
  [group('format & lint')]
  proto-fmt:
-@@ -109,6 +114,12 @@ check:
+@@ -109,6 +119,12 @@ check:
  check-pkg pkg:
      cargo check -p {{ pkg }} --locked
  
