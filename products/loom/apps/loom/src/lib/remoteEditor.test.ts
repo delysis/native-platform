@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { defaultMarkdownParser } from 'prosemirror-markdown';
 import { EditorState, TextSelection } from 'prosemirror-state';
 import { history, undo } from 'prosemirror-history';
@@ -31,6 +31,20 @@ describe('remote document updates', () => {
     state = state.apply(state.tr.setSelection(TextSelection.create(state.doc, 7, 12)));
     state = applyRemoteDocument(state, defaultMarkdownParser.parse('Hello lovely world'));
     expect(state.doc.textBetween(state.selection.from, state.selection.to)).toBe('world');
+  });
+
+  it('preserves unchanged text anchors when the diff deadline expires inside a paragraph', () => {
+    let state = EditorState.create({ doc: defaultMarkdownParser.parse('Hello world'), plugins: [history()] });
+    state = state.apply(state.tr.insertText('local ', 7));
+    state = state.apply(state.tr.setSelection(TextSelection.create(state.doc, 13, 18)));
+    // Root matching finishes, then the bounded recursive diff runs out of time.
+    const clock = vi.spyOn(performance, 'now').mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValueOnce(0).mockReturnValue(17);
+    try {
+      state = applyRemoteDocument(state, defaultMarkdownParser.parse('First Hello local world'));
+    } finally { clock.mockRestore(); }
+    expect(state.doc.textBetween(state.selection.from, state.selection.to)).toBe('world');
+    expect(undo(state, transaction => state = state.apply(transaction))).toBe(true);
+    expect(state.doc.textContent).toBe('First Hello world');
   });
 
   it('maps textarea positions in UTF-16 without dropping an emoji', () => {

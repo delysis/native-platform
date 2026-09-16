@@ -59,6 +59,19 @@ function documentSpans(before: Node, after: Node, from = 0, nextFrom = 0, deadli
       return result;
     }
   }
+  if (!before.isLeaf && !after.isLeaf && before.sameMarkup(after)) {
+    // Deadline exhaustion is not a structural change. Preserve unchanged
+    // prefix/suffix anchors inside this node instead of replacing the node
+    // and collapsing its selection and local undo mappings.
+    const start = before.content.findDiffStart(after.content);
+    const end = before.content.findDiffEnd(after.content);
+    if (start === null || end === null) return [];
+    const overlap = Math.max(0, start - Math.min(end.a, end.b));
+    const contentFrom = from + (before.type.name === 'doc' ? 0 : 1);
+    const nextContentFrom = nextFrom + (after.type.name === 'doc' ? 0 : 1);
+    return [{ from: contentFrom + start, to: contentFrom + end.a + overlap,
+      nextFrom: nextContentFrom + start, nextTo: nextContentFrom + end.b + overlap }];
+  }
   return [{ from, to: from + before.nodeSize, nextFrom, nextTo: nextFrom + after.nodeSize }];
 }
 
