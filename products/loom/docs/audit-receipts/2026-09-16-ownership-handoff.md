@@ -85,3 +85,32 @@ does not invent authority from a stale backup or self-signed replacement.
 Phone-linked Signal, physically separate Internet peers, physical concurrent
 typing/IME and final release acceptance also remain open. No Signal account was
 linked, group edited, or message sent during this work.
+
+## CI follow-up and native preparation
+
+Run `35062073078` caught an omitted reviewed build-script hash after the handoff
+command was registered. The failing guard also reproduced locally in
+`/tmp/loom-owner-policy-before.log`. Review of the change confirmed that the only
+build-script addition is `cabal_transfer_owner` in Tauri's command list; it adds
+no test-harness flags or conditional compilation. The reviewed hash in
+`ci/ignored-tests.json` now binds that exact script. The source guard and ignored
+test inventory remain intact. The full policy command passed all 129 Node tests,
+all four current-document tests, document validation and `xtask policy`; its log
+is `/tmp/loom-owner-policy-after.log`.
+
+The debug native build at `30f2b418f0f24d07f7b81a1ed4930c933e5e4ac1` completed;
+its log is `/tmp/loom-owner-30f2b41-build.log`. Two independent bundle identifiers,
+`app.delysis.loom.handoff30f2b41.owner` and
+`app.delysis.loom.handoff30f2b41.peer`, use fresh isolated profiles. Both ad-hoc
+signatures passed deep, strict verification. Executable and frontend hashes and
+exact paths are recorded in `/tmp/loom-native-handoff-preparation.json`. Neither
+bundle was launched: native discovery again reported that the Mac was locked.
+PID and accessibility evidence are therefore absent, and this is build
+preparation only.
+
+Review of upstream's `scripts/product-state-backup.mjs` confirmed that it restores
+the historical file tree exactly. That rollback behavior is not a device-recovery
+protocol: the snapshot may precede an ownership handoff, invitation consumption,
+or spent compute budget. It also does not transfer Signal's OS-vault credential
+or external workspace folders. No profile or credential was restored during
+this review. The missing recovery authority remains an explicit design boundary.
