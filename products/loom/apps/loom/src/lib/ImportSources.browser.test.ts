@@ -45,7 +45,6 @@ describe('source import cancellation', () => {
       media_kinds: [], warnings: [], inline_markdown: '[Retained source](loom-attachment:source)'
     } satisfies ImportBatch['imported'][number];
     try {
-      await page.getByText('Import sources', { exact: true }).click();
       await page.getByRole('button', { name: 'Choose files', exact: true }).click();
       await vi.waitFor(() => expect(native.invoke).toHaveBeenCalledWith(
         'plugin:loom|attachment_import_batch_choose', expect.objectContaining({ folder: false })
@@ -66,11 +65,11 @@ describe('source import cancellation', () => {
       expect(page.getByRole('button', { name: 'Stop import', exact: true }).query()).toBeNull();
 
       await page.getByRole('checkbox').click();
-      await page.getByRole('button', { name: 'Add selected to context (1/16)', exact: true }).click();
+      await page.getByRole('button', { name: 'Use here (1/16)', exact: true }).click();
       expect(onUse).toHaveBeenCalledWith([retained]);
       expect(page.getByRole('button', { name: 'Stop import', exact: true }).query()).toBeNull();
       use.resolve(true);
-      await expect.element(page.getByRole('status')).toHaveTextContent('Selected sources added');
+      await expect.element(page.getByRole('status')).toHaveTextContent('References inserted');
       await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
       await vi.waitFor(() => expect(native.invoke).toHaveBeenCalledWith('plugin:loom|import_account_disconnect', {
         projectId: 'project-a', sessionId: 'session-a', service: 'gmail', accountEmail: 'writer@example.test'

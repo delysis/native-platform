@@ -2,11 +2,11 @@
 //! call; references never execute, and results never overwrite source writing.
 
 use super::*;
+use crate::material_context::{self, Value};
 use loom_document::{
     NeuralCommand, NeuralExpression, document_references, parse_neural_command,
     render_base_function_prompt,
 };
-use std::fmt::Write as _;
 use std::sync::atomic::AtomicUsize;
 
 #[path = "terminal_remote.rs"]
@@ -17,6 +17,18 @@ pub(super) use remote::{terminal_recover, terminal_run_peer};
 const MAX_CALLS: usize = 8;
 const MAX_PROMPT_BYTES: usize = 65_536;
 const MAX_HISTORY: usize = 64;
+const TERMINAL_GENERATION_TOKENS: u32 = 512;
+const MAX_PRESENTATION_EVENTS: usize = 16;
+
+fn remaining_context_bytes(context_tokens: u32, used_bytes: usize) -> usize {
+    usize::try_from(
+        context_tokens
+            .saturating_sub(TERMINAL_GENERATION_TOKENS)
+            .saturating_sub(1_024),
+    )
+    .unwrap_or(usize::MAX)
+    .saturating_sub(used_bytes)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct TerminalRun {
@@ -37,6 +49,106 @@ pub(super) struct TerminalRun {
     created_at_ms: i64,
     #[serde(default)]
     remote: Option<remote::PeerModel>,
+    /// Derived only at the IPC boundary; retained receipts have no event log.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Vec::is_empty")]
+    events: Vec<TerminalEvent>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TerminalEvent {
+    kind: TerminalEventKind,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalEventKind {
+    Search,
+    Context,
+}
+
+fn event_text(text: &str, limit: usize) -> String {
+    let mut characters = text.chars();
+    let mut bounded: String = characters
+        .by_ref()
+        .take(limit)
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if characters.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+/// Receipts establish what happened. Expressions and model-written prose never
+/// manufacture tool events, and presentation never rewrites retained evidence.
+fn projected_run(receipt: &RunReceipt) -> TerminalRun {
+    let mut run = receipt.run.clone();
+    run.events.clear();
+    let retained_sources = receipt
+        .bindings
+        .values()
+        .filter_map(|value| match value {
+            Value::Material { material } if material.text.is_some() => {
+                Some(material.material.id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let sources = receipt.sources.len().saturating_add(retained_sources.len());
+    if sources > 0 {
+        run.events.push(TerminalEvent {
+            kind: TerminalEventKind::Context,
+            label: format!(
+                "Read {sources} referenced {}",
+                if sources == 1 { "source" } else { "sources" }
+            ),
+            detail: None,
+        });
+    }
+    let available = MAX_PRESENTATION_EVENTS - run.events.len();
+    let displayed = if receipt.searches.len() > available {
+        available - 1
+    } else {
+        receipt.searches.len()
+    };
+    for search in receipt.searches.iter().take(displayed) {
+        let count = search.hits.len();
+        let outcome = if count == 0 && !search.complete {
+            "No passages retained".to_owned()
+        } else if count == 0 {
+            "No matching passages".to_owned()
+        } else {
+            format!(
+                "{count} {} retained",
+                if count == 1 { "passage" } else { "passages" }
+            )
+        };
+        let partial = if search.complete {
+            ""
+        } else {
+            " · partial results"
+        };
+        run.events.push(TerminalEvent {
+            kind: TerminalEventKind::Search,
+            label: event_text(&format!("Searched {}", search.material.name), 96),
+            detail: Some(event_text(
+                &format!("“{}” · {outcome}{partial}", event_text(&search.query, 160)),
+                256,
+            )),
+        });
+    }
+    let remaining = receipt.searches.len().saturating_sub(displayed);
+    if remaining > 0 {
+        run.events.push(TerminalEvent {
+            kind: TerminalEventKind::Search,
+            label: format!("{remaining} more searches"),
+            detail: None,
+        });
+    }
+    run
 }
 
 /// Display metadata is retained with the exact native input, never substituted
@@ -61,7 +173,13 @@ fn terminal_sampling(
     step: u32,
     boundary: Option<TerminalTurnBoundary>,
 ) -> SamplingConfig {
-    let mut sampling = sampling_for_weave_case(command_id, step, 512, 0.8, WeavePreset::ManualV2);
+    let mut sampling = sampling_for_weave_case(
+        command_id,
+        step,
+        TERMINAL_GENERATION_TOKENS,
+        0.8,
+        WeavePreset::ManualV2,
+    );
     if let Some(TerminalTurnBoundary::Chat) = boundary {
         sampling.stop = vec!["\nUser:".into(), "\nAssistant:".into()];
     }
@@ -92,7 +210,13 @@ struct RunReceipt {
     #[serde(default)]
     media: Vec<TerminalMediaEvidence>,
     model: Option<VerifiedModelDescriptor>,
-    bindings: BTreeMap<String, String>,
+    bindings: BTreeMap<String, Value>,
+    #[serde(default)]
+    evidence: Vec<crate::materials::MaterialEvidence>,
+    #[serde(default)]
+    searches: Vec<crate::materials::MaterialSearch>,
+    #[serde(default)]
+    omitted_evidence: BTreeSet<String>,
     sources: Vec<crate::document_bindings::ResolvedDocument>,
     steps: Vec<BlobId>,
 }
@@ -215,6 +339,10 @@ fn expression_names(
             names.insert(name.clone());
         }
         NeuralExpression::Literal { .. } => {}
+        NeuralExpression::Find { source, query } => {
+            expression_names(source, names, calls);
+            expression_names(query, names, calls);
+        }
         NeuralExpression::Call {
             function,
             arguments,
@@ -229,15 +357,21 @@ fn expression_names(
 }
 
 fn function_names(expression: &NeuralExpression, names: &mut BTreeSet<String>) {
-    if let NeuralExpression::Call {
-        function,
-        arguments,
-    } = expression
-    {
-        names.insert(function.clone());
-        for argument in arguments {
-            function_names(argument, names);
+    match expression {
+        NeuralExpression::Call {
+            function,
+            arguments,
+        } => {
+            names.insert(function.clone());
+            for argument in arguments {
+                function_names(argument, names);
+            }
         }
+        NeuralExpression::Find { source, query } => {
+            function_names(source, names);
+            function_names(query, names);
+        }
+        _ => {}
     }
 }
 
@@ -473,7 +607,7 @@ fn terminal_start<R: Runtime>(
         }
         let mut result = read_receipt(&root, &command_id.to_string(), true)?.unwrap_or(receipt);
         settle_interrupted(&root, &mut result.run, state)?;
-        return Ok(result.run);
+        return Ok(projected_run(&result));
     }
     let document_id = document_id.parse::<DocumentId>().map_err(io_failure)?;
     let summary = store
@@ -570,35 +704,28 @@ fn terminal_start<R: Runtime>(
         if function.ends_with('/') {
             return Err(failure("A function must name one document."));
         }
-        let documents =
-            crate::document_bindings::resolve_references(store, std::slice::from_ref(&function))?;
-        for document in documents {
-            for reference in document_references(&document.text).map_err(io_failure)? {
-                all_names.insert(reference.name);
-            }
+        let function_value = material_context::resolve(store, &function)?;
+        let function_text = material_context::exact(&function_value)?;
+        for reference in document_references(&function_text).map_err(io_failure)? {
+            all_names.insert(reference.name);
         }
     }
-    let all_names = all_names.into_iter().collect::<Vec<_>>();
-    let sources = crate::document_bindings::resolve_references(store, &all_names)?;
+    if !all_names.is_empty() {
+        crate::material_commands::restore_grants(&state, store)?;
+    }
     let mut bindings = BTreeMap::new();
-    let mut binding_bytes = 0;
-    for name in all_names.into_iter().collect::<BTreeSet<_>>() {
-        let documents =
-            crate::document_bindings::resolve_references(store, std::slice::from_ref(&name))?;
-        let mut text = String::new();
-        for document in documents {
-            if !text.is_empty() {
-                text.push_str("\n\n");
+    let mut sources = Vec::new();
+    let mut seen_documents = BTreeSet::new();
+    for name in all_names {
+        let value = material_context::resolve(store, &name)?;
+        if let Value::Documents { documents } = &value {
+            for document in documents {
+                if seen_documents.insert(document.document_id) {
+                    sources.push(document.clone());
+                }
             }
-            text.push_str(&document.text);
         }
-        binding_bytes += text.len();
-        if binding_bytes > MAX_PROMPT_BYTES {
-            return Err(failure(
-                "The combined document references exceed the context budget.",
-            ));
-        }
-        bindings.insert(name, bounded(text)?);
+        bindings.insert(name, value);
     }
     let media = if !literal && (model.is_some() || remote_target.is_some()) {
         let media = crate::terminal_media::resolve(
@@ -606,6 +733,10 @@ fn terminal_start<R: Runtime>(
             &source,
             &sources,
             model.as_ref().map_or(2048, resident_context_tokens),
+        )?;
+        let media = crate::terminal_media::merge(
+            media,
+            material_context::native_media(store, bindings.values())?,
         )?;
         if let Some(model) = &model {
             validate_media_against_resident_model(&media, &model.descriptor)?;
@@ -668,6 +799,7 @@ fn terminal_start<R: Runtime>(
             error: None,
             created_at_ms: now_unix_ms(),
             remote: remote_target.as_ref().map(remote::PeerModel::from),
+            events: Vec::new(),
         },
         request_fingerprint: fingerprint,
         source_document_id: document_id,
@@ -677,6 +809,9 @@ fn terminal_start<R: Runtime>(
         media: media_evidence,
         model: model.as_ref().map(|model| model.descriptor.clone()),
         bindings,
+        evidence: Vec::new(),
+        searches: Vec::new(),
+        omitted_evidence: BTreeSet::new(),
         sources,
         steps: Vec::new(),
     };
@@ -809,7 +944,7 @@ fn spawn_worker<R: Runtime>(
     let worker_control = Arc::clone(&control);
     let worker_app = app;
     let worker_identity = identity.clone();
-    let response = receipt.run.clone();
+    let response = projected_run(&receipt);
     let worker = std::thread::Builder::new()
         .name("loom-experiment".into())
         .spawn(move || {
@@ -911,68 +1046,160 @@ impl Evaluator<'_> {
         )?)
     }
 
-    fn evaluate_command(&mut self, command: &NeuralCommand) -> Result<String, IpcFailure> {
+    fn evaluate_command(&mut self, command: &NeuralCommand) -> Result<Value, IpcFailure> {
         if self.receipt.remote.is_some() && self.remote_cancel_requested()? {
-            return self.settle_remote_cancellation();
+            return self.settle_remote_cancellation().map(Value::Text);
         }
         match command {
             NeuralCommand::Prompt(text) => {
                 let mut prefix = String::new();
-                for (name, value) in &self.receipt.bindings {
-                    let _ = write!(prefix, "# {name}\n\n{value}\n\n");
+                let query = self
+                    .receipt
+                    .run
+                    .presentation
+                    .as_ref()
+                    .map_or(text.as_str(), |presentation| presentation.input.as_str());
+                let query = query.to_owned();
+                for (name, value) in self.receipt.bindings.clone() {
+                    self.append_context(&mut prefix, &name, &value, &query, text.len())?;
                 }
                 prefix.push_str(text);
-                self.complete(bounded(prefix)?)
+                self.complete(bounded(prefix)?).map(Value::Text)
             }
             NeuralCommand::Expression(expression) => self.evaluate(expression),
         }
     }
 
-    fn evaluate(&mut self, expression: &NeuralExpression) -> Result<String, IpcFailure> {
+    fn evaluate(&mut self, expression: &NeuralExpression) -> Result<Value, IpcFailure> {
         if self.receipt.remote.is_none() && self.control.cancelled.load(Ordering::Acquire) {
             return Err(failure("Cancelled"));
         }
         match expression {
             NeuralExpression::Reference { name } => self.binding(name),
-            NeuralExpression::Literal { text } => Ok(text.clone()),
+            NeuralExpression::Literal { text } => Ok(Value::Text(text.clone())),
+            NeuralExpression::Find { source, query } => {
+                let source = self.evaluate(source)?;
+                let query = material_context::exact(&self.evaluate(query)?)?;
+                let value =
+                    self.with_store(|store| material_context::search(store, &source, &query))?;
+                self.record_evidence(&value);
+                Ok(value)
+            }
             NeuralExpression::Call {
                 function,
                 arguments,
             } => {
-                let function = self.binding(function)?;
+                let function = material_context::exact(&self.binding(function)?)?;
                 let mut inputs = Vec::new();
                 for argument in arguments {
-                    inputs.push(self.evaluate(argument)?);
+                    let value = self.evaluate(argument)?;
+                    self.record_evidence(&value);
+                    inputs.push(material_context::exact(&value)?);
                 }
                 if inputs.is_empty() {
                     inputs.push(self.input.clone());
                 }
+                let query = bounded(inputs.join("\n\n"))?;
+                let input_refs = inputs.iter().map(String::as_str).collect::<Vec<_>>();
+                let base_prompt_bytes = render_base_function_prompt(&function, &input_refs)
+                    .map_err(io_failure)?
+                    .len();
                 let mut contextual_function = String::new();
                 let mut seen_context = BTreeSet::new();
                 for reference in document_references(&function).map_err(io_failure)? {
                     if !seen_context.insert(reference.name.clone()) {
                         continue;
                     }
-                    let context = self.binding(&reference.name)?;
-                    let _ = write!(contextual_function, "# {}\n\n{context}\n\n", reference.name);
+                    let value = self.binding(&reference.name)?;
+                    self.append_context(
+                        &mut contextual_function,
+                        &reference.name,
+                        &value,
+                        &query,
+                        base_prompt_bytes,
+                    )?;
                 }
                 contextual_function.push_str(&function);
-                let prompt = render_base_function_prompt(
-                    &contextual_function,
-                    &inputs.iter().map(String::as_str).collect::<Vec<_>>(),
-                )
-                .map_err(io_failure)?;
-                self.complete(bounded(prompt)?)
+                let prompt = render_base_function_prompt(&contextual_function, &input_refs)
+                    .map_err(io_failure)?;
+                self.complete(bounded(prompt)?).map(Value::Text)
             }
         }
     }
 
-    fn binding(&self, name: &str) -> Result<String, IpcFailure> {
+    fn record_evidence(&mut self, value: &Value) {
+        if let Value::Evidence {
+            evidence,
+            retrieval,
+        } = value
+        {
+            if let Some(search) = retrieval
+                && !self.receipt.searches.iter().any(|prior| {
+                    prior.material.id == search.material.id
+                        && prior.query == search.query
+                        && prior.source_revision == search.source_revision
+                        && prior
+                            .hits
+                            .iter()
+                            .map(|hit| &hit.id)
+                            .eq(search.hits.iter().map(|hit| &hit.id))
+                })
+            {
+                self.receipt.searches.push(search.clone());
+            }
+            for hit in evidence {
+                if !self.receipt.evidence.iter().any(|prior| prior.id == hit.id) {
+                    self.receipt.evidence.push(hit.clone());
+                }
+            }
+        }
+    }
+
+    fn append_context(
+        &mut self,
+        prefix: &mut String,
+        name: &str,
+        value: &Value,
+        query: &str,
+        base_bytes: usize,
+    ) -> Result<(), IpcFailure> {
+        let label = format!("# {name:?}\n\n");
+        let used = base_bytes
+            .saturating_add(prefix.len())
+            .saturating_add(label.len())
+            .saturating_add(2);
+        let budget = if self.receipt.remote.is_some() {
+            // The peer enforces its actual resident model's context. This
+            // requester retains the existing bounded exact-prompt contract.
+            MAX_PROMPT_BYTES.saturating_sub(used)
+        } else {
+            let model = self
+                .model
+                .ok_or_else(|| failure("Choose a local model before trying this idea."))?;
+            remaining_context_bytes(resident_context_tokens(model), used)
+        };
+        let consulted = self.consult(value, query, budget)?;
+        prefix.push_str(&label);
+        prefix.push_str(&material_context::exact(&consulted)?);
+        prefix.push_str("\n\n");
+        Ok(())
+    }
+
+    fn consult(&mut self, value: &Value, query: &str, budget: usize) -> Result<Value, IpcFailure> {
+        let (consulted, omitted) = self.with_store(|store| {
+            material_context::consult_with_budget(store, value, query, budget)
+        })?;
+        self.receipt.omitted_evidence.extend(omitted);
+        self.record_evidence(&consulted);
+        Ok(consulted)
+    }
+
+    fn binding(&self, name: &str) -> Result<Value, IpcFailure> {
         self.receipt
             .bindings
             .get(name)
             .cloned()
-            .ok_or_else(|| failure(format!("Unresolved document @{name}")))
+            .ok_or_else(|| failure(format!("Unresolved reference @{name}")))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1013,8 +1240,15 @@ impl Evaluator<'_> {
             };
             let context_evidence = store
                 .store_provenance_blob(
-                    &serde_json::to_vec(&(&self.receipt.sources, &self.receipt.media))
-                        .map_err(io_failure)?,
+                    &serde_json::to_vec(&(
+                        &self.receipt.sources,
+                        &self.receipt.media,
+                        &self.receipt.evidence,
+                        &self.receipt.searches,
+                        &self.receipt.bindings,
+                        &self.receipt.omitted_evidence,
+                    ))
+                    .map_err(io_failure)?,
                 )
                 .map_err(IpcFailure::store)?;
             let prompt_artifact = store
@@ -1120,7 +1354,12 @@ impl Evaluator<'_> {
         if candidate.terminal.status == GenerationTerminalStatus::Completed
             || !candidate.output_text.is_empty()
         {
-            self.retain(&candidate.output_text, evidence)?;
+            self.retain(
+                &candidate.output_text,
+                evidence,
+                true,
+                &self.step.to_string(),
+            )?;
         }
         if candidate.terminal.status != GenerationTerminalStatus::Completed {
             return Err(failure(if self.control.cancelled.load(Ordering::Acquire) {
@@ -1132,7 +1371,13 @@ impl Evaluator<'_> {
         Ok(candidate.output_text.clone())
     }
 
-    fn retain(&mut self, text: &str, evidence: BlobId) -> Result<(), IpcFailure> {
+    fn retain(
+        &mut self,
+        text: &str,
+        evidence: BlobId,
+        generated: bool,
+        slot: &str,
+    ) -> Result<(), IpcFailure> {
         let title = self
             .receipt
             .run
@@ -1146,12 +1391,15 @@ impl Evaluator<'_> {
         } else {
             title.trim()
         };
-        let path = format!("Runs/{}/{}/{title}.md", self.receipt.run.run_id, self.step);
+        let path = format!("Runs/{}/{}/{title}.md", self.receipt.run.run_id, slot);
         let (id, path) = self.with_store(|store| {
             if self.receipt.remote.is_some() {
+                // Step zero belongs to a final retained expression, distinct
+                // from every model job (numbered from one).
+                let output_step = if slot == "result" { 0 } else { self.step };
                 let saved = store
                     .create_derived_document_idempotent(
-                        remote::output_id(&self.receipt.run.run_id, self.step),
+                        remote::output_id(&self.receipt.run.run_id, output_step),
                         &path,
                         DocumentContent::Prose(text.to_owned()),
                         evidence,
@@ -1167,21 +1415,21 @@ impl Evaluator<'_> {
                     .map_err(IpcFailure::store)?;
                 return Ok((document.document_id, document.relative_path));
             }
-            if self.step == 0 {
-                store
-                    .create_derived_document_if_absent(
-                        &path,
-                        DocumentContent::Prose(text.to_owned()),
-                        "retained expression",
-                        evidence,
-                    )
-                    .map_err(IpcFailure::store)?;
-            } else {
+            if generated {
                 store
                     .create_generated_document_if_absent(
                         &path,
                         DocumentContent::Prose(text.to_owned()),
                         "retained experiment",
+                        evidence,
+                    )
+                    .map_err(IpcFailure::store)?;
+            } else {
+                store
+                    .create_derived_document_if_absent(
+                        &path,
+                        DocumentContent::Prose(text.to_owned()),
+                        "retained expression",
                         evidence,
                     )
                     .map_err(IpcFailure::store)?;
@@ -1200,7 +1448,9 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    fn finish(&mut self, outcome: Result<String, IpcFailure>) -> Result<(), IpcFailure> {
+    fn finish(&mut self, outcome: Result<Value, IpcFailure>) -> Result<(), IpcFailure> {
+        let outcome =
+            outcome.and_then(|value| material_context::exact(&value).map(|text| (value, text)));
         if self.receipt.remote.is_some() {
             if let Some(error) = self
                 .control
@@ -1227,8 +1477,10 @@ impl Evaluator<'_> {
             }
         }
         match outcome {
-            Ok(text) => {
-                if self.receipt.run.output_document_id.is_none() {
+            Ok((value, text)) => {
+                self.record_evidence(&value);
+                if self.receipt.run.output_document_id.is_none() || !matches!(value, Value::Text(_))
+                {
                     let evidence = self.with_store(|store| {
                         store
                             .store_provenance_blob(
@@ -1236,7 +1488,7 @@ impl Evaluator<'_> {
                             )
                             .map_err(IpcFailure::store)
                     })?;
-                    self.retain(&text, evidence)?;
+                    self.retain(&text, evidence, false, "result")?;
                 }
                 self.receipt.run.status = "completed".into();
             }
@@ -1288,10 +1540,10 @@ pub(super) async fn terminal_list(
     let mut runs = Vec::new();
     for id in ids.into_iter().rev().take(MAX_HISTORY) {
         if let Some(receipt) = read_receipt(store.root(), &id, true)? {
-            runs.push(receipt.run);
+            runs.push(projected_run(&receipt));
         } else if let Some(mut receipt) = read_receipt(store.root(), &id, false)? {
             settle_interrupted(store.root(), &mut receipt.run, &state)?;
-            runs.push(receipt.run);
+            runs.push(projected_run(&receipt));
         }
     }
     Ok(runs)

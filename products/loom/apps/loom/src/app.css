@@ -528,9 +528,6 @@ button.document-row:hover { background: var(--chrome-hover); }
 .workspace-pane-main { grid-column:2; grid-row:1; }
 .workspace-pane-right { grid-column:3; grid-row:1; border-left:1px solid var(--line); }
 .workspace-pane-bottom { grid-column:2 / -1; grid-row:2; border-top:1px solid var(--line); }
-.workspace-pane-header { flex:none; display:flex; align-items:center; min-height:30px; padding:0 8px; }
-.workspace-pane-header select { max-width:100%; border:0; background:transparent; color:var(--muted); font-size:11px; }
-.workspace-pane-header span { color:var(--muted); font-size:11px; }
 .workspace-pane-content { display:flex; flex:1; flex-direction:column; min-width:0; min-height:0; }
 .workspace-pane-slot.hidden-pane, .workspace-pane-content.hidden-pane { display:none; }
 .outline-panel { position:relative; grid-row:1 / -1; }
@@ -553,3 +550,14 @@ button.document-row:hover { background: var(--chrome-hover); }
 .loompad-choice:not(:disabled):hover, .loompad-choice.held { color: var(--ink); background: var(--moss-soft); }
 .loompad-choice:disabled { opacity: .5; }
 .loompad-key { color: var(--quiet); font: 600 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* Material replaces the main content view without detaching unsaved editor state. */
+.writing-content { display:contents; }
+.writing-content.material-covered { display:none; }
+.material-add-menu { position:absolute; top:30px; left:110px; z-index:40; min-width:170px; padding:4px; border:1px solid var(--line); border-radius:6px; background:var(--paper); box-shadow:var(--shadow); }
+.material-add-menu button { display:block; width:100%; min-height:30px; border:0; border-radius:4px; background:none; padding:5px 9px; text-align:left; }
+.material-add-menu button:hover { background:var(--chrome-hover); }
+.material-row.active { background:var(--chrome-hover); }
+.material-pin { margin-left:auto; flex:0 !important; opacity:.6; }
+.material-connect-view { min-height:0; flex:1; overflow:auto; }
+.material-connect-view .import-sources { padding:12px; }

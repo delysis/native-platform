@@ -21,6 +21,8 @@
   export let onCancelRun: (run: TerminalRun) => void = () => {};
   export let onRun: () => void;
   export let onCancel: () => void;
+  export let pinnedOutputs = new Set<string>();
+  export let onPin: ((run: TerminalRun) => void) | undefined = undefined;
   export let onOpen: (run: TerminalRun) => void;
   export let onClose: () => void;
   let input: HTMLTextAreaElement | undefined;
@@ -123,6 +125,7 @@
         {/if}
         {#if run.status === 'running'}<span class="terminal-status" role="status">…</span>{/if}
         {#if run.output_document_id}<button type="button" class="terminal-output-link" on:click={() => onOpen(run)} disabled={disabled}>{run.output_relative_path ?? 'Open output'}</button>{/if}
+        {#if run.output_document_id && onPin}<button type="button" class="terminal-output-link" aria-label={pinnedOutputs.has(run.output_document_id) ? 'Unpin output from workspace' : 'Pin output in workspace'} aria-pressed={pinnedOutputs.has(run.output_document_id)} on:click={() => onPin?.(run)} disabled={disabled}>{pinnedOutputs.has(run.output_document_id) ? 'Unpin' : 'Pin'}</button>{/if}
       </div>
     {/each}
     {#if outputError}<p class="terminal-error" role="alert">{outputError}</p>{/if}

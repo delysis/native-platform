@@ -149,6 +149,7 @@ async fn interrupted_pipeline_with_media(
             error: None,
             created_at_ms: now_unix_ms(),
             remote: Some(PeerModel::from(&target(pair))),
+            events: Vec::new(),
         },
         request_fingerprint: BlobId::digest(b"interrupted fixture request"),
         source_document_id: source.document_id,
@@ -158,9 +159,12 @@ async fn interrupted_pipeline_with_media(
         media: media_evidence,
         model: None,
         bindings: BTreeMap::from([
-            ("Polish".into(), "Polish these words.".into()),
-            ("Draft".into(), source.text.clone()),
+            ("Polish".into(), Value::Text("Polish these words.".into())),
+            ("Draft".into(), Value::Text(source.text.clone())),
         ]),
+        evidence: Vec::new(),
+        searches: Vec::new(),
+        omitted_evidence: BTreeSet::new(),
         sources: Vec::new(),
         steps: Vec::new(),
     };

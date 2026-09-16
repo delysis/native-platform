@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-material-read-evidence"
+description = "Enables the material_read_evidence command without any pre-configured scope."
+commands.allow = ["material_read_evidence"]
+
+[[permission]]
+identifier = "deny-material-read-evidence"
+description = "Denies the material_read_evidence command without any pre-configured scope."
+commands.deny = ["material_read_evidence"]

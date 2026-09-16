@@ -137,7 +137,7 @@ pub(crate) async fn terminal_recover<R: Runtime>(
         .map_err(io_failure)?;
     let store = require_bound_store(&mut session, &project_id, &session_id)?;
     if let Some(receipt) = read_receipt(store.root(), &run_id, true)? {
-        return Ok(receipt.run);
+        return Ok(projected_run(&receipt));
     }
     let receipt = read_receipt(store.root(), &run_id, false)?
         .ok_or_else(|| failure("This experiment does not exist."))?;
@@ -156,7 +156,7 @@ pub(crate) async fn terminal_recover<R: Runtime>(
         .map_err(io_failure)?
         .is_some()
     {
-        return Ok(receipt.run);
+        return Ok(projected_run(&receipt));
     }
     let command = if receipt.literal_input {
         NeuralCommand::Prompt(bounded(receipt.run.expression.clone())?)
@@ -435,20 +435,25 @@ impl Evaluator<'_> {
             store
                 .store_provenance_blob(
                     &serde_json::to_vec(&serde_json::json!({
-                            "kind": "loom_terminal_peer_step_v1",
-                            "run_id": self.receipt.run.run_id,
-                            "step": self.step,
-                            "source_revision_id": self.receipt.source_revision_id,
-                            "sources": self.receipt.sources,
-                            "request": job.request,
-                    "receipt": job.receipt,
-                        }))
+                        "kind": "loom_terminal_peer_step_v1",
+                        "run_id": self.receipt.run.run_id,
+                        "step": self.step,
+                        "source_revision_id": self.receipt.source_revision_id,
+                        "sources": self.receipt.sources,
+                        "media": self.receipt.media,
+                        "bindings": self.receipt.bindings,
+                        "evidence": self.receipt.evidence,
+                        "searches": self.receipt.searches,
+                        "omitted_evidence": self.receipt.omitted_evidence,
+                        "request": job.request,
+                        "receipt": job.receipt,
+                    }))
                     .map_err(io_failure)?,
                 )
                 .map_err(IpcFailure::store)
         })?;
         self.receipt.steps.push(evidence);
-        self.retain(text, evidence)
+        self.retain(text, evidence, false, &self.step.to_string())
     }
 }
 

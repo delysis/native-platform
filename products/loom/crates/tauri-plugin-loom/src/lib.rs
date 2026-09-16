@@ -11,6 +11,10 @@ mod document_watcher;
 mod external_import;
 mod import_batch;
 mod import_jobs;
+mod material_commands;
+mod material_context;
+mod material_media;
+mod materials;
 mod microphone_capture;
 mod model_catalog;
 mod model_download;
@@ -2100,6 +2104,15 @@ impl Builder {
                 project_current,
                 project_recover,
                 document_create,
+                material_commands::material_list,
+                material_commands::material_read,
+                material_commands::material_search,
+                material_commands::material_read_evidence,
+                material_commands::material_bind_attachment,
+                material_commands::material_set_pinned,
+                material_commands::material_remove,
+                material_commands::material_add_library,
+                material_commands::material_add_library_path,
                 workspace_template_get,
                 workspace_template_enable,
                 audio_record_start,
@@ -2527,6 +2540,7 @@ pub struct ProjectSnapshot {
     root: String,
     schema_version: u32,
     documents: Vec<DocumentSummary>,
+    retained_output_document_ids: Vec<String>,
     folder_warnings: Vec<String>,
     pending_recovery: u64,
 }
@@ -4518,6 +4532,8 @@ fn loom_asset_protocol_response(
         read_authorized_loom_asset(state, &asset_request)
     } else if let Some(media_request) = parse_loom_context_media_uri(request.uri()) {
         read_authorized_context_media(state, &media_request)
+    } else if let Some(media_request) = material_media::parse(request.uri()) {
+        material_media::read(state, &media_request)
     } else {
         return empty_loom_asset_response(http::StatusCode::BAD_REQUEST);
     };
@@ -8551,7 +8567,39 @@ fn weave_start_inner<R: Runtime>(
             max_tokens,
         )
         .map_err(|error| IpcFailure::context_attachment(&error))?;
-        document_bindings::append_completion_context(store, &loaded.text, &mut attachment_context)?;
+        if !loom_document::document_references(&loaded.text)
+            .map_err(|error| IpcFailure::new("material_context_invalid", error.to_string(), false))?
+            .is_empty()
+        {
+            material_commands::restore_grants(state, store)?;
+        }
+        // Match the attachment planner's conservative byte-per-token envelope;
+        // every branch's generation and the runtime scaffold keep their reserve.
+        let context_bytes = resident_context_tokens(loaded_model)
+            .saturating_sub(branch_count.saturating_mul(max_tokens))
+            .saturating_sub(1_024);
+        let material_budget = usize::try_from(context_bytes)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(attachment_context.manuscript_prompt.len())
+            .saturating_sub(attachment_context.context_preamble.len())
+            .saturating_sub(2);
+        let material_plan = material_context::markdown_plan_with_budget(
+            store,
+            &loaded.text,
+            source_prefix,
+            material_budget,
+        )?;
+        attachment_context.media = terminal_media::merge(
+            attachment_context.media,
+            material_context::native_media(store, material_plan.bindings.values())?,
+        )?;
+        let document_context = &material_plan.text;
+        if !document_context.is_empty() {
+            attachment_context.context_preamble.push_str("\n\n");
+            attachment_context
+                .context_preamble
+                .push_str(document_context);
+        }
         let exact_prefix = attachment_context.manuscript_prompt.clone();
         if exact_prefix.is_empty()
             && attachment_context.context_preamble.is_empty()
@@ -8619,8 +8667,8 @@ fn weave_start_inner<R: Runtime>(
         let retrieval_evidence_blob_id = {
             let identity =
                 serde_json::to_vec(&match &speculation {
-                    Some(batch) => serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "loompad": batch }),
-                    None => serde_json::to_value(&attachment_context.retrieval_evidence).map_err(|error| IpcFailure::new("attachment_context_encode_failed", error.to_string(), false))?,
+                    Some(batch) => serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "loompad": batch }),
+                    None => serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan }),
                 }).map_err(|error| {
                     IpcFailure::new("attachment_context_encode_failed", error.to_string(), false)
                 })?;
@@ -10668,6 +10716,17 @@ fn snapshot_for(
         root,
         schema_version: store.manifest().schema_version,
         documents,
+        retained_output_document_ids: ["retained experiment", "retained expression"]
+            .into_iter()
+            .map(|reason| store.document_ids_created_with_reason(reason))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(IpcFailure::store)?
+            .into_iter()
+            .flatten()
+            .map(|id| id.to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         folder_warnings: store.folder_warnings().to_vec(),
         pending_recovery: store.pending_outbox_count().map_err(IpcFailure::store)?,
     })

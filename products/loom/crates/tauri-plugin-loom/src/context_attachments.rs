@@ -59,7 +59,7 @@ pub(crate) struct StoredAttachment {
     pub(crate) media_markdown: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ContextAttachmentPresentationKind {
     Text,
@@ -69,7 +69,7 @@ pub(crate) enum ContextAttachmentPresentationKind {
     Mixed,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ContextMediaPresentation {
     pub(crate) id: String,
     pub(crate) kind: MediaKind,
@@ -80,7 +80,7 @@ pub(crate) struct ContextMediaPresentation {
     pub(crate) waveform_peaks: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct ContextAttachmentPresentation {
     pub(crate) id: String,
     pub(crate) file_name: String,
@@ -1039,6 +1039,46 @@ fn attachment_presentation(manifest: AttachmentManifest) -> ContextAttachmentPre
             .collect(),
         warnings: manifest.attachment.warnings,
     }
+}
+
+/// Read one retained source independently of any document's selected context.
+/// Canonical bytes are verified against the immutable object identity.
+pub(crate) fn read_source(
+    project_root: &Path,
+    attachment_id: &str,
+) -> Result<(ContextAttachmentPresentation, String), ContextAttachmentError> {
+    let manifest = read_manifest_metadata(project_root, attachment_id)?;
+    let text = read_canonical_text(project_root, &manifest)?;
+    let revision = manifest_revision(&manifest)?;
+    let mut presentation = attachment_presentation(manifest);
+    presentation.source_revision = revision;
+    Ok((presentation, text))
+}
+
+/// Describe an immutable source without materializing its potentially large
+/// canonical text. A consumer must verify bytes when it actually reads them.
+pub(crate) fn describe_source(
+    project_root: &Path,
+    attachment_id: &str,
+) -> Result<ContextAttachmentPresentation, ContextAttachmentError> {
+    let manifest = read_manifest_metadata(project_root, attachment_id)?;
+    let revision = manifest_revision(&manifest)?;
+    let mut presentation = attachment_presentation(manifest);
+    presentation.source_revision = revision;
+    Ok(presentation)
+}
+
+/// A named material reference explicitly selects this retained source alone.
+pub(crate) fn source_native_media(
+    project_root: &Path,
+    attachment_id: &str,
+) -> Result<Vec<MediaInput>, ContextAttachmentError> {
+    let manifests = vec![(
+        attachment_id.to_owned(),
+        read_manifest_metadata(project_root, attachment_id)?,
+    )];
+    preflight_native_media(&manifests)?;
+    load_admitted_media(project_root, manifests)
 }
 
 #[allow(clippy::too_many_lines)]

@@ -14,9 +14,10 @@
   import { convertFileSrc } from '@tauri-apps/api/core';
   import LoomEditor from './LoomEditor.svelte';
   import TerminalPane from './TerminalPane.svelte';
+  import ChatTurn from './ChatTurn.svelte';
   import SourceEditor from './SourceEditor.svelte';
-  import { addDocumentContexts, importAttachmentPaths, cancelTerminalRun, listTerminalRuns, normalizeFailure, runTerminal } from './ipc';
-  import { editableImportMarkdown } from './importedMarkdown';
+  import { addDocumentContexts, importAttachmentPaths, bindAttachmentMaterial, addLibraryMaterialPath, cancelTerminalRun, listTerminalRuns, normalizeFailure, runTerminal } from './ipc';
+  import { importedMaterialMarkdown, materialReferenceMarkdown, isDatabasePath } from './materials';
   import { decodeVerseForEditor as decodeSourceForEditor, encodeVerseFromEditor as encodeSourceFromEditor } from './verseCodec';
   import { canUseVisualMarkdown } from './markdownSafety';
   import { newUlid } from './ulid';
@@ -41,6 +42,9 @@
   export let beforeAttachmentImport: () => Promise<boolean> = async () => true;
   export let onContextChanged: (snapshot: DocumentContextSnapshot, project: string, session: string, document: string) => void = () => {};
   export let onBusyChange: (busy: boolean) => void = () => {};
+  export let pinnedOutputs = new Set<string>();
+  export let onPinOutput: ((documentId: string) => void) | undefined = undefined;
+  export let onFocus: () => void = () => {};
 
   let composing = false;
   function setComposing(active: boolean): void { composing = active; onCompositionChange(active); }
@@ -64,6 +68,7 @@
   let editor: LoomEditor | undefined;
   let sourceEditor: SourceEditor | undefined;
   let historyViewport: HTMLDivElement | undefined;
+  let entryArea: HTMLTextAreaElement | undefined;
   let following = true;
   afterUpdate(() => { if (following && historyViewport) historyViewport.scrollTop = historyViewport.scrollHeight; });
   function trackScroll(): void {
@@ -74,7 +79,12 @@
   $: busy = importing || dispatching || pending !== null || runs.some((run) => run.status === 'running');
   $: reportBusy(busy);
   $: target = resolveDocument(config.document, documents, source);
-  $: recentRuns = runs.slice(-8);
+  $: recentRuns = runs;
+  $: pendingRun = pending && !runs.some(run => run.run_id === pending?.commandId) ? {
+    run_id: pending.commandId, presentation: pending.presentation, status: 'running' as const,
+    expression: pending.expression, output_document_id: null, output_relative_path: null,
+    preview: '', error: null, created_at_ms: 0
+  } : null;
   $: if (mounted && config.kind === 'chat') void hydrateOutputs(scope, recentRuns, documents);
   $: editingCurrent = !config.document || target?.document_id === source?.summary.document_id;
   $: editorKey = `${scope}/${source?.summary.document_id ?? ''}`;
@@ -86,6 +96,33 @@
   export function applyRemoteValue(text: string): void {
     if (editingCurrent && !composing) sourceEditor?.applyRemoteValue(decodeSourceForEditor(text).display);
   }
+
+  export function focusInput(): void {
+    if (config.kind === 'editor') { editor?.focusCurrentSelection(); sourceEditor?.focusCurrentSelection(); }
+    else entryArea?.focus();
+  }
+
+  /** Keep the initiating pane and exact selection while a source takes focus. */
+  export function captureReferenceInsertion(): ((markdown: string) => boolean) | null {
+    if (!mounted || readonly || composing || busy || !source || !flush() || (config.kind === 'editor' && !editingCurrent)) return null;
+    const captured = { scope, kind: config.kind, documentId: source.summary.document_id, value, entry, visual,
+      start: entryArea?.selectionStart ?? entry.length, end: entryArea?.selectionEnd ?? entry.length };
+    const visualAnchor = visual && config.kind === 'editor' ? editor?.captureTextInsertionAnchor() : null;
+    const sourceAnchor = !visual && config.kind === 'editor' ? sourceEditor?.captureTextInsertionAnchor() : null;
+    return markdown => {
+      if (!mounted || readonly || composing || busy || scope !== captured.scope || config.kind !== captured.kind ||
+          source?.summary.document_id !== captured.documentId || value !== captured.value || entry !== captured.entry || visual !== captured.visual) return false;
+      if (captured.kind === 'editor') return Boolean(captured.visual
+        ? visualAnchor && editor?.insertMarkdownAtAnchor(visualAnchor, markdown)
+        : sourceAnchor && sourceEditor?.insertTextAtAnchor(sourceAnchor, markdown));
+      const before = captured.entry.slice(0, captured.start), after = captured.entry.slice(captured.end);
+      const next = before + markdown + after;
+      if (new TextEncoder().encode(next).length > MAX_PROMPT_BYTES) return false;
+      entry = next;
+      return true;
+    };
+  }
+
 
   export async function importDroppedPaths(paths: string[], point: { x: number; y: number }): Promise<void> {
     if (!mounted || readonly || composing || busy || !source || !paths.length ||
@@ -102,12 +139,16 @@
     try {
       if (!await beforeAttachmentImport()) return;
       if (!current()) throw new Error('The pane changed before import. Drop the files again at the intended location.');
-      const report = await importAttachmentPaths(captured.projectId, captured.sessionId, paths);
+      const files = paths.filter(path => !isDatabasePath(path));
+      const libraries = await Promise.all(paths.filter(isDatabasePath).map(path => addLibraryMaterialPath(captured.projectId, captured.sessionId, path)));
+      const report = files.length ? await importAttachmentPaths(captured.projectId, captured.sessionId, files) : { imported: [], failures: [] };
       const imported = report.imported;
       error = report.failures.map((item) => `${item.name}: ${item.message}`).join("\n");
-      if (!imported.length) return;
+      if (!imported.length && !libraries.length) return;
       if (!current()) throw new Error('The pane changed during import. The files are retained; drop them again at the intended location.');
-      const markdown = imported.map(editableImportMarkdown).join('\n\n');
+      const materials = await Promise.all(imported.map(item => bindAttachmentMaterial(captured.projectId, captured.sessionId, item.id)));
+      if (!current()) throw new Error('The pane changed. Your sources are retained in this workspace.');
+      const markdown = [...libraries.map(materialReferenceMarkdown), ...imported.map((item, index) => importedMaterialMarkdown(item, materials[index]))].join('\n\n');
       if (captured.kind === 'editor') {
         const before = sourceAnchor?.value.slice(0, sourceAnchor.start) ?? '';
         const after = sourceAnchor?.value.slice(sourceAnchor.end) ?? '';
@@ -285,7 +326,7 @@
 </script>
 
 {#if config.visible}
-<section data-workspace-pane={paneId} data-loom-document={source?.summary.document_id} class="workspace-pane" class:browser={config.kind === 'browser'} aria-label={config.title ?? config.kind} aria-busy={busy}>
+<section data-workspace-pane={paneId} data-loom-document={source?.summary.document_id} class="workspace-pane" class:browser={config.kind === 'browser'} aria-label={config.title ?? config.kind} aria-busy={busy} on:focusin={onFocus}>
   {#if error && config.kind !== 'terminal'}<p class="error" role="alert">{error}{#if pending}<button on:click={() => void refresh()}>Check result</button>{/if}</p>{/if}
   {#if config.kind === 'editor'}
     {#if source && editingCurrent}
@@ -301,25 +342,23 @@
     {:else if target}<button on:click={() => onOpenDocument(target.document_id)}>Open {target.title}</button>
     {:else}<p class="empty">{config.document ? 'Document unavailable' : 'Open a document'}</p>{/if}
   {:else if config.kind === 'terminal'}
-    <TerminalPane embedded open={true} bind:entry {projectId} {sessionId} {documents} {runs} {busy} {error} disabled={readonly} runDisabled={!entry.trim()} uncertain={pending !== null} onCheck={() => void refresh()} onRun={() => void submit()} onCancel={() => void stop()} onOpen={(run) => run.output_document_id && onOpenDocument(run.output_document_id)} onClose={() => {}} />
+    <TerminalPane embedded open={true} bind:entry {projectId} {sessionId} {documents} {runs} {busy} {error} disabled={readonly} runDisabled={!entry.trim()} uncertain={pending !== null} onCheck={() => void refresh()} onRun={() => void submit()} onCancel={() => void stop()} pinnedOutputs={pinnedOutputs} onPin={onPinOutput ? (run) => run.output_document_id && onPinOutput?.(run.output_document_id) : undefined} onOpen={(run) => run.output_document_id && onOpenDocument(run.output_document_id)} onClose={() => {}} />
   {:else}
     {#if config.kind === 'browser'}
       {#if preview}<iframe title={config.title ?? 'Page preview'} sandbox="" referrerpolicy="no-referrer" src={preview}></iframe>{/if}
     {:else}
       <div class="history" aria-label="Retained conversation" bind:this={historyViewport} on:scroll={trackScroll}>
         {#each recentRuns as run (run.run_id)}
-          <article>
-            {#if run.presentation?.input}<p class="input">{run.presentation.input}</p>{/if}
-            {#if outputText[run.run_id] !== undefined || run.preview}<div class="output">{outputText[run.run_id] ?? run.preview}</div>{/if}
-            {#if run.output_document_id}<button class="output-link" aria-label="Open output document" on:click={() => run.output_document_id && onOpenDocument(run.output_document_id)}>Open</button>{/if}
-            {#if run.error}<p class="error">{run.error}</p>{/if}
-            {#if run.status !== 'completed'}<small role="status">{run.status === 'running' ? 'Thinking…' : run.status}</small>{/if}
-          </article>
+          <ChatTurn {run} output={outputText[run.run_id] ?? run.preview}
+            pinned={Boolean(run.output_document_id && pinnedOutputs.has(run.output_document_id))}
+            onOpen={run.output_document_id ? () => onOpenDocument(run.output_document_id!) : undefined}
+            onPin={run.output_document_id && onPinOutput ? () => onPinOutput?.(run.output_document_id!) : undefined} />
         {/each}
+        {#if pendingRun}<ChatTurn run={pendingRun} output="" />{/if}
       </div>
     {/if}
     <form on:submit|preventDefault={() => void submit()}>
-      <textarea bind:value={entry} rows="1" aria-label={config.kind === 'chat' ? 'Message' : 'Page description'} on:keydown={keydown} on:compositionstart={() => setComposing(true)} on:compositionend={() => setComposing(false)} disabled={readonly}></textarea>
+      <textarea bind:this={entryArea} bind:value={entry} rows="1" aria-label={config.kind === 'chat' ? 'Message' : 'Page description'} on:keydown={keydown} on:compositionstart={() => setComposing(true)} on:compositionend={() => setComposing(false)} disabled={readonly}></textarea>
       {#if busy || config.kind === 'browser'}
       <div class="composer-actions">
       {#if busy}<button class="send" type="button" aria-label="Stop" on:click={() => void stop()} disabled={readonly}>■</button>
@@ -334,20 +373,15 @@
 <style>
   .workspace-pane { display:flex; flex-direction:column; min-width:0; min-height:0; height:100%; overflow:hidden; color:inherit; }
   .history,.editor { min-height:0; flex:1; overflow:auto; }
-  .history { padding:6px 9px; }
-  article { margin-bottom:12px; }
-  p { margin:4px 0; white-space:pre-wrap; overflow-wrap:anywhere; }
-  .input { font-weight:600; }
-  .output { display:block; padding:0; width:100%; border:0; background:none; color:inherit; text-align:left; white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; line-height:1.45; }
-  .output-link { opacity:0; border:0; background:none; color:inherit; padding:0; font-size:.75rem; }
-  article:hover .output-link, article:focus-within .output-link { opacity:.65; }
-  form { display:flex; flex-direction:column; gap:0; padding:4px; border-top:1px solid #8883; }
+  .history { padding:12px 14px 0; font-size:14px; }
+  .history :global(.chat-turn) { width:100%; max-width:780px; margin-left:auto; margin-right:auto; }
+  form { display:flex; flex-direction:column; gap:0; padding:5px; border-top:1px solid var(--line-soft); }
   .composer-actions { display:flex; align-items:center; gap:5px; }
   .composer-actions button { min-height:26px; padding:2px 6px; }
   .send { margin-left:auto; width:28px; }
-  textarea { width:100%; box-sizing:border-box; min-width:0; min-height:28px; max-height:120px; padding:5px; resize:vertical; background:transparent; color:inherit; font:inherit; border:1px solid #8884; border-radius:4px; }
+  textarea { width:100%; box-sizing:border-box; min-width:0; min-height:28px; max-height:120px; padding:7px 9px; resize:vertical; background:var(--paper-deep); color:inherit; font:inherit; border:1px solid var(--line-soft); border-radius:8px; }
   button { min-height:30px; padding:4px 8px; cursor:pointer; }
-  .error { color:#b64238; font-size:.8rem; padding:4px 8px; }
-  small,.empty { opacity:.65; }
+  .error { color:var(--danger); font-size:.8rem; padding:4px 8px; }
+  .empty { opacity:.65; }
   iframe { flex:1; width:100%; min-height:120px; border:0; background:white; }
 </style>

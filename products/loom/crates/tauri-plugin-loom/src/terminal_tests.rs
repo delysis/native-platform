@@ -144,6 +144,290 @@ impl Drop for TerminalFixture {
     }
 }
 
+fn imported_source(fixture: &TerminalFixture, text: &str) -> crate::materials::MaterialEntry {
+    fixture.with_store(|store| {
+        let path = fixture.root().join("research.txt");
+        std::fs::write(&path, text).unwrap();
+        let attachment = crate::context_attachments::import_path(store.root(), &path).unwrap();
+        crate::materials::bind_attachment(store, &attachment.id, Some("Research")).unwrap()
+    })
+}
+
+#[test]
+fn find_run_needs_no_model_and_replays_retained_evidence_after_source_removal() {
+    let fixture = TerminalFixture::new();
+    let material = imported_source(&fixture, "The nightjar sings. @Missing stays source text.");
+    let id = CommandId::new();
+    let expression = "=find(@Research, \"nightjar\")";
+    fixture.run(id, expression).unwrap();
+    let completed = fixture.wait(id);
+    assert_eq!(completed.status, "completed", "{:?}", completed.error);
+    let receipt = read_receipt(&fixture.root(), &id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    assert!(receipt.model.is_none());
+    assert!(receipt.steps.is_empty());
+    assert_eq!(receipt.searches.len(), 1);
+    assert_eq!(receipt.searches[0].query, "nightjar");
+    assert_eq!(receipt.searches[0].material.id, material.id);
+    assert!(!receipt.evidence.is_empty());
+    assert!(
+        receipt.run.events.is_empty(),
+        "events are IPC projection only"
+    );
+    let search_event = completed
+        .events
+        .iter()
+        .find(|event| event.kind == TerminalEventKind::Search)
+        .unwrap();
+    assert_eq!(search_event.label, "Searched Research");
+    assert!(search_event.detail.as_ref().unwrap().contains("nightjar"));
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &crate::terminal_receipts::read(&fixture.root(), &id.to_string(), true)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(persisted["run"].get("events").is_none());
+    let path = completed.output_relative_path.as_ref().unwrap();
+    fixture.with_store(|store| {
+        let output = store.read_document(path).unwrap();
+        assert!(output.text.contains("nightjar"));
+        assert!(output.text.contains("@Missing stays source text."));
+        assert_eq!(
+            store
+                .revision_provenance(output.revision_id)
+                .unwrap()
+                .segments[0]
+                .contribution,
+            loom_types::ContributionKind::Source
+        );
+        assert_eq!(
+            store.read_document("Draft.md").unwrap().text,
+            fixture.source.text
+        );
+        crate::materials::remove(store, &material.id).unwrap();
+    });
+    let replay = fixture.run(id, expression).unwrap();
+    assert_eq!(replay.output_document_id, completed.output_document_id);
+    let retained = read_receipt(&fixture.root(), &id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.evidence[0].text, receipt.evidence[0].text);
+    assert!(fixture.run(CommandId::new(), expression).is_err());
+}
+
+#[test]
+fn events_project_only_recorded_operations_and_bound_large_metadata() {
+    let fixture = TerminalFixture::new();
+    imported_source(&fixture, "The nightjar sings.");
+    let id = CommandId::new();
+    fixture.run(id, "=find(@Research, \"nightjar\")").unwrap();
+    fixture.wait(id);
+    let mut receipt = read_receipt(&fixture.root(), &id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    let mut search = receipt.searches[0].clone();
+    search.query = "長い質問\n".repeat(100);
+    search.material.name = "Research\n".repeat(100);
+    receipt.searches = vec![search; MAX_PRESENTATION_EVENTS + 5];
+    let projected = projected_run(&receipt);
+    assert_eq!(projected.events.len(), MAX_PRESENTATION_EVENTS);
+    assert!(
+        projected
+            .events
+            .last()
+            .unwrap()
+            .label
+            .ends_with("more searches")
+    );
+    for event in projected.events {
+        assert!(event.label.chars().count() <= 97);
+        assert!(!event.label.chars().any(char::is_control));
+        if let Some(detail) = event.detail {
+            assert!(detail.chars().count() <= 257);
+            assert!(!detail.chars().any(char::is_control));
+        }
+    }
+    receipt.run.status = "failed".into();
+    receipt.run.error = Some("Search unavailable".into());
+    receipt.run.expression = "=find(@Research, \"nightjar\")".into();
+    receipt.searches.clear();
+    receipt.sources.clear();
+    receipt.bindings.clear();
+    receipt.evidence.clear();
+    let projected = projected_run(&receipt);
+    assert!(
+        projected.events.is_empty(),
+        "an expression is not an executed search"
+    );
+    assert_eq!(projected.status, "failed");
+    assert_eq!(projected.error.as_deref(), Some("Search unavailable"));
+}
+
+#[test]
+fn find_operands_count_nested_model_calls_and_function_context_admission() {
+    let NeuralCommand::Expression(expression) =
+        parse_neural_command("=find(@Research, @Question(@Draft)) |> @Compare").unwrap()
+    else {
+        panic!("expression")
+    };
+    let mut names = BTreeSet::new();
+    let mut calls = 0;
+    expression_names(&expression, &mut names, &mut calls);
+    assert_eq!(calls, 2);
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "Research".into(),
+            "Question".into(),
+            "Draft".into(),
+            "Compare".into()
+        ])
+    );
+    let mut functions = BTreeSet::new();
+    function_names(&expression, &mut functions);
+    assert_eq!(
+        functions,
+        BTreeSet::from(["Question".into(), "Compare".into()])
+    );
+}
+
+#[test]
+fn final_evidence_replaces_an_intermediate_generation_in_run_output() {
+    let fixture = TerminalFixture::new();
+    let material = imported_source(&fixture, "The nightjar sings beneath the moon.");
+    let initial_id = CommandId::new();
+    fixture.run(initial_id, "=@Draft").unwrap();
+    fixture.wait(initial_id);
+    let mut receipt = read_receipt(&fixture.root(), &initial_id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    let id = CommandId::new();
+    receipt.run.run_id = id.to_string();
+    receipt.run.status = "running".into();
+    receipt.run.output_document_id = None;
+    receipt.run.output_relative_path = None;
+    let state = fixture.app.state::<PluginState>();
+    let identity = GenerationFamilyIdentity {
+        request_id: format!("terminal-{id}"),
+        project_id: fixture.project_id.parse().unwrap(),
+        session_id: fixture.session_id.parse().unwrap(),
+        document_id: fixture.source.document_id,
+    };
+    let control = TerminalControl::default();
+    let root = fixture.root();
+    let mut evaluator = Evaluator {
+        state: state.clone(),
+        identity: &identity,
+        model: None,
+        control: &control,
+        source: Some(&fixture.source),
+        root: &root,
+        recovery: RecoveryMode::Resume,
+        input: String::new(),
+        receipt,
+        media: Vec::new(),
+        step: 1,
+    };
+    // Exercise retention after a preceding inference step without pretending
+    // that a fixture executed a model. The retrieval below uses the real store.
+    let evidence = fixture.with_store(|store| {
+        store
+            .store_provenance_blob(b"intermediate query retention fixture")
+            .unwrap()
+    });
+    evaluator.retain("nightjar", evidence, true, "1").unwrap();
+    let intermediate = evaluator.receipt.run.output_relative_path.clone().unwrap();
+    let found = fixture.with_store(|store| {
+        let source = material_context::resolve(store, &material.id).unwrap();
+        material_context::search(store, &source, "nightjar").unwrap()
+    });
+    evaluator.finish(Ok(found)).unwrap();
+    let completed = read_receipt(&fixture.root(), &id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.run.status, "completed");
+    let final_path = completed.run.output_relative_path.unwrap();
+    assert_ne!(final_path, intermediate);
+    assert_eq!(completed.searches[0].query, "nightjar");
+    fixture.with_store(|store| {
+        let final_output = store.read_document(&final_path).unwrap();
+        let intermediate = store.read_document(&intermediate).unwrap();
+        assert_eq!(intermediate.text, "nightjar");
+        assert!(
+            final_output
+                .text
+                .contains("nightjar sings beneath the moon")
+        );
+        assert_eq!(
+            store
+                .revision_provenance(final_output.revision_id)
+                .unwrap()
+                .segments[0]
+                .contribution,
+            loom_types::ContributionKind::Source
+        );
+        assert_eq!(
+            store
+                .revision_provenance(intermediate.revision_id)
+                .unwrap()
+                .segments[0]
+                .contribution,
+            loom_types::ContributionKind::Generated
+        );
+    });
+}
+
+#[test]
+fn evaluator_consultation_budgets_evidence_without_shortening_exact_values() {
+    let fixture = TerminalFixture::new();
+    let paragraphs = format!("{}\n", "The nightjar sings in moonlight. ".repeat(100)).repeat(3);
+    let material = imported_source(&fixture, &paragraphs);
+    let id = CommandId::new();
+    fixture.run(id, "=@Draft").unwrap();
+    fixture.wait(id);
+    let receipt = read_receipt(&fixture.root(), &id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    let state = fixture.app.state::<PluginState>();
+    let identity = GenerationFamilyIdentity {
+        request_id: format!("terminal-{id}"),
+        project_id: fixture.project_id.parse().unwrap(),
+        session_id: fixture.session_id.parse().unwrap(),
+        document_id: fixture.source.document_id,
+    };
+    let control = TerminalControl::default();
+    let root = fixture.root();
+    let mut evaluator = Evaluator {
+        state: state.clone(),
+        identity: &identity,
+        model: None,
+        control: &control,
+        source: Some(&fixture.source),
+        root: &root,
+        recovery: RecoveryMode::Resume,
+        input: String::new(),
+        receipt,
+        media: Vec::new(),
+        step: 0,
+    };
+    let value = fixture.with_store(|store| material_context::resolve(store, &material.id).unwrap());
+    let exact_before = material_context::exact(&value).unwrap();
+    let budget = remaining_context_bytes(4096, 160);
+    let consulted = evaluator.consult(&value, "nightjar", budget).unwrap();
+    assert!(material_context::exact(&consulted).unwrap().len() <= budget);
+    assert!(!evaluator.receipt.omitted_evidence.is_empty());
+    assert!(!evaluator.receipt.evidence.is_empty());
+    assert!(!evaluator.receipt.searches[0].complete);
+    assert_eq!(material_context::exact(&value).unwrap(), exact_before);
+    assert_eq!(evaluator.step, 0, "consultation performs no inference");
+    let frozen: RunReceipt =
+        serde_json::from_slice(&serde_json::to_vec(&evaluator.receipt).unwrap()).unwrap();
+    assert_eq!(frozen.omitted_evidence, evaluator.receipt.omitted_evidence);
+    assert_eq!(remaining_context_bytes(4096, usize::MAX), 0);
+}
+
 #[test]
 fn reference_run_retains_source_value_and_replays_without_duplicate_writing() {
     let fixture = TerminalFixture::new();

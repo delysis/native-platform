@@ -40,6 +40,7 @@ export interface ProjectSnapshot {
   root: string;
   schema_version: number;
   documents: DocumentSummary[];
+  retained_output_document_ids?: string[];
   folder_warnings?: string[];
   pending_recovery: number;
 }
@@ -555,6 +556,7 @@ export interface ReconciliationPreview {
 
 export interface TerminalRun {
   remote?: { host: string; model: import('./compute').ComputeModel } | null;
+  events?: Array<{ kind: 'search' | 'context'; label: string; detail?: string }>;
   turn_boundary?: 'chat' | null;
   source_document_id?: string;
   presentation?: { pane_id: string; input: string } | null;

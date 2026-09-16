@@ -152,12 +152,19 @@ async fn reviewed_context_crosses_quic_as_editable_markdown_with_only_selected_m
         32,
     )
     .unwrap();
-    crate::document_bindings::append_completion_context(
+    let plan = crate::material_context::markdown_plan_with_budget(
         &destination,
         &published.reference,
-        &mut completion,
+        &page.text,
+        65_536,
     )
     .unwrap();
+    completion.media = crate::terminal_media::merge(
+        completion.media,
+        crate::material_context::native_media(&destination, plan.bindings.values()).unwrap(),
+    )
+    .unwrap();
+    completion.context_preamble.push_str(&plan.text);
     assert_eq!(completion.media.len(), 1);
     assert_eq!(completion.media[0].bytes, audio_bytes);
     assert!(
@@ -176,11 +183,7 @@ async fn reviewed_context_crosses_quic_as_editable_markdown_with_only_selected_m
             .join(&private.id)
             .exists()
     );
-    assert!(
-        crate::document_bindings::context_for_markdown(&destination, &published.reference)
-            .unwrap()
-            .contains("The corrected excerpt to share.")
-    );
+    assert!(plan.text.contains("The corrected excerpt to share."));
     owner_network.shutdown().await.unwrap();
     peer_network.shutdown().await.unwrap();
 }
