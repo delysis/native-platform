@@ -15,6 +15,12 @@ use sqlx::{Row, SqlitePool};
 
 pub const MAX_CONVERSATIONS: usize = 2000;
 
+pub struct Page {
+    pub messages: Vec<Message>,
+    /// Exclusive timestamp cursor, including records omitted from the view.
+    pub next_before: Option<u64>,
+}
+
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -139,7 +145,7 @@ pub async fn page(
     account: ServiceId,
     before: Option<u64>,
     limit: usize,
-) -> Result<Vec<Message>> {
+) -> Result<Page> {
     if limit == 0 || limit > MAX_PAGE_SIZE {
         bail!("Invalid Signal page size");
     }
@@ -148,15 +154,23 @@ pub async fn page(
         Thread::Contact(id) => (None, Some(id.raw_uuid().as_bytes().to_vec())),
     };
     let before = i64::try_from(before.unwrap_or(i64::MAX as u64))?;
-    // Presage's messages() materializes the full range. Select a bounded set of
-    // timestamps here, then let Presage decode each exact record.
+    // Bound decoded records independently of visible messages. One extra
+    // timestamp proves whether more history exists without decoding it.
     crate::retention::sweep(database).await?;
     let rows = sqlx::query("SELECT m.ts, r.expires_at FROM thread_messages m JOIN loom_retention_v1 r ON r.ts = m.ts AND r.thread_id = m.thread_id WHERE m.thread_id = (SELECT id FROM threads WHERE group_master_key = ? OR recipient_id = ?) AND m.ts < ? ORDER BY m.ts DESC LIMIT ?")
-        .bind(group).bind(contact).bind(before).bind(limit as i64).fetch_all(database).await?;
+        .bind(group).bind(contact).bind(before).bind((MAX_PAGE_SIZE + 1) as i64).fetch_all(database).await?;
     let mut messages = Vec::new();
-    let mut bytes = 0;
-    for row in rows {
+    let mut bytes = 2; // JSON array delimiters.
+    let mut last_scanned = None;
+    let mut next_before = None;
+    for (index, row) in rows.into_iter().enumerate() {
+        if index == MAX_PAGE_SIZE || messages.len() == limit {
+            next_before = last_scanned;
+            break;
+        }
         let timestamp = u64::try_from(row.try_get::<i64, _>("ts")?)?;
+        let previous = last_scanned;
+        last_scanned = Some(timestamp);
         let Some(content) = store.message(thread, timestamp).await? else {
             continue;
         };
@@ -179,10 +193,6 @@ pub async fn page(
             continue;
         }
         let text = clipped(body.body.as_deref().unwrap_or_default(), MAX_MESSAGE_BYTES);
-        bytes += text.len();
-        if bytes > 1024 * 1024 {
-            break;
-        }
         let sender = content.metadata.sender;
         let sender_name = store
             .contact_by_id(&sender)
@@ -190,7 +200,7 @@ pub async fn page(
             .map(|contact| contact.name)
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| sender.service_id_string());
-        messages.push(Message {
+        let message = Message {
             id: format!("{}:{timestamp}:{}", id(thread), sender.service_id_string()),
             timestamp,
             sender_id: sender.service_id_string(),
@@ -202,10 +212,23 @@ pub async fn page(
             ephemeral: expiry.is_some(),
             expires_at: expiry,
             attachment_count: body.attachments.len(),
-        });
+        };
+        let encoded_bytes = serde_json::to_vec(&message)?.len() + usize::from(!messages.is_empty());
+        if bytes + encoded_bytes > 1024 * 1024 {
+            // Account for JSON escaping and metadata, not just prose bytes.
+            // This row was not returned: keep it eligible on the next page.
+            anyhow::ensure!(!messages.is_empty(), "Signal message exceeds page budget");
+            next_before = previous;
+            break;
+        }
+        bytes += encoded_bytes;
+        messages.push(message);
     }
     messages.reverse();
-    Ok(messages)
+    Ok(Page {
+        messages,
+        next_before,
+    })
 }
 
 fn clipped(text: &str, limit: usize) -> String {
@@ -215,3 +238,7 @@ fn clipped(text: &str, limit: usize) -> String {
     }
     text[..end].to_owned()
 }
+
+#[cfg(test)]
+#[path = "messages_tests.rs"]
+mod tests;

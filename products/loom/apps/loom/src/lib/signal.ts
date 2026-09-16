@@ -46,7 +46,7 @@ export type SignalEvent =
   | { kind: 'link'; url: string; qr_code: string }
   | { kind: 'conversations'; conversations: SignalConversation[] }
   | { kind: 'identity'; conversation_id: string; members: SignalIdentityMember[]; review: SignalIdentityReview | null }
-  | { kind: 'messages'; conversation_id: string; messages: SignalMessage[] }
+  | { kind: 'messages'; conversation_id: string; messages: SignalMessage[]; next_before: number | null }
   | { kind: 'group_workspace'; conversation_id: string; review: SignalGroupWorkspaceReview | null }
   | { kind: 'workspaces'; conversation_id: string; links: SignalWorkspaceLinks }
   | { kind: 'draft'; conversation_id: string; draft: SignalDraft }

@@ -422,9 +422,10 @@ async fn handle(
             }
             .await;
             match result {
-                Ok(messages) => Event::Messages {
+                Ok(page) => Event::Messages {
                     conversation_id,
-                    messages,
+                    messages: page.messages,
+                    next_before: page.next_before,
                 },
                 Err(_) => failure("read_failed", "Signal messages could not be read.", true),
             }

@@ -492,17 +492,18 @@ async fn group_metadata_notifications_do_not_become_empty_chat_messages() {
         &thread,
         account().into(),
         None,
-        100,
+        2,
     )
     .await
     .unwrap();
     assert_eq!(
-        page.len(),
+        page.messages.len(),
         2,
         "metadata belongs to the group state, not the chat transcript"
     );
-    assert_eq!(page[0].text, "Hello from our garden");
-    assert_eq!(page[1].attachment_count, 1);
+    assert_eq!(page.messages[0].text, "Hello from our garden");
+    assert_eq!(page.messages[1].attachment_count, 1);
+    assert_eq!(page.next_before, None);
     fixture.close().await;
 }
 

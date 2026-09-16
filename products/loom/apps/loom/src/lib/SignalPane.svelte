@@ -14,12 +14,15 @@
   export let editor: SignalDraftEditor;
   export let modelLabel = 'Local model';
   export let workspaceScope = '';
-  let status: SignalStatus = { version: 4, phase: 'unlinked', account_id: null, device_name: null };
+  let status: SignalStatus = { version: 5, phase: 'unlinked', account_id: null, device_name: null };
   let identityRefresh = 0;
   let conversations: SignalConversation[] = [];
   let selected = editor.conversation;
   let search = '';
   let messages: SignalMessage[] = [];
+  let before: number | null = null;
+  let nextBefore: number | null = null;
+  let loadingMessages = false;
   let draft = editor.text;
   let proposal = '';
   let error = '';
@@ -101,6 +104,7 @@
       await editor.open(id);
       if (!mounted) return;
       selected = id; draft = editor.text; proposal = ''; error = ''; messages = []; uncertain = editor.pending;
+      before = null; nextBefore = null;
       links = null;
       await Promise.all([loadMessages(), loadWorkspaces()]);
       await tick(); composer?.focus();
@@ -126,16 +130,27 @@
     void saveDraft().catch(failure => error = normalizeFailure(failure).message);
   }
 
-  async function loadMessages(): Promise<void> {
+  async function loadMessages(requestedBefore = before): Promise<void> {
     const expected = selected, version = ++serial;
     if (!expected) return;
     const following = !viewport || viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 64;
-    const result = await signalRequest({ kind: 'messages', conversation_id: expected, before: null, limit: 100 });
-    if (!mounted || version !== serial || selected !== expected) return;
-    if (result.kind === 'messages' && result.conversation_id === expected) {
-      messages = result.messages;
-      if (following) { await tick(); if (viewport) viewport.scrollTop = viewport.scrollHeight; }
-    } else if (result.kind === 'failure') error = result.message;
+    const navigating = requestedBefore !== before;
+    loadingMessages = true;
+    try {
+      const result = await signalRequest({ kind: 'messages', conversation_id: expected, before: requestedBefore, limit: 100 });
+      if (!mounted || version !== serial || selected !== expected) return;
+      if (result.kind === 'messages' && result.conversation_id === expected) {
+        messages = result.messages; before = requestedBefore; nextBefore = result.next_before;
+        if (following || navigating) {
+          await tick();
+          if (mounted && version === serial && viewport) viewport.scrollTop = viewport.scrollHeight;
+        }
+      } else if (result.kind === 'failure') error = result.message;
+    } catch (failure) {
+      if (mounted && version === serial) error = normalizeFailure(failure).message;
+    } finally {
+      if (mounted && version === serial) loadingMessages = false;
+    }
   }
 
   async function loadWorkspaces(): Promise<void> {
@@ -179,7 +194,7 @@
     try {
       const result = await editor.send(check);
       if (!mounted) return;
-      if (result.kind === 'sent') await loadMessages();
+      if (result.kind === 'sent') await loadMessages(null);
       else if (result.kind === 'not_sent') error = 'This message was not sent. Your draft is ready.';
       else if (result.kind === 'failure') error = result.message;
     } catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
@@ -255,6 +270,12 @@
       {#if conversation.is_group}
         {#key selected}<SignalGroupWorkspace conversation={selected} workspaces={links?.workspaces ?? []} connected={status.phase === 'connected'} onChanged={() => void refresh()} />{/key}
       {/if}
+      {#if nextBefore !== null || before !== null}
+        <nav class="history" aria-label="Signal message history">
+          {#if nextBefore !== null}<button type="button" disabled={loadingMessages || busy || drafting} on:click={() => void loadMessages(nextBefore)}>Earlier messages</button>{/if}
+          {#if before !== null}<button type="button" disabled={loadingMessages || busy || drafting} on:click={() => void loadMessages(null)}>Latest messages</button>{/if}
+        </nav>
+      {/if}
       <div class="messages" bind:this={viewport} role="log" aria-label={`Messages with ${conversation.title}`} aria-live="polite">
         {#each visible as message (message.id)}
           <article class:outgoing={message.outgoing}>
@@ -268,14 +289,14 @@
             {#if message.edited}<small>Edited</small>{/if}
           </article>
         {/each}
-        {#if !visible.length}<p class="quiet">New messages will appear here after Signal syncs this device.</p>{/if}
+        {#if !visible.length}<p class="quiet">{before !== null || nextBefore !== null ? 'No chat messages in this part of the conversation.' : 'New messages will appear here after Signal syncs this device.'}</p>{/if}
       </div>
       {#if proposal}<div class="proposal"><p>{proposal}</p><button type="button" disabled={busy || !!uncertain} on:click={() => { changeDraft(proposal); proposal = ''; }}>Use draft</button><button type="button" on:click={() => proposal = ''}>Discard</button></div>{/if}
       <div class="compose">
         <textarea bind:this={composer} aria-label="Signal message draft" placeholder="Write a message…" rows="3" value={draft} on:input={event => changeDraft(event.currentTarget.value)} on:keydown={keydown} disabled={busy || !!uncertain}></textarea>
         {#if saving}<span class="quiet" role="status">Saving draft…</span>{/if}
         <div class="actions">
-          <button type="button" title={`Draft locally with ${modelLabel} using the last 20 messages. The draft is retained in this workspace.`} disabled={!canDraft} on:click={() => void draftReply()}>{drafting ? 'Drafting…' : 'Draft locally'}</button>
+          <button type="button" title={`Draft locally with ${modelLabel} using up to 20 displayed messages. The draft is retained in this workspace.`} disabled={!canDraft} on:click={() => void draftReply()}>{drafting ? 'Drafting…' : 'Draft locally'}</button>
           <button type="button" disabled={busy || drafting || !!uncertain} on:click={() => void invite()}>Invite to cabal</button>
           {#if uncertain}<button type="button" disabled={busy} on:click={() => void send(true)}>Check send</button>
           {:else}<button type="button" class="send" disabled={busy || drafting || !draft.trim() || status.phase !== 'connected'} on:click={() => void send()}>Send</button>{/if}
@@ -302,6 +323,7 @@
   .workspaces > div { display:flex; align-items:center; background:var(--paper-deep); border-radius:5px; max-width:100%; }
   .workspaces button:first-child { min-width:0; overflow-wrap:anywhere; text-align:left; }
   .messages { flex:1; min-height:80px; overflow:auto; padding:4px 12px 12px; }
+  .history { display:flex; justify-content:space-between; padding:0 8px; font-size:11px; }
   article { margin:12px 18px 12px 0; } article.outgoing { margin:12px 0 12px 18px; }
   .byline { display:flex; align-items:baseline; gap:8px; font-size:10px; color:var(--muted); } time { margin-left:auto; }
   article p { white-space:pre-wrap; overflow-wrap:anywhere; line-height:1.6; margin:3px 0; } small { color:var(--muted); font-size:10px; }

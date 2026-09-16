@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { page } from 'vitest/browser';
 import SignalPane from './SignalPane.svelte';
 import { SignalDraftEditor } from './signalDraft';
-import type { SignalCommand, SignalDraft, SignalEvent, SignalWorkspaceLinks } from './signal';
+import type { SignalCommand, SignalDraft, SignalEvent, SignalMessage, SignalWorkspaceLinks } from './signal';
 import '../app.css';
 
 const ipc = vi.hoisted(() => ({ request: vi.fn(), listen: vi.fn() }));
@@ -20,9 +20,9 @@ beforeEach(() => {
   drafts.clear(); links.clear(); description = ''; ipc.request.mockReset(); ipc.listen.mockResolvedValue(() => {});
   ipc.request.mockImplementation(async (command: SignalCommand): Promise<SignalEvent> => {
     switch (command.kind) {
-      case 'status': return { kind: 'status', status: { version: 4, phase: 'connected', account_id: 'me', device_name: 'Loom' } };
+      case 'status': return { kind: 'status', status: { version: 5, phase: 'connected', account_id: 'me', device_name: 'Loom' } };
       case 'conversations': return { kind: 'conversations', conversations: ['alice', 'bob'].map(id => ({ id, title: id, description, disappearing: false, is_group: false })) };
-      case 'messages': return { kind: 'messages', conversation_id: command.conversation_id, messages: [] };
+      case 'messages': return { kind: 'messages', conversation_id: command.conversation_id, messages: [], next_before: null };
       case 'workspaces': return { kind: 'workspaces', conversation_id: command.conversation_id, links: links.get(command.conversation_id) ?? { version: 0, workspaces: [] } };
       case 'update_workspace': {
         const next = { version: command.expected_version + 1, workspaces: (links.get(command.conversation_id)?.workspaces ?? []).filter(item => item.id !== command.workspace_id) };
@@ -49,6 +49,54 @@ function render(editor: SignalDraftEditor, options: Partial<ComponentProps<typeo
   pane = mount(SignalPane, { target, props });
   return { ...props, scope };
 }
+
+function message(text: string, timestamp: number): SignalMessage {
+  return { id: `message-${timestamp}`, timestamp, sender_id: 'alice', sender_name: 'Alice', outgoing: false, text, edited: false, deleted: false, ephemeral: false, expires_at: null, attachment_count: 0 };
+}
+
+describe('Signal history', () => {
+  it('crosses a metadata-only page and keeps that page open during a live refresh', async () => {
+    const original = ipc.request.getMockImplementation()!;
+    ipc.request.mockImplementation((command: SignalCommand, id: string) => command.kind === 'messages'
+      ? { kind: 'messages', conversation_id: command.conversation_id, messages: command.before === null ? [] : [message('Older writing is still here', 300)], next_before: command.before === null ? 400 : null }
+      : original(command, id));
+    const editor = new SignalDraftEditor(ipc.request); await editor.open('alice');
+    const { onDraft } = render(editor);
+    await expect.element(page.getByText('No chat messages in this part of the conversation.')).toBeVisible();
+    await page.getByRole('button', { name: 'Earlier messages', exact: true }).click();
+    await expect.element(page.getByText('Older writing is still here', { exact: true })).toBeVisible();
+    expect(ipc.request.mock.calls.filter(([command]) => command.kind === 'messages').at(-1)?.[0].before).toBe(400);
+    await ipc.listen.mock.calls[0][0]({ kind: 'changed', conversation_id: 'alice' });
+    await expect.element(page.getByText('Older writing is still here', { exact: true })).toBeVisible();
+    expect(ipc.request.mock.calls.filter(([command]) => command.kind === 'messages').at(-1)?.[0].before).toBe(400);
+    await page.getByRole('button', { name: 'Latest messages', exact: true }).click();
+    await expect.element(page.getByRole('button', { name: 'Earlier messages', exact: true })).toBeVisible();
+    expect(document.body.textContent).not.toContain('Older writing is still here');
+    expect(onDraft).not.toHaveBeenCalled();
+    expect(ipc.request.mock.calls.some(([command]) => command.kind === 'send')).toBe(false);
+  });
+
+  it('rejects a delayed earlier page after switching conversations', async () => {
+    const original = ipc.request.getMockImplementation()!;
+    let finish!: (event: SignalEvent) => void;
+    ipc.request.mockImplementation((command: SignalCommand, id: string) => {
+      if (command.kind !== 'messages') return original(command, id);
+      if (command.conversation_id === 'bob') return { kind: 'messages', conversation_id: 'bob', messages: [message('Only Bob belongs here', 500)], next_before: null };
+      if (command.before !== null) return new Promise(resolve => finish = resolve);
+      return { kind: 'messages', conversation_id: 'alice', messages: [], next_before: 400 };
+    });
+    const editor = new SignalDraftEditor(ipc.request); await editor.open('alice'); render(editor);
+    await page.getByRole('button', { name: 'Earlier messages', exact: true }).click();
+    await expect.poll(() => typeof finish).toBe('function');
+    await page.getByRole('combobox', { name: 'Signal conversation' }).selectOptions('bob');
+    await expect.element(page.getByText('Only Bob belongs here', { exact: true })).toBeVisible();
+    finish({ kind: 'messages', conversation_id: 'alice', messages: [message('Private older Alice text', 300)], next_before: 200 });
+    await tick();
+    expect(document.body.textContent).not.toContain('Private older Alice text');
+    expect(document.querySelector('nav.history')).toBeNull();
+    await expect.element(page.getByRole('textbox', { name: 'Signal message draft' })).toBeEnabled();
+  });
+});
 
 describe('Signal pane ownership', () => {
   it('does not put a hidden pane’s delayed invitation in another friend’s draft', async () => {

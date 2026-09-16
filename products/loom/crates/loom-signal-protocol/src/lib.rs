@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_PAGE_SIZE: usize = 100;
@@ -123,6 +123,7 @@ pub enum Event {
     Messages {
         conversation_id: String,
         messages: Vec<Message>,
+        next_before: Option<u64>,
     },
     Draft {
         conversation_id: String,

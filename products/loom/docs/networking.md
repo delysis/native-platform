@@ -86,6 +86,15 @@ Hiding a pane cannot interrupt send settlement or transplant an invitation into
 another conversation. Local proposals belong to the workspace that started them
 and disappear on a workspace switch; a delayed proposal never replaces the draft.
 
+Conversation history uses bounded pages with an explicit continuation cursor.
+Each page projects at most 100 stored records and returns at most one MiB of
+JSON-encoded messages. Group updates and reactions do not consume the requested
+visible-message count. Even a page containing only protocol events retains its
+cursor: **Earlier messages** can reach the older writing, and **Latest messages**
+returns to the live conversation. A refresh preserves the page being read;
+switching conversations discards delayed page replies. Local reply drafting uses
+up to 20 messages from the displayed page. No history is deleted by navigation.
+
 The terminal can explicitly select a friend's shared model. Only the resolved
 text and explicitly resolved native media for each call cross that connection;
 raw expressions, document paths, and private attachment labels stay on the
