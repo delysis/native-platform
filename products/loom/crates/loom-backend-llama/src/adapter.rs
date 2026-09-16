@@ -2791,11 +2791,14 @@ mod tests {
         let error = handle
             .wait_timeout(Duration::from_secs(5))
             .expect_err("overflow cannot produce a completed candidate");
-        assert!(matches!(
-            error,
-            LlamaBackendError::OutputContract(message)
-                if message.starts_with("loom_text_stream_output_overflow:")
-        ));
+        assert!(
+            matches!(
+                &error,
+                LlamaBackendError::OutputContract(message)
+                    if message.starts_with("loom_text_stream_output_overflow:")
+            ),
+            "expected native text output overflow, got {error:?}"
+        );
         let events = drain_events(&handle);
         let delivered_bytes = events
             .iter()
@@ -2905,11 +2908,14 @@ mod tests {
         let error = handle
             .wait_timeout(Duration::from_secs(5))
             .expect_err("a drained stream cannot reuse its cumulative byte allowance");
-        assert!(matches!(
-            error,
-            LlamaBackendError::OutputContract(message)
-                if message.starts_with("loom_text_stream_output_overflow:")
-        ));
+        assert!(
+            matches!(
+                &error,
+                LlamaBackendError::OutputContract(message)
+                    if message.starts_with("loom_text_stream_output_overflow:")
+            ),
+            "expected native text output overflow, got {error:?}"
+        );
         delivered.extend(drain_events(&handle));
         assert_failed_contiguous_text_delivery(&delivered, MAX_GENERATED_OUTPUT_BYTES);
     }
