@@ -111,6 +111,7 @@ tracing = "0.1.44"
 ulid = { version = "1.2.1", features = ["serde"] }
 unicase = "2.9.0"
 unicode-normalization = "0.1.25"
+unicode-segmentation = "1.13.3"
 url = { version = "2.5.7", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 

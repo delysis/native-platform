@@ -13,6 +13,9 @@ use tokio::{
 };
 use url::Url;
 
+mod revisions;
+pub use revisions::{DriveRevision, DriveRevisionPage, RevisionCoverage, RevisionModifier};
+
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const MAX_RESPONSE: usize = 32 * 1024 * 1024;
 pub const MAX_PAGE_FILES: usize = 16;
