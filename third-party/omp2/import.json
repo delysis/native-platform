@@ -94,7 +94,7 @@
   "patches": [
     {
       "path": "0001-repair-inference-resource-boundaries.patch",
-      "sha256": "4e6879e5774956e67a93b4db1ee3c0405b62ee1d869cd8e4019f6b8889e734c1",
+      "sha256": "7b39298328ccbd75c9fc1532a2aa16cc58dd792fc3659c3b748b08668195fc67",
       "purpose": "Restore the omp-ai test gate; retain stream/session admission and final accounting; bound decompressed output before allocation, with cancellation and real HTTP regressions.",
       "files": [
         {
@@ -160,7 +160,7 @@
         {
           "path": "justfile",
           "before_sha256": "cee1c970151111b71dd2fd1f175666b23fc30f9c122b949f54167a7ea34db7fc",
-          "after_sha256": "5b8fe91e952cf9d171d6a3225aa7188893f5eacde5eab83d4bf7dc95c1fe7617"
+          "after_sha256": "f43c2339fef75da780f2d713389751abf4a5303acc54813dd48b9e34c599a32b"
         }
       ]
     }

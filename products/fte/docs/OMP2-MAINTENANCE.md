@@ -157,7 +157,7 @@ the supplied upstream checkout. An incomplete output is removed on failure.
 ```sh
 cargo run --locked -p xtask -- omp2 prepare /tmp/omp2-upstream /tmp/omp2-qualified-UNIQUE
 cd /tmp/omp2-qualified-UNIQUE
-just fmt-check-rust
+just fmt-check-pkg omp-ai
 just test-pkg omp-ai
 just clippy-pkg omp-ai
 ```

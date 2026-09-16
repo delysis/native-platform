@@ -63,7 +63,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" = nightly-2026-08-08
-          just fmt-check-rust
+          just fmt-check-pkg omp-ai
           just test-pkg omp-ai
           just clippy-pkg omp-ai
       - name: Record tested tree
