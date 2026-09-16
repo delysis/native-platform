@@ -350,7 +350,7 @@ mod tests {
     }
     pub(super) fn setup() -> (Fixture, PathBuf, PathBuf, String) {
         let fixture = Fixture::new();
-        let upstream = fixture.0.join("upstream");
+        let upstream = fixture.0.join("upstream #100% café");
         let downstream = fixture.0.join("downstream");
         fs::create_dir(&upstream).expect("valid test fixture");
         fs::create_dir(&downstream).expect("valid test fixture");
@@ -401,12 +401,20 @@ mod tests {
         )
         .expect("valid test fixture");
         command(&downstream, &["init", "-q"]);
+        // Match the real repository's byte-preserving snapshot contract even
+        // when Git's platform or user configuration enables CRLF conversion.
+        fs::write(
+            downstream.join(".gitattributes"),
+            include_bytes!("../../.gitattributes"),
+        )
+        .expect("valid test fixture");
         (fixture, upstream, downstream, revision)
     }
 
     #[test]
     fn proposal_applies_and_rollback_restores_verified_sources() {
         let (fixture, upstream, downstream, _) = setup();
+        command(&downstream, &["config", "core.autocrlf", "true"]);
         fs::write(upstream.join("codec.rs"), "improved behavior\n").expect("valid test fixture");
         command(&upstream, &["commit", "-qam", "improvement"]);
         let revision = command(&upstream, &["rev-parse", "HEAD"]);
@@ -491,11 +499,6 @@ mod tests {
     #[test]
     fn pinned_source_and_patch_bytes_survive_crlf_enabled_checkout() {
         let (fixture, _, downstream, _) = setup();
-        fs::write(
-            downstream.join(".gitattributes"),
-            include_bytes!("../../.gitattributes"),
-        )
-        .expect("copy real checkout attributes");
         let path = format!("{DIRECTORY}/upstream/codec.rs");
         let patch = format!("{DIRECTORY}/patches/runtime.patch");
         write(

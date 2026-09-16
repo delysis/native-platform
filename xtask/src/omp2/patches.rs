@@ -78,6 +78,10 @@ fn checkout(source_root: &Path, revision: &str, output: &Path) -> Result<()> {
         "OMP² output already exists; use a fresh directory"
     );
     let source_root = source_root.canonicalize()?;
+    // Rust's canonical Windows paths use a verbatim prefix that Git can
+    // misread as an SSH host. A file URL also escapes spaces and URL delimiters.
+    let source_url = url::Url::from_directory_path(&source_root)
+        .map_err(|()| anyhow::anyhow!("cannot represent the local checkout as a file URL"))?;
     checked(
         &source_root,
         &["cat-file", "-e", &format!("{revision}^{{commit}}")],
@@ -98,7 +102,7 @@ fn checkout(source_root: &Path, revision: &str, output: &Path) -> Result<()> {
             "--no-tags",
             "--depth=1",
             "--",
-            source_root.to_str().context("non-UTF8 checkout")?,
+            source_url.as_str(),
             revision,
         ],
     )?;
