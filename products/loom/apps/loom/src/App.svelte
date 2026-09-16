@@ -6,6 +6,7 @@
   import TerminalPane from './lib/TerminalPane.svelte';
   import PaneDivider from './lib/PaneDivider.svelte';
   import PaneHeader from './lib/PaneHeader.svelte';
+  import { visiblePanes, togglePaneVisibility } from './lib/paneLayout';
   import Loompad from './lib/Loompad.svelte';
   import { loompadPrefix, type LoompadLength } from './lib/loompad';
   import type { CompletionCandidate } from './lib/completionSession';
@@ -420,9 +421,11 @@
   $: effectiveTerminalHeight = Math.min(terminalHeight, terminalLimit);
   $: outlineLimit = Math.max(150, workspaceWidth * 0.35);
   $: rightLimit = Math.max(180, workspaceWidth - (outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0) - 200);
-  $: mainPaneOpen = !hiddenPaneSlots.has('main');
-  $: rightPaneOpen = paneSlots.some(slot => slot.position === 'right' && slot.selected && !hiddenPaneSlots.has('right'));
-  $: bottomPaneOpen = paneSlots.some(slot => slot.position === 'bottom' && slot.selected && !hiddenPaneSlots.has('bottom'));
+  $: equippedPanePositions = paneSlots.filter(slot => slot.selected).map(slot => slot.position);
+  $: paneVisibility = visiblePanes(equippedPanePositions, hiddenPaneSlots);
+  $: mainPaneOpen = paneVisibility.main;
+  $: rightPaneOpen = paneVisibility.right;
+  $: bottomPaneOpen = paneVisibility.bottom;
   $: mainColumn = mainPaneOpen ? 'minmax(0,1fr)' : '0px';
   $: sideColumn = mainPaneOpen ? (rightPaneOpen ? `${Math.min(rightWidth, rightLimit)}px` : '0px') : 'minmax(0,1fr)';
   $: bottomOnly = bottomPaneOpen && !mainPaneOpen && !rightPaneOpen;
@@ -9668,8 +9671,7 @@
   function togglePane(position: 'main' | 'right' | 'bottom'): void {
     // Collapsing only changes presentation. Mounted editors and active runs
     // retain their state, so a busy pane must never trap its owner on screen.
-    const next = new Set(hiddenPaneSlots);
-    if (next.has(position)) next.delete(position); else next.add(position);
+    const next = togglePaneVisibility(position, equippedPanePositions, hiddenPaneSlots);
     hiddenPaneSlots = next;
     if (position === 'main' && next.has('main')) {
       cancelSuggestionTimer();
@@ -9755,7 +9757,7 @@
         on:mousedown={startTitlebarDrag}
       ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
       <div class="canvas-controls-right" data-no-window-drag>
-        {#each paneSlots.filter(slot => slot.selected) as slot (slot.position)}
+        {#each paneSlots.filter(slot => slot.selected && (slot.position !== 'main' || !mainPaneOpen || rightPaneOpen || bottomPaneOpen)) as slot (slot.position)}
           {@const title = slot.selected![1].title ?? slot.selected![0]}
           <button class="titlebar-button" class:active={!hiddenPaneSlots.has(slot.position)} type="button"
             aria-label={`${hiddenPaneSlots.has(slot.position) ? 'Show' : 'Collapse'} ${title}`} aria-pressed={!hiddenPaneSlots.has(slot.position)} title={title}
@@ -9763,7 +9765,7 @@
             <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/>{#if slot.position === 'right'}<path d="M10 2.5v11"/>{:else if slot.position === 'bottom'}<path d="M2 10h12"/>{:else}<path d="M5 2.5v11M11 2.5v11"/>{/if}</svg>
           </button>
         {/each}
-        {#if project && !mainPane}
+        {#if project && !mainPane && (!mainPaneOpen || rightPaneOpen || bottomPaneOpen)}
           <button class="titlebar-button" class:active={mainPaneOpen} type="button" aria-label={mainPaneOpen ? 'Collapse main pane' : 'Show main pane'} aria-pressed={mainPaneOpen} title="Main pane" on:click={() => togglePane('main')}>
             <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/><path d="M5 2.5v11M11 2.5v11"/></svg>
           </button>
@@ -10378,10 +10380,11 @@
       {#each paneSlots as slot (slot.position)}
         {#if slot.selected && (slot.position !== 'main' || customMain)}
           {@const selected = slot.selected}
-          <aside class:hidden-pane={hiddenPaneSlots.has(slot.position) || (slot.position === 'main' && (Boolean(activeMaterial) || materialsOpen))} class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
+          <aside class:hidden-pane={!paneVisibility[slot.position] || (slot.position === 'main' && (Boolean(activeMaterial) || materialsOpen))} class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
             {#if slot.position === 'right'}<PaneDivider edge="left" label="Resize right pane" size={Math.min(rightWidth, rightLimit)} min={180} max={rightLimit} onResize={(size) => rightWidth = size} />{/if}
             {#if slot.position === 'bottom'}<PaneDivider edge="top" label="Resize bottom pane" size={Math.min(bottomHeight, workspaceHeight * 0.6)} min={100} max={workspaceHeight * 0.6} onResize={(size) => bottomHeight = size} />{/if}
             <PaneHeader title={selected[1].title ?? selected[0]} choices={slot.choices} selected={selected[0]}
+              collapsible={slot.position !== 'main' || rightPaneOpen || bottomPaneOpen}
               selectionDisabled={busyPaneSlots.has(slot.position)} onSelect={(id) => selectPane(slot.position, id)} onCollapse={() => togglePane(slot.position)} />
             {#each slot.choices as [paneId, paneConfig] (paneId)}
               <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
