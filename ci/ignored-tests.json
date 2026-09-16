@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 46,
+  "expected_test_count": 47,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -1055,6 +1055,26 @@
       ],
       "evidence_class": "real-model-runtime",
       "promotion_prohibition": "Passing this local model and QUIC test cannot promote native sharing UI, Signal linking, Internet NAT traversal, or release acceptance.",
+      "platforms": [
+        "linux",
+        "macos"
+      ]
+    },
+    {
+      "test_id": "peer_compute::batch::native_qualification::independent_peers_share_native_decode",
+      "package": "tauri-plugin-loom",
+      "target": "lib",
+      "source": "products/loom/crates/tauri-plugin-loom/src/peer_compute_batch_qualification.rs",
+      "prerequisite": "requires a real GGUF and instrumented native decode observations; run scripts/qualify-peer-native.mjs",
+      "required_environment": [
+        "MOM_LLAMA_MODEL_PATH",
+        "LOOM_NATIVE_BATCH_TRACE_PATH",
+        "LOOM_NATIVE_BATCH_MAPPING_PATH",
+        "LOOM_NATIVE_BATCH_OUTPUT_PATH",
+        "LOOM_QUALIFICATION_SOURCE_SHA"
+      ],
+      "evidence_class": "real-model-runtime",
+      "promotion_prohibition": "Passing this instrumented production peer executor test cannot promote packaged-app, physical-network, continuous-admission, cross-platform, or release readiness.",
       "platforms": [
         "linux",
         "macos"

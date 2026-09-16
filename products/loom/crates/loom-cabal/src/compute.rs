@@ -1,5 +1,6 @@
 //! Whole, explicitly granted model jobs. These receipts are remote assertions;
 //! a signature authenticates the host, not its model or execution environment.
+mod batching;
 mod client;
 mod media;
 mod retention;
@@ -34,6 +35,7 @@ pub(crate) use wire::{Handler, Request, Response, request};
 pub(crate) const ALPN: &[u8] = b"app.delysis.loom/compute/4";
 const STORAGE_VERSION: i64 = 4;
 pub const MAX_COMPUTE_TEXT_BYTES: usize = 64 * 1024;
+pub const MAX_COMPUTE_BATCH_JOBS: usize = 4;
 const MAX_OUTPUT_TOKENS: u32 = 2048;
 const MAX_JOB_SECONDS: u32 = 120;
 const MAX_GRANT_JOBS: u32 = 256;
@@ -272,21 +274,68 @@ pub enum ComputeRejection {
     Unavailable,
 }
 
-/// The host adapter must own and join its actual native model worker, including
-/// after cancellation. Dropping a future is not worker shutdown. Local model
-/// selection and idle admission belong to that adapter, never to peer input.
+pub type ComputeFuture =
+    Pin<Box<dyn Future<Output = std::result::Result<String, ComputeFailure>> + Send>>;
+pub type ComputeBatchFuture = Pin<Box<dyn Future<Output = Vec<ComputeBatchOutput>> + Send>>;
+
+/// A transient scheduling envelope, never a replacement for a durable job.
+#[derive(Clone, Debug)]
+pub struct ComputeBatchJob {
+    pub job: HostComputeJob,
+    pub cancel: CancellationToken,
+}
+
+#[derive(Debug)]
+pub struct ComputeBatchOutput {
+    pub peer: PublicKey,
+    pub job: Uuid,
+    pub result: std::result::Result<String, ComputeFailure>,
+}
+
+/// The adapter owns and joins native work, including after cancellation.
+/// Batch-aware adapters must cancel individual cases, not their siblings.
 pub trait ComputeExecutor: std::fmt::Debug + Send + Sync + 'static {
-    /// An advisory admission check. Execute must recheck its native authority
-    /// because local activity or model selection can change before dispatch.
     fn available(&self, _model: &ComputeModel) -> bool {
         true
     }
 
-    fn execute(
-        &self,
-        job: HostComputeJob,
-        cancel: CancellationToken,
-    ) -> Pin<Box<dyn Future<Output = std::result::Result<String, ComputeFailure>> + Send>>;
+    /// Static collection only. This does not promise continuous admission.
+    fn batch_limit(&self) -> usize {
+        1
+    }
+
+    /// The host also enforces identical cabal, membership epoch and exact model.
+    /// The adapter must enforce its prompt/media/cache compatibility boundary.
+    fn batch_compatible(&self, _first: &HostComputeJob, _next: &HostComputeJob) -> bool {
+        false
+    }
+
+    fn execute(&self, job: HostComputeJob, cancel: CancellationToken) -> ComputeFuture;
+
+    fn execute_batch(&self, mut jobs: Vec<ComputeBatchJob>) -> ComputeBatchFuture {
+        if jobs.len() != 1 {
+            return Box::pin(async move {
+                jobs.into_iter()
+                    .map(|item| ComputeBatchOutput {
+                        peer: item.job.peer,
+                        job: item.job.id,
+                        result: Err(ComputeFailure::InputUnsupported),
+                    })
+                    .collect()
+            });
+        }
+        let item = jobs.remove(0);
+        let peer = item.job.peer;
+        let job = item.job.id;
+        let work = self.execute(item.job, item.cancel);
+        Box::pin(async move {
+            vec![ComputeBatchOutput {
+                peer,
+                job,
+                result: work.await,
+            }]
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -297,11 +346,17 @@ pub struct HostComputeJob {
     pub input: ComputeInput,
 }
 
+struct PendingComputeJob {
+    job: HostComputeJob,
+    admitted_at: tokio::time::Instant,
+}
+
 type Authority = Arc<dyn Fn(&ComputeGrant) -> bool + Send + Sync>;
 
 struct HostState {
     ledger: Ledger,
-    active: Option<HostComputeJob>,
+    active: Vec<HostComputeJob>,
+    collecting: bool,
     closed: bool,
     failure: Option<String>,
 }
@@ -310,7 +365,7 @@ pub struct ComputeHost {
     state: Arc<Mutex<HostState>>,
     authority: Authority,
     executor: Arc<dyn ComputeExecutor>,
-    pending: mpsc::Sender<HostComputeJob>,
+    pending: mpsc::Sender<PendingComputeJob>,
     stop: CancellationToken,
     worker: tokio::sync::Mutex<Option<JoinHandle<Result<()>>>>,
 }
@@ -330,13 +385,14 @@ impl ComputeHost {
     ) -> Result<Arc<Self>> {
         let state = Arc::new(Mutex::new(HostState {
             ledger: Ledger::open(directory, identity)?,
-            active: None,
+            active: Vec::new(),
+            collecting: false,
             closed: false,
             failure: None,
         }));
-        let (pending, receiver) = mpsc::channel(1);
+        let (pending, receiver) = mpsc::channel(MAX_COMPUTE_BATCH_JOBS);
         let stop = CancellationToken::new();
-        let worker = tokio::spawn(supervise(
+        let worker = tokio::spawn(batching::supervise(
             state.clone(),
             authority.clone(),
             executor.clone(),
@@ -353,8 +409,7 @@ impl ComputeHost {
         }))
     }
 
-    /// Called only by the local host, after explicit user selection of a peer
-    /// and verified model. Remote protocol requests have no grant operation.
+    /// Called only by the local host after explicit peer and model selection.
     pub fn grant(&self, grant: ComputeGrant) -> Result<()> {
         grant.validate()?;
         let mut state = self.lock()?;
@@ -373,7 +428,12 @@ impl ComputeHost {
         let result = (|| {
             let mut state = self.lock()?;
             state.ledger.revoke(grant)?;
-            if let Some(job) = state.active.clone().filter(|job| job.grant.id == grant) {
+            for job in state
+                .active
+                .clone()
+                .into_iter()
+                .filter(|job| job.grant.id == grant)
+            {
                 state
                     .ledger
                     .cancel(job.peer, job.id, ComputeCancellation::GrantRevoked)?;
@@ -416,9 +476,7 @@ impl ComputeHost {
 
     pub async fn shutdown(&self) -> Result<()> {
         self.stop();
-        // Keep the handle in its owner while awaiting. Taking it first would
-        // detach the worker if this shutdown future were cancelled or timed out.
-        // Concurrent and later shutdown callers must still join that same work.
+        // Retain the handle across an abandoned or timed-out shutdown future.
         let mut slot = self.worker.lock().await;
         if let Some(worker) = slot.as_mut() {
             let result = worker
@@ -445,9 +503,7 @@ impl ComputeHost {
     fn respond(&self, peer: PublicKey, request: Request) -> Result<Response> {
         let mut state = self.lock()?;
         let cancel = matches!(&request, Request::Cancel { .. });
-        // Retrieval and existing-job cancellation survive grant revocation.
-        // Cancelling an unobserved job spends its reviewed grant once and binds
-        // the exact input, so a delayed submission can never execute it.
+        // Exact retries and retrieval precede admission, even after revocation.
         match request {
             Request::Status { job } => Ok(receipt_response(state.ledger.get(peer, job)?)),
             Request::Offers { cabal } => {
@@ -505,18 +561,36 @@ impl ComputeHost {
                     return reject(ComputeRejection::InvalidRequest);
                 }
                 let fingerprint = input.fingerprint(grant.id)?;
-                if !cancel && (state.active.is_some() || !self.executor.available(&grant.model)) {
-                    return reject(ComputeRejection::Busy);
-                }
-                if !state.ledger.has_capacity(&grant, Some(&input))? {
-                    return reject(ComputeRejection::Exhausted);
-                }
                 let pending = HostComputeJob {
                     id: job,
                     peer,
                     grant,
                     input,
                 };
+                if !cancel {
+                    let limit = self.executor.batch_limit().clamp(1, MAX_COMPUTE_BATCH_JOBS);
+                    let compatible = state.active.first().is_none_or(|first| {
+                        state.collecting
+                            && first.grant.cabal == pending.grant.cabal
+                            && first.grant.epoch == pending.grant.epoch
+                            && first.grant.model == pending.grant.model
+                            && self.executor.batch_compatible(first, &pending)
+                    });
+                    if state.active.len() >= limit
+                        || state.active.iter().filter(|item| item.peer == peer).count() >= 2
+                        || !compatible
+                        || !self.executor.available(&pending.grant.model)
+                    {
+                        return reject(ComputeRejection::Busy);
+                    }
+                }
+                if !state
+                    .ledger
+                    .has_capacity(&pending.grant, Some(&pending.input))?
+                {
+                    return reject(ComputeRejection::Exhausted);
+                }
+                let admitted_at = tokio::time::Instant::now();
                 let receipt = state.ledger.accept(&pending, fingerprint)?;
                 if cancel {
                     state
@@ -533,12 +607,24 @@ impl ComputeHost {
                         receipt: Box::new(receipt),
                     });
                 }
-                state.active = Some(pending.clone());
-                if self.pending.try_send(pending).is_err() {
+                if state.active.is_empty() {
+                    state.collecting = true;
+                }
+                state.active.push(pending.clone());
+                if self
+                    .pending
+                    .try_send(PendingComputeJob {
+                        job: pending,
+                        admitted_at,
+                    })
+                    .is_err()
+                {
                     state.closed = true;
+                    self.stop.cancel();
                     state
                         .ledger
                         .transition(peer, job, ComputeStatus::Interrupted)?;
+                    state.active.retain(|item| item.peer != peer || item.id != job);
                     return reject(ComputeRejection::Unavailable);
                 }
                 Ok(Response::Receipt {
@@ -566,150 +652,6 @@ fn receipt_response(receipt: Option<RemoteJobReceipt>) -> Response {
     )
 }
 
-async fn supervise(
-    state: Arc<Mutex<HostState>>,
-    authority: Authority,
-    executor: Arc<dyn ComputeExecutor>,
-    mut pending: mpsc::Receiver<HostComputeJob>,
-    stop: CancellationToken,
-) -> Result<()> {
-    let outcome = loop {
-        let job = tokio::select! {
-            biased;
-            value = pending.recv() => match value { Some(job) => job, None => break Ok(()) },
-            () = stop.cancelled() => break Ok(()),
-        };
-        if let Err(error) = run_job(&state, &authority, executor.clone(), job, &stop).await {
-            // A persistence failure must not open the slot or replay a model.
-            stop.cancel();
-            break Err(error);
-        }
-        if stop.is_cancelled() {
-            break Ok(());
-        }
-    };
-    let cleanup = (|| {
-        let mut state = state
-            .lock()
-            .map_err(|_| Error::Invalid("Compute owner stopped"))?;
-        state.closed = true;
-        if let Some(job) = state.active.take() {
-            state
-                .ledger
-                .transition(job.peer, job.id, ComputeStatus::Interrupted)?;
-        }
-        Ok(())
-    })();
-    outcome.and(cleanup)
-}
-
-fn cancellation(
-    state: &mut HostState,
-    authority: &Authority,
-    job: &HostComputeJob,
-    stop: &CancellationToken,
-    expired: bool,
-) -> Result<Option<ComputeCancellation>> {
-    let reason = if stop.is_cancelled() {
-        Some(ComputeCancellation::HostStopping)
-    } else if state.ledger.find_grant(job.grant.id)?.is_none() || !authority(&job.grant) {
-        Some(ComputeCancellation::GrantRevoked)
-    } else if expired {
-        Some(ComputeCancellation::TimeLimit)
-    } else {
-        None
-    };
-    let receipt = if let Some(reason) = reason {
-        state.ledger.cancel(job.peer, job.id, reason)?
-    } else {
-        state.ledger.get(job.peer, job.id)?
-    }
-    .ok_or(Error::Invalid("Compute job disappeared"))?;
-    Ok(match receipt.payload.status {
-        ComputeStatus::Cancelling { reason } => Some(reason),
-        _ => None,
-    })
-}
-
-async fn run_job(
-    state: &Mutex<HostState>,
-    authority: &Authority,
-    executor: Arc<dyn ComputeExecutor>,
-    job: HostComputeJob,
-    stop: &CancellationToken,
-) -> Result<()> {
-    {
-        let mut state = state
-            .lock()
-            .map_err(|_| Error::Invalid("Compute owner stopped"))?;
-        if let Some(reason) = cancellation(&mut state, authority, &job, stop, false)? {
-            state
-                .ledger
-                .transition(job.peer, job.id, ComputeStatus::Cancelled { reason })?;
-            state.active = None;
-            return Ok(());
-        }
-        state
-            .ledger
-            .transition(job.peer, job.id, ComputeStatus::Running)?;
-    }
-    let cancel = CancellationToken::new();
-    let worker_cancel = cancel.clone();
-    let worker_job = job.clone();
-    // A separately joined task contains adapter panics. Cancellation never drops
-    // this task: the adapter retains ownership until native worker joining ends.
-    let mut worker = tokio::spawn(async move { executor.execute(worker_job, worker_cancel).await });
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs(u64::from(job.grant.max_seconds));
-    let mut persistence_failure = None;
-    let result = loop {
-        tokio::select! {
-            result = &mut worker => break result,
-            () = tokio::time::sleep(Duration::from_millis(50)) => {
-                let observed = state.lock().map_err(|_| Error::Invalid("Compute owner stopped"))
-                    .and_then(|mut state| cancellation(&mut state, authority, &job, stop, tokio::time::Instant::now() >= deadline));
-                match observed {
-                    Ok(Some(_)) => cancel.cancel(),
-                    Ok(None) => (),
-                    Err(error) => { cancel.cancel(); persistence_failure = Some(error); }
-                }
-            }
-        }
-    };
-    // Even failed durable cancellation waits for the adapter to join first.
-    if let Some(error) = persistence_failure {
-        return Err(error);
-    }
-    let mut state = state
-        .lock()
-        .map_err(|_| Error::Invalid("Compute owner stopped"))?;
-    let status = if let Some(reason) = cancellation(
-        &mut state,
-        authority,
-        &job,
-        stop,
-        tokio::time::Instant::now() >= deadline,
-    )? {
-        ComputeStatus::Cancelled { reason }
-    } else {
-        match result {
-            Ok(Ok(text)) if text.len() <= MAX_COMPUTE_TEXT_BYTES => {
-                ComputeStatus::Completed { text }
-            }
-            Ok(Ok(_)) => ComputeStatus::Failed {
-                failure: ComputeFailure::InvalidOutput,
-            },
-            Ok(Err(failure)) => ComputeStatus::Failed { failure },
-            Err(_) => ComputeStatus::Failed {
-                failure: ComputeFailure::WorkerPanicked,
-            },
-        }
-    };
-    state.ledger.transition(job.peer, job.id, status)?;
-    state.active = None;
-    Ok(())
-}
-
 fn now_ms() -> Result<u64> {
     u64::try_from(
         SystemTime::now()
@@ -723,3 +665,7 @@ fn now_ms() -> Result<u64> {
 #[cfg(test)]
 #[path = "compute/record_tests.rs"]
 mod record_tests;
+
+#[cfg(test)]
+#[path = "compute/batch_tests.rs"]
+mod batch_tests;
