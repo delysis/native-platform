@@ -104,6 +104,15 @@ async fn interrupted_pipeline_with_media(
     pair: &Pair,
     media: Vec<llama_native_types::MediaInput>,
 ) -> CommandId {
+    interrupted_pipeline_with_source(pair, media, None).await
+}
+
+#[allow(clippy::too_many_lines)] // Keep the captured admission and interruption boundary together.
+async fn interrupted_pipeline_with_source(
+    pair: &Pair,
+    media: Vec<llama_native_types::MediaInput>,
+    material: Option<Value>,
+) -> CommandId {
     let id = CommandId::new();
     let source = source(pair);
     let root = pair.temporary.path().join("writing");
@@ -132,13 +141,26 @@ async fn interrupted_pipeline_with_media(
             })
             .collect()
     };
+    let argument = if material.is_some() {
+        "find(@Research, \"nightjar\")"
+    } else {
+        "@Draft"
+    };
+    let first_expression = format!("=@Polish({argument})");
+    let mut bindings = BTreeMap::from([
+        ("Polish".into(), Value::Text("Polish these words.".into())),
+        ("Draft".into(), Value::Text(source.text.clone())),
+    ]);
+    if let Some(material) = material {
+        bindings.insert("Research".into(), material);
+    }
     let receipt = RunReceipt {
         remote: Some(target(pair)),
         literal_input: false,
         run: TerminalRun {
             run_id: id.to_string(),
             status: "running".into(),
-            expression: "=@Polish(@Polish(@Draft))".into(),
+            expression: format!("=@Polish(@Polish({argument}))"),
             source_document_id: source.document_id.to_string(),
             presentation: None,
             turn_boundary: None,
@@ -158,10 +180,7 @@ async fn interrupted_pipeline_with_media(
         context_references: None,
         media: media_evidence,
         model: None,
-        bindings: BTreeMap::from([
-            ("Polish".into(), Value::Text("Polish these words.".into())),
-            ("Draft".into(), Value::Text(source.text.clone())),
-        ]),
+        bindings,
         evidence: Vec::new(),
         searches: Vec::new(),
         omitted_evidence: BTreeSet::new(),
@@ -192,7 +211,7 @@ async fn interrupted_pipeline_with_media(
             recovery: RecoveryMode::Resume,
         };
         evaluator
-            .evaluate_command(&parse_neural_command("=@Polish(@Draft)").unwrap())
+            .evaluate_command(&parse_neural_command(&first_expression).unwrap())
             .unwrap();
         // Deliberately no finish: models a requester process lost after import.
     })
@@ -200,6 +219,64 @@ async fn interrupted_pipeline_with_media(
     .unwrap();
     assert_eq!(pair.executor.0.load(Ordering::SeqCst), 1);
     id
+}
+
+fn research(pair: &Pair) -> (crate::materials::MaterialEntry, Value) {
+    let state = pair.app.state::<PluginState>();
+    let mut session = state.session.lock().unwrap();
+    let store = session.store.as_mut().unwrap();
+    let path = store.root().join("research.txt");
+    std::fs::write(&path, "The nightjar sings in our original garden.").unwrap();
+    let attachment = crate::context_attachments::import_path(store.root(), &path).unwrap();
+    let material =
+        crate::materials::bind_attachment(store, &attachment.id, Some("Research")).unwrap();
+    let value = material_context::resolve(store, &material.id).unwrap();
+    (material, value)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_recovery_uses_saved_search_evidence_after_the_source_is_removed() {
+    let pair = Pair::new().await;
+    let (material, value) = research(&pair);
+    let id = interrupted_pipeline_with_source(&pair, Vec::new(), Some(value.clone())).await;
+    {
+        let state = pair.app.state::<PluginState>();
+        let mut session = state.session.lock().unwrap();
+        let store = session.store.as_mut().unwrap();
+        crate::materials::remove(store, &material.id).unwrap();
+        assert!(material_context::search(store, &value, "nightjar").is_err());
+    }
+    pair.reopen_requester().await;
+    let checked = recover(&pair, id, RecoveryMode::Check).await;
+    assert_eq!(checked.status, "unconfirmed");
+    assert_eq!(pair.executor.0.load(Ordering::SeqCst), 1);
+    let resumed = recover(&pair, id, RecoveryMode::Resume).await;
+    assert_eq!(resumed.status, "completed", "{:?}", resumed.error);
+    assert!(resumed.preview.contains("original garden"));
+    assert_eq!(pair.executor.0.load(Ordering::SeqCst), 2);
+    assert!(
+        resumed
+            .events
+            .iter()
+            .any(|event| event.kind == TerminalEventKind::Search)
+    );
+    let receipt = read_receipt(
+        &pair.temporary.path().join("writing"),
+        &id.to_string(),
+        true,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(receipt.searches.len(), 1);
+    assert_eq!(receipt.searches[0].query, "nightjar");
+    assert_eq!(
+        serde_json::to_value(&receipt.evidence).unwrap(),
+        serde_json::to_value(&receipt.searches[0].hits).unwrap()
+    );
+    let replay = recover(&pair, id, RecoveryMode::Check).await;
+    assert_eq!(replay.events.len(), resumed.events.len());
+    assert_eq!(pair.executor.0.load(Ordering::SeqCst), 2);
+    pair.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -356,7 +433,8 @@ async fn check_never_creates_a_later_step_and_resume_reuses_results_after_reques
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelling_an_interrupted_pipeline_persists_across_reopen_and_blocks_later_steps() {
     let pair = Pair::new().await;
-    let id = interrupted_pipeline(&pair).await;
+    let (_, material) = research(&pair);
+    let id = interrupted_pipeline_with_source(&pair, Vec::new(), Some(material)).await;
     terminal_cancel(
         pair.project.clone(),
         pair.session.clone(),
@@ -368,6 +446,13 @@ async fn cancelling_an_interrupted_pipeline_persists_across_reopen_and_blocks_la
     pair.reopen_requester().await;
     let recovered = recover(&pair, id, RecoveryMode::Resume).await;
     assert_eq!(recovered.status, "cancelled", "{:?}", recovered.error);
+    assert!(recovered.preview.contains("original garden"));
+    assert!(
+        recovered
+            .events
+            .iter()
+            .any(|event| event.kind == TerminalEventKind::Search)
+    );
     assert_eq!(pair.executor.0.load(Ordering::SeqCst), 1);
     assert!(
         find_job(

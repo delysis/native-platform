@@ -5,7 +5,7 @@ import MaterialView from './MaterialView.svelte';
 import type { MaterialEntry, MaterialEvidence } from './materials';
 import '../app.css';
 const ipc = vi.hoisted(() => ({ read: vi.fn(), search: vi.fn(), evidence: vi.fn(), pin: vi.fn(), original: vi.fn(), remove: vi.fn() }));
-vi.mock('./ipc', async original => ({ ...await original<typeof import('./ipc')>(), readMaterial: ipc.read, searchMaterial: ipc.search, readMaterialEvidence: ipc.evidence, pinMaterial: ipc.pin, removeMaterial: ipc.remove, revealAttachmentOriginal: ipc.original }));
+vi.mock('./ipc', async original => ({ ...await original<typeof import('./ipc')>(), readMaterial: ipc.read, searchMaterial: ipc.search, readMaterialEvidence: ipc.evidence, pinMaterial: ipc.pin, removeMaterial: ipc.remove, revealMaterialOriginal: ipc.original }));
 const material: MaterialEntry = { id: 'material-' + 'a'.repeat(64), name: 'Research', reference: '@"materials/Research#a"', kind: 'library', pinned: false, available: true, source_path: '/private/library.sqlite', attachment_id: null };
 const evidence: MaterialEvidence = { id: 'b'.repeat(64), reference: '@"evidence/b"', material_id: material.id, title: 'A source', text: 'Exact café evidence.\nSecond line.', source_revision: 'revision', text_sha256: 'hash', locator: { document_id: 'source', block_id: 7 } };
 let view: ReturnType<typeof mount> | undefined;
@@ -21,6 +21,12 @@ function render(props: Partial<ComponentProps<typeof MaterialView>> = {}) {
   return { onUse, onChanged, onClose, onRemoved };
 }
 describe('named material viewing', () => {
+  it('reveals an original using the retained material identity', async () => {
+    render({ material: { ...material, kind: 'attachment', attachment_id: 'a'.repeat(64) } });
+    await page.getByText('•••', { exact: true }).click();
+    await page.getByRole('button', { name: 'Open original' }).click();
+    expect(ipc.original).toHaveBeenCalledWith('project', 'session', material.id);
+  });
   it('keeps insertion actions out of the header and always exposes closing the source', async () => {
     const { onClose } = render({ initialEvidence: evidence, originTitle: null });
     await expect.element(page.getByRole('button', { name: 'Close source' })).toBeVisible();

@@ -73,6 +73,19 @@ fn cancelled() -> IpcFailure {
     )
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PeerContext {
+    request: BlobId,
+    evidence: Vec<crate::materials::MaterialEvidence>,
+    searches: Vec<crate::materials::MaterialSearch>,
+    omitted: BTreeSet<String>,
+}
+
+fn context_id(step: u32) -> BlobId {
+    BlobId::digest(format!("loom_terminal_peer_context_v1:{step}").as_bytes())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct PeerTerminalRequest {
@@ -334,13 +347,27 @@ impl Evaluator<'_> {
                     "Saved steps are checked. Resume to continue this experiment.",
                 ));
             }
-            None => tauri::async_runtime::block_on(compute_job_prepare(
-                project.clone(),
-                session.clone(),
-                request.clone(),
-                target.roster_hash,
-                self.state.clone(),
-            ))?,
+            None => {
+                let context = PeerContext {
+                    request: BlobId::digest(&serde_json::to_vec(&request).map_err(io_failure)?),
+                    evidence: self.receipt.evidence.clone(),
+                    searches: self.receipt.searches.clone(),
+                    omitted: self.receipt.omitted_evidence.clone(),
+                };
+                crate::terminal_receipts::write_context(
+                    self.root,
+                    &self.receipt.run.run_id,
+                    context_id(self.step),
+                    &serde_json::to_vec(&context).map_err(io_failure)?,
+                )?;
+                tauri::async_runtime::block_on(compute_job_prepare(
+                    project.clone(),
+                    session.clone(),
+                    request.clone(),
+                    target.roster_hash,
+                    self.state.clone(),
+                ))?
+            }
         };
         let deadline = std::time::Instant::now()
             + Duration::from_secs(u64::from(target.grant.max_seconds) + 10);
@@ -431,6 +458,24 @@ impl Evaluator<'_> {
     }
 
     fn retain_remote(&mut self, job: &ClientJob, text: &str) -> Result<(), IpcFailure> {
+        let bytes = crate::terminal_receipts::read_context(
+            self.root,
+            &self.receipt.run.run_id,
+            context_id(self.step),
+        )?
+        .ok_or_else(|| failure("The peer step's saved source evidence is unavailable."))?;
+        let context: PeerContext = serde_json::from_slice(&bytes).map_err(io_failure)?;
+        if context.request != BlobId::digest(&serde_json::to_vec(&job.request).map_err(io_failure)?)
+        {
+            return Err(failure(
+                "The peer step's source evidence belongs to different input.",
+            ));
+        }
+        // Cancellation can retain completed jobs without reevaluating their
+        // expressions. Restore the evidence frozen before this exact dispatch.
+        self.receipt.evidence = context.evidence;
+        self.receipt.searches = context.searches;
+        self.receipt.omitted_evidence = context.omitted;
         let evidence = self.with_store(|store| {
             store
                 .store_provenance_blob(

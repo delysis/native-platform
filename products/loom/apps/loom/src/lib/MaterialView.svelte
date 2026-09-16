@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { convertFileSrc } from '@tauri-apps/api/core';
-  import { readMaterial, searchMaterial, readMaterialEvidence, revealAttachmentOriginal, normalizeFailure, pinMaterial, removeMaterial } from './ipc';
+  import { readMaterial, searchMaterial, readMaterialEvidence, revealMaterialOriginal, normalizeFailure, pinMaterial, removeMaterial } from './ipc';
   import { materialLocatorLabel, materialReferenceMarkdown, evidenceReferenceMarkdown, type MaterialEntry, type MaterialRead, type MaterialEvidence, type MaterialSearch } from './materials';
 
   export let projectId: string;
@@ -93,7 +93,7 @@
   }
   async function original(): Promise<void> {
     if (!material.attachment_id) return;
-    try { await revealAttachmentOriginal(projectId, sessionId, material.attachment_id); }
+    try { await revealMaterialOriginal(projectId, sessionId, material.id); }
     catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
   }
   async function copyReference(): Promise<void> {

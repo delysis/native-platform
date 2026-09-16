@@ -4770,31 +4770,40 @@ async fn document_export_choose<R: Runtime>(
 async fn attachment_reveal_original(
     project_id: String,
     session_id: String,
-    document_id: String,
-    attachment_id: String,
+    document_id: Option<String>,
+    attachment_id: Option<String>,
+    material_id: Option<String>,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
     let _admission = lock_application_admission(&state, "an attachment reveal")?;
     let path = {
         let mut session = lock_session(&state)?;
         let store = require_bound_store(&mut session, &project_id, &session_id)?;
-        let document_id = document_id
-            .parse::<DocumentId>()
-            .map_err(|_| stale_document_action_failure())?;
-        let registered = store
-            .registered_document(document_id)
-            .map_err(IpcFailure::store)?
-            .ok_or_else(stale_document_action_failure)?;
-        let document = store
-            .read_document(&registered.relative_path)
-            .map_err(IpcFailure::store)?;
-        context_attachments::shared::original_for_document(
-            store.root(),
-            &document_id.to_string(),
-            &document.text,
-            &attachment_id,
-        )
-        .map_err(|error| IpcFailure::context_attachment(&error))?
+        if let (None, None, Some(material_id)) = (&document_id, &attachment_id, &material_id) {
+            materials::original_path(store, material_id)?
+        } else if let (Some(document_id), Some(attachment_id), None) =
+            (&document_id, &attachment_id, &material_id)
+        {
+            let document_id = document_id
+                .parse::<DocumentId>()
+                .map_err(|_| stale_document_action_failure())?;
+            let registered = store
+                .registered_document(document_id)
+                .map_err(IpcFailure::store)?
+                .ok_or_else(stale_document_action_failure)?;
+            let document = store
+                .read_document(&registered.relative_path)
+                .map_err(IpcFailure::store)?;
+            context_attachments::shared::original_for_document(
+                store.root(),
+                &document_id.to_string(),
+                &document.text,
+                attachment_id,
+            )
+            .map_err(|error| IpcFailure::context_attachment(&error))?
+        } else {
+            return Err(stale_document_action_failure());
+        }
     };
     tauri_plugin_opener::reveal_item_in_dir(path)
         .map_err(|error| IpcFailure::new("attachment_reveal_failed", error.to_string(), false))

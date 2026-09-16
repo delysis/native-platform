@@ -49,6 +49,7 @@
     {#each cabal.problems as problem}<p class="error" role="alert"><strong>{problem.name}</strong><br />{problem.message}</p>{/each}
     {#if cabal.documents.some(item => item.shared.deleted)}<p class="quiet">An open document was removed from this cabal. Its text stays here until you leave it.</p>{/if}
     {#if unsaved || cabal.read_only || cabal.orphaned_changes || cabal.removed_documents}<div class="recovery"><p>Unsent edits and removed writing can be kept in private recovery copies.</p><button type="button" disabled={busy} on:click={() => void run(async () => { const paths = await onRecover(); note = `${paths.length} recovery ${paths.length === 1 ? 'copy' : 'copies'} in the workspace`; })}>Recover my copies</button></div>{/if}
+    <slot />
     {#if owner}<button class="invite" type="button" disabled={busy} on:click={() => void run(invite)}>Invite someone</button>{/if}
     {#if owner}{#key cabal.id}<CabalOwnership {cabal} {onTransfer} />{/key}{/if}
     {#key cabal.id}<ComputeHostControls {cabal} scope={{ projectId, sessionId, cabalId: cabal.id }} sharing={computeSharing} />{/key}

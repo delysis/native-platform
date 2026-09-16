@@ -8220,13 +8220,14 @@
     const attachmentId = href.match(/^loom-attachment:([a-f0-9]{64})$/u)?.[1];
     if (attachmentId) {
       const sourceId = link.closest('[data-loom-document]')?.getAttribute('data-loom-document') ?? document?.summary.document_id;
+      if (!sourceId) return;
       if (sourceId && cabal) {
         // Native lookup preserves both shared and private recovery namespaces.
         void revealAttachmentOriginal(project.project_id, project.session_id, sourceId, attachmentId).catch(recordFailure);
         return;
       }
       const captured = { projectId: project.project_id, sessionId: project.session_id };
-      void bindAttachmentMaterial(captured.projectId, captured.sessionId, attachmentId).then(item => {
+      void bindAttachmentMaterial(captured.projectId, captured.sessionId, attachmentId, sourceId).then(item => {
         if (project?.session_id !== captured.sessionId) return;
         materialChanged(item); openMaterial(item);
       }).catch(recordFailure);
@@ -10288,14 +10289,6 @@
                 >×</button>
               </div>
             </div>
-              {#if cabal?.documents.some(item => item.local.summary.document_id === document?.summary.document_id)}
-                {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
-                  <ShareContext scope={{ projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id }}
-                    readonly={editorReadonly || contextAttachmentBusy || Boolean(cabal?.read_only)}
-                    beforeReview={persistCurrentContextText}
-                    onOpen={(published) => openSharedContextDocument(published.document_id)} />
-                {/key}
-              {/if}
             <div class="context-composer">
               <div class="context-editor-surface" on:focusout={flushContextEditorProjection}>
                 {#if mode === 'visual' && canUseVisualMarkdown(contextText, true)}
@@ -10665,7 +10658,19 @@
               projectId={project.project_id} sessionId={project.session_id} {computeSharing}
               onClose={() => cabalOpen = false} onInvite={inviteCabal}
               onJoin={async (invitation, name) => { await doOpenProject(() => joinCabal(invitation, name)); }}
-              onRemove={removeCabalMember} onTransfer={handOffCabalOwner} onRecover={recoverCabalCopies} />
+              onRemove={removeCabalMember} onTransfer={handOffCabalOwner} onRecover={recoverCabalCopies}>
+              {#if document && cabal?.documents.some(item => item.local.summary.document_id === document?.summary.document_id)}
+                {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
+                  <div class="cabal-document-context" aria-label={`Context for ${document.summary.title}`}>
+                    <p>Context for <strong>{document.summary.title}</strong></p>
+                    <ShareContext scope={{ projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id }}
+                      readonly={editorReadonly || contextAttachmentBusy || Boolean(cabal?.read_only)}
+                      beforeReview={persistCurrentContextText}
+                      onOpen={(published) => openSharedContextDocument(published.document_id)} />
+                  </div>
+                {/key}
+              {/if}
+            </CabalPane>
           {/key}
         </aside>
       {/if}

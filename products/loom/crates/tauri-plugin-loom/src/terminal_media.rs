@@ -183,6 +183,11 @@ mod tests {
         assert_eq!(media.len(), 2);
         assert_eq!(media[0].bytes, first_bytes);
         assert_eq!(media[1].bytes, second_bytes);
+        let value = crate::material_context::resolve(&store, "reference").unwrap();
+        let referenced_media = crate::material_context::native_media(&store, [&value]).unwrap();
+        assert_eq!(referenced_media.len(), 2);
+        assert_eq!(referenced_media[0].bytes, second_bytes);
+        assert_eq!(referenced_media[1].bytes, first_bytes);
         assert_eq!(
             resolve(&store, &source, &[], 32_768)
                 .expect("source only")

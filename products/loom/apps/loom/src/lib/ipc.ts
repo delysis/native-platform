@@ -994,8 +994,11 @@ export function cancelImportAccount(projectId: string, sessionId: string, operat
 export function listMaterials(projectId: string, sessionId: string): Promise<import('./materials').MaterialEntry[]> {
   return call('material_list', { projectId, sessionId });
 }
-export function bindAttachmentMaterial(projectId: string, sessionId: string, attachmentId: string): Promise<import('./materials').MaterialEntry> {
-  return call('material_bind_attachment', { projectId, sessionId, attachmentId });
+export function bindAttachmentMaterial(projectId: string, sessionId: string, attachmentId: string, documentId?: string): Promise<import('./materials').MaterialEntry> {
+  return call('material_bind_attachment', { projectId, sessionId, documentId, attachmentId });
+}
+export function revealMaterialOriginal(projectId: string, sessionId: string, materialId: string): Promise<void> {
+  return call('attachment_reveal_original', { projectId, sessionId, materialId });
 }
 export function readMaterial(projectId: string, sessionId: string, materialId: string): Promise<import('./materials').MaterialRead> {
   return call('material_read', { projectId, sessionId, id: materialId });

@@ -141,6 +141,8 @@ button:disabled { cursor: default; opacity: .45; }
 .completion-context-heading, .completion-context-card { display: flex; align-items: center; gap: .75rem; }
 .completion-context-heading { justify-content: space-between; }
 .context-heading-actions { display: flex; align-items: center; gap: 4px; }
+.cabal-document-context { margin: 12px; }
+.cabal-document-context > p { margin: 0; color: var(--muted); }
 .completion-context-heading > div, .completion-context-card-copy { display: grid; gap: .15rem; }
 .completion-context-heading span, .completion-context-pane > p, .completion-context-card small { color: var(--muted); font-size: .78rem; }
 .completion-context-heading strong { font-size: .9rem; }

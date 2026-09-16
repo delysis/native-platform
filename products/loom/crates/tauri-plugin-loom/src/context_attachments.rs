@@ -1078,7 +1078,14 @@ pub(crate) fn source_native_media(
         read_manifest_metadata(project_root, attachment_id)?,
     )];
     preflight_native_media(&manifests)?;
-    load_admitted_media(project_root, manifests)
+    load_admitted_media(
+        project_root,
+        &AdmittedContext {
+            context: DocumentContext::default(),
+            manifests,
+            inline_root: project_root.to_owned(),
+        },
+    )
 }
 
 #[allow(clippy::too_many_lines)]

@@ -382,8 +382,9 @@ machines remains unverified. Peer model jobs retain and transmit
 the exact selected native media. Document-context settings remain local; they are
 not silently published with a manuscript.
 
-Cmd/Ctrl+Shift+C opens Materials in the otherwise quiet document sidebar. For a
-shared document, it offers **Share context as a document**.
+Cmd/Ctrl+Shift+C opens source connections in the main pane. For a shared
+document, the cabal pane offers **Share context as a document**, labeled with
+the current note. Named sources retain upstream's compact materials navigation.
 The native review names the current cabal members and shows the exact visible
 authored instructions, quoted source excerpts, and selected files. Publication
 creates an ordinary Markdown document under
@@ -438,6 +439,16 @@ retains exact native media evidence privately; its public result remains a signe
 remote assertion. Media consumes the active and retained storage budgets, and
 space for the terminal receipt is reserved before admission. Compute frames stop at
 12 MiB, independently of the smaller workspace synchronization frame bound.
+
+Material searches and budgeted source selections are frozen locally before peer
+execution. Recovery uses their exact retained passages even after the source is
+removed. Check cannot create a new lookup; Resume may perform a previously
+unreached lookup only against the admitted source revision. Each dispatched
+step also freezes its private source evidence, so cancellation can retain a
+completed result without reevaluating the expression or changing its provenance.
+Explicit document references include visible inline media, never that document's
+private scratch attachments. Attachment links retain their originating document's
+namespace; a received hash cannot become a grant to a private original.
 
 The native adapter uses the loaded, verified model and
 reserves an independent job owner after two seconds without local model work.

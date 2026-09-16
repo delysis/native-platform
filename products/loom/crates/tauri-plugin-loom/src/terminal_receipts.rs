@@ -79,6 +79,30 @@ pub(super) fn read(root: &Path, id: &str, finished: bool) -> Result<Option<Vec<u
     read_named(root, &file_name(id, finished)?)
 }
 
+// Bind each peer lookup to its frozen source, query and context budget. These
+// receipts are immutable and durable before a remote model can consume them.
+pub(super) fn read_context(
+    root: &Path,
+    id: &str,
+    input: loom_types::BlobId,
+) -> Result<Option<Vec<u8>>, IpcFailure> {
+    read_named(root, &context_name(id, input)?)
+}
+
+pub(super) fn write_context(
+    root: &Path,
+    id: &str,
+    input: loom_types::BlobId,
+    bytes: &[u8],
+) -> Result<(), IpcFailure> {
+    write_named(root, &context_name(id, input)?, bytes)
+}
+
+fn context_name(id: &str, input: loom_types::BlobId) -> Result<String, IpcFailure> {
+    file_name(id, false)?;
+    Ok(format!("{id}.context.{input}.json"))
+}
+
 fn read_named(root: &Path, name: &str) -> Result<Option<Vec<u8>>, IpcFailure> {
     #[cfg(all(unix, not(any(target_os = "redox", target_os = "espidf"))))]
     return unix::Directory::open(root)?.read(name);

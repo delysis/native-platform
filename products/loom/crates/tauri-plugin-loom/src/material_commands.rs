@@ -103,12 +103,23 @@ pub(super) async fn material_read_evidence(
 pub(super) async fn material_bind_attachment(
     project_id: String,
     session_id: String,
+    document_id: Option<String>,
     attachment_id: String,
     name: Option<String>,
     state: State<'_, PluginState>,
 ) -> Result<MaterialEntry, IpcFailure> {
     with_store(&state, &project_id, &session_id, |store| {
-        materials::bind_attachment(store, &attachment_id, name.as_deref())
+        match document_id.as_deref() {
+            Some(document_id) => materials::bind_document_attachment(
+                store,
+                document_id,
+                &attachment_id,
+                name.as_deref(),
+            ),
+            // Explicit imports have no document yet. Links always supply their
+            // originating document so their namespace is checked above.
+            None => materials::bind_attachment(store, &attachment_id, name.as_deref()),
+        }
     })
 }
 

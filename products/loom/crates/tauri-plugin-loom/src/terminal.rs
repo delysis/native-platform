@@ -221,6 +221,14 @@ struct RunReceipt {
     steps: Vec<BlobId>,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ContextLookup {
+    input: BlobId,
+    value: Value,
+    omitted: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct TerminalControl {
     cancelled: AtomicBool,
@@ -711,7 +719,7 @@ fn terminal_start<R: Runtime>(
         }
     }
     if !all_names.is_empty() {
-        crate::material_commands::restore_grants(&state, store)?;
+        crate::material_commands::restore_grants(state, store)?;
     }
     let mut bindings = BTreeMap::new();
     let mut sources = Vec::new();
@@ -1080,8 +1088,7 @@ impl Evaluator<'_> {
             NeuralExpression::Find { source, query } => {
                 let source = self.evaluate(source)?;
                 let query = material_context::exact(&self.evaluate(query)?)?;
-                let value =
-                    self.with_store(|store| material_context::search(store, &source, &query))?;
+                let (value, _) = self.lookup_context(&source, &query, None)?;
                 self.record_evidence(&value);
                 Ok(value)
             }
@@ -1186,12 +1193,59 @@ impl Evaluator<'_> {
     }
 
     fn consult(&mut self, value: &Value, query: &str, budget: usize) -> Result<Value, IpcFailure> {
-        let (consulted, omitted) = self.with_store(|store| {
-            material_context::consult_with_budget(store, value, query, budget)
-        })?;
+        let (consulted, omitted) = self.lookup_context(value, query, Some(budget))?;
         self.receipt.omitted_evidence.extend(omitted);
         self.record_evidence(&consulted);
         Ok(consulted)
+    }
+
+    fn lookup_context(
+        &self,
+        value: &Value,
+        query: &str,
+        budget: Option<usize>,
+    ) -> Result<(Value, Vec<String>), IpcFailure> {
+        let resolve = || {
+            self.with_store(|store| match budget {
+                Some(budget) => material_context::consult_with_budget(store, value, query, budget),
+                None => {
+                    material_context::search(store, value, query).map(|value| (value, Vec::new()))
+                }
+            })
+        };
+        if self.receipt.remote.is_none() {
+            return resolve();
+        }
+        let input =
+            BlobId::digest(&serde_json::to_vec(&(value, query, budget)).map_err(io_failure)?);
+        let run = &self.receipt.run.run_id;
+        if let Some(bytes) = crate::terminal_receipts::read_context(self.root, run, input)? {
+            let saved: ContextLookup = serde_json::from_slice(&bytes).map_err(io_failure)?;
+            if saved.input != input {
+                return Err(failure("Saved source lookup belongs to different input."));
+            }
+            return Ok((saved.value, saved.omitted));
+        }
+        if self.recovery == RecoveryMode::Check {
+            return Err(IpcFailure::new(
+                "terminal_remote_unconfirmed",
+                "Saved sources are checked. Resume to continue this experiment.",
+                true,
+            ));
+        }
+        let (value, omitted) = resolve()?;
+        let saved = ContextLookup {
+            input,
+            value,
+            omitted,
+        };
+        crate::terminal_receipts::write_context(
+            self.root,
+            run,
+            input,
+            &serde_json::to_vec(&saved).map_err(io_failure)?,
+        )?;
+        Ok((saved.value, saved.omitted))
     }
 
     fn binding(&self, name: &str) -> Result<Value, IpcFailure> {
