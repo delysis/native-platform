@@ -104,6 +104,7 @@ fn assemble(root: &Path, output: &Path) -> Result<Receipt> {
             .args(["metadata", "--frozen", "--format-version", "1"]),
     )?;
     let mut metadata: Metadata = serde_json::from_slice(&metadata.stdout)?;
+    verify_git_notices(&worker, &metadata.packages)?;
     metadata
         .packages
         .sort_by(|a, b| (&a.name, &a.version, &a.source).cmp(&(&b.name, &b.version, &b.source)));
@@ -149,6 +150,43 @@ fn assemble(root: &Path, output: &Path) -> Result<Receipt> {
 
 fn cargo() -> Command {
     Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+}
+
+fn verify_git_notices(worker: &Path, packages: &[Package]) -> Result<()> {
+    const SOURCE: &str = "git+https://github.com/signalapp/libsignal?";
+    const FILES: [&str; 2] = ["LICENSE", "acknowledgments/acknowledgments-desktop.md"];
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Notices {
+        source: String,
+        files: std::collections::BTreeMap<String, String>,
+    }
+    let sources = packages
+        .iter()
+        .filter_map(|package| package.source.as_deref())
+        .filter(|source| source.starts_with(SOURCE))
+        .collect::<Vec<_>>();
+    if sources.is_empty() {
+        return Ok(());
+    }
+    // Cargo vendors these workspace crates without their repository-root license.
+    let root = worker.join("notices/libsignal");
+    let notices: Notices = serde_json::from_slice(&fs::read(root.join("UPSTREAM.json"))?)?;
+    ensure!(
+        sources.iter().all(|source| *source == notices.source),
+        "libsignal notices do not match the resolved source revision"
+    );
+    ensure!(
+        notices.files.len() == FILES.len(),
+        "unexpected libsignal notice inventory"
+    );
+    for name in FILES {
+        ensure!(
+            notices.files.get(name) == Some(&hash_file(&root.join(name))?),
+            "libsignal notice does not match its reviewed source: {name}"
+        );
+    }
+    Ok(())
 }
 
 fn clean_source(root: &Path) -> Result<Source> {

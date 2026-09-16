@@ -33,6 +33,38 @@ fn repository(root: &Path) {
 }
 
 #[test]
+fn libsignal_notice_verification_rejects_changed_text_or_a_different_dependency_pin() {
+    let temp = tempfile::tempdir().expect("notice fixture");
+    let directory = temp.path().join("notices/libsignal");
+    write(&directory, "LICENSE", "fixture license\n");
+    write(
+        &directory,
+        "acknowledgments/acknowledgments-desktop.md",
+        "fixture acknowledgments\n",
+    );
+    let source = "git+https://github.com/signalapp/libsignal?tag=v0.99.0#reviewed";
+    let receipt = serde_json::json!({"source": source, "files": {
+        "LICENSE": hash_file(&directory.join("LICENSE")).expect("license hash"),
+        "acknowledgments/acknowledgments-desktop.md": hash_file(&directory.join("acknowledgments/acknowledgments-desktop.md")).expect("acknowledgments hash")
+    }});
+    write(&directory, "UPSTREAM.json", &receipt.to_string());
+    let mut packages = [Package {
+        name: "libsignal-core".into(),
+        version: "0.1.0".into(),
+        source: Some(source.into()),
+        license: Some("AGPL-3.0-only".into()),
+        license_file: None,
+    }];
+    verify_git_notices(temp.path(), &packages).expect("reviewed notice");
+    write(&directory, "LICENSE", "changed license\n");
+    assert!(verify_git_notices(temp.path(), &packages).is_err());
+    write(&directory, "LICENSE", "fixture license\n");
+    packages[0].source =
+        Some("git+https://github.com/signalapp/libsignal?tag=new#unreviewed".into());
+    assert!(verify_git_notices(temp.path(), &packages).is_err());
+}
+
+#[test]
 fn archived_git_and_path_dependencies_build_without_original_sources_or_cargo_cache() {
     let temp = tempfile::tempdir().expect("fixture directory");
     let upstream = temp.path().join("upstream");

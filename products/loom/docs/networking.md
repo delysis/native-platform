@@ -442,8 +442,10 @@ upstream notices, pinned dependency lockfile, and corresponding source when
 distributing it. The process boundary provides lifecycle and dependency isolation;
 it is not a declaration about the legal scope of the combined distribution.
 
-The app bundles the worker and modified Presage license texts and upstream notices
-under `Contents/Resources/licenses/loom-signal`. The macOS release script checks
+The app bundles the worker and modified Presage license texts and upstream notices,
+plus libsignal's repository-root license and upstream desktop acknowledgments,
+under `Contents/Resources/licenses/loom-signal`. The source task verifies the
+libsignal notice hashes and their exact resolved Git source. The macOS release script checks
 those files against source, then places `loom-signal-source-<revision>.tar.gz` and
 `loom-signal-source.json` beside the app archive. The release receipt binds the
 signed worker, source receipt, and source archive by SHA-256. Distribute these

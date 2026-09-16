@@ -4,7 +4,10 @@ The `loom-signal` executable links Presage and Signal's libsignal implementation
 Loom's worker and its modified Presage crates are licensed AGPL-3.0-only. Their
 license texts and the Presage upstream revisions, original file hashes, and
 modification notes accompany this notice in the app's `licenses/loom-signal`
-resources. Other dependencies retain their own licenses and notices.
+resources. Libsignal's repository-root license and upstream desktop dependency
+acknowledgments are also retained from its exact pinned commit; the latter is
+libsignal's upstream inventory, not Loom's dependency inventory. Other dependencies
+retain their own licenses and notices in the source archive.
 
 Each Loom release produced by `scripts/release-macos.sh` includes an adjacent
 `loom-signal-source-<Git revision>.tar.gz` and `loom-signal-source.json` receipt.
