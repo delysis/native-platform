@@ -1,6 +1,6 @@
 use super::*;
-use loom_cabal::compute::{ComputeGrant, ComputeInput, ComputePromptFormat};
 use loom_cabal::Identity;
+use loom_cabal::compute::{ComputeGrant, ComputeInput, ComputePromptFormat};
 use uuid::Uuid;
 
 fn job(model: ComputeModel) -> HostComputeJob {
@@ -67,11 +67,14 @@ fn independent_preparation_never_relabels_one_peers_source_as_anothers() {
     let first_prepared = prepare(&mut store, &model, &first).expect("first source");
     let second_prepared = prepare(&mut store, &model, &second).expect("second source");
     assert_ne!(first_prepared.request_id, second_prepared.request_id);
-    let a = &first_prepared.request.cases[0].generation;
-    let b = &second_prepared.request.cases[0].generation;
-    assert_ne!(a.document_id, b.document_id);
-    assert_ne!(a.source_revision_id, b.source_revision_id);
-    assert_ne!(a.branch_id, b.branch_id);
+    let first_generation = &first_prepared.request.cases[0].generation;
+    let second_generation = &second_prepared.request.cases[0].generation;
+    assert_ne!(first_generation.document_id, second_generation.document_id);
+    assert_ne!(
+        first_generation.source_revision_id,
+        second_generation.source_revision_id
+    );
+    assert_ne!(first_generation.branch_id, second_generation.branch_id);
     let requests = native_requests(&[first_prepared, second_prepared]);
     assert_eq!(requests.len(), 2);
     assert_ne!(requests[0].request_id, requests[1].request_id);
@@ -84,7 +87,9 @@ fn independent_preparation_never_relabels_one_peers_source_as_anothers() {
 fn a_batch_cannot_wait_on_foreground_admission_while_holding_its_idle_lease() {
     let directory = tempfile::tempdir().expect("fixture");
     let mut state = PluginState::with_app_local_data_root(
-        Some(directory.path().into()), true, BuildModelPolicy::default(),
+        Some(directory.path().into()),
+        true,
+        BuildModelPolicy::default(),
     );
     state.peer_compute = Arc::new(IdleComputeOwner::new(Duration::ZERO));
     let model = crate::tests::test_loaded_model(Path::new("fixture.gguf"), "fixture");
@@ -95,11 +100,21 @@ fn a_batch_cannot_wait_on_foreground_admission_while_holding_its_idle_lease() {
     let executor = NativeExecutor::from_state(&state);
     let admission = state.application.lock().expect("foreground owns admission");
     let outcomes = tauri::async_runtime::block_on(executor.execute_batch(vec![
-        ComputeBatchJob { job: first, cancel: CancellationToken::new() },
-        ComputeBatchJob { job: second, cancel: CancellationToken::new() },
+        ComputeBatchJob {
+            job: first,
+            cancel: CancellationToken::new(),
+        },
+        ComputeBatchJob {
+            job: second,
+            cancel: CancellationToken::new(),
+        },
     ]));
     assert_eq!(outcomes.len(), 2);
-    assert!(outcomes.iter().all(|item| item.result == Err(ComputeFailure::HostBusy)));
+    assert!(
+        outcomes
+            .iter()
+            .all(|item| item.result == Err(ComputeFailure::HostBusy))
+    );
     assert!(state.peer_compute.idle());
     assert!(!directory.path().join("peer-compute-writing").exists());
     drop(admission);
