@@ -49,6 +49,28 @@ pub struct ComputeModel {
     pub media: Vec<ComputeModality>,
 }
 
+impl ComputeModel {
+    fn validate(&self) -> Result<()> {
+        if !valid_digest(&self.fingerprint)
+            || self.name.is_empty()
+            || self.name.len() > 160
+            || self.name.chars().any(char::is_control)
+            || self.media.len() > 2
+            || self.media.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::Invalid("Invalid compute model"));
+        }
+        Ok(())
+    }
+}
+
+fn valid_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ComputeGrant {
@@ -72,19 +94,9 @@ pub struct ComputeGrantStatus {
 
 impl ComputeGrant {
     fn validate(&self) -> Result<()> {
+        self.model.validate()?;
         if self.id.is_nil()
             || self.cabal.is_nil()
-            || self.model.fingerprint.len() != 64
-            || !self
-                .model
-                .fingerprint
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            || self.model.name.is_empty()
-            || self.model.name.len() > 160
-            || self.model.name.chars().any(char::is_control)
-            || self.model.media.len() > 2
-            || self.model.media.windows(2).any(|pair| pair[0] >= pair[1])
             || !(1..=MAX_OUTPUT_TOKENS).contains(&self.max_output_tokens)
             || !(1..=MAX_JOB_SECONDS).contains(&self.max_seconds)
             || !(1..=MAX_GRANT_JOBS).contains(&self.jobs)
@@ -212,6 +224,32 @@ pub struct RemoteJobRecord {
     pub created_at_ms: u64,
     pub recorded_at_ms: u64,
     pub status: ComputeStatus,
+}
+
+impl RemoteJobRecord {
+    /// Shared structural checks for wire replies and both durable ledgers.
+    /// These do not establish that the host performed the claimed execution.
+    fn validate(&self) -> Result<()> {
+        self.model.validate()?;
+        let revision_valid = match self.status {
+            ComputeStatus::Accepted => self.revision == 0,
+            ComputeStatus::Running => self.revision == 1,
+            ComputeStatus::Cancelling { .. } => (1..=2).contains(&self.revision),
+            ComputeStatus::Cancelled { .. } => (2..=3).contains(&self.revision),
+            ComputeStatus::Completed { .. } | ComputeStatus::Failed { .. } => self.revision == 2,
+            ComputeStatus::Interrupted => (1..=3).contains(&self.revision),
+        };
+        if self.job.is_nil()
+            || self.grant.is_nil()
+            || !valid_digest(&self.request_fingerprint)
+            || self.created_at_ms > self.recorded_at_ms
+            || !revision_valid
+            || matches!(&self.status, ComputeStatus::Completed { text } if text.len() > MAX_COMPUTE_TEXT_BYTES)
+        {
+            return Err(Error::Invalid("Invalid remote compute result"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -378,13 +416,16 @@ impl ComputeHost {
 
     pub async fn shutdown(&self) -> Result<()> {
         self.stop();
-        // Retain this lock through joining: a concurrent shutdown must wait too.
+        // Keep the handle in its owner while awaiting. Taking it first would
+        // detach the worker if this shutdown future were cancelled or timed out.
+        // Concurrent and later shutdown callers must still join that same work.
         let mut slot = self.worker.lock().await;
-        if let Some(worker) = slot.take() {
+        if let Some(worker) = slot.as_mut() {
             let result = worker
                 .await
                 .map_err(|_| Error::Invalid("Compute supervisor stopped unexpectedly"))
                 .and_then(|result| result);
+            *slot = None;
             if let Err(error) = result {
                 self.lock()?.failure = Some(error.to_string());
             }
@@ -678,3 +719,7 @@ fn now_ms() -> Result<u64> {
     )
     .map_err(|_| Error::Invalid("Compute clock overflow"))
 }
+
+#[cfg(test)]
+#[path = "compute/record_tests.rs"]
+mod record_tests;
