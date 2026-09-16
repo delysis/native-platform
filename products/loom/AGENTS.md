@@ -18,6 +18,10 @@
   A model-free fixture or a built bundle must never be described as a working
   writing app. Report missing native acceptance explicitly. When this core path
   fails, repair it before expanding scope or handing over another build.
+- Keep one verified native app available for the user. Do not launch a second
+  model-free editor for unrelated UI checks on their desktop. Reuse the loaded
+  writer and preserve the current writing; isolated data is not a reason to
+  disable the product's headline feature.
 - Keep the macOS smoke helpers aligned with actual shortcuts and controls in
   the same change that modifies those controls. Do not add visible product
   controls just to satisfy an obsolete test harness.
