@@ -4,6 +4,7 @@
   import VisualFormatMenu from './VisualFormatMenu.svelte';
   import {
     completionPresentation,
+    compatibleCompletionPresentations,
     completionSessionContextKey,
     completionShouldRequestNextBatch,
     consumeCompletionText,
@@ -79,19 +80,15 @@
       ? selectedCompletionCandidate(session)
       : completionPresentation(session)
     : null;
-  $: alternatives = session?.acceptedChunks.length === 0
-    ? session.candidates.map((candidate) => ({
+  $: alternatives = session
+    ? (session.acceptedChunks.length === 0 ? session.candidates : compatibleCompletionPresentations(session))
+      .map((candidate) => ({
         candidateId: candidate.candidateId,
         presentationKey: candidate.presentationKey,
         text: candidate.text,
         runId: candidate.runId
       }))
-    : presentation ? [{
-        candidateId: presentation.candidateId,
-        presentationKey: presentation.presentationKey,
-        text: presentation.text,
-        runId: presentation.runId
-      }] : [];
+    : [];
   $: unconsumeText = session?.acceptedChunks.at(-1) ?? '';
   $: {
     const exhausted = Boolean(

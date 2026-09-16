@@ -17,9 +17,9 @@ the actual selected representation, which may differ from the original input.
 
 The existing context-snapshot command accepts explicit material records when
 editing excerpts or restoring a co-writer. Instruction-only saves preserve the
-current source versions and excerpts. The sidebar exposes instructions and
-material cards for the active document, including when a custom pane occupies the
-main area. Importing alone still does not select material or edit a manuscript.
+current source versions and excerpts. When explicitly requested, the sidebar exposes instructions and material cards
+for the active document, including when a custom pane occupies the main area.
+They remain hidden in the ordinary workspace. Importing alone still does not select material or edit a manuscript.
 
 ## Preparation and cache authority
 

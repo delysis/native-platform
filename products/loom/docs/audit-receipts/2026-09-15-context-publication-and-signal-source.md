@@ -108,10 +108,71 @@ default to development. The release script also compares the staged sidecar with
 the release worker before signing and records its profile. A process-boundary
 fixture verifies both compiler arguments and copied artifacts: its unset-flag
 release case failed before the fix and all four cases passed afterward. Combined
-with the workflow checks, 50 tests passed. Complete candidate execution after this
-repair remains pending until its own receipt is inspected.
+with the workflow checks, 50 tests passed. The subsequent complete candidate
+execution is recorded below.
 
 Local detailed receipts are `/tmp/loom-context-acceptance.json` and
 `/tmp/loom-signal-packaging-acceptance.json`. Generated build caches and extracted
 copies were removed after verification; source archives and user-edited test
 workspaces were retained.
+
+## Optimized release candidate
+
+The full candidate pipeline completed at
+`be2e8ef40dccafe314fa27b815eae4abdcb64ad8`, using Rust 1.95.0 and pnpm 11.16.0.
+The receipt records a clean source tree, the optimized Signal worker, exact
+notice resources, frozen offline source resolution, frontend tests, native
+promotion/close checks, and a verified ad-hoc signature. Notarization was not
+requested. The earlier `200df70` candidate remains rejected.
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `Loom.app.zip` (34,654,594 bytes) | `420c3e6f061551652d227ab1042780958817df985e142d86609609cd2ca025c0` |
+| Signed app executable | `511290a5621039b577640b4b68205b72053b553da57e783b6b03c6dff981d2c2` |
+| Packaged Signal worker | `748c26f4f0f4bff9de5bd4378ccfff1fea22d090acb44c84805ed1171a260722` |
+| Corresponding-source archive | `0eafe814d313881282543a1c9c9cdaf35432541c1305bc909b8b0458a636d30b` |
+| Corresponding-source receipt | `10a27f4139b6eea12cdf863e4ac243c2a15a54af810c275c8ca1c8a173ad73d5` |
+
+After extracting the actual ZIP, its signature, both executable hashes, all nine
+notice files, and the adjacent source-artifact hashes were checked independently.
+The packaged worker created a dedicated unlinked SQLCipher store and reported
+protocol version 4. A concurrent worker refused the same vault with
+`vault_unavailable` and exited nonzero; the first worker continued serving Status.
+It then reported Stopped and exited successfully while its parent's stdin was
+still open. A subsequent process reopened the encrypted store, remained unlinked,
+and exited cleanly on EOF. All owned processes exited. No account was linked and
+no message was sent. Detailed evidence is `/tmp/loom-release-worker-acceptance.json`.
+
+Two ad-hoc-signed copies derived from that exact extracted archive used separate
+existing synthetic profiles and identifiers `app.delysis.loom.releasebe2e8ef.owner`
+and `app.delysis.loom.releasebe2e8ef.peer`. The owner executable hash was
+`93f0a08e2e2ef05556bde6ebe9a7e62e643af48bfd8cc43478b9261d7a31de1a`;
+the peer hash was
+`15302718092bdab729edb10d8b0785870f962f4e9229970a6ea60244d11f4877`.
+Owner PID 34698 reopened the saved workspace and displayed the current shared
+recording notice. Its Signal pane showed Unlinked, backed by child PID 35032
+inside that bundle. Both applications reopened their saved cabal folders without
+another invitation; the owner's cabal pane showed Fern connected. The owner
+verified and loaded the existing Gemma 4 12B model from its isolated model library.
+Native Quit closed both apps and the Signal child; process inspection confirmed
+that none remained. No peer grant or job was submitted during this run, so it
+does not establish native host preemption or cancellation.
+
+These receipts precede the upstream quiet-sidebar and Drive-history changes at
+`fb3a1b2d5d64b85d148d064cda908912b689347c`. They do not certify the later merged UI.
+
+## Upstream integration checks
+
+The subsequent merge incorporates that main revision, preserving its single
+writing-mode control, ghost-choice cycling and quiet sidebar. Signal's shortcut
+and the Materials/suggestion shortcuts coexist; context publication remains
+inside Materials, opened with Cmd/Ctrl+Shift+C.
+
+The merged tree passed 345 Rust library tests across `loom-document`, `loom-cabal`
+and `tauri-plugin-loom` (five existing plugin tests ignored), strict Clippy for
+those crates and all their targets, the native app check, workspace formatting
+and current-documentation validation. It also passed 491 frontend unit tests,
+84 focused WebKit tests covering editor interactions, Loompad, cabal editing,
+connection settings, Materials and context publication, and Svelte checking
+with zero errors or warnings. These are integration checks, not native acceptance
+of the merged application.

@@ -28,15 +28,8 @@
     }
     const heldIndex = LOOMPAD_KEYS.indexOf(chord.choices.at(-1) as typeof LOOMPAD_KEYS[number]);
     const heldRun = heldIndex < 0 ? null : slots[page * 4 + heldIndex]?.runId;
-    const incoming = new Map(next.map(candidate => [candidate.runId, candidate]));
-    const distinct = new Map<string, CompletionCandidate>();
-    // Keep a surviving representative on its key; full branches remain cached
-    // in the parent and can diverge again after this exact word is consumed.
-    for (const candidate of [...slots.flatMap(slot => slot && incoming.has(slot.runId) ? [incoming.get(slot.runId)!] : []), ...next]) {
-      const word = loompadPrefix(candidate.text, 'word', visual);
-      if (word && !distinct.has(word)) distinct.set(word, candidate);
-    }
-    const byRun = new Map([...distinct.values()].map(candidate => [candidate.runId, candidate]));
+    // Sample identity owns the key, even when several runs share a first word.
+    const byRun = new Map(next.map(candidate => [candidate.runId, candidate]));
     const pageAnchor = slots.slice(page * 4, page * 4 + 4).find(slot => slot && byRun.has(slot.runId));
     const kept: Array<CompletionCandidate | null> = [];
     for (let offset = 0; offset < slots.length; offset += 4) {
@@ -103,17 +96,15 @@
 {#if modifierHeld && focused && !blocked && visibleSlots.some(Boolean)}
 <div class="loompad" role="group" aria-label="Loompad">
   {#each visibleSlots as candidate, index}
-    {#if candidate}
     <button class="loompad-choice" class:selected={candidate?.runId === selectedRunId}
       class:held={chord.choices.at(-1) === LOOMPAD_KEYS[index]}
       data-direction={LOOMPAD_KEYS[index].slice(3).toLowerCase()}
       type="button" disabled={!focused || blocked || !candidate?.text}
-      aria-label={`${LOOMPAD_KEYS[index].slice(3)}: ${candidate ? loompadPrefix(candidate.text, 'word', visual) ?? '' : 'Waiting'}`}
+      aria-label={`${LOOMPAD_KEYS[index].slice(3)}: ${candidate ? loompadPrefix(candidate.text, 'word', visual) ?? '' : 'Unavailable'}`}
       on:mouseenter={() => { if (candidate) onChoose(candidate); }} on:mousedown|preventDefault on:click={() => { if (candidate) onAccept(candidate, 'word'); }}>
       <kbd class="loompad-key">{LOOMPAD_KEYS[index].slice(3)}</kbd>
-      <span>{candidate ? loompadPrefix(candidate.text, 'word', visual) ?? '…' : '…'}</span>
+      <span>{candidate ? loompadPrefix(candidate.text, 'word', visual) ?? '…' : '—'}</span>
     </button>
-    {/if}
   {/each}
 </div>
 {/if}

@@ -73,7 +73,7 @@ button:disabled { cursor: default; opacity: .45; }
 .mode-toggle[aria-pressed="true"] { color: var(--ink); background: var(--chrome-hover); }
 .mode-toggle .markdown-monogram { font-size: 8px; font-weight: 800; letter-spacing: -.04em; }
 .suggestions-toggle { touch-action: manipulation; }
-.suggestions-toggle.active, .shuttle-toggle.active { color: var(--moss); background: color-mix(in srgb, var(--moss-soft) 72%, transparent); }
+.suggestions-toggle.active, .loompad-toggle.active, .shuttle-toggle.active { color: var(--moss); background: color-mix(in srgb, var(--moss-soft) 72%, transparent); }
 .suggestions-toggle.preparing { color: var(--warning); }
 .suggestions-toggle.needs-attention, .shuttle-toggle.needs-attention { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
 .suggestions-toggle svg { stroke-width: 1.2; }
@@ -543,9 +543,6 @@ button.document-row:hover { background: var(--chrome-hover); }
 .fan-visible .loom-completion-lens-trigger { visibility:visible; }
 
 
-.completion-mode-toggle { display: inline-flex; align-items: center; gap: 1px; padding: 1px; border: 1px solid var(--line); border-radius: 7px; }
-.completion-mode-toggle .titlebar-button { border-radius: 5px; }
-.completion-mode-toggle .titlebar-button[aria-pressed="true"] { color: var(--moss); background: var(--paper); box-shadow: 0 1px 3px rgb(0 0 0 / 10%); }
 
 /* Invoked choices overlay the writing surface without taking document height. */
 .editor-stage:has(.loompad) { position: relative; }

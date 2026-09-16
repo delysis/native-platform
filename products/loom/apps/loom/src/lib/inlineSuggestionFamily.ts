@@ -151,47 +151,54 @@ export function inlineSuggestionFamily(
   if (!familyIds.size) return [];
 
   const family: InlineGhostSuggestion[] = [];
-  for (const familyId of familyIds) for (const branch of state.branches) {
-    if (
-      branch.weave_command_id !== familyId ||
-      !branchBelongsToSuggestionScope(branch, targetByte, state) ||
-      branch.selection === 'promote' ||
-      branch.selection === 'reject' ||
-      !['queued', 'generating', 'ready'].includes(branch.status)
-    ) continue;
-
-    const candidateId = `run:${branch.run_id}`;
-    if (state.dismissedCandidateIds.includes(candidateId)) continue;
-    const verified = verifiedGhostSuggestion(branch, state.verifiedBodyByRun[branch.run_id]);
-    const liveText = state.liveTextByRun[branch.run_id];
-    const liveSequence = state.liveTextSequenceByRun?.[branch.run_id];
-    const hasLiveProjection = liveText !== undefined && liveSequence !== undefined;
-    const rawText = verified?.text ?? (hasLiveProjection ? liveText : branch.text);
-    const text = projectInlineCandidateText(
-      targetByte,
-      editorMode,
-      state.manuscriptText,
-      rawText,
-      state.sourceNewline
-    );
-    if (!text) continue;
-    const rawPresentationKey = verified?.presentationKey ??
-      (hasLiveProjection ? `stream:${branch.run_id}:${liveSequence}` : `branch:${branch.branch_id}`);
-    const presentationKey = projectedInlinePresentationKey(rawPresentationKey, rawText, text);
-    if (editorMode === 'visual') {
+  for (const familyId of familyIds) {
+    const batch: InlineGhostSuggestion[] = [];
+    for (const branch of state.branches) {
       if (
-        state.unpresentableVisualKeys.includes(presentationKey)
+        branch.weave_command_id !== familyId ||
+        !branchBelongsToSuggestionScope(branch, targetByte, state) ||
+        branch.selection === 'promote' ||
+        branch.selection === 'reject' ||
+        !['queued', 'generating', 'ready'].includes(branch.status)
       ) continue;
-    }
 
-    family.push({
-      candidateId,
-      presentationKey,
-      text,
-      runId: branch.run_id,
-      targetByte,
-      insertsOnAccept: !verified || text !== rawText
-    });
+      const candidateId = `run:${branch.run_id}`;
+      const verified = verifiedGhostSuggestion(branch, state.verifiedBodyByRun[branch.run_id]);
+      const liveText = state.liveTextByRun[branch.run_id];
+      const liveSequence = state.liveTextSequenceByRun?.[branch.run_id];
+      const hasLiveProjection = liveText !== undefined && liveSequence !== undefined;
+      const rawText = verified?.text ?? (hasLiveProjection ? liveText : branch.text);
+      const text = projectInlineCandidateText(
+        targetByte,
+        editorMode,
+        state.manuscriptText,
+        rawText,
+        state.sourceNewline
+      );
+      if (!text) continue;
+      const rawPresentationKey = verified?.presentationKey ??
+        (hasLiveProjection ? `stream:${branch.run_id}:${liveSequence}` : `branch:${branch.branch_id}`);
+      const presentationKey = projectedInlinePresentationKey(rawPresentationKey, rawText, text);
+      if (editorMode === 'visual') {
+        if (
+          state.unpresentableVisualKeys.includes(presentationKey)
+        ) continue;
+      }
+
+      batch.push({
+        candidateId,
+        presentationKey,
+        text,
+        runId: branch.run_id,
+        targetByte,
+        insertsOnAccept: !verified || text !== rawText
+      });
+    }
+    // A weave is a four-sample choice, not four independently arriving choices.
+    // Keep incomplete streaming families private until every slot can be shown.
+    if (batch.length === WEAVE_FAMILY_SIZE) {
+      family.push(...batch.filter(candidate => !state.dismissedCandidateIds.includes(candidate.candidateId)));
+    }
   }
   return family;
 }

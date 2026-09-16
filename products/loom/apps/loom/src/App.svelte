@@ -478,6 +478,7 @@
   let terminalRefreshSerial = 0;
   let terminalPollTimer: number | undefined;
   let contextPaneOpen = false;
+  let materialsOpen = false;
   let focusedSpeechTarget: SpeechInputTarget = 'manuscript';
   let contextPaneElement: HTMLDivElement | undefined;
   let contextToggleElement: HTMLButtonElement | undefined;
@@ -1157,12 +1158,12 @@
     : mode === 'source'
       ? sourceSuggestionFamily
       : [];
-  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, loompadActive);
+  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, true);
   $: completionView = completionControllerView(
     completionController,
     completionContextKey,
     baseSuggestionFamily,
-    loompadActive
+    true
   );
   $: boundCompletionSession = completionView.boundSession;
   $: if (boundCompletionSession && !loompadActive) {
@@ -7737,7 +7738,7 @@
       completionController,
       activeSuggestionFamily,
       offset,
-      loompadActive
+      true
     );
     if (cycled.state === completionController) return;
     completionController = cycled.state;
@@ -8095,6 +8096,8 @@
     if (modifier && event.shiftKey && !event.altKey && !event.isComposing) {
       const key = event.key.toLowerCase();
       if (key === 'y') { event.preventDefault(); void toggleSignal(); return; }
+      if (key === 'c' && document) { event.preventDefault(); materialsOpen = !materialsOpen; if (materialsOpen) outlineOpen = true; return; }
+      if (key === 'g') { event.preventDefault(); void setSuggestionsEnabled(!suggestionsEnabled); return; }
       if (key === 'p') { event.preventDefault(); openModelManager(window.document.activeElement as HTMLElement); return; }
       if (key === 'u') { event.preventDefault(); void readAloud(); return; }
       if (event.code === 'Comma') { event.preventDefault(); void refreshWorkspaceTemplate(true); return; }
@@ -9825,18 +9828,18 @@
           ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="6.4" y="2.5" width="5.2" height="8.3" rx="2.6"/><path d="M4.4 8.8a4.6 4.6 0 0 0 9.2 0M9 13.4v2.1M6.8 15.5h4.4"/></svg></button>
           <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Audio is attached to this document. Shared documents also share their recordings.')}</span>
         {/if}
-        <div class="completion-mode-toggle" role="group" aria-label="Writing suggestions">
-          <button class="titlebar-button suggestions-toggle" class:active={suggestionsEnabled && suggestionInteraction === 'ghost'}
-            type="button" aria-label="Ghost text" aria-pressed={suggestionsEnabled && suggestionInteraction === 'ghost'}
-            title="Ghost text" disabled={!project || suggestionsChanging} on:click={() => void setSuggestionInteraction('ghost')}>
+        <button class="titlebar-button" class:suggestions-toggle={suggestionInteraction === 'ghost'} class:loompad-toggle={suggestionInteraction === 'loompad'}
+          class:active={suggestionsEnabled} type="button"
+          aria-label={suggestionInteraction === 'ghost' ? 'Ghost text' : 'Loompad'}
+          title={suggestionsEnabled ? (suggestionInteraction === 'ghost' ? 'Switch to Loompad' : 'Switch to ghost text') : 'Enable suggestions'}
+          disabled={!project || suggestionsChanging}
+          on:click={() => void setSuggestionInteraction(suggestionsEnabled ? (suggestionInteraction === 'ghost' ? 'loompad' : 'ghost') : suggestionInteraction)}>
+          {#if suggestionInteraction === 'ghost'}
             <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M3.5 15V8a5.5 5.5 0 0 1 11 0v7l-2.75-2-2.75 2-2.75-2-2.75 2Z"/><path d="M7 7v1M11 7v1"/></svg>
-          </button>
-          <button class="titlebar-button loompad-toggle" class:active={loompadActive}
-            type="button" aria-label="Loompad" aria-pressed={loompadActive} title="Loompad"
-            disabled={!project || suggestionsChanging} on:click={() => void setSuggestionInteraction('loompad')}>
+          {:else}
             <svg aria-hidden="true" viewBox="0 0 20 18"><rect x="7.5" y="2" width="5" height="5" rx="1"/><rect x="1.5" y="8.5" width="5" height="5" rx="1"/><rect x="7.5" y="8.5" width="5" height="5" rx="1"/><rect x="13.5" y="8.5" width="5" height="5" rx="1"/></svg>
-          </button>
-        </div>
+          {/if}
+        </button>
 
       </div>
     </div>
@@ -9944,12 +9947,12 @@
             </div>
             {/if}
           {/each}
-          {#if desktop && document}
+          {#if materialsOpen && desktop && document}
             {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
               <ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={document.summary.title} onUse={useImportedSources} />
             {/key}
           {/if}
-          {#if desktop && document}
+          {#if materialsOpen && desktop && document}
             {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
               <DocumentMaterials title={document.summary.title} instructions={contextText} attachments={contextAttachments} disabled={editorReadonly || contextAttachmentBusy} error={contextLoadError} onInstructions={updateContextText} onFlush={flushContextText} onRemove={(id) => void removeContextAttachment(id)} onSave={saveMaterialExcerpt}>
                 {#if cabal?.documents.some(item => item.local.summary.document_id === document?.summary.document_id)}

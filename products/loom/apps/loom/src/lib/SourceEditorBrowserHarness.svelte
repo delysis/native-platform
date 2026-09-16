@@ -3,6 +3,7 @@
   import SourceEditor from './SourceEditor.svelte';
   import {
     completionPresentation,
+    compatibleCompletionPresentations,
     consumeCompletionText,
     cycleCompletionSession,
     insertAtUtf8Boundary,
@@ -42,19 +43,15 @@
       ? selectedCompletionCandidate(session)
       : completionPresentation(session)
     : null;
-  $: alternatives = session?.acceptedChunks.length === 0
-    ? session.candidates.map((candidate) => ({
+  $: alternatives = session
+    ? (session.acceptedChunks.length === 0 ? session.candidates : compatibleCompletionPresentations(session))
+      .map((candidate) => ({
         candidateId: candidate.candidateId,
         presentationKey: candidate.presentationKey,
         text: candidate.text,
         runId: candidate.runId
       }))
-    : presentation ? [{
-        candidateId: presentation.candidateId,
-        presentationKey: presentation.presentationKey,
-        text: presentation.text,
-        runId: presentation.runId
-      }] : [];
+    : [];
   $: unconsumeText = session?.acceptedChunks.at(-1) ?? '';
 
   function insert(candidateId: string, presentationKey: string, text: string): boolean {

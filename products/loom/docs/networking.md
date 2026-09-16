@@ -297,12 +297,14 @@ cannot name another document's private image. Local prompt execution resolves
 shared images and audio as native model inputs, including media reached through
 explicit document references. Existing model/projector modality checks still
 apply. Local QUIC tests and native storage/protocol tests establish transfer,
-recovery, integrity, and isolation; current packaged two-device model execution
-with these attachments remains unverified. Peer model jobs retain and transmit
+recovery, integrity, and isolation. The Gemma 4 receipt below records packaged
+media execution between two isolated apps on one Mac; execution between physical
+machines remains unverified. Peer model jobs retain and transmit
 the exact selected native media. Document-context settings remain local; they are
 not silently published with a manuscript.
 
-The Materials sidebar of a shared document offers **Share context as a document**.
+Cmd/Ctrl+Shift+C opens Materials in the otherwise quiet document sidebar. For a
+shared document, it offers **Share context as a document**.
 The native review names the current cabal members and shows the exact visible
 authored instructions, quoted source excerpts, and selected files. Publication
 creates an ordinary Markdown document under
@@ -386,8 +388,9 @@ only exact already-saved requests remain recoverable after membership changes.
 Status rejection or a lost connection leaves the latest signed receipt intact
 and reports delivery separately. A persisted cancellation wins over a later
 submission; terminal results are returned from storage without dispatching again.
-The app history returns bounded previews. Packaged two-device model selection,
-native media execution, and result recovery still need acceptance.
+The app history returns bounded previews. The revision-specific packaged receipt
+below covers model selection, native media execution, and result recovery on one
+Mac. Physical two-device execution and packaged host preemption remain unverified.
 
 An accepted job is committed before dispatch. Each authenticated caller owns its
 job IDs, and a retry must match the exact original input and grant. Status checks
