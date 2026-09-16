@@ -15,8 +15,9 @@ function requiredEnv(name) {
   return value;
 }
 
-const base = requiredEnv("CI_BASE_SHA");
 const head = requiredEnv("CI_HEAD_SHA");
+const fullRun = process.env.CI_FULL_RUN === "true";
+const base = fullRun ? process.env.CI_BASE_SHA || head : requiredEnv("CI_BASE_SHA");
 const eventName = process.env.GITHUB_EVENT_NAME ?? "local";
 const plannerRoot = path.resolve(import.meta.dirname, "../..");
 const ignoredRegistry = JSON.parse(
@@ -29,22 +30,30 @@ if (ignoredRegistry.schema !== "native-platform.ignored-tests.v2") {
 // Include deletions. A removed build, policy, or dependency file can be at
 // least as consequential as an addition, and must never disappear from the
 // plan merely because it no longer exists at HEAD.
-const changed = execFileSync(
-  "git",
-  [
-    "diff",
-    "--name-only",
-    "--no-renames",
-    "-z",
-    "--diff-filter=ACDMRTUXB",
-    base,
-    head,
-  ],
-  { encoding: "utf8" },
-)
-  .split("\0")
-  .filter(Boolean)
-  .sort();
+let comparisonError;
+let changed;
+try {
+  changed = execFileSync(
+    "git",
+    [
+      "diff",
+      "--name-only",
+      "--no-renames",
+      "-z",
+      "--diff-filter=ACDMRTUXB",
+      base,
+      head,
+    ],
+    { encoding: "utf8" },
+  )
+    .split("\0")
+    .filter(Boolean)
+    .sort();
+} catch (error) {
+  if (!fullRun) throw error;
+  comparisonError = error.message;
+  changed = [];
+}
 
 const presence = {
   mom:
@@ -279,6 +288,17 @@ const risk = dependencySelection.effects.includes("release") ? "release"
   : dependencySelection.effects.includes("import") ? "import" : "docs";
 const jobs = jobsFor(flags);
 const macosMatrix = macosMatrixFor(flags);
+// Linux's selected workspace test job already builds this exact test graph.
+// Keep the guarded listing there; other platforms retain their own inventory.
+const ignoredMatrix = flags.root || flags.full
+  ? ["macos-latest", "windows-latest"]
+  : ["ubuntu-latest", "macos-latest", "windows-latest"];
+// A main push is compared with the last successful full-CI main revision,
+// not merely its parent: canceling an older run must not lose code coverage.
+const fullRequired = !fullRun || eventName !== "push" || !process.env.CI_BASE_SHA ||
+  Boolean(comparisonError) || dependencySelection.metadata_status !== "available" ||
+  dependencySelection.file_classifications.some((file) =>
+    file.class !== "documentation" || file.primary_groups.length > 0 || file.effects.length > 0);
 
 const plan = {
   schema: "native-platform.ci-plan.v1",
@@ -291,6 +311,9 @@ const plan = {
   flags,
   dependency_selection: dependencySelection,
   macos_matrix: macosMatrix,
+  ignored_matrix: ignoredMatrix,
+  full_required: fullRequired,
+  ...(comparisonError ? { comparison_error: comparisonError } : {}),
   jobs,
 };
 
@@ -308,4 +331,6 @@ if (process.env.GITHUB_OUTPUT) {
     process.env.GITHUB_OUTPUT,
     `macos_matrix=${JSON.stringify(macosMatrix)}\n`,
   );
+  fs.appendFileSync(process.env.GITHUB_OUTPUT, `ignored_matrix=${JSON.stringify(ignoredMatrix)}\n`);
+  fs.appendFileSync(process.env.GITHUB_OUTPUT, `full_required=${fullRequired}\n`);
 }

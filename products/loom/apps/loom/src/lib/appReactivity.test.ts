@@ -1,16 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { compile } from 'svelte/compiler';
-import { describe, expect, it } from 'vitest';
-
-// Compile the fixture during module setup, just as Vite compiles imported
-// components. The tests check emitted dependencies, not compiler throughput on
-// a machine that may also be building native code.
-const appSource = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
-const compiledApp = compile(appSource, {
-  filename: 'App.svelte',
-  generate: 'client',
-  dev: false
-}).js.code;
+import { beforeAll, describe, expect, it } from 'vitest';
 
 function dependencyThunkFor(compiled: string, assignment: string): string {
   const assignmentIndex = compiled.indexOf(assignment);
@@ -21,10 +11,20 @@ function dependencyThunkFor(compiled: string, assignment: string): string {
 }
 
 describe('App ghost reactivity wiring', () => {
-  it('tracks late branch hydration and caret changes in both ghost effects', () => {
-    const source = appSource;
-    const compiled = compiledApp;
+  const source = readFileSync(new URL('../App.svelte', import.meta.url), 'utf8');
+  let compiled: string;
 
+  beforeAll(() => {
+    // Compile the real app as fixture setup; assertion time does not include
+    // the compiler's CPU cost on shared CI runners.
+    compiled = compile(source, {
+      filename: 'App.svelte',
+      generate: 'client',
+      dev: false
+    }).js.code;
+  });
+
+  it('tracks late branch hydration and caret changes in both ghost effects', () => {
     const visual = dependencyThunkFor(compiled, '$.set(visualAutocompleteDisposition');
     expect(visual).toContain('verifiedBranchBodyByRun');
     expect(visual).toContain('currentReadyBranches');
