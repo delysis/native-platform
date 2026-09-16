@@ -283,8 +283,12 @@ impl Network {
         self.stop.cancel();
         self.compute.stop();
         let mut slot = self.worker.lock().await;
-        let worker = if let Some(worker) = slot.take() {
-            worker.await.map_err(network_error)
+        // Await in the owner slot: cancellation of this future must not detach
+        // a supervisor that a later shutdown caller is still obliged to join.
+        let worker = if let Some(worker) = slot.as_mut() {
+            let result = worker.await.map_err(network_error);
+            *slot = None;
+            result
         } else {
             Ok(())
         };
@@ -755,3 +759,7 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 fn network_error(error: impl std::fmt::Display) -> Error {
     Error::Network(error.to_string())
 }
+
+#[cfg(test)]
+#[path = "transport_shutdown_tests.rs"]
+mod shutdown_tests;
