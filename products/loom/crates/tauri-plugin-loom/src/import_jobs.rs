@@ -328,6 +328,14 @@ impl ImportOperation {
         state: &PluginState,
         commit: impl FnOnce() -> Result<T, IpcFailure>,
     ) -> Result<T, IpcFailure> {
+        self.publish_to_store(state, |_| commit())
+    }
+
+    pub(super) fn publish_to_store<T>(
+        &self,
+        state: &PluginState,
+        commit: impl FnOnce(&mut loom_store::ProjectStore) -> Result<T, IpcFailure>,
+    ) -> Result<T, IpcFailure> {
         self.check()?;
         let _admission = lock_application_admission(state, "publishing an import")?;
         let mut session = lock_session(state)?;
@@ -346,7 +354,7 @@ impl ImportOperation {
         {
             return Err(failure("The import destination changed."));
         }
-        commit()
+        commit(store)
     }
 }
 

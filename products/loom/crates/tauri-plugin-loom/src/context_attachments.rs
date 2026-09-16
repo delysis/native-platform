@@ -9,8 +9,9 @@ use std::sync::{Mutex, OnceLock};
 use atomic_write_file::AtomicWriteFile;
 use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
 use attachment_native_types::{
-    AttachmentReceipt, AudioPreparationPolicy, Coverage, DetectedFormat, MediaFamily,
-    PreparationPlan, PreparationPolicy, PreparedPart, TargetCapabilities,
+    ArtifactPayload, AttachmentBundle, AttachmentReceipt, AudioPreparationPolicy, Coverage,
+    DetectedFormat, MediaFamily, PreparationPlan, PreparationPolicy, PreparedPart, SegmentKind,
+    TargetCapabilities,
 };
 use image::{ImageDecoder as _, ImageEncoder as _};
 use llama_native_types::{MediaInput, MediaKind};
@@ -89,6 +90,17 @@ pub(crate) struct ContextAttachmentPresentation {
     pub(crate) warnings: Vec<String>,
     pub(crate) source_revision: String,
     pub(crate) excerpt: Option<String>,
+    #[serde(default)]
+    pub(crate) pdf_pages: Vec<PdfPageLocation>,
+}
+
+/// An extracted PDF page's exact byte span in the retained canonical text.
+/// Missing pages are not evidence of an empty page or complete extraction.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct PdfPageLocation {
+    pub(crate) number: u32,
+    pub(crate) start_byte: usize,
+    pub(crate) end_byte: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -143,6 +155,8 @@ struct AttachmentManifest {
     canonical_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     canonical_text_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pdf_pages: Vec<PdfPageLocation>,
     media: Vec<StoredMedia>,
     preparation_plan: PreparationPlan,
     processing_receipt: AttachmentReceipt,
@@ -374,6 +388,90 @@ impl PreparedAttachment {
     }
 }
 
+fn retained_pdf_pages(
+    bundle: &AttachmentBundle,
+    plan: &PreparationPlan,
+) -> Result<Vec<PdfPageLocation>, ContextAttachmentError> {
+    if !bundle.graph.objects.iter().any(|object| {
+        object.id == bundle.graph.root && object.detection.selected == Some(DetectedFormat::Pdf)
+    }) {
+        return Ok(Vec::new());
+    }
+    let mut pages = Vec::new();
+    let mut offset = 0;
+    let mut has_text = false;
+    for part in &plan.parts {
+        let PreparedPart::UntrustedText {
+            artifact_id,
+            text,
+            source,
+            ..
+        } = part
+        else {
+            continue;
+        };
+        if has_text {
+            offset += 2; // The canonical representation joins parts with two newlines.
+        }
+        has_text = true;
+        if *source == bundle.graph.root {
+            let artifact = bundle
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.id == *artifact_id)
+                .ok_or(ContextAttachmentError::ContextInvalid)?;
+            let ArtifactPayload::Text {
+                text: artifact_text,
+                segments,
+                ..
+            } = &artifact.payload
+            else {
+                return Err(ContextAttachmentError::ContextInvalid);
+            };
+            if artifact_text != text {
+                return Err(ContextAttachmentError::ContextInvalid);
+            }
+            for segment in segments
+                .iter()
+                .filter(|segment| segment.kind == SegmentKind::Page)
+            {
+                let number = segment
+                    .coordinates
+                    .as_ref()
+                    .and_then(|coordinates| coordinates.get("page"))
+                    .and_then(|number| number.parse::<u32>().ok())
+                    .filter(|number| *number > 0)
+                    .ok_or(ContextAttachmentError::ContextInvalid)?;
+                if segment.start_byte >= segment.end_byte
+                    || !text.is_char_boundary(segment.start_byte)
+                    || !text.is_char_boundary(segment.end_byte)
+                {
+                    return Err(ContextAttachmentError::ContextInvalid);
+                }
+                pages.push(PdfPageLocation {
+                    number,
+                    start_byte: offset + segment.start_byte,
+                    end_byte: offset + segment.end_byte,
+                });
+            }
+        }
+        offset += text.len();
+    }
+    Ok(pages)
+}
+
+fn valid_pdf_pages(pages: &[PdfPageLocation], attachment: &StoredAttachment) -> bool {
+    (pages.is_empty() || attachment.detected_format == "pdf")
+        && pages.iter().all(|page| {
+            page.number > 0
+                && page.start_byte < page.end_byte
+                && u64::try_from(page.end_byte).is_ok_and(|end| end <= attachment.text_bytes)
+        })
+        && pages
+            .windows(2)
+            .all(|pair| pair[0].number < pair[1].number && pair[0].end_byte <= pair[1].start_byte)
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn prepare_provided(
     project_root: &Path,
@@ -584,11 +682,16 @@ pub(crate) fn prepare_provided(
         editable_markdown: None,
         media_markdown: None,
     };
+    let pdf_pages = retained_pdf_pages(&prepared.bundle, &prepared.plan)?;
+    if !valid_pdf_pages(&pdf_pages, &attachment) {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
     let manifest = AttachmentManifest {
         schema: MANIFEST_SCHEMA.to_owned(),
         attachment: attachment.clone(),
         canonical_text: None,
         canonical_text_sha256,
+        pdf_pages,
         media: stored_media,
         preparation_plan: prepared.plan,
         processing_receipt: prepared.receipt,
@@ -1002,6 +1105,7 @@ fn attachment_presentation(manifest: AttachmentManifest) -> ContextAttachmentPre
     ContextAttachmentPresentation {
         source_revision: String::new(),
         excerpt: None,
+        pdf_pages: manifest.pdf_pages,
         id: manifest.attachment.id,
         file_name: manifest.attachment.file_name,
         detected_format: manifest.attachment.detected_format,
@@ -1033,6 +1137,11 @@ pub(crate) fn read_source(
 ) -> Result<(ContextAttachmentPresentation, String), ContextAttachmentError> {
     let manifest = read_manifest_metadata(project_root, attachment_id)?;
     let text = read_canonical_text(project_root, &manifest)?;
+    if manifest.pdf_pages.iter().any(|page| {
+        !text.is_char_boundary(page.start_byte) || !text.is_char_boundary(page.end_byte)
+    }) {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
     let revision = manifest_revision(&manifest)?;
     let mut presentation = attachment_presentation(manifest);
     presentation.source_revision = revision;
@@ -2041,6 +2150,7 @@ fn read_manifest_if_present(
     let target_fingerprint_is_valid =
         manifest.preparation_plan.target_fingerprint == gemma_target().fingerprint;
     if !text_representation_is_valid
+        || !valid_pdf_pages(&manifest.pdf_pages, &manifest.attachment)
         || manifest.attachment.id != id
         || manifest.attachment.media_kinds != expected_media_kinds
         || manifest.attachment.inline_markdown
@@ -2239,7 +2349,111 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::io::Cursor;
+
+    fn two_page_pdf() -> Vec<u8> {
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_owned(),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R >> >> >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>".to_owned(),
+            "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>".to_owned(),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>".to_owned(),
+        ];
+        for text in ["First page", "Second page"] {
+            let content = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+            objects.push(format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            ));
+        }
+        let mut pdf = "%PDF-1.5\n".to_owned();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            writeln!(pdf, "{} 0 obj\n{object}\nendobj", index + 1).expect("write object");
+        }
+        let xref = pdf.len();
+        pdf.push_str("xref\n0 8\n0000000000 65535 f \n");
+        for offset in offsets {
+            writeln!(pdf, "{offset:010} 00000 n ").expect("write cross reference");
+        }
+        writeln!(
+            pdf,
+            "trailer\n<< /Size 8 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF"
+        )
+        .expect("write trailer");
+        pdf.into_bytes()
+    }
+
+    #[test]
+    fn pdf_page_locations_survive_import_without_changing_source_bytes() {
+        let project = tempfile::tempdir().expect("project");
+        let path = project.path().join("pages.pdf");
+        let original = two_page_pdf();
+        fs::write(&path, &original).expect("write PDF");
+        let attachment = import_path(project.path(), &path).expect("import PDF");
+        let (presentation, text) = read_source(project.path(), &attachment.id).expect("read PDF");
+        assert_eq!(presentation.pdf_pages.len(), 2, "{presentation:?}\n{text}");
+        for (page, (number, content)) in presentation
+            .pdf_pages
+            .iter()
+            .zip([(1, "First page"), (2, "Second page")])
+        {
+            assert_eq!(page.number, number);
+            assert_eq!(
+                &text[page.start_byte..page.end_byte],
+                format!("## Page {number}\n\n{content}\n\n")
+            );
+        }
+        assert_eq!(
+            fs::read(original_path(project.path(), &attachment.id).expect("original path"))
+                .expect("original"),
+            original
+        );
+        let again = import_path(project.path(), &path).expect("repeat import");
+        assert_eq!(
+            read_source(project.path(), &again.id).expect("same source"),
+            (presentation, text)
+        );
+    }
+
+    #[test]
+    fn unmapped_pdf_stays_unmapped_and_page_corruption_is_rejected() {
+        let project = tempfile::tempdir().expect("project");
+        let path = project.path().join("pages.pdf");
+        fs::write(&path, two_page_pdf()).expect("write PDF");
+        let attachment = import_path(project.path(), &path).expect("import PDF");
+        let mut manifest =
+            read_manifest_metadata(project.path(), &attachment.id).expect("manifest");
+        let manifest_path = attachment_root(project.path())
+            .expect("root")
+            .join("manifests")
+            .join(format!("{}.json", attachment.id));
+        manifest.pdf_pages.clear();
+        let unmapped = serde_json::to_vec(&manifest).expect("manifest bytes");
+        fs::write(&manifest_path, &unmapped).expect("fixture without mapping");
+        import_path(project.path(), &path).expect("reimport does not rewrite immutable manifest");
+        assert_eq!(fs::read(&manifest_path).expect("manifest"), unmapped);
+        assert!(
+            read_source(project.path(), &attachment.id)
+                .expect("source")
+                .0
+                .pdf_pages
+                .is_empty()
+        );
+        manifest.pdf_pages.push(PdfPageLocation {
+            number: 1,
+            start_byte: 0,
+            end_byte: usize::MAX,
+        });
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec(&manifest).expect("invalid fixture"),
+        )
+        .expect("write fixture");
+        assert!(read_source(project.path(), &attachment.id).is_err());
+    }
 
     #[test]
     fn explicit_material_edits_preserve_instructions_and_exact_source_identity() {

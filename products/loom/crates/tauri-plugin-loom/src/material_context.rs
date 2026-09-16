@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::IpcFailure;
 use crate::document_bindings::{self, ResolvedDocument};
+pub(super) use crate::materials::FolderScanBudget;
 use crate::materials::{
     self, MaterialEntry, MaterialEvidence, MaterialKind, MaterialRead, MaterialSearch,
 };
@@ -36,13 +37,16 @@ pub(super) enum Value {
     Documents {
         documents: Vec<ResolvedDocument>,
     },
+    Folder {
+        folder: document_bindings::FolderSnapshot,
+    },
     Material {
         material: MaterialValue,
     },
     Evidence {
         evidence: Vec<MaterialEvidence>,
         #[serde(default)]
-        retrieval: Option<MaterialSearch>,
+        retrieval: Option<Box<MaterialSearch>>,
     },
 }
 
@@ -85,6 +89,56 @@ pub(super) struct ContextPlan {
     pub omitted_evidence: BTreeMap<String, Vec<String>>,
 }
 
+/// Shared operation bound: overlapping folders cannot multiply admission work.
+#[derive(Default)]
+pub(super) struct FolderAdmissionBudget {
+    documents: BTreeSet<loom_types::DocumentId>,
+    bytes: usize,
+}
+
+impl FolderAdmissionBudget {
+    pub(super) fn admit(&mut self, value: &Value) -> Result<(), IpcFailure> {
+        let Value::Folder { folder } = value else {
+            return Ok(());
+        };
+        self.documents
+            .extend(folder.members.iter().map(|member| member.document_id));
+        self.bytes = self.bytes.saturating_add(
+            serde_json::to_vec(folder)
+                .map_err(|error| failure(error.to_string()))?
+                .len(),
+        );
+        if self.documents.len() > document_bindings::MAX_FOLDER_DOCUMENTS
+            || self.bytes > 1024 * 1024
+        {
+            return Err(failure(
+                "The referenced folders exceed this operation's 1,024-document or 1 MiB membership limit.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn evidence_artifact_ids(
+    evidence: &[MaterialEvidence],
+) -> Result<Vec<loom_types::ArtifactId>, IpcFailure> {
+    let mut ids = BTreeSet::new();
+    for hit in evidence {
+        if hit.locator.get("kind").and_then(serde_json::Value::as_str) == Some("document_revision")
+        {
+            let value = hit
+                .locator
+                .get("artifact_id")
+                .ok_or_else(|| failure("Document evidence is missing its source artifact."))?;
+            ids.insert(
+                serde_json::from_value(value.clone())
+                    .map_err(|error| failure(error.to_string()))?,
+            );
+        }
+    }
+    Ok(ids.into_iter().collect())
+}
+
 fn failure(message: impl Into<String>) -> IpcFailure {
     IpcFailure::new("material_context_invalid", message, false)
 }
@@ -99,6 +153,11 @@ pub(super) fn bounded(text: String) -> Result<String, IpcFailure> {
 }
 
 pub(super) fn resolve(store: &ProjectStore, name: &str) -> Result<Value, IpcFailure> {
+    if name.ends_with('/') {
+        return Ok(Value::Folder {
+            folder: document_bindings::snapshot_folder(store, name)?,
+        });
+    }
     if let Some(evidence) = materials::resolve_evidence_reference(store, name)? {
         return Ok(Value::Evidence {
             evidence: vec![evidence],
@@ -157,6 +216,9 @@ fn evidence_passage(hit: &MaterialEvidence) -> String {
 
 pub(super) fn exact(value: &Value) -> Result<String, IpcFailure> {
     match value {
+        Value::Folder { .. } => Err(failure(
+            "A folder is a collection, not an exact text argument. Use find(@Folder/, \"query\") to select evidence.",
+        )),
         Value::Text(text) => bounded(text.clone()),
         Value::Documents { documents } => bounded(
             documents
@@ -187,9 +249,28 @@ pub(super) fn search(
     source: &Value,
     query: &str,
 ) -> Result<Value, IpcFailure> {
+    search_with_cancel(store, source, query, &FolderScanBudget::default(), &|| {
+        false
+    })
+}
+
+pub(super) fn search_with_cancel(
+    store: &ProjectStore,
+    source: &Value,
+    query: &str,
+    scan_budget: &FolderScanBudget,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Value, IpcFailure> {
+    if let Value::Folder { folder } = source {
+        let result = materials::search_folder(store, folder, query, scan_budget, cancelled)?;
+        return Ok(Value::Evidence {
+            evidence: result.hits.clone(),
+            retrieval: Some(Box::new(result)),
+        });
+    }
     let Value::Material { material } = source else {
         return Err(failure(
-            "find() requires an imported source or library reference as its first argument.",
+            "find() requires a folder, imported source, or library reference as its first argument.",
         ));
     };
     if query.trim().is_empty() || query.len() > 4096 {
@@ -203,7 +284,7 @@ pub(super) fn search(
     }
     Ok(Value::Evidence {
         evidence: result.hits.clone(),
-        retrieval: Some(result),
+        retrieval: Some(Box::new(result)),
     })
 }
 
@@ -222,6 +303,7 @@ pub(super) fn consult(
     query: &str,
 ) -> Result<Value, IpcFailure> {
     match value {
+        Value::Folder { .. } => search(store, value, query_window(query)),
         Value::Material { material }
             if material.material.kind == MaterialKind::Library
                 || material.text.is_none()
@@ -242,13 +324,35 @@ pub(super) fn markdown_plan(
     markdown_plan_with_budget(store, markdown, query, MAX_BYTES)
 }
 
+#[cfg(all(test, unix))]
 pub(super) fn consult_with_budget(
     store: &ProjectStore,
     value: &Value,
     query: &str,
     budget: usize,
 ) -> Result<(Value, Vec<String>), IpcFailure> {
+    consult_with_budget_and_cancel(
+        store,
+        value,
+        query,
+        budget,
+        &FolderScanBudget::default(),
+        &|| false,
+    )
+}
+
+pub(super) fn consult_with_budget_and_cancel(
+    store: &ProjectStore,
+    value: &Value,
+    query: &str,
+    budget: usize,
+    scan_budget: &FolderScanBudget,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(Value, Vec<String>), IpcFailure> {
     let consulted = match value {
+        Value::Folder { .. } => {
+            search_with_cancel(store, value, query_window(query), scan_budget, cancelled)?
+        }
         Value::Material { material }
             if material
                 .text
@@ -326,17 +430,23 @@ pub(super) fn markdown_plan_with_budget(
         ..ContextPlan::default()
     };
     let mut seen = BTreeSet::new();
+    let mut folder_budget = FolderAdmissionBudget::default();
+    let scan_budget = FolderScanBudget::default();
     for reference in references {
         if !seen.insert(reference.name.clone()) {
             continue;
         }
         let value = resolve(store, &reference.name)?;
+        folder_budget.admit(&value)?;
         let header = format!("\n--- Referenced material {:?} ---\n", reference.name);
         let footer = "\n--- End material ---\n";
         let remaining = plan
             .byte_budget
             .saturating_sub(plan.text.len() + header.len() + footer.len());
-        let (consulted, omitted) = consult_with_budget(store, &value, query, remaining)?;
+        let (consulted, omitted) =
+            consult_with_budget_and_cancel(store, &value, query, remaining, &scan_budget, &|| {
+                false
+            })?;
         if !omitted.is_empty() {
             plan.omitted_evidence
                 .insert(reference.name.clone(), omitted);
@@ -382,7 +492,7 @@ pub(super) fn native_media<'a>(
                     );
                 }
             }
-            Value::Text(_) | Value::Evidence { .. } => {}
+            Value::Text(_) | Value::Evidence { .. } | Value::Folder { .. } => {}
         }
     }
     crate::terminal_media::merge(Vec::new(), media)

@@ -36,6 +36,7 @@ const COMMANDS: &[&str] = &[
     "attachment_ingest",
     "attachment_import_choose",
     "attachment_import_paths",
+    "workspace_copy_files",
     "attachment_reveal_original",
     "document_context_list",
     "document_context_add",

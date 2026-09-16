@@ -63,6 +63,7 @@
   let latestSelectionCallback = 'none';
   let selectionAccessibility: VisualSelectionAccessibilityWitness =
     unavailableVisualSelectionWitness();
+  export let onSelectionWitness: (witness: VisualSelectionAccessibilityWitness, markdown: string) => void = () => {};
   let formatting: VisualFormatState = {
     block: 'body',
     bold: false,
@@ -249,7 +250,10 @@
       onImmediateDocumentMutation={immediateMutation}
       onCaretNavigation={caretNavigation}
       onSelectionChange={selectionChanged}
-      onSelectionAccessibilityChange={(witness) => selectionAccessibility = witness}
+      onSelectionAccessibilityChange={(witness) => {
+        selectionAccessibility = witness;
+        onSelectionWitness(witness, markdown);
+      }}
       onGhostInsert={insert}
       onGhostUnconsume={unconsume}
       onGhostCycle={cycle}

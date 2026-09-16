@@ -72,6 +72,7 @@ jobs:
         with:
           workspaces: ${{ runner.temp }}/omp2-tested -> ${{ github.workspace }}/target/omp2
           shared-key: omp2-runtime-macos
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Exercise the maintained upstream crate
         working-directory: ${{ runner.temp }}/omp2-tested
         shell: bash
