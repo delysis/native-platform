@@ -8,8 +8,8 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounde
 use llama_native_types::{
     ChatMessage, ChatRole, ChatTemplateChoice, CompletionPrompt, GenerationBatchRequest,
     GenerationCase, GenerationEvent as NativeEvent, GenerationEventKind as NativeEventKind,
-    GenerationOutput, GenerationState, MAX_GENERATED_OUTPUT_BYTES, MediaInput, MediaKind,
-    NativeError, NativeTransport, SamplingConfig, SpecialTokenPolicy,
+    GenerationInput, GenerationOutput, GenerationState, MAX_GENERATED_OUTPUT_BYTES, MediaInput,
+    MediaKind, NativeError, NativeTransport, SamplingConfig, SpecialTokenPolicy,
 };
 use loom_types::{
     ArtifactId, BlobId, BranchCandidate, BranchId, ByteRange, CandidateId, GeneratedSpan,
@@ -1320,6 +1320,8 @@ struct BackendReceipt<'a> {
     input_contract: WriterInputContract,
     context_binding: ContinuationContextBinding,
     output: &'a GenerationOutput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    function_input: Option<FunctionInputEvidence>,
 }
 
 #[derive(Deserialize)]
@@ -1329,6 +1331,15 @@ struct OwnedBackendReceipt {
     input_contract: WriterInputContract,
     context_binding: ContinuationContextBinding,
     output: GenerationOutput,
+    #[serde(default)]
+    function_input: Option<FunctionInputEvidence>,
+}
+
+/// Exact submitted native input, not a claim of downstream rendered tokens.
+#[derive(Debug, Deserialize, Serialize)]
+struct FunctionInputEvidence {
+    model_chat_template_sha256: String,
+    input: GenerationInput,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1340,6 +1351,8 @@ enum WriterInputContract {
     RawCompletionWithMediaPrefix,
     InstructionChat,
     Gemma4NonThinkingChat,
+    FunctionModelChat,
+    FunctionGemma4NonThinking,
 }
 
 /// Verifies that preserved native receipt bytes describe this exact Loom run.
@@ -1389,7 +1402,13 @@ pub fn validate_candidate_receipt_binding(
         !expected_context_binding.media.is_empty(),
         expected_model,
     );
-    let identities_match = receipt.exact_prompt_blob_id == expected_prompt_blob_id
+    let identities_match = function_input_matches(
+        &receipt,
+        expected_prompt_mode,
+        expected_prompt_blob_id,
+        expected_model,
+        !expected_context_binding.media.is_empty(),
+    ) && receipt.exact_prompt_blob_id == expected_prompt_blob_id
         && receipt.model_environment_id == expected_model.model_environment_id
         && receipt.input_contract == expected_input_contract
         && &receipt.context_binding == expected_context_binding
@@ -1491,6 +1510,16 @@ fn build_candidate_material(
         input_contract: writer_input_contract_for_request(request, model),
         context_binding: continuation_context_binding(&request.context_preamble, &request.media)?,
         output: &output,
+        function_input: (request.prompt_recipe.mode == PromptMode::Function).then(|| {
+            FunctionInputEvidence {
+                model_chat_template_sha256: model.chat_template_sha256.clone(),
+                input: build_function_input(
+                    &request.exact_manuscript_prefix,
+                    model,
+                    !request.media.is_empty(),
+                ),
+            }
+        }),
     })?;
     let backend_receipt_blob_id = BlobId::digest(&backend_receipt_bytes);
     let output_blob_id = BlobId::digest(output.text.as_bytes());
@@ -1636,17 +1665,19 @@ fn validate_request(
     let prompt_blob_id = BlobId::digest(request.exact_manuscript_prefix.as_bytes());
     if !matches!(
         request.prompt_recipe.mode,
-        PromptMode::Completion | PromptMode::RawCompletion
+        PromptMode::Completion | PromptMode::RawCompletion | PromptMode::Function
     ) {
         return Err(LlamaBackendError::InvalidRequest(
-            "continuation requires Completion or RawCompletion mode".to_string(),
+            "continuation requires Completion, RawCompletion, or Function mode".to_string(),
         ));
     }
-    if request.prompt_recipe.mode == PromptMode::RawCompletion
-        && !request.context_preamble.is_empty()
+    if matches!(
+        request.prompt_recipe.mode,
+        PromptMode::RawCompletion | PromptMode::Function
+    ) && !request.context_preamble.is_empty()
     {
         return Err(LlamaBackendError::InvalidRequest(
-            "raw completion requires a self-contained text prompt without a hidden context preamble".to_string(),
+            "raw completion and functions require a self-contained text prompt without a hidden context preamble".to_string(),
         ));
     }
     if request.prompt_recipe.exact_prompt_blob_id != prompt_blob_id {
@@ -1732,6 +1763,7 @@ fn build_native_request(
             .map(|case| GenerationCase {
                 case_id: case.generation.branch_id.to_string(),
                 input: match input_contract {
+                    WriterInputContract::FunctionModelChat | WriterInputContract::FunctionGemma4NonThinking => build_function_input(&request.exact_manuscript_prefix, model, !request.media.is_empty()),
                     WriterInputContract::RawCompletion
                     | WriterInputContract::RawCompletionWithMediaPrefix => {
                         llama_native_types::GenerationInput::Completion {
@@ -1807,9 +1839,106 @@ fn writer_input_contract_for_mode(
 ) -> WriterInputContract {
     if mode == PromptMode::RawCompletion {
         raw_input_contract(has_media)
+    } else if mode == PromptMode::Function {
+        function_input_contract(model, has_media)
     } else {
         writer_input_contract_for_media(has_media, model)
     }
+}
+
+const FUNCTION_GEMMA_PREFIX: &str = "<|turn>user\n";
+const FUNCTION_GEMMA_SUFFIX: &str = "<turn|>\n<|turn>model\n<|channel>thought\n<channel|>";
+
+fn function_input_contract(
+    model: &VerifiedModelDescriptor,
+    has_media: bool,
+) -> WriterInputContract {
+    if !model.capabilities.chat.is_supported() {
+        raw_input_contract(has_media)
+    } else if model.architecture.as_deref() == Some("gemma4") {
+        WriterInputContract::FunctionGemma4NonThinking
+    } else {
+        WriterInputContract::FunctionModelChat
+    }
+}
+
+fn build_function_input(
+    prompt: &str,
+    model: &VerifiedModelDescriptor,
+    has_media: bool,
+) -> GenerationInput {
+    let contract = function_input_contract(model, has_media);
+    if matches!(
+        contract,
+        WriterInputContract::RawCompletion | WriterInputContract::RawCompletionWithMediaPrefix
+    ) || (contract == WriterInputContract::FunctionGemma4NonThinking && !has_media)
+    {
+        let text = if contract == WriterInputContract::FunctionGemma4NonThinking {
+            format!("{FUNCTION_GEMMA_PREFIX}{prompt}{FUNCTION_GEMMA_SUFFIX}")
+        } else {
+            prompt.to_owned()
+        };
+        GenerationInput::Completion {
+            prompts: vec![CompletionPrompt::Text {
+                text,
+                special_tokens: SpecialTokenPolicy::AddBosParseSpecial,
+            }],
+        }
+    } else {
+        GenerationInput::Chat {
+            messages: vec![ChatMessage {
+                role: ChatRole::User,
+                content: prompt.to_owned(),
+            }],
+            template: if contract == WriterInputContract::FunctionGemma4NonThinking {
+                ChatTemplateChoice::Gemma4NonThinking
+            } else {
+                ChatTemplateChoice::ModelDefault
+            },
+        }
+    }
+}
+
+fn function_input_matches(
+    receipt: &OwnedBackendReceipt,
+    mode: PromptMode,
+    prompt_blob: BlobId,
+    model: &VerifiedModelDescriptor,
+    has_media: bool,
+) -> bool {
+    if mode != PromptMode::Function {
+        return receipt.function_input.is_none();
+    }
+    let Some(evidence) = &receipt.function_input else {
+        return false;
+    };
+    if evidence.model_chat_template_sha256 != model.chat_template_sha256 {
+        return false;
+    }
+    let prompt = match &evidence.input {
+        GenerationInput::Completion { prompts } if prompts.len() == 1 => {
+            let CompletionPrompt::Text { text, .. } = &prompts[0] else {
+                return false;
+            };
+            if function_input_contract(model, has_media)
+                == WriterInputContract::FunctionGemma4NonThinking
+            {
+                let Some(prompt) = text
+                    .strip_prefix(FUNCTION_GEMMA_PREFIX)
+                    .and_then(|text| text.strip_suffix(FUNCTION_GEMMA_SUFFIX))
+                else {
+                    return false;
+                };
+                prompt
+            } else {
+                text
+            }
+        }
+        GenerationInput::Chat { messages, .. } if messages.len() == 1 => &messages[0].content,
+        _ => return false,
+    };
+    BlobId::digest(prompt.as_bytes()) == prompt_blob
+        && evidence.input == build_function_input(prompt, model, has_media)
 }
 
 fn writer_input_contract_for_media(
@@ -3249,7 +3378,11 @@ mod tests {
 
     #[test]
     fn numeric_continuations_retain_exact_output_and_provenance() {
-        for mode in [PromptMode::RawCompletion, PromptMode::Completion] {
+        for mode in [
+            PromptMode::RawCompletion,
+            PromptMode::Completion,
+            PromptMode::Function,
+        ] {
             let mut request = request_with_two_cases();
             request.exact_manuscript_prefix = "Return pi to ten decimal places:".to_owned();
             request.prompt_recipe.mode = mode;
@@ -3335,6 +3468,178 @@ mod tests {
                     .collect::<String>();
                 assert_eq!(streamed, texts[index]);
             }
+        }
+    }
+
+    #[test]
+    fn document_function_formats_only_the_inspected_model_protocol() {
+        let mut request = request_with_two_cases();
+        request.prompt_recipe.mode = PromptMode::Function;
+        request.exact_manuscript_prefix = " \r\nScore this evidence: λ\nOutput:\n".to_owned();
+        request.prompt_recipe.exact_prompt_blob_id =
+            BlobId::digest(request.exact_manuscript_prefix.as_bytes());
+        let mut model = verify_model_inspection(&request.model, model_inspection(&request.model))
+            .expect("verified fixture");
+        let raw = build_native_request(&request, &model);
+        assert_eq!(
+            raw.cases[0].input,
+            GenerationInput::Completion {
+                prompts: vec![CompletionPrompt::Text {
+                    text: request.exact_manuscript_prefix.clone(),
+                    special_tokens: SpecialTokenPolicy::AddBosParseSpecial,
+                }]
+            }
+        );
+        model.capabilities.chat = crate::CapabilitySupport::Supported;
+        for architecture in ["fixture", "gemma4"] {
+            model.architecture = Some(architecture.to_owned());
+            let native = build_native_request(&request, &model);
+            if architecture == "gemma4" {
+                assert_eq!(
+                    native.cases[0].input,
+                    GenerationInput::Completion {
+                        prompts: vec![CompletionPrompt::Text {
+                            text: format!(
+                                "<|turn>user\n{}<turn|>\n<|turn>model\n<|channel>thought\n<channel|>",
+                                request.exact_manuscript_prefix
+                            ),
+                            special_tokens: SpecialTokenPolicy::AddBosParseSpecial,
+                        }]
+                    }
+                );
+            } else {
+                assert_eq!(
+                    native.cases[0].input,
+                    GenerationInput::Chat {
+                        messages: vec![ChatMessage {
+                            role: ChatRole::User,
+                            content: request.exact_manuscript_prefix.clone()
+                        }],
+                        template: ChatTemplateChoice::ModelDefault,
+                    }
+                );
+            }
+            request.prompt_recipe.mode = PromptMode::RawCompletion;
+            assert_eq!(
+                build_native_request(&request, &model).cases[0].input,
+                raw.cases[0].input
+            );
+            request.prompt_recipe.mode = PromptMode::Function;
+        }
+        let bytes = b"fixture media".to_vec();
+        request.media.push(MediaInput {
+            id: "source".into(),
+            kind: MediaKind::Audio,
+            mime: "audio/wav".into(),
+            sha256: BlobId::digest(&bytes).to_string(),
+            bytes,
+        });
+        let native = build_native_request(&request, &model);
+        assert_eq!(native.media, request.media);
+        assert_eq!(
+            native.cases[0].input,
+            GenerationInput::Chat {
+                messages: vec![ChatMessage {
+                    role: ChatRole::User,
+                    content: request.exact_manuscript_prefix.clone()
+                }],
+                template: ChatTemplateChoice::Gemma4NonThinking,
+            }
+        );
+        request.context_preamble = "unrecorded instruction".into();
+        assert!(
+            matches!(validate_request(&request, &model, DEFAULT_EVENT_CAPACITY),
+            Err(LlamaBackendError::InvalidRequest(message)) if message.contains("self-contained"))
+        );
+    }
+
+    #[test]
+    fn document_function_receipt_retains_and_validates_exact_native_framing() {
+        let mut request = request_with_two_cases();
+        request.prompt_recipe.mode = PromptMode::Function;
+        let outputs = (0..request.cases.len())
+            .map(|index| native_output(&request, index, GenerationState::Completed, true))
+            .collect();
+        let mut runtime = fake_runtime(
+            &request,
+            outputs,
+            native_events(&request),
+            true,
+            RuntimeEvidenceClass::TestFixture,
+        );
+        let inspection = &mut Arc::get_mut(&mut runtime)
+            .expect("exclusive fixture")
+            .inspection;
+        inspection.descriptor.architecture = "gemma4".to_owned();
+        inspection.descriptor.capabilities.chat_template_available = true;
+        inspection.descriptor.capabilities.exact.prompts.chat = true;
+        inspection
+            .descriptor
+            .capabilities
+            .prompt_forms
+            .push(PromptForm::Chat);
+        let backend = LlamaBackend::with_runtime(runtime.clone(), 64).expect("fixture backend");
+        let handle = backend
+            .start_exact_continuation(request)
+            .expect("start function");
+        let result = handle
+            .wait_timeout(Duration::from_secs(2))
+            .expect("function result");
+        let captured = runtime
+            .captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("native input");
+        let candidate = &result.candidates[0];
+        let receipt: OwnedBackendReceipt =
+            serde_json::from_slice(&candidate.backend_receipt_bytes).expect("receipt");
+        assert_eq!(
+            receipt.input_contract,
+            WriterInputContract::FunctionGemma4NonThinking
+        );
+        assert_eq!(
+            receipt
+                .function_input
+                .as_ref()
+                .expect("exact native input")
+                .input,
+            captured.cases[0].input
+        );
+        let validate = |record: &CandidateProvenanceRecord, mode| {
+            validate_candidate_receipt_binding(
+                record,
+                &result.request_id,
+                result.exact_prompt_blob_id,
+                mode,
+                &result.context_binding,
+                &result.model,
+                0,
+            )
+        };
+        validate(candidate, PromptMode::Function).expect("bound function receipt");
+        assert!(validate(candidate, PromptMode::RawCompletion).is_err());
+        let original: serde_json::Value =
+            serde_json::from_slice(&candidate.backend_receipt_bytes).expect("receipt JSON");
+        for field in ["framing", "template", "missing"] {
+            let mut altered = original.clone();
+            match field {
+                "framing" => {
+                    altered["function_input"]["input"]["prompts"][0]["text"] =
+                        "unrelated prompt".into();
+                }
+                "template" => {
+                    altered["function_input"]["model_chat_template_sha256"] =
+                        "00".repeat(32).into();
+                }
+                _ => altered["function_input"] = serde_json::Value::Null,
+            }
+            let mut forged = candidate.clone();
+            forged.backend_receipt_bytes = serde_json::to_vec(&altered).expect("altered receipt");
+            assert!(
+                validate(&forged, PromptMode::Function).is_err(),
+                "accepted changed {field}"
+            );
         }
     }
 

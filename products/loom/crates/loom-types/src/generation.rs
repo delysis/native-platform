@@ -46,6 +46,8 @@ pub enum PromptMode {
     Completion,
     /// Exact text continuation, independent of any model chat capability.
     RawCompletion,
+    /// A document function, framed only by the inspected model input contract.
+    Function,
     FillInMiddle,
 }
 

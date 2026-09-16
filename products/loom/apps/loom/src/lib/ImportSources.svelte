@@ -7,10 +7,11 @@
 
   export let projectId: string;
   export let sessionId: string;
-  export let documentTitle: string;
-  export let onUse: (items: ContextAttachment[]) => Promise<boolean>;
-  export let onImported: () => void = () => {};
-  function publishImported(): void { onImported(); }
+  export let onOpen: (item: ContextAttachment, projectId: string, sessionId: string) => Promise<void>;
+  export let onImported: (items: ContextAttachment[], projectId: string, sessionId: string) => Promise<void>;
+  async function publishImported(): Promise<void> {
+    if (report?.imported.length) await onImported(report.imported, projectId, sessionId);
+  }
   let accounts: ImportAccount[] = [];
   let service: 'gmail' | 'drive' = 'gmail';
   let webUrl = '';
@@ -27,7 +28,6 @@
   let operationId = '';
   let message = '';
   let report: ImportBatch | null = null;
-  let selected: string[] = [];
   let lastQuery = '';
   let lastSource: ImportSource = 'gmail';
   let lastAccount = '';
@@ -55,7 +55,7 @@
     try {
       const result = await connectImportAccount(projectId, sessionId, service, clientId.trim(), clientSecret, operationId);
       accounts = [...accounts.filter((item) => item.service !== result.service || item.email !== result.email), result];
-      chosenEmail = result.email ?? ''; configuring = false; report = null; selected = [];
+      chosenEmail = result.email ?? ''; configuring = false; report = null;
       message = `Connected ${result.email}. Sync runs only when you request it.`;
     } catch (error) { message = errorText(error); }
     finally { clientSecret = ''; busy = false; authorizing = false; operationId = ''; }
@@ -64,7 +64,7 @@
     busy = true;
     try {
       await disconnectImportAccount(projectId, sessionId, service, account ?? '');
-      await refresh(); report = null; selected = [];
+      await refresh(); report = null;
       message = 'Connection removed from this device. Imported files remain in the project. You can also revoke Loom in your Google account settings.';
     } catch (error) { message = errorText(error); }
     finally { busy = false; }
@@ -75,8 +75,8 @@
     try {
       const token = next && canNext ? report?.next_page_token : undefined;
       report = await syncImportAccount(projectId, sessionId, source, account ?? '', query, token ?? null, operationId);
-      publishImported();
-      lastQuery = query; lastSource = source; lastAccount = account ?? ''; selected = [];
+      await publishImported();
+      lastQuery = query; lastSource = source; lastAccount = account ?? '';
       message = `${report.imported.length} imported; ${report.failures.length} failed.${report.next_page_token ? ' More results are available.' : ' End of results.'}`;
     } catch (error) { message = errorText(error); }
     finally { busy = false; operationId = ''; }
@@ -85,7 +85,7 @@
     operationId = newUlid();
     busy = true; message = 'Reading local sources…';
     try {
-      report = await chooseImportBatch(projectId, sessionId, folder, operationId); selected = []; publishImported();
+      report = await chooseImportBatch(projectId, sessionId, folder, operationId); await publishImported();
       message = `${report.imported.length} imported; ${report.failures.length} failed or skipped.`;
     } catch (error) { message = errorText(error); }
     finally { busy = false; operationId = ''; }
@@ -93,30 +93,27 @@
   async function web(): Promise<void> {
     operationId = newUlid();
     busy = true; message = 'Importing the public web document…';
-    try { report = await importSourceUrl(projectId, sessionId, webUrl.trim(), operationId); selected = []; publishImported(); message = 'Source retained. Select it below to reference it.'; }
+    try { report = await importSourceUrl(projectId, sessionId, webUrl.trim(), operationId); await publishImported(); message = 'Source added.'; }
     catch (error) { message = errorText(error); }
     finally { busy = false; operationId = ''; }
   }
   async function paste(): Promise<void> {
     operationId = newUlid();
     busy = true;
-    try { report = await importPastedSources(projectId, sessionId, pasted, separator, operationId); selected = []; publishImported(); message = `${report.imported.length} pasted sources imported; ${report.failures.length} failed.`; }
+    try { report = await importPastedSources(projectId, sessionId, pasted, separator, operationId); await publishImported(); message = `${report.imported.length} pasted sources imported; ${report.failures.length} failed.`; }
     catch (error) { message = errorText(error); }
     finally { busy = false; operationId = ''; }
   }
-  async function useSelected(): Promise<void> {
+  async function openSource(item: ContextAttachment): Promise<void> {
+    if (busy) return;
     busy = true;
-    try {
-      if (await onUse(report?.imported.filter((item) => selected.includes(item.id)) ?? [])) {
-        message = 'References inserted.'; selected = [];
-      }
-    } catch (error) { message = errorText(error); }
+    try { await onOpen(item, projectId, sessionId); }
+    catch (error) { message = errorText(error); }
     finally { busy = false; }
   }
 </script>
 
 <section class="import-sources">
-  <p>Use here inserts references in <strong>{documentTitle}</strong>.</p>
   <p>Bring documents, Slack archives, Claude conversations, LinkedIn exports, and mailboxes into this project.</p>
   <div class="actions">
     <button disabled={busy} on:click={() => void local(false)}>Choose files</button>
@@ -130,13 +127,13 @@
   <label>Public document URL <input type="url" bind:value={webUrl} disabled={busy} placeholder="https://…" maxlength="4096" /></label>
   <button disabled={busy || !webUrl.trim()} on:click={() => void web()}>Import URL</button>
   <label>Connected source
-    <select bind:value={source} disabled={busy} on:change={() => { query = source === 'drive' ? '' : 'newer_than:30d'; report = null; selected = []; }}>
+    <select bind:value={source} disabled={busy} on:change={() => { query = source === 'drive' ? '' : 'newer_than:30d'; report = null; }}>
       <option value="gmail">Gmail</option><option value="google_alerts">Google Alerts in Gmail</option>
       <option value="linked_in">LinkedIn notifications in Gmail</option><option value="drive">Google Drive</option>
     </select>
   </label>
   {#if account && !configuring}
-    <label>Account <select bind:value={chosenEmail} disabled={busy} on:change={() => { report = null; selected = []; }}>
+    <label>Account <select bind:value={chosenEmail} disabled={busy} on:change={() => { report = null; }}>
       <option value="">Choose account (default: {availableAccounts[0]?.email})</option>
       {#each availableAccounts as item}<option value={item.email ?? ''}>{item.email}</option>{/each}
     </select></label>
@@ -159,14 +156,14 @@
   {#if report}
     <div class="results">
       {#each report.imported as item, index (`${item.id}:${index}`)}
-        <label class="result"><input type="checkbox" bind:group={selected} value={item.id} disabled={busy} />
-          <span>{item.file_name} <small>{item.text_bytes.toLocaleString()} text bytes{item.coverage_complete ? '' : ' · Partial import'}</small>
-            {#each item.warnings as warning}<small>{warning}</small>{/each}</span>
-        </label>
+        <div class="result">
+          <button class="source-link" disabled={busy} on:click={() => void openSource(item)}>{item.file_name}</button>
+          {#if !item.coverage_complete}<small>Partial import</small>{/if}
+          {#each item.warnings as warning}<small>{warning}</small>{/each}
+        </div>
       {/each}
       {#each report.failures as item}<p class="failure">{item.name}: {item.message}</p>{/each}
     </div>
-    {#if report.imported.length > 0}<button disabled={busy || selected.length === 0 || selected.length > 16} on:click={() => void useSelected()}>Use here ({selected.length}/16)</button>{/if}
   {/if}
 </section>
 
@@ -185,9 +182,8 @@
   button:disabled { opacity: .5; cursor: default; }
   .actions { display: flex; flex-wrap: wrap; gap: 4px; }
   .results { max-height: 22rem; min-width: 0; overflow: auto; }
-  .result { display: flex; gap: 5px; align-items: start; }
-  .result input { flex: none; }
-  .result span { min-width: 0; }
+  .result { min-width: 0; padding-block: 4px; }
+  .source-link { display: block; text-align: left; border: 0; overflow-wrap: anywhere; }
   small { display: block; color: var(--muted); margin-top: 2px; }
   .failure { color: var(--danger); }
 </style>

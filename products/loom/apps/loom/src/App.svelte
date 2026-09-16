@@ -2251,13 +2251,26 @@
     }
   }
 
-  async function useImportedSources(items: import('./lib/types').ContextAttachment[]): Promise<boolean> {
-    if (!project || !document || editorReadonly || contextAttachmentBusy || items.length === 0) return false;
-    const captured = { projectId: project.project_id, sessionId: project.session_id };
-    const bound = await Promise.all(items.map(item => bindAttachmentMaterial(captured.projectId, captured.sessionId, item.id)));
-    if (project?.session_id !== captured.sessionId) return false;
-    bound.forEach(materialChanged);
-    return useMaterialReference(bound.map(materialReferenceMarkdown).join('\n\n'), null);
+  async function addImportedSources(items: import('./lib/types').ContextAttachment[], projectId: string, sessionId: string): Promise<void> {
+    const current = () => project?.project_id === projectId && project.session_id === sessionId;
+    const failures: string[] = [];
+    for (const item of items) {
+      if (!current()) return;
+      try {
+        const bound = await bindAttachmentMaterial(projectId, sessionId, item.id);
+        if (current()) materialChanged(bound);
+      } catch (error) { failures.push(`${item.file_name}: ${normalizeFailure(error).message}`); }
+    }
+    if (current() && failures.length) throw new Error(failures.join('\n'));
+  }
+
+  async function openImportedSource(item: import('./lib/types').ContextAttachment, projectId: string, sessionId: string): Promise<void> {
+    if (project?.project_id !== projectId || project.session_id !== sessionId) return;
+    const bound = materialEntries.find(entry => entry.attachment_id === item.id)
+      ?? await bindAttachmentMaterial(projectId, sessionId, item.id);
+    if (project?.project_id !== projectId || project.session_id !== sessionId) return;
+    materialChanged(bound);
+    openMaterial(bound);
   }
 
   async function saveMaterialExcerpt(attachmentId: string, sourceRevision: string, excerpt: string | null): Promise<boolean> {
@@ -9972,7 +9985,7 @@
         {:else if materialsOpen}
           <section class="material-connect-view" aria-label="Add sources">
             <PaneHeader title="Add sources" onCollapse={closeMaterial} />
-            {#if document}{#key project.session_id}<ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={materialOrigin?.title ?? document.summary.title} onUse={useImportedSources} onImported={() => void refreshMaterials()} />{/key}{/if}
+            {#if document}{#key project.session_id}<ImportSources projectId={project.project_id} sessionId={project.session_id} onOpen={openImportedSource} onImported={addImportedSources} />{/key}{/if}
           </section>
         {/if}
         <div class="writing-content" class:material-covered={Boolean(activeMaterial) || materialsOpen} inert={Boolean(activeMaterial) || materialsOpen}>

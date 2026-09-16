@@ -22,6 +22,9 @@ choose only one. Leaving it commented keeps the usual local default.
 # Or replace catalog with a build-policy profile:
 # profile = "gemma_4_e2b_base_q8_loom_v1"
 
+# [functions]
+# format = "model"
+
 # [theme]
 # mode = "system"
 # canvas = "#faf9f6"
@@ -165,6 +168,7 @@ impl WorkspaceTheme {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct WorkspaceConfig {
     model: Option<WorkspaceModel>,
+    functions: FunctionSettings,
     theme: WorkspaceTheme,
     panes: BTreeMap<String, PaneConfig>,
 }
@@ -173,6 +177,7 @@ impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             model: None,
+            functions: FunctionSettings::default(),
             theme: WorkspaceTheme::default(),
             panes: [
                 ("writing", PaneKind::Editor),
@@ -191,8 +196,54 @@ impl Default for WorkspaceConfig {
 #[serde(default, deny_unknown_fields)]
 struct WorkspaceOverrides {
     model: Option<WorkspaceModel>,
+    functions: FunctionSettings,
     theme: WorkspaceTheme,
     panes: BTreeMap<String, PaneOverrides>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum FunctionFormat {
+    #[default]
+    Model,
+    Raw,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct FunctionSettings {
+    format: FunctionFormat,
+}
+
+/// A run freezes its recipe and the configuration revision that selected it.
+/// The configuration is evidence, never implicit prompt context.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct FunctionRecipe {
+    pub format: FunctionFormat,
+    pub configuration: Option<crate::document_bindings::ResolvedDocument>,
+}
+
+pub(super) fn function_recipe(store: &mut ProjectStore) -> Result<FunctionRecipe, IpcFailure> {
+    let Some(loaded) = load_template(store)? else {
+        return Ok(FunctionRecipe {
+            format: FunctionFormat::Model,
+            configuration: None,
+        });
+    };
+    let config = parse_config(&loaded.text)
+        .map_err(|message| IpcFailure::new("workspace_template_failed", message, false))?;
+    Ok(FunctionRecipe {
+        format: config.functions.format,
+        configuration: Some(crate::document_bindings::ResolvedDocument {
+            name: TEMPLATE_PATH.into(),
+            path: TEMPLATE_PATH.into(),
+            document_id: loaded.document_id,
+            revision_id: loaded.revision_id,
+            blob_id: loaded.blob_id,
+            artifact_id: loaded.artifact_id,
+            text: loaded.text,
+        }),
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -248,6 +299,7 @@ fn parse_config(markdown: &str) -> Result<WorkspaceConfig, String> {
         config.model = Some(model);
     }
     overrides.theme.validate()?;
+    config.functions = overrides.functions;
     config.theme = overrides.theme;
     for (name, pane) in overrides.panes {
         if !valid_pane_id(&name) {
@@ -348,13 +400,26 @@ fn config_fence(markdown: &str) -> Result<&str, String> {
     Ok(found.unwrap_or(""))
 }
 
-fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
+fn load_template(store: &mut ProjectStore) -> Result<Option<LoadedDocument>, IpcFailure> {
     let document = store
         .list_documents()
         .map_err(IpcFailure::store)?
         .into_iter()
         .find(|document| document.relative_path == TEMPLATE_PATH);
-    let Some(document) = document else {
+    if document.is_none() {
+        return Ok(None);
+    }
+    store
+        .import_external_changes_if_uncontested(TEMPLATE_PATH, "Read external workspace settings")
+        .map_err(IpcFailure::store)?;
+    store
+        .read_document(TEMPLATE_PATH)
+        .map(Some)
+        .map_err(IpcFailure::store)
+}
+
+fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
+    let Some(loaded) = load_template(store)? else {
         return Ok(WorkspaceTemplateSnapshot {
             enabled: false,
             document_id: None,
@@ -363,19 +428,13 @@ fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFa
             error: None,
         });
     };
-    store
-        .import_external_changes_if_uncontested(TEMPLATE_PATH, "Read external workspace settings")
-        .map_err(IpcFailure::store)?;
-    let loaded = store
-        .read_document(TEMPLATE_PATH)
-        .map_err(IpcFailure::store)?;
     let (config, error) = match parse_config(&loaded.text) {
         Ok(config) => (config, None),
         Err(error) => (WorkspaceConfig::default(), Some(error)),
     };
     Ok(WorkspaceTemplateSnapshot {
         enabled: true,
-        document_id: Some(document.document_id.to_string()),
+        document_id: Some(loaded.document_id.to_string()),
         revision_id: Some(loaded.revision_id.to_string()),
         config,
         error,
@@ -443,6 +502,46 @@ pub(super) async fn workspace_template_enable(
 mod tests {
     use super::*;
     use std::fmt::Write as _;
+
+    #[test]
+    fn function_recipe_retains_configuration_and_rejects_invalid_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("Writing");
+        let (mut store, _) = ProjectStore::initialize(&root, "Writing").unwrap();
+        let default = function_recipe(&mut store).unwrap();
+        assert_eq!(default.format, FunctionFormat::Model);
+        assert!(default.configuration.is_none());
+        let raw = "```loom-workspace\n[functions]\nformat='raw'\n```\n";
+        store
+            .create_document_if_absent(
+                TEMPLATE_PATH,
+                DocumentContent::Prose(raw.into()),
+                "Explicit raw functions",
+            )
+            .unwrap();
+        let frozen = function_recipe(&mut store).unwrap();
+        let original = frozen.configuration.as_ref().unwrap();
+        assert_eq!(frozen.format, FunctionFormat::Raw);
+        assert_eq!(original.text, raw);
+        assert_eq!(store.read_blob(original.blob_id).unwrap(), raw.as_bytes());
+
+        std::fs::write(root.join(TEMPLATE_PATH), raw.replace("'raw'", "'model'")).unwrap();
+        let changed = function_recipe(&mut store).unwrap();
+        assert_eq!(changed.format, FunctionFormat::Model);
+        assert_ne!(
+            changed.configuration.unwrap().revision_id,
+            original.revision_id
+        );
+        assert_eq!(store.read_blob(original.blob_id).unwrap(), raw.as_bytes());
+        assert_eq!(frozen.format, FunctionFormat::Raw);
+
+        std::fs::write(root.join(TEMPLATE_PATH), raw.replace("'raw'", "'guess'")).unwrap();
+        assert_eq!(
+            function_recipe(&mut store).unwrap_err().code,
+            "workspace_template_failed"
+        );
+        assert!(snapshot(&mut store).unwrap().error.is_some());
+    }
 
     #[test]
     fn workspace_theme_defaults_and_strict_colors() {
