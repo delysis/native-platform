@@ -52,6 +52,8 @@ pub(super) async fn material_list(
     state: State<'_, PluginState>,
 ) -> Result<Vec<MaterialEntry>, IpcFailure> {
     with_store(&state, &project_id, &session_id, |store| {
+        workspace_template::collection_definitions(store)
+            .map_err(|error| materials::MaterialError::Invalid(error.message))?;
         restore_grants(&state, store)
             .map_err(|error| materials::MaterialError::Invalid(error.message))?;
         materials::list(store)

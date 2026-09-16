@@ -4,7 +4,7 @@ use super::{MAX_TEMPLATE_BYTES, TEMPLATE_PATH, config_fence_range, load_template
 use crate::IpcFailure;
 use loom_document::DocumentContent;
 use loom_store::{LoadedDocument, ProjectStore, StoreError};
-use loom_types::{BlobId, DocumentKind, RevisionId};
+use loom_types::{BlobId, RevisionId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use toml_edit::{ArrayOfTables, DocumentMut, Item, Table};
@@ -173,38 +173,10 @@ pub(crate) fn collection_definitions_current(
     }
 }
 
-fn load_for_edit(store: &mut ProjectStore) -> Result<Option<LoadedDocument>, IpcFailure> {
-    if let Some(loaded) = load_template(store)? {
-        return Ok(Some(loaded));
-    }
-    match std::fs::symlink_metadata(store.root().join(TEMPLATE_PATH)) {
-        Ok(metadata) => {
-            if metadata.len() > MAX_TEMPLATE_BYTES as u64
-                || !metadata.is_file()
-                || metadata.file_type().is_symlink()
-            {
-                return Err(failure(
-                    "The existing workspace configuration is not an ordinary file within 64 KiB.",
-                ));
-            }
-            store
-                .adopt_visible_document_if_absent(
-                    TEMPLATE_PATH,
-                    DocumentKind::Prose,
-                    "Read workspace collection definitions",
-                )
-                .map_err(IpcFailure::store)?;
-            load_template(store)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(failure(error.to_string())),
-    }
-}
-
 pub(crate) fn collection_definitions(
     store: &mut ProjectStore,
 ) -> Result<CollectionDefinitionsSnapshot, IpcFailure> {
-    definitions_snapshot(load_for_edit(store)?.as_ref())
+    definitions_snapshot(load_template(store)?.as_ref())
 }
 
 pub(crate) fn collection_definition(
@@ -221,7 +193,7 @@ fn checked_base(
     store: &mut ProjectStore,
     expected_revision: Option<RevisionId>,
 ) -> Result<Option<LoadedDocument>, IpcFailure> {
-    let loaded = load_for_edit(store)?;
+    let loaded = load_template(store)?;
     if loaded.as_ref().map(|document| document.revision_id) != expected_revision {
         return Err(IpcFailure::new(
             "workspace_configuration_changed",

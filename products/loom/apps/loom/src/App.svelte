@@ -9628,6 +9628,7 @@
       if (!flushEditors()) { deferredTemplateSession = scope.sessionId; deferredWorkspaceTemplate = snapshot; return; }
       workspaceTemplate = snapshot;
       workspaceTemplateScope = `${scope.projectId}/${scope.sessionId}`;
+      void refreshMaterials();
       void tick().then(requestPreferredWriterForCurrentWorkspace);
       const registered = project?.documents.find(item => item.document_id === snapshot.document_id);
       if (snapshot.document_id && registered?.revision_id !== snapshot.revision_id) {

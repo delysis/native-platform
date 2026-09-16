@@ -429,13 +429,41 @@ fn load_template(store: &mut ProjectStore) -> Result<Option<LoadedDocument>, Ipc
         .into_iter()
         .find(|document| document.relative_path == TEMPLATE_PATH);
     if document.is_none() {
-        return Ok(None);
+        match std::fs::symlink_metadata(store.root().join(TEMPLATE_PATH)) {
+            Ok(metadata) => {
+                if metadata.len() > MAX_TEMPLATE_BYTES as u64
+                    || !metadata.is_file()
+                    || metadata.file_type().is_symlink()
+                {
+                    return Err(IpcFailure::new(
+                        "workspace_template_failed",
+                        "The workspace configuration must be an ordinary file within 64 KiB.",
+                        false,
+                    ));
+                }
+                store
+                    .adopt_visible_document_if_absent(
+                        TEMPLATE_PATH,
+                        DocumentKind::Prose,
+                        "Read workspace settings",
+                    )
+                    .map_err(IpcFailure::store)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(IpcFailure::new(
+                    "workspace_template_failed",
+                    error.to_string(),
+                    false,
+                ));
+            }
+        }
     }
     store
         .import_external_changes_if_uncontested(TEMPLATE_PATH, "Read external workspace settings")
         .map_err(IpcFailure::store)?;
     store
-        .read_document(TEMPLATE_PATH)
+        .read_document_bounded(TEMPLATE_PATH, MAX_TEMPLATE_BYTES as u64)
         .map(Some)
         .map_err(IpcFailure::store)
 }
@@ -729,11 +757,44 @@ mod tests {
             ProjectStore::initialize(directory.path().join("Writing"), "Writing").unwrap();
         let text = "# Mine\r\n```loom-workspace\r\nunknown = true\r\n```\r\n";
         std::fs::write(store.root().join(TEMPLATE_PATH), text).unwrap();
-        assert!(!snapshot(&mut store).unwrap().enabled);
-        let result = enable(&mut store).unwrap();
+        let result = snapshot(&mut store).unwrap();
         assert!(result.enabled && result.error.is_some() && result.document_id.is_some());
         assert_eq!(store.read_document(TEMPLATE_PATH).unwrap().text, text);
         assert_eq!(enable(&mut store).unwrap().revision_id, result.revision_id);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn copied_collection_settings_load_without_enabling_panes_or_authorizing_acquisition() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut store, _) =
+            ProjectStore::initialize(directory.path().join("Writing"), "Writing").unwrap();
+        let id = format!("material-{}", "a".repeat(64));
+        let text = format!(
+            "# Research workspace\r\n```loom-workspace\r\npanes_enabled = false\r\n[[collections]]\r\nid = '{id}'\r\nname = 'Research'\r\nscope = {{ kind = 'drive_folder', id = 'explicit-test-scope' }}\r\n```\r\n"
+        );
+        std::fs::write(store.root().join(TEMPLATE_PATH), &text).unwrap();
+        let loaded = snapshot(&mut store).unwrap();
+        assert!(!loaded.enabled);
+        assert!(loaded.error.is_none());
+        assert!(loaded.document_id.is_some());
+        let materials = crate::materials::list(&store).unwrap();
+        assert_eq!(materials.len(), 1);
+        assert_eq!(materials[0].id, id);
+        assert_eq!(materials[0].name, "Research");
+        assert!(
+            crate::connected_collections::read_head(&store, &id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read(store.root().join(TEMPLATE_PATH)).unwrap(),
+            text.as_bytes()
+        );
+        assert_eq!(
+            snapshot(&mut store).unwrap().revision_id,
+            loaded.revision_id
+        );
     }
     #[test]
     #[cfg(unix)]
