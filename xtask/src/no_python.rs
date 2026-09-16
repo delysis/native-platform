@@ -419,24 +419,26 @@ mod tests {
     #[test]
     fn checks_git_owned_files_and_ignores_external_tool_caches() {
         let fixture = GitFixture::new();
-        fs::write(fixture.0.join(".gitignore"), "node_modules/\ntarget/\n").unwrap();
+        fs::write(fixture.0.join(".gitignore"), "node_modules/\ntarget/\n")
+            .expect("write fixture ignore rules");
         fs::write(
             fixture.0.join("README.md"),
             "Python and pyo3 are prohibited.\n",
         )
-        .unwrap();
-        fs::create_dir_all(fixture.0.join("node_modules/tool")).unwrap();
+        .expect("write fixture contents");
+        fs::create_dir_all(fixture.0.join("node_modules/tool"))
+            .expect("create ignored tool directory");
         fs::write(
             fixture.0.join("node_modules/tool/build.py"),
             "fixture bytes; never executed\n",
         )
-        .unwrap();
+        .expect("write fixture contents");
         fixture.git(&["add", ".gitignore", "README.md"]);
         check(&fixture.0).expect("ignored dependencies do not become project source");
         fixture.git(&["add", "--force", "node_modules/tool/build.py"]);
         assert!(
             check(&fixture.0)
-                .unwrap_err()
+                .expect_err("tracked Python artifact or dependency must be rejected")
                 .to_string()
                 .contains("Python file is forbidden")
         );
@@ -444,33 +446,43 @@ mod tests {
     #[test]
     fn detects_extensionless_python_and_aliased_runtime_in_tracked_files() {
         let fixture = GitFixture::new();
-        fs::write(fixture.0.join("runner"), "#!/usr/bin/env -S python3 -u\n").unwrap();
+        fs::write(fixture.0.join("runner"), "#!/usr/bin/env -S python3 -u\n")
+            .expect("write Python shebang fixture");
         fixture.git(&["add", "runner"]);
         assert!(
             check(&fixture.0)
-                .unwrap_err()
+                .expect_err("tracked Python artifact or dependency must be rejected")
                 .to_string()
                 .contains("Python shebang")
         );
-        fs::write(fixture.0.join("runner"), "#!/bin/sh\n").unwrap();
+        fs::write(fixture.0.join("runner"), "#!/bin/sh\n")
+            .expect("replace fixture with shell shebang");
         fs::write(
             fixture.0.join("Cargo.toml"),
             "[dependencies]\nbridge={package='cpython',version='1'}\n",
         )
-        .unwrap();
+        .expect("write fixture contents");
         fixture.git(&["add", "Cargo.toml"]);
-        assert!(format!("{:#}", check(&fixture.0).unwrap_err()).contains("cpython"));
+        assert!(
+            format!(
+                "{:#}",
+                check(&fixture.0)
+                    .expect_err("tracked Python artifact or dependency must be rejected")
+            )
+            .contains("cpython")
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn rejects_extensionless_symlinks_to_python_files() {
         let fixture = GitFixture::new();
-        std::os::unix::fs::symlink("outside/script.py", fixture.0.join("runner")).unwrap();
+        std::os::unix::fs::symlink("outside/script.py", fixture.0.join("runner"))
+            .expect("create Python symlink fixture");
         fixture.git(&["add", "runner"]);
         assert!(
             check(&fixture.0)
-                .unwrap_err()
+                .expect_err("tracked Python artifact or dependency must be rejected")
                 .to_string()
                 .contains("Python symlink target")
         );
