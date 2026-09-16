@@ -504,6 +504,7 @@ mod tests {
     use std::fmt::Write as _;
 
     #[test]
+    #[cfg(unix)]
     fn function_recipe_retains_configuration_and_rejects_invalid_edits() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("Writing");

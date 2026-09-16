@@ -315,7 +315,7 @@ pub(super) fn consult(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn markdown_plan(
     store: &ProjectStore,
     markdown: &str,
@@ -498,6 +498,6 @@ pub(super) fn native_media<'a>(
     crate::terminal_media::merge(Vec::new(), media)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "material_context_tests.rs"]
 mod tests;
