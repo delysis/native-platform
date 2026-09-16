@@ -11212,22 +11212,32 @@ mod tests {
     #[test]
     fn native_exit_recording_never_blocks_on_an_owned_application_admission_boundary() {
         let state = Arc::new(PluginState::default());
-        let admission =
-            lock_application_admission(&state, "fixture work").expect("admit fixture work");
-        let (sent, received) = std::sync::mpsc::channel();
+        let (admitted, ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
         let worker_state = Arc::clone(&state);
         let worker = std::thread::spawn(move || {
-            sent.send(record_application_exit_request(&worker_state))
-                .expect("send exit disposition");
+            let admission = lock_application_admission(&worker_state, "fixture work")
+                .expect("admit fixture work");
+            admitted.send(()).expect("signal owned admission");
+            // Release the guard even if a regression blocks the caller. The
+            // assertion below checks ordering, not thread-start latency.
+            let release = released.recv_timeout(Duration::from_secs(5));
+            assert_eq!(*admission, ApplicationPhase::Running);
+            drop(admission);
+            release
         });
 
-        assert!(
-            !received
-                .recv_timeout(Duration::from_millis(20))
-                .expect("event-thread exit recording must be nonblocking")
-        );
-        worker.join().expect("join exit-request worker");
-        drop(admission);
+        ready
+            .recv()
+            .expect("admission is held before recording exit");
+        let may_exit = record_application_exit_request(&state);
+        let release_sent = release.send(());
+        worker
+            .join()
+            .expect("join admission worker")
+            .expect("exit recording must finish before admission is released");
+        release_sent.expect("release admission after recording exit");
+        assert!(!may_exit);
         assert_eq!(
             *state.application.lock().expect("application phase"),
             ApplicationPhase::Running

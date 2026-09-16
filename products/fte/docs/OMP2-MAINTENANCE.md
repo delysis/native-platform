@@ -174,6 +174,12 @@ importer or workflow, and again on main. It executes the reviewed pinned code;
 the weekly candidate review remains read-only and does not execute new upstream
 code. Live hosted credentials and model downloads are not part of this gate.
 
+After the macOS gate, the workflow runs the downstream import, patch-review and
+exact rollback fixtures plus strict importer Clippy on Windows. These fixtures
+include escaped local paths and CRLF conversion. Git reads patch bytes through
+an open file handle so Windows verbatim paths never reach its patch reader.
+Upstream runtime qualification remains scoped to the macOS job.
+
 The maintained corrections cover:
 
 - The misspelled AWS test attribute that blocked compilation of the normal suite.
