@@ -6,7 +6,6 @@ use loom_cabal::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
-    time::Duration,
 };
 use uuid::Uuid;
 
@@ -400,8 +399,13 @@ async fn quic_pages_a_sealed_history_to_a_new_member() -> Result<()> {
     reader.remember_peer(&host.address())?;
     let reader = Arc::new(Mutex::new(reader));
     remote.add(reader.clone())?;
-    let transferred = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
+    // This fixture fits two 128-change pages. Bound convergence by protocol
+    // progress, not the time Windows needs to durably commit all 151 changes.
+    // Each network request retains its production timeout; one extra pass
+    // accommodates the background synchronizer sharing these endpoints.
+    let transferred = async {
+        for _ in 0..3 {
+            let before = reader.lock().expect("reader lock").sync_state()?;
             remote
                 .sync_now(reader.clone(), identity.public_key())
                 .await?;
@@ -410,14 +414,21 @@ async fn quic_pages_a_sealed_history_to_a_new_member() -> Result<()> {
             {
                 return Ok::<(), loom_cabal::Error>(());
             }
-            tokio::task::yield_now().await;
+            if reader.lock().expect("reader lock").sync_state()? == before {
+                return Err(loom_cabal::Error::Invalid(
+                    "Sealed history made no progress",
+                ));
+            }
         }
-    })
+        Err(loom_cabal::Error::Invalid(
+            "Sealed history exceeded its page budget",
+        ))
+    }
     .await;
     // Always join both owned endpoints, including a failed assertion path.
     remote.shutdown().await?;
     host.shutdown().await?;
-    transferred.expect("sealed history transfer timed out")?;
+    transferred?;
     assert_eq!(
         reader.lock().expect("reader lock").view(document.id)?.text,
         "A pond, revision 149."
