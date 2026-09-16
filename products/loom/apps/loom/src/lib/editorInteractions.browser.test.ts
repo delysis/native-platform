@@ -22,6 +22,7 @@ function render(
     autocomplete?: boolean;
     shuttle?: boolean;
     completionFrames?: readonly (readonly CompletionCandidate[])[];
+    reconcileSelectionFamily?: boolean;
     acceptImageAttachments?: boolean;
     onImageAttachments?: (files: readonly File[]) => Promise<readonly string[]>;
     onImageAttachmentsCommitted?: (count: number) => void;
@@ -1230,6 +1231,69 @@ describe('real WebKit editor interactions', () => {
     await expect.element(page.getByRole('status', { name: 'Serialized Markdown' })).toHaveTextContent('hello world');
     expect(serializedMarkdown()).toBe('hello world');
     await expect.element(page.getByText(' stays', { exact: true }).first()).toBeVisible();
+  });
+
+  it('cycles a fresh streamed family before audio across same-anchor reconciliation and invalidates moved selection', async () => {
+    const markdown = `hello\n\n![Audio: fixture.wav](loom-attachment:${'a'.repeat(64)}/${'b'.repeat(64)} "loom-waveform:001080ff")`;
+    const choices = fourChoiceCompletion();
+    render(markdown, [], {
+      reconcileSelectionFamily: true,
+      completionFrames: [choices.slice(0, 1), choices, choices.map((candidate) => ({
+        ...candidate, presentationKey: `${candidate.candidateId}:2`, text: `${candidate.text} continues`
+      }))]
+    });
+    const editorLocator = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await expect.element(editorLocator).toBeVisible();
+    const editor = editorLocator.element();
+    editor.focus();
+    const text = editor.querySelector('p')?.firstChild;
+    expect(text?.textContent).toBe('hello');
+    document.getSelection()?.collapse(text!, 5);
+    document.dispatchEvent(new Event('selectionchange'));
+    const latest = page.getByRole('status', { name: 'Latest Selection Callback' });
+    await expect.element(latest).toHaveTextContent('5:none');
+    const advance = page.getByRole('button', { name: 'Advance completion stream' });
+    await advance.click();
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    const nullCount = page.getByRole('status', { name: 'Null Selection Callback Count', exact: true });
+    const nullsBefore = nullCount.element().textContent;
+    const requests = page.getByRole('status', { name: 'Generation Requests' });
+    const requestsBefore = requests.element().textContent;
+    const witness = () => JSON.parse(
+      page.getByRole('status', { name: 'Visual Selection Witness' }).element().textContent ?? '{}'
+    );
+
+    await advance.click();
+    await page.getByRole('button', { name: 'Reconcile current selection' }).click();
+    // Direct chord covers delivery without a preceding Alt event. Dispatch
+    // immediately after reconciliation, before another visibility assertion.
+    const down = new KeyboardEvent('keydown', {
+      key: 'ArrowDown', code: 'ArrowDown', altKey: true, bubbles: true, cancelable: true
+    });
+    editor.dispatchEvent(down);
+    expect(down.defaultPrevented).toBe(true);
+    await expect.element(page.getByText(' there', { exact: true }).first()).toBeVisible();
+    expect(nullCount.element().textContent).toBe(nullsBefore);
+    expect(requests.element().textContent).toBe(requestsBefore);
+    expect(witness()).toMatchObject({ available: true, empty: true, caretByteOffset: 5 });
+    expect(serializedMarkdown()).toBe(markdown);
+
+    dispatchOptionUp(editor);
+    await advance.click();
+    await userEvent.keyboard('{Alt>}{ArrowUp}{/Alt}');
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    expect(witness()).toMatchObject({ available: true, empty: true, caretByteOffset: 5 });
+    expect(requests.element().textContent).toBe(requestsBefore);
+    expect(serializedMarkdown()).toBe(markdown);
+
+    // A real move is a different boundary: it must revoke the presentation.
+    await userEvent.keyboard('{ArrowLeft}');
+    await expect.element(latest).toHaveTextContent('4:none');
+    await expect.element(page.getByRole('status', { name: 'Completion Context' })).toHaveTextContent('none');
+    expect(editor.querySelector('.loom-visual-ghost')).toBeNull();
+    expect(Number(nullCount.element().textContent)).toBeGreaterThan(Number(nullsBefore));
+    expect(Number(requests.element().textContent)).toBeGreaterThan(Number(requestsBefore));
+    expect(serializedMarkdown()).toBe(markdown);
   });
 
   for (const mode of ['visual', 'source'] as const) {
