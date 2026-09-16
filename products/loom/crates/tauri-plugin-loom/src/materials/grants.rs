@@ -200,6 +200,7 @@ pub(crate) fn forget_selected_grant(store: &ProjectStore, root: &Path, id: &str)
     save(store, root, &approved)
 }
 
+// These integration fixtures require the supported private project store.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
