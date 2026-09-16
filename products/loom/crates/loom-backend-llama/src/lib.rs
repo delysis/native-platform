@@ -4,6 +4,7 @@ mod adapter;
 mod discovery;
 mod download;
 mod fit;
+mod independent;
 mod model;
 mod runtime;
 
@@ -21,6 +22,9 @@ pub use download::{
 pub use fit::{
     ByteEstimate, ByteEstimateBasis, FitEstimationError, FitVerdict, ModelFitEstimate,
     ModelFitInput, estimate_model_fit,
+};
+pub use independent::{
+    IndependentRawBatch, IndependentRawCompletion, IndependentRawRequest, MAX_INDEPENDENT_RAW_CASES,
 };
 pub use model::{
     CapabilitySupport, LocalDevicePreference, LocalModelProfile, ModelInspectionError,
