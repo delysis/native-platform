@@ -63,7 +63,7 @@ jobs:
         with:
           toolchain: "1.92.0"
       - run: node --test scripts/ci/test-ci-metadata-selection.mjs scripts/ci/test-ci-plan.mjs scripts/ci/test-ci-required.mjs scripts/ci/test-ignored-tests.mjs scripts/ci/test-product-state-backup.mjs scripts/ci/test-workflows.mjs
-      - run: cargo test --locked -p xtask no_python::
+      - run: cargo test --locked -p xtask no_python
       - run: cargo run --locked -p xtask -- policy
       - run: cargo tree --locked -i libsqlite3-sys
 
