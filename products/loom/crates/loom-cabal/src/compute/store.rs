@@ -282,6 +282,7 @@ impl Ledger {
             recorded_at_ms: created_at_ms,
             status: ComputeStatus::Accepted,
         })?;
+        receipt.payload.validate()?;
         let input = serde_json::to_string(&job.input)?;
         let body = serde_json::to_string(&receipt)?;
         let tx = self.database.transaction()?;
@@ -350,7 +351,7 @@ impl Ledger {
 
     fn receipt_bodies(&self, peer: PublicKey, job: Uuid) -> Result<Vec<String>> {
         let mut query = self.database.prepare(
-            "SELECT CASE WHEN length(CAST(body AS BLOB)) <= ? THEN body END
+            "SELECT revision, CASE WHEN length(CAST(body AS BLOB)) <= ? THEN body END
              FROM receipts WHERE peer = ? AND job = ? ORDER BY revision LIMIT 5",
         )?;
         let bodies = query
@@ -360,13 +361,25 @@ impl Ledger {
                     peer.to_string(),
                     job.to_string()
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
             )?
-            .collect::<std::result::Result<Vec<String>, _>>()?;
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         if bodies.len() > 4 {
             return Err(Error::Invalid("Too many compute receipts"));
         }
-        Ok(bodies)
+        // Unlike the requester, the host writes every revision atomically.
+        // Missing history or unsigned index changes must never be normalized.
+        bodies
+            .into_iter()
+            .enumerate()
+            .map(|(index, (revision, body))| {
+                let receipt: RemoteJobReceipt = serde_json::from_str(&body)?;
+                if revision as usize != index || revision != receipt.payload.revision {
+                    return Err(Error::Invalid("Compute receipt index mismatch"));
+                }
+                Ok(body)
+            })
+            .collect()
     }
 
     pub fn cancel(
@@ -436,8 +449,11 @@ impl Ledger {
                 .ok_or(Error::Invalid("Compute revision overflow"))?,
             recorded_at_ms: now_ms()?.max(old.payload.recorded_at_ms),
             status,
-            ..old.payload
+            ..old.payload.clone()
         })?;
+        // Reject a changed cancellation reason, invalid output or impossible
+        // record before inserting anything, not on the next attempted read.
+        client::validate_advance(&old, &receipt)?;
         let body = serde_json::to_string(&receipt)?;
         let tx = self.database.transaction()?;
         tx.execute(
@@ -802,6 +818,125 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn rejected_cancellation_reason_change_preserves_the_last_valid_receipt() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let identity = Identity::generate()?;
+        let job = job(&identity);
+        let mut ledger = Ledger::open(directory.path(), identity.clone())?;
+        ledger.grant(job.grant.clone())?;
+        ledger.accept(&job, job.input.fingerprint(job.grant.id)?)?;
+        let cancelling = ledger
+            .cancel(job.peer, job.id, ComputeCancellation::Requested)?
+            .expect("cancelling receipt");
+        assert!(
+            ledger
+                .transition(
+                    job.peer,
+                    job.id,
+                    ComputeStatus::Cancelled {
+                        reason: ComputeCancellation::GrantRevoked,
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(
+            ledger.get(job.peer, job.id)?.expect("preserved").hash()?,
+            cancelling.hash()?
+        );
+        let terminal = ledger.transition(
+            job.peer,
+            job.id,
+            ComputeStatus::Cancelled {
+                reason: ComputeCancellation::Requested,
+            },
+        )?;
+        drop(ledger);
+        let reopened = Ledger::open(directory.path(), identity)?;
+        assert_eq!(
+            reopened.get(job.peer, job.id)?.expect("terminal").hash()?,
+            terminal.hash()?
+        );
+        assert_eq!(reopened.remaining_jobs(&job.grant)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_output_is_rejected_before_it_can_poison_the_ledger() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let identity = Identity::generate()?;
+        let job = job(&identity);
+        let mut ledger = Ledger::open(directory.path(), identity.clone())?;
+        ledger.grant(job.grant.clone())?;
+        ledger.accept(&job, job.input.fingerprint(job.grant.id)?)?;
+        let running = ledger.transition(job.peer, job.id, ComputeStatus::Running)?;
+        assert!(
+            ledger
+                .transition(
+                    job.peer,
+                    job.id,
+                    ComputeStatus::Completed {
+                        text: "x".repeat(MAX_COMPUTE_TEXT_BYTES + 1),
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(
+            ledger.get(job.peer, job.id)?.expect("running").hash()?,
+            running.hash()?
+        );
+        assert_eq!(ledger.receipt_bodies(job.peer, job.id)?.len(), 2);
+        let terminal = ledger.transition(
+            job.peer,
+            job.id,
+            ComputeStatus::Completed { text: "ok".into() },
+        )?;
+        drop(ledger);
+        let reopened = Ledger::open(directory.path(), identity)?;
+        assert_eq!(
+            reopened.get(job.peer, job.id)?.expect("terminal").hash()?,
+            terminal.hash()?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn host_history_requires_signed_indexes_and_the_original_acceptance() -> Result<()> {
+        for remove_acceptance in [false, true] {
+            let directory = tempfile::tempdir()?;
+            let identity = Identity::generate()?;
+            let job = job(&identity);
+            let mut ledger = Ledger::open(directory.path(), identity.clone())?;
+            ledger.grant(job.grant.clone())?;
+            let accepted = ledger.accept(&job, job.input.fingerprint(job.grant.id)?)?;
+            ledger.transition(job.peer, job.id, ComputeStatus::Running)?;
+            if remove_acceptance {
+                ledger
+                    .database
+                    .execute("DELETE FROM receipts WHERE revision = 0", [])?;
+                // Keep the byte index consistent to isolate history validation.
+                ledger.database.execute(
+                    "UPDATE jobs SET stored_bytes = stored_bytes - ?",
+                    [serde_json::to_string(&accepted)?.len() as i64],
+                )?;
+            } else {
+                ledger.database.execute(
+                    "UPDATE receipts SET revision = 42 WHERE revision = 1",
+                    [],
+                )?;
+            }
+            assert!(ledger.get(job.peer, job.id).is_err());
+            assert!(
+                ledger
+                    .transition(job.peer, job.id, ComputeStatus::Interrupted)
+                    .is_err()
+            );
+            drop(ledger);
+            assert!(Ledger::open(directory.path(), identity).is_err());
+        }
+        Ok(())
+    }
+
     #[derive(Debug, Default)]
     struct OwnedUntilReleased {
         started: tokio::sync::Notify,
@@ -875,6 +1010,13 @@ mod tests {
             .ledger
             .database
             .pragma_update(None, "query_only", false)?;
+        let mut abandoned = Box::pin(host.shutdown());
+        std::future::poll_fn(|cx| {
+            assert!(abandoned.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(abandoned);
         owner.released.notify_one();
         assert!(
             host.shutdown().await.is_err(),
