@@ -390,7 +390,10 @@ and reports delivery separately. A persisted cancellation wins over a later
 submission; terminal results are returned from storage without dispatching again.
 The app history returns bounded previews. The revision-specific packaged receipt
 below covers model selection, native media execution, and result recovery on one
-Mac. Physical two-device execution and packaged host preemption remain unverified.
+Mac. The [native lifecycle receipt](audit-receipts/2026-09-15-native-compute-lifecycle.md)
+also covers foreground preemption, explicit cancellation, host shutdown and
+restart without redispatch on the merged main revision. Physical two-device
+execution remains unverified.
 
 An accepted job is committed before dispatch. Each authenticated caller owns its
 job IDs, and a retry must match the exact original input and grant. Status checks

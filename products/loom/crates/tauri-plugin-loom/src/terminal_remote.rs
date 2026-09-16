@@ -3,8 +3,8 @@
 use super::*;
 use crate::cabals::requesting::{JobDelivery, JobReply, find_job};
 use loom_cabal::compute::{
-    ClientJob, ClientRequest, ComputeGrant, ComputeInput, ComputeModel, ComputeRejection,
-    ComputeStatus,
+    ClientJob, ClientRequest, ComputeFailure, ComputeGrant, ComputeInput, ComputeModel,
+    ComputeRejection, ComputeStatus,
 };
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
@@ -393,11 +393,40 @@ impl Evaluator<'_> {
                 Ok(text.clone())
             }
             ComputeStatus::Cancelled { .. } => Err(cancelled()),
-            _ => Err(IpcFailure::new(
+            ComputeStatus::Failed { failure } => Err(IpcFailure::new(
                 "terminal_remote_failed",
-                format!("The peer stopped this step: {status:?}"),
+                match failure {
+                    ComputeFailure::HostBusy => {
+                        "Your friend's model was busy or shutting down. This job stopped."
+                    }
+                    ComputeFailure::ModelUnavailable => {
+                        "Your friend's selected model is no longer available."
+                    }
+                    ComputeFailure::InputUnsupported => {
+                        "Your friend's model could not use this job's input."
+                    }
+                    ComputeFailure::ExecutionFailed => {
+                        "Your friend's model could not finish this job."
+                    }
+                    ComputeFailure::InvalidOutput => {
+                        "The result from your friend's model did not pass validation."
+                    }
+                    ComputeFailure::WorkerPanicked => {
+                        "Your friend's model worker stopped unexpectedly."
+                    }
+                },
                 false,
             )),
+            ComputeStatus::Interrupted => Err(IpcFailure::new(
+                "terminal_remote_failed",
+                "Your friend's app stopped before this job finished. It was not rerun.",
+                false,
+            )),
+            ComputeStatus::Accepted | ComputeStatus::Running | ComputeStatus::Cancelling { .. } => {
+                Err(unconfirmed(
+                    "The friend has not returned a final result. Check again when connected.",
+                ))
+            }
         }
     }
 
