@@ -9817,11 +9817,13 @@
               ? 'Stop recording'
               : speechInput
                 ? 'Recognizing locally — click to cancel'
-                : 'Record audio for this document')}
+                : cabal?.documents.some(item => item.local.summary.document_id === document?.summary.document_id)
+                  ? 'Record audio for this document — shared with your cabal'
+                  : 'Record audio for this document')}
             disabled={!desktop || !document || speechStarting || (editorReadonly && !speechInputActive())}
             on:click={toggleSpeechInput}
           ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="6.4" y="2.5" width="5.2" height="8.3" rx="2.6"/><path d="M4.4 8.8a4.6 4.6 0 0 0 9.2 0M9 13.4v2.1M6.8 15.5h4.4"/></svg></button>
-          <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Audio stays on this device and is attached to this document')}</span>
+          <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Audio is attached to this document. Shared documents also share their recordings.')}</span>
         {/if}
         <div class="completion-mode-toggle" role="group" aria-label="Writing suggestions">
           <button class="titlebar-button suggestions-toggle" class:active={suggestionsEnabled && suggestionInteraction === 'ghost'}

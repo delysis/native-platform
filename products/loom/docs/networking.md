@@ -469,6 +469,13 @@ connection cleanup detached and reproduced a crash during process exit.
 
 ## Remaining acceptance and implementation
 
+The [context publication and Signal source receipt](audit-receipts/2026-09-15-context-publication-and-signal-source.md)
+records native owner-side publication of a curated excerpt and exact WAV, with
+the original text absent from shared assets. Its peer window remained in use, so
+that run did not establish peer receipt or collaborative editing. The same receipt
+records an actual offline build from the distributed Signal sources and exact
+packaged license/notice resources, with revision-specific limits.
+
 On 2026-09-14, two independently profiled native macOS applications exercised
 the real Iroh transport and ordinary Markdown projections on one Mac. The
 initial run used `b4d719f`; the repaired run used `2d1827d`, with the second bundle
