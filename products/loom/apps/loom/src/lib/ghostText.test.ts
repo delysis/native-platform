@@ -892,12 +892,13 @@ describe('ghost-text plugin state', () => {
       selection: Selection.atEnd(resetDoc),
       plugins: [plugin]
     });
-    // A whole-candidate-only callback cannot promote a hidden suffix.
+    // Completed candidates accept the visible prefix through insertion, never
+    // through whole-candidate promotion of the hidden suffix.
     setGhostText(view, suggestion);
     visible = true;
     expect(plugin.props.handleKeyDown?.call(plugin, view, tab)).toBe(true);
     expect(wholeCandidateAccepted).toBe(false);
-    expect(state.doc.textContent).toBe(`The sentence waits${VISUAL_TAB_INDENT}`);
+    expect(state.doc.textContent).toBe('The sentence waits for');
     state = EditorState.create({ doc: resetDoc, selection: Selection.atEnd(resetDoc), plugins: [plugin] });
     setGhostText(view, { ...suggestion, insertsOnAccept: true });
     const handled = plugin.props.handleKeyDown?.call(plugin, view, tab);

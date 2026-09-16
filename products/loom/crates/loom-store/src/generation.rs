@@ -4140,8 +4140,8 @@ mod tests {
         ModelEnvironment {
             environment_id: ModelEnvironmentId::digest(name.as_bytes()),
             model_identifier: format!("test/{name}"),
-            model_fingerprint: BlobId::digest(format!("model-{name}").as_bytes()),
-            tokenizer_fingerprint: BlobId::digest(format!("tokenizer-{name}").as_bytes()),
+            model_fingerprint: Some(BlobId::digest(format!("model-{name}").as_bytes())),
+            tokenizer_fingerprint: Some(BlobId::digest(format!("tokenizer-{name}").as_bytes())),
             backend_identifier: "test-backend".into(),
             capabilities: json!({"completion": true}),
         }

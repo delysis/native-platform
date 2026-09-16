@@ -12,16 +12,16 @@ afterEach(async () => {
   document.body.replaceChildren();
 });
 
-function render(mode: 'visual' | 'source', loompad = false) {
+function render(mode: 'visual' | 'source', loompad = false, insertsOnAccept = true) {
   const target = document.createElement('div');
   document.body.append(target);
-  mounted = mount(CompletionControllerBrowserHarness, { target, props: { mode, loompad } });
+  mounted = mount(CompletionControllerBrowserHarness, { target, props: { mode, loompad, insertsOnAccept } });
   return mounted;
 }
 
 describe('completion controller and editor callback ordering', () => {
-  it.each(['visual', 'source'] as const)('Tab accepts only the visible %s word and retains its suffix', async (mode) => {
-    render(mode);
+  it.each([['visual', true], ['visual', false], ['source', true], ['source', false]] as const)('Tab accepts only the visible %s word and retains its suffix (initial insertion: %s)', async (mode, insertsOnAccept) => {
+    render(mode, false, insertsOnAccept);
     await page.getByRole('textbox').click();
     const selector = mode === 'visual' ? '.loom-visual-ghost' : '.loom-source-ghost-text';
     await expect.poll(() => document.querySelector(selector)?.textContent).toBe(' one');

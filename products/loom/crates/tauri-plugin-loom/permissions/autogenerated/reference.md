@@ -59,6 +59,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-document-reconcile-apply`
 - `allow-build-model-policy-get`
 - `allow-model-catalog-list`
+- `allow-inference-status`
 - `allow-model-list`
 - `allow-model-choose`
 - `allow-model-download-status`
@@ -1429,6 +1430,32 @@ Enables the import_text_sources command without any pre-configured scope.
 <td>
 
 Denies the import_text_sources command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-inference-status`
+
+</td>
+<td>
+
+Enables the inference_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-inference-status`
+
+</td>
+<td>
+
+Denies the inference_status command without any pre-configured scope.
 
 </td>
 </tr>

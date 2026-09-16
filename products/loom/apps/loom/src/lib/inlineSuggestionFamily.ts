@@ -30,7 +30,7 @@ export interface InlineSuggestionState {
   liveTextByRun: Record<string, string>;
   /** Missing sequence authority fails closed instead of using byte length as identity. */
   liveTextSequenceByRun?: Record<string, string>;
-  currentModel: ModelCapabilitySummary | null | undefined;
+  currentModel: Pick<ModelCapabilitySummary, 'model_id'> | null | undefined;
   document: OpenDocument | null;
   suggestionsEnabled: boolean;
   promotionReady: boolean;

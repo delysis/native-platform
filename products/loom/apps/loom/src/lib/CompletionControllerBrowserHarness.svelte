@@ -19,6 +19,7 @@
 
   export let mode: 'visual' | 'source' = 'visual';
   export let loompad = false;
+  export let insertsOnAccept = true;
 
   const family: InlineGhostSuggestion[] = [
     {
@@ -27,7 +28,7 @@
       text: ' one two',
       runId: 'run-a',
       targetByte: 5,
-      insertsOnAccept: true
+      insertsOnAccept
     },
     {
       candidateId: 'candidate-b',
@@ -35,7 +36,7 @@
       text: ' another path',
       runId: 'run-b',
       targetByte: 5,
-      insertsOnAccept: true
+      insertsOnAccept
     },
     {
       candidateId: 'candidate-c',
@@ -43,7 +44,7 @@
       text: ' third road',
       runId: 'run-c',
       targetByte: 5,
-      insertsOnAccept: true
+      insertsOnAccept
     },
     {
       candidateId: 'candidate-d',
@@ -51,7 +52,7 @@
       text: ' final turn',
       runId: 'run-d',
       targetByte: 5,
-      insertsOnAccept: true
+      insertsOnAccept
     }
   ];
   const contextKey = `browser-session:browser-document:1:${mode}`;

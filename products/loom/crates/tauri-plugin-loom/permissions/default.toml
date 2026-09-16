@@ -59,6 +59,7 @@ permissions = [
   "allow-document-reconcile-apply",
   "allow-build-model-policy-get",
   "allow-model-catalog-list",
+  "allow-inference-status",
   "allow-model-list",
   "allow-model-choose",
   "allow-model-download-status",

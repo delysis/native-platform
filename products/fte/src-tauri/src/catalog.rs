@@ -27,6 +27,16 @@ pub struct QuotaSpec {
 }
 
 impl QuotaSpec {
+    pub fn gateway_limits(&self) -> fte_types::QuotaLimits {
+        let finite = |limit: u32| (self.documented && limit < u32::MAX).then_some(u64::from(limit));
+        fte_types::QuotaLimits {
+            requests_per_minute: finite(self.rpm),
+            requests_per_day: finite(self.rpd),
+            tokens_per_minute: finite(self.tpm),
+            tokens_per_day: finite(self.tpd),
+        }
+    }
+
     pub fn has_documented_limit(&self) -> bool {
         self.documented
     }

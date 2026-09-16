@@ -62,6 +62,15 @@ async fn real_chat_completion_and_stable_prefix_hit_are_in_process() {
     config.batch_tokens = 256;
     let model_id = config.model_id.clone();
     backend.register_model(config).expect("load real GGUF");
+    assert_eq!(
+        backend.descriptor().models[0].capabilities.modalities,
+        vec![fte_types::Modality::Text]
+    );
+    let other_consumer = LlamaNativeBackend::new_borrowed(Arc::clone(&host));
+    assert!(
+        other_consumer.descriptor().models.is_empty(),
+        "a borrowed host must not advertise routes not registered by this consumer"
+    );
 
     let stable_system = (0..24)
         .map(|index| {

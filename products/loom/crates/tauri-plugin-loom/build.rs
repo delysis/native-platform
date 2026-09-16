@@ -64,6 +64,7 @@ const COMMANDS: &[&str] = &[
     "document_draft_clear",
     "document_reconciliation_preview",
     "document_reconcile_apply",
+    "inference_status",
     "build_model_policy_get",
     "model_catalog_list",
     "model_list",
