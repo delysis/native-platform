@@ -1,6 +1,6 @@
 import { mount, unmount } from 'svelte';
 import { afterEach, expect, it, vi } from 'vitest';
-import { page } from 'vitest/browser';
+import { page, userEvent } from 'vitest/browser';
 import LoomEditor from './LoomEditor.svelte';
 import SourceEditor from './SourceEditor.svelte';
 import '../app.css';
@@ -36,4 +36,20 @@ it('marks the source reference through its mirror while preserving the native te
   expect(getComputedStyle(marked).textDecorationLine).toBe('underline');
   await expect.element(page.getByRole('textbox', { name: 'Markdown source editor' })).toHaveValue('Before @Lost after.');
   expect(target.querySelector('.source-ghost-viewport')?.hasAttribute('hidden')).toBe(false);
+});
+
+it('follows the visual caret with accessible diagnostics without changing the writing', async () => {
+  const target = document.createElement('div'); document.body.append(target);
+  const onChange = vi.fn();
+  read.mockResolvedValue([{ start: 7, end: 12, message: 'Source missing' }]);
+  mounted = mount(LoomEditor, { target, props: { value: 'Before @Lost', referenceScope, onChange, onGhostPresentationRejected: () => {} } });
+  const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
+  await expect.element(page.getByTitle('Source missing')).toBeVisible();
+  await userEvent.click(editor);
+  await userEvent.keyboard('{ArrowRight}');
+  await userEvent.keyboard('{Meta>}{ArrowRight}{/Meta}');
+  await expect.element(editor).toHaveAttribute('aria-description', 'Source missing');
+  await userEvent.keyboard('{Meta>}{ArrowLeft}{/Meta}');
+  await expect.element(editor).toHaveAttribute('aria-description', '');
+  expect(onChange).not.toHaveBeenCalled();
 });

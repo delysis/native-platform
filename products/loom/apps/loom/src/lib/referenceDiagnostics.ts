@@ -67,7 +67,14 @@ export function referenceDiagnosticPlugin(): Plugin<DecorationSet> {
       init: () => DecorationSet.empty,
       apply: (transaction, current) => transaction.getMeta(referenceDiagnosticKey) ?? (transaction.docChanged ? DecorationSet.empty : current)
     },
-    props: { decorations: state => referenceDiagnosticKey.getState(state) }
+    props: {
+      decorations: state => referenceDiagnosticKey.getState(state),
+      attributes: state => {
+        const selected = referenceDiagnosticKey.getState(state)?.find(state.selection.from, state.selection.to) ?? [];
+        const messages = selected.map(item => item.spec.message).filter((message): message is string => typeof message === 'string');
+        return { 'aria-description': [...new Set(messages)].join(' ') };
+      }
+    }
   });
 }
 
@@ -103,7 +110,7 @@ export function visualReferenceDecorations(doc: Node, text: string, items: reado
     return DecorationSet.create(doc, items.flatMap((item, index) => {
       const range = ranges.get(index);
       return range?.from !== undefined && range.to !== undefined && range.from < range.to
-        ? [Decoration.inline(range.from, range.to, { class: 'reference-unavailable', title: item.message, 'aria-description': item.message })] : [];
+        ? [Decoration.inline(range.from, range.to, { class: 'reference-unavailable', title: item.message, 'aria-description': item.message }, { message: item.message })] : [];
     }));
   } catch { return DecorationSet.empty; }
 }

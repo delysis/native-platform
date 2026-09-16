@@ -8663,6 +8663,12 @@
       ) {
         const captureIsCurrent = weaveCaptureStillCurrent(captured);
         const failure = normalizeFailure(error);
+        // Ordinary typing can leave an unfinished or unresolved mention. Its
+        // inline diagnostic owns the feedback; automatic inference must not
+        // interrupt the writer with a technical toast. Explicit runs still
+        // report their own failures, and command recovery below stays intact.
+        const referenceNeedsAttention = failure.code === 'document_reference_missing' ||
+          failure.code === 'document_reference_ambiguous';
         if (captureIsCurrent && captured.speculation && failure.speculation_recovery) {
           uncertainWeave = null;
           try { await recoverLoompad(captured, failure.speculation_recovery); }
@@ -8685,7 +8691,7 @@
           return true;
         }
         if (captureIsCurrent) {
-          recordFailure(failure);
+          if (!referenceNeedsAttention) recordFailure(failure);
           uncertainWeave = captured;
         }
         try {
@@ -8704,7 +8710,7 @@
             }
           } else if (captureIsCurrent) {
             uncertainWeave = null;
-            announce('No Weave was committed; the request can be started again');
+            if (!referenceNeedsAttention) announce('No Weave was committed; the request can be started again');
           }
         } catch {
           if (captureIsCurrent) {
