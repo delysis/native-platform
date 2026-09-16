@@ -498,6 +498,7 @@ pub(super) fn native_media<'a>(
     crate::terminal_media::merge(Vec::new(), media)
 }
 
+// These integration fixtures require the supported private project store.
 #[cfg(all(test, unix))]
 #[path = "material_context_tests.rs"]
 mod tests;
