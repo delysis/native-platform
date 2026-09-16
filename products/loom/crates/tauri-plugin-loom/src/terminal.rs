@@ -2,6 +2,7 @@
 //! call; references never execute, and results never overwrite source writing.
 
 use super::*;
+use crate::material_context::{self, Value};
 use loom_document::{
     NeuralCommand, NeuralExpression, document_references, parse_neural_command,
     render_base_function_prompt,
@@ -81,7 +82,11 @@ struct RunReceipt {
     #[serde(default)]
     media: Vec<TerminalMediaEvidence>,
     model: Option<VerifiedModelDescriptor>,
-    bindings: BTreeMap<String, String>,
+    bindings: BTreeMap<String, Value>,
+    #[serde(default)]
+    evidence: Vec<crate::materials::MaterialEvidence>,
+    #[serde(default)]
+    searches: Vec<crate::materials::MaterialSearch>,
     sources: Vec<crate::document_bindings::ResolvedDocument>,
     steps: Vec<BlobId>,
 }
@@ -184,6 +189,10 @@ fn expression_names(
             names.insert(name.clone());
         }
         NeuralExpression::Literal { .. } => {}
+        NeuralExpression::Find { source, query } => {
+            expression_names(source, names, calls);
+            expression_names(query, names, calls);
+        }
         NeuralExpression::Call {
             function,
             arguments,
@@ -198,15 +207,21 @@ fn expression_names(
 }
 
 fn function_names(expression: &NeuralExpression, names: &mut BTreeSet<String>) {
-    if let NeuralExpression::Call {
-        function,
-        arguments,
-    } = expression
-    {
-        names.insert(function.clone());
-        for argument in arguments {
-            function_names(argument, names);
+    match expression {
+        NeuralExpression::Call {
+            function,
+            arguments,
+        } => {
+            names.insert(function.clone());
+            for argument in arguments {
+                function_names(argument, names);
+            }
         }
+        NeuralExpression::Find { source, query } => {
+            function_names(source, names);
+            function_names(query, names);
+        }
+        _ => {}
     }
 }
 
@@ -443,35 +458,28 @@ pub(super) async fn terminal_run<R: Runtime>(
         if function.ends_with('/') {
             return Err(failure("A function must name one document."));
         }
-        let documents =
-            crate::document_bindings::resolve_references(store, std::slice::from_ref(&function))?;
-        for document in documents {
-            for reference in document_references(&document.text).map_err(io_failure)? {
-                all_names.insert(reference.name);
-            }
+        let function_value = material_context::resolve(store, &function)?;
+        let function_text = material_context::exact(&function_value)?;
+        for reference in document_references(&function_text).map_err(io_failure)? {
+            all_names.insert(reference.name);
         }
     }
-    let all_names = all_names.into_iter().collect::<Vec<_>>();
-    let sources = crate::document_bindings::resolve_references(store, &all_names)?;
+    if !all_names.is_empty() {
+        crate::material_commands::restore_grants(&state, store)?;
+    }
     let mut bindings = BTreeMap::new();
-    let mut binding_bytes = 0;
-    for name in all_names.into_iter().collect::<BTreeSet<_>>() {
-        let documents =
-            crate::document_bindings::resolve_references(store, std::slice::from_ref(&name))?;
-        let mut text = String::new();
-        for document in documents {
-            if !text.is_empty() {
-                text.push_str("\n\n");
+    let mut sources = Vec::new();
+    let mut seen_documents = BTreeSet::new();
+    for name in all_names {
+        let value = material_context::resolve(store, &name)?;
+        if let Value::Documents { documents } = &value {
+            for document in documents {
+                if seen_documents.insert(document.document_id) {
+                    sources.push(document.clone());
+                }
             }
-            text.push_str(&document.text);
         }
-        binding_bytes += text.len();
-        if binding_bytes > MAX_PROMPT_BYTES {
-            return Err(failure(
-                "The combined document references exceed the context budget.",
-            ));
-        }
-        bindings.insert(name, bounded(text)?);
+        bindings.insert(name, value);
     }
     let media = if let Some(model) = &model {
         let media = crate::terminal_media::resolve(
@@ -479,6 +487,10 @@ pub(super) async fn terminal_run<R: Runtime>(
             &source,
             &sources,
             resident_context_tokens(model),
+        )?;
+        let media = crate::terminal_media::merge(
+            media,
+            material_context::native_media(store, bindings.values())?,
         )?;
         validate_media_against_resident_model(&media, &model.descriptor)?;
         media
@@ -542,6 +554,8 @@ pub(super) async fn terminal_run<R: Runtime>(
         media: media_evidence,
         model: model.as_ref().map(|model| model.descriptor.clone()),
         bindings,
+        evidence: Vec::new(),
+        searches: Vec::new(),
         sources,
         steps: Vec::new(),
     };
@@ -706,47 +720,76 @@ impl Evaluator<'_> {
         )?)
     }
 
-    fn evaluate_command(&mut self, command: &NeuralCommand) -> Result<String, IpcFailure> {
+    fn evaluate_command(&mut self, command: &NeuralCommand) -> Result<Value, IpcFailure> {
         match command {
             NeuralCommand::Prompt(text) => {
                 let mut prefix = String::new();
-                for (name, value) in &self.receipt.bindings {
-                    let _ = write!(prefix, "# {name}\n\n{value}\n\n");
+                let query = self
+                    .receipt
+                    .run
+                    .presentation
+                    .as_ref()
+                    .map_or(text.as_str(), |presentation| presentation.input.as_str());
+                let query = query.to_owned();
+                for (name, value) in self.receipt.bindings.clone() {
+                    let value = self.consult(&value, &query)?;
+                    let _ = write!(
+                        prefix,
+                        "# {name:?}\n\n{}\n\n",
+                        material_context::exact(&value)?
+                    );
                 }
                 prefix.push_str(text);
-                self.complete(bounded(prefix)?)
+                self.complete(bounded(prefix)?).map(Value::Text)
             }
             NeuralCommand::Expression(expression) => self.evaluate(expression),
         }
     }
 
-    fn evaluate(&mut self, expression: &NeuralExpression) -> Result<String, IpcFailure> {
+    fn evaluate(&mut self, expression: &NeuralExpression) -> Result<Value, IpcFailure> {
         if self.control.cancelled.load(Ordering::Acquire) {
             return Err(failure("Cancelled"));
         }
         match expression {
             NeuralExpression::Reference { name } => self.binding(name),
-            NeuralExpression::Literal { text } => Ok(text.clone()),
+            NeuralExpression::Literal { text } => Ok(Value::Text(text.clone())),
+            NeuralExpression::Find { source, query } => {
+                let source = self.evaluate(source)?;
+                let query = material_context::exact(&self.evaluate(query)?)?;
+                let value =
+                    self.with_store(|store| material_context::search(store, &source, &query))?;
+                self.record_evidence(&value);
+                Ok(value)
+            }
             NeuralExpression::Call {
                 function,
                 arguments,
             } => {
-                let function = self.binding(function)?;
+                let function = material_context::exact(&self.binding(function)?)?;
                 let mut inputs = Vec::new();
                 for argument in arguments {
-                    inputs.push(self.evaluate(argument)?);
+                    let value = self.evaluate(argument)?;
+                    self.record_evidence(&value);
+                    inputs.push(material_context::exact(&value)?);
                 }
                 if inputs.is_empty() {
                     inputs.push(self.input.clone());
                 }
+                let query = bounded(inputs.join("\n\n"))?;
                 let mut contextual_function = String::new();
                 let mut seen_context = BTreeSet::new();
                 for reference in document_references(&function).map_err(io_failure)? {
                     if !seen_context.insert(reference.name.clone()) {
                         continue;
                     }
-                    let context = self.binding(&reference.name)?;
-                    let _ = write!(contextual_function, "# {}\n\n{context}\n\n", reference.name);
+                    let value = self.binding(&reference.name)?;
+                    let context = self.consult(&value, &query)?;
+                    let _ = write!(
+                        contextual_function,
+                        "# {:?}\n\n{}\n\n",
+                        reference.name,
+                        material_context::exact(&context)?
+                    );
                 }
                 contextual_function.push_str(&function);
                 let prompt = render_base_function_prompt(
@@ -754,17 +797,51 @@ impl Evaluator<'_> {
                     &inputs.iter().map(String::as_str).collect::<Vec<_>>(),
                 )
                 .map_err(io_failure)?;
-                self.complete(bounded(prompt)?)
+                self.complete(bounded(prompt)?).map(Value::Text)
             }
         }
     }
 
-    fn binding(&self, name: &str) -> Result<String, IpcFailure> {
+    fn record_evidence(&mut self, value: &Value) {
+        if let Value::Evidence {
+            evidence,
+            retrieval,
+        } = value
+        {
+            if let Some(search) = retrieval
+                && !self.receipt.searches.iter().any(|prior| {
+                    prior.material.id == search.material.id
+                        && prior.query == search.query
+                        && prior.source_revision == search.source_revision
+                        && prior
+                            .hits
+                            .iter()
+                            .map(|hit| &hit.id)
+                            .eq(search.hits.iter().map(|hit| &hit.id))
+                })
+            {
+                self.receipt.searches.push(search.clone());
+            }
+            for hit in evidence {
+                if !self.receipt.evidence.iter().any(|prior| prior.id == hit.id) {
+                    self.receipt.evidence.push(hit.clone());
+                }
+            }
+        }
+    }
+
+    fn consult(&mut self, value: &Value, query: &str) -> Result<Value, IpcFailure> {
+        let consulted = self.with_store(|store| material_context::consult(store, value, query))?;
+        self.record_evidence(&consulted);
+        Ok(consulted)
+    }
+
+    fn binding(&self, name: &str) -> Result<Value, IpcFailure> {
         self.receipt
             .bindings
             .get(name)
             .cloned()
-            .ok_or_else(|| failure(format!("Unresolved document @{name}")))
+            .ok_or_else(|| failure(format!("Unresolved reference @{name}")))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -799,8 +876,14 @@ impl Evaluator<'_> {
             };
             let context_evidence = store
                 .store_provenance_blob(
-                    &serde_json::to_vec(&(&self.receipt.sources, &self.receipt.media))
-                        .map_err(io_failure)?,
+                    &serde_json::to_vec(&(
+                        &self.receipt.sources,
+                        &self.receipt.media,
+                        &self.receipt.evidence,
+                        &self.receipt.searches,
+                        &self.receipt.bindings,
+                    ))
+                    .map_err(io_failure)?,
                 )
                 .map_err(IpcFailure::store)?;
             let prompt_artifact = store
@@ -906,7 +989,12 @@ impl Evaluator<'_> {
         if candidate.terminal.status == GenerationTerminalStatus::Completed
             || !candidate.output_text.is_empty()
         {
-            self.retain(&candidate.output_text, evidence)?;
+            self.retain(
+                &candidate.output_text,
+                evidence,
+                true,
+                &self.step.to_string(),
+            )?;
         }
         if candidate.terminal.status != GenerationTerminalStatus::Completed {
             return Err(failure(if self.control.cancelled.load(Ordering::Acquire) {
@@ -918,7 +1006,13 @@ impl Evaluator<'_> {
         Ok(candidate.output_text.clone())
     }
 
-    fn retain(&mut self, text: &str, evidence: BlobId) -> Result<(), IpcFailure> {
+    fn retain(
+        &mut self,
+        text: &str,
+        evidence: BlobId,
+        generated: bool,
+        slot: &str,
+    ) -> Result<(), IpcFailure> {
         let title = self
             .receipt
             .run
@@ -932,23 +1026,23 @@ impl Evaluator<'_> {
         } else {
             title.trim()
         };
-        let path = format!("Runs/{}/{}/{title}.md", self.receipt.run.run_id, self.step);
+        let path = format!("Runs/{}/{}/{title}.md", self.receipt.run.run_id, slot);
         let id = self.with_store(|store| {
-            if self.step == 0 {
-                store
-                    .create_derived_document_if_absent(
-                        &path,
-                        DocumentContent::Prose(text.to_owned()),
-                        "retained expression",
-                        evidence,
-                    )
-                    .map_err(IpcFailure::store)?;
-            } else {
+            if generated {
                 store
                     .create_generated_document_if_absent(
                         &path,
                         DocumentContent::Prose(text.to_owned()),
                         "retained experiment",
+                        evidence,
+                    )
+                    .map_err(IpcFailure::store)?;
+            } else {
+                store
+                    .create_derived_document_if_absent(
+                        &path,
+                        DocumentContent::Prose(text.to_owned()),
+                        "retained expression",
                         evidence,
                     )
                     .map_err(IpcFailure::store)?;
@@ -964,10 +1058,14 @@ impl Evaluator<'_> {
         Ok(())
     }
 
-    fn finish(&mut self, outcome: Result<String, IpcFailure>) -> Result<(), IpcFailure> {
+    fn finish(&mut self, outcome: Result<Value, IpcFailure>) -> Result<(), IpcFailure> {
+        let outcome =
+            outcome.and_then(|value| material_context::exact(&value).map(|text| (value, text)));
         match outcome {
-            Ok(text) => {
-                if self.receipt.run.output_document_id.is_none() {
+            Ok((value, text)) => {
+                self.record_evidence(&value);
+                if self.receipt.run.output_document_id.is_none() || !matches!(value, Value::Text(_))
+                {
                     let evidence = self.with_store(|store| {
                         store
                             .store_provenance_blob(
@@ -975,7 +1073,7 @@ impl Evaluator<'_> {
                             )
                             .map_err(IpcFailure::store)
                     })?;
-                    self.retain(&text, evidence)?;
+                    self.retain(&text, evidence, false, "result")?;
                 }
                 self.receipt.run.status = "completed".into();
             }

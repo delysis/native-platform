@@ -3,6 +3,16 @@
 [default]
 description = "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions."
 permissions = [
+  "allow-material-list",
+  "allow-material-read",
+  "allow-material-search",
+  "allow-material-read-evidence",
+  "allow-material-bind-attachment",
+  "allow-material-set-pinned",
+  "allow-material-remove",
+  "allow-material-add-library",
+  "allow-material-add-library-path",
+
   "allow-project-open-default",
   "allow-project-prepare-open",
   "allow-project-prepare-open-path",

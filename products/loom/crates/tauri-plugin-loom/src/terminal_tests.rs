@@ -143,6 +143,172 @@ impl Drop for TerminalFixture {
     }
 }
 
+fn imported_source(fixture: &TerminalFixture, text: &str) -> crate::materials::MaterialEntry {
+    fixture.with_store(|store| {
+        let path = fixture.root().join("research.txt");
+        std::fs::write(&path, text).unwrap();
+        let attachment = crate::context_attachments::import_path(store.root(), &path).unwrap();
+        crate::materials::bind_attachment(store, &attachment.id, Some("Research")).unwrap()
+    })
+}
+
+#[test]
+fn find_run_needs_no_model_and_replays_retained_evidence_after_source_removal() {
+    let fixture = TerminalFixture::new();
+    let material = imported_source(&fixture, "The nightjar sings. @Missing stays source text.");
+    let id = CommandId::new();
+    let expression = "=find(@Research, \"nightjar\")";
+    fixture.run(id, expression).unwrap();
+    let completed = fixture.wait(id);
+    assert_eq!(completed.status, "completed", "{:?}", completed.error);
+    let receipt = read_receipt(&fixture.root(), &id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    assert!(receipt.model.is_none());
+    assert!(receipt.steps.is_empty());
+    assert_eq!(receipt.searches.len(), 1);
+    assert_eq!(receipt.searches[0].query, "nightjar");
+    assert_eq!(receipt.searches[0].material.id, material.id);
+    assert!(!receipt.evidence.is_empty());
+    let path = completed.output_relative_path.as_ref().unwrap();
+    fixture.with_store(|store| {
+        let output = store.read_document(path).unwrap();
+        assert!(output.text.contains("nightjar"));
+        assert!(output.text.contains("@Missing stays source text."));
+        assert_eq!(
+            store
+                .revision_provenance(output.revision_id)
+                .unwrap()
+                .segments[0]
+                .contribution,
+            loom_types::ContributionKind::Source
+        );
+        assert_eq!(
+            store.read_document("Draft.md").unwrap().text,
+            fixture.source.text
+        );
+        crate::materials::remove(store, &material.id).unwrap();
+    });
+    let replay = fixture.run(id, expression).unwrap();
+    assert_eq!(replay.output_document_id, completed.output_document_id);
+    let retained = read_receipt(&fixture.root(), &id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.evidence[0].text, receipt.evidence[0].text);
+    assert!(fixture.run(CommandId::new(), expression).is_err());
+}
+
+#[test]
+fn find_operands_count_nested_model_calls_and_function_context_admission() {
+    let NeuralCommand::Expression(expression) =
+        parse_neural_command("=find(@Research, @Question(@Draft)) |> @Compare").unwrap()
+    else {
+        panic!("expression")
+    };
+    let mut names = BTreeSet::new();
+    let mut calls = 0;
+    expression_names(&expression, &mut names, &mut calls);
+    assert_eq!(calls, 2);
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "Research".into(),
+            "Question".into(),
+            "Draft".into(),
+            "Compare".into()
+        ])
+    );
+    let mut functions = BTreeSet::new();
+    function_names(&expression, &mut functions);
+    assert_eq!(
+        functions,
+        BTreeSet::from(["Question".into(), "Compare".into()])
+    );
+}
+
+#[test]
+fn final_evidence_replaces_an_intermediate_generation_in_run_output() {
+    let fixture = TerminalFixture::new();
+    let material = imported_source(&fixture, "The nightjar sings beneath the moon.");
+    let initial_id = CommandId::new();
+    fixture.run(initial_id, "=@Draft").unwrap();
+    fixture.wait(initial_id);
+    let mut receipt = read_receipt(&fixture.root(), &initial_id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    let id = CommandId::new();
+    receipt.run.run_id = id.to_string();
+    receipt.run.status = "running".into();
+    receipt.run.output_document_id = None;
+    receipt.run.output_relative_path = None;
+    let state = fixture.app.state::<PluginState>();
+    let identity = GenerationFamilyIdentity {
+        request_id: format!("terminal-{id}"),
+        project_id: fixture.project_id.parse().unwrap(),
+        session_id: fixture.session_id.parse().unwrap(),
+        document_id: fixture.source.document_id,
+    };
+    let control = TerminalControl::default();
+    let mut evaluator = Evaluator {
+        state: &state,
+        identity: &identity,
+        model: None,
+        control: &control,
+        source: &fixture.source,
+        input: String::new(),
+        receipt,
+        media: Vec::new(),
+        step: 1,
+    };
+    // Exercise retention after a preceding inference step without pretending
+    // that a fixture executed a model. The retrieval below uses the real store.
+    let evidence = fixture.with_store(|store| {
+        store
+            .store_provenance_blob(b"intermediate query retention fixture")
+            .unwrap()
+    });
+    evaluator.retain("nightjar", evidence, true, "1").unwrap();
+    let intermediate = evaluator.receipt.run.output_relative_path.clone().unwrap();
+    let found = fixture.with_store(|store| {
+        let source = material_context::resolve(store, &material.id).unwrap();
+        material_context::search(store, &source, "nightjar").unwrap()
+    });
+    evaluator.finish(Ok(found)).unwrap();
+    let completed = read_receipt(&fixture.root(), &id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.run.status, "completed");
+    let final_path = completed.run.output_relative_path.unwrap();
+    assert_ne!(final_path, intermediate);
+    assert_eq!(completed.searches[0].query, "nightjar");
+    fixture.with_store(|store| {
+        let final_output = store.read_document(&final_path).unwrap();
+        let intermediate = store.read_document(&intermediate).unwrap();
+        assert_eq!(intermediate.text, "nightjar");
+        assert!(
+            final_output
+                .text
+                .contains("nightjar sings beneath the moon")
+        );
+        assert_eq!(
+            store
+                .revision_provenance(final_output.revision_id)
+                .unwrap()
+                .segments[0]
+                .contribution,
+            loom_types::ContributionKind::Source
+        );
+        assert_eq!(
+            store
+                .revision_provenance(intermediate.revision_id)
+                .unwrap()
+                .segments[0]
+                .contribution,
+            loom_types::ContributionKind::Generated
+        );
+    });
+}
+
 #[test]
 fn reference_run_retains_source_value_and_replays_without_duplicate_writing() {
     let fixture = TerminalFixture::new();

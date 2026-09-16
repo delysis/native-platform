@@ -553,3 +553,16 @@ button.document-row:hover { background: var(--chrome-hover); }
 .loompad-choice:not(:disabled):hover, .loompad-choice.held { color: var(--ink); background: var(--moss-soft); }
 .loompad-choice:disabled { opacity: .5; }
 .loompad-key { color: var(--quiet); font: 600 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* Material replaces the main content view without detaching unsaved editor state. */
+.writing-content { display:contents; }
+.writing-content.material-covered { display:none; }
+.material-add-menu { position:absolute; top:30px; left:110px; z-index:40; min-width:170px; padding:4px; border:1px solid var(--line); border-radius:6px; background:var(--paper); box-shadow:var(--shadow); }
+.material-add-menu button { display:block; width:100%; min-height:30px; border:0; border-radius:4px; background:none; padding:5px 9px; text-align:left; }
+.material-add-menu button:hover { background:var(--chrome-hover); }
+.material-row.active { background:var(--chrome-hover); }
+.material-pin { margin-left:auto; flex:0 !important; opacity:.6; }
+.material-connect-view { min-height:0; flex:1; overflow:auto; }
+.material-connect-view > header { display:flex; align-items:center; gap:8px; padding:6px 12px; border-bottom:1px solid var(--line-soft); }
+.material-connect-view > header button { border:0; background:none; font-size:1.5rem; }
+.material-connect-view .import-sources { padding:12px; }
