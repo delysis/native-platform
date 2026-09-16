@@ -1,0 +1,3773 @@
+diff --git a/crates/ai/README.md b/crates/ai/README.md
+index 5cd46fe6b51cc9396051fe50af42bf19d4b9a4e3..c64654c0de0341a88dd931a4ed465601fcd4b66a 100644
+--- a/crates/ai/README.md
++++ b/crates/ai/README.md
+@@ -4,6 +4,33 @@
+ 
+ The crate keeps the public edge statically typed while the provider center is erased once at service construction. Calls are cheap to clone because operation payloads are shared, streams and sessions retain explicit ownership, errors are structured and secret-free, and receipts account for every attempt, recovery, usage dimension, and integer monetary unit. Provider identity and capability vocabulary come from `omp-catalog`; this crate does not infer policy from provider or model strings.
+ 
++## Response ownership and resource bounds
++
++Route admission covers the live response or realtime session, including its
++terminal bookkeeping. Finishing the HTTP handshake does not release a slot.
++Dropping readiness, a pending call, or a response releases its reservation;
++terminal streams release transport resources before admitting replacement work.
++Admission is process-local and its waiter count is bounded.
++
++Aggregate inference budgets reserve request allowance atomically and retain one
++accounting owner until the answer completes, fails, or is dropped. Final usage
++is charged once across retries and terminal receipts. Scopes with measured
++token, cost, or wall-time ceilings serialize outstanding requests because their
++final spend is not known at admission. Unreported usage cannot become free
++allowance. These are admission ceilings, not a promise that a single admitted
++request cannot exceed the remaining measured allowance.
++
++Compressed HTTP bodies enforce a cumulative decoded-output bound in the codec's
++output sink, before growing its output buffer. Both success and error bodies
++use this bound, and malformed or truncated encodings fail explicitly. The limit
++does not include the codec's separately bounded scratch/history windows or HTTP
++and frame buffers, and is not a whole-process memory ceiling.
++
++Run `just test-pkg omp-ai` for unit/integration tests and doctests, and
++`just clippy-pkg omp-ai` for the affected crate's lints. These tests require no
++live provider credentials. The response-lifetime and compressed-body
++regressions include local HTTP fixtures; they do not qualify live providers.
++
+ ## Local TTS (Kokoro)
+ 
+ The optional local TTS backend runs Kokoro-82M text-to-speech inference on [candle](https://github.com/huggingface/candle), with Metal acceleration on macOS. Its model pipeline combines an ALBERT text encoder, duration and prosody predictors with bidirectional LSTMs, and an iSTFTNet vocoder. It performs pure inference without downloading models or accessing the network: callers provide checkpoint weights and voice embeddings as candle tensors. The implementation is derived from Kyle Kelley's MIT-licensed `voice-kokoro` crate and includes modifications by Stencil Labs; see [NOTICE](NOTICE) and the retained [license](src/local/tts/kokoro/LICENSE).
+diff --git a/crates/ai/src/answer.rs b/crates/ai/src/answer.rs
+index c89f0cd36ff809bc4774bb79a9f1ed9836ff75f8..401bc2f0d06aff277f33ed4d491a90ef6d8b4fbe 100644
+--- a/crates/ai/src/answer.rs
++++ b/crates/ai/src/answer.rs
+@@ -44,6 +44,88 @@ use crate::{
+ /// Owned asynchronous stream of fallible values.
+ pub type OutputStream<T> = Pin<Box<dyn Stream<Item = Result<T, Error>> + Send + 'static>>;
+ 
++/// Internal ownership transferred from a handshake into its live response.
++/// Accounting guards settle in `Drop`; successful terminal observations are
++/// distinct from cancellation, failure, or an abandoned response.
++pub(crate) trait ResponseGuard: Send + 'static {
++	fn complete(&mut self) {}
++	fn receipt(&mut self, _receipt: &ExecutionReceipt) {}
++	fn usage(&mut self, _usage: Usage, _cost: Cost) {}
++	fn response(&mut self, completion: &crate::event::Completion) {
++		self.receipt(&completion.receipt);
++		self.usage(completion.usage, completion.receipt.cost);
++	}
++}
++
++pin_project_lite::pin_project! {
++	struct GuardedStream<T, G> {
++		inner: Option<OutputStream<T>>,
++		guard: Option<G>,
++		observe: fn(&T, &mut G) -> bool,
++		eof_complete: bool,
++	}
++}
++
++impl<T, G: ResponseGuard> Stream for GuardedStream<T, G> {
++	type Item = Result<T, Error>;
++
++	fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
++		let this = self.project();
++		let Some(inner) = this.inner.as_mut() else {
++			return Poll::Ready(None);
++		};
++		let item = inner.as_mut().poll_next(cx);
++		let Some(guard) = this.guard.as_mut() else {
++			return item;
++		};
++		match &item {
++			Poll::Ready(Some(Ok(event))) => {
++				if (this.observe)(event, guard) {
++					guard.complete();
++					this.inner.take();
++					this.guard.take();
++				}
++			},
++			Poll::Ready(Some(Err(error))) => {
++				guard.receipt(error.receipt());
++				this.inner.take();
++				this.guard.take();
++			},
++			Poll::Ready(None) => {
++				if *this.eof_complete {
++					guard.complete();
++				}
++				this.inner.take();
++				this.guard.take();
++			},
++			Poll::Pending => {},
++		}
++		item
++	}
++}
++
++fn retain_stream_guard<T: Send + 'static, G: ResponseGuard>(
++	stream: &mut OutputStream<T>,
++	guard: G,
++	observe: fn(&T, &mut G) -> bool,
++	eof_complete: bool,
++) {
++	// Stream erasure already exists at this I/O ownership boundary. One wrapper
++	// allocation per response never adds allocation to frame/token polling.
++	let inner = std::mem::replace(stream, Box::pin(futures::stream::empty()));
++	*stream =
++		Box::pin(GuardedStream { inner: Some(inner), guard: Some(guard), observe, eof_complete });
++}
++
++fn observe_generation<T, G: ResponseGuard>(event: &GenerationEvent<T>, guard: &mut G) -> bool {
++	if let GenerationEvent::Completed(summary) = event {
++		guard.usage(summary.usage, summary.cost);
++		true
++	} else {
++		false
++	}
++}
++
+ /// Canonical chat event stream and its optional same-session response path.
+ pub struct ChatStream {
+ 	events:  OutputStream<ChatEvent>,
+@@ -283,6 +365,63 @@ pub enum AnswerBody {
+ }
+ 
+ impl AnswerBody {
++	/// Retains request ownership through the live body, or settles immediately
++	/// when the response body is already a completed unary value.
++	pub(crate) fn retain_guard<G: ResponseGuard>(&mut self, mut guard: G) {
++		match self {
++			Self::Chat(chat) => retain_stream_guard(
++				&mut chat.events,
++				guard,
++				|event, guard| {
++					if let ChatEvent::Completed(completion) = event {
++						guard.receipt(&completion.receipt);
++						guard.usage(completion.usage, completion.receipt.cost);
++						true
++					} else {
++						false
++					}
++				},
++				false,
++			),
++			Self::Images(events) => retain_stream_guard(events, guard, observe_generation, false),
++			Self::Video(session) => {
++				retain_stream_guard(&mut session.events, guard, observe_generation, false);
++			},
++			Self::Speech(events) => {
++				retain_stream_guard(events, guard, |event, _| event.final_chunk, false);
++			},
++			Self::Transcript(events) => retain_stream_guard(
++				events,
++				guard,
++				|event, guard| {
++					if let TranscriptEvent::Completed { usage, .. } = event {
++						guard.usage(*usage, Cost::default());
++						true
++					} else {
++						false
++					}
++				},
++				false,
++			),
++			Self::Realtime(session) => session.retain_guard(guard),
++			Self::Native(response) => match &mut response.body {
++				NativeResponseBody::Stream(events) => {
++					retain_stream_guard(events, guard, |_, _| false, true);
++				},
++				NativeResponseBody::Json(_) | NativeResponseBody::Bytes(_) => guard.complete(),
++			},
++			Self::Tokens(_)
++			| Self::TokenIds(_)
++			| Self::Text(_)
++			| Self::Embeddings(_)
++			| Self::Search(_)
++			| Self::ParallelExtract(_)
++			| Self::Usage(_)
++			| Self::Models(_)
++			| Self::Auth(_) => guard.complete(),
++		}
++	}
++
+ 	/// Returns the body variant without consuming stream or session state.
+ 	pub const fn kind(&self) -> AnswerKind {
+ 		match self {
+@@ -828,14 +967,30 @@ pub enum RealtimeEvent {
+ 	Closed,
+ }
+ 
++struct RealtimeResponseGuards {
++	guards:             [Option<Box<dyn ResponseGuard>>; 3],
++	response_active:    bool,
++	ambiguous_response: bool,
++}
++
+ /// Owned bounded bidirectional realtime session.
+ ///
+ /// Channels are private so all caller input observes backpressure and the
+ /// single terminal close transition.
++///
++/// Finite token/cost accounting requires an explicit successful close receipt
++/// with no unfinished or overlapping response. The event vocabulary does not
++/// correlate overlapping caller inputs with completions; that ambiguity, or a
++/// legacy `Closed` event, leaves usage conservatively unsettled.
+ pub struct RealtimeSession {
+ 	pub(crate) outbound: flume::Sender<RealtimeInput>,
+ 	pub(crate) inbound:  Receiver<Result<RealtimeEvent, Error>>,
+ 	pub(crate) closed:   Arc<AtomicBool>,
++	// The fixed stack has one route-admission guard, outer accounting, and
++	// live-registry accounting. Retention is private to this composition.
++	guards:              Mutex<RealtimeResponseGuards>,
++	// Receive and accounting observation share an order even for recv(&self).
++	pub(crate) receive:  tokio::sync::Mutex<()>,
+ }
+ 
+ impl RealtimeSession {
+@@ -846,7 +1001,90 @@ impl RealtimeSession {
+ 		inbound: Receiver<Result<RealtimeEvent, Error>>,
+ 		closed: Arc<AtomicBool>,
+ 	) -> Self {
+-		Self { outbound, inbound, closed }
++		Self {
++			outbound,
++			inbound,
++			closed,
++			guards: Mutex::new(RealtimeResponseGuards {
++				guards:             [None, None, None],
++				response_active:    false,
++				ambiguous_response: false,
++			}),
++			receive: tokio::sync::Mutex::const_new(()),
++		}
++	}
++
++	pub(crate) fn retain_guard<G: ResponseGuard>(&mut self, guard: G) {
++		let slot = self
++			.guards
++			.get_mut()
++			.guards
++			.iter_mut()
++			.find(|slot| slot.is_none())
++			.expect("one admission and at most two accounting guards per realtime session");
++		*slot = Some(Box::new(guard));
++	}
++
++	pub(crate) fn observe_guard_input(&self, input: &RealtimeInput) {
++		if matches!(
++			input,
++			RealtimeInput::Audio(_)
++				| RealtimeInput::Text(_)
++				| RealtimeInput::Commit
++				| RealtimeInput::ToolResult { .. }
++				| RealtimeInput::AppendContext(_)
++				| RealtimeInput::SettleDelegation(_)
++		) {
++			// Mark before dispatch: a provider can respond before send returns.
++			// Failed dispatch remains conservatively incomplete until a response
++			// terminal proves that all outstanding work has settled.
++			let mut state = self.guards.lock();
++			// The public event vocabulary has no request/response correlation.
++			// Overlapping input cannot be certified by a later uncorrelated
++			// completion, so retain that uncertainty through session closure.
++			state.ambiguous_response |= state.response_active;
++			state.response_active = true;
++		}
++	}
++
++	pub(crate) fn observe_guard_event(&self, event: Option<&Result<RealtimeEvent, Error>>) {
++		let terminal = matches!(
++			event,
++			None | Some(Err(_) | Ok(RealtimeEvent::Closed | RealtimeEvent::CloseReceipt(_)))
++		);
++		let mut state = self.guards.lock();
++		match event {
++			Some(Ok(RealtimeEvent::Chat(ChatEvent::Completed(_)))) => state.response_active = false,
++			Some(Ok(
++				RealtimeEvent::Chat(_)
++				| RealtimeEvent::Audio(_)
++				| RealtimeEvent::Transcript(RealtimeTranscript {
++					role: RealtimeTranscriptRole::Assistant,
++					..
++				}),
++			)) => state.response_active = true,
++			_ => {},
++		}
++		let incomplete_response = state.response_active || state.ambiguous_response;
++		for guard in state.guards.iter_mut().flatten() {
++			match event {
++				Some(Err(error)) => guard.receipt(error.receipt()),
++				Some(Ok(RealtimeEvent::Chat(ChatEvent::Completed(completion)))) => {
++					guard.response(completion);
++				},
++				Some(Ok(RealtimeEvent::CloseReceipt(receipt)))
++					if receipt.reason == RealtimeCloseReason::Completed && !incomplete_response =>
++				{
++					guard.complete();
++				},
++				_ => {},
++			}
++		}
++		if terminal {
++			let finished = std::mem::take(&mut state.guards);
++			drop(state);
++			drop(finished);
++		}
+ 	}
+ 
+ 	/// Returns whether close was requested or the session reached terminal
+@@ -1481,4 +1719,241 @@ mod tests {
+ 		assert!(matches!(commands.try_recv(), Ok(JobCommand::Cancel { acknowledgement: None })));
+ 		assert!(commands.try_recv().is_err());
+ 	}
++	#[derive(Default)]
++	struct GuardObservations {
++		dropped:       usize,
++		completed:     usize,
++		receipts:      usize,
++		output_tokens: u64,
++	}
++	struct ObservedGuard(Arc<Mutex<GuardObservations>>);
++	impl Drop for ObservedGuard {
++		fn drop(&mut self) {
++			self.0.lock().dropped += 1;
++		}
++	}
++	impl ResponseGuard for ObservedGuard {
++		fn complete(&mut self) {
++			self.0.lock().completed += 1;
++		}
++
++		fn receipt(&mut self, _: &ExecutionReceipt) {
++			self.0.lock().receipts += 1;
++		}
++
++		fn usage(&mut self, usage: Usage, _: Cost) {
++			self.0.lock().output_tokens += usage.output_tokens;
++		}
++	}
++	fn completed_chat() -> ChatEvent {
++		ChatEvent::Completed(crate::event::Completion {
++			reason:  crate::event::FinishReason::Stop,
++			blocks:  0,
++			usage:   Usage { output_tokens: 7, ..Usage::default() },
++			receipt: Box::default(),
++		})
++	}
++
++	#[tokio::test]
++	async fn response_guards_distinguish_truncated_chat_from_native_eof() {
++		let chat_observed = Arc::new(Mutex::new(GuardObservations::default()));
++		let mut chat = AnswerBody::Chat(ChatStream::ordinary(Box::pin(futures::stream::empty())));
++		chat.retain_guard(ObservedGuard(chat_observed.clone()));
++		let AnswerBody::Chat(stream) = &mut chat else {
++			panic!("chat");
++		};
++		assert!(stream.next().await.is_none());
++		assert_eq!(chat_observed.lock().completed, 0, "chat EOF without a terminal is incomplete");
++		assert_eq!(chat_observed.lock().dropped, 1);
++
++		let native_observed = Arc::new(Mutex::new(GuardObservations::default()));
++		let mut native = AnswerBody::Native(NativeResponse {
++			status:              200,
++			media_type:          None,
++			provider_request_id: None,
++			body:                NativeResponseBody::Stream(Box::pin(futures::stream::empty())),
++		});
++		native.retain_guard(ObservedGuard(native_observed.clone()));
++		let AnswerBody::Native(NativeResponse { body: NativeResponseBody::Stream(stream), .. }) =
++			&mut native
++		else {
++			panic!("native stream");
++		};
++		assert!(stream.next().await.is_none());
++		assert_eq!(native_observed.lock().completed, 1, "native EOF is its terminal boundary");
++		assert_eq!(native_observed.lock().dropped, 1);
++	}
++
++	#[tokio::test]
++	async fn response_guard_fuses_at_terminal_without_polling_unguarded_work() {
++		let observed = Arc::new(Mutex::new(GuardObservations::default()));
++		let error = Error::new(
++			crate::error::ErrorKind::ProviderContractMismatch,
++			crate::error::ErrorPhase::Streaming,
++			crate::error::RetryAction::Never,
++			ExecutionReceipt::default(),
++		);
++		let mut body = AnswerBody::Chat(ChatStream::ordinary(Box::pin(futures::stream::iter([
++			Ok(completed_chat()),
++			Err(error),
++		]))));
++		body.retain_guard(ObservedGuard(observed.clone()));
++		let AnswerBody::Chat(stream) = &mut body else {
++			panic!("chat");
++		};
++		assert!(matches!(stream.next().await, Some(Ok(ChatEvent::Completed(_)))));
++		assert_eq!(observed.lock().output_tokens, 7);
++		assert_eq!(observed.lock().receipts, 1);
++		assert_eq!(observed.lock().completed, 1);
++		assert_eq!(observed.lock().dropped, 1);
++		assert!(stream.next().await.is_none(), "terminal responses must never poll unguarded work");
++		assert!(stream.next().await.is_none());
++		drop(body);
++		assert_eq!(observed.lock().dropped, 1);
++	}
++
++	#[tokio::test]
++	async fn realtime_response_guards_observe_usage_then_settle_once_at_close() {
++		let (mut session, mut endpoint) = RealtimeSession::bounded(1).unwrap();
++		let admission = Arc::new(Mutex::new(GuardObservations::default()));
++		let accounting = Arc::new(Mutex::new(GuardObservations::default()));
++		let outer = Arc::new(Mutex::new(GuardObservations::default()));
++		session.retain_guard(ObservedGuard(admission.clone()));
++		session.retain_guard(ObservedGuard(accounting.clone()));
++		session.retain_guard(ObservedGuard(outer.clone()));
++		endpoint
++			.send(Ok(RealtimeEvent::Chat(completed_chat())))
++			.await
++			.unwrap();
++		session.recv().await.unwrap().unwrap();
++		for observed in [&admission, &accounting, &outer] {
++			let observed = observed.lock();
++			assert_eq!(observed.output_tokens, 7);
++			assert_eq!(observed.receipts, 1);
++			assert_eq!(observed.completed, 0, "a chat turn does not end a realtime session");
++			assert_eq!(observed.dropped, 0);
++		}
++		endpoint
++			.send(Ok(RealtimeEvent::CloseReceipt(RealtimeCloseReceipt {
++				origin:    RealtimeCloseOrigin::Provider,
++				reason:    RealtimeCloseReason::Completed,
++				closed_at: SystemTime::now(),
++			})))
++			.await
++			.unwrap();
++		session.recv().await.unwrap().unwrap();
++		drop(session);
++		for observed in [&admission, &accounting, &outer] {
++			let observed = observed.lock();
++			assert_eq!(observed.completed, 1);
++			assert_eq!(observed.dropped, 1);
++		}
++	}
++	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++	async fn concurrent_realtime_receivers_observe_usage_before_close() {
++		let (mut session, mut endpoint) = RealtimeSession::bounded(3).unwrap();
++		let observed = Arc::new(Mutex::new(GuardObservations::default()));
++		session.retain_guard(ObservedGuard(observed.clone()));
++		let session = Arc::new(session);
++		let first = {
++			let session = session.clone();
++			tokio::spawn(async move { session.recv().await })
++		};
++		let second = {
++			let session = session.clone();
++			tokio::spawn(async move { session.recv().await })
++		};
++		let third = {
++			let session = session.clone();
++			tokio::spawn(async move { session.recv().await })
++		};
++		endpoint
++			.send(Ok(RealtimeEvent::Chat(completed_chat())))
++			.await
++			.unwrap();
++		endpoint
++			.send(Ok(RealtimeEvent::Chat(completed_chat())))
++			.await
++			.unwrap();
++		endpoint
++			.send(Ok(RealtimeEvent::CloseReceipt(RealtimeCloseReceipt {
++				origin:    RealtimeCloseOrigin::Provider,
++				reason:    RealtimeCloseReason::Completed,
++				closed_at: SystemTime::now(),
++			})))
++			.await
++			.unwrap();
++		tokio::time::timeout(Duration::from_secs(2), async {
++			first.await.unwrap().unwrap().unwrap();
++			second.await.unwrap().unwrap().unwrap();
++			third.await.unwrap().unwrap().unwrap();
++		})
++		.await
++		.unwrap();
++		let observed = observed.lock();
++		assert_eq!(observed.receipts, 2);
++		assert_eq!(observed.output_tokens, 14);
++		assert_eq!(observed.completed, 1);
++		assert_eq!(observed.dropped, 1);
++	}
++	#[tokio::test]
++	async fn realtime_close_does_not_certify_an_unfinished_later_response() {
++		for caller_input in [false, true] {
++			let (mut session, mut endpoint) = RealtimeSession::bounded(1).unwrap();
++			let observed = Arc::new(Mutex::new(GuardObservations::default()));
++			session.retain_guard(ObservedGuard(observed.clone()));
++			endpoint
++				.send(Ok(RealtimeEvent::Chat(completed_chat())))
++				.await
++				.unwrap();
++			session.recv().await.unwrap().unwrap();
++			if caller_input {
++				session.send(RealtimeInput::Commit).await.unwrap();
++			} else {
++				endpoint
++					.send(Ok(RealtimeEvent::Chat(ChatEvent::TextDelta {
++						index: 0,
++						text:  sf!("partial"),
++					})))
++					.await
++					.unwrap();
++				session.recv().await.unwrap().unwrap();
++			}
++			endpoint.send(Ok(RealtimeEvent::Closed)).await.unwrap();
++			session.recv().await.unwrap().unwrap();
++			let observed = observed.lock();
++			assert_eq!(observed.output_tokens, 7);
++			assert_eq!(observed.completed, 0, "earlier usage cannot certify unfinished later work");
++			assert_eq!(observed.dropped, 1);
++		}
++	}
++	#[tokio::test]
++	async fn overlapping_realtime_input_latches_uncertainty_after_completion() {
++		let (mut session, mut endpoint) = RealtimeSession::bounded(2).unwrap();
++		let observed = Arc::new(Mutex::new(GuardObservations::default()));
++		session.retain_guard(ObservedGuard(observed.clone()));
++		session.send(RealtimeInput::Commit).await.unwrap();
++		session
++			.send(RealtimeInput::Text(sf!("next request")))
++			.await
++			.unwrap();
++		endpoint
++			.send(Ok(RealtimeEvent::Chat(completed_chat())))
++			.await
++			.unwrap();
++		session.recv().await.unwrap().unwrap();
++		endpoint
++			.send(Ok(RealtimeEvent::CloseReceipt(RealtimeCloseReceipt {
++				origin:    RealtimeCloseOrigin::Provider,
++				reason:    RealtimeCloseReason::Completed,
++				closed_at: SystemTime::now(),
++			})))
++			.await
++			.unwrap();
++		session.recv().await.unwrap().unwrap();
++		let observed = observed.lock();
++		assert_eq!(observed.output_tokens, 7);
++		assert_eq!(observed.completed, 0, "uncorrelated completion cannot settle overlapping input");
++		assert_eq!(observed.dropped, 1);
++	}
+ }
+diff --git a/crates/ai/src/auth/aws.rs b/crates/ai/src/auth/aws.rs
+index 242a804151c1389a2b0bebb1ae32ba7693ba8599..c26c0aa1c650edcc2057ca721325fd6bacfbfd27 100644
+--- a/crates/ai/src/auth/aws.rs
++++ b/crates/ai/src/auth/aws.rs
+@@ -2284,7 +2284,7 @@ mod tests {
+ 		assert_eq!(resolver.effective_region().await.expect("explicit region"), sf!("eu-west-2"),);
+ 	}
+ 
+-	#[tokio::tes]
++	#[tokio::test]
+ 	async fn registry_availability_classifies_every_ambient_source_without_network() {
+ 		let environment = FakeEnvironment::default()
+ 			.with("AWS_ACCESS_KEY_ID", "AKIAENV")
+diff --git a/crates/ai/src/layer/admission.rs b/crates/ai/src/layer/admission.rs
+index d222df998c99c7ca6a2e8a2157ebf3d2a24a42b0..31bb11af64c68a3aa992fc97c57861290fd115a7 100644
+--- a/crates/ai/src/layer/admission.rs
++++ b/crates/ai/src/layer/admission.rs
+@@ -1,5 +1,6 @@
+ //! Route/account concurrency admission, bounded queuing, and readiness
+-//! backpressure.
++//! backpressure. The admitted response owns its permit until the live stream
++//! or session ends, not merely until its handshake completes.
+ 
+ use std::{
+ 	pin,
+@@ -7,13 +8,17 @@ use std::{
+ 		Arc,
+ 		atomic::{AtomicUsize, Ordering},
+ 	},
+-	task::{Context, Poll, Waker},
++	task::{Context, Poll},
+ };
+ 
+-use parking_lot::Mutex;
++use futures::Stream;
++use tokio::sync::{OwnedSemaphorePermit, Semaphore};
++use tokio_util::sync::PollSemaphore;
+ use tower::{Layer, Service};
+ 
+ use crate::{
++	answer::{AnswerBody, GenerationEvent, NativeResponseBody, ResponseGuard, TranscriptEvent},
++	codec::{HandshakenResponse, RawEvent, RawEventStream},
+ 	error::{Error, ErrorKind, ErrorPhase, RetryAction},
+ 	layer::LayerCall,
+ 	receipt::ExecutionReceipt,
+@@ -25,9 +30,8 @@ pub struct AdmissionController(Arc<AdmissionState>);
+ struct AdmissionState {
+ 	limit:       usize,
+ 	queue_limit: usize,
+-	active:      AtomicUsize,
++	semaphore:   Arc<Semaphore>,
+ 	waiting:     AtomicUsize,
+-	wakers:      Mutex<Vec<Waker>>,
+ }
+ impl AdmissionController {
+ 	/// Creates a controller with nonzero concurrency and a bounded waiter count.
+@@ -36,44 +40,27 @@ impl AdmissionController {
+ 		Self(Arc::new(AdmissionState {
+ 			limit,
+ 			queue_limit,
+-			active: AtomicUsize::new(0),
++			semaphore: Arc::new(Semaphore::new(limit)),
+ 			waiting: AtomicUsize::new(0),
+-			wakers: Mutex::new(Vec::new()),
+ 		}))
+ 	}
+ 
+ 	fn try_acquire(&self) -> Option<AdmissionPermit> {
+-		let mut active = self.0.active.load(Ordering::Acquire);
+-		loop {
+-			if active >= self.0.limit {
+-				return None;
+-			}
+-			match self.0.active.compare_exchange_weak(
+-				active,
+-				active + 1,
+-				Ordering::AcqRel,
+-				Ordering::Acquire,
+-			) {
+-				Ok(_) => return Some(AdmissionPermit(self.clone())),
+-				Err(observed) => active = observed,
+-			}
+-		}
++		Arc::clone(&self.0.semaphore)
++			.try_acquire_owned()
++			.ok()
++			.map(|permit| AdmissionPermit { _permit: permit })
+ 	}
+ 
+-	/// Returns active admitted calls.
++	/// Returns occupied admission slots, including readiness reservations.
+ 	pub fn active(&self) -> usize {
+-		self.0.active.load(Ordering::Acquire)
++		self.0.limit - self.0.semaphore.available_permits()
+ 	}
+ }
+-struct AdmissionPermit(AdmissionController);
+-impl Drop for AdmissionPermit {
+-	fn drop(&mut self) {
+-		self.0.0.active.fetch_sub(1, Ordering::AcqRel);
+-		for waker in self.0.0.wakers.lock().drain(..) {
+-			waker.wake();
+-		}
+-	}
++struct AdmissionPermit {
++	_permit: OwnedSemaphorePermit,
+ }
++impl ResponseGuard for AdmissionPermit {}
+ 
+ /// Adds admission control before account/auth/network work.
+ #[derive(Clone)]
+@@ -90,6 +77,7 @@ impl AdmissionLayer {
+ pub struct AdmissionService<S> {
+ 	inner:      S,
+ 	controller: AdmissionController,
++	acquire:    PollSemaphore,
+ 	permit:     Option<AdmissionPermit>,
+ 	waiting:    bool,
+ }
+@@ -98,6 +86,7 @@ impl<S: Clone> Clone for AdmissionService<S> {
+ 		Self {
+ 			inner:      self.inner.clone(),
+ 			controller: self.controller.clone(),
++			acquire:    self.acquire.clone(),
+ 			permit:     None,
+ 			waiting:    false,
+ 		}
+@@ -114,30 +103,40 @@ impl<S> Layer<S> for AdmissionLayer {
+ 	type Service = AdmissionService<S>;
+ 
+ 	fn layer(&self, inner: S) -> Self::Service {
+-		AdmissionService { inner, controller: self.controller.clone(), permit: None, waiting: false }
++		AdmissionService {
++			inner,
++			controller: self.controller.clone(),
++			acquire: PollSemaphore::new(Arc::clone(&self.controller.0.semaphore)),
++			permit: None,
++			waiting: false,
++		}
+ 	}
+ }
+ impl<S, T> Service<LayerCall<T>> for AdmissionService<S>
+ where
+-	S: Service<LayerCall<T>, Error = Error>,
++	S: Service<LayerCall<T>, Response = HandshakenResponse, Error = Error>,
+ {
+ 	type Error = Error;
+ 	type Future = AdmissionFuture<S::Future>;
+-	type Response = S::Response;
++	type Response = HandshakenResponse;
+ 
+ 	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Error>> {
+ 		if self.permit.is_none() {
+-			if let Some(permit) = self.controller.try_acquire() {
+-				self.permit = Some(permit);
+-				if self.waiting {
+-					self.controller.0.waiting.fetch_sub(1, Ordering::AcqRel);
+-					self.waiting = false;
+-				}
+-			} else {
+-				if !self.waiting {
+-					let waiting = self.controller.0.waiting.fetch_add(1, Ordering::AcqRel);
+-					if waiting >= self.controller.0.queue_limit {
+-						self.controller.0.waiting.fetch_sub(1, Ordering::AcqRel);
++			if !self.waiting {
++				self.permit = self.controller.try_acquire();
++				if self.permit.is_none() {
++					let queued = self.controller.0.waiting.try_update(
++						Ordering::AcqRel,
++						Ordering::Acquire,
++						|waiting| {
++							if waiting < self.controller.0.queue_limit {
++								Some(waiting + 1)
++							} else {
++								None
++							}
++						},
++					);
++					if queued.is_err() {
+ 						return Poll::Ready(Err(Error::new(
+ 							ErrorKind::ResourceExhausted,
+ 							ErrorPhase::Admission,
+@@ -147,14 +146,15 @@ where
+ 					}
+ 					self.waiting = true;
+ 				}
+-				self.controller.0.wakers.lock().push(cx.waker().clone());
+-				if let Some(permit) = self.controller.try_acquire() {
+-					self.permit = Some(permit);
+-					self.controller.0.waiting.fetch_sub(1, Ordering::AcqRel);
+-					self.waiting = false;
+-				} else {
+-					return Poll::Pending;
+-				}
++			}
++			if self.waiting {
++				// PollSemaphore owns one cancellable waiter and replaces its waker
++				// on repoll. A busy caller cannot grow an unbounded waker list.
++				let permit = std::task::ready!(self.acquire.poll_acquire(cx))
++					.expect("private admission semaphore is never closed");
++				self.controller.0.waiting.fetch_sub(1, Ordering::AcqRel);
++				self.waiting = false;
++				self.permit = Some(AdmissionPermit { _permit: permit });
+ 			}
+ 		}
+ 		match self.inner.poll_ready(cx) {
+@@ -171,48 +171,170 @@ where
+ 			.permit
+ 			.take()
+ 			.expect("call requires successful readiness on this admission service instance");
+-		AdmissionFuture { inner: self.inner.call(request), _permit: permit }
++		AdmissionFuture { inner: self.inner.call(request), permit: Some(permit) }
+ 	}
+ }
+ 
+-pin_project_lite::pin_project! { /// Future retaining admission through the response handshake.
+-	pub struct AdmissionFuture<F> { #[pin] inner: F, _permit: AdmissionPermit }
++pin_project_lite::pin_project! {
++	 /// Future transferring admission from readiness into the live response.
++	 pub struct AdmissionFuture<F> {
++		  #[pin] inner: F,
++		  permit: Option<AdmissionPermit>,
++	 }
+ }
+-impl<F, T> Future for AdmissionFuture<F>
++impl<F> Future for AdmissionFuture<F>
+ where
+-	F: Future<Output = Result<T, Error>>,
++	F: Future<Output = Result<HandshakenResponse, Error>>,
+ {
+-	type Output = Result<T, Error>;
++	type Output = Result<HandshakenResponse, Error>;
+ 
+ 	fn poll(self: pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+-		self.project().inner.poll(cx)
++		let this = self.project();
++		let response = std::task::ready!(this.inner.poll(cx));
++		let permit = this
++			.permit
++			.take()
++			.expect("admission future polled after completion");
++		Poll::Ready(response.map(|mut response| {
++			if let Some(events) = response.events.take() {
++				response.events =
++					Some(Box::pin(AdmittedEvents { inner: Some(events), permit: Some(permit) }));
++			} else if let Some(session) = response.realtime.as_mut() {
++				session.retain_guard(permit);
++			}
++			response
++		}))
+ 	}
+ }
+ 
++struct AdmittedEvents {
++	inner:  Option<RawEventStream>,
++	permit: Option<AdmissionPermit>,
++}
++impl Stream for AdmittedEvents {
++	type Item = Result<RawEvent, Error>;
++
++	fn poll_next(mut self: pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
++		let Some(inner) = self.inner.as_mut() else {
++			return Poll::Ready(None);
++		};
++		let mut item = inner.as_mut().poll_next(cx);
++		match &mut item {
++			Poll::Ready(Some(Ok(RawEvent::Answer(body)))) if has_live_body(body) => {
++				if let Some(permit) = self.permit.take() {
++					body.retain_guard(permit);
++				}
++			},
++			Poll::Ready(None | Some(Err(_) | Ok(RawEvent::Failure(_)))) => {
++				self.inner = None;
++				self.permit.take();
++			},
++			Poll::Ready(Some(Ok(
++				RawEvent::ImageGeneration(GenerationEvent::Completed(_))
++				| RawEvent::VideoGeneration(GenerationEvent::Completed(_))
++				| RawEvent::Transcript(TranscriptEvent::Completed { .. }),
++			))) => {
++				self.inner = None;
++				self.permit.take();
++			},
++			Poll::Ready(Some(Ok(RawEvent::Audio(chunk)))) if chunk.final_chunk => {
++				self.inner = None;
++				self.permit.take();
++			},
++			_ => {},
++		}
++		// RawCompletion is not EOF: recovery still drains provider metadata and
++		// usage before publishing the canonical terminal completion.
++		item
++	}
++}
++
++const fn has_live_body(body: &AnswerBody) -> bool {
++	matches!(
++		body,
++		AnswerBody::Chat(_)
++			| AnswerBody::Images(_)
++			| AnswerBody::Video(_)
++			| AnswerBody::Speech(_)
++			| AnswerBody::Transcript(_)
++			| AnswerBody::Realtime(_)
++			| AnswerBody::Native(crate::answer::NativeResponse {
++				body: NativeResponseBody::Stream(_),
++				..
++			})
++	)
++}
++
+ #[cfg(test)]
+ mod tests {
+ 	use std::{
+ 		future,
+ 		future::Ready,
++		sync::{
++			Arc,
++			atomic::{AtomicUsize, Ordering},
++		},
+ 		task::{Context, Poll},
+ 	};
+ 
+-	use tower::{Layer, Service};
++	use futures::{
++		StreamExt, stream,
++		task::{ArcWake, waker},
++	};
++	use tower::{Layer, Service, service_fn};
+ 
+ 	use super::{AdmissionController, AdmissionLayer};
+ 	use crate::{
+-		error::Error,
++		answer::{
++			AnswerBody, AudioChunk, NativeResponse, NativeResponseBody, RealtimeEvent,
++			RealtimeSession, TokenCount, TokenizerProvenance,
++		},
++		body::BodySource,
++		codec::{HandshakeMeta, HandshakenResponse, RawCompletion, RawEvent, RawEventStream},
++		error::{Error, ErrorKind, ErrorPhase, RetryAction},
++		event::FinishReason,
+ 		layer::{ExecutionContext, LayerCall},
+-		receipt::ExecutionBudget,
++		receipt::{ExecutionBudget, ExecutionReceipt, Usage},
+ 	};
++
++	fn request() -> LayerCall<()> {
++		LayerCall { payload: (), context: ExecutionContext::new(ExecutionBudget::default()) }
++	}
++	fn response(events: RawEventStream) -> HandshakenResponse {
++		HandshakenResponse {
++			meta:     HandshakeMeta {
++				status:              None,
++				headers:             Box::new([]),
++				provider_request_id: None,
++			},
++			body:     BodySource::Bytes(bytes::Bytes::new())
++				.begin_attempt()
++				.evidence_handle(),
++			events:   Some(events),
++			control:  None,
++			realtime: None,
++		}
++	}
++	fn error() -> Error {
++		Error::new(
++			ErrorKind::ProviderContractMismatch,
++			ErrorPhase::Handshake,
++			RetryAction::Never,
++			ExecutionReceipt::default(),
++		)
++	}
++	fn cx() -> Context<'static> {
++		Context::from_waker(futures::task::noop_waker_ref())
++	}
++
+ 	#[derive(Clone, Default)]
+ 	struct ReadyChecked {
+ 		ready: bool,
+ 	}
+ 	impl Service<LayerCall<()>> for ReadyChecked {
+ 		type Error = Error;
+-		type Future = Ready<Result<(), Error>>;
+-		type Response = ();
++		type Future = Ready<Result<HandshakenResponse, Error>>;
++		type Response = HandshakenResponse;
+ 
+ 		fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
+ 			self.ready = true;
+@@ -221,9 +343,10 @@ mod tests {
+ 
+ 		fn call(&mut self, _: LayerCall<()>) -> Self::Future {
+ 			assert!(std::mem::take(&mut self.ready));
+-			future::ready(Ok::<(), Error>(()))
++			future::ready(Ok(response(Box::pin(stream::empty()))))
+ 		}
+ 	}
++
+ 	#[tokio::test]
+ 	async fn readiness_and_call_use_same_instance() {
+ 		let mut service =
+@@ -231,12 +354,279 @@ mod tests {
+ 		futures::future::poll_fn(|cx| service.poll_ready(cx))
+ 			.await
+ 			.unwrap();
+-		service
+-			.call(LayerCall {
+-				payload: (),
+-				context: ExecutionContext::new(ExecutionBudget::default()),
+-			})
++		service.call(request()).await.unwrap();
++	}
++
++	#[tokio::test]
++	async fn live_response_retains_permit_after_handshake() {
++		let controller = AdmissionController::new(1, 1);
++		let inner = service_fn(|_: LayerCall<()>| async {
++			Ok::<_, Error>(response(Box::pin(stream::pending())))
++		});
++		let mut service = AdmissionLayer::new(controller.clone()).layer(inner);
++		futures::future::poll_fn(|cx| service.poll_ready(cx))
+ 			.await
+ 			.unwrap();
++		let response = service.call(request()).await.unwrap();
++		assert_eq!(controller.active(), 1, "live response must retain admission");
++		let mut other = service.clone();
++		assert!(other.poll_ready(&mut cx()).is_pending());
++		drop(service);
++		assert_eq!(controller.active(), 1, "response owns the permit independently of its service");
++		drop(response);
++		assert!(matches!(other.poll_ready(&mut cx()), Poll::Ready(Ok(()))));
++		drop(other);
++		assert_eq!(controller.active(), 0);
++	}
++
++	#[tokio::test]
++	async fn completion_keeps_permit_until_metadata_drain_then_releases_at_eof() {
++		let controller = AdmissionController::new(1, 1);
++		let inner = service_fn(|_: LayerCall<()>| async {
++			Ok::<_, Error>(response(Box::pin(stream::iter([Ok(RawEvent::Completion(
++				RawCompletion { reason: FinishReason::Stop, blocks: 0, usage: Usage::default() },
++			))]))))
++		});
++		let mut service = AdmissionLayer::new(controller.clone()).layer(inner);
++		assert!(service.poll_ready(&mut cx()).is_ready());
++		let mut response = service.call(request()).await.unwrap();
++		let events = response.events.as_mut().unwrap();
++		assert!(matches!(events.next().await, Some(Ok(RawEvent::Completion(_)))));
++		assert_eq!(controller.active(), 1);
++		assert!(events.next().await.is_none());
++		assert_eq!(controller.active(), 0);
++		assert!(events.next().await.is_none());
++	}
++
++	#[tokio::test]
++	async fn stream_error_releases_before_stream_is_dropped() {
++		let controller = AdmissionController::new(1, 0);
++		let inner = service_fn(|_: LayerCall<()>| async {
++			Ok::<_, Error>(response(Box::pin(stream::iter([Err(error())]))))
++		});
++		let mut service = AdmissionLayer::new(controller.clone()).layer(inner);
++		assert!(service.poll_ready(&mut cx()).is_ready());
++		let mut response = service.call(request()).await.unwrap();
++		assert!(matches!(response.events.as_mut().unwrap().next().await, Some(Err(_))));
++		assert_eq!(controller.active(), 0);
++		assert!(service.poll_ready(&mut cx()).is_ready());
++	}
++
++	#[test]
++	fn dropped_future_and_handshake_error_release_immediately() {
++		let controller = AdmissionController::new(1, 0);
++		let inner =
++			service_fn(|_: LayerCall<()>| future::pending::<Result<HandshakenResponse, Error>>());
++		let mut service = AdmissionLayer::new(controller.clone()).layer(inner);
++		assert!(service.poll_ready(&mut cx()).is_ready());
++		let future = service.call(request());
++		assert_eq!(controller.active(), 1);
++		drop(future);
++		assert_eq!(controller.active(), 0);
++		let mut failing =
++			AdmissionLayer::new(controller.clone()).layer(service_fn(|_: LayerCall<()>| {
++				future::ready(Err::<HandshakenResponse, _>(error()))
++			}));
++		assert!(failing.poll_ready(&mut cx()).is_ready());
++		let mut future = std::pin::pin!(failing.call(request()));
++		assert!(matches!(future.as_mut().poll(&mut cx()), Poll::Ready(Err(_))));
++		assert_eq!(controller.active(), 0, "a retained completed future must not retain a permit");
++	}
++
++	#[test]
++	fn dropped_ready_service_and_waiter_release_their_reservations() {
++		let controller = AdmissionController::new(1, 1);
++		let mut service = AdmissionLayer::new(controller.clone()).layer(ReadyChecked::default());
++		assert!(service.poll_ready(&mut cx()).is_ready());
++		let mut queued = service.clone();
++		for _ in 0..1000 {
++			assert!(queued.poll_ready(&mut cx()).is_pending());
++		}
++		assert_eq!(controller.0.waiting.load(Ordering::Acquire), 1);
++		let mut excess = service.clone();
++		assert!(
++			matches!(excess.poll_ready(&mut cx()), Poll::Ready(Err(error)) if error.kind == ErrorKind::ResourceExhausted)
++		);
++		drop(queued);
++		assert_eq!(controller.0.waiting.load(Ordering::Acquire), 0);
++		assert!(excess.poll_ready(&mut cx()).is_pending());
++		drop(service);
++		assert!(matches!(excess.poll_ready(&mut cx()), Poll::Ready(Ok(()))));
++		drop(excess);
++		assert_eq!(controller.active(), 0);
++		assert_eq!(controller.0.waiting.load(Ordering::Acquire), 0);
++	}
++
++	struct WakeCount(AtomicUsize);
++	impl ArcWake for WakeCount {
++		fn wake_by_ref(this: &Arc<Self>) {
++			this.0.fetch_add(1, Ordering::Relaxed);
++		}
++	}
++	#[test]
++	fn queued_repoll_replaces_the_waker_without_duplicate_registration() {
++		let controller = AdmissionController::new(1, 1);
++		let mut service = AdmissionLayer::new(controller).layer(ReadyChecked::default());
++		assert!(service.poll_ready(&mut cx()).is_ready());
++		let mut queued = service.clone();
++		let old = Arc::new(WakeCount(AtomicUsize::new(0)));
++		let new = Arc::new(WakeCount(AtomicUsize::new(0)));
++		assert!(
++			queued
++				.poll_ready(&mut Context::from_waker(&waker(old.clone())))
++				.is_pending()
++		);
++		for _ in 0..1000 {
++			assert!(
++				queued
++					.poll_ready(&mut Context::from_waker(&waker(new.clone())))
++					.is_pending()
++			);
++		}
++		drop(service);
++		assert_eq!(old.0.load(Ordering::Relaxed), 0);
++		assert_eq!(new.0.load(Ordering::Relaxed), 1);
++		assert!(queued.poll_ready(&mut cx()).is_ready());
++	}
++
++	#[test]
++	#[should_panic(
++		expected = "call requires successful readiness on this admission service instance"
++	)]
++	fn cloning_does_not_transfer_readiness() {
++		let mut service =
++			AdmissionLayer::new(AdmissionController::new(1, 1)).layer(ReadyChecked::default());
++		assert!(service.poll_ready(&mut cx()).is_ready());
++		drop(service.clone().call(request()));
++	}
++
++	#[derive(Clone)]
++	struct FailingReadiness;
++	impl Service<LayerCall<()>> for FailingReadiness {
++		type Error = Error;
++		type Future = Ready<Result<HandshakenResponse, Error>>;
++		type Response = HandshakenResponse;
++
++		fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Error>> {
++			Poll::Ready(Err(error()))
++		}
++
++		fn call(&mut self, _: LayerCall<()>) -> Self::Future {
++			panic!("readiness failed")
++		}
++	}
++	#[test]
++	fn inner_readiness_error_releases_reserved_permit() {
++		let controller = AdmissionController::new(1, 0);
++		let mut service = AdmissionLayer::new(controller.clone()).layer(FailingReadiness);
++		assert!(matches!(service.poll_ready(&mut cx()), Poll::Ready(Err(_))));
++		assert_eq!(controller.active(), 0);
++	}
++
++	#[tokio::test]
++	async fn unary_response_retains_permit_through_eof() {
++		let controller = AdmissionController::new(1, 0);
++		let inner = service_fn(|_: LayerCall<()>| async {
++			Ok::<_, Error>(response(Box::pin(stream::iter([Ok(RawEvent::Answer(
++				AnswerBody::Tokens(TokenCount {
++					tokens:     3,
++					provenance: TokenizerProvenance {
++						tokenizer: "test".into(),
++						revision:  "1".into(),
++						exact:     true,
++					},
++				}),
++			))]))))
++		});
++		let mut service = AdmissionLayer::new(controller.clone()).layer(inner);
++		assert!(service.poll_ready(&mut cx()).is_ready());
++		let mut response = service.call(request()).await.unwrap();
++		let events = response.events.as_mut().unwrap();
++		assert!(matches!(events.next().await, Some(Ok(RawEvent::Answer(AnswerBody::Tokens(_))))));
++		assert_eq!(controller.active(), 1);
++		assert!(events.next().await.is_none());
++		assert_eq!(controller.active(), 0);
++	}
++
++	#[tokio::test]
++	async fn opaque_stream_answer_inherits_permit_from_raw_events() {
++		let controller = AdmissionController::new(1, 0);
++		let inner = service_fn(|_: LayerCall<()>| async {
++			Ok::<_, Error>(response(Box::pin(stream::iter([Ok(RawEvent::Answer(
++				AnswerBody::Native(NativeResponse {
++					status:              200,
++					media_type:          None,
++					provider_request_id: None,
++					body:                NativeResponseBody::Stream(Box::pin(stream::pending())),
++				}),
++			))]))))
++		});
++		let mut service = AdmissionLayer::new(controller.clone()).layer(inner);
++		assert!(service.poll_ready(&mut cx()).is_ready());
++		let mut response = service.call(request()).await.unwrap();
++		let body = response
++			.events
++			.as_mut()
++			.unwrap()
++			.next()
++			.await
++			.unwrap()
++			.unwrap();
++		drop(response);
++		assert_eq!(controller.active(), 1);
++		drop(body);
++		assert_eq!(controller.active(), 0);
++	}
++
++	#[tokio::test]
++	async fn media_terminal_releases_permit_without_extra_poll() {
++		let controller = AdmissionController::new(1, 0);
++		let inner = service_fn(|_: LayerCall<()>| async {
++			Ok::<_, Error>(response(Box::pin(stream::iter([Ok(RawEvent::Audio(AudioChunk {
++				bytes:       bytes::Bytes::new(),
++				start_ms:    None,
++				end_ms:      None,
++				final_chunk: true,
++			}))]))))
++		});
++		let mut service = AdmissionLayer::new(controller.clone()).layer(inner);
++		assert!(service.poll_ready(&mut cx()).is_ready());
++		let mut response = service.call(request()).await.unwrap();
++		assert!(response.events.as_mut().unwrap().next().await.is_some());
++		assert_eq!(controller.active(), 0);
++	}
++
++	#[tokio::test]
++	async fn realtime_permit_lasts_until_observed_close_or_drop() {
++		let controller = AdmissionController::new(1, 0);
++		let (session, mut endpoint) = RealtimeSession::bounded(1).unwrap();
++		let mut next_session = Some(session);
++		let mut service =
++			AdmissionLayer::new(controller.clone()).layer(service_fn(move |_: LayerCall<()>| {
++				let mut response = response(Box::pin(stream::empty()));
++				response.events = None;
++				response.realtime = Some(
++					next_session
++						.take()
++						.unwrap_or_else(|| RealtimeSession::bounded(1).unwrap().0),
++				);
++				future::ready(Ok::<_, Error>(response))
++			}));
++		assert!(service.poll_ready(&mut cx()).is_ready());
++		let response = service.call(request()).await.unwrap();
++		let session = response.realtime.as_ref().unwrap();
++		assert_eq!(controller.active(), 1);
++		session.close().await.unwrap();
++		assert_eq!(controller.active(), 1, "close request is not terminal acknowledgement");
++		endpoint.send(Ok(RealtimeEvent::Closed)).await.unwrap();
++		session.recv().await.unwrap().unwrap();
++		assert_eq!(controller.active(), 0);
++		drop(response);
++		assert_eq!(controller.active(), 0);
++		assert!(service.poll_ready(&mut cx()).is_ready());
++		let response = service.call(request()).await.unwrap();
++		assert_eq!(controller.active(), 1);
++		drop(response);
++		assert_eq!(controller.active(), 0);
+ 	}
+ }
+diff --git a/crates/ai/src/layer/answer.rs b/crates/ai/src/layer/answer.rs
+index 6508f20bf83879647052c513e667a7739f4c1934..fc02621a0ec3d14aaf3fd0835315bc2b67571b8f 100644
+--- a/crates/ai/src/layer/answer.rs
++++ b/crates/ai/src/layer/answer.rs
+@@ -269,8 +269,9 @@ fn chat_stream(
+ 					{
+ 						context.finalize_error(&mut error); let error = error.committed(context.is_committed()); abort.disarm(); yield Err(error); break;
+ 					}
++					if terminal { abort.disarm(); }
+ 					yield Ok(event);
+-					if terminal { abort.disarm(); break; }
++					if terminal { break; }
+ 				},
+ 				Some(Ok(RawEvent::Control(ProviderControlEvent::WorkflowAction { request_id, name, arguments, timeout_ms }))) => {
+ 					yield Ok(ChatEvent::WorkflowAction(WorkflowAction {
+@@ -338,12 +339,12 @@ fn image_stream(
+ 				Ok(RawEvent::ImageGeneration(event)) => {
+ 					let terminal = matches!(event, crate::answer::GenerationEvent::Completed(_));
+ 					if !terminal { context.commit(); }
+-					yield Ok(event);
+ 					if terminal {
+ 						if let Err(mut error) = context.commit_session() { context.finalize_error(&mut error); yield Err(error); return; }
+ 						abort.disarm();
+-						return;
+ 					}
++					yield Ok(event);
++					if terminal { return; }
+ 				}
+ 				Ok(RawEvent::Metadata(metadata)) => context.observe_provider_metadata(metadata),
+ 				Ok(RawEvent::Telemetry(telemetry)) => context.observe_provider_telemetry(telemetry),
+@@ -367,12 +368,12 @@ fn audio_stream(mut input: RawEventStream, context: ExecutionContext) -> AudioSt
+ 				Ok(RawEvent::Audio(chunk)) => {
+ 					let terminal = chunk.final_chunk;
+ 					context.commit();
+-					yield Ok(chunk);
+ 					if terminal {
+ 						if let Err(error) = context.commit_session() { yield Err(error); return; }
+ 						abort.disarm();
+-						return;
+ 					}
++					yield Ok(chunk);
++					if terminal { return; }
+ 				}
+ 				Ok(RawEvent::Metadata(metadata)) => context.observe_provider_metadata(metadata),
+ 				Ok(RawEvent::Telemetry(telemetry)) => context.observe_provider_telemetry(telemetry),
+@@ -396,12 +397,12 @@ fn transcript_stream(mut input: RawEventStream, context: ExecutionContext) -> Tr
+ 				Ok(RawEvent::Transcript(event)) => {
+ 					let terminal = matches!(event, crate::answer::TranscriptEvent::Completed { .. });
+ 					context.commit();
+-					yield Ok(event);
+ 					if terminal {
+ 						if let Err(error) = context.commit_session() { yield Err(error); return; }
+ 						abort.disarm();
+-						return;
+ 					}
++					yield Ok(event);
++					if terminal { return; }
+ 				}
+ 				Ok(RawEvent::Metadata(metadata)) => context.observe_provider_metadata(metadata),
+ 				Ok(RawEvent::Telemetry(telemetry)) => context.observe_provider_telemetry(telemetry),
+@@ -824,4 +825,165 @@ mod tests {
+ 		let error = output.next().await.unwrap().unwrap_err();
+ 		assert!(error.committed);
+ 	}
++	struct TerminalTransaction {
++		fail:    bool,
++		commits: std::sync::atomic::AtomicUsize,
++		aborts:  std::sync::atomic::AtomicUsize,
++	}
++	impl crate::layer::session::SessionCompletion for TerminalTransaction {
++		fn record_chat_event(&self, _: &ChatEvent, _: &ExecutionContext) -> Result<(), Error> {
++			Ok(())
++		}
++
++		fn commit(
++			&self,
++			_: Vec<crate::codec::ProviderStateEvent>,
++			_: &crate::receipt::ExecutionReceipt,
++			context: &ExecutionContext,
++		) -> Result<(), Error> {
++			self
++				.commits
++				.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++			if self.fail {
++				Err(Error::new(
++					ErrorKind::ProviderContractMismatch,
++					ErrorPhase::Recovery,
++					RetryAction::Never,
++					context.receipt(),
++				))
++			} else {
++				Ok(())
++			}
++		}
++
++		fn abort(&self, _: bool) {
++			self
++				.aborts
++				.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++		}
++	}
++
++	fn terminal_output(operation: OperationKind, context: ExecutionContext) -> OutputStream<()> {
++		match operation {
++			OperationKind::Chat => {
++				let input = Box::pin(futures::stream::iter([Ok(RawEvent::Chat(
++					ChatEvent::Completed(Completion {
++						reason:  FinishReason::Stop,
++						blocks:  0,
++						usage:   Usage::default(),
++						receipt: Box::default(),
++					}),
++				))]));
++				let meta = ResponseMeta {
++					request_id:          "terminal".into(),
++					provider:            "test".into(),
++					route:               "test".into(),
++					model:               None,
++					provider_request_id: None,
++					created_at:          SystemTime::UNIX_EPOCH,
++				};
++				Box::pin(chat_stream(input, meta, context).filter_map(|item| {
++					std::future::ready(match item {
++						Ok(ChatEvent::Started(_)) => None,
++						other => Some(other.map(|_| ())),
++					})
++				}))
++			},
++			OperationKind::Speak => {
++				let input = Box::pin(futures::stream::iter([Ok(RawEvent::Audio(AudioChunk {
++					bytes:       Bytes::from_static(b"final"),
++					start_ms:    None,
++					end_ms:      None,
++					final_chunk: true,
++				}))]));
++				Box::pin(audio_stream(input, context).map(|item| item.map(|_| ())))
++			},
++			OperationKind::GenerateImage => {
++				let input = Box::pin(futures::stream::iter([Ok(RawEvent::ImageGeneration(
++					crate::answer::GenerationEvent::Completed(crate::answer::GenerationSummary {
++						artifacts: 0,
++						elapsed:   Duration::ZERO,
++						usage:     Usage::default(),
++						cost:      Default::default(),
++					}),
++				))]));
++				Box::pin(image_stream(input, context).map(|item| item.map(|_| ())))
++			},
++			OperationKind::Transcribe => {
++				let input = Box::pin(futures::stream::iter([Ok(RawEvent::Transcript(
++					crate::answer::TranscriptEvent::Completed {
++						text:  sf!("final"),
++						usage: Usage::default(),
++					},
++				))]));
++				Box::pin(transcript_stream(input, context).map(|item| item.map(|_| ())))
++			},
++			_ => unreachable!("terminal stream fixture"),
++		}
++	}
++
++	#[tokio::test]
++	async fn dropping_at_terminal_preserves_committed_session() {
++		for operation in [
++			OperationKind::Chat,
++			OperationKind::Speak,
++			OperationKind::GenerateImage,
++			OperationKind::Transcribe,
++		] {
++			let transaction = Arc::new(TerminalTransaction {
++				fail:    false,
++				commits: Default::default(),
++				aborts:  Default::default(),
++			});
++			let context = ExecutionContext::new(ExecutionBudget::default());
++			context.set_session_completion(Some(transaction.clone()));
++			let mut output = terminal_output(operation, context);
++			output.next().await.unwrap().unwrap();
++			assert_eq!(
++				transaction
++					.commits
++					.load(std::sync::atomic::Ordering::Relaxed),
++				1,
++				"terminal must describe a committed session"
++			);
++			drop(output);
++			assert_eq!(
++				transaction
++					.aborts
++					.load(std::sync::atomic::Ordering::Relaxed),
++				0
++			);
++		}
++	}
++
++	#[tokio::test]
++	async fn failed_session_commit_is_reported_before_terminal_success() {
++		for operation in [
++			OperationKind::Chat,
++			OperationKind::Speak,
++			OperationKind::GenerateImage,
++			OperationKind::Transcribe,
++		] {
++			let transaction = Arc::new(TerminalTransaction {
++				fail:    true,
++				commits: Default::default(),
++				aborts:  Default::default(),
++			});
++			let context = ExecutionContext::new(ExecutionBudget::default());
++			context.set_session_completion(Some(transaction.clone()));
++			let mut output = terminal_output(operation, context);
++			let error = output
++				.next()
++				.await
++				.expect("terminal result")
++				.expect_err("failed commit cannot publish terminal success");
++			assert_eq!(error.kind, ErrorKind::ProviderContractMismatch);
++			assert_eq!(
++				transaction
++					.commits
++					.load(std::sync::atomic::Ordering::Relaxed),
++				1
++			);
++		}
++	}
+ }
+diff --git a/crates/ai/src/layer/budget.rs b/crates/ai/src/layer/budget.rs
+index 9e321aa8a8df08ed3b5147035877f33f459e5efd..7ead3051c68a09ba2bc0eb860ddc82502ad2f2ab 100644
+--- a/crates/ai/src/layer/budget.rs
++++ b/crates/ai/src/layer/budget.rs
+@@ -1,32 +1,38 @@
+ //! Logical-execution budgets shared by all retries and semantic attempts.
+ 
+ use std::{
+-	collections::HashMap,
+ 	sync::Arc,
+ 	task::{Context, Poll},
+ 	time::{Duration, Instant},
+ };
+ 
+-use omp_core::{Str, sf};
++use omp_core::{FastHashMap, Str, sf};
+ use parking_lot::Mutex;
+ use tower::{Layer, Service};
+ 
+ use crate::{
++	answer::{Answer, ResponseGuard},
+ 	call::Call,
+ 	error::{Error, ErrorDetail, ErrorKind, ErrorPhase, RetryAction},
++	event::Completion,
+ 	layer::{ExecutionContext, LayerCall},
+-	receipt::Cost,
++	receipt::{Cost, ExecutionReceipt, Usage, UsageSource},
+ };
+ 
+-/// Hard inference ceilings applied independently to one extension's turn and
+-/// session ledgers.
++/// Admission ceilings applied independently to one extension's turn and
++/// session ledgers. Measured usage can exceed a ceiling within one request;
++/// the next request is then rejected.
++///
++/// Scopes with token, cost, or wall-time limits admit only one outstanding
++/// request: its final spend is unknown until it finishes. Request-only limits
++/// permit concurrent work up to the atomically reserved request count.
+ #[derive(Clone, Debug, Default, Eq, PartialEq)]
+ pub struct InferenceBudget {
+-	/// Maximum admitted requests.
++	/// Maximum admitted requests, including failed and cancelled work.
+ 	pub max_requests:      Option<u64>,
+ 	/// Maximum aggregate input tokens.
+ 	pub max_input_tokens:  Option<u64>,
+-	/// Maximum aggregate output and reasoning tokens.
++	/// Maximum aggregate output tokens, including their reasoning subset.
+ 	pub max_output_tokens: Option<u64>,
+ 	/// Maximum aggregate wall-clock time.
+ 	pub max_wall_time:     Option<Duration>,
+@@ -52,23 +58,26 @@ struct LedgerKey {
+ #[derive(Clone, Copy, Debug, Default)]
+ struct InferenceSpend {
+ 	requests:      u64,
++	in_flight:     u64,
+ 	input_tokens:  u64,
+ 	output_tokens: u64,
+ 	wall_time:     Duration,
+ 	micro_usd:     i128,
++	unknown_usage: bool,
++	unknown_cost:  bool,
+ }
+ 
+ #[derive(Default)]
+ struct LedgerState {
+-	turn:    HashMap<LedgerKey, InferenceSpend>,
+-	session: HashMap<LedgerKey, InferenceSpend>,
++	turn:    FastHashMap<LedgerKey, InferenceSpend>,
++	session: FastHashMap<LedgerKey, InferenceSpend>,
+ }
+ 
+ /// Shared, stack-owned inference accounting keyed by extension and turn or
+ /// extension and session.
+ #[derive(Clone, Default)]
+ pub struct InferenceLedger {
+-	policies: Arc<Mutex<HashMap<Str, InferenceBudgetPolicy>>>,
++	policies: Arc<Mutex<FastHashMap<Str, InferenceBudgetPolicy>>>,
+ 	default:  Arc<Mutex<InferenceBudgetPolicy>>,
+ 	state:    Arc<Mutex<LedgerState>>,
+ }
+@@ -85,8 +94,18 @@ impl InferenceLedger {
+ 		self.policies.lock().insert(extension, policy);
+ 	}
+ 
+-	/// Admits one request before any provider-facing service can run.
+-	pub fn admit(&self, call: &Call, context: &ExecutionContext) -> Result<(), Error> {
++	/// Reserves one request before any provider-facing service can run.
++	///
++	/// The returned owner must be retained until the answer finishes. Dropping
++	/// it accounts observed work once and retains the request charge. Abandoned
++	/// or failed work closes finite token/cost admission for the scope because
++	/// its unreported usage is not known to be zero. A successful response that
++	/// omits usage or pricing evidence also closes the corresponding ceiling.
++	pub fn admit(
++		&self,
++		call: &Call,
++		context: &ExecutionContext,
++	) -> Result<InferenceReservation, Error> {
+ 		let policy = self
+ 			.policies
+ 			.lock()
+@@ -108,55 +127,167 @@ impl InferenceLedger {
+ 			),
+ 		};
+ 		let mut state = self.state.lock();
+-		check_budget(state.turn.entry(turn.clone()).or_default(), &policy.per_turn, context)?;
++		check_budget(&state.turn.get(&turn).copied().unwrap_or_default(), &policy.per_turn, context)?;
+ 		check_budget(
+-			state.session.entry(session.clone()).or_default(),
++			&state.session.get(&session).copied().unwrap_or_default(),
+ 			&policy.per_session,
+ 			context,
+ 		)?;
+-		let turn_spend = state.turn.get_mut(&turn).expect("entry inserted");
++		let turn_spend = state.turn.entry(turn.clone()).or_default();
+ 		turn_spend.requests = turn_spend.requests.saturating_add(1);
+-		let session_spend = state.session.get_mut(&session).expect("entry inserted");
++		turn_spend.in_flight = turn_spend.in_flight.saturating_add(1);
++		let session_spend = state.session.entry(session.clone()).or_default();
+ 		session_spend.requests = session_spend.requests.saturating_add(1);
+-		Ok(())
+-	}
+-
+-	/// Bills completed or failed provider work after it has been measured by
+-	/// the execution context.
+-	pub fn charge(&self, call: &Call, context: &ExecutionContext) {
+-		let receipt = context.receipt();
+-		let charge = InferenceSpend {
+-			input_tokens: receipt.usage.input_tokens,
+-			// `output_tokens` already includes the reasoning subset; adding
+-			// `reasoning_tokens` again would bill thinking twice.
+-			output_tokens: receipt.usage.output_tokens,
+-			wall_time: context.elapsed(),
+-			micro_usd: receipt.cost.micro_usd,
+-			..InferenceSpend::default()
+-		};
+-		let extension = call.attribution.extension.clone();
+-		let turn_scope = call
+-			.session
+-			.as_ref()
+-			.map_or_else(|| call.id.clone().into_inner(), |session| session.turn.clone().into_inner());
+-		let session_scope = call.session.as_ref().map_or_else(
+-			|| call.id.clone().into_inner(),
+-			|request| request.conversation.clone().into_inner(),
+-		);
+-		let mut state = self.state.lock();
+-		accumulate(
+-			state
+-				.turn
+-				.entry(LedgerKey { extension: extension.clone(), scope: turn_scope })
+-				.or_default(),
+-			charge,
+-		);
+-		accumulate(
++		session_spend.in_flight = session_spend.in_flight.saturating_add(1);
++		Ok(InferenceReservation {
++			ledger: self.clone(),
++			turn,
++			session,
++			context: context.clone(),
++			observed: InferenceSpend::default(),
++			completed: false,
++			usage_observed: false,
++			cost_observed: false,
++			cost_snapshot: None,
++			responses: None,
++		})
++	}
++}
++
++/// Single owner of an admitted request's final accounting.
++///
++/// Moving this owner into an answer ensures successful completion, error,
++/// cancellation, or drop charges the same reservation exactly once. It is
++/// deliberately not cloneable and has no separate public charge operation.
++#[must_use = "retain the reservation until its answer terminates"]
++pub struct InferenceReservation {
++	ledger:         InferenceLedger,
++	turn:           LedgerKey,
++	session:        LedgerKey,
++	context:        ExecutionContext,
++	observed:       InferenceSpend,
++	completed:      bool,
++	usage_observed: bool,
++	cost_observed:  bool,
++	cost_snapshot:  Option<Cost>,
++	responses:      Option<InferenceSpend>,
++}
++
++impl InferenceReservation {
++	/// Transfers accounting into the answer's stream or session, or settles a
++	/// unary answer before returning it. Errors settle the observed receipt.
++	pub fn finish(mut self, result: Result<Answer, Error>) -> Result<Answer, Error> {
++		match result {
++			Ok(mut answer) => {
++				self.receipt(&answer.receipt);
++				answer.body.retain_guard(self);
++				Ok(answer)
++			},
++			Err(error) => {
++				self.receipt(error.receipt());
++				Err(error)
++			},
++		}
++	}
++
++	fn observe_totals(&mut self, usage: Usage, cost: Cost) {
++		// Stream and context snapshots describe the same work. Take their
++		// maxima instead of adding a terminal snapshot to its own attempt.
++		self.observed.input_tokens = self.observed.input_tokens.max(usage.input_tokens);
++		self.observed.output_tokens = self.observed.output_tokens.max(usage.output_tokens);
++		self.observed.micro_usd = self.observed.micro_usd.max(cost.micro_usd);
++	}
++}
++
++impl ResponseGuard for InferenceReservation {
++	fn complete(&mut self) {
++		self.completed = true;
++	}
++
++	fn receipt(&mut self, receipt: &ExecutionReceipt) {
++		self.context.merge_receipt(receipt);
++		self.usage(receipt.usage, receipt.cost);
++		self.cost_observed = cost_is_observed(receipt);
++		if self.cost_observed {
++			self.cost_snapshot = Some(receipt.cost);
++		}
++	}
++
++	fn usage(&mut self, usage: Usage, cost: Cost) {
++		self.observe_totals(usage, cost);
++		// The last terminal usage observation matters. An earlier hidden
++		// attempt cannot make missing usage on the final attempt known.
++		self.usage_observed = usage.source != UsageSource::Unknown;
++		self.cost_observed |= cost.micro_usd != 0;
++		if cost.micro_usd != 0 {
++			self.cost_snapshot = Some(cost);
++		}
++	}
++
++	fn response(&mut self, completion: &Completion) {
++		// Realtime sessions contain multiple distinct responses. Their final
++		// attempt usage is additive, unlike duplicate cumulative receipts.
++		let responses = self.responses.get_or_insert_with(InferenceSpend::default);
++		responses.input_tokens = responses
++			.input_tokens
++			.saturating_add(completion.usage.input_tokens);
++		responses.output_tokens = responses
++			.output_tokens
++			.saturating_add(completion.usage.output_tokens);
++		responses.micro_usd = responses
++			.micro_usd
++			.saturating_add(completion.receipt.cost.micro_usd);
++		responses.unknown_usage |= completion.usage.source == UsageSource::Unknown;
++		responses.unknown_cost |= !cost_is_observed(&completion.receipt);
++		self.observe_totals(completion.receipt.usage, completion.receipt.cost);
++	}
++}
++
++fn cost_is_observed(receipt: &ExecutionReceipt) -> bool {
++	// The pricing pipeline records priced attempts, including genuine free
++	// attempts. A default receipt (notably realtime wire completions) has no
++	// such evidence; zero there must not certify a free request.
++	receipt.cost.micro_usd != 0
++		|| (!receipt.attempts.is_empty()
++			&& receipt
++				.attempts
++				.iter()
++				.all(|attempt| attempt.usage.source != UsageSource::Unknown))
++}
++
++impl Drop for InferenceReservation {
++	fn drop(&mut self) {
++		if !self.completed {
++			self.context.cancel();
++		}
++		let receipt = self.context.receipt();
++		self.observe_totals(receipt.usage, receipt.cost);
++		if let Some(responses) = self.responses {
++			self.observed.input_tokens = self.observed.input_tokens.max(responses.input_tokens);
++			self.observed.output_tokens = self.observed.output_tokens.max(responses.output_tokens);
++			self.observed.micro_usd = responses.micro_usd;
++			self.observed.unknown_usage = responses.unknown_usage;
++			self.observed.unknown_cost = responses.unknown_cost;
++		} else {
++			if let Some(cost) = self.cost_snapshot {
++				// Unlike token counters, authoritative costs can decrease when
++				// the provider explicitly credits work. Preserve the signed total.
++				self.observed.micro_usd = cost.micro_usd;
++			}
++			self.observed.unknown_usage = !self.usage_observed;
++			self.observed.unknown_cost = !self.cost_observed;
++		}
++		self.observed.wall_time = self.context.elapsed();
++		self.observed.unknown_usage |= !self.completed;
++		self.observed.unknown_cost |= !self.completed || self.observed.unknown_usage;
++		let mut state = self.ledger.state.lock();
++		settle(state.turn.get_mut(&self.turn).expect("admitted turn"), self.observed);
++		settle(
+ 			state
+ 				.session
+-				.entry(LedgerKey { extension, scope: session_scope })
+-				.or_default(),
+-			charge,
++				.get_mut(&self.session)
++				.expect("admitted session"),
++			self.observed,
+ 		);
+ 	}
+ }
+@@ -176,6 +307,23 @@ fn check_budget(
+ 			spend.requests.saturating_add(1).into(),
+ 		));
+ 	}
++	let limits_usage = budget.max_input_tokens.is_some()
++		|| budget.max_output_tokens.is_some()
++		|| budget.max_usd.is_some();
++	if spend.unknown_usage && limits_usage {
++		return Err(budget_error(context, "unreported_usage", 0, 1));
++	}
++	if spend.unknown_cost && budget.max_usd.is_some() {
++		return Err(budget_error(context, "unreported_cost", 0, 1));
++	}
++	if spend.in_flight > 0 && (limits_usage || budget.max_wall_time.is_some()) {
++		return Err(budget_error(
++			context,
++			"in_flight_requests",
++			1,
++			spend.in_flight.saturating_add(1).into(),
++		));
++	}
+ 	if let Some(limit) = budget.max_input_tokens
+ 		&& spend.input_tokens >= limit
+ 	{
+@@ -225,11 +373,15 @@ fn budget_error(
+ 	.detail(ErrorDetail::budget(sf!(dimension), limit, observed))
+ }
+ 
+-const fn accumulate(target: &mut InferenceSpend, charge: InferenceSpend) {
++const fn settle(target: &mut InferenceSpend, charge: InferenceSpend) {
++	target.in_flight = target.in_flight.saturating_sub(1);
+ 	target.input_tokens = target.input_tokens.saturating_add(charge.input_tokens);
++	// Output already includes reasoning. Never add its diagnostic subset.
+ 	target.output_tokens = target.output_tokens.saturating_add(charge.output_tokens);
+ 	target.wall_time = target.wall_time.saturating_add(charge.wall_time);
+ 	target.micro_usd = target.micro_usd.saturating_add(charge.micro_usd);
++	target.unknown_usage |= charge.unknown_usage;
++	target.unknown_cost |= charge.unknown_cost;
+ }
+ 
+ /// Constructs the outer budget boundary.
+@@ -245,7 +397,7 @@ impl OverallBudgetLayer {
+ 	}
+ }
+ 
+-/// Adds one execution context and enforces its deadline across the inner stack.
++/// Adds one execution context and accounts for the complete answer lifetime.
+ #[derive(Clone)]
+ pub struct OverallBudgetService<S> {
+ 	inner:  S,
+@@ -262,10 +414,10 @@ impl<S> Layer<S> for OverallBudgetLayer {
+ 
+ impl<S> Service<Call> for OverallBudgetService<S>
+ where
+-	S: Service<LayerCall<Call>, Error = Error>,
++	S: Service<LayerCall<Call>, Response = Answer, Error = Error>,
+ {
+ 	type Error = Error;
+-	type Response = S::Response;
++	type Response = Answer;
+ 
+ 	type Future = impl Future<Output = Result<Self::Response, Self::Error>>;
+ 
+@@ -285,12 +437,10 @@ where
+ 		}
+ 		let context = ExecutionContext::new(call.budget.clone());
+ 		context.set_retry_sink(call.response_hooks.retry_sink());
+-		let result = context
++		let reservation = context
+ 			.checkpoint(ErrorPhase::Readiness)
+ 			.and_then(|()| self.ledger.admit(&call, &context));
+-		let accounting_call = call.clone();
+-		let ledger = self.ledger.clone();
+-		let future = if result.is_ok() {
++		let future = if reservation.is_ok() {
+ 			Some(
+ 				self
+ 					.inner
+@@ -300,14 +450,16 @@ where
+ 			None
+ 		};
+ 		async move {
+-			result?;
++			let mut reservation = reservation?;
+ 			let response = future
+ 				.expect("future exists after successful budget admission")
+ 				.await;
+-			ledger.charge(&accounting_call, &context);
+-			let response = response?;
+-			context.checkpoint(ErrorPhase::Streaming)?;
+-			Ok(response)
++			let response = response.and_then(|answer| {
++				reservation.receipt(&answer.receipt);
++				context.checkpoint(ErrorPhase::Streaming)?;
++				Ok(answer)
++			});
++			reservation.finish(response)
+ 		}
+ 	}
+ }
+@@ -359,6 +511,28 @@ mod tests {
+ 		})
+ 	}
+ 
++	fn unary_answer(call: &LayerCall<Call>) -> crate::answer::Answer {
++		crate::answer::Answer {
++			meta:    crate::answer::ResponseMeta {
++				request_id:          call.payload.id.clone(),
++				provider:            omp_catalog::ProviderId::from("provider"),
++				route:               omp_catalog::RouteId::from("route"),
++				model:               None,
++				provider_request_id: None,
++				created_at:          std::time::SystemTime::now(),
++			},
++			receipt: call.context.receipt(),
++			body:    crate::answer::AnswerBody::Tokens(crate::answer::TokenCount {
++				tokens:     0,
++				provenance: crate::answer::TokenizerProvenance {
++					tokenizer: omp_core::sf!("test"),
++					revision:  omp_core::sf!("test"),
++					exact:     true,
++				},
++			}),
++		}
++	}
++
+ 	#[tokio::test]
+ 	async fn request_budget_exhaustion_rejects_before_dispatch() {
+ 		let ledger = InferenceLedger::default();
+@@ -368,9 +542,9 @@ mod tests {
+ 		});
+ 		let calls = Arc::new(AtomicUsize::new(0));
+ 		let inner_calls = Arc::clone(&calls);
+-		let inner = service_fn(move |_| {
++		let inner = service_fn(move |call: LayerCall<Call>| {
+ 			inner_calls.fetch_add(1, Ordering::Relaxed);
+-			async { Ok::<_, Error>(()) }
++			async move { Ok::<_, Error>(unary_answer(&call)) }
+ 		});
+ 		let mut service = OverallBudgetLayer::new(ledger).layer(inner);
+ 		service.call(call()).await.unwrap();
+@@ -398,10 +572,14 @@ mod tests {
+ 		});
+ 		let inner = service_fn(move |call: LayerCall<Call>| {
+ 			call.context.with_receipt(|receipt| {
+-				receipt.usage =
+-					Usage { output_tokens: 1000, reasoning_tokens: 800, ..Usage::default() };
++				receipt.usage = Usage {
++					output_tokens: 1000,
++					reasoning_tokens: 800,
++					source: crate::receipt::UsageSource::Provider,
++					..Usage::default()
++				};
+ 			});
+-			async { Ok::<_, Error>(()) }
++			async move { Ok::<_, Error>(unary_answer(&call)) }
+ 		});
+ 		let mut service = OverallBudgetLayer::new(ledger.clone()).layer(inner);
+ 		service.call(call()).await.unwrap();
+@@ -415,4 +593,540 @@ mod tests {
+ 			.expect_err("2000 billed output tokens must exhaust a 1500 token budget");
+ 		assert_eq!(error.kind, ErrorKind::BudgetExhausted);
+ 	}
++
++	#[tokio::test]
++	async fn terminal_stream_usage_exhausts_the_next_request_budget() {
++		use futures::StreamExt as _;
++
++		let ledger = InferenceLedger::default();
++		ledger.set_policy(omp_core::sf!("extension"), InferenceBudgetPolicy {
++			per_turn:    InferenceBudget {
++				max_output_tokens: Some(1000),
++				..InferenceBudget::default()
++			},
++			per_session: InferenceBudget::default(),
++		});
++		let inner = service_fn(|call: LayerCall<Call>| async move {
++			let receipt = call.context.receipt();
++			let events = Box::pin(async_stream::stream! {
++				let usage = Usage {
++					output_tokens: 1000,
++					reasoning_tokens: 800,
++					source: crate::receipt::UsageSource::Provider,
++					..Usage::default()
++				};
++				call.context.with_receipt(|receipt| receipt.usage = usage);
++				yield Ok(crate::event::ChatEvent::Completed(crate::event::Completion {
++					reason: crate::event::FinishReason::Stop,
++					blocks: 0,
++					usage,
++					receipt: call.context.receipt().into(),
++				}));
++			});
++			Ok::<_, Error>(crate::answer::Answer {
++				meta: crate::answer::ResponseMeta {
++					request_id:          call.payload.id.clone(),
++					provider:            omp_catalog::ProviderId::from("provider"),
++					route:               omp_catalog::RouteId::from("route"),
++					model:               None,
++					provider_request_id: None,
++					created_at:          std::time::SystemTime::now(),
++				},
++				receipt,
++				body: crate::answer::AnswerBody::Chat(crate::answer::ChatStream::ordinary(events)),
++			})
++		});
++		let mut service = OverallBudgetLayer::new(ledger).layer(inner);
++		let answer = service.call(call()).await.unwrap();
++		let crate::answer::AnswerBody::Chat(mut stream) = answer.body else {
++			panic!("expected chat stream");
++		};
++		assert!(stream.next().await.unwrap().is_ok());
++		let error = service
++			.call(call())
++			.await
++			.expect_err("terminal usage must be billed before admitting another request");
++		assert_eq!(error.kind, ErrorKind::BudgetExhausted);
++	}
++
++	fn scoped_call(turn: &'static str, conversation: &'static str) -> Call {
++		let mut call = call();
++		call.session = Some(crate::call::SessionRequest {
++			conversation:   crate::id::ConversationId::from(conversation),
++			revision:       crate::id::Revision::from("revision"),
++			turn:           crate::id::TurnId::from(turn),
++			strategy:       crate::call::ContextStrategy::Replay,
++			append_only:    true,
++			provider_reset: false,
++			forked:         false,
++		});
++		call
++	}
++
++	fn output_policy(limit: u64) -> InferenceBudgetPolicy {
++		InferenceBudgetPolicy {
++			per_turn:    InferenceBudget {
++				max_output_tokens: Some(limit),
++				..InferenceBudget::default()
++			},
++			per_session: InferenceBudget::default(),
++		}
++	}
++
++	fn spend(ledger: &InferenceLedger) -> super::InferenceSpend {
++		let state = ledger.state.lock();
++		*state.turn.values().next().expect("admitted request")
++	}
++
++	#[test]
++	fn concurrent_request_reservations_cannot_exceed_the_limit() {
++		let ledger = InferenceLedger::default();
++		ledger.set_policy(omp_core::sf!("extension"), InferenceBudgetPolicy {
++			per_turn:    InferenceBudget { max_requests: Some(2), ..InferenceBudget::default() },
++			per_session: InferenceBudget::default(),
++		});
++		let barrier = Arc::new(std::sync::Barrier::new(8));
++		let threads: [_; 8] = std::array::from_fn(|_| {
++			let ledger = ledger.clone();
++			let barrier = barrier.clone();
++			std::thread::spawn(move || {
++				let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++				barrier.wait();
++				ledger.admit(&call(), &context).ok()
++			})
++		});
++		let reservations: Vec<_> = threads
++			.into_iter()
++			.filter_map(|thread| thread.join().unwrap())
++			.collect();
++		assert_eq!(reservations.len(), 2);
++		assert_eq!(spend(&ledger).requests, 2);
++		assert_eq!(spend(&ledger).in_flight, 2);
++		drop(reservations);
++		assert_eq!(spend(&ledger).in_flight, 0);
++		assert_eq!(spend(&ledger).requests, 2, "cancellation must not refund admitted requests");
++	}
++
++	#[test]
++	fn session_reservation_blocks_other_turns_without_consuming_their_requests() {
++		let ledger = InferenceLedger::default();
++		ledger.set_policy(omp_core::sf!("extension"), InferenceBudgetPolicy {
++			per_turn:    InferenceBudget::default(),
++			per_session: InferenceBudget {
++				max_output_tokens: Some(100),
++				..InferenceBudget::default()
++			},
++		});
++		let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++		let first = ledger
++			.admit(&scoped_call("first", "conversation"), &context)
++			.unwrap();
++		assert!(
++			ledger
++				.admit(&scoped_call("second", "conversation"), &context)
++				.is_err()
++		);
++		{
++			let state = ledger.state.lock();
++			let second = state
++				.turn
++				.iter()
++				.find(|(key, _)| key.scope.as_str() == "second");
++			assert!(second.is_none(), "rejected calls must not allocate new scope state");
++		}
++		context.with_receipt(|receipt| {
++			receipt.usage.output_tokens = 20;
++			receipt.usage.source = crate::receipt::UsageSource::Provider;
++		});
++		first
++			.finish(Ok(unary_answer(&LayerCall { payload: call(), context: context.clone() })))
++			.unwrap();
++		let second_context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++		let second = ledger
++			.admit(&scoped_call("second", "conversation"), &second_context)
++			.unwrap();
++		second_context.with_receipt(|receipt| {
++			receipt.usage.output_tokens = 80;
++			receipt.usage.source = crate::receipt::UsageSource::Provider;
++		});
++		second
++			.finish(Ok(unary_answer(&LayerCall { payload: call(), context: second_context })))
++			.unwrap();
++		assert!(
++			ledger
++				.admit(&scoped_call("third", "conversation"), &context)
++				.is_err()
++		);
++		assert_eq!(
++			ledger
++				.state
++				.lock()
++				.session
++				.values()
++				.next()
++				.unwrap()
++				.output_tokens,
++			100
++		);
++	}
++
++	#[tokio::test]
++	async fn failed_stream_bills_observed_usage_and_closes_unreported_budget() {
++		use futures::StreamExt as _;
++		let ledger = InferenceLedger::default();
++		ledger.set_policy(omp_core::sf!("extension"), output_policy(100));
++		let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++		let reservation = ledger.admit(&call(), &context).unwrap();
++		let mut answer = unary_answer(&LayerCall { payload: call(), context: context.clone() });
++		let stream_context = context.clone();
++		answer.body = crate::answer::AnswerBody::Chat(crate::answer::ChatStream::ordinary(Box::pin(
++			async_stream::stream! {
++				stream_context.with_receipt(|receipt| receipt.usage.output_tokens = 7);
++				yield Ok(crate::event::ChatEvent::TextDelta { index: 0, text: omp_core::sf!("partial") });
++				yield Err(Error::new(ErrorKind::StreamCorruption, crate::error::ErrorPhase::Streaming, crate::error::RetryAction::Never, stream_context.receipt()));
++			},
++		)));
++		let answer = reservation.finish(Ok(answer)).unwrap();
++		let crate::answer::AnswerBody::Chat(mut stream) = answer.body else {
++			panic!("chat");
++		};
++		assert!(stream.next().await.unwrap().is_ok());
++		assert!(stream.next().await.unwrap().is_err());
++		assert_eq!(spend(&ledger).output_tokens, 7);
++		assert_eq!(spend(&ledger).in_flight, 0);
++		assert!(spend(&ledger).unknown_usage);
++		assert!(context.is_cancelled());
++		drop(stream);
++		assert_eq!(spend(&ledger).output_tokens, 7, "drop after error cannot charge twice");
++		assert!(ledger.admit(&call(), &context).is_err());
++	}
++
++	#[test]
++	fn dropping_an_unpolled_stream_charges_once_and_cancels() {
++		let ledger = InferenceLedger::default();
++		ledger.set_policy(omp_core::sf!("extension"), output_policy(100));
++		let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++		let reservation = ledger.admit(&call(), &context).unwrap();
++		let mut answer = unary_answer(&LayerCall { payload: call(), context: context.clone() });
++		answer.body = crate::answer::AnswerBody::Chat(crate::answer::ChatStream::ordinary(Box::pin(
++			futures::stream::pending(),
++		)));
++		let answer = reservation.finish(Ok(answer)).unwrap();
++		assert_eq!(spend(&ledger).in_flight, 1);
++		assert!(
++			ledger.admit(&call(), &context).is_err(),
++			"finite usage scope must reserve outstanding work"
++		);
++		drop(answer);
++		assert_eq!(spend(&ledger).requests, 1);
++		assert_eq!(spend(&ledger).in_flight, 0);
++		assert!(spend(&ledger).unknown_usage);
++		assert!(context.is_cancelled());
++		assert!(ledger.admit(&call(), &context).is_err(), "missing terminal usage is not zero usage");
++	}
++
++	#[test]
++	fn dropping_a_handshake_future_retains_the_request_and_settles_reservation() {
++		let ledger = InferenceLedger::default();
++		ledger.set_policy(omp_core::sf!("extension"), output_policy(100));
++		let inner = service_fn(|_: LayerCall<Call>| {
++			futures::future::pending::<Result<crate::answer::Answer, Error>>()
++		});
++		let mut service = OverallBudgetLayer::new(ledger.clone()).layer(inner);
++		let future = service.call(call());
++		assert_eq!(spend(&ledger).in_flight, 1);
++		drop(future);
++		assert_eq!(spend(&ledger).requests, 1);
++		assert_eq!(spend(&ledger).in_flight, 0);
++		assert!(spend(&ledger).unknown_usage);
++	}
++
++	#[test]
++	fn unary_errors_charge_the_reported_receipt_once() {
++		let ledger = InferenceLedger::default();
++		let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++		let reservation = ledger.admit(&call(), &context).unwrap();
++		let mut receipt = context.receipt();
++		receipt.usage = Usage {
++			input_tokens: 20,
++			output_tokens: 10,
++			reasoning_tokens: 8,
++			source: crate::receipt::UsageSource::Provider,
++			..Usage::default()
++		};
++		receipt.cost = crate::receipt::Cost { micro_usd: 50 };
++		let error = Error::new(
++			ErrorKind::Connectivity,
++			crate::error::ErrorPhase::Handshake,
++			crate::error::RetryAction::Never,
++			receipt,
++		);
++		assert!(reservation.finish(Err(error)).is_err());
++		let charged = spend(&ledger);
++		assert_eq!(charged.input_tokens, 20);
++		assert_eq!(charged.output_tokens, 10);
++		assert_eq!(charged.micro_usd, 50);
++		assert_eq!(charged.in_flight, 0);
++	}
++
++	#[tokio::test]
++	async fn terminal_receipt_is_billed_without_a_context_side_channel() {
++		use futures::StreamExt as _;
++		for budget in [
++			InferenceBudget { max_input_tokens: Some(20), ..InferenceBudget::default() },
++			InferenceBudget {
++				max_usd: Some(crate::receipt::Cost { micro_usd: 50 }),
++				..InferenceBudget::default()
++			},
++		] {
++			let ledger = InferenceLedger::default();
++			ledger.set_policy(omp_core::sf!("extension"), InferenceBudgetPolicy {
++				per_turn:    budget,
++				per_session: InferenceBudget::default(),
++			});
++			let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++			let reservation = ledger.admit(&call(), &context).unwrap();
++			let mut answer = unary_answer(&LayerCall { payload: call(), context: context.clone() });
++			let mut receipt = context.receipt();
++			receipt.usage = Usage {
++				input_tokens: 20,
++				output_tokens: 10,
++				reasoning_tokens: 8,
++				source: crate::receipt::UsageSource::Provider,
++				..Usage::default()
++			};
++			receipt.cost = crate::receipt::Cost { micro_usd: 50 };
++			let completion = crate::event::ChatEvent::Completed(crate::event::Completion {
++				reason:  crate::event::FinishReason::Stop,
++				blocks:  0,
++				usage:   receipt.usage,
++				receipt: receipt.into(),
++			});
++			answer.body = crate::answer::AnswerBody::Chat(crate::answer::ChatStream::ordinary(
++				Box::pin(futures::stream::iter([Ok(completion)])),
++			));
++			let answer = reservation.finish(Ok(answer)).unwrap();
++			let crate::answer::AnswerBody::Chat(mut stream) = answer.body else {
++				panic!("chat");
++			};
++			assert!(stream.next().await.unwrap().is_ok());
++			assert_eq!(spend(&ledger).in_flight, 0);
++			assert!(!spend(&ledger).unknown_usage);
++			assert!(stream.next().await.is_none());
++			drop(stream);
++			let charged = spend(&ledger);
++			assert_eq!(charged.input_tokens, 20);
++			assert_eq!(charged.output_tokens, 10);
++			assert_eq!(charged.micro_usd, 50);
++			assert!(ledger.admit(&call(), &context).is_err());
++		}
++	}
++
++	#[tokio::test]
++	async fn streamed_wall_time_includes_work_after_handshake() {
++		use futures::StreamExt as _;
++		let ledger = InferenceLedger::default();
++		ledger.set_policy(omp_core::sf!("extension"), InferenceBudgetPolicy {
++			per_turn:    InferenceBudget {
++				max_wall_time: Some(std::time::Duration::from_millis(10)),
++				..InferenceBudget::default()
++			},
++			per_session: InferenceBudget::default(),
++		});
++		let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++		let reservation = ledger.admit(&call(), &context).unwrap();
++		let mut answer = unary_answer(&LayerCall { payload: call(), context: context.clone() });
++		answer.body = crate::answer::AnswerBody::Chat(crate::answer::ChatStream::ordinary(Box::pin(
++			async_stream::stream! {
++				tokio::time::sleep(std::time::Duration::from_millis(20)).await;
++				yield Ok(crate::event::ChatEvent::Completed(crate::event::Completion {
++					reason: crate::event::FinishReason::Stop,
++					blocks: 0,
++					usage: Usage::default(),
++					receipt: Box::default(),
++				}));
++			},
++		)));
++		let answer = reservation.finish(Ok(answer)).unwrap();
++		assert_eq!(spend(&ledger).wall_time, std::time::Duration::ZERO);
++		let crate::answer::AnswerBody::Chat(mut stream) = answer.body else {
++			panic!("chat");
++		};
++		assert!(stream.next().await.unwrap().is_ok());
++		assert!(spend(&ledger).wall_time >= std::time::Duration::from_millis(20));
++		assert!(ledger.admit(&call(), &context).is_err());
++	}
++
++	#[tokio::test]
++	async fn successful_unknown_usage_is_not_a_measured_zero() {
++		use futures::StreamExt as _;
++		for source in [crate::receipt::UsageSource::Unknown, crate::receipt::UsageSource::Provider] {
++			let ledger = InferenceLedger::default();
++			ledger.set_policy(omp_core::sf!("extension"), output_policy(20));
++			let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++			// Usage from an earlier hidden attempt is still billable, but it
++			// must not certify missing usage on the final attempt.
++			context.with_receipt(|receipt| {
++				receipt.usage = Usage {
++					output_tokens: 3,
++					source: crate::receipt::UsageSource::Provider,
++					..Usage::default()
++				};
++			});
++			let reservation = ledger.admit(&call(), &context).unwrap();
++			let mut answer = unary_answer(&LayerCall { payload: call(), context: context.clone() });
++			let usage = Usage { source, ..Usage::default() };
++			let completion = crate::event::ChatEvent::Completed(crate::event::Completion {
++				reason: crate::event::FinishReason::Stop,
++				blocks: 0,
++				usage,
++				receipt: Box::default(),
++			});
++			answer.body = crate::answer::AnswerBody::Chat(crate::answer::ChatStream::ordinary(
++				Box::pin(futures::stream::iter([Ok(completion)])),
++			));
++			let answer = reservation.finish(Ok(answer)).unwrap();
++			let crate::answer::AnswerBody::Chat(mut stream) = answer.body else {
++				panic!("chat");
++			};
++			assert!(stream.next().await.unwrap().is_ok());
++			assert_eq!(spend(&ledger).unknown_usage, source == crate::receipt::UsageSource::Unknown);
++			assert_eq!(spend(&ledger).output_tokens, 3);
++			let next = ledger.admit(&call(), &context);
++			assert_eq!(next.is_ok(), source != crate::receipt::UsageSource::Unknown);
++		}
++	}
++
++	#[tokio::test]
++	async fn unpriced_zero_cost_does_not_bypass_the_cost_ceiling() {
++		let ledger = InferenceLedger::default();
++		ledger.set_policy(omp_core::sf!("extension"), InferenceBudgetPolicy {
++			per_turn:    InferenceBudget {
++				max_usd: Some(crate::receipt::Cost { micro_usd: 100 }),
++				..InferenceBudget::default()
++			},
++			per_session: InferenceBudget::default(),
++		});
++		let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++		let reservation = ledger.admit(&call(), &context).unwrap();
++		let mut answer = unary_answer(&LayerCall { payload: call(), context: context.clone() });
++		answer.receipt.usage = Usage {
++			output_tokens: 7,
++			source: crate::receipt::UsageSource::Provider,
++			..Usage::default()
++		};
++		reservation.finish(Ok(answer)).unwrap();
++		assert!(!spend(&ledger).unknown_usage);
++		assert!(spend(&ledger).unknown_cost);
++		assert!(ledger.admit(&call(), &context).is_err());
++	}
++
++	#[tokio::test]
++	async fn failed_post_handshake_checkpoint_preserves_answer_usage() {
++		let ledger = InferenceLedger::default();
++		let inner = service_fn(|call: LayerCall<Call>| async move {
++			let mut answer = unary_answer(&call);
++			answer.receipt.usage = Usage {
++				output_tokens: 7,
++				source: crate::receipt::UsageSource::Provider,
++				..Usage::default()
++			};
++			answer.receipt.cost = crate::receipt::Cost { micro_usd: 50 };
++			call.context.cancel();
++			Ok::<_, Error>(answer)
++		});
++		let mut service = OverallBudgetLayer::new(ledger.clone()).layer(inner);
++		assert!(service.call(call()).await.is_err());
++		assert_eq!(spend(&ledger).output_tokens, 7);
++		assert_eq!(spend(&ledger).micro_usd, 50);
++		assert_eq!(spend(&ledger).in_flight, 0);
++	}
++
++	#[tokio::test]
++	async fn realtime_responses_are_additive_on_close_and_partial_cancellation() {
++		#[derive(Clone, Copy)]
++		enum Settlement {
++			Completed,
++			PartialDrop,
++			BareClose,
++		}
++		for settlement in [Settlement::Completed, Settlement::PartialDrop, Settlement::BareClose] {
++			let ledger = InferenceLedger::default();
++			ledger.set_policy(omp_core::sf!("extension"), output_policy(14));
++			let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++			let reservation = ledger.admit(&call(), &context).unwrap();
++			let mut answer = unary_answer(&LayerCall { payload: call(), context: context.clone() });
++			let (session, mut endpoint) = crate::answer::RealtimeSession::bounded(1).unwrap();
++			answer.body = crate::answer::AnswerBody::Realtime(session);
++			let answer = reservation.finish(Ok(answer)).unwrap();
++			let crate::answer::AnswerBody::Realtime(session) = answer.body else {
++				panic!("realtime");
++			};
++			for _ in 0..2 {
++				let usage = Usage {
++					output_tokens: 7,
++					reasoning_tokens: 5,
++					source: crate::receipt::UsageSource::Provider,
++					..Usage::default()
++				};
++				let receipt = crate::receipt::ExecutionReceipt { usage, ..Default::default() };
++				endpoint
++					.send(Ok(crate::answer::RealtimeEvent::Chat(crate::event::ChatEvent::Completed(
++						crate::event::Completion {
++							reason: crate::event::FinishReason::Stop,
++							blocks: 0,
++							usage,
++							receipt: receipt.into(),
++						},
++					))))
++					.await
++					.unwrap();
++				session.recv().await.unwrap().unwrap();
++				assert_eq!(spend(&ledger).in_flight, 1);
++			}
++			let terminal = match settlement {
++				Settlement::Completed => {
++					crate::answer::RealtimeEvent::CloseReceipt(crate::answer::RealtimeCloseReceipt {
++						origin:    crate::answer::RealtimeCloseOrigin::Provider,
++						reason:    crate::answer::RealtimeCloseReason::Completed,
++						closed_at: std::time::SystemTime::now(),
++					})
++				},
++				Settlement::PartialDrop => {
++					crate::answer::RealtimeEvent::Chat(crate::event::ChatEvent::TextDelta {
++						index: 0,
++						text:  omp_core::sf!("unfinished third response"),
++					})
++				},
++				Settlement::BareClose => crate::answer::RealtimeEvent::Closed,
++			};
++			endpoint.send(Ok(terminal)).await.unwrap();
++			session.recv().await.unwrap().unwrap();
++			drop(session);
++			let charged = spend(&ledger);
++			assert_eq!(charged.output_tokens, 14, "two 7-token responses must be billed once each");
++			assert_eq!(charged.in_flight, 0);
++			assert_eq!(charged.requests, 1);
++			assert_eq!(charged.unknown_usage, !matches!(settlement, Settlement::Completed));
++			assert!(charged.unknown_cost, "wire-only realtime completions carry no pricing evidence");
++			assert!(ledger.admit(&call(), &context).is_err());
++		}
++	}
++
++	#[test]
++	fn explicit_cost_credits_keep_their_signed_value() {
++		let ledger = InferenceLedger::default();
++		let context = crate::layer::ExecutionContext::new(ExecutionBudget::default());
++		let reservation = ledger.admit(&call(), &context).unwrap();
++		let mut answer = unary_answer(&LayerCall { payload: call(), context });
++		answer.receipt.usage = Usage {
++			output_tokens: 7,
++			source: crate::receipt::UsageSource::Provider,
++			..Usage::default()
++		};
++		answer.receipt.cost = crate::receipt::Cost { micro_usd: -50 };
++		reservation.finish(Ok(answer)).unwrap();
++		assert_eq!(spend(&ledger).micro_usd, -50);
++		assert!(!spend(&ledger).unknown_cost);
++	}
+ }
+diff --git a/crates/ai/src/operation/realtime.rs b/crates/ai/src/operation/realtime.rs
+index 15fe62de9c70b044cca25e52248177bf240495f9..389e5d609fd5df623ec8249e73668fbec0f276d2 100644
+--- a/crates/ai/src/operation/realtime.rs
++++ b/crates/ai/src/operation/realtime.rs
+@@ -161,6 +161,7 @@ impl RealtimeSession {
+ 		if kind == RealtimeInputKind::Close && self.closed.swap(true, Ordering::AcqRel) {
+ 			return Err(RealtimeSessionError::AlreadyClosed);
+ 		}
++		self.observe_guard_input(&input);
+ 		if let Err(error) = self.outbound.try_send(input) {
+ 			if kind == RealtimeInputKind::Close {
+ 				self.closed.store(false, Ordering::Release);
+@@ -185,6 +186,7 @@ impl RealtimeSession {
+ 		if kind == RealtimeInputKind::Close && self.closed.swap(true, Ordering::AcqRel) {
+ 			return Err(RealtimeSessionError::AlreadyClosed);
+ 		}
++		self.observe_guard_input(&input);
+ 		if self.outbound.send_async(input).await.is_err() {
+ 			if kind == RealtimeInputKind::Close {
+ 				self.closed.store(false, Ordering::Release);
+@@ -207,11 +209,12 @@ impl RealtimeSession {
+ 
+ 	/// Receives the next provider event without buffering it elsewhere.
+ 	pub async fn recv(&self) -> Result<Result<RealtimeEvent, Error>, RealtimeSessionError> {
+-		let event = self
+-			.inbound
+-			.recv_async()
+-			.await
+-			.map_err(|_| RealtimeSessionError::InboundClosed)?;
++		let _receive = self.receive.lock().await;
++		let Ok(event) = self.inbound.recv_async().await else {
++			self.observe_guard_event(None);
++			return Err(RealtimeSessionError::InboundClosed);
++		};
++		self.observe_guard_event(Some(&event));
+ 		if matches!(&event, Ok(RealtimeEvent::CloseReceipt(_) | RealtimeEvent::Closed) | Err(_)) {
+ 			self.closed.store(true, Ordering::Release);
+ 		}
+diff --git a/crates/ai/src/registry.rs b/crates/ai/src/registry.rs
+index 4cefead8591d0c128d642bec9fb8567f1be6e5ac..60d3102031c7a20e3bf89435df8c94bd0fbe43b4 100644
+--- a/crates/ai/src/registry.rs
++++ b/crates/ai/src/registry.rs
+@@ -597,20 +597,13 @@ impl Service<LayerCall<Call>> for LiveRegistryDispatch {
+ 		let registry = self.registry.clone();
+ 		Box::pin(async move {
+ 			let snapshot = registry.load();
+-			snapshot
++			let reservation = snapshot
+ 				.registry
+ 				.inner
+ 				.inference_ledger
+ 				.admit(&call.payload, &call.context)?;
+-			let accounting_call = call.payload.clone();
+-			let context = call.context.clone();
+ 			let result = dispatch_preplanned(snapshot.registry.as_ref().clone(), call).await;
+-			snapshot
+-				.registry
+-				.inner
+-				.inference_ledger
+-				.charge(&accounting_call, &context);
+-			result
++			reservation.finish(result)
+ 		})
+ 	}
+ }
+@@ -1281,4 +1274,154 @@ mod tests {
+ 		assert_eq!(wire_calls.load(Ordering::Relaxed), 0);
+ 		let _ = fs::remove_file(store_path);
+ 	}
++
++	#[tokio::test]
++	async fn static_and_live_registries_charge_terminal_usage_once() {
++		use futures::StreamExt as _;
++
++		for live in [false, true] {
++			let catalog = Arc::new(Catalog::embedded().clone());
++			let route = catalog.routes().first().unwrap().clone();
++			let provider = catalog.provider(&route.provider).unwrap().clone();
++			let wire_policy = Arc::new(catalog.wire_policy(&provider.wire_policy).unwrap().clone());
++			let ledger = InferenceLedger::default();
++			ledger.set_default_policy(InferenceBudgetPolicy {
++				per_turn:    InferenceBudget {
++					max_output_tokens: Some(1500),
++					..InferenceBudget::default()
++				},
++				per_session: InferenceBudget::default(),
++			});
++			let selected = route.clone();
++			let service = RouteProviderService::new(service_fn(move |call: LayerCall<Call>| {
++				let route = selected.clone();
++				async move {
++					let receipt = call.context.receipt();
++					let events = Box::pin(async_stream::stream! {
++						let final_receipt = ExecutionReceipt {
++							usage: Usage { output_tokens: 1000, reasoning_tokens: 800, source: crate::receipt::UsageSource::Provider, ..Usage::default() },
++							..Default::default()
++						};
++						yield Ok(crate::event::ChatEvent::Completed(crate::event::Completion {
++							reason: crate::event::FinishReason::Stop,
++							blocks: 0,
++							usage: final_receipt.usage,
++							receipt: final_receipt.into(),
++						}));
++					});
++					Ok::<_, Error>(Answer {
++						meta: ResponseMeta {
++							request_id:          call.payload.id,
++							provider:            route.provider,
++							route:               route.id,
++							model:               None,
++							provider_request_id: None,
++							created_at:          SystemTime::now(),
++						},
++						receipt,
++						body: AnswerBody::Chat(crate::answer::ChatStream::ordinary(events)),
++					})
++				}
++			}));
++			let registry = Registry {
++				inner: Arc::new(RegistryInner {
++					catalog:          catalog.clone(),
++					bindings:         HashMap::from([(
++						route.id.clone(),
++						RouteBinding::Available(service),
++					)]),
++					auth_manager:     None,
++					usage_manager:    None,
++					inference_ledger: ledger,
++					generation:       1,
++					settings:         settings::InferenceSettings::default(),
++				}),
++			};
++			let budget = ExecutionBudget::default();
++			let plan = ExecutionPlan {
++				planned_at: SystemTime::now(),
++				catalog_revision: catalog.revision().clone(),
++				registry_generation: 1,
++				expires_at: Instant::now() + Duration::from_secs(30),
++				operation: OperationKind::Chat,
++				model: None,
++				provider: provider.id.clone(),
++				route: route.id.clone(),
++				codec: route.codec.clone(),
++				policy_model: None,
++				wire_policy,
++				thinking_policy: None,
++				thinking_selection: None,
++				decisions: Arc::from([]),
++				fallback_scope: FallbackScope { primary: None, explicit: Arc::from([]) },
++				fallbacks: Arc::from([]),
++				replay: ReplayPlan::Replayable,
++				budget: budget.clone(),
++				runtime_evidence: RuntimeRouteEvidence {
++					route:            route.id.clone(),
++					generation:       1,
++					health:           RouteHealth::Healthy,
++					quota_millionths: 1_000_000,
++					latency:          Duration::ZERO,
++					affinity:         false,
++					operation:        CapabilityAvailability::Native,
++					capabilities:     Arc::from([]),
++				},
++				wire_target: None,
++			};
++			let call = Call {
++				id: RequestId::from("stream-budget"),
++				target: Target::ProviderService(provider.id),
++				deadline: None,
++				budget,
++				session: None,
++				debug_session: None,
++				affinity: Default::default(),
++				response_hooks: Default::default(),
++				attribution: CallInferenceAttribution::core(),
++				execution: Some(Arc::new(plan)),
++				operation: OperationCall::Chat(Arc::new(crate::call::ChatRequest {
++					messages:          Arc::from([]),
++					tools:             Arc::from([]),
++					hosted_tools:      Arc::from([]),
++					tool_choice:       crate::call::Setting::Unset,
++					output:            crate::call::Setting::Unset,
++					reasoning:         crate::call::Setting::Unset,
++					verbosity:         crate::call::Setting::Unset,
++					cache_retention:   crate::call::Setting::Unset,
++					service_tier:      crate::call::Setting::Unset,
++					sampling:          crate::call::Sampling::default(),
++					max_output_tokens: None,
++					top_logprobs:      None,
++					safety:            Arc::from([]),
++					negotiation:       crate::call::NegotiationPolicy::default(),
++					forced_call:       None,
++				})),
++				staging: None,
++			};
++			let mut service = if live {
++				registry.into_handle().service()
++			} else {
++				registry.service()
++			};
++			for _ in 0..2 {
++				let answer = service.call(call.clone()).await.unwrap();
++				let error = service
++					.call(call.clone())
++					.await
++					.expect_err("unsettled resource reservation must block concurrent calls");
++				assert_eq!(error.kind, ErrorKind::BudgetExhausted);
++				let AnswerBody::Chat(mut stream) = answer.body else {
++					panic!("chat");
++				};
++				assert!(stream.next().await.unwrap().is_ok());
++				assert!(stream.next().await.is_none());
++			}
++			let error = service
++				.call(call)
++				.await
++				.expect_err("2000 completed output tokens must exhaust the 1500 token ceiling");
++			assert_eq!(error.kind, ErrorKind::BudgetExhausted);
++		}
++	}
+ }
+diff --git a/crates/ai/src/settings.rs b/crates/ai/src/settings.rs
+index d8cde7e0096fcd3aea6a2686402c84e70eed5744..580c82b35a63b9a003467aa4e6bf2160d018ff4b 100644
+--- a/crates/ai/src/settings.rs
++++ b/crates/ai/src/settings.rs
+@@ -1081,7 +1081,7 @@ omp_con::var! {
+ 			"legacy.path": "sampling.verbosity",
+ 		},
+ 	};
+-	/// Maximum concurrent LLM requests per provider id (for example "openai" or "anthropic"), shared across local OMP processes with this config root. Omitted providers are unlimited.
++	/// Maximum concurrent LLM requests per provider id (for example "openai" or "anthropic"), shared by route services within this OMP process. Omitted providers are unlimited.
+ 	pub static AI_PROVIDER_MAX_IN_FLIGHT = ai_provider_max_in_flight: Kv {
+ 		default: serialize_table(&BTreeMap::<Str, usize>::new()),
+ 		validate: validate_max_in_flight,
+diff --git a/crates/ai/src/transport/encoding.rs b/crates/ai/src/transport/encoding.rs
+index 93f551978e2edf79026ea919f83f089afeced708..0c807f319c2b0b66ff3722d81c65bfe14cde43cd 100644
+--- a/crates/ai/src/transport/encoding.rs
++++ b/crates/ai/src/transport/encoding.rs
+@@ -1,21 +1,21 @@
+ //! Streaming `Content-Encoding` decoding for provider response bodies.
+ //!
+-//! Codecs may advertise compressed encodings (the Claude Code profile sends
+-//! `accept-encoding: gzip, deflate, br, zstd`), and providers honour them on
+-//! streaming responses. The framers downstream expect plain bytes, so every
+-//! body chunk passes through one incremental decoder selected from the
+-//! response's `content-encoding` header before framing. Byte accounting
+-//! against the response bound happens on the decoded output.
++//! The response limit is cumulative decoded output, enforced by the codec's
++//! output sink before allocation or copying, including bytes emitted at EOF.
++//! It is not a process-memory ceiling: codecs retain their own bounded scratch
++//! and history windows, and HTTP/framing have separate buffers. Deflate uses
++//! its standard 32 KiB window; Brotli accepts only RFC 7932 windows (up to
++//! 16 MiB), and Zstd is explicitly capped at a 16 MiB window.
+ 
+ use std::io::{self, Write as _};
+ 
+ use bytes::Bytes;
+-use flate2::write::{GzDecoder, ZlibDecoder};
++use flate2::write::GzDecoder;
+ use http::{HeaderMap, header};
+ use thiserror::Error;
+ 
+-/// Brotli scratch buffer size; the decoder allocates once per response.
+-const BROTLI_BUFFER_BYTES: usize = 8 * 1024;
++const DECODE_BUFFER_BYTES: usize = 8 * 1024;
++const ZSTD_WINDOW_LOG_MAX: u32 = 24;
+ 
+ /// A `content-encoding` value the transport cannot decode.
+ #[derive(Clone, Debug, Eq, PartialEq, Error)]
+@@ -25,27 +25,225 @@ pub struct UnsupportedEncoding {
+ 	pub value: String,
+ }
+ 
+-/// Incremental body decoder selected from one response's `content-encoding`.
+-pub enum ContentDecoder {
+-	/// Plain bytes; chunks pass through untouched.
+-	Identity,
+-	/// RFC 1952 gzip.
+-	Gzip(GzDecoder<Vec<u8>>),
+-	/// RFC 1950 zlib-wrapped deflate, the encoding HTTP `deflate` denotes.
+-	Deflate(ZlibDecoder<Vec<u8>>),
+-	/// RFC 7932 brotli.
+-	Brotli(Box<brotli::DecompressorWriter<Vec<u8>>>),
+-	/// RFC 8878 zstd.
+-	Zstd(zstd::stream::write::Decoder<'static, Vec<u8>>),
++/// Failure while decoding a response body.
++#[derive(Debug, Error)]
++pub enum ContentDecodeError {
++	/// The cumulative decoded body exceeds the configured bound.
++	#[error("decoded response exceeds {limit} bytes")]
++	LimitExceeded {
++		/// Maximum accepted decoded bytes for the entire response.
++		limit: u64,
++	},
++	/// Invalid, truncated, or unsupported codec data.
++	#[error("invalid compressed response")]
++	Invalid(#[source] io::Error),
++}
++
++#[derive(Debug, Error)]
++#[error("decoded response exceeds {limit} bytes")]
++struct OutputLimitExceeded {
++	limit: u64,
++}
++
++impl From<io::Error> for ContentDecodeError {
++	fn from(error: io::Error) -> Self {
++		if let Some(limit) = error
++			.get_ref()
++			.and_then(|inner| inner.downcast_ref::<OutputLimitExceeded>())
++		{
++			Self::LimitExceeded { limit: limit.limit }
++		} else {
++			Self::Invalid(error)
++		}
++	}
++}
++
++/// Incremental decoder with a non-resetting, per-response decoded byte limit.
++/// Private codec state prevents constructing an unbounded decoder by hand.
++pub struct ContentDecoder {
++	inner: Decoder,
++}
++
++enum Decoder {
++	Identity(BoundedOutput),
++	Gzip(GzDecoder<BoundedOutput>),
++	Deflate(DeflateDecoder),
++	Brotli(Box<BrotliDecoder>),
++	Zstd(zstd::stream::zio::Writer<BoundedOutput, zstd::stream::raw::Decoder<'static>>),
++}
++
++/// Transfers output to the caller, retaining the cumulative budget after each
++/// transfer. `reserve_exact` avoids amortized growth beyond the response limit.
++struct BoundedOutput {
++	bytes:     Vec<u8>,
++	limit:     u64,
++	remaining: u64,
++	exceeded:  bool,
++}
++
++impl BoundedOutput {
++	const fn new(limit: u64) -> Self {
++		Self { bytes: Vec::new(), limit, remaining: limit, exceeded: false }
++	}
++
++	fn account(&mut self, length: usize) -> io::Result<()> {
++		let length = length as u64;
++		if self.exceeded || length > self.remaining {
++			self.exceeded = true;
++			return Err(io::Error::other(OutputLimitExceeded { limit: self.limit }));
++		}
++		self.remaining -= length;
++		Ok(())
++	}
++
++	fn take(&mut self) -> Bytes {
++		Bytes::from(std::mem::take(&mut self.bytes))
++	}
++}
++
++impl io::Write for BoundedOutput {
++	fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++		self.account(bytes.len())?;
++		self.bytes.reserve_exact(bytes.len());
++		self.bytes.extend_from_slice(bytes);
++		Ok(bytes.len())
++	}
++
++	fn flush(&mut self) -> io::Result<()> {
++		Ok(())
++	}
++}
++
++struct DeflateDecoder {
++	state:    flate2::Decompress,
++	output:   BoundedOutput,
++	complete: bool,
++}
++
++impl DeflateDecoder {
++	fn new(limit: u64) -> Self {
++		Self {
++			state:    flate2::Decompress::new(true),
++			output:   BoundedOutput::new(limit),
++			complete: false,
++		}
++	}
++
++	fn push(&mut self, mut input: &[u8]) -> io::Result<()> {
++		let mut scratch = [0; DECODE_BUFFER_BYTES];
++		loop {
++			let before_in = self.state.total_in();
++			let before_out = self.state.total_out();
++			let status = self
++				.state
++				.decompress(input, &mut scratch, flate2::FlushDecompress::None)
++				.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
++			let read = (self.state.total_in() - before_in) as usize;
++			let written = (self.state.total_out() - before_out) as usize;
++			self.output.write_all(&scratch[..written])?;
++			input = &input[read..];
++			if status == flate2::Status::StreamEnd {
++				if !input.is_empty() {
++					return Err(io::ErrorKind::InvalidData.into());
++				}
++				self.complete = true;
++				return Ok(());
++			}
++			if read == 0 && written == 0 {
++				return if input.is_empty() {
++					Ok(())
++				} else {
++					Err(io::ErrorKind::InvalidData.into())
++				};
++			}
++		}
++	}
++
++	fn finish(&mut self) -> io::Result<()> {
++		self.push(&[])?;
++		if self.complete {
++			Ok(())
++		} else {
++			Err(io::ErrorKind::UnexpectedEof.into())
++		}
++	}
++}
++
++type BrotliState = brotli::BrotliState<
++	brotli::HeapAlloc<u8>,
++	brotli::HeapAlloc<u32>,
++	brotli::HeapAlloc<brotli::HuffmanCode>,
++>;
++
++struct BrotliDecoder {
++	state:    BrotliState,
++	output:   BoundedOutput,
++	total:    usize,
++	complete: bool,
++}
++
++impl BrotliDecoder {
++	fn new(limit: u64) -> Self {
++		Self {
++			// The convenience writer enables the non-RFC large-window extension.
++			// Strict mode rejects it before its attacker-selected allocation.
++			state:    BrotliState::new_strict(
++				brotli::HeapAlloc::default(),
++				brotli::HeapAlloc::default(),
++				brotli::HeapAlloc::default(),
++			),
++			output:   BoundedOutput::new(limit),
++			total:    0,
++			complete: false,
++		}
++	}
++
++	fn push(&mut self, input: &[u8]) -> io::Result<()> {
++		let mut available_in = input.len();
++		let mut input_offset = 0;
++		let mut scratch = [0; DECODE_BUFFER_BYTES];
++		loop {
++			let mut available_out = scratch.len();
++			let mut output_offset = 0;
++			let result = brotli::BrotliDecompressStream(
++				&mut available_in,
++				&mut input_offset,
++				input,
++				&mut available_out,
++				&mut output_offset,
++				&mut scratch,
++				&mut self.total,
++				&mut self.state,
++			);
++			self.output.write_all(&scratch[..output_offset])?;
++			match result {
++				brotli::BrotliResult::NeedsMoreOutput => {},
++				brotli::BrotliResult::NeedsMoreInput => return Ok(()),
++				brotli::BrotliResult::ResultSuccess if available_in == 0 => {
++					self.complete = true;
++					return Ok(());
++				},
++				_ => return Err(io::ErrorKind::InvalidData.into()),
++			}
++		}
++	}
++
++	fn finish(&mut self) -> io::Result<()> {
++		self.push(&[])?;
++		if self.complete {
++			Ok(())
++		} else {
++			Err(io::ErrorKind::UnexpectedEof.into())
++		}
++	}
+ }
+ 
+ impl ContentDecoder {
+-	/// Selects the decoder for a response; absent or `identity` encodings pass
+-	/// bytes through. Stacked encodings are rejected: no provider emits them
+-	/// and silently decoding one layer would corrupt the framer input.
+-	pub fn from_headers(headers: &HeaderMap) -> Result<Self, UnsupportedEncoding> {
++	/// Selects the decoder and cumulative decoded byte bound. Stacked encodings
++	/// are rejected; decoding only one layer would corrupt the framer input.
++	pub fn from_headers(headers: &HeaderMap, limit: u64) -> Result<Self, UnsupportedEncoding> {
+ 		let Some(value) = headers.get(header::CONTENT_ENCODING) else {
+-			return Ok(Self::Identity);
++			return Ok(Self { inner: Decoder::Identity(BoundedOutput::new(limit)) });
+ 		};
+ 		let value = value.to_str().map_err(|_| UnsupportedEncoding {
+ 			value: String::from_utf8_lossy(value.as_bytes()).into_owned(),
+@@ -55,87 +253,88 @@ impl ContentDecoder {
+ 			.map(str::trim)
+ 			.filter(|token| !token.is_empty() && !token.eq_ignore_ascii_case("identity"));
+ 		let Some(token) = tokens.next() else {
+-			return Ok(Self::Identity);
++			return Ok(Self { inner: Decoder::Identity(BoundedOutput::new(limit)) });
+ 		};
+ 		if tokens.next().is_some() {
+ 			return Err(UnsupportedEncoding { value: value.to_owned() });
+ 		}
+-		match token.to_ascii_lowercase().as_str() {
+-			"gzip" | "x-gzip" => Ok(Self::Gzip(GzDecoder::new(Vec::new()))),
+-			"deflate" => Ok(Self::Deflate(ZlibDecoder::new(Vec::new()))),
+-			"br" => Ok(Self::Brotli(Box::new(brotli::DecompressorWriter::new(
+-				Vec::new(),
+-				BROTLI_BUFFER_BYTES,
+-			)))),
+-			"zstd" => zstd::stream::write::Decoder::new(Vec::new())
+-				.map(Self::Zstd)
+-				.map_err(|_| UnsupportedEncoding { value: value.to_owned() }),
+-			_ => Err(UnsupportedEncoding { value: value.to_owned() }),
+-		}
++		let output = BoundedOutput::new(limit);
++		let inner = match token.to_ascii_lowercase().as_str() {
++			"gzip" | "x-gzip" => Decoder::Gzip(GzDecoder::new(output)),
++			"deflate" => Decoder::Deflate(DeflateDecoder::new(limit)),
++			"br" => Decoder::Brotli(Box::new(BrotliDecoder::new(limit))),
++			"zstd" => {
++				let mut decoder = zstd::stream::raw::Decoder::new()
++					.map_err(|_| UnsupportedEncoding { value: value.to_owned() })?;
++				decoder
++					.set_parameter(zstd::stream::raw::DParameter::WindowLogMax(ZSTD_WINDOW_LOG_MAX))
++					.map_err(|_| UnsupportedEncoding { value: value.to_owned() })?;
++				Decoder::Zstd(zstd::stream::zio::Writer::new(output, decoder))
++			},
++			_ => return Err(UnsupportedEncoding { value: value.to_owned() }),
++		};
++		Ok(Self { inner })
+ 	}
+ 
+-	/// Reports whether chunks pass through unchanged.
++	/// Reports whether chunks pass through unchanged, after checking the bound.
+ 	#[must_use]
+ 	pub const fn is_identity(&self) -> bool {
+-		matches!(self, Self::Identity)
++		matches!(self.inner, Decoder::Identity(_))
+ 	}
+ 
+-	/// Feeds one wire chunk and returns every decoded byte available so far.
+-	pub fn push(&mut self, chunk: Bytes) -> io::Result<Bytes> {
+-		match self {
+-			Self::Identity => Ok(chunk),
+-			Self::Gzip(decoder) => {
+-				decoder.write_all(&chunk)?;
+-				decoder.flush()?;
+-				Ok(take(decoder.get_mut()))
++	/// Feeds one wire chunk, rejecting excess output before growing its buffer.
++	pub fn push(&mut self, chunk: Bytes) -> Result<Bytes, ContentDecodeError> {
++		match &mut self.inner {
++			Decoder::Identity(output) => {
++				output.account(chunk.len())?;
++				Ok(chunk)
+ 			},
+-			Self::Deflate(decoder) => {
++			Decoder::Gzip(decoder) => {
+ 				decoder.write_all(&chunk)?;
+ 				decoder.flush()?;
+-				Ok(take(decoder.get_mut()))
++				Ok(decoder.get_mut().take())
+ 			},
+-			Self::Brotli(decoder) => {
+-				decoder.write_all(&chunk)?;
+-				decoder.flush()?;
+-				Ok(take(decoder.get_mut()))
++			Decoder::Deflate(decoder) => {
++				decoder.push(&chunk)?;
++				Ok(decoder.output.take())
++			},
++			Decoder::Brotli(decoder) => {
++				decoder.push(&chunk)?;
++				Ok(decoder.output.take())
+ 			},
+-			Self::Zstd(decoder) => {
++			Decoder::Zstd(decoder) => {
+ 				decoder.write_all(&chunk)?;
+ 				decoder.flush()?;
+-				Ok(take(decoder.get_mut()))
++				Ok(decoder.writer_mut().take())
+ 			},
+ 		}
+ 	}
+ 
+-	/// Drains the decoder at end of body, failing on a truncated compressed
+-	/// stream.
+-	pub fn finish(&mut self) -> io::Result<Bytes> {
+-		match self {
+-			Self::Identity => Ok(Bytes::new()),
+-			Self::Gzip(decoder) => {
++	/// Drains the decoder at EOF, checking both the remaining bound and the
++	/// compression format's terminal marker.
++	pub fn finish(&mut self) -> Result<Bytes, ContentDecodeError> {
++		match &mut self.inner {
++			Decoder::Identity(_) => Ok(Bytes::new()),
++			Decoder::Gzip(decoder) => {
+ 				decoder.try_finish()?;
+-				Ok(take(decoder.get_mut()))
++				Ok(decoder.get_mut().take())
+ 			},
+-			Self::Deflate(decoder) => {
+-				decoder.try_finish()?;
+-				Ok(take(decoder.get_mut()))
++			Decoder::Deflate(decoder) => {
++				decoder.finish()?;
++				Ok(decoder.output.take())
+ 			},
+-			Self::Brotli(decoder) => {
+-				decoder.flush()?;
+-				Ok(take(decoder.get_mut()))
++			Decoder::Brotli(decoder) => {
++				decoder.finish()?;
++				Ok(decoder.output.take())
+ 			},
+-			Self::Zstd(decoder) => {
+-				decoder.flush()?;
+-				Ok(take(decoder.get_mut()))
++			Decoder::Zstd(decoder) => {
++				decoder.finish()?;
++				Ok(decoder.writer_mut().take())
+ 			},
+ 		}
+ 	}
+ }
+ 
+-fn take(output: &mut Vec<u8>) -> Bytes {
+-	Bytes::from(std::mem::take(output))
+-}
+-
+ #[cfg(test)]
+ mod tests {
+ 	use http::HeaderValue;
+@@ -166,16 +365,16 @@ mod tests {
+ 	#[test]
+ 	fn absent_and_identity_encodings_pass_through() {
+ 		assert!(
+-			ContentDecoder::from_headers(&HeaderMap::new())
++			ContentDecoder::from_headers(&HeaderMap::new(), 64 * 1024)
+ 				.unwrap()
+ 				.is_identity()
+ 		);
+ 		assert!(
+-			ContentDecoder::from_headers(&headers("identity"))
++			ContentDecoder::from_headers(&headers("identity"), 64 * 1024)
+ 				.unwrap()
+ 				.is_identity()
+ 		);
+-		let mut decoder = ContentDecoder::Identity;
++		let mut decoder = ContentDecoder::from_headers(&HeaderMap::new(), 64 * 1024).unwrap();
+ 		assert_eq!(decoder.push(Bytes::from_static(b"abc")).unwrap(), Bytes::from_static(b"abc"));
+ 		assert!(decoder.finish().unwrap().is_empty());
+ 	}
+@@ -185,7 +384,7 @@ mod tests {
+ 		let payload = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\n";
+ 		let wire = gzip(payload);
+ 		for piece in [1, 3, 7, wire.len()] {
+-			let mut decoder = ContentDecoder::from_headers(&headers("gzip")).unwrap();
++			let mut decoder = ContentDecoder::from_headers(&headers("gzip"), 64 * 1024).unwrap();
+ 			assert_eq!(decode_in_pieces(&mut decoder, &wire, piece), payload, "piece={piece}");
+ 		}
+ 	}
+@@ -196,24 +395,24 @@ mod tests {
+ 
+ 		let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+ 		zlib.write_all(&payload).unwrap();
+-		let mut decoder = ContentDecoder::from_headers(&headers("deflate")).unwrap();
++		let mut decoder = ContentDecoder::from_headers(&headers("deflate"), 64 * 1024).unwrap();
+ 		assert_eq!(decode_in_pieces(&mut decoder, &zlib.finish().unwrap(), 5), payload);
+ 
+ 		let mut br = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+ 		br.write_all(&payload).unwrap();
+ 		let br = br.into_inner();
+-		let mut decoder = ContentDecoder::from_headers(&headers("br")).unwrap();
++		let mut decoder = ContentDecoder::from_headers(&headers("br"), 64 * 1024).unwrap();
+ 		assert_eq!(decode_in_pieces(&mut decoder, &br, 5), payload);
+ 
+ 		let zst = zstd::encode_all(payload.as_slice(), 3).unwrap();
+-		let mut decoder = ContentDecoder::from_headers(&headers("zstd")).unwrap();
++		let mut decoder = ContentDecoder::from_headers(&headers("zstd"), 64 * 1024).unwrap();
+ 		assert_eq!(decode_in_pieces(&mut decoder, &zst, 5), payload);
+ 	}
+ 
+ 	#[test]
+ 	fn truncated_gzip_body_fails_at_finish() {
+ 		let wire = gzip(b"data: {\"type\":\"ping\"}\n\n".repeat(32).as_slice());
+-		let mut decoder = ContentDecoder::from_headers(&headers("gzip")).unwrap();
++		let mut decoder = ContentDecoder::from_headers(&headers("gzip"), 64 * 1024).unwrap();
+ 		let _ = decoder
+ 			.push(Bytes::copy_from_slice(&wire[..wire.len() / 2]))
+ 			.unwrap();
+@@ -222,8 +421,147 @@ mod tests {
+ 
+ 	#[test]
+ 	fn unknown_and_stacked_encodings_are_rejected() {
+-		assert!(ContentDecoder::from_headers(&headers("compress")).is_err());
+-		assert!(ContentDecoder::from_headers(&headers("gzip, br")).is_err());
+-		assert!(ContentDecoder::from_headers(&headers("identity, gzip")).is_ok());
++		assert!(ContentDecoder::from_headers(&headers("compress"), 64 * 1024).is_err());
++		assert!(ContentDecoder::from_headers(&headers("gzip, br"), 64 * 1024).is_err());
++		assert!(ContentDecoder::from_headers(&headers("identity, gzip"), 64 * 1024).is_ok());
++	}
++	fn compress(encoding: &str, payload: &[u8]) -> Vec<u8> {
++		match encoding {
++			"identity" => payload.to_vec(),
++			"gzip" => gzip(payload),
++			"deflate" => {
++				let mut writer =
++					flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
++				writer.write_all(payload).unwrap();
++				writer.finish().unwrap()
++			},
++			"br" => {
++				let mut writer = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
++				writer.write_all(payload).unwrap();
++				writer.into_inner()
++			},
++			"zstd" => zstd::encode_all(payload, 3).unwrap(),
++			_ => unreachable!(),
++		}
++	}
++
++	fn output(decoder: &ContentDecoder) -> &BoundedOutput {
++		match &decoder.inner {
++			Decoder::Identity(output) => output,
++			Decoder::Gzip(decoder) => decoder.get_ref(),
++			Decoder::Deflate(decoder) => &decoder.output,
++			Decoder::Brotli(decoder) => &decoder.output,
++			Decoder::Zstd(decoder) => decoder.writer(),
++		}
++	}
++
++	#[test]
++	fn compressed_bombs_fail_before_output_allocation_exceeds_the_limit() {
++		let payload = vec![b'x'; 8 * 1024 * 1024];
++		let limit = 64 * 1024;
++		for encoding in ["gzip", "deflate", "br", "zstd"] {
++			let wire = compress(encoding, &payload);
++			assert!(wire.len() < limit as usize, "fixture must expand: {encoding}");
++			for piece in [1, 7, wire.len()] {
++				let mut decoder = ContentDecoder::from_headers(&headers(encoding), limit).unwrap();
++				let mut error = None;
++				for chunk in wire.chunks(piece) {
++					if let Err(failure) = decoder.push(Bytes::copy_from_slice(chunk)) {
++						error = Some(failure);
++						break;
++					}
++				}
++				let error = error
++					.or_else(|| decoder.finish().err())
++					.expect("bomb must fail");
++				assert!(
++					matches!(error, ContentDecodeError::LimitExceeded { limit: 65_536 }),
++					"{encoding}/{piece}: {error}"
++				);
++				let output = output(&decoder);
++				assert!(output.bytes.len() <= limit as usize);
++				assert!(output.bytes.capacity() <= limit as usize, "no speculative expansion");
++				assert!(output.exceeded, "limit is sticky, including decoder drop");
++			}
++		}
++	}
++
++	#[test]
++	fn exact_and_tiny_bounds_count_cumulative_output_across_chunks() {
++		for encoding in ["identity", "gzip", "deflate", "br", "zstd"] {
++			for size in [0, 1, 7, 8193] {
++				let payload = vec![b'x'; size];
++				let wire = compress(encoding, &payload);
++				for piece in [1, 7, wire.len().max(1)] {
++					let mut decoder =
++						ContentDecoder::from_headers(&headers(encoding), size as u64).unwrap();
++					assert_eq!(
++						decode_in_pieces(&mut decoder, &wire, piece),
++						payload,
++						"{encoding}/{size}/{piece}"
++					);
++					assert_eq!(output(&decoder).remaining, 0);
++				}
++				if size != 0 {
++					let mut decoder =
++						ContentDecoder::from_headers(&headers(encoding), size as u64 - 1).unwrap();
++					let mut error = None;
++					for chunk in wire.chunks(1) {
++						if let Err(failure) = decoder.push(Bytes::copy_from_slice(chunk)) {
++							error = Some(failure);
++							break;
++						}
++					}
++					assert!(
++						matches!(
++							error.or_else(|| decoder.finish().err()),
++							Some(ContentDecodeError::LimitExceeded { .. })
++						),
++						"{encoding}/{size}"
++					);
++				}
++			}
++		}
++	}
++
++	#[test]
++	fn malformed_and_truncated_encodings_fail_without_exceeding_the_bound() {
++		for encoding in ["gzip", "deflate", "br", "zstd"] {
++			let wire = compress(encoding, b"a complete compressed response");
++			for truncated in [&wire[..wire.len() / 2], &wire[..wire.len() - 1], &[]] {
++				let mut decoder = ContentDecoder::from_headers(&headers(encoding), 1024).unwrap();
++				let result = decoder
++					.push(Bytes::copy_from_slice(truncated))
++					.and_then(|_| decoder.finish());
++				assert!(
++					matches!(result, Err(ContentDecodeError::Invalid(_))),
++					"{encoding}: {result:?}"
++				);
++			}
++			let mut decoder = ContentDecoder::from_headers(&headers(encoding), 1024).unwrap();
++			assert!(
++				decoder
++					.push(Bytes::from_static(&[0xff; 32]))
++					.and_then(|_| decoder.finish())
++					.is_err(),
++				"{encoding}"
++			);
++		}
++	}
++
++	#[test]
++	fn codec_window_extensions_are_rejected_before_large_allocation() {
++		let mut decoder = ContentDecoder::from_headers(&headers("br"), 1024).unwrap();
++		// The large-window extension starts with the otherwise invalid WBITS 17
++		// bit pattern, then declares a 30-bit window. Strict RFC mode rejects it.
++		assert!(decoder.push(Bytes::from_static(&[0x11, 30, 0, 0])).is_err());
++
++		let mut decoder = ContentDecoder::from_headers(&headers("zstd"), 1024).unwrap();
++		// Zstd magic, no content size, window descriptor = 2^25 (32 MiB).
++		assert!(
++			decoder
++				.push(Bytes::from_static(&[0x28, 0xb5, 0x2f, 0xfd, 0, 120, 0, 0, 0]))
++				.is_err()
++		);
+ 	}
+ }
+diff --git a/crates/ai/src/transport/http.rs b/crates/ai/src/transport/http.rs
+index c3e9faae69d3d2c89594ed6417edf8d5662c1e0b..29ff01f3457a853ef9b107c22187ea604480dbb4 100644
+--- a/crates/ai/src/transport/http.rs
++++ b/crates/ai/src/transport/http.rs
+@@ -63,7 +63,7 @@ use crate::{
+ 			MAX_BROWSER_BODY_BYTES as BROWSER_MAX_BROWSER_BODY_BYTES, MAX_BROWSER_DEADLINE,
+ 		},
+ 		cassette::{CapturedFrame, capture_frame, is_commit_candidate},
+-		encoding::ContentDecoder,
++		encoding::{ContentDecodeError, ContentDecoder},
+ 		proxy,
+ 	},
+ };
+@@ -792,7 +792,13 @@ async fn execute(
+ 	let retry_hint = retry_after_hint(&parts.headers);
+ 	let headers = sanitize_headers(&parts.headers);
+ 	let concurrency_admission = concurrency_admission_rejection(&parts.headers);
+-	let content = ContentDecoder::from_headers(&parts.headers).map_err(|unsupported| {
++	let response_limit = transport.encoded.bounds.response;
++	let decoded_limit = if (200..300).contains(&status) {
++		response_limit
++	} else {
++		response_limit.min(MAX_PROVIDER_ERROR_BODY_BYTES as u64)
++	};
++	let content = ContentDecoder::from_headers(&parts.headers, decoded_limit).map_err(|unsupported| {
+ 		tracing::warn!(encoding = %unsupported.value, "provider response uses an unsupported content-encoding");
+ 		record_failure(
+ 			protocol_error(ErrorPhase::Handshake, false, "content-encoding-unsupported"),
+@@ -814,12 +820,10 @@ async fn execute(
+ 	captures
+ 		.lock()
+ 		.push(HttpCaptureRecord { snapshot: Arc::clone(&capture), evidence: evidence.clone() });
+-	let response_limit = transport.encoded.bounds.response;
+-
+ 	if !(200..300).contains(&status) {
+ 		let body = collect_error_response_body(
+ 			incoming,
+-			response_limit.min(MAX_PROVIDER_ERROR_BODY_BYTES as u64),
++			decoded_limit,
+ 			&transport.cancel,
+ 			deadline,
+ 			started,
+@@ -858,7 +862,6 @@ async fn execute(
+ 		incoming,
+ 		framing,
+ 		frame_limit,
+-		response_limit,
+ 		transport.decoder.take().ok_or_else(|| {
+ 			record_failure(
+ 				protocol_error(ErrorPhase::Handshake, false, "ordinary-decoder-missing"),
+@@ -1177,8 +1180,7 @@ async fn collect_error_response_body(
+ ) -> Result<Bytes, Error> {
+ 	let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+ 	let mut output = BytesMut::with_capacity(limit.min(8 * 1024));
+-	let corrupt = || protocol_error(ErrorPhase::Handshake, false, "content-encoding-corrupt");
+-	while output.len() < limit {
++	loop {
+ 		let next = tokio::select! {
+ 			next = incoming.frame() => next,
+ 			() = poll_fn(|context| cancel.poll_cancelled(context)) => return Err(cancelled(false)),
+@@ -1190,9 +1192,12 @@ async fn collect_error_response_body(
+ 		let Some(next) = next else {
+ 			// A truncated compressed error body still classifies by status; keep
+ 			// whatever decoded so far.
+-			if let Ok(tail) = content.finish() {
+-				let remaining = limit.saturating_sub(output.len());
+-				output.extend_from_slice(&tail[..tail.len().min(remaining)]);
++			match content.finish() {
++				Ok(tail) => output.extend_from_slice(&tail),
++				Err(error @ ContentDecodeError::LimitExceeded { .. }) => {
++					return Err(content_decode_error(error, false, true));
++				},
++				Err(ContentDecodeError::Invalid(_)) => {},
+ 			}
+ 			break;
+ 		};
+@@ -1201,13 +1206,31 @@ async fn collect_error_response_body(
+ 		let Ok(chunk) = frame.into_data() else {
+ 			continue;
+ 		};
+-		let chunk = content.push(chunk).map_err(|_| corrupt())?;
+-		let remaining = limit.saturating_sub(output.len());
+-		output.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
++		let chunk = content
++			.push(chunk)
++			.map_err(|error| content_decode_error(error, false, false))?;
++		output.extend_from_slice(&chunk);
+ 	}
+ 	Ok(output.freeze())
+ }
+ 
++fn content_decode_error(error: ContentDecodeError, emitted: bool, eof: bool) -> Error {
++	let reason = match error {
++		ContentDecodeError::LimitExceeded { .. } => "response-body-limit",
++		ContentDecodeError::Invalid(_) if eof => "content-encoding-truncated",
++		ContentDecodeError::Invalid(_) => "content-encoding-corrupt",
++	};
++	protocol_error(
++		if emitted {
++			ErrorPhase::Streaming
++		} else {
++			ErrorPhase::Handshake
++		},
++		emitted,
++		reason,
++	)
++}
++
+ fn header_str<'h>(headers: &'h HeaderMap, name: &HeaderName) -> Option<&'h str> {
+ 	headers.get(name).and_then(|value| value.to_str().ok())
+ }
+@@ -1674,7 +1697,6 @@ fn decode_stream(
+ 	mut incoming: Incoming,
+ 	protocol: FramingProtocol,
+ 	frame_limit: usize,
+-	response_limit: u64,
+ 	mut decoder: DecoderState,
+ 	cancel: Cancellation,
+ 	capture_limit: u64,
+@@ -1691,7 +1713,6 @@ fn decode_stream(
+ 	async_stream::stream! {
+ 		let mut guard = CancelOnDrop::new(cancel.clone());
+ 		let mut framer = ResponseFramer::new(protocol, frame_limit);
+-		let mut response_bytes = 0_u64;
+ 		let mut capture_remaining = capture_limit;
+ 		let mut ordinal = 0_u64;
+ 		let mut emitted = false;
+@@ -1712,10 +1733,13 @@ fn decode_stream(
+ 			let chunk = match next {
+ 				None => {
+ 					ended = true;
+-					if let Ok(tail) = content.finish() { tail } else {
+-						let error = protocol_error(if emitted { ErrorPhase::Streaming } else { ErrorPhase::Handshake }, emitted, "content-encoding-truncated");
+-						yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+-						break;
++					match content.finish() {
++						Ok(tail) => tail,
++						Err(error) => {
++							let error = content_decode_error(error, emitted, true);
++							yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
++							break;
++						},
+ 					}
+ 				},
+ 				Some(Err(_)) => {
+@@ -1737,20 +1761,17 @@ fn decode_stream(
+ 				},
+ 				Some(Ok(body_frame)) => {
+ 					let Ok(chunk) = body_frame.into_data() else { continue };
+-					if let Ok(decoded) = content.push(chunk) { decoded } else {
+-						let error = protocol_error(if emitted { ErrorPhase::Streaming } else { ErrorPhase::Handshake }, emitted, "content-encoding-corrupt");
+-						yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+-						break;
++					match content.push(chunk) {
++						Ok(decoded) => decoded,
++						Err(error) => {
++							let error = content_decode_error(error, emitted, false);
++							yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
++							break;
++						},
+ 					}
+ 				},
+ 			};
+ 			if !chunk.is_empty() {
+-				response_bytes = response_bytes.saturating_add(chunk.len() as u64);
+-				if response_bytes > response_limit {
+-					let error = protocol_error(if emitted { ErrorPhase::Streaming } else { ErrorPhase::Handshake }, emitted, "response-body-limit");
+-					yield Err(record_failure(error, &attempt, &evidence, Some(status), provider_request_id.as_ref(), started, emitted));
+-					break;
+-				}
+ 				let frames = match framer.push(chunk) {
+ 					Ok(frames) => frames,
+ 					Err(error) => {
+diff --git a/crates/ai/src/transport/tests.rs b/crates/ai/src/transport/tests.rs
+index 7e60af6a4407617788a5070cfc6e4c51e8a5477c..5c773a2041ba60b5e549f3a45ea5257252a6ab07 100644
+--- a/crates/ai/src/transport/tests.rs
++++ b/crates/ai/src/transport/tests.rs
+@@ -2,7 +2,7 @@ use std::{
+ 	future,
+ 	num::NonZeroUsize,
+ 	sync::{
+-		Arc, Mutex as StdMutex,
++		Arc,
+ 		atomic::{AtomicUsize, Ordering},
+ 	},
+ };
+@@ -11,6 +11,7 @@ use bytes::Bytes;
+ use futures::{FutureExt as _, StreamExt as _, stream};
+ use omp_catalog::{OperationKind, ProviderId, RouteId};
+ use omp_core::{Str, sf};
++use parking_lot::Mutex;
+ use tokio::{
+ 	io::{AsyncReadExt as _, AsyncWriteExt as _},
+ 	net::TcpListener,
+@@ -45,7 +46,7 @@ use crate::{
+ #[derive(Default)]
+ struct ResponseObserver {
+ 	subscribed: bool,
+-	observed:   StdMutex<Vec<ProviderResponseObservation>>,
++	observed:   Mutex<Vec<ProviderResponseObservation>>,
+ }
+ 
+ impl crate::codec::ProviderHookObserver for ResponseObserver {}
+@@ -56,11 +57,7 @@ impl ProviderResponseObserver for ResponseObserver {
+ 	}
+ 
+ 	fn observe(&self, observation: ProviderResponseObservation) {
+-		self
+-			.observed
+-			.lock()
+-			.expect("observer lock")
+-			.push(observation);
++		self.observed.lock().push(observation);
+ 	}
+ }
+ 
+@@ -249,7 +246,7 @@ async fn provider_response_hook_is_bitmap_gated_and_fires_for_each_attempt() {
+ 		}
+ 	});
+ 	let observer =
+-		Arc::new(ResponseObserver { subscribed: true, observed: StdMutex::new(Vec::new()) });
++		Arc::new(ResponseObserver { subscribed: true, observed: Mutex::new(Vec::new()) });
+ 	let mut service = HttpTransport::new();
+ 	for attempt in 0..2 {
+ 		let mut call = request(
+@@ -291,7 +288,7 @@ async fn provider_response_hook_is_bitmap_gated_and_fires_for_each_attempt() {
+ 	);
+ 	server.await.expect("response fixture");
+ 
+-	let observed = observer.observed.lock().expect("observer lock");
++	let observed = observer.observed.lock();
+ 	assert_eq!(observed.len(), 2);
+ 	assert_eq!((observed[0].status, observed[1].status), (503, 200));
+ 	assert_eq!(observed[0].request_id.as_deref(), Some("req-1"));
+@@ -319,13 +316,7 @@ async fn provider_response_hook_is_bitmap_gated_and_fires_for_each_attempt() {
+ 	assert!(observed[1].headers.iter().any(|(name, value)| {
+ 		name.as_str() == "anthropic-ratelimit-requests-remaining" && value.as_str() == "3"
+ 	}));
+-	assert!(
+-		unsubscribed
+-			.observed
+-			.lock()
+-			.expect("observer lock")
+-			.is_empty()
+-	);
++	assert!(unsubscribed.observed.lock().is_empty());
+ }
+ 
+ fn attempt(
+@@ -1392,6 +1383,147 @@ async fn gzip_encoded_anthropic_stream_decodes_to_a_completion() {
+ 	server.await.expect("fixture server");
+ }
+ 
++/// Both successful and rejected HTTP responses must hand their effective
++/// decoded byte ceiling to the decompressor, before parsing or classification.
++#[tokio::test]
++async fn compressed_response_bombs_respect_success_and_error_body_limits() {
++	use std::io::Write as _;
++	let payload = vec![b'x'; 8 * 1024 * 1024];
++	for encoding in ["gzip", "deflate", "br", "zstd"] {
++		let wire = match encoding {
++			"gzip" => {
++				let mut writer =
++					flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
++				writer.write_all(&payload).unwrap();
++				writer.finish().unwrap()
++			},
++			"deflate" => {
++				let mut writer =
++					flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
++				writer.write_all(&payload).unwrap();
++				writer.finish().unwrap()
++			},
++			"br" => {
++				let mut writer = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
++				writer.write_all(&payload).unwrap();
++				writer.into_inner()
++			},
++			"zstd" => zstd::encode_all(payload.as_slice(), 3).unwrap(),
++			_ => unreachable!(),
++		};
++		for (status, limit) in [(200, 65_536), (429, payload.len() as u64), (400, 1024)] {
++			let listener = TcpListener::bind("127.0.0.1:0")
++				.await
++				.expect("fixture listener");
++			let address = listener.local_addr().unwrap();
++			let wire = wire.clone();
++			let server = tokio::spawn(async move {
++				let (mut socket, _) = listener.accept().await.unwrap();
++				let mut request = [0; 4096];
++				let _ = socket.read(&mut request).await.unwrap();
++				let headers = format!(
++					"HTTP/1.1 {status} Response\r\ncontent-encoding: {encoding}\r\ncontent-length: \
++					 {}\r\n\r\n",
++					wire.len()
++				);
++				socket.write_all(headers.as_bytes()).await.unwrap();
++				socket.write_all(&wire).await.unwrap();
++				socket.shutdown().await.unwrap();
++			});
++			let mut service = HttpTransport::new();
++			service.ready().await.unwrap();
++			let mut call = request(
++				BodySource::Bytes(Bytes::from_static(b"request")),
++				EmitDecoder,
++				Cancellation::default(),
++			);
++			call.encoded.uri = sf!("http://{address}/stream");
++			call.encoded.bounds.response = limit;
++			call.encoded.bounds.frame = payload.len() as u64;
++			let error = time::timeout(time::Duration::from_secs(5), service.call(call))
++				.await
++				.expect("bounded response deadline")
++				.err()
++				.expect("body limit failure");
++			assert_eq!(error.kind, ErrorKind::Protocol, "{encoding}/{status}");
++			assert_eq!(error.status, Some(status));
++			assert_eq!(error.phase, ErrorPhase::Handshake);
++			assert_eq!(error.action, RetryAction::Never);
++			assert!(!error.committed);
++			assert!(
++				matches!(error.detail_ref(), Some(ErrorDetail::Protocol { reason }) if reason.0.as_str() == "response-body-limit"),
++				"{error:?}"
++			);
++			server.await.unwrap();
++		}
++	}
++}
++
++#[tokio::test]
++async fn compressed_response_limit_remains_cumulative_after_visible_output() {
++	use std::io::Write as _;
++	let mut writer = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
++	writer.write_all(b"data: first\n\n").unwrap();
++	writer.flush().unwrap();
++	let prefix = std::mem::take(writer.get_mut());
++	writer.write_all(&vec![b'x'; 128 * 1024]).unwrap();
++	let suffix = writer.finish().unwrap();
++	let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++	let address = listener.local_addr().unwrap();
++	let (visible_tx, visible_rx) = oneshot::channel();
++	let server = tokio::spawn(async move {
++		let (mut socket, _) = listener.accept().await.unwrap();
++		let mut request = [0; 4096];
++		let _ = socket.read(&mut request).await.unwrap();
++		let headers = format!(
++			"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n\r\n",
++			prefix.len() + suffix.len()
++		);
++		socket.write_all(headers.as_bytes()).await.unwrap();
++		socket.write_all(&prefix).await.unwrap();
++		time::timeout(time::Duration::from_secs(5), visible_rx)
++			.await
++			.unwrap()
++			.unwrap();
++		socket.write_all(&suffix).await.unwrap();
++		socket.shutdown().await.unwrap();
++	});
++	let mut service = HttpTransport::new();
++	service.ready().await.unwrap();
++	let mut call = request(
++		BodySource::Bytes(Bytes::from_static(b"request")),
++		CapturedSseDecoder,
++		Cancellation::default(),
++	);
++	call.encoded.uri = sf!("http://{address}/stream");
++	call.encoded.framing = FramingProtocol::Sse;
++	call.encoded.bounds.response = 64 * 1024;
++	let response = time::timeout(time::Duration::from_secs(5), service.call(call))
++		.await
++		.unwrap()
++		.unwrap();
++	let mut events = response.events.unwrap();
++	let first = events.next().await.unwrap().unwrap();
++	assert!(
++		matches!(first, RawEvent::Chat(ChatEvent::TextDelta { text, .. }) if text.as_str() == "first")
++	);
++	visible_tx.send(()).unwrap();
++	let error = time::timeout(time::Duration::from_secs(5), events.next())
++		.await
++		.unwrap()
++		.unwrap()
++		.err()
++		.expect("stream body limit");
++	assert_eq!(error.phase, ErrorPhase::Streaming);
++	assert!(error.committed);
++	assert_eq!(error.action, RetryAction::Never);
++	assert!(
++		matches!(error.detail_ref(), Some(ErrorDetail::Protocol { reason }) if reason.0.as_str() == "response-body-limit")
++	);
++	assert!(events.next().await.is_none());
++	server.await.unwrap();
++}
++
+ #[tokio::test]
+ async fn unsupported_content_encoding_fails_closed_without_retry() {
+ 	let listener = TcpListener::bind("127.0.0.1:0")
+diff --git a/justfile b/justfile
+index d890796678f43a37797707201c1a7f9417b508aa..90d54551250b1ea0cbb97387b2bad174cb35a0b3 100644
+--- a/justfile
++++ b/justfile
+@@ -43,6 +43,16 @@ fmt-check: fmt-check-rust proto-fmt-check
+ fmt-check-rust:
+     cargo fmt --all -- --check
+ 
++# Check one maintained crate without unrelated workspace formatting debt.
++[group('format & lint')]
++fmt-check-pkg pkg:
++    cargo fmt -p {{ pkg }} -- --check
++
++# Format one crate while preserving unrelated workspace edits.
++[group('format & lint')]
++fmt-pkg pkg:
++    cargo fmt -p {{ pkg }}
++
+ # Format every `.proto` schema under crates/proto in place (buf.yaml).
+ [group('format & lint')]
+ proto-fmt:
+@@ -109,6 +119,12 @@ check:
+ check-pkg pkg:
+     cargo check -p {{ pkg }} --locked
+ 
++# Run the affected crate's library, examples and test lints without requiring
++# unrelated application or embedded-Python setup.
++[group('format & lint')]
++clippy-pkg pkg:
++    cargo clippy -p {{ pkg }} --all-targets --locked
++
+ # Build the `omp` CLI/daemon binary (dev profile).
+ [group('build & check')]
+ build:

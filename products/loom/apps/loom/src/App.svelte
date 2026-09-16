@@ -74,6 +74,7 @@
     listCoWriters,
     listCuratedModels,
     listDocumentContext,
+    getInferenceStatus,
     listModels,
     listModelDownloads,
     openDefaultProject,
@@ -789,7 +790,7 @@
   } | null = null;
   $: loompadSnapshotKey = JSON.stringify([project?.project_id, project?.session_id,
     document?.summary.document_id, document?.summary.revision_id, document?.visible_blob_id,
-    mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte, currentModel?.model_id,
+    mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte, currentWriter?.model_id,
     contextEpoch, documentEpoch, completionController.intentEpoch, editVersion]);
   $: loompadFamilyIds = loompadActive && loompadReservoir?.key === loompadSnapshotKey
     ? loompadReservoir.familyIds : undefined;
@@ -1139,11 +1140,13 @@
   $: fileRows = workspaceRows(visibleWorkspaceDocuments(project?.documents ?? [], project?.retained_output_document_ids ?? [], pinnedOutputs), collapsedFolders, search);
   $: loadedModel = models.find((model) => model.loaded) ?? null;
   $: currentModel = workspaceWriterModel(models, buildModelPolicy, curatedModels, workspaceTemplate, workspaceTemplateScope === `${project?.project_id}/${project?.session_id}`);
+  let configuredWriter: { model_id: string; completion: boolean } | null = null;
+  $: currentWriter = configuredWriter ?? currentModel;
   $: suggestionSetupNeeded = Boolean(
     project &&
     document &&
     completionAutomationActive &&
-    !currentModel &&
+    !currentWriter &&
     !modelLoading &&
     !modelUnloading &&
     !modelChoosing &&
@@ -1166,7 +1169,7 @@
     branch.selection !== 'promote' &&
     branch.selection !== 'reject' &&
     branch.source_revision_id === document?.summary.revision_id &&
-    branch.model_id === currentModel?.model_id
+    branch.model_id === currentWriter?.model_id
   );
   $: branchPromotionReady = Boolean(
     project &&
@@ -1219,7 +1222,7 @@
     verifiedBodyByRun: verifiedBranchBodyByRun,
     liveTextByRun: liveBranchTextByRun,
     liveTextSequenceByRun: liveBranchTextSequenceByRun,
-    currentModel,
+    currentModel: currentWriter,
     document,
     suggestionsEnabled: completionAutomationActive,
     promotionReady: branchPromotionReady,
@@ -1236,7 +1239,7 @@
     verifiedBodyByRun: verifiedBranchBodyByRun,
     liveTextByRun: liveBranchTextByRun,
     liveTextSequenceByRun: liveBranchTextSequenceByRun,
-    currentModel,
+    currentModel: currentWriter,
     document,
     suggestionsEnabled: completionAutomationActive,
     promotionReady: branchPromotionReady,
@@ -1306,13 +1309,13 @@
     if (selected && familyRunIds.has(selected.runId) &&
         project?.project_id === captured.projectId && project.session_id === captured.sessionId &&
         document?.summary.document_id === captured.documentId && documentEpoch === captured.epoch &&
-        contextEpoch === captured.contextEpoch && currentModel?.model_id === captured.modelId &&
+        contextEpoch === captured.contextEpoch && currentWriter?.model_id === captured.modelId &&
         insertAtUtf8Boundary(captured.sourceMarkdown, captured.cursorByte,
           acceptedCompletionText(boundCompletionSession)) === documentText) {
       const originals = inlineSuggestionFamily(captured.cursorByte, mode, {
         branches, authoritativeFamilyIds: loompadReservoir.familyIds, requireExplicitFamily: true,
         verifiedBodyByRun: verifiedBranchBodyByRun, liveTextByRun: liveBranchTextByRun,
-        liveTextSequenceByRun: liveBranchTextSequenceByRun, currentModel,
+        liveTextSequenceByRun: liveBranchTextSequenceByRun, currentModel: currentWriter,
         document: captured.sourceDocument, suggestionsEnabled: true, promotionReady: true,
         dismissedCandidateIds, unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
         manuscriptText: captured.sourceMarkdown, sourceNewline: sourceGhostNewline
@@ -1338,6 +1341,8 @@
   $: completionWitnessSelected = completionView.witnessSelected;
   $: completionAccessibilityWitness = JSON.stringify({
     schema: 'delysis.loom-completion-witness.v1',
+    writer_id: currentWriter?.model_id ?? '',
+    writer_source: configuredWriter ? 'configured_server' : 'native',
     mode,
     context_key: boundCompletionSession?.contextKey ?? '',
     session_cached: Boolean(boundCompletionSession),
@@ -1415,7 +1420,7 @@
         ? 'Needs attention'
         : !suggestionsEnabled
           ? 'Off'
-          : currentModel
+          : currentWriter
             ? 'Ready'
             : 'Set up';
   $: nativeWindowTitle = activeMaterial?.name ?? (materialsOpen ? 'Add sources' : null) ?? document?.summary.title ?? project?.title ?? 'Loom';
@@ -1470,7 +1475,7 @@
       completionContextKey,
       editVersion
     ),
-    modelAvailable: Boolean(currentModel),
+    modelAvailable: Boolean(currentWriter),
     modelTransitioning: modelLoading || modelUnloading,
     compositionActive,
     visualMutationPending,
@@ -1506,7 +1511,7 @@
     enabled: desktop &&
       branchPromotionReady &&
       completionAutomationActive &&
-      Boolean(currentModel) &&
+      Boolean(currentWriter) &&
       activeBranchCount === 0 &&
       completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion),
     disposition: mode === 'visual'
@@ -4018,7 +4023,7 @@
       !desktop ||
       !project ||
       !document ||
-      !currentModel ||
+      !currentWriter ||
       !completionAutomationActive ||
       !branchPromotionReady
     ) return;
@@ -4057,7 +4062,7 @@
         intentEpoch: completionController.intentEpoch,
         mode: retryMode,
         targetByte,
-        modelId: currentModel.model_id,
+        modelId: currentWriter.model_id,
         sourceNewline: retryMode === 'source' ? sourceGhostNewline : null,
         waitsRemaining: maximumAutocompleteRetryWaits
       });
@@ -4486,7 +4491,7 @@
       !applicationAllowsModelPreparation(applicationClosePhase) ||
       !captured ||
       !completionAutomationActive ||
-      currentModel || unavailableWorkspaceWriterKey === workspaceWriterKey()
+      currentWriter || unavailableWorkspaceWriterKey === workspaceWriterKey()
     ) return;
     requestPreferredWriterEnsure(captured);
   }
@@ -4494,7 +4499,7 @@
   function drainPreferredWriterEnsure(): Promise<boolean> {
     if (preferredWriterEnsureInFlight) return preferredWriterEnsureInFlight;
     const captured = preferredWriterPending;
-    if (!captured) return Promise.resolve(Boolean(currentModel));
+    if (!captured) return Promise.resolve(Boolean(currentWriter));
     if (unavailableWorkspaceWriterKey === workspaceWriterKey()) {
       clearPreferredWriterRequest(captured);
       return Promise.resolve(false);
@@ -4535,7 +4540,7 @@
       !workspaceRestoreIsCurrent(captured)
     ) return false;
     if (!await prepareWorkspaceWriterTemplate(captured)) return false;
-    if (currentModel) {
+    if (currentWriter) {
       if (document) scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
       return true;
     }
@@ -4552,7 +4557,7 @@
     }
     await tick();
     if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
-    if (currentModel) {
+    if (currentWriter) {
       if (document) scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
       return true;
     }
@@ -4567,12 +4572,13 @@
     const refreshSerial = ++modelRefreshSerial;
     modelRefreshInFlightCount += 1;
     try {
-      const discovered = await listModels();
+      const [discovered, inference] = await Promise.all([listModels(), getInferenceStatus()]);
       if (
         !componentMounted ||
         refreshSerial !== modelRefreshSerial ||
         (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
       ) return false;
+      configuredWriter = inference.suggestions;
       models = discovered;
       const rememberedPath = loadLastLocalModelPath();
       selectedModelPath = preferredWriterModelPath(
@@ -5595,7 +5601,7 @@
         clearPreferredWriterRequest();
         scheduleActiveBranchPoll();
       }
-      let writerReady = Boolean(currentModel);
+      let writerReady = Boolean(currentWriter);
       if (automationEnabled && !writerReady) {
         const captured: WorkspaceRestoreCapture = {
           restoreSerial: workspaceRestoreSerial,
@@ -5603,11 +5609,11 @@
           sessionId: boundProject.session_id
         };
         requestPreferredWriterEnsure(captured);
-        writerReady = Boolean(currentModel);
+        writerReady = Boolean(currentWriter);
       }
       announce(enabled
         ? writerReady
-          ? 'Suggestions on; Loom will quietly prepare private strands when typing pauses'
+          ? 'Suggestions on; Loom will quietly prepare strands when typing pauses'
           : 'Suggestions on; Loom is preparing a tested local writer'
         : 'Suggestions off');
       if (engineBecameEnabled && writerReady && document) {
@@ -6154,9 +6160,9 @@
       return false;
     }
 
-    if (suggestionsEnabled && currentModel && document) {
+    if (suggestionsEnabled && currentWriter && document) {
       scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
-    } else if (suggestionsEnabled && !currentModel) {
+    } else if (suggestionsEnabled && !currentWriter) {
       queuePreferredWriterRequest(captured);
     }
     return true;
@@ -7180,7 +7186,7 @@
     if (
       !project ||
       !document ||
-      !currentModel ||
+      !currentWriter ||
       !completionAutomationActive ||
       project.project_id !== ticket.projectId ||
       project.session_id !== ticket.sessionId ||
@@ -7191,7 +7197,7 @@
       editVersion !== ticket.editVersion ||
       completionController.intentEpoch !== ticket.intentEpoch ||
       mode !== ticket.mode ||
-      currentModel.model_id !== ticket.modelId ||
+      currentWriter.model_id !== ticket.modelId ||
       sourceGhostNewline !== ticket.sourceNewline ||
       !branchPromotionReady
     ) return null;
@@ -7907,7 +7913,7 @@
         cancelSuggestionTimer();
         scheduleActiveBranchPoll();
       }
-      let writerReady = Boolean(currentModel);
+      let writerReady = Boolean(currentWriter);
       if (automationEnabled && !writerReady) {
         const captured: WorkspaceRestoreCapture = {
           restoreSerial: workspaceRestoreSerial,
@@ -7916,7 +7922,7 @@
         };
         await tick();
         requestPreferredWriterEnsure(captured);
-        writerReady = Boolean(currentModel);
+        writerReady = Boolean(currentWriter);
       }
       if (engineBecameEnabled && writerReady && document) {
         scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'explicit_enable');
@@ -8350,7 +8356,7 @@
       contextEpoch === captured.contextEpoch &&
       editVersion === captured.editVersion &&
       completionController.intentEpoch === captured.intentEpoch &&
-      currentModel?.model_id === captured.modelId &&
+      currentWriter?.model_id === captured.modelId &&
       completionAutomationActive
     );
   }
@@ -8491,7 +8497,7 @@
   }
 
   async function startAutomaticWeave(): Promise<boolean> {
-    if (loompadBackgroundPaused() || terminalIsBusy() || weaveStarting || !project || !document || !currentModel) return false;
+    if (loompadBackgroundPaused() || terminalIsBusy() || weaveStarting || !project || !document || !currentWriter) return false;
     const startingEditVersion = editVersion;
     if (compositionActive || !flushEditors()) return false;
     if (editVersion !== startingEditVersion) {
@@ -8524,7 +8530,7 @@
       cursorByte,
       editVersion,
       intentEpoch: completionController.intentEpoch,
-      modelId: currentModel.model_id,
+      modelId: currentWriter.model_id,
       sourceDocument: document,
       sourceMarkdown: documentText
     };
@@ -8556,7 +8562,7 @@
         uncertainWeave = null;
         if (started.branches.some(isBranchActive)) scheduleWeaveStatusPoll(captured);
         announce(started.branches.some(isBranchActive)
-          ? 'Suggestions are growing privately'
+          ? 'Suggestions are growing'
           : 'Stored strands were recovered');
       } else {
         await cancelDetachedWeave(started, captured);
@@ -9305,7 +9311,7 @@
     await tick();
     if (contextPaneOpen) focusContextEditorAtEnd();
     else focusCurrentWritingSurfaceAtEnd();
-    if (completionAutomationActive && currentModel && document) {
+    if (completionAutomationActive && currentWriter && document) {
       scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
     }
     announce(`${next} editor mode`);
@@ -9381,7 +9387,7 @@
       applicationAllowsModelPreparation(applicationClosePhase)
     ) {
       requestPreferredWriterForCurrentWorkspace();
-      if (currentModel && document) {
+      if (currentWriter && document) {
         scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
       }
     }

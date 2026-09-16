@@ -10,11 +10,17 @@ publish.workspace = true
 [dependencies]
 fte-types = { path = "../fte-types" }
 tokio.workspace = true
+tokio-util.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+axum.workspace = true
+fte-providers = { path = "../fte-providers" }
+fte-protocols = { path = "../fte-protocols" }
+fte-store = { path = "../fte-store" }
 
 [lints]
 workspace = true

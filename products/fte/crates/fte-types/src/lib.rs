@@ -14,6 +14,14 @@ use uuid::Uuid;
 
 pub const DEFAULT_EVENT_CAPACITY: usize = 256;
 
+/// Injected response persistence. The gateway owns ordering relative to its
+/// terminal event; products own the storage implementation and its lifetime.
+pub trait ResponseStore: Send + Sync {
+    fn put(&self, response: &GatewayResponse) -> Result<(), GatewayError>;
+    fn get(&self, id: &str) -> Result<Option<GatewayResponse>, GatewayError>;
+    fn delete(&self, id: &str) -> Result<bool, GatewayError>;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, Ord, PartialOrd)]
 #[serde(transparent)]
 pub struct RequestId(pub String);
@@ -50,6 +58,18 @@ pub enum ModelSelector {
     Profile {
         name: String,
     },
+    /// Application-authorized exact routes in fallback order. Scoring never
+    /// changes this order and ordinary privacy/capability gates still apply.
+    Priority {
+        routes: Vec<RouteTarget>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteTarget {
+    pub backend_id: String,
+    pub model_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -82,6 +102,21 @@ pub struct GatewayRequest {
 
 impl GatewayRequest {
     pub fn validate(&self) -> Result<(), GatewayError> {
+        if let ModelSelector::Priority { routes } = &self.model
+            && (routes.is_empty()
+                || routes.len() > 16
+                || routes.iter().enumerate().any(|(index, route)| {
+                    route.backend_id.is_empty()
+                        || route.model_id.is_empty()
+                        || routes[..index].contains(route)
+                }))
+        {
+            return Err(GatewayError::invalid_request(
+                &self.request_id,
+                "route_priority_invalid",
+                "priority routing requires between one and sixteen distinct exact routes",
+            ));
+        }
         if self.client_id.trim().is_empty() {
             return Err(GatewayError::invalid_request(
                 &self.request_id,
@@ -134,6 +169,34 @@ pub enum GenerationInput {
 }
 
 impl GenerationInput {
+    /// Required content modalities, bounded by the four canonical variants.
+    /// Function-result content is subject to the same gate as message content.
+    #[must_use]
+    pub fn required_modalities(&self) -> Vec<Modality> {
+        let mut modalities = vec![Modality::Text];
+        if let Self::Chat { items } = self {
+            for item in items {
+                let blocks = match item {
+                    InputItem::Message { content, .. } => content,
+                    InputItem::FunctionResult { output, .. } => output,
+                    _ => continue,
+                };
+                for block in blocks {
+                    let modality = match block {
+                        ContentBlock::Image { .. } => Modality::Image,
+                        ContentBlock::Audio { .. } => Modality::Audio,
+                        ContentBlock::Document { .. } => Modality::Document,
+                        _ => Modality::Text,
+                    };
+                    if !modalities.contains(&modality) {
+                        modalities.push(modality);
+                    }
+                }
+            }
+        }
+        modalities
+    }
+
     #[must_use]
     pub const fn prompt_form(&self) -> PromptForm {
         match self {
@@ -504,7 +567,19 @@ pub struct ModelDescriptor {
     pub capabilities: ModelCapabilities,
     pub context_tokens: Option<u32>,
     pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub quota: QuotaLimits,
     pub observed: RouteObservations,
+}
+
+/// Explicit finite ceilings. None means unknown/unmetered, never zero.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct QuotaLimits {
+    pub requests_per_minute: Option<u64>,
+    pub requests_per_day: Option<u64>,
+    pub tokens_per_minute: Option<u64>,
+    pub tokens_per_day: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

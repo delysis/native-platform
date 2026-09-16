@@ -1,5 +1,6 @@
 //! Persistent gateway state and injected secret/cache-store boundaries.
 
+pub use fte_types::ResponseStore;
 use fte_types::{GatewayError, GatewayResponse, RequestId};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::path::Path;
@@ -7,12 +8,6 @@ use std::sync::Mutex;
 
 pub trait SecretResolver: Send + Sync {
     fn resolve(&self, provider: &str) -> Result<Option<String>, GatewayError>;
-}
-
-pub trait ResponseStore: Send + Sync {
-    fn put(&self, response: &GatewayResponse) -> Result<(), GatewayError>;
-    fn get(&self, id: &str) -> Result<Option<GatewayResponse>, GatewayError>;
-    fn delete(&self, id: &str) -> Result<bool, GatewayError>;
 }
 
 pub struct SqliteStore {

@@ -216,3 +216,32 @@ closure for a non-reading SSE client. An ignored real-GGUF adapter test proves
 cold prefix creation, second-request restoration, raw Completion input, one
 resident model across those requests, explicit adapter drain, and final joined
 host shutdown using `MOM_LLAMA_MODEL_PATH`.
+
+## Embedded policy and persistence
+
+`ModelSelector::Priority` accepts one to sixteen distinct exact backend/model
+routes. Their order is authoritative; normal privacy, modality, readiness,
+quota and circuit gates still apply. Named `local-only` and `hosted-only`
+selectors constrain location independently of the surrounding routing profile.
+
+`ModelDescriptor::quota` supplies optional finite minute/day request and token
+ceilings. Admission and settlement are shared by every transport; limits are
+process-local, not a provider-account billing guarantee. Unknown usage does not
+refund a finite token window. Server tokenization and upstream limits remain
+authoritative.
+
+Applications that support `store_response` or `previous_response_id` must inject
+one `ResponseStore` with `Gateway::bind_response_store`. The gateway persists a
+response before publishing successful completion and restores route affinity
+from that store on later requests. Missing storage, failed persistence, and
+protocols that cannot restore continuation IDs return explicit errors. The
+loopback and Tauri edges bind their stores to this same gateway boundary.
+
+`Builder::with_defaults` now returns `Result<Builder, GatewayError>` and updates
+the existing gateway's metadata. Use `?` when composing a builder. Registered
+backends and injected storage are retained.
+
+Loom embeds the router and provider crates directly for its optional global
+[dotfile](../../loom/docs/inference-dotfile.md). Its native writer keeps its own
+native receipt and token contract. This integration starts neither the generic
+FTE Tauri plugin nor a loopback server or default gateway database.

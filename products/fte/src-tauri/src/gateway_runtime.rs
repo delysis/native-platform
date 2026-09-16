@@ -239,7 +239,10 @@ impl GatewayRuntimeOwner {
         let database = Arc::new(RwLock::new(None));
         let gateway = Arc::new(
             Gateway::new(GatewayDefaults {
-                catalog_version: "free-token-energy-desktop-v2".to_string(),
+                catalog_version: format!(
+                    "free-token-energy-desktop-v2;{}",
+                    fte_providers::omp2_catalog_version()?
+                ),
             })
             .with_outcome_observer(Arc::new(DesktopActivityObserver {
                 database: Arc::clone(&database),
@@ -1075,82 +1078,48 @@ fn register_hosted_backends(
         },
     );
 
-    if let Some(entries) = catalog.remove("anthropic") {
-        register(
-            gateway,
-            HostedProviderConfig::anthropic(
-                "anthropic",
-                "Anthropic",
-                "anthropic",
-                descriptors("anthropic", entries, true, true),
-            ),
-            Arc::clone(&secrets),
-        )?;
-    }
-
-    if let Some(entries) = catalog.remove("gemini") {
-        let mut models = descriptors("gemini", entries, true, false);
-        for model in &mut models {
-            model.capabilities.structured_output = true;
-        }
-        register(
-            gateway,
-            HostedProviderConfig::gemini("gemini", "Google Gemini", "gemini", models),
-            Arc::clone(&secrets),
-        )?;
-    }
-
-    for (id, name, chat, completion) in [
-        (
-            "openrouter",
-            "OpenRouter",
-            "https://openrouter.ai/api/v1/chat/completions",
-            Some("https://openrouter.ai/api/v1/completions"),
-        ),
-        (
-            "groq",
-            "Groq Cloud",
-            "https://api.groq.com/openai/v1/chat/completions",
-            None,
-        ),
-        (
-            "mistral",
-            "Mistral AI",
-            "https://api.mistral.ai/v1/chat/completions",
-            None,
-        ),
-        (
-            "nvidia",
-            "NVIDIA NIM",
-            "https://integrate.api.nvidia.com/v1/chat/completions",
-            None,
-        ),
-        (
-            "cerebras",
-            "Cerebras",
-            "https://api.cerebras.ai/v1/chat/completions",
-            Some("https://api.cerebras.ai/v1/completions"),
-        ),
+    for (id, name) in [
+        ("anthropic", "Anthropic"),
+        ("gemini", "Google Gemini"),
+        ("openrouter", "OpenRouter"),
+        ("groq", "Groq Cloud"),
+        ("mistral", "Mistral AI"),
+        ("nvidia", "NVIDIA NIM"),
+        ("cerebras", "Cerebras"),
     ] {
         let Some(entries) = catalog.remove(id) else {
             continue;
         };
-        let mut config = HostedProviderConfig::openai_compatible(
+        let mut models = descriptors(
             id,
-            name,
-            id,
-            chat,
-            descriptors(id, entries, false, false),
+            entries,
+            matches!(id, "anthropic" | "gemini"),
+            id == "anthropic",
         );
-        config.endpoints.completions = completion.map(ToString::to_string);
+        if id == "gemini" {
+            for model in &mut models {
+                model.capabilities.structured_output = true;
+            }
+        }
+        let mut config = HostedProviderConfig::from_omp2(id, name, id, models)?;
+        // OMP² has no raw-completion operation; preserve only our explicitly
+        // contracted endpoints and model capabilities for this local extension.
+        if matches!(id, "openrouter" | "cerebras") {
+            config.endpoints.completions = config
+                .endpoints
+                .chat_completions
+                .as_deref()
+                .and_then(|url| url.strip_suffix("/chat/completions"))
+                .map(|base| format!("{base}/completions"));
+        }
         if id == "openrouter" {
             config.static_headers.insert(
-                "http-referer".to_string(),
-                "https://free-token-energy.local".to_string(),
+                "http-referer".into(),
+                "https://free-token-energy.local".into(),
             );
             config
                 .static_headers
-                .insert("x-title".to_string(), "Free Token Energy".to_string());
+                .insert("x-title".into(), "Free Token Energy".into());
         }
         register(gateway, config, Arc::clone(&secrets))?;
     }
@@ -1347,6 +1316,7 @@ fn descriptors(
                 },
                 context_tokens: None,
                 max_output_tokens: None,
+                quota: entry.quota.gateway_limits(),
                 observed: RouteObservations::default(),
             }
         })
