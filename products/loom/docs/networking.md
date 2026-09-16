@@ -99,7 +99,11 @@ The terminal can explicitly select a friend's shared model. Only the resolved
 text and explicitly resolved native media for each call cross that connection;
 raw expressions, document paths, and private attachment labels stay on the
 requesting device. Peer calls use the same document functions and nested
-pipelines as local calls. Model offers and grant reviews show the modalities
+pipelines as local calls. The admitted `.loom.md` function format selects raw
+completion or the host model's native function framing; the exact format is
+bound to each job, retry, and retained result. Configuration stays private on
+the requesting device and is retained as evidence, never implicit prompt text.
+Model offers and grant reviews show the modalities
 reported by the host's verified model/projector. Chat stop sequences still
 require the local model path.
 
@@ -488,7 +492,7 @@ execution remains unverified.
 An accepted job is committed before dispatch. Each authenticated caller owns its
 job IDs, and a retry must match the exact original input and grant. Status checks
 and cancellation never dispatch model work. The current compute protocol is
-version 3 (`app.delysis.loom/compute/3`); host and requesting ledgers are version 3.
+version 4 (`app.delysis.loom/compute/4`); host and requesting ledgers are version 4.
 Earlier experimental ledgers are preserved and rejected without migration.
 Cancellation carries the exact grant and input, so even cancellation
 that arrives before submission receives a durable terminal receipt. This spends

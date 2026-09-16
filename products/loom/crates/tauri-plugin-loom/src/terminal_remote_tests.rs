@@ -24,6 +24,23 @@ fn source(pair: &Pair) -> LoadedDocument {
         .unwrap()
 }
 
+fn document(pair: &Pair, path: &str, text: &str) {
+    pair.app
+        .state::<PluginState>()
+        .session
+        .lock()
+        .unwrap()
+        .store
+        .as_mut()
+        .unwrap()
+        .create_document_if_absent(
+            path,
+            DocumentContent::Prose(text.into()),
+            "peer recipe fixture",
+        )
+        .unwrap();
+}
+
 async fn wait(pair: &Pair, id: CommandId) -> TerminalRun {
     let deadline = std::time::Instant::now() + Duration::from_secs(8);
     loop {
@@ -154,6 +171,11 @@ async fn interrupted_pipeline_with_source(
     if let Some(material) = material {
         bindings.insert("Research".into(), material);
     }
+    let function_recipe = {
+        let state = pair.app.state::<PluginState>();
+        let mut session = state.session.lock().unwrap();
+        crate::workspace_template::function_recipe(session.store.as_mut().unwrap()).unwrap()
+    };
     let receipt = RunReceipt {
         remote: Some(target(pair)),
         literal_input: false,
@@ -178,6 +200,7 @@ async fn interrupted_pipeline_with_source(
         source_revision_id: source.revision_id,
         input_blob_id,
         context_references: None,
+        function_recipe: Some(function_recipe),
         media: media_evidence,
         model: None,
         bindings,
@@ -311,12 +334,14 @@ async fn peer_terminal_uses_the_selected_host_without_a_local_model_and_preserve
             .unwrap()
             .unwrap();
         assert!(receipt.model.is_none());
+        assert!(receipt.function_recipe.is_none());
         let evidence: serde_json::Value =
             serde_json::from_slice(&store.read_blob(receipt.steps[0]).unwrap()).unwrap();
         assert_eq!(
             evidence["receipt"]["payload"]["kind"],
             "loom_remote_execution_v1"
         );
+        assert_eq!(evidence["request"]["input"]["format"], "raw");
         assert!(
             evidence
                 .to_string()
@@ -330,6 +355,53 @@ async fn peer_terminal_uses_the_selected_host_without_a_local_model_and_preserve
         "completed"
     );
     assert_eq!(pair.executor.0.load(Ordering::SeqCst), 1);
+    pair.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_functions_freeze_the_admitted_format_without_sending_workspace_configuration() {
+    let pair = Pair::new().await;
+    let root = pair.temporary.path().join("writing");
+    document(&pair, "Polish.md", "Polish these words.");
+    document(&pair, ".loom.md", "");
+    for (format, expected) in [
+        ("model", ComputePromptFormat::Function),
+        ("raw", ComputePromptFormat::Raw),
+    ] {
+        let configuration = format!(
+            "Private configuration.\n```loom-workspace\n[functions]\nformat='{format}'\n```\n"
+        );
+        std::fs::write(root.join(".loom.md"), &configuration).unwrap();
+        let id = CommandId::new();
+        start(&pair, id, "=@\"Polish.md\"(@Draft)").await;
+        let run = wait(&pair, id).await;
+        assert_eq!(run.status, "completed", "{:?}", run.error);
+        let job = find_job(
+            &pair.project,
+            &pair.session,
+            job_id(&id.to_string(), 1),
+            &pair.app.state(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(job.request.input.format, expected);
+        assert!(job.request.input.prompt.contains("Polish these words."));
+        assert!(job.request.input.prompt.contains("My untouched writing."));
+        assert!(!job.request.input.prompt.contains("Private configuration"));
+        let receipt = read_receipt(&root, &id.to_string(), true).unwrap().unwrap();
+        assert_eq!(
+            receipt.function_recipe.unwrap().configuration.unwrap().text,
+            configuration
+        );
+        let calls = pair.executor.0.load(Ordering::SeqCst);
+        std::fs::write(root.join(".loom.md"), "Invalid configuration now.").unwrap();
+        assert_eq!(
+            start(&pair, id, "=@\"Polish.md\"(@Draft)").await.status,
+            "completed"
+        );
+        assert_eq!(pair.executor.0.load(Ordering::SeqCst), calls);
+    }
     pair.close().await;
 }
 
@@ -371,11 +443,18 @@ async fn refused_jobs_retain_delivery_reports_across_reopen_without_inventing_a_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn check_never_creates_a_later_step_and_resume_reuses_results_after_requester_reopen() {
     let pair = Pair::new().await;
-    let id = interrupted_pipeline(&pair).await;
     let root = pair.temporary.path().join("writing");
+    let configuration = "```loom-workspace\n[functions]\nformat='raw'\n```\n";
+    document(&pair, ".loom.md", configuration);
+    let id = interrupted_pipeline(&pair).await;
     // Simulate the ledger owner reopening and a newer visible manuscript.
     pair.reopen_requester().await;
     std::fs::write(root.join("Draft.md"), "New human writing must stay.").unwrap();
+    std::fs::write(
+        root.join(".loom.md"),
+        configuration.replace("'raw'", "'model'"),
+    )
+    .unwrap();
     let first_output = root.join(format!("Runs/{id}/1/Polish.md"));
     std::fs::write(&first_output, "My edited result stays too.").unwrap();
     let checked = recover(&pair, id, RecoveryMode::Check).await;
@@ -417,6 +496,33 @@ async fn check_never_creates_a_later_step_and_resume_reuses_results_after_reques
             .contains("My untouched writing.")
     );
     assert!(!final_job.request.input.prompt.contains("New human writing"));
+    assert!(!final_job.request.input.prompt.contains("loom-workspace"));
+    assert_eq!(final_job.request.input.format, ComputePromptFormat::Raw);
+    {
+        let receipt = read_receipt(&root, &id.to_string(), true).unwrap().unwrap();
+        let recipe = receipt.function_recipe.as_ref().unwrap();
+        assert_eq!(
+            recipe.format,
+            crate::workspace_template::FunctionFormat::Raw
+        );
+        assert_eq!(recipe.configuration.as_ref().unwrap().text, configuration);
+        let state = pair.app.state::<PluginState>();
+        let session = state.session.lock().unwrap();
+        let evidence: serde_json::Value = serde_json::from_slice(
+            &session
+                .store
+                .as_ref()
+                .unwrap()
+                .read_blob(*receipt.steps.last().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            evidence["function_recipe"]["configuration"]["text"],
+            configuration
+        );
+        assert_eq!(evidence["request"]["input"]["format"], "raw");
+    }
     assert_eq!(
         std::fs::read_to_string(root.join("Draft.md")).unwrap(),
         "New human writing must stay."

@@ -116,6 +116,7 @@ impl Pair {
             host: host_identity.public_key(),
             grant,
             input: ComputeInput {
+                format: loom_cabal::compute::ComputePromptFormat::Raw,
                 media: Vec::new(),
                 prompt: "A garden 🌱 @literal".into(),
                 seed: 3,

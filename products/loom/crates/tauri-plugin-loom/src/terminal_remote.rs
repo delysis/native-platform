@@ -4,7 +4,7 @@ use super::*;
 use crate::cabals::requesting::{JobDelivery, JobReply, find_job};
 use loom_cabal::compute::{
     ClientJob, ClientRequest, ComputeFailure, ComputeGrant, ComputeInput, ComputeModel,
-    ComputeRejection, ComputeStatus,
+    ComputePromptFormat, ComputeRejection, ComputeStatus,
 };
 use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
@@ -304,7 +304,20 @@ impl Evaluator<'_> {
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(super) fn complete_remote(&mut self, prompt: String) -> Result<String, IpcFailure> {
+    pub(super) fn complete_remote(
+        &mut self,
+        prompt: String,
+        mode: PromptMode,
+    ) -> Result<String, IpcFailure> {
+        let format = match mode {
+            PromptMode::RawCompletion => ComputePromptFormat::Raw,
+            PromptMode::Function => ComputePromptFormat::Function,
+            _ => {
+                return Err(failure(
+                    "This prompt format cannot run on a friend's model.",
+                ));
+            }
+        };
         if self.remote_cancel_requested()? {
             return self.settle_remote_cancellation();
         }
@@ -320,6 +333,7 @@ impl Evaluator<'_> {
             host: target.host.parse().map_err(io_failure)?,
             grant: target.grant.clone(),
             input: ComputeInput {
+                format,
                 media: crate::peer_media::encode(&self.media, &target.grant.model)?,
                 prompt,
                 max_output_tokens: 512.min(target.grant.max_output_tokens),
@@ -487,6 +501,7 @@ impl Evaluator<'_> {
                         "sources": self.receipt.sources,
                         "media": self.receipt.media,
                         "bindings": self.receipt.bindings,
+                        "function_recipe": self.receipt.function_recipe,
                         "evidence": self.receipt.evidence,
                         "searches": self.receipt.searches,
                         "omitted_evidence": self.receipt.omitted_evidence,

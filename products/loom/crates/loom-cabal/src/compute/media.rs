@@ -119,6 +119,7 @@ mod tests {
         let image = ComputeMedia::new(ComputeMediaFormat::Png, b"wire fixture")?;
         let audio = ComputeMedia::new(ComputeMediaFormat::Wav, b"audio fixture")?;
         let input = ComputeInput {
+            format: crate::compute::ComputePromptFormat::Raw,
             prompt: "Describe".into(),
             max_output_tokens: 16,
             seed: 7,

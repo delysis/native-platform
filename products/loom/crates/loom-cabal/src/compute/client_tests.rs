@@ -62,6 +62,7 @@ mod supported {
                     jobs: 2,
                 },
                 input: ComputeInput {
+                    format: ComputePromptFormat::Raw,
                     media: Vec::new(),
                     prompt: "Exact 🌱 @document =function() input".into(),
                     max_output_tokens: 16,
@@ -446,7 +447,7 @@ mod supported {
         let body: String = client
             .database
             .query_row("SELECT body FROM requests", [], |row| row.get(0))?;
-        client.database.pragma_update(None, "user_version", 2)?;
+        client.database.pragma_update(None, "user_version", 3)?;
         drop(client);
         assert!(fixture.open().is_err());
         let database = Connection::open(fixture.directory.path().join("requests.db"))?;
@@ -455,7 +456,7 @@ mod supported {
                 .get::<_, String>(0))?,
             body
         );
-        database.pragma_update(None, "user_version", 3)?;
+        database.pragma_update(None, "user_version", STORAGE_VERSION)?;
         drop(database);
         assert!(
             ComputeClient::open(fixture.directory.path(), Identity::generate()?.public_key())

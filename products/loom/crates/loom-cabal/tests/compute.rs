@@ -199,6 +199,7 @@ impl Pair {
 
 fn input() -> ComputeInput {
     ComputeInput {
+        format: loom_cabal::compute::ComputePromptFormat::Raw,
         media: Vec::new(),
         prompt: "A small garden 🌱".into(),
         max_output_tokens: 128,
@@ -436,6 +437,18 @@ async fn explicit_grant_and_authenticated_job_retries_run_once_over_quic() -> Re
         ComputeRejection::MismatchedRetry,
     );
     rejected(pair.submit(Uuid::new_v4()).await?, ComputeRejection::Busy);
+    let mut reframed = input();
+    reframed.format = loom_cabal::compute::ComputePromptFormat::Function;
+    assert_ne!(
+        reframed.fingerprint(pair.grant.id)?,
+        input().fingerprint(pair.grant.id)?
+    );
+    rejected(
+        pair.peer
+            .compute_submit(pair.network.address(), job, pair.grant.id, reframed)
+            .await?,
+        ComputeRejection::MismatchedRetry,
+    );
     let stranger = Network::start(&Identity::generate()?, NetworkMode::Direct {}).await?;
     rejected(
         stranger.compute_status(pair.network.address(), job).await?,

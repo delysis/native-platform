@@ -52,7 +52,7 @@ impl Ledger {
         let exists = database_path.exists();
         let database = Connection::open(&database_path)?;
         let version: i64 = database.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if exists && version != 3 {
+        if exists && version != STORAGE_VERSION {
             return Err(Error::Invalid(
                 "Unsupported compute ledger; it was preserved",
             ));
@@ -82,7 +82,7 @@ impl Ledger {
                 "INSERT INTO owner(key) VALUES (?)",
                 [identity.public_key().to_string()],
             )?;
-            database.pragma_update(None, "user_version", 3)?;
+            database.pragma_update(None, "user_version", STORAGE_VERSION)?;
             #[cfg(unix)]
             File::open(directory)?.sync_all()?;
         }
@@ -479,6 +479,7 @@ mod tests {
                 jobs: 1,
             },
             input: ComputeInput {
+                format: ComputePromptFormat::Raw,
                 media: Vec::new(),
                 prompt: "Preserved input".into(),
                 max_output_tokens: 10,
@@ -598,7 +599,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("compute.db");
         let database = Connection::open(&path)?;
-        database.execute_batch("PRAGMA user_version = 2; CREATE TABLE sentinel (body TEXT); INSERT INTO sentinel VALUES ('keep me');")?;
+        database.execute_batch("PRAGMA user_version = 3; CREATE TABLE sentinel (body TEXT); INSERT INTO sentinel VALUES ('keep me');")?;
         drop(database);
         let before = std::fs::read(&path)?;
         assert!(Ledger::open(directory.path(), Identity::generate()?).is_err());

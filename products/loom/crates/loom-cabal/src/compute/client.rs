@@ -126,7 +126,7 @@ impl ComputeClient {
         let database = Connection::open_with_flags(&database_path, flags)?;
         let version: i64 = database.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if exists {
-            if version != 3 {
+            if version != STORAGE_VERSION {
                 return Err(Error::Invalid(
                     "Unsupported compute requests; they were preserved",
                 ));
@@ -151,7 +151,7 @@ impl ComputeClient {
                 CREATE TABLE receipts (job TEXT NOT NULL REFERENCES requests(id), revision INTEGER NOT NULL,
                     terminal INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(job, revision));")?;
             database.execute("INSERT INTO owner(key) VALUES (?)", [peer.to_string()])?;
-            database.pragma_update(None, "user_version", 3)?;
+            database.pragma_update(None, "user_version", STORAGE_VERSION)?;
             File::open(directory)?.sync_all()?;
         }
         let client = Self {

@@ -260,6 +260,7 @@ mod tests {
         let host = Identity::generate()?;
         let peer = Identity::generate()?.public_key();
         let input = ComputeInput {
+            format: ComputePromptFormat::Raw,
             media: Vec::new(),
             prompt: "My words".into(),
             max_output_tokens: 10,
@@ -294,6 +295,28 @@ mod tests {
             receipt: Box::new(host.sign(record.clone())?),
         };
         validate_response(&response, &request, host.public_key(), peer)?;
+        let mut reframed = input.clone();
+        reframed.format = ComputePromptFormat::Function;
+        assert!(
+            validate_response(
+                &response,
+                &Request::Submit {
+                    job,
+                    grant,
+                    input: reframed
+                },
+                host.public_key(),
+                peer,
+            )
+            .is_err(),
+            "a signed raw result cannot stand in for a function result"
+        );
+        let mut old_input = serde_json::to_value(&input)?;
+        old_input
+            .as_object_mut()
+            .expect("input object")
+            .remove("format");
+        assert!(serde_json::from_value::<ComputeInput>(old_input).is_err());
         let bytes = encode(&response)?;
         assert!(String::from_utf8_lossy(&bytes).contains("loom_remote_execution_v1"));
         validate_response(

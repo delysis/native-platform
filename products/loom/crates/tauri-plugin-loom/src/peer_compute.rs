@@ -332,7 +332,7 @@ impl NativeExecutor {
             candidate,
             &prepared.request_id,
             prepared.prompt_blob,
-            PromptMode::RawCompletion,
+            prompt_mode(job.input.format),
             &result.context_binding,
             &model.descriptor,
             0,
@@ -398,6 +398,13 @@ struct Prepared {
     prompt_blob: BlobId,
 }
 
+fn prompt_mode(format: loom_cabal::compute::ComputePromptFormat) -> PromptMode {
+    match format {
+        loom_cabal::compute::ComputePromptFormat::Raw => PromptMode::RawCompletion,
+        loom_cabal::compute::ComputePromptFormat::Function => PromptMode::Function,
+    }
+}
+
 fn prepare(
     store: &mut ProjectStore,
     model: &LoadedModel,
@@ -433,7 +440,7 @@ fn prepare(
         .store_provenance_blob(job.input.prompt.as_bytes())
         .map_err(failed)?;
     let recipe = PromptRecipe {
-        mode: PromptMode::RawCompletion,
+        mode: prompt_mode(job.input.format),
         exact_prompt_blob_id: prompt_blob,
         exact_prompt_token_ids: None,
         ordered_input_artifact_ids: vec![source.artifact_id],

@@ -31,7 +31,8 @@ pub use media::{
 };
 pub use wire::Response as ComputeReply;
 pub(crate) use wire::{Handler, Request, Response, request};
-pub(crate) const ALPN: &[u8] = b"app.delysis.loom/compute/3";
+pub(crate) const ALPN: &[u8] = b"app.delysis.loom/compute/4";
+const STORAGE_VERSION: i64 = 4;
 pub const MAX_COMPUTE_TEXT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_TOKENS: u32 = 2048;
 const MAX_JOB_SECONDS: u32 = 120;
@@ -100,9 +101,18 @@ impl ComputeGrant {
 #[serde(deny_unknown_fields)]
 pub struct ComputeInput {
     pub prompt: String,
+    pub format: ComputePromptFormat,
     pub max_output_tokens: u32,
     pub seed: u32,
     pub media: Vec<ComputeMedia>,
+}
+
+/// Explicit model framing, bound to the exact request and every retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputePromptFormat {
+    Raw,
+    Function,
 }
 
 impl ComputeInput {
@@ -131,7 +141,7 @@ impl ComputeInput {
     pub fn fingerprint(&self, grant: Uuid) -> Result<String> {
         self.validate()?;
         Ok(hex::encode(Sha256::digest(serde_json::to_vec(&(
-            "loom_compute_input_v2",
+            "loom_compute_input_v3",
             grant,
             self,
         ))?)))

@@ -19,6 +19,7 @@ fn input_job(model: ComputeModel) -> HostComputeJob {
             jobs: 1,
         },
         input: ComputeInput {
+            format: loom_cabal::compute::ComputePromptFormat::Raw,
             media: Vec::new(),
             prompt: "@Private =function() stays literal. 🌱".into(),
             max_output_tokens: 16,
@@ -138,6 +139,10 @@ fn peer_input_is_literal_derived_writing_with_private_provenance_and_no_duplicat
     assert_eq!(prepared.request.exact_manuscript_prefix, job.input.prompt);
     assert!(prepared.request.context_preamble.is_empty());
     assert!(prepared.request.media.is_empty());
+    assert_eq!(
+        prepared.request.prompt_recipe.mode,
+        PromptMode::RawCompletion
+    );
     assert_eq!(prepared.request.cases.len(), 1);
     let source = store
         .read_document(format!("Requests/{}/{}.md", job.peer, job.id))
@@ -155,6 +160,15 @@ fn peer_input_is_literal_derived_writing_with_private_provenance_and_no_duplicat
         "even an accidental second adapter invocation cannot rerun a recorded job"
     );
     assert_eq!(store.list_documents().expect("documents").len(), 1);
+    let mut function_job = input_job(model_claim(&model).expect("model claim"));
+    function_job.input.format = loom_cabal::compute::ComputePromptFormat::Function;
+    let function = prepare(&mut store, &model, &function_job).expect("prepare function input");
+    assert_eq!(function.request.prompt_recipe.mode, PromptMode::Function);
+    assert_eq!(
+        function.request.exact_manuscript_prefix,
+        function_job.input.prompt
+    );
+    assert!(function.request.context_preamble.is_empty());
 }
 
 #[cfg(unix)]
