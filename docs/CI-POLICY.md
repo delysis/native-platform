@@ -85,3 +85,13 @@ non-Unix tests assert that boundary, while portable protocol/schema tests remain
 enabled. No platform is certified by compiling it. Signing, OS credentials,
 loaded-model shutdown, and visible packaged interactions require their own
 current evidence.
+
+Loom handoff additionally requires the actual packaged writing journey with the
+cached Gemma writer. `scripts/smoke-macos-app.sh loom` fails before launch without
+both model and projector; real completions are mandatory. Exercise visible ghost
+text, a four-candidate family, Option-Up/Down cycling, acceptance, exact reversal,
+and saved writing after reopening. Bind the result to the delivered executable,
+not a separate development server or an older app. Missing local acceptance is
+unfinished work, even when macOS CI passes. Run focused checks while editing and
+one warm-model acceptance session after the build settles. Keep Linux/Windows
+advisory; do not turn this into a full-workspace build for every edit.

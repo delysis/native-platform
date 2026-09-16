@@ -74,33 +74,6 @@ func completionWitness() -> [String: Any]? {
     return nil
 }
 
-func supportsPress(_ element: AXUIElement) -> Bool {
-    var names: CFArray?
-    guard AXUIElementCopyActionNames(element, &names) == .success,
-          let actions = names as? [String] else { return false }
-    return actions.contains(kAXPressAction as String)
-}
-
-func button(named name: String) -> AXUIElement? {
-    descendants().first { element in
-        strings(element).contains(where: { $0.contains(name) }) &&
-            supportsPress(element) &&
-            (attribute(element, kAXEnabledAttribute as CFString) as? Bool) != false
-    }
-}
-
-func pressButton(named name: String, timeout: TimeInterval = 10) -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    repeat {
-        if let control = button(named: name),
-           AXUIElementPerformAction(control, kAXPressAction as CFString) == .success {
-            return true
-        }
-        Thread.sleep(forTimeInterval: 0.05)
-    } while Date() < deadline
-    return false
-}
-
 func visual(_ witness: [String: Any]) -> [String: Any] {
     witness["visual"] as? [String: Any] ?? [:]
 }
@@ -495,7 +468,8 @@ guard let optionReleased = waitForWitness(timeout: 10, { witness in
     exit(1)
 }
 
-guard pressButton(named: "Turn Shuttle on") else {
+guard postKey(38, down: true, flags: [.maskCommand, .maskShift]),
+      postKey(38, down: false, flags: [.maskCommand, .maskShift]) else {
     fputs("could not enable Shuttle on the cached completion session\n", stderr)
     exit(1)
 }
@@ -539,7 +513,8 @@ guard shuttleAcceptedBytes.count - original.count == integer(shuttleAction, "ins
     exit(1)
 }
 
-guard pressButton(named: "Turn Shuttle off") else {
+guard postKey(38, down: true, flags: [.maskCommand, .maskShift]),
+      postKey(38, down: false, flags: [.maskCommand, .maskShift]) else {
     fputs("could not stop Shuttle after its first cached word\n", stderr)
     exit(1)
 }
@@ -723,7 +698,8 @@ guard let tabReleased = waitForWitness(timeout: 10, { witness in
     exit(1)
 }
 
-guard pressButton(named: "Turn autocomplete off") else {
+guard postKey(5, down: true, flags: [.maskCommand, .maskShift]),
+      postKey(5, down: false, flags: [.maskCommand, .maskShift]) else {
     fputs("could not turn the shared completion engine off after cached checks\n", stderr)
     exit(1)
 }

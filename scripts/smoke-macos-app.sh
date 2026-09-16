@@ -6,7 +6,7 @@ COMPONENT=${1:-}
 SUPPLIED_ARTIFACT=${2:-}
 RECEIPT_DESTINATION=${3:-}
 LOOM_SMOKE_GGUF_MODEL_PATH=${LOOM_SMOKE_GGUF_MODEL_PATH:-}
-LOOM_SMOKE_REAL_COMPLETIONS=${LOOM_SMOKE_REAL_COMPLETIONS:-}
+LOOM_SMOKE_PROJECTOR_PATH=${LOOM_SMOKE_PROJECTOR_PATH:-}
 MOM_ACCEPTANCE_PRODUCT_NAME=${MOM_ACCEPTANCE_PRODUCT_NAME:-}
 MOM_ACCEPTANCE_BUNDLE_ID=${MOM_ACCEPTANCE_BUNDLE_ID:-}
 MOM_ACCEPTANCE_SOURCE_SHA=${MOM_ACCEPTANCE_SOURCE_SHA:-}
@@ -120,12 +120,18 @@ if [ -n "$DELYSIS_ACCEPTANCE_SOURCE_SHA" ]; then
   fi
 fi
 
-if [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ] && [ ! -f "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
-  echo "LOOM_SMOKE_GGUF_MODEL_PATH is not a model file: $LOOM_SMOKE_GGUF_MODEL_PATH" >&2
-  exit 1
-fi
-if [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
-  LOOM_SMOKE_REAL_COMPLETIONS=1
+if [ "$COMPONENT" = loom ]; then
+  # An isolated editor with no writer is not a Loom acceptance run. Fail before
+  # building helpers or opening a window; never silently downgrade to fixtures.
+  if [ ! -f "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
+    echo "Loom acceptance requires local Gemma: set LOOM_SMOKE_GGUF_MODEL_PATH to the cached gemma-4-12b-it-qat-q4_0.gguf file" >&2
+    exit 1
+  fi
+  LOOM_SMOKE_PROJECTOR_PATH=${LOOM_SMOKE_PROJECTOR_PATH:-$(dirname -- "$LOOM_SMOKE_GGUF_MODEL_PATH")/mmproj-gemma-4-12b-it-qat-q4_0.gguf}
+  if [ ! -f "$LOOM_SMOKE_PROJECTOR_PATH" ]; then
+    echo "Loom acceptance requires the matching local projector: set LOOM_SMOKE_PROJECTOR_PATH" >&2
+    exit 1
+  fi
 fi
 
 require_equal() {
@@ -264,6 +270,7 @@ PRODUCT_STATE_CANONICAL=$(CDPATH= cd -- "$PRODUCT_STATE" && pwd -P)
 ACTIVE_PID=
 ACTIVE_LAUNCHER_PID=
 LOOM_SMOKE_MODEL_LINK=
+LOOM_SMOKE_PROJECTOR_LINK=
 LOOM_PROJECT_BUSY_MONITOR_PID=
 LOOM_PROJECT_BUSY_MONITOR_STOP=
 LOOM_GENERATION_GUARD_PID=
@@ -305,6 +312,9 @@ cleanup_failed_process() {
   if [ -n "$LOOM_SMOKE_MODEL_LINK" ] && [ -f "$LOOM_SMOKE_MODEL_LINK" ]; then
     unlink "$LOOM_SMOKE_MODEL_LINK"
   fi
+  if [ -n "$LOOM_SMOKE_PROJECTOR_LINK" ] && [ -f "$LOOM_SMOKE_PROJECTOR_LINK" ]; then
+    unlink "$LOOM_SMOKE_PROJECTOR_LINK"
+  fi
 }
 trap cleanup_failed_process EXIT HUP INT TERM
 
@@ -313,18 +323,23 @@ SMOKE_HELPERS="$SMOKE_ROOT/helpers"
 cargo run --quiet --locked --manifest-path "$ROOT/Cargo.toml" -p xtask -- \
   macos-smoke-support "$SMOKE_HELPERS"
 
-if [ "$COMPONENT" = loom ] && [ -n "$LOOM_SMOKE_GGUF_MODEL_PATH" ]; then
+if [ "$COMPONENT" = loom ]; then
   model_library="$PRODUCT_STATE/models"
   mkdir -p "$model_library"
-  LOOM_SMOKE_MODEL_LINK="$model_library/gemma-4-12B-it-qat-q4_0.gguf"
+  LOOM_SMOKE_MODEL_LINK="$model_library/gemma-4-12b-it-qat-q4_0.gguf"
+  LOOM_SMOKE_PROJECTOR_LINK="$model_library/mmproj-gemma-4-12b-it-qat-q4_0.gguf"
   if [ -e "$LOOM_SMOKE_MODEL_LINK" ]; then
     echo "isolated acceptance model target already exists: $LOOM_SMOKE_MODEL_LINK" >&2
     exit 1
   fi
-  ln "$LOOM_SMOKE_GGUF_MODEL_PATH" "$LOOM_SMOKE_MODEL_LINK"
+  ln -L "$LOOM_SMOKE_GGUF_MODEL_PATH" "$LOOM_SMOKE_MODEL_LINK"
+  ln -L "$LOOM_SMOKE_PROJECTOR_PATH" "$LOOM_SMOKE_PROJECTOR_LINK"
   require_equal "acceptance model hard-link identity" \
     "$(stat -Lf '%d:%i' "$LOOM_SMOKE_GGUF_MODEL_PATH")" \
     "$(stat -Lf '%d:%i' "$LOOM_SMOKE_MODEL_LINK")"
+  require_equal "acceptance projector hard-link identity" \
+    "$(stat -Lf '%d:%i' "$LOOM_SMOKE_PROJECTOR_PATH")" \
+    "$(stat -Lf '%d:%i' "$LOOM_SMOKE_PROJECTOR_LINK")"
 fi
 
 foreground_loom_process() {
@@ -367,11 +382,6 @@ type_into_loom_editor() {
   "$SMOKE_HELPERS/type_into_loom_editor" "$target_pid" "$sentinel"
 }
 
-exercise_loom_completion_controls() {
-  target_pid=$1
-  "$SMOKE_HELPERS/exercise_loom_completion_controls" "$target_pid"
-}
-
 exercise_loom_formatting_palette() {
   target_pid=$1
   action_name=$2
@@ -394,10 +404,9 @@ require_loom_editor_state() {
 
 set_loom_completion_toggle() {
   target_pid=$1
-  control_name=$2
-  already_name=$3
-  press_requirement=${4:-allow-already}
-  "$SMOKE_HELPERS/set_loom_completion_toggle" "$target_pid" "$control_name" "$already_name" "$press_requirement"
+  target_state=$2
+  press_requirement=${3:-allow-already}
+  "$SMOKE_HELPERS/set_loom_completion_toggle" "$target_pid" "$target_state" "$press_requirement"
 }
 
 wait_for_loom_accessibility_text() {
@@ -1195,22 +1204,14 @@ run_once() {
       echo "application logs: $stdout_log and $stderr_log" >&2
       return 1
     fi
-    if [ -n "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
-      if ! RUN_1_AUTOCOMPLETE_OFF_EVIDENCE=$(set_loom_completion_toggle \
-        "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"); then
-        echo "could not establish autocomplete off before real-completion typing" >&2
-        return 1
-      fi
-      loom_generation_count_before_batch=$(sqlite3 \
-        "$loom_database" \
-        'SELECT count(*) FROM generation_runs;')
-    else
-      if ! RUN_1_COMPLETION_CONTROLS_EVIDENCE=$(exercise_loom_completion_controls "$ACTIVE_PID"); then
-        echo "autocomplete and Shuttle did not behave as independent native controls" >&2
-        echo "application logs: $stdout_log and $stderr_log" >&2
-        return 1
-      fi
+    if ! RUN_1_AUTOCOMPLETE_OFF_EVIDENCE=$(set_loom_completion_toggle \
+      "$ACTIVE_PID" off); then
+      echo "could not establish autocomplete off before real-completion typing" >&2
+      return 1
     fi
+    loom_generation_count_before_batch=$(sqlite3 \
+      "$loom_database" \
+      'SELECT count(*) FROM generation_runs;')
     RUN_1_EDITOR_CORE_SENTINEL='Loom native smoke: editor persistence.'
     RUN_1_EDITOR_INPUT_SENTINEL="$RUN_1_EDITOR_CORE_SENTINEL "
     RUN_1_EDITOR_SENTINEL=$RUN_1_EDITOR_INPUT_SENTINEL
@@ -1234,136 +1235,135 @@ run_once() {
       echo "ordinary editor typing exposed a project_busy alert" >&2
       return 1
     fi
-    if [ -n "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
-      loom_generation_count_after_off_typing=$(sqlite3 \
-        "$loom_database" \
-        'SELECT count(*) FROM generation_runs;')
-      require_equal "generation-run count while autocomplete was off during typing" \
-        "$loom_generation_count_before_batch" "$loom_generation_count_after_off_typing"
-      if ! start_loom_generation_guard \
-        "$loom_database" \
-        "$loom_generation_count_before_batch" \
-        "launch-1-generation-family-guard"; then
-        echo "could not start the one-family generation guard" >&2
-        return 1
+    loom_generation_count_after_off_typing=$(sqlite3 \
+      "$loom_database" \
+      'SELECT count(*) FROM generation_runs;')
+    require_equal "generation-run count while autocomplete was off during typing" \
+      "$loom_generation_count_before_batch" "$loom_generation_count_after_off_typing"
+    if ! start_loom_generation_guard \
+      "$loom_database" \
+      "$loom_generation_count_before_batch" \
+      "launch-1-generation-family-guard"; then
+      echo "could not start the one-family generation guard" >&2
+      return 1
+    fi
+    if ! start_loom_live_streaming_monitor \
+      "$ACTIVE_PID" "$loom_database" "$loom_generation_count_before_batch" \
+      "$RUN_1_EDITOR_SENTINEL" "launch-1-live-stream-monitor" \
+      "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"; then
+      echo "could not initialize the pre-terminal WYSIWYG live-stream observer" >&2
+      return 1
+    fi
+    if ! RUN_1_AUTOCOMPLETE_ENABLE_EVIDENCE=$(set_loom_completion_toggle \
+      "$ACTIVE_PID" on "require-press"); then
+      echo "could not enable autocomplete exactly once for the real-model presentation check" >&2
+      return 1
+    fi
+    if ! wait_for_loom_live_streaming_monitor; then
+      RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-live-stream-diagnostics.json"
+      capture_loom_completion_diagnostics \
+        "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
+        "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
+      echo "a real generation never exposed correlated pre-terminal WYSIWYG ghost text" >&2
+      echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
+      cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    RUN_1_LIVE_STREAMING_EVIDENCE=$(cat "$LOOM_LIVE_STREAM_MONITOR_OUTPUT")
+    if ! RUN_1_REAL_GENERATION_EVIDENCE=$(wait_for_loom_generation_family \
+      "$loom_database" \
+      "$loom_generation_count_before_batch"); then
+      RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-completion-diagnostics.json"
+      capture_loom_completion_diagnostics \
+        "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
+        "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
+      echo "completion control state: $(loom_completion_control_state "$ACTIVE_PID" 2>&1 || true)" >&2
+      echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
+      cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
+      echo "the first real completion family violated its generation/alert guard" >&2
+      return 1
+    fi
+    if ! RUN_1_REAL_GHOST_EVIDENCE=$(wait_for_loom_accessibility_text \
+      "$ACTIVE_PID" "Suggestion available." "$RUN_1_EDITOR_SENTINEL" \
+      "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"); then
+      RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-ghost-timeout-diagnostics.json"
+      capture_loom_completion_diagnostics \
+        "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
+        "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
+      echo "a real four-way batch never produced an observed visible ghost presentation" >&2
+      echo "completion control state: $(loom_completion_control_state "$ACTIVE_PID" 2>&1 || true)" >&2
+      echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
+      cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
+      echo "visible ghost presentation admitted an extra run or exposed project_busy" >&2
+      return 1
+    fi
+    RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC="$SMOKE_ROOT/launch-1-idle-resume-identity-diagnostics.json"
+    rm -f "$RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC"
+    if ! RUN_1_IDLE_RESUME_GHOST_EVIDENCE=$(exercise_loom_idle_resume_ghost \
+      "$ACTIVE_PID" "$loom_database" "$loom_generation_count_before_batch" \
+      "$RUN_1_EDITOR_SENTINEL" \
+      "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" \
+      "$RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC"); then
+      RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-idle-resume-diagnostics.json"
+      capture_loom_completion_diagnostics \
+        "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
+        "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
+      echo "the exact cached WYSIWYG ghost did not survive native hide/idle/resume" >&2
+      echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
+      cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
+      if [ -f "$RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC" ]; then
+        echo "idle/resume identity diagnostics: $RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC" >&2
+        cat "$RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC" >&2
       fi
-      if ! start_loom_live_streaming_monitor \
-        "$ACTIVE_PID" "$loom_database" "$loom_generation_count_before_batch" \
-        "$RUN_1_EDITOR_SENTINEL" "launch-1-live-stream-monitor" \
-        "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"; then
-        echo "could not initialize the pre-terminal WYSIWYG live-stream observer" >&2
-        return 1
-      fi
-      if ! RUN_1_AUTOCOMPLETE_ENABLE_EVIDENCE=$(set_loom_completion_toggle \
-        "$ACTIVE_PID" "Turn autocomplete on" "Turn autocomplete off" "require-press"); then
-        echo "could not enable autocomplete exactly once for the real-model presentation check" >&2
-        return 1
-      fi
-      if ! wait_for_loom_live_streaming_monitor; then
-        RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-live-stream-diagnostics.json"
-        capture_loom_completion_diagnostics \
-          "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
-          "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
-        echo "a real generation never exposed correlated pre-terminal WYSIWYG ghost text" >&2
-        echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
-        cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
-        echo "application logs: $stdout_log and $stderr_log" >&2
-        return 1
-      fi
-      RUN_1_LIVE_STREAMING_EVIDENCE=$(cat "$LOOM_LIVE_STREAM_MONITOR_OUTPUT")
-      if ! RUN_1_REAL_GENERATION_EVIDENCE=$(wait_for_loom_generation_family \
-        "$loom_database" \
-        "$loom_generation_count_before_batch"); then
-        RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-completion-diagnostics.json"
-        capture_loom_completion_diagnostics \
-          "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
-          "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
-        echo "completion control state: $(loom_completion_control_state "$ACTIVE_PID" 2>&1 || true)" >&2
-        echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
-        cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
-        echo "application logs: $stdout_log and $stderr_log" >&2
-        return 1
-      fi
-      if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
-        echo "the first real completion family violated its generation/alert guard" >&2
-        return 1
-      fi
-      if ! RUN_1_REAL_GHOST_EVIDENCE=$(wait_for_loom_accessibility_text \
-        "$ACTIVE_PID" "Suggestion available." "$RUN_1_EDITOR_SENTINEL" \
-        "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"); then
-        RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-ghost-timeout-diagnostics.json"
-        capture_loom_completion_diagnostics \
-          "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
-          "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
-        echo "a real four-way batch never produced an observed visible ghost presentation" >&2
-        echo "completion control state: $(loom_completion_control_state "$ACTIVE_PID" 2>&1 || true)" >&2
-        echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
-        cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
-        echo "application logs: $stdout_log and $stderr_log" >&2
-        return 1
-      fi
-      if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
-        echo "visible ghost presentation admitted an extra run or exposed project_busy" >&2
-        return 1
-      fi
-      RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC="$SMOKE_ROOT/launch-1-idle-resume-identity-diagnostics.json"
-      rm -f "$RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC"
-      if ! RUN_1_IDLE_RESUME_GHOST_EVIDENCE=$(exercise_loom_idle_resume_ghost \
-        "$ACTIVE_PID" "$loom_database" "$loom_generation_count_before_batch" \
-        "$RUN_1_EDITOR_SENTINEL" \
-        "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE" \
-        "$RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC"); then
-        RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-idle-resume-diagnostics.json"
-        capture_loom_completion_diagnostics \
-          "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
-          "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
-        echo "the exact cached WYSIWYG ghost did not survive native hide/idle/resume" >&2
-        echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
-        cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
-        if [ -f "$RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC" ]; then
-          echo "idle/resume identity diagnostics: $RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC" >&2
-          cat "$RUN_1_IDLE_RESUME_GHOST_FAILURE_DIAGNOSTIC" >&2
-        fi
-        echo "application logs: $stdout_log and $stderr_log" >&2
-        return 1
-      fi
-      if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
-        echo "native idle/resume admitted an extra run or exposed project_busy" >&2
-        return 1
-      fi
-      loom_generation_count_before_reversal=$(sqlite3 \
-        "$loom_database" \
-        'SELECT count(*) FROM generation_runs;')
-      loom_expected_generation_count=$((loom_generation_count_before_batch + 4))
-      require_equal "generation-run count before Option reversal" \
-        "$loom_expected_generation_count" "$loom_generation_count_before_reversal"
-      if ! RUN_1_REAL_WORD_REVERSAL_EVIDENCE=$(exercise_loom_completion_word_reversal \
-        "$ACTIVE_PID" "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" \
-        "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"); then
-        RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-interaction-failure-diagnostics.json"
-        capture_loom_completion_diagnostics \
-          "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
-          "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
-        echo "the exact four-choice cache did not survive fan, Shuttle, Return, Tab, and rollback checks" >&2
-        echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
-        cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
-        echo "application logs: $stdout_log and $stderr_log" >&2
-        return 1
-      fi
-      if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
-        echo "cached completion interactions admitted a fifth run or exposed project_busy" >&2
-        return 1
-      fi
-      loom_generation_count_after_reversal=$(sqlite3 \
-        "$loom_database" \
-        'SELECT count(*) FROM generation_runs;')
-      require_equal "generation-run count across all cached completion interactions" \
-        "$loom_generation_count_before_reversal" "$loom_generation_count_after_reversal"
-      if ! DELYSIS_DATABASE_FAMILY="$RUN_1_REAL_GENERATION_EVIDENCE" \
-        DELYSIS_LIVE_STREAM_FAMILY="$RUN_1_LIVE_STREAMING_EVIDENCE" \
-        DELYSIS_IDLE_RESUME_FAMILY="$RUN_1_IDLE_RESUME_GHOST_EVIDENCE" \
-        DELYSIS_ACCESSIBILITY_FAMILY="$RUN_1_REAL_WORD_REVERSAL_EVIDENCE" \
-        node <<'NODE'
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
+      echo "native idle/resume admitted an extra run or exposed project_busy" >&2
+      return 1
+    fi
+    loom_generation_count_before_reversal=$(sqlite3 \
+      "$loom_database" \
+      'SELECT count(*) FROM generation_runs;')
+    loom_expected_generation_count=$((loom_generation_count_before_batch + 4))
+    require_equal "generation-run count before Option reversal" \
+      "$loom_expected_generation_count" "$loom_generation_count_before_reversal"
+    if ! RUN_1_REAL_WORD_REVERSAL_EVIDENCE=$(exercise_loom_completion_word_reversal \
+      "$ACTIVE_PID" "$loom_manuscript" "$RUN_1_EDITOR_SENTINEL" \
+      "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"); then
+      RUN_1_COMPLETION_DIAGNOSTICS="$SMOKE_ROOT/launch-1-interaction-failure-diagnostics.json"
+      capture_loom_completion_diagnostics \
+        "$ACTIVE_PID" "$loom_database" "$loom_manuscript" \
+        "$loom_generation_count_before_batch" "$RUN_1_COMPLETION_DIAGNOSTICS"
+      echo "the exact four-choice cache did not survive fan, Shuttle, Return, Tab, and rollback checks" >&2
+      echo "completion diagnostics: $RUN_1_COMPLETION_DIAGNOSTICS" >&2
+      cat "$RUN_1_COMPLETION_DIAGNOSTICS" >&2
+      echo "application logs: $stdout_log and $stderr_log" >&2
+      return 1
+    fi
+    if ! require_loom_generation_guard || ! require_loom_project_busy_monitor; then
+      echo "cached completion interactions admitted a fifth run or exposed project_busy" >&2
+      return 1
+    fi
+    loom_generation_count_after_reversal=$(sqlite3 \
+      "$loom_database" \
+      'SELECT count(*) FROM generation_runs;')
+    require_equal "generation-run count across all cached completion interactions" \
+      "$loom_generation_count_before_reversal" "$loom_generation_count_after_reversal"
+    if ! DELYSIS_DATABASE_FAMILY="$RUN_1_REAL_GENERATION_EVIDENCE" \
+      DELYSIS_LIVE_STREAM_FAMILY="$RUN_1_LIVE_STREAMING_EVIDENCE" \
+      DELYSIS_IDLE_RESUME_FAMILY="$RUN_1_IDLE_RESUME_GHOST_EVIDENCE" \
+      DELYSIS_ACCESSIBILITY_FAMILY="$RUN_1_REAL_WORD_REVERSAL_EVIDENCE" \
+      node <<'NODE'
 const db = JSON.parse(process.env.DELYSIS_DATABASE_FAMILY);
 const live = JSON.parse(process.env.DELYSIS_LIVE_STREAM_FAMILY);
 const idle = JSON.parse(process.env.DELYSIS_IDLE_RESUME_FAMILY);
@@ -1390,16 +1390,15 @@ if (
   process.exit(1);
 }
 NODE
-      then
-        echo "the native fan witness was not bound to the admitted database family" >&2
-        return 1
-      fi
-      if ! stop_loom_generation_guard; then
-        echo "the four-run family did not remain singular through every cached interaction" >&2
-        return 1
-      fi
-      RUN_1_REAL_GENERATION_GUARD_EVIDENCE=$(cat "$LOOM_GENERATION_GUARD_OUTPUT")
+    then
+      echo "the native fan witness was not bound to the admitted database family" >&2
+      return 1
     fi
+    if ! stop_loom_generation_guard; then
+      echo "the four-run family did not remain singular through every cached interaction" >&2
+      return 1
+    fi
+    RUN_1_REAL_GENERATION_GUARD_EVIDENCE=$(cat "$LOOM_GENERATION_GUARD_OUTPUT")
     RUN_1_TITLE_SENTINEL="# $RUN_1_EDITOR_SENTINEL"
     if ! RUN_1_FORMAT_TITLE_EVIDENCE=$(exercise_loom_formatting_palette "$ACTIVE_PID" "Title") ||
       ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_TITLE_SENTINEL" ||
@@ -1742,7 +1741,6 @@ DELYSIS_SMOKE_RUN_2_MOM_UI_IDENTITY="${RUN_2_MOM_UI_IDENTITY:-}" \
 DELYSIS_SMOKE_RUN_1_DRAG_EVIDENCE="${RUN_1_DRAG_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_BEFORE="${RUN_1_MANUSCRIPT_SHA256_BEFORE:-}" \
 DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER="${RUN_1_MANUSCRIPT_SHA256_AFTER:-}" \
-DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE="${RUN_1_COMPLETION_CONTROLS_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE="${RUN_1_EDITOR_EVIDENCE:-}" \
 DELYSIS_SMOKE_RUN_1_EDITOR_INPUT_SENTINEL="${RUN_1_EDITOR_INPUT_SENTINEL:-}" \
 DELYSIS_SMOKE_RUN_1_EDITOR_SENTINEL="${RUN_1_EDITOR_SENTINEL:-}" \
@@ -1772,9 +1770,6 @@ node <<'NODE' > "$RECEIPT"
 const e = process.env;
 const titlebarDrag = e.DELYSIS_SMOKE_RUN_1_DRAG_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_DRAG_EVIDENCE)
-  : null;
-const completionControls = e.DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE
-  ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_COMPLETION_CONTROLS_EVIDENCE)
   : null;
 const editorInput = e.DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE
   ? JSON.parse(e.DELYSIS_SMOKE_RUN_1_EDITOR_EVIDENCE)
@@ -1839,7 +1834,6 @@ const receipt = {
       titlebar_drag: titlebarDrag,
       manuscript_sha256_before_drag: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_BEFORE || null,
       manuscript_sha256_after_drag: e.DELYSIS_SMOKE_RUN_1_MANUSCRIPT_SHA_AFTER || null,
-      completion_controls: completionControls,
       project_busy_regression: projectBusyRegression,
       editor_input: editorInput ? {
         ...editorInput,
@@ -1907,6 +1901,10 @@ fi
 if [ -n "$LOOM_SMOKE_MODEL_LINK" ] && [ -f "$LOOM_SMOKE_MODEL_LINK" ]; then
   unlink "$LOOM_SMOKE_MODEL_LINK"
   LOOM_SMOKE_MODEL_LINK=
+fi
+if [ -n "$LOOM_SMOKE_PROJECTOR_LINK" ] && [ -f "$LOOM_SMOKE_PROJECTOR_LINK" ]; then
+  unlink "$LOOM_SMOKE_PROJECTOR_LINK"
+  LOOM_SMOKE_PROJECTOR_LINK=
 fi
 
 trap - EXIT HUP INT TERM

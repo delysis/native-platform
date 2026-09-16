@@ -18,18 +18,17 @@ while cursor < queue.count && cursor < 4096 {
     let values = [kAXDescriptionAttribute, kAXTitleAttribute, kAXHelpAttribute, kAXValueAttribute]
         .compactMap { attribute(element, $0 as CFString) as? String }
         .filter { !$0.isEmpty }
-    if values.contains(where: { $0.contains("Turn autocomplete") }) {
-        let evidence: [String: Any] = [
-            "description": values,
-            "enabled": (attribute(element, kAXEnabledAttribute as CFString) as? Bool) ?? false
-        ]
-        let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
-        print(String(data: data, encoding: .utf8)!)
-        exit(0)
+    for value in values {
+        if let data = value.data(using: .utf8),
+           let witness = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           witness["schema"] as? String == "delysis.loom-completion-witness.v1" {
+            print(value)
+            exit(0)
+        }
     }
     if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
         queue.append(contentsOf: children)
     }
 }
-fputs("could not find Loom's autocomplete control\n", stderr)
+fputs("could not read Loom's completion state\n", stderr)
 exit(1)

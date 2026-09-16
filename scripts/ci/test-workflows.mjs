@@ -163,6 +163,37 @@ test("local macOS smoke can verify the exact emitted archive", () => {
   assert.match(smoke, /input_release_receipt_sha256:/);
 });
 
+test("Loom acceptance refuses missing real-model assets before opening a bundle", (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "loom-smoke-preflight-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  writeExecutable(path.join(directory, "uname"), "#!/bin/sh\nprintf 'Darwin\\n'\n");
+  const model = path.join(directory, "gemma-4-12b-it-qat-q4_0.gguf");
+  fs.writeFileSync(model, "preflight file; not a model");
+  for (const [modelPath, expected] of [
+    ["", /Loom acceptance requires local Gemma/],
+    [model, /Loom acceptance requires the matching local projector/],
+  ]) {
+    const result = spawnSync("sh", [smokeScriptPath, "loom", "/missing/Loom.app"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${directory}${path.delimiter}${process.env.PATH}`,
+        DELYSIS_ACCEPTANCE_SOURCE_SHA: "",
+        MOM_ACCEPTANCE_SOURCE_SHA: "",
+        MOM_ACCEPTANCE_PRODUCT_NAME: "",
+        MOM_ACCEPTANCE_BUNDLE_ID: "",
+        LOOM_SMOKE_GGUF_MODEL_PATH: modelPath,
+        LOOM_SMOKE_PROJECTOR_PATH: "",
+        LOOM_SMOKE_REAL_COMPLETIONS: "", // The former opt-in cannot bypass the gate.
+      },
+      timeout: 5_000,
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, expected);
+    assert.doesNotMatch(result.stderr, /packaged application is missing/);
+  }
+});
+
 test("Loom UI smoke cannot attach to an active editor or invent a model identity", () => {
   const support = path.join(root, "scripts/macos-smoke-support");
   const smoke = [read(smokeScriptPath), ...fs.readdirSync(support)
@@ -171,9 +202,9 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
     .map((name) => read(path.join(support, name)))].join("\n");
   assert.match(smoke, /running_exact_pids=\$\(exact_bundle_pid\)/);
   assert.match(smoke, /refusing to run macOS UI smoke while the exact application bundle is already running/);
-  assert.match(smoke, /gemma-4-12B-it-qat-q4_0\.gguf/);
+  assert.match(smoke, /gemma-4-12b-it-qat-q4_0\.gguf/);
   assert.ok(
-    smoke.indexOf('LOOM_SMOKE_MODEL_LINK="$model_library/gemma-4-12B-it-qat-q4_0.gguf"') <
+    smoke.indexOf('LOOM_SMOKE_MODEL_LINK="$model_library/gemma-4-12b-it-qat-q4_0.gguf"') <
       smoke.indexOf("run_once 1"),
     "the exact Gemma link must exist before Loom startup discovery",
   );
@@ -204,9 +235,6 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /row\.candidate_output_blob_id === row\.evidence_output_blob_id/);
   assert.match(smoke, /row\.generated_span_artifact_id === row\.output_artifact_id/);
   assert.match(smoke, /completion control state:/);
-  assert.match(smoke, /var pressed = false/);
-  assert.match(smoke, /if description\.contains\(alreadyName\) \{/);
-  assert.match(smoke, /guard pressed \|\| !requirePress/);
   assert.match(smoke, /suggestionLabelPattern/);
   assert.match(smoke, /strings\(element\)\.contains\("Completion suggestions"\)/);
   assert.match(smoke, /kAXListRole/);
