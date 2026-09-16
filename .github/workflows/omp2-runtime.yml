@@ -53,6 +53,15 @@ jobs:
       - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab
         with:
           tool: just@1.58.0,cargo-nextest@0.9.143
+      - name: Install realtime native build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install opus pkgconf ninja
+          # audiopus_sys otherwise falls back to an old vendored CMake project.
+          test -f "$(brew --prefix opus)/lib/libopus.a"
+          echo "PKG_CONFIG_PATH=$(brew --prefix opus)/lib/pkgconfig" >> "$GITHUB_ENV"
+          pkg-config --modversion opus >> "$GITHUB_STEP_SUMMARY"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
           workspaces: ${{ runner.temp }}/omp2-tested -> ${{ github.workspace }}/target/omp2

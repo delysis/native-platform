@@ -163,7 +163,10 @@ just clippy-pkg omp-ai
 ```
 
 Use upstream's pinned nightly and components. `just test-pkg` includes nextest
-and doctests. On macOS hosts without upstream's machine-specific linker path,
+and doctests. The default realtime feature needs Opus: on macOS install
+`opus`, `pkgconf` and `ninja` with Homebrew. CI verifies the static Opus library
+and records its version instead of relying on the old vendored CMake fallback.
+On macOS hosts without upstream's machine-specific linker path,
 set `RUSTFLAGS='-Z threads=8'` to use the system linker; `omp-ai` does not need
 the embedded Python application setup. The dedicated `omp2-runtime.yml` job
 runs the same patched crate gate on macOS for changes to the manifest, patches,
