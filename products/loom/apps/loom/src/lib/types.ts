@@ -555,6 +555,7 @@ export interface ReconciliationPreview {
 }
 
 export interface TerminalRun {
+  events?: Array<{ kind: 'search' | 'context'; label: string; detail?: string }>;
   turn_boundary?: 'chat' | null;
   source_document_id?: string;
   presentation?: { pane_id: string; input: string } | null;

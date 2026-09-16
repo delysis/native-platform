@@ -44,7 +44,7 @@ describe('workspace panes', () => {
     const { beforeRun, onOpenDocument } = await render({ context: ['@document', '@"Voice notes"'], document: '@Draft' });
     await expect.poll(() => document.querySelector('.output')?.textContent).toBe(fullAnswer);
     await page.getByText(fullAnswer, { exact: true }).click();
-    const range = document.createRange(); range.selectNodeContents(document.querySelector('.output')!);
+    const range = document.createRange(); range.selectNodeContents(document.querySelector('.output p')!);
     const selection = window.getSelection(); selection?.removeAllRanges(); selection?.addRange(range);
     expect(selection?.toString()).toBe(fullAnswer);
     expect(onOpenDocument).not.toHaveBeenCalled();
@@ -71,6 +71,19 @@ describe('workspace panes', () => {
     expect(request.expression).not.toContain('@document');
     expect(request.expression).toContain('User: Continue that idea\nAssistant:');
     expect(request.sourceRevisionId).toBe('revision');
+  });
+
+  it('keeps hidden reasoning and Markdown bytes intact in the next raw prompt', async () => {
+    const raw = '<think>A private model trace.</think>**The moon.**';
+    ipc.open.mockResolvedValue({ ...source, text: raw });
+    await render();
+    await expect.poll(() => document.querySelector('.output strong')?.textContent).toBe('The moon.');
+    expect(document.querySelector('details')?.open).toBe(false);
+    ipc.run.mockImplementation(async request => ({ ...run(request.commandId), presentation: request.presentation }));
+    await page.getByRole('textbox', { name: 'Message' }).fill('Continue');
+    await userEvent.keyboard('{Enter}');
+    await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
+    expect(ipc.run.mock.calls[0][0].expression).toContain('Assistant: ' + raw);
   });
 
   it('pins a retained output explicitly without invoking a model or editing its originating document', async () => {

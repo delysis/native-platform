@@ -13,6 +13,7 @@ const MAX_CALLS: usize = 8;
 const MAX_PROMPT_BYTES: usize = 65_536;
 const MAX_HISTORY: usize = 64;
 const TERMINAL_GENERATION_TOKENS: u32 = 512;
+const MAX_PRESENTATION_EVENTS: usize = 16;
 
 fn remaining_context_bytes(context_tokens: u32, used_bytes: usize) -> usize {
     usize::try_from(
@@ -41,6 +42,106 @@ pub(super) struct TerminalRun {
     preview: String,
     error: Option<String>,
     created_at_ms: i64,
+    /// Derived only at the IPC boundary; retained receipts have no event log.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Vec::is_empty")]
+    events: Vec<TerminalEvent>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TerminalEvent {
+    kind: TerminalEventKind,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TerminalEventKind {
+    Search,
+    Context,
+}
+
+fn event_text(text: &str, limit: usize) -> String {
+    let mut characters = text.chars();
+    let mut bounded: String = characters
+        .by_ref()
+        .take(limit)
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if characters.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+/// Receipts establish what happened. Expressions and model-written prose never
+/// manufacture tool events, and presentation never rewrites retained evidence.
+fn projected_run(receipt: &RunReceipt) -> TerminalRun {
+    let mut run = receipt.run.clone();
+    run.events.clear();
+    let retained_sources = receipt
+        .bindings
+        .values()
+        .filter_map(|value| match value {
+            Value::Material { material } if material.text.is_some() => {
+                Some(material.material.id.as_str())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let sources = receipt.sources.len().saturating_add(retained_sources.len());
+    if sources > 0 {
+        run.events.push(TerminalEvent {
+            kind: TerminalEventKind::Context,
+            label: format!(
+                "Read {sources} referenced {}",
+                if sources == 1 { "source" } else { "sources" }
+            ),
+            detail: None,
+        });
+    }
+    let available = MAX_PRESENTATION_EVENTS - run.events.len();
+    let displayed = if receipt.searches.len() > available {
+        available - 1
+    } else {
+        receipt.searches.len()
+    };
+    for search in receipt.searches.iter().take(displayed) {
+        let count = search.hits.len();
+        let outcome = if count == 0 && !search.complete {
+            "No passages retained".to_owned()
+        } else if count == 0 {
+            "No matching passages".to_owned()
+        } else {
+            format!(
+                "{count} {} retained",
+                if count == 1 { "passage" } else { "passages" }
+            )
+        };
+        let partial = if search.complete {
+            ""
+        } else {
+            " · partial results"
+        };
+        run.events.push(TerminalEvent {
+            kind: TerminalEventKind::Search,
+            label: event_text(&format!("Searched {}", search.material.name), 96),
+            detail: Some(event_text(
+                &format!("“{}” · {outcome}{partial}", event_text(&search.query, 160)),
+                256,
+            )),
+        });
+    }
+    let remaining = receipt.searches.len().saturating_sub(displayed);
+    if remaining > 0 {
+        run.events.push(TerminalEvent {
+            kind: TerminalEventKind::Search,
+            label: format!("{remaining} more searches"),
+            detail: None,
+        });
+    }
+    run
 }
 
 /// Display metadata is retained with the exact native input, never substituted
@@ -402,7 +503,7 @@ pub(super) async fn terminal_run<R: Runtime>(
         }
         let mut result = read_receipt(&root, &command_id.to_string(), true)?.unwrap_or(receipt);
         settle_interrupted(&mut result.run, &state)?;
-        return Ok(result.run);
+        return Ok(projected_run(&result));
     }
     let document_id = document_id.parse::<DocumentId>().map_err(io_failure)?;
     let summary = store
@@ -563,6 +664,7 @@ pub(super) async fn terminal_run<R: Runtime>(
             preview: String::new(),
             error: None,
             created_at_ms: now_unix_ms(),
+            events: Vec::new(),
         },
         request_fingerprint: fingerprint,
         source_document_id: document_id,
@@ -641,7 +743,7 @@ pub(super) async fn terminal_run<R: Runtime>(
     let worker_control = Arc::clone(&control);
     let worker_app = app.clone();
     let worker_identity = identity.clone();
-    let response = receipt.run.clone();
+    let response = projected_run(&receipt);
     let worker = std::thread::Builder::new()
         .name("loom-experiment".into())
         .spawn(move || {
@@ -1165,10 +1267,10 @@ pub(super) async fn terminal_list(
     let mut runs = Vec::new();
     for id in ids.into_iter().rev().take(MAX_HISTORY) {
         if let Some(receipt) = read_receipt(store.root(), &id, true)? {
-            runs.push(receipt.run);
+            runs.push(projected_run(&receipt));
         } else if let Some(mut receipt) = read_receipt(store.root(), &id, false)? {
             settle_interrupted(&mut receipt.run, &state)?;
-            runs.push(receipt.run);
+            runs.push(projected_run(&receipt));
         }
     }
     Ok(runs)

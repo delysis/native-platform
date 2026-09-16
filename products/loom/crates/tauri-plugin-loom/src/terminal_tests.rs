@@ -170,6 +170,24 @@ fn find_run_needs_no_model_and_replays_retained_evidence_after_source_removal() 
     assert_eq!(receipt.searches[0].query, "nightjar");
     assert_eq!(receipt.searches[0].material.id, material.id);
     assert!(!receipt.evidence.is_empty());
+    assert!(
+        receipt.run.events.is_empty(),
+        "events are IPC projection only"
+    );
+    let search_event = completed
+        .events
+        .iter()
+        .find(|event| event.kind == TerminalEventKind::Search)
+        .unwrap();
+    assert_eq!(search_event.label, "Searched Research");
+    assert!(search_event.detail.as_ref().unwrap().contains("nightjar"));
+    let persisted: serde_json::Value = serde_json::from_slice(
+        &crate::terminal_receipts::read(&fixture.root(), &id.to_string(), true)
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(persisted["run"].get("events").is_none());
     let path = completed.output_relative_path.as_ref().unwrap();
     fixture.with_store(|store| {
         let output = store.read_document(path).unwrap();
@@ -196,6 +214,54 @@ fn find_run_needs_no_model_and_replays_retained_evidence_after_source_removal() 
         .unwrap();
     assert_eq!(retained.evidence[0].text, receipt.evidence[0].text);
     assert!(fixture.run(CommandId::new(), expression).is_err());
+}
+
+#[test]
+fn events_project_only_recorded_operations_and_bound_large_metadata() {
+    let fixture = TerminalFixture::new();
+    imported_source(&fixture, "The nightjar sings.");
+    let id = CommandId::new();
+    fixture.run(id, "=find(@Research, \"nightjar\")").unwrap();
+    fixture.wait(id);
+    let mut receipt = read_receipt(&fixture.root(), &id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    let mut search = receipt.searches[0].clone();
+    search.query = "長い質問\n".repeat(100);
+    search.material.name = "Research\n".repeat(100);
+    receipt.searches = vec![search; MAX_PRESENTATION_EVENTS + 5];
+    let projected = projected_run(&receipt);
+    assert_eq!(projected.events.len(), MAX_PRESENTATION_EVENTS);
+    assert!(
+        projected
+            .events
+            .last()
+            .unwrap()
+            .label
+            .ends_with("more searches")
+    );
+    for event in projected.events {
+        assert!(event.label.chars().count() <= 97);
+        assert!(!event.label.chars().any(char::is_control));
+        if let Some(detail) = event.detail {
+            assert!(detail.chars().count() <= 257);
+            assert!(!detail.chars().any(char::is_control));
+        }
+    }
+    receipt.run.status = "failed".into();
+    receipt.run.error = Some("Search unavailable".into());
+    receipt.run.expression = "=find(@Research, \"nightjar\")".into();
+    receipt.searches.clear();
+    receipt.sources.clear();
+    receipt.bindings.clear();
+    receipt.evidence.clear();
+    let projected = projected_run(&receipt);
+    assert!(
+        projected.events.is_empty(),
+        "an expression is not an executed search"
+    );
+    assert_eq!(projected.status, "failed");
+    assert_eq!(projected.error.as_deref(), Some("Search unavailable"));
 }
 
 #[test]
