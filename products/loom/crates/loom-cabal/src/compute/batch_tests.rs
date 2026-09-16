@@ -40,11 +40,7 @@ impl ComputeExecutor for FixtureExecutor {
             && first.grant.model == next.grant.model
     }
 
-    fn execute(
-        &self,
-        _job: HostComputeJob,
-        _cancel: CancellationToken,
-    ) -> ComputeFuture {
+    fn execute(&self, _job: HostComputeJob, _cancel: CancellationToken) -> ComputeFuture {
         panic!("the batch-aware executor must receive the batch envelope")
     }
 
@@ -59,12 +55,20 @@ impl ComputeExecutor for FixtureExecutor {
             owner.started.notify_one();
             if owner.wait_for_cancel {
                 jobs[0].cancel.cancelled().await;
-                assert!(!jobs[1].cancel.is_cancelled(), "cancellation leaked to a sibling");
+                assert!(
+                    !jobs[1].cancel.is_cancelled(),
+                    "cancellation leaked to a sibling"
+                );
                 owner.cancelled.notify_one();
             }
-            owner.release.acquire().await.expect("release fixture").forget();
-            // Reversed completion order must still route by (peer, job), not UUID
-            // alone or a vector's incidental position.
+            owner
+                .release
+                .acquire()
+                .await
+                .expect("release fixture")
+                .forget();
+            // Reversed completion order must still route by (peer, job), not
+            // UUID alone or a vector's incidental position.
             jobs.into_iter()
                 .rev()
                 .map(|item| ComputeBatchOutput {
@@ -105,7 +109,14 @@ fn input() -> ComputeInput {
 }
 
 fn submit(host: &ComputeHost, grant: &ComputeGrant, job: Uuid) -> Result<RemoteJobReceipt> {
-    match host.respond(grant.peer, Request::Submit { job, grant: grant.id, input: input() })? {
+    match host.respond(
+        grant.peer,
+        Request::Submit {
+            job,
+            grant: grant.id,
+            input: input(),
+        },
+    )? {
         Response::Receipt { receipt } => Ok(*receipt),
         other => panic!("expected accepted job, got {other:?}"),
     }
@@ -143,7 +154,12 @@ async fn independent_peers_share_an_envelope_but_not_cancellation_or_identity() 
     let directory = tempfile::tempdir()?;
     let identity = Identity::generate()?;
     let fixture = BatchFixture::new(true);
-    let host = ComputeHost::open(directory.path(), identity.clone(), Arc::new(|_| true), Arc::new(FixtureExecutor(fixture.clone())))?;
+    let host = ComputeHost::open(
+        directory.path(),
+        identity.clone(),
+        Arc::new(|_| true),
+        Arc::new(FixtureExecutor(fixture.clone())),
+    )?;
     let cabal = Uuid::new_v4();
     let first = grant(Identity::generate()?.public_key(), cabal);
     let second = grant(Identity::generate()?.public_key(), cabal);
@@ -155,25 +171,64 @@ async fn independent_peers_share_an_envelope_but_not_cancellation_or_identity() 
     submit(&host, &second, job)?;
     observed(&fixture.started).await;
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
-    assert_eq!(*fixture.observed.lock().expect("batch"), vec![(first.peer, job), (second.peer, job)]);
-    let _ = host.respond(first.peer, Request::Cancel { job, grant: first.id, input: input() })?;
+    assert_eq!(
+        *fixture.observed.lock().expect("batch"),
+        vec![(first.peer, job), (second.peer, job)]
+    );
+    let _ = host.respond(
+        first.peer,
+        Request::Cancel {
+            job,
+            grant: first.id,
+            input: input(),
+        },
+    )?;
     observed(&fixture.cancelled).await;
-    assert!(matches!(status(&host, &first, job)?.payload.status, ComputeStatus::Cancelling { .. }));
-    assert_eq!(status(&host, &second, job)?.payload.status, ComputeStatus::Running);
+    assert!(matches!(
+        status(&host, &first, job)?.payload.status,
+        ComputeStatus::Cancelling { .. }
+    ));
+    assert_eq!(
+        status(&host, &second, job)?.payload.status,
+        ComputeStatus::Running
+    );
     fixture.release.add_permits(1);
     let cancelled = terminal(&host, &first, job).await?;
     let completed = terminal(&host, &second, job).await?;
-    assert_eq!(cancelled.payload.status, ComputeStatus::Cancelled { reason: ComputeCancellation::Requested });
-    assert_eq!(completed.payload.status, ComputeStatus::Completed { text: second.peer.to_string() });
+    assert_eq!(
+        cancelled.payload.status,
+        ComputeStatus::Cancelled {
+            reason: ComputeCancellation::Requested
+        }
+    );
+    assert_eq!(
+        completed.payload.status,
+        ComputeStatus::Completed {
+            text: second.peer.to_string()
+        }
+    );
     assert_eq!(submit(&host, &first, job)?.hash()?, cancelled.hash()?);
     assert_eq!(submit(&host, &second, job)?.hash()?, completed.hash()?);
-    assert!(host.grant_statuses()?.iter().all(|item| item.jobs_remaining == 3));
+    assert!(
+        host.grant_statuses()?
+            .iter()
+            .all(|item| item.jobs_remaining == 3)
+    );
     host.shutdown().await?;
     drop(host);
-    let reopened = ComputeHost::open(directory.path(), identity, Arc::new(|_| true), Arc::new(FixtureExecutor(fixture.clone())))?;
+    let reopened = ComputeHost::open(
+        directory.path(),
+        identity,
+        Arc::new(|_| true),
+        Arc::new(FixtureExecutor(fixture.clone())),
+    )?;
     assert_eq!(submit(&reopened, &first, job)?.hash()?, cancelled.hash()?);
     assert_eq!(submit(&reopened, &second, job)?.hash()?, completed.hash()?);
-    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1, "restart replayed a settled batch");
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        1,
+        "restart replayed a settled batch"
+    );
     reopened.shutdown().await
 }
 
@@ -181,28 +236,75 @@ async fn independent_peers_share_an_envelope_but_not_cancellation_or_identity() 
 async fn bounded_collection_rejects_cross_scope_and_excess_without_spending_grants() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let fixture = BatchFixture::new(false);
-    let host = ComputeHost::open(directory.path(), Identity::generate()?, Arc::new(|_| true), Arc::new(FixtureExecutor(fixture.clone())))?;
+    let host = ComputeHost::open(
+        directory.path(),
+        Identity::generate()?,
+        Arc::new(|_| true),
+        Arc::new(FixtureExecutor(fixture.clone())),
+    )?;
     let cabal = Uuid::new_v4();
-    let grants = (0..5).map(|_| Ok(grant(Identity::generate()?.public_key(), cabal))).collect::<Result<Vec<_>>>()?;
-    for grant in &grants { host.grant(grant.clone())?; }
-    for grant in grants.iter().take(4) { submit(&host, grant, Uuid::new_v4())?; }
-    let rejected = host.respond(grants[4].peer, Request::Submit { job: Uuid::new_v4(), grant: grants[4].id, input: input() })?;
-    assert!(matches!(rejected, Response::Rejected { reason: ComputeRejection::Busy }));
-    assert_eq!(host.grant_statuses()?.iter().find(|item| item.grant.id == grants[4].id).expect("grant").jobs_remaining, 4);
+    let grants = (0..5)
+        .map(|_| Ok(grant(Identity::generate()?.public_key(), cabal)))
+        .collect::<Result<Vec<_>>>()?;
+    for grant in &grants {
+        host.grant(grant.clone())?;
+    }
+    for grant in grants.iter().take(4) {
+        submit(&host, grant, Uuid::new_v4())?;
+    }
+    let rejected = host.respond(
+        grants[4].peer,
+        Request::Submit {
+            job: Uuid::new_v4(),
+            grant: grants[4].id,
+            input: input(),
+        },
+    )?;
+    assert!(matches!(
+        rejected,
+        Response::Rejected {
+            reason: ComputeRejection::Busy
+        }
+    ));
+    assert_eq!(
+        host.grant_statuses()?
+            .iter()
+            .find(|item| item.grant.id == grants[4].id)
+            .expect("grant")
+            .jobs_remaining,
+        4
+    );
     fixture.release.add_permits(1);
     observed(&fixture.started).await;
     host.shutdown().await?;
 
     let directory = tempfile::tempdir()?;
     let fixture = BatchFixture::new(false);
-    let host = ComputeHost::open(directory.path(), Identity::generate()?, Arc::new(|_| true), Arc::new(FixtureExecutor(fixture.clone())))?;
+    let host = ComputeHost::open(
+        directory.path(),
+        Identity::generate()?,
+        Arc::new(|_| true),
+        Arc::new(FixtureExecutor(fixture.clone())),
+    )?;
     let first = grant(Identity::generate()?.public_key(), cabal);
     let other = grant(Identity::generate()?.public_key(), Uuid::new_v4());
     host.grant(first.clone())?;
     host.grant(other.clone())?;
     submit(&host, &first, Uuid::new_v4())?;
-    let rejected = host.respond(other.peer, Request::Submit { job: Uuid::new_v4(), grant: other.id, input: input() })?;
-    assert!(matches!(rejected, Response::Rejected { reason: ComputeRejection::Busy }));
+    let rejected = host.respond(
+        other.peer,
+        Request::Submit {
+            job: Uuid::new_v4(),
+            grant: other.id,
+            input: input(),
+        },
+    )?;
+    assert!(matches!(
+        rejected,
+        Response::Rejected {
+            reason: ComputeRejection::Busy
+        }
+    ));
     fixture.release.add_permits(1);
     host.shutdown().await
 }
@@ -211,7 +313,12 @@ async fn bounded_collection_rejects_cross_scope_and_excess_without_spending_gran
 async fn revoked_collected_job_is_not_dispatched_and_does_not_cancel_its_sibling() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let fixture = BatchFixture::new(false);
-    let host = ComputeHost::open(directory.path(), Identity::generate()?, Arc::new(|_| true), Arc::new(FixtureExecutor(fixture.clone())))?;
+    let host = ComputeHost::open(
+        directory.path(),
+        Identity::generate()?,
+        Arc::new(|_| true),
+        Arc::new(FixtureExecutor(fixture.clone())),
+    )?;
     let cabal = Uuid::new_v4();
     let first = grant(Identity::generate()?.public_key(), cabal);
     let second = grant(Identity::generate()?.public_key(), cabal);
@@ -223,8 +330,21 @@ async fn revoked_collected_job_is_not_dispatched_and_does_not_cancel_its_sibling
     submit(&host, &second, second_job)?;
     host.revoke(first.id)?;
     fixture.release.add_permits(1);
-    assert_eq!(terminal(&host, &first, first_job).await?.payload.status, ComputeStatus::Cancelled { reason: ComputeCancellation::GrantRevoked });
-    assert_eq!(terminal(&host, &second, second_job).await?.payload.status, ComputeStatus::Completed { text: second.peer.to_string() });
-    assert_eq!(*fixture.observed.lock().expect("batch"), vec![(second.peer, second_job)]);
+    assert_eq!(
+        terminal(&host, &first, first_job).await?.payload.status,
+        ComputeStatus::Cancelled {
+            reason: ComputeCancellation::GrantRevoked
+        }
+    );
+    assert_eq!(
+        terminal(&host, &second, second_job).await?.payload.status,
+        ComputeStatus::Completed {
+            text: second.peer.to_string()
+        }
+    );
+    assert_eq!(
+        *fixture.observed.lock().expect("batch"),
+        vec![(second.peer, second_job)]
+    );
     host.shutdown().await
 }
