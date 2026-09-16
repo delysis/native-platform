@@ -580,11 +580,8 @@ test("required job names and workflow matrices match the checked-in R3 snapshot"
   }
 
   const ignoredBlock = pr.match(/^  ignored-tests:[\s\S]*?(?=^  fuzz-build:)/m)?.[0];
-  const ignoredMatrix = ignoredBlock
-    ?.match(/^\s+os: \[([^\]]+)\]$/m)?.[1]
-    .split(",")
-    .map((value) => value.trim());
-  assert.deepEqual(ignoredMatrix, snapshot.pr.ignored_test_os_matrix);
+  assert.match(ignoredBlock, /os: \$\{\{ fromJSON\(needs\.plan\.outputs\.ignored_matrix\) \}\}/);
+  assert.deepEqual(snapshot.pr.ignored_test_os_matrix, ["ubuntu-latest", "macos-latest", "windows-latest"]);
 
   const macosComponents = [
     ...new Set(
@@ -628,7 +625,7 @@ test("relevant PRs retain asynchronous guarded-list ignored-test reconciliation"
   const block = source.match(/^  ignored-tests:[\s\S]*?(?=^  fuzz-build:)/m)?.[0];
   assert.ok(block, "ignored-tests PR job block is missing");
   assert.match(block, /fail-fast: false/);
-  assert.match(block, /os: \[ubuntu-latest, macos-latest, windows-latest\]/);
+  assert.match(block, /os: \$\{\{ fromJSON\(needs\.plan\.outputs\.ignored_matrix\) \}\}/);
   assert.match(block, /runs-on: \$\{\{ matrix\.os \}\}/);
   assert.match(block, /if: runner\.os == 'Windows'/);
   assert.match(block, /if: runner\.os == 'Linux'/);
@@ -743,7 +740,7 @@ test("long Linux lanes parallelize test and Clippy without dropping either", () 
     assert.ok(block, "parallel Linux job block is missing");
     assert.match(block, /fail-fast: false/);
     assert.match(block, /command: \[test, clippy\]/);
-    assert.match(block, /save-if: \$\{\{ matrix\.command == 'test' \}\}/);
+    assert.match(block, /save-if: false/);
     assert.match(block, /if: \$\{\{ matrix\.command == 'test' \}\}/);
     assert.match(block, /if: \$\{\{ matrix\.command == 'clippy' \}\}/);
   }
@@ -846,8 +843,8 @@ test("the required macOS matrix preserves every gate without serializing them", 
   assert.match(macos, /name: Compile macOS smoke support\n\s+if: \$\{\{ matrix\.component == 'release' \}\}\n\s+run: cargo run --locked -p xtask -- macos-smoke-support/);
   assert.match(read(fullRootPath), /name: Compile macOS smoke support\n\s+if: runner.os == 'macOS'\n\s+run: cargo run --locked -p xtask -- macos-smoke-support/);
   assert.match(macos, /Swatinem\/rust-cache@[0-9a-f]{40}\n\s+with:/);
-  assert.match(macos, /shared-key: platform-macos-\$\{\{ matrix\.component \}\}/);
-  assert.doesNotMatch(macos, /save-if:/);
+  assert.match(macos, /shared-key: workspace-\$\{\{ runner.os \}\}/);
+  assert.match(macos, /save-if: false/);
   assert.doesNotMatch(rootGraph, /needs\.plan\.outputs\.mom/);
   assert.match(macos, /name: Mom macOS parity/);
   assert.match(macos, /matrix\.component == 'mom'/);
@@ -918,7 +915,7 @@ test("Windows PR coverage is limited to selected portability and inventory gates
   )?.[0];
   const mom = pr.match(/^  mom-windows:[\s\S]*?(?=^  loom-linux:)/m)?.[0];
   const loom = pr.match(/^  loom-windows:[\s\S]*?(?=^  frontend:)/m)?.[0];
-  assert.match(ignored, /windows-latest/);
+  assert.match(ignored, /fromJSON\(needs\.plan\.outputs\.ignored_matrix\)/);
   assert.match(information, /windows-latest/);
   assert.match(mom, /windows-latest/);
   assert.match(loom, /windows-latest/);
@@ -983,7 +980,9 @@ function assertAcyclicJobs(jobs) {
 function scheduled(job, needs, cancelled = false) {
   const expression = job.match(/^    if: \$\{\{ (.+) \}\}$/m)?.[1];
   assert.ok(expression, "explicit scheduling condition is required");
-  return runInNewContext(expression, { needs, cancelled: () => cancelled });
+  // Actions permits hyphens in property identifiers; JavaScript needs brackets.
+  const javascript = expression.replace(/\bneeds\.([a-z][a-z0-9]*-[a-z0-9-]+)/g, "needs['$1']");
+  return runInNewContext(javascript, { needs, cancelled: () => cancelled });
 }
 
 test("PR advisory scheduling waits for the development gate without requiring its success", () => {
@@ -1014,11 +1013,108 @@ test("full advisory scheduling reserves runners for macOS and fast checks first"
     assert.deepEqual(jobNeeds(job), ["macos-required", "frontend", "policy-and-graphs"], id);
     for (const result of ["success", "failure", "skipped", "cancelled"]) {
       const needs = Object.fromEntries(jobNeeds(job).map((dependency) => [dependency, { result }]));
+      needs["policy-and-graphs"].outputs = { full_required: "true" };
       assert.equal(scheduled(job, needs), true, `${id}: ${result}`);
       assert.equal(scheduled(job, needs, true), false, `${id}: cancelled workflow`);
     }
   }
-  for (const id of ["root-macos", "frontend", "policy-and-graphs"]) {
-    assert.deepEqual(jobNeeds(jobs.get(id)), [], id);
+  for (const id of ["root-macos", "frontend"]) {
+    assert.deepEqual(jobNeeds(jobs.get(id)), ["policy-and-graphs"], id);
+  }
+  assert.deepEqual(jobNeeds(jobs.get("policy-and-graphs")), []);
+});
+
+test("Linux inventory retains its exact command and one owner for every selection", () => {
+  const jobs = workflowJobs(read(prPath));
+  const root = jobs.get("root-linux");
+  const step = root.match(/- name: Reconcile Linux ignored-test inventory[\s\S]*?(?=\n      - )/)[0];
+  const condition = step.match(/if: \$\{\{ (.+) \}\}/)[1];
+  assert.match(root, /cargo test --locked --workspace --all-targets --no-fail-fast/);
+  assert.match(step, /run: node scripts\/ci\/validate-ignored-tests\.mjs --cargo-list/);
+  assert.doesNotMatch(step, /continue-on-error/);
+  for (const rootSelected of [false, true]) {
+    for (const full of [false, true]) {
+      for (const inventory of [false, true]) {
+        const needs = { plan: { result: "success", outputs: {
+          root: String(rootSelected), full: String(full), ignored_tests: String(inventory),
+        } } };
+        const rootRuns = scheduled(root, needs);
+        const selected = inventory || full;
+        const inRoot = rootRuns && runInNewContext(condition, {
+          needs, matrix: { command: "test" }, cancelled: () => false,
+        });
+        const standalone = selected && !(rootSelected || full);
+        assert.equal(Number(inRoot) + Number(standalone), Number(selected));
+        assert.equal(runInNewContext(condition, {
+          needs, matrix: { command: "clippy" }, cancelled: () => false,
+        }), false);
+      }
+    }
+  }
+});
+
+test("compatible PR caches restore main baselines without redundant writers", () => {
+  const pr = read(prPath);
+  for (const [id, job] of workflowJobs(pr)) {
+    if (!job.includes("Swatinem/rust-cache") || id === "fuzz-build") continue;
+    assert.match(job, /save-if: false/, id);
+    assert.match(job, id === "policy" ? /shared-key: policy-linux/ : /shared-key: workspace-\$\{\{ runner.os \}\}/, id);
+  }
+  const fullRoot = read(fullRootPath);
+  assert.match(fullRoot, /shared-key: workspace-\$\{\{ runner.os \}\}/);
+  assert.match(fullRoot, /save-if: \$\{\{ github.ref == 'refs\/heads\/main' \}\}/);
+  for (const source of [pr, read(fullPath), fullRoot]) {
+    assert.doesNotMatch(source, /add-rust-environment-hash-key: false|enableCrossOsArchive: true/);
+  }
+});
+
+test("documentation-only full runs require qualified history and retain policy checks", () => {
+  const jobs = workflowJobs(read(fullPath));
+  const policy = jobs.get("policy-and-graphs");
+  assert.match(policy, /gh run list --workflow ci-full.yml --branch main --status success/);
+  assert.match(policy, /CI_BASE_SHA: \$\{\{ steps.baseline.outputs.sha \}\}/);
+  assert.match(policy, /node scripts\/ci\/validate-current-docs.mjs/);
+  assert.match(policy, /cargo run --locked -p xtask -- policy/);
+  for (const id of ["root-macos", "root", "frontend", "fuzz-build", "model-integration"]) {
+    for (const fullRequired of ["true", "false", ""]) {
+      assert.equal(scheduled(jobs.get(id), {
+        "policy-and-graphs": { outputs: { full_required: fullRequired } },
+      }), fullRequired === "true", `${id}: ${fullRequired}`);
+    }
+  }
+  const summary = jobs.get("full-summary").match(/node -e '\n([\s\S]*?)\n          '/)[1];
+  for (const full of [true, false]) {
+    const needs = Object.fromEntries(jobNeeds(jobs.get("full-summary")).map(id => [id, {
+      result: full || ["policy-and-graphs", "macos-required"].includes(id) ? "success" : "skipped",
+    }]));
+    const check = (mode = String(full)) => spawnSync(process.execPath, ["-e", summary], {
+      env: { ...process.env, CI_NEEDS_JSON: JSON.stringify(needs), FULL_REQUIRED: mode },
+    }).status;
+    assert.equal(check(), 0);
+    assert.notEqual(check(""), 0);
+    for (const id of Object.keys(needs)) {
+      const before = needs[id].result;
+      needs[id].result = "failure";
+      assert.notEqual(check(), 0, `${full}: ${id}`);
+      needs[id].result = before;
+    }
+  }
+});
+
+test("automatic full runs supersede older pushes while explicit qualification remains independent", () => {
+  const full = read(fullPath);
+  const expression = full.match(/^  group: ci-full-(.+)$/m)[1];
+  const group = (event, run) => expression.replace(/\$\{\{ (.+?) \}\}/g, (_, e) =>
+    runInNewContext(e, { github: { event_name: event, ref: "refs/heads/main", run_id: run } }));
+  assert.equal(group("push", 1), group("push", 2));
+  assert.notEqual(group("push", 1), group("schedule", 1));
+  assert.notEqual(group("workflow_dispatch", 1), group("workflow_dispatch", 2));
+  assert.match(full, /cancel-in-progress: \$\{\{ github.event_name == 'push' \}\}/);
+  for (const source of [read(prPath), full, read(fullRootPath)]) {
+    for (const [id, job] of workflowJobs(source)) {
+      if (!job.includes("    runs-on:")) continue;
+      const limit = Number(job.match(/^    timeout-minutes: (\d+)$/m)?.[1]);
+      assert.ok(limit > 0 && limit <= 90, `${id}: bounded execution`);
+    }
   }
 });

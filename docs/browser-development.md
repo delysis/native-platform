@@ -46,6 +46,26 @@ Consolidate workflows only after demonstrating equivalent old/new coverage at
 the same revision; preserve negative cases and separately attributable outcomes.
 Do not alter test meaning while calling the change orchestration cleanup.
 
+Batch related edits after focused local checks before pushing a new CI revision.
+Reserve a manually dispatched full run for settled cross-platform qualification;
+the ordinary PR, main and nightly workflows already provide their own coverage.
+Automatic full runs cancel superseded pushes. A documentation-only main push
+keeps policy and documentation checks and may skip native builds only when its
+code matches the last successful main qualification. Missing history, unknown
+inputs and mixed code/documentation changes retain full coverage. Nightly and
+manual qualification always run the full suite.
+
+Stable Rust jobs restore compatible dependency caches written by full main
+runs, retaining Cargo's toolchain, target, environment and dependency keys.
+PR jobs do not publish duplicate caches for each product and pull request.
+Policy, fuzzing and the pinned OMP runtime keep separate cache families.
+Linux's ignored-test inventory runs beside an already selected complete
+workspace test build. Otherwise it retains its standalone job; macOS and Windows
+retain their separate inventory jobs. The guarded listing and registry checks
+are unchanged, and their failures remain visible in the owning job and step.
+Execution limits include headroom above measured cold builds; they do not alter
+individual test deadlines.
+
 For releases, test the package being delivered through ordinary installation,
 signing/quarantine handling and the real user-visible operation. Keep external
 acceptance separate from CI. Formal verification beyond the existing proofs
