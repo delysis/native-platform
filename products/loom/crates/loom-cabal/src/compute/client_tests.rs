@@ -138,8 +138,8 @@ mod supported {
             pending.receipt.is_none(),
             "restart cannot invent a remote terminal receipt"
         );
-        assert_eq!(client.jobs(fixture.request.grant.cabal)?.len(), 1);
-        assert!(client.jobs(Uuid::new_v4())?.is_empty());
+        assert_eq!(client.job_ids(fixture.request.grant.cabal)?.len(), 1);
+        assert!(client.job_ids(Uuid::new_v4())?.is_empty());
         Ok(())
     }
 
@@ -304,6 +304,131 @@ mod supported {
     }
 
     #[test]
+    fn settled_request_history_outlives_the_active_limit_and_keeps_exact_retries() -> Result<()> {
+        let mut fixture = Fixture::new()?;
+        let original = fixture.request.clone();
+        let mut client = fixture.open()?;
+        let mut latest = Uuid::nil();
+        for index in 0..MAX_JOBS + 4 {
+            if index > 0 {
+                fixture.request.id = Uuid::new_v4();
+            }
+            latest = fixture.request.id;
+            client.prepare(fixture.request.clone())?;
+            let accepted = fixture.receipt(ComputeStatus::Accepted, 0)?;
+            client.record(accepted.clone())?;
+            client.request_cancel(fixture.request.id)?;
+            client.record(fixture.receipt(
+                ComputeStatus::Cancelled {
+                    reason: ComputeCancellation::Requested,
+                },
+                2,
+            )?)?;
+            assert!(matches!(
+                client
+                    .record(accepted)?
+                    .receipt
+                    .expect("terminal")
+                    .payload
+                    .status,
+                ComputeStatus::Cancelled { .. }
+            ));
+        }
+        assert_eq!(client.usage()?.unfinished, 0);
+        let ids = client.job_ids(original.grant.cabal)?;
+        assert_eq!(ids.len(), MAX_JOBS as usize);
+        assert_eq!(ids[0], latest);
+        assert!(!ids.contains(&original.id), "the preview page is bounded");
+        drop(client);
+        let mut client = fixture.open()?;
+        let old = client.prepare(original.clone())?;
+        assert_eq!(old.request, original);
+        assert!(old.cancel_requested);
+        assert!(matches!(
+            old.receipt.expect("terminal").payload.status,
+            ComputeStatus::Cancelled { .. }
+        ));
+        let mut changed = original;
+        changed.input.prompt.push_str("different");
+        assert!(client.prepare(changed).is_err());
+        assert_eq!(
+            client.usage()?.unfinished,
+            0,
+            "an archived retry never prepares new work"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_request_archival_rolls_back_and_missing_or_corrupt_history_fails_closed() -> Result<()>
+    {
+        let fixture = Fixture::new()?;
+        let mut client = fixture.open()?;
+        client.prepare(fixture.request.clone())?;
+        let accepted = fixture.receipt(ComputeStatus::Accepted, 0)?;
+        client.record(accepted.clone())?;
+        let completed = fixture.receipt(
+            ComputeStatus::Completed {
+                text: "saved output".into(),
+            },
+            2,
+        )?;
+        client.database.execute_batch("CREATE TRIGGER reject_retirement BEFORE UPDATE OF settled ON requests BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END;")?;
+        assert!(client.record(completed.clone()).is_err());
+        assert_eq!(
+            client
+                .get(fixture.request.id)?
+                .expect("job")
+                .receipt
+                .expect("accepted")
+                .hash()?,
+            accepted.hash()?
+        );
+        assert_eq!(client.usage()?.unfinished, 1);
+        client
+            .database
+            .execute_batch("DROP TRIGGER reject_retirement")?;
+        client.record(completed.clone())?;
+        assert_eq!(client.usage()?.unfinished, 0);
+        let body: String = client.database.query_row(
+            "SELECT body FROM requests WHERE id = ?",
+            [fixture.request.id.to_string()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(body, encode(&fixture.request)?);
+        let saved: String = client.database.query_row(
+            "SELECT body FROM receipts WHERE job = ? AND revision = 0",
+            [fixture.request.id.to_string()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(saved, encode(&accepted)?);
+        client.database.execute(
+            "UPDATE requests SET body = ? WHERE id = ?",
+            params![
+                body.replace("Exact", "Altered"),
+                fixture.request.id.to_string()
+            ],
+        )?;
+        assert!(client.get(fixture.request.id).is_err());
+        client.database.execute(
+            "UPDATE requests SET body = ? WHERE id = ?",
+            params![body, fixture.request.id.to_string()],
+        )?;
+        client.database.execute(
+            "DELETE FROM receipts WHERE job = ?",
+            [fixture.request.id.to_string()],
+        )?;
+        drop(client);
+        let mut client = fixture.open()?;
+        assert!(client.get(fixture.request.id).is_err());
+        assert!(
+            client.prepare(fixture.request.clone()).is_err(),
+            "missing history cannot become a new dispatch"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn one_device_owns_private_storage_and_incompatible_or_corrupt_data_is_preserved() -> Result<()>
     {
         use std::os::unix::fs::PermissionsExt;
@@ -321,7 +446,7 @@ mod supported {
         let body: String = client
             .database
             .query_row("SELECT body FROM requests", [], |row| row.get(0))?;
-        client.database.pragma_update(None, "user_version", 9)?;
+        client.database.pragma_update(None, "user_version", 2)?;
         drop(client);
         assert!(fixture.open().is_err());
         let database = Connection::open(fixture.directory.path().join("requests.db"))?;
@@ -330,7 +455,7 @@ mod supported {
                 .get::<_, String>(0))?,
             body
         );
-        database.pragma_update(None, "user_version", 2)?;
+        database.pragma_update(None, "user_version", 3)?;
         drop(database);
         assert!(
             ComputeClient::open(fixture.directory.path(), Identity::generate()?.public_key())

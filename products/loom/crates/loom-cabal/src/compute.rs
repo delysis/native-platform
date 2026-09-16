@@ -2,6 +2,7 @@
 //! a signature authenticates the host, not its model or execution environment.
 mod client;
 mod media;
+mod retention;
 mod store;
 mod wire;
 

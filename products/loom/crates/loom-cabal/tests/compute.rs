@@ -382,7 +382,7 @@ async fn requesting_device_restart_recovers_lost_replies_and_preserves_cancellat
         1,
         "only the original reviewed submission executes"
     );
-    assert_eq!(client.jobs(pair.grant.cabal)?.len(), 1);
+    assert_eq!(client.job_ids(pair.grant.cabal)?.len(), 1);
     pair.close().await
 }
 

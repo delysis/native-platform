@@ -279,13 +279,17 @@ pub(crate) async fn compute_jobs(
         .lock()
         .map_err(|_| failure("Cabal owner stopped."))?
         .id();
-    // The ledger bounds total history; only a small preview crosses the UI IPC.
-    Ok(binding
-        .client()?
-        .jobs(cabal)
+    // Read one archived job at a time; only bounded previews accumulate.
+    let client = binding.client()?;
+    client
+        .job_ids(cabal)
         .map_err(failure)?
         .into_iter()
-        .map(|job| {
+        .map(|id| {
+            let job = client
+                .get(id)
+                .map_err(failure)?
+                .ok_or_else(|| failure("Saved peer job is unavailable."))?;
             let (state, preview) = match job.receipt.as_ref().map(|receipt| &receipt.payload.status)
             {
                 None => ("unconfirmed", String::new()),
@@ -299,16 +303,16 @@ pub(crate) async fn compute_jobs(
                     ("completed", text.chars().take(256).collect())
                 }
             };
-            JobSummary {
+            Ok(JobSummary {
                 id: job.request.id,
                 host: job.request.host.to_string(),
                 model: job.request.grant.model,
                 cancel_requested: job.cancel_requested,
                 state,
                 preview,
-            }
+            })
         })
-        .collect())
+        .collect()
 }
 
 #[derive(Clone, Copy)]

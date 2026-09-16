@@ -3,12 +3,8 @@ use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs::{File, OpenOptions};
 
-const MAX_JOBS: i64 = 256;
+use retention::{MAX_PENDING as MAX_JOBS, Usage};
 const MAX_GRANTS: i64 = 64;
-const MAX_STORED_BYTES: i64 = 64 * 1024 * 1024;
-// Input storage is measured separately. JSON can expand an output text byte
-// sixfold; reserve its maximum and all transition receipts before dispatch.
-const RECEIPT_STORAGE_RESERVE: i64 = 1024 * 1024;
 
 pub(super) struct Ledger {
     database: Connection,
@@ -20,7 +16,7 @@ impl Ledger {
     pub fn open(directory: &Path, identity: Identity) -> Result<Self> {
         if directory
             .symlink_metadata()
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            .is_ok_and(|metadata| !metadata.is_dir() || metadata.file_type().is_symlink())
         {
             return Err(Error::Invalid("Compute storage cannot be a symbolic link"));
         }
@@ -32,11 +28,15 @@ impl Ledger {
         }
         let database_path = directory.join("compute.db");
         let lease_path = directory.join("compute.lock");
-        for path in [&database_path, &lease_path] {
-            if path
-                .symlink_metadata()
-                .is_ok_and(|metadata| !metadata.file_type().is_file())
-            {
+        for path in [
+            &database_path,
+            &lease_path,
+            &directory.join("compute.db-wal"),
+            &directory.join("compute.db-shm"),
+        ] {
+            if path.symlink_metadata().is_ok_and(|metadata| {
+                !metadata.file_type().is_file() || metadata.len() > retention::MAX_DATABASE_BYTES
+            }) {
                 return Err(Error::Invalid("Compute storage must use ordinary files"));
             }
         }
@@ -52,7 +52,7 @@ impl Ledger {
         let exists = database_path.exists();
         let database = Connection::open(&database_path)?;
         let version: i64 = database.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if exists && version != 2 {
+        if exists && version != 3 {
             return Err(Error::Invalid(
                 "Unsupported compute ledger; it was preserved",
             ));
@@ -64,42 +64,51 @@ impl Ledger {
                 return Err(Error::Invalid("Compute ledger belongs to another device"));
             }
         }
-        database.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;
-            PRAGMA max_page_count = 32768;
-            CREATE TABLE IF NOT EXISTS owner (key TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, body TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS jobs (peer TEXT NOT NULL, id TEXT NOT NULL, grant_id TEXT NOT NULL REFERENCES grants(id),
-                input TEXT NOT NULL, PRIMARY KEY(peer, id));
-            CREATE TABLE IF NOT EXISTS receipts (peer TEXT NOT NULL, job TEXT NOT NULL, revision INTEGER NOT NULL,
-                body TEXT NOT NULL, PRIMARY KEY(peer, job, revision), FOREIGN KEY(peer, job) REFERENCES jobs(peer, id));")?;
+        database.execute_batch(
+            "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;",
+        )?;
+        retention::configure(&database)?;
         if !exists {
+            database.execute_batch("CREATE TABLE owner (key TEXT NOT NULL);
+                CREATE TABLE grants (id TEXT PRIMARY KEY, body TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, retired INTEGER NOT NULL DEFAULT 0);
+                CREATE TABLE jobs (peer TEXT NOT NULL, id TEXT NOT NULL, grant_id TEXT NOT NULL REFERENCES grants(id),
+                    input TEXT NOT NULL, settled INTEGER NOT NULL DEFAULT 0 CHECK (settled IN (0, 1)),
+                    stored_bytes INTEGER NOT NULL CHECK (stored_bytes >= 0), PRIMARY KEY(peer, id));
+                CREATE INDEX jobs_retention ON jobs(settled, stored_bytes);
+                CREATE INDEX jobs_by_grant ON jobs(grant_id);
+                CREATE TABLE receipts (peer TEXT NOT NULL, job TEXT NOT NULL, revision INTEGER NOT NULL,
+                    body TEXT NOT NULL, PRIMARY KEY(peer, job, revision), FOREIGN KEY(peer, job) REFERENCES jobs(peer, id));")?;
             database.execute(
                 "INSERT INTO owner(key) VALUES (?)",
                 [identity.public_key().to_string()],
             )?;
-            database.pragma_update(None, "user_version", 2)?;
+            database.pragma_update(None, "user_version", 3)?;
+            #[cfg(unix)]
+            File::open(directory)?.sync_all()?;
         }
         let owner: String = database.query_row("SELECT key FROM owner", [], |row| row.get(0))?;
         if owner != identity.public_key().to_string() {
             return Err(Error::Invalid("Compute ledger belongs to another device"));
         }
-        let jobs: i64 = database.query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))?;
         let grants: i64 =
-            database.query_row("SELECT count(*) FROM grants", [], |row| row.get(0))?;
-        if jobs > MAX_JOBS || grants > MAX_GRANTS {
-            return Err(Error::Invalid("Compute ledger exceeds storage limits"));
+            database.query_row("SELECT count(*) FROM grants WHERE retired = 0", [], |row| {
+                row.get(0)
+            })?;
+        if grants > MAX_GRANTS {
+            return Err(Error::Invalid("Too many active compute grants"));
         }
         let mut ledger = Self {
             database,
             identity,
             _lease: lease,
         };
+        ledger.usage()?.validate()?;
         // No continuation can be owned across a process restart. Append this
         // fact without changing the immutable accepted input or prior receipts.
         let keys = ledger
             .database
-            .prepare("SELECT peer, id FROM jobs")?
-            .query_map([], |row| {
+            .prepare("SELECT peer, id FROM jobs WHERE settled = 0 LIMIT ?")?
+            .query_map([MAX_JOBS + 1], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -149,27 +158,48 @@ impl Ledger {
 
     pub fn revoke(&mut self, id: Uuid) -> Result<()> {
         if self.database.execute(
-            "UPDATE grants SET revoked = 1 WHERE id = ?",
+            "UPDATE grants SET revoked = 1, retired = 1 WHERE id = ?",
             [id.to_string()],
         )? == 0
         {
-            self.ensure_grant_capacity()?;
             // A cancelled, uncertain local grant must reject even a delayed
-            // first admission. This tombstone shares the grant identity bound.
+            // first admission. Its identity remains after leaving the active set.
             self.database.execute(
-                "INSERT INTO grants(id, body, revoked) VALUES (?, '', 1)",
+                "INSERT INTO grants(id, body, revoked, retired) VALUES (?, '', 1, 1)",
                 [id.to_string()],
             )?;
         }
         Ok(())
     }
 
-    fn ensure_grant_capacity(&self) -> Result<()> {
-        let count: i64 = self
-            .database
-            .query_row("SELECT count(*) FROM grants", [], |row| row.get(0))?;
+    fn ensure_grant_capacity(&mut self) -> Result<()> {
+        // Only exhausted grants with every job settled can leave the active
+        // set. Keep the original body and identity: an exact retry cannot
+        // restore its budget, and an uncertain revocation cannot be forgotten.
+        for grant in self.grants()? {
+            if self.remaining_jobs(&grant)? == 0 {
+                let unfinished: bool = self.database.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM jobs WHERE grant_id = ? AND settled = 0)",
+                    [grant.id.to_string()],
+                    |row| row.get(0),
+                )?;
+                if !unfinished {
+                    self.database.execute(
+                        "UPDATE grants SET retired = 1 WHERE id = ?",
+                        [grant.id.to_string()],
+                    )?;
+                }
+            }
+        }
+        let count: i64 = self.database.query_row(
+            "SELECT count(*) FROM grants WHERE retired = 0",
+            [],
+            |row| row.get(0),
+        )?;
         if count >= MAX_GRANTS {
-            return Err(Error::Invalid("Compute grant ledger is full"));
+            return Err(Error::Invalid(
+                "Too many active compute grants; revoke an unused grant",
+            ));
         }
         Ok(())
     }
@@ -186,9 +216,14 @@ impl Ledger {
     pub fn grants(&self) -> Result<Vec<ComputeGrant>> {
         let bodies = self
             .database
-            .prepare("SELECT body FROM grants WHERE revoked = 0 ORDER BY id")?
+            .prepare(
+                "SELECT body FROM grants WHERE revoked = 0 AND retired = 0 ORDER BY id LIMIT 65",
+            )?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        if bodies.len() > MAX_GRANTS as usize {
+            return Err(Error::Invalid("Too many active compute grants"));
+        }
         bodies
             .into_iter()
             .map(|body| {
@@ -204,27 +239,29 @@ impl Ledger {
     }
 
     pub fn has_capacity(&self, grant: &ComputeGrant, input: Option<&ComputeInput>) -> Result<bool> {
-        let total: i64 = self
-            .database
-            .query_row("SELECT count(*) FROM jobs", [], |row| row.get(0))?;
-        let bytes: i64 = self.database.query_row(
-            "SELECT (SELECT coalesce(sum(length(CAST(input AS BLOB))), 0) FROM jobs)
-                + (SELECT coalesce(sum(length(CAST(body AS BLOB))), 0) FROM receipts)",
-            [],
-            |row| row.get(0),
-        )?;
-        Ok(total < MAX_JOBS
-            && self.remaining_jobs(grant)? > 0
-            && bytes
-                <= MAX_STORED_BYTES
-                    - RECEIPT_STORAGE_RESERVE
-                    - i64::try_from(
-                        input
-                            .map(serde_json::to_vec)
-                            .transpose()?
-                            .map_or(0, |bytes| bytes.len()),
-                    )
-                    .map_err(|_| Error::Invalid("Compute input exceeds storage limit"))?)
+        let input_bytes = input
+            .map(serde_json::to_vec)
+            .transpose()?
+            .map_or(0, |bytes| bytes.len());
+        Ok(self.remaining_jobs(grant)? > 0 && self.usage()?.can_accept(input_bytes))
+    }
+
+    fn usage(&self) -> Result<Usage> {
+        self.database
+            .query_row(
+                "SELECT coalesce(sum(settled = 0), 0),
+            coalesce(sum(CASE WHEN settled = 0 THEN stored_bytes ELSE 0 END), 0),
+            coalesce(sum(stored_bytes), 0) FROM jobs",
+                [],
+                |row| {
+                    Ok(Usage {
+                        unfinished: row.get(0)?,
+                        active_bytes: row.get(1)?,
+                        retained_bytes: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 
     pub fn accept(
@@ -245,64 +282,91 @@ impl Ledger {
             recorded_at_ms: created_at_ms,
             status: ComputeStatus::Accepted,
         })?;
+        let input = serde_json::to_string(&job.input)?;
+        let body = serde_json::to_string(&receipt)?;
         let tx = self.database.transaction()?;
         tx.execute(
-            "INSERT INTO jobs(peer, id, grant_id, input) VALUES (?, ?, ?, ?)",
+            "INSERT INTO jobs(peer, id, grant_id, input, stored_bytes) VALUES (?, ?, ?, ?, ?)",
             params![
                 job.peer.to_string(),
                 job.id.to_string(),
                 job.grant.id.to_string(),
-                serde_json::to_string(&job.input)?,
+                input,
+                (input.len() + body.len()) as i64,
             ],
         )?;
         tx.execute(
             "INSERT INTO receipts(peer, job, revision, body) VALUES (?, ?, 0, ?)",
-            params![
-                job.peer.to_string(),
-                job.id.to_string(),
-                serde_json::to_string(&receipt)?,
-            ],
+            params![job.peer.to_string(), job.id.to_string(), body,],
         )?;
         tx.commit()?;
         Ok(receipt)
     }
 
     pub fn get(&self, peer: PublicKey, job: Uuid) -> Result<Option<RemoteJobReceipt>> {
-        let encoded: Option<String> = self.database.query_row(
-            "SELECT body FROM receipts WHERE peer = ? AND job = ? ORDER BY revision DESC LIMIT 1",
-            params![peer.to_string(), job.to_string()], |row| row.get(0),
+        let saved: Option<(String, Option<String>, bool, i64)> = self.database.query_row(
+            "SELECT grant_id, CASE WHEN length(CAST(input AS BLOB)) <= ? THEN input END, settled, stored_bytes
+             FROM jobs WHERE peer = ? AND id = ?",
+            params![MAX_COMPUTE_FRAME_BYTES as i64, peer.to_string(), job.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         ).optional()?;
-        let Some(encoded) = encoded else {
+        let Some((grant_id, input, settled, stored_bytes)) = saved else {
             return Ok(None);
         };
-        if encoded.len() > crate::MAX_FRAME_BYTES {
-            return Err(Error::Invalid("Compute receipt exceeds limit"));
-        }
-        let receipt: RemoteJobReceipt = serde_json::from_str(&encoded)?;
-        receipt.verify()?;
-        if receipt.signer != self.identity.public_key()
-            || receipt.payload.peer != peer
-            || receipt.payload.job != job
-        {
+        let input = input.ok_or(Error::Invalid("Compute input exceeds its storage limit"))?;
+        let grant: String = self.database.query_row(
+            "SELECT body FROM grants WHERE id = ?",
+            [&grant_id],
+            |row| row.get(0),
+        )?;
+        let request = ClientRequest {
+            id: job,
+            host: self.identity.public_key(),
+            grant: serde_json::from_str(&grant)?,
+            input: serde_json::from_str(&input)?,
+        };
+        if request.grant.peer != peer || request.grant.id.to_string() != grant_id {
             return Err(Error::Invalid("Compute receipt identity mismatch"));
         }
-        let (grant, input): (String, String) = self.database.query_row(
-            "SELECT grant_id, input FROM jobs WHERE peer = ? AND id = ?",
-            params![peer.to_string(), job.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let grant = grant
-            .parse()
-            .map_err(|_| Error::Invalid("Invalid compute grant identity"))?;
-        let input: ComputeInput = serde_json::from_str(&input)?;
-        if receipt.payload.grant != grant
-            || receipt.payload.request_fingerprint != input.fingerprint(grant)?
-        {
+        let mut bytes = input.len() as i64;
+        let mut latest = None;
+        for body in self.receipt_bodies(peer, job)? {
+            bytes += body.len() as i64;
+            let receipt: RemoteJobReceipt = serde_json::from_str(&body)?;
+            client::validate_receipt(&request, &receipt)?;
+            if let Some(previous) = &latest {
+                client::validate_advance(previous, &receipt)?;
+            }
+            latest = Some(receipt);
+        }
+        let receipt = latest.ok_or(Error::Invalid("Compute job has no receipt"))?;
+        if settled != receipt.payload.status.is_terminal() || bytes != stored_bytes {
             return Err(Error::Invalid(
-                "Compute receipt does not match the saved input",
+                "Compute retention index does not match its receipts",
             ));
         }
         Ok(Some(receipt))
+    }
+
+    fn receipt_bodies(&self, peer: PublicKey, job: Uuid) -> Result<Vec<String>> {
+        let mut query = self.database.prepare(
+            "SELECT CASE WHEN length(CAST(body AS BLOB)) <= ? THEN body END
+             FROM receipts WHERE peer = ? AND job = ? ORDER BY revision LIMIT 5",
+        )?;
+        let bodies = query
+            .query_map(
+                params![
+                    crate::MAX_FRAME_BYTES as i64,
+                    peer.to_string(),
+                    job.to_string()
+                ],
+                |row| row.get(0),
+            )?
+            .collect::<std::result::Result<Vec<String>, _>>()?;
+        if bodies.len() > 4 {
+            return Err(Error::Invalid("Too many compute receipts"));
+        }
+        Ok(bodies)
     }
 
     pub fn cancel(
@@ -374,15 +438,20 @@ impl Ledger {
             status,
             ..old.payload
         })?;
-        self.database.execute(
+        let body = serde_json::to_string(&receipt)?;
+        let tx = self.database.transaction()?;
+        tx.execute(
             "INSERT INTO receipts(peer, job, revision, body) VALUES (?, ?, ?, ?)",
             params![
                 peer.to_string(),
                 job.to_string(),
                 receipt.payload.revision,
-                serde_json::to_string(&receipt)?,
+                body
             ],
         )?;
+        tx.execute("UPDATE jobs SET settled = ?, stored_bytes = stored_bytes + ? WHERE peer = ? AND id = ?",
+            params![receipt.payload.status.is_terminal(), body.len() as i64, peer.to_string(), job.to_string()])?;
+        tx.commit()?;
         Ok(receipt)
     }
 }
@@ -448,12 +517,10 @@ mod tests {
                 !reopened.has_capacity(&job.grant, Some(&job.input))?,
                 "restart cannot restore a consumed budget"
             );
-            let original: String = reopened.database.query_row(
-                "SELECT body FROM receipts WHERE revision = 0",
-                [],
-                |row| row.get(0),
-            )?;
-            assert_eq!(original, serde_json::to_string(&accepted)?);
+            assert_eq!(
+                reopened.receipt_bodies(job.peer, job.id)?[0],
+                serde_json::to_string(&accepted)?
+            );
             assert!(
                 reopened
                     .transition(job.peer, job.id, ComputeStatus::Running)
@@ -493,21 +560,24 @@ mod tests {
     }
 
     #[test]
-    fn uncertain_revocations_share_the_bounded_grant_identity_ledger() -> Result<()> {
+    fn uncertain_revocations_retain_identity_without_occupying_active_grant_slots() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let identity = Identity::generate()?;
         let mut ledger = Ledger::open(directory.path(), identity)?;
         let mut first = Uuid::nil();
-        for index in 0..MAX_GRANTS {
+        for index in 0..=MAX_GRANTS {
             let id = Uuid::new_v4();
             if index == 0 {
                 first = id;
             }
             ledger.revoke(id)?;
         }
-        assert!(ledger.revoke(Uuid::new_v4()).is_err());
+        ledger.revoke(Uuid::new_v4())?;
         ledger.revoke(first)?;
         assert!(ledger.grants()?.is_empty());
+        let mut late = job(&Identity::generate()?);
+        late.grant.id = first;
+        assert!(ledger.grant(late.grant).is_err());
         Ok(())
     }
 
@@ -528,7 +598,7 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("compute.db");
         let database = Connection::open(&path)?;
-        database.execute_batch("PRAGMA user_version = 77; CREATE TABLE sentinel (body TEXT); INSERT INTO sentinel VALUES ('keep me');")?;
+        database.execute_batch("PRAGMA user_version = 2; CREATE TABLE sentinel (body TEXT); INSERT INTO sentinel VALUES ('keep me');")?;
         drop(database);
         let before = std::fs::read(&path)?;
         assert!(Ledger::open(directory.path(), Identity::generate()?).is_err());
@@ -537,30 +607,143 @@ mod tests {
     }
 
     #[test]
-    fn grant_and_storage_caps_keep_consumed_identities_durable() -> Result<()> {
+    fn settled_jobs_outlive_active_limits_without_restoring_spent_budgets() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let identity = Identity::generate()?;
         let mut ledger = Ledger::open(directory.path(), identity.clone())?;
         let mut job = job(&identity);
-        job.grant.jobs = MAX_JOBS as u32;
-        ledger.grant(job.grant.clone())?;
-        for _ in 0..MAX_JOBS {
+        let mut saved = Vec::new();
+        // More jobs and grant identities than either old lifetime limit.
+        for _ in 0..MAX_JOBS + 4 {
             job.id = Uuid::new_v4();
-            assert!(ledger.has_capacity(&job.grant, Some(&job.input))?);
-            ledger.accept(&job, job.input.fingerprint(job.grant.id)?)?;
-            ledger.transition(job.peer, job.id, ComputeStatus::Interrupted)?;
-        }
-        assert!(!ledger.has_capacity(&job.grant, Some(&job.input))?);
-        for _ in 1..MAX_GRANTS {
             job.grant.id = Uuid::new_v4();
             ledger.grant(job.grant.clone())?;
-            ledger.revoke(job.grant.id)?;
+            assert!(ledger.has_capacity(&job.grant, Some(&job.input))?);
+            ledger.accept(&job, job.input.fingerprint(job.grant.id)?)?;
+            let terminal = ledger.transition(job.peer, job.id, ComputeStatus::Interrupted)?;
+            saved.push((job.clone(), terminal.hash()?));
         }
-        job.grant.id = Uuid::new_v4();
-        assert!(
-            ledger.grant(job.grant).is_err(),
-            "revocation must not recycle identity tombstones"
+        drop(ledger);
+        let mut ledger = Ledger::open(directory.path(), identity)?;
+        for (job, hash) in &saved {
+            assert_eq!(
+                ledger.get(job.peer, job.id)?.expect("archived").hash()?,
+                *hash
+            );
+            assert_eq!(ledger.remaining_jobs(&job.grant)?, 0);
+            ledger.grant(job.grant.clone())?;
+            assert!(!ledger.has_capacity(&job.grant, Some(&job.input))?);
+        }
+        assert_eq!(
+            ledger.database.query_row(
+                "SELECT count(*) FROM jobs WHERE settled = 0",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
         );
+        assert_eq!(
+            ledger.database.query_row(
+                "SELECT count(*) FROM jobs WHERE settled = 1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            MAX_JOBS + 4
+        );
+        assert_eq!(
+            ledger.grants()?.len(),
+            1,
+            "retrying retired grants cannot reactivate them"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_grants_stay_bounded_while_revoked_identities_remain_retired() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let identity = Identity::generate()?;
+        let mut ledger = Ledger::open(directory.path(), identity.clone())?;
+        let first = job(&identity).grant;
+        ledger.grant(first.clone())?;
+        for _ in 1..MAX_GRANTS {
+            ledger.grant(job(&identity).grant)?;
+        }
+        let next = job(&identity).grant;
+        assert!(ledger.grant(next.clone()).is_err());
+        ledger.revoke(first.id)?;
+        ledger.grant(next)?;
+        assert!(ledger.grant(first).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn spent_grant_is_not_retired_while_its_job_is_unfinished() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let identity = Identity::generate()?;
+        let mut ledger = Ledger::open(directory.path(), identity.clone())?;
+        let pending = job(&identity);
+        ledger.grant(pending.grant.clone())?;
+        ledger.accept(&pending, pending.input.fingerprint(pending.grant.id)?)?;
+        for _ in 1..MAX_GRANTS {
+            ledger.grant(job(&identity).grant)?;
+        }
+        let next = job(&identity).grant;
+        assert!(ledger.grant(next.clone()).is_err());
+        assert!(ledger.find_grant(pending.grant.id)?.is_some());
+        ledger.transition(pending.peer, pending.id, ComputeStatus::Interrupted)?;
+        ledger.grant(next)?;
+        assert!(ledger.find_grant(pending.grant.id)?.is_none());
+        ledger.grant(pending.grant.clone())?;
+        assert!(ledger.find_grant(pending.grant.id)?.is_none());
+        assert_eq!(ledger.remaining_jobs(&pending.grant)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn archive_commit_is_atomic_and_missing_history_never_becomes_a_new_job() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let identity = Identity::generate()?;
+        let mut ledger = Ledger::open(directory.path(), identity.clone())?;
+        let job = job(&identity);
+        ledger.grant(job.grant.clone())?;
+        let accepted = ledger.accept(&job, job.input.fingerprint(job.grant.id)?)?;
+        ledger.database.execute_batch("CREATE TRIGGER reject_retirement BEFORE UPDATE OF settled ON jobs BEGIN SELECT RAISE(ABORT, 'injected storage failure'); END;")?;
+        assert!(
+            ledger
+                .transition(job.peer, job.id, ComputeStatus::Interrupted)
+                .is_err()
+        );
+        assert_eq!(
+            ledger.get(job.peer, job.id)?.expect("original").hash()?,
+            accepted.hash()?
+        );
+        assert_eq!(ledger.usage()?.unfinished, 1);
+        assert_eq!(ledger.receipt_bodies(job.peer, job.id)?.len(), 1);
+        ledger
+            .database
+            .execute_batch("DROP TRIGGER reject_retirement")?;
+        ledger.transition(job.peer, job.id, ComputeStatus::Interrupted)?;
+        let input: String = ledger.database.query_row(
+            "SELECT input FROM jobs WHERE peer = ? AND id = ?",
+            params![job.peer.to_string(), job.id.to_string()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(input, serde_json::to_string(&job.input)?);
+        assert_eq!(
+            ledger.receipt_bodies(job.peer, job.id)?[0],
+            serde_json::to_string(&accepted)?
+        );
+        ledger.database.execute(
+            "DELETE FROM receipts WHERE peer = ? AND job = ?",
+            params![job.peer.to_string(), job.id.to_string()],
+        )?;
+        assert!(ledger.get(job.peer, job.id).is_err());
+        assert!(
+            ledger
+                .accept(&job, job.input.fingerprint(job.grant.id)?)
+                .is_err()
+        );
+        assert_eq!(ledger.remaining_jobs(&job.grant)?, 0);
         Ok(())
     }
 
@@ -578,7 +761,8 @@ mod tests {
         )?];
         ledger.grant(job.grant.clone())?;
         let mut accepted = 0;
-        while ledger.has_capacity(&job.grant, Some(&job.input))? {
+        for _ in 0..6 {
+            assert!(ledger.has_capacity(&job.grant, Some(&job.input))?);
             job.id = Uuid::new_v4();
             ledger.accept(&job, job.input.fingerprint(job.grant.id)?)?;
             ledger.transition(job.peer, job.id, ComputeStatus::Running)?;
@@ -592,13 +776,20 @@ mod tests {
             accepted += 1;
         }
         assert_eq!(
-            accepted, 5,
-            "six full inputs would exceed the 64 MiB ledger"
+            accepted, 6,
+            "settled media leaves the active storage budget"
         );
+        let usage = ledger.usage()?;
+        assert!(usage.retained_bytes > retention::MAX_ACTIVE_BYTES);
+        assert!(
+            usage.retained_bytes
+                < 6 * (serde_json::to_vec(&job.input)?.len() as i64 + retention::RECEIPT_RESERVE)
+        );
+        assert_eq!(usage.active_bytes, 0);
         let bytes: i64 = ledger.database.query_row(
-            "SELECT (SELECT sum(length(CAST(input AS BLOB))) FROM jobs) + (SELECT sum(length(CAST(body AS BLOB))) FROM receipts)", [], |row| row.get(0),
+            "SELECT (SELECT coalesce(sum(length(CAST(input AS BLOB))), 0) FROM jobs) + (SELECT coalesce(sum(length(CAST(body AS BLOB))), 0) FROM receipts)", [], |row| row.get(0),
         )?;
-        assert!(bytes <= MAX_STORED_BYTES);
+        assert_eq!(bytes, usage.retained_bytes);
         assert!(
             ledger
                 .get(job.peer, job.id)?

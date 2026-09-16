@@ -5,12 +5,8 @@ use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::fs::{File, OpenOptions};
 
-const MAX_JOBS: i64 = 256;
-const MAX_BYTES: i64 = 64 * 1024 * 1024;
+use retention::{MAX_PENDING as MAX_JOBS, Usage};
 const MAX_RECORD_BYTES: usize = MAX_COMPUTE_FRAME_BYTES;
-// A job has at most four receipts, with text only in a successful terminal.
-// Reserve its terminal before dispatch, even when several peers are offline.
-const RECEIPT_RESERVE: i64 = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,7 +100,8 @@ impl ComputeClient {
                 .join(name)
                 .symlink_metadata()
                 .is_ok_and(|metadata| {
-                    !metadata.file_type().is_file() || metadata.len() > 128 * 1024 * 1024
+                    !metadata.file_type().is_file()
+                        || metadata.len() > retention::MAX_DATABASE_BYTES
                 })
             {
                 return Err(Error::Invalid(
@@ -129,7 +126,7 @@ impl ComputeClient {
         let database = Connection::open_with_flags(&database_path, flags)?;
         let version: i64 = database.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if exists {
-            if version != 2 {
+            if version != 3 {
                 return Err(Error::Invalid(
                     "Unsupported compute requests; they were preserved",
                 ));
@@ -141,17 +138,20 @@ impl ComputeClient {
             }
         }
         database.execute_batch(
-            "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;
-            PRAGMA max_page_count = 32768;",
+            "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;",
         )?;
+        retention::configure(&database)?;
         if !exists {
             database.execute_batch("CREATE TABLE owner (key TEXT NOT NULL);
-                CREATE TABLE requests (id TEXT PRIMARY KEY, cabal TEXT NOT NULL, body TEXT NOT NULL);
+                CREATE TABLE requests (id TEXT PRIMARY KEY, cabal TEXT NOT NULL, body TEXT NOT NULL,
+                    settled INTEGER NOT NULL DEFAULT 0 CHECK (settled IN (0, 1)), stored_bytes INTEGER NOT NULL CHECK (stored_bytes >= 0));
+                CREATE INDEX requests_retention ON requests(settled, stored_bytes);
+                CREATE INDEX requests_by_cabal ON requests(cabal);
                 CREATE TABLE cancellations (job TEXT PRIMARY KEY REFERENCES requests(id));
                 CREATE TABLE receipts (job TEXT NOT NULL REFERENCES requests(id), revision INTEGER NOT NULL,
                     terminal INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(job, revision));")?;
             database.execute("INSERT INTO owner(key) VALUES (?)", [peer.to_string()])?;
-            database.pragma_update(None, "user_version", 2)?;
+            database.pragma_update(None, "user_version", 3)?;
             File::open(directory)?.sync_all()?;
         }
         let client = Self {
@@ -159,10 +159,7 @@ impl ComputeClient {
             peer,
             _lease: lease,
         };
-        let (jobs, bytes, _) = client.usage()?;
-        if jobs > MAX_JOBS || bytes > MAX_BYTES {
-            return Err(Error::Invalid("Compute request ledger exceeds its limits"));
-        }
+        client.usage()?.validate()?;
         // Read and verify saved assertions without interpreting a restart as a
         // remote terminal event or implicitly resubmitting an unfinished job.
         for id in client.ids(None)? {
@@ -185,23 +182,18 @@ impl ComputeClient {
             };
         }
         let body = encode(&request)?;
-        let (jobs, bytes, pending) = self.usage()?;
-        if jobs >= MAX_JOBS
-            || bytes
-                + (pending + 1) * RECEIPT_RESERVE
-                + i64::try_from(body.len()).expect("bounded record")
-                > MAX_BYTES
-        {
+        if !self.usage()?.can_accept(body.len()) {
             return Err(Error::Invalid(
-                "Compute request ledger is full; existing jobs were preserved",
+                "Compute request ledger or archive is full; existing jobs were preserved",
             ));
         }
         self.database.execute(
-            "INSERT INTO requests(id, cabal, body) VALUES (?, ?, ?)",
+            "INSERT INTO requests(id, cabal, body, stored_bytes) VALUES (?, ?, ?, ?)",
             params![
                 request.id.to_string(),
                 request.grant.cabal.to_string(),
-                body
+                body,
+                body.len() as i64,
             ],
         )?;
         self.get(request.id)?
@@ -250,6 +242,7 @@ impl ComputeClient {
         if request.id != job || request.grant.cabal.to_string() != cabal {
             return Err(Error::Invalid("Compute request identity mismatch"));
         }
+        let mut bytes = body.len() as i64;
         let mut receipt: Option<RemoteJobReceipt> = None;
         let mut query = self.database.prepare("SELECT revision, terminal, length(CAST(body AS BLOB)), CASE WHEN length(CAST(body AS BLOB)) <= ? THEN body END
             FROM receipts WHERE job = ? ORDER BY revision")?;
@@ -258,10 +251,11 @@ impl ComputeClient {
             job.to_string()
         ])?;
         while let Some(row) = rows.next()? {
-            let bytes: i64 = row.get(2)?;
-            if bytes > i64::try_from(MAX_RECORD_BYTES).expect("bounded record limit") {
+            let receipt_bytes: i64 = row.get(2)?;
+            if receipt_bytes > i64::try_from(MAX_RECORD_BYTES).expect("bounded record limit") {
                 return Err(Error::Invalid("Compute receipt exceeds its limit"));
             }
+            bytes += receipt_bytes;
             let body: String = row.get(3)?;
             let next: RemoteJobReceipt = serde_json::from_str(&body)?;
             validate_receipt(&request, &next)?;
@@ -275,6 +269,21 @@ impl ComputeClient {
             }
             receipt = Some(next);
         }
+        let (settled, stored_bytes): (bool, i64) = self.database.query_row(
+            "SELECT settled, stored_bytes FROM requests WHERE id = ?",
+            [job.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if settled
+            != receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.payload.status.is_terminal())
+            || bytes != stored_bytes
+        {
+            return Err(Error::Invalid(
+                "Compute retention index does not match its receipts",
+            ));
+        }
         let cancel_requested = self.database.query_row(
             "SELECT EXISTS(SELECT 1 FROM cancellations WHERE job = ?)",
             [job.to_string()],
@@ -287,14 +296,10 @@ impl ComputeClient {
         }))
     }
 
-    pub fn jobs(&self, cabal: Uuid) -> Result<Vec<ClientJob>> {
-        self.ids(Some(cabal))?
-            .into_iter()
-            .map(|id| {
-                self.get(id)?
-                    .ok_or(Error::Invalid("Compute request disappeared"))
-            })
-            .collect()
+    /// Newest 256 identities only. Read and release each job individually when
+    /// constructing previews; never collect a page of full media payloads.
+    pub fn job_ids(&self, cabal: Uuid) -> Result<Vec<Uuid>> {
+        self.ids(Some(cabal))
     }
 
     pub fn record(&mut self, receipt: RemoteJobReceipt) -> Result<ClientJob> {
@@ -323,10 +328,14 @@ impl ComputeClient {
             validate_advance(old, &receipt)?;
         }
         let body = encode(&receipt)?;
-        if self.usage()?.1 + i64::try_from(body.len()).expect("bounded record") > MAX_BYTES {
+        let usage = self.usage()?;
+        if usage.active_bytes + body.len() as i64 > retention::MAX_ACTIVE_BYTES
+            || usage.retained_bytes + body.len() as i64 > retention::MAX_RETAINED_BYTES
+        {
             return Err(Error::Invalid("Compute receipt storage is full"));
         }
-        self.database.execute(
+        let tx = self.database.transaction()?;
+        tx.execute(
             "INSERT INTO receipts(job, revision, terminal, body) VALUES (?, ?, ?, ?)",
             params![
                 receipt.payload.job.to_string(),
@@ -335,20 +344,41 @@ impl ComputeClient {
                 body
             ],
         )?;
+        tx.execute(
+            "UPDATE requests SET settled = ?, stored_bytes = stored_bytes + ? WHERE id = ?",
+            params![
+                receipt.payload.status.is_terminal(),
+                body.len() as i64,
+                receipt.payload.job.to_string()
+            ],
+        )?;
+        tx.commit()?;
         self.get(receipt.payload.job)?
             .ok_or(Error::Invalid("Compute request disappeared"))
     }
 
     fn ids(&self, cabal: Option<Uuid>) -> Result<Vec<Uuid>> {
-        let mut query = self.database.prepare(
-            "SELECT id FROM requests WHERE (? IS NULL OR cabal = ?) ORDER BY id LIMIT 257",
-        )?;
-        let value = cabal.map(|id| id.to_string());
+        // Opening verifies only the bounded unfinished set. Settled history is
+        // verified lazily by identity, and UI listing returns the newest page.
+        let (sql, value, limit) = if let Some(cabal) = cabal {
+            (
+                "SELECT id FROM requests WHERE cabal = ? ORDER BY rowid DESC LIMIT ?",
+                cabal.to_string(),
+                MAX_JOBS,
+            )
+        } else {
+            (
+                "SELECT id FROM requests WHERE settled = 0 AND ? = '' ORDER BY rowid DESC LIMIT ?",
+                String::new(),
+                MAX_JOBS + 1,
+            )
+        };
+        let mut query = self.database.prepare(sql)?;
         let ids = query
-            .query_map(params![value, value], |row| row.get::<_, String>(0))?
+            .query_map(params![value, limit], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        if i64::try_from(ids.len()).expect("bounded request count") > MAX_JOBS {
-            return Err(Error::Invalid("Too many compute requests"));
+        if ids.len() > MAX_JOBS as usize {
+            return Err(Error::Invalid("Too many unfinished compute requests"));
         }
         ids.into_iter()
             .map(|id| {
@@ -358,11 +388,22 @@ impl ComputeClient {
             .collect()
     }
 
-    fn usage(&self) -> Result<(i64, i64, i64)> {
-        self.database.query_row("SELECT (SELECT count(*) FROM requests),
-            (SELECT coalesce(sum(length(CAST(body AS BLOB))), 0) FROM requests) + (SELECT coalesce(sum(length(CAST(body AS BLOB))), 0) FROM receipts),
-            (SELECT count(*) FROM requests WHERE NOT EXISTS(SELECT 1 FROM receipts WHERE receipts.job = requests.id AND terminal = 1))",
-            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(Into::into)
+    fn usage(&self) -> Result<Usage> {
+        self.database
+            .query_row(
+                "SELECT coalesce(sum(settled = 0), 0),
+            coalesce(sum(CASE WHEN settled = 0 THEN stored_bytes ELSE 0 END), 0),
+            coalesce(sum(stored_bytes), 0) FROM requests",
+                [],
+                |row| {
+                    Ok(Usage {
+                        unfinished: row.get(0)?,
+                        active_bytes: row.get(1)?,
+                        retained_bytes: row.get(2)?,
+                    })
+                },
+            )
+            .map_err(Into::into)
     }
 }
 
@@ -374,7 +415,7 @@ fn encode(value: &impl Serialize) -> Result<String> {
     Ok(body)
 }
 
-fn validate_receipt(request: &ClientRequest, receipt: &RemoteJobReceipt) -> Result<()> {
+pub(super) fn validate_receipt(request: &ClientRequest, receipt: &RemoteJobReceipt) -> Result<()> {
     receipt.verify()?;
     let value = &receipt.payload;
     if receipt.signer != request.host
@@ -405,7 +446,7 @@ fn validate_receipt(request: &ClientRequest, receipt: &RemoteJobReceipt) -> Resu
     Ok(())
 }
 
-fn validate_advance(old: &RemoteJobReceipt, next: &RemoteJobReceipt) -> Result<()> {
+pub(super) fn validate_advance(old: &RemoteJobReceipt, next: &RemoteJobReceipt) -> Result<()> {
     let before = &old.payload;
     let after = &next.payload;
     let valid = match (&before.status, &after.status) {

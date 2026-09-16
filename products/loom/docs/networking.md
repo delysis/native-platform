@@ -356,8 +356,8 @@ bytes, formats, or ordering. Terminal recovery reads its immutable media blobs,
 without rereading source attachments or following later document edits. Check
 cannot create a later pipeline step; Resume uses the original bytes. The host
 retains exact native media evidence privately; its public result remains a signed
-remote assertion. Media storage consumes the existing 64 MiB ledgers, and space
-for the terminal receipt is reserved before admission. Compute frames stop at
+remote assertion. Media consumes the active and retained storage budgets, and
+space for the terminal receipt is reserved before admission. Compute frames stop at
 12 MiB, independently of the smaller workspace synchronization frame bound.
 
 The native adapter uses the loaded, verified model and
@@ -398,7 +398,7 @@ execution remains unverified.
 An accepted job is committed before dispatch. Each authenticated caller owns its
 job IDs, and a retry must match the exact original input and grant. Status checks
 and cancellation never dispatch model work. The current compute protocol is
-version 3 (`app.delysis.loom/compute/3`); host and requesting ledgers are version 2.
+version 3 (`app.delysis.loom/compute/3`); host and requesting ledgers are version 3.
 Earlier experimental ledgers are preserved and rejected without migration.
 Cancellation carries the exact grant and input, so even cancellation
 that arrives before submission receives a durable terminal receipt. This spends
@@ -422,10 +422,31 @@ claim, and result. Signatures authenticate the host's claim; they do not prove
 which model it executed and cannot mint local live-worker evidence. Only the
 requesting device can retrieve its result, including after its grant ends.
 
-The host ledger retains at most 64 grant identities, 256 jobs, and 64 MiB of
-payloads, reserving space for a maximum result before admission. A full ledger
-rejects new work instead of recycling identities or silently losing retry
-history. Archival and longer-lived retention remain product work.
+The host permits at most 64 active grants. Revoked and fully spent grants leave
+that active set while their identities, original bodies and spent budgets remain
+recorded. An exact retry cannot reactivate a retired grant. A spent grant with
+unfinished work keeps its slot until that work settles.
+
+Each compute ledger permits at most 256 unfinished jobs and 64 MiB of active
+payloads, including reserved result space. Settled input and signed receipts stay
+in their original immutable SQLite rows. A transaction appends the terminal
+receipt and marks the job settled; failure leaves the previous state intact.
+This releases active capacity without deleting retry history, replenishing a
+grant, or dispatching anything. Every read checks the storage index against the
+exact input and verified receipt chain. Missing or inconsistent receipts are an
+error, never a new job. Startup checks the bounded unfinished set; older settled
+jobs are verified when read. History lists the newest 256 identities and builds
+previews one job at a time, keeping full media payloads out of the accumulated
+history response. Older results remain retrievable by their saved job identity.
+
+Retained compute payloads have a 4 GiB limit per ledger, with a further 128 MiB
+allowance for SQLite metadata and indexes. Admission reserves the complete
+result in both budgets. A full ledger refuses new work and preserves its history;
+there is no automatic deletion, history-reset command or identity recycling.
+Collaborative document history retains its separate bounds and still needs
+archival. The [retention receipt](audit-receipts/2026-09-15-compute-retention.md)
+records storage and integration checks; it does not certify a native release
+using the new ledger format.
 
 ## Build and licensing
 
