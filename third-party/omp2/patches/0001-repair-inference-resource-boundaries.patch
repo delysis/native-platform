@@ -572,7 +572,7 @@ index 242a804151c1389a2b0bebb1ae32ba7693ba8599..c26c0aa1c650edcc2057ca721325fd6b
  		let environment = FakeEnvironment::default()
  			.with("AWS_ACCESS_KEY_ID", "AKIAENV")
 diff --git a/crates/ai/src/layer/admission.rs b/crates/ai/src/layer/admission.rs
-index d222df998c99c7ca6a2e8a2157ebf3d2a24a42b0..b3dce026ed0a7d3d6b6ba198c26a29ce6c608c55 100644
+index d222df998c99c7ca6a2e8a2157ebf3d2a24a42b0..31bb11af64c68a3aa992fc97c57861290fd115a7 100644
 --- a/crates/ai/src/layer/admission.rs
 +++ b/crates/ai/src/layer/admission.rs
 @@ -1,5 +1,6 @@
@@ -1050,7 +1050,7 @@ index d222df998c99c7ca6a2e8a2157ebf3d2a24a42b0..b3dce026ed0a7d3d6b6ba198c26a29ce
 +	#[test]
 +	fn dropped_ready_service_and_waiter_release_their_reservations() {
 +		let controller = AdmissionController::new(1, 1);
-+		let mut service = AdmissionLayer::new(controller).layer(ReadyChecked::default());
++		let mut service = AdmissionLayer::new(controller.clone()).layer(ReadyChecked::default());
 +		assert!(service.poll_ready(&mut cx()).is_ready());
 +		let mut queued = service.clone();
 +		for _ in 0..1000 {
@@ -1080,7 +1080,7 @@ index d222df998c99c7ca6a2e8a2157ebf3d2a24a42b0..b3dce026ed0a7d3d6b6ba198c26a29ce
 +	#[test]
 +	fn queued_repoll_replaces_the_waker_without_duplicate_registration() {
 +		let controller = AdmissionController::new(1, 1);
-+		let mut service = AdmissionLayer::new(controller.clone()).layer(ReadyChecked::default());
++		let mut service = AdmissionLayer::new(controller).layer(ReadyChecked::default());
 +		assert!(service.poll_ready(&mut cx()).is_ready());
 +		let mut queued = service.clone();
 +		let old = Arc::new(WakeCount(AtomicUsize::new(0)));
