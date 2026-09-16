@@ -528,9 +528,6 @@ button.document-row:hover { background: var(--chrome-hover); }
 .workspace-pane-main { grid-column:2; grid-row:1; }
 .workspace-pane-right { grid-column:3; grid-row:1; border-left:1px solid var(--line); }
 .workspace-pane-bottom { grid-column:2 / -1; grid-row:2; border-top:1px solid var(--line); }
-.workspace-pane-header { flex:none; display:flex; align-items:center; min-height:30px; padding:0 8px; }
-.workspace-pane-header select { max-width:100%; border:0; background:transparent; color:var(--muted); font-size:11px; }
-.workspace-pane-header span { color:var(--muted); font-size:11px; }
 .workspace-pane-content { display:flex; flex:1; flex-direction:column; min-width:0; min-height:0; }
 .workspace-pane-slot.hidden-pane, .workspace-pane-content.hidden-pane { display:none; }
 .outline-panel { position:relative; grid-row:1 / -1; }
@@ -563,6 +560,4 @@ button.document-row:hover { background: var(--chrome-hover); }
 .material-row.active { background:var(--chrome-hover); }
 .material-pin { margin-left:auto; flex:0 !important; opacity:.6; }
 .material-connect-view { min-height:0; flex:1; overflow:auto; }
-.material-connect-view > header { display:flex; align-items:center; gap:8px; padding:6px 12px; border-bottom:1px solid var(--line-soft); }
-.material-connect-view > header button { border:0; background:none; font-size:1.5rem; }
 .material-connect-view .import-sources { padding:12px; }

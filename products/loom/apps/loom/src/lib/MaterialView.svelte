@@ -105,16 +105,16 @@
 
 <section class="material-view" aria-label={material.name} aria-busy={busy}>
   <header>
-    <button class="back" on:click={onClose} aria-label="Back to writing">‹</button>
     <h1>{selected?.title ?? material.name}</h1>
-    {#if originTitle}<button class="use" disabled={busy || (!material.available && !selected)} on:click={() => void use()} title={`Reference in ${originTitle}`}>Use here</button>{/if}
     <details class="actions"><summary aria-label="Source actions" on:mousedown|preventDefault>•••</summary><div class="action-menu">
+      {#if originTitle}<button disabled={busy || (!material.available && !selected)} on:click={() => void use()}>Insert reference</button>{/if}
       <button on:click={() => void copyReference()}>Copy reference</button>
       {#if text && originTitle}<button disabled={busy} on:mousedown|preventDefault on:click={() => void use(true)}>Insert quotation</button>{/if}
       {#if material.attachment_id}<button on:click={() => void original()}>Open original</button>{/if}
       {#if material.available}<button disabled={busy} on:click={() => void pin()}>{material.pinned ? 'Unpin' : 'Pin'}</button>{/if}
       {#if removable}<button disabled={busy} on:click={() => void remove()}>Remove from workspace</button>{/if}
     </div></details>
+    <button class="close" on:click={onClose} aria-label="Close source" title="Close source"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="m4 4 8 8M12 4l-8 8" /></svg></button>
   </header>
   {#if error}<p class="error" role="alert">{error}</p>{/if}
   {#if !material.available && !selected}
@@ -166,7 +166,9 @@
   button,input,summary { font:inherit; color:inherit; }
   button { cursor:pointer; border:1px solid #8883; border-radius:5px; background:transparent; padding:4px 8px; min-height:28px; }
   button:disabled { opacity:.5; cursor:default; }
-  .back { border:0; font-size:1.5rem; padding:0 7px; }
+  .close { display:grid; place-items:center; width:28px; min-width:28px; border:0; padding:4px; }
+  .close:hover { background:var(--chrome-hover); }
+  .close svg { width:14px; height:14px; stroke:currentColor; stroke-width:1.5; fill:none; }
   .actions { position:relative; }
   summary { cursor:pointer; padding:5px; list-style:none; }
   summary::-webkit-details-marker { display:none; }

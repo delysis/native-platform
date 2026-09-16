@@ -21,6 +21,14 @@ function render(props: Partial<ComponentProps<typeof MaterialView>> = {}) {
   return { onUse, onChanged, onClose, onRemoved };
 }
 describe('named material viewing', () => {
+  it('keeps insertion actions out of the header and always exposes closing the source', async () => {
+    const { onClose } = render({ initialEvidence: evidence, originTitle: null });
+    await expect.element(page.getByRole('button', { name: 'Close source' })).toBeVisible();
+    expect(page.getByRole('button', { name: 'Use here' }).query()).toBeNull();
+    expect(page.getByRole('button', { name: 'Insert reference' }).query()).toBeNull();
+    await page.getByRole('button', { name: 'Close source' }).click();
+    expect(onClose).toHaveBeenCalledOnce();
+  });
   it('searches only on request, opens exact retained passages, and uses the passage instead of the collection', async () => {
     const { onUse } = render();
     await expect.poll(() => ipc.read.mock.calls.length).toBe(1);
@@ -30,7 +38,8 @@ describe('named material viewing', () => {
     await page.getByRole('button', { name: /A source/ }).click();
     await expect.element(page.getByText('Exact café evidence.\nSecond line.', { exact: true })).toBeVisible();
     expect(ipc.evidence).toHaveBeenCalledWith('project', 'session', material.id, evidence.id);
-    await page.getByRole('button', { name: 'Use here' }).click();
+    await page.getByText('•••', { exact: true }).click();
+    await page.getByRole('button', { name: 'Insert reference' }).click();
     expect(onUse).toHaveBeenCalledWith(`[@A source](loom-evidence:${evidence.id})`, null);
   });
   it('pinning only changes navigation and explicit insertion supplies exact retained text', async () => {
@@ -90,12 +99,14 @@ describe('named material viewing', () => {
     const { onUse } = render({ material: { ...material, available: false }, initialEvidence: evidence });
     await expect.element(page.getByText('Exact café evidence.\nSecond line.', { exact: true })).toBeVisible();
     expect(ipc.read).not.toHaveBeenCalled();
-    await page.getByRole('button', { name: 'Use here' }).click();
+    await page.getByText('•••', { exact: true }).click();
+    await page.getByRole('button', { name: 'Insert reference' }).click();
     expect(onUse).toHaveBeenCalledOnce();
   });
   it('keeps a stale insertion failure in the source view without changing the selected passage', async () => {
     render({ initialEvidence: evidence, onUse: vi.fn().mockResolvedValue(false) });
-    await page.getByRole('button', { name: 'Use here' }).click();
+    await page.getByText('•••', { exact: true }).click();
+    await page.getByRole('button', { name: 'Insert reference' }).click();
     await expect.element(page.getByRole('alert')).toHaveTextContent('The writing changed');
     await expect.element(page.getByText('Exact café evidence.\nSecond line.', { exact: true })).toBeVisible();
   });

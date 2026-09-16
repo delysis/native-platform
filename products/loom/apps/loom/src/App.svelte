@@ -5,6 +5,7 @@
   import LoomEditor from './lib/LoomEditor.svelte';
   import TerminalPane from './lib/TerminalPane.svelte';
   import PaneDivider from './lib/PaneDivider.svelte';
+  import PaneHeader from './lib/PaneHeader.svelte';
   import Loompad from './lib/Loompad.svelte';
   import { loompadPrefix, type LoompadLength } from './lib/loompad';
   import type { CompletionCandidate } from './lib/completionSession';
@@ -416,8 +417,12 @@
   $: effectiveTerminalHeight = Math.min(terminalHeight, terminalLimit);
   $: outlineLimit = Math.max(150, workspaceWidth * 0.35);
   $: rightLimit = Math.max(180, workspaceWidth - (outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0) - 200);
+  $: mainPaneOpen = !hiddenPaneSlots.has('main');
   $: rightPaneOpen = paneSlots.some(slot => slot.position === 'right' && slot.selected && !hiddenPaneSlots.has('right'));
   $: bottomPaneOpen = paneSlots.some(slot => slot.position === 'bottom' && slot.selected && !hiddenPaneSlots.has('bottom'));
+  $: mainColumn = mainPaneOpen ? 'minmax(0,1fr)' : '0px';
+  $: sideColumn = mainPaneOpen ? (rightPaneOpen ? `${Math.min(rightWidth, rightLimit)}px` : '0px') : 'minmax(0,1fr)';
+  $: bottomOnly = bottomPaneOpen && !mainPaneOpen && !rightPaneOpen;
   let paneEditors: Record<string, WorkspacePane> = {};
   let paneBusy: Record<string, boolean> = {};
   let paneComposing: Record<string, boolean> = {};
@@ -499,6 +504,7 @@
   }
   function openMaterial(item: MaterialEntry): void {
     if (compositionActive || !flushEditors()) return;
+    showMainPane();
     if (!activeMaterial && !materialsOpen) captureMaterialOrigin();
     activeMaterialEvidence = null; activeMaterial = item; materialsOpen = false; addMenuOpen = false;
     clearSuggestionTimerHandle();
@@ -565,6 +571,7 @@
     finally { contextAttachmentBusy = false; }
   }
   function openMaterialConnections(): void {
+    showMainPane();
     captureMaterialOrigin(); activeMaterial = null; materialsOpen = true; addMenuOpen = false;
   }
 
@@ -1094,11 +1101,13 @@
   const suggestionsRetryDelayMs = 350;
   const maximumAutomaticSuggestionRetries = 1;
   const maximumAutocompleteRetryWaits = 50;
+  $: completionSurfaceVisible = mainPaneOpen && !customMain && !activeMaterial && !materialsOpen;
+  $: completionAutomationActive = completionSurfaceVisible && completionEngineEnabled({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled });
   function completionAutomationEnabled(
     autocomplete = suggestionsEnabled,
     shuttle = shuttleEnabled
   ): boolean {
-    return !activeMaterial && !materialsOpen && completionEngineEnabled({ autocomplete, shuttle });
+    return completionSurfaceVisible && completionEngineEnabled({ autocomplete, shuttle });
   }
 
   $: completionSession = completionController.session;
@@ -1133,7 +1142,7 @@
   $: suggestionSetupNeeded = Boolean(
     project &&
     document &&
-    completionAutomationEnabled() &&
+    completionAutomationActive &&
     !currentModel &&
     !modelLoading &&
     !modelUnloading &&
@@ -1212,7 +1221,7 @@
     liveTextSequenceByRun: liveBranchTextSequenceByRun,
     currentModel,
     document,
-    suggestionsEnabled: completionAutomationEnabled(),
+    suggestionsEnabled: completionAutomationActive,
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
     unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
@@ -1229,7 +1238,7 @@
     liveTextSequenceByRun: liveBranchTextSequenceByRun,
     currentModel,
     document,
-    suggestionsEnabled: completionAutomationEnabled(),
+    suggestionsEnabled: completionAutomationActive,
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
     unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
@@ -1380,7 +1389,7 @@
       : '';
   $: finishCompletionIfExhausted(completionExhaustionKey);
   $: visualAutocompleteDisposition = autocompleteDisposition({
-    active: mode === 'visual' && completionAutomationEnabled() && !visualMutationPending && branchPromotionReady,
+    active: mode === 'visual' && completionAutomationActive && !visualMutationPending && branchPromotionReady,
     branches: currentReadyBranches,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     dismissedCandidateIds,
@@ -1389,7 +1398,7 @@
     presentationCompatible: visualGhostTextMayBePlainProse
   });
   $: sourceAutocompleteDisposition = autocompleteDisposition({
-    active: mode === 'source' && completionAutomationEnabled() && !sourceDirty && !compositionActive && branchPromotionReady,
+    active: mode === 'source' && completionAutomationActive && !sourceDirty && !compositionActive && branchPromotionReady,
     branches: currentReadyBranches,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     dismissedCandidateIds,
@@ -1452,7 +1461,7 @@
     : visualSelectionByte === 0;
   $: completionLifecycle = automaticCompletionLifecycle({
     desktop,
-    automationEnabled: completionAutomationEnabled(),
+    automationEnabled: completionAutomationActive,
     projectAvailable: Boolean(project),
     documentAvailable: Boolean(document),
     hybridDocument: document?.summary.kind === 'hybrid',
@@ -1496,7 +1505,7 @@
   $: retryEvaluationSnapshot = {
     enabled: desktop &&
       branchPromotionReady &&
-      completionAutomationEnabled() &&
+      completionAutomationActive &&
       Boolean(currentModel) &&
       activeBranchCount === 0 &&
       completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion),
@@ -1610,7 +1619,7 @@
     requireExplicitCompletionFamily = true;
     contextEpoch += 1;
     invalidateCompletionForCaretNavigation();
-    if (completionAutomationEnabled()) scheduleAutomaticSuggestions(editVersion, 0);
+    if (completionAutomationActive) scheduleAutomaticSuggestions(editVersion, 0);
   }
 
   function contextMediaUrl(media: ContextMediaPresentation): string | null {
@@ -2066,7 +2075,7 @@
         if (contextText === snapshot.markdown) {
           contextTextSaveState = 'clean';
           contextEpoch += 1;
-          if (completionAutomationEnabled()) scheduleAutomaticSuggestions(editVersion, 0);
+          if (completionAutomationActive) scheduleAutomaticSuggestions(editVersion, 0);
         } else {
           // A newer edit (including reverting an in-flight save) must be sent
           // after the now-authoritative reply. Never label stale backend text
@@ -3997,7 +4006,7 @@
       !project ||
       !document ||
       !currentModel ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !branchPromotionReady
     ) return;
     const sourceRevisionId = document.summary.revision_id;
@@ -4434,7 +4443,7 @@
   function queuePreferredWriterRequest(captured: WorkspaceRestoreCapture): void {
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !workspaceRestoreIsCurrent(captured)
     ) return;
     preferredWriterPending = { ...captured };
@@ -4463,7 +4472,7 @@
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
       !captured ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       currentModel || unavailableWorkspaceWriterKey === workspaceWriterKey()
     ) return;
     requestPreferredWriterEnsure(captured);
@@ -4479,7 +4488,7 @@
     }
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !workspaceRestoreIsCurrent(captured)
     ) {
       clearPreferredWriterRequest(captured);
@@ -4509,7 +4518,7 @@
   ): Promise<boolean> {
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !workspaceRestoreIsCurrent(captured)
     ) return false;
     if (!await prepareWorkspaceWriterTemplate(captured)) return false;
@@ -4521,7 +4530,7 @@
     const refreshed = await refreshModels(captured);
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !workspaceRestoreIsCurrent(captured)
     ) return false;
     if (!refreshed && modelRefreshInFlightCount > 0) {
@@ -5705,7 +5714,7 @@
     if (!quiet) {
       announce(`${loaded.display_name} is verified for exact local completion`);
     }
-    if (completionAutomationEnabled() && loaded.completion && document) {
+    if (completionAutomationActive && loaded.completion && document) {
       await tick();
       if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
       if (quiet) announce('Suggestions ready');
@@ -6147,7 +6156,7 @@
     if (!workspaceRestoreIsCurrent(captured)) return;
     await recoverModelDownloads();
     if (!workspaceRestoreIsCurrent(captured)) return;
-    if (!shouldDiscoverModelsOnStartup(completionAutomationEnabled())) return;
+    if (!shouldDiscoverModelsOnStartup(completionAutomationActive)) return;
     requestPreferredWriterEnsure(captured);
   }
 
@@ -6756,6 +6765,7 @@
         transition = 'idle';
         wakePreferredWriterEnsure();
         if (focusWritingSurface && document?.summary.document_id === target.documentId) {
+          showMainPane();
           await tick();
           if (
             applicationClosePhase === 'running' &&
@@ -7085,7 +7095,7 @@
     completionController = setCompletionSchedule(completionController, null);
     if (
       !desktop ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !project ||
       !document ||
       !completionGenerationIsArmed(
@@ -7158,7 +7168,7 @@
       !project ||
       !document ||
       !currentModel ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       project.project_id !== ticket.projectId ||
       project.session_id !== ticket.sessionId ||
       document.summary.document_id !== ticket.documentId ||
@@ -7205,7 +7215,7 @@
       terminalIsBusy() ||
       completionController.scheduled !== schedule ||
       targetEditVersion !== editVersion ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !project ||
       !document ||
       !completionGenerationIsArmed(
@@ -7878,7 +7888,7 @@
         shuttleTimer = undefined;
         shuttleTimerKey = '';
       }
-      const automationEnabled = completionAutomationEnabled();
+      const automationEnabled = completionAutomationActive;
       if (!automationEnabled) {
         clearPreferredWriterRequest();
         cancelSuggestionTimer();
@@ -8328,7 +8338,7 @@
       editVersion === captured.editVersion &&
       completionController.intentEpoch === captured.intentEpoch &&
       currentModel?.model_id === captured.modelId &&
-      completionAutomationEnabled()
+      completionAutomationActive
     );
   }
 
@@ -9282,7 +9292,7 @@
     await tick();
     if (contextPaneOpen) focusContextEditorAtEnd();
     else focusCurrentWritingSurfaceAtEnd();
-    if (completionAutomationEnabled() && currentModel && document) {
+    if (completionAutomationActive && currentModel && document) {
       scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
     }
     announce(`${next} editor mode`);
@@ -9314,7 +9324,7 @@
       project.session_id === closing.session_id
     );
     const agency = pendingCloseAgency;
-    const restoreAutomation = agency?.suggestionsEnabled ?? completionAutomationEnabled();
+    const restoreAutomation = agency?.suggestionsEnabled ?? completionAutomationActive;
     const restoreSuggestions = pendingCloseInlineSuggestionsEnabled ?? suggestionsEnabled;
     const restoreShuttle = pendingCloseShuttleEnabled ?? shuttleEnabled;
     if (agency && sameSession) {
@@ -9459,7 +9469,7 @@
       // Stop new automatic admission before native close drains any reserved
       // startup already in flight. Keep the persisted preference unchanged so
       // a later reopen can restore the author's choice deliberately.
-      pendingCloseAgency ??= captureProjectCloseAgency(completionAutomationEnabled());
+      pendingCloseAgency ??= captureProjectCloseAgency(completionAutomationActive);
       pendingCloseInlineSuggestionsEnabled ??= suggestionsEnabled;
       pendingCloseShuttleEnabled ??= shuttleEnabled;
       suggestionsEnabled = false;
@@ -9606,11 +9616,23 @@
     void tick().then(requestPreferredWriterForCurrentWorkspace);
   }
 
+  function showMainPane(): void {
+    if (!hiddenPaneSlots.has('main')) return;
+    const next = new Set(hiddenPaneSlots);
+    next.delete('main');
+    hiddenPaneSlots = next;
+  }
+
   function togglePane(position: 'main' | 'right' | 'bottom'): void {
-    if (!flushEditors() || busyPaneSlots.has(position)) return;
+    // Collapsing only changes presentation. Mounted editors and active runs
+    // retain their state, so a busy pane must never trap its owner on screen.
     const next = new Set(hiddenPaneSlots);
     if (next.has(position)) next.delete(position); else next.add(position);
     hiddenPaneSlots = next;
+    if (position === 'main' && next.has('main')) {
+      cancelSuggestionTimer();
+      void cancelActiveBranches();
+    }
   }
 
   function selectPane(position: 'main' | 'right' | 'bottom', id: string): void {
@@ -9691,14 +9713,19 @@
         on:mousedown={startTitlebarDrag}
       ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
       <div class="canvas-controls-right" data-no-window-drag>
-        {#each paneSlots.filter(slot => slot.position !== 'main' && slot.selected) as slot (slot.position)}
+        {#each paneSlots.filter(slot => slot.selected) as slot (slot.position)}
           {@const title = slot.selected![1].title ?? slot.selected![0]}
           <button class="titlebar-button" class:active={!hiddenPaneSlots.has(slot.position)} type="button"
-            aria-label={`${hiddenPaneSlots.has(slot.position) ? 'Show' : 'Hide'} ${title}`} aria-pressed={!hiddenPaneSlots.has(slot.position)} title={title}
-            disabled={busyPaneSlots.has(slot.position)} on:click={() => togglePane(slot.position)}>
-            <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/>{#if slot.position === 'right'}<path d="M10 2.5v11"/>{:else}<path d="M2 10h12"/>{/if}</svg>
+            aria-label={`${hiddenPaneSlots.has(slot.position) ? 'Show' : 'Collapse'} ${title}`} aria-pressed={!hiddenPaneSlots.has(slot.position)} title={title}
+            on:click={() => togglePane(slot.position)}>
+            <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/>{#if slot.position === 'right'}<path d="M10 2.5v11"/>{:else if slot.position === 'bottom'}<path d="M2 10h12"/>{:else}<path d="M5 2.5v11M11 2.5v11"/>{/if}</svg>
           </button>
         {/each}
+        {#if project && !mainPane}
+          <button class="titlebar-button" class:active={mainPaneOpen} type="button" aria-label={mainPaneOpen ? 'Collapse main pane' : 'Show main pane'} aria-pressed={mainPaneOpen} title="Main pane" on:click={() => togglePane('main')}>
+            <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/><path d="M5 2.5v11M11 2.5v11"/></svg>
+          </button>
+        {/if}
         {#if document && mode === 'visual' && canUseVisual && (!contextPaneOpen || canUseVisualMarkdown(contextText, true))}
           <VisualFormatMenu
             bind:this={formatMenu}
@@ -9757,7 +9784,7 @@
 
   {#if project}
     <div bind:clientWidth={workspaceWidth} bind:clientHeight={workspaceHeight} class:outline-open={outlineOpen} class="workspace-grid"
-      style={`grid-template-columns:${outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0}px minmax(0,1fr) ${rightPaneOpen ? Math.min(rightWidth, rightLimit) : 0}px; grid-template-rows:minmax(0,1fr) ${bottomPaneOpen ? Math.min(bottomHeight, workspaceHeight * 0.6) : 0}px;`}>
+      style={`grid-template-columns:${outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0}px ${mainColumn} ${sideColumn}; grid-template-rows:${bottomOnly ? '0px minmax(0,1fr)' : `minmax(0,1fr) ${bottomPaneOpen ? Math.min(bottomHeight, workspaceHeight * 0.6) : 0}px`};`}>
       <aside
         id="project-outline"
         bind:this={outlineElement}
@@ -9929,7 +9956,7 @@
         {/if}
       </aside>
 
-      <main id="manuscript" class="manuscript-area" tabindex="-1" class:workspace-main-hidden={customMain && !activeMaterial && !materialsOpen}>
+      <main id="manuscript" class="manuscript-area" tabindex="-1" class:workspace-main-hidden={!mainPaneOpen || (customMain && !activeMaterial && !materialsOpen)}>
         {#if activeMaterial}
           {#key `${project.session_id}/${activeMaterial.id}/${activeMaterialEvidence?.id ?? ""}`}
             <MaterialView projectId={project.project_id} sessionId={project.session_id} material={activeMaterial}
@@ -9938,7 +9965,7 @@
           {/key}
         {:else if materialsOpen}
           <section class="material-connect-view" aria-label="Add sources">
-            <header><button on:click={closeMaterial} aria-label="Back to writing">‹</button><span>Add sources</span></header>
+            <PaneHeader title="Add sources" onCollapse={closeMaterial} />
             {#if document}{#key project.session_id}<ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={materialOrigin?.title ?? document.summary.title} onUse={useImportedSources} onImported={() => void refreshMaterials()} />{/key}{/if}
           </section>
         {/if}
@@ -10305,13 +10332,8 @@
           <aside class:hidden-pane={hiddenPaneSlots.has(slot.position) || (slot.position === 'main' && (Boolean(activeMaterial) || materialsOpen))} class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
             {#if slot.position === 'right'}<PaneDivider edge="left" label="Resize right pane" size={Math.min(rightWidth, rightLimit)} min={180} max={rightLimit} onResize={(size) => rightWidth = size} />{/if}
             {#if slot.position === 'bottom'}<PaneDivider edge="top" label="Resize bottom pane" size={Math.min(bottomHeight, workspaceHeight * 0.6)} min={100} max={workspaceHeight * 0.6} onResize={(size) => bottomHeight = size} />{/if}
-            <header class="workspace-pane-header">
-              {#if slot.choices.length > 1}
-                <select aria-label="Pane" value={selected[0]} disabled={busyPaneSlots.has(slot.position)} on:change={(event) => selectPane(slot.position, event.currentTarget.value)}>
-                  {#each slot.choices as [id, config]}<option value={id}>{config.title ?? id}</option>{/each}
-                </select>
-              {:else}<span>{selected[1].title ?? selected[0]}</span>{/if}
-            </header>
+            <PaneHeader title={selected[1].title ?? selected[0]} choices={slot.choices} selected={selected[0]}
+              selectionDisabled={busyPaneSlots.has(slot.position)} onSelect={(id) => selectPane(slot.position, id)} onCollapse={() => togglePane(slot.position)} />
             {#each slot.choices as [paneId, paneConfig] (paneId)}
               <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
             <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
