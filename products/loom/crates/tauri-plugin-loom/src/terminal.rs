@@ -239,6 +239,9 @@ struct RunReceipt {
     evidence: Vec<crate::materials::MaterialEvidence>,
     #[serde(default)]
     searches: Vec<crate::materials::MaterialSearch>,
+    /// Typed full-scope aggregates, each retaining its explicit source origin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    counts: Vec<Value>,
     /// Source attribution indexes the exact snapshots above without duplicating
     /// their text. Empty searches retain an origin through their search index.
     #[serde(default)]
@@ -347,6 +350,7 @@ fn expression_names(
             names.insert(name.clone());
         }
         NeuralExpression::Literal { .. } => {}
+        NeuralExpression::Count { source } => expression_names(source, names, calls),
         NeuralExpression::Find { source, query } => {
             expression_names(source, names, calls);
             expression_names(query, names, calls);
@@ -366,6 +370,7 @@ fn expression_names(
 
 fn function_names(expression: &NeuralExpression, names: &mut BTreeSet<String>) {
     match expression {
+        NeuralExpression::Count { source } => function_names(source, names),
         NeuralExpression::Call {
             function,
             arguments,
@@ -647,7 +652,9 @@ fn start_run<R: Runtime>(
     if let NeuralCommand::Expression(expression) = &command {
         function_names(expression, &mut functions);
     }
-    let function_recipe = if functions.is_empty() {
+    let workspace_chat =
+        scope == RunScope::Workspace && matches!(turn_boundary, Some(TerminalTurnBoundary::Chat));
+    let function_recipe = if functions.is_empty() && !workspace_chat {
         None
     } else if scope == RunScope::Workspace {
         Some(crate::workspace_template::function_recipe_from_snapshot(
@@ -824,6 +831,7 @@ fn start_run<R: Runtime>(
         bindings,
         evidence: Vec::new(),
         searches: Vec::new(),
+        counts: Vec::new(),
         source_uses: Vec::new(),
         omitted_evidence: BTreeSet::new(),
         sources,
@@ -1038,7 +1046,7 @@ impl Evaluator<'_> {
                     self.append_context(&mut prefix, &name, &value, &query, text.len())?;
                 }
                 prefix.push_str(text);
-                self.complete(bounded(prefix)?, PromptMode::RawCompletion)
+                self.complete(bounded(prefix)?, self.function_prompt_mode())
                     .map(Value::Text)
             }
             NeuralCommand::Expression(expression) => self.evaluate(expression),
@@ -1052,6 +1060,12 @@ impl Evaluator<'_> {
         match expression {
             NeuralExpression::Reference { name } => self.binding(name),
             NeuralExpression::Literal { text } => Ok(Value::Text(text.clone())),
+            NeuralExpression::Count { source } => {
+                let source = self.evaluate(source)?;
+                let value = self.with_read_context(|context| context.count_documents(&source))?;
+                self.record_evidence(&value)?;
+                Ok(value)
+            }
             NeuralExpression::Find { source, query } => {
                 let source = self.evaluate(source)?;
                 let query = material_context::exact(&self.evaluate(query)?)?;
@@ -1100,21 +1114,39 @@ impl Evaluator<'_> {
                 contextual_function.push_str(&function);
                 let prompt = render_base_function_prompt(&contextual_function, &input_refs)
                     .map_err(io_failure)?;
-                let mode = match self
-                    .receipt
-                    .function_recipe
-                    .as_ref()
-                    .map(|recipe| recipe.format)
-                {
-                    Some(crate::workspace_template::FunctionFormat::Model) => PromptMode::Function,
-                    _ => PromptMode::RawCompletion,
-                };
+                let mode = self.function_prompt_mode();
                 self.complete(bounded(prompt)?, mode).map(Value::Text)
             }
         }
     }
 
+    fn function_prompt_mode(&self) -> PromptMode {
+        match self
+            .receipt
+            .function_recipe
+            .as_ref()
+            .map(|recipe| recipe.format)
+        {
+            Some(crate::workspace_template::FunctionFormat::Model) => PromptMode::Function,
+            _ => PromptMode::RawCompletion,
+        }
+    }
+
     fn record_evidence(&mut self, value: &Value) -> Result<(), IpcFailure> {
+        if let Value::Count { .. } = value.unscoped() {
+            if !matches!(value, Value::Scoped { .. }) {
+                return Err(failure("A count is missing its source origin."));
+            }
+            let snapshot = serde_json::to_value(value).map_err(io_failure)?;
+            if !self
+                .receipt
+                .counts
+                .iter()
+                .any(|prior| serde_json::to_value(prior).is_ok_and(|prior| prior == snapshot))
+            {
+                self.receipt.counts.push(value.clone());
+            }
+        }
         if let Value::Evidence {
             evidence,
             retrieval,
@@ -1294,6 +1326,7 @@ impl Evaluator<'_> {
                         &self.receipt.function_recipe,
                         &self.receipt.source_uses,
                         &self.receipt.workspace_configuration,
+                        &self.receipt.counts,
                     ))
                     .map_err(io_failure)?,
                 )

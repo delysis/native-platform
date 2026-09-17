@@ -204,6 +204,20 @@ impl<'a> ReadContext<'a> {
         Ok((origin.clone().wrap(result), omitted))
     }
 
+    pub(crate) fn count_documents(self, source: &Value) -> Result<Value, IpcFailure> {
+        let (store, value, origin) = self.source(source)?;
+        let Value::Material { material } = value else {
+            return Err(failure(
+                "count requires an entire supported research library; selected passages are not corpus totals.",
+            ));
+        };
+        let count =
+            materials::count_documents(store, &material.material.id, &material.source_revision)?;
+        Ok(origin.clone().wrap(Value::Count {
+            count: Box::new(count),
+        }))
+    }
+
     pub(crate) fn native_media<'v>(
         self,
         values: impl IntoIterator<Item = &'v Value>,

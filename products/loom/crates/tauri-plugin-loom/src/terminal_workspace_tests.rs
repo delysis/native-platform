@@ -463,3 +463,87 @@ fn function_format_uses_the_admitted_configuration_snapshot() {
         assert_eq!(configuration.text, raw);
     });
 }
+
+#[test]
+fn workspace_count_retains_owner_library_scope_without_model_or_snippet_totals() {
+    let mut fixture = TerminalFixture::new();
+    let path = fixture.directory.path().join("count-library.sqlite3");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(include_str!("materials/alexandria-fixture.sql"))
+        .unwrap();
+    drop(connection);
+    let before = std::fs::read(&path).unwrap();
+    let mut request = request(&fixture, "=count(@Research)");
+    fixture
+        .with_store(|store| crate::materials::add_library(store, &path, Some("Research")).unwrap());
+    request.configuration_revision_id = fixture.with_store(|store| {
+        store
+            .read_document(".loom.md")
+            .unwrap()
+            .revision_id
+            .to_string()
+    });
+    child(&mut fixture, "The active child is not the library owner.");
+    let started = run(&fixture, request.clone()).unwrap();
+    let receipt = wait(&fixture, &started.run_id);
+    assert_eq!(receipt.run.status, "completed", "{:?}", receipt.run.error);
+    assert!(receipt.model.is_none());
+    assert!(receipt.steps.is_empty());
+    assert!(receipt.searches.is_empty());
+    assert_eq!(receipt.counts.len(), 1);
+    let retained = &receipt.counts[0];
+    let Value::Scoped { origin, .. } = retained else {
+        panic!("count lost origin");
+    };
+    let Value::Count { count } = retained.unscoped() else {
+        panic!("count lost type");
+    };
+    assert_eq!(count.result.value, 1);
+    let state = fixture.app.state::<PluginState>();
+    {
+        let session = state.session.lock().unwrap();
+        let owner = crate::workspace_owner::store(&session).unwrap();
+        let attribution = serde_json::to_value(origin).unwrap();
+        assert_eq!(
+            attribution["project_id"],
+            owner.manifest().project_id.to_string()
+        );
+        assert_eq!(attribution["root"], owner.root().to_str().unwrap());
+        assert_ne!(
+            attribution["project_id"],
+            session
+                .store
+                .as_ref()
+                .unwrap()
+                .manifest()
+                .project_id
+                .to_string()
+        );
+        assert_eq!(
+            owner
+                .read_document(receipt.run.output_relative_path.as_ref().unwrap())
+                .unwrap()
+                .text,
+            count.text()
+        );
+        assert!(
+            material_context::local_artifact_ids(session.store.as_ref().unwrap(), [retained])
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    // Replaying the admitted command reads retained truth, not today's library.
+    std::fs::remove_file(&path).unwrap();
+    let replay = run(&fixture, request).unwrap();
+    assert_eq!(replay.run_id, started.run_id);
+    assert_eq!(
+        read_receipt(&fixture.root(), &started.run_id, true)
+            .unwrap()
+            .unwrap()
+            .counts
+            .len(),
+        1
+    );
+}

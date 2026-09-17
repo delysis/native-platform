@@ -46,6 +46,9 @@ const PROFILE_NAME: &str = "alexandria.blocks.v1";
 
 static NEXT_BACKEND_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
+mod count;
+pub use count::{DocumentCount, DocumentCountRequest};
+
 #[derive(Debug, Clone)]
 pub struct AlexandriaBackendConfig {
     pub backend_id: String,
@@ -2259,6 +2262,10 @@ mod tests {
     use std::sync::Arc;
 
     const FIXTURE_FINGERPRINT: &str = "volatile-sqlite-snapshot-v1:fixture-operation";
+
+    mod count_tests {
+        include!("count_tests.rs");
+    }
 
     fn fixture_ids() -> Result<(ResourceId, ReleaseId, RepresentationId), Box<dyn Error>> {
         Ok((

@@ -577,7 +577,16 @@ pub(super) async fn workspace_template_get(
     let _admission = lock_application_admission(&state, "workspace configuration")?;
     let mut session = lock_session(&state)?;
     require_bound_store(&mut session, &project_id, &session_id)?;
-    snapshot(crate::workspace_owner::store_mut(&mut session)?)
+    refresh_owner_snapshot(&mut session)
+}
+
+fn refresh_owner_snapshot(session: &mut Session) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
+    let owner = crate::workspace_owner::store_mut(session)?;
+    // The owner watcher remains active while another folder is displayed.
+    // Discover only its bounded writing files; never scan the active child's
+    // configuration or replace existing document history.
+    owner.discover_documents().map_err(IpcFailure::store)?;
+    snapshot(owner)
 }
 
 #[tauri::command]
@@ -596,6 +605,50 @@ pub(super) async fn workspace_template_enable(
 mod tests {
     use super::*;
     use std::fmt::Write as _;
+
+    #[test]
+    fn refresh_discovers_parked_owner_documents_without_adopting_child_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner_root = directory.path().join("Owner");
+        let child_root = directory.path().join("Child");
+        let (owner, _) = ProjectStore::initialize(&owner_root, "Owner").unwrap();
+        let (child, _) = ProjectStore::initialize(&child_root, "Child").unwrap();
+        let state = PluginState::with_app_local_data_root(
+            Some(directory.path().join("app")),
+            true,
+            BuildModelPolicy::default(),
+        );
+        let mut session = state.session.lock().unwrap();
+        crate::workspace_owner::establish(&mut session, &owner);
+        session.store = Some(owner);
+        crate::workspace_owner::park_active(&mut session);
+        session.store = Some(child);
+        let text = "Owner source.\r\n";
+        std::fs::write(owner_root.join("Facts.md"), text).unwrap();
+        std::fs::write(child_root.join("Facts.md"), "Conflicting child source.").unwrap();
+        refresh_owner_snapshot(&mut session).unwrap();
+        let owner = crate::workspace_owner::store(&session).unwrap();
+        let facts = crate::document_bindings::resolve_document_id(owner, "Facts").unwrap();
+        assert_eq!(owner.read_document("Facts.md").unwrap().document_id, facts);
+        assert_eq!(owner.read_document("Facts.md").unwrap().text, text);
+        assert_eq!(
+            std::fs::read(owner_root.join("Facts.md")).unwrap(),
+            text.as_bytes()
+        );
+        assert!(
+            crate::document_bindings::resolve_document_id(session.store.as_ref().unwrap(), "Facts")
+                .is_err()
+        );
+        refresh_owner_snapshot(&mut session).unwrap();
+        assert_eq!(
+            crate::document_bindings::resolve_document_id(
+                crate::workspace_owner::store(&session).unwrap(),
+                "Facts"
+            )
+            .unwrap(),
+            facts
+        );
+    }
 
     #[test]
     #[cfg(unix)]

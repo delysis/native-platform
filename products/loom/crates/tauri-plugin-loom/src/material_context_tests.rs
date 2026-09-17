@@ -671,3 +671,48 @@ fn ordinary_budgeted_consultation_reports_zero_matches_explicitly() {
     assert_eq!(retrieval.query, "nightjar");
     assert!(retrieval.hits.is_empty());
 }
+
+#[test]
+fn corpus_count_retains_scope_and_refuses_snippets_or_replaced_source() {
+    let (directory, mut store) = project();
+    let path = directory.path().join("count.sqlite3");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(include_str!("materials/alexandria-fixture.sql"))
+        .unwrap();
+    drop(connection);
+    let entry = materials::add_library(&mut store, &path, Some("Research")).unwrap();
+    let context = ReadContext::from(&store);
+    let frozen = context.resolve(&entry.id).unwrap();
+    let counted = context.count_documents(&frozen).unwrap();
+    let Value::Count { count } = counted.unscoped() else {
+        panic!("count lost its type");
+    };
+    assert_eq!(count.result.value, 1);
+    assert_eq!(count.material.id, entry.id);
+    assert_eq!(
+        exact(&counted).unwrap(),
+        "1 document record in the entire library \"Research\".\n"
+    );
+    let serialized = serde_json::to_vec(&counted).unwrap();
+    let snippets = context
+        .search_with_cancel(&frozen, "prayer", &FolderScanBudget::default(), &|| false)
+        .unwrap();
+    assert!(context.count_documents(&snippets).is_err());
+    assert!(
+        context
+            .count_documents(&Value::Text("3 retrieved snippets".into()))
+            .is_err()
+    );
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute("UPDATE documents SET title='Changed'", [])
+        .unwrap();
+    drop(connection);
+    assert!(ReadContext::from(&store).count_documents(&frozen).is_err());
+    materials::add_library(&mut store, &path, Some("Research")).unwrap();
+    assert!(ReadContext::from(&store).count_documents(&frozen).is_err());
+    let replay: Value = serde_json::from_slice(&serialized).unwrap();
+    assert_eq!(exact(&replay).unwrap(), exact(&counted).unwrap());
+    assert_eq!(serde_json::to_vec(&replay).unwrap(), serialized);
+}

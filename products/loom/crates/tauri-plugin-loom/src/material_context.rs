@@ -41,6 +41,9 @@ pub(super) enum Value {
         value: Box<Value>,
     },
     Text(String),
+    Count {
+        count: Box<materials::MaterialCount>,
+    },
     Documents {
         documents: Vec<ResolvedDocument>,
     },
@@ -298,6 +301,7 @@ pub(super) fn exact(value: &Value) -> Result<String, IpcFailure> {
             "A folder is a collection, not an exact text argument. Use find(@Folder/, \"query\") to select evidence.",
         )),
         Value::Text(text) => bounded(text.clone()),
+        Value::Count { count } => bounded(count.text()),
         Value::Documents { documents } => bounded(
             documents
                 .iter()
@@ -626,6 +630,7 @@ pub(super) fn native_media<'a>(
                 }
             }
             Value::Text(_)
+            | Value::Count { .. }
             | Value::Evidence { .. }
             | Value::Folder { .. }
             | Value::Collection { .. } => {}

@@ -40,6 +40,10 @@ pub enum NeuralExpression {
         source: Box<Self>,
         query: Box<Self>,
     },
+    /// Full-scope host count; never the size of a retrieved evidence set.
+    Count {
+        source: Box<Self>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -363,6 +367,7 @@ fn expression_depth(expression: &NeuralExpression) -> usize {
         NeuralExpression::Find { source, query } => {
             1 + expression_depth(source).max(expression_depth(query))
         }
+        NeuralExpression::Count { source } => 1 + expression_depth(source),
         _ => 1,
     }
 }
@@ -464,8 +469,21 @@ impl Parser<'_> {
                 source: Box::new(source),
                 query: Box::new(query),
             })
+        } else if self.take("count") {
+            self.whitespace();
+            if !self.take("(") {
+                return Err(self.error("expected ( after count"));
+            }
+            let [source]: [NeuralExpression; 1] = self
+                .arguments(depth)?
+                .try_into()
+                .map_err(|_| self.error("count requires exactly one library source"))?;
+            Ok(NeuralExpression::Count {
+                source: Box::new(source),
+            })
         } else {
-            Err(self.error("expected @document, @function(...), find(...), or quoted text"))
+            Err(self
+                .error("expected @document, @function(...), find(...), count(...), or quoted text"))
         }
     }
 
@@ -553,6 +571,42 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_is_a_host_operation_with_exactly_one_source() {
+        let count = NeuralExpression::Count {
+            source: Box::new(NeuralExpression::Reference {
+                name: "Research".into(),
+            }),
+        };
+        assert_eq!(
+            parse_neural_command("=count(@Research)").unwrap(),
+            NeuralCommand::Expression(count.clone())
+        );
+        assert_eq!(
+            parse_neural_command("=count(@Research) |> @Explain").unwrap(),
+            NeuralCommand::Expression(NeuralExpression::Call {
+                function: "Explain".into(),
+                arguments: vec![count]
+            })
+        );
+        assert!(matches!(
+            parse_neural_command("=@count(@Research)").unwrap(),
+            NeuralCommand::Expression(NeuralExpression::Call { .. })
+        ));
+        for unsupported in [
+            "=count()",
+            "=count(@Research, \"2020\")",
+            "=sum(@Research)",
+            "=date_range(@Research, \"2020\")",
+            "=counted(@Research)",
+        ] {
+            assert!(
+                parse_neural_command(unsupported).is_err(),
+                "accepted {unsupported}"
+            );
+        }
+    }
 
     #[test]
     fn smart_quoted_reference_names_preserve_original_byte_ranges() {

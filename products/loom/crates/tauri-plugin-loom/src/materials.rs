@@ -26,8 +26,10 @@ use crate::context_attachments::{self, ContextAttachmentPresentation};
 pub(crate) mod collections;
 mod folders;
 mod grants;
+mod query;
 pub(crate) use folders::{FolderRetrieval, FolderScanBudget, search_folder};
 pub(crate) use grants::{forget_selected_grant, persist_selected_grant, restore_selected_grants};
+pub(crate) use query::{MaterialCount, count_documents};
 
 const SCHEMA: &str = "loom.materials.v1";
 const MAX_BINDINGS: usize = 4096;
@@ -966,9 +968,11 @@ fn load_evidence(store: &ProjectStore, id: &str) -> Result<MaterialEvidence> {
     let bytes = read_safe(
         &storage(store)?.join("evidence").join(format!("{id}.json")),
         MAX_EVIDENCE_BYTES,
-    ).map_err(|error| match error {
-        MaterialError::Io(io) if io.kind() == std::io::ErrorKind::NotFound =>
-            MaterialError::NotFound(format!("evidence/{id}")),
+    )
+    .map_err(|error| match error {
+        MaterialError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            MaterialError::NotFound(format!("evidence/{id}"))
+        }
         other => other,
     })?;
     if digest(&bytes) != id {
