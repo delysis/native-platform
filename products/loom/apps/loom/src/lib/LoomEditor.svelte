@@ -779,7 +779,13 @@
           unconsume: authorizeCompletionReversal,
           cycle: onGhostCycle,
           modifier: setOptionHeld,
-          navigate: onCaretNavigation,
+          navigate: () => {
+            onCaretNavigation();
+            // Native navigation can leave the caret unchanged (Cmd-Right at
+            // line end). Reconcile after the default action even when WebKit
+            // emits no selection transaction, so completion can resume.
+            scheduleSelectionReport();
+          },
           pin: setLensPinned,
           dismiss: (candidateId, presentationKey) => onGhostDismiss(candidateId, presentationKey),
           visible: (presentationKey, expectedSurfaceKey, anchorByteOffset) =>

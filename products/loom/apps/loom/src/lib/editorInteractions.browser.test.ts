@@ -1296,6 +1296,45 @@ describe('real WebKit editor interactions', () => {
     expect(serializedMarkdown()).toBe(markdown);
   });
 
+  it('reports the unchanged exact caret after Cmd-Right dismisses a ghost at paragraph end before audio', async () => {
+    const markdown = `hello\n\n![Audio: fixture.wav](loom-attachment:${'a'.repeat(64)}/${'b'.repeat(64)} "loom-waveform:001080ff")`;
+    render(markdown, [], {
+      reconcileSelectionFamily: true,
+      completionFrames: [fourChoiceCompletion()]
+    });
+    const editorLocator = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await expect.element(editorLocator).toBeVisible();
+    const editor = editorLocator.element();
+    editor.focus();
+    const text = editor.querySelector('p')?.firstChild;
+    expect(text?.textContent).toBe('hello');
+    document.getSelection()?.collapse(text!, 5);
+    document.dispatchEvent(new Event('selectionchange'));
+    const latest = page.getByRole('status', { name: 'Latest Selection Callback' });
+    await expect.element(latest).toHaveTextContent('5:none');
+    await page.getByRole('button', { name: 'Advance completion stream' }).click();
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    // Let the initial selection's delayed report finish before measuring the
+    // report owed by this new navigation event, even when native movement is nil.
+    await new Promise((resolve) => window.setTimeout(resolve, 80));
+    const callbacks = page.getByRole('status', { name: 'Selection Callback Count', exact: true });
+    const before = Number(callbacks.element().textContent);
+
+    await userEvent.keyboard('{Meta>}{ArrowRight}{/Meta}');
+
+    await expect.element(page.getByRole('status', { name: 'Completion Context' })).toHaveTextContent('none');
+    expect(editor.querySelector('.loom-visual-ghost')).toBeNull();
+    expect(serializedMarkdown()).toBe(markdown);
+    const selection = document.getSelection();
+    expect(selection?.isCollapsed).toBe(true);
+    expect(selection?.anchorNode?.textContent).toBe('hello');
+    expect(selection?.anchorOffset).toBe(5);
+    // The owner must learn the still-exact caret again so its pending
+    // navigation can settle and authorize a fresh family, not revive the old one.
+    await expect.poll(() => Number(callbacks.element().textContent)).toBeGreaterThan(before);
+    await expect.element(latest).toHaveTextContent('5:none');
+  });
+
   for (const mode of ['visual', 'source'] as const) {
     it(`cycles compatible ${mode} ghost words in both directions after accepting a word`, async () => {
       const choices = [' one alpha tail', ' one beta tail', ' other gamma'].map((text, index) => ({

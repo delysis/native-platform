@@ -12,7 +12,9 @@
 - Before handing over any Loom build, exercise that exact native bundle with the
   cached Gemma writer: type ordinary prose, observe real ghost text and four
   alternatives, cycle with Option-Up/Down, accept, undo to the original bytes,
-  and confirm writing survives reopening. Keep the writer warm and reuse one
+  and confirm writing survives reopening. At a line end, press Command-Right
+  without moving the caret and verify suggestions resume without another edit.
+  Keep the writer warm and reuse one
   build; do not rerun a workspace test suite for each interaction.
 - Component tests with supplied candidates prove editor behavior, not inference.
   A model-free fixture or a built bundle must never be described as a working
