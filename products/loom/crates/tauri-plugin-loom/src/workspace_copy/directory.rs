@@ -75,7 +75,7 @@ fn discover(source: &Path, destination: &str, stop: &AtomicBool) -> Result<CopyP
     };
     let mut remaining = MAX_BYTES;
     let mut visited = 0;
-    let deadline = Instant::now() + Duration::from_secs(180);
+    let deadline = Instant::now() + Duration::from_mins(3);
     while let Some((directory, relative)) = pending.pop() {
         for entry in directory.entries().map_err(io_failure)? {
             if stop.load(Ordering::Acquire) {

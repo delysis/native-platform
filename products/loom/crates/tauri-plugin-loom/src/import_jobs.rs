@@ -24,12 +24,61 @@ pub(super) struct ImportJobs {
 #[derive(Debug, Default)]
 struct Registry {
     closed: bool,
-    cancel_scope: Option<String>,
-    cancelled: std::collections::BTreeSet<String>,
-    revoked_session: Option<String>,
+    draining: bool,
+    cancelled: std::collections::BTreeSet<(String, String)>,
+    revoked_sessions: std::collections::BTreeSet<String>,
     active: Option<ActiveImport>,
-    workers: Vec<JoinHandle<()>>,
-    coordinators: Vec<JoinHandle<()>>,
+    workers: Vec<SessionWorker>,
+    coordinators: Vec<SessionWorker>,
+}
+
+#[derive(Debug)]
+struct SessionWorker {
+    session_id: String,
+    handle: JoinHandle<()>,
+}
+
+impl Registry {
+    fn check_session(&self, session_id: &str) -> Result<(), IpcFailure> {
+        if self.closed {
+            return Err(failure("Imports are unavailable until Loom restarts."));
+        }
+        if self.revoked_sessions.contains(session_id) {
+            return Err(failure("This project session is closing."));
+        }
+        Ok(())
+    }
+
+    fn revoke(&mut self, session_id: &str) {
+        // Revocation supersedes individual Stop latches without forgetting
+        // outstanding requests from other sessions. Bound lifetime bookkeeping.
+        if self.revoked_sessions.len() >= 4096 && !self.revoked_sessions.contains(session_id) {
+            self.closed = true;
+        } else {
+            self.revoked_sessions.insert(session_id.to_owned());
+        }
+        self.cancelled.retain(|(session, _)| session != session_id);
+        if let Some(active) = &self.active
+            && active.session_id == session_id
+        {
+            active.cancel.store(true, Ordering::Release);
+            active.signal.send_replace(true);
+        }
+    }
+}
+
+// Taken handles remain part of admission until every join has finished.
+// The drain mutex serializes these guards; inner never stays locked while joining.
+struct DrainAdmission<'a>(&'a ImportJobs);
+
+impl Drop for DrainAdmission<'_> {
+    fn drop(&mut self) {
+        self.0
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .draining = false;
+    }
 }
 
 #[derive(Debug)]
@@ -61,12 +110,13 @@ fn validate_operation_id(id: &str) -> Result<(), IpcFailure> {
         .map_err(|_| failure("The import operation ID is invalid."))
 }
 
-fn reap_finished(workers: &mut Vec<JoinHandle<()>>) -> Result<(), IpcFailure> {
+fn reap_finished(workers: &mut Vec<SessionWorker>) -> Result<(), IpcFailure> {
     let mut index = 0;
     while index < workers.len() {
-        if workers[index].is_finished() {
+        if workers[index].handle.is_finished() {
             workers
                 .swap_remove(index)
+                .handle
                 .join()
                 .map_err(|_| failure("An import worker stopped unexpectedly."))?;
         } else {
@@ -74,6 +124,19 @@ fn reap_finished(workers: &mut Vec<JoinHandle<()>>) -> Result<(), IpcFailure> {
         }
     }
     Ok(())
+}
+
+fn take_workers(workers: &mut Vec<SessionWorker>, session_id: Option<&str>) -> Vec<SessionWorker> {
+    let mut selected = Vec::new();
+    let mut index = 0;
+    while index < workers.len() {
+        if session_id.is_none_or(|session| workers[index].session_id == session) {
+            selected.push(workers.swap_remove(index));
+        } else {
+            index += 1;
+        }
+    }
+    selected
 }
 
 impl ImportJobs {
@@ -103,19 +166,21 @@ impl ImportJobs {
             active.cancel.store(true, Ordering::Release);
             active.signal.send_replace(true);
         }
-        if registry.cancel_scope.as_deref() != Some(session_id) {
-            registry.cancel_scope = Some(session_id.to_owned());
-            registry.cancelled.clear();
+        // Stop stays idempotent after close; revoked admission already covers
+        // every operation in this scope, so no individual latch is needed.
+        if registry.closed || registry.revoked_sessions.contains(session_id) {
+            return Ok(());
         }
         // Keep preadmission cancellation until the session ends. Never evict a
         // latch that an outstanding IPC request could still consume.
-        if registry.cancelled.len() >= 1024 && !registry.cancelled.contains(operation_id) {
-            registry.revoked_session = Some(session_id.to_owned());
+        let key = (session_id.to_owned(), operation_id.to_owned());
+        if registry.cancelled.len() >= 1024 && !registry.cancelled.contains(&key) {
+            registry.revoke(session_id);
             return Err(failure(
                 "Too many stopped imports. Reopen this folder to import more sources.",
             ));
         }
-        registry.cancelled.insert(operation_id.to_owned());
+        registry.cancelled.insert(key);
         Ok(())
     }
 
@@ -124,11 +189,7 @@ impl ImportJobs {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        registry.revoked_session = Some(session_id.to_owned());
-        if let Some(active) = &registry.active {
-            active.cancel.store(true, Ordering::Release);
-            active.signal.send_replace(true);
-        }
+        registry.revoke(session_id);
     }
 
     pub(super) fn drain_session(&self, session_id: &str) -> Result<usize, IpcFailure> {
@@ -154,11 +215,12 @@ impl ImportJobs {
             registry
                 .workers
                 .iter()
-                .position(|worker| worker.thread().id() == id)
+                .position(|worker| worker.handle.thread().id() == id)
                 .map(|index| registry.workers.swap_remove(index))
         };
         if let Some(worker) = worker {
             worker
+                .handle
                 .join()
                 .map_err(|_| failure("An import worker stopped unexpectedly."))?;
         }
@@ -178,16 +240,34 @@ impl ImportJobs {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(session_id) = session_id {
-                registry.revoked_session = Some(session_id.to_owned());
+                registry.revoke(session_id);
             } else {
                 registry.closed = true;
+                if let Some(active) = &registry.active {
+                    active.cancel.store(true, Ordering::Release);
+                    active.signal.send_replace(true);
+                }
             }
-            if let Some(active) = &registry.active {
-                active.cancel.store(true, Ordering::Release);
-                active.signal.send_replace(true);
+            // A compute call retains its active operation until finish_worker
+            // joins, including thread-local cleanup. No matching active owner or
+            // registered handle means this session has nothing left to wait for.
+            if session_id.is_some_and(|session| {
+                registry
+                    .active
+                    .as_ref()
+                    .is_none_or(|active| active.session_id != session)
+                    && !registry
+                        .workers
+                        .iter()
+                        .chain(&registry.coordinators)
+                        .any(|worker| worker.session_id == session)
+            }) {
+                return Ok(0);
             }
-            std::mem::take(&mut registry.coordinators)
+            registry.draining = true;
+            take_workers(&mut registry.coordinators, session_id)
         };
+        let _admission = DrainAdmission(self);
         let mut count = coordinators.len();
         let mut panicked = false;
         {
@@ -195,22 +275,23 @@ impl ImportJobs {
                 .join_workers
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let workers = std::mem::take(
+            let workers = take_workers(
                 &mut self
                     .inner
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .workers,
+                session_id,
             );
             count += workers.len();
             for worker in workers {
-                panicked |= worker.join().is_err();
+                panicked |= worker.handle.join().is_err();
             }
         }
         // Coordinators may still be returning from compute. Release the
         // worker-join lock before waiting for them to finish.
         for coordinator in coordinators {
-            panicked |= coordinator.join().is_err();
+            panicked |= coordinator.handle.join().is_err();
         }
         if panicked {
             Err(failure("An import worker stopped unexpectedly."))
@@ -235,9 +316,7 @@ impl ImportOperation {
                 .lock()
                 .map_err(|_| failure("Import state is unavailable."))?;
             self.check()?;
-            if registry.closed {
-                return Err(failure("Loom is closing."));
-            }
+            registry.check_session(&self.session_id)?;
             // Transfer the operation only after releasing the registry lock:
             // dropping an operation (including spawn failure) locks it too.
             let worker = std::thread::Builder::new()
@@ -248,7 +327,10 @@ impl ImportOperation {
                     }
                 })
                 .map_err(|error| failure(error.to_string()))?;
-            registry.coordinators.push(worker);
+            registry.coordinators.push(SessionWorker {
+                session_id: self.session_id.clone(),
+                handle: worker,
+            });
         }
         sender
             .send((self, work))
@@ -281,20 +363,20 @@ impl ImportOperation {
             .inner
             .lock()
             .map_err(|_| failure("Import state is unavailable."))?;
-        if registry.closed || registry.revoked_session.as_deref() == Some(session_id) {
-            return Err(failure("This project session is closing."));
-        }
-        if registry.cancel_scope.as_deref() == Some(session_id)
-            && registry.cancelled.contains(operation_id)
+        registry.check_session(session_id)?;
+        if registry
+            .cancelled
+            .contains(&(session_id.to_owned(), operation_id.to_owned()))
         {
             return Err(failure("Import stopped before it began."));
         }
-        if registry.active.is_some()
+        if registry.draining
+            || registry.active.is_some()
             || registry
                 .workers
                 .iter()
                 .chain(&registry.coordinators)
-                .any(|worker| !worker.is_finished())
+                .any(|worker| !worker.handle.is_finished())
         {
             return Err(failure(
                 "Another import is running. Stop it or wait for it to finish.",
@@ -349,9 +431,7 @@ impl ImportOperation {
                 .lock()
                 .map_err(|_| failure("Import state is unavailable."))?;
             self.check()?;
-            if registry.closed {
-                return Err(failure("Loom is closing."));
-            }
+            registry.check_session(&self.session_id)?;
             // Reap completed handles without waiting for any running worker.
             reap_finished(&mut registry.workers)?;
             let cancel = Arc::clone(&self.cancel);
@@ -367,7 +447,10 @@ impl ImportOperation {
                 })
                 .map_err(|error| failure(error.to_string()))?;
             let id = worker.thread().id();
-            registry.workers.push(worker);
+            registry.workers.push(SessionWorker {
+                session_id: self.session_id.clone(),
+                handle: worker,
+            });
             id
         };
         let result = receiver.await;
@@ -389,7 +472,7 @@ impl ImportOperation {
                     return Err(failure("Import stopped."));
                 }
                 tokio::select! {
-                    result = tokio::time::timeout(std::time::Duration::from_secs(180), work) =>
+                    result = tokio::time::timeout(std::time::Duration::from_mins(3), work) =>
                         result.map_err(|_| failure("The import reached its three-minute limit."))?,
                     _ = signal.changed() => Err(failure("Import stopped.")),
                 }
@@ -430,12 +513,13 @@ impl ImportOperation {
         let store = require_bound_store(&mut session, &self.project_id, &self.session_id)?;
         // Serialize the final link with cancel/revoke. Once Stop returns, no
         // previously admitted worker can publish another selectable source.
-        let _publication = self
+        let publication = self
             .jobs
             .inner
             .lock()
             .map_err(|_| failure("Import state is unavailable."))?;
         self.check()?;
+        publication.check_session(&self.session_id)?;
         if store.root() != self.root
             || Handle::from_path(store.root()).map_err(|error| failure(error.to_string()))?
                 != self.root_identity
@@ -542,17 +626,139 @@ mod tests {
     }
 
     #[test]
+    fn closing_another_session_leaves_the_import_and_its_workers_owned() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (state, project, session) = opened(temporary.path());
+        let id = CommandId::new().to_string();
+        let operation = ImportOperation::reserve(&state, &project, &session, &id).unwrap();
+        let (started, observed_start) = mpsc::channel();
+        let (finished, observed_finish) = mpsc::channel();
+        operation
+            .dispatch(move |operation| {
+                let result: Result<(), IpcFailure> =
+                    tauri::async_runtime::block_on(operation.network(async move {
+                        started.send(()).unwrap();
+                        std::future::pending().await
+                    }));
+                finished.send(result.is_err()).unwrap();
+            })
+            .unwrap();
+        observed_start.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        state.imports.revoke_session("another-session");
+        let survived_revoke = state.imports.is_running(&session, &id);
+        let drained = state.imports.drain_session("another-session").unwrap();
+        let survived_drain = state.imports.is_running(&session, &id);
+        let still_owned = {
+            let registry = state.imports.inner.lock().unwrap();
+            registry.workers.len() == 1 && registry.coordinators.len() == 1
+        };
+
+        // Always join the real request before asserting, including on failure.
+        state.imports.shutdown().unwrap();
+        assert!(
+            observed_finish
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        );
+        assert!(survived_revoke, "unrelated close cancelled the import");
+        assert_eq!(drained, 0, "unrelated close took another session's workers");
+        assert!(survived_drain && still_owned);
+    }
+
+    #[test]
     fn stop_before_admission_is_retained_for_that_operation_only() {
         let temporary = tempfile::tempdir().unwrap();
         let (state, project, session) = opened(temporary.path());
         let id = CommandId::new().to_string();
         state.imports.cancel(&session, &id).unwrap();
+        state
+            .imports
+            .cancel("another-session", &CommandId::new().to_string())
+            .unwrap();
         assert!(ImportOperation::reserve(&state, &project, &session, &id).is_err());
         let next =
             ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
                 .unwrap();
         assert!(next.check().is_ok());
         assert_eq!(published_count(temporary.path()), 0);
+    }
+
+    #[test]
+    fn revoked_sessions_remain_closed_when_another_session_closes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (state, project, session) = opened(temporary.path());
+        state.imports.revoke_session(&session);
+        state.imports.revoke_session("another-session");
+        state
+            .imports
+            .cancel(&session, &CommandId::new().to_string())
+            .unwrap();
+        assert!(
+            ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn another_session_cannot_enter_while_taken_workers_are_still_joining() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (state, project, session) = opened(temporary.path());
+        let other_root = tempfile::tempdir().unwrap();
+        let (other, other_project, other_session) = opened(other_root.path());
+        tauri::async_runtime::block_on(async {
+            let operation =
+                ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
+                    .unwrap();
+            let (started, observed_start) = tokio::sync::oneshot::channel();
+            let (release, blocked) = mpsc::channel();
+            let waiter = tokio::spawn(async move {
+                operation
+                    .compute(move || {
+                        started.send(()).unwrap();
+                        blocked.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            });
+            observed_start.await.unwrap();
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+            let jobs = Arc::clone(&state.imports);
+            let drain = std::thread::spawn(move || jobs.drain_session(&session));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let taken = loop {
+                if state.imports.inner.lock().unwrap().workers.is_empty() {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let denied = ImportOperation::reserve_in(
+                &other,
+                &state.imports,
+                &other_project,
+                &other_session,
+                &CommandId::new().to_string(),
+            )
+            .is_err();
+            release.send(()).unwrap();
+            drain.join().unwrap().unwrap();
+            assert!(taken, "drain did not reach the blocked join");
+            assert!(denied, "taken handles disappeared from import admission");
+            assert!(
+                ImportOperation::reserve_in(
+                    &other,
+                    &state.imports,
+                    &other_project,
+                    &other_session,
+                    &CommandId::new().to_string()
+                )
+                .is_ok()
+            );
+        });
     }
 
     #[test]

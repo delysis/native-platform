@@ -2356,7 +2356,6 @@ impl IpcFailure {
             ContextAttachmentError::UnsafeSource => "attachment_source_refused",
             ContextAttachmentError::SourceSize => "attachment_size_refused",
             ContextAttachmentError::Processing(_) => "attachment_processing_failed",
-            ContextAttachmentError::NoRepresentation => "attachment_no_model_representation",
             ContextAttachmentError::ContextLimit => "attachment_context_limit",
             ContextAttachmentError::ManualTextLimit => "attachment_context_text_limit",
             ContextAttachmentError::ContextInvalid => "attachment_context_invalid",

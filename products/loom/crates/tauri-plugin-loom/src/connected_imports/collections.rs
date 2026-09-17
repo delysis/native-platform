@@ -353,7 +353,7 @@ async fn refresh_pages(
                 .map_err(failure)
         })
         .await?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let deadline = tokio::time::Instant::now() + Duration::from_mins(5);
     let initial_bytes = head.checkpoint.bytes_read;
     let initial_pages = head.checkpoint.pages_completed;
     loop {
@@ -374,7 +374,7 @@ async fn refresh_pages(
         if !head.checkpoint.page_open {
             *head = list_page(state, operation, private, def, head, &remote).await?;
         }
-        let page_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_secs(180));
+        let page_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_mins(3));
         let mut page_bytes = 0usize;
         while let Some(member) = head.checkpoint.pending.first().cloned() {
             operation.check()?;

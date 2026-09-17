@@ -250,8 +250,6 @@ pub(crate) enum ContextAttachmentError {
     SourceSize,
     #[error("attachment processing failed: {0}")]
     Processing(String),
-    #[error("the attachment produced no safe text or media representation")]
-    NoRepresentation,
     #[error("the document context already contains Loom's 32-attachment limit")]
     ContextLimit,
     #[error("pasted context exceeds Loom's 256 KB saved-text limit")]
@@ -614,12 +612,6 @@ pub(crate) fn prepare_provided(
         ));
     }
     let id = prepared.bundle.graph.root.0.clone();
-    if prepared.bundle.graph.objects.iter().any(|object| {
-        object.id == prepared.bundle.graph.root
-            && object.detection.selected == Some(DetectedFormat::Executable)
-    }) {
-        return Err(ContextAttachmentError::NoRepresentation);
-    }
     // Retaining an original does not assert extraction or model support.
     // Identity is the root's content hash, shared with its immutable receipt.
     install_object(project_root, &id, &original)?;
@@ -2706,56 +2698,86 @@ mod tests {
 
     #[test]
     fn source_only_files_retain_originals_without_inventing_model_content() {
-        let project = tempfile::tempdir().unwrap();
-        let source = tempfile::tempdir().unwrap();
-        let bytes = b"\x00\xff\xfe\xfd\x80\x81\x82\x83";
-        let path = source.path().join("Archive.bin");
-        fs::write(&path, bytes).unwrap();
-        let attachment = import_path(project.path(), &path).unwrap();
-        assert_eq!(attachment.text_bytes, 0);
-        assert!(attachment.media_kinds.is_empty());
-        assert!(attachment.editable_markdown.is_none());
-        assert!(
-            attachment
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("not sent to the model"))
-        );
-        fs::remove_file(&path).unwrap();
-        assert_eq!(
-            fs::read(original_path(project.path(), &attachment.id).unwrap()).unwrap(),
-            bytes
-        );
-        let snapshot = add_document_context_snapshot(
-            project.path(),
-            "doc",
-            std::slice::from_ref(&attachment.id),
-        )
-        .unwrap();
-        assert_eq!(
-            snapshot.attachments[0].presentation_kind,
-            ContextAttachmentPresentationKind::File
-        );
-        let persisted = set_document_context_snapshot(
-            project.path(),
-            "doc",
-            "",
-            std::slice::from_ref(&attachment.id),
-        )
-        .unwrap();
-        assert_eq!(persisted.attachments.len(), 1);
-        let resolved =
-            resolve_for_generation_with_budget(project.path(), "doc", "Writing", 32768, 4, 128)
-                .unwrap();
-        assert!(resolved.media.is_empty());
-        assert!(resolved.context_preamble.is_empty());
-        assert_eq!(resolved.manuscript_prompt, "Writing");
-        assert!(
-            remove_document_context_snapshot(project.path(), "doc", &attachment.id)
-                .unwrap()
-                .attachments
-                .is_empty()
-        );
+        for (name, bytes, executable) in [
+            (
+                "Archive.bin",
+                b"\x00\xff\xfe\xfd\x80\x81\x82\x83".as_slice(),
+                false,
+            ),
+            ("Program.elf", b"\x7fELF\x02\x01\x01\x00".as_slice(), true),
+            (
+                "Program.exe",
+                b"MZ\x00\x00\xff\xfe\x80\x81".as_slice(),
+                true,
+            ),
+        ] {
+            let project = tempfile::tempdir().unwrap();
+            let source = tempfile::tempdir().unwrap();
+            let path = source.path().join(name);
+            fs::write(&path, bytes).unwrap();
+            let attachment = import_path(project.path(), &path).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            if executable {
+                assert_eq!(attachment.detected_format, "executable");
+            }
+            assert_eq!(attachment.text_bytes, 0);
+            assert!(attachment.media_kinds.is_empty());
+            assert!(attachment.editable_markdown.is_none());
+            assert!(
+                attachment
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("not sent to the model"))
+            );
+            let retained = original_path(project.path(), &attachment.id).unwrap();
+            assert_eq!(fs::read(&retained).unwrap(), bytes);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    fs::metadata(&retained).unwrap().permissions().mode() & 0o111,
+                    0
+                );
+            }
+            let snapshot = add_document_context_snapshot(
+                project.path(),
+                "doc",
+                std::slice::from_ref(&attachment.id),
+            )
+            .unwrap();
+            assert_eq!(
+                snapshot.attachments[0].presentation_kind,
+                ContextAttachmentPresentationKind::File
+            );
+            let persisted = set_document_context_snapshot(
+                project.path(),
+                "doc",
+                "",
+                std::slice::from_ref(&attachment.id),
+            )
+            .unwrap();
+            assert_eq!(persisted.attachments.len(), 1);
+            let resolved =
+                resolve_for_generation_with_budget(project.path(), "doc", "Writing", 32768, 4, 128)
+                    .unwrap();
+            assert!(resolved.media.is_empty());
+            assert!(resolved.context_preamble.is_empty());
+            assert_eq!(resolved.manuscript_prompt, "Writing");
+            assert!(
+                remove_document_context_snapshot(project.path(), "doc", &attachment.id)
+                    .unwrap()
+                    .attachments
+                    .is_empty()
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read(&retained).unwrap(), bytes);
+            // A missing external original does not erase the retained source.
+            fs::remove_file(&path).unwrap();
+            assert_eq!(
+                fs::read(original_path(project.path(), &attachment.id).unwrap()).unwrap(),
+                bytes
+            );
+        }
     }
 
     #[test]
