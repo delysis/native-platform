@@ -15,7 +15,7 @@ pub(crate) struct SourceOrigin {
 }
 
 impl SourceOrigin {
-    fn of(store: &ProjectStore) -> Self {
+    pub(crate) fn of(store: &ProjectStore) -> Self {
         Self {
             project_id: store.manifest().project_id,
             root: store.root().to_owned(),
@@ -26,7 +26,7 @@ impl SourceOrigin {
         self.project_id == store.manifest().project_id && self.root == store.root()
     }
 
-    fn wrap(self, value: Value) -> Value {
+    pub(crate) fn wrap(self, value: Value) -> Value {
         Value::Scoped {
             origin: self,
             value: Box::new(value),
@@ -38,6 +38,7 @@ impl SourceOrigin {
 pub(crate) struct ReadContext<'a> {
     pub documents: &'a ProjectStore,
     pub materials: &'a ProjectStore,
+    pub mounted: Option<&'a crate::workspace_references::Snapshots>,
 }
 
 pub(crate) struct SelectedSource<'a> {
@@ -51,11 +52,19 @@ impl<'a> From<&'a ProjectStore> for ReadContext<'a> {
         Self {
             documents: store,
             materials: store,
+            mounted: None,
         }
     }
 }
 
 impl<'a> ReadContext<'a> {
+    pub(crate) fn with_mounted(
+        mut self,
+        mounted: &'a crate::workspace_references::Snapshots,
+    ) -> Self {
+        self.mounted = Some(mounted);
+        self
+    }
     pub(crate) fn reference(self, name: &str) -> Result<SelectedSource<'a>, IpcFailure> {
         if let Some((evidence, store)) = self.retained_evidence(name)? {
             return Ok(SelectedSource {
@@ -106,6 +115,17 @@ impl<'a> ReadContext<'a> {
     }
 
     pub(crate) fn resolve(self, name: &str) -> Result<Value, IpcFailure> {
+        if name.contains("::") {
+            return self
+                .mounted
+                .and_then(|mounted| mounted.entries.get(name))
+                .ok_or_else(|| {
+                    failure("The mounted document was not admitted for this operation.")
+                })?
+                .as_ref()
+                .map(|snapshot| snapshot.value.clone())
+                .map_err(Clone::clone);
+        }
         let (value, store) = resolve_value(self, name)?;
         Ok(SourceOrigin::of(store).wrap(value))
     }
@@ -192,6 +212,18 @@ impl<'a> ReadContext<'a> {
             }
             return Ok((source.clone(), Vec::new()));
         }
+        // Exact documents are already frozen inputs. Consultation must not
+        // reopen a former root or reinterpret its provenance as authority.
+        if let Value::Scoped { value, .. } = source
+            && matches!(value.as_ref(), Value::Documents { .. })
+        {
+            if exact(value)?.len() > budget {
+                return Err(budget_failure(
+                    "The referenced document does not fit the remaining context.",
+                ));
+            }
+            return Ok((source.clone(), Vec::new()));
+        }
         let (store, value, origin) = self.source(source)?;
         let (result, omitted) = super::consult_with_budget_and_cancel(
             store,
@@ -227,10 +259,46 @@ impl<'a> ReadContext<'a> {
             if matches!(value, Value::Text(_)) {
                 continue;
             }
+            if let Some(snapshot) = self
+                .mounted
+                .into_iter()
+                .flat_map(|snapshots| snapshots.entries.values())
+                .filter_map(|snapshot| snapshot.as_ref().ok())
+                .find(|snapshot| same_documents(&snapshot.value, value))
+            {
+                media.extend(snapshot.media.clone());
+                continue;
+            }
             let (store, value, _) = self.source(value)?;
             media.extend(super::native_media(store, [value])?);
         }
         crate::terminal_media::merge(Vec::new(), media)
+    }
+}
+
+fn same_documents(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (
+            Value::Scoped {
+                origin: a,
+                value: av,
+            },
+            Value::Scoped {
+                origin: b,
+                value: bv,
+            },
+        ) if a == b => match (av.as_ref(), bv.as_ref()) {
+            (Value::Documents { documents: a }, Value::Documents { documents: b }) => {
+                a.len() == b.len()
+                    && a.iter().zip(b).all(|(a, b)| {
+                        a.document_id == b.document_id
+                            && a.revision_id == b.revision_id
+                            && a.blob_id == b.blob_id
+                    })
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 

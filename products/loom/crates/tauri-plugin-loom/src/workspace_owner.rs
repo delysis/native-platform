@@ -105,6 +105,7 @@ pub(super) fn read_context<'a>(
         ));
     }
     Ok(crate::material_context::ReadContext {
+        mounted: None,
         documents,
         materials: store(session)?,
     })

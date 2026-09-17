@@ -41,6 +41,17 @@ export interface MaterialSearch {
   warnings: string[];
 }
 
+/** Navigation only. Native reads remain authoritative for all source bytes. */
+export interface MaterialNavigation {
+  query: string;
+  pageIndex: number;
+  pdfText: boolean;
+  sourceRevision: string | null;
+  pdfPageCount: number;
+  evidenceId: string | null;
+  member: { occurrenceId: string; snapshotId: string } | null;
+}
+
 export type MaterialPdfPage = NonNullable<ContextAttachmentPresentation['pdf_pages']>[number];
 
 /** Refuse malformed boundaries instead of changing source bytes with replacement characters. */

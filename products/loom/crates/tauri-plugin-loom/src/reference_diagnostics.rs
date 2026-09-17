@@ -63,13 +63,22 @@ pub(super) async fn document_reference_diagnostics(
         .workspace
         .as_ref()
         .ok_or_else(|| IpcFailure::new("workspace_not_open", "Open a workspace first.", false))?;
+    let references = loom_document::document_references(&text)
+        .map_err(|error| IpcFailure::new("document_reference_invalid", error.to_string(), false))?;
+    let mut mounted = crate::workspace_references::Snapshots::default();
+    mounted.admit(
+        &state,
+        &session,
+        references.iter().map(|reference| reference.name.as_str()),
+    )?;
     let context = crate::workspace_owner::read_context(
         &session,
         &project_id,
         &session_id,
         &owner.project_id.to_string(),
         &owner.session_id.to_string(),
-    )?;
+    )?
+    .with_mounted(&mounted);
     diagnose(context, &text)
 }
 

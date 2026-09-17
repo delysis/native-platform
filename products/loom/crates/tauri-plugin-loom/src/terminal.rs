@@ -236,6 +236,8 @@ struct RunReceipt {
     model: Option<VerifiedModelDescriptor>,
     bindings: BTreeMap<String, Value>,
     #[serde(default)]
+    function_contexts: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
     evidence: Vec<crate::materials::MaterialEvidence>,
     #[serde(default)]
     searches: Vec<crate::materials::MaterialSearch>,
@@ -694,14 +696,19 @@ fn start_run<R: Runtime>(
     }
     let fingerprint = BlobId::digest(&fingerprint_bytes);
     let mut all_names = names.into_iter().collect::<BTreeSet<_>>();
+    let mut mounted = crate::workspace_references::Snapshots::default();
+    mounted.admit(state, &session, all_names.iter().map(String::as_str))?;
+    let mut function_contexts = BTreeMap::new();
     {
-        let read_context = scope.read_context(
-            &mut session,
-            &project_id,
-            &session_id,
-            &owner_project_id.to_string(),
-            &owner_session_id.to_string(),
-        )?;
+        let read_context = scope
+            .read_context(
+                &mut session,
+                &project_id,
+                &session_id,
+                &owner_project_id.to_string(),
+                &owner_session_id.to_string(),
+            )?
+            .with_mounted(&mounted);
         for function in functions {
             if function.ends_with('/') {
                 return Err(failure("A function must name one document."));
@@ -714,11 +721,16 @@ fn start_run<R: Runtime>(
                 read_context.resolve(&function)?
             };
             let function_text = material_context::exact(&function_value)?;
+            let mut direct = BTreeMap::new();
             for reference in document_references(&function_text).map_err(io_failure)? {
-                all_names.insert(reference.name);
+                let bound = crate::workspace_references::relative(&function, &reference.name)?;
+                all_names.insert(bound.clone());
+                direct.insert(reference.name, bound);
             }
+            function_contexts.insert(function, direct);
         }
     }
+    mounted.admit(state, &session, all_names.iter().map(String::as_str))?;
     let mut bindings = BTreeMap::new();
     let mut sources = Vec::new();
     let mut seen_documents = BTreeSet::new();
@@ -729,13 +741,15 @@ fn start_run<R: Runtime>(
         capture = Some(value);
         capture_media = media;
     }
-    let read_context = scope.read_context(
-        &mut session,
-        &project_id,
-        &session_id,
-        &owner_project_id.to_string(),
-        &owner_session_id.to_string(),
-    )?;
+    let read_context = scope
+        .read_context(
+            &mut session,
+            &project_id,
+            &session_id,
+            &owner_project_id.to_string(),
+            &owner_session_id.to_string(),
+        )?
+        .with_mounted(&mounted);
     for name in all_names {
         let value = if scope == RunScope::Workspace && name == "document" {
             capture
@@ -749,7 +763,10 @@ fn start_run<R: Runtime>(
             && !(scope == RunScope::Workspace && name == "document")
         {
             for document in documents {
-                if seen_documents.insert(document.document_id) {
+                if crate::material_context::local_artifact_ids(read_context.documents, [&value])?
+                    .contains(&document.artifact_id)
+                    && seen_documents.insert(document.document_id)
+                {
                     sources.push(document.clone());
                 }
             }
@@ -783,7 +800,14 @@ fn start_run<R: Runtime>(
         validate_media_against_resident_model(&media, &model.descriptor)?;
         media
     } else {
-        Vec::new()
+        // A reference-only expression still retains the mounted document's
+        // exact media independently of the source root's later lifetime.
+        read_context.native_media(
+            bindings
+                .iter()
+                .filter(|(name, _)| name.contains("::"))
+                .map(|(_, value)| value),
+        )?
     };
     let store = scope.store(&mut session, &project_id, &session_id)?;
     let media_evidence = crate::terminal_media::retain(store, &media)?;
@@ -829,6 +853,7 @@ fn start_run<R: Runtime>(
         media: media_evidence,
         model: model.as_ref().map(|model| model.descriptor.clone()),
         bindings,
+        function_contexts,
         evidence: Vec::new(),
         searches: Vec::new(),
         counts: Vec::new(),
@@ -1081,6 +1106,12 @@ impl Evaluator<'_> {
                 function,
                 arguments,
             } => {
+                let direct = self
+                    .receipt
+                    .function_contexts
+                    .get(function)
+                    .cloned()
+                    .unwrap_or_default();
                 let function = material_context::exact(&self.binding(function)?)?;
                 let mut inputs = Vec::new();
                 for argument in arguments {
@@ -1102,7 +1133,8 @@ impl Evaluator<'_> {
                     if !seen_context.insert(reference.name.clone()) {
                         continue;
                     }
-                    let value = self.binding(&reference.name)?;
+                    let value =
+                        self.binding(direct.get(&reference.name).unwrap_or(&reference.name))?;
                     self.append_context(
                         &mut contextual_function,
                         &reference.name,

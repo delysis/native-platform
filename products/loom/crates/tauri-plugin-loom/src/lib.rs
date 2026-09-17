@@ -31,6 +31,7 @@ mod workspace_copy;
 mod workspace_output;
 mod workspace_owner;
 mod workspace_preview;
+mod workspace_references;
 mod workspace_roots;
 mod workspace_source_import;
 mod workspace_template;
@@ -2146,6 +2147,7 @@ impl Builder {
                 workspace_template_get,
                 workspace_output::workspace_pane_output,
                 workspace_output::workspace_document_resolve,
+                workspace_references::workspace_reference_resolve,
                 workspace_template_enable,
                 audio_record_start,
                 audio_record_stop,
@@ -8756,13 +8758,23 @@ fn weave_start_inner<R: Runtime>(
                 false,
             )
         })?;
+        let references = loom_document::document_references(&loaded.text).map_err(|error| {
+            IpcFailure::new("document_reference_invalid", error.to_string(), false)
+        })?;
+        let mut mounted = workspace_references::Snapshots::default();
+        mounted.admit(
+            state,
+            &session,
+            references.iter().map(|reference| reference.name.as_str()),
+        )?;
         let source_context = workspace_owner::read_context(
             &session,
             &project_id,
             &session_id,
             &owner.project_id.to_string(),
             &owner.session_id.to_string(),
-        )?;
+        )?
+        .with_mounted(&mounted);
         let material_plan = material_context::markdown_plan_with_budget(
             source_context,
             &loaded.text,
@@ -10140,15 +10152,13 @@ async fn generation_cancel<R: Runtime>(
     // Persist the user's request before delivering the process-local side
     // effect. Reaching a terminal state in this interval is benign: a cancel
     // request is not a promise that the terminal status will be Cancelled.
-    let _delivered = state
-        .generations
-        .cancel_run(route.identity.project_id, route.identity.session_id, run_id)
-        .map_err(|error| IpcFailure::generation_registry(&error))?;
-    emit_desktop_event(
-        &app,
-        &route.identity,
-        LoomEvent::Generation(outcome.event.clone()),
-    )?;
+    if let Some(event) = outcome.event {
+        let _delivered = state
+            .generations
+            .cancel_run(route.identity.project_id, route.identity.session_id, run_id)
+            .map_err(|error| IpcFailure::generation_registry(&error))?;
+        emit_desktop_event(&app, &route.identity, LoomEvent::Generation(event))?;
+    }
     let mut receipt = Receipt::from(outcome.receipt);
     receipt.request_fingerprint = Some(outcome.request_fingerprint.to_string());
     receipt.replayed = outcome.replayed;

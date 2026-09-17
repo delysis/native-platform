@@ -61,6 +61,7 @@ permissions = [
   "allow-document-open",
   "allow-workspace-pane-output",
   "allow-workspace-document-resolve",
+  "allow-workspace-reference-resolve",
   "allow-document-import-external",
   "allow-shader-preview",
   "allow-document-checkpoint",

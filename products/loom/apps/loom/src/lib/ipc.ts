@@ -1026,6 +1026,10 @@ export function resolveWorkspaceDocument(projectId: string, sessionId: string, r
   return call('workspace_document_resolve', { projectId, sessionId, reference });
 }
 
+export function resolveWorkspaceReference(projectId: string, sessionId: string, reference: string): Promise<{ root_id: string; document_id: string; workspace_session_id: string }> {
+  return call('workspace_reference_resolve', { projectId, sessionId, reference });
+}
+
 export function compileShaderPreview(source: string): Promise<{ fragment: string }> {
   return call('shader_preview', { source });
 }

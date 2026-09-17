@@ -17,7 +17,7 @@
         if (/^https?:\/\//i.test(href)) {
           link.setAttribute('target', '_blank');
           link.setAttribute('rel', 'noopener noreferrer');
-        } else if (!/^loom-(?:material|evidence|attachment):/.test(href)) {
+        } else if (!/^loom-(?:material|evidence|attachment|document):/.test(href)) {
           link.replaceWith(...link.childNodes);
         }
       }

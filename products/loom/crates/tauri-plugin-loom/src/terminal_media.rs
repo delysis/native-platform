@@ -13,8 +13,8 @@ use super::IpcFailure;
 use super::context_attachments::resolve_media_for_document;
 use super::document_bindings::ResolvedDocument;
 
-const MAX_MEDIA: usize = 32;
-const MAX_MEDIA_BYTES: usize = 128 * 1024 * 1024;
+pub(super) const MAX_MEDIA: usize = 32;
+pub(super) const MAX_MEDIA_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(super) struct RetainedMedia {

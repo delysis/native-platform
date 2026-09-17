@@ -31,6 +31,7 @@ const COMMANDS: &[&str] = &[
     "workspace_template_get",
     "workspace_pane_output",
     "workspace_document_resolve",
+    "workspace_reference_resolve",
     "workspace_template_enable",
     "audio_record_start",
     "audio_record_stop",

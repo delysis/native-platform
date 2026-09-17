@@ -503,6 +503,7 @@ fn final_evidence_replaces_an_intermediate_generation_in_run_output() {
     let intermediate = evaluator.receipt.run.output_relative_path.clone().unwrap();
     let found = fixture.with_store(|store| {
         let context = material_context::ReadContext {
+            mounted: None,
             documents: store,
             materials: store,
         };
@@ -588,6 +589,7 @@ fn evaluator_consultation_budgets_evidence_without_shortening_exact_values() {
     };
     let value = fixture.with_store(|store| {
         material_context::ReadContext {
+            mounted: None,
             documents: store,
             materials: store,
         }

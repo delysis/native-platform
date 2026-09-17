@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
+  import { resolveWorkspaceReference } from './lib/ipc';
   import { convertFileSrc } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import { Menu } from '@tauri-apps/api/menu';
@@ -21,7 +22,7 @@
   import MaterialView from './lib/MaterialView.svelte';
   import { resolveScopedMaterialReference } from './lib/materialEvidenceScope';
   import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, resolveMaterialReference } from './lib/ipc';
-  import { materialReferenceMarkdown, materialQuotationMarkdown, importedMaterialMarkdown, isDatabasePath, type MaterialEntry, type MaterialEvidence } from './lib/materials';
+  import { materialReferenceMarkdown, materialQuotationMarkdown, importedMaterialMarkdown, isDatabasePath, type MaterialEntry, type MaterialEvidence, type MaterialNavigation } from './lib/materials';
   import { workspaceWriterCandidates, workspaceWriterModel, type WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
   import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
   import { startAudioRecording, stopAudioRecording, synthesizeAudio, type AudioRecording } from './lib/ipc';
@@ -504,6 +505,22 @@
   let activeMaterial: MaterialEntry | null = null;
   let activeMaterialScope: MaterialScope | null = null;
   let activeMaterialEvidence: MaterialEvidence | null = null;
+  let materialNavigation = new Map<string, { scope: MaterialScope; navigation: MaterialNavigation }>();
+  function materialNavigationKey(scope: MaterialScope, id: string): string { return JSON.stringify([scope.projectId, scope.sessionId, id]); }
+  function rememberMaterialNavigation(scope: MaterialScope, id: string, navigation: MaterialNavigation): void {
+    if ((!isOwnerMaterialScope(scope) && (project?.project_id !== scope.projectId || project?.session_id !== scope.sessionId)) || activeMaterial?.id !== id) return;
+    const key = materialNavigationKey(scope, id);
+    if (JSON.stringify(materialNavigation.get(key)?.navigation) === JSON.stringify(navigation)) return;
+    const next = new Map(materialNavigation); next.delete(key); next.set(key, { scope, navigation });
+    if (next.size > 128) next.delete(next.keys().next().value!);
+    materialNavigation = next;
+  }
+  $: pruneMaterialNavigation(materialOwnerScope, project?.project_id, project?.session_id);
+  function pruneMaterialNavigation(owner: MaterialScope | null, projectId?: string, sessionId?: string): void {
+    const next = new Map([...materialNavigation].filter(([, { scope }]) =>
+      (owner?.projectId === scope.projectId && owner.sessionId === scope.sessionId) || (projectId === scope.projectId && sessionId === scope.sessionId)));
+    if (next.size !== materialNavigation.size) materialNavigation = next;
+  }
   let materialOriginPane: string | null = null;
   let materialOrigin: {
     projectId: string; sessionId: string; documentId: string; title: string; markdown: string;
@@ -512,6 +529,7 @@
   } | null = null;
   $: if (desktop && materialOwnerScope && materialScope !== `${materialOwnerScope.projectId}/${materialOwnerScope.sessionId}`) {
     materialScope = `${materialOwnerScope.projectId}/${materialOwnerScope.sessionId}`;
+    materialNavigation = new Map();
     activeMaterial = null; activeMaterialScope = null; materialOrigin = null; materialOriginPane = null; materialEntries = []; materialsOpen = false;
     void refreshMaterials();
   }
@@ -527,7 +545,16 @@
     if (!captured) return;
     try {
       const entries = await listMaterials(captured.projectId, captured.sessionId);
-      if (isOwnerMaterialScope(captured)) materialEntries = entries;
+      if (isOwnerMaterialScope(captured)) {
+        const removed = materialEntries.filter(previous => !entries.some(entry => entry.id === previous.id));
+        if (removed.length) {
+          const next = new Map(materialNavigation);
+          for (const item of removed) next.delete(materialNavigationKey(captured, item.id));
+          materialNavigation = next;
+          if (activeMaterial && removed.some(item => item.id === activeMaterial?.id) && activeMaterialScope && isOwnerMaterialScope(activeMaterialScope)) closeMaterial();
+        }
+        materialEntries = entries;
+      }
     } catch (error) { if (isOwnerMaterialScope(captured)) recordFailure(error); }
   }
   function isOwnerMaterialScope(scope: MaterialScope): boolean {
@@ -576,6 +603,7 @@
   }
   function materialRemoved(id: string, sessionId: string): void {
     if (workspaceRoots?.workspace_session_id !== sessionId) return;
+    if (materialOwnerScope) { const next = new Map(materialNavigation); next.delete(materialNavigationKey(materialOwnerScope, id)); materialNavigation = next; }
     materialEntries = materialEntries.filter(item => item.id !== id);
     if (activeMaterial?.id === id) closeMaterial();
   }
@@ -1389,8 +1417,10 @@
         : null
       : null;
   $: completionWitnessSelected = completionView.witnessSelected;
+  let nativeDropWitness: { type: string; point: { x: number; y: number } | null; scope: string | null; path_count: number } | null = null;
   $: completionAccessibilityWitness = JSON.stringify({
     schema: 'delysis.loom-completion-witness.v1',
+    native_drop: nativeDropWitness,
     writer_id: currentWriter?.model_id ?? '',
     writer_source: configuredWriter ? 'configured_server' : 'native',
     writer_setup: {
@@ -2632,6 +2662,7 @@
   async function installNativeAttachmentDrop(): Promise<void> {
     unlistenNativeAttachmentDrop = await getCurrentWindow().onDragDropEvent(({ payload }) => {
       if (payload.type === 'leave') {
+        nativeDropWitness = { type: payload.type, point: null, scope: null, path_count: 0 };
         contextDropActive = false;
         workspaceDropActive = false;
         workspaceDropFolder = null;
@@ -2640,6 +2671,11 @@
       const point = nativeDropPoint(payload.position);
       const outline = outlineElement?.getBoundingClientRect();
       const inOutline = Boolean(outlineOpen && outline && point.x >= outline.left && point.x < outline.right && point.y >= outline.top && point.y < outline.bottom);
+      const inPane = Array.from(window.document.querySelectorAll<HTMLElement>('[data-workspace-pane]')).some(element => {
+        const rect = element.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom;
+      });
+      nativeDropWitness = { type: payload.type, point, scope: inOutline ? 'outline' : inPane ? 'pane' : nativeAttachmentDropScope(point), path_count: 'paths' in payload ? payload.paths.length : 0 };
       workspaceDropFolder = inOutline ? workspaceFolderAt(point) : null;
       workspaceDropActive = inOutline && workspaceDropFolder !== null;
       if (payload.type === 'drop') {
@@ -5582,6 +5618,16 @@
     let restoreTrigger = action !== 'open';
     try {
       switch (action) {
+        case 'copy_reference': {
+          const root = workspaceRoots?.roots.find(root => project && workspaceRootIsActive(root, project));
+          const summary = project?.documents.find(item => item.document_id === target.documentId);
+          if (!root || !summary || workspaceRoots?.roots.filter(item => item.name === root.name).length !== 1) throw new Error('This document needs one uniquely named workspace folder.');
+          const name = `${root.name}::${summary.relative_path}`;
+          const href = [...new TextEncoder().encode(name)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+          const label = `@${JSON.stringify(name)}`.replace(/[\\\[\]]/g, '\\$&');
+          await window.navigator.clipboard.writeText(`[${label}](loom-document:${href})`);
+          break;
+        }
         case 'open':
           await selectCapturedDocument(target, true, true);
           restoreTrigger =
@@ -8302,10 +8348,27 @@
   }
 
   function handleAttachmentLink(event: MouseEvent): void {
-    const link = event.target instanceof Element ? event.target.closest('a[href^="loom-attachment:"], a[href^="loom-material:"], a[href^="loom-evidence:"]') : null;
+    const link = event.target instanceof Element ? event.target.closest('a[href^="loom-attachment:"], a[href^="loom-material:"], a[href^="loom-evidence:"], a[href^="loom-document:"]') : null;
     if (!link || !project) return;
     event.preventDefault(); event.stopPropagation();
     const href = link.getAttribute('href') ?? '';
+    if (href.startsWith('loom-document:')) {
+      const captured = { projectId: project.project_id, sessionId: project.session_id, owner: workspaceRoots?.workspace_session_id };
+      void (async () => {
+        const hex = href.slice('loom-document:'.length);
+        if (!/^(?:[a-f0-9]{2}){1,4096}$/u.test(hex)) throw new Error('Invalid document reference.');
+        const name = new TextDecoder('utf-8', { fatal: true }).decode(Uint8Array.from(hex.match(/../g)!, byte => parseInt(byte, 16)));
+        const destination = await resolveWorkspaceReference(captured.projectId, captured.sessionId, name);
+        if (project?.session_id !== captured.sessionId || workspaceRoots?.workspace_session_id !== captured.owner || destination.workspace_session_id !== captured.owner) return;
+        const root = workspaceRoots?.roots.find(item => item.id === destination.root_id);
+        if (!root || !project) return;
+        if (!workspaceRootIsActive(root, project) && !await doOpenProject({ rootId: root.id })) return;
+        if (!project || workspaceRoots?.workspace_session_id !== captured.owner || !workspaceRootIsActive(root, project)) return;
+        const summary = project.documents.find(item => item.document_id === destination.document_id);
+        if (summary) await selectDocument(summary, true);
+      })().catch(error => { if (workspaceRoots?.workspace_session_id === captured.owner) recordFailure(error); });
+      return;
+    }
     const evidenceId = href.match(/^loom-evidence:([a-f0-9]{64})$/u)?.[1];
     const materialReference = href.match(/^loom-material:(material-[a-f0-9]{64}|materials\/[^\r\n]+)$/u)?.[1];
     const reference = evidenceId ? `evidence/${evidenceId}` : materialReference;
@@ -10217,6 +10280,11 @@
               on:focus={() => documentContextFocusIndex = documentDeleteMenuIndex(Boolean(documentContextRevealLabel))}
               on:click={() => void runDocumentContextAction('delete')}
             >Delete Manuscript…</button>
+            <button type="button" role="menuitem"
+              tabindex={documentContextFocusIndex === documentDeleteMenuIndex(Boolean(documentContextRevealLabel)) + 1 ? 0 : -1}
+              disabled={fileCommandInFlight || documentContextActionInFlight}
+              on:focus={() => documentContextFocusIndex = documentDeleteMenuIndex(Boolean(documentContextRevealLabel)) + 1}
+              on:click={() => void runDocumentContextAction('copy_reference')}>Copy reference</button>
           </div>
         {/if}
       </aside>
@@ -10224,8 +10292,10 @@
       <main id="manuscript" class="manuscript-area" tabindex="-1" class:workspace-main-hidden={!mainPaneOpen || (customMain && !activeMaterial && !materialsOpen)}>
         {#if activeMaterial && activeMaterialScope}
           {@const viewScope = activeMaterialScope}
+          {@const viewMaterialId = activeMaterial.id}
           {#key `${viewScope.projectId}/${viewScope.sessionId}/${activeMaterial.id}/${activeMaterialEvidence?.id ?? ""}`}
             <MaterialView projectId={viewScope.projectId} sessionId={viewScope.sessionId} material={activeMaterial}
+              navigation={materialNavigation.get(materialNavigationKey(viewScope, viewMaterialId))?.navigation} onNavigationChange={value => rememberMaterialNavigation(viewScope, viewMaterialId, value)}
               initialEvidence={activeMaterialEvidence} originTitle={materialOrigin?.title ?? null} onClose={closeMaterial} onUse={useMaterialReference} onOpenDocument={openMaterialWriting}
               workspaceOwned={isOwnerMaterialScope(viewScope)} removable={isOwnerMaterialScope(viewScope) && materialEntries.some(item => item.id === activeMaterial?.id)} onRemoved={materialRemoved} onChanged={(item) => ownerMaterialChanged(item, viewScope)} onReopen={() => void chooseMaterialLibrary()} />
           {/key}

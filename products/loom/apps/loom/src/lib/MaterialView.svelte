@@ -5,12 +5,14 @@
   import type { CollectionMember, MaterialPdfPage } from './types';
   import { convertFileSrc } from '@tauri-apps/api/core';
   import { readMaterialPdfPage, readMaterial, readCollectionMember, searchMaterial, readMaterialEvidence, revealAttachmentOriginal, normalizeFailure, pinMaterial, removeMaterial } from './ipc';
-  import { materialLocatorLabel, materialLocatorPage, materialPdfPageText, materialWritingDocument, materialReferenceMarkdown, evidenceReferenceMarkdown, type MaterialEntry, type MaterialRead, type MaterialEvidence, type MaterialSearch } from './materials';
+  import { materialLocatorLabel, materialLocatorPage, materialPdfPageText, materialWritingDocument, materialReferenceMarkdown, evidenceReferenceMarkdown, type MaterialEntry, type MaterialRead, type MaterialEvidence, type MaterialSearch, type MaterialNavigation } from './materials';
 
   export let projectId: string;
   export let sessionId: string;
   export let material: MaterialEntry;
   export let initialEvidence: MaterialEvidence | null = null;
+  export let navigation: MaterialNavigation | undefined = undefined;
+  export let onNavigationChange: (navigation: MaterialNavigation) => void = () => {};
   export let originTitle: string | null = null;
   export let onClose: () => void;
   export let onUse: (reference: string, text: string | null) => Promise<boolean>;
@@ -25,19 +27,21 @@
   let results: MaterialSearch | null = null;
   let selected: MaterialEvidence | null = initialEvidence;
   let memberOpen = false;
+  let memberTarget: MaterialNavigation['member'] = initialEvidence ? null : navigation?.member ?? null;
+  let restoring = true;
   let collectionRevision = '';
-  let query = '';
+  let query = navigation?.query ?? '';
   let error = '';
   let busy = false;
   let serial = 0;
   let mounted = false;
   let sourceTextElement: HTMLDivElement | undefined;
   let contentElement: HTMLDivElement | undefined;
-  let pageIndex = 0;
+  let pageIndex = navigation?.pageIndex ?? 0;
   let pdfImage: MaterialPdfPage | null = null;
   let pdfCount = 0;
   let pdfCountToken = '';
-  let pdfText = false;
+  let pdfText = navigation?.pdfText ?? false;
   let pdfLoading = false;
   let pdfError = '';
   let pdfRequestKey = '';
@@ -63,6 +67,17 @@
   $: writingDocumentId = materialWritingDocument(selected?.locator, projectId);
   $: text = selected?.text ?? (pdfToken && pdfPages.length ? pageText ?? '' : pageText ?? source?.text ?? '');
   $: warnings = [...new Set([...(source?.warnings ?? []), ...(results?.warnings ?? []), ...(selected?.warnings ?? [])])];
+  $: if (mounted && !restoring) onNavigationChange({ query, pageIndex, pdfText, sourceRevision: source?.source_revision ?? null, pdfPageCount: pdfCountToken === pdfToken ? pdfCount : 0, evidenceId: selected?.id ?? null, member: memberTarget });
+
+  function restoreSource(value: MaterialRead): void {
+    source = value;
+    if (navigation?.sourceRevision && navigation.sourceRevision !== value.source_revision) pageIndex = 0;
+    const token = value.presentation?.pdf_preview_token;
+    if (token && navigation?.sourceRevision === value.source_revision && navigation.pdfPageCount > 0) {
+      pdfCount = navigation.pdfPageCount; pdfCountToken = token;
+      pageIndex = Math.min(pageIndex, pdfCount - 1);
+    } else if (!token) pageIndex = Math.min(pageIndex, Math.max(0, (value.presentation?.pdf_pages?.length ?? 0) - 1));
+  }
 
   async function drawPdf(key: string, token: string, number: number): Promise<void> {
     const request = ++pdfSerial;
@@ -78,19 +93,19 @@
   }
   async function load(): Promise<void> {
     const request = ++serial; busy = true; error = '';
-    try { const value = await readMaterial(projectId, sessionId, material.id); if (mounted && serial === request) source = value; }
+    try { const value = await readMaterial(projectId, sessionId, material.id); if (mounted && serial === request) restoreSource(value); }
     catch (failure) { if (mounted && serial === request) error = normalizeFailure(failure).message; }
     finally { if (mounted && serial === request) busy = false; }
   }
   async function search(): Promise<void> {
     if (!query.trim() || busy) return;
     const request = ++serial; busy = true; error = ''; selected = null;
-    if (material.kind === 'collection') { source = null; memberOpen = false; }
+    if (material.kind === 'collection') { source = null; memberOpen = false; memberTarget = null; }
     try { const value = await searchMaterial(projectId, sessionId, material.id, query.trim()); if (mounted && serial === request) results = value; }
     catch (failure) { if (mounted && serial === request) error = normalizeFailure(failure).message; }
     finally { if (mounted && serial === request) busy = false; }
   }
-  async function openEvidence(hit: MaterialEvidence): Promise<void> {
+  async function openEvidence(hit: Pick<MaterialEvidence, 'id'>): Promise<void> {
     const request = ++serial; busy = true; error = '';
     try { const value = await readMaterialEvidence(projectId, sessionId, material.id, hit.id); if (mounted && serial === request) selected = value; }
     catch (failure) { if (mounted && serial === request) error = normalizeFailure(failure).message; }
@@ -100,11 +115,11 @@
     const request = ++serial; busy = true; error = '';
     try {
       const value = await readCollectionMember(projectId, sessionId, material.id, member.occurrence_id, member.snapshot_id);
-      if (mounted && request === serial) { source = value; selected = null; results = null; memberOpen = true; pageIndex = 0; }
+      if (mounted && request === serial) { source = value; selected = null; results = null; memberOpen = true; memberTarget = { occurrenceId: member.occurrence_id, snapshotId: member.snapshot_id }; pageIndex = 0; }
     } catch (failure) { if (mounted && request === serial) error = normalizeFailure(failure).message; }
     finally { if (mounted && request === serial) busy = false; }
   }
-  function backToCollection(): void { ++serial; busy = false; selected = null; source = null; results = null; memberOpen = false; pageIndex = 0; }
+  function backToCollection(): void { ++serial; busy = false; selected = null; source = null; results = null; memberOpen = false; memberTarget = null; pageIndex = 0; }
   function changePage(index: number): void {
     if (busy || pdfLoading || !Number.isInteger(index) || index < 0 || index >= (pdfToken ? pdfCount : pdfPages.length)) return;
     pageIndex = index;
@@ -125,7 +140,9 @@
         error = 'This retained passage has no matching extracted page in the available source.';
         return;
       }
-      source = value; memberOpen = material.kind === 'collection'; pageIndex = value.presentation?.pdf_preview_token ? number - 1 : index; pdfText = false; selected = null; results = null;
+      source = value; memberOpen = material.kind === 'collection';
+      memberTarget = memberOpen && typeof location?.collection_snapshot === 'string' && typeof location?.occurrence_id === 'string' ? { occurrenceId: location.occurrence_id, snapshotId: location.collection_snapshot } : null;
+      pageIndex = value.presentation?.pdf_preview_token ? number - 1 : index; pdfText = false; selected = null; results = null;
       contentElement?.scrollTo(0, 0);
     } catch (failure) { if (mounted && serial === request) error = normalizeFailure(failure).message; }
     finally { if (mounted && serial === request) busy = false; }
@@ -189,7 +206,23 @@
     catch (failure) { if (mounted) error = normalizeFailure(failure).message; }
     finally { if (mounted) busy = false; }
   }
-  onMount(() => { mounted = true; if (material.available && material.kind !== 'folder' && !initialEvidence) void load(); return () => { mounted = false; serial += 1; pdfSerial += 1; pdfAbort?.abort(); }; });
+  async function restoreNavigation(): Promise<void> {
+    try {
+      if (initialEvidence) return;
+      if (navigation?.evidenceId) {
+        await openEvidence({ id: navigation.evidenceId });
+      } else if (memberTarget && material.kind === 'collection') {
+        const request = ++serial; busy = true;
+        try {
+          const value = await readCollectionMember(projectId, sessionId, material.id, memberTarget.occurrenceId, memberTarget.snapshotId);
+          if (mounted && request === serial) { restoreSource(value); memberOpen = true; }
+        } catch (failure) {
+          if (mounted && request === serial) { error = normalizeFailure(failure).message; memberTarget = null; }
+        } finally { if (mounted && request === serial) busy = false; }
+      } else if (material.available && material.kind !== 'folder') await load();
+    } finally { if (mounted) restoring = false; }
+  }
+  onMount(() => { mounted = true; void restoreNavigation(); return () => { mounted = false; serial += 1; pdfSerial += 1; pdfAbort?.abort(); }; });
 </script>
 
 <section class="material-view" aria-label={material.name} aria-busy={busy}>
@@ -232,7 +265,7 @@
     {#if material.kind === 'collection' && !selected && !memberOpen}
       <div class="collection-state"><CollectionProgress {projectId} {sessionId} collectionId={material.id} onChanged={status => collectionRevision = `${status.retained_count}:${status.phase}`} /></div>
     {/if}
-    {#if selected && results}<button class="return-results" on:click={() => selected = null}>‹ Results</button>{/if}
+    {#if selected && (results || material.kind === 'library')}<button class="return-results" on:click={() => selected = null}>{results ? '‹ Results' : '‹ Search'}</button>{/if}
     {#if warnings.length || ((material.kind === 'attachment' || memberOpen) && source?.complete === false) || results?.complete === false || selected?.complete === false}
       <details class="coverage"><summary>{((material.kind === 'attachment' || memberOpen) && source?.complete === false) || selected?.complete === false ? 'Only part of this source is readable' : results?.complete === false ? 'Partial results' : 'Source notes'}</summary>
         {#each warnings as warning}<p>{warning}</p>{/each}

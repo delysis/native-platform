@@ -61,6 +61,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-document-open`
 - `allow-workspace-pane-output`
 - `allow-workspace-document-resolve`
+- `allow-workspace-reference-resolve`
 - `allow-document-import-external`
 - `allow-shader-preview`
 - `allow-document-checkpoint`
@@ -2977,6 +2978,32 @@ Enables the workspace_pane_run command without any pre-configured scope.
 <td>
 
 Denies the workspace_pane_run command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-reference-resolve`
+
+</td>
+<td>
+
+Enables the workspace_reference_resolve command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-reference-resolve`
+
+</td>
+<td>
+
+Denies the workspace_reference_resolve command without any pre-configured scope.
 
 </td>
 </tr>

@@ -31,6 +31,7 @@ fn child_writing_reads_owner_sources_without_mixing_document_identity() {
     let inline = attachment(&mut child, "Inline", "A source dropped into this document.");
     document(&mut child, "Notes.md", "My local note.");
     let context = ReadContext {
+        mounted: None,
         documents: &child,
         materials: &owner,
     };
@@ -99,6 +100,7 @@ fn child_writing_reads_owner_sources_without_mixing_document_identity() {
     document(&mut child, "nested/Research.md", "Conflicting local alias.");
     assert!(
         ReadContext {
+            mounted: None,
             documents: &child,
             materials: &owner
         }
@@ -108,6 +110,7 @@ fn child_writing_reads_owner_sources_without_mixing_document_identity() {
     assert_eq!(
         exact(
             &ReadContext {
+                mounted: None,
                 documents: &child,
                 materials: &owner
             }
@@ -127,6 +130,7 @@ fn explicit_owner_media_uses_owner_bytes_and_binding() {
     let imported = crate::context_attachments::import_path(owner.root(), &png).unwrap();
     let material = materials::bind_attachment(&mut owner, &imported.id, Some("Picture")).unwrap();
     let context = ReadContext {
+        mounted: None,
         documents: &child,
         materials: &owner,
     };
@@ -138,6 +142,7 @@ fn explicit_owner_media_uses_owner_bytes_and_binding() {
     materials::remove(&mut owner, &material.id).unwrap();
     assert!(
         ReadContext {
+            mounted: None,
             documents: &child,
             materials: &owner
         }
@@ -191,6 +196,7 @@ fn copied_projects_cannot_supply_local_artifact_fks_or_ambiguous_evidence() {
             .is_empty()
     );
     let context = ReadContext {
+        mounted: None,
         documents: &copy,
         materials: &original,
     };

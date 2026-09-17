@@ -260,6 +260,25 @@ fn reference_link_at(
         return Some((end, None));
     }
     let target = &line[target_start + 1..target_end.unwrap_or(line.len())];
+    if let Some(hex) = target.strip_prefix("loom-document:") {
+        let name = if target_end.is_some()
+            && line.as_bytes().get(label_start + 1) == Some(&b'@')
+            && hex.len() <= 8192
+            && hex.len().is_multiple_of(2)
+            && hex.is_ascii()
+        {
+            (0..hex.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&hex[at..at + 2], 16))
+                .collect::<Result<Vec<_>, _>>()
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes).ok())
+                .filter(|name| name.contains("::") && !name.chars().any(char::is_control))
+        } else {
+            None
+        };
+        return Some((end, name));
+    }
     let (hash, prefix) = if let Some(value) = target.strip_prefix("loom-material:") {
         (value.strip_prefix("material-").unwrap_or(""), "material-")
     } else if let Some(value) = target.strip_prefix("loom-evidence:") {
@@ -514,7 +533,11 @@ impl Parser<'_> {
             return Ok(name);
         }
         let start = self.offset;
-        for character in self.source[self.offset..].chars() {
+        while let Some(character) = self.source[self.offset..].chars().next() {
+            if self.source[self.offset..].starts_with("::") {
+                self.offset += 2;
+                continue;
+            }
             if character.is_alphanumeric()
                 || matches!(character, '_' | '-' | '/' | '.' | '#')
                 || matches!(character, '\u{0300}'..='\u{036f}' | '\u{1ab0}'..='\u{1aff}' | '\u{1dc0}'..='\u{1dff}' | '\u{20d0}'..='\u{20ff}' | '\u{fe20}'..='\u{fe2f}')
@@ -570,6 +593,29 @@ impl Parser<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mounted_names_are_explicit_and_colons_in_prose_remain_punctuation() {
+        let references =
+            super::document_references("Use @Research::Notes and @Local: unchanged.").unwrap();
+        assert_eq!(
+            references
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Research::Notes", "Local"]
+        );
+        assert!(super::parse_neural_command("=@Research::Explain(@Research::Notes)").is_ok());
+        let linked = "[@Misleading](loom-document:52657365617263683a3a4e6f746573)";
+        assert_eq!(
+            super::document_references(linked).unwrap()[0].name,
+            "Research::Notes"
+        );
+        assert!(
+            super::document_references("[Open](loom-document:52657365617263683a3a4e6f746573)")
+                .unwrap()
+                .is_empty()
+        );
+    }
     use super::*;
 
     #[test]

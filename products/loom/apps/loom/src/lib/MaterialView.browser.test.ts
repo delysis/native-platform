@@ -2,7 +2,7 @@ import { mount, unmount, type ComponentProps } from 'svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { page } from 'vitest/browser';
 import MaterialView from './MaterialView.svelte';
-import type { MaterialEntry, MaterialEvidence, MaterialRead } from './materials';
+import type { MaterialEntry, MaterialEvidence, MaterialRead, MaterialNavigation } from './materials';
 import '../app.css';
 const ipc = vi.hoisted(() => ({ read: vi.fn(), pdf: vi.fn(), search: vi.fn(), evidence: vi.fn(), pin: vi.fn(), original: vi.fn(), remove: vi.fn() }));
 vi.mock('./ipc', async original => ({ ...await original<typeof import('./ipc')>(), readMaterial: ipc.read, readMaterialPdfPage: ipc.pdf, searchMaterial: ipc.search, readMaterialEvidence: ipc.evidence, pinMaterial: ipc.pin, removeMaterial: ipc.remove, revealAttachmentOriginal: ipc.original }));
@@ -30,6 +30,55 @@ function pdfSource(): MaterialRead {
   } };
 }
 describe('named material viewing', () => {
+  it('restores query and exact evidence across remounts without caching payloads, while explicit links override selection', async () => {
+    let navigation: MaterialNavigation | undefined;
+    const remember = (value: MaterialNavigation) => { navigation = value; };
+    render({ onNavigationChange: remember });
+    await page.getByRole('searchbox', { name: 'Search Research' }).fill('history');
+    await page.getByRole('button', { name: 'Search', exact: true }).click();
+    await page.getByRole('button', { name: /A source/ }).click();
+    await expect.poll(() => navigation?.evidenceId).toBe(evidence.id);
+    expect(navigation?.query).toBe('history');
+    expect(JSON.stringify(navigation)).not.toContain(evidence.text);
+    await unmount(view!); view = undefined; document.body.replaceChildren();
+    render({ navigation, onNavigationChange: remember });
+    await expect.element(page.getByText(evidence.text, { exact: true })).toBeVisible();
+    expect(ipc.evidence).toHaveBeenCalledTimes(2);
+    expect(ipc.evidence).toHaveBeenLastCalledWith('project', 'session', material.id, evidence.id);
+    expect(ipc.search).toHaveBeenCalledOnce();
+    await page.getByRole('button', { name: '‹ Search', exact: true }).click();
+    await expect.element(page.getByRole('searchbox', { name: 'Search Research' })).toHaveValue('history');
+    await unmount(view!); view = undefined; document.body.replaceChildren();
+    const explicit = { ...evidence, id: 'explicit', text: 'Explicit retained link wins.' };
+    render({ navigation: { ...navigation!, evidenceId: evidence.id }, initialEvidence: explicit, onNavigationChange: remember });
+    await expect.element(page.getByText(explicit.text, { exact: true })).toBeVisible();
+    expect(ipc.evidence).toHaveBeenCalledTimes(2);
+    await expect.poll(() => navigation?.evidenceId).toBe(explicit.id);
+  });
+
+  it('restores the selected PDF page and text view using a fresh native source read', async () => {
+    const read = pdfSource(); read.presentation!.pdf_preview_token = 'retained-pdf';
+    ipc.pdf.mockImplementation(async (_token: string, number: number) => ({ page: number, page_count: 3, width: 1, height: 1, incomplete: false, png_base64: '' }));
+    let navigation: MaterialNavigation | undefined;
+    const remember = (value: MaterialNavigation) => { navigation = value; };
+    render({ material: read.material, onNavigationChange: remember }, read);
+    await expect.poll(() => navigation?.pdfPageCount).toBe(3);
+    await page.getByRole('button', { name: 'Next page' }).click();
+    await expect.poll(() => navigation?.pageIndex).toBe(1);
+    await expect.element(page.getByRole('button', { name: 'Next page' })).toBeEnabled();
+    await page.getByRole('button', { name: 'Next page' }).click();
+    await page.getByText('•••', { exact: true }).click();
+    await page.getByRole('button', { name: 'Show extracted text' }).click();
+    await expect.poll(() => navigation?.pdfText).toBe(true);
+    await unmount(view!); view = undefined; document.body.replaceChildren();
+    render({ material: read.material, navigation, onNavigationChange: remember }, read);
+    await expect.poll(() => document.querySelector('.source-text')?.textContent).toBe('## Page 3\nSecond extracted page 🖋.\n');
+    await expect.element(page.getByRole('combobox', { name: 'Page', exact: true })).toHaveValue('2');
+    await expect.element(page.getByRole('button', { name: 'Previous page' })).toBeEnabled();
+    expect(ipc.read).toHaveBeenCalledTimes(2);
+    expect(ipc.pdf).toHaveBeenCalledTimes(3);
+  });
+
   it('opens original pages including pages without extracted text, and keeps quotations on canonical text', async () => {
     const read = pdfSource();
     read.presentation!.pdf_preview_token = 'retained-pdf';
