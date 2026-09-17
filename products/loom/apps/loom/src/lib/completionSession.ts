@@ -341,9 +341,11 @@ export function completionShouldRequestNextBatch(
   editorMutationPending: boolean,
   selectedCandidateReady: boolean
 ): boolean {
+  // Retired tails remain only as reversal witnesses. Their old run may have
+  // been cancelled; neither its status nor its text can satisfy this policy.
   return !editorMutationPending &&
-    selectedCandidateReady &&
-    remainingCompletionText(session) === '';
+    (session.presentationsRetired ||
+      (selectedCandidateReady && remainingCompletionText(session) === ''));
 }
 
 export interface CompletionExhaustionLatch {
