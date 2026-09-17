@@ -4,16 +4,39 @@ use super::first_word_choices::{Admission, FirstWordGate};
 use super::*;
 use llama_cpp_2::token::data::LlamaTokenData;
 use llama_cpp_2::token::data_array::LlamaTokenDataArray;
+use llama_native_types::FIRST_WORD_CHOICE_MAX_EOG_TOKENS;
 use std::collections::BTreeSet;
 
-fn sample_saved_logits(sampler: &mut LlamaSampler, logits: &[f32]) -> NativeResult<LlamaToken> {
-    let mut candidates = LlamaTokenDataArray::from_iter(
-        logits
-            .iter()
-            .enumerate()
-            .map(|(index, logit)| LlamaTokenData::new(LlamaToken::new(index as i32), *logit, 0.0)),
+fn initial_candidates(logits: &[f32], exclusions: &BTreeSet<i32>) -> Option<LlamaTokenDataArray> {
+    if !logits
+        .iter()
+        .enumerate()
+        .any(|(index, logit)| logit.is_finite() && !exclusions.contains(&(index as i32)))
+    {
+        return None;
+    }
+    Some(LlamaTokenDataArray::from_iter(
+        logits.iter().enumerate().map(|(index, logit)| {
+            let token_id = index as i32;
+            let masked = if exclusions.contains(&token_id) {
+                f32::NEG_INFINITY
+            } else {
+                *logit
+            };
+            LlamaTokenData::new(LlamaToken::new(token_id), masked, 0.0)
+        }),
         false,
-    );
+    ))
+}
+
+fn sample_saved_logits(
+    sampler: &mut LlamaSampler,
+    logits: &[f32],
+    exclusions: &BTreeSet<i32>,
+) -> NativeResult<Option<LlamaToken>> {
+    let Some(mut candidates) = initial_candidates(logits, exclusions) else {
+        return Ok(None);
+    };
     sampler.apply(&mut candidates);
     let token = candidates.selected_token().ok_or_else(|| {
         NativeError::new(
@@ -21,14 +44,26 @@ fn sample_saved_logits(sampler: &mut LlamaSampler, logits: &[f32]) -> NativeResu
             "word-choice sampler selected no token",
         )
     })?;
+    if exclusions.contains(&token.0)
+        || !usize::try_from(token.0)
+            .ok()
+            .and_then(|index| logits.get(index))
+            .is_some_and(|logit| logit.is_finite())
+    {
+        return Err(NativeError::new(
+            NativeErrorCode::DecodeFailed,
+            "word-choice sampler selected an excluded or non-finite initial token",
+        ));
+    }
     // sample() normally owns accept. Here we use apply() against an immutable
     // snapshot, so exactly one explicit accept restores those same semantics.
     sampler.accept(token);
-    Ok(token)
+    Ok(Some(token))
 }
 
 fn discard_proposal(branch: &mut ActiveBranch<'_>) {
     branch.decoder = UTF_8.new_decoder();
+    branch.decoder_finalized = false;
     branch.text.clear();
     branch.generated_token_ids.clear();
     branch.generated = 0;
@@ -46,7 +81,7 @@ fn reset_proposal(
     seed: u32,
     tracking: &mut SequenceTracking<'_>,
 ) -> NativeResult<()> {
-    context
+    let removed = context
         .clear_kv_cache_seq(
             Some(branch.sequence_id as u32),
             Some(prompt_position as u32),
@@ -55,6 +90,7 @@ fn reset_proposal(
         .map_err(|error| {
             native_decode_error("failed to discard rejected word proposal KV", error)
         })?;
+    require_kv_removal(removed)?;
     discard_proposal(branch);
     branch.next_position = prompt_position;
     branch.state = GenerationState::Generating;
@@ -72,6 +108,17 @@ fn reset_proposal(
         .token_ids
         .insert(branch.sequence_id, prompt_tokens.to_vec());
     Ok(())
+}
+
+fn require_kv_removal(removed: bool) -> NativeResult<()> {
+    if removed {
+        Ok(())
+    } else {
+        Err(NativeError::new(
+            NativeErrorCode::DecodeFailed,
+            "native memory refused word-choice sequence removal; retry state cannot be restored",
+        ))
+    }
 }
 
 fn emit_piece(
@@ -152,6 +199,20 @@ pub(super) fn generate(
         .map(|branch| FirstWordGate::new(policy, branch.request.sampling.seed))
         .collect::<Vec<_>>();
     let mut reserved = BTreeSet::new();
+    // Nonempty choices cannot begin with EOG. This explicit static mask avoids
+    // zero-token retries without pretending that a previous EOG owns a word.
+    let mut initial_exclusions = BTreeSet::new();
+    for token_id in 0..model.n_vocab() {
+        if model.is_eog_token(LlamaToken::new(token_id)) {
+            initial_exclusions.insert(token_id);
+            if initial_exclusions.len() > FIRST_WORD_CHOICE_MAX_EOG_TOKENS {
+                return Err(NativeError::new(
+                    NativeErrorCode::UnsupportedParameter,
+                    "model EOG set exceeds the bounded first-word policy mask",
+                ));
+            }
+        }
+    }
     loop {
         // Request order decides duplicate ownership, never wall-clock timing or
         // word length. Admitted branches continue streaming while later slots retry.
@@ -171,11 +232,12 @@ pub(super) fn generate(
                 }
                 branch.state = GenerationState::Cancelled;
                 branch.finish_reason = "cancelled".to_string();
-                context
+                let removed = context
                     .clear_kv_cache_seq(Some(index as u32), None, None)
                     .map_err(|error| {
                         native_decode_error("failed to cancel word-choice sequence", error)
                     })?;
+                require_kv_removal(removed)?;
                 continue;
             }
             if gate.pending() && admission_turn != Some(index) {
@@ -188,7 +250,23 @@ pub(super) fn generate(
                 ));
             }
             let token = if gate.pending() && branch.generated == 0 {
-                sample_saved_logits(&mut branch.sampler, &prompt_logits[index])?
+                gate.begin_attempt(&initial_exclusions);
+                let Some(token) = sample_saved_logits(
+                    &mut branch.sampler,
+                    &prompt_logits[index],
+                    &initial_exclusions,
+                )?
+                else {
+                    gate.exhaust_initial_support();
+                    branch.state = GenerationState::Completed;
+                    branch.finish_reason = "first_word_choices_exhausted".to_string();
+                    continue;
+                };
+                // Admission is serial by slot, so reserving at the actual draw
+                // is equivalent to reserving after rejection/admission, and also
+                // truthfully covers a subsequently cancelled proposal.
+                initial_exclusions.insert(token.0);
+                token
             } else {
                 branch.sampler.sample(context, branch.logit_index)
             };
@@ -199,7 +277,12 @@ pub(super) fn generate(
                 branch.finish_reason = "end_of_generation".to_string();
                 branch.terminal_sampled_token_id = Some(token.0);
                 if was_pending {
-                    finalize_generated_text(&mut branch.decoder, &mut branch.text, false)?;
+                    finalize_generated_text_once(
+                        &mut branch.decoder,
+                        &mut branch.text,
+                        false,
+                        &mut branch.decoder_finalized,
+                    )?;
                 }
             } else {
                 gate.record_nonterminal_token();
@@ -309,4 +392,123 @@ pub(super) fn generate(
         branch.first_word_choice = Some(gate.evidence);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llama_native_types::FirstWordChoiceAttemptOutcome;
+
+    #[test]
+    fn initial_mask_precedes_sampling_and_lexical_guard_still_rejects_duplicates() {
+        // The repeated uppercase spelling has a different token ID. Initial
+        // sampling alone cannot enforce lexical identity across these proposals.
+        let logits = [100.0, 10.0, 9.0, 8.0, 7.0, 6.0];
+        let pieces = ["", "It ", "IT ", "A ", "Silver ", "Cloud "];
+        let mut exclusions = BTreeSet::from([0]); // Static EOG mask.
+        let mut words = BTreeSet::new();
+        let mut selected = Vec::new();
+        let mut drawn = Vec::new();
+        for slot in 0..4 {
+            let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV2, slot);
+            loop {
+                gate.begin_attempt(&exclusions);
+                let before_draw = exclusions.iter().copied().collect::<Vec<_>>();
+                let token = sample_saved_logits(&mut LlamaSampler::greedy(), &logits, &exclusions)
+                    .expect("sample")
+                    .expect("remaining support");
+                assert!(!exclusions.contains(&token.0));
+                exclusions.insert(token.0);
+                drawn.push(token.0);
+                gate.record_nonterminal_token();
+                let piece = pieces[usize::try_from(token.0).expect("token index")];
+                let admission = gate.observe(piece, &[token.0], None, false, &mut words);
+                let attempt = gate.evidence.attempts.last().expect("recorded proposal");
+                assert_eq!(attempt.initial_token_exclusions, before_draw);
+                assert_eq!(attempt.token_ids, [token.0]);
+                match admission {
+                    Admission::Accepted => {
+                        selected.push(piece);
+                        break;
+                    }
+                    Admission::Retry => {
+                        assert_eq!(piece, "IT ");
+                        assert_eq!(attempt.outcome, FirstWordChoiceAttemptOutcome::Duplicate);
+                    }
+                    other => panic!("unexpected admission: {other:?}"),
+                }
+            }
+            assert_eq!(
+                gate.evidence.total_attempted_tokens,
+                if slot == 1 { 2 } else { 1 }
+            );
+        }
+        assert_eq!(selected, ["It ", "A ", "Silver ", "Cloud "]);
+        assert_eq!(drawn, [1, 2, 3, 4, 5]);
+        assert_eq!(logits, [100.0, 10.0, 9.0, 8.0, 7.0, 6.0]);
+    }
+
+    #[test]
+    fn exhausted_initial_support_records_no_draw_or_completion_cost() {
+        let exclusions = BTreeSet::from([0, 1]);
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV2, 3);
+        gate.begin_attempt(&exclusions);
+        assert!(
+            sample_saved_logits(
+                &mut LlamaSampler::greedy(),
+                &[9.0, 8.0, f32::NEG_INFINITY],
+                &exclusions
+            )
+            .expect("empty support")
+            .is_none()
+        );
+        gate.exhaust_initial_support();
+        assert!(!gate.pending());
+        assert!(gate.evidence.exhausted);
+        assert_eq!(gate.evidence.selected_attempt, None);
+        assert_eq!(gate.evidence.total_attempted_tokens, 0);
+        let attempt = &gate.evidence.attempts[0];
+        assert_eq!(attempt.initial_token_exclusions, [0, 1]);
+        assert!(attempt.token_ids.is_empty());
+        assert_eq!(attempt.terminal_token_id, None);
+        assert_eq!(
+            attempt.outcome,
+            FirstWordChoiceAttemptOutcome::InitialSupportExhausted
+        );
+    }
+
+    #[test]
+    fn refused_native_removal_cannot_authorize_a_retry() {
+        assert!(require_kv_removal(true).is_ok());
+        assert_eq!(
+            require_kv_removal(false).expect_err("backend refusal").code,
+            NativeErrorCode::DecodeFailed
+        );
+    }
+
+    #[test]
+    fn first_word_eog_and_common_terminal_path_finish_decoder_once() {
+        let mut decoder = UTF_8.new_decoder();
+        let mut text = decode_generated_utf8_piece(&mut decoder, b"word", false).expect("word");
+        let mut finalized = false;
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV2, 41);
+        let mut words = BTreeSet::new();
+        assert!(
+            finalize_generated_text_once(&mut decoder, &mut text, false, &mut finalized)
+                .expect("EOG admission")
+                .is_empty()
+        );
+        assert_eq!(
+            gate.observe(&text, &[7], Some(99), true, &mut words),
+            Admission::Accepted
+        );
+        assert!(
+            finalize_generated_text_once(&mut decoder, &mut text, false, &mut finalized)
+                .expect("common terminal event")
+                .is_empty()
+        );
+        assert_eq!(text, "word");
+        assert_eq!(gate.evidence.selected_attempt, Some(0));
+        assert_eq!(gate.evidence.attempts[0].terminal_token_id, Some(99));
+    }
 }

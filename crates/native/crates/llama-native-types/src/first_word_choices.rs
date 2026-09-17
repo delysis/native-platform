@@ -6,14 +6,21 @@ use unicode_normalization::UnicodeNormalization;
 pub const FIRST_WORD_CHOICE_MAX_ATTEMPTS: u32 = 32;
 pub const FIRST_WORD_CHOICE_MAX_PREFIX_TOKENS: u32 = 16;
 pub const FIRST_WORD_CHOICE_MAX_CASES: usize = 4;
+pub const FIRST_WORD_CHOICE_MAX_EOG_TOKENS: usize = 128;
+pub const FIRST_WORD_CHOICE_MAX_INITIAL_EXCLUSIONS: usize = FIRST_WORD_CHOICE_MAX_EOG_TOKENS
+    + FIRST_WORD_CHOICE_MAX_CASES * FIRST_WORD_CHOICE_MAX_ATTEMPTS as usize;
 
-/// Selection without replacement by normalized first lexical word. Each proposal
-/// uses the unchanged per-case sampler; this policy never widens its support.
-/// Slots reserve words in request order. Exhaustion returns no duplicate word.
+/// First-token sampling without replacement followed by complete lexical-word
+/// rejection. On every initial draw, all model EOG IDs and prior proposal initial
+/// IDs are masked to negative infinity BEFORE the configured sampler chain.
+/// Tails retain the configured sampler. Seeds and each actual mask are recorded.
+/// Slots reserve words in request order. This is NOT sampling conditioned exactly
+/// on different lexical words: shared whitespace/punctuation/subword initial IDs
+/// exclude all their possible continuations. Exhaustion returns no duplicate word.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FirstWordChoicePolicy {
-    DistinctV1,
+    DistinctV2,
 }
 
 impl FirstWordChoicePolicy {
@@ -26,7 +33,7 @@ impl FirstWordChoicePolicy {
             return base_seed;
         }
         let mut digest = Sha256::new();
-        digest.update(b"llama-native:first-word-distinct-v1\0");
+        digest.update(b"llama-native:first-word-distinct-v2\0");
         digest.update(base_seed.to_le_bytes());
         digest.update(attempt.to_le_bytes());
         let bytes = digest.finalize();
@@ -42,11 +49,15 @@ pub enum FirstWordChoiceAttemptOutcome {
     PrefixLimit,
     EndOfGeneration,
     Cancelled,
+    InitialSupportExhausted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FirstWordChoiceAttempt {
     pub seed: u32,
+    /// Sorted token IDs masked before this proposal's initial sampler application.
+    /// Empty for cancellation before a proposal was started.
+    pub initial_token_exclusions: Vec<i32>,
     /// Exact sampled, non-EOG proposal prefix. No rejected bytes are streamed.
     pub token_ids: Vec<i32>,
     pub terminal_token_id: Option<i32>,
@@ -136,7 +147,7 @@ mod tests {
 
     #[test]
     fn attempt_seeds_are_explicit_repeatable_and_never_random_sentinel() {
-        let policy = FirstWordChoicePolicy::DistinctV1;
+        let policy = FirstWordChoicePolicy::DistinctV2;
         assert_eq!(policy.attempt_seed(41, 0), 41);
         let seeds = (0..FIRST_WORD_CHOICE_MAX_ATTEMPTS)
             .map(|attempt| policy.attempt_seed(41, attempt))
