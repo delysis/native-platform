@@ -133,6 +133,26 @@ export function clearCompletionSession(
   return { ...state, session: null, pendingText: null };
 }
 
+/** Retire a sampling policy's tails without revoking already accepted prose. */
+export function retireCompletionCandidates(
+  state: CompletionControllerState
+): CompletionControllerState {
+  const session = state.session;
+  if (!session) return state;
+  const selected = selectedCompletionCandidate(session);
+  if (!selected || (!session.acceptedChunks.length && !session.rollbackSessions?.length)) {
+    return { ...state, session: null };
+  }
+  return {
+    ...state,
+    session: {
+      ...session,
+      presentationsRetired: true,
+      authorityFrozen: session.acceptedChunks.length > 0
+    }
+  };
+}
+
 export function resetCompletionSurface(
   state: CompletionControllerState
 ): CompletionControllerState {
@@ -232,8 +252,9 @@ export function completionControllerView(
 ): CompletionControllerView {
   const boundSession = state.session?.contextKey === contextKey ? state.session : null;
   const activeFamily = completionActiveFamily(boundSession, state.pendingText, baseFamily, sharedPrefixAlternatives);
+  const retired = boundSession?.presentationsRetired ? completionPresentation(boundSession) : null;
   const selected = activeFamily.find((candidate) => candidate.runId === state.activeRunId) ??
-    activeFamily[0] ?? null;
+    activeFamily[0] ?? (retired ? { ...retired, text: '' } : null);
   const witnessSelected = boundSession
     ? selectedCompletionCandidate(boundSession) as InlineGhostSuggestion | null
     : null;
@@ -260,6 +281,7 @@ function completionActiveFamily(
 ): InlineGhostSuggestion[] {
   if (pendingText !== null) return [];
   if (!session) return [...baseFamily];
+  if (session.presentationsRetired) return [];
   if (session.acceptedChunks.length === 0) {
     return session.candidates as InlineGhostSuggestion[];
   }

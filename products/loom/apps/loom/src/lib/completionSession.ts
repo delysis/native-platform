@@ -16,6 +16,8 @@ export interface CompletionSession {
   acceptedChunks: string[];
   /** Once insertion starts, only an explicit exact-caret refill may replace this snapshot. */
   authorityFrozen: boolean;
+  /** Sampling-policy changes retire choices, but preserve their exact undo witness. */
+  presentationsRetired: boolean;
   /** Earlier accepted families, retained only for exact word-by-word reversal. */
   rollbackSessions?: Omit<CompletionSession, 'rollbackSessions'>[];
 }
@@ -56,7 +58,8 @@ export function startCompletionSession(
     candidates: snapshots,
     selectedRunId,
     acceptedChunks: [],
-    authorityFrozen: false
+    authorityFrozen: false,
+    presentationsRetired: false
   };
 }
 
@@ -190,9 +193,9 @@ export function synchronizeCompletionCandidates(
     const oldPresentationKeys = new Set(
       session.candidates.map((candidate) => candidate.presentationKey)
     );
-    const cachedChoicesExhausted = forkAtCurrentCaret
+    const cachedChoicesExhausted = session.presentationsRetired || (forkAtCurrentCaret
       ? compatibleCompletionPresentations(session).length === 0
-      : remaining === '';
+      : remaining === '');
     const freshFamily =
       candidates.length > 0 &&
       candidates.every((candidate) =>
@@ -231,7 +234,7 @@ export function synchronizeCompletionCandidates(
   const selectedRunId = snapshots.some((candidate) => candidate.runId === session.selectedRunId)
     ? session.selectedRunId
     : snapshots[0].runId;
-  const unchanged = selectedRunId === session.selectedRunId &&
+  const unchanged = !session.presentationsRetired && selectedRunId === session.selectedRunId &&
     snapshots.length === session.candidates.length &&
     snapshots.every((candidate, index) => {
       const previous = session.candidates[index];
@@ -243,7 +246,7 @@ export function synchronizeCompletionCandidates(
         previous.targetByte === candidate.targetByte &&
         previous.insertsOnAccept === candidate.insertsOnAccept;
     });
-  return unchanged ? session : { ...session, candidates: snapshots, selectedRunId };
+  return unchanged ? session : { ...session, candidates: snapshots, selectedRunId, presentationsRetired: false };
 }
 
 /** Caller supplies only the proven original family, never a new caret's candidates. */
