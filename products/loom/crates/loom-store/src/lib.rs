@@ -15,6 +15,9 @@ mod provenance;
 mod reconciliation;
 mod schema;
 mod store;
+mod workspace_copy;
+
+pub use workspace_copy::{PreparedWorkspaceCopy, WorkspaceCopyOutcome};
 
 pub use document_snapshot::ImportedDocumentSnapshot;
 pub use draft::{TransientDraft, TransientDraftClaim, TransientDraftWriteOutcome};
@@ -28,6 +31,7 @@ pub use generation::{
     StoredGenerationTerminalEvidence, TerminalCandidateInput, TerminalCandidateOutcome,
     TerminalEvidenceInput, TerminalGenerationInput, TerminalGenerationOutcome,
 };
+pub use paths::ensure_private_storage_supported;
 pub use protected_copy::ProtectedCopy;
 pub use provenance::{
     IdempotentSaveOutcome, MAX_EDIT_DIFF_WINDOW_BYTES, MAX_EDIT_DIFF_WINDOW_CHARACTERS,

@@ -73,7 +73,7 @@ button:disabled { cursor: default; opacity: .45; }
 .mode-toggle[aria-pressed="true"] { color: var(--ink); background: var(--chrome-hover); }
 .mode-toggle .markdown-monogram { font-size: 8px; font-weight: 800; letter-spacing: -.04em; }
 .suggestions-toggle { touch-action: manipulation; }
-.suggestions-toggle.active, .shuttle-toggle.active { color: var(--moss); background: color-mix(in srgb, var(--moss-soft) 72%, transparent); }
+.suggestions-toggle.active, .loompad-toggle.active, .shuttle-toggle.active { color: var(--moss); background: color-mix(in srgb, var(--moss-soft) 72%, transparent); }
 .suggestions-toggle.preparing { color: var(--warning); }
 .suggestions-toggle.needs-attention, .shuttle-toggle.needs-attention { color: var(--danger); background: color-mix(in srgb, var(--danger) 10%, transparent); }
 .suggestions-toggle svg { stroke-width: 1.2; }
@@ -490,6 +490,7 @@ button.document-row:hover { background: var(--chrome-hover); }
 .document-row-group.template-file { color:var(--muted); }
 .folder-row { width:100%; min-width:0; display:flex; align-items:center; gap:5px; min-height:26px; padding:4px 6px; border:0; border-radius:4px; background:transparent; color:var(--muted); font-family:inherit; font-size:12px; line-height:18px; text-align:left; cursor:pointer; }
 .folder-row:hover { color:var(--ink); background:var(--chrome-hover); }
+.folder-row.drop-target { color:var(--ink); background:var(--chrome-hover); outline:2px solid var(--moss); outline-offset:-2px; }
 .folder-row::before { content:""; flex:none; width:5px; height:5px; border-right:1.25px solid currentColor; border-bottom:1.25px solid currentColor; transform:rotate(-45deg); opacity:.8; }
 .folder-row[aria-expanded="true"]::before { transform:translateY(-1px) rotate(45deg); }
 .folder-row svg { display:none; }
@@ -505,9 +506,6 @@ button.document-row:hover { background: var(--chrome-hover); }
 .workspace-pane-main { grid-column:2; grid-row:1; }
 .workspace-pane-right { grid-column:3; grid-row:1; border-left:1px solid var(--line); }
 .workspace-pane-bottom { grid-column:2 / -1; grid-row:2; border-top:1px solid var(--line); }
-.workspace-pane-header { flex:none; display:flex; align-items:center; min-height:30px; padding:0 8px; }
-.workspace-pane-header select { max-width:100%; border:0; background:transparent; color:var(--muted); font-size:11px; }
-.workspace-pane-header span { color:var(--muted); font-size:11px; }
 .workspace-pane-content { display:flex; flex:1; flex-direction:column; min-width:0; min-height:0; }
 .workspace-pane-slot.hidden-pane, .workspace-pane-content.hidden-pane { display:none; }
 .outline-panel { position:relative; grid-row:1 / -1; }
@@ -520,9 +518,6 @@ button.document-row:hover { background: var(--chrome-hover); }
 .fan-visible .loom-completion-lens-trigger { visibility:visible; }
 
 
-.completion-mode-toggle { display: inline-flex; align-items: center; gap: 1px; padding: 1px; border: 1px solid var(--line); border-radius: 7px; }
-.completion-mode-toggle .titlebar-button { border-radius: 5px; }
-.completion-mode-toggle .titlebar-button[aria-pressed="true"] { color: var(--moss); background: var(--paper); box-shadow: 0 1px 3px rgb(0 0 0 / 10%); }
 
 /* Invoked choices overlay the writing surface without taking document height. */
 .editor-stage:has(.loompad) { position: relative; }
@@ -533,3 +528,14 @@ button.document-row:hover { background: var(--chrome-hover); }
 .loompad-choice:not(:disabled):hover, .loompad-choice.held { color: var(--ink); background: var(--moss-soft); }
 .loompad-choice:disabled { opacity: .5; }
 .loompad-key { color: var(--quiet); font: 600 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* Material replaces the main content view without detaching unsaved editor state. */
+.writing-content { display:contents; }
+.writing-content.material-covered { display:none; }
+.material-add-menu { position:absolute; top:30px; left:110px; z-index:40; min-width:170px; padding:4px; border:1px solid var(--line); border-radius:6px; background:var(--paper); box-shadow:var(--shadow); }
+.material-add-menu button { display:block; width:100%; min-height:30px; border:0; border-radius:4px; background:none; padding:5px 9px; text-align:left; }
+.material-add-menu button:hover { background:var(--chrome-hover); }
+.material-row.active { background:var(--chrome-hover); }
+.material-pin { margin-left:auto; flex:0 !important; opacity:.6; }
+.material-connect-view { min-height:0; flex:1; overflow:auto; }
+.material-connect-view .import-sources { padding:12px; }

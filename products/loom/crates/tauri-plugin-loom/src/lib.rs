@@ -14,15 +14,22 @@ mod external_import;
 mod generation_profiles;
 mod import_batch;
 mod import_jobs;
+mod inference;
+mod material_commands;
+mod material_context;
+mod material_media;
+mod materials;
 mod microphone_capture;
 mod model_catalog;
 mod model_config;
 mod model_download;
+mod server_weave;
 mod shader_preview;
 mod speech_input;
 mod terminal;
 mod terminal_media;
 mod terminal_receipts;
+mod workspace_copy;
 mod workspace_preview;
 mod workspace_template;
 
@@ -258,6 +265,7 @@ struct AutomaticBudgetReservation<'authority> {
 }
 
 impl AutomaticBudgetAuthority {
+    #[cfg(test)]
     fn reserve(
         &self,
         writer: &AutomaticSuggestionAuthority,
@@ -266,9 +274,18 @@ impl AutomaticBudgetAuthority {
         self.reserve_at(writer, scope, Instant::now())
     }
 
+    #[cfg(test)]
     fn reserve_at(
         &self,
         _writer: &AutomaticSuggestionAuthority,
+        scope: AutomaticBudgetScope,
+        now: Instant,
+    ) -> Result<AutomaticBudgetReservation<'_>, AutomaticBudgetError> {
+        self.reserve_scope_at(scope, now)
+    }
+
+    fn reserve_scope_at(
+        &self,
         scope: AutomaticBudgetScope,
         now: Instant,
     ) -> Result<AutomaticBudgetReservation<'_>, AutomaticBudgetError> {
@@ -469,6 +486,7 @@ pub struct PluginState {
     prepared_project: Mutex<Option<PreparedProject>>,
     folder_picker_open: AtomicBool,
     imports: Arc<import_jobs::ImportJobs>,
+    inference: Option<Arc<inference::Service>>,
     native_runtime: Arc<NativeHostRuntime>,
     backend: Arc<LlamaBackend>,
     model: Mutex<ModelRegistry>,
@@ -497,6 +515,19 @@ impl Default for PluginState {
 }
 
 impl PluginState {
+    fn shutdown_inference(&self) -> Result<(), IpcFailure> {
+        if let Some(service) = &self.inference {
+            tauri::async_runtime::block_on(service.gateway.shutdown()).map_err(|_| {
+                IpcFailure::new(
+                    "inference_shutdown_failed",
+                    "configured inference did not drain cleanly",
+                    false,
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     fn with_app_local_data_root(
         app_local_data_root: Option<PathBuf>,
         isolate_model_discovery: bool,
@@ -516,6 +547,7 @@ impl PluginState {
             prepared_project: Mutex::new(None),
             folder_picker_open: AtomicBool::new(false),
             imports: Arc::default(),
+            inference: None,
             native_runtime,
             backend,
             model: Mutex::new(ModelRegistry::default()),
@@ -565,6 +597,9 @@ impl Drop for PluginState {
         let _desktop_workers = self.join_desktop_workers_for_exit();
         if let Err(error) = tauri::async_runtime::block_on(self.speech_input.shutdown()) {
             eprintln!("Loom speech input did not stop during plugin drop: {error}");
+        }
+        if let Err(error) = self.shutdown_inference() {
+            eprintln!("Loom inference teardown: {}", error.message);
         }
         let _native_runtime = self.native_runtime.shutdown_for_process_exit();
         if let Err(error) = self.generation_lifecycle.close() {
@@ -909,7 +944,9 @@ mod automatic_writer_authority {
     }
 }
 
-use automatic_writer_authority::{AuthorizedWeaveModel, AutomaticSuggestionAuthority};
+use automatic_writer_authority::AuthorizedWeaveModel;
+#[cfg(test)]
+use automatic_writer_authority::AutomaticSuggestionAuthority;
 
 #[derive(Clone, Debug)]
 struct GenerationResultBinding {
@@ -952,6 +989,7 @@ enum GenerationWorkerSlot {
 enum GenerationWorkerOwner {
     Llama(Box<LlamaGenerationHandle>),
     Terminal(Arc<terminal::TerminalControl>),
+    Server(Arc<server_weave::Cancellation>),
     #[cfg(test)]
     Controlled(Arc<dyn ControlledGenerationWorkerCancellation>),
 }
@@ -968,6 +1006,7 @@ enum GenerationBackendWorkerJoined {
         count: usize,
         panicked: bool,
     },
+    Server,
     #[cfg(test)]
     Controlled,
 }
@@ -1253,6 +1292,7 @@ impl GenerationWorkerOwner {
                 let _ = owner.cancel_all();
             }
             Self::Terminal(control) => control.cancel(),
+            Self::Server(owner) => owner.cancel_all(),
             #[cfg(test)]
             Self::Controlled(cancellation) => cancellation.cancel_all(),
         }
@@ -1269,6 +1309,10 @@ impl GenerationWorkerOwner {
                 count: control.joined_count(),
                 panicked: control.panicked(),
             },
+            Self::Server(owner) => {
+                owner.cancel_all();
+                GenerationBackendWorkerJoined::Server
+            }
             #[cfg(test)]
             Self::Controlled(cancellation) => {
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1290,6 +1334,7 @@ impl GenerationBackendWorkerJoined {
         match self {
             Self::Llama(joined) => joined.worker_panicked(),
             Self::Terminal { panicked, .. } => *panicked,
+            Self::Server => false,
             #[cfg(test)]
             Self::Controlled => false,
         }
@@ -1299,6 +1344,7 @@ impl GenerationBackendWorkerJoined {
         match self {
             Self::Llama(joined) => joined.joined_worker_count(),
             Self::Terminal { count, .. } => *count,
+            Self::Server => 0,
             #[cfg(test)]
             Self::Controlled => 0,
         }
@@ -2056,6 +2102,15 @@ impl Builder {
                 project_current,
                 project_recover,
                 document_create,
+                material_commands::material_list,
+                material_commands::material_read,
+                material_commands::material_search,
+                material_commands::material_read_evidence,
+                material_commands::material_bind_attachment,
+                material_commands::material_set_pinned,
+                material_commands::material_remove,
+                material_commands::material_add_library,
+                material_commands::material_add_library_path,
                 workspace_template_get,
                 workspace_template_enable,
                 audio_record_start,
@@ -2065,6 +2120,7 @@ impl Builder {
                 document_delete,
                 import_batch::import_text_sources,
                 import_batch::attachment_import_batch_choose,
+                workspace_copy::workspace_copy_files,
                 connected_imports::import_account_cancel,
                 connected_imports::import_source_url,
                 connected_imports::import_accounts,
@@ -2101,6 +2157,7 @@ impl Builder {
                 document_draft_clear,
                 document_reconciliation_preview,
                 document_reconcile_apply,
+                inference_status,
                 build_model_policy_get,
                 model_catalog_list,
                 model_list,
@@ -2136,11 +2193,29 @@ impl Builder {
                 let app_local_data_root = app_local_data_root
                     .clone()
                     .or_else(|| app.path().app_local_data_dir().ok());
-                app.manage(PluginState::with_app_local_data_root(
+                let mut state = PluginState::with_app_local_data_root(
                     app_local_data_root,
                     isolate_model_discovery,
                     build_model_policy,
-                ));
+                );
+                let inference_path = if isolate_model_discovery {
+                    state
+                        .app_local_data_root
+                        .as_ref()
+                        .map(|root| root.join(".loom.toml"))
+                } else {
+                    app.path()
+                        .home_dir()
+                        .ok()
+                        .map(|home| home.join(".loom.toml"))
+                };
+                if let Some(path) = inference_path {
+                    match inference::Service::read(&path) {
+                        Ok(service) => state.inference = service,
+                        Err(error) => eprintln!("Loom inference: {}", error.message),
+                    }
+                }
+                app.manage(state);
                 Ok(())
             })
             .on_window_ready(|window| {
@@ -2192,6 +2267,15 @@ impl Builder {
             })
             .build()
     }
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn inference_status(state: State<'_, PluginState>) -> inference::Status {
+    state
+        .inference
+        .as_ref()
+        .map_or_else(inference::Status::default, inference::Service::status)
 }
 
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, menu_id: &str) {
@@ -2504,6 +2588,7 @@ pub struct ProjectSnapshot {
     root: String,
     schema_version: u32,
     documents: Vec<DocumentSummary>,
+    retained_output_document_ids: Vec<String>,
     folder_warnings: Vec<String>,
     pending_recovery: u64,
 }
@@ -3277,6 +3362,7 @@ fn initialize_project(path: &Path, title: String) -> Result<ProjectStore, IpcFai
 }
 
 fn open_or_initialize_default_project(path: &Path) -> Result<ProjectStore, IpcFailure> {
+    loom_store::ensure_private_storage_supported().map_err(IpcFailure::store)?;
     if !path.join(".loom").try_exists().map_err(|error| {
         IpcFailure::new("default_project_inspection_failed", error.to_string(), true)
     })? {
@@ -4473,6 +4559,8 @@ fn loom_asset_protocol_response(
         read_authorized_loom_asset(state, &asset_request)
     } else if let Some(media_request) = parse_loom_context_media_uri(request.uri()) {
         read_authorized_context_media(state, &media_request)
+    } else if let Some(media_request) = material_media::parse(request.uri()) {
+        material_media::read(state, &media_request)
     } else {
         return empty_loom_asset_response(http::StatusCode::BAD_REQUEST);
     };
@@ -8454,24 +8542,17 @@ fn weave_start_inner<R: Runtime>(
         _ => None,
     };
     let _model_lifecycle = lock_model_lifecycle(state)?;
-    let authorized_model =
-        AuthorizedWeaveModel::bind(policy, loaded_model(state)?, &state.build_model_policy)?;
+    let authorized_model = server_weave::Engine::bind(policy, state)?;
     let branch_count = authorized_model.branch_count();
-    let loaded_model = authorized_model.loaded();
-    let max_cases = loaded_model
-        .descriptor
-        .capabilities
-        .max_cases
-        .min(loaded_model.profile.max_parallel_cases);
+    let max_cases = authorized_model.max_cases();
     if branch_count > max_cases {
         return Err(IpcFailure::new(
             "model_branch_limit",
-            format!("the verified model supports at most {max_cases} parallel branches"),
+            format!("the active writing engine supports at most {max_cases} parallel branches"),
             false,
         ));
     }
-    let model_environment = model_environment_from_verified(&loaded_model.descriptor)
-        .map_err(|error| IpcFailure::backend(&error))?;
+    let model_environment = authorized_model.environment()?;
 
     let request_id = format!("weave-{command_id}");
     let (
@@ -8535,21 +8616,21 @@ fn weave_start_inner<R: Runtime>(
         )?;
         let persona_context = generation_profiles::preamble(&generation_profile);
         let retrieval_context_tokens = generation_profiles::reserve_context(
-            resident_context_tokens(loaded_model),
+            authorized_model.context_tokens(),
             &persona_context,
             branch_count,
             initial_sampling.max_tokens,
         )?;
-        let automatic_budget_reservation = match authorized_model.automatic_writer() {
-        Some(writer) => Some(
+        let automatic_budget_reservation = if authorized_model.is_automatic() {
+            Some(
             state
                 .automatic_budget
-                .reserve(writer, AutomaticBudgetScope {
+                .reserve_scope_at(AutomaticBudgetScope {
                     project: store.manifest().project_id,
                     session: active_session_id,
                     document: document_id,
                     source_revision: source_revision_id,
-                })
+                }, Instant::now())
                 .map_err(|error| match error {
                     AutomaticBudgetError::Exhausted => IpcFailure::new(
                         "automatic_generation_throttled",
@@ -8567,9 +8648,10 @@ fn weave_start_inner<R: Runtime>(
                         false,
                     ),
                 })?,
-        ),
-        None => None,
-    };
+        )
+        } else {
+            None
+        };
         let source_prefix = captured.prefix();
         let mut attachment_context = resolve_for_generation_with_budget(
             store.root(),
@@ -8585,12 +8667,39 @@ fn weave_start_inner<R: Runtime>(
                 .context_preamble
                 .insert_str(0, &persona_context);
         }
-        let document_context = document_bindings::context_for_markdown(store, &loaded.text)?;
+        if !loom_document::document_references(&loaded.text)
+            .map_err(|error| IpcFailure::new("material_context_invalid", error.to_string(), false))?
+            .is_empty()
+        {
+            material_commands::restore_grants(state, store)?;
+        }
+        // Match the attachment planner's conservative byte-per-token envelope;
+        // every branch's generation and the runtime scaffold keep their reserve.
+        let context_bytes = authorized_model
+            .context_tokens()
+            .saturating_sub(branch_count.saturating_mul(initial_sampling.max_tokens))
+            .saturating_sub(1_024);
+        let material_budget = usize::try_from(context_bytes)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(attachment_context.manuscript_prompt.len())
+            .saturating_sub(attachment_context.context_preamble.len())
+            .saturating_sub(2);
+        let material_plan = material_context::markdown_plan_with_budget(
+            store,
+            &loaded.text,
+            source_prefix,
+            material_budget,
+        )?;
+        attachment_context.media = terminal_media::merge(
+            attachment_context.media,
+            material_context::native_media(store, material_plan.bindings.values())?,
+        )?;
+        let document_context = &material_plan.text;
         if !document_context.is_empty() {
             attachment_context.context_preamble.push_str("\n\n");
             attachment_context
                 .context_preamble
-                .push_str(&document_context);
+                .push_str(document_context);
         }
         let exact_prefix = attachment_context.manuscript_prompt.clone();
         if exact_prefix.is_empty()
@@ -8604,10 +8713,7 @@ fn weave_start_inner<R: Runtime>(
             ));
         }
         if !attachment_context.media.is_empty() {
-            validate_media_against_resident_model(
-                &attachment_context.media,
-                &loaded_model.descriptor,
-            )?;
+            authorized_model.validate_media(&attachment_context.media)?;
         }
         let speculation = loompad_request.map(|(sample_target, batch_offset)| {
             let context = continuation_context_binding(&attachment_context.context_preamble, &attachment_context.media)
@@ -8617,6 +8723,8 @@ fn weave_start_inner<R: Runtime>(
                 "session": active_session_id, "document": document_id, "revision": source_revision_id,
                 "cursor": cursor_byte, "prompt": BlobId::digest(exact_prefix.as_bytes()),
                 "context": context, "model": model_environment,
+                "materials": BlobId::digest(&serde_json::to_vec(&material_plan)
+                    .map_err(|error| IpcFailure::new("speculation_identity_failed", error.to_string(), false))?),
             })).map_err(|error| IpcFailure::new("speculation_identity_failed", error.to_string(), false))?;
             Ok::<_, IpcFailure>(LoompadBatch { snapshot_id: BlobId::digest(&identity).to_string(), sample_target, batch_offset })
         }).transpose()?;
@@ -8646,11 +8754,21 @@ fn weave_start_inner<R: Runtime>(
         let environment_artifact = store
             .record_model_environment(&model_environment)
             .map_err(IpcFailure::store)?;
+        let mut context_inputs = material_context::evidence_artifact_ids(&material_plan.evidence)?;
+        for value in material_plan.bindings.values() {
+            if let material_context::Value::Documents { documents } = value {
+                context_inputs.extend(documents.iter().map(|document| document.artifact_id));
+            }
+        }
+        context_inputs.sort();
+        context_inputs.dedup();
+        let mut prompt_inputs = vec![loaded.artifact_id];
+        prompt_inputs.extend(context_inputs.iter().copied());
         let prompt_recipe = PromptRecipe {
             mode: PromptMode::Completion,
             exact_prompt_blob_id,
             exact_prompt_token_ids: None,
-            ordered_input_artifact_ids: vec![loaded.artifact_id],
+            ordered_input_artifact_ids: prompt_inputs,
             prompt_token_count: None,
         };
         let prompt_artifact = store
@@ -8659,6 +8777,7 @@ fn weave_start_inner<R: Runtime>(
         let retrieval_evidence_blob_id = {
             let identity = serde_json::to_vec(&generation_profiles::ProfiledContextEvidence {
                 retrieval: attachment_context.retrieval_evidence.clone(),
+                materials: Some(material_plan.clone()),
                 generation_profile: Some(generation_profile.clone()),
                 applied_co_writer,
                 loompad: speculation.clone(),
@@ -8679,8 +8798,8 @@ fn weave_start_inner<R: Runtime>(
         let context_artifact = store
             .record_context_recipe(&ContextRecipe {
                 source_revision_id,
-                ordered_source_artifact_ids: Vec::new(),
-                token_budget: u64::from(resident_context_tokens(loaded_model)),
+                ordered_source_artifact_ids: context_inputs,
+                token_budget: u64::from(authorized_model.context_tokens()),
                 retrieval_evidence_blob_id,
             })
             .map_err(IpcFailure::store)?;
@@ -8880,6 +8999,32 @@ fn weave_start_inner<R: Runtime>(
             lifecycle_lease,
         )
     };
+    let authorized_model = match authorized_model {
+        server_weave::Engine::Server { scope, .. } => {
+            return server_weave::submit(
+                state,
+                app,
+                &application_admission,
+                scope,
+                server_weave::Prepared {
+                    identity,
+                    exact_prefix,
+                    context_preamble,
+                    prompt_recipe,
+                    cases,
+                    queued_branches,
+                    runs,
+                    lifecycle_ticket,
+                    lifecycle_lease,
+                    command_id,
+                    source_revision_id,
+                    speculation,
+                },
+            );
+        }
+        server_weave::Engine::Native(model) => *model,
+    };
+    let loaded_model = authorized_model.loaded();
     let exact_prompt_blob_id = BlobId::digest(exact_prefix.as_bytes());
     let context_binding = continuation_context_binding(&context_preamble, &media)
         .map_err(|error| IpcFailure::backend(&error))?;
@@ -10180,6 +10325,10 @@ fn quiesce_unpreventable_runtime_exit<R: Runtime>(app: &AppHandle<R>) {
     // cancellation authority are attached, making a detached start
     // impossible at this point in safe code.
     let desktop_workers = state.join_desktop_workers_for_exit();
+    if let Err(error) = state.shutdown_inference() {
+        eprintln!("Loom inference teardown: {}", error.message);
+        return;
+    }
     let _model_lifecycle = state
         .model_lifecycle
         .lock()
@@ -10461,6 +10610,7 @@ fn application_close<R: Runtime>(
     tauri::async_runtime::block_on(state.speech_input.shutdown())
         .map_err(|error| IpcFailure::speech_input(&error))?;
     let desktop_workers = state.join_desktop_workers()?;
+    state.shutdown_inference()?;
     let _model_lifecycle = lock_model_lifecycle(&state)?;
     let mut model_registry = lock_model_registry(&state)?;
     ensure_model_registry_ready_for_application_shutdown(&model_registry)?;
@@ -10685,6 +10835,17 @@ fn snapshot_for(
         root,
         schema_version: store.manifest().schema_version,
         documents,
+        retained_output_document_ids: ["retained experiment", "retained expression"]
+            .into_iter()
+            .map(|reason| store.document_ids_created_with_reason(reason))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(IpcFailure::store)?
+            .into_iter()
+            .flatten()
+            .map(|id| id.to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         folder_warnings: store.folder_warnings().to_vec(),
         pending_recovery: store.pending_outbox_count().map_err(IpcFailure::store)?,
     })
@@ -11185,22 +11346,32 @@ mod tests {
     #[test]
     fn native_exit_recording_never_blocks_on_an_owned_application_admission_boundary() {
         let state = Arc::new(PluginState::default());
-        let admission =
-            lock_application_admission(&state, "fixture work").expect("admit fixture work");
-        let (sent, received) = std::sync::mpsc::channel();
+        let (admitted, ready) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
         let worker_state = Arc::clone(&state);
         let worker = std::thread::spawn(move || {
-            sent.send(record_application_exit_request(&worker_state))
-                .expect("send exit disposition");
+            let admission = lock_application_admission(&worker_state, "fixture work")
+                .expect("admit fixture work");
+            admitted.send(()).expect("signal owned admission");
+            // Release the guard even if a regression blocks the caller. The
+            // assertion below checks ordering, not thread-start latency.
+            let release = released.recv_timeout(Duration::from_secs(5));
+            assert_eq!(*admission, ApplicationPhase::Running);
+            drop(admission);
+            release
         });
 
-        assert!(
-            !received
-                .recv_timeout(Duration::from_millis(20))
-                .expect("event-thread exit recording must be nonblocking")
-        );
-        worker.join().expect("join exit-request worker");
-        drop(admission);
+        ready
+            .recv()
+            .expect("admission is held before recording exit");
+        let may_exit = record_application_exit_request(&state);
+        let release_sent = release.send(());
+        worker
+            .join()
+            .expect("join admission worker")
+            .expect("exit recording must finish before admission is released");
+        release_sent.expect("release admission after recording exit");
+        assert!(!may_exit);
         assert_eq!(
             *state.application.lock().expect("application phase"),
             ApplicationPhase::Running
@@ -12625,8 +12796,8 @@ mod tests {
         let environment = ModelEnvironment {
             environment_id: loom_types::ModelEnvironmentId::digest(b"test-close-environment"),
             model_identifier: "test-close-model".to_owned(),
-            model_fingerprint: BlobId::digest(b"test-close-model"),
-            tokenizer_fingerprint: BlobId::digest(b"test-close-tokenizer"),
+            model_fingerprint: Some(BlobId::digest(b"test-close-model")),
+            tokenizer_fingerprint: Some(BlobId::digest(b"test-close-tokenizer")),
             backend_identifier: "test-close-backend".to_owned(),
             capabilities: serde_json::json!({"completion": true}),
         };
@@ -14104,6 +14275,42 @@ mod tests {
         )
         .expect_err("symlinked acceptance model library must be rejected");
         assert_eq!(error.code, "isolated_model_library_unavailable");
+    }
+
+    #[test]
+    #[cfg(not(unix))]
+    fn unsupported_project_storage_returns_typed_ipc_failure_without_mutation() {
+        let temporary = tempfile::tempdir().expect("temporary app data");
+        let missing = temporary.path().join(DEFAULT_PROJECT_DIRECTORY);
+        let existing = temporary.path().join("existing");
+        std::fs::create_dir(&existing).expect("existing writing folder");
+        let manuscript = existing.join(INITIAL_DOCUMENT);
+        std::fs::write(&manuscript, b"Keep this exact prose.\r\n").expect("existing manuscript");
+
+        for path in [&missing, &existing] {
+            let error = open_or_initialize_default_project(path)
+                .expect_err("default opening must reject unsupported storage");
+            assert_eq!(error.code, "private_storage_unsupported");
+            assert!(!error.retryable);
+            let error = initialize_project(path, "Writing".into())
+                .expect_err("initialization must reject unsupported storage");
+            assert_eq!(error.code, "private_storage_unsupported");
+            assert!(!error.retryable);
+        }
+        assert!(
+            !missing.exists(),
+            "rejection must not create the writing folder"
+        );
+        assert_eq!(
+            std::fs::read(&manuscript).expect("preserved manuscript"),
+            b"Keep this exact prose.\r\n"
+        );
+        assert_eq!(
+            std::fs::read_dir(&existing)
+                .expect("unchanged folder")
+                .count(),
+            1
+        );
     }
 
     #[test]

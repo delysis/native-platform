@@ -2964,7 +2964,9 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2972,10 +2974,16 @@ name = "fte-router"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
+ "fte-protocols",
+ "fte-providers",
+ "fte-store",
  "fte-types",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -5003,8 +5011,11 @@ version = "0.1.0"
 dependencies = [
  "loom-types",
  "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "similar",
  "thiserror 2.0.20",
+ "unicode-segmentation",
  "workspace-document",
 ]
 
@@ -8780,6 +8791,7 @@ dependencies = [
  "atomic-write-file",
  "attachment-native-host",
  "attachment-native-types",
+ "axum",
  "base64 0.22.1",
  "cpal 0.16.0",
  "crossbeam-channel",
@@ -8789,10 +8801,17 @@ dependencies = [
  "desktop-model-discovery",
  "desktop-speech",
  "desktop-vault",
+ "fte-providers",
+ "fte-router",
+ "fte-store",
+ "fte-types",
  "hound",
  "http",
  "image",
  "information-native-acquire",
+ "information-native-backend-sqlite",
+ "information-native-retrieval",
+ "information-native-types",
  "keyring",
  "libc",
  "llama-native-types",
@@ -8805,6 +8824,7 @@ dependencies = [
  "loom-types",
  "naga",
  "notify",
+ "rusqlite",
  "rustix 1.1.4",
  "same-file",
  "serde",
@@ -8821,7 +8841,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
  "toml 0.9.12+spec-1.1.0",
+ "url",
  "windows-sys 0.61.2",
  "workspace-document",
 ]
@@ -11104,6 +11126,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "toml 0.9.12+spec-1.1.0",
+ "url",
 ]
 
 [[package]]

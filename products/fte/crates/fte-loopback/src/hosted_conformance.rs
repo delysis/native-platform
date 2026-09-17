@@ -58,6 +58,7 @@ async fn hosted_exchange(
         backend_id: "fixture".into(),
         location: BackendLocation::Hosted,
         capabilities: ModelCapabilities {
+            modalities: vec![fte_types::Modality::Text],
             prompt_forms: vec![PromptForm::Chat, PromptForm::Completion],
             streaming: true,
             tools: true,
@@ -65,6 +66,7 @@ async fn hosted_exchange(
         },
         context_tokens: None,
         max_output_tokens: None,
+        quota: Default::default(),
         observed: Default::default(),
     }];
     let mut config = match protocol {
@@ -256,6 +258,7 @@ fn fixture_model(id: &str) -> ModelDescriptor {
         backend_id: id.into(),
         location: BackendLocation::Hosted,
         capabilities: ModelCapabilities {
+            modalities: vec![fte_types::Modality::Text],
             prompt_forms: vec![PromptForm::Chat],
             streaming: true,
             tools: true,
@@ -263,6 +266,7 @@ fn fixture_model(id: &str) -> ModelDescriptor {
         },
         context_tokens: None,
         max_output_tokens: None,
+        quota: Default::default(),
         observed: Default::default(),
     }
 }

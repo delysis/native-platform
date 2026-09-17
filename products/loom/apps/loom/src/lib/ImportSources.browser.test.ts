@@ -19,7 +19,7 @@ function deferred<T>() {
 describe('source import cancellation', () => {
   it('sends Stop through the real IPC lane before completion and preserves partial results', async () => {
     const batch = deferred<ImportBatch>();
-    const use = deferred<boolean>();
+    const opened = deferred<void>();
     const disconnect = deferred<void>();
     const target = document.createElement('div');
     document.body.append(target);
@@ -35,9 +35,10 @@ describe('source import cancellation', () => {
         default: throw new Error(`Unexpected native command: ${command}`);
       }
     });
-    const onUse = vi.fn(() => use.promise);
+    const onOpen = vi.fn(() => opened.promise);
+    const onImported = vi.fn(async () => {});
     const component = mount(ImportSources, { target, props: {
-      projectId: 'project-a', sessionId: 'session-a', documentTitle: 'Draft', onUse, onSettings: vi.fn()
+      projectId: 'project-a', sessionId: 'session-a', onOpen, onImported, onSettings: vi.fn()
     } });
     const retained = {
       id: 'a'.repeat(64), file_name: 'Retained source.md', byte_count: 14,
@@ -45,7 +46,6 @@ describe('source import cancellation', () => {
       media_kinds: [], warnings: [], inline_markdown: '[Retained source](loom-attachment:source)'
     } satisfies ImportBatch['imported'][number];
     try {
-      await page.getByText('Import sources', { exact: true }).click();
       await page.getByRole('button', { name: 'Choose files', exact: true }).click();
       await vi.waitFor(() => expect(native.invoke).toHaveBeenCalledWith(
         'plugin:loom|attachment_import_batch_choose', expect.objectContaining({ folder: false })
@@ -61,16 +61,19 @@ describe('source import cancellation', () => {
       // The import has not resolved: cancel must bypass its pending ordering lane.
       await expect.element(page.getByRole('status')).toHaveTextContent('Stopping…');
       batch.resolve({ imported: [retained], failures: [{ name: 'Next source.pdf', message: 'Import stopped.' }], next_page_token: null });
-      await expect.element(page.getByRole('checkbox', { name: /^Retained source\.md/ })).toBeVisible();
+      await expect.element(page.getByRole('button', { name: 'Retained source.md', exact: true })).toBeVisible();
       await expect.element(page.getByText('Next source.pdf: Import stopped.', { exact: true })).toBeVisible();
+      expect(onImported).toHaveBeenCalledWith([retained], 'project-a', 'session-a');
+      expect(onOpen).not.toHaveBeenCalled();
+      expect(page.getByRole('checkbox').query()).toBeNull();
+      expect(page.getByRole('button', { name: /Use here/ }).query()).toBeNull();
       expect(page.getByRole('button', { name: 'Stop import', exact: true }).query()).toBeNull();
 
-      await page.getByRole('checkbox').click();
-      await page.getByRole('button', { name: 'Add selected to context (1/16)', exact: true }).click();
-      expect(onUse).toHaveBeenCalledWith([retained]);
+      await page.getByRole('button', { name: 'Retained source.md', exact: true }).click();
+      expect(onOpen).toHaveBeenCalledWith(retained, 'project-a', 'session-a');
       expect(page.getByRole('button', { name: 'Stop import', exact: true }).query()).toBeNull();
-      use.resolve(true);
-      await expect.element(page.getByRole('status')).toHaveTextContent('Selected sources added');
+      opened.resolve();
+      await expect.element(page.getByRole('status')).toHaveTextContent('1 imported; 1 failed or skipped.');
       await page.getByRole('button', { name: 'Disconnect', exact: true }).click();
       await vi.waitFor(() => expect(native.invoke).toHaveBeenCalledWith('plugin:loom|import_account_disconnect', {
         projectId: 'project-a', sessionId: 'session-a', service: 'gmail', accountEmail: 'writer@example.test'
@@ -81,7 +84,7 @@ describe('source import cancellation', () => {
       expect(native.invoke.mock.calls.filter(([command]) => command === 'plugin:loom|import_account_cancel')).toHaveLength(1);
     } finally {
       batch.resolve({ imported: [], failures: [], next_page_token: null });
-      use.resolve(false); disconnect.resolve();
+      opened.resolve(); disconnect.resolve();
       await unmount(component); target.remove();
       if (previousRuntime) Object.defineProperty(window, '__TAURI_INTERNALS__', previousRuntime);
       else Reflect.deleteProperty(window, '__TAURI_INTERNALS__');

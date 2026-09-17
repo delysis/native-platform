@@ -339,9 +339,8 @@
       alternatives: snapshot.alternatives,
       hidden: snapshot.hidden || rollbackOnly,
       unconsumeText: snapshot.unconsumeText,
-      // Once a word is consumed the session is locked to one candidate. Do
-      // not hide its cached remainder behind a now-empty alternatives fan
-      // while Option is still held.
+      // Only candidates sharing the exact accepted prefix remain alternatives.
+      // Keep the cached remainder visible when just one continuation survives.
       fanVisible: !snapshot.hidden && snapshot.optionHeld && snapshot.alternatives.length > 1,
       fanPinned: !snapshot.hidden && snapshot.lensPinned && snapshot.alternatives.length > 1
     } : null;

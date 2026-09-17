@@ -31,13 +31,13 @@ async function render(config: Partial<WorkspacePaneConfig> = {}, value = source.
   const target = document.createElement('div'); target.style.height = '400px'; target.style.width = '320px'; document.body.append(target);
   ipc.list.mockResolvedValue(config.kind === 'browser' ? [] : [run('old'), run('unrelated', 'other')]);
   if (!ipc.open.getMockImplementation()) ipc.open.mockResolvedValue({ ...source, text: fullAnswer });
-  const beforeRun = vi.fn(async () => currentSource), onOpenDocument = vi.fn(), onChange = vi.fn(), onCompositionChange = vi.fn();
+  const beforeRun = vi.fn(async () => currentSource), onOpenDocument = vi.fn(), onChange = vi.fn(), onCompositionChange = vi.fn(), onPinOutput = vi.fn();
   mounted = mount(WorkspacePane, { target, props: {
     paneId: 'conversation', config: { kind: 'chat', position: 'right', visible: true, title: null, document: null, context: ['Voice notes'], ...config },
-    projectId: 'project', sessionId: 'session', source: currentSource, value, documents: [currentSource.summary, { ...source.summary, document_id: 'result', relative_path: 'Runs/1/Answer.md', title: 'Answer' }], beforeRun, onOpenDocument, onChange, onCompositionChange
+    projectId: 'project', sessionId: 'session', source: currentSource, value, documents: [currentSource.summary, { ...source.summary, document_id: 'result', relative_path: 'Runs/1/Answer.md', title: 'Answer' }], beforeRun, onOpenDocument, onChange, onCompositionChange, onPinOutput
   } });
   await tick(); await expect.poll(() => ipc.list.mock.calls.length).toBe(1);
-  return { beforeRun, onOpenDocument, onChange, onCompositionChange };
+  return { beforeRun, onOpenDocument, onChange, onCompositionChange, onPinOutput };
 }
 
 describe('workspace panes', () => {
@@ -57,7 +57,7 @@ describe('workspace panes', () => {
     const { beforeRun, onOpenDocument } = await render({ context: ['@document', '@"Voice notes"'], document: '@Draft' });
     await expect.poll(() => document.querySelector('.output')?.textContent).toBe(fullAnswer);
     await page.getByText(fullAnswer, { exact: true }).click();
-    const range = document.createRange(); range.selectNodeContents(document.querySelector('.output')!);
+    const range = document.createRange(); range.selectNodeContents(document.querySelector('.output p')!);
     const selection = window.getSelection(); selection?.removeAllRanges(); selection?.addRange(range);
     expect(selection?.toString()).toBe(fullAnswer);
     expect(onOpenDocument).not.toHaveBeenCalled();
@@ -84,6 +84,45 @@ describe('workspace panes', () => {
     expect(request.expression).not.toContain('@document');
     expect(request.expression).toContain('User: Continue that idea\nAssistant:');
     expect(request.sourceRevisionId).toBe('revision');
+  });
+
+  it('keeps hidden reasoning and Markdown bytes intact in the next raw prompt', async () => {
+    const raw = '<think>A private model trace.</think>**The moon.**';
+    ipc.open.mockResolvedValue({ ...source, text: raw });
+    await render();
+    await expect.poll(() => document.querySelector('.output strong')?.textContent).toBe('The moon.');
+    expect(document.querySelector('details')?.open).toBe(false);
+    ipc.run.mockImplementation(async request => ({ ...run(request.commandId), presentation: request.presentation }));
+    await page.getByRole('textbox', { name: 'Message' }).fill('Continue');
+    await userEvent.keyboard('{Enter}');
+    await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
+    expect(ipc.run.mock.calls[0][0].expression).toContain('Assistant: ' + raw);
+  });
+
+  it('pins a retained output explicitly without invoking a model or editing its originating document', async () => {
+    const { onPinOutput, onChange, onOpenDocument } = await render();
+    await page.getByRole('button', { name: 'Pin output in workspace' }).click();
+    expect(onPinOutput).toHaveBeenCalledWith('result');
+    expect(onChange).not.toHaveBeenCalled();
+    expect(onOpenDocument).not.toHaveBeenCalled();
+    expect(ipc.run).not.toHaveBeenCalled();
+  });
+
+  it('inserts a source into the captured chat selection and refuses a changed input', async () => {
+    await render();
+    const input = page.getByRole('textbox', { name: 'Message' });
+    await input.fill('Before after');
+    (input.element() as HTMLTextAreaElement).setSelectionRange(7, 7);
+    const pane = mounted as unknown as WorkspacePane;
+    const insert = pane.captureReferenceInsertion();
+    expect(insert).not.toBeNull();
+    expect(insert!('[@Source](loom-material:material-' + 'a'.repeat(64) + ') ')).toBe(true);
+    await expect.element(input).toHaveValue('Before [@Source](loom-material:material-' + 'a'.repeat(64) + ') after');
+    const stale = pane.captureReferenceInsertion();
+    await input.fill('A changed message');
+    expect(stale!('unexpected')).toBe(false);
+    await expect.element(input).toHaveValue('A changed message');
+    expect(ipc.run).not.toHaveBeenCalled();
   });
 
   it('keeps a lost admission uncertain and does not issue another generation', async () => {

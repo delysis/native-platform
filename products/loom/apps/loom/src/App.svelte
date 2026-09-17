@@ -5,15 +5,20 @@
   import LoomEditor from './lib/LoomEditor.svelte';
   import TerminalPane from './lib/TerminalPane.svelte';
   import PaneDivider from './lib/PaneDivider.svelte';
+  import PaneHeader from './lib/PaneHeader.svelte';
   import Loompad from './lib/Loompad.svelte';
   import { loompadPrefix, type LoompadLength } from './lib/loompad';
   import type { CompletionCandidate } from './lib/completionSession';
   import type { TerminalSourceRange } from './lib/terminalSelection';
-  import { workspaceRows } from './lib/workspaceTree';
+  import { visibleWorkspaceDocuments, readPinnedOutputs, rememberPinnedOutputs } from './lib/workspaceRetention';
+  import { workspaceRows, workspaceCopyDestination } from './lib/workspaceTree';
   import { readWorkspaceFolders, rememberWorkspaceFolder, type WorkspaceFolder } from './lib/workspaceFolders';
   import WorkspacePane from './lib/WorkspacePane.svelte';
   import SetupFlow from './lib/SetupFlow.svelte';
   import { workspaceWriterCandidates, workspaceWriterModel, type SetupChoices, type WorkspaceTemplateSnapshot, type WorkspaceWriterCandidate } from './lib/workspaceTemplate';
+  import MaterialView from './lib/MaterialView.svelte';
+  import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, readMaterialEvidence } from './lib/ipc';
+  import { materialReferenceMarkdown, materialQuotationMarkdown, importedMaterialMarkdown, isDatabasePath, type MaterialEntry, type MaterialEvidence } from './lib/materials';
   import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
   import { startAudioRecording, stopAudioRecording, synthesizeAudio, type AudioRecording } from './lib/ipc';
   import VisualFormatMenu from './lib/VisualFormatMenu.svelte';
@@ -21,7 +26,6 @@
   import ImportSources from './lib/ImportSources.svelte';
   import ConfiguredDownloads from './lib/ConfiguredDownloads.svelte';
   import MaterialExcerpt from './lib/MaterialExcerpt.svelte';
-  import DocumentMaterials from './lib/DocumentMaterials.svelte';
   import MissingDocumentRecoveryNotice from './lib/MissingDocumentRecoveryNotice.svelte';
   import {
     abortApplicationClose,
@@ -59,6 +63,7 @@
     getWeaveStatus,
     ingestImageAttachment,
     importAttachmentPaths,
+    copyWorkspaceFiles,
     revealAttachmentOriginal,
     isDesktopRuntime,
     listenForApplicationCloseRequests,
@@ -72,6 +77,7 @@
     listCoWriters,
     listCuratedModels,
     listDocumentContext,
+    getInferenceStatus,
     listModels,
     listModelDownloads,
     openDefaultProject,
@@ -174,7 +180,7 @@
   } from './lib/applicationCloseCoordinator';
   import { ApplicationCloseRetryScheduler } from './lib/applicationCloseRetry';
   import { DetachedProjectCloseCoordinator } from './lib/detachedProjectClose';
-  import { editableImportMarkdown, normalizeImportedMarkdown } from './lib/importedMarkdown';
+  import { normalizeImportedMarkdown } from './lib/importedMarkdown';
   import { nativeDropPoint as convertNativeDropPoint, nativeDropScope } from './lib/nativeAttachmentDrop';
   import { suggestionsEnabledFromStoredPreference } from './lib/suggestionPreference';
   import {
@@ -391,6 +397,7 @@
   let workspaceRootExpanded = true;
   let workspaceDocuments: Record<string, string> = {};
   let workspaceDropActive = false;
+  let workspaceDropFolder: string | null = null;
   let outlineElement: HTMLElement | undefined;
   $: visibleWorkspaceFolders = project && !workspaceFolders.some(folder => folder.root === project?.root)
     ? [...workspaceFolders, { root: project.root, title: project.title }] : workspaceFolders;
@@ -433,8 +440,12 @@
   $: effectiveTerminalHeight = Math.min(terminalHeight, terminalLimit);
   $: outlineLimit = Math.max(150, workspaceWidth * 0.35);
   $: rightLimit = Math.max(180, workspaceWidth - (outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0) - 200);
+  $: mainPaneOpen = !hiddenPaneSlots.has('main');
   $: rightPaneOpen = paneSlots.some(slot => slot.position === 'right' && slot.selected && !hiddenPaneSlots.has('right'));
   $: bottomPaneOpen = paneSlots.some(slot => slot.position === 'bottom' && slot.selected && !hiddenPaneSlots.has('bottom'));
+  $: mainColumn = mainPaneOpen ? 'minmax(0,1fr)' : '0px';
+  $: sideColumn = mainPaneOpen ? (rightPaneOpen ? `${Math.min(rightWidth, rightLimit)}px` : '0px') : 'minmax(0,1fr)';
+  $: bottomOnly = bottomPaneOpen && !mainPaneOpen && !rightPaneOpen;
   let paneEditors: Record<string, WorkspacePane> = {};
   let paneBusy: Record<string, boolean> = {};
   let paneComposing: Record<string, boolean> = {};
@@ -459,6 +470,15 @@
   let terminalOpen = false;
   let terminalEntry = '';
   let terminalRuns: TerminalRun[] = [];
+  let pinnedOutputs = new Set<string>();
+  function toggleOutputPin(documentId: string): void {
+    if (!project || !project.documents.some(item => item.document_id === documentId)) return;
+    const next = new Set(pinnedOutputs);
+    if (next.has(documentId)) next.delete(documentId); else next.add(documentId);
+    try { rememberPinnedOutputs(window.localStorage, project.project_id, next); }
+    catch { announce('This navigation pin could not be saved on this device.'); }
+    pinnedOutputs = next;
+  }
   let terminalDispatching = false;
   let terminalCancelRequested = false;
   let cancelledTerminalIds = new Set<string>();
@@ -468,6 +488,120 @@
   let terminalRefreshSerial = 0;
   let terminalPollTimer: number | undefined;
   let contextPaneOpen = false;
+  let materialsOpen = false;
+  let addMenuOpen = false;
+  let materialEntries: MaterialEntry[] = [];
+  let materialScope = '';
+  let activeMaterial: MaterialEntry | null = null;
+  let activeMaterialEvidence: MaterialEvidence | null = null;
+  let materialOriginPane: string | null = null;
+  let materialOrigin: {
+    projectId: string; sessionId: string; documentId: string; title: string; markdown: string;
+    mode: EditorMode; visualAnchor: VisualTextInsertionAnchor | null; sourceAnchor: SourceTextInsertionAnchor | null;
+    paneInsert: ((markdown: string) => boolean) | null; paneId: string | null;
+  } | null = null;
+  $: if (desktop && project && materialScope !== `${project.project_id}/${project.session_id}`) {
+    materialScope = `${project.project_id}/${project.session_id}`;
+    activeMaterial = null; materialOrigin = null; materialOriginPane = null; materialEntries = []; materialsOpen = false;
+    void refreshMaterials();
+  }
+  $: if (!project) { materialScope = ''; materialEntries = []; activeMaterial = null; materialOrigin = null; }
+  $: visibleMaterials = materialEntries.filter(item => !item.workspace_path && (!search.trim() || item.name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())))
+    .sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.name.localeCompare(b.name));
+
+  async function refreshMaterials(): Promise<void> {
+    if (!project) return;
+    const captured = { projectId: project.project_id, sessionId: project.session_id };
+    try {
+      const entries = await listMaterials(captured.projectId, captured.sessionId);
+      if (project?.project_id === captured.projectId && project.session_id === captured.sessionId) materialEntries = entries;
+    } catch (error) { if (project?.session_id === captured.sessionId) recordFailure(error); }
+  }
+  function captureMaterialOrigin(): void {
+    if (!project || !document || editorReadonly || compositionActive || !flushEditors()) { materialOrigin = null; return; }
+    const paneInsert = materialOriginPane ? paneEditors[materialOriginPane]?.captureReferenceInsertion() ?? null : null;
+    if (materialOriginPane && !paneInsert) { materialOrigin = null; return; }
+    materialOrigin = {
+      paneInsert, paneId: materialOriginPane,
+      projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id,
+      title: document.summary.title, markdown: documentText, mode,
+      visualAnchor: mode === 'visual' ? visualEditor?.captureTextInsertionAnchor() ?? null : null,
+      sourceAnchor: mode === 'source' ? sourceEditor?.captureTextInsertionAnchor() ?? null : null
+    };
+  }
+  function openMaterial(item: MaterialEntry): void {
+    if (compositionActive || !flushEditors()) return;
+    showMainPane();
+    if (!activeMaterial && !materialsOpen) captureMaterialOrigin();
+    activeMaterialEvidence = null; activeMaterial = item; materialsOpen = false; addMenuOpen = false;
+    clearSuggestionTimerHandle();
+  }
+  function closeMaterial(): void {
+    const paneId = materialOrigin?.paneId;
+    activeMaterialEvidence = null; activeMaterial = null; materialsOpen = false; materialOrigin = null;
+    void tick().then(() => {
+      if (paneId) paneEditors[paneId]?.focusInput();
+      else { visualEditor?.focusCurrentSelection(); sourceEditor?.focusCurrentSelection(); }
+    });
+  }
+  async function useMaterialReference(reference: string, contents: string | null): Promise<boolean> {
+    const origin = materialOrigin;
+    if (!origin || editorReadonly || !project || !document || project.project_id !== origin.projectId ||
+        project.session_id !== origin.sessionId || document.summary.document_id !== origin.documentId ||
+        mode !== origin.mode || documentText !== origin.markdown) return false;
+    // An explicit derivation remains tied to the retained source in portable text.
+    const markdown = contents === null ? reference : materialQuotationMarkdown(reference, contents);
+    const inserted = origin.paneInsert ? origin.paneInsert(markdown) : origin.mode === 'visual'
+      ? Boolean(origin.visualAnchor && visualEditor?.insertMarkdownAtAnchor(origin.visualAnchor, markdown))
+      : Boolean(origin.sourceAnchor && sourceEditor?.insertTextAtAnchor(origin.sourceAnchor, markdown));
+    if (inserted) closeMaterial();
+    return inserted;
+  }
+  function materialRemoved(id: string, sessionId: string): void {
+    if (project?.session_id !== sessionId) return;
+    materialEntries = materialEntries.filter(item => item.id !== id);
+    if (activeMaterial?.id === id) closeMaterial();
+  }
+  function materialChanged(item: MaterialEntry): void {
+    materialEntries = [...materialEntries.filter(existing => existing.id !== item.id), item];
+    if (activeMaterial?.id === item.id) activeMaterial = item;
+  }
+  async function chooseMaterialLibrary(): Promise<void> {
+    if (!project || fileCommandInFlight || opening) return;
+    const captured = { projectId: project.project_id, sessionId: project.session_id };
+    if (!activeMaterial && !materialsOpen) captureMaterialOrigin();
+    addMenuOpen = false;
+    try {
+      const item = await addLibraryMaterial(captured.projectId, captured.sessionId);
+      if (item && project?.project_id === captured.projectId && project.session_id === captured.sessionId) {
+        materialChanged(item); openMaterial(item); outlineOpen = true;
+      }
+    } catch (error) { if (project?.session_id === captured.sessionId) recordFailure(error); }
+  }
+  async function chooseMaterialFiles(): Promise<void> {
+    if (!project || fileCommandInFlight || opening || contextAttachmentBusy) return;
+    const captured = { projectId: project.project_id, sessionId: project.session_id };
+    captureMaterialOrigin(); addMenuOpen = false; contextAttachmentBusy = true;
+    try {
+      const report = await chooseAttachments(captured.projectId, captured.sessionId);
+      for (const attachment of report.imported) {
+        const item = await bindAttachmentMaterial(captured.projectId, captured.sessionId, attachment.id);
+        if (project?.session_id !== captured.sessionId) return;
+        materialChanged(item);
+      }
+      if (report.failures.length) recordFailure(new Error(report.failures.map(item => `${item.name}: ${item.message}`).join('\n')));
+      if (project?.session_id !== captured.sessionId) return;
+      outlineOpen = true;
+      const first = materialEntries.find(item => item.attachment_id === report.imported[0]?.id);
+      if (first) openMaterial(first);
+    } catch (error) { if (project?.session_id === captured.sessionId) recordFailure(error); }
+    finally { contextAttachmentBusy = false; }
+  }
+  function openMaterialConnections(): void {
+    showMainPane();
+    captureMaterialOrigin(); activeMaterial = null; materialsOpen = true; addMenuOpen = false;
+  }
+
   let focusedSpeechTarget: SpeechInputTarget = 'manuscript';
   let contextPaneElement: HTMLDivElement | undefined;
   let contextToggleElement: HTMLButtonElement | undefined;
@@ -676,7 +810,7 @@
   } | null = null;
   $: loompadSnapshotKey = JSON.stringify([project?.project_id, project?.session_id,
     document?.summary.document_id, document?.summary.revision_id, document?.visible_blob_id,
-    mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte, currentModel?.model_id,
+    mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte, currentWriter?.model_id,
     contextEpoch, documentEpoch, completionController.intentEpoch, editVersion]);
   $: loompadFamilyIds = loompadActive && loompadReservoir?.key === loompadSnapshotKey
     ? loompadReservoir.familyIds : undefined;
@@ -984,11 +1118,13 @@
   const suggestionsRetryDelayMs = 350;
   const maximumAutomaticSuggestionRetries = 1;
   const maximumAutocompleteRetryWaits = 50;
+  $: completionSurfaceVisible = mainPaneOpen && !customMain && !activeMaterial && !materialsOpen && document?.summary.relative_path !== '.mine.toml';
+  $: completionAutomationActive = completionSurfaceVisible && completionEngineEnabled({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled });
   function completionAutomationEnabled(
     autocomplete = suggestionsEnabled,
     shuttle = shuttleEnabled
   ): boolean {
-    return completionEngineEnabled({ autocomplete, shuttle });
+    return completionSurfaceVisible && completionEngineEnabled({ autocomplete, shuttle });
   }
 
   $: completionSession = completionController.session;
@@ -1003,6 +1139,7 @@
     terminalSessionKey = `${project?.project_id ?? ''}:${project?.session_id ?? ''}`;
     terminalRefreshSerial += 1;
     terminalRuns = [];
+    pinnedOutputs = project ? readPinnedOutputs(window.localStorage, project.project_id) : new Set();
     terminalEntry = '';
     terminalError = '';
     terminalDispatching = false;
@@ -1016,14 +1153,16 @@
   }
 
   $: folderWarnings = project?.folder_warnings ?? [];
-  $: fileRows = workspaceRows(project?.documents ?? [], collapsedFolders, search);
+  $: fileRows = workspaceRows(visibleWorkspaceDocuments(project?.documents ?? [], project?.retained_output_document_ids ?? [], pinnedOutputs), collapsedFolders, search, materialEntries);
   $: loadedModel = models.find((model) => model.loaded) ?? null;
   $: currentModel = workspaceWriterModel(models, buildModelPolicy, curatedModels, workspaceTemplate, workspaceTemplateScope === `${project?.project_id}/${project?.session_id}`);
+  let configuredWriter: { model_id: string; completion: boolean } | null = null;
+  $: currentWriter = configuredWriter ?? currentModel;
   $: suggestionSetupNeeded = Boolean(
     project &&
     document &&
-    completionAutomationEnabled() &&
-    !currentModel &&
+    completionAutomationActive &&
+    !currentWriter &&
     !modelLoading &&
     !modelUnloading &&
     !modelChoosing &&
@@ -1046,7 +1185,7 @@
     branch.selection !== 'promote' &&
     branch.selection !== 'reject' &&
     branch.source_revision_id === document?.summary.revision_id &&
-    branch.model_id === currentModel?.model_id
+    branch.model_id === currentWriter?.model_id
   );
   $: branchPromotionReady = Boolean(
     project &&
@@ -1099,9 +1238,9 @@
     verifiedBodyByRun: verifiedBranchBodyByRun,
     liveTextByRun: liveBranchTextByRun,
     liveTextSequenceByRun: liveBranchTextSequenceByRun,
-    currentModel,
+    currentModel: currentWriter,
     document,
-    suggestionsEnabled: document?.summary.relative_path !== '.mine.toml' && completionAutomationEnabled(),
+    suggestionsEnabled: completionAutomationActive,
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
     unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
@@ -1116,9 +1255,9 @@
     verifiedBodyByRun: verifiedBranchBodyByRun,
     liveTextByRun: liveBranchTextByRun,
     liveTextSequenceByRun: liveBranchTextSequenceByRun,
-    currentModel,
+    currentModel: currentWriter,
     document,
-    suggestionsEnabled: document?.summary.relative_path !== '.mine.toml' && completionAutomationEnabled(),
+    suggestionsEnabled: completionAutomationActive,
     promotionReady: branchPromotionReady,
     dismissedCandidateIds,
     unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
@@ -1130,12 +1269,12 @@
     : mode === 'source'
       ? sourceSuggestionFamily
       : [];
-  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, loompadActive);
+  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, true);
   $: completionView = completionControllerView(
     completionController,
     completionContextKey,
     baseSuggestionFamily,
-    loompadActive
+    true
   );
   $: boundCompletionSession = completionView.boundSession;
   $: if (boundCompletionSession && !loompadActive) {
@@ -1186,13 +1325,13 @@
     if (selected && familyRunIds.has(selected.runId) &&
         project?.project_id === captured.projectId && project.session_id === captured.sessionId &&
         document?.summary.document_id === captured.documentId && documentEpoch === captured.epoch &&
-        contextEpoch === captured.contextEpoch && currentModel?.model_id === captured.modelId &&
+        contextEpoch === captured.contextEpoch && currentWriter?.model_id === captured.modelId &&
         insertAtUtf8Boundary(captured.sourceMarkdown, captured.cursorByte,
           acceptedCompletionText(boundCompletionSession)) === documentText) {
       const originals = inlineSuggestionFamily(captured.cursorByte, mode, {
         branches, authoritativeFamilyIds: loompadReservoir.familyIds, requireExplicitFamily: true,
         verifiedBodyByRun: verifiedBranchBodyByRun, liveTextByRun: liveBranchTextByRun,
-        liveTextSequenceByRun: liveBranchTextSequenceByRun, currentModel,
+        liveTextSequenceByRun: liveBranchTextSequenceByRun, currentModel: currentWriter,
         document: captured.sourceDocument, suggestionsEnabled: true, promotionReady: true,
         dismissedCandidateIds, unpresentableVisualKeys: unpresentableVisualGhostPresentationKeys,
         manuscriptText: captured.sourceMarkdown, sourceNewline: sourceGhostNewline
@@ -1218,6 +1357,8 @@
   $: completionWitnessSelected = completionView.witnessSelected;
   $: completionAccessibilityWitness = JSON.stringify({
     schema: 'delysis.loom-completion-witness.v1',
+    writer_id: currentWriter?.model_id ?? '',
+    writer_source: configuredWriter ? 'configured_server' : 'native',
     mode,
     context_key: boundCompletionSession?.contextKey ?? '',
     session_cached: Boolean(boundCompletionSession),
@@ -1269,7 +1410,7 @@
       : '';
   $: finishCompletionIfExhausted(completionExhaustionKey);
   $: visualAutocompleteDisposition = autocompleteDisposition({
-    active: mode === 'visual' && document?.summary.relative_path !== '.mine.toml' && completionAutomationEnabled() && !visualMutationPending && branchPromotionReady,
+    active: mode === 'visual' && completionAutomationActive && !visualMutationPending && branchPromotionReady,
     branches: currentReadyBranches,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     dismissedCandidateIds,
@@ -1278,7 +1419,7 @@
     presentationCompatible: visualGhostTextMayBePlainProse
   });
   $: sourceAutocompleteDisposition = autocompleteDisposition({
-    active: mode === 'source' && document?.summary.relative_path !== '.mine.toml' && completionAutomationEnabled() && !sourceDirty && !compositionActive && branchPromotionReady,
+    active: mode === 'source' && completionAutomationActive && !sourceDirty && !compositionActive && branchPromotionReady,
     branches: currentReadyBranches,
     verifiedBodyByRun: verifiedBranchBodyByRun,
     dismissedCandidateIds,
@@ -1295,10 +1436,10 @@
         ? 'Needs attention'
         : !suggestionsEnabled
           ? 'Off'
-          : currentModel
+          : currentWriter
             ? 'Ready'
             : 'Set up';
-  $: nativeWindowTitle = document?.summary.title ?? project?.title ?? 'Loom';
+  $: nativeWindowTitle = activeMaterial?.name ?? (materialsOpen ? 'Add sources' : null) ?? document?.summary.title ?? project?.title ?? 'Loom';
   $: workspaceTheme = workspaceTemplate?.error ? null : workspaceTemplate?.config.theme;
   $: resolvedAppearance = resolveAppearance(appearanceOverride ? appearance : workspaceTheme?.mode ?? 'system', systemDark);
   $: if (desktop) void syncNativeWindowTitle(nativeWindowTitle);
@@ -1341,7 +1482,7 @@
     : visualSelectionByte === 0;
   $: completionLifecycle = automaticCompletionLifecycle({
     desktop,
-    automationEnabled: completionAutomationEnabled(),
+    automationEnabled: completionAutomationActive,
     projectAvailable: Boolean(project),
     documentAvailable: Boolean(document) && document?.summary.relative_path !== '.mine.toml',
     hybridDocument: document?.summary.kind === 'hybrid',
@@ -1350,7 +1491,7 @@
       completionContextKey,
       editVersion
     ),
-    modelAvailable: Boolean(currentModel),
+    modelAvailable: Boolean(currentWriter),
     modelTransitioning: modelLoading || modelUnloading,
     compositionActive,
     visualMutationPending,
@@ -1385,8 +1526,8 @@
   $: retryEvaluationSnapshot = {
     enabled: desktop &&
       branchPromotionReady &&
-      completionAutomationEnabled() &&
-      Boolean(currentModel) &&
+      completionAutomationActive &&
+      Boolean(currentWriter) &&
       activeBranchCount === 0 &&
       completionGenerationIsArmed(completionGenerationIntent, completionContextKey, editVersion),
     disposition: mode === 'visual'
@@ -1499,7 +1640,7 @@
     requireExplicitCompletionFamily = true;
     contextEpoch += 1;
     invalidateCompletionForCaretNavigation();
-    if (completionAutomationEnabled()) scheduleAutomaticSuggestions(editVersion, 0);
+    if (completionAutomationActive) scheduleAutomaticSuggestions(editVersion, 0);
   }
 
   function contextMediaUrl(media: ContextMediaPresentation): string | null {
@@ -1959,7 +2100,7 @@
         if (contextText === snapshot.markdown) {
           contextTextSaveState = 'clean';
           contextEpoch += 1;
-          if (completionAutomationEnabled()) scheduleAutomaticSuggestions(editVersion, 0);
+          if (completionAutomationActive) scheduleAutomaticSuggestions(editVersion, 0);
         } else {
           // A newer edit (including reverting an in-flight save) must be sent
           // after the now-authoritative reply. Never label stale backend text
@@ -2130,22 +2271,26 @@
     }
   }
 
-  async function useImportedSources(items: import('./lib/types').ContextAttachment[]): Promise<boolean> {
-    if (!project || !document || editorReadonly || contextAttachmentBusy || items.length === 0) return false;
-    const captured = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id };
-    contextAttachmentBusy = true;
-    try {
-      if (!await persistCurrentContextText()) return false;
-      if (
-        project?.project_id !== captured.projectId ||
-        project.session_id !== captured.sessionId ||
-        document?.summary.document_id !== captured.documentId ||
-        editorReadonly
-      ) return false;
-      const snapshot = await addDocumentContexts(captured.projectId, captured.sessionId, captured.documentId, [...new Set(items.map((item) => item.id))]);
-      if (!adoptAuthoritativeContext(snapshot, captured.projectId, captured.sessionId, captured.documentId)) return false;
-      return true;
-    } finally { contextAttachmentBusy = false; }
+  async function addImportedSources(items: import('./lib/types').ContextAttachment[], projectId: string, sessionId: string): Promise<void> {
+    const current = () => project?.project_id === projectId && project.session_id === sessionId;
+    const failures: string[] = [];
+    for (const item of items) {
+      if (!current()) return;
+      try {
+        const bound = await bindAttachmentMaterial(projectId, sessionId, item.id);
+        if (current()) materialChanged(bound);
+      } catch (error) { failures.push(`${item.file_name}: ${normalizeFailure(error).message}`); }
+    }
+    if (current() && failures.length) throw new Error(failures.join('\n'));
+  }
+
+  async function openImportedSource(item: import('./lib/types').ContextAttachment, projectId: string, sessionId: string): Promise<void> {
+    if (project?.project_id !== projectId || project.session_id !== sessionId) return;
+    const bound = materialEntries.find(entry => entry.attachment_id === item.id)
+      ?? await bindAttachmentMaterial(projectId, sessionId, item.id);
+    if (project?.project_id !== projectId || project.session_id !== sessionId) return;
+    materialChanged(bound);
+    openMaterial(bound);
   }
 
   async function saveMaterialExcerpt(attachmentId: string, sourceRevision: string, excerpt: string | null): Promise<boolean> {
@@ -2231,16 +2376,24 @@
         project.session_id !== captured.sessionId ||
         document?.summary.document_id !== captured.documentId
       ) return;
-      const report = await importAttachmentPaths(captured.projectId, captured.sessionId, paths);
+      const filePaths = paths.filter(path => !isDatabasePath(path));
+      const libraries = await Promise.all(paths.filter(isDatabasePath).map(path => addLibraryMaterialPath(captured.projectId, captured.sessionId, path)));
+      const report = filePaths.length ? await importAttachmentPaths(captured.projectId, captured.sessionId, filePaths) : { imported: [], failures: [] };
+      if (project?.session_id !== captured.sessionId) return;
+      libraries.forEach(materialChanged);
       const imported = report.imported;
       if (report.failures.length) recordFailure(new Error(report.failures.map((item) => `${item.name}: ${item.message}`).join("\n")));
-      if (!imported.length) return;
+      if (!imported.length && !libraries.length) return;
       if (project?.project_id !== captured.projectId || project.session_id !== captured.sessionId ||
           document?.summary.document_id !== captured.documentId || mode !== captured.mode ||
           (scope === 'inline' && documentText !== captured.markdown)) {
         throw new Error('The editor changed during import. The file is stored; drop it again at the intended location.');
       }
       if (scope === 'context') {
+        if (libraries.length) {
+          updateContextText([contextText, ...libraries.map(materialReferenceMarkdown)].filter(Boolean).join('\n\n'));
+          if (!await persistCurrentContextText()) return;
+        }
         const snapshot = await addDocumentContexts(
             captured.projectId,
             captured.sessionId,
@@ -2254,7 +2407,10 @@
           captured.documentId
         )) return;
       } else {
-        const markdown = imported.map(editableImportMarkdown).join('\n\n');
+        const bound = await Promise.all(imported.map(item => bindAttachmentMaterial(captured.projectId, captured.sessionId, item.id)));
+        if (project?.project_id !== captured.projectId || project.session_id !== captured.sessionId || document?.summary.document_id !== captured.documentId || mode !== captured.mode || documentText !== captured.markdown) throw new Error('The writing changed. Your files are retained in this workspace.');
+        bound.forEach(materialChanged);
+        const markdown = [...libraries.map(materialReferenceMarkdown), ...imported.map((item, index) => importedMaterialMarkdown(item, bound[index]))].join('\n\n');
         const before = sourceAnchor?.value.slice(0, sourceAnchor.start) ?? '';
         const after = sourceAnchor?.value.slice(sourceAnchor.end) ?? '';
         const prefix = before && !before.endsWith('\n\n') ? (before.endsWith('\n') ? '\n' : '\n\n') : '';
@@ -2271,6 +2427,7 @@
     } finally {
       contextAttachmentBusy = false;
       contextDropActive = false;
+      if (project?.session_id === captured.sessionId) void refreshMaterials();
     }
   }
 
@@ -2282,9 +2439,23 @@
     }
   }
 
+  function workspaceFolderAt(point: { x: number; y: number }): string | null {
+    return workspaceCopyDestination(window.document.elementFromPoint(point.x, point.y), outlineElement);
+  }
+
+  async function openMaterialWriting(id: string): Promise<void> {
+    const candidate = project?.documents.find(item => item.document_id === id);
+    if (!candidate) throw new Error('This writing is no longer in the folder.');
+    await selectDocument(candidate, true);
+    if (document?.summary.document_id === id) closeMaterial();
+  }
+
   async function handleNativeDrop(paths: string[], point: { x: number; y: number }): Promise<void> {
     if (fileCommandInFlight || opening || !paths.length) return;
     const captured = { session: project?.session_id, document: document?.summary.document_id, markdown: documentText, mode };
+    const outline = outlineElement?.getBoundingClientRect();
+    const inOutline = Boolean(outlineOpen && outline && point.x >= outline.left && point.x < outline.right && point.y >= outline.top && point.y < outline.bottom);
+    const destination = inOutline ? workspaceFolderAt(point) : null;
     try {
       const directories = await projectDropDirectories(paths);
       if (!componentMounted || applicationClosePhase !== 'running' || fileCommandInFlight || opening ||
@@ -2293,6 +2464,28 @@
       if (directories.length) {
         await openDroppedFolders(directories);
       } else {
+        if (!project) return;
+        if (inOutline) {
+          if (destination === null) return;
+          const projectId = project.project_id;
+          const sessionId = project.session_id;
+          for (const path of paths.filter(isDatabasePath)) {
+            const library = await addLibraryMaterialPath(projectId, sessionId, path);
+            if (project?.session_id !== sessionId) return;
+            materialChanged(library);
+          }
+          const files = paths.filter(path => !isDatabasePath(path));
+          if (!files.length) return;
+          const report = await copyWorkspaceFiles(projectId, sessionId, destination, files);
+          if (project?.session_id !== sessionId) return;
+          report.materials.forEach(materialChanged);
+          const refreshed = await currentProjectSession();
+          if (project?.session_id !== sessionId) return;
+          project = refreshed;
+          if (report.failures.length) recordFailure(new Error(report.failures.map(item => `${item.name}: ${item.message}`).join('\n')));
+          if (report.copied.length) announce(`Copied ${report.copied.length} file${report.copied.length === 1 ? '' : 's'}`);
+          return;
+        }
         const pane = Array.from(window.document.querySelectorAll<HTMLElement>('[data-workspace-pane]')).find(element => {
           const rect = element.getBoundingClientRect();
           return rect.width > 0 && rect.height > 0 && point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom;
@@ -2301,6 +2494,7 @@
         if (paneId && paneEditors[paneId]) {
           await paneEditors[paneId].importDroppedPaths(paths, point);
           await refreshDocumentContext();
+          await refreshMaterials();
           return;
         }
         const scope = nativeAttachmentDropScope(point);
@@ -2316,15 +2510,18 @@
       if (payload.type === 'leave') {
         contextDropActive = false;
         workspaceDropActive = false;
+        workspaceDropFolder = null;
         return;
       }
       const point = nativeDropPoint(payload.position);
       const outline = outlineElement?.getBoundingClientRect();
       const inOutline = Boolean(outlineOpen && outline && point.x >= outline.left && point.x < outline.right && point.y >= outline.top && point.y < outline.bottom);
-      workspaceDropActive = inOutline;
+      workspaceDropFolder = inOutline ? workspaceFolderAt(point) : null;
+      workspaceDropActive = inOutline && workspaceDropFolder !== null;
       if (payload.type === 'drop') {
         workspaceDropActive = false;
         contextDropActive = false;
+        workspaceDropFolder = null;
         void handleNativeDrop(payload.paths, point);
         return;
       }
@@ -3852,8 +4049,8 @@
       !desktop ||
       !project ||
       !document ||
-      !currentModel ||
-      !completionAutomationEnabled() ||
+      !currentWriter ||
+      !completionAutomationActive ||
       !branchPromotionReady
     ) return;
     const sourceRevisionId = document.summary.revision_id;
@@ -3891,7 +4088,7 @@
         intentEpoch: completionController.intentEpoch,
         mode: retryMode,
         targetByte,
-        modelId: currentModel.model_id,
+        modelId: currentWriter.model_id,
         sourceNewline: retryMode === 'source' ? sourceGhostNewline : null,
         waitsRemaining: maximumAutocompleteRetryWaits
       });
@@ -4290,7 +4487,7 @@
   function queuePreferredWriterRequest(captured: WorkspaceRestoreCapture): void {
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !workspaceRestoreIsCurrent(captured)
     ) return;
     preferredWriterPending = { ...captured };
@@ -4319,8 +4516,8 @@
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
       !captured ||
-      !completionAutomationEnabled() ||
-      currentModel || unavailableWorkspaceWriterKey === workspaceWriterKey()
+      !completionAutomationActive ||
+      currentWriter || unavailableWorkspaceWriterKey === workspaceWriterKey()
     ) return;
     requestPreferredWriterEnsure(captured);
   }
@@ -4328,14 +4525,14 @@
   function drainPreferredWriterEnsure(): Promise<boolean> {
     if (preferredWriterEnsureInFlight) return preferredWriterEnsureInFlight;
     const captured = preferredWriterPending;
-    if (!captured) return Promise.resolve(Boolean(currentModel));
+    if (!captured) return Promise.resolve(Boolean(currentWriter));
     if (unavailableWorkspaceWriterKey === workspaceWriterKey()) {
       clearPreferredWriterRequest(captured);
       return Promise.resolve(false);
     }
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !workspaceRestoreIsCurrent(captured)
     ) {
       clearPreferredWriterRequest(captured);
@@ -4365,11 +4562,11 @@
   ): Promise<boolean> {
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !workspaceRestoreIsCurrent(captured)
     ) return false;
     if (!await prepareWorkspaceWriterTemplate(captured)) return false;
-    if (currentModel) {
+    if (currentWriter) {
       if (document) scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
       return true;
     }
@@ -4377,7 +4574,7 @@
     const refreshed = await refreshModels(captured);
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !workspaceRestoreIsCurrent(captured)
     ) return false;
     if (!refreshed && modelRefreshInFlightCount > 0) {
@@ -4386,7 +4583,7 @@
     }
     await tick();
     if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
-    if (currentModel) {
+    if (currentWriter) {
       if (document) scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'model_ready');
       return true;
     }
@@ -4401,12 +4598,13 @@
     const refreshSerial = ++modelRefreshSerial;
     modelRefreshInFlightCount += 1;
     try {
-      const discovered = await listModels();
+      const [discovered, inference] = await Promise.all([listModels(), getInferenceStatus()]);
       if (
         !componentMounted ||
         refreshSerial !== modelRefreshSerial ||
         (expectedWorkspace && !workspaceRestoreIsCurrent(expectedWorkspace))
       ) return false;
+      configuredWriter = inference.suggestions;
       models = discovered;
       const rememberedPath = loadLastLocalModelPath();
       selectedModelPath = workspaceTemplate?.model_path ?? preferredWriterModelPath(
@@ -4652,6 +4850,7 @@
 
   function captureDocumentContextTarget(summary: DocumentSummary): CapturedDocumentTarget | null {
     if (!project) return null;
+    activeMaterialEvidence = null; activeMaterial = null; materialsOpen = false; materialOrigin = null;
     const target = captureDocumentTarget(project, summary);
     if (!target) {
       announce(`${summary.title} does not expose a complete active revision yet`);
@@ -4766,6 +4965,7 @@
   }
 
   function handleDocumentRowClick(event: MouseEvent, summary: DocumentSummary): void {
+    if (activeMaterial || materialsOpen) { closeMaterial(); if (summary.document_id === document?.summary.document_id) return; }
     if (documentContextSuppressClickId === summary.document_id) {
       documentContextSuppressClickId = null;
       if (documentContextSuppressClickTimer !== undefined) {
@@ -4785,6 +4985,7 @@
       if (target) void beginDocumentRename(target, event.currentTarget as HTMLElement);
       return;
     }
+    if (activeMaterial || materialsOpen) { closeMaterial(); if (summary.document_id === document?.summary.document_id) return; }
     void selectDocument(summary, true);
   }
 
@@ -5427,7 +5628,7 @@
         clearPreferredWriterRequest();
         scheduleActiveBranchPoll();
       }
-      let writerReady = Boolean(currentModel);
+      let writerReady = Boolean(currentWriter);
       if (automationEnabled && !writerReady) {
         const captured: WorkspaceRestoreCapture = {
           restoreSerial: workspaceRestoreSerial,
@@ -5435,11 +5636,11 @@
           sessionId: boundProject.session_id
         };
         requestPreferredWriterEnsure(captured);
-        writerReady = Boolean(currentModel);
+        writerReady = Boolean(currentWriter);
       }
       announce(enabled
         ? writerReady
-          ? 'Suggestions on; Loom will quietly prepare private strands when typing pauses'
+          ? 'Suggestions on; Loom will quietly prepare strands when typing pauses'
           : 'Suggestions on; Loom is preparing a tested local writer'
         : 'Suggestions off');
       if (engineBecameEnabled && writerReady && document) {
@@ -5561,7 +5762,7 @@
     if (!quiet) {
       announce(`${loaded.display_name} is verified for exact local completion`);
     }
-    if (completionAutomationEnabled() && loaded.completion && document) {
+    if (completionAutomationActive && loaded.completion && document) {
       await tick();
       if (!applicationAllowsModelPreparation(applicationClosePhase)) return false;
       if (quiet) announce('Suggestions ready');
@@ -5990,9 +6191,9 @@
       return false;
     }
 
-    if (suggestionsEnabled && currentModel && document) {
+    if (suggestionsEnabled && currentWriter && document) {
       scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
-    } else if (suggestionsEnabled && !currentModel) {
+    } else if (suggestionsEnabled && !currentWriter) {
       queuePreferredWriterRequest(captured);
     }
     return true;
@@ -6005,7 +6206,7 @@
     if (!workspaceRestoreIsCurrent(captured)) return;
     await recoverModelDownloads();
     if (!workspaceRestoreIsCurrent(captured)) return;
-    if (!shouldDiscoverModelsOnStartup(completionAutomationEnabled())) return;
+    if (!shouldDiscoverModelsOnStartup(completionAutomationActive)) return;
     requestPreferredWriterEnsure(captured);
   }
 
@@ -6614,6 +6815,7 @@
         transition = 'idle';
         wakePreferredWriterEnsure();
         if (focusWritingSurface && document?.summary.document_id === target.documentId) {
+          showMainPane();
           await tick();
           if (
             applicationClosePhase === 'running' &&
@@ -6944,7 +7146,7 @@
     completionController = setCompletionSchedule(completionController, null);
     if (
       !desktop ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !project ||
       !document ||
       !completionGenerationIsArmed(
@@ -7016,8 +7218,8 @@
     if (
       !project ||
       !document ||
-      !currentModel ||
-      !completionAutomationEnabled() ||
+      !currentWriter ||
+      !completionAutomationActive ||
       project.project_id !== ticket.projectId ||
       project.session_id !== ticket.sessionId ||
       document.summary.document_id !== ticket.documentId ||
@@ -7027,7 +7229,7 @@
       editVersion !== ticket.editVersion ||
       completionController.intentEpoch !== ticket.intentEpoch ||
       mode !== ticket.mode ||
-      currentModel.model_id !== ticket.modelId ||
+      currentWriter.model_id !== ticket.modelId ||
       sourceGhostNewline !== ticket.sourceNewline ||
       !branchPromotionReady
     ) return null;
@@ -7064,7 +7266,7 @@
       terminalIsBusy() ||
       completionController.scheduled !== schedule ||
       targetEditVersion !== editVersion ||
-      !completionAutomationEnabled() ||
+      !completionAutomationActive ||
       !project ||
       !document ||
       !completionGenerationIsArmed(
@@ -7690,7 +7892,7 @@
       completionController,
       activeSuggestionFamily,
       offset,
-      loompadActive
+      true
     );
     if (cycled.state === completionController) return;
     completionController = cycled.state;
@@ -7737,13 +7939,13 @@
         shuttleTimer = undefined;
         shuttleTimerKey = '';
       }
-      const automationEnabled = completionAutomationEnabled();
+      const automationEnabled = completionAutomationActive;
       if (!automationEnabled) {
         clearPreferredWriterRequest();
         cancelSuggestionTimer();
         scheduleActiveBranchPoll();
       }
-      let writerReady = Boolean(currentModel);
+      let writerReady = Boolean(currentWriter);
       if (automationEnabled && !writerReady) {
         const captured: WorkspaceRestoreCapture = {
           restoreSerial: workspaceRestoreSerial,
@@ -7752,7 +7954,7 @@
         };
         await tick();
         requestPreferredWriterEnsure(captured);
-        writerReady = Boolean(currentModel);
+        writerReady = Boolean(currentWriter);
       }
       if (engineBecameEnabled && writerReady && document) {
         scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'explicit_enable');
@@ -7956,11 +8158,39 @@
   }
 
   function handleAttachmentLink(event: MouseEvent): void {
-    const link = event.target instanceof Element ? event.target.closest('a[href^="loom-attachment:"]') : null;
-    if (!link) return;
+    const link = event.target instanceof Element ? event.target.closest('a[href^="loom-attachment:"], a[href^="loom-material:"], a[href^="loom-evidence:"]') : null;
+    if (!link || !project) return;
     event.preventDefault(); event.stopPropagation();
-    const id = link.getAttribute('href')?.match(/^loom-attachment:([a-f0-9]{64})$/u)?.[1];
-    if (project && id) void revealAttachmentOriginal(project.project_id, project.session_id, id).catch(recordFailure);
+    const href = link.getAttribute('href') ?? '';
+    const evidenceId = href.match(/^loom-evidence:([a-f0-9]{64})$/u)?.[1];
+    if (evidenceId) {
+      const captured = { projectId: project.project_id, sessionId: project.session_id };
+      captureMaterialOrigin();
+      void readMaterialEvidence(captured.projectId, captured.sessionId, '', evidenceId).then(evidence => {
+        if (project?.session_id !== captured.sessionId) return;
+        const item = materialEntries.find(entry => entry.id === evidence.material_id) ?? {
+          id: evidence.material_id, name: evidence.title, reference: evidence.reference, kind: evidence.material_id.startsWith('folder-') ? 'folder' as const : 'attachment' as const,
+          pinned: false, available: false, source_path: null, attachment_id: null
+        };
+        openMaterial(item); activeMaterialEvidence = evidence;
+      }).catch(recordFailure);
+      return;
+    }
+    const materialId = href.match(/^loom-material:(material-[a-f0-9]{64})$/u)?.[1];
+    if (materialId) {
+      const item = materialEntries.find(entry => entry.id === materialId);
+      if (item) openMaterial(item);
+      else recordFailure(new Error('This source is no longer available in this workspace.'));
+      return;
+    }
+    const attachmentId = href.match(/^loom-attachment:([a-f0-9]{64})$/u)?.[1];
+    if (attachmentId) {
+      const captured = { projectId: project.project_id, sessionId: project.session_id };
+      void bindAttachmentMaterial(captured.projectId, captured.sessionId, attachmentId).then(item => {
+        if (project?.session_id !== captured.sessionId) return;
+        materialChanged(item); openMaterial(item);
+      }).catch(recordFailure);
+    }
   }
 
   function handleGlobalKeydownCapture(event: KeyboardEvent): void {
@@ -7978,6 +8208,8 @@
 
   function handleGlobalKeydown(event: KeyboardEvent): void {
     if (event.defaultPrevented) return;
+    if (event.key === 'Escape' && addMenuOpen) { event.preventDefault(); addMenuOpen = false; return; }
+    if (event.key === 'Escape' && (activeMaterial || materialsOpen)) { event.preventDefault(); closeMaterial(); return; }
     if (event.key === 'Escape' && spokenAudio) { event.preventDefault(); stopReadAloud(); return; }
     if (event.key === 'Escape' && documentContextTarget) {
       event.preventDefault();
@@ -8021,6 +8253,8 @@
     }
     if (modifier && event.shiftKey && !event.altKey && !event.isComposing) {
       const key = event.key.toLowerCase();
+      if (key === 'c' && document) { event.preventDefault(); if (materialsOpen) closeMaterial(); else openMaterialConnections(); return; }
+      if (key === 'g') { event.preventDefault(); void setSuggestionsEnabled(!suggestionsEnabled); return; }
       if (key === 'p') { event.preventDefault(); openModelManager(window.document.activeElement as HTMLElement); return; }
       if (key === 'u') { event.preventDefault(); void readAloud(); return; }
       if (key === 'r') { event.preventDefault(); void reloadModelFromSettings(); return; }
@@ -8056,6 +8290,7 @@
   }
 
   function handleGlobalPointerdown(event: PointerEvent): void {
+    if (addMenuOpen && event.target instanceof Element && !event.target.closest('.material-add-menu, .new-document-button')) addMenuOpen = false;
     if (
       coWriterOpen &&
       event.target instanceof Node &&
@@ -8156,8 +8391,8 @@
       contextEpoch === captured.contextEpoch &&
       editVersion === captured.editVersion &&
       completionController.intentEpoch === captured.intentEpoch &&
-      currentModel?.model_id === captured.modelId &&
-      completionAutomationEnabled()
+      currentWriter?.model_id === captured.modelId &&
+      completionAutomationActive
     );
   }
 
@@ -8297,7 +8532,7 @@
   }
 
   async function startAutomaticWeave(): Promise<boolean> {
-    if (loompadBackgroundPaused() || terminalIsBusy() || weaveStarting || !project || !document || !currentModel) return false;
+    if (loompadBackgroundPaused() || terminalIsBusy() || weaveStarting || !project || !document || !currentWriter) return false;
     const startingEditVersion = editVersion;
     if (compositionActive || !flushEditors()) return false;
     if (editVersion !== startingEditVersion) {
@@ -8330,7 +8565,7 @@
       cursorByte,
       editVersion,
       intentEpoch: completionController.intentEpoch,
-      modelId: currentModel.model_id,
+      modelId: currentWriter.model_id,
       sourceDocument: document,
       sourceMarkdown: documentText
     };
@@ -8362,7 +8597,7 @@
         uncertainWeave = null;
         if (started.branches.some(isBranchActive)) scheduleWeaveStatusPoll(captured);
         announce(started.branches.some(isBranchActive)
-          ? 'Suggestions are growing privately'
+          ? 'Suggestions are growing'
           : 'Stored strands were recovered');
       } else {
         await cancelDetachedWeave(started, captured);
@@ -9115,7 +9350,7 @@
     await tick();
     if (contextPaneOpen) focusContextEditorAtEnd();
     else focusCurrentWritingSurfaceAtEnd();
-    if (completionAutomationEnabled() && currentModel && document) {
+    if (completionAutomationActive && currentWriter && document) {
       scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
     }
     announce(`${next} editor mode`);
@@ -9147,7 +9382,7 @@
       project.session_id === closing.session_id
     );
     const agency = pendingCloseAgency;
-    const restoreAutomation = agency?.suggestionsEnabled ?? completionAutomationEnabled();
+    const restoreAutomation = agency?.suggestionsEnabled ?? completionAutomationActive;
     const restoreSuggestions = pendingCloseInlineSuggestionsEnabled ?? suggestionsEnabled;
     const restoreShuttle = pendingCloseShuttleEnabled ?? shuttleEnabled;
     if (agency && sameSession) {
@@ -9191,7 +9426,7 @@
       applicationAllowsModelPreparation(applicationClosePhase)
     ) {
       requestPreferredWriterForCurrentWorkspace();
-      if (currentModel && document) {
+      if (currentWriter && document) {
         scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'document_open');
       }
     }
@@ -9292,7 +9527,7 @@
       // Stop new automatic admission before native close drains any reserved
       // startup already in flight. Keep the persisted preference unchanged so
       // a later reopen can restore the author's choice deliberately.
-      pendingCloseAgency ??= captureProjectCloseAgency(completionAutomationEnabled());
+      pendingCloseAgency ??= captureProjectCloseAgency(completionAutomationActive);
       pendingCloseInlineSuggestionsEnabled ??= suggestionsEnabled;
       pendingCloseShuttleEnabled ??= shuttleEnabled;
       suggestionsEnabled = false;
@@ -9516,11 +9751,23 @@
     if (deferredWorkspaceTemplate) acceptWorkspaceSettings(deferredWorkspaceTemplate);
   }
 
+  function showMainPane(): void {
+    if (!hiddenPaneSlots.has('main')) return;
+    const next = new Set(hiddenPaneSlots);
+    next.delete('main');
+    hiddenPaneSlots = next;
+  }
+
   function togglePane(position: 'main' | 'right' | 'bottom'): void {
-    if (!flushEditors() || busyPaneSlots.has(position)) return;
+    // Collapsing only changes presentation. Mounted editors and active runs
+    // retain their state, so a busy pane must never trap its owner on screen.
     const next = new Set(hiddenPaneSlots);
     if (next.has(position)) next.delete(position); else next.add(position);
     hiddenPaneSlots = next;
+    if (position === 'main' && next.has('main')) {
+      cancelSuggestionTimer();
+      void cancelActiveBranches();
+    }
   }
 
   function selectPane(position: 'main' | 'right' | 'bottom', id: string): void {
@@ -9579,11 +9826,19 @@
           <button
             class="titlebar-button new-document-button"
             type="button"
-            aria-label="New document"
-            title="New document (⌘N)"
+            aria-label="Add" aria-expanded={addMenuOpen} aria-haspopup="menu"
+            title="Add"
             disabled={fileCommandInFlight || editorReadonly}
-            on:click={() => void newDocument()}
+            on:click={() => addMenuOpen = !addMenuOpen}
           ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
+          {#if addMenuOpen}
+            <div class="material-add-menu" role="menu" aria-label="Add">
+              <button role="menuitem" title="New document (⌘N)" on:click={() => { addMenuOpen = false; closeMaterial(); void newDocument(); }}>New document</button>
+              <button role="menuitem" on:click={() => void chooseMaterialFiles()}>Add files…</button>
+              <button role="menuitem" on:click={() => void chooseMaterialLibrary()}>Open library…</button>
+              <button role="menuitem" on:click={openMaterialConnections}>Connect sources…</button>
+            </div>
+          {/if}
         {/if}
 
       </div>
@@ -9593,14 +9848,19 @@
         on:mousedown={startTitlebarDrag}
       ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
       <div class="canvas-controls-right" data-no-window-drag>
-        {#each paneSlots.filter(slot => slot.position !== 'main' && slot.selected) as slot (slot.position)}
+        {#each paneSlots.filter(slot => slot.selected) as slot (slot.position)}
           {@const title = slot.selected![1].title ?? slot.selected![0]}
           <button class="titlebar-button" class:active={!hiddenPaneSlots.has(slot.position)} type="button"
-            aria-label={`${hiddenPaneSlots.has(slot.position) ? 'Show' : 'Hide'} ${title}`} aria-pressed={!hiddenPaneSlots.has(slot.position)} title={title}
-            disabled={busyPaneSlots.has(slot.position)} on:click={() => togglePane(slot.position)}>
-            <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/>{#if slot.position === 'right'}<path d="M10 2.5v11"/>{:else}<path d="M2 10h12"/>{/if}</svg>
+            aria-label={`${hiddenPaneSlots.has(slot.position) ? 'Show' : 'Collapse'} ${title}`} aria-pressed={!hiddenPaneSlots.has(slot.position)} title={title}
+            on:click={() => togglePane(slot.position)}>
+            <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/>{#if slot.position === 'right'}<path d="M10 2.5v11"/>{:else if slot.position === 'bottom'}<path d="M2 10h12"/>{:else}<path d="M5 2.5v11M11 2.5v11"/>{/if}</svg>
           </button>
         {/each}
+        {#if project && !mainPane}
+          <button class="titlebar-button" class:active={mainPaneOpen} type="button" aria-label={mainPaneOpen ? 'Collapse main pane' : 'Show main pane'} aria-pressed={mainPaneOpen} title="Main pane" on:click={() => togglePane('main')}>
+            <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/><path d="M5 2.5v11M11 2.5v11"/></svg>
+          </button>
+        {/if}
         {#if document && mode === 'visual' && canUseVisual && (!contextPaneOpen || canUseVisualMarkdown(contextText, true))}
           <VisualFormatMenu
             bind:this={formatMenu}
@@ -9614,7 +9874,7 @@
             }}
           />
         {/if}
-        {#if document}
+        {#if document && !activeMaterial && !materialsOpen}
           <button
             class:recording={Boolean(speechRecording) && !speechError}
             class:transcribing={Boolean(speechInput)}
@@ -9638,18 +9898,20 @@
           ><svg aria-hidden="true" viewBox="0 0 18 18"><rect x="6.4" y="2.5" width="5.2" height="8.3" rx="2.6"/><path d="M4.4 8.8a4.6 4.6 0 0 0 9.2 0M9 13.4v2.1M6.8 15.5h4.4"/></svg></button>
           <span id="speech-input-help" class="sr-only">{speechError || (speechRecording ? 'Recording locally' : speechInput ? 'Recognizing speech locally' : 'Audio stays on this device and is attached to this document')}</span>
         {/if}
-        <div class="completion-mode-toggle" role="group" aria-label="Writing suggestions">
-          <button class="titlebar-button suggestions-toggle" class:active={suggestionsEnabled && suggestionInteraction === 'ghost'}
-            type="button" aria-label="Ghost text" aria-pressed={suggestionsEnabled && suggestionInteraction === 'ghost'}
-            title="Ghost text" disabled={!project || suggestionsChanging} on:click={() => void setSuggestionInteraction('ghost')}>
+        {#if !activeMaterial && !materialsOpen}
+        <button class="titlebar-button" class:suggestions-toggle={suggestionInteraction === 'ghost'} class:loompad-toggle={suggestionInteraction === 'loompad'}
+          class:active={suggestionsEnabled} type="button"
+          aria-label={suggestionInteraction === 'ghost' ? 'Ghost text' : 'Loompad'}
+          title={suggestionsEnabled ? (suggestionInteraction === 'ghost' ? 'Switch to Loompad' : 'Switch to ghost text') : 'Enable suggestions'}
+          disabled={!project || suggestionsChanging}
+          on:click={() => void setSuggestionInteraction(suggestionsEnabled ? (suggestionInteraction === 'ghost' ? 'loompad' : 'ghost') : suggestionInteraction)}>
+          {#if suggestionInteraction === 'ghost'}
             <svg aria-hidden="true" viewBox="0 0 18 18"><path d="M3.5 15V8a5.5 5.5 0 0 1 11 0v7l-2.75-2-2.75 2-2.75-2-2.75 2Z"/><path d="M7 7v1M11 7v1"/></svg>
-          </button>
-          <button class="titlebar-button loompad-toggle" class:active={loompadActive}
-            type="button" aria-label="Loompad" aria-pressed={loompadActive} title="Loompad"
-            disabled={!project || suggestionsChanging} on:click={() => void setSuggestionInteraction('loompad')}>
+          {:else}
             <svg aria-hidden="true" viewBox="0 0 20 18"><rect x="7.5" y="2" width="5" height="5" rx="1"/><rect x="1.5" y="8.5" width="5" height="5" rx="1"/><rect x="7.5" y="8.5" width="5" height="5" rx="1"/><rect x="13.5" y="8.5" width="5" height="5" rx="1"/></svg>
-          </button>
-        </div>
+          {/if}
+        </button>
+        {/if}
 
       </div>
     </div>
@@ -9660,7 +9922,7 @@
       <div class="error-banner" role="alert">{workspaceTemplate.error}<button type="button" class="bare-button compact" on:click={() => void refreshWorkspaceTemplate(true)}>Open settings file</button></div>
     {/if}
     <div bind:clientWidth={workspaceWidth} bind:clientHeight={workspaceHeight} class:outline-open={outlineOpen} class="workspace-grid"
-      style={`grid-template-columns:${outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0}px minmax(0,1fr) ${rightPaneOpen ? Math.min(rightWidth, rightLimit) : 0}px; grid-template-rows:minmax(0,1fr) ${bottomPaneOpen ? Math.min(bottomHeight, workspaceHeight * 0.6) : 0}px;`}>
+      style={`grid-template-columns:${outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0}px ${mainColumn} ${sideColumn}; grid-template-rows:${bottomOnly ? '0px minmax(0,1fr)' : `minmax(0,1fr) ${bottomPaneOpen ? Math.min(bottomHeight, workspaceHeight * 0.6) : 0}px`};`}>
       <aside
         id="project-outline"
         bind:this={outlineElement}
@@ -9678,7 +9940,7 @@
         <nav class="document-list" aria-label="Workspace folders">
           {#each visibleWorkspaceFolders as folder (folder.root)}
             {@const active = folder.root === project.root}
-            <button class="folder-row workspace-root" class:active type="button" title={folder.root}
+            <button class="folder-row workspace-root" class:active class:drop-target={active && workspaceDropFolder === ''} data-copy-folder={active ? '' : undefined} type="button" title={folder.root}
               aria-label={`${active && workspaceRootExpanded ? 'Collapse' : 'Open'} folder ${folder.title}`}
               aria-expanded={active && workspaceRootExpanded} disabled={fileCommandInFlight || opening}
               on:click={() => { if (active) workspaceRootExpanded = !workspaceRootExpanded; else void doOpenProject(folder.root); }}>
@@ -9688,8 +9950,13 @@
             <div class="workspace-root-documents">
           {#each fileRows as row (row.path)}
             {#if row.folder}
-              <button class="folder-row" type="button" style={`padding-left: ${8 + row.depth * 14}px`} aria-expanded={!collapsedFolders.has(row.path) || Boolean(search.trim())} on:click={() => { const next = new Set(collapsedFolders); if (next.has(row.path)) next.delete(row.path); else next.add(row.path); collapsedFolders = next; }}>
+              <button class="folder-row" class:drop-target={workspaceDropFolder === row.path} data-copy-folder={row.path} type="button" style={`padding-left: ${8 + row.depth * 14}px`} aria-expanded={!collapsedFolders.has(row.path) || Boolean(search.trim())} on:click={() => { const next = new Set(collapsedFolders); if (next.has(row.path)) next.delete(row.path); else next.add(row.path); collapsedFolders = next; }}>
                 <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{row.title}</span>
+              </button>
+            {:else if 'material' in row}
+              <button class="folder-row material-row" class:active={activeMaterial?.id === row.material.id} type="button" title={row.path}
+                style={`padding-left: ${8 + row.depth * 14}px`} on:click={() => openMaterial(row.material)}>
+                <span>{row.material.name}</span>{#if row.material.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}
               </button>
             {:else}
             {@const candidate = row.document}
@@ -9755,23 +10022,18 @@
             {/if}
             {/if}
           {:else}
-            <p class="empty-copy">No notes.</p>
+            {#if !visibleMaterials.length}<p class="empty-copy">No notes.</p>{/if}
+          {/each}
+          {#each visibleMaterials as item (item.id)}
+            <button class="folder-row material-row" class:active={activeMaterial?.id === item.id} type="button" title={item.name}
+              on:click={() => openMaterial(item)}>
+              <svg aria-hidden="true" viewBox="0 0 16 16">{#if item.kind === 'library'}<path d="M2 4h4l1.5 1.5H14v7H2Z"/>{:else}<path d="M4 2h5l3 3v9H4Z M9 2v4h3"/>{/if}</svg>
+              <span>{item.name}</span>{#if item.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}
+            </button>
           {/each}
             </div>
             {/if}
           {/each}
-          {#if desktop && document}
-            {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
-              <ImportSources projectId={project.project_id} sessionId={project.session_id} documentTitle={document.summary.title} onUse={useImportedSources}
-                googleClientConfigured={workspaceTemplateScope === `${project.project_id}/${project.session_id}` && !workspaceTemplate?.error && Boolean(workspaceTemplate?.google_client_configured)}
-                onSettings={() => void refreshWorkspaceTemplate(true)} />
-            {/key}
-          {/if}
-          {#if desktop && document}
-            {#key `${project.project_id}:${project.session_id}:${document.summary.document_id}`}
-              <DocumentMaterials title={document.summary.title} instructions={contextText} attachments={contextAttachments} disabled={editorReadonly || contextAttachmentBusy} error={contextLoadError} onInstructions={updateContextText} onFlush={flushContextText} onRemove={(id) => void removeContextAttachment(id)} onSave={saveMaterialExcerpt} />
-            {/key}
-          {/if}
         </nav>
         {#if folderWarnings.length > 0}
           <details class="folder-warnings">
@@ -9837,7 +10099,22 @@
         {/if}
       </aside>
 
-      <main id="manuscript" class="manuscript-area" tabindex="-1" class:workspace-main-hidden={customMain}>
+      <main id="manuscript" class="manuscript-area" tabindex="-1" class:workspace-main-hidden={!mainPaneOpen || (customMain && !activeMaterial && !materialsOpen)}>
+        {#if activeMaterial}
+          {#key `${project.session_id}/${activeMaterial.id}/${activeMaterialEvidence?.id ?? ""}`}
+            <MaterialView projectId={project.project_id} sessionId={project.session_id} material={activeMaterial}
+              initialEvidence={activeMaterialEvidence} originTitle={materialOrigin?.title ?? null} onClose={closeMaterial} onUse={useMaterialReference} onOpenDocument={openMaterialWriting}
+              removable={materialEntries.some(item => item.id === activeMaterial?.id)} onRemoved={materialRemoved} onChanged={materialChanged} onReopen={() => void chooseMaterialLibrary()} />
+          {/key}
+        {:else if materialsOpen}
+          <section class="material-connect-view" aria-label="Add sources">
+            <PaneHeader title="Add sources" onCollapse={closeMaterial} />
+            {#if document}{#key project.session_id}<ImportSources projectId={project.project_id} sessionId={project.session_id} onOpen={openImportedSource} onImported={addImportedSources}
+              googleClientConfigured={workspaceTemplateScope === `${project.project_id}/${project.session_id}` && !workspaceTemplate?.error && Boolean(workspaceTemplate?.google_client_configured)}
+              onSettings={() => void refreshWorkspaceTemplate(true)} />{/key}{/if}
+          </section>
+        {/if}
+        <div class="writing-content" class:material-covered={Boolean(activeMaterial) || materialsOpen} inert={Boolean(activeMaterial) || materialsOpen}>
         {#if document && contextPaneOpen}
           <div
             bind:this={contextPaneElement}
@@ -10060,7 +10337,7 @@
             </div>
           {/if}
 
-          <section class="editor-stage" data-attachment-drop="inline" aria-label="Writing surface" on:focusin={(event) => rememberSpeechEditor(event, 'manuscript')}>
+          <section class="editor-stage" data-attachment-drop="inline" aria-label="Writing surface" on:focusin={(event) => { materialOriginPane = null; rememberSpeechEditor(event, 'manuscript'); }}>
             {#if showVisual}
               <div class="editor-pane visual-pane" aria-label="Visual editor pane">
                 {#if exactTextSurface}
@@ -10192,23 +10469,19 @@
             {/if}
           </section>
         {/if}
+        </div>
       </main>
       {#each paneSlots as slot (slot.position)}
         {#if slot.selected && (slot.position !== 'main' || customMain)}
           {@const selected = slot.selected}
-          <aside class:hidden-pane={hiddenPaneSlots.has(slot.position)} class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
+          <aside class:hidden-pane={hiddenPaneSlots.has(slot.position) || (slot.position === 'main' && (Boolean(activeMaterial) || materialsOpen))} class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
             {#if slot.position === 'right'}<PaneDivider edge="left" label="Resize right pane" size={Math.min(rightWidth, rightLimit)} min={180} max={rightLimit} onResize={(size) => rightWidth = size} />{/if}
             {#if slot.position === 'bottom'}<PaneDivider edge="top" label="Resize bottom pane" size={Math.min(bottomHeight, workspaceHeight * 0.6)} min={100} max={workspaceHeight * 0.6} onResize={(size) => bottomHeight = size} />{/if}
-            <header class="workspace-pane-header">
-              {#if slot.choices.length > 1}
-                <select aria-label="Pane" value={selected[0]} disabled={busyPaneSlots.has(slot.position)} on:change={(event) => selectPane(slot.position, event.currentTarget.value)}>
-                  {#each slot.choices as [id, config]}<option value={id}>{config.title ?? id}</option>{/each}
-                </select>
-              {:else}<span>{selected[1].title ?? selected[0]}</span>{/if}
-            </header>
+            <PaneHeader title={selected[1].title ?? selected[0]} choices={slot.choices} selected={selected[0]}
+              selectionDisabled={busyPaneSlots.has(slot.position)} onSelect={(id) => selectPane(slot.position, id)} onCollapse={() => togglePane(slot.position)} />
             {#each slot.choices as [paneId, paneConfig] (paneId)}
               <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
-            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
+            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
               </div>
             {/each}
           </aside>
@@ -10246,6 +10519,8 @@
         modelLabel={currentModel?.display_name ?? ''}
         onRun={() => void runRetainedOutput(terminalEntry)}
         onCancel={() => void stopTerminalRun()}
+        pinnedOutputs={pinnedOutputs}
+        onPin={(run) => run.output_document_id && toggleOutputPin(run.output_document_id)}
         onOpen={(run) => void openTerminalOutput(run)}
         onClose={closeTerminal}
       />

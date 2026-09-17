@@ -1,7 +1,7 @@
 use crate::{BoundedText, DocumentLimits, ProcessorFailure, RenderResult, RenderedDocument};
 use attachment_native_types::{SegmentKind, TextFormat, TextSegment};
-use lopdf::{Document, LoadOptions};
-use std::collections::BTreeMap;
+use lopdf::{Document, LoadOptions, Object, ObjectId};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) struct PdfOutcome {
     pub text: RenderResult,
@@ -29,7 +29,7 @@ pub(crate) fn canonicalize_pdf(
         max_decompressed_size: Some(limits.max_pdf_page_decompressed_bytes),
         ..LoadOptions::default()
     };
-    let document = match Document::load_mem_with_options(bytes, options) {
+    let mut document = match Document::load_mem_with_options(bytes, options) {
         Ok(document) => document,
         Err(_) => {
             return PdfOutcome {
@@ -45,14 +45,25 @@ pub(crate) fn canonicalize_pdf(
         }
     };
     let page_limit = usize::try_from(limits.max_pdf_pages).unwrap_or(usize::MAX);
-    let all_pages = document.get_pages().keys().copied().collect::<Vec<_>>();
+    let all_pages = document.get_pages();
     let mut output = BoundedText::new(max_output_bytes);
     output.push("# PDF\n\n");
     let mut segments = Vec::new();
     let mut warnings = Vec::new();
     let mut issues = Vec::new();
     let mut extracted_pages = 0_u32;
-    for page in all_pages.iter().take(page_limit) {
+    for (page, page_id) in all_pages.iter().take(page_limit) {
+        if expose_inherited_resources(&mut document, *page_id).is_none() {
+            let failure = ProcessorFailure::partial(
+                "pdf_page_resources_unavailable",
+                format!(
+                    "PDF page {page} has invalid or excessively nested inherited resources and was omitted."
+                ),
+            );
+            warnings.push(failure.safe_message.clone());
+            issues.push(failure);
+            continue;
+        }
         let heading = format!("## Page {page}\n\n");
         let page_output_budget = output.remaining().saturating_sub(heading.len() + 2);
         if page_output_budget == 0 {
@@ -158,6 +169,40 @@ pub(crate) fn canonicalize_pdf(
     }
 }
 
+/// lopdf 0.44 only discovers inherited resource dictionaries by reference.
+/// Promote a valid inline ancestor dictionary in the parsed working copy. Move
+/// it once, rather than cloning potentially large font/resource maps per page;
+/// the original PDF bytes and retained text are never rewritten.
+fn expose_inherited_resources(document: &mut Document, page_id: ObjectId) -> Option<()> {
+    let mut current = page_id;
+    let mut visited = BTreeSet::new();
+    for _ in 0..128 {
+        if !visited.insert(current) {
+            return None;
+        }
+        let node = document.get_dictionary(current).ok()?;
+        if let Ok(resources) = node.get(b"Resources") {
+            if current != page_id && matches!(resources, Object::Dictionary(_)) {
+                let resources = document
+                    .get_dictionary_mut(current)
+                    .ok()?
+                    .remove(b"Resources")?;
+                let resource_id = document.add_object(resources);
+                document
+                    .get_dictionary_mut(current)
+                    .ok()?
+                    .set("Resources", resource_id);
+            }
+            return Some(());
+        }
+        match node.get(b"Parent") {
+            Ok(parent) => current = parent.as_reference().ok()?,
+            Err(_) => return Some(()),
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +301,57 @@ mod tests {
                 .iter()
                 .any(|issue| issue.code == "pdf_page_limit_exceeded")
         );
+        assert_eq!(document.segments.len(), 1);
+        assert_eq!(
+            document.segments[0]
+                .coordinates
+                .as_ref()
+                .expect("page coordinates")["page"],
+            "1"
+        );
+        let full = canonicalize_pdf(&bytes, &DocumentLimits::default(), usize::MAX)
+            .text
+            .expect("parse both pages")
+            .expect("extract both pages");
+        assert_eq!(full.segments.len(), 2);
+        for (segment, (number, word)) in full.segments.iter().zip([(1, "first"), (2, "second")]) {
+            assert_eq!(segment.kind, SegmentKind::Page);
+            assert_eq!(
+                segment.coordinates.as_ref().expect("page coordinates")["page"],
+                number.to_string()
+            );
+            assert_eq!(
+                &full.text[segment.start_byte..segment.end_byte],
+                format!("## Page {number}\n\n{word}\n\n")
+            );
+        }
+        let resources = source
+            .get_dictionary(resources_id)
+            .expect("resources")
+            .clone();
+        source
+            .get_dictionary_mut(pages_id)
+            .expect("pages")
+            .set("Resources", resources);
+        let mut inline = Vec::new();
+        source
+            .save_to(&mut inline)
+            .expect("serialize inline inherited resources");
+        let inline = canonicalize_pdf(&inline, &DocumentLimits::default(), usize::MAX)
+            .text
+            .expect("parse inline resources")
+            .expect("extract inherited inline resources");
+        assert_eq!(inline.text, full.text);
+        assert_eq!(inline.segments, full.segments);
+    }
+
+    #[test]
+    fn inherited_resource_walk_rejects_cycles() {
+        let mut document = Document::with_version("1.5");
+        let node_id = document.new_object_id();
+        let mut node = lopdf::Dictionary::new();
+        node.set("Parent", node_id);
+        document.objects.insert(node_id, Object::Dictionary(node));
+        assert!(expose_inherited_resources(&mut document, node_id).is_none());
     }
 }

@@ -11,7 +11,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    thread::JoinHandle,
+    thread::{JoinHandle, ThreadId},
 };
 
 #[derive(Debug, Default)]
@@ -107,6 +107,32 @@ impl ImportJobs {
 
     pub(super) fn shutdown(&self) -> Result<usize, IpcFailure> {
         self.drain(None)
+    }
+
+    fn finish_worker(&self, id: ThreadId) -> Result<(), IpcFailure> {
+        // Sending a result does not finish a thread. Join before reporting
+        // completion, and share drain ownership so close cannot miss this join.
+        let _drain = self
+            .drain
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let worker = {
+            let mut registry = self
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry
+                .workers
+                .iter()
+                .position(|worker| worker.thread().id() == id)
+                .map(|index| registry.workers.swap_remove(index))
+        };
+        if let Some(worker) = worker {
+            worker
+                .join()
+                .map_err(|_| failure("An import worker stopped unexpectedly."))?;
+        }
+        Ok(())
     }
 
     fn drain(&self, session_id: Option<&str>) -> Result<usize, IpcFailure> {
@@ -217,7 +243,7 @@ impl ImportOperation {
     ) -> Result<T, IpcFailure> {
         self.check()?;
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        {
+        let worker_id = {
             let mut registry = self
                 .jobs
                 .inner
@@ -252,13 +278,14 @@ impl ImportOperation {
                     let _ = sender.send(result);
                 })
                 .map_err(|error| failure(error.to_string()))?;
+            let id = worker.thread().id();
             registry.workers.push(worker);
-        }
-        let result = receiver
-            .await
-            .map_err(|_| failure("An import worker stopped unexpectedly."))?;
+            id
+        };
+        let result = receiver.await;
+        self.jobs.finish_worker(worker_id)?;
         self.check()?;
-        result
+        result.map_err(|_| failure("An import worker stopped unexpectedly."))?
     }
 
     /// Network futures live on an owned worker too. Cancellation drops the
@@ -301,6 +328,14 @@ impl ImportOperation {
         state: &PluginState,
         commit: impl FnOnce() -> Result<T, IpcFailure>,
     ) -> Result<T, IpcFailure> {
+        self.publish_to_store(state, |_| commit())
+    }
+
+    pub(super) fn publish_to_store<T>(
+        &self,
+        state: &PluginState,
+        commit: impl FnOnce(&mut loom_store::ProjectStore) -> Result<T, IpcFailure>,
+    ) -> Result<T, IpcFailure> {
         self.check()?;
         let _admission = lock_application_admission(state, "publishing an import")?;
         let mut session = lock_session(state)?;
@@ -319,7 +354,7 @@ impl ImportOperation {
         {
             return Err(failure("The import destination changed."));
         }
-        commit()
+        commit(store)
     }
 }
 
@@ -388,6 +423,71 @@ mod tests {
                 .unwrap();
         assert!(next.check().is_ok());
         assert_eq!(published_count(temporary.path()), 0);
+    }
+
+    #[test]
+    fn compute_waits_for_worker_exit_before_returning_success_or_failure() {
+        struct ExitGate {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+        impl Drop for ExitGate {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+            }
+        }
+        thread_local! {
+            static EXIT_GATE: std::cell::RefCell<Option<ExitGate>> = const {
+                std::cell::RefCell::new(None)
+            };
+        }
+        for succeeds in [true, false] {
+            let temporary = tempfile::tempdir().unwrap();
+            let (state, project, session) = opened(temporary.path());
+            let operation =
+                ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
+                    .unwrap();
+            let (entered, exiting) = mpsc::channel();
+            let (release, blocked) = mpsc::channel();
+            let (completed, completion) = mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let result = tauri::async_runtime::block_on(operation.compute(move || {
+                    EXIT_GATE.with(|gate| {
+                        *gate.borrow_mut() = Some(ExitGate {
+                            entered,
+                            release: blocked,
+                        });
+                    });
+                    if succeeds {
+                        Ok(())
+                    } else {
+                        Err(failure("conversion failed"))
+                    }
+                }));
+                drop(operation);
+                completed.send(()).unwrap();
+                result
+            });
+            // Thread-local cleanup begins after the result is sent. Hold that
+            // exact race window open, then always release it before asserting.
+            exiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            let premature = completion.recv_timeout(Duration::from_millis(50));
+            release.send(()).unwrap();
+            let result = waiter.join().unwrap();
+            assert!(
+                premature.is_err(),
+                "compute returned before its worker exited"
+            );
+            assert_eq!(result.is_ok(), succeeds);
+            if let Err(error) = result {
+                assert_eq!(error.message, "conversion failed");
+            }
+            let next =
+                ImportOperation::reserve(&state, &project, &session, &CommandId::new().to_string())
+                    .expect("completed imports must immediately release admission");
+            drop(next);
+        }
     }
 
     #[test]
@@ -617,7 +717,7 @@ mod tests {
                     .unwrap()
                     .is_err()
             );
-            assert_eq!(state.imports.shutdown().unwrap(), 1);
+            assert_eq!(state.imports.shutdown().unwrap(), 0);
         });
     }
 

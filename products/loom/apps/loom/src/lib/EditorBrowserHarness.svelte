@@ -4,6 +4,7 @@
   import VisualFormatMenu from './VisualFormatMenu.svelte';
   import {
     completionPresentation,
+    compatibleCompletionPresentations,
     completionSessionContextKey,
     completionShouldRequestNextBatch,
     consumeCompletionText,
@@ -62,6 +63,7 @@
   let latestSelectionCallback = 'none';
   let selectionAccessibility: VisualSelectionAccessibilityWitness =
     unavailableVisualSelectionWitness();
+  export let onSelectionWitness: (witness: VisualSelectionAccessibilityWitness, markdown: string) => void = () => {};
   let formatting: VisualFormatState = {
     block: 'body',
     bold: false,
@@ -78,19 +80,15 @@
       ? selectedCompletionCandidate(session)
       : completionPresentation(session)
     : null;
-  $: alternatives = session?.acceptedChunks.length === 0
-    ? session.candidates.map((candidate) => ({
+  $: alternatives = session
+    ? (session.acceptedChunks.length === 0 ? session.candidates : compatibleCompletionPresentations(session))
+      .map((candidate) => ({
         candidateId: candidate.candidateId,
         presentationKey: candidate.presentationKey,
         text: candidate.text,
         runId: candidate.runId
       }))
-    : presentation ? [{
-        candidateId: presentation.candidateId,
-        presentationKey: presentation.presentationKey,
-        text: presentation.text,
-        runId: presentation.runId
-      }] : [];
+    : [];
   $: unconsumeText = session?.acceptedChunks.at(-1) ?? '';
   $: {
     const exhausted = Boolean(
@@ -252,7 +250,10 @@
       onImmediateDocumentMutation={immediateMutation}
       onCaretNavigation={caretNavigation}
       onSelectionChange={selectionChanged}
-      onSelectionAccessibilityChange={(witness) => selectionAccessibility = witness}
+      onSelectionAccessibilityChange={(witness) => {
+        selectionAccessibility = witness;
+        onSelectionWitness(witness, markdown);
+      }}
       onGhostInsert={insert}
       onGhostUnconsume={unconsume}
       onGhostCycle={cycle}

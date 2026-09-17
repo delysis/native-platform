@@ -241,11 +241,17 @@ impl MineConfig {
     /// A missing dotfile inherits defaults. This never creates directories or
     /// writes settings; invalid existing content stays available for repair.
     pub fn read(project_root: &Path) -> Result<Self, ConfigError> {
+        Self::read_source(project_root)?
+            .as_deref()
+            .map_or_else(|| Ok(Self::default()), Self::parse)
+    }
+
+    /// Capture the exact bounded authored bytes with the same no-symlink file
+    /// admission as normal settings reads. Absence grants no write authority.
+    pub fn read_source(project_root: &Path) -> Result<Option<String>, ConfigError> {
         match read_project_file(project_root, Path::new(CONFIG_FILE), MAX_CONFIG_BYTES) {
-            Ok(source) => Self::parse(&source),
-            Err(ConfigError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Self::default())
-            }
+            Ok(source) => Ok(Some(source)),
+            Err(ConfigError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
     }

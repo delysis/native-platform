@@ -25,8 +25,9 @@ impl ModelRole {
 pub struct ModelEnvironment {
     pub environment_id: ModelEnvironmentId,
     pub model_identifier: String,
-    pub model_fingerprint: BlobId,
-    pub tokenizer_fingerprint: BlobId,
+    /// None when model weights are owned by a configured inference server.
+    pub model_fingerprint: Option<BlobId>,
+    pub tokenizer_fingerprint: Option<BlobId>,
     pub backend_identifier: String,
     #[serde(default)]
     pub capabilities: serde_json::Value,
@@ -45,6 +46,8 @@ pub enum PromptMode {
     Completion,
     /// Exact text continuation, independent of any model chat capability.
     RawCompletion,
+    /// A document function, framed only by the inspected model input contract.
+    Function,
     FillInMiddle,
 }
 
@@ -114,6 +117,7 @@ pub struct TokenTrace {
 pub enum InferenceEvidenceKind {
     Fixture,
     HistoricalReceipt,
+    ServerResponse,
     LiveInference,
     Mock,
 }

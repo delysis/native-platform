@@ -64,6 +64,7 @@ const INDEPENDENT_COMMANDS = new Set([
   'model_download_list',
   'model_download_start',
   'model_download_status',
+  'inference_status',
   'model_list',
   'model_load',
   'model_load_catalog_candidate',
@@ -224,6 +225,14 @@ export function importAttachmentPaths(
 
 export function revealAttachmentOriginal(projectId: string, sessionId: string, attachmentId: string): Promise<void> {
   return call('attachment_reveal_original', { projectId, sessionId, attachmentId });
+}
+
+export function copyWorkspaceFiles(projectId: string, sessionId: string, destination: string, paths: readonly string[]): Promise<{
+  copied: string[];
+  materials: import('./materials').MaterialEntry[];
+  failures: { name: string; message: string }[];
+}> {
+  return call('workspace_copy_files', { projectId, sessionId, destination, paths: [...paths], operationId: newUlid() });
 }
 
 export function chooseAttachments(
@@ -612,6 +621,10 @@ export function closeProject(
   return call('project_close', { projectId, sessionId, commandId });
 }
 
+export function getInferenceStatus(): Promise<{ suggestions: { model_id: string; completion: boolean } | null }> {
+  return call('inference_status');
+}
+
 export function listModels(): Promise<ModelCapabilitySummary[]> {
   return call('model_list');
 }
@@ -982,4 +995,34 @@ export function importPastedSources(projectId: string, sessionId: string, text: 
 
 export function cancelImportAccount(projectId: string, sessionId: string, operationId: string): Promise<void> {
   return call('import_account_cancel', { projectId, sessionId, operationId });
+}
+
+// Named material uses the same project/session ordering lane as document edits.
+export function listMaterials(projectId: string, sessionId: string): Promise<import('./materials').MaterialEntry[]> {
+  return call('material_list', { projectId, sessionId });
+}
+export function bindAttachmentMaterial(projectId: string, sessionId: string, attachmentId: string): Promise<import('./materials').MaterialEntry> {
+  return call('material_bind_attachment', { projectId, sessionId, attachmentId });
+}
+export function readMaterial(projectId: string, sessionId: string, materialId: string): Promise<import('./materials').MaterialRead> {
+  return call('material_read', { projectId, sessionId, id: materialId });
+}
+export function searchMaterial(projectId: string, sessionId: string, materialId: string, query: string): Promise<import('./materials').MaterialSearch> {
+  return call('material_search', { projectId, sessionId, id: materialId, query });
+}
+export function readMaterialEvidence(projectId: string, sessionId: string, materialId: string, evidenceId: string): Promise<import('./materials').MaterialEvidence> {
+  return call('material_read_evidence', { projectId, sessionId, id: materialId, evidenceId });
+}
+export function addLibraryMaterial(projectId: string, sessionId: string): Promise<import('./materials').MaterialEntry | null> {
+  return call('material_add_library', { projectId, sessionId });
+}
+export function addLibraryMaterialPath(projectId: string, sessionId: string, path: string): Promise<import('./materials').MaterialEntry> {
+  return call('material_add_library_path', { projectId, sessionId, path });
+}
+export function pinMaterial(projectId: string, sessionId: string, materialId: string, pinned: boolean): Promise<import('./materials').MaterialEntry> {
+  return call('material_set_pinned', { projectId, sessionId, id: materialId, pinned });
+}
+
+export function removeMaterial(projectId: string, sessionId: string, materialId: string): Promise<void> {
+  return call('material_remove', { projectId, sessionId, id: materialId });
 }

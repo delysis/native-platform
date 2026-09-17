@@ -12,6 +12,11 @@ file selection, account consent, credentials, persistence, and context
 promotion. Other native-kit consumers receive the new parser capabilities
 through the existing `AttachmentHost` API; no second ingestion engine exists.
 
+The follow-up [Drive histories and readable revisions](drive-history-and-diffs.md)
+records the donor's editing/feedback patterns, Google API limits, a bounded
+revision-metadata API, and an offline Rust diff-format workbench. That workbench
+does not claim native historical-content import or learned author preferences.
+
 ## Source inventory and disposition
 
 Examined on 2026-09-14:

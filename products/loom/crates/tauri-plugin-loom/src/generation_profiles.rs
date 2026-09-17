@@ -121,6 +121,8 @@ pub(super) fn reserve_context(
 pub(super) struct ProfiledContextEvidence {
     #[serde(flatten)]
     pub retrieval: crate::context_attachments::ContextRetrievalEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub materials: Option<crate::material_context::ContextPlan>,
     #[serde(default)]
     pub generation_profile: Option<FrozenGenerationProfile>,
     #[serde(default)]
@@ -249,6 +251,7 @@ mod tests {
         let profile = freeze(store.root(), GenerationTask::ManualWriting).unwrap();
         let evidence = ProfiledContextEvidence {
             retrieval: crate::context_attachments::ContextRetrievalEvidence::default(),
+            materials: None,
             generation_profile: Some(profile),
             applied_co_writer: None,
             loompad: None,

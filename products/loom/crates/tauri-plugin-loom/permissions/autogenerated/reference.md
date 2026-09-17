@@ -4,6 +4,15 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 
 #### This default permission set includes the following:
 
+- `allow-material-list`
+- `allow-material-read`
+- `allow-material-search`
+- `allow-material-read-evidence`
+- `allow-material-bind-attachment`
+- `allow-material-set-pinned`
+- `allow-material-remove`
+- `allow-material-add-library`
+- `allow-material-add-library-path`
 - `allow-project-open-default`
 - `allow-project-prepare-open`
 - `allow-project-prepare-open-path`
@@ -21,6 +30,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-attachment-ingest`
 - `allow-attachment-import-choose`
 - `allow-attachment-import-paths`
+- `allow-workspace-copy-files`
 - `allow-attachment-reveal-original`
 - `allow-import-text-sources`
 - `allow-attachment-import-batch-choose`
@@ -49,6 +59,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-document-reconcile-apply`
 - `allow-build-model-policy-get`
 - `allow-model-catalog-list`
+- `allow-inference-status`
 - `allow-model-list`
 - `allow-model-choose`
 - `allow-model-download-status`
@@ -1426,6 +1437,266 @@ Denies the import_text_sources command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-inference-status`
+
+</td>
+<td>
+
+Enables the inference_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-inference-status`
+
+</td>
+<td>
+
+Denies the inference_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-material-add-library`
+
+</td>
+<td>
+
+Enables the material_add_library command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-add-library`
+
+</td>
+<td>
+
+Denies the material_add_library command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-material-add-library-path`
+
+</td>
+<td>
+
+Enables the material_add_library_path command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-add-library-path`
+
+</td>
+<td>
+
+Denies the material_add_library_path command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-material-bind-attachment`
+
+</td>
+<td>
+
+Enables the material_bind_attachment command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-bind-attachment`
+
+</td>
+<td>
+
+Denies the material_bind_attachment command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-material-list`
+
+</td>
+<td>
+
+Enables the material_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-list`
+
+</td>
+<td>
+
+Denies the material_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-material-read`
+
+</td>
+<td>
+
+Enables the material_read command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-read`
+
+</td>
+<td>
+
+Denies the material_read command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-material-read-evidence`
+
+</td>
+<td>
+
+Enables the material_read_evidence command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-read-evidence`
+
+</td>
+<td>
+
+Denies the material_read_evidence command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-material-remove`
+
+</td>
+<td>
+
+Enables the material_remove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-remove`
+
+</td>
+<td>
+
+Denies the material_remove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-material-search`
+
+</td>
+<td>
+
+Enables the material_search command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-search`
+
+</td>
+<td>
+
+Denies the material_search command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-material-set-pinned`
+
+</td>
+<td>
+
+Enables the material_set_pinned command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-set-pinned`
+
+</td>
+<td>
+
+Denies the material_set_pinned command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-model-catalog-list`
 
 </td>
@@ -2277,6 +2548,32 @@ Enables the weave_status command without any pre-configured scope.
 <td>
 
 Denies the weave_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-copy-files`
+
+</td>
+<td>
+
+Enables the workspace_copy_files command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-copy-files`
+
+</td>
+<td>
+
+Denies the workspace_copy_files command without any pre-configured scope.
 
 </td>
 </tr>

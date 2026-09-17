@@ -188,7 +188,7 @@ export function reconcileCompletionController(
   state: CompletionControllerState,
   contextKey: string,
   family: readonly InlineGhostSuggestion[],
-  forkAtCurrentCaret = false
+  forkAtCurrentCaret = true
 ): CompletionControllerState {
   let session = state.session;
   let pendingText = state.pendingText;
@@ -221,7 +221,7 @@ export function completionControllerView(
   state: CompletionControllerState,
   contextKey: string,
   baseFamily: readonly InlineGhostSuggestion[],
-  sharedPrefixAlternatives = false
+  sharedPrefixAlternatives = true
 ): CompletionControllerView {
   const boundSession = state.session?.contextKey === contextKey ? state.session : null;
   const activeFamily = completionActiveFamily(boundSession, state.pendingText, baseFamily, sharedPrefixAlternatives);
@@ -249,7 +249,7 @@ function completionActiveFamily(
   session: CompletionSession | null,
   pendingText: string | null,
   baseFamily: readonly InlineGhostSuggestion[],
-  sharedPrefixAlternatives = false
+  sharedPrefixAlternatives = true
 ): InlineGhostSuggestion[] {
   if (pendingText !== null) return [];
   if (!session) return [...baseFamily];
@@ -405,7 +405,7 @@ export function cycleCompletion(
   state: CompletionControllerState,
   family: readonly InlineGhostSuggestion[],
   offset: number,
-  sharedPrefixAlternatives = false
+  sharedPrefixAlternatives = true
 ): CompletionControllerTransition {
   if (state.session) {
     const session = cycleCompletionSession(state.session, offset, sharedPrefixAlternatives);

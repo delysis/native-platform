@@ -11,6 +11,9 @@ version = 1
 # [assistance]
 # suggestions = true
 
+# [workspace.functions]
+# format = "model"
+
 # [workspace.panes.chat]
 # visible = true
 # context = ["@document"]
@@ -80,6 +83,14 @@ pub(super) use loom_text_session::configuration::Snapshot as WorkspaceTemplateSn
 
 fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
     loom_text_session::configuration::read(store).map_err(IpcFailure::store)
+}
+
+pub(super) use loom_config::FunctionFormat;
+pub(super) use loom_text_session::configuration::FunctionRecipe;
+
+pub(super) fn function_recipe(store: &mut ProjectStore) -> Result<FunctionRecipe, IpcFailure> {
+    loom_text_session::configuration::function_recipe(store)
+        .map_err(|error| IpcFailure::new("workspace_template_failed", error.to_string(), false))
 }
 
 fn enable(

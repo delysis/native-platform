@@ -60,7 +60,9 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
     ensure_directory_with_policy(path, DirectoryPolicy::Private)
 }
 
-pub(crate) const fn ensure_private_storage_supported() -> Result<()> {
+/// Check platform support before a caller prepares any project directories.
+/// Store entry points enforce this too, before their own filesystem operations.
+pub const fn ensure_private_storage_supported() -> Result<()> {
     if cfg!(unix) {
         Ok(())
     } else {

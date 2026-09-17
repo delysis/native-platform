@@ -3,6 +3,16 @@
 [default]
 description = "Open and edit Loom's app-owned default project or a user-selected project. Generation and hosted-provider authority are separate permissions."
 permissions = [
+  "allow-material-list",
+  "allow-material-read",
+  "allow-material-search",
+  "allow-material-read-evidence",
+  "allow-material-bind-attachment",
+  "allow-material-set-pinned",
+  "allow-material-remove",
+  "allow-material-add-library",
+  "allow-material-add-library-path",
+
   "allow-project-open-default",
   "allow-project-prepare-open",
   "allow-project-prepare-open-path",
@@ -20,6 +30,7 @@ permissions = [
   "allow-attachment-ingest",
   "allow-attachment-import-choose",
   "allow-attachment-import-paths",
+  "allow-workspace-copy-files",
   "allow-attachment-reveal-original",
   "allow-import-text-sources",
   "allow-attachment-import-batch-choose",
@@ -48,6 +59,7 @@ permissions = [
   "allow-document-reconcile-apply",
   "allow-build-model-policy-get",
   "allow-model-catalog-list",
+  "allow-inference-status",
   "allow-model-list",
   "allow-model-choose",
   "allow-model-download-status",

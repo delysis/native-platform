@@ -1054,7 +1054,10 @@ export function createGhostTextPlugin(
             // exists. Clearing first would invalidate every legitimate
             // acceptance before the parent can bind it to durable authority.
             const word = nextVisualSuggestionWord(plan.text);
-            const accepted = word && (plan.insertsOnAccept
+            // A completed candidate still admits an explicit partial-word
+            // insertion; whole-candidate promotion cannot accept a hidden suffix.
+            const insertWord = plan.insertsOnAccept || word !== plan.text;
+            const accepted = word && (insertWord
               ? Boolean(handlers.insert?.(
                   plan.candidateId,
                   plan.presentationKey,
@@ -1063,7 +1066,7 @@ export function createGhostTextPlugin(
                 ))
               : word === plan.text && handlers.accept(plan.candidateId, plan.presentationKey));
             if (accepted) {
-              view.dispatch(plan.insertsOnAccept
+              view.dispatch(insertWord
                 ? view.state.tr.insertText(word!)
                 : clearTransaction(view));
               return true;

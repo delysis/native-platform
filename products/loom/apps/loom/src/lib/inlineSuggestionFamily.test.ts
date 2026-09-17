@@ -83,8 +83,8 @@ function state(manuscriptText: string): InlineSuggestionState {
       seed: String(index + 1)
     })),
     verifiedBodyByRun: {},
-    liveTextByRun: { 'run-1': 'world continues' },
-    liveTextSequenceByRun: { 'run-1': '7' },
+    liveTextByRun: Object.fromEntries([1, 2, 3, 4].map(i => [`run-${i}`, 'world continues'])),
+    liveTextSequenceByRun: Object.fromEntries([1, 2, 3, 4].map(i => [`run-${i}`, '7'])),
     currentModel,
     document,
     suggestionsEnabled: true,
@@ -97,14 +97,27 @@ function state(manuscriptText: string): InlineSuggestionState {
 }
 
 describe('inline suggestion family', () => {
+  it('publishes all four samples together despite staggered streaming delivery', () => {
+    const selection = state('hello');
+    selection.liveTextByRun = {};
+    selection.liveTextSequenceByRun = {};
+    for (let index = 1; index <= 4; index += 1) {
+      selection.liveTextByRun[`run-${index}`] = `choice ${index}`;
+      selection.liveTextSequenceByRun[`run-${index}`] = '1';
+      expect(inlineSuggestionFamily(5, 'visual', selection)).toHaveLength(index === 4 ? 4 : 0);
+    }
+    selection.branches[3].status = 'failed';
+    expect(inlineSuggestionFamily(5, 'visual', selection)).toEqual([]);
+  });
+
   it('projects a streamed visual candidate against the current canonical manuscript', () => {
-    expect(inlineSuggestionFamily(5, 'visual', state('hello'))).toMatchObject([{
+    expect(inlineSuggestionFamily(5, 'visual', state('hello'))[0]).toMatchObject({
       runId: 'run-1',
       targetByte: 5,
       presentationKey: 'stream:run-1:7:prose-prefix:16',
       text: ' world continues',
       insertsOnAccept: true
-    }]);
+    });
     expect(inlineSuggestionFamily(5, 'visual', state(''))).toEqual([]);
   });
 

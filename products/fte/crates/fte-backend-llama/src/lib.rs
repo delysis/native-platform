@@ -555,15 +555,15 @@ impl GatewayBackend for LlamaNativeBackend {
         let configured = configuration
             .map(|configuration| configuration.models.into_values().collect::<Vec<_>>())
             .unwrap_or_default();
-        let mut models = inspected
+        let models = configured
             .iter()
-            .map(map_model_descriptor)
-            .collect::<Vec<_>>();
-        for config in configured {
-            if !models.iter().any(|model| model.id == config.model_id) {
-                models.push(configured_model_descriptor(&config));
-            }
-        }
+            .map(|config| {
+                inspected
+                    .iter()
+                    .find(|native| native.model_id == config.model_id)
+                    .map_or_else(|| configured_model_descriptor(config), map_model_descriptor)
+            })
+            .collect();
         BackendDescriptor {
             id: BACKEND_ID.to_string(),
             display_name: "llama.cpp (in process)".to_string(),
@@ -594,6 +594,13 @@ impl GatewayBackend for LlamaNativeBackend {
 
     async fn execute(&self, request: BackendRequest) -> Result<GatewayTicket, GatewayError> {
         let request_id = request.request.request_id.clone();
+        if request.request.storage.previous_response_id.is_some() {
+            return Err(GatewayError::invalid_request(
+                &request_id,
+                "native_continuation_unsupported",
+                "local conversation continuation requires explicit message items",
+            ));
+        }
         validate_cache_policy(&request.request.cache, &request.request.input, &request_id)?;
         let input = translate_input(&request.request.input, &request_id)?;
         let sampling = translate_sampling(&request.request.sampling);
@@ -1280,11 +1287,9 @@ fn map_model_descriptor(native: &llama_native_types::NativeModelDescriptor) -> M
                     NativePromptForm::FillInMiddle => PromptForm::FillInMiddle,
                 })
                 .collect(),
-            modalities: if native.capabilities.multimodal {
-                vec![Modality::Text, Modality::Image, Modality::Audio]
-            } else {
-                vec![Modality::Text]
-            },
+            // This adapter currently translates text only, even when the
+            // borrowed native runtime can execute multimodal requests.
+            modalities: vec![Modality::Text],
             tools: false,
             structured_output: false,
             reasoning: false,
@@ -1293,6 +1298,7 @@ fn map_model_descriptor(native: &llama_native_types::NativeModelDescriptor) -> M
         },
         context_tokens: Some(native.context_tokens),
         max_output_tokens: None,
+        quota: Default::default(),
         observed: RouteObservations::default(),
     }
 }
@@ -1306,11 +1312,7 @@ fn configured_model_descriptor(config: &NativeModelConfig) -> ModelDescriptor {
         location: BackendLocation::LocalEmbedded,
         capabilities: ModelCapabilities {
             prompt_forms: vec![PromptForm::Chat, PromptForm::Completion],
-            modalities: if config.mmproj_path.is_some() {
-                vec![Modality::Text, Modality::Image, Modality::Audio]
-            } else {
-                vec![Modality::Text]
-            },
+            modalities: vec![Modality::Text],
             tools: false,
             structured_output: false,
             reasoning: false,
@@ -1319,6 +1321,7 @@ fn configured_model_descriptor(config: &NativeModelConfig) -> ModelDescriptor {
         },
         context_tokens: Some(config.context_tokens),
         max_output_tokens: None,
+        quota: Default::default(),
         observed: RouteObservations::default(),
     }
 }

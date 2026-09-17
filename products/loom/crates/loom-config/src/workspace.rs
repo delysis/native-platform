@@ -84,10 +84,26 @@ pub enum PanePosition {
     Bottom,
 }
 
+/// Native function prompt framing; reading it never executes a function.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FunctionFormat {
+    #[default]
+    Model,
+    Raw,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FunctionSettings {
+    pub format: FunctionFormat,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkspaceOverrides {
     pub model: Option<WorkspaceModel>,
+    pub functions: FunctionSettings,
     pub theme: WorkspaceTheme,
     pub panes: BTreeMap<String, PaneOverrides>,
 }
@@ -137,6 +153,7 @@ impl PaneConfig {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct WorkspaceConfig {
     pub model: Option<WorkspaceModel>,
+    pub functions: FunctionSettings,
     pub theme: WorkspaceTheme,
     pub panes: BTreeMap<String, PaneConfig>,
 }
@@ -145,6 +162,7 @@ impl Default for WorkspaceConfig {
     fn default() -> Self {
         Self {
             model: None,
+            functions: FunctionSettings::default(),
             theme: WorkspaceTheme::default(),
             panes: [
                 ("writing", PaneKind::Editor),
@@ -174,6 +192,7 @@ impl WorkspaceOverrides {
         }
         self.theme.validate()?;
         config.model.clone_from(&self.model);
+        config.functions = self.functions;
         config.theme.clone_from(&self.theme);
         if all_panes_visible {
             for pane in config.panes.values_mut() {

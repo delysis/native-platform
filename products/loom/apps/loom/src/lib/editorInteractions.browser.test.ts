@@ -5,6 +5,7 @@ import '../app.css';
 import EditorBrowserHarness from './EditorBrowserHarness.svelte';
 import SourceEditorBrowserHarness from './SourceEditorBrowserHarness.svelte';
 import type { CompletionCandidate } from './completionSession';
+import type { VisualSelectionAccessibilityWitness } from './completionAccessibility';
 
 let mounted: ReturnType<typeof mount> | null = null;
 
@@ -26,6 +27,7 @@ function render(
     onImageAttachmentsCommitted?: (count: number) => void;
     onImageAttachmentError?: (message: string) => void;
     resolveImageAssetUrl?: (markdownPath: string) => string | null;
+    onSelectionWitness?: (witness: VisualSelectionAccessibilityWitness, markdown: string) => void;
   } = {}
 ): void {
   const target = document.createElement('div');
@@ -248,15 +250,19 @@ describe('real WebKit editor interactions', () => {
   });
 
   it('withdraws stale selection evidence until typed document state settles', async () => {
-    render('Something');
+    const changes: { witness: VisualSelectionAccessibilityWitness; markdown: string }[] = [];
+    render('Something', [], { onSelectionWitness: (witness, markdown) => changes.push({ witness, markdown }) });
     const editor = page.getByRole('textbox', { name: 'Manuscript editor' });
     const witness = () => JSON.parse(
       page.getByRole('status', { name: 'Visual Selection Witness' }).element().textContent ?? '{}'
     );
     await editor.click();
+    changes.length = 0;
     await userEvent.keyboard('{Meta>}a{/Meta}Replacement');
 
-    expect(witness()).toMatchObject({ available: false });
+    // Keyboard automation can finish after projection has settled. Observe the
+    // actual callback boundary instead of racing the editor's debounce timer.
+    expect(changes.some(({ witness, markdown }) => !witness.available && markdown !== 'Replacement')).toBe(true);
     await expect.poll(serializedMarkdown).toBe('Replacement');
     await expect.poll(witness).toMatchObject({
       available: true,
@@ -1194,6 +1200,70 @@ describe('real WebKit editor interactions', () => {
     await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
       .toHaveTextContent('0');
   });
+
+  it('cycles the visible word with Option arrows without a prior modifier or fan event', async () => {
+    render('hello', fourChoiceCompletion().map((candidate) => ({
+      ...candidate, text: `${candidate.text} stays cached`
+    })));
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    const editor = page.getByRole('textbox', { name: 'Manuscript editor' }).element();
+    expect(completionFanIsVisible()).toBe(false);
+    const down = new KeyboardEvent('keydown', {
+      key: 'ArrowDown', code: 'ArrowDown', altKey: true, bubbles: true, cancelable: true
+    });
+    editor.dispatchEvent(down);
+    expect(down.defaultPrevented).toBe(true);
+    await expect.element(page.getByText(' there', { exact: true }).first()).toBeVisible();
+    expect(serializedMarkdown()).toBe('hello');
+    dispatchOptionUp(editor);
+    await expect.poll(completionFanIsVisible).toBe(false);
+
+    const up = new KeyboardEvent('keydown', {
+      key: 'ArrowUp', code: 'ArrowUp', altKey: true, bubbles: true, cancelable: true
+    });
+    editor.dispatchEvent(up);
+    expect(up.defaultPrevented).toBe(true);
+    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    dispatchOptionUp(editor);
+    await expect.poll(completionFanIsVisible).toBe(false);
+    await userEvent.keyboard('{Tab}');
+    await expect.element(page.getByRole('status', { name: 'Serialized Markdown' })).toHaveTextContent('hello world');
+    expect(serializedMarkdown()).toBe('hello world');
+    await expect.element(page.getByText(' stays', { exact: true }).first()).toBeVisible();
+  });
+
+  for (const mode of ['visual', 'source'] as const) {
+    it(`cycles compatible ${mode} ghost words in both directions after accepting a word`, async () => {
+      const choices = [' one alpha tail', ' one beta tail', ' other gamma'].map((text, index) => ({
+        candidateId: `choice-${index}`, presentationKey: `choice-${index}:1`, text,
+        runId: `run-${index}`, targetByte: 5, insertsOnAccept: true
+      }));
+      if (mode === 'visual') render('hello', choices);
+      else renderSource('hello', choices);
+      await expect.element(page.getByText(' one', { exact: true }).first()).toBeVisible();
+      await userEvent.keyboard('{Tab}');
+      const output = page.getByRole('status', { name: mode === 'visual' ? 'Serialized Markdown' : 'Source Markdown' });
+      await expect.element(output).toHaveTextContent('hello one');
+      const prose = output.element().textContent;
+      const editor = page.getByRole('textbox', { name: mode === 'visual' ? 'Manuscript editor' : 'Markdown source editor' }).element();
+      const visibleWord = () => document.querySelector(mode === 'visual' ? '.loom-visual-ghost' : '.loom-source-ghost-text')?.textContent?.trim();
+      await expect.poll(visibleWord).toBe('alpha');
+      dispatchKey(editor, 'keydown', 'ArrowDown', 'ArrowDown', true);
+      await expect.poll(visibleWord).toBe('beta');
+      expect(output.element().textContent).toBe(prose);
+      dispatchKey(editor, 'keydown', 'ArrowUp', 'ArrowUp', true);
+      await expect.poll(visibleWord).toBe('alpha');
+      expect(output.element().textContent).toBe(prose);
+      dispatchKey(editor, 'keydown', 'ArrowUp', 'ArrowUp', true);
+      await expect.poll(visibleWord).toBe('beta');
+      // Wrapping visits only candidates that begin with the exact accepted bytes.
+      expect(output.element().textContent).toBe(prose);
+      dispatchOptionUp(editor);
+      await userEvent.keyboard('{Tab}');
+      await expect.element(output).toHaveTextContent('hello one beta');
+      expect(output.element().textContent).not.toContain('other');
+    });
+  }
 
   it('keeps all four alternatives visible while Option cycles the active candidate', async () => {
     render('hello', fourChoiceCompletion());
