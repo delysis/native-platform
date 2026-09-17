@@ -1267,7 +1267,7 @@
     : mode === 'source'
       ? sourceSuggestionFamily
       : [];
-  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, true);
+  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, true, loompadActive);
   $: completionView = completionControllerView(
     completionController,
     completionContextKey,
@@ -5761,9 +5761,11 @@
         : sourceEditor?.acceptLoompadText(candidate.candidateId, candidate.presentationKey, text);
       if (accepted) {
         await tick();
-        // Keep admitted tails growing; refill only after a pause or exhaustion.
-        if (loompadActive) scheduleAutomaticSuggestions(editVersion,
-          activeSuggestionFamily.length ? 5_000 : 250, 'document_edit');
+        // Retained tails stay usable while a fresh family grows at this caret.
+        if (loompadActive) {
+          if (activeBranchCount > 0) void cancelActiveBranches();
+          scheduleAutomaticSuggestions(editVersion, 250, 'document_edit');
+        }
       }
     } finally { loompadAccepting = false; }
   }
@@ -7799,13 +7801,15 @@
   function reconcileVisibleCompletionController(
     contextKey: string,
     family: readonly InlineGhostSuggestion[],
-    forkAtCurrentCaret = false
+    forkAtCurrentCaret = false,
+    refillLoompad = false
   ): void {
     const reconciled = reconcileCompletionController(
       completionController,
       contextKey,
       family,
-      forkAtCurrentCaret
+      forkAtCurrentCaret,
+      refillLoompad
     );
     if (reconciled !== completionController) completionController = reconciled;
   }
@@ -8643,7 +8647,7 @@
         expectedVisibleBlobId: captured.visibleBlobId,
         cursorByte: captured.cursorByte,
         policy: captured.speculation
-          ? { kind: 'loompad_v1', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
+          ? { kind: 'loompad_v2', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
           : { kind: 'automatic_v2' }
       });
       if (installWeaveSnapshot(started, captured)) {

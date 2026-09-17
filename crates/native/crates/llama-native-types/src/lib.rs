@@ -3,10 +3,12 @@ use std::path::PathBuf;
 
 mod controlled_generation;
 mod exact_token_budget;
+mod first_word_choices;
 mod sampling_fingerprint;
 
 pub use controlled_generation::*;
 pub use exact_token_budget::*;
+pub use first_word_choices::*;
 pub use sampling_fingerprint::{SAMPLING_CONFIG_FINGERPRINT_DOMAIN, SamplingConfigFingerprint};
 
 pub const MAX_PARALLEL_SEQUENCES: u32 = 4;
@@ -729,12 +731,16 @@ pub struct GenerationCase {
     pub cached_prefix: Option<SequenceStateBlob>,
 }
 
-/// An ordered family of independently sampled generation cases.
+/// An ordered family of generation cases, independently sampled unless an
+/// explicit cross-case selection policy is supplied.
 ///
 /// The engine preserves `cases` order in outputs, detects token-exact prefixes
 /// across cases, and exposes each `case_id` as the branch cancellation key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GenerationBatchRequest {
+    /// Explicit cross-case selection. Absent batches remain independently sampled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_word_choices: Option<FirstWordChoicePolicy>,
     pub request_id: String,
     pub model_id: String,
     /// Ordered media shared by every case in this exact batch. Media bytes
@@ -1943,6 +1949,9 @@ pub struct TokenObservation {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GenerationOutput {
+    /// Proposal/rejection evidence for explicitly requested word-distinct families.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_word_choice: Option<FirstWordChoiceEvidence>,
     pub request_id: String,
     pub branch_id: String,
     /// Stable zero-based index of this output in the submitted batch.
@@ -3716,6 +3725,7 @@ mod tests {
     #[test]
     fn generation_batch_round_trip_preserves_case_order_and_exact_tokens() {
         let request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "family".to_string(),
             model_id: "model".to_string(),
             media: Vec::new(),

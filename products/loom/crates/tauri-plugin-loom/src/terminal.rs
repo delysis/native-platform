@@ -1137,6 +1137,7 @@ impl Evaluator<'_> {
                 exact_manuscript_prefix: prompt,
                 context_preamble: String::new(),
                 media: self.media.clone(),
+                first_word_choices: None,
                 prompt_recipe: recipe.clone(),
                 cases: vec![case],
             })
@@ -1179,6 +1180,7 @@ impl Evaluator<'_> {
             &model.descriptor,
             // Terminal submits one continuation case, always at input index 0.
             0,
+            None,
         )
         .map_err(|error| IpcFailure::backend(&error))?;
         let evidence = self.with_store(|store| {

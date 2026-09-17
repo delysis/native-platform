@@ -6,6 +6,7 @@
   import { loompadPrefix, type LoompadLength } from './loompad';
   import {
     authorizeCompletionInsertion,
+    authorizeCompletionUnconsume,
     clearCompletionSession,
     completionControllerView,
     cycleCompletion,
@@ -21,7 +22,7 @@
   export let loompad = false;
   export let insertsOnAccept = true;
 
-  const family: InlineGhostSuggestion[] = [
+  let family: InlineGhostSuggestion[] = [
     {
       candidateId: 'candidate-a',
       presentationKey: 'candidate-a:presentation',
@@ -90,6 +91,19 @@
     });
     controller = authorization.state;
     return authorization.authorized;
+  }
+
+  function unconsume(candidateId: string, presentationKey: string, text: string): boolean {
+    const authorization = authorizeCompletionUnconsume(controller, {
+      eligible: selected, candidateId, presentationKey, text, manuscriptText: markdown
+    });
+    controller = authorization.state;
+    return authorization.authorized;
+  }
+
+  export function installRefill(candidates: InlineGhostSuggestion[]): void {
+    family = candidates;
+    controller = reconcileCompletionController(controller, contextKey, family, true, loompad);
   }
 
   function chooseLoompad(candidate: InlineGhostSuggestion): void {
@@ -167,6 +181,7 @@
         onImmediateDocumentMutation={invalidateIfManualMutation}
         onSelectionChange={(targetByte) => reportCaret(targetByte)}
         onGhostInsert={insert}
+        onGhostUnconsume={unconsume}
         onGhostPresentationRejected={() => {}}
       />
     </div>
@@ -187,6 +202,7 @@
         onValueInput={sourceInput}
         onSelectionChange={(textarea) => reportCaret(textarea.selectionStart)}
         onGhostInsert={insert}
+        onGhostUnconsume={unconsume}
       />
     </div>
   {/if}
