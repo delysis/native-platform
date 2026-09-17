@@ -3,6 +3,9 @@
 
 use super::*;
 
+#[path = "terminal_workspace_tests.rs"]
+mod workspace_tests;
+
 struct TerminalFixture {
     // Drop the app, including its store lease, before deleting the directory.
     app: tauri::App<tauri::test::MockRuntime>,

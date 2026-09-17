@@ -28,10 +28,11 @@ mod terminal;
 mod terminal_media;
 mod terminal_receipts;
 mod workspace_copy;
+mod workspace_output;
 mod workspace_owner;
-mod workspace_source_import;
 mod workspace_preview;
 mod workspace_roots;
+mod workspace_source_import;
 mod workspace_template;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -113,7 +114,10 @@ use crate::speech_input::{
     SpeechInputError, SpeechInputService, SpeechInputSnapshot, SpeechInputTarget,
     SpeechRecordingSnapshot,
 };
-use crate::terminal::{terminal_cancel, terminal_list, terminal_run};
+use crate::terminal::{
+    terminal_cancel, terminal_list, terminal_run, workspace_pane_cancel, workspace_pane_list,
+    workspace_pane_run,
+};
 use crate::workspace_template::{workspace_template_enable, workspace_template_get};
 use speech_native_host::SpeechHostStatus;
 
@@ -595,6 +599,11 @@ impl Drop for PluginState {
         // native authority that those callbacks can wake in the renderer.
         let document_filesystem_watcher = session.document_filesystem_watcher.take();
         drop(document_filesystem_watcher);
+        let owner_filesystem_watcher = session
+            .workspace
+            .as_mut()
+            .and_then(|owner| owner.filesystem_watcher.take());
+        drop(owner_filesystem_watcher);
         if let Ok(phase) = self.application.get_mut() {
             *phase = ApplicationPhase::Closing;
         }
@@ -2135,6 +2144,8 @@ impl Builder {
                 material_commands::material_add_library,
                 material_commands::material_add_library_path,
                 workspace_template_get,
+                workspace_output::workspace_pane_output,
+                workspace_output::workspace_document_resolve,
                 workspace_template_enable,
                 audio_record_start,
                 audio_record_stop,
@@ -2209,6 +2220,9 @@ impl Builder {
                 terminal_run,
                 terminal_list,
                 terminal_cancel,
+                workspace_pane_run,
+                workspace_pane_list,
+                workspace_pane_cancel,
                 shader_preview,
                 generation_cancel,
                 candidate_keep,
@@ -2990,10 +3004,13 @@ async fn project_open_default<R: Runtime>(
     let result = {
         let mut session = lock_session_internal(&state)?;
         if session.workspace.is_some() {
-            workspace_owner::take_parked(&mut session)
+            workspace_owner::store_mut(&mut session)?;
+            Ok(ProjectChoiceStore::Workspace)
         } else {
             drop(session);
-            default_project_path(&state).and_then(|path| open_or_initialize_default_project(&path))
+            default_project_path(&state)
+                .and_then(|path| open_or_initialize_default_project(&path))
+                .map(ProjectChoiceStore::from)
         }
     };
     choice.finish(&app, result)
@@ -3200,7 +3217,21 @@ fn lock_prepared_project(
     })
 }
 
-fn take_prepared_project(state: &PluginState, id: CommandId) -> Result<ProjectStore, IpcFailure> {
+enum ProjectChoiceStore {
+    New(Box<ProjectStore>),
+    Workspace,
+}
+
+impl From<ProjectStore> for ProjectChoiceStore {
+    fn from(store: ProjectStore) -> Self {
+        Self::New(Box::new(store))
+    }
+}
+
+fn take_prepared_project(
+    state: &PluginState,
+    id: CommandId,
+) -> Result<ProjectChoiceStore, IpcFailure> {
     let mut prepared = lock_prepared_project(state)?;
     if prepared
         .as_ref()
@@ -3216,25 +3247,20 @@ fn take_prepared_project(state: &PluginState, id: CommandId) -> Result<ProjectSt
                 false,
             ));
         }
-        return match candidate.store {
-            Some(store) => {
-                if candidate.workspace_session.is_some() {
-                    let owner = workspace_owner::store_mut(&mut session)?;
-                    let private = workspace_owner::private_root(state)?;
-                    if let Some(id) = candidate.granted_root {
-                        workspace_roots::validate_opened(owner, &id, &store, &private)?;
-                    } else {
-                        workspace_roots::mount(
-                            owner,
-                            &store,
-                            &private,
-                            candidate.workspace_revision,
-                        )?;
-                    }
+        return if let Some(store) = candidate.store {
+            if candidate.workspace_session.is_some() {
+                let owner = workspace_owner::store_mut(&mut session)?;
+                let private = workspace_owner::private_root(state)?;
+                if let Some(id) = candidate.granted_root {
+                    workspace_roots::validate_opened(owner, &id, &store, &private)?;
+                } else {
+                    workspace_roots::mount(owner, &store, &private, candidate.workspace_revision)?;
                 }
-                Ok(store)
             }
-            None => workspace_owner::take_parked(&mut session),
+            Ok(store.into())
+        } else {
+            workspace_owner::store(&session)?;
+            Ok(ProjectChoiceStore::Workspace)
         };
     }
     Err(IpcFailure::new(
@@ -3302,7 +3328,7 @@ impl ProjectChoiceReservation<'_> {
     fn finish<R: Runtime>(
         self,
         app: &AppHandle<R>,
-        result: Result<ProjectStore, IpcFailure>,
+        result: Result<impl Into<ProjectChoiceStore>, IpcFailure>,
     ) -> Result<ProjectSnapshot, IpcFailure> {
         self.finish_with_document_filesystem_watcher(result, |store, session_id| {
             DocumentFilesystemWatcher::start(
@@ -3324,16 +3350,24 @@ impl ProjectChoiceReservation<'_> {
 
     fn finish_with_document_filesystem_watcher(
         mut self,
-        result: Result<ProjectStore, IpcFailure>,
+        result: Result<impl Into<ProjectChoiceStore>, IpcFailure>,
         start_watcher: impl FnOnce(
             &ProjectStore,
             CommandId,
         ) -> Result<Option<DocumentFilesystemWatcher>, IpcFailure>,
     ) -> Result<ProjectSnapshot, IpcFailure> {
-        self.pending_store = Some(result?);
+        self.pending_store = Some(match result?.into() {
+            ProjectChoiceStore::New(store) => *store,
+            ProjectChoiceStore::Workspace => return self.finish_owner_with_watcher(start_watcher),
+        });
         let store = self.pending_store.as_ref().expect("prepared store");
         let session_id = CommandId::new();
-        let document_filesystem_watcher = start_watcher(store, session_id)?;
+        let owner_watch_session = {
+            let session = lock_session_internal(self.state)?;
+            session.workspace.is_none().then(CommandId::new)
+        };
+        let document_filesystem_watcher =
+            start_watcher(store, owner_watch_session.unwrap_or(session_id))?;
         // Establish observation before reading the handoff snapshot. The
         // renderer performs one coalesced refresh after attaching it, closing
         // the small interval in which correctly scoped early hints are still
@@ -3354,8 +3388,15 @@ impl ProjectChoiceReservation<'_> {
                 session_id.to_string(),
             )
             .map_err(|error| IpcFailure::speech_input(&error))?;
-        session.document_filesystem_watcher = document_filesystem_watcher;
         workspace_owner::establish(&mut session, store);
+        if let Some(owner_session_id) = owner_watch_session {
+            let owner = session.workspace.as_mut().expect("established owner");
+            owner.session_id = owner_session_id;
+            owner.filesystem_watcher = document_filesystem_watcher;
+            session.document_filesystem_watcher = None;
+        } else {
+            session.document_filesystem_watcher = document_filesystem_watcher;
+        }
         session.store = self.pending_store.take();
         session.active_session_id = Some(session_id);
         session.agency = AgencyGate::default();
@@ -3368,9 +3409,62 @@ impl ProjectChoiceReservation<'_> {
     #[cfg(test)]
     fn finish_without_document_filesystem_watcher(
         self,
-        result: Result<ProjectStore, IpcFailure>,
+        result: Result<impl Into<ProjectChoiceStore>, IpcFailure>,
     ) -> Result<ProjectSnapshot, IpcFailure> {
         self.finish_with_document_filesystem_watcher(result, |_store, _session_id| Ok(None))
+    }
+
+    fn finish_owner_with_watcher(
+        mut self,
+        start_watcher: impl FnOnce(
+            &ProjectStore,
+            CommandId,
+        ) -> Result<Option<DocumentFilesystemWatcher>, IpcFailure>,
+    ) -> Result<ProjectSnapshot, IpcFailure> {
+        // Existing pane workers can keep using the parked owner during chooser
+        // preparation. Hold the session lock only for this final borrowed read
+        // and atomic activation; never move its store through pending_store.
+        let mut session = lock_session_internal(self.state)?;
+        if session.phase != SessionPhase::Choosing || session.store.is_some() {
+            return Err(IpcFailure::new(
+                "project_choice_state_changed",
+                "The project chooser lost its reserved session.",
+                false,
+            ));
+        }
+        let owner = session.workspace.as_ref().ok_or_else(|| {
+            IpcFailure::new("workspace_not_open", "Open a workspace first.", false)
+        })?;
+        let owner_session = owner.session_id;
+        let store = workspace_owner::store(&session)?;
+        let watcher = if owner.filesystem_watcher.is_none() {
+            start_watcher(store, owner_session)?
+        } else {
+            None
+        };
+        let session_id = CommandId::new();
+        let snapshot = snapshot_for(store, session_id)?;
+        self.state
+            .speech_input
+            .bind_scope(
+                store.manifest().project_id.to_string(),
+                session_id.to_string(),
+            )
+            .map_err(|error| IpcFailure::speech_input(&error))?;
+        if let Some(watcher) = watcher {
+            session
+                .workspace
+                .as_mut()
+                .expect("borrowed owner")
+                .filesystem_watcher = Some(watcher);
+        }
+        session.store = Some(workspace_owner::take_parked(&mut session)?);
+        session.document_filesystem_watcher = None;
+        session.active_session_id = Some(session_id);
+        session.agency = AgencyGate::default();
+        session.phase = SessionPhase::Open;
+        self.committed = true;
+        Ok(snapshot)
     }
 }
 
@@ -4868,7 +4962,8 @@ async fn attachment_reveal_original(
     let _admission = lock_application_admission(&state, "an attachment reveal")?;
     let path = {
         let mut session = lock_session(&state)?;
-        let store = material_commands::require_source_store(&mut session, &project_id, &session_id)?;
+        let store =
+            material_commands::require_source_store(&mut session, &project_id, &session_id)?;
         context_attachments::original_path(store.root(), &attachment_id)
             .map_err(|error| IpcFailure::context_attachment(&error))?
     };
@@ -8655,11 +8750,18 @@ fn weave_start_inner<R: Runtime>(
             .saturating_sub(attachment_context.context_preamble.len())
             .saturating_sub(2);
         let owner = session.workspace.as_ref().ok_or_else(|| {
-            IpcFailure::new("workspace_not_open", "The source workspace is not open.", false)
+            IpcFailure::new(
+                "workspace_not_open",
+                "The source workspace is not open.",
+                false,
+            )
         })?;
         let source_context = workspace_owner::read_context(
-            &session, &project_id, &session_id,
-            &owner.project_id.to_string(), &owner.session_id.to_string(),
+            &session,
+            &project_id,
+            &session_id,
+            &owner.project_id.to_string(),
+            &owner.session_id.to_string(),
         )?;
         let material_plan = material_context::markdown_plan_with_budget(
             source_context,
@@ -8738,7 +8840,8 @@ fn weave_start_inner<R: Runtime>(
         let environment_artifact = store
             .record_model_environment(&model_environment)
             .map_err(IpcFailure::store)?;
-        let context_inputs = material_context::local_artifact_ids(store, material_plan.bindings.values())?;
+        let context_inputs =
+            material_context::local_artifact_ids(store, material_plan.bindings.values())?;
         let mut prompt_inputs = vec![loaded.artifact_id];
         prompt_inputs.extend(context_inputs.iter().copied());
         let prompt_recipe = PromptRecipe {
@@ -9376,7 +9479,7 @@ fn sampling_for_weave_case(
     }
 }
 
-fn loaded_model(state: &State<'_, PluginState>) -> Result<LoadedModel, IpcFailure> {
+fn loaded_model(state: &PluginState) -> Result<LoadedModel, IpcFailure> {
     loaded_model_for_state(state)
 }
 
@@ -10594,6 +10697,7 @@ fn application_close<R: Runtime>(
     let _audio = state.audio_capture.close_guard()?;
     let close_attempt = begin_application_close(&state)?;
     lock_prepared_project(&state)?.take();
+    terminal::drain_workspace_runs(&state, PROJECT_CLOSE_GENERATION_WAIT)?;
     if state
         .generations
         .active_branch_count()
@@ -11583,7 +11687,9 @@ mod tests {
         let private = tempfile::tempdir().expect("private workspace grants");
         std::fs::write(next.path().join("Notes.md"), "Exact next writing.\r\n").unwrap();
         let state = PluginState::with_app_local_data_root(
-            Some(private.path().to_owned()), true, BuildModelPolicy::default(),
+            Some(private.path().to_owned()),
+            true,
+            BuildModelPolicy::default(),
         );
         let mut store = initialize_project(current.path(), "Current".into()).unwrap();
         let source = store.read_document(INITIAL_DOCUMENT).unwrap();
@@ -11615,7 +11721,11 @@ mod tests {
         let id = prepare_project_path(&state, next.path().to_str().unwrap())
             .unwrap()
             .unwrap();
-        let candidate = take_prepared_project(&state, id.parse().unwrap()).unwrap();
+        let ProjectChoiceStore::New(candidate) =
+            take_prepared_project(&state, id.parse().unwrap()).unwrap()
+        else {
+            panic!("new folder")
+        };
         assert_eq!(
             candidate.read_document("Notes.md").unwrap().text,
             "Exact next writing.\r\n"

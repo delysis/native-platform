@@ -59,6 +59,8 @@ permissions = [
   "allow-speech-input-capabilities",
   "allow-speech-input-status",
   "allow-document-open",
+  "allow-workspace-pane-output",
+  "allow-workspace-document-resolve",
   "allow-document-import-external",
   "allow-shader-preview",
   "allow-document-checkpoint",

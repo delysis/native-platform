@@ -17,6 +17,7 @@
   import { workspaceRows, workspaceCopyDestination } from './lib/workspaceTree';
   import { workspaceFoldersForProject, workspaceRootIsActive, type WorkspaceFolderRow, type WorkspaceRootsSnapshot } from './lib/workspaceFolders';
   import WorkspacePane from './lib/WorkspacePane.svelte';
+  import { WorkspacePaneDrafts, type WorkspacePanePreparation } from './lib/workspacePaneDrafts';
   import MaterialView from './lib/MaterialView.svelte';
   import { resolveScopedMaterialReference } from './lib/materialEvidenceScope';
   import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, resolveMaterialReference } from './lib/ipc';
@@ -420,6 +421,9 @@
   let templateKey = '';
   let templateSerial = 0;
   let paneSelection: Record<string, string> = {};
+  const paneDrafts = new WorkspacePaneDrafts();
+  let workspaceOutputRevision = 0;
+  let workspaceRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   let hiddenPaneSlots = new Set<string>();
   let workspaceWidth = 1000;
   let workspaceHeight = 600;
@@ -461,6 +465,12 @@
   let terminalEntry = '';
   let terminalRuns: TerminalRun[] = [];
   let pinnedOutputs = new Set<string>();
+  let ownerPinnedOutputs = new Set<string>();
+  let ownerPinsSession = '';
+  $: if (workspaceRoots && ownerPinsSession !== workspaceRoots.workspace_session_id) {
+    ownerPinsSession = workspaceRoots.workspace_session_id;
+    ownerPinnedOutputs = readPinnedOutputs(window.localStorage, workspaceRoots.workspace_id);
+  }
   function toggleOutputPin(documentId: string): void {
     if (!project || !project.documents.some(item => item.document_id === documentId)) return;
     const next = new Set(pinnedOutputs);
@@ -468,6 +478,7 @@
     try { rememberPinnedOutputs(window.localStorage, project.project_id, next); }
     catch { announce('This navigation pin could not be saved on this device.'); }
     pinnedOutputs = next;
+    if (workspaceOwnerActive) ownerPinnedOutputs = new Set(next);
   }
   let terminalDispatching = false;
   let terminalCancelRequested = false;
@@ -2746,6 +2757,7 @@
       unlistenWindowFocus?.();
       unlistenFileCommands?.();
       unlistenDocumentFilesystemHints?.();
+      if (workspaceRefreshTimer) clearTimeout(workspaceRefreshTimer);
     };
   });
 
@@ -3130,6 +3142,10 @@
     try {
       const unlisten = await listenForDocumentFilesystemHints((hint) => {
         routeDocumentFilesystemHint(hint, project, scheduleProjectFilesystemRefresh);
+        if (workspaceRoots && hint.project_id === workspaceRoots.workspace_id && hint.session_id === workspaceRoots.workspace_session_id) {
+          scheduleWorkspaceRefresh();
+          if (workspaceOwnerActive) scheduleProjectFilesystemRefresh();
+        }
       });
       if (!componentMounted) {
         unlisten();
@@ -9753,6 +9769,19 @@
     return { status: 'closed' };
   }
 
+  function scheduleWorkspaceRefresh(): void {
+    const owner = materialOwnerScope;
+    if (!owner || !project) return;
+    if (workspaceRefreshTimer) clearTimeout(workspaceRefreshTimer);
+    workspaceRefreshTimer = setTimeout(() => {
+      workspaceRefreshTimer = undefined;
+      if (!componentMounted || !project || materialOwnerScope?.projectId !== owner.projectId || materialOwnerScope.sessionId !== owner.sessionId) return;
+      workspaceOutputRevision += 1;
+      void refreshWorkspaceTemplate();
+      void refreshWorkspaceRoots();
+    }, 80);
+  }
+
   async function refreshWorkspaceRoots(): Promise<WorkspaceRootsSnapshot | null> {
     if (!project) return null;
     const scope = { projectId: project.project_id, sessionId: project.session_id };
@@ -9815,6 +9844,18 @@
     if (candidate) await selectDocument(candidate, true);
   }
 
+  async function openOwnerPaneDocument(id: string, ownerSession: string, pin = false): Promise<void> {
+    if (!project || workspaceRoots?.workspace_session_id !== ownerSession) return;
+    const owner = workspaceRoots.roots.find(root => root.owner);
+    if (!owner) return;
+    if (!workspaceRootIsActive(owner, project) && !await doOpenProject({ rootId: owner.id })) return;
+    if (!project || workspaceRoots?.workspace_session_id !== ownerSession || !workspaceRootIsActive(owner, project)) return;
+    await refreshProjectFilesystemState();
+    if (!project || workspaceRoots?.workspace_session_id !== ownerSession || !workspaceRootIsActive(owner, project)) return;
+    if (pin) toggleOutputPin(id);
+    else await openPaneDocument(id);
+  }
+
   function applyDeferredTemplate(): void {
     if (project?.session_id !== deferredTemplateSession) { deferredWorkspaceTemplate = null; return; }
     if (!flushEditors()) return;
@@ -9847,16 +9888,16 @@
     paneSelection = { ...paneSelection, [position]: id };
   }
 
-  async function preparePaneRun(): Promise<OpenDocument | null> {
-    if (!project || !document || editorReadonly || compositionActive || !flushEditors()) return null;
-    const expected = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id, epoch: documentEpoch, text: documentText };
+  async function preparePaneRun(): Promise<WorkspacePanePreparation | null> {
+    if (!project || editorReadonly || compositionActive || !flushEditors()) return null;
+    const expected = { projectId: project.project_id, sessionId: project.session_id, documentId: document?.summary.document_id, epoch: documentEpoch, text: documentText };
     const current = () => terminalScopeIsCurrent(expected.projectId, expected.sessionId) && document?.summary.document_id === expected.documentId && documentEpoch === expected.epoch && documentText === expected.text;
     cancelSuggestionTimer();
     await cancelActiveBranches();
     if (!current() || !await flushCurrentDocument() || !current()) return null;
     if (!currentModel && !await loadPreferredSuggestionModel(currentWorkspaceCapture() ?? undefined)) return null;
     if (!current() || !currentModel) return null;
-    return document;
+    return { document };
   }
 
   function kindLabel(kind: DocumentKind): string {
@@ -10554,7 +10595,7 @@
               selectionDisabled={busyPaneSlots.has(slot.position)} onSelect={(id) => selectPane(slot.position, id)} onCollapse={() => togglePane(slot.position)} />
             {#each slot.choices as [paneId, paneConfig] (paneId)}
               <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
-            <WorkspacePane {referenceScope} {materialOwnerScope} bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
+            <WorkspacePane workspaceScope={materialOwnerScope} configurationRevisionId={workspaceTemplate?.revision_id ?? null} ownerActive={workspaceOwnerActive} outputRevision={workspaceOutputRevision} draft={workspaceRoots ? paneDrafts.forPane(workspaceRoots.workspace_session_id, paneId) : undefined} {referenceScope} {materialOwnerScope} bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => workspaceRoots && void openOwnerPaneDocument(id, workspaceRoots.workspace_session_id)} onRunsChanged={() => { if (workspaceOwnerActive) scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={ownerPinnedOutputs} onPinOutput={(id) => workspaceRoots && void openOwnerPaneDocument(id, workspaceRoots.workspace_session_id, true)} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
               </div>
             {/each}
           </aside>

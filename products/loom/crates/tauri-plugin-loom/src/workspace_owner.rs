@@ -10,6 +10,7 @@ pub(super) struct Owner {
     pub session_id: CommandId,
     pub root: PathBuf,
     parked: Option<ProjectStore>,
+    pub filesystem_watcher: Option<crate::DocumentFilesystemWatcher>,
 }
 
 pub(super) fn establish(session: &mut Session, store: &ProjectStore) {
@@ -19,6 +20,7 @@ pub(super) fn establish(session: &mut Session, store: &ProjectStore) {
             session_id: CommandId::new(),
             root: store.root().to_owned(),
             parked: None,
+            filesystem_watcher: None,
         });
     }
 }
@@ -283,10 +285,15 @@ mod tests {
             true,
             crate::BuildModelPolicy::default(),
         );
+        let initial_watch_session = std::cell::Cell::new(None);
         let opened = crate::reserve_project_choice(&state)
             .unwrap()
-            .finish_without_document_filesystem_watcher(
+            .finish_with_document_filesystem_watcher(
                 ProjectStore::open_folder(owner_dir.path()).map_err(IpcFailure::store),
+                |_, session_id| {
+                    initial_watch_session.set(Some(session_id));
+                    Ok(None)
+                },
             )
             .unwrap();
         let owner_session = crate::lock_session(&state)
@@ -295,6 +302,8 @@ mod tests {
             .as_ref()
             .unwrap()
             .session_id;
+        assert_eq!(initial_watch_session.get(), Some(owner_session));
+        assert_ne!(owner_session.to_string(), opened.session_id);
         let prepared = crate::prepare_project_folder(&state, Some(other_dir.path().to_owned()))
             .unwrap()
             .unwrap()
@@ -363,25 +372,45 @@ mod tests {
             .unwrap();
         close(&state, &other);
         let choice = crate::reserve_project_choice(&state).unwrap();
+        let selected = crate::take_prepared_project(&state, prepared).unwrap();
+        // A running pane can publish after the owner return is prepared but
+        // before the new active document session has been committed.
+        {
+            let mut session = crate::lock_session_internal(&state).unwrap();
+            require_store_mut(&mut session, &opened.project_id, &owner_session.to_string())
+                .unwrap()
+                .create_document_if_absent(
+                    "During return.md",
+                    loom_document::DocumentContent::Prose("Retained while returning.".into()),
+                    "retained experiment",
+                )
+                .unwrap();
+        }
         let error = choice
-            .finish_with_document_filesystem_watcher(
-                crate::take_prepared_project(&state, prepared),
-                |_, _| Err(IpcFailure::new("watcher_failed", "fixture failure", false)),
-            )
+            .finish_with_document_filesystem_watcher(Ok(selected), |_, _| {
+                Err(IpcFailure::new("watcher_failed", "fixture failure", false))
+            })
             .unwrap_err();
         assert_eq!(error.code, "watcher_failed");
-        let owner = {
-            let mut session = crate::lock_session_internal(&state).unwrap();
+        {
+            let session = crate::lock_session_internal(&state).unwrap();
             assert_eq!(session.phase, SessionPhase::Closed);
             assert_eq!(
                 store(&session).unwrap().manifest().project_id.to_string(),
                 opened.project_id
             );
-            take_parked(&mut session).unwrap()
-        };
+            assert_eq!(
+                store(&session)
+                    .unwrap()
+                    .read_document("During return.md")
+                    .unwrap()
+                    .text,
+                "Retained while returning."
+            );
+        }
         let reopened = crate::reserve_project_choice(&state)
             .unwrap()
-            .finish_without_document_filesystem_watcher(Ok(owner))
+            .finish_without_document_filesystem_watcher(Ok(crate::ProjectChoiceStore::Workspace))
             .unwrap();
         assert_eq!(reopened.project_id, opened.project_id);
         assert_ne!(reopened.session_id, opened.session_id);

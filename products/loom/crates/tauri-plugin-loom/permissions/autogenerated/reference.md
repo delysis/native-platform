@@ -59,6 +59,8 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-speech-input-capabilities`
 - `allow-speech-input-status`
 - `allow-document-open`
+- `allow-workspace-pane-output`
+- `allow-workspace-document-resolve`
 - `allow-document-import-external`
 - `allow-shader-preview`
 - `allow-document-checkpoint`
@@ -2845,6 +2847,136 @@ Enables the workspace_copy_folder_choose command without any pre-configured scop
 <td>
 
 Denies the workspace_copy_folder_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-document-resolve`
+
+</td>
+<td>
+
+Enables the workspace_document_resolve command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-document-resolve`
+
+</td>
+<td>
+
+Denies the workspace_document_resolve command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-pane-cancel`
+
+</td>
+<td>
+
+Enables the workspace_pane_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-pane-cancel`
+
+</td>
+<td>
+
+Denies the workspace_pane_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-pane-list`
+
+</td>
+<td>
+
+Enables the workspace_pane_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-pane-list`
+
+</td>
+<td>
+
+Denies the workspace_pane_list command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-pane-output`
+
+</td>
+<td>
+
+Enables the workspace_pane_output command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-pane-output`
+
+</td>
+<td>
+
+Denies the workspace_pane_output command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-pane-run`
+
+</td>
+<td>
+
+Enables the workspace_pane_run command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-pane-run`
+
+</td>
+<td>
+
+Denies the workspace_pane_run command without any pre-configured scope.
 
 </td>
 </tr>

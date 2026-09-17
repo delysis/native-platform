@@ -16,27 +16,31 @@
   import TerminalPane from './TerminalPane.svelte';
   import ChatTurn from './ChatTurn.svelte';
   import SourceEditor from './SourceEditor.svelte';
-  import { addDocumentContexts, importAttachmentPaths, bindAttachmentMaterial, addLibraryMaterialPath, cancelTerminalRun, listTerminalRuns, normalizeFailure, runTerminal } from './ipc';
+  import { addDocumentContexts, importAttachmentPaths, bindAttachmentMaterial, addLibraryMaterialPath, cancelWorkspacePaneRun, listWorkspacePaneRuns, readWorkspacePaneOutput, resolveWorkspaceDocument, normalizeFailure, runWorkspacePane } from './ipc';
   import { importedMaterialMarkdown, materialReferenceMarkdown, isDatabasePath } from './materials';
   import { decodeVerseForEditor as decodeSourceForEditor, encodeVerseFromEditor as encodeSourceFromEditor } from './verseCodec';
   import { canUseVisualMarkdown } from './markdownSafety';
   import { newUlid } from './ulid';
-  import { RetainedOutputLoader } from './retainedOutput';
-  import type { DocumentContextSnapshot, DocumentSummary, OpenDocument, TerminalRun, TerminalRunRequest } from './types';
+  import { createWorkspacePaneDraft, type WorkspacePaneDraftStore, type WorkspacePaneSubmission, type WorkspacePaneRunRequest, type WorkspacePanePreparation } from './workspacePaneDrafts';
+  import type { DocumentContextSnapshot, OpenDocument, TerminalRun } from './types';
 
   export let paneId: string;
+  export let draft: WorkspacePaneDraftStore = createWorkspacePaneDraft();
   export let config: WorkspacePaneConfig;
   export let projectId: string;
   export let sessionId: string;
+  export let workspaceScope: import('./materialEvidenceScope').MaterialSourceScope | null = null;
+  export let configurationRevisionId: string | null = null;
+  export let ownerActive = false;
+  export let outputRevision = 0;
   export let materialOwnerScope: import('./materialEvidenceScope').MaterialSourceScope | null = null;
-  export let documents: DocumentSummary[] = [];
   export let source: OpenDocument | null = null;
   export let value = '';
   export let referenceScope: import('./referenceDiagnostics').ReferenceScope | null = null;
   export let readonly = false;
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onChange: (value: string) => void = () => {};
-  export let beforeRun: () => Promise<OpenDocument | null>;
+  export let beforeRun: () => Promise<WorkspacePanePreparation | null>;
   export let onOpenDocument: (id: string) => void;
   export let onRunsChanged: () => void = () => {};
   export let beforeAttachmentImport: () => Promise<boolean> = async () => true;
@@ -50,20 +54,24 @@
   function setComposing(active: boolean): void { composing = active; onCompositionChange(active); }
   let mounted = false;
   let scope = '';
-  let entry = '';
+  let scopeSerial = 0;
+  let activeDraft = draft;
   let runs: TerminalRun[] = [];
   let error = '';
   let dispatching = false;
   let importing = false;
-  let pending: TerminalRunRequest | null = null;
   let cancelRequested = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let refreshing = false;
+  let refreshedOutputRevision = -1;
 
   let visualSession = '';
   let outputText: Record<string, string> = {};
   let outputSerial = 0;
-  const outputLoader = new RetainedOutputLoader();
+  let outputDocuments: Record<string, OpenDocument> = {};
+  let configuredDocument: OpenDocument | null = null;
+  let configuredDocumentKey = '';
+  let configuredDocumentSerial = 0;
   const MAX_PROMPT_BYTES = 64 * 1024;
   let editor: LoomEditor | undefined;
   let sourceEditor: SourceEditor | undefined;
@@ -74,23 +82,27 @@
   function trackScroll(): void {
     if (historyViewport) following = historyViewport.scrollHeight - historyViewport.scrollTop - historyViewport.clientHeight < 48;
   }
-  $: nextScope = `${projectId}/${sessionId}/${paneId}`;
-  $: if (mounted && scope !== nextScope) resetScope(nextScope);
-  $: busy = importing || dispatching || pending !== null || runs.some((run) => run.status === 'running');
+  $: nextScope = `${projectId}/${sessionId}/${workspaceScope?.projectId ?? ''}/${workspaceScope?.sessionId ?? ''}/${paneId}`;
+  $: if (mounted && (scope !== nextScope || activeDraft !== draft)) resetScope(nextScope);
+  $: if (mounted && !refreshing && refreshedOutputRevision !== outputRevision) void refresh();
+  $: busy = importing || dispatching || $draft.pending !== null || runs.some((run) => run.status === 'running');
   $: reportBusy(busy);
-  $: target = resolveDocument(config.document, documents, source);
+  $: paneError = error || $draft.failure || ($draft.pending && !dispatching ? 'The previous submission has not been confirmed.' : '');
+  $: nextConfiguredDocumentKey = `${workspaceScope?.projectId ?? ''}/${workspaceScope?.sessionId ?? ''}/${config.document ?? ''}/${configurationRevisionId ?? ''}/${outputRevision}`;
+  $: if (mounted && configuredDocumentKey !== nextConfiguredDocumentKey) void loadConfiguredDocument(nextConfiguredDocumentKey);
+  $: target = config.document === '@document' ? source?.summary ?? null : configuredDocument?.summary ?? null;
   $: recentRuns = runs;
-  $: pendingRun = pending && !runs.some(run => run.run_id === pending?.commandId) ? {
-    run_id: pending.commandId, presentation: pending.presentation, status: 'running' as const,
-    expression: pending.expression, output_document_id: null, output_relative_path: null,
+  $: pendingRun = $draft.pending && !runs.some(run => run.run_id === $draft.pending?.command_id) ? {
+    run_id: $draft.pending.command_id, presentation: { pane_id: $draft.pending.pane_id, input: $draft.pending.input }, status: 'running' as const,
+    expression: $draft.pending.expression, output_document_id: null, output_relative_path: null,
     preview: '', error: null, created_at_ms: 0
   } : null;
-  $: if (mounted && config.kind === 'chat') void hydrateOutputs(scope, recentRuns, documents);
-  $: editingCurrent = !config.document || target?.document_id === source?.summary.document_id;
+  $: if (mounted && (config.kind === 'chat' || config.kind === 'browser')) void hydrateOutputs(scope, recentRuns, outputRevision);
+  $: editingCurrent = !config.document || config.document === '@document' || (ownerActive && target?.document_id === source?.summary.document_id);
   $: editorKey = `${scope}/${source?.summary.document_id ?? ''}`;
   $: visual = selectVisual(value, editorKey);
   $: sourceDecoded = decodeSourceForEditor(value);
-  $: preview = mounted && config.kind === 'browser' ? previewUrl(projectId, sessionId, target, runs, documents) : '';
+  $: preview = mounted && config.kind === 'browser' ? previewUrl(runs, outputDocuments, configuredDocument) : '';
 
   export function flush(): boolean { return !composing && (editor?.flushPending() ?? true); }
 
@@ -102,20 +114,20 @@
   /** Keep the initiating pane and exact selection while a source takes focus. */
   export function captureReferenceInsertion(openedReference?: Element): ((markdown: string) => boolean) | null {
     if (!mounted || readonly || composing || busy || !source || !flush() || (config.kind === 'editor' && !editingCurrent)) return null;
-    const captured = { scope, kind: config.kind, documentId: source.summary.document_id, value, entry, visual,
-      start: entryArea?.selectionStart ?? entry.length, end: entryArea?.selectionEnd ?? entry.length };
+    const captured = { scope, scopeSerial, draft, kind: config.kind, documentId: source.summary.document_id, value, entry: $draft.entry, visual,
+      start: entryArea?.selectionStart ?? $draft.entry.length, end: entryArea?.selectionEnd ?? $draft.entry.length };
     const visualAnchor = visual && config.kind === 'editor' ? editor?.captureTextInsertionAnchor(openedReference) : null;
     const sourceAnchor = !visual && config.kind === 'editor' ? sourceEditor?.captureTextInsertionAnchor() : null;
     return markdown => {
-      if (!mounted || readonly || composing || busy || scope !== captured.scope || config.kind !== captured.kind ||
-          source?.summary.document_id !== captured.documentId || value !== captured.value || entry !== captured.entry || visual !== captured.visual) return false;
+      if (!mounted || readonly || composing || busy || scope !== captured.scope || scopeSerial !== captured.scopeSerial || draft !== captured.draft || config.kind !== captured.kind ||
+          source?.summary.document_id !== captured.documentId || value !== captured.value || $draft.entry !== captured.entry || visual !== captured.visual) return false;
       if (captured.kind === 'editor') return Boolean(captured.visual
         ? visualAnchor && editor?.insertMarkdownAtAnchor(visualAnchor, markdown)
         : sourceAnchor && sourceEditor?.insertTextAtAnchor(sourceAnchor, markdown));
       const before = captured.entry.slice(0, captured.start), after = captured.entry.slice(captured.end);
       const next = before + markdown + after;
       if (new TextEncoder().encode(next).length > MAX_PROMPT_BYTES) return false;
-      entry = next;
+      $draft.entry = next;
       return true;
     };
   }
@@ -125,15 +137,15 @@
     if (!mounted || readonly || composing || busy || !source || !paths.length ||
         (config.kind === 'editor' && !editingCurrent)) return;
     if (!flush()) return;
-    const captured = { scope, projectId, sessionId, documentId: source.summary.document_id,
-      kind: config.kind, value, entry, visual, materialOwnerScope };
+    const captured = { scope, scopeSerial, draft, projectId, sessionId, documentId: source.summary.document_id,
+      kind: config.kind, value, entry: $draft.entry, visual, materialOwnerScope };
     const visualAnchor = visual && config.kind === 'editor' ? editor?.captureAttachmentAnchor(point.x, point.y) : null;
     const sourceAnchor = !visual && config.kind === 'editor' ? sourceEditor?.captureTextInsertionAnchor() : null;
     importing = true; error = '';
-    const current = () => mounted && scope === captured.scope && !readonly && !composing &&
+    const current = () => mounted && scope === captured.scope && scopeSerial === captured.scopeSerial && draft === captured.draft && !readonly && !composing &&
       source?.summary.document_id === captured.documentId && config.kind === captured.kind &&
       materialOwnerScope?.projectId === captured.materialOwnerScope?.projectId && materialOwnerScope?.sessionId === captured.materialOwnerScope?.sessionId &&
-      value === captured.value && entry === captured.entry && visual === captured.visual;
+      value === captured.value && $draft.entry === captured.entry && visual === captured.visual;
     try {
       if (!await beforeAttachmentImport()) return;
       if (!current()) throw new Error('The pane changed before import. Drop the files again at the intended location.');
@@ -171,12 +183,12 @@
           onContextChanged(snapshot, captured.projectId, captured.sessionId, captured.documentId);
         }
         if (!current()) throw new Error('The pane changed during import. The files remain attached to their original document.');
-        entry = next;
+        $draft.entry = next;
         onRunsChanged();
       }
     } catch (failure) {
-      if (mounted && scope === captured.scope) error = normalizeFailure(failure).message;
-    } finally { if (mounted && scope === captured.scope) importing = false; }
+      if (mounted && scope === captured.scope && scopeSerial === captured.scopeSerial && draft === captured.draft) error = normalizeFailure(failure).message;
+    } finally { if (mounted && scope === captured.scope && scopeSerial === captured.scopeSerial && draft === captured.draft) importing = false; }
   }
 
   function reportBusy(value: boolean): void { onBusyChange(value); }
@@ -185,77 +197,123 @@
     if (admitted) visualSession = key;
     return admitted;
   }
-  function resolveDocument(reference: string | null, summaries: DocumentSummary[], current: OpenDocument | null): DocumentSummary | null {
-    if (!reference) return null;
-    if (reference === '@document') return current?.summary ?? null;
-    let name = reference.replace(/^@/, '');
-    if (name.startsWith('"')) { try { name = JSON.parse(name); } catch { return null; } }
-    const exact = summaries.find((doc) => doc.document_id === name || doc.relative_path === name);
-    if (exact) return exact;
-    const matches = summaries.filter((doc) => doc.title === name);
-    return matches.length === 1 ? matches[0] : null;
+  async function loadConfiguredDocument(key: string): Promise<void> {
+    configuredDocumentKey = key;
+    const serial = ++configuredDocumentSerial, owner = workspaceScope;
+    configuredDocument = null;
+    if (!owner || !config.document || config.document === '@document') return;
+    const current = captureScope();
+    try {
+      let reference = config.document.replace(/^@/, '');
+      if (reference.startsWith('"')) reference = JSON.parse(reference);
+      const opened = await resolveWorkspaceDocument(owner.projectId, owner.sessionId, reference);
+      if (current() && serial === configuredDocumentSerial) configuredDocument = opened;
+    } catch (failure) { if (current() && serial === configuredDocumentSerial) error = normalizeFailure(failure).message; }
   }
   function resetScope(next: string): void {
     if (timer) clearTimeout(timer);
-    scope = next; following = true;
-    runs = []; entry = ''; error = ''; pending = null; dispatching = false; importing = false;
+    scope = next; configuredDocumentKey = ''; scopeSerial += 1; activeDraft = draft; following = true;
+    runs = []; error = ''; dispatching = false; importing = false;
     refreshing = false; cancelRequested = false;
-    outputText = {}; outputLoader.clear(); outputSerial += 1;
+    outputText = {}; outputDocuments = {}; outputSerial += 1;
     void refresh(next);
   }
-  async function refresh(expected = scope): Promise<void> {
-    if (!mounted || expected !== scope || refreshing) return;
-    refreshing = true;
-    const project = projectId, session = sessionId;
+  function captureScope(): () => boolean {
+    const expected = scope, serial = scopeSerial, captured = draft;
+    return () => mounted && scope === expected && scopeSerial === serial && draft === captured;
+  }
+  function settleSubmission(retained: WorkspacePaneDraftStore, request: WorkspacePaneRunRequest, submission: WorkspacePaneSubmission): void {
+    retained.update(current => {
+      if (current.pending !== request) return current;
+      const accepted = submission.status === 'accepted' && (submission.run.status === 'running' || submission.run.status === 'completed');
+      return { entry: accepted && current.entry === request.input ? '' : current.entry, pending: null,
+        failure: submission.status === 'rejected' ? submission.error.message : accepted ? null : submission.run.error ?? 'The submission did not complete. Your input is retained.' };
+    });
+  }
+  function confirmSubmission(request: WorkspacePaneRunRequest, run: TerminalRun): void {
+    if ($draft.pending !== request || run.run_id !== request.command_id) return;
+    settleSubmission(draft, request, { status: 'accepted', run });
+    error = '';
+  }
+  async function checkResult(): Promise<void> {
+    const request = $draft.pending;
+    if (!request) return;
+    const current = captureScope();
     try {
-      const all = await listTerminalRuns(project, session);
-      if (!mounted || expected !== scope) return;
+      // Recovery reads the admitted owner request; it never starts a new run.
+      const history = await listWorkspacePaneRuns(request.workspace_id, request.workspace_session_id);
+      if (!current() || $draft.pending !== request) return;
+      const run = history.find(item => item.run_id === request.command_id);
+      if (run) {
+        confirmSubmission(request, run);
+        runs = [...runs.filter(item => item.run_id !== run.run_id), run];
+        onRunsChanged();
+        await refresh();
+      } else error = '';
+    } catch (failure) { if (current()) error = normalizeFailure(failure).message; }
+  }
+  async function refresh(expected = scope): Promise<void> {
+    if (!mounted || expected !== scope || refreshing || !workspaceScope) return;
+    refreshing = true;
+    refreshedOutputRevision = outputRevision;
+    const { projectId: project, sessionId: session } = workspaceScope;
+    const current = captureScope();
+    try {
+      const all = await listWorkspacePaneRuns(project, session);
+      if (!current()) return;
       const previous = runs.map((run) => `${run.run_id}/${run.status}`).join();
       runs = all.filter((run) => run.presentation?.pane_id === paneId).sort((a, b) => a.created_at_ms - b.created_at_ms);
-      if (pending && runs.some((run) => run.run_id === pending?.commandId)) pending = null;
-      if (cancelRequested) {
-        for (const run of runs.filter((run) => run.status === 'running')) await cancelTerminalRun(project, session, run.run_id);
+      const request = $draft.pending;
+      if (request?.workspace_id === project && request.workspace_session_id === session) {
+        const run = runs.find(item => item.run_id === request.command_id);
+        if (run) confirmSubmission(request, run);
       }
+      if (cancelRequested) {
+        for (const run of runs.filter((run) => run.status === 'running')) {
+          if (!current()) return;
+          await cancelWorkspacePaneRun(project, session, run.run_id);
+        }
+      }
+      if (!current()) return;
       if (previous !== runs.map((run) => `${run.run_id}/${run.status}`).join()) onRunsChanged();
     } catch (failure) {
-      if (mounted && expected === scope) error = normalizeFailure(failure).message;
+      if (current()) error = normalizeFailure(failure).message;
     } finally {
-      if (mounted && expected === scope) {
+      if (current()) {
         refreshing = false;
         if (timer) clearTimeout(timer);
         if (runs.some((run) => run.status === 'running')) timer = setTimeout(() => void refresh(expected), 800);
       }
     }
   }
-  function readOutput(run: TerminalRun, summaries: DocumentSummary[]): Promise<string> {
-    return outputLoader.read(projectId, sessionId, run, summaries);
+  async function readOutput(run: TerminalRun, owner = workspaceScope): Promise<OpenDocument> {
+    if (!owner) throw new Error('The workspace is not ready.');
+    const opened = await readWorkspacePaneOutput(owner.projectId, owner.sessionId, run.run_id);
+    if (!opened) throw new Error('The retained document is not available yet.');
+    return opened;
   }
-  async function hydrateOutputs(expected: string, history: TerminalRun[], summaries: DocumentSummary[]): Promise<void> {
-    const serial = ++outputSerial;
-    const texts: Record<string, string> = {};
+  async function hydrateOutputs(_expected: string, history: TerminalRun[], _revision: number): Promise<void> {
+    const serial = ++outputSerial, current = captureScope();
+    const texts: Record<string, string> = {}, opened: Record<string, OpenDocument> = {};
     for (const run of history) {
-      if (!run.output_document_id || !summaries.some((doc) => doc.document_id === run.output_document_id)) continue;
-      try { texts[run.run_id] = await readOutput(run, summaries); }
-      catch (failure) { if (mounted && expected === scope && serial === outputSerial) error = normalizeFailure(failure).message; }
-      if (!mounted || expected !== scope || serial !== outputSerial) return;
+      if (!run.output_document_id) continue;
+      try {
+        const document = await readOutput(run);
+        texts[run.run_id] = document.text; opened[run.run_id] = document;
+      } catch (failure) { if (current() && serial === outputSerial) error = normalizeFailure(failure).message; }
+      if (!current() || serial !== outputSerial) return;
     }
-    if (mounted && expected === scope && serial === outputSerial) outputText = texts;
+    if (current() && serial === outputSerial) { outputText = texts; outputDocuments = opened; }
   }
-  function referenceName(reference: string, current: OpenDocument): string {
-    if (reference === '@document') return current.summary.relative_path;
-    const name = reference.replace(/^@/, '');
-    return name.startsWith('"') ? JSON.parse(name) : name;
-  }
-  async function prompt(input: string, current: OpenDocument): Promise<{ expression: string; contextReferences?: string[] }> {
+  async function prompt(input: string, current: () => boolean): Promise<string> {
+    const owner = workspaceScope;
     let expression = input;
-    let contextReferences: string[] | undefined;
     if (config.kind !== 'terminal') {
-      contextReferences = [...new Set([...config.context, ...(config.document ? [config.document] : [])]
-        .map((name) => referenceName(name, current)))];
       const history: string[] = [];
       if (config.kind === 'chat') {
         for (const run of runs.filter((run) => run.status === 'completed').slice(-8)) {
-          const output = await readOutput(run, documents);
+          const output = (await readOutput(run, owner)).text;
+          if (!current()) throw new Error('The pane changed before submission.');
           history.push(`User: ${run.presentation?.input ?? ''}\nAssistant: ${output}`);
         }
       }
@@ -263,56 +321,84 @@
       expression = [...history, task].join('\n\n');
     }
     if (new TextEncoder().encode(expression).length > MAX_PROMPT_BYTES) throw new Error('The conversation exceeds the 64 KiB prompt limit.');
-    return { expression, ...(contextReferences ? { contextReferences } : {}) };
+    return expression;
   }
   async function submit(): Promise<void> {
-    if (busy || composing || readonly || !entry.trim()) return;
-    const expected = scope, input = entry;
-    dispatching = true; error = ''; cancelRequested = false;
+    if (busy || composing || readonly || !workspaceScope || !configurationRevisionId || !$draft.entry.trim()) return;
+    const expected = scope, input = $draft.entry, stillCurrent = captureScope();
+    const owner = workspaceScope, revision = configurationRevisionId, retained = draft;
+    const sourceScope = { projectId, sessionId };
+    dispatching = true; error = ''; $draft.failure = null; cancelRequested = false;
     try {
-      const current = await beforeRun();
-      if (!mounted || expected !== scope || cancelRequested) return;
-      if (!current?.summary.revision_id) throw new Error('Open and save a document first.');
-      const preparedPrompt = await prompt(input, current);
-      if (!mounted || expected !== scope || cancelRequested) return;
-      const request: TerminalRunRequest = {
-        projectId, sessionId, commandId: newUlid(), documentId: current.summary.document_id,
-        sourceRevisionId: current.summary.revision_id, expectedVisibleBlobId: current.visible_blob_id,
-        sourceStartByte: 0, sourceEndByte: 0, ...preparedPrompt,
-        ...(config.kind === 'chat' ? { turnBoundary: 'chat' as const } : {}),
-        presentation: { pane_id: paneId, input }
+      const prepared = await beforeRun();
+      if (!stillCurrent() || cancelRequested) return;
+      if (!prepared) return;
+      const current = prepared.document;
+      if (current && !current.summary.revision_id) throw new Error('Save the document before running.');
+      const expression = await prompt(input, stillCurrent);
+      if (!stillCurrent() || cancelRequested) return;
+      const request: WorkspacePaneRunRequest = {
+        workspace_id: owner.projectId, workspace_session_id: owner.sessionId,
+        command_id: newUlid(), pane_id: paneId, configuration_revision_id: revision,
+        expression, input,
+        ...(current ? { captured_document: {
+          project_id: sourceScope.projectId, session_id: sourceScope.sessionId,
+          document_id: current.summary.document_id, revision_id: current.summary.revision_id!,
+          visible_blob_id: current.visible_blob_id
+        } } : {})
       };
-      pending = request;
-      const run = await runTerminal(request);
-      if (!mounted || expected !== scope) return;
-      if (run.run_id !== request.commandId) throw new Error('The retained result belongs to a different run.');
-      pending = null; entry = '';
+      $draft.pending = request;
+      const submission = await runWorkspacePane(request);
+      if (submission.status === 'rejected') {
+        settleSubmission(retained, request, submission);
+        if (stillCurrent()) error = '';
+        return;
+      }
+      const run = submission.run;
+      if (run.run_id !== request.command_id) throw new Error('The retained result belongs to a different run.');
+      settleSubmission(retained, request, submission);
+      if (!stillCurrent()) return;
+      error = run.status === 'running' || run.status === 'completed' ? '' : run.error ?? 'The submission did not complete. Your input is retained.';
       runs = [...runs.filter((item) => item.run_id !== run.run_id), run];
       onRunsChanged();
       await refresh(expected);
     } catch (failure) {
-      if (mounted && expected === scope) {
+      if (stillCurrent()) {
         error = normalizeFailure(failure).message;
-        if (failure && typeof failure === 'object' && 'code' in failure) pending = null;
+        // A typed persistence failure can follow admission too. Only a retained
+        // receipt may settle this request; a thrown error never authorizes retry.
         await refresh(expected);
       }
-    } finally { if (mounted && expected === scope) dispatching = false; }
+    } finally { if (stillCurrent()) dispatching = false; }
   }
   async function stop(): Promise<void> {
     cancelRequested = true;
-    const expected = scope;
+    const expected = scope, current = captureScope();
+    if (!workspaceScope) return;
+    const { projectId: project, sessionId: session } = workspaceScope;
+    const request = $draft.pending;
+    const ids = new Set(runs.filter(run => run.status === 'running').map(run => run.run_id));
     try {
-      const ids = new Set(runs.filter((run) => run.status === 'running').map((run) => run.run_id));
-      if (pending) ids.add(pending.commandId);
-      for (const id of ids) await cancelTerminalRun(projectId, sessionId, id);
+      if (request) {
+        await cancelWorkspacePaneRun(request.workspace_id, request.workspace_session_id, request.command_id);
+        if (!current()) return;
+        if (request.workspace_id === project && request.workspace_session_id === session) ids.delete(request.command_id);
+      }
+      for (const id of ids) {
+        if (!current()) return;
+        await cancelWorkspacePaneRun(project, session, id);
+      }
       await refresh(expected);
-    } catch (failure) { if (mounted && expected === scope) error = normalizeFailure(failure).message; }
+    } catch (failure) { if (current()) error = normalizeFailure(failure).message; }
   }
-  function previewUrl(project: string, session: string, chosen: DocumentSummary | null, history: TerminalRun[], summaries: DocumentSummary[]): string {
-    const latest = history.filter((run) => run.status === 'completed' && run.output_document_id).at(-1);
-    const summary = summaries.find((doc) => doc.document_id === latest?.output_document_id) ?? chosen;
-    if (!project || !session || !summary?.revision_id || !summary.active_blob_id) return '';
-    return convertFileSrc(`v1-${project}-${session}-${summary.document_id}-${summary.revision_id}-${summary.active_blob_id}`, 'loom-preview');
+  function previewUrl(history: TerminalRun[], outputs: Record<string, OpenDocument>, configured: OpenDocument | null): string {
+    const latest = history.filter(run => run.status === 'completed' && run.output_document_id).at(-1);
+    const output = latest ? outputs[latest.run_id] : null;
+    const document = output ?? (config.document === '@document' ? source : configured);
+    const selectedScope = output || config.document !== '@document' ? workspaceScope : { projectId, sessionId };
+    const summary = document?.summary;
+    if (!selectedScope || !summary?.revision_id || !summary.active_blob_id) return '';
+    return convertFileSrc(`v1-${selectedScope.projectId}-${selectedScope.sessionId}-${summary.document_id}-${summary.revision_id}-${summary.active_blob_id}`, 'loom-preview');
   }
   function keydown(event: KeyboardEvent): void {
     if (event.isComposing) return;
@@ -328,7 +414,7 @@
 
 {#if config.visible}
 <section data-workspace-pane={paneId} class="workspace-pane" class:browser={config.kind === 'browser'} aria-label={config.title ?? config.kind} aria-busy={busy} on:focusin={onFocus}>
-  {#if error && config.kind !== 'terminal'}<p class="error" role="alert">{error}{#if pending}<button on:click={() => void refresh()}>Check result</button>{/if}</p>{/if}
+  {#if paneError && config.kind !== 'terminal'}<p class="error" role="alert">{paneError}{#if $draft.pending}<button on:click={() => void checkResult()}>Check result</button>{/if}</p>{/if}
   {#if config.kind === 'editor'}
     {#if source && editingCurrent}
       <div class="editor">
@@ -343,7 +429,7 @@
     {:else if target}<button on:click={() => onOpenDocument(target.document_id)}>Open {target.title}</button>
     {:else}<p class="empty">{config.document ? 'Document unavailable' : 'Open a document'}</p>{/if}
   {:else if config.kind === 'terminal'}
-    <TerminalPane embedded open={true} bind:entry {projectId} {sessionId} {documents} {runs} {busy} {error} disabled={readonly} runDisabled={!entry.trim()} uncertain={pending !== null} onCheck={() => void refresh()} onRun={() => void submit()} onCancel={() => void stop()} pinnedOutputs={pinnedOutputs} onPin={onPinOutput ? (run) => run.output_document_id && onPinOutput?.(run.output_document_id) : undefined} onOpen={(run) => run.output_document_id && onOpenDocument(run.output_document_id)} onClose={() => {}} />
+    <TerminalPane embedded open={true} bind:entry={$draft.entry} projectId={workspaceScope?.projectId ?? ''} sessionId={workspaceScope?.sessionId ?? ''} documents={[]} {outputRevision} readOutput={(run) => readOutput(run).then(document => document.text)} {runs} {busy} error={paneError} disabled={readonly} runDisabled={!$draft.entry.trim()} uncertain={$draft.pending !== null} onCheck={() => void checkResult()} onRun={() => void submit()} onCancel={() => void stop()} pinnedOutputs={pinnedOutputs} onPin={onPinOutput ? (run) => run.output_document_id && onPinOutput?.(run.output_document_id) : undefined} onOpen={(run) => run.output_document_id && onOpenDocument(run.output_document_id)} onClose={() => {}} />
   {:else}
     {#if config.kind === 'browser'}
       {#if preview}<iframe title={config.title ?? 'Page preview'} sandbox="" referrerpolicy="no-referrer" src={preview}></iframe>{/if}
@@ -359,11 +445,11 @@
       </div>
     {/if}
     <form on:submit|preventDefault={() => void submit()}>
-      <textarea bind:this={entryArea} bind:value={entry} rows="1" aria-label={config.kind === 'chat' ? 'Message' : 'Page description'} on:keydown={keydown} on:compositionstart={() => setComposing(true)} on:compositionend={() => setComposing(false)} disabled={readonly}></textarea>
+      <textarea bind:this={entryArea} bind:value={$draft.entry} rows="1" aria-label={config.kind === 'chat' ? 'Message' : 'Page description'} on:keydown={keydown} on:compositionstart={() => setComposing(true)} on:compositionend={() => setComposing(false)} disabled={readonly}></textarea>
       {#if busy || config.kind === 'browser'}
       <div class="composer-actions">
       {#if busy}<button class="send" type="button" aria-label="Stop" on:click={() => void stop()} disabled={readonly}>■</button>
-      {:else}<button class="send" type="submit" aria-label="Run" disabled={readonly || composing || !entry.trim()}>↑</button>{/if}
+      {:else}<button class="send" type="submit" aria-label="Run" disabled={readonly || composing || !$draft.entry.trim()}>↑</button>{/if}
       </div>
       {/if}
     </form>

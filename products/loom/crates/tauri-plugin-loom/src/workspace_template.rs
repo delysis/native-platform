@@ -84,12 +84,12 @@ pub(super) enum PanePosition {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct PaneConfig {
-    kind: PaneKind,
+    pub(super) kind: PaneKind,
     position: PanePosition,
     visible: bool,
     title: Option<String>,
-    document: Option<String>,
-    context: Vec<String>,
+    pub(super) document: Option<String>,
+    pub(super) context: Vec<String>,
 }
 
 impl PaneConfig {
@@ -176,11 +176,11 @@ impl WorkspaceTheme {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(super) struct WorkspaceConfig {
-    panes_enabled: bool,
+    pub(super) panes_enabled: bool,
     model: Option<WorkspaceModel>,
     functions: FunctionSettings,
     theme: WorkspaceTheme,
-    panes: BTreeMap<String, PaneConfig>,
+    pub(super) panes: BTreeMap<String, PaneConfig>,
     collections: Vec<CollectionDefinition>,
 }
 
@@ -265,6 +265,13 @@ pub(super) fn function_recipe(store: &mut ProjectStore) -> Result<FunctionRecipe
             origin: None,
         });
     };
+    function_recipe_from_snapshot(store, &loaded)
+}
+
+pub(super) fn function_recipe_from_snapshot(
+    store: &ProjectStore,
+    loaded: &LoadedDocument,
+) -> Result<FunctionRecipe, IpcFailure> {
     let config = parse_config(&loaded.text)
         .map_err(|message| IpcFailure::new("workspace_template_failed", message, false))?;
     Ok(FunctionRecipe {
@@ -280,7 +287,7 @@ pub(super) fn function_recipe(store: &mut ProjectStore) -> Result<FunctionRecipe
             revision_id: loaded.revision_id,
             blob_id: loaded.blob_id,
             artifact_id: loaded.artifact_id,
-            text: loaded.text,
+            text: loaded.text.clone(),
         }),
     })
 }
@@ -326,7 +333,7 @@ fn validate_reference(reference: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_config(markdown: &str) -> Result<WorkspaceConfig, String> {
+pub(super) fn parse_config(markdown: &str) -> Result<WorkspaceConfig, String> {
     if markdown.len() > MAX_TEMPLATE_BYTES {
         return Err("The workspace template exceeds 64 KiB.".into());
     }

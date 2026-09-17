@@ -1,15 +1,17 @@
 import { mount, unmount, tick } from 'svelte';
+import { get } from 'svelte/store';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { page, userEvent } from 'vitest/browser';
 import WorkspacePane, { type WorkspacePaneConfig } from './WorkspacePane.svelte';
 import type { OpenDocument, TerminalRun } from './types';
+import { WorkspacePaneDrafts, type WorkspacePaneDraftStore } from './workspacePaneDrafts';
 import '../app.css';
 
 vi.mock('@tauri-apps/api/core', async (original) => ({ ...await original<typeof import('@tauri-apps/api/core')>(), convertFileSrc: (path: string, protocol: string) => `${protocol}://localhost/${path}` }));
-const ipc = vi.hoisted(() => ({ list: vi.fn(), run: vi.fn(), cancel: vi.fn(), open: vi.fn(), import: vi.fn(), bind: vi.fn() }));
+const ipc = vi.hoisted(() => ({ list: vi.fn(), run: vi.fn(), cancel: vi.fn(), open: vi.fn(), resolve: vi.fn(), import: vi.fn(), bind: vi.fn() }));
 vi.mock('./ipc', async (original) => ({
   ...await original<typeof import('./ipc')>(),
-  listTerminalRuns: ipc.list, runTerminal: ipc.run, cancelTerminalRun: ipc.cancel, openDocument: ipc.open,
+  listWorkspacePaneRuns: ipc.list, runWorkspacePane: ipc.run, cancelWorkspacePaneRun: ipc.cancel, readWorkspacePaneOutput: ipc.open, resolveWorkspaceDocument: ipc.resolve,
   importAttachmentPaths: ipc.import, bindAttachmentMaterial: ipc.bind,
   normalizeFailure: (error: unknown) => ({ message: error instanceof Error ? error.message : String(error) })
 }));
@@ -27,16 +29,19 @@ function run(id: string, paneId = 'conversation'): TerminalRun {
   return { run_id: id, status: 'completed', expression: 'prompt', presentation: { pane_id: paneId, input: 'Earlier message' },
     output_document_id: 'result', output_relative_path: 'Runs/1/Answer.md', preview: 'Earlier answer', error: null, created_at_ms: 1 };
 }
-async function render(config: Partial<WorkspacePaneConfig> = {}, value = source.text) {
+async function render(config: Partial<WorkspacePaneConfig> = {}, value = source.text, retained: { draft?: WorkspacePaneDraftStore; projectId?: string; sessionId?: string; workspaceScope?: { projectId: string; sessionId: string }; ownerActive?: boolean; source?: OpenDocument | null } = {}) {
+  const initialListCalls = ipc.list.mock.calls.length;
   const target = document.createElement('div'); target.style.height = '400px'; target.style.width = '320px'; document.body.append(target);
   ipc.list.mockResolvedValue(config.kind === 'browser' ? [] : [run('old'), run('unrelated', 'other')]);
   if (!ipc.open.getMockImplementation()) ipc.open.mockResolvedValue({ ...source, text: fullAnswer });
-  const beforeRun = vi.fn(async () => source), onOpenDocument = vi.fn(), onChange = vi.fn(), onCompositionChange = vi.fn(), onPinOutput = vi.fn();
+  if (!ipc.resolve.getMockImplementation()) ipc.resolve.mockImplementation(async (_project, _session, reference) => reference === 'Answer' ? { ...source, summary: { ...source.summary, document_id: 'result', title: 'Answer' } } : source);
+  const beforeRun = vi.fn(async () => ({ document: retained.source === undefined ? source : retained.source })), onOpenDocument = vi.fn(), onChange = vi.fn(), onCompositionChange = vi.fn(), onPinOutput = vi.fn();
   mounted = mount(WorkspacePane, { target, props: {
     paneId: 'conversation', config: { kind: 'chat', position: 'right', visible: true, title: null, document: null, context: ['Voice notes'], ...config },
-    projectId: 'project', sessionId: 'session', source, value, documents: [source.summary, { ...source.summary, document_id: 'result', relative_path: 'Runs/1/Answer.md', title: 'Answer' }], beforeRun, onOpenDocument, onChange, onCompositionChange, onPinOutput
+    workspaceScope: { projectId: 'owner', sessionId: 'workspace-session' }, configurationRevisionId: 'template-revision',
+    projectId: 'project', sessionId: 'session', source, value, beforeRun, onOpenDocument, onChange, onCompositionChange, onPinOutput, ...retained
   } });
-  await tick(); await expect.poll(() => ipc.list.mock.calls.length).toBe(1);
+  await tick(); await expect.poll(() => ipc.list.mock.calls.length).toBe(initialListCalls + 1);
   return { beforeRun, onOpenDocument, onChange, onCompositionChange, onPinOutput };
 }
 
@@ -80,7 +85,7 @@ describe('workspace panes', () => {
     expect(document.querySelectorAll('article')).toHaveLength(1);
     await page.getByRole('button', { name: 'Open output document' }).click();
     expect(onOpenDocument).toHaveBeenCalledWith('result');
-    ipc.run.mockImplementation(async (request) => ({ ...run(request.commandId), presentation: request.presentation }));
+    ipc.run.mockImplementation(async (request) => ({ status: 'accepted', run: { ...run(request.command_id), presentation: { pane_id: request.pane_id, input: request.input } } }));
     const input = page.getByRole('textbox', { name: 'Message' });
     const inputRect = input.element().getBoundingClientRect();
     expect(document.querySelector('.composer-actions')).toBeNull();
@@ -93,13 +98,39 @@ describe('workspace panes', () => {
     await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
     expect(beforeRun).toHaveBeenCalledOnce();
     const request = ipc.run.mock.calls[0][0];
-    expect(request.turnBoundary).toBe('chat');
-    expect(request.presentation).toEqual({ pane_id: 'conversation', input: 'Continue that idea' });
-    expect(request.contextReferences).toEqual(['Draft.md', 'Voice notes', 'Draft']);
+    expect(request.workspace_id).toBe('owner');
+    expect(request.workspace_session_id).toBe('workspace-session');
+    expect(request.configuration_revision_id).toBe('template-revision');
+    expect(request.pane_id).toBe('conversation');
+    expect(request.input).toBe('Continue that idea');
+    expect(request).not.toHaveProperty('contextReferences');
+    expect(request).not.toHaveProperty('turnBoundary');
     expect(request.expression).toContain('Assistant: ' + fullAnswer);
     expect(request.expression).not.toContain('@document');
     expect(request.expression).toContain('User: Continue that idea\nAssistant:');
-    expect(request.sourceRevisionId).toBe('revision');
+    expect(request.captured_document).toEqual({ project_id: 'project', session_id: 'session', document_id: 'draft', revision_id: 'revision', visible_blob_id: 'blob' });
+  });
+
+  it('keeps an explicit @document reference literal and sends its independently captured source identity', async () => {
+    await render();
+    ipc.run.mockImplementation(async request => ({ status: 'accepted', run: { ...run(request.command_id), presentation: { pane_id: request.pane_id, input: request.input } } }));
+    await page.getByRole('textbox', { name: 'Message' }).fill('Consider @document');
+    await userEvent.keyboard('{Enter}');
+    await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
+    const request = ipc.run.mock.calls[0][0];
+    expect(request.expression).toContain('Consider @document');
+    expect(request.captured_document.project_id).toBe('project');
+    expect(request.workspace_id).toBe('owner');
+  });
+
+  it('can admit an owner-only pane run without inventing a current document', async () => {
+    await render({}, '', { source: null });
+    ipc.run.mockImplementation(async request => ({ status: 'accepted', run: { ...run(request.command_id), presentation: { pane_id: request.pane_id, input: request.input } } }));
+    await page.getByRole('textbox', { name: 'Message' }).fill('Start here');
+    await userEvent.keyboard('{Enter}');
+    await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
+    expect(ipc.run.mock.calls[0][0]).not.toHaveProperty('captured_document');
+    expect(ipc.run.mock.calls[0][0].workspace_id).toBe('owner');
   });
 
   it('keeps hidden reasoning and Markdown bytes intact in the next raw prompt', async () => {
@@ -108,7 +139,7 @@ describe('workspace panes', () => {
     await render();
     await expect.poll(() => document.querySelector('.output strong')?.textContent).toBe('The moon.');
     expect(document.querySelector('details')?.open).toBe(false);
-    ipc.run.mockImplementation(async request => ({ ...run(request.commandId), presentation: request.presentation }));
+    ipc.run.mockImplementation(async request => ({ status: 'accepted', run: { ...run(request.command_id), presentation: { pane_id: request.pane_id, input: request.input } } }));
     await page.getByRole('textbox', { name: 'Message' }).fill('Continue');
     await userEvent.keyboard('{Enter}');
     await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
@@ -152,6 +183,105 @@ describe('workspace panes', () => {
     expect(document.querySelector('button[type=submit]')).toBeNull();
   });
 
+  it('retains a workspace draft and its unresolved request across a root-transition remount', async () => {
+    const drafts = new WorkspacePaneDrafts();
+    const retained = drafts.forPane('workspace-session', 'conversation');
+    await render({}, source.text, { draft: retained });
+    await page.getByRole('textbox', { name: 'Message' }).fill('Keep this idea');
+    await unmount(mounted!); mounted = undefined; document.body.replaceChildren();
+    await render({}, source.text, { draft: drafts.forPane('workspace-session', 'conversation'), projectId: 'child', sessionId: 'child-session' });
+    await expect.element(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Keep this idea');
+    ipc.run.mockRejectedValue(new Error('Reply interrupted'));
+    await page.getByRole('textbox', { name: 'Message' }).click();
+    await userEvent.keyboard('{Enter}');
+    await expect.element(page.getByRole('button', { name: 'Check result' })).toBeVisible();
+    const request = get(retained).pending;
+    expect(request?.captured_document?.project_id).toBe('child');
+    expect(request?.workspace_session_id).toBe('workspace-session');
+    await unmount(mounted!); mounted = undefined; document.body.replaceChildren();
+    await render({}, source.text, { draft: drafts.forPane('workspace-session', 'conversation'), projectId: 'next-root', sessionId: 'next-session' });
+    await expect.element(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Keep this idea');
+    expect(get(retained).pending).toBe(request);
+    await page.getByRole('button', { name: 'Check result' }).click();
+    expect(ipc.list).toHaveBeenLastCalledWith('owner', 'workspace-session');
+    await page.getByRole('textbox', { name: 'Message' }).click();
+    await userEvent.keyboard('{Enter}');
+    expect(ipc.run).toHaveBeenCalledOnce();
+    await page.getByRole('button', { name: 'Stop', exact: true }).click();
+    expect(ipc.cancel).toHaveBeenCalledWith('owner', 'workspace-session', request!.command_id);
+    expect(get(retained).pending).toBe(request);
+  });
+
+  it('recovers an admitted owner run after remount without resubmission or child output reads', async () => {
+    const drafts = new WorkspacePaneDrafts(), draft = drafts.forPane('workspace-session', 'conversation');
+    await render({}, source.text, { draft });
+    let complete!: (run: TerminalRun) => void;
+    ipc.run.mockImplementation(() => new Promise<TerminalRun>(resolve => { complete = resolve; }).then(run => ({ status: 'accepted', run })));
+    await page.getByRole('textbox', { name: 'Message' }).fill('Retain this conversation');
+    await userEvent.keyboard('{Enter}');
+    await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
+    const request = get(draft).pending!;
+    await unmount(mounted!); mounted = undefined; document.body.replaceChildren();
+    await render({}, source.text, { draft, projectId: 'child-root', sessionId: 'child-session' });
+    ipc.list.mockResolvedValue([{ ...run(request.command_id), presentation: { pane_id: request.pane_id, input: request.input } }]);
+    await page.getByRole('button', { name: 'Check result' }).click();
+    await expect.element(page.getByRole('textbox', { name: 'Message' })).toHaveValue('');
+    expect(get(draft).pending).toBeNull();
+    expect(ipc.run).toHaveBeenCalledOnce();
+    expect(ipc.list).toHaveBeenLastCalledWith('owner', 'workspace-session');
+    expect(ipc.open.mock.calls.every(([project, session]) => project === 'owner' && session === 'workspace-session')).toBe(true);
+    await page.getByRole('textbox', { name: 'Message' }).fill('A new thought in the child folder');
+    complete(run(request.command_id));
+    await tick();
+    await expect.element(page.getByRole('textbox', { name: 'Message' })).toHaveValue('A new thought in the child folder');
+  });
+
+  it('does not confuse an owner editor document with a child copy that has the same document ID', async () => {
+    ipc.resolve.mockResolvedValue({ ...source, summary: { ...source.summary, title: 'Owner draft' } });
+    const { onOpenDocument, onChange } = await render({ kind: 'editor', document: '@Draft' });
+    await page.getByRole('button', { name: 'Open Owner draft' }).click();
+    expect(ipc.resolve).toHaveBeenCalledWith('owner', 'workspace-session', 'Draft');
+    expect(onOpenDocument).toHaveBeenCalledWith('draft');
+    expect(document.querySelector('[contenteditable=true]')).toBeNull();
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it('does not let a late submission completion clear another workspace draft', async () => {
+    const drafts = new WorkspacePaneDrafts();
+    const original = drafts.forPane('workspace-one', 'conversation');
+    await render({}, source.text, { draft: original });
+    let complete!: (run: TerminalRun) => void;
+    ipc.run.mockImplementation(() => new Promise<TerminalRun>(resolve => { complete = resolve; }).then(run => ({ status: 'accepted', run })));
+    await page.getByRole('textbox', { name: 'Message' }).fill('First workspace');
+    await userEvent.keyboard('{Enter}');
+    await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
+    const request = get(original).pending!;
+    await unmount(mounted!); mounted = undefined; document.body.replaceChildren();
+    const replacement = drafts.forPane('workspace-two', 'conversation');
+    await render({}, source.text, { draft: replacement, workspaceScope: { projectId: 'other-owner', sessionId: 'workspace-two' } });
+    await expect.element(page.getByRole('textbox', { name: 'Message' })).toHaveValue('');
+    expect(get(replacement).pending).toBeNull();
+    await page.getByRole('textbox', { name: 'Message' }).fill('Second workspace');
+    complete(run(request.command_id));
+    await tick();
+    await expect.element(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Second workspace');
+    expect(get(replacement).pending).toBeNull();
+    expect(get(original).entry).toBe('');
+    expect(get(original).pending).toBeNull();
+  });
+
+  it('preserves newly edited input when the previous submission succeeds', async () => {
+    await render();
+    let complete!: (run: TerminalRun) => void;
+    ipc.run.mockImplementation(() => new Promise<TerminalRun>(resolve => { complete = resolve; }).then(run => ({ status: 'accepted', run })));
+    await page.getByRole('textbox', { name: 'Message' }).fill('Submitted idea');
+    await userEvent.keyboard('{Enter}');
+    await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
+    await page.getByRole('textbox', { name: 'Message' }).fill('Next idea');
+    complete(run(ipc.run.mock.calls[0][0].command_id));
+    await expect.element(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Next idea');
+  });
+
   it('opens the configured editor document rather than editing unrelated current writing', async () => {
     const { onOpenDocument, onChange } = await render({ kind: 'editor', document: '@Answer' });
     await page.getByRole('button', { name: 'Open Answer' }).click();
@@ -162,20 +292,20 @@ describe('workspace panes', () => {
 
   it('binds the sandboxed preview to exact native document identity and retains page generation', async () => {
     await render({ kind: 'browser', document: 'Draft.md' });
-    await expect.poll(() => document.querySelector('iframe')?.src).toContain('loom-preview://localhost/v1-project-session-draft-revision-blob');
+    await expect.poll(() => document.querySelector('iframe')?.src).toContain('loom-preview://localhost/v1-owner-workspace-session-draft-revision-blob');
     const frame = document.querySelector('iframe')!;
     expect(frame.getAttribute('sandbox')).toBe('');
     expect(frame.hasAttribute('srcdoc')).toBe(false);
     expect(frame.referrerPolicy).toBe('no-referrer');
-    expect(ipc.open).not.toHaveBeenCalled();
-    ipc.run.mockImplementation(async (request) => ({ ...run(request.commandId), presentation: request.presentation }));
+    expect(ipc.resolve).toHaveBeenCalledWith('owner', 'workspace-session', 'Draft.md');
+    ipc.run.mockImplementation(async (request) => ({ status: 'accepted', run: { ...run(request.command_id), presentation: { pane_id: request.pane_id, input: request.input } } }));
     await page.getByRole('textbox', { name: 'Page description' }).fill('A quiet reading page');
     await page.getByRole('button', { name: 'Run', exact: true }).click();
     await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
     expect(ipc.run.mock.calls[0][0].turnBoundary).toBeUndefined();
-    expect(ipc.run.mock.calls[0][0].contextReferences).toEqual(['Voice notes', 'Draft.md']);
+    expect(ipc.run.mock.calls[0][0]).not.toHaveProperty('contextReferences');
     expect(ipc.run.mock.calls[0][0].expression).toContain('Write a complete static HTML page for: A quiet reading page');
-    expect(ipc.run.mock.calls[0][0].presentation).toEqual({ pane_id: 'conversation', input: 'A quiet reading page' });
+    expect(ipc.run.mock.calls[0][0].input).toBe('A quiet reading page');
   });
 
   it('rejects oversized prompts before admitting a native run', async () => {
@@ -224,22 +354,58 @@ describe('workspace panes', () => {
     expect(document.querySelector('form button')).toBeNull();
     let active: TerminalRun | undefined;
     ipc.run.mockImplementation(async (request) => {
-      active = { ...run(request.commandId), status: 'running', presentation: request.presentation };
-      return active;
+      active = { ...run(request.command_id), status: 'running', presentation: { pane_id: request.pane_id, input: request.input } };
+      return { status: 'accepted', run: active };
     });
     ipc.list.mockImplementation(async () => active ? [active] : []);
     await userEvent.keyboard('{Enter}');
     await expect.element(page.getByRole('button', { name: 'Stop', exact: true })).toBeVisible();
-    expect(ipc.run.mock.calls[0][0].presentation.input).toBe('Line one\nLine two');
+    expect(ipc.run.mock.calls[0][0].input).toBe('Line one\nLine two');
     ipc.cancel.mockImplementation(async () => { active = { ...active!, status: 'cancelled' }; });
     await page.getByRole('button', { name: 'Stop', exact: true }).click();
     await expect.poll(() => document.querySelector('form button')).toBeNull();
-    expect(ipc.cancel).toHaveBeenCalledWith('project', 'session', active!.run_id);
+    expect(ipc.cancel).toHaveBeenCalledWith('owner', 'workspace-session', active!.run_id);
   });
 
-  it('retains explicit recovery for an uncertain chat admission', async () => {
+  it('settles a late authoritative rejection in the retained draft after a root remount', async () => {
+    const draft = new WorkspacePaneDrafts().forPane('workspace-session', 'conversation');
+    await render({}, source.text, { draft });
+    let rejectBeforeAdmission!: () => void;
+    ipc.run.mockImplementation(() => new Promise(resolve => {
+      rejectBeforeAdmission = () => resolve({ status: 'rejected', error: { code: 'configuration_changed', message: 'Configuration changed.', retryable: true } });
+    }));
+    await page.getByRole('textbox', { name: 'Message' }).fill('Keep this unsubmitted idea');
+    await userEvent.keyboard('{Enter}');
+    await expect.poll(() => ipc.run.mock.calls.length).toBe(1);
+    await unmount(mounted!); mounted = undefined; document.body.replaceChildren();
+    await render({}, source.text, { draft, projectId: 'child-root', sessionId: 'child-session' });
+    rejectBeforeAdmission();
+    await expect.poll(() => get(draft).pending).toBeNull();
+    await expect.element(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Keep this unsubmitted idea');
+    await expect.poll(() => document.querySelector('form button')).toBeNull();
+    await expect.element(page.getByRole('alert')).toHaveTextContent('Configuration changed.');
+    expect(ipc.run).toHaveBeenCalledOnce();
+  });
+
+  it('keeps rejected input editable and permits a deliberate resubmission only after authoritative rejection', async () => {
+    const draft = new WorkspacePaneDrafts().forPane('workspace-session', 'conversation');
+    await render({}, source.text, { draft });
+    ipc.run.mockResolvedValue({ status: 'rejected', error: { code: 'configuration_changed', message: 'The pane configuration changed.', retryable: true } });
+    await page.getByRole('textbox', { name: 'Message' }).fill('Keep my words');
+    await userEvent.keyboard('{Enter}');
+    await expect.element(page.getByRole('alert')).toHaveTextContent('The pane configuration changed.');
+    await expect.element(page.getByRole('textbox', { name: 'Message' })).toHaveValue('Keep my words');
+    expect(get(draft).pending).toBeNull();
+    expect(ipc.run).toHaveBeenCalledOnce();
+    expect(document.querySelector('form button')).toBeNull();
+    await userEvent.keyboard('{Enter}');
+    await expect.poll(() => ipc.run.mock.calls.length).toBe(2);
+    expect(ipc.run.mock.calls[1][0].command_id).not.toBe(ipc.run.mock.calls[0][0].command_id);
+  });
+
+  it.each([new Error('Reply interrupted'), { code: 'filesystem_error', message: 'Receipt write interrupted' }])('retains explicit recovery for an uncertain chat admission: %s', async failure => {
     await render();
-    ipc.run.mockRejectedValue(new Error('Reply interrupted'));
+    ipc.run.mockRejectedValue(failure);
     await page.getByRole('textbox', { name: 'Message' }).fill('Continue');
     await userEvent.keyboard('{Enter}');
     await expect.element(page.getByRole('button', { name: 'Check result' })).toBeVisible();

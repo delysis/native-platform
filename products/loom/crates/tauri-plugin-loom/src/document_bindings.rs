@@ -239,6 +239,17 @@ fn select_document<'a>(
     Ok(())
 }
 
+/// Navigation resolves one registered identity without spending a prompt's
+/// context budget or reading source bytes as an inference input.
+pub(super) fn resolve_document_id(
+    store: &ProjectStore,
+    name: &str,
+) -> Result<DocumentId, IpcFailure> {
+    validate_name(name)?;
+    let registry = store.list_documents().map_err(IpcFailure::store)?;
+    resolve_document(&registry, name).map(|document| document.document_id)
+}
+
 fn resolve_document<'a>(
     registry: &'a [DocumentSummary],
     name: &str,

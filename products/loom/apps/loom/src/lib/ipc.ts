@@ -1006,6 +1006,26 @@ export function cancelTerminalRun(projectId: string, sessionId: string, runId: s
   return call('terminal_cancel', { projectId, sessionId, runId });
 }
 
+export function runWorkspacePane(request: import('./workspacePaneDrafts').WorkspacePaneRunRequest): Promise<import('./workspacePaneDrafts').WorkspacePaneSubmission> {
+  return call('workspace_pane_run', { request });
+}
+
+export function listWorkspacePaneRuns(projectId: string, sessionId: string): Promise<TerminalRun[]> {
+  return call('workspace_pane_list', { projectId, sessionId });
+}
+
+export function cancelWorkspacePaneRun(projectId: string, sessionId: string, runId: string): Promise<void> {
+  return call('workspace_pane_cancel', { projectId, sessionId, runId });
+}
+
+export function readWorkspacePaneOutput(projectId: string, sessionId: string, runId: string): Promise<OpenDocument | null> {
+  return call('workspace_pane_output', { projectId, sessionId, runId });
+}
+
+export function resolveWorkspaceDocument(projectId: string, sessionId: string, reference: string): Promise<OpenDocument | null> {
+  return call('workspace_document_resolve', { projectId, sessionId, reference });
+}
+
 export function compileShaderPreview(source: string): Promise<{ fragment: string }> {
   return call('shader_preview', { source });
 }
