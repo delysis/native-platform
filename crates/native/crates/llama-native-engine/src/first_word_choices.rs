@@ -19,6 +19,7 @@ pub(super) enum Admission {
 pub(super) struct FirstWordGate {
     pub evidence: FirstWordChoiceEvidence,
     base_seed: u32,
+    initial_token_exclusions: Vec<i32>,
 }
 
 impl FirstWordGate {
@@ -32,6 +33,7 @@ impl FirstWordGate {
                 exhausted: false,
             },
             base_seed,
+            initial_token_exclusions: Vec::new(),
         }
     }
 
@@ -53,6 +55,22 @@ impl FirstWordGate {
 
     pub fn record_nonterminal_token(&mut self) {
         self.evidence.total_attempted_tokens += 1;
+    }
+
+    pub fn begin_attempt(&mut self, exclusions: &BTreeSet<i32>) {
+        self.initial_token_exclusions = exclusions.iter().copied().collect();
+    }
+
+    pub fn exhaust_initial_support(&mut self) {
+        self.evidence.attempts.push(FirstWordChoiceAttempt {
+            seed: self.seed(),
+            initial_token_exclusions: std::mem::take(&mut self.initial_token_exclusions),
+            token_ids: Vec::new(),
+            terminal_token_id: None,
+            word_key: None,
+            outcome: FirstWordChoiceAttemptOutcome::InitialSupportExhausted,
+        });
+        self.evidence.exhausted = true;
     }
 
     pub fn observe(
@@ -81,6 +99,7 @@ impl FirstWordGate {
         let accepted = outcome == FirstWordChoiceAttemptOutcome::Accepted;
         self.evidence.attempts.push(FirstWordChoiceAttempt {
             seed: self.seed(),
+            initial_token_exclusions: std::mem::take(&mut self.initial_token_exclusions),
             token_ids: tokens.to_vec(),
             terminal_token_id,
             word_key,
@@ -103,6 +122,7 @@ impl FirstWordGate {
         }
         self.evidence.attempts.push(FirstWordChoiceAttempt {
             seed: self.seed(),
+            initial_token_exclusions: std::mem::take(&mut self.initial_token_exclusions),
             token_ids: tokens.to_vec(),
             terminal_token_id: None,
             word_key: None,
@@ -116,9 +136,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cancellation_distinguishes_waiting_slot_from_started_proposal() {
+        let mut waiting = FirstWordGate::new(FirstWordChoicePolicy::DistinctV2, 1);
+        waiting.cancel(&[]);
+        assert!(
+            waiting.evidence.attempts[0]
+                .initial_token_exclusions
+                .is_empty()
+        );
+        assert!(waiting.evidence.attempts[0].token_ids.is_empty());
+
+        let mut started = FirstWordGate::new(FirstWordChoicePolicy::DistinctV2, 1);
+        started.begin_attempt(&BTreeSet::from([9, 0, 7]));
+        started.record_nonterminal_token();
+        started.cancel(&[3]);
+        assert_eq!(
+            started.evidence.attempts[0].initial_token_exclusions,
+            [0, 7, 9]
+        );
+        assert_eq!(started.evidence.attempts[0].token_ids, [3]);
+        assert_eq!(started.evidence.total_attempted_tokens, 1);
+        assert!(!waiting.pending());
+        assert!(!started.pending());
+    }
+
+    #[test]
     fn duplicate_prefix_is_rejected_before_any_emission_permission() {
         let mut words = BTreeSet::from(["the".to_string()]);
-        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV1, 41);
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV2, 41);
         assert_eq!(
             gate.observe("Th", &[1], None, false, &mut words),
             Admission::Pending
@@ -136,14 +181,14 @@ mod tests {
         assert_eq!(gate.evidence.selected_attempt, Some(1));
         assert_eq!(
             gate.evidence.attempts[1].seed,
-            FirstWordChoicePolicy::DistinctV1.attempt_seed(41, 1)
+            FirstWordChoicePolicy::DistinctV2.attempt_seed(41, 1)
         );
     }
 
     #[test]
     fn bounded_shortfall_never_admits_duplicate_or_partial_word() {
         let mut words = BTreeSet::new();
-        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV1, 2);
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV2, 2);
         let tokens = vec![9; FIRST_WORD_CHOICE_MAX_PREFIX_TOKENS as usize];
         for attempt in 0..FIRST_WORD_CHOICE_MAX_ATTEMPTS {
             let result = gate.observe("unfinished", &tokens, None, false, &mut words);
@@ -164,7 +209,7 @@ mod tests {
     #[test]
     fn eog_can_complete_a_word_but_cancellation_cannot() {
         let mut words = BTreeSet::new();
-        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV1, 3);
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV2, 3);
         gate.cancel(&[8]);
         assert!(!gate.pending());
         assert_eq!(gate.evidence.selected_attempt, None);
@@ -172,7 +217,7 @@ mod tests {
             gate.evidence.attempts[0].outcome,
             FirstWordChoiceAttemptOutcome::Cancelled
         );
-        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV1, 3);
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV2, 3);
         assert_eq!(
             gate.observe("fin", &[8], Some(99), true, &mut words),
             Admission::Accepted
@@ -183,7 +228,7 @@ mod tests {
     #[test]
     fn token_limit_is_not_a_word_boundary_and_rejected_work_remains_charged() {
         let mut words = BTreeSet::new();
-        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV1, 17);
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctV2, 17);
         gate.record_nonterminal_token();
         assert_eq!(
             gate.observe("part", &[7], None, true, &mut words),

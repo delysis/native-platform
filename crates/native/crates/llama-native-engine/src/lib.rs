@@ -3827,6 +3827,7 @@ fn generate_batch(
                 request: branch,
                 sampler,
                 decoder: UTF_8.new_decoder(),
+                decoder_finalized: false,
                 text: String::new(),
                 generated_token_ids: Vec::with_capacity(branch.sampling.max_tokens as usize),
                 token_piece_trace: retain_token_piece_traces.then(|| {
@@ -3984,10 +3985,11 @@ fn generate_batch(
         }
     }
     for branch in &mut branches {
-        let piece = finalize_generated_text(
+        let piece = finalize_generated_text_once(
             &mut branch.decoder,
             &mut branch.text,
             branch.finish_reason == "stop_sequence",
+            &mut branch.decoder_finalized,
         )?;
         if !piece.is_empty() {
             supervision.emit(GenerationEvent {
@@ -4229,6 +4231,7 @@ fn generate_multimodal_batch(
             request: branch,
             sampler: build_sampler(model, &branch.sampling),
             decoder: UTF_8.new_decoder(),
+            decoder_finalized: false,
             text: String::new(),
             generated_token_ids: Vec::with_capacity(branch.sampling.max_tokens as usize),
             token_piece_trace: retain_token_piece_traces
@@ -4389,10 +4392,11 @@ fn generate_multimodal_batch(
         }
     }
     for branch in &mut branches {
-        let piece = finalize_generated_text(
+        let piece = finalize_generated_text_once(
             &mut branch.decoder,
             &mut branch.text,
             branch.finish_reason == "stop_sequence",
+            &mut branch.decoder_finalized,
         )?;
         if !piece.is_empty() {
             supervision.emit(GenerationEvent {
@@ -4927,6 +4931,22 @@ fn finalize_generated_text(
     if !stopped {
         append_generated_utf8_piece(text, &piece)?;
     }
+    Ok(piece)
+}
+
+/// Word admission may finish UTF-8 at EOG before the common terminal-event
+/// path runs. encoding_rs forbids reusing a finished decoder, even with no bytes.
+fn finalize_generated_text_once(
+    decoder: &mut encoding_rs::Decoder,
+    text: &mut String,
+    stopped: bool,
+    finalized: &mut bool,
+) -> NativeResult<String> {
+    if *finalized {
+        return Ok(String::new());
+    }
+    let piece = finalize_generated_text(decoder, text, stopped)?;
+    *finalized = true;
     Ok(piece)
 }
 
@@ -5871,6 +5891,7 @@ struct ActiveBranch<'a> {
     request: &'a BranchRequest,
     sampler: LlamaSampler,
     decoder: encoding_rs::Decoder,
+    decoder_finalized: bool,
     text: String,
     generated_token_ids: Vec<i32>,
     token_piece_trace: Option<TokenPieceTrace>,
@@ -10210,7 +10231,7 @@ mod tests {
     #[test]
     fn first_word_policy_requires_explicit_seeds_and_cannot_claim_legacy_authority() {
         let mut request = GenerationBatchRequest {
-            first_word_choices: Some(FirstWordChoicePolicy::DistinctV1),
+            first_word_choices: Some(FirstWordChoicePolicy::DistinctV2),
             request_id: "word-choices".to_string(),
             model_id: "model".to_string(),
             media: Vec::new(),

@@ -1470,8 +1470,31 @@ fn build_result(
         )));
     }
     let mut first_words = BTreeSet::new();
+    let mut initial_draws: Option<BTreeSet<i32>> = None;
     for (output, case) in outputs.iter().zip(&request.cases) {
         validate_word_choice_output(request.first_word_choices, &case.generation, output)?;
+        if let Some(evidence) = &output.first_word_choice {
+            for attempt in &evidence.attempts {
+                // A queued cancellation performed no draw and reserved nothing.
+                let Some(first_token) = attempt
+                    .token_ids
+                    .first()
+                    .copied()
+                    .or(attempt.terminal_token_id)
+                else {
+                    continue;
+                };
+                let exclusions: BTreeSet<_> =
+                    attempt.initial_token_exclusions.iter().copied().collect();
+                let expected = initial_draws.get_or_insert_with(|| exclusions.clone());
+                if *expected != exclusions || !expected.insert(first_token) {
+                    return Err(LlamaBackendError::OutputContract(
+                        "distinct-word family did not retain its initial draws without replacement"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
         if let Some(word) = output
             .first_word_choice
             .as_ref()
@@ -1519,8 +1542,9 @@ fn validate_word_choice_output(
     output: &GenerationOutput,
 ) -> Result<(), LlamaBackendError> {
     use llama_native_types::{
-        FIRST_WORD_CHOICE_MAX_ATTEMPTS, FIRST_WORD_CHOICE_MAX_PREFIX_TOKENS,
-        FirstWordChoiceAttemptOutcome as Outcome, complete_first_word_key,
+        FIRST_WORD_CHOICE_MAX_ATTEMPTS, FIRST_WORD_CHOICE_MAX_INITIAL_EXCLUSIONS,
+        FIRST_WORD_CHOICE_MAX_PREFIX_TOKENS, FirstWordChoiceAttemptOutcome as Outcome,
+        complete_first_word_key,
     };
     let invalid = || {
         LlamaBackendError::OutputContract(
@@ -1543,8 +1567,27 @@ fn validate_word_choice_output(
         let attempt_index = u32::try_from(index).map_err(|_| invalid())?;
         if attempt.seed != policy.attempt_seed(seed, attempt_index)
             || attempt.token_ids.len() > FIRST_WORD_CHOICE_MAX_PREFIX_TOKENS as usize
+            || attempt.initial_token_exclusions.len() > FIRST_WORD_CHOICE_MAX_INITIAL_EXCLUSIONS
             || attempt.token_ids.iter().any(|token| *token < 0)
             || attempt.terminal_token_id.is_some_and(|token| token < 0)
+            || attempt
+                .initial_token_exclusions
+                .iter()
+                .any(|token| *token < 0)
+            || attempt
+                .initial_token_exclusions
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            || attempt
+                .token_ids
+                .first()
+                .or(attempt.terminal_token_id.as_ref())
+                .is_some_and(|token| {
+                    attempt
+                        .initial_token_exclusions
+                        .binary_search(token)
+                        .is_ok()
+                })
             || (attempt.outcome == Outcome::Accepted) != (selected == Some(index))
         {
             return Err(invalid());
@@ -2521,7 +2564,7 @@ mod tests {
         };
         let request = request_with_two_cases();
         let generation = &request.cases[0].generation;
-        let policy = FirstWordChoicePolicy::DistinctV1;
+        let policy = FirstWordChoicePolicy::DistinctV2;
         let mut output = native_output(&request, 0, GenerationState::Completed, true);
         output.text = "river bends.".to_string();
         output.first_word_choice = Some(FirstWordChoiceEvidence {
@@ -2529,6 +2572,7 @@ mod tests {
             attempts: vec![
                 FirstWordChoiceAttempt {
                     seed: 41,
+                    initial_token_exclusions: vec![99],
                     token_ids: vec![201, 202],
                     terminal_token_id: None,
                     word_key: Some("the".to_string()),
@@ -2536,6 +2580,7 @@ mod tests {
                 },
                 FirstWordChoiceAttempt {
                     seed: policy.attempt_seed(41, 1),
+                    initial_token_exclusions: vec![99, 201],
                     token_ids: vec![101],
                     terminal_token_id: None,
                     word_key: Some("river".to_string()),
@@ -2548,7 +2593,7 @@ mod tests {
         });
         validate_word_choice_output(Some(policy), generation, &output).expect("bound retry");
         assert!(validate_word_choice_output(None, generation, &output).is_err());
-        for change in 0..5 {
+        for change in 0..7 {
             let mut changed = output.clone();
             let evidence = changed.first_word_choice.as_mut().expect("evidence");
             match change {
@@ -2556,7 +2601,9 @@ mod tests {
                 1 => evidence.total_attempted_tokens -= 1,
                 2 => evidence.attempts[1].token_ids[0] = 999,
                 3 => evidence.selected_attempt = Some(0),
-                _ => changed.text = "another word".to_string(),
+                4 => changed.text = "another word".to_string(),
+                5 => evidence.attempts[1].initial_token_exclusions = vec![99, 101, 201],
+                _ => evidence.attempts[1].initial_token_exclusions = vec![201, 99],
             }
             assert!(
                 validate_word_choice_output(Some(policy), generation, &changed).is_err(),

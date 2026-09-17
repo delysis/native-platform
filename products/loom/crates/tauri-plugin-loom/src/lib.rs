@@ -9098,7 +9098,9 @@ fn generation_seed(command_id: CommandId, index: u32, preset: WeavePreset) -> u3
     // The low two bits are a lossless policy-version tag. For one command and
     // case index, no two current presets can ever share a seed, even if every
     // other sampling field happens to match.
-    (entropy & !0b11) | preset.seed_tag()
+    let seed = (entropy & !0b11) | preset.seed_tag();
+    // llama.cpp reserves MAX for random seeding. Keep the tag and reproducibility.
+    if seed == u32::MAX { seed - 4 } else { seed }
 }
 
 impl WeavePreset {
@@ -9171,7 +9173,7 @@ fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePo
 impl ValidatedWeavePolicy {
     const fn first_word_choices(&self) -> Option<llama_native_types::FirstWordChoicePolicy> {
         match self {
-            Self::LoompadV2 { .. } => Some(llama_native_types::FirstWordChoicePolicy::DistinctV1),
+            Self::LoompadV2 { .. } => Some(llama_native_types::FirstWordChoicePolicy::DistinctV2),
             Self::AutomaticV2 | Self::ManualV2 { .. } => None,
         }
     }
@@ -9240,7 +9242,11 @@ fn sampling_for_weave_case(
         top_k: 40,
         // Keep enough support for distinct words. Retries use this exact saved
         // sampler; they never secretly widen a narrowed distribution.
-        top_p: if preset == WeavePreset::LoompadV2 { 1.0 } else { 0.95 },
+        top_p: if preset == WeavePreset::LoompadV2 {
+            1.0
+        } else {
+            0.95
+        },
         min_p: if preset == WeavePreset::AutomaticProseV2 {
             0.05
         } else {
