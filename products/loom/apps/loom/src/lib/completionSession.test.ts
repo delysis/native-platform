@@ -30,6 +30,17 @@ const candidates: CompletionCandidate[] = [
 ];
 
 describe('cached completion session', () => {
+  it('requests fresh choices after reversing into a retired sampling family', () => {
+    const accepted = consumeCompletionWord(startCompletionSession('scope', candidates, 'run-a')!)!.session;
+    const retired = { ...accepted, presentationsRetired: true };
+    expect(completionShouldRequestNextBatch(retired, true, false)).toBe(false);
+    expect(completionShouldRequestNextBatch(retired, false, false)).toBe(true);
+    const reversed = unconsumeCompletionWord(retired)!;
+    expect(reversed.text).toBe(' one ');
+    expect(remainingCompletionText(reversed.session)).toBe(' one two');
+    expect(completionShouldRequestNextBatch(reversed.session, false, false)).toBe(true);
+  });
+
   it('keeps a compatible sibling and original undo when a fresh partial arrives after selected exhaustion', () => {
     const original = [
       { ...candidates[0], text: ' one' },
