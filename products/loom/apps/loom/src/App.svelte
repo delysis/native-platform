@@ -790,8 +790,9 @@
     document?.summary.document_id, document?.summary.revision_id, document?.visible_blob_id,
     mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte, currentWriter?.model_id,
     contextEpoch, documentEpoch, completionController.intentEpoch, editVersion]);
+  // An ordinary ghost family is not a batch of distinct first-word choices.
   $: loompadFamilyIds = loompadActive && loompadReservoir?.key === loompadSnapshotKey
-    ? loompadReservoir.familyIds : undefined;
+    ? loompadReservoir.familyIds : loompadActive ? [] : undefined;
   let cancellingRunIds: string[] = [];
   let cancellationCommandByRun: Record<string, string> = {};
   let promotionArmedCandidateId: string | null = null;
