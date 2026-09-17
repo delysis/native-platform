@@ -287,6 +287,7 @@
     rejectVisualPresentation,
     resetCompletionDiscovery,
     resetCompletionSurface,
+    retireCompletionCandidates,
     setCompletionSchedule,
     setDismissedCompletionCandidates,
     settleCompletionNavigation,
@@ -5649,6 +5650,10 @@
     if (suggestionsChanging) return;
     const enabled = suggestionInteraction !== next || !suggestionsEnabled;
     if (shuttleEnabled) await setShuttleEnabled(false);
+    if (next === 'loompad' && suggestionInteraction !== next) {
+      completionController = retireCompletionCandidates(completionController);
+      loompadReservoir = null;
+    }
     suggestionInteraction = next;
     await setSuggestionsEnabled(enabled);
     if (enabled && next === 'loompad') {
