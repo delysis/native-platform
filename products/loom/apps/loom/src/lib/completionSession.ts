@@ -213,6 +213,19 @@ export function synchronizeCompletionCandidates(
       ? startCompletionSession(session.contextKey, candidates, candidates[0].runId)
       : session;
   }
+  if (session.rollbackSessions?.length) {
+    const selected = selectedCompletionCandidate(session);
+    if (!selected) return null;
+    // A refill has no newly accepted chunks, but still owns earlier insertions.
+    // Losing its presentation (for example while a streamed family settles)
+    // must not erase their exact-caret reversal witness or retain stale choices.
+    if (candidates.length === 0) {
+      return session.candidates.length === 1 && selected.text === ''
+        ? session
+        : { ...session, candidates: [{ ...selected, text: '' }] };
+    }
+    if (candidates.some(candidate => candidate.targetByte !== selected.targetByte)) return null;
+  }
   if (candidates.length === 0) return null;
   const snapshots = candidates.map((candidate) => ({ ...candidate }));
   const selectedRunId = snapshots.some((candidate) => candidate.runId === session.selectedRunId)

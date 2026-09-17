@@ -3,6 +3,7 @@ import {
   advanceCompletionExhaustionLatch,
   acceptedCompletionText,
   completionPresentation,
+  completionRollbackText,
   compatibleCompletionPresentations,
   mergeCompatibleCompletionCandidates,
   consumeCompletionText,
@@ -222,6 +223,34 @@ describe('cached completion session', () => {
     });
     expect(handedOff.candidates).toEqual(fresh);
     expect(unconsumeCompletionWord(handedOff)).toBeNull();
+  });
+
+  it('keeps refill reversal through a missing family without authorizing stale insertions', () => {
+    const accepted = consumeCompletionText(
+      startCompletionSession('doc:visual', candidates, 'run-a')!, ' one'
+    )!.session;
+    const fresh = ['silver', 'amber', 'blue', 'green'].map((word, index) => ({
+      candidateId: `next-${index}`, presentationKey: `next-${index}:1`,
+      runId: `next-run-${index}`, text: ` ${word} light`, targetByte: 9,
+      insertsOnAccept: true
+    }));
+    const refilled = synchronizeCompletionCandidates(accepted, fresh, true, true)!;
+    const hidden = synchronizeCompletionCandidates(refilled, [])!;
+    expect(completionRollbackText(hidden)).toBe(' one');
+    expect(remainingCompletionText(hidden)).toBe('');
+    expect(hidden.candidates).toEqual([{ ...fresh[0], text: '' }]);
+    expect(consumeCompletionWord(hidden)).toBeNull();
+    expect(consumeCompletionText(hidden, ' silver')).toBeNull();
+    expect(synchronizeCompletionCandidates(hidden, [])).toBe(hidden);
+    const reversed = unconsumeCompletionWord(hidden)!;
+    expect(removeBeforeUtf8Boundary('Hello one', 9, reversed.text)).toBe('Hello');
+    expect(reversed.session.candidates).toEqual(candidates);
+
+    const restored = synchronizeCompletionCandidates(hidden, fresh)!;
+    expect(restored.candidates).toEqual(fresh);
+    expect(unconsumeCompletionWord(restored)?.text).toBe(' one');
+    expect(synchronizeCompletionCandidates(hidden,
+      fresh.map(candidate => ({ ...candidate, targetByte: 10 })))).toBeNull();
   });
 
   it('re-arms the same exhaustion identity after rollback', () => {
