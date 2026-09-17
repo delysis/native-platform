@@ -17,7 +17,7 @@ pub(super) struct ReferenceDiagnostic {
 }
 
 fn diagnose(
-    store: &loom_store::ProjectStore,
+    context: material_context::ReadContext<'_>,
     text: &str,
 ) -> Result<Vec<ReferenceDiagnostic>, IpcFailure> {
     let references = loom_document::document_references(text)
@@ -27,8 +27,8 @@ fn diagnose(
     for reference in references {
         let message =
             checked.entry(reference.name.clone()).or_insert_with(
-                || match material_context::resolve(store, &reference.name) {
-                    Ok(Value::Material { material }) if !material.material.available => {
+                || match context.resolve(&reference.name) {
+                    Ok(value) if matches!(value.unscoped(), Value::Material { material } if !material.material.available) => {
                         Some(format!(
                             "Source @{} is unavailable. Open it to reconnect.",
                             reference.name
@@ -58,8 +58,19 @@ pub(super) async fn document_reference_diagnostics(
 ) -> Result<Vec<ReferenceDiagnostic>, IpcFailure> {
     let _admission = lock_application_admission(&state, "reference diagnostics")?;
     let mut session = lock_session(&state)?;
-    let store = require_bound_store(&mut session, &project_id, &session_id)?;
-    diagnose(store, &text)
+    require_bound_store(&mut session, &project_id, &session_id)?;
+    let owner = session
+        .workspace
+        .as_ref()
+        .ok_or_else(|| IpcFailure::new("workspace_not_open", "Open a workspace first.", false))?;
+    let context = crate::workspace_owner::read_context(
+        &session,
+        &project_id,
+        &session_id,
+        &owner.project_id.to_string(),
+        &owner.session_id.to_string(),
+    )?;
+    diagnose(context, &text)
 }
 
 #[cfg(all(test, unix))]
@@ -75,7 +86,7 @@ mod tests {
         std::fs::write(root.path().join("b/Notes.md"), "Two").unwrap();
         let store = loom_store::ProjectStore::open_folder(root.path()).unwrap();
         let text = "🌒 @Missing @Notes @\"a/Notes.md\"\n\n> @Quoted\n\n`@Code`\n\n@Missing";
-        let diagnostics = diagnose(&store, text).unwrap();
+        let diagnostics = diagnose((&store).into(), text).unwrap();
         let marked: Vec<_> = diagnostics
             .iter()
             .map(|item| &text[item.start..item.end])

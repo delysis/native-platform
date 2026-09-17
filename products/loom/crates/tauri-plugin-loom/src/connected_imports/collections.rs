@@ -4,8 +4,9 @@ use super::{
     ACCOUNT_OPERATION, AccountStore, Duration, GoogleService, GoogleSession, ImportOperation,
     ImportQuery, IpcFailure, PluginState, RemoteFile, Serialize, State, SyncFailure,
     download_page_file, google_import, lock_application_admission, lock_session,
-    prepare_remote_file, require_bound_store,
+    prepare_remote_file,
 };
+use crate::workspace_owner::require_store_mut as require_workspace_store;
 use serde::Deserialize;
 
 #[allow(clippy::needless_pass_by_value)] // Consumes heterogeneous errors at map_err boundaries.
@@ -151,7 +152,7 @@ pub(crate) async fn collection_add(
     let _account = ACCOUNT_OPERATION
         .try_lock()
         .map_err(|_| failure("Another account import is running."))?;
-    let operation = ImportOperation::reserve(&state, &project_id, &session_id, &operation_id)?;
+    let operation = ImportOperation::reserve_workspace(&state, &project_id, &session_id, &operation_id)?;
     let def = CollectionDefinition {
         id: format!(
             "material-{}",
@@ -188,7 +189,7 @@ pub(crate) async fn collection_status(
 ) -> Result<CollectionStatus, IpcFailure> {
     let _admission = lock_application_admission(&state, "collection progress")?;
     let mut session = lock_session(&state)?;
-    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    let store = require_workspace_store(&mut session, &project_id, &session_id)?;
     let def = definition(store, &id)?;
     status(&state, store, &session_id, &def)
 }
@@ -207,7 +208,7 @@ pub(crate) async fn collection_authorize(
         .map_err(|_| failure("Another account import is running."))?;
     let _admission = lock_application_admission(&state, "connecting a collection")?;
     let mut session = lock_session(&state)?;
-    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    let store = require_workspace_store(&mut session, &project_id, &session_id)?;
     let def = definition(store, &id)?;
     if def.fingerprint()? != definition_fingerprint {
         return Err(failure(
@@ -235,7 +236,7 @@ pub(crate) async fn collection_cancel(
 ) -> Result<CollectionStatus, IpcFailure> {
     let _admission = lock_application_admission(&state, "stopping a collection refresh")?;
     let mut session = lock_session(&state)?;
-    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    let store = require_workspace_store(&mut session, &project_id, &session_id)?;
     let def = definition(store, &id)?;
     let head = storage::read_head(store, &id)
         .map_err(failure)?
@@ -260,7 +261,7 @@ pub(crate) async fn collection_refresh<R: Runtime>(
         .try_lock()
         .map_err(|_| failure("Another account import is running."))?;
     let job_id = crate::CommandId::new().to_string();
-    let operation = ImportOperation::reserve(&state, &project_id, &session_id, &job_id)?;
+    let operation = ImportOperation::reserve_workspace(&state, &project_id, &session_id, &job_id)?;
     let private = private_root(&state)?;
     let (def, credentials, head) = operation.publish_to_store(&state, |store| {
         let def = definition(store, &id)?;
@@ -282,7 +283,7 @@ pub(crate) async fn collection_refresh<R: Runtime>(
     })?;
     let initial = {
         let mut session = lock_session(&state)?;
-        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        let store = require_workspace_store(&mut session, &project_id, &session_id)?;
         status(&state, store, &session_id, &def)?
     };
     operation.dispatch(move |operation| {
@@ -521,7 +522,7 @@ pub(crate) async fn collection_members(
 ) -> Result<materials::collections::MembersPage, IpcFailure> {
     let _admission = lock_application_admission(&state, "reading a collection")?;
     let mut session = lock_session(&state)?;
-    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    let store = require_workspace_store(&mut session, &project_id, &session_id)?;
     materials::collections::members(store, &id, offset, snapshot_id.as_deref()).map_err(Into::into)
 }
 #[tauri::command]
@@ -536,7 +537,7 @@ pub(crate) async fn collection_read_member(
     let read = {
         let _admission = lock_application_admission(&state, "reading a collection source")?;
         let mut session = lock_session(&state)?;
-        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        let store = require_workspace_store(&mut session, &project_id, &session_id)?;
         materials::collections::read_member(store, &id, &snapshot_id, &occurrence_id)?
     };
     crate::material_media::bind_tokens(read, &project_id, &session_id)

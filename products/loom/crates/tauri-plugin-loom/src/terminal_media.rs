@@ -6,6 +6,8 @@ use std::collections::HashSet;
 
 use llama_native_types::MediaInput;
 use loom_store::{LoadedDocument, ProjectStore};
+use loom_types::BlobId;
+use serde::{Deserialize, Serialize};
 
 use super::IpcFailure;
 use super::context_attachments::resolve_media_for_document;
@@ -13,6 +15,54 @@ use super::document_bindings::ResolvedDocument;
 
 const MAX_MEDIA: usize = 32;
 const MAX_MEDIA_BYTES: usize = 128 * 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct RetainedMedia {
+    pub id: String,
+    pub kind: llama_native_types::MediaKind,
+    pub mime: String,
+    /// Content address of the exact bytes supplied to native inference.
+    pub bytes_blob_id: BlobId,
+}
+
+/// Snapshot native inputs into the run's store, independently of source-store
+/// lifetime. Validate the whole batch before publishing any input blobs.
+pub(super) fn retain(
+    store: &mut ProjectStore,
+    media: &[MediaInput],
+) -> Result<Vec<RetainedMedia>, IpcFailure> {
+    if media.len() > MAX_MEDIA {
+        return Err(limit());
+    }
+    let mut total = 0_usize;
+    for item in media {
+        total = total.checked_add(item.bytes.len()).ok_or_else(limit)?;
+        if total > MAX_MEDIA_BYTES {
+            return Err(limit());
+        }
+        if BlobId::digest(&item.bytes).to_string() != item.sha256 {
+            return Err(IpcFailure::new(
+                "media_identity_mismatch",
+                "The attached media bytes do not match their admitted identity.",
+                false,
+            ));
+        }
+    }
+    media
+        .iter()
+        .map(|item| {
+            let bytes_blob_id = store
+                .store_provenance_blob(&item.bytes)
+                .map_err(IpcFailure::store)?;
+            Ok(RetainedMedia {
+                id: item.id.clone(),
+                kind: item.kind,
+                mime: item.mime.clone(),
+                bytes_blob_id,
+            })
+        })
+        .collect()
+}
 
 pub(super) fn resolve(
     store: &ProjectStore,
@@ -110,6 +160,69 @@ mod tests {
         writer.write_sample(sample).expect("sample");
         writer.finalize().expect("finished WAV");
         bytes.into_inner()
+    }
+
+    #[test]
+    fn run_media_bytes_survive_original_source_store_removal() {
+        let owner_directory = tempfile::tempdir().expect("source directory");
+        let (owner, _) = ProjectStore::initialize(owner_directory.path().join("Owner"), "Owner")
+            .expect("owner store");
+        let bytes = wav(42);
+        let source =
+            import_recorded_wav(owner.root(), "voice.wav".into(), &bytes).expect("source audio");
+        let media = crate::context_attachments::source_native_media(owner.root(), &source.id)
+            .expect("admitted media");
+        assert_eq!(media.len(), 1);
+        let destination_directory = tempfile::tempdir().expect("run directory");
+        let (mut destination, _) =
+            ProjectStore::initialize(destination_directory.path().join("Writing"), "Writing")
+                .expect("run store");
+        let retained = retain(&mut destination, &media).expect("retained run media");
+        drop(media);
+        drop(owner);
+        owner_directory
+            .close()
+            .expect("remove original test source store");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(
+            destination
+                .read_blob(retained[0].bytes_blob_id)
+                .expect("independent run bytes"),
+            bytes
+        );
+        let serialized = serde_json::to_vec(&retained).expect("media provenance");
+        let reopened: Vec<RetainedMedia> =
+            serde_json::from_slice(&serialized).expect("retained metadata");
+        assert_eq!(reopened[0].bytes_blob_id, BlobId::digest(&bytes));
+    }
+
+    #[test]
+    fn media_hash_mismatch_rejects_entire_batch_before_retention() {
+        let directory = tempfile::tempdir().expect("run directory");
+        let (mut store, _) = ProjectStore::initialize(directory.path().join("Writing"), "Writing")
+            .expect("run store");
+        let bytes = wav(7);
+        let valid = MediaInput {
+            id: "valid".into(),
+            kind: llama_native_types::MediaKind::Audio,
+            mime: "audio/wav".into(),
+            sha256: BlobId::digest(&bytes).to_string(),
+            bytes,
+        };
+        let invalid = MediaInput {
+            sha256: BlobId::digest(b"different bytes").to_string(),
+            ..valid.clone()
+        };
+        assert_eq!(
+            retain(&mut store, &[valid.clone(), invalid])
+                .expect_err("hash mismatch")
+                .code,
+            "media_identity_mismatch"
+        );
+        assert!(
+            store.read_blob(BlobId::digest(&valid.bytes)).is_err(),
+            "No preceding batch member was written before validation finished."
+        );
     }
 
     #[test]

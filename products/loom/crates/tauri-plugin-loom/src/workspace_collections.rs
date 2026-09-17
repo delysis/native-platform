@@ -189,7 +189,7 @@ pub(crate) fn collection_definition(
         .find(|definition| definition.id == id))
 }
 
-pub(super) fn checked_base(
+pub(crate) fn checked_base(
     store: &mut ProjectStore,
     expected_revision: Option<RevisionId>,
 ) -> Result<Option<LoadedDocument>, IpcFailure> {
@@ -222,7 +222,7 @@ fn reject_pending_draft(store: &ProjectStore, loaded: &LoadedDocument) -> Result
 }
 
 /// Edit only the authoritative fence; Markdown and all unrelated TOML stay intact.
-pub(super) fn edit_config(
+pub(crate) fn edit_config(
     markdown: &str,
     edit: impl FnOnce(&mut DocumentMut) -> Result<(), IpcFailure>,
 ) -> Result<String, IpcFailure> {
@@ -256,7 +256,7 @@ pub(super) fn edit_config(
     Ok(output)
 }
 
-pub(super) fn save_config(
+pub(crate) fn save_config(
     store: &mut ProjectStore,
     loaded: Option<&LoadedDocument>,
     text: String,

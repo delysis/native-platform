@@ -96,13 +96,18 @@ async fn read_page(
     page: usize,
     operation_id: &str,
 ) -> Result<PdfPage, IpcFailure> {
-    let authority = capture_loom_asset_authority_for(state, request.project_id, request.session_id)
-        .map_err(|_| unavailable())?;
+    let (authority, owner_scope) =
+        capture_source_authority(state, request).map_err(|_| unavailable())?;
     let attachment = selected_attachment(state, &authority, request).map_err(|_| unavailable())?;
     if attachment != request.media_sha256 {
         return Err(unavailable());
     }
-    let operation = import_jobs::ImportOperation::reserve_in(
+    let reserve = if owner_scope {
+        import_jobs::ImportOperation::reserve_workspace_in
+    } else {
+        import_jobs::ImportOperation::reserve_in
+    };
+    let operation = reserve(
         state,
         &state.previews,
         &request.project_id.to_string(),

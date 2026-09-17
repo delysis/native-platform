@@ -265,14 +265,14 @@ fn unchanged_selected_text_still_has_new_plan_identity_when_membership_changes()
     let Value::Evidence {
         retrieval: Some(before),
         ..
-    } = &before.bindings["Notes/"]
+    } = before.bindings["Notes/"].unscoped()
     else {
         panic!("retained search")
     };
     let Value::Evidence {
         retrieval: Some(after),
         ..
-    } = &after.bindings["Notes/"]
+    } = after.bindings["Notes/"].unscoped()
     else {
         panic!("retained search")
     };

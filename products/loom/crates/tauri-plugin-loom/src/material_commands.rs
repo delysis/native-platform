@@ -45,8 +45,38 @@ fn with_store<T>(
 ) -> Result<T, IpcFailure> {
     let _admission = lock_application_admission(state, "material access")?;
     let mut session = lock_session(state)?;
-    let store = require_bound_store(&mut session, project, session_id)?;
+    let store = workspace_owner::require_store_mut(&mut session, project, session_id)?;
     action(store).map_err(Into::into)
+}
+
+/// A source viewer retains the exact scope that opened it. Named workspace
+/// sources and document-local inline attachments never borrow each other's IDs.
+fn with_read_store<T>(
+    state: &PluginState,
+    project: &str,
+    session_id: &str,
+    action: impl FnOnce(&mut ProjectStore) -> Result<T, materials::MaterialError>,
+) -> Result<T, IpcFailure> {
+    let _admission = lock_application_admission(state, "source read")?;
+    let mut session = lock_session(state)?;
+    action(require_source_store(&mut session, project, session_id)?).map_err(Into::into)
+}
+
+pub(super) fn require_source_store<'a>(
+    session: &'a mut Session,
+    project: &str,
+    session_id: &str,
+) -> Result<&'a mut ProjectStore, IpcFailure> {
+    let owner = project
+        .parse()
+        .ok()
+        .zip(session_id.parse().ok())
+        .is_some_and(|(project, id)| workspace_owner::is_bound(session, project, id));
+    if owner {
+        workspace_owner::require_store_mut(session, project, session_id)
+    } else {
+        require_bound_store(session, project, session_id)
+    }
 }
 
 #[tauri::command]
@@ -71,7 +101,7 @@ pub(super) async fn material_read(
     id: String,
     state: State<'_, PluginState>,
 ) -> Result<MaterialRead, IpcFailure> {
-    let read = with_store(&state, &project_id, &session_id, |store| {
+    let read = with_read_store(&state, &project_id, &session_id, |store| {
         materials::read(store, &id)
     })?;
     crate::material_media::bind_tokens(read, &project_id, &session_id)
@@ -85,7 +115,7 @@ pub(super) async fn material_search(
     query: String,
     state: State<'_, PluginState>,
 ) -> Result<MaterialSearch, IpcFailure> {
-    with_store(&state, &project_id, &session_id, |store| {
+    with_read_store(&state, &project_id, &session_id, |store| {
         restore_grants(&state, store)
             .map_err(|error| materials::MaterialError::Invalid(error.message))?;
         materials::search(store, &id, &query)
@@ -100,7 +130,7 @@ pub(super) async fn material_read_evidence(
     evidence_id: String,
     state: State<'_, PluginState>,
 ) -> Result<MaterialEvidence, IpcFailure> {
-    with_store(&state, &project_id, &session_id, |store| {
+    with_read_store(&state, &project_id, &session_id, |store| {
         materials::read_evidence(store, &id, &evidence_id)
     })
 }
@@ -113,9 +143,10 @@ pub(super) async fn material_bind_attachment(
     name: Option<String>,
     state: State<'_, PluginState>,
 ) -> Result<MaterialEntry, IpcFailure> {
-    with_store(&state, &project_id, &session_id, |store| {
-        materials::bind_attachment(store, &attachment_id, name.as_deref())
-    })
+    let _admission = lock_application_admission(&state, "inline attachment source")?;
+    let mut session = lock_session(&state)?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    materials::bind_attachment(store, &attachment_id, name.as_deref()).map_err(Into::into)
 }
 
 #[tauri::command]

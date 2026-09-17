@@ -15,6 +15,7 @@
   export let onClose: () => void;
   export let onUse: (reference: string, text: string | null) => Promise<boolean>;
   export let removable = true;
+  export let workspaceOwned = true;
   export let onRemoved: (id: string, session: string) => void = () => {};
   export let onChanged: (entry: MaterialEntry) => void;
   export let onReopen: () => void;
@@ -212,7 +213,7 @@
       {#if selectedPage && material.available && originalId}<button disabled={busy} on:click={() => void openSourcePage()}>Open page {selectedPage}</button>{/if}
       {#if pdfToken && !selected && !results}<button on:click={() => pdfText = !pdfText}>{pdfText ? "Show original page" : "Show extracted text"}</button>{/if}
       {#if originalId}<button on:click={() => void original()}>Reveal original</button>{/if}
-      {#if material.available && material.kind !== 'folder'}<button disabled={busy} on:click={() => void pin()}>{material.pinned ? 'Unpin' : 'Pin'}</button>{/if}
+      {#if workspaceOwned && material.available && material.kind !== 'folder'}<button disabled={busy} on:click={() => void pin()}>{material.pinned ? 'Unpin' : 'Pin'}</button>{/if}
       {#if removable && material.kind !== 'folder'}<button disabled={busy} on:click={() => void remove()}>Remove from workspace</button>{/if}
     </div></details>
     <button class="close" on:click={onClose} aria-label="Close source" title="Close source"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="m4 4 8 8M12 4l-8 8" /></svg></button>

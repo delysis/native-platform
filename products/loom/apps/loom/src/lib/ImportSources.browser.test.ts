@@ -2,7 +2,7 @@ import { mount, unmount } from 'svelte';
 import { describe, expect, it, vi } from 'vitest';
 import { page } from 'vitest/browser';
 import ImportSources from './ImportSources.svelte';
-import type { ImportBatch } from './ipc';
+import type { ImportBatch, WorkspaceSourceImportReport } from './ipc';
 
 const native = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock('@tauri-apps/api/core', async (original) => ({
@@ -18,7 +18,7 @@ function deferred<T>() {
 
 describe('source import cancellation', () => {
   it('sends Stop through the real IPC lane before completion and preserves partial results', async () => {
-    const batch = deferred<ImportBatch>();
+    const batch = deferred<WorkspaceSourceImportReport>();
     const opened = deferred<void>();
     const disconnect = deferred<void>();
     const target = document.createElement('div');
@@ -29,8 +29,8 @@ describe('source import cancellation', () => {
     native.invoke.mockImplementation(async (command: string) => {
       switch (command) {
         case 'plugin:loom|import_accounts': return [{ service: 'gmail', email: 'writer@example.test' }];
-        case 'plugin:loom|attachment_import_batch_choose': return batch.promise;
-        case 'plugin:loom|import_account_cancel': return;
+        case 'plugin:loom|workspace_source_import_choose': return batch.promise;
+        case 'plugin:loom|workspace_source_import_cancel': return;
         case 'plugin:loom|import_account_disconnect': return disconnect.promise;
         default: throw new Error(`Unexpected native command: ${command}`);
       }
@@ -48,19 +48,21 @@ describe('source import cancellation', () => {
     try {
       await page.getByRole('button', { name: 'Choose files', exact: true }).click();
       await vi.waitFor(() => expect(native.invoke).toHaveBeenCalledWith(
-        'plugin:loom|attachment_import_batch_choose', expect.objectContaining({ folder: false })
+        'plugin:loom|workspace_source_import_choose', expect.objectContaining({ projectId: 'project-a', sessionId: 'session-a' })
       ));
-      const admission = native.invoke.mock.calls.find(([command]) => command === 'plugin:loom|attachment_import_batch_choose')!;
+      const admission = native.invoke.mock.calls.find(([command]) => command === 'plugin:loom|workspace_source_import_choose')!;
       const operationId: string = admission[1].operationId;
       // ULID's first character must fit 128 bits, and its alphabet excludes I/L/O/U.
       expect(operationId).toMatch(/^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
       await page.getByRole('button', { name: 'Stop import', exact: true }).click();
-      await vi.waitFor(() => expect(native.invoke).toHaveBeenCalledWith('plugin:loom|import_account_cancel', {
+      await vi.waitFor(() => expect(native.invoke).toHaveBeenCalledWith('plugin:loom|workspace_source_import_cancel', {
         projectId: 'project-a', sessionId: 'session-a', operationId
       }));
       // The import has not resolved: cancel must bypass its pending ordering lane.
       await expect.element(page.getByRole('status')).toHaveTextContent('Stopping…');
-      batch.resolve({ imported: [retained], failures: [{ name: 'Next source.pdf', message: 'Import stopped.' }], next_page_token: null });
+      batch.resolve({ workspace_id: 'project-a', workspace_session_id: 'session-a', operation_id: operationId,
+        imported: [{ attachment: retained, material: { id: 'material-source', name: 'Retained source', reference: '@source', kind: 'attachment', pinned: false, available: true, source_path: null, attachment_id: retained.id } }],
+        failures: [{ name: 'Next source.pdf', message: 'Import stopped.' }], cancelled: true });
       await expect.element(page.getByRole('button', { name: 'Retained source.md', exact: true })).toBeVisible();
       await expect.element(page.getByText('Next source.pdf: Import stopped.', { exact: true })).toBeVisible();
       expect(onImported).toHaveBeenCalledWith([retained], 'project-a', 'session-a');
@@ -82,9 +84,9 @@ describe('source import cancellation', () => {
       expect(page.getByRole('button', { name: 'Stop import', exact: true }).query()).toBeNull();
       disconnect.resolve();
       await expect.element(page.getByRole('status')).toHaveTextContent('Connection removed');
-      expect(native.invoke.mock.calls.filter(([command]) => command === 'plugin:loom|import_account_cancel')).toHaveLength(1);
+      expect(native.invoke.mock.calls.filter(([command]) => command === 'plugin:loom|workspace_source_import_cancel')).toHaveLength(1);
     } finally {
-      batch.resolve({ imported: [], failures: [], next_page_token: null });
+      batch.resolve({ workspace_id: 'project-a', workspace_session_id: 'session-a', operation_id: '', imported: [], failures: [], cancelled: true });
       opened.resolve(); disconnect.resolve();
       await unmount(component); target.remove();
       if (previousRuntime) Object.defineProperty(window, '__TAURI_INTERNALS__', previousRuntime);

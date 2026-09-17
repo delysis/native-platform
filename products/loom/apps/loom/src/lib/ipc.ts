@@ -53,6 +53,7 @@ export function documentReferenceDiagnostics(projectId: string, sessionId: strin
 // latency optimization rather than a correctness boundary.
 const INDEPENDENT_COMMANDS = new Set([
   'material_pdf_page',
+  'workspace_source_import_cancel',
   'import_account_cancel',
   'collection_cancel',
   'collection_status',
@@ -149,6 +150,18 @@ export function prepareProjectOpen(): Promise<string | null> {
 
 export function prepareProjectOpenPath(path: string): Promise<string | null> {
   return call('project_prepare_open_path', { path });
+}
+
+export function getWorkspaceRoots(projectId: string, sessionId: string): Promise<import('./workspaceFolders').WorkspaceRootsSnapshot> {
+  return call('workspace_roots_get', { projectId, sessionId });
+}
+
+export function prepareWorkspaceRoot(projectId: string, sessionId: string, rootId: string): Promise<string | null> {
+  return call('workspace_root_prepare', { projectId, sessionId, rootId });
+}
+
+export function removeWorkspaceRoot(projectId: string, sessionId: string, rootId: string): Promise<void> {
+  return call('workspace_root_remove', { projectId, sessionId, rootId });
 }
 
 export function projectDropDirectories(paths: string[]): Promise<string[]> {
@@ -254,6 +267,31 @@ export function chooseAttachments(
   operationId = newUlid()
 ): Promise<ImportBatch> {
   return call('attachment_import_choose', { projectId, sessionId, operationId });
+}
+
+export interface WorkspaceSourceImportReport {
+  workspace_id: string;
+  workspace_session_id: string;
+  operation_id: string;
+  imported: Array<{ attachment: ContextAttachment; material: import('./materials').MaterialEntry | null }>;
+  failures: Array<{ name: string; message: string }>;
+  cancelled: boolean;
+}
+
+export function chooseWorkspaceSources(projectId: string, sessionId: string, operationId = newUlid()): Promise<WorkspaceSourceImportReport> {
+  return call('workspace_source_import_choose', { projectId, sessionId, operationId });
+}
+
+export function importWorkspaceSourcePaths(projectId: string, sessionId: string, paths: readonly string[], operationId = newUlid()): Promise<WorkspaceSourceImportReport> {
+  return call('workspace_source_import_paths', { projectId, sessionId, operationId, paths: [...paths] });
+}
+
+export function pasteWorkspaceSources(projectId: string, sessionId: string, text: string, separator: string, operationId = newUlid()): Promise<WorkspaceSourceImportReport> {
+  return call('workspace_source_import_paste', { projectId, sessionId, operationId, text, separator });
+}
+
+export function cancelWorkspaceSourceImport(projectId: string, sessionId: string, operationId: string): Promise<void> {
+  return call('workspace_source_import_cancel', { projectId, sessionId, operationId });
 }
 
 export function listDocumentContext(
@@ -1035,6 +1073,10 @@ export function searchMaterial(projectId: string, sessionId: string, materialId:
 }
 export function readMaterialEvidence(projectId: string, sessionId: string, materialId: string, evidenceId: string): Promise<import('./materials').MaterialEvidence> {
   return call('material_read_evidence', { projectId, sessionId, id: materialId, evidenceId });
+}
+
+export function resolveMaterialReference(projectId: string, sessionId: string, reference: string): Promise<import('./materialEvidenceScope').MaterialReferenceResolution> {
+  return call('material_resolve_reference', { projectId, sessionId, reference });
 }
 export function addLibraryMaterial(projectId: string, sessionId: string): Promise<import('./materials').MaterialEntry | null> {
   return call('material_add_library', { projectId, sessionId });

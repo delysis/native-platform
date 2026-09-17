@@ -15,6 +15,7 @@ mod inference;
 mod material_commands;
 mod material_context;
 mod material_media;
+mod material_references;
 mod materials;
 mod microphone_capture;
 mod model_catalog;
@@ -27,7 +28,10 @@ mod terminal;
 mod terminal_media;
 mod terminal_receipts;
 mod workspace_copy;
+mod workspace_owner;
+mod workspace_source_import;
 mod workspace_preview;
+mod workspace_roots;
 mod workspace_template;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -212,6 +216,7 @@ struct Session {
     phase: SessionPhase,
     document_filesystem_watcher: Option<DocumentFilesystemWatcher>,
     store: Option<ProjectStore>,
+    workspace: Option<workspace_owner::Owner>,
     active_session_id: Option<CommandId>,
     agency: AgencyGate,
     last_close: Option<ProjectCloseReceipt>,
@@ -471,7 +476,10 @@ fn recorded_loompad_batch(
 #[derive(Debug)]
 struct PreparedProject {
     id: CommandId,
-    store: ProjectStore,
+    store: Option<ProjectStore>,
+    workspace_session: Option<CommandId>,
+    workspace_revision: Option<RevisionId>,
+    granted_root: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2100,6 +2108,13 @@ impl Builder {
                 project_open_default,
                 project_prepare_open,
                 project_prepare_open_path,
+                workspace_owner::workspace_roots_get,
+                workspace_owner::workspace_root_prepare,
+                workspace_owner::workspace_root_remove,
+                workspace_source_import::workspace_source_import_paths,
+                workspace_source_import::workspace_source_import_choose,
+                workspace_source_import::workspace_source_import_paste,
+                workspace_source_import::workspace_source_import_cancel,
                 project_drop_directories,
                 project_commit_open,
                 project_discard_open,
@@ -2108,6 +2123,7 @@ impl Builder {
                 project_recover,
                 document_create,
                 material_commands::material_list,
+                material_references::material_resolve_reference,
                 reference_diagnostics::document_reference_diagnostics,
                 material_commands::material_read,
                 material_media::pdf::material_pdf_page,
@@ -2971,8 +2987,15 @@ async fn project_open_default<R: Runtime>(
 ) -> Result<ProjectSnapshot, IpcFailure> {
     ensure_application_running(&state, "a project session")?;
     let choice = reserve_project_choice(&state)?;
-    let result =
-        default_project_path(&state).and_then(|path| open_or_initialize_default_project(&path));
+    let result = {
+        let mut session = lock_session_internal(&state)?;
+        if session.workspace.is_some() {
+            workspace_owner::take_parked(&mut session)
+        } else {
+            drop(session);
+            default_project_path(&state).and_then(|path| open_or_initialize_default_project(&path))
+        }
+    };
     choice.finish(&app, result)
 }
 
@@ -3113,14 +3136,39 @@ fn prepare_project_folder(
     let path = path
         .canonicalize()
         .map_err(|error| IpcFailure::new("selected_folder_unavailable", error.to_string(), true))?;
-    {
-        let session = lock_session(state)?;
+    let (workspace_session, workspace_revision) = {
+        let mut session = lock_session(state)?;
         if let Some(current) = &session.store
             && current.root() == path
         {
             return Ok(None);
         }
-    }
+        let owner_session = session.workspace.as_ref().map(|owner| owner.session_id);
+        let revision = if owner_session.is_some() {
+            let owner = workspace_owner::store_mut(&mut session)?;
+            workspace_template::load_template(owner)?;
+            workspace_roots::current_revision(owner)?
+        } else {
+            None
+        };
+        if session
+            .workspace
+            .as_ref()
+            .is_some_and(|owner| owner.root == path)
+        {
+            let id = CommandId::new();
+            snapshot_for(workspace_owner::store(&session)?, id)?;
+            *lock_prepared_project(state)? = Some(PreparedProject {
+                id,
+                store: None,
+                workspace_session: owner_session,
+                workspace_revision: revision,
+                granted_root: Some(workspace_roots::OWNER_ROOT_ID.into()),
+            });
+            return Ok(Some(id.to_string()));
+        }
+        (owner_session, revision)
+    };
     let mut store = ProjectStore::open_folder(&path).map_err(IpcFailure::store)?;
     store
         .recover_interrupted_generations()
@@ -3130,7 +3178,13 @@ fn prepare_project_folder(
     // Surface an unreadable catalogue before asking the renderer to save and
     // close the current writing. The commit reads a fresh handoff snapshot.
     snapshot_for(&store, id)?;
-    *lock_prepared_project(state)? = Some(PreparedProject { id, store });
+    *lock_prepared_project(state)? = Some(PreparedProject {
+        id,
+        store: Some(store),
+        workspace_session,
+        workspace_revision,
+        granted_root: None,
+    });
     Ok(Some(id.to_string()))
 }
 
@@ -3152,7 +3206,36 @@ fn take_prepared_project(state: &PluginState, id: CommandId) -> Result<ProjectSt
         .as_ref()
         .is_some_and(|candidate| candidate.id == id)
     {
-        return Ok(prepared.take().expect("matching prepared project").store);
+        let candidate = prepared.take().expect("matching prepared project");
+        drop(prepared);
+        let mut session = lock_session_internal(state)?;
+        if candidate.workspace_session != session.workspace.as_ref().map(|owner| owner.session_id) {
+            return Err(IpcFailure::new(
+                "workspace_changed",
+                "Choose the folder again in this workspace.",
+                false,
+            ));
+        }
+        return match candidate.store {
+            Some(store) => {
+                if candidate.workspace_session.is_some() {
+                    let owner = workspace_owner::store_mut(&mut session)?;
+                    let private = workspace_owner::private_root(state)?;
+                    if let Some(id) = candidate.granted_root {
+                        workspace_roots::validate_opened(owner, &id, &store, &private)?;
+                    } else {
+                        workspace_roots::mount(
+                            owner,
+                            &store,
+                            &private,
+                            candidate.workspace_revision,
+                        )?;
+                    }
+                }
+                Ok(store)
+            }
+            None => workspace_owner::take_parked(&mut session),
+        };
     }
     Err(IpcFailure::new(
         "prepared_project_expired",
@@ -3204,6 +3287,7 @@ fn reserve_project_choice(state: &PluginState) -> Result<ProjectChoiceReservatio
         state,
         _application_admission: application_admission,
         committed: false,
+        pending_store: None,
     })
 }
 
@@ -3211,6 +3295,7 @@ struct ProjectChoiceReservation<'a> {
     state: &'a PluginState,
     _application_admission: MutexGuard<'a, ApplicationPhase>,
     committed: bool,
+    pending_store: Option<ProjectStore>,
 }
 
 impl ProjectChoiceReservation<'_> {
@@ -3245,14 +3330,15 @@ impl ProjectChoiceReservation<'_> {
             CommandId,
         ) -> Result<Option<DocumentFilesystemWatcher>, IpcFailure>,
     ) -> Result<ProjectSnapshot, IpcFailure> {
-        let store = result?;
+        self.pending_store = Some(result?);
+        let store = self.pending_store.as_ref().expect("prepared store");
         let session_id = CommandId::new();
-        let document_filesystem_watcher = start_watcher(&store, session_id)?;
+        let document_filesystem_watcher = start_watcher(store, session_id)?;
         // Establish observation before reading the handoff snapshot. The
         // renderer performs one coalesced refresh after attaching it, closing
         // the small interval in which correctly scoped early hints are still
         // rejected because no renderer session is attached yet.
-        let snapshot = snapshot_for(&store, session_id)?;
+        let snapshot = snapshot_for(store, session_id)?;
         let mut session = lock_session_internal(self.state)?;
         if session.phase != SessionPhase::Choosing {
             return Err(IpcFailure::new(
@@ -3269,7 +3355,8 @@ impl ProjectChoiceReservation<'_> {
             )
             .map_err(|error| IpcFailure::speech_input(&error))?;
         session.document_filesystem_watcher = document_filesystem_watcher;
-        session.store = Some(store);
+        workspace_owner::establish(&mut session, store);
+        session.store = self.pending_store.take();
         session.active_session_id = Some(session_id);
         session.agency = AgencyGate::default();
         session.phase = SessionPhase::Open;
@@ -3300,6 +3387,9 @@ impl Drop for ProjectChoiceReservation<'_> {
             .session
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(store) = self.pending_store.take() {
+            workspace_owner::restore_parked(&mut session, store);
+        }
         if session.phase == SessionPhase::Choosing {
             session.phase = SessionPhase::Closed;
         }
@@ -3578,7 +3668,7 @@ fn close_project_with_wait(
         closed_at_unix_ms: now_unix_ms(),
     };
     let document_filesystem_watcher = session.document_filesystem_watcher.take();
-    session.store = None;
+    workspace_owner::park_active(&mut session);
     session.active_session_id = None;
     session.agency = AgencyGate::default();
     session.phase = SessionPhase::Closed;
@@ -4778,7 +4868,7 @@ async fn attachment_reveal_original(
     let _admission = lock_application_admission(&state, "an attachment reveal")?;
     let path = {
         let mut session = lock_session(&state)?;
-        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        let store = material_commands::require_source_store(&mut session, &project_id, &session_id)?;
         context_attachments::original_path(store.root(), &attachment_id)
             .map_err(|error| IpcFailure::context_attachment(&error))?
     };
@@ -8551,7 +8641,7 @@ fn weave_start_inner<R: Runtime>(
             .map_err(|error| IpcFailure::new("material_context_invalid", error.to_string(), false))?
             .is_empty()
         {
-            material_commands::restore_grants(state, store)?;
+            material_commands::restore_grants(state, workspace_owner::store_mut(&mut session)?)?;
         }
         // Match the attachment planner's conservative byte-per-token envelope;
         // every branch's generation and the runtime scaffold keep their reserve.
@@ -8564,8 +8654,15 @@ fn weave_start_inner<R: Runtime>(
             .saturating_sub(attachment_context.manuscript_prompt.len())
             .saturating_sub(attachment_context.context_preamble.len())
             .saturating_sub(2);
+        let owner = session.workspace.as_ref().ok_or_else(|| {
+            IpcFailure::new("workspace_not_open", "The source workspace is not open.", false)
+        })?;
+        let source_context = workspace_owner::read_context(
+            &session, &project_id, &session_id,
+            &owner.project_id.to_string(), &owner.session_id.to_string(),
+        )?;
         let material_plan = material_context::markdown_plan_with_budget(
-            store,
+            source_context,
             &loaded.text,
             source_prefix,
             material_budget,
@@ -8577,8 +8674,10 @@ fn weave_start_inner<R: Runtime>(
         )?;
         attachment_context.media = terminal_media::merge(
             attachment_context.media,
-            material_context::native_media(store, material_plan.bindings.values())?,
+            source_context.native_media(material_plan.bindings.values())?,
         )?;
+        let store = require_bound_store(&mut session, &project_id, &session_id)?;
+        let retained_media = terminal_media::retain(store, &attachment_context.media)?;
         let document_context = &material_plan.text;
         if !document_context.is_empty() {
             attachment_context.context_preamble.push_str("\n\n");
@@ -8639,14 +8738,7 @@ fn weave_start_inner<R: Runtime>(
         let environment_artifact = store
             .record_model_environment(&model_environment)
             .map_err(IpcFailure::store)?;
-        let mut context_inputs = material_context::evidence_artifact_ids(&material_plan.evidence)?;
-        for value in material_plan.bindings.values() {
-            if let material_context::Value::Documents { documents } = value {
-                context_inputs.extend(documents.iter().map(|document| document.artifact_id));
-            }
-        }
-        context_inputs.sort();
-        context_inputs.dedup();
+        let context_inputs = material_context::local_artifact_ids(store, material_plan.bindings.values())?;
         let mut prompt_inputs = vec![loaded.artifact_id];
         prompt_inputs.extend(context_inputs.iter().copied());
         let prompt_recipe = PromptRecipe {
@@ -8662,8 +8754,8 @@ fn weave_start_inner<R: Runtime>(
         let retrieval_evidence_blob_id = {
             let identity =
                 serde_json::to_vec(&match &speculation {
-                    Some(batch) => serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "loompad": batch }),
-                    None => serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan }),
+                    Some(batch) => serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media, "loompad": batch }),
+                    None => serde_json::json!({ "retrieval": attachment_context.retrieval_evidence, "materials": material_plan, "media": retained_media }),
                 }).map_err(|error| {
                     IpcFailure::new("attachment_context_encode_failed", error.to_string(), false)
                 })?;
@@ -11488,8 +11580,11 @@ mod tests {
     fn workspace_path_preparation_revalidates_hints_without_replacing_live_drafts() {
         let current = tempfile::tempdir().expect("current writing");
         let next = tempfile::tempdir().expect("next writing");
+        let private = tempfile::tempdir().expect("private workspace grants");
         std::fs::write(next.path().join("Notes.md"), "Exact next writing.\r\n").unwrap();
-        let state = PluginState::default();
+        let state = PluginState::with_app_local_data_root(
+            Some(private.path().to_owned()), true, BuildModelPolicy::default(),
+        );
         let mut store = initialize_project(current.path(), "Current".into()).unwrap();
         let source = store.read_document(INITIAL_DOCUMENT).unwrap();
         store
@@ -11545,9 +11640,14 @@ mod tests {
     fn prepared_folder_lease_survives_old_session_close_and_is_consumed_once() {
         let current = tempfile::tempdir().expect("current folder");
         let next = tempfile::tempdir().expect("next folder");
+        let private = tempfile::tempdir().expect("private application data");
         std::fs::write(next.path().join("Existing.md"), "Exact writing.\r\n")
             .expect("existing manuscript");
-        let state = PluginState::default();
+        let state = PluginState::with_app_local_data_root(
+            Some(private.path().to_owned()),
+            true,
+            BuildModelPolicy::default(),
+        );
         let store = initialize_project(current.path(), "Current".into()).expect("current store");
         let opened = reserve_project_choice(&state)
             .expect("reserve")
@@ -11593,7 +11693,12 @@ mod tests {
             std::fs::read(next.path().join("Existing.md")).expect("unchanged bytes"),
             b"Exact writing.\r\n"
         );
-        drop(ProjectStore::open(current.path()).expect("old lease released"));
+        assert!(matches!(
+            ProjectStore::open(current.path()),
+            Err(loom_store::StoreError::ProjectAlreadyOpen(_))
+        ));
+        drop(state);
+        drop(ProjectStore::open(current.path()).expect("workspace lease released on shutdown"));
     }
 
     #[test]
@@ -14897,6 +15002,7 @@ mod tests {
             phase: SessionPhase::Open,
             document_filesystem_watcher: None,
             store: Some(store),
+            workspace: None,
             active_session_id: Some(session_id),
             agency: AgencyGate::default(),
             last_close: None,

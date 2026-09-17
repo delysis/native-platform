@@ -83,7 +83,7 @@ fn projected_run(receipt: &RunReceipt) -> TerminalRun {
     let retained_sources = receipt
         .bindings
         .values()
-        .filter_map(|value| match value {
+        .filter_map(|value| match value.unscoped() {
             Value::Material { material } if material.text.is_some() => {
                 Some(material.material.id.as_str())
             }
@@ -180,11 +180,36 @@ fn terminal_sampling(
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct TerminalMediaEvidence {
-    id: String,
-    kind: llama_native_types::MediaKind,
-    mime: String,
-    bytes_blob_id: BlobId,
+struct SourceUse {
+    origin: material_context::SourceOrigin,
+    evidence_ids: Vec<String>,
+    search_index: Option<usize>,
+}
+
+impl SourceUse {
+    fn evidence_value(
+        &self,
+        evidence: &[crate::materials::MaterialEvidence],
+    ) -> Result<Value, IpcFailure> {
+        let evidence = self
+            .evidence_ids
+            .iter()
+            .map(|id| {
+                evidence
+                    .iter()
+                    .find(|hit| &hit.id == id)
+                    .cloned()
+                    .ok_or_else(|| failure("A retained source use is missing its evidence."))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Value::Scoped {
+            origin: self.origin.clone(),
+            value: Box::new(Value::Evidence {
+                evidence,
+                retrieval: None,
+            }),
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -199,13 +224,17 @@ struct RunReceipt {
     #[serde(default)]
     context_references: Option<Vec<String>>,
     #[serde(default)]
-    media: Vec<TerminalMediaEvidence>,
+    media: Vec<crate::terminal_media::RetainedMedia>,
     model: Option<VerifiedModelDescriptor>,
     bindings: BTreeMap<String, Value>,
     #[serde(default)]
     evidence: Vec<crate::materials::MaterialEvidence>,
     #[serde(default)]
     searches: Vec<crate::materials::MaterialSearch>,
+    /// Source attribution indexes the exact snapshots above without duplicating
+    /// their text. Empty searches retain an origin through their search index.
+    #[serde(default)]
+    source_uses: Vec<SourceUse>,
     #[serde(default)]
     omitted_evidence: BTreeSet<String>,
     sources: Vec<crate::document_bindings::ResolvedDocument>,
@@ -582,8 +611,33 @@ pub(super) async fn terminal_run<R: Runtime>(
     let function_recipe = if functions.is_empty() {
         None
     } else {
-        Some(crate::workspace_template::function_recipe(store)?)
+        Some(crate::workspace_template::function_recipe(
+            crate::workspace_owner::store_mut(&mut session)?,
+        )?)
     };
+    let owner = session
+        .workspace
+        .as_ref()
+        .ok_or_else(|| failure("The workspace closed before this experiment began."))?;
+    let owner_project_id = owner.project_id;
+    let owner_session_id = owner.session_id;
+    if !names.is_empty() || !functions.is_empty() {
+        crate::material_commands::restore_grants(
+            &state,
+            crate::workspace_owner::require_store_mut(
+                &mut session,
+                &owner_project_id.to_string(),
+                &owner_session_id.to_string(),
+            )?,
+        )?;
+    }
+    let read_context = crate::workspace_owner::read_context(
+        &session,
+        &project_id,
+        &session_id,
+        &owner_project_id.to_string(),
+        &owner_session_id.to_string(),
+    )?;
     if let Some(recipe) = &function_recipe {
         fingerprint_bytes.extend(serde_json::to_vec(recipe).map_err(io_failure)?);
     }
@@ -593,23 +647,20 @@ pub(super) async fn terminal_run<R: Runtime>(
         if function.ends_with('/') {
             return Err(failure("A function must name one document."));
         }
-        let function_value = material_context::resolve(store, &function)?;
+        let function_value = read_context.resolve(&function)?;
         let function_text = material_context::exact(&function_value)?;
         for reference in document_references(&function_text).map_err(io_failure)? {
             all_names.insert(reference.name);
         }
-    }
-    if !all_names.is_empty() {
-        crate::material_commands::restore_grants(&state, store)?;
     }
     let mut bindings = BTreeMap::new();
     let mut sources = Vec::new();
     let mut seen_documents = BTreeSet::new();
     let mut folder_budget = material_context::FolderAdmissionBudget::default();
     for name in all_names {
-        let value = material_context::resolve(store, &name)?;
+        let value = read_context.resolve(&name)?;
         folder_budget.admit(&value)?;
-        if let Value::Documents { documents } = &value {
+        if let Value::Documents { documents } = value.unscoped() {
             for document in documents {
                 if seen_documents.insert(document.document_id) {
                     sources.push(document.clone());
@@ -620,39 +671,20 @@ pub(super) async fn terminal_run<R: Runtime>(
     }
     let media = if let Some(model) = &model {
         let media = crate::terminal_media::resolve(
-            store,
+            read_context.documents,
             &source,
             &sources,
             resident_context_tokens(model),
         )?;
-        let media = crate::terminal_media::merge(
-            media,
-            material_context::native_media(store, bindings.values())?,
-        )?;
+        let media =
+            crate::terminal_media::merge(media, read_context.native_media(bindings.values())?)?;
         validate_media_against_resident_model(&media, &model.descriptor)?;
         media
     } else {
         Vec::new()
     };
-    let media_evidence = media
-        .iter()
-        .map(|item| {
-            let bytes_blob_id = store
-                .store_provenance_blob(&item.bytes)
-                .map_err(IpcFailure::store)?;
-            if bytes_blob_id.to_string() != item.sha256 {
-                return Err(failure(
-                    "The attached media changed before this experiment.",
-                ));
-            }
-            Ok(TerminalMediaEvidence {
-                id: item.id.clone(),
-                kind: item.kind,
-                mime: item.mime.clone(),
-                bytes_blob_id,
-            })
-        })
-        .collect::<Result<Vec<_>, IpcFailure>>()?;
+    let store = require_bound_store(&mut session, &project_id, &session_id)?;
+    let media_evidence = crate::terminal_media::retain(store, &media)?;
     let input_blob_id = store
         .store_provenance_blob(input.as_bytes())
         .map_err(IpcFailure::store)?;
@@ -695,6 +727,7 @@ pub(super) async fn terminal_run<R: Runtime>(
         bindings,
         evidence: Vec::new(),
         searches: Vec::new(),
+        source_uses: Vec::new(),
         omitted_evidence: BTreeSet::new(),
         sources,
         steps: Vec::new(),
@@ -771,6 +804,8 @@ pub(super) async fn terminal_run<R: Runtime>(
             let mut evaluator = Evaluator {
                 state: &state,
                 identity: &worker_identity,
+                owner_project_id,
+                owner_session_id,
                 model: model.as_ref(),
                 control: &worker_control,
                 source: &source,
@@ -839,6 +874,8 @@ pub(super) async fn terminal_run<R: Runtime>(
 struct Evaluator<'a> {
     state: &'a PluginState,
     identity: &'a GenerationFamilyIdentity,
+    owner_project_id: ProjectId,
+    owner_session_id: CommandId,
     model: Option<&'a LoadedModel>,
     control: &'a TerminalControl,
     source: &'a LoadedDocument,
@@ -850,6 +887,20 @@ struct Evaluator<'a> {
 }
 
 impl Evaluator<'_> {
+    fn with_read_context<T>(
+        &self,
+        operation: impl FnOnce(material_context::ReadContext<'_>) -> Result<T, IpcFailure>,
+    ) -> Result<T, IpcFailure> {
+        let session = lock_session_internal(self.state)?;
+        operation(crate::workspace_owner::read_context(
+            &session,
+            &self.identity.project_id.to_string(),
+            &self.identity.session_id.to_string(),
+            &self.owner_project_id.to_string(),
+            &self.owner_session_id.to_string(),
+        )?)
+    }
+
     fn with_store<T>(
         &self,
         operation: impl FnOnce(&mut ProjectStore) -> Result<T, IpcFailure>,
@@ -894,16 +945,12 @@ impl Evaluator<'_> {
             NeuralExpression::Find { source, query } => {
                 let source = self.evaluate(source)?;
                 let query = material_context::exact(&self.evaluate(query)?)?;
-                let value = self.with_store(|store| {
-                    material_context::search_with_cancel(
-                        store,
-                        &source,
-                        &query,
-                        &self.folder_scan_budget,
-                        &|| self.control.cancelled.load(Ordering::Acquire),
-                    )
+                let value = self.with_read_context(|context| {
+                    context.search_with_cancel(&source, &query, &self.folder_scan_budget, &|| {
+                        self.control.cancelled.load(Ordering::Acquire)
+                    })
                 })?;
-                self.record_evidence(&value);
+                self.record_evidence(&value)?;
                 Ok(value)
             }
             NeuralExpression::Call {
@@ -914,7 +961,7 @@ impl Evaluator<'_> {
                 let mut inputs = Vec::new();
                 for argument in arguments {
                     let value = self.evaluate(argument)?;
-                    self.record_evidence(&value);
+                    self.record_evidence(&value)?;
                     inputs.push(material_context::exact(&value)?);
                 }
                 if inputs.is_empty() {
@@ -957,32 +1004,51 @@ impl Evaluator<'_> {
         }
     }
 
-    fn record_evidence(&mut self, value: &Value) {
+    fn record_evidence(&mut self, value: &Value) -> Result<(), IpcFailure> {
         if let Value::Evidence {
             evidence,
             retrieval,
-        } = value
+        } = value.unscoped()
         {
-            if let Some(search) = retrieval
-                && !self.receipt.searches.iter().any(|prior| {
-                    prior.material.id == search.material.id
-                        && prior.query == search.query
-                        && prior.source_revision == search.source_revision
-                        && prior
-                            .hits
-                            .iter()
-                            .map(|hit| &hit.id)
-                            .eq(search.hits.iter().map(|hit| &hit.id))
-                })
-            {
-                self.receipt.searches.push(search.as_ref().clone());
-            }
+            let Value::Scoped { origin, .. } = value else {
+                return Err(failure("Retrieved evidence is missing its source origin."));
+            };
+            let search_index = if let Some(search) = retrieval {
+                let snapshot = serde_json::to_vec(search.as_ref()).map_err(io_failure)?;
+                let mut existing = None;
+                for (index, prior) in self.receipt.searches.iter().enumerate() {
+                    if serde_json::to_vec(prior).map_err(io_failure)? == snapshot {
+                        existing = Some(index);
+                        break;
+                    }
+                }
+                Some(existing.unwrap_or_else(|| {
+                    let index = self.receipt.searches.len();
+                    self.receipt.searches.push(search.as_ref().clone());
+                    index
+                }))
+            } else {
+                None
+            };
             for hit in evidence {
                 if !self.receipt.evidence.iter().any(|prior| prior.id == hit.id) {
                     self.receipt.evidence.push(hit.clone());
                 }
             }
+            let source_use = SourceUse {
+                origin: origin.clone(),
+                evidence_ids: evidence.iter().map(|hit| hit.id.clone()).collect(),
+                search_index,
+            };
+            if !self.receipt.source_uses.iter().any(|prior| {
+                prior.origin == source_use.origin
+                    && prior.evidence_ids == source_use.evidence_ids
+                    && prior.search_index == source_use.search_index
+            }) {
+                self.receipt.source_uses.push(source_use);
+            }
         }
+        Ok(())
     }
 
     fn append_context(
@@ -1010,9 +1076,8 @@ impl Evaluator<'_> {
     }
 
     fn consult(&mut self, value: &Value, query: &str, budget: usize) -> Result<Value, IpcFailure> {
-        let (consulted, omitted) = self.with_store(|store| {
-            material_context::consult_with_budget_and_cancel(
-                store,
+        let (consulted, omitted) = self.with_read_context(|context| {
+            context.consult_with_budget_and_cancel(
                 value,
                 query,
                 budget,
@@ -1021,7 +1086,7 @@ impl Evaluator<'_> {
             )
         })?;
         self.receipt.omitted_evidence.extend(omitted);
-        self.record_evidence(&consulted);
+        self.record_evidence(&consulted)?;
         Ok(consulted)
     }
 
@@ -1053,17 +1118,23 @@ impl Evaluator<'_> {
                 .record_model_environment(&environment)
                 .map_err(IpcFailure::store)?;
             let mut inputs = vec![self.source.artifact_id];
-            inputs.extend(self.receipt.sources.iter().map(|source| source.artifact_id));
-            inputs.extend(material_context::evidence_artifact_ids(
-                &self.receipt.evidence,
+            let evidence_values = self
+                .receipt
+                .source_uses
+                .iter()
+                .map(|source| source.evidence_value(&self.receipt.evidence))
+                .collect::<Result<Vec<_>, _>>()?;
+            inputs.extend(material_context::local_artifact_ids(
+                store,
+                self.receipt.bindings.values().chain(&evidence_values),
             )?);
-            if let Some(configuration) = self
+            if let Some(artifact_id) = self
                 .receipt
                 .function_recipe
                 .as_ref()
-                .and_then(|recipe| recipe.configuration.as_ref())
+                .and_then(|recipe| recipe.local_configuration_artifact(store))
             {
-                inputs.push(configuration.artifact_id);
+                inputs.push(artifact_id);
             }
             inputs.sort();
             inputs.dedup();
@@ -1083,6 +1154,10 @@ impl Evaluator<'_> {
                         &self.receipt.searches,
                         &self.receipt.bindings,
                         &self.receipt.omitted_evidence,
+                        // Foreign configuration is retained with its source
+                        // identity and exact bytes, never as a local artifact ID.
+                        &self.receipt.function_recipe,
+                        &self.receipt.source_uses,
                     ))
                     .map_err(io_failure)?,
                 )
@@ -1266,7 +1341,7 @@ impl Evaluator<'_> {
             outcome.and_then(|value| material_context::exact(&value).map(|text| (value, text)));
         match outcome {
             Ok((value, text)) => {
-                self.record_evidence(&value);
+                self.record_evidence(&value)?;
                 if self.receipt.run.output_document_id.is_none() || !matches!(value, Value::Text(_))
                 {
                     let evidence = self.with_store(|store| {

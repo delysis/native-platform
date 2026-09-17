@@ -39,6 +39,7 @@ impl TerminalFixture {
         {
             let mut session = state.session.lock().expect("session lock");
             session.phase = SessionPhase::Open;
+            crate::workspace_owner::establish(&mut session, &store);
             session.store = Some(store);
             session.active_session_id = Some(session_id);
         }
@@ -55,6 +56,13 @@ impl TerminalFixture {
 
     fn root(&self) -> PathBuf {
         self.directory.path().join("Writing")
+    }
+
+    fn owner_identity(&self) -> (ProjectId, CommandId) {
+        let state = self.app.state::<PluginState>();
+        let session = state.session.lock().expect("session lock");
+        let owner = session.workspace.as_ref().expect("workspace owner");
+        (owner.project_id, owner.session_id)
     }
 
     fn run(&self, id: CommandId, expression: &str) -> Result<TerminalRun, IpcFailure> {
@@ -150,6 +158,91 @@ fn imported_source(fixture: &TerminalFixture, text: &str) -> crate::materials::M
         let attachment = crate::context_attachments::import_path(store.root(), &path).unwrap();
         crate::materials::bind_attachment(store, &attachment.id, Some("Research")).unwrap()
     })
+}
+
+#[test]
+fn owner_source_find_retains_scoped_evidence_and_output_in_active_child() {
+    let mut fixture = TerminalFixture::new();
+    let material = imported_source(&fixture, "The nightjar sings beneath the moon.");
+    let owner_root = fixture.root();
+    let child_root = fixture.directory.path().join("Child");
+    let (mut child, _) = ProjectStore::initialize(&child_root, "Child").unwrap();
+    child
+        .create_document_if_absent(
+            "Draft.md",
+            DocumentContent::Prose("Child writing stays intact.".into()),
+            "child writing",
+        )
+        .unwrap();
+    fixture.source = child.read_document("Draft.md").unwrap();
+    fixture.project_id = child.manifest().project_id.to_string();
+    let child_session = CommandId::new();
+    fixture.session_id = child_session.to_string();
+    {
+        let state = fixture.app.state::<PluginState>();
+        let mut session = state.session.lock().unwrap();
+        crate::workspace_owner::park_active(&mut session);
+        session.store = Some(child);
+        session.active_session_id = Some(child_session);
+        session.phase = SessionPhase::Open;
+    }
+
+    let id = CommandId::new();
+    fixture
+        .run(id, &format!("=find(@{}, \"nightjar\")", material.id))
+        .unwrap();
+    let run = fixture.wait(id);
+    assert_eq!(run.status, "completed", "{:?}", run.error);
+    let receipt = read_receipt(&child_root, &id.to_string(), true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.searches.len(), 1);
+    assert_eq!(
+        receipt.source_uses.len(),
+        1,
+        "Repeated retention must not duplicate source attribution."
+    );
+    assert_eq!(receipt.source_uses[0].search_index, Some(0));
+    let Value::Scoped { origin, .. } = &receipt.bindings[&material.id] else {
+        panic!("source binding must retain its owner identity");
+    };
+    assert_eq!(&receipt.source_uses[0].origin, origin);
+    assert_eq!(
+        receipt.source_uses[0].evidence_ids,
+        receipt
+            .evidence
+            .iter()
+            .map(|hit| hit.id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        read_receipt(&owner_root, &id.to_string(), true)
+            .unwrap()
+            .is_none()
+    );
+    fixture.with_store(|store| {
+        assert!(crate::materials::list(store).unwrap().is_empty());
+        assert_eq!(
+            store.read_document("Draft.md").unwrap().text,
+            "Child writing stays intact."
+        );
+        let output = store
+            .read_document(run.output_relative_path.as_ref().unwrap())
+            .unwrap();
+        assert!(output.text.contains("nightjar sings beneath the moon"));
+        let value = receipt.source_uses[0]
+            .evidence_value(&receipt.evidence)
+            .unwrap();
+        assert!(
+            material_context::local_artifact_ids(store, [&value])
+                .unwrap()
+                .is_empty()
+        );
+    });
+    let state = fixture.app.state::<PluginState>();
+    let session = state.session.lock().unwrap();
+    let owner = crate::workspace_owner::store(&session).unwrap();
+    assert_eq!(crate::materials::list(owner).unwrap()[0].id, material.id);
 }
 
 #[test]
@@ -381,9 +474,12 @@ fn final_evidence_replaces_an_intermediate_generation_in_run_output() {
         document_id: fixture.source.document_id,
     };
     let control = TerminalControl::default();
+    let (owner_project_id, owner_session_id) = fixture.owner_identity();
     let mut evaluator = Evaluator {
         state: &state,
         identity: &identity,
+        owner_project_id,
+        owner_session_id,
         model: None,
         control: &control,
         source: &fixture.source,
@@ -403,8 +499,19 @@ fn final_evidence_replaces_an_intermediate_generation_in_run_output() {
     evaluator.retain("nightjar", evidence, true, "1").unwrap();
     let intermediate = evaluator.receipt.run.output_relative_path.clone().unwrap();
     let found = fixture.with_store(|store| {
-        let source = material_context::resolve(store, &material.id).unwrap();
-        material_context::search(store, &source, "nightjar").unwrap()
+        let context = material_context::ReadContext {
+            documents: store,
+            materials: store,
+        };
+        let source = context.resolve(&material.id).unwrap();
+        context
+            .search_with_cancel(
+                &source,
+                "nightjar",
+                &material_context::FolderScanBudget::default(),
+                &|| false,
+            )
+            .unwrap()
     });
     evaluator.finish(Ok(found)).unwrap();
     let completed = read_receipt(&fixture.root(), &id.to_string(), true)
@@ -461,9 +568,12 @@ fn evaluator_consultation_budgets_evidence_without_shortening_exact_values() {
         document_id: fixture.source.document_id,
     };
     let control = TerminalControl::default();
+    let (owner_project_id, owner_session_id) = fixture.owner_identity();
     let mut evaluator = Evaluator {
         state: &state,
         identity: &identity,
+        owner_project_id,
+        owner_session_id,
         model: None,
         control: &control,
         source: &fixture.source,
@@ -473,7 +583,14 @@ fn evaluator_consultation_budgets_evidence_without_shortening_exact_values() {
         step: 0,
         folder_scan_budget: material_context::FolderScanBudget::default(),
     };
-    let value = fixture.with_store(|store| material_context::resolve(store, &material.id).unwrap());
+    let value = fixture.with_store(|store| {
+        material_context::ReadContext {
+            documents: store,
+            materials: store,
+        }
+        .resolve(&material.id)
+        .unwrap()
+    });
     let exact_before = material_context::exact(&value).unwrap();
     let budget = remaining_context_bytes(4096, 160);
     let consulted = evaluator.consult(&value, "nightjar", budget).unwrap();

@@ -28,6 +28,7 @@
   export let config: WorkspacePaneConfig;
   export let projectId: string;
   export let sessionId: string;
+  export let materialOwnerScope: import('./materialEvidenceScope').MaterialSourceScope | null = null;
   export let documents: DocumentSummary[] = [];
   export let source: OpenDocument | null = null;
   export let value = '';
@@ -125,18 +126,22 @@
         (config.kind === 'editor' && !editingCurrent)) return;
     if (!flush()) return;
     const captured = { scope, projectId, sessionId, documentId: source.summary.document_id,
-      kind: config.kind, value, entry, visual };
+      kind: config.kind, value, entry, visual, materialOwnerScope };
     const visualAnchor = visual && config.kind === 'editor' ? editor?.captureAttachmentAnchor(point.x, point.y) : null;
     const sourceAnchor = !visual && config.kind === 'editor' ? sourceEditor?.captureTextInsertionAnchor() : null;
     importing = true; error = '';
     const current = () => mounted && scope === captured.scope && !readonly && !composing &&
       source?.summary.document_id === captured.documentId && config.kind === captured.kind &&
+      materialOwnerScope?.projectId === captured.materialOwnerScope?.projectId && materialOwnerScope?.sessionId === captured.materialOwnerScope?.sessionId &&
       value === captured.value && entry === captured.entry && visual === captured.visual;
     try {
       if (!await beforeAttachmentImport()) return;
       if (!current()) throw new Error('The pane changed before import. Drop the files again at the intended location.');
       const files = paths.filter(path => !isDatabasePath(path));
-      const libraries = await Promise.all(paths.filter(isDatabasePath).map(path => addLibraryMaterialPath(captured.projectId, captured.sessionId, path)));
+      const libraryPaths = paths.filter(isDatabasePath);
+      const owner = captured.materialOwnerScope;
+      if (libraryPaths.length && !owner) throw new Error('The workspace is not ready for sources yet.');
+      const libraries = owner ? await Promise.all(libraryPaths.map(path => addLibraryMaterialPath(owner.projectId, owner.sessionId, path))) : [];
       const report = files.length ? await importAttachmentPaths(captured.projectId, captured.sessionId, files) : { imported: [], references: [], failures: [] };
       const imported = report.imported;
       error = report.failures.map((item) => `${item.name}: ${item.message}`).join("\n");

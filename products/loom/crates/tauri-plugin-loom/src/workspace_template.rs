@@ -4,7 +4,7 @@
 use super::*;
 
 #[path = "workspace_collections.rs"]
-mod collections;
+pub(crate) mod collections;
 #[path = "workspace_materials.rs"]
 pub(crate) mod materials;
 pub(super) use collections::{
@@ -12,8 +12,8 @@ pub(super) use collections::{
     collection_definitions_current, remove_collection, upsert_collection,
 };
 
-const TEMPLATE_PATH: &str = ".loom.md";
-const MAX_TEMPLATE_BYTES: usize = 65_536;
+pub(crate) const TEMPLATE_PATH: &str = ".loom.md";
+pub(crate) const MAX_TEMPLATE_BYTES: usize = 65_536;
 const MAX_PANES: usize = 8;
 
 const DEFAULT_TEMPLATE: &str = r##"# Workspace
@@ -215,6 +215,7 @@ struct WorkspaceOverrides {
     panes: BTreeMap<String, PaneOverrides>,
     collections: Vec<CollectionDefinition>,
     materials: Vec<crate::materials::Binding>,
+    roots: Vec<crate::workspace_roots::RootDefinition>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -237,6 +238,23 @@ struct FunctionSettings {
 pub(super) struct FunctionRecipe {
     pub format: FunctionFormat,
     pub configuration: Option<crate::document_bindings::ResolvedDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ConfigurationOrigin>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(super) struct ConfigurationOrigin {
+    project_id: ProjectId,
+    root: PathBuf,
+}
+
+impl FunctionRecipe {
+    pub(super) fn local_configuration_artifact(&self, store: &ProjectStore) -> Option<ArtifactId> {
+        let origin = self.origin.as_ref()?;
+        (origin.project_id == store.manifest().project_id && origin.root == store.root())
+            .then(|| self.configuration.as_ref().map(|source| source.artifact_id))
+            .flatten()
+    }
 }
 
 pub(super) fn function_recipe(store: &mut ProjectStore) -> Result<FunctionRecipe, IpcFailure> {
@@ -244,12 +262,17 @@ pub(super) fn function_recipe(store: &mut ProjectStore) -> Result<FunctionRecipe
         return Ok(FunctionRecipe {
             format: FunctionFormat::Model,
             configuration: None,
+            origin: None,
         });
     };
     let config = parse_config(&loaded.text)
         .map_err(|message| IpcFailure::new("workspace_template_failed", message, false))?;
     Ok(FunctionRecipe {
         format: config.functions.format,
+        origin: Some(ConfigurationOrigin {
+            project_id: store.manifest().project_id,
+            root: store.root().to_owned(),
+        }),
         configuration: Some(crate::document_bindings::ResolvedDocument {
             name: TEMPLATE_PATH.into(),
             path: TEMPLATE_PATH.into(),
@@ -311,6 +334,8 @@ fn parse_config(markdown: &str) -> Result<WorkspaceConfig, String> {
         .map_err(|error| format!("Workspace settings: {error}"))?;
     collections::validate_definitions(&overrides.collections).map_err(|error| error.message)?;
     crate::materials::validate_bindings(&overrides.materials).map_err(|error| error.to_string())?;
+    crate::workspace_roots::validate_definitions(&overrides.roots)
+        .map_err(|error| error.message)?;
     let mut config = WorkspaceConfig {
         panes_enabled: overrides.panes_enabled.unwrap_or(true),
         collections: overrides.collections,
@@ -390,7 +415,7 @@ fn config_fence(markdown: &str) -> Result<&str, String> {
     Ok(config_fence_range(markdown)?.map_or("", |range| &markdown[range]))
 }
 
-fn config_fence_range(markdown: &str) -> Result<Option<std::ops::Range<usize>>, String> {
+pub(crate) fn config_fence_range(markdown: &str) -> Result<Option<std::ops::Range<usize>>, String> {
     let mut open: Option<(u8, usize, bool, usize)> = None;
     let mut found = None;
     let mut offset = 0;
@@ -426,7 +451,9 @@ fn config_fence_range(markdown: &str) -> Result<Option<std::ops::Range<usize>>, 
     Ok(found)
 }
 
-fn load_template(store: &mut ProjectStore) -> Result<Option<LoadedDocument>, IpcFailure> {
+pub(crate) fn load_template(
+    store: &mut ProjectStore,
+) -> Result<Option<LoadedDocument>, IpcFailure> {
     let document = store
         .list_documents()
         .map_err(IpcFailure::store)?
@@ -472,7 +499,7 @@ fn load_template(store: &mut ProjectStore) -> Result<Option<LoadedDocument>, Ipc
         .map_err(IpcFailure::store)
 }
 
-fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
+pub(super) fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
     let Some(loaded) = load_template(store)? else {
         return Ok(WorkspaceTemplateSnapshot {
             enabled: false,
@@ -495,7 +522,7 @@ fn snapshot(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFa
     })
 }
 
-fn enable(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
+pub(super) fn enable(store: &mut ProjectStore) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
     let current = snapshot(store)?;
     if current.enabled {
         return Ok(current);
@@ -542,7 +569,8 @@ pub(super) async fn workspace_template_get(
 ) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
     let _admission = lock_application_admission(&state, "workspace configuration")?;
     let mut session = lock_session(&state)?;
-    snapshot(require_bound_store(&mut session, &project_id, &session_id)?)
+    require_bound_store(&mut session, &project_id, &session_id)?;
+    snapshot(crate::workspace_owner::store_mut(&mut session)?)
 }
 
 #[tauri::command]
@@ -553,7 +581,8 @@ pub(super) async fn workspace_template_enable(
 ) -> Result<WorkspaceTemplateSnapshot, IpcFailure> {
     let _admission = lock_application_admission(&state, "workspace configuration")?;
     let mut session = lock_session(&state)?;
-    enable(require_bound_store(&mut session, &project_id, &session_id)?)
+    require_bound_store(&mut session, &project_id, &session_id)?;
+    enable(crate::workspace_owner::store_mut(&mut session)?)
 }
 
 #[cfg(test)]

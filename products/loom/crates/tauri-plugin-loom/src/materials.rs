@@ -966,7 +966,11 @@ fn load_evidence(store: &ProjectStore, id: &str) -> Result<MaterialEvidence> {
     let bytes = read_safe(
         &storage(store)?.join("evidence").join(format!("{id}.json")),
         MAX_EVIDENCE_BYTES,
-    )?;
+    ).map_err(|error| match error {
+        MaterialError::Io(io) if io.kind() == std::io::ErrorKind::NotFound =>
+            MaterialError::NotFound(format!("evidence/{id}")),
+        other => other,
+    })?;
     if digest(&bytes) != id {
         return Err(invalid("retained evidence identity mismatch"));
     }

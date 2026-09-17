@@ -37,7 +37,7 @@ fn validate_session(
     session_id: &str,
 ) -> Result<(), IpcFailure> {
     let _admission = lock_application_admission(state, "connected import")?;
-    require_bound_store(&mut *lock_session(state)?, project_id, session_id)?;
+    crate::workspace_owner::require_store_mut(&mut *lock_session(state)?, project_id, session_id)?;
     Ok(())
 }
 
@@ -73,7 +73,7 @@ pub(crate) async fn import_account_connect(
     let _operation = ACCOUNT_OPERATION
         .try_lock()
         .map_err(|_| failure("Another account import is running."))?;
-    let operation = ImportOperation::reserve(&state, &project_id, &session_id, &operation_id)?;
+    let operation = ImportOperation::reserve_workspace(&state, &project_id, &session_id, &operation_id)?;
     let credential = operation
         .network(async move {
             let pending = google_import::begin_authorization(client_id, client_secret, service)
@@ -110,7 +110,7 @@ pub(crate) async fn import_account_disconnect(
         failure("An account import is running; wait for it to finish before disconnecting.")
     })?;
     let _admission = lock_application_admission(&state, "disconnecting an import account")?;
-    require_bound_store(&mut *lock_session(&state)?, &project_id, &session_id)?;
+    crate::workspace_owner::require_store_mut(&mut *lock_session(&state)?, &project_id, &session_id)?;
     AccountStore::new(&project_id, service).disconnect(&account_email)
 }
 
@@ -185,7 +185,7 @@ pub(crate) async fn import_source_url(
     url: String,
     state: State<'_, PluginState>,
 ) -> Result<SyncReport, IpcFailure> {
-    let operation = ImportOperation::reserve(&state, &project_id, &session_id, &operation_id)?;
+    let operation = ImportOperation::reserve_workspace(&state, &project_id, &session_id, &operation_id)?;
     if url.len() > 4096 || !url.starts_with("https://") {
         return Err(failure("Enter a public HTTPS document URL."));
     }
@@ -209,11 +209,14 @@ pub(crate) async fn import_source_url(
         prepared.attachment.media_markdown = None;
         Ok(prepared)
     }).await?;
-    let attachment = operation.publish(&state, prepared)?;
+    let (source, binding_failure) = crate::workspace_source_import::publish(&operation, &state, prepared)?;
+    let failures = binding_failure.into_iter().map(|message| SyncFailure {
+        name: source.attachment.file_name.clone(), message,
+    }).collect();
     Ok(SyncReport {
-        imported: vec![attachment],
+        imported: vec![source.attachment],
         references: Vec::new(),
-        failures: Vec::new(),
+        failures,
         next_page_token: None,
     })
 }
@@ -225,7 +228,8 @@ pub(crate) async fn import_account_cancel(
     operation_id: String,
     state: State<'_, PluginState>,
 ) -> Result<(), IpcFailure> {
-    validate_session(&state, &project_id, &session_id)?;
+    let _admission = lock_application_admission(&state, "stopping a document import")?;
+    require_bound_store(&mut *lock_session(&state)?, &project_id, &session_id)?;
     state.imports.cancel(&session_id, &operation_id)?;
     Ok(())
 }

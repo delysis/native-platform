@@ -89,8 +89,15 @@ struct ActiveImport {
     signal: tokio::sync::watch::Sender<bool>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ImportScope {
+    Document,
+    Workspace,
+}
+
 #[derive(Debug)]
 pub(super) struct ImportOperation {
+    scope: ImportScope,
     jobs: Arc<ImportJobs>,
     cancel: Arc<AtomicBool>,
     signal: tokio::sync::watch::Sender<bool>,
@@ -357,6 +364,48 @@ impl ImportOperation {
         let _admission = lock_application_admission(state, "an import")?;
         let mut session = lock_session(state)?;
         let store = require_bound_store(&mut session, project_id, session_id)?;
+        Self::reserve_at_store(jobs, store, session_id, operation_id, ImportScope::Document)
+    }
+
+    /// Named sources use the explicit stable workspace token, never whichever
+    /// document root happens to be displayed when an RPC reaches admission.
+    pub(super) fn reserve_workspace(
+        state: &PluginState,
+        project_id: &str,
+        session_id: &str,
+        operation_id: &str,
+    ) -> Result<Self, IpcFailure> {
+        Self::reserve_workspace_in(state, &state.imports, project_id, session_id, operation_id)
+    }
+
+    pub(super) fn reserve_workspace_in(
+        state: &PluginState,
+        jobs: &Arc<ImportJobs>,
+        project_id: &str,
+        session_id: &str,
+        operation_id: &str,
+    ) -> Result<Self, IpcFailure> {
+        validate_operation_id(operation_id)?;
+        let _admission = lock_application_admission(state, "a workspace import")?;
+        let mut session = lock_session(state)?;
+        let store =
+            crate::workspace_owner::require_store_mut(&mut session, project_id, session_id)?;
+        Self::reserve_at_store(
+            jobs,
+            store,
+            session_id,
+            operation_id,
+            ImportScope::Workspace,
+        )
+    }
+
+    fn reserve_at_store(
+        jobs: &Arc<ImportJobs>,
+        store: &crate::ProjectStore,
+        session_id: &str,
+        operation_id: &str,
+        scope: ImportScope,
+    ) -> Result<Self, IpcFailure> {
         let root = store.root().to_owned();
         let root_identity = Handle::from_path(&root).map_err(|error| failure(error.to_string()))?;
         let mut registry = jobs
@@ -393,14 +442,23 @@ impl ImportOperation {
             signal: signal.clone(),
         });
         Ok(Self {
+            scope,
             jobs: Arc::clone(jobs),
             cancel,
             signal,
             root,
             root_identity,
-            project_id: project_id.to_owned(),
+            project_id: store.manifest().project_id.to_string(),
             session_id: session_id.to_owned(),
         })
+    }
+
+    pub(super) fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub(super) fn session_id(&self) -> &str {
+        &self.session_id
     }
 
     pub(super) fn stop_flag(&self) -> Arc<AtomicBool> {
@@ -510,7 +568,16 @@ impl ImportOperation {
         self.check()?;
         let _admission = lock_application_admission(state, "publishing an import")?;
         let mut session = lock_session(state)?;
-        let store = require_bound_store(&mut session, &self.project_id, &self.session_id)?;
+        let store = match self.scope {
+            ImportScope::Document => {
+                require_bound_store(&mut session, &self.project_id, &self.session_id)?
+            }
+            ImportScope::Workspace => crate::workspace_owner::require_store_mut(
+                &mut session,
+                &self.project_id,
+                &self.session_id,
+            )?,
+        };
         // Serialize the final link with cancel/revoke. Once Stop returns, no
         // previously admitted worker can publish another selectable source.
         let publication = self
@@ -569,6 +636,12 @@ mod tests {
         (state, snapshot.project_id, snapshot.session_id)
     }
 
+    fn workspace_identity(state: &PluginState) -> (String, String) {
+        let session = lock_session(state).unwrap();
+        let owner = session.workspace.as_ref().unwrap();
+        (owner.project_id.to_string(), owner.session_id.to_string())
+    }
+
     fn published_count(root: &std::path::Path) -> usize {
         std::fs::read_dir(root.join(".loom/attachments/manifests"))
             .into_iter()
@@ -581,6 +654,180 @@ mod tests {
                 })
             })
             .count()
+    }
+
+    #[test]
+    fn workspace_publication_stays_with_parked_owner_across_root_transitions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (state, project, document_session) = opened(temporary.path());
+        let (_, owner_session) = workspace_identity(&state);
+        let operation = ImportOperation::reserve_workspace(
+            &state,
+            &project,
+            &owner_session,
+            &CommandId::new().to_string(),
+        )
+        .unwrap();
+        assert_eq!(operation.project_id(), project);
+        assert_ne!(operation.session_id(), document_session);
+        state.imports.revoke_session(&document_session);
+        assert_eq!(state.imports.drain_session(&document_session).unwrap(), 0);
+        {
+            let mut session = lock_session(&state).unwrap();
+            crate::workspace_owner::park_active(&mut session);
+            session.active_session_id = None;
+        }
+        for (phase, path) in [
+            (crate::SessionPhase::Closed, "closed.md"),
+            (crate::SessionPhase::Choosing, "choosing.md"),
+        ] {
+            lock_session(&state).unwrap().phase = phase;
+            operation
+                .publish_to_store(&state, |store| {
+                    assert_eq!(store.manifest().project_id.to_string(), project);
+                    store
+                        .create_document_if_absent(
+                            path,
+                            loom_document::DocumentContent::Prose("Retained by the owner".into()),
+                            "workspace publication",
+                        )
+                        .map_err(IpcFailure::store)?;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let other = tempfile::tempdir().unwrap();
+        let mounted = initialize_project(other.path(), "Mounted".into()).unwrap();
+        {
+            let mut session = lock_session(&state).unwrap();
+            session.store = Some(mounted);
+            session.active_session_id = Some(CommandId::new());
+            session.phase = crate::SessionPhase::Open;
+        }
+        operation
+            .publish_to_store(&state, |store| {
+                store
+                    .create_document_if_absent(
+                        "mounted.md",
+                        loom_document::DocumentContent::Prose("Still the owner's source".into()),
+                        "workspace publication",
+                    )
+                    .map_err(IpcFailure::store)?;
+                Ok(())
+            })
+            .unwrap();
+        for path in ["closed.md", "choosing.md", "mounted.md"] {
+            assert!(temporary.path().join(path).is_file());
+            assert!(!other.path().join(path).exists());
+        }
+        // The captured owner token remains an authority check, not a lookup hint.
+        lock_session(&state)
+            .unwrap()
+            .workspace
+            .as_mut()
+            .unwrap()
+            .session_id = CommandId::new();
+        assert!(
+            operation
+                .publish_to_store::<()>(&state, |_| panic!("stale owner published"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn document_publication_does_not_gain_parked_workspace_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (state, project, session_id) = opened(temporary.path());
+        let operation =
+            ImportOperation::reserve(&state, &project, &session_id, &CommandId::new().to_string())
+                .unwrap();
+        {
+            let mut session = lock_session(&state).unwrap();
+            crate::workspace_owner::park_active(&mut session);
+            session.active_session_id = None;
+            session.phase = crate::SessionPhase::Closed;
+        }
+        assert!(
+            operation
+                .publish_to_store::<()>(&state, |_| panic!("document import published after close"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_admission_preserves_owner_stop_latches_and_global_shutdown() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (state, project, document_session) = opened(temporary.path());
+        let (_, owner_session) = workspace_identity(&state);
+        let id = CommandId::new().to_string();
+        state.imports.cancel(&owner_session, &id).unwrap();
+        assert!(ImportOperation::reserve_workspace(&state, &project, &owner_session, &id).is_err());
+        assert!(
+            ImportOperation::reserve_workspace(
+                &state,
+                &project,
+                &document_session,
+                &CommandId::new().to_string()
+            )
+            .is_err()
+        );
+        state.close_requested.store(true, Ordering::Release);
+        assert!(
+            ImportOperation::reserve_workspace(
+                &state,
+                &project,
+                &owner_session,
+                &CommandId::new().to_string()
+            )
+            .is_err()
+        );
+        state.close_requested.store(false, Ordering::Release);
+        state.imports.shutdown().unwrap();
+        assert!(
+            ImportOperation::reserve_workspace(
+                &state,
+                &project,
+                &owner_session,
+                &CommandId::new().to_string()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn workspace_workers_survive_document_drain_and_are_joined_at_shutdown() {
+        let temporary = tempfile::tempdir().unwrap();
+        let (state, project, document_session) = opened(temporary.path());
+        let id = CommandId::new().to_string();
+        let (_, owner_session) = workspace_identity(&state);
+        let operation =
+            ImportOperation::reserve_workspace(&state, &project, &owner_session, &id).unwrap();
+        let owner_session = operation.session_id().to_owned();
+        let (started, observed_start) = mpsc::channel();
+        let (finished, observed_finish) = mpsc::channel();
+        operation
+            .dispatch(move |operation| {
+                let result: Result<(), IpcFailure> =
+                    tauri::async_runtime::block_on(operation.network(async move {
+                        started.send(()).unwrap();
+                        std::future::pending().await
+                    }));
+                finished.send(result.is_err()).unwrap();
+            })
+            .unwrap();
+        observed_start.recv_timeout(Duration::from_secs(5)).unwrap();
+        let drained = state.imports.drain_session(&document_session).unwrap();
+        let still_running = state.imports.is_running(&owner_session, &id);
+        state.imports.shutdown().unwrap();
+        assert_eq!(drained, 0);
+        assert!(still_running);
+        assert!(
+            observed_finish
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+        );
+        assert!(state.imports.inner.lock().unwrap().workers.is_empty());
+        assert!(state.imports.inner.lock().unwrap().coordinators.is_empty());
     }
 
     #[test]

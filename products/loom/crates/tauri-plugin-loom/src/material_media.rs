@@ -159,20 +159,48 @@ fn selected_attachment(
         .session
         .lock()
         .map_err(|_| LoomAssetReadFailure::Unavailable)?;
-    if session.phase != SessionPhase::Open
-        || session.active_session_id != Some(authority.session_id)
+    let store = source_store(&session, request)?;
+    if store.root() != authority.project_root {
+        return Err(LoomAssetReadFailure::NotFound);
+    }
+    attachment_in_store(store, request)
+}
+
+fn source_store<'a>(
+    session: &'a Session,
+    request: &Request,
+) -> Result<&'a ProjectStore, LoomAssetReadFailure> {
+    if workspace_owner::is_bound(session, request.project_id, request.session_id) {
+        return workspace_owner::store(session).map_err(|_| LoomAssetReadFailure::NotFound);
+    }
+    if session.phase != SessionPhase::Open || session.active_session_id != Some(request.session_id)
     {
         return Err(LoomAssetReadFailure::NotFound);
     }
-    let store = session
+    session
         .store
         .as_ref()
-        .filter(|store| {
-            store.manifest().project_id == authority.project_id
-                && store.root() == authority.project_root
-        })
-        .ok_or(LoomAssetReadFailure::NotFound)?;
-    attachment_in_store(store, request)
+        .filter(|store| store.manifest().project_id == request.project_id)
+        .ok_or(LoomAssetReadFailure::NotFound)
+}
+
+fn capture_source_authority(
+    state: &PluginState,
+    request: &Request,
+) -> Result<(LoomAssetAuthority, bool), LoomAssetReadFailure> {
+    let session = state
+        .session
+        .lock()
+        .map_err(|_| LoomAssetReadFailure::Unavailable)?;
+    let store = source_store(&session, request)?;
+    Ok((
+        LoomAssetAuthority {
+            project_id: request.project_id,
+            session_id: request.session_id,
+            project_root: store.root().to_owned(),
+        },
+        workspace_owner::is_bound(&session, request.project_id, request.session_id),
+    ))
 }
 fn attachment_in_store(
     store: &ProjectStore,
@@ -200,8 +228,7 @@ pub(super) fn read(
     state: &PluginState,
     request: &Request,
 ) -> Result<LoadedProtocolAsset, LoomAssetReadFailure> {
-    let authority =
-        capture_loom_asset_authority_for(state, request.project_id, request.session_id)?;
+    let (authority, _) = capture_source_authority(state, request)?;
     let attachment = selected_attachment(state, &authority, request)?;
     let media = context_attachments::read_context_media(
         &authority.project_root,
@@ -224,6 +251,113 @@ mod tests {
     use super::*;
     use crate::connected_collections as collections;
     use crate::workspace_template::{CollectionDefinition, CollectionScope};
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One owner lifetime: active, parked, then revoked.
+    fn owner_media_survives_document_switch_but_not_binding_removal() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut owner, _) = ProjectStore::initialize(temp.path().join("Owner"), "Owner").unwrap();
+        let png = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native.png");
+        let attachment = context_attachments::import_path(owner.root(), &png).unwrap();
+        let material =
+            materials::bind_attachment(&mut owner, &attachment.id, Some("Picture")).unwrap();
+        let media_sha256 = materials::read(&owner, &material.id)
+            .unwrap()
+            .presentation
+            .unwrap()
+            .media[0]
+            .sha256
+            .clone();
+        let owner_id = owner.manifest().project_id;
+        let document_session = CommandId::new();
+        let state = PluginState::default();
+        let owner_session = {
+            let mut session = state.session.lock().unwrap();
+            workspace_owner::establish(&mut session, &owner);
+            let id = session.workspace.as_ref().unwrap().session_id;
+            session.phase = SessionPhase::Open;
+            session.active_session_id = Some(document_session);
+            session.store = Some(owner);
+            id
+        };
+        let request = Request {
+            project_id: owner_id,
+            session_id: owner_session,
+            material_id: material.id.clone(),
+            media_sha256,
+            member: None,
+        };
+        let bytes = std::fs::read(&png).unwrap();
+        assert_eq!(read(&state, &request).unwrap().bytes, bytes);
+        let document_request = Request {
+            session_id: document_session,
+            ..request.clone()
+        };
+        assert_eq!(read(&state, &document_request).unwrap().bytes, bytes);
+        {
+            let mut session = state.session.lock().unwrap();
+            workspace_owner::park_active(&mut session);
+            let (child, _) = ProjectStore::initialize(temp.path().join("Child"), "Child").unwrap();
+            session.store = Some(child);
+            session.active_session_id = Some(CommandId::new());
+        }
+        assert_eq!(read(&state, &request).unwrap().bytes, bytes);
+        assert_eq!(
+            read(&state, &document_request),
+            Err(LoomAssetReadFailure::NotFound)
+        );
+        {
+            let session = state.session.lock().unwrap();
+            let child_id = session
+                .store
+                .as_ref()
+                .unwrap()
+                .manifest()
+                .project_id
+                .to_string();
+            let child_session = session.active_session_id.unwrap().to_string();
+            let context = workspace_owner::read_context(
+                &session,
+                &child_id,
+                &child_session,
+                &owner_id.to_string(),
+                &owner_session.to_string(),
+            )
+            .unwrap();
+            assert_eq!(context.materials.manifest().project_id, owner_id);
+            assert_ne!(context.documents.root(), context.materials.root());
+            assert!(
+                workspace_owner::read_context(
+                    &session,
+                    &child_id,
+                    &document_session.to_string(),
+                    &owner_id.to_string(),
+                    &owner_session.to_string(),
+                )
+                .is_err()
+            );
+            assert!(
+                workspace_owner::read_context(
+                    &session,
+                    &child_id,
+                    &child_session,
+                    &owner_id.to_string(),
+                    &CommandId::new().to_string(),
+                )
+                .is_err()
+            );
+        }
+        {
+            let mut session = state.session.lock().unwrap();
+            materials::remove(
+                workspace_owner::store_mut(&mut session).unwrap(),
+                &material.id,
+            )
+            .unwrap();
+        }
+        assert_eq!(read(&state, &request), Err(LoomAssetReadFailure::NotFound));
+        assert_eq!(std::fs::read(&png).unwrap(), bytes);
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)]

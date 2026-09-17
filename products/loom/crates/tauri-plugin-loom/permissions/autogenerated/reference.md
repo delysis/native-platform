@@ -6,6 +6,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 
 - `allow-document-reference-diagnostics`
 - `allow-material-list`
+- `allow-material-resolve-reference`
 - `allow-material-read`
 - `allow-material-pdf-page`
 - `allow-material-search`
@@ -18,6 +19,13 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-project-open-default`
 - `allow-project-prepare-open`
 - `allow-project-prepare-open-path`
+- `allow-workspace-roots-get`
+- `allow-workspace-root-prepare`
+- `allow-workspace-root-remove`
+- `allow-workspace-source-import-paths`
+- `allow-workspace-source-import-choose`
+- `allow-workspace-source-import-paste`
+- `allow-workspace-source-import-cancel`
 - `allow-project-drop-directories`
 - `allow-project-commit-open`
 - `allow-project-discard-open`
@@ -1856,6 +1864,32 @@ Denies the material_remove command without any pre-configured scope.
 <tr>
 <td>
 
+`loom:allow-material-resolve-reference`
+
+</td>
+<td>
+
+Enables the material_resolve_reference command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-material-resolve-reference`
+
+</td>
+<td>
+
+Denies the material_resolve_reference command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
 `loom:allow-material-search`
 
 </td>
@@ -2811,6 +2845,188 @@ Enables the workspace_copy_folder_choose command without any pre-configured scop
 <td>
 
 Denies the workspace_copy_folder_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-root-prepare`
+
+</td>
+<td>
+
+Enables the workspace_root_prepare command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-root-prepare`
+
+</td>
+<td>
+
+Denies the workspace_root_prepare command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-root-remove`
+
+</td>
+<td>
+
+Enables the workspace_root_remove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-root-remove`
+
+</td>
+<td>
+
+Denies the workspace_root_remove command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-roots-get`
+
+</td>
+<td>
+
+Enables the workspace_roots_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-roots-get`
+
+</td>
+<td>
+
+Denies the workspace_roots_get command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-source-import-cancel`
+
+</td>
+<td>
+
+Enables the workspace_source_import_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-source-import-cancel`
+
+</td>
+<td>
+
+Denies the workspace_source_import_cancel command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-source-import-choose`
+
+</td>
+<td>
+
+Enables the workspace_source_import_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-source-import-choose`
+
+</td>
+<td>
+
+Denies the workspace_source_import_choose command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-source-import-paste`
+
+</td>
+<td>
+
+Enables the workspace_source_import_paste command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-source-import-paste`
+
+</td>
+<td>
+
+Denies the workspace_source_import_paste command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-source-import-paths`
+
+</td>
+<td>
+
+Enables the workspace_source_import_paths command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-source-import-paths`
+
+</td>
+<td>
+
+Denies the workspace_source_import_paths command without any pre-configured scope.
 
 </td>
 </tr>

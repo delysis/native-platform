@@ -24,6 +24,194 @@ fn attachment(store: &mut ProjectStore, name: &str, text: &str) -> MaterialEntry
 }
 
 #[test]
+fn child_writing_reads_owner_sources_without_mixing_document_identity() {
+    let (_owner_directory, mut owner) = project();
+    let (_child_directory, mut child) = project();
+    let source = attachment(&mut owner, "Research", "The nightjar sings at dusk.");
+    let inline = attachment(&mut child, "Inline", "A source dropped into this document.");
+    document(&mut child, "Notes.md", "My local note.");
+    let context = ReadContext {
+        documents: &child,
+        materials: &owner,
+    };
+    assert_eq!(
+        exact(&context.resolve(&inline.id).unwrap()).unwrap(),
+        "A source dropped into this document."
+    );
+    let plan = markdown_plan_with_budget(
+        context,
+        "@Research @Notes",
+        "nightjar",
+        4096,
+        ReferenceRequirement::All,
+    )
+    .unwrap();
+    assert!(plan.text.contains("The nightjar sings at dusk."));
+    assert!(plan.text.contains("My local note."));
+    let note = child.read_document("Notes.md").unwrap();
+    assert_eq!(
+        local_artifact_ids(&child, plan.bindings.values()).unwrap(),
+        vec![note.artifact_id]
+    );
+    let snapshot: ContextPlan =
+        serde_json::from_slice(&serde_json::to_vec(&plan).unwrap()).unwrap();
+    assert_eq!(
+        exact(&snapshot.bindings["Research"]).unwrap(),
+        "The nightjar sings at dusk."
+    );
+    let found = context
+        .search_with_cancel(
+            &plan.bindings["Research"],
+            "nightjar",
+            &FolderScanBudget::default(),
+            &|| false,
+        )
+        .unwrap();
+    assert!(exact(&found).unwrap().contains("nightjar"));
+    assert!(local_artifact_ids(&child, [&found]).unwrap().is_empty());
+    let Value::Scoped {
+        origin: source_origin,
+        ..
+    } = &plan.bindings["Research"]
+    else {
+        panic!("source origin")
+    };
+    let Value::Scoped {
+        origin: evidence_origin,
+        ..
+    } = &found
+    else {
+        panic!("evidence origin")
+    };
+    assert_eq!(source_origin, evidence_origin);
+    let Value::Evidence { evidence, .. } = found.unscoped() else {
+        panic!("evidence")
+    };
+    let retained = context
+        .resolve(&format!("evidence/{}", evidence[0].id))
+        .unwrap();
+    assert_eq!(exact(&retained).unwrap(), exact(&found).unwrap());
+    assert!(
+        ReadContext::from(&child)
+            .search_with_cancel(&found, "nightjar", &FolderScanBudget::default(), &|| false)
+            .is_err()
+    );
+    document(&mut child, "nested/Research.md", "Conflicting local alias.");
+    assert!(
+        ReadContext {
+            documents: &child,
+            materials: &owner
+        }
+        .resolve("Research")
+        .is_err()
+    );
+    assert_eq!(
+        exact(
+            &ReadContext {
+                documents: &child,
+                materials: &owner
+            }
+            .resolve(&source.id)
+            .unwrap()
+        )
+        .unwrap(),
+        "The nightjar sings at dusk."
+    );
+}
+
+#[test]
+fn explicit_owner_media_uses_owner_bytes_and_binding() {
+    let (_owner_directory, mut owner) = project();
+    let (_child_directory, child) = project();
+    let png = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native.png");
+    let imported = crate::context_attachments::import_path(owner.root(), &png).unwrap();
+    let material = materials::bind_attachment(&mut owner, &imported.id, Some("Picture")).unwrap();
+    let context = ReadContext {
+        documents: &child,
+        materials: &owner,
+    };
+    let value = context.resolve("Picture").unwrap();
+    let expected = materials::native_media(&owner, &material.id).unwrap();
+    assert!(!expected.is_empty());
+    assert_eq!(context.native_media([&value]).unwrap(), expected);
+    assert!(ReadContext::from(&child).native_media([&value]).is_err());
+    materials::remove(&mut owner, &material.id).unwrap();
+    assert!(
+        ReadContext {
+            documents: &child,
+            materials: &owner
+        }
+        .native_media([&value])
+        .is_err()
+    );
+}
+
+#[test]
+fn copied_projects_cannot_supply_local_artifact_fks_or_ambiguous_evidence() {
+    fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+        fs::create_dir_all(destination).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let (directory, mut original) = project();
+    document(&mut original, "Notes/Field.md", "The nightjar stays here.");
+    let resolved = ReadContext::from(&original)
+        .resolve("Notes/Field.md")
+        .unwrap();
+    let folder = ReadContext::from(&original).resolve("Notes/").unwrap();
+    let found = ReadContext::from(&original)
+        .search_with_cancel(&folder, "nightjar", &FolderScanBudget::default(), &|| false)
+        .unwrap();
+    let Value::Evidence { evidence, .. } = found.unscoped() else {
+        panic!("evidence")
+    };
+    let reference = format!("evidence/{}", evidence[0].id);
+    let original_root = original.root().to_owned();
+    drop(original);
+    let copied_root = directory.path().join("Copy");
+    copy_tree(&original_root, &copied_root);
+    let original = ProjectStore::open(&original_root).unwrap();
+    let copy = ProjectStore::open(&copied_root).unwrap();
+    assert_eq!(original.manifest().project_id, copy.manifest().project_id);
+    assert!(
+        !local_artifact_ids(&original, [&resolved, &found])
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        local_artifact_ids(&copy, [&resolved, &found])
+            .unwrap()
+            .is_empty()
+    );
+    let context = ReadContext {
+        documents: &copy,
+        materials: &original,
+    };
+    assert_eq!(
+        context.resolve(&reference).unwrap_err().code,
+        "material_context_invalid"
+    );
+    // A corrupt copy must not silently fall through to the valid original.
+    let evidence_file = copy
+        .root()
+        .join(".loom/materials/evidence")
+        .join(format!("{}.json", evidence[0].id));
+    assert!(evidence_file.is_file());
+    fs::write(&evidence_file, "corrupt").unwrap();
+    assert_eq!(
+        context.resolve(&reference).unwrap_err().code,
+        "material_failed"
+    );
+}
+
+#[test]
 fn writing_continues_with_recorded_missing_references_and_smart_quoted_context() {
     let (_directory, mut store) = project();
     document(&mut store, "Notes.md", "A known source.");
@@ -303,7 +491,7 @@ fn small_context_retrieves_whole_pdf_passages_without_shortening_exact_arguments
     let Value::Evidence {
         retrieval: Some(retrieval),
         ..
-    } = &plan.bindings[&source.id]
+    } = plan.bindings[&source.id].unscoped()
     else {
         panic!("frozen retrieval")
     };
@@ -360,7 +548,7 @@ fn writing_defers_oversized_pdf_evidence_but_keeps_later_context_and_exact_recei
             .unwrap()
             .is_empty()
     );
-    let Value::Evidence { evidence, .. } = &plan.budget_omissions[&name] else {
+    let Value::Evidence { evidence, .. } = plan.budget_omissions[&name].unscoped() else {
         panic!("the frozen, unconsumed evidence must remain in the receipt")
     };
     assert_eq!(evidence[0].id, retained.id);
@@ -476,7 +664,7 @@ fn ordinary_budgeted_consultation_reports_zero_matches_explicitly() {
     let Value::Evidence {
         retrieval: Some(retrieval),
         ..
-    } = &plan.bindings[&source.id]
+    } = plan.bindings[&source.id].unscoped()
     else {
         panic!("frozen empty retrieval")
     };

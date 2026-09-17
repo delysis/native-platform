@@ -15,10 +15,11 @@
   import type { TerminalSourceRange } from './lib/terminalSelection';
   import { visibleWorkspaceDocuments, readPinnedOutputs, rememberPinnedOutputs } from './lib/workspaceRetention';
   import { workspaceRows, workspaceCopyDestination } from './lib/workspaceTree';
-  import { readWorkspaceFolders, rememberWorkspaceFolder, type WorkspaceFolder } from './lib/workspaceFolders';
+  import { workspaceFoldersForProject, workspaceRootIsActive, type WorkspaceFolderRow, type WorkspaceRootsSnapshot } from './lib/workspaceFolders';
   import WorkspacePane from './lib/WorkspacePane.svelte';
   import MaterialView from './lib/MaterialView.svelte';
-  import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, readMaterialEvidence } from './lib/ipc';
+  import { resolveScopedMaterialReference } from './lib/materialEvidenceScope';
+  import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, resolveMaterialReference } from './lib/ipc';
   import { materialReferenceMarkdown, materialQuotationMarkdown, importedMaterialMarkdown, isDatabasePath, type MaterialEntry, type MaterialEvidence } from './lib/materials';
   import { workspaceWriterCandidates, workspaceWriterModel, type WorkspaceTemplateSnapshot } from './lib/workspaceTemplate';
   import { getWorkspaceTemplate, enableWorkspaceTemplate } from './lib/ipc';
@@ -44,7 +45,11 @@
     clearTransientDraft,
     applyDocumentReconciliation,
     chooseAttachments,
+    chooseWorkspaceSources,
     prepareProjectOpen,
+    getWorkspaceRoots,
+    prepareWorkspaceRoot,
+    removeWorkspaceRoot,
     commitProjectOpen,
     discardProjectOpen,
     chooseModel,
@@ -398,14 +403,15 @@
   let lastFailure: LoomFailure | null = null;
   let opening = false;
   let search = '';
-  let workspaceFolders: WorkspaceFolder[] = [];
+  let workspaceRoots: WorkspaceRootsSnapshot | null = null;
+  let workspaceRootsScope = '';
+  let workspaceRootsSerial = 0;
   let workspaceRootExpanded = true;
   let workspaceDocuments: Record<string, string> = {};
   let workspaceDropActive = false;
   let workspaceDropFolder: string | null = null;
   let outlineElement: HTMLElement | undefined;
-  $: visibleWorkspaceFolders = project && !workspaceFolders.some(folder => folder.root === project?.root)
-    ? [...workspaceFolders, { root: project.root, title: project.title }] : workspaceFolders;
+  $: visibleWorkspaceFolders = workspaceFoldersForProject(workspaceRoots, workspaceRootsScope, project);
   let workspaceTemplate: WorkspaceTemplateSnapshot | null = null;
   let workspaceTemplateScope = '';
   let deferredWorkspaceTemplate: WorkspaceTemplateSnapshot | null = null;
@@ -475,12 +481,17 @@
   let materialsOpen = false;
   let addMenuOpen = false;
   let materialEntries: MaterialEntry[] = [];
+  type MaterialScope = { projectId: string; sessionId: string };
+  $: materialOwnerScope = workspaceRoots ? { projectId: workspaceRoots.workspace_id, sessionId: workspaceRoots.workspace_session_id } : null;
+  $: workspaceOwner = workspaceRoots?.roots.find(root => root.owner);
+  $: workspaceOwnerActive = Boolean(project && workspaceOwner && workspaceRootIsActive(workspaceOwner, project));
   $: referenceScope = project ? {
     projectId: project.project_id, sessionId: project.session_id,
     revision: JSON.stringify([project.documents.map(item => [item.document_id, item.revision_id, item.relative_path, item.title, item.externally_modified]), materialEntries.map(item => [item.id, item.name, item.available])])
   } : null;
   let materialScope = '';
   let activeMaterial: MaterialEntry | null = null;
+  let activeMaterialScope: MaterialScope | null = null;
   let activeMaterialEvidence: MaterialEvidence | null = null;
   let materialOriginPane: string | null = null;
   let materialOrigin: {
@@ -488,22 +499,28 @@
     mode: EditorMode; visualAnchor: VisualTextInsertionAnchor | null; sourceAnchor: SourceTextInsertionAnchor | null;
     paneInsert: ((markdown: string) => boolean) | null; paneId: string | null;
   } | null = null;
-  $: if (desktop && project && materialScope !== `${project.project_id}/${project.session_id}`) {
-    materialScope = `${project.project_id}/${project.session_id}`;
-    activeMaterial = null; materialOrigin = null; materialOriginPane = null; materialEntries = []; materialsOpen = false;
+  $: if (desktop && materialOwnerScope && materialScope !== `${materialOwnerScope.projectId}/${materialOwnerScope.sessionId}`) {
+    materialScope = `${materialOwnerScope.projectId}/${materialOwnerScope.sessionId}`;
+    activeMaterial = null; activeMaterialScope = null; materialOrigin = null; materialOriginPane = null; materialEntries = []; materialsOpen = false;
     void refreshMaterials();
   }
-  $: if (!project) { materialScope = ''; materialEntries = []; activeMaterial = null; materialOrigin = null; }
-  $: visibleMaterials = materialEntries.filter(item => !item.workspace_path && (!search.trim() || item.name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())))
+  $: if (materialOrigin && (project?.project_id !== materialOrigin.projectId || project?.session_id !== materialOrigin.sessionId || document?.summary.document_id !== materialOrigin.documentId)) materialOrigin = null;
+  $: if (activeMaterialScope && !isOwnerMaterialScope(activeMaterialScope) && (project?.project_id !== activeMaterialScope.projectId || project?.session_id !== activeMaterialScope.sessionId)) {
+    activeMaterial = null; activeMaterialScope = null; activeMaterialEvidence = null;
+  }
+  $: visibleMaterials = materialEntries.filter(item => workspaceOwnerActive && !item.workspace_path && (!search.trim() || item.name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase())))
     .sort((a, b) => Number(b.pinned) - Number(a.pinned) || a.name.localeCompare(b.name));
 
   async function refreshMaterials(): Promise<void> {
-    if (!project) return;
-    const captured = { projectId: project.project_id, sessionId: project.session_id };
+    const captured = materialOwnerScope;
+    if (!captured) return;
     try {
       const entries = await listMaterials(captured.projectId, captured.sessionId);
-      if (project?.project_id === captured.projectId && project.session_id === captured.sessionId) materialEntries = entries;
-    } catch (error) { if (project?.session_id === captured.sessionId) recordFailure(error); }
+      if (isOwnerMaterialScope(captured)) materialEntries = entries;
+    } catch (error) { if (isOwnerMaterialScope(captured)) recordFailure(error); }
+  }
+  function isOwnerMaterialScope(scope: MaterialScope): boolean {
+    return workspaceRoots?.workspace_id === scope.projectId && workspaceRoots.workspace_session_id === scope.sessionId;
   }
   function captureMaterialOrigin(openedReference?: Element): void {
     if (!project || !document || editorReadonly || compositionActive || !flushEditors()) { materialOrigin = null; return; }
@@ -517,16 +534,17 @@
       sourceAnchor: mode === 'source' ? sourceEditor?.captureTextInsertionAnchor() ?? null : null
     };
   }
-  function openMaterial(item: MaterialEntry, openedReference?: Element): void {
+  function openMaterial(item: MaterialEntry, openedReference?: Element, scope: MaterialScope | null = materialOwnerScope, captureOrigin = true): void {
+    if (!scope) return;
     if (compositionActive || !flushEditors()) return;
     showMainPane();
-    if (!activeMaterial && !materialsOpen) captureMaterialOrigin(openedReference);
-    activeMaterialEvidence = null; activeMaterial = item; materialsOpen = false; addMenuOpen = false;
+    if (captureOrigin && !activeMaterial && !materialsOpen) captureMaterialOrigin(openedReference);
+    activeMaterialEvidence = null; activeMaterial = item; activeMaterialScope = scope; materialsOpen = false; addMenuOpen = false;
     clearSuggestionTimerHandle();
   }
   function closeMaterial(): void {
     const paneId = materialOrigin?.paneId;
-    activeMaterialEvidence = null; activeMaterial = null; materialsOpen = false; materialOrigin = null;
+    activeMaterialEvidence = null; activeMaterial = null; activeMaterialScope = null; materialsOpen = false; materialOrigin = null;
     void tick().then(() => {
       if (paneId) paneEditors[paneId]?.focusInput();
       else { visualEditor?.focusCurrentSelection(); sourceEditor?.focusCurrentSelection(); }
@@ -546,43 +564,48 @@
     return inserted;
   }
   function materialRemoved(id: string, sessionId: string): void {
-    if (project?.session_id !== sessionId) return;
+    if (workspaceRoots?.workspace_session_id !== sessionId) return;
     materialEntries = materialEntries.filter(item => item.id !== id);
     if (activeMaterial?.id === id) closeMaterial();
   }
   function materialChanged(item: MaterialEntry): void {
+    // Document-local imports stay local. An identically named source in a
+    // mounted folder must never become a workspace source merely by rendering.
+    if (workspaceOwnerActive && materialOwnerScope) ownerMaterialChanged(item, materialOwnerScope);
+    else if (activeMaterial?.id === item.id && activeMaterialScope?.sessionId === project?.session_id) activeMaterial = item;
+  }
+  function ownerMaterialChanged(item: MaterialEntry, scope: MaterialScope): void {
+    if (!isOwnerMaterialScope(scope)) return;
     materialEntries = [...materialEntries.filter(existing => existing.id !== item.id), item];
-    if (activeMaterial?.id === item.id) activeMaterial = item;
+    if (activeMaterial?.id === item.id && activeMaterialScope && isOwnerMaterialScope(activeMaterialScope)) activeMaterial = item;
   }
   async function chooseMaterialLibrary(): Promise<void> {
-    if (!project || fileCommandInFlight || opening) return;
-    const captured = { projectId: project.project_id, sessionId: project.session_id };
+    if (!project || !materialOwnerScope || fileCommandInFlight || opening) return;
+    const captured = materialOwnerScope;
     if (!activeMaterial && !materialsOpen) captureMaterialOrigin();
     addMenuOpen = false;
     try {
       const item = await addLibraryMaterial(captured.projectId, captured.sessionId);
-      if (item && project?.project_id === captured.projectId && project.session_id === captured.sessionId) {
-        materialChanged(item); openMaterial(item); outlineOpen = true;
+      if (item && isOwnerMaterialScope(captured)) {
+        ownerMaterialChanged(item, captured); openMaterial(item, undefined, captured, false); outlineOpen = true;
       }
-    } catch (error) { if (project?.session_id === captured.sessionId) recordFailure(error); }
+    } catch (error) { if (isOwnerMaterialScope(captured)) recordFailure(error); }
   }
   async function chooseMaterialFiles(): Promise<void> {
-    if (!project || fileCommandInFlight || opening || contextAttachmentBusy) return;
-    const captured = { projectId: project.project_id, sessionId: project.session_id };
+    if (!project || !materialOwnerScope || fileCommandInFlight || opening || contextAttachmentBusy) return;
+    const captured = materialOwnerScope;
+    const operationId = newUlid();
     captureMaterialOrigin(); addMenuOpen = false; contextAttachmentBusy = true;
     try {
-      const report = await chooseAttachments(captured.projectId, captured.sessionId);
-      for (const attachment of report.imported) {
-        const item = await bindAttachmentMaterial(captured.projectId, captured.sessionId, attachment.id);
-        if (project?.session_id !== captured.sessionId) return;
-        materialChanged(item);
-      }
+      const report = await chooseWorkspaceSources(captured.projectId, captured.sessionId, operationId);
+      if (!isOwnerMaterialScope(captured)) return;
+      if (report.workspace_id !== captured.projectId || report.workspace_session_id !== captured.sessionId || report.operation_id !== operationId) throw new Error('The source import belongs to a different workspace.');
+      for (const { material } of report.imported) if (material) ownerMaterialChanged(material, captured);
       if (report.failures.length) recordFailure(new Error(report.failures.map(item => `${item.name}: ${item.message}`).join('\n')));
-      if (project?.session_id !== captured.sessionId) return;
       outlineOpen = true;
-      const first = materialEntries.find(item => item.attachment_id === report.imported[0]?.id);
-      if (first) openMaterial(first);
-    } catch (error) { if (project?.session_id === captured.sessionId) recordFailure(error); }
+      const first = report.imported.find(item => item.material)?.material;
+      if (first) openMaterial(first, undefined, captured, false);
+    } catch (error) { if (isOwnerMaterialScope(captured)) recordFailure(error); }
     finally { contextAttachmentBusy = false; }
   }
   function openMaterialConnections(): void {
@@ -1153,7 +1176,7 @@
   }
 
   $: folderWarnings = project?.folder_warnings ?? [];
-  $: fileRows = workspaceRows(visibleWorkspaceDocuments(project?.documents ?? [], project?.retained_output_document_ids ?? [], pinnedOutputs), collapsedFolders, search, materialEntries, project?.directories ?? []);
+  $: fileRows = workspaceRows(visibleWorkspaceDocuments(project?.documents ?? [], project?.retained_output_document_ids ?? [], pinnedOutputs), collapsedFolders, search, workspaceOwnerActive ? materialEntries : [], project?.directories ?? []);
   $: loadedModel = models.find((model) => model.loaded) ?? null;
   $: currentModel = workspaceWriterModel(models, buildModelPolicy, curatedModels, workspaceTemplate, workspaceTemplateScope === `${project?.project_id}/${project?.session_id}`);
   let configuredWriter: { model_id: string; completion: boolean } | null = null;
@@ -2273,25 +2296,17 @@
   }
 
   async function addImportedSources(items: import('./lib/types').ContextAttachment[], projectId: string, sessionId: string): Promise<void> {
-    const current = () => project?.project_id === projectId && project.session_id === sessionId;
-    const failures: string[] = [];
-    for (const item of items) {
-      if (!current()) return;
-      try {
-        const bound = await bindAttachmentMaterial(projectId, sessionId, item.id);
-        if (current()) materialChanged(bound);
-      } catch (error) { failures.push(`${item.file_name}: ${normalizeFailure(error).message}`); }
-    }
-    if (current() && failures.length) throw new Error(failures.join('\n'));
+    if (items.length && isOwnerMaterialScope({ projectId, sessionId })) await refreshMaterials();
   }
 
   async function openImportedSource(item: import('./lib/types').ContextAttachment, projectId: string, sessionId: string): Promise<void> {
-    if (project?.project_id !== projectId || project.session_id !== sessionId) return;
-    const bound = materialEntries.find(entry => entry.attachment_id === item.id)
-      ?? await bindAttachmentMaterial(projectId, sessionId, item.id);
-    if (project?.project_id !== projectId || project.session_id !== sessionId) return;
-    materialChanged(bound);
-    openMaterial(bound);
+    const scope = { projectId, sessionId };
+    if (!isOwnerMaterialScope(scope)) return;
+    await refreshMaterials();
+    if (!isOwnerMaterialScope(scope)) return;
+    const bound = materialEntries.find(entry => entry.attachment_id === item.id);
+    if (!bound) throw new Error('The original is retained, but this source could not be opened.');
+    openMaterial(bound, undefined, scope, false);
   }
 
   async function saveMaterialExcerpt(attachmentId: string, sourceRevision: string, excerpt: string | null): Promise<boolean> {
@@ -2378,10 +2393,13 @@
         document?.summary.document_id !== captured.documentId
       ) return;
       const filePaths = paths.filter(path => !isDatabasePath(path));
-      const libraries = await Promise.all(paths.filter(isDatabasePath).map(path => addLibraryMaterialPath(captured.projectId, captured.sessionId, path)));
+      const owner = materialOwnerScope;
+      const libraryPaths = paths.filter(isDatabasePath);
+      if (libraryPaths.length && !owner) throw new Error('The workspace is not ready for sources yet.');
+      const libraries = owner ? await Promise.all(libraryPaths.map(path => addLibraryMaterialPath(owner.projectId, owner.sessionId, path))) : [];
       const report = filePaths.length ? await importAttachmentPaths(captured.projectId, captured.sessionId, filePaths) : { imported: [], references: [], failures: [] };
       if (project?.session_id !== captured.sessionId) return;
-      libraries.forEach(materialChanged);
+      if (owner) libraries.forEach(item => ownerMaterialChanged(item, owner));
       const imported = report.imported;
       if (report.failures.length) recordFailure(new Error(report.failures.map((item) => `${item.name}: ${item.message}`).join("\n")));
       if (!imported.length && !libraries.length && !report.references?.length) return;
@@ -2436,7 +2454,7 @@
     if (fileCommandInFlight || opening || !paths.length) return;
     // Each folder uses the same prepared-open/save/commit path as the picker.
     for (const path of paths.slice(0, 32)) {
-      if (!await doOpenProject(path)) break;
+      if (!await doOpenProject({ path })) break;
     }
   }
 
@@ -2466,12 +2484,15 @@
     }
   }
 
-  async function showFolderActions(event: MouseEvent | KeyboardEvent, destination: string): Promise<void> {
+  async function showFolderActions(event: MouseEvent | KeyboardEvent, destination: string, root?: WorkspaceFolderRow): Promise<void> {
     if (event instanceof KeyboardEvent && !isDocumentContextTriggerKey(event)) return;
     event.preventDefault();
     event.stopPropagation();
     if (!project || fileCommandInFlight || opening || contextAttachmentBusy) return;
     const { project_id: projectId, session_id: sessionId } = project;
+    const active = !root || workspaceRootIsActive(root, project);
+    const workspaceSessionId = workspaceRoots?.workspace_session_id;
+    if (root?.owner && !active) return;
     const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect();
     const at = event instanceof MouseEvent
       ? new LogicalPosition(event.clientX, event.clientY)
@@ -2479,12 +2500,14 @@
     let menu: Menu | undefined;
     try {
       const copy = copyingFolder;
-      menu = await Menu.new({ items: copy?.sessionId === sessionId && copy.destination === destination
+      menu = await Menu.new({ items: [...(active ? copy?.sessionId === sessionId && copy.destination === destination
         ? [{ id: 'stop-folder-copy', text: 'Stop Copying', action: () => {
             void cancelImportAccount(copy.projectId, copy.sessionId, copy.operationId).catch(recordFailure);
           } }]
         : [{ id: 'copy-folder-here', text: 'Copy Folder Here…', enabled: !copy,
-          action: () => { void copyFolderHere(projectId, sessionId, destination).catch(recordFailure); } }] });
+          action: () => { void copyFolderHere(projectId, sessionId, destination).catch(recordFailure); } }] : []),
+        ...(root && !root.owner && !root.transient && workspaceSessionId ? [{ id: 'remove-workspace-folder', text: 'Remove from Workspace',
+          action: () => { void detachWorkspaceRoot(root, workspaceSessionId); } }] : [])] });
       await menu.popup(at);
     } catch (error) {
       recordFailure(error);
@@ -2493,7 +2516,35 @@
     }
   }
 
+  async function detachWorkspaceRoot(root: WorkspaceFolderRow, workspaceSessionId: string): Promise<void> {
+    if (!project || root.owner || root.transient || opening || fileCommandInFlight || workspaceRoots?.workspace_session_id !== workspaceSessionId) return;
+    try {
+      if (workspaceRootIsActive(root, project)) {
+        const owner = workspaceRoots.roots.find(folder => folder.owner);
+        if (!owner || !await doOpenProject({ rootId: owner.id })) return;
+      }
+      if (!project || workspaceRoots?.workspace_session_id !== workspaceSessionId) return;
+      fileCommandInFlight = true;
+      if (!flushEditors()) return;
+      await saveNow();
+      if (!project || uncertainSave || saveState === 'error' || saveState === 'uncertain' || workspaceRoots?.workspace_session_id !== workspaceSessionId) return;
+      await removeWorkspaceRoot(project.project_id, project.session_id, root.id);
+      await refreshWorkspaceRoots();
+      scheduleProjectFilesystemRefresh(0);
+      announce(`Removed ${root.name} from the workspace`);
+    } catch (error) {
+      recordFailure(error);
+    } finally {
+      fileCommandInFlight = false;
+    }
+  }
+
   async function openMaterialWriting(id: string): Promise<void> {
+    const scope = activeMaterialScope;
+    if (scope && isOwnerMaterialScope(scope) && !workspaceOwnerActive) {
+      const owner = workspaceRoots?.roots.find(root => root.owner);
+      if (!owner || !await doOpenProject({ rootId: owner.id }) || !isOwnerMaterialScope(scope)) return;
+    }
     const candidate = project?.documents.find(item => item.document_id === id);
     if (!candidate) throw new Error('This writing is no longer in the folder.');
     await selectDocument(candidate, true);
@@ -2519,10 +2570,12 @@
           if (destination === null) return;
           const projectId = project.project_id;
           const sessionId = project.session_id;
+          const owner = materialOwnerScope;
           for (const path of paths.filter(isDatabasePath)) {
-            const library = await addLibraryMaterialPath(projectId, sessionId, path);
-            if (project?.session_id !== sessionId) return;
-            materialChanged(library);
+            if (!owner) return;
+            const library = await addLibraryMaterialPath(owner.projectId, owner.sessionId, path);
+            if (!isOwnerMaterialScope(owner) || project?.session_id !== sessionId) return;
+            ownerMaterialChanged(library, owner);
           }
           const files = paths.filter(path => !isDatabasePath(path));
           if (!files.length) return;
@@ -2592,7 +2645,6 @@
     };
     appearanceMedia.addEventListener('change', syncSystemAppearance);
     desktop = isDesktopRuntime();
-    try { workspaceFolders = readWorkspaceFolders(window.localStorage); } catch { workspaceFolders = []; }
     if (desktop) void refreshCuratedModels();
     if (desktop) void installNativeAttachmentDrop();
     documentContextRevealLabel = desktop
@@ -6302,16 +6354,19 @@
     });
   }
 
-  async function doOpenProject(path?: string): Promise<boolean> {
+  async function doOpenProject(target?: { path: string } | { rootId: string }): Promise<boolean> {
     if (fileCommandInFlight || opening || applicationClosePhase !== 'running') return false;
+    if (target && 'rootId' in target && !project) return false;
     opening = true;
     fileCommandInFlight = true;
     let preparationId: string | null = null;
     let handoffStarted = false;
     try {
       // The chooser and validation leave the current editor/session intact.
-      preparationId = await (path ? prepareProjectOpenPath(path) : prepareProjectOpen());
-      if (!preparationId) return Boolean(path);
+      preparationId = target && 'rootId' in target
+        ? project && await prepareWorkspaceRoot(project.project_id, project.session_id, target.rootId)
+        : target ? await prepareProjectOpenPath(target.path) : await prepareProjectOpen();
+      if (!preparationId) return Boolean(target);
       if (!componentMounted || applicationClosePhase !== 'running') return false;
       clearFailure();
       if (project) {
@@ -6518,12 +6573,9 @@
       missingDocumentRecovery = null;
       missingDocumentCopyState = 'idle';
     }
-    let folderStorage: Storage | undefined;
-    try { folderStorage = window.localStorage; } catch { /* Workspace navigation does not require storage. */ }
-    workspaceFolders = rememberWorkspaceFolder(workspaceFolders, { root: opened.root, title: opened.title }, folderStorage);
+    await refreshWorkspaceRoots();
+    if (!workspaceRestoreIsCurrent(captured)) return false;
     workspaceRootExpanded = true;
-    hiddenPaneSlots = new Set();
-    paneSelection = {};
     clearPreferredWriterRequest();
     cancelSuggestionTimer();
     clearCompletionSession();
@@ -8229,32 +8281,34 @@
     event.preventDefault(); event.stopPropagation();
     const href = link.getAttribute('href') ?? '';
     const evidenceId = href.match(/^loom-evidence:([a-f0-9]{64})$/u)?.[1];
-    if (evidenceId) {
-      const captured = { projectId: project.project_id, sessionId: project.session_id };
+    const materialReference = href.match(/^loom-material:(material-[a-f0-9]{64}|materials\/[^\r\n]+)$/u)?.[1];
+    const reference = evidenceId ? `evidence/${evidenceId}` : materialReference;
+    if (reference) {
+      const captured = { projectId: project.project_id, sessionId: project.session_id, root: project.root };
+      const owner = materialOwnerScope;
+      const current = () => project?.project_id === captured.projectId && project.session_id === captured.sessionId && project.root === captured.root && (!owner || isOwnerMaterialScope(owner));
       captureMaterialOrigin(link);
-      void readMaterialEvidence(captured.projectId, captured.sessionId, '', evidenceId).then(evidence => {
-        if (project?.session_id !== captured.sessionId) return;
-        const item = materialEntries.find(entry => entry.id === evidence.material_id) ?? {
+      void resolveScopedMaterialReference(captured, owner, reference, current, resolveMaterialReference).then(result => {
+        if (!result) return;
+        const { evidence } = result;
+        const scope = { projectId: result.project_id, sessionId: result.session_id };
+        const item = result.material ?? (evidence ? {
           id: evidence.material_id, name: evidence.title, reference: evidence.reference, kind: evidence.material_id.startsWith('folder-') ? 'folder' as const : 'attachment' as const,
           pinned: false, available: false, source_path: null, attachment_id: null
-        };
-        openMaterial(item, link); activeMaterialEvidence = evidence;
-      }).catch(recordFailure);
-      return;
-    }
-    const materialId = href.match(/^loom-material:(material-[a-f0-9]{64})$/u)?.[1];
-    if (materialId) {
-      const item = materialEntries.find(entry => entry.id === materialId);
-      if (item) openMaterial(item, link);
-      else recordFailure(new Error('This source is no longer available in this workspace.'));
+        } : null);
+        if (!item) return;
+        openMaterial(item, link, scope, false); activeMaterialEvidence = evidence;
+      }).catch(error => { if (current()) recordFailure(error); });
       return;
     }
     const attachmentId = href.match(/^loom-attachment:([a-f0-9]{64})$/u)?.[1];
     if (attachmentId) {
       const captured = { projectId: project.project_id, sessionId: project.session_id };
+      const sourceScope = workspaceOwnerActive ? materialOwnerScope : captured;
+      captureMaterialOrigin(link);
       void bindAttachmentMaterial(captured.projectId, captured.sessionId, attachmentId).then(item => {
         if (project?.session_id !== captured.sessionId) return;
-        materialChanged(item); openMaterial(item, link);
+        materialChanged(item); openMaterial(item, link, sourceScope, false);
       }).catch(recordFailure);
     }
   }
@@ -9699,9 +9753,37 @@
     return { status: 'closed' };
   }
 
+  async function refreshWorkspaceRoots(): Promise<WorkspaceRootsSnapshot | null> {
+    if (!project) return null;
+    const scope = { projectId: project.project_id, sessionId: project.session_id };
+    const serial = ++workspaceRootsSerial;
+    try {
+      const snapshot = await getWorkspaceRoots(scope.projectId, scope.sessionId);
+      if (serial !== workspaceRootsSerial || !terminalScopeIsCurrent(scope.projectId, scope.sessionId)) return null;
+      if (workspaceRoots && workspaceRoots.workspace_session_id !== snapshot.workspace_session_id) {
+        workspaceDocuments = {};
+        hiddenPaneSlots = new Set();
+        paneSelection = {};
+      }
+      workspaceRoots = snapshot;
+      workspaceRootsScope = `${scope.projectId}/${scope.sessionId}`;
+      return snapshot;
+    } catch (error) {
+      if (serial === workspaceRootsSerial && terminalScopeIsCurrent(scope.projectId, scope.sessionId)) recordFailure(error);
+      return null;
+    }
+  }
+
   async function refreshWorkspaceTemplate(enable = false): Promise<void> {
     if (!project || compositionActive || !flushEditors()) return;
     if (document?.summary.relative_path === '.loom.md' && editVersion !== savedVersion) return;
+    if (enable) {
+      const roots = await refreshWorkspaceRoots();
+      const owner = roots?.roots.find(folder => folder.owner);
+      if (!project || !owner) return;
+      if (!workspaceRootIsActive(owner, project) && !await doOpenProject({ rootId: owner.id })) return;
+    }
+    if (!project) return;
     const scope = { projectId: project.project_id, sessionId: project.session_id };
     const serial = ++templateSerial;
     try {
@@ -9710,10 +9792,12 @@
       if (!flushEditors()) { deferredTemplateSession = scope.sessionId; deferredWorkspaceTemplate = snapshot; return; }
       workspaceTemplate = snapshot;
       workspaceTemplateScope = `${scope.projectId}/${scope.sessionId}`;
+      void refreshWorkspaceRoots();
       void refreshMaterials();
       void tick().then(requestPreferredWriterForCurrentWorkspace);
       const registered = project?.documents.find(item => item.document_id === snapshot.document_id);
-      if (snapshot.document_id && registered?.revision_id !== snapshot.revision_id) {
+      const owner = workspaceRoots?.roots.find(folder => folder.owner);
+      if (snapshot.document_id && project && owner && workspaceRootIsActive(owner, project) && registered?.revision_id !== snapshot.revision_id) {
         scheduleProjectFilesystemRefresh(0);
       }
       if (enable && snapshot.document_id) {
@@ -9923,15 +10007,15 @@
           <input bind:value={search} type="search" placeholder="Find in folder" />
         </label>
         <nav class="document-list" aria-label="Workspace folders">
-          {#each visibleWorkspaceFolders as folder (folder.root)}
-            {@const active = folder.root === project.root}
-            <button class="folder-row workspace-root" class:active class:drop-target={active && workspaceDropFolder === ''} data-copy-folder={active ? '' : undefined} type="button" title={folder.root}
-              aria-label={`${active && workspaceRootExpanded ? 'Collapse' : 'Open'} folder ${folder.title}`}
-              aria-expanded={active && workspaceRootExpanded} disabled={fileCommandInFlight || opening}
-              on:contextmenu={(event) => { if (active) void showFolderActions(event, ''); }}
-              on:keydown={(event) => { if (active) void showFolderActions(event, ''); }}
-              on:click={() => { if (active) workspaceRootExpanded = !workspaceRootExpanded; else void doOpenProject(folder.root); }}>
-              <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{folder.title}</span>{#if active && copyingFolder?.sessionId === project.session_id && copyingFolder.destination === ''}<span aria-label="Copying">…</span>{/if}
+          {#each visibleWorkspaceFolders as folder (folder.id)}
+            {@const active = workspaceRootIsActive(folder, project)}
+            <button class="folder-row workspace-root" class:active class:unavailable={!folder.available} class:drop-target={active && workspaceDropFolder === ''} data-copy-folder={active ? '' : undefined} type="button" title={folder.available ? folder.path ?? folder.name : `${folder.name} is unavailable`}
+              aria-label={`${active && workspaceRootExpanded ? 'Collapse' : 'Open'} folder ${folder.name}${folder.available ? '' : ' (unavailable)'}`}
+              aria-expanded={active && workspaceRootExpanded} aria-disabled={!folder.available} disabled={fileCommandInFlight || opening}
+              on:contextmenu={(event) => void showFolderActions(event, '', folder)}
+              on:keydown={(event) => void showFolderActions(event, '', folder)}
+              on:click={() => { if (active) workspaceRootExpanded = !workspaceRootExpanded; else if (folder.available) void doOpenProject({ rootId: folder.id }); }}>
+              <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M2 4h4l1.5 1.5H14v7H2Z"/></svg><span>{folder.name}</span>{#if active && copyingFolder?.sessionId === project.session_id && copyingFolder.destination === ''}<span aria-label="Copying">…</span>{/if}
             </button>
             {#if active && workspaceRootExpanded}
             <div class="workspace-root-documents">
@@ -10087,18 +10171,19 @@
       </aside>
 
       <main id="manuscript" class="manuscript-area" tabindex="-1" class:workspace-main-hidden={!mainPaneOpen || (customMain && !activeMaterial && !materialsOpen)}>
-        {#if activeMaterial}
-          {#key `${project.session_id}/${activeMaterial.id}/${activeMaterialEvidence?.id ?? ""}`}
-            <MaterialView projectId={project.project_id} sessionId={project.session_id} material={activeMaterial}
+        {#if activeMaterial && activeMaterialScope}
+          {@const viewScope = activeMaterialScope}
+          {#key `${viewScope.projectId}/${viewScope.sessionId}/${activeMaterial.id}/${activeMaterialEvidence?.id ?? ""}`}
+            <MaterialView projectId={viewScope.projectId} sessionId={viewScope.sessionId} material={activeMaterial}
               initialEvidence={activeMaterialEvidence} originTitle={materialOrigin?.title ?? null} onClose={closeMaterial} onUse={useMaterialReference} onOpenDocument={openMaterialWriting}
-              removable={materialEntries.some(item => item.id === activeMaterial?.id)} onRemoved={materialRemoved} onChanged={materialChanged} onReopen={() => void chooseMaterialLibrary()} />
+              workspaceOwned={isOwnerMaterialScope(viewScope)} removable={isOwnerMaterialScope(viewScope) && materialEntries.some(item => item.id === activeMaterial?.id)} onRemoved={materialRemoved} onChanged={(item) => ownerMaterialChanged(item, viewScope)} onReopen={() => void chooseMaterialLibrary()} />
           {/key}
         {:else if materialsOpen}
           <section class="material-connect-view" aria-label="Add sources">
             <PaneHeader title="Add sources" onCollapse={closeMaterial} />
-            {#if document}{#key project.session_id}<ImportSources projectId={project.project_id} sessionId={project.session_id} onOpen={openImportedSource} onImported={addImportedSources}
-              onCollectionAdded={async (item, projectId, sessionId) => { if (project?.project_id === projectId && project.session_id === sessionId) { materialChanged(item); const refreshed = await currentProjectSession(); if (project?.session_id === sessionId) project = refreshed; } }}
-              onOpenCollection={async (item, projectId, sessionId) => { if (project?.project_id === projectId && project.session_id === sessionId) openMaterial(item); }} />{/key}{/if}
+            {#if materialOwnerScope}{#key materialOwnerScope.sessionId}<ImportSources projectId={materialOwnerScope.projectId} sessionId={materialOwnerScope.sessionId} onOpen={openImportedSource} onImported={addImportedSources} onOpenFolder={openAnotherProject}
+              onCollectionAdded={async (item, projectId, sessionId) => { const scope = { projectId, sessionId }; if (isOwnerMaterialScope(scope)) { ownerMaterialChanged(item, scope); void refreshMaterials(); } }}
+              onOpenCollection={async (item, projectId, sessionId) => { const scope = { projectId, sessionId }; if (isOwnerMaterialScope(scope)) openMaterial(item, undefined, scope); }} />{/key}{/if}
           </section>
         {/if}
         <div class="writing-content" class:material-covered={Boolean(activeMaterial) || materialsOpen} inert={Boolean(activeMaterial) || materialsOpen}>
@@ -10469,7 +10554,7 @@
               selectionDisabled={busyPaneSlots.has(slot.position)} onSelect={(id) => selectPane(slot.position, id)} onCollapse={() => togglePane(slot.position)} />
             {#each slot.choices as [paneId, paneConfig] (paneId)}
               <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
-            <WorkspacePane {referenceScope} bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
+            <WorkspacePane {referenceScope} {materialOwnerScope} bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
               </div>
             {/each}
           </aside>
@@ -10953,3 +11038,7 @@
     {completionAccessibilityWitness}
   </div>
 </div>
+
+<style>
+  .workspace-root.unavailable { opacity: 0.55; }
+</style>

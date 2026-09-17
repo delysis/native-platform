@@ -1,25 +1,37 @@
-export interface WorkspaceFolder { root: string; title: string }
-const KEY = 'loom.workspace-folders';
-const LIMIT = 32;
+import type { ProjectSnapshot } from './types';
 
-// Remembered paths are navigation hints, never filesystem authority. Native
-// preparation reopens and validates the directory before replacing a session.
-export function readWorkspaceFolders(storage: Pick<Storage, 'getItem'>): WorkspaceFolder[] {
-  try {
-    const value: unknown = JSON.parse(storage.getItem(KEY) ?? '[]');
-    if (!Array.isArray(value)) return [];
-    const roots = new Set<string>();
-    return value.filter((item): item is WorkspaceFolder => {
-      if (!item || typeof item !== 'object' || typeof item.root !== 'string' || typeof item.title !== 'string' ||
-        !item.root || item.root.length > 4096 || !item.title || item.title.length > 256 || roots.has(item.root)) return false;
-      roots.add(item.root); return true;
-    }).slice(-LIMIT);
-  } catch { return []; }
+/** Declarations and availability come from the owning workspace and its private grants. */
+export interface WorkspaceFolder {
+  id: string;
+  name: string;
+  owner: boolean;
+  available: boolean;
+  path: string | null;
+  project_id: string | null;
 }
 
-export function rememberWorkspaceFolder(folders: WorkspaceFolder[], folder: WorkspaceFolder, storage?: Pick<Storage, 'setItem'>): WorkspaceFolder[] {
-  const next = (folders.some(item => item.root === folder.root)
-    ? folders.map(item => item.root === folder.root ? folder : item) : [...folders, folder]).slice(-LIMIT);
-  try { storage?.setItem(KEY, JSON.stringify(next)); } catch { /* Navigation still works without persistence. */ }
-  return next;
+export interface WorkspaceRootsSnapshot {
+  workspace_id: string;
+  workspace_session_id: string;
+  roots: WorkspaceFolder[];
+}
+
+export type WorkspaceFolderRow = WorkspaceFolder & { transient?: true };
+
+export function workspaceRootIsActive(folder: WorkspaceFolder, project: Pick<ProjectSnapshot, 'root' | 'project_id'>): boolean {
+  return folder.path === project.root && folder.project_id === project.project_id;
+}
+
+/** Never show another session's folders while the native snapshot is arriving. */
+export function workspaceFoldersForProject(
+  snapshot: WorkspaceRootsSnapshot | null,
+  snapshotScope: string,
+  project: Pick<ProjectSnapshot, 'root' | 'project_id' | 'session_id' | 'title'> | null
+): WorkspaceFolderRow[] {
+  if (!project) return [];
+  const roots = snapshot && snapshotScope === `${project.project_id}/${project.session_id}` ? snapshot.roots : [];
+  if (roots.some(folder => workspaceRootIsActive(folder, project))) return roots;
+  // A declaration can disappear during editing. Keep the open writing visible
+  // until the author leaves it, without resurrecting a declaration or a grant.
+  return [...roots, { id: 'active-root', name: project.title, owner: false, available: true, path: project.root, project_id: project.project_id, transient: true }];
 }

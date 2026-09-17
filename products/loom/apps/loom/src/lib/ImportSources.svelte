@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { newUlid } from './ulid';
   import type { ContextAttachment } from './types';
-  import { importAccounts, connectImportAccount, disconnectImportAccount, addCollection, refreshCollection, chooseImportBatch, importSourceUrl, importPastedSources, cancelImportAccount,
+  import { importAccounts, connectImportAccount, disconnectImportAccount, addCollection, refreshCollection, chooseWorkspaceSources, importSourceUrl, pasteWorkspaceSources, cancelWorkspaceSourceImport,
     type ImportAccount, type ImportBatch, type ImportSource } from './ipc';
 
   import CollectionProgress from './CollectionProgress.svelte';
@@ -12,6 +12,7 @@
   export let projectId: string;
   export let sessionId: string;
   export let onOpen: (item: ContextAttachment, projectId: string, sessionId: string) => Promise<void>;
+  export let onOpenFolder: () => Promise<void> = async () => {};
   export let onImported: (items: ContextAttachment[], projectId: string, sessionId: string) => Promise<void>;
   export let onCollectionAdded: (entry: MaterialEntry, projectId: string, sessionId: string) => Promise<void> = async () => {};
   export let onOpenCollection: (entry: MaterialEntry, projectId: string, sessionId: string) => Promise<void> = async () => {};
@@ -36,6 +37,7 @@
   let operationId = '';
   let message = '';
   let report: ImportBatch | null = null;
+  let unboundSources = new Set<string>();
   $: service = source === 'drive' ? 'drive' : 'gmail';
   $: availableAccounts = accounts.filter((item) => item.service === service && item.email);
   $: account = availableAccounts.find((item) => item.email === chosenEmail)?.email;
@@ -102,10 +104,21 @@
     finally { busy = false; }
   }
   async function local(folder: boolean): Promise<void> {
+    if (folder) {
+      busy = true;
+      try { await onOpenFolder(); }
+      catch (error) { message = errorText(error); }
+      finally { busy = false; }
+      return;
+    }
     operationId = newUlid();
     busy = true; message = 'Reading local sources…';
     try {
-      report = await chooseImportBatch(projectId, sessionId, folder, operationId); await publishImported();
+      const imported = await chooseWorkspaceSources(projectId, sessionId, operationId);
+      if (imported.workspace_id !== projectId || imported.workspace_session_id !== sessionId || imported.operation_id !== operationId) throw new Error('The source import belongs to a different workspace.');
+      unboundSources = new Set(imported.imported.filter(item => !item.material).map(item => item.attachment.id));
+      report = { imported: imported.imported.map(item => item.attachment), failures: imported.failures, next_page_token: null };
+      await publishImported();
       message = `${report.imported.length} imported; ${report.failures.length} failed or skipped.`;
     } catch (error) { message = errorText(error); }
     finally { busy = false; operationId = ''; }
@@ -113,19 +126,25 @@
   async function web(): Promise<void> {
     operationId = newUlid();
     busy = true; message = 'Importing the public web document…';
-    try { report = await importSourceUrl(projectId, sessionId, webUrl.trim(), operationId); await publishImported(); message = 'Source added.'; }
+    try { report = await importSourceUrl(projectId, sessionId, webUrl.trim(), operationId); unboundSources = new Set(); await publishImported(); message = report.failures.length ? `${report.imported.length} retained; ${report.failures.length} failed or skipped.` : 'Source added.'; }
     catch (error) { message = errorText(error); }
     finally { busy = false; operationId = ''; }
   }
   async function paste(): Promise<void> {
     operationId = newUlid();
     busy = true;
-    try { report = await importPastedSources(projectId, sessionId, pasted, separator, operationId); await publishImported(); message = `${report.imported.length} pasted sources imported; ${report.failures.length} failed.`; }
+    try {
+      const imported = await pasteWorkspaceSources(projectId, sessionId, pasted, separator, operationId);
+      if (imported.workspace_id !== projectId || imported.workspace_session_id !== sessionId || imported.operation_id !== operationId) throw new Error('The source import belongs to a different workspace.');
+      unboundSources = new Set(imported.imported.filter(item => !item.material).map(item => item.attachment.id));
+      report = { imported: imported.imported.map(item => item.attachment), failures: imported.failures, next_page_token: null };
+      await publishImported(); message = `${report.imported.length} pasted sources imported; ${report.failures.length} failed.`;
+    }
     catch (error) { message = errorText(error); }
     finally { busy = false; operationId = ''; }
   }
   async function openSource(item: ContextAttachment): Promise<void> {
-    if (busy) return;
+    if (busy || unboundSources.has(item.id)) return;
     busy = true;
     try { await onOpen(item, projectId, sessionId); }
     catch (error) { message = errorText(error); }
@@ -179,13 +198,14 @@
     <button disabled={busy || !clientId.trim()} on:click={() => void connect()}>Connect {service === 'drive' ? 'Drive' : 'Gmail'}</button>
   {/if}
   {/if}
-  {#if busy && operationId}<button on:click={() => { void cancelImportAccount(projectId, sessionId, operationId).then(() => { message = "Stopping… Completed sources remain available."; }).catch((error) => message = errorText(error)); }}>{authorizing ? "Cancel connection" : "Stop import"}</button>{/if}
+  {#if busy && operationId}<button on:click={() => { void cancelWorkspaceSourceImport(projectId, sessionId, operationId).then(() => { message = "Stopping… Completed sources remain available."; }).catch((error) => message = errorText(error)); }}>{authorizing ? "Cancel connection" : "Stop import"}</button>{/if}
   <p role="status">{message}</p>
   {#if report}
     <div class="results">
       {#each report.imported as item, index (`${item.id}:${index}`)}
         <div class="result">
-          <button class="source-link" disabled={busy} on:click={() => void openSource(item)}>{item.file_name}</button>
+          <button class="source-link" disabled={busy || unboundSources.has(item.id)} on:click={() => void openSource(item)}>{item.file_name}</button>
+          {#if unboundSources.has(item.id)}<small>Original retained; source unavailable</small>{/if}
           {#if !item.coverage_complete}<small>Partial import</small>{/if}
           {#each item.warnings as warning}<small>{warning}</small>{/each}
         </div>
