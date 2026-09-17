@@ -148,6 +148,7 @@ export function retireCompletionCandidates(
     session: {
       ...session,
       presentationsRetired: true,
+      rollbackSessions: session.rollbackSessions?.map(witness => ({ ...witness, presentationsRetired: true })),
       authorityFrozen: session.acceptedChunks.length > 0
     }
   };
