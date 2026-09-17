@@ -20,6 +20,27 @@ function render(mode: 'visual' | 'source', loompad = false, insertsOnAccept = tr
 }
 
 describe('completion controller and editor callback ordering', () => {
+  it.each(['visual', 'source'] as const)('reverses an accepted %s word while a refilled family is temporarily unavailable', async (mode) => {
+    const keyboard = userEvent.setup();
+    const harness = render(mode, true);
+    await page.getByRole('textbox').click();
+    await keyboard.keyboard('{Alt>}[KeyW]{/Alt}');
+    const manuscript = () => page.getByRole('status', { name: 'Controller Markdown' }).element().textContent;
+    const accepted = mode === 'visual' ? 'Hello one' : 'Hello one ';
+    await expect.poll(manuscript).toBe(accepted);
+    harness.installRefill(['silver', 'amber', 'blue', 'green'].map((word, index) => ({
+      candidateId: `next-${index}`, presentationKey: `next-${index}:1`, runId: `next-run-${index}`,
+      targetByte: new TextEncoder().encode(accepted).length,
+      text: `${mode === 'visual' ? ' ' : ''}${word} light`, insertsOnAccept: true
+    })));
+    await expect.element(page.getByRole('status', { name: 'Controller Remainder' })).toHaveTextContent('silver light');
+    harness.installRefill([]);
+    await expect.poll(() => page.getByRole('status', { name: 'Controller Remainder' }).element().textContent).toBe('');
+    expect(harness.attemptLoompad('next-0', 'next-0:1', ' silver')).toBe(false);
+    await keyboard.keyboard('{Alt>}{ArrowLeft}{/Alt}');
+    await expect.poll(manuscript).toBe('Hello');
+    await keyboard.cleanup();
+  });
   it.each([['visual', true], ['visual', false], ['source', true], ['source', false]] as const)('Tab accepts only the visible %s word and retains its suffix (initial insertion: %s)', async (mode, insertsOnAccept) => {
     render(mode, false, insertsOnAccept);
     await page.getByRole('textbox').click();
