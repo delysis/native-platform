@@ -2,6 +2,7 @@ import {
   acceptedCompletionText,
   advanceCompletionExhaustionLatch,
   completionPresentation,
+  completionRollbackText,
   completionSessionMatchesPresentation,
   consumeCompletionText,
   cycleCompletionSession,
@@ -30,6 +31,7 @@ import {
   type SuggestionAlternative
 } from './suggestionInteraction';
 import type { VerseNewlineKind } from './verseCodec';
+import { loompadWordKey } from './loompad';
 
 export interface AutocompleteRetryTicket {
   projectId: string;
@@ -188,7 +190,8 @@ export function reconcileCompletionController(
   state: CompletionControllerState,
   contextKey: string,
   family: readonly InlineGhostSuggestion[],
-  forkAtCurrentCaret = true
+  forkAtCurrentCaret = true,
+  refillLoompad = false
 ): CompletionControllerState {
   let session = state.session;
   let pendingText = state.pendingText;
@@ -200,7 +203,10 @@ export function reconcileCompletionController(
     if (!session && family.length > 0) {
       session = startCompletionSession(contextKey, family, family[0].runId);
     } else if (session) {
-      session = synchronizeCompletionCandidates(session, family, forkAtCurrentCaret && pendingText === null);
+      const completeRefill = refillLoompad && pendingText === null && family.length >= 4 &&
+        new Set(family.map(candidate => loompadWordKey(candidate.text)).filter(Boolean)).size >= 4;
+      session = synchronizeCompletionCandidates(session, family,
+        forkAtCurrentCaret && pendingText === null, completeRefill);
       if (!session) pendingText = null;
     }
   }
@@ -240,7 +246,7 @@ export function completionControllerView(
       text: candidate.text,
       runId: candidate.runId
     })),
-    unconsumeText: boundSession?.acceptedChunks.at(-1) ?? '',
+    unconsumeText: boundSession ? completionRollbackText(boundSession) : '',
     witnessSelected
   };
 }

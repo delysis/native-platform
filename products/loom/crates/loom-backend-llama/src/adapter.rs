@@ -80,6 +80,9 @@ pub struct ExactContinuationRequest {
     /// accepted directly by the resident multimodal projector.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<MediaInput>,
+    /// Explicit family selection; independent continuation remains the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_word_choices: Option<llama_native_types::FirstWordChoicePolicy>,
     pub prompt_recipe: PromptRecipe,
     pub cases: Vec<ContinuationCase>,
 }
@@ -120,6 +123,8 @@ pub struct CandidateProvenanceRecord {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ExactContinuationResult {
     pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_word_choices: Option<llama_native_types::FirstWordChoicePolicy>,
     pub exact_prompt_blob_id: BlobId,
     pub exact_manuscript_prefix: String,
     pub context_binding: ContinuationContextBinding,
@@ -1223,6 +1228,7 @@ fn run_generation_worker(
             }
             let _ = result_tx.send(Ok(ExactContinuationResult {
                 request_id: request.request_id,
+                first_word_choices: request.first_word_choices,
                 exact_prompt_blob_id,
                 exact_manuscript_prefix: request.exact_manuscript_prefix,
                 context_binding,
@@ -1321,6 +1327,8 @@ struct BackendReceipt<'a> {
     context_binding: ContinuationContextBinding,
     output: &'a GenerationOutput,
     #[serde(skip_serializing_if = "Option::is_none")]
+    first_word_choices: Option<llama_native_types::FirstWordChoicePolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     function_input: Option<FunctionInputEvidence>,
 }
 
@@ -1331,6 +1339,8 @@ struct OwnedBackendReceipt {
     input_contract: WriterInputContract,
     context_binding: ContinuationContextBinding,
     output: GenerationOutput,
+    #[serde(default)]
+    first_word_choices: Option<llama_native_types::FirstWordChoicePolicy>,
     #[serde(default)]
     function_input: Option<FunctionInputEvidence>,
 }
@@ -1361,6 +1371,7 @@ enum WriterInputContract {
 /// digest proves that bytes were preserved; these comparisons prove that the
 /// preserved bytes bind the prompt, model environment, branch, output, and
 /// token evidence that the store is about to attribute.
+#[allow(clippy::too_many_arguments)]
 pub fn validate_candidate_receipt_binding(
     record: &CandidateProvenanceRecord,
     expected_request_id: &str,
@@ -1369,9 +1380,11 @@ pub fn validate_candidate_receipt_binding(
     expected_context_binding: &ContinuationContextBinding,
     expected_model: &VerifiedModelDescriptor,
     expected_input_index: usize,
+    expected_first_word_choices: Option<llama_native_types::FirstWordChoicePolicy>,
 ) -> Result<(), LlamaBackendError> {
     let receipt: OwnedBackendReceipt = serde_json::from_slice(&record.backend_receipt_bytes)?;
     let output = &receipt.output;
+    validate_word_choice_output(expected_first_word_choices, &record.generation, output)?;
     let output_token_ids = output
         .generated_token_ids
         .iter()
@@ -1415,6 +1428,7 @@ pub fn validate_candidate_receipt_binding(
         && output.request_id == expected_request_id
         && output.branch_id == record.generation.branch_id.to_string()
         && output.input_index == expected_input_index
+        && receipt.first_word_choices == expected_first_word_choices
         && output.model_id == expected_model.local_model_id
         && output.text == record.output_text
         && output.finish_reason == record.finish_reason
@@ -1455,6 +1469,25 @@ fn build_result(
             identities.len()
         )));
     }
+    let mut first_words = BTreeSet::new();
+    for (output, case) in outputs.iter().zip(&request.cases) {
+        validate_word_choice_output(request.first_word_choices, &case.generation, output)?;
+        if let Some(word) = output
+            .first_word_choice
+            .as_ref()
+            .and_then(|evidence| {
+                evidence
+                    .selected_attempt
+                    .and_then(|index| evidence.attempts.get(index as usize))
+            })
+            .and_then(|attempt| attempt.word_key.as_ref())
+            && !first_words.insert(word)
+        {
+            return Err(LlamaBackendError::OutputContract(
+                "distinct-word family returned a duplicate first word".to_string(),
+            ));
+        }
+    }
     let evidence_kind = match runtime_evidence {
         RuntimeEvidenceClass::RealNative => InferenceEvidenceKind::LiveInference,
         RuntimeEvidenceClass::TestFixture => InferenceEvidenceKind::Fixture,
@@ -1476,6 +1509,67 @@ fn build_result(
             )
         })
         .collect()
+}
+
+/// A retry is sampling work, not another copy of the original single draw.
+/// Keep its proposal evidence and deterministic seeds bound to the saved run.
+fn validate_word_choice_output(
+    policy: Option<llama_native_types::FirstWordChoicePolicy>,
+    generation: &GenerationStart,
+    output: &GenerationOutput,
+) -> Result<(), LlamaBackendError> {
+    use llama_native_types::{
+        FIRST_WORD_CHOICE_MAX_ATTEMPTS, FIRST_WORD_CHOICE_MAX_PREFIX_TOKENS,
+        FirstWordChoiceAttemptOutcome as Outcome, complete_first_word_key,
+    };
+    let invalid = || {
+        LlamaBackendError::OutputContract(
+            "first-word selection evidence disagrees with the admitted sampler or output"
+                .to_string(),
+        )
+    };
+    let (policy, evidence) = match (policy, output.first_word_choice.as_ref()) {
+        (None, None) => return Ok(()),
+        (Some(policy), Some(evidence)) if evidence.policy == policy => (policy, evidence),
+        _ => return Err(invalid()),
+    };
+    let seed = u32::try_from(generation.seed).map_err(|_| invalid())?;
+    if evidence.attempts.len() > FIRST_WORD_CHOICE_MAX_ATTEMPTS as usize {
+        return Err(invalid());
+    }
+    let selected = evidence.selected_attempt.map(|index| index as usize);
+    let mut attempted_tokens = output.generated_token_ids.len() as u64;
+    for (index, attempt) in evidence.attempts.iter().enumerate() {
+        let attempt_index = u32::try_from(index).map_err(|_| invalid())?;
+        if attempt.seed != policy.attempt_seed(seed, attempt_index)
+            || attempt.token_ids.len() > FIRST_WORD_CHOICE_MAX_PREFIX_TOKENS as usize
+            || attempt.token_ids.iter().any(|token| *token < 0)
+            || attempt.terminal_token_id.is_some_and(|token| token < 0)
+            || (attempt.outcome == Outcome::Accepted) != (selected == Some(index))
+        {
+            return Err(invalid());
+        }
+        if selected != Some(index) {
+            attempted_tokens += attempt.token_ids.len() as u64;
+        }
+    }
+    if attempted_tokens != evidence.total_attempted_tokens {
+        return Err(invalid());
+    }
+    if let Some(index) = selected {
+        let accepted = evidence.attempts.get(index).ok_or_else(invalid)?;
+        if index + 1 != evidence.attempts.len()
+            || evidence.exhausted
+            || accepted.word_key.is_none()
+            || accepted.word_key != complete_first_word_key(&output.text, true)
+            || !output.generated_token_ids.starts_with(&accepted.token_ids)
+        {
+            return Err(invalid());
+        }
+    } else if !output.text.is_empty() || !output.generated_token_ids.is_empty() {
+        return Err(invalid());
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1510,6 +1604,7 @@ fn build_candidate_material(
         input_contract: writer_input_contract_for_request(request, model),
         context_binding: continuation_context_binding(&request.context_preamble, &request.media)?,
         output: &output,
+        first_word_choices: request.first_word_choices,
         function_input: (request.prompt_recipe.mode == PromptMode::Function).then(|| {
             FunctionInputEvidence {
                 model_chat_template_sha256: model.chat_template_sha256.clone(),
@@ -1755,6 +1850,7 @@ fn build_native_request(
     let contextual_prefix = contextual_manuscript_prefix(request);
     GenerationBatchRequest {
         request_id: request.request_id.clone(),
+        first_word_choices: request.first_word_choices,
         model_id: request.model.model_id.clone(),
         media: request.media.clone(),
         cases: request
@@ -2359,6 +2455,7 @@ mod tests {
             exact_manuscript_prefix: prefix.clone(),
             context_preamble: String::new(),
             media: Vec::new(),
+            first_word_choices: None,
             prompt_recipe: PromptRecipe {
                 mode: PromptMode::Completion,
                 exact_prompt_blob_id: BlobId::digest(prefix.as_bytes()),
@@ -2384,6 +2481,7 @@ mod tests {
             text: " and did not stop.".to_string(),
             generated_token_ids: vec![101, 102],
             token_observations: None,
+            first_word_choice: None,
             state,
             finish_reason: if state == GenerationState::Cancelled {
                 "cancelled".to_string()
@@ -2412,6 +2510,58 @@ mod tests {
             } else {
                 NativeTransport::InProcess
             },
+        }
+    }
+
+    #[test]
+    fn first_word_receipt_binds_retry_seed_cost_and_selected_prefix() {
+        use llama_native_types::{
+            FirstWordChoiceAttempt, FirstWordChoiceAttemptOutcome as Outcome,
+            FirstWordChoiceEvidence, FirstWordChoicePolicy,
+        };
+        let request = request_with_two_cases();
+        let generation = &request.cases[0].generation;
+        let policy = FirstWordChoicePolicy::DistinctV1;
+        let mut output = native_output(&request, 0, GenerationState::Completed, true);
+        output.text = "river bends.".to_string();
+        output.first_word_choice = Some(FirstWordChoiceEvidence {
+            policy,
+            attempts: vec![
+                FirstWordChoiceAttempt {
+                    seed: 41,
+                    token_ids: vec![201, 202],
+                    terminal_token_id: None,
+                    word_key: Some("the".to_string()),
+                    outcome: Outcome::Duplicate,
+                },
+                FirstWordChoiceAttempt {
+                    seed: policy.attempt_seed(41, 1),
+                    token_ids: vec![101],
+                    terminal_token_id: None,
+                    word_key: Some("river".to_string()),
+                    outcome: Outcome::Accepted,
+                },
+            ],
+            selected_attempt: Some(1),
+            total_attempted_tokens: 4,
+            exhausted: false,
+        });
+        validate_word_choice_output(Some(policy), generation, &output).expect("bound retry");
+        assert!(validate_word_choice_output(None, generation, &output).is_err());
+        for change in 0..5 {
+            let mut changed = output.clone();
+            let evidence = changed.first_word_choice.as_mut().expect("evidence");
+            match change {
+                0 => evidence.attempts[1].seed ^= 1,
+                1 => evidence.total_attempted_tokens -= 1,
+                2 => evidence.attempts[1].token_ids[0] = 999,
+                3 => evidence.selected_attempt = Some(0),
+                _ => changed.text = "another word".to_string(),
+            }
+            assert!(
+                validate_word_choice_output(Some(policy), generation, &changed).is_err(),
+                "altered first-word evidence {change} was accepted"
+            );
         }
     }
 
@@ -2582,6 +2732,7 @@ mod tests {
                 &result.context_binding,
                 &result.model,
                 input_index,
+                None,
             )
             .expect("receipt must bind the exact fixture result");
         }
@@ -3304,6 +3455,7 @@ mod tests {
             &expected_context,
             &result.model,
             0,
+            None,
         )
         .expect("the sole case remains index zero with an attachment");
         assert!(
@@ -3315,6 +3467,7 @@ mod tests {
                 &expected_context,
                 &result.model,
                 request.media.len(),
+                None,
             )
             .is_err(),
             "attachment count must never be used as the output case index"
@@ -3330,6 +3483,7 @@ mod tests {
                 &wrong_context,
                 &result.model,
                 0,
+                None,
             )
             .is_err(),
             "correcting the case index must not weaken media identity checks"
@@ -3453,6 +3607,7 @@ mod tests {
                     &result.context_binding,
                     &result.model,
                     index,
+                    None,
                 )
                 .expect("numeric output remains bound to its exact request and token evidence");
                 let streamed = events
@@ -3615,6 +3770,7 @@ mod tests {
                 &result.context_binding,
                 &result.model,
                 0,
+                None,
             )
         };
         validate(candidate, PromptMode::Function).expect("bound function receipt");

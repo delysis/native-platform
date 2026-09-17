@@ -94,6 +94,32 @@ describe('completion controller and editor callback ordering', () => {
       // beside the modifier-only Loompad, even after accepting a word.
       expect(Array.from(document.querySelectorAll<HTMLElement>('.loom-ghost-fan, .source-suggestion-fan'))
         .some(fan => getComputedStyle(fan).display !== 'none' && getComputedStyle(fan).visibility !== 'hidden')).toBe(false);
+
+      // A partial or duplicate refill must not steal a still-usable tail.
+      // A complete fresh family replaces it at the new exact caret, while
+      // reversal still crosses back into the original accepted family.
+      const next = ['silver', 'amber', 'blue', 'green'].map((word, index) => ({
+        candidateId: `refill-${index}`, presentationKey: `refill-${index}:1`,
+        runId: `refill-run-${index}`, targetByte: new TextEncoder().encode(expected).length,
+        text: `${mode === 'visual' ? ' ' : ''}${word} light`, insertsOnAccept: true
+      }));
+      harness.installRefill(next.slice(0, 2));
+      await expect.element(page.getByRole('status', { name: 'Controller Remainder' })).toHaveTextContent('two');
+      harness.installRefill(next.map(candidate => ({ ...candidate, text: next[0].text })));
+      await expect.element(page.getByRole('status', { name: 'Controller Remainder' })).toHaveTextContent('two');
+      harness.installRefill(next.map(candidate => ({ ...candidate, targetByte: candidate.targetByte + 1 })));
+      await expect.element(page.getByRole('status', { name: 'Controller Remainder' })).toHaveTextContent('two');
+      harness.installRefill(next);
+      await expect.poll(() => [...document.querySelectorAll<HTMLButtonElement>('.loompad-choice')]
+        .filter(button => !button.disabled).length).toBe(4);
+      await expect.element(page.getByRole('status', { name: 'Controller Remainder' })).toHaveTextContent('silver light');
+      expect(manuscript()).toBe(expected);
+      await keyboard.keyboard('[KeyA]');
+      await expect.poll(manuscript).toBe(mode === 'visual' ? 'Hello one amber' : 'Hello one amber ');
+      await keyboard.keyboard('{ArrowLeft}');
+      await expect.poll(manuscript).toBe(expected);
+      await keyboard.keyboard('{ArrowLeft}');
+      await expect.poll(manuscript).toBe('Hello');
       await keyboard.keyboard('{/Alt}');
       await keyboard.cleanup();
     }

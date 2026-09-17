@@ -23,9 +23,16 @@ impl Engine {
         if let Some(scope) = state.inference.as_ref().and_then(|service| {
             service.scope(matches!(
                 policy,
-                ValidatedWeavePolicy::AutomaticV2 | ValidatedWeavePolicy::LoompadV1 { .. }
+                ValidatedWeavePolicy::AutomaticV2 | ValidatedWeavePolicy::LoompadV2 { .. }
             ))
         }) {
+            if policy.first_word_choices().is_some() {
+                return Err(IpcFailure::new(
+                    "distinct_words_unavailable",
+                    "This configured writer cannot sample distinct word choices.",
+                    false,
+                ));
+            }
             return Ok(Self::Server { scope, policy });
         }
         AuthorizedWeaveModel::bind(
@@ -616,13 +623,20 @@ mod tests {
                 &state,
             )
         };
+        if matches!(policy, WeavePolicySnapshot::LoompadV2 { .. }) {
+            assert_eq!(start().unwrap_err().code, "distinct_words_unavailable");
+            assert!(calls.lock().unwrap().is_empty());
+            tauri::async_runtime::block_on(service.gateway.shutdown()).unwrap();
+            server.abort();
+            return;
+        }
         assert_eq!(start().unwrap_err().code, "generation_blocked");
         assert!(calls.lock().unwrap().is_empty());
         state.session.lock().unwrap().agency.set_focus_mode(false);
         let started = start().unwrap();
         assert_eq!(
             started.speculation.is_some(),
-            matches!(policy, WeavePolicySnapshot::LoompadV1 { .. })
+            matches!(policy, WeavePolicySnapshot::LoompadV2 { .. })
         );
         if cancel {
             tauri::async_runtime::block_on(async {
@@ -703,10 +717,10 @@ mod tests {
         exercise(true, WeavePolicySnapshot::AutomaticV2 {});
     }
     #[test]
-    fn loompad_uses_suggestion_scope_and_retains_snapshot_authority() {
+    fn loompad_never_relabels_independent_server_draws_as_distinct_words() {
         exercise(
             false,
-            WeavePolicySnapshot::LoompadV1 {
+            WeavePolicySnapshot::LoompadV2 {
                 sample_target: 4,
                 batch_offset: 0,
             },

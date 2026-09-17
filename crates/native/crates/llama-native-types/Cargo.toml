@@ -12,6 +12,8 @@ description = "Stable product-neutral request, event, model and cache DTOs for l
 serde = { workspace = true, features = ["rc"] }
 sha2.workspace = true
 thiserror.workspace = true
+unicode-normalization.workspace = true
+unicode_categories = "0.1.1"
 
 [dev-dependencies]
 serde_json.workspace = true

@@ -285,6 +285,7 @@ mod tests {
 
     fn request(cases: Vec<GenerationCase>) -> GenerationBatchRequest {
         GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "budget".to_string(),
             model_id: "model".to_string(),
             media: Vec::new(),
