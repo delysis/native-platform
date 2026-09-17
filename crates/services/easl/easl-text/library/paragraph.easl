@@ -1,0 +1,158 @@
+; Paragraph-wide minimum-raggedness composition over shaped break opportunities.
+; This module has no host calls, global state, font I/O or Loom dependencies.
+; Advances use a high/low pair so long paragraphs retain subpixel differences.
+(struct TextBreak
+  cluster: u32
+  advance: vec2f
+  trimmed: vec2f
+  hyphen: f32
+  mandatory: u32
+  ; An explicitly indivisible overflow edge may start here. MAX disables it.
+  ; This preserves an oversized shaped cluster without relaxing other edges.
+  overflow-start: u32)
+
+(struct TextPolicy
+  hyphen-penalty: f32
+  consecutive-hyphen-penalty: f32
+  last-line-weight: f32
+  ; Candidate edges plus any position-dependent measurement work.
+  edge-limit: u32)
+
+; status: 0 success, 1 invalid input, 2 no fitting solution, 3 work limit.
+; Output is emitted in reading order, only after a complete solution exists.
+(struct TextComposition
+  status: u32
+  count: u32
+  edges: u32)
+
+(defn text-default-policy []: TextPolicy
+  (TextPolicy 0.05 0.2 0. 1000000u))
+
+(defn text-bounded [value: f32 maximum: f32]: bool
+  (and (>= value 0.) (<= value maximum)))
+
+(defn text-line-advance [start: TextBreak end: TextBreak]: f32
+  (+ (+ (- end.trimmed.x start.advance.x)
+        (- end.trimmed.y start.advance.y))
+     (if (== end.mandatory 0u) end.hyphen 0.)))
+
+; A measurement callback receives point indices and remaining work. Ordinary
+; prefix differences need no extra work. Position-dependent spans charge their
+; traversal to the same budget. text-compose requires monotone measurements as
+; starts move earlier. Use text-compose-contextual when shaping changes widths.
+(struct TextLineMeasure status: u32 advance: f32 work: u32)
+(defn text-prefix-measure [start: TextBreak end: TextBreak]: TextLineMeasure
+  (TextLineMeasure 0u (text-line-advance start end) 0u))
+
+(defn text-compose [n: u32
+                    point-at: (Fn [u32] TextBreak)
+                    measure: (Fn [u32 u32 u32] TextLineMeasure)
+                    width: f32
+                    policy: TextPolicy
+                    emit-break: (Fn [u32 u32] ())]: TextComposition
+  (text-compose-measured n point-at measure width policy true emit-break))
+
+; Contextual shaping can make a longer candidate narrower. Examine all earlier
+; starts within the paragraph/work bound; an overwide suffix cannot prove that
+; every containing line is also overwide. The caller can cache measurements at
+; boundaries proven safe by shaping. It must not substitute whole-paragraph
+; prefix widths for a candidate whose shaping changes at either line edge.
+(defn text-compose-contextual [n: u32
+                               point-at: (Fn [u32] TextBreak)
+                               measure: (Fn [u32 u32 u32] TextLineMeasure)
+                               width: f32 policy: TextPolicy
+                               emit-break: (Fn [u32 u32] ())]: TextComposition
+  (text-compose-measured n point-at measure width policy false emit-break))
+
+(defn text-compose-measured [n: u32
+                             point-at: (Fn [u32] TextBreak)
+                             measure: (Fn [u32 u32 u32] TextLineMeasure)
+                             width: f32 policy: TextPolicy monotone: bool
+                             emit-break: (Fn [u32 u32] ())]: TextComposition
+  (let []
+    (when (or (< n 2u) (> n 4096u))
+      (return (TextComposition 1u 0u 0u)))
+    (when (not (and (> width 0.) (<= width 10000000.)))
+      (return (TextComposition 1u 0u 0u)))
+    (when (or (not (text-bounded policy.hyphen-penalty 100.))
+              (or (not (text-bounded policy.consecutive-hyphen-penalty 100.))
+                  (or (not (text-bounded policy.last-line-weight 100.))
+                      (> policy.edge-limit 1000000u))))
+      (return (TextComposition 1u 0u 0u)))
+    (when (or (!= (.cluster (point-at 0u)) 0u)
+              (or (any (!= (.advance (point-at 0u)) (vec2f 0.)))
+                  (== (.mandatory (point-at (- n 1u))) 0u)))
+      (return (TextComposition 1u 0u 0u)))
+    (for [i n]
+      (let [point (point-at i)
+            advance (+ point.advance.x point.advance.y)
+            trimmed (+ point.trimmed.x point.trimmed.y)]
+        (when (or (not (text-bounded advance 100000000000000.))
+                  (or (not (text-bounded trimmed advance))
+                      (not (text-bounded point.hyphen 100000000000000.))))
+          (return (TextComposition 1u 0u 0u)))
+        (when (and (!= point.overflow-start 4294967295u)
+                   (>= point.overflow-start point.cluster))
+          (return (TextComposition 1u 0u 0u)))
+        (when (> i 0u)
+          (let [before (point-at (- i 1u))]
+            (when (or (<= point.cluster before.cluster)
+                      (< advance (+ before.advance.x before.advance.y)))
+              (return (TextComposition 1u 0u 0u)))))))
+    ; Minimize unavoidable overflow first, then typography cost. A permitted
+    ; indivisible overflow edge is a fallback, never a zero-raggedness shortcut
+    ; that can beat a fitting contextual line. Counts avoid a magic f32 penalty.
+    (let [@var costs: [4096: f32] (zeroed-array)
+          @var overflows: [4096: u32] (zeroed-array)
+          @var previous: [4096: u32] (zeroed-array)
+          @var paragraph-start 0u
+          @var edges 0u]
+      (for [i 1u (< i n) (+= i 1u)]
+        (= (costs i) 1000000000.) (= (overflows i) 4294967295u))
+      (for [end 1u (< end n) (+= end 1u)]
+        (let [point (point-at end)
+              @var start end]
+          (while (> start paragraph-start)
+            (-= start 1u)
+            (+= edges 1u)
+            (when (> edges policy.edge-limit)
+              (return (TextComposition 3u 0u edges)))
+            (let [before (point-at start)
+                  measured (measure start end (- policy.edge-limit edges))
+                  occupied measured.advance]
+              (when (or (== measured.status 3u) (> measured.work (- policy.edge-limit edges)))
+                (return (TextComposition 3u 0u edges)))
+              (+= edges measured.work)
+              (when (or (!= measured.status 0u) (not (<= (abs occupied) 100000000000000.)))
+                (return (TextComposition 1u 0u edges)))
+              (let [overflow (> occupied (+ width 0.01))
+                    overwide (and overflow (!= before.cluster point.overflow-start))]
+              (when (and overwide monotone) (break))
+              (when (and (not overwide) (< (costs start) 1000000000.))
+                (let [slack (/ (max 0. (- width occupied)) width)
+                      hyphen (and (== point.mandatory 0u) (> point.hyphen 0.))
+                      penalty (if hyphen
+                                  (if (> before.hyphen 0.)
+                                      policy.consecutive-hyphen-penalty
+                                      policy.hyphen-penalty)
+                                  0.)
+                      weight (if (== point.mandatory 0u) 1. policy.last-line-weight)
+                      candidate (+ (+ (costs start) (* weight (* slack slack))) penalty)
+                      overflow-count (+ (overflows start) (if overflow 1u 0u))]
+                  (when (or (< overflow-count (overflows end))
+                    (and (== overflow-count (overflows end)) (< candidate (costs end))))
+                    (= (costs end) candidate)
+                    (= (overflows end) overflow-count)
+                    (= (previous end) start)))))))
+          (when (!= point.mandatory 0u) (= paragraph-start end))))
+      (when (>= (costs (- n 1u)) 1000000000.)
+        (return (TextComposition 2u 0u edges)))
+      (let [@var index (- n 1u) @var count 0u
+            @var chosen: [4096: u32] (zeroed-array)]
+        (while (> index 0u)
+          (= (chosen count) (.cluster (point-at index)))
+          (+= count 1u)
+          (= index (previous index)))
+        (for [i count]
+          (emit-break i (chosen (- (- count 1u) i))))
+        (TextComposition 0u count edges)))))

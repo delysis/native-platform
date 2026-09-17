@@ -1,0 +1,33 @@
+(import "editing.easl")
+
+; kind: 0 unhandled, 1 editing command, 2 preedit update, 3 cancel preedit.
+; Text bytes and composition cursor remain in the original TextInputEvent.
+; Navigation/clipboard/history commands are deliberately unhandled here.
+(struct TextInputDecision kind: u32 command: TextEditCommand)
+
+(defn text-input-decision [event: TextInputEvent primary-mask: u32 word-mask: u32]: TextInputDecision
+  (let [none (TextInputDecision 0u (TextEditCommand 0u 0u 0u 0u))
+        primary (!= (& event.modifiers primary-mask) 0u)
+        word (!= (& event.modifiers word-mask) 0u)
+        altgr (and (== primary-mask 2u) (== (& event.modifiers 6u) 6u))]
+    (when (< event.text-end event.text-start) (return none))
+    (when (== event.kind 3u)
+      (return (TextInputDecision 2u (TextEditCommand 0u 0u 0u 0u))))
+    (when (or (== event.kind 5u) (== event.kind 6u))
+      (return (TextInputDecision 3u (TextEditCommand 0u 0u 0u 0u))))
+    (when (== event.kind 0u)
+      ; AltGr may include control+alt. Preserve its committed Unicode text.
+      (when (and primary (not altgr)) (return none))
+      (return (TextInputDecision 1u (TextEditCommand 9u 0u (- event.text-end event.text-start) 0u))))
+    (when (!= event.kind 1u) (return none))
+    ; AltGr's key-down must not trigger a shortcut before its text commit.
+    (when altgr (return none))
+    (when (and primary (== event.key 14u))
+      (return (TextInputDecision 1u (TextEditCommand 0u 0u 0u 0u))))
+    ; Control may be both the shortcut and word modifier on the same platform.
+    (when (and primary (not (and word (== primary-mask word-mask)))) (return none))
+    (when (== event.key 1u)
+      (return (TextInputDecision 1u (TextEditCommand (if word 6u 4u) 0u 0u 0u))))
+    (when (== event.key 2u)
+      (return (TextInputDecision 1u (TextEditCommand (if word 7u 5u) 0u 0u 0u))))
+    none))

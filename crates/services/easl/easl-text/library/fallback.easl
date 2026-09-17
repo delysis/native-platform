@@ -1,0 +1,91 @@
+(import "measure.easl")
+
+; Font selection is EASL policy over actual shaping results. Candidates arrive
+; in preference order. Keep a complete extended grapheme in one font, choosing
+; the fewest .notdef glyphs, with the earlier candidate winning equal scores.
+; An unresolved grapheme remains editable and uses the best available font.
+(struct TextFontChoice font: u32 missing: u32)
+(struct TextFontResult status: u32 count: u32 missing: u32 work: u32)
+(defn text-font-unset []: TextFontChoice (TextFontChoice 4294967295u 4294967295u))
+
+; Facts are the native complete grapheme partition. Glyphs are one contextual
+; span's logical-cluster-order records, relative to span-start. Validate exact
+; coverage, whole-grapheme cluster edges, slots and budget before changing any
+; choice. Only choice-at may alias emit-choice; all other inputs stay immutable.
+; Work counts library inspections, not native font shaping operations.
+(defn text-font-consider [facts: u32 fact-at: (Fn [u32] TextGrapheme)
+                         glyphs: u32 glyph-at: (Fn [u32] FontShapedGlyph)
+                         span-start: u32 span-end: u32 font: u32 capacity: u32
+                         choice-at: (Fn [u32] TextFontChoice)
+                         emit-choice: (Fn [u32 TextFontChoice] ()) budget: u32]: TextRunResult
+  (when (or (> facts 65535u) (or (> glyphs 65535u)
+    (or (< capacity facts) (> budget 1000000u)))) (return (TextRunResult 2u 0u 0u)))
+  (when (or (>= font 64u) (or (> span-start span-end) (> span-end 1048576u)))
+    (return (TextRunResult 1u 0u 0u)))
+  (when (< budget 66u) (return (TextRunResult 2u 0u 66u)))
+  (let [first (text-measure-boundary facts fact-at span-start)
+        after (text-measure-boundary facts fact-at span-end)
+        @var used 0u]
+    (when (or (> first after) (> after facts)) (return (TextRunResult 1u 0u 66u)))
+    (for [pass 2u]
+      (let [@var cursor 0u @var previous 0u @var work 33u]
+        (while (< cursor glyphs)
+          (let [glyph (glyph-at cursor) @var missing 0u]
+            (when (or (!= glyph.start previous) (or (<= glyph.end glyph.start)
+              (> glyph.end (- span-end span-start)))) (return (TextRunResult 1u 0u (* work 2u))))
+            (+= work 33u)
+            (when (> work (/ budget 2u)) (return (TextRunResult 2u 0u (* work 2u))))
+            (let [begin (text-measure-boundary facts fact-at (+ span-start glyph.start))
+                  end (text-measure-boundary facts fact-at (+ span-start glyph.end))]
+              (when (or (>= begin end) (> end after)) (return (TextRunResult 1u 0u (* work 2u))))
+              (while (< cursor glyphs)
+                (let [item (glyph-at cursor)]
+                  (when (!= item.start glyph.start) (break))
+                  (when (!= item.end glyph.end) (return (TextRunResult 1u 0u (* work 2u))))
+                  (+= work 1u)
+                  (when (> work (/ budget 2u)) (return (TextRunResult 2u 0u (* work 2u))))
+                  (when (== item.id 0u) (+= missing 1u)))
+                (+= cursor 1u))
+              (+= work (- end begin))
+              (when (> work (/ budget 2u)) (return (TextRunResult 2u 0u (* work 2u))))
+              (for [i begin (< i end) (+= i 1u)]
+                (let [old (choice-at i)
+                      unset (and (== old.font 4294967295u) (== old.missing 4294967295u))]
+                  (when (not (or unset (and (< old.font 64u) (<= old.missing 65535u))))
+                    (return (TextRunResult 1u 0u (* work 2u))))
+                  (when (and (== pass 1u) (< missing old.missing))
+                    (emit-choice i (TextFontChoice font missing))))))
+            (= previous glyph.end)))
+        (when (!= previous (- span-end span-start)) (return (TextRunResult 1u 0u (* work 2u))))
+        (= used (* work 2u))))
+    (TextRunResult 0u (- after first) used)))
+
+; Coalesce the fully considered logical partition into font/style runs accepted
+; by text-plan-runs. Report unresolved graphemes instead of dropping their text.
+; style-at returns the consumer's style ID for each WHOLE grapheme. Equal font
+; choices must not erase style boundaries. Output must not alias facts, choices
+; or styles. No output is published on a failed check.
+(defn text-font-runs [facts: u32 fact-at: (Fn [u32] TextGrapheme)
+                      choice-at: (Fn [u32] TextFontChoice) style-at: (Fn [u32] u32) capacity: u32
+                      emit-run: (Fn [u32 TextFontRun] ()) budget: u32]: TextFontResult
+  (when (or (> facts 65535u) (> budget 1000000u)) (return (TextFontResult 2u 0u 0u 0u)))
+  (let [work (* 2u facts) @var count 0u @var missing 0u @var previous 0u
+        @var font 4294967295u @var style 0u]
+    (when (> work budget) (return (TextFontResult 2u 0u 0u work)))
+    (for [i facts]
+      (let [fact (fact-at i) choice (choice-at i) next-style (style-at i)]
+        (when (or (!= fact.start previous) (or (<= fact.end fact.start)
+          (or (> fact.end 1048576u) (or (>= choice.font 64u) (> choice.missing 65535u)))))
+          (return (TextFontResult 1u 0u 0u work)))
+        (when (or (!= choice.font font) (!= next-style style))
+          (+= count 1u) (= font choice.font) (= style next-style))
+        (when (> choice.missing 0u) (+= missing 1u))
+        (= previous fact.end)))
+    (when (> count capacity) (return (TextFontResult 2u 0u 0u work)))
+    (let [@var begin 0u @var output 0u]
+      (for [i facts]
+        (when (if (== (+ i 1u) facts) true
+          (or (!= (.font (choice-at i)) (.font (choice-at (+ i 1u)))) (!= (style-at i) (style-at (+ i 1u)))))
+          (emit-run output (TextFontRun (.start (fact-at begin)) (.end (fact-at i)) (.font (choice-at i)) (style-at i)))
+          (+= output 1u) (= begin (+ i 1u)))))
+    (TextFontResult 0u count missing work)))

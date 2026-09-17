@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "source": "https://github.com/notofonts/kawi/releases/tag/NotoSansKawi-v1.000",
+  "reference_commit": "83d11aee7386e271a9810a92bd4ce98b2d8d4325",
+  "archive_url": "https://github.com/notofonts/kawi/releases/download/NotoSansKawi-v1.000/NotoSansKawi-v1.000.zip",
+  "archive_sha256": "a7f2381e3f918fe49e6bca9336ee30e59417707165287ca888fffc6bad16b414",
+  "license": "OFL-1.1",
+  "purpose": "Pinned Kawi shaping regression input. No font modification, no general font quality or language coverage claim.",
+  "files": [
+    {
+      "archive_path": "NotoSansKawi/full/ttf/NotoSansKawi-Regular.ttf",
+      "destination": "crates/services/easl/easl-text/tests/fonts/noto-sans-kawi.ttf",
+      "sha256": "9b096a56d902675f75011f7765a5b7261af942ff09ee5d5ca23ee209d3fd37bd"
+    },
+    {
+      "archive_path": "OFL.txt",
+      "destination": "crates/services/easl/easl-text/tests/fonts/noto-sans-kawi-OFL.txt",
+      "sha256": "13a37d6fb70d8c4c04f2b8452731029208427934ba4151dd1e8221f006950e3d"
+    },
+    {
+      "archive_path": "AUTHORS.txt",
+      "destination": "crates/services/easl/easl-text/tests/fonts/noto-sans-kawi-AUTHORS.txt",
+      "sha256": "6c0709e21c372f7f2cd422b9f60ed81fa193440c81a3cd4a4a6c02c47c3e4f08"
+    }
+  ]
+}

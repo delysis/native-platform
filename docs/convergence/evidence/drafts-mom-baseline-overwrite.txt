@@ -1,0 +1,24 @@
+   Compiling mom-llama-runtime v0.0.0 (/Users/george/.codex/worktrees/native-platform-converge-runs/products/mom/crates/mom-llama-runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.88s
+     Running unittests src/lib.rs (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/target/debug/deps/mom_llama_runtime-daf8a7c308ce043c)
+
+running 1 test
+test attachments::tests::draft_snapshot_interleaving_keeps_both_conversations ... FAILED
+
+failures:
+
+---- attachments::tests::draft_snapshot_interleaving_keeps_both_conversations stdout ----
+
+thread 'attachments::tests::draft_snapshot_interleaving_keeps_both_conversations' (3553787) panicked at products/mom/crates/mom-llama-runtime/src/attachments.rs:4227:9:
+assertion `left == right` failed
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    attachments::tests::draft_snapshot_interleaving_keeps_both_conversations
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 171 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p mom-llama-runtime --lib`

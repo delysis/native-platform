@@ -13,7 +13,17 @@ export const visualMarkdownSchema = new Schema({
       attrs: { terminalSuffix: { default: '' } }
     }
   },
-  marks: markdownSchema.spec.marks.toObject()
+  marks: {
+    ...markdownSchema.spec.marks.toObject(),
+    link: {
+      ...markdownSchema.spec.marks.get('link')!,
+      toDOM(mark) {
+        const attrs: Record<string, string | null> = { href: mark.attrs.href, title: mark.attrs.title };
+        if (/^loom-attachment:[a-f0-9]{64}$/u.test(mark.attrs.href)) attrs['aria-description'] = 'Save original…';
+        return ['a', attrs, 0];
+      }
+    }
+  }
 });
 const parsers = new WeakMap<Schema, MarkdownParser>();
 function parserFor(schema: Schema): MarkdownParser {

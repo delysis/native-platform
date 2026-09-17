@@ -1,0 +1,72 @@
+{
+  "reviewed_main": "8ce8948f3bcfc24df87ed0346801dedc7402feb0",
+  "application_source": "5e320795d7348942fd90dcc1a93ff68cbbeaec54",
+  "local_rustc": "1.95.0 (Homebrew)",
+  "ci_rust_toolchain": "1.92.0",
+  "scope_note": "Full local tests ran on a87c4c1; the only subsequent application change combines identical unsupported-storage match arms. Strict Clippy and native build ran on that final source. Initial SQLite fingerprint assertion and configuration-test compilation/lint failures were repaired before these results; earlier unsuccessful runs are not included as passes.",
+  "checks": [
+    {
+      "check": "rust tests",
+      "passed": 1833,
+      "failed": 0,
+      "ignored": 44,
+      "log_sha256": "233b9e44ae2c330e7d7fe727d8d9d6846bf332bb0df362e826c167a4bf7e86db",
+      "log": "/tmp/mine-vault-workspace-accepted-tests.txt"
+    },
+    {
+      "check": "Rust doctests",
+      "passed": 20,
+      "failed": 0,
+      "ignored": 0,
+      "log_sha256": "981478a0e921af67b6885b7bb5953894266184ac17cbfb231e0469d4635c4e74",
+      "log": "/tmp/mine-vault-workspace-doctests.txt"
+    },
+    {
+      "check": "Loom frontend tests",
+      "files": 64,
+      "passed": 467
+    },
+    {
+      "check": "Loom WebKit components",
+      "files": 15,
+      "passed": 121
+    },
+    {
+      "check": "Svelte diagnostics",
+      "errors": 0,
+      "warnings": 0
+    },
+    {
+      "check": "CI policy Node tests",
+      "passed": 124
+    },
+    {
+      "check": "strict workspace Clippy, all targets and features",
+      "result": "pass",
+      "log": "/tmp/mine-vault-workspace-final-clippy.txt"
+    },
+    {
+      "check": "xtask policy and Information boundaries",
+      "result": "pass"
+    },
+    {
+      "check": "stock SQLite engine identity",
+      "result": "pass",
+      "version": "3.53.2"
+    },
+    {
+      "check": "SQLCipher engine identity under workspace feature unification",
+      "result": "pass",
+      "sqlite_version": "3.51.3",
+      "sqlcipher_version": "4.14.0 community"
+    },
+    {
+      "check": "bounded native executable fixture repair in Mama",
+      "passed": 181,
+      "strict_clippy": "pass",
+      "scope": "overlaps workspace tests; only test fixtures changed; production 128 MiB limit and native/staging/approval validation retained"
+    }
+  ],
+  "native_ui": "pending: computer-use tool reported Mac locked; user unlock requested",
+  "ci": "The first full Linux run on 5e32079 failed 12 oversized-current_exe Mama fixtures. A bounded real native fixture repair passed locally; live remote rerun status is maintained on PR #47."
+}

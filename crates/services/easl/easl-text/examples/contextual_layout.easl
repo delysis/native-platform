@@ -1,0 +1,399 @@
+(import "flow_scene.easl")
+(import "../library/measure.easl")
+
+; Contextual document consumer using the same editor, painter and viewport as
+; the existing multiline scene. All layout/cache decisions below are EASL.
+; The explicit font cascade is immutable between preparations. A font change
+; must invalidate line-prepared and ctx-prepared before another layout.
+(var ctx-prepared: u32) (var ctx-source: TextBuffer)
+(var ctx-facts: [TextGrapheme]) (var ctx-document-facts: [TextGrapheme])
+(var ctx-slots: [TextMeasureSlot]) (var ctx-prefixes: [TextShapedPrefix])
+(var ctx-trims: [u32]) (var ctx-points: [u32]) (var ctx-breaks: [u32])
+(var ctx-cached-glyphs: [FontShapedGlyph]) (var ctx-glyph-first: [u32]) (var ctx-glyph-after: [u32])
+(var ctx-point-count: u32) (var ctx-break-count: u32) (var ctx-emergency: bool) (var ctx-plain: bool)
+@external (var ctx-shapes: u32) @external (var ctx-cache-hits: u32)
+@external (var ctx-preparations: u32) @external (var ctx-measurements: u32)
+(var ctx-positioned: [TextPlacedGlyph]) (var ctx-quads: [TextGlyphQuad])
+(var ctx-quad-fonts: [u32]) (var ctx-quad-colors: [vec4u])
+(var ctx-decorations: [TextDecoration]) (var ctx-decoration-count: u32)
+(var ctx-decoration-ranges: [vec2u]) (var ctx-bottom: f32)
+; Published GPU buffers are separate from staging, including after a late error.
+@{group 0 binding 10 address storage} (var ctx-paint-fonts: [u32])
+@{group 0 binding 11 address storage} (var ctx-paint-colors: [vec4u])
+@{group 0 binding 12 address storage} (var ctx-paint-decorations: [TextDecoration])
+@{group 0 binding 13 address uniform} (var ctx-decoration-first: u32)
+(var ctx-painted-decoration-ranges: [vec2u])
+(var ctx-style-snapshot: [TextStyledSpan]) (var ctx-style-fonts: [u32])
+(var ctx-strut-snapshot: TextRunStyle) (var ctx-strut-font: u32)
+(var ctx-local-styles: [TextStyledSpan])
+(var ctx-clusters: [TextClusterBox])
+@external (var ctx-font-mask: u32) @external (var ctx-missing-glyphs: u32)
+(var ctx-cells: [TextCell]) (var ctx-lines: [TextFlowLine]) (var ctx-index: [TextLineCells])
+(var ctx-quad-count: u32) (var ctx-cluster-count: u32) (var ctx-line-count: u32) (var ctx-extent: f32)
+
+(defn ctx-fact-at [i: u32]: TextGrapheme (ctx-facts i))
+(defn ctx-slot-at [i: u32]: TextMeasureSlot (ctx-slots i))
+(defn ctx-emit-slot [i: u32 item: TextMeasureSlot] (= (ctx-slots i) item))
+(defn ctx-emit-prefix [i: u32 item: TextShapedPrefix] (= (ctx-prefixes i) item))
+(defn ctx-cluster-at [i: u32]: TextClusterBox (ctx-clusters i))
+(defn ctx-cell-at [i: u32]: TextCell (ctx-cells i))
+(defn ctx-emit-cell [i: u32 item: TextCell] (= (ctx-cells i) item))
+(defn ctx-emit-index [i: u32 item: TextLineCells] (= (ctx-index i) item))
+(defn ctx-emit-break [i: u32 item: u32] (= (ctx-breaks i) item))
+(defn ctx-byte [i: u32]: u32
+  (if (== i (array-length ctx-facts)) (text-length ctx-source) (.start (ctx-facts i))))
+(defn ctx-scalar [byte: u32]: u32
+  (let [@var low 0u @var high (array-length line-facts)]
+    (while (< low high)
+      (let [middle (+ low (/ (- high low) 2u))]
+        (if (< (.start (line-facts middle)) byte) (= low (+ middle 1u)) (= high middle))))
+    low))
+(defn ctx-native-shape [run: TextShapeRun]
+  (ctx-native-shape-budget run 1000000u))
+(defn ctx-native-shape-budget [run: TextShapeRun budget: u32]
+  (line-shape-budget ctx-source run budget) (+= ctx-shapes 1u) (+= flow-shapes 1u))
+
+; Cache full-paragraph shaping plus per-grapheme safety/advance facts. The run
+; accumulator accepts visual run order without reversing source or marks.
+; Immutable font/feature/language tables are caller-owned. Compare actual styles
+; and selected font IDs as well as source identity before reusing shaped facts.
+(defn ctx-prepare-styled [value: TextBuffer count: u32 span-at: (Fn [u32] TextStyledSpan)
+    font-for-style: (Fn [TextRunStyle] u32) strut: TextRunStyle]: u32
+  (when (> count 4096u) (return 2u))
+  (let [@var same (and (== ctx-prepared value.handle) (== line-prepared value.handle))]
+    (= same (and same (and (== count (array-length ctx-style-snapshot))
+      (and (text-style-equal strut ctx-strut-snapshot) (== (font-for-style strut) ctx-strut-font)))))
+    (when same
+      (for [i count]
+        (let [a (span-at i) b (ctx-style-snapshot i)]
+          (when (or (!= a.start b.start) (or (!= a.end b.end)
+            (or (not (text-style-equal a.style b.style)) (!= (font-for-style a.style) (ctx-style-fonts i)))))
+            (= same false))))
+      (when same (return 0u))))
+  (= ctx-prepared 0u) (= ctx-source value) (+= ctx-preparations 1u)
+  (let [status (line-prepare-styled value count span-at font-for-style strut)]
+    (when (!= status 0u) (return status)))
+  (= ctx-facts (text-graphemes value))
+  (let [facts (array-length ctx-facts)]
+    (when (>= facts 4096u) (return 2u))
+    (= ctx-trims (zeroed-array (+ facts 1u)))
+    (= ctx-slots (zeroed-array (+ facts 1u))) (= ctx-prefixes (zeroed-array (+ facts 1u)))
+    (= ctx-glyph-first (zeroed-array facts)) (= ctx-glyph-after (zeroed-array facts))
+    (= ctx-cached-glyphs (zeroed-array 4096u))
+    (= ctx-points (zeroed-array (+ facts 1u))) (= ctx-breaks (zeroed-array (+ facts 1u)))
+    (for [i facts]
+      (let [fact (ctx-facts i)]
+        (when (== fact.scalar 173u) (return 4u))
+        (= (ctx-trims (+ i 1u)) (if (== fact.scalar 32u) (ctx-trims i) (+ i 1u)))))
+    (= ctx-plain true)
+    ; L1 can change levels at non-space controls/whitespace near a line end.
+    ; Such paragraphs use exact candidate shaping instead of this fast cache.
+    (for [i (array-length line-directions)]
+      (let [fact (line-directions i)]
+        (when (and (!= fact.reset 0u) (!= fact.scalar 32u)) (= ctx-plain false))))
+    (let [plan (line-plan value 0u (array-length line-facts) 1000000u) @var cached 0u]
+      (when (!= plan.status 0u) (return plan.status))
+      (for [i plan.count]
+        (let [run (line-runs i)]
+          (ctx-native-shape run)
+          (when (!= line-shape-status 0u) (return line-shape-status))
+          (let [glyphs (array-length line-glyphs)]
+            (when (> glyphs (- 4096u cached)) (return 2u))
+            (let [measured (text-measure-run facts ctx-fact-at glyphs line-glyph-at run.start
+                            (+ facts 1u) ctx-slot-at ctx-emit-slot 1000000u)]
+              (when (!= measured.status 0u) (return measured.status)))
+            (let [@var cursor 0u]
+              (while (< cursor glyphs)
+                (let [first (line-glyphs cursor) byte (+ run.start first.start)
+                      boundary (text-measure-boundary facts ctx-fact-at byte)]
+                  (= (ctx-glyph-first boundary) cached)
+                  (while (< cursor glyphs)
+                    (let [glyph (line-glyphs cursor)]
+                      (when (!= glyph.start first.start) (break))
+                      (= (ctx-cached-glyphs cached) (FontShapedGlyph glyph.id (+ run.start glyph.start)
+                        (+ run.start glyph.end) glyph.x glyph.y glyph.advance glyph.flags)))
+                    (+= cursor 1u) (+= cached 1u))
+                  (= (ctx-glyph-after boundary) cached))))))))
+    (let [prefixes (text-measure-prefixes facts ctx-slot-at (+ facts 1u) ctx-emit-prefix)]
+      (when (!= prefixes.status 0u) (return prefixes.status))))
+  (= ctx-style-snapshot (zeroed-array count)) (= ctx-style-fonts (zeroed-array count))
+  (for [i count]
+    (= (ctx-style-snapshot i) (span-at i))
+    (= (ctx-style-fonts i) (font-for-style (.style (span-at i)))))
+  (= ctx-strut-snapshot strut) (= ctx-strut-font (font-for-style strut))
+  (= ctx-prepared value.handle)
+  0u)
+
+(defn ctx-safe [start: u32 end: u32]: bool
+  (and ctx-plain (and (.safe (ctx-prefixes start)) (.safe (ctx-prefixes end)))))
+
+; Copy only complete cached clusters when BOTH edges are shaping-safe. Otherwise
+; shape this run with the actual line's context supplied by the EASL run planner.
+(defn ctx-supply [run: TextShapeRun]
+  (ctx-supply-budget run 1000000u))
+(defn ctx-supply-budget [run: TextShapeRun budget: u32]
+  (let [facts (array-length ctx-facts)
+        begin (text-measure-boundary facts ctx-fact-at run.start)
+        end (text-measure-boundary facts ctx-fact-at run.end)]
+    (if (ctx-safe begin end)
+      (let [@var count 0u]
+        (= line-shape-status 0u) (= line-style-work 0u)
+        (for [i begin (< i end) (+= i 1u)] (+= count (- (ctx-glyph-after i) (ctx-glyph-first i))))
+        (= line-glyphs (zeroed-array count))
+        (= count 0u)
+        (for [i begin (< i end) (+= i 1u)]
+          (for [j (ctx-glyph-first i) (< j (ctx-glyph-after i)) (+= j 1u)]
+            (let [glyph (ctx-cached-glyphs j)]
+              (= (line-glyphs count) (FontShapedGlyph glyph.id (- glyph.start run.start)
+                (- glyph.end run.start) glyph.x glyph.y glyph.advance glyph.flags)))
+            (+= count 1u)))
+        (+= ctx-cache-hits 1u))
+      (ctx-native-shape-budget run budget))))
+
+(defn ctx-point-at [i: u32]: TextBreak
+  (let [end (ctx-points i)]
+    (TextBreak end (.advance (ctx-prefixes end)) (.advance (ctx-prefixes (ctx-trims end))) 0.
+      (if (== (+ i 1u) ctx-point-count) 1u 0u)
+      (if (and ctx-emergency (> end 0u)) (- end 1u) 4294967295u))))
+
+(defn ctx-measure-range [start: u32 end: u32 budget: u32]: TextLineMeasure
+  (let [trim (max start (ctx-trims end))]
+    (when (== start trim) (return (TextLineMeasure 0u 0. 0u)))
+    (when (ctx-safe start trim)
+      (return (let [before (.advance (ctx-prefixes start)) after (.advance (ctx-prefixes trim))]
+        (TextLineMeasure 0u (max 0. (+ (- after.x before.x) (- after.y before.y))) 0u))))
+    (let [begin-byte (ctx-byte start) end-byte (ctx-byte trim) input-work (- end-byte begin-byte)]
+      (when (> input-work budget) (return (TextLineMeasure 3u 0. 0u)))
+      (let [plan (line-plan ctx-source (ctx-scalar begin-byte) (ctx-scalar end-byte) (- budget input-work))
+            @var work (+ plan.work input-work) @var advance (vec2f 0.)]
+        (when (!= plan.status 0u)
+          (return (TextLineMeasure (if (== plan.status 2u) 3u 1u) 0. work)))
+        (for [i plan.count]
+          (ctx-supply-budget (line-runs i) (- budget work))
+          (when (!= line-shape-status 0u)
+            (return (TextLineMeasure (if (== line-shape-status 2u) 3u 1u) 0. work)))
+          (when (> line-style-work (- budget work)) (return (TextLineMeasure 3u 0. work)))
+          (+= work line-style-work)
+          (let [glyphs (array-length line-glyphs)]
+            (when (> glyphs (- budget work)) (return (TextLineMeasure 3u 0. work)))
+            (+= work glyphs)
+            (for [j glyphs] (= advance (text-flow-add advance (.advance (line-glyphs j)))))))
+        (TextLineMeasure 0u (+ advance.x advance.y) work)))))
+(defn ctx-measure [start: u32 end: u32 budget: u32]: TextLineMeasure
+  (+= ctx-measurements 1u)
+  (ctx-measure-range (ctx-points start) (ctx-points end) budget))
+
+(defn ctx-compose [width: f32 emergency: bool budget: u32]: TextComposition
+  (= ctx-emergency emergency) (= ctx-point-count 1u) (= (ctx-points 0u) 0u)
+  (let [facts (array-length ctx-facts) @var monotone ctx-plain]
+    (when (== facts 0u) (= (ctx-breaks 0u) 0u) (return (TextComposition 0u 1u 0u)))
+    (for [i facts]
+      (when (or emergency (or (!= (.break-after (ctx-facts i)) 0u) (== (+ i 1u) facts)))
+        (= (ctx-points ctx-point-count) (+ i 1u)) (+= ctx-point-count 1u)))
+    (for [i ctx-point-count]
+      (let [point (ctx-points i)]
+        (when (not (ctx-safe point point)) (= monotone false))
+        (when (not (ctx-safe (ctx-trims point) (ctx-trims point))) (= monotone false))))
+    (if monotone
+      (text-compose ctx-point-count ctx-point-at ctx-measure width (TextPolicy 0.05 0.2 0. budget) ctx-emit-break)
+      (text-compose-contextual ctx-point-count ctx-point-at ctx-measure width (TextPolicy 0.05 0.2 0. budget) ctx-emit-break))))
+
+(var ctx-work: u32)
+
+; Every selected line is measured and placed with the same exact context/cache
+; decision. Trailing ASCII spaces retain zero-width cells at the visual trailing
+; edge; a paragraph separator is one original-source cell (including CRLF).
+(defn ctx-place-paragraph [value: TextBuffer source-offset: u32 grapheme-offset: u32 separator-end: u32
+    count: u32 span-at: (Fn [u32] TextStyledSpan) font-for-style: (Fn [TextRunStyle] u32)
+    strut: TextRunStyle]: u32
+  (let [prepared (ctx-prepare-styled value count span-at font-for-style strut)]
+    (when (!= prepared 0u) (return prepared)))
+  (let [@var chosen (ctx-compose flow-width false (- 1000000u ctx-work))]
+    (+= ctx-work chosen.edges)
+    (when (== chosen.status 2u)
+      (= chosen (ctx-compose flow-width true (- 1000000u ctx-work))) (+= ctx-work chosen.edges))
+    (when (!= chosen.status 0u) (return (+ 10u chosen.status)))
+    (= ctx-break-count chosen.count))
+  (let [@var start 0u
+        rtl (if (== (array-length line-directions) 0u) false (== (.base (line-directions 0u)) 1u))]
+    (for [i ctx-break-count]
+      (when (>= ctx-line-count 4096u) (return 2u))
+      (let [end (ctx-breaks i) trim (max start (ctx-trims end))
+            last (== (+ i 1u) ctx-break-count)
+            measured (ctx-measure-range start end (- 1000000u ctx-work))]
+        (when (!= measured.status 0u) (return (+ 10u measured.status)))
+        (+= ctx-work measured.work)
+        (let [planned (line-plan value (ctx-scalar (ctx-byte start)) (ctx-scalar (ctx-byte trim))
+                        (- 1000000u ctx-work))]
+          (when (!= planned.status 0u) (return planned.status))
+          (+= ctx-work planned.work))
+        (let [metrics (line-current-metrics) height (+ metrics.ascent metrics.descent)
+              x (+ 40. (if rtl (max 0. (- flow-width measured.advance)) 0.)) y ctx-bottom
+              placed (line-place-with (vec2f x (+ y metrics.ascent)) ctx-line-count source-offset ctx-supply)
+              first-quad ctx-quad-count first-cluster ctx-cluster-count
+              has-separator (and last (> separator-end (+ source-offset (text-length value))))]
+          (when (!= placed 0u) (return placed))
+          (when (or (> (abs (- line-advance measured.advance)) 0.02)
+            (and (> line-advance (+ flow-width 0.02)) (not (and ctx-emergency (== end (+ start 1u))))))
+            (return 1u))
+          (when (or (> line-quad-count (- 4096u ctx-quad-count))
+            (> (+ line-cluster-count (+ (- end trim) 1u)) (- 8192u ctx-cluster-count))) (return 2u))
+          (when (> line-decoration-count (- 8192u ctx-decoration-count)) (return 2u))
+          (= (ctx-decoration-ranges ctx-line-count)
+            (vec2u ctx-decoration-count (+ ctx-decoration-count line-decoration-count)))
+          (for [j line-decoration-count]
+            (= (ctx-decorations ctx-decoration-count) (line-decorations j)) (+= ctx-decoration-count 1u))
+          (+= ctx-missing-glyphs line-missing-glyphs)
+          (for [j line-quad-count]
+            (= (ctx-positioned ctx-quad-count) (line-positioned j))
+            (= (ctx-quad-fonts ctx-quad-count) (line-quad-fonts j))
+            (= (ctx-quad-colors ctx-quad-count) (line-quad-colors j))
+            (= ctx-font-mask (| ctx-font-mask (<< 1u (line-quad-fonts j))))
+            (+= ctx-quad-count 1u))
+          (for [j line-cluster-count]
+            (let [@var cluster (line-clusters j)]
+              (= cluster.bounds.y y) (= cluster.bounds.w height)
+              (= (ctx-clusters ctx-cluster-count) cluster) (+= ctx-cluster-count 1u)))
+          (let [trailing-x (if rtl x (+ x line-advance))]
+            (for [j trim (< j end) (+= j 1u)]
+              (let [fact (ctx-facts j)]
+                (= (ctx-clusters ctx-cluster-count) (TextClusterBox (vec4f trailing-x y 0. height)
+                  (+ source-offset fact.start) (+ source-offset fact.end) ctx-line-count rtl))
+                (+= ctx-cluster-count 1u)))
+            (when has-separator
+              (= (ctx-clusters ctx-cluster-count) (TextClusterBox (vec4f trailing-x y 0. height)
+                (+ source-offset (text-length value)) separator-end ctx-line-count rtl))
+              (+= ctx-cluster-count 1u))
+            (when (== ctx-cluster-count first-cluster)
+              (= (ctx-clusters ctx-cluster-count) (TextClusterBox (vec4f trailing-x y 0. height)
+                (+ source-offset (ctx-byte start)) (+ source-offset (ctx-byte start)) ctx-line-count rtl))
+              (+= ctx-cluster-count 1u)))
+          (= (ctx-lines ctx-line-count) (TextFlowLine (+ source-offset (ctx-byte start))
+            (if has-separator separator-end (+ source-offset (ctx-byte end)))
+            (+ grapheme-offset start) (+ grapheme-offset (+ end (if has-separator 1u 0u)))
+            first-quad ctx-quad-count (vec4f x y line-advance height)))
+          (= ctx-extent (max ctx-extent (+ (- x 40.) line-advance)))
+          (+= ctx-line-count 1u) (+= ctx-bottom height))
+        (= start end))))
+  0u)
+
+; Ordinary UTF-8 document paragraphs share the existing widget contract. Keep
+; quads, line ranges, cells and source identity staged until the whole document
+; validates. A single-paragraph document keeps its cache across width changes;
+; multi-paragraph cache retention is a remaining performance task.
+(defn contextual-layout []: u32
+  (let [body (line-default-style)]
+    (contextual-layout-with false 0u (fn [i] (TextStyledSpan 0u 0u body)) (fn [s] 0u) body)))
+
+; Spans refer to the visible document's original UTF-8 bytes. The caller derives
+; them again after edits/preedit; this view never edits persistent rich content.
+; Gaps use strut, and the existing widget consumes the resulting variable-height
+; cells/index for pointer, caret, selection, scroll and composition placement.
+(defn contextual-layout-styled [count: u32 span-at: (Fn [u32] TextStyledSpan)
+    font-for-style: (Fn [TextRunStyle] u32) strut: TextRunStyle]: u32
+  (contextual-layout-with true count span-at font-for-style strut))
+
+(defn contextual-layout-with [styled: bool count: u32 span-at: (Fn [u32] TextStyledSpan)
+    font-for-style: (Fn [TextRunStyle] u32) strut: TextRunStyle]: u32
+  (+= flow-layouts 1u)
+  (when (not (and (> flow-width 0.) (<= flow-width 10000000.))) (return 1u))
+  (let [source (text-editor-visible demo-editor) bytes (text-length source)]
+    (= ctx-document-facts (text-graphemes source))
+    (when (or (> count 4096u) (>= (array-length ctx-document-facts) 4096u)) (return 2u))
+    (let [validated (text-project-styles bytes count span-at 0u bytes strut 8193u
+                      (fn [i s] ()) 1000000u)]
+      (when (!= validated.status 0u) (return validated.status))
+      (= ctx-work validated.work))
+    (for [i count]
+      (let [span (span-at i) facts (array-length ctx-document-facts)]
+        (when (or (> (text-measure-boundary facts (fn [j] (ctx-document-facts j)) span.start) facts)
+                  (> (text-measure-boundary facts (fn [j] (ctx-document-facts j)) span.end) facts)) (return 4u))))
+    (= ctx-positioned (zeroed-array 4096u)) (= ctx-quad-fonts (zeroed-array 4096u))
+    (= ctx-quad-colors (zeroed-array 4096u)) (= ctx-decorations (zeroed-array 8192u))
+    (= ctx-decoration-ranges (zeroed-array 4096u)) (= ctx-decoration-count 0u) (= ctx-bottom 24.)
+    (= ctx-clusters (zeroed-array 8192u))
+    (= ctx-font-mask 0u) (= ctx-missing-glyphs 0u)
+    (= ctx-lines (zeroed-array 4096u)) (= ctx-cells (zeroed-array 8192u))
+    (= ctx-quad-count 0u) (= ctx-cluster-count 0u) (= ctx-line-count 0u) (= ctx-extent 0.)
+    (let [@var cursor 0u @var start 0u @var grapheme-start 0u]
+      (while true
+        (let [facts (array-length ctx-document-facts)]
+          (while (< cursor facts)
+            (when (== (.break-after (ctx-document-facts cursor)) 2u) (break))
+            (+= cursor 1u))
+          (let [end (if (== cursor facts) bytes (.start (ctx-document-facts cursor)))
+                separator-end (if (== cursor facts) bytes (.end (ctx-document-facts cursor)))
+                whole (and (== start 0u) (== end bytes))
+                paragraph (if whole source (text-slice source start end)) @var local-count 0u]
+            (when styled
+              (= ctx-local-styles (zeroed-array 4096u))
+              (let [projected (text-project-styles bytes count span-at start end strut 4096u
+                    (fn [i s] (= (ctx-local-styles i) s)) (- 1000000u ctx-work))]
+                (when (!= projected.status 0u)
+                  (when (not whole) (text-release paragraph)) (return projected.status))
+                (= local-count projected.count) (+= ctx-work projected.work)))
+            (let [status (ctx-place-paragraph paragraph start grapheme-start separator-end
+                    local-count (fn [i] (ctx-local-styles i)) font-for-style strut)]
+              (when (not whole) (text-release paragraph))
+              (when (!= status 0u) (return status)))
+            (when (== cursor facts) (break))
+            (= start separator-end) (+= cursor 1u) (= grapheme-start cursor)))))
+    (let [cells (text-build-cells source ctx-cluster-count ctx-cluster-at 8192u ctx-emit-cell)]
+      (when (!= cells.status 0u) (return cells.status))
+      (= ctx-index (zeroed-array ctx-line-count))
+      (let [index (text-index-lines cells.count ctx-cell-at ctx-line-count ctx-emit-index)]
+        (when (!= index.status 0u) (return index.status)))
+      (let [status (cascade-prepare-pages ctx-quad-count (fn [i] (ctx-quad-fonts i))
+                     (fn [i] (.id (.glyph (ctx-positioned i)))))]
+        (when (!= status 0u) (return status)))
+      (cascade-publish-pages)
+      (= ctx-quads (zeroed-array ctx-quad-count))
+      (for [i ctx-quad-count]
+        (let [item (ctx-positioned i) font (ctx-quad-fonts i)]
+          (= (ctx-quads i) (text-placed-glyph-quad item (cascade-metric font item.glyph.id) (cascade-size font)))))
+      (= specimen-quads ctx-quads) (= specimen-count ctx-quad-count)
+      (= ctx-paint-fonts ctx-quad-fonts) (= ctx-paint-colors ctx-quad-colors)
+      (= ctx-paint-decorations ctx-decorations) (= ctx-painted-decoration-ranges ctx-decoration-ranges)
+      (= demo-clusters ctx-clusters) (= demo-cells ctx-cells) (= demo-cell-count cells.count)
+      (= flow-lines ctx-lines) (= flow-line-count ctx-line-count) (= flow-index ctx-index)
+      (= flow-extent ctx-extent) (= demo-source source)))
+  0u)
+
+; One glyph draw retains visual order across fonts and colors. Decorations use
+; their line ranges, so both streams only submit visible lines and share scroll.
+(struct ContextualGlyphVertex @{builtin position} clip: vec4f @{location 0} uv: vec2f
+  @{location 1 interpolate flat} font: u32 @{location 2} color: vec4f)
+(struct ContextualDecorationVertex @{builtin position} clip: vec4f @{location 0} color: vec4f)
+@vertex
+(defn contextual-glyph-vertex []: ContextualGlyphVertex
+  (let [index (vertex-index) at (+ flow-quad-first (/ index 6u))
+        quad (flow-screen-quad (specimen-quads at)) corner (text-quad-corner index)]
+    (ContextualGlyphVertex (text-quad-position quad corner demo-viewport)
+      (text-quad-uv quad corner) (ctx-paint-fonts at) (/ (vec4f (ctx-paint-colors at)) 255.))))
+@fragment
+(defn contextual-glyph-fragment [input: ContextualGlyphVertex]: @{location 0} vec4f
+  (let [primary (.w (texture-sample specimen-font specimen-sampler input.uv))
+        second (.w (texture-sample cascade-second specimen-sampler input.uv))
+        third (.w (texture-sample cascade-third specimen-sampler input.uv))
+        coverage (match input.font 0u primary 1u second _ third)]
+    (vec4f input.color.xyz (* input.color.w coverage))))
+@vertex
+(defn contextual-decoration-vertex []: ContextualDecorationVertex
+  (let [index (vertex-index) d (ctx-paint-decorations (+ ctx-decoration-first (/ index 6u)))
+        quad (flow-screen-quad (TextGlyphQuad d.bounds (vec4f 0.) 0u 0u))]
+    (ContextualDecorationVertex (text-quad-position quad (text-quad-corner index) demo-viewport)
+      (/ (vec4f d.color) 255.))))
+@fragment
+(defn contextual-decoration-fragment [input: ContextualDecorationVertex]: @{location 0} vec4f input.color)
+@cpu
+(defn contextual-draw []
+  (flow-draw-before)
+  (when (< flow-visible.x flow-visible.y)
+    (= flow-quad-first (.quad-start (flow-lines flow-visible.x)))
+    (= ctx-decoration-first (.x (ctx-painted-decoration-ranges flow-visible.x)))
+    (let [last (.quad-end (flow-lines (- flow-visible.y 1u)))
+          after (.y (ctx-painted-decoration-ranges (- flow-visible.y 1u)))]
+      (dispatch-render-shaders contextual-glyph-vertex contextual-glyph-fragment (* (- last flow-quad-first) 6u) 2u)
+      (dispatch-render-shaders contextual-decoration-vertex contextual-decoration-fragment
+        (* (- after ctx-decoration-first) 6u) 2u)))
+  (flow-draw-after))

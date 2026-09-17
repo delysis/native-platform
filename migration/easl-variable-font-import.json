@@ -1,0 +1,21 @@
+{
+  "repository": "https://github.com/arrowtype/shantell-sans",
+  "commit": "43932aa9375e60fbcb930b0f865f2f60eae9d206",
+  "purpose": "Unmodified OFL variable outline font fixture for EASL face, weight, italic and shared shaping/raster instance verification",
+  "files": [
+    {
+      "source_path": "fonts/Shantell Sans/Desktop/ShantellSans[BNCE,INFM,SPAC,ital,wght].ttf",
+      "path": "crates/services/easl/easl-text/tests/fonts/shantell-sans-variable.ttf",
+      "bytes": 2036676,
+      "sha256": "fbcd62f1c48f1d2cdf3f988f600c18137a4e42744370caf950c99d3b27567d25",
+      "url": "https://raw.githubusercontent.com/arrowtype/shantell-sans/43932aa9375e60fbcb930b0f865f2f60eae9d206/fonts/Shantell%20Sans/Desktop/ShantellSans%5BBNCE%2CINFM%2CSPAC%2Cital%2Cwght%5D.ttf"
+    },
+    {
+      "source_path": "OFL.txt",
+      "path": "crates/services/easl/easl-text/tests/fonts/shantell-sans-variable-OFL.txt",
+      "bytes": 4397,
+      "sha256": "ebfce7d104d597c385b71e9fbf8f0e2034e73320f857086105dc265b82c05caa",
+      "url": "https://raw.githubusercontent.com/arrowtype/shantell-sans/43932aa9375e60fbcb930b0f865f2f60eae9d206/OFL.txt"
+    }
+  ]
+}

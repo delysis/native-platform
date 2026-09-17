@@ -45,7 +45,36 @@ fn check_policy(root: &Path) -> Result<()> {
     Ok(())
 }
 
+// EASL is a runtime dependency; the separate Studio application must not ship.
+fn check_easl_runtime_boundary(root: &Path) -> Result<()> {
+    for path in [
+        "crates/services/easl/vendor/easl-studio",
+        "crates/services/easl/vendor/cast",
+        "crates/services/easl/vendor/hollow-rs",
+        "crates/services/easl/easl-native-host",
+    ] {
+        ensure!(
+            !root.join(path).exists(),
+            "removed Studio source is present: {path}"
+        );
+    }
+    let lock: toml::Value =
+        toml::from_str(&read_text(&root.join("Cargo.lock"))?).context("parse root Cargo.lock")?;
+    for package in lock["package"].as_array().context("lockfile packages")? {
+        let name = package["name"].as_str().context("lockfile package name")?;
+        ensure!(
+            !matches!(
+                name,
+                "easl_studio" | "cast_visualizer" | "hollow" | "easl-native-host"
+            ),
+            "Studio dependency is forbidden in the native EASL stack: {name}"
+        );
+    }
+    Ok(())
+}
+
 fn check_workspace(root: &Path) -> Result<()> {
+    check_easl_runtime_boundary(root)?;
     let cargo_text = read_text(&root.join("Cargo.toml"))?;
     let cargo: toml::Value = toml::from_str(&cargo_text).context("parse root Cargo.toml")?;
     ensure!(cargo["workspace"]["resolver"].as_str() == Some("3"));
@@ -63,9 +92,13 @@ fn check_workspace(root: &Path) -> Result<()> {
                         "crates/services/attachment/fuzz",
                         "vendor/glib",
                         "vendor/ort-sys",
+                        "crates/services/easl/vendor/easl",
+                        "crates/services/easl/vendor/fsexp",
+                        "crates/services/easl/vendor/harfrust",
+                        "crates/services/easl/vendor/parley",
                     ])
             }),
-        "only the Attachment fuzz workspace and patched external GLib/ort-sys crates may be excluded"
+        "only registered external vendor packages and the Attachment fuzz workspace may be excluded"
     );
 
     let output = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
@@ -133,6 +166,7 @@ fn check_workspace(root: &Path) -> Result<()> {
                 root.join("crates/services/attachment/fuzz/Cargo.lock"),
                 // Published dependency source; the root lock resolves this patch.
                 root.join("vendor/ort-sys/Cargo.lock"),
+                root.join("crates/services/easl/vendor/harfrust/Cargo.lock"),
             ]),
         "unknown nested Cargo lock"
     );
@@ -190,6 +224,7 @@ fn check_package_groups(
                 "native",
                 "gateway",
                 "service-attachment",
+                "service-easl",
                 "service-information",
                 "service-speech",
                 "product-fte",
@@ -339,6 +374,7 @@ mod tests {
             "native",
             "gateway",
             "service-attachment",
+            "service-easl",
             "service-information",
             "service-speech",
             "product-fte",

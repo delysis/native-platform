@@ -1,0 +1,1348 @@
+use std::collections::{HashMap, HashSet};
+
+use std::sync::{Arc, RwLock};
+
+use take_mut::take;
+
+use crate::compiler::entry::BuiltinIOAttribute;
+use crate::compiler::expression::compile_typed_name;
+use crate::compiler::types::AbstractArraySize;
+use crate::vm::compile::BytecodeCompilationState;
+use crate::{
+  Never,
+  compiler::{
+    annotation::FunctionAnnotation,
+    effects::{Effect, EffectCache, EffectType},
+    entry::{EntryPoint, IOAttributes},
+    enums::AbstractEnum,
+    expression::{Exp, arg_list_and_return_type_from_easl_tree},
+    program::{CompilerTarget, NameContext, TypeDefs},
+    structs::AbstractStructField,
+    types::{
+      ConstGenericValue, GenericArgument, Variable, VariableKind,
+      parse_generic_argument,
+    },
+    util::compile_word,
+    vars::VariableAddressSpace,
+  },
+  parse::EaslTree,
+};
+
+use super::{
+  annotation::Annotation,
+  error::{
+    CompileError, CompileErrorKind::*, CompileResult, ErrorLog, SourceTrace,
+    err,
+  },
+  expression::{ExpKind, ExpressionCompilationPosition, TypedExp},
+  program::Program,
+  structs::AbstractStruct,
+  types::{AbstractType, ExpTypeInfo, Type, TypeConstraint, TypeState},
+  util::indent,
+};
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionArgumentAnnotation {
+  pub var: bool,
+  pub ownership: Ownership,
+  pub attributes: IOAttributes,
+}
+
+impl FunctionArgumentAnnotation {
+  pub fn empty(arg_source_trace: SourceTrace) -> Self {
+    Self {
+      var: false,
+      ownership: Ownership::Owned,
+      attributes: IOAttributes::empty(arg_source_trace),
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopLevelFunction {
+  pub name_source_trace: SourceTrace,
+  pub arg_names: Vec<(Arc<str>, SourceTrace)>,
+  pub arg_annotations: Vec<FunctionArgumentAnnotation>,
+  pub return_attributes: IOAttributes,
+  pub entry_point: Option<EntryPoint>,
+  pub expression: TypedExp,
+}
+
+#[derive(Debug, Clone)]
+pub enum FunctionImplementationKind {
+  Builtin {
+    effect_type: EffectType,
+    target_configuration: FunctionTargetConfiguration,
+    target_specific_emulations: HashSet<CompilerTarget>,
+  },
+  StructConstructor,
+  EnumConstructor(Arc<str>),
+  Composite(Arc<RwLock<TopLevelFunction>>),
+}
+impl PartialEq for FunctionImplementationKind {
+  fn eq(&self, other: &Self) -> bool {
+    match (self, other) {
+      (
+        FunctionImplementationKind::Builtin {
+          effect_type: a_et,
+          target_configuration: a_tc,
+          target_specific_emulations: a_tse,
+        },
+        FunctionImplementationKind::Builtin {
+          effect_type: b_et,
+          target_configuration: b_tc,
+          target_specific_emulations: b_tse,
+        },
+      ) => a_et == b_et && a_tc == b_tc && a_tse == b_tse,
+      (
+        FunctionImplementationKind::StructConstructor,
+        FunctionImplementationKind::StructConstructor,
+      ) => true,
+      (
+        FunctionImplementationKind::EnumConstructor(a),
+        FunctionImplementationKind::EnumConstructor(b),
+      ) => a == b,
+      (
+        FunctionImplementationKind::Composite(a),
+        FunctionImplementationKind::Composite(b),
+      ) => *a.read().unwrap() == *b.read().unwrap(),
+      _ => false,
+    }
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Ownership {
+  Owned,
+  Reference,
+  MutableReference,
+  Pointer(VariableAddressSpace),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecialCasedBuiltinFunction {
+  Print,
+  ZeroedArray,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionTargetConfiguration {
+  Default,
+  SpecialCased(SpecialCasedBuiltinFunction),
+  BuiltinAttributeLookup(BuiltinIOAttribute),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AbstractFunctionSignature {
+  pub name: Arc<str>,
+  pub generic_args: Vec<(Arc<str>, GenericArgument, SourceTrace)>,
+  pub arg_types: Vec<(AbstractType, Ownership)>,
+  pub return_type: AbstractType,
+  pub implementation: FunctionImplementationKind,
+  pub associative: bool,
+  pub captured_scope: Option<AbstractStruct>,
+  pub entry_point: Option<EntryPoint>,
+}
+
+impl Default for AbstractFunctionSignature {
+  fn default() -> Self {
+    Self {
+      name: "".into(),
+      generic_args: vec![],
+      arg_types: vec![],
+      return_type: AbstractType::Unit,
+      implementation: FunctionImplementationKind::Builtin {
+        effect_type: EffectType::empty(),
+        target_configuration: FunctionTargetConfiguration::Default,
+        target_specific_emulations: HashSet::new(),
+      },
+      associative: false,
+      captured_scope: None,
+      entry_point: None,
+    }
+  }
+}
+
+pub fn is_vec_name(name: &str) -> bool {
+  matches!(
+    name,
+    "vec2"
+      | "vec3"
+      | "vec4"
+      | "vec2f"
+      | "vec3f"
+      | "vec4f"
+      | "vec2i"
+      | "vec3i"
+      | "vec4i"
+      | "vec2u"
+      | "vec3u"
+      | "vec4u"
+      | "vec2b"
+      | "vec3b"
+      | "vec4b"
+  )
+}
+
+pub fn extract_vec_size(name: &str) -> Option<usize> {
+  match name {
+    "vec2" | "vec2f" | "vec2i" | "vec2u" | "vec2b" => Some(2usize),
+    "vec3" | "vec3f" | "vec3i" | "vec3u" | "vec3b" => Some(3usize),
+    "vec4" | "vec4f" | "vec4i" | "vec4u" | "vec4b" => Some(4usize),
+    _ => None,
+  }
+}
+
+pub fn extract_mat_size(name: &str) -> Option<(usize, usize)> {
+  if name.len() < 6 || !name.starts_with("mat") {
+    return None;
+  }
+  let bytes = name.as_bytes();
+  if bytes[4] != b'x' {
+    return None;
+  }
+  let cols = (bytes[3] as char).to_digit(10)? as usize;
+  let rows = (bytes[5] as char).to_digit(10)? as usize;
+  if !(2..=4).contains(&cols) || !(2..=4).contains(&rows) {
+    return None;
+  }
+  if name.len() > 6 {
+    if name.len() > 7 {
+      return None;
+    }
+    match bytes[6] {
+      b'f' | b'i' | b'u' => {}
+      _ => return None,
+    }
+  }
+  Some((cols, rows))
+}
+
+impl AbstractFunctionSignature {
+  pub fn is_builtin_vector_constructor(&self) -> bool {
+    matches!(
+      &self.implementation,
+      FunctionImplementationKind::Builtin { .. }
+    ) && is_vec_name(&*self.name)
+  }
+  pub fn reference_arg_positions(&self) -> Vec<usize> {
+    self
+      .arg_types
+      .iter()
+      .enumerate()
+      .filter_map(|(i, (_, ownership))| match ownership {
+        Ownership::Reference | Ownership::MutableReference => Some(i),
+        _ => None,
+      })
+      .collect()
+  }
+  pub fn remove_unitlike_arguments(&mut self, names: &mut NameContext) {
+    let mut arg_types = self.arg_types.clone();
+    if let FunctionImplementationKind::Composite(implementation) =
+      &self.implementation
+    {
+      let mut implementation = implementation.write().unwrap();
+      loop {
+        let mut changed = false;
+        for i in 0..arg_types.len() {
+          if arg_types[i].0.is_unitlike(names) {
+            arg_types.remove(i);
+            let ExpKind::Function(arg_names, _) =
+              &mut implementation.expression.kind
+            else {
+              panic!()
+            };
+            arg_names.remove(i);
+            implementation.expression.data.as_known_mut(|t| match t {
+              Type::Function(function_signature) => {
+                function_signature.args.remove(i);
+              }
+              _ => {}
+            });
+            changed = true;
+            break;
+          }
+        }
+        if !changed {
+          break;
+        }
+      }
+    }
+    self.arg_types = arg_types;
+  }
+  pub fn inline_def_array_sizes(
+    &mut self,
+    u32_constants: &HashMap<Arc<str>, u32>,
+  ) {
+    for (arg_type, _) in self.arg_types.iter_mut() {
+      arg_type
+        .walk_mut(&mut |t| {
+          match t {
+            AbstractType::AbstractArray { size, .. } => {
+              if let AbstractArraySize::Constant(constant_name) = size
+                && let Some(n) = u32_constants.get(constant_name)
+              {
+                *size = AbstractArraySize::Literal(*n);
+              }
+            }
+            AbstractType::Type(t) => t.inline_def_array_sizes(u32_constants),
+            _ => {}
+          }
+          Ok::<bool, Never>(true)
+        })
+        .unwrap();
+    }
+    self
+      .return_type
+      .walk_mut(&mut |t| {
+        match t {
+          AbstractType::AbstractArray { size, .. } => {
+            if let AbstractArraySize::Constant(constant_name) = size
+              && let Some(n) = u32_constants.get(constant_name)
+            {
+              *size = AbstractArraySize::Literal(*n);
+            }
+          }
+          AbstractType::Type(t) => t.inline_def_array_sizes(u32_constants),
+          _ => {}
+        }
+        Ok::<bool, Never>(true)
+      })
+      .unwrap();
+  }
+  pub fn representative_type(&self, names: &mut NameContext) -> AbstractStruct {
+    if let Some(captured_scope) = &self.captured_scope {
+      return captured_scope.clone();
+    }
+    let name = names
+      .get_monomorphized_name(self.name.clone(), vec!["Representative".into()]);
+    let source_trace = match &self.implementation {
+      FunctionImplementationKind::Composite(f) => {
+        f.read().unwrap().name_source_trace.clone()
+      }
+      _ => SourceTrace::empty(),
+    };
+    AbstractStruct {
+      name: (name.clone(), source_trace.clone()),
+      filled_generics: HashMap::new(),
+      fields: vec![AbstractStructField {
+        attributes: IOAttributes::empty(source_trace.clone()),
+        name,
+        field_type: AbstractType::Unit,
+        source_trace: source_trace.clone(),
+      }],
+      generic_args: vec![],
+      abstract_ancestor: None,
+      source_trace,
+      opaque: false,
+    }
+  }
+  pub(crate) fn from_defn_ast(
+    mut children_iter: impl Iterator<Item = EaslTree>,
+    first_child_source_trace: SourceTrace,
+    parens_source_trace: SourceTrace,
+    annotation: Option<Annotation>,
+    program: &Program,
+    errors: &mut ErrorLog,
+  ) -> Option<Self> {
+    use crate::parse::Encloser::*;
+    use fsexp::syntax::EncloserOrOperator::*;
+    let Some(name_ast) = children_iter.next() else {
+      errors.log(CompileError::new(
+        InvalidDefn("Missing Name".into()),
+        parens_source_trace.clone(),
+      ));
+      return None;
+    };
+    let fn_and_generic_names: Option<(
+      Arc<str>,
+      SourceTrace,
+      Vec<(Arc<str>, GenericArgument, SourceTrace)>,
+    )> = match name_ast {
+      EaslTree::Leaf(pos, name) => Some((name.into(), pos.into(), vec![])),
+      EaslTree::Inner((_, Encloser(Parens)), subtrees) => {
+        let mut subtrees_iter = subtrees.into_iter();
+        if let Some(EaslTree::Leaf(pos, name)) = subtrees_iter.next() {
+          match subtrees_iter
+            .map(|subtree| {
+              parse_generic_argument(subtree, &program.typedefs, &vec![])
+            })
+            .collect::<CompileResult<Vec<_>>>()
+          {
+            Ok(generic_args) => Some((name.into(), pos.into(), generic_args)),
+            Err(e) => {
+              errors.log(e);
+              None
+            }
+          }
+        } else {
+          errors.log(CompileError::new(
+            InvalidDefn("Invalid name".into()),
+            first_child_source_trace,
+          ));
+          None
+        }
+      }
+      _ => {
+        errors.log(CompileError::new(
+          InvalidDefn(
+            "Expected name or parens with name and generic arguments".into(),
+          ),
+          first_child_source_trace,
+        ));
+        None
+      }
+    };
+    let Some((fn_name, fn_name_source, generic_args)) = fn_and_generic_names
+    else {
+      return None;
+    };
+    let Some(arg_list_ast) = children_iter.next() else {
+      errors.log(CompileError::new(
+        InvalidDefn("Missing Argument List".into()),
+        parens_source_trace.clone(),
+      ));
+      return None;
+    };
+    let skolems = generic_args
+      .iter()
+      .map(|(name, arg, _)| (name.clone(), arg.type_constraints()))
+      .collect();
+
+    if let Some((
+      source_path,
+      arg_names,
+      arg_types,
+      arg_annotations,
+      return_info,
+    )) = arg_list_and_return_type_from_easl_tree(
+      arg_list_ast,
+      &program.typedefs,
+      &skolems,
+      errors,
+    ) {
+      let arg_types: Vec<AbstractType> = match arg_types
+        .into_iter()
+        .map(|x| {
+          x.ok_or_else(|| {
+            CompileError::new(FunctionArgMissingType, source_path.clone())
+          })
+        })
+        .collect::<CompileResult<Vec<_>>>()
+      {
+        Ok(t) => t,
+        Err(e) => {
+          errors.log(e);
+          return None;
+        }
+      };
+      let (return_type, return_source, return_annotation) = return_info
+        .unwrap_or_else(|| (AbstractType::Unit, source_path.clone(), None));
+      match return_type.concretize(
+        &skolems,
+        &program.typedefs,
+        source_path.clone().into(),
+      ) {
+        Ok(concrete_return_type) => {
+          match arg_types
+            .iter()
+            .zip(arg_annotations.iter())
+            .map(|(t, annotation)| {
+              let ownership = annotation.ownership;
+              let mut typestate: ExpTypeInfo = t
+                .concretize(
+                  &skolems,
+                  &program.typedefs,
+                  source_path.clone().into(),
+                )?
+                .known()
+                .into();
+              typestate.ownership = ownership;
+              Ok((
+                (
+                  Variable {
+                    var_type: typestate,
+                    kind: if annotation.var {
+                      VariableKind::Var
+                    } else {
+                      VariableKind::Let
+                    },
+                  },
+                  if let AbstractType::Generic(generic_name) = t {
+                    generic_args
+                      .iter()
+                      .find_map(|(name, generic_arg, _)| {
+                        if let GenericArgument::Type(constraints) = generic_arg
+                          && generic_name == name
+                        {
+                          Some(constraints.clone())
+                        } else {
+                          None
+                        }
+                      })
+                      .unwrap_or(vec![])
+                  } else {
+                    vec![]
+                  },
+                ),
+                ownership,
+              ))
+            })
+            .collect::<CompileResult<(
+              Vec<(Variable, Vec<TypeConstraint>)>,
+              Vec<Ownership>,
+            )>>() {
+            Ok((concrete_args, arg_ownerships)) => {
+              match TypedExp::function_from_body_tree(
+                source_path.clone(),
+                children_iter.collect(),
+                concrete_return_type.known().into(),
+                arg_names.clone(),
+                concrete_args,
+                &program.typedefs,
+                &skolems,
+                &mut program.names.write().unwrap(),
+              ) {
+                Ok(expression) => {
+                  let parsed_annotation = if let Some(annotation) = &annotation
+                  {
+                    match annotation.validate_as_function_annotation() {
+                      Ok(is_associative) => is_associative,
+                      Err(e) => {
+                        errors.log(e);
+                        FunctionAnnotation::default()
+                      }
+                    }
+                  } else {
+                    FunctionAnnotation::default()
+                  };
+                  let return_attributes =
+                    if let Some(return_annotation) = return_annotation {
+                      let (attributes, residual) =
+                        IOAttributes::parse_from_annotation(
+                          return_annotation,
+                          None,
+                          errors,
+                        );
+                      if !residual.is_empty() {
+                        errors.log(CompileError {
+                          kind: InvalidReturnAnnotations,
+                          source_trace: source_path.clone(),
+                        });
+                      }
+                      attributes
+                    } else {
+                      IOAttributes::empty(return_source)
+                    };
+                  let implementation = FunctionImplementationKind::Composite(
+                    Arc::new(RwLock::new(TopLevelFunction {
+                      name_source_trace: fn_name_source,
+                      arg_names,
+                      arg_annotations,
+                      return_attributes,
+                      entry_point: parsed_annotation.entry,
+                      expression,
+                    })),
+                  );
+                  return Some(AbstractFunctionSignature {
+                    name: fn_name,
+                    generic_args,
+                    arg_types: arg_types
+                      .into_iter()
+                      .zip(arg_ownerships)
+                      .collect(),
+                    return_type,
+                    implementation,
+                    associative: parsed_annotation.associative,
+                    entry_point: parsed_annotation.entry,
+                    captured_scope: None,
+                  });
+                }
+                Err(e) => errors.log(e),
+              }
+            }
+            Err(e) => {
+              errors.log(e);
+            }
+          }
+        }
+        Err(e) => {
+          errors.log(e);
+        }
+      }
+    }
+    None
+  }
+  pub(crate) fn has_uninlined_higher_order_arguments(&self) -> bool {
+    self.arg_types.iter().any(|(t, _)| {
+      if let AbstractType::Type(Type::Function(f)) = t
+        && f.abstract_ancestor.is_none()
+      {
+        true
+      } else {
+        false
+      }
+    })
+  }
+  pub(crate) fn normalized_signature(
+    &self,
+  ) -> (Vec<Vec<TypeConstraint>>, Vec<AbstractType>, AbstractType) {
+    let mut used_generic_names = vec![];
+    for (t, _) in self.arg_types.iter() {
+      t.track_generic_names(&mut used_generic_names);
+    }
+    self
+      .return_type
+      .track_generic_names(&mut used_generic_names);
+    let generic_name_order: Vec<Arc<str>> = {
+      let mut duplicate_generic_names = HashSet::new();
+      used_generic_names
+        .into_iter()
+        .filter_map(|name| {
+          if duplicate_generic_names.contains(&name) {
+            None
+          } else {
+            duplicate_generic_names.insert(name.clone());
+            Some(name)
+          }
+        })
+        .collect()
+    };
+    let ordered_type_constraints: Vec<Vec<TypeConstraint>> = generic_name_order
+      .iter()
+      .map(|name| {
+        self
+          .generic_args
+          .iter()
+          .find_map(|(generic_name, generic_arg, _)| {
+            if let GenericArgument::Type(constraints) = generic_arg
+              && generic_name == name
+            {
+              Some(constraints.clone())
+            } else {
+              None
+            }
+          })
+          .unwrap()
+      })
+      .collect();
+    let rename_generics = |mut t: AbstractType| {
+      for (i, name) in generic_name_order.iter().enumerate() {
+        t = t.rename_generic(name, &format!("{i}"));
+      }
+      t
+    };
+    (
+      ordered_type_constraints,
+      self
+        .arg_types
+        .iter()
+        .map(|(t, _)| rename_generics(t.clone()))
+        .collect(),
+      rename_generics(self.return_type.clone()),
+    )
+  }
+  pub fn arg_names(
+    &self,
+    source_trace: &SourceTrace,
+  ) -> CompileResult<Vec<(Arc<str>, SourceTrace)>> {
+    if let FunctionImplementationKind::Composite(f) = &self.implementation {
+      Ok(f.read().unwrap().arg_names.clone())
+    } else {
+      err(ExpectedCompositeFunction, source_trace.clone())
+    }
+  }
+  pub fn arg_annotations(
+    &self,
+    source_trace: SourceTrace,
+  ) -> CompileResult<Vec<FunctionArgumentAnnotation>> {
+    if let FunctionImplementationKind::Composite(f) = &self.implementation {
+      Ok(f.read().unwrap().arg_annotations.clone())
+    } else {
+      err(ExpectedCompositeFunction, source_trace)
+    }
+  }
+  pub fn implementation(
+    &self,
+    source_trace: SourceTrace,
+  ) -> CompileResult<TopLevelFunction> {
+    if let FunctionImplementationKind::Composite(f) = &self.implementation {
+      Ok(f.read().unwrap().clone())
+    } else {
+      err(ExpectedCompositeFunction, source_trace)
+    }
+  }
+  pub fn generate_monomorphized(
+    &self,
+    arg_types: Vec<Type>,
+    return_type: Type,
+    base_program: &Program,
+    new_program: &mut Program,
+    target: CompilerTarget,
+    source_trace: SourceTrace,
+  ) -> CompileResult<Self> {
+    let mut monomorphized = self.clone();
+    let mut generic_type_bindings = HashMap::new();
+    let mut generic_constant_bindings = HashMap::new();
+    for i in 0..self.arg_types.len() {
+      self.arg_types[i].0.extract_generic_bindings(
+        &arg_types[i],
+        &mut generic_type_bindings,
+        &mut generic_constant_bindings,
+      );
+    }
+    self.return_type.extract_generic_bindings(
+      &return_type,
+      &mut generic_type_bindings,
+      &mut generic_constant_bindings,
+    );
+    let generic_arg_names = self
+      .generic_args
+      .iter()
+      .map(|(arg, generic_arg, _)| match generic_arg {
+        GenericArgument::Type(bounds) => {
+          let generic_type = generic_type_bindings.get(arg).unwrap();
+          if let Some(unsatisfied_bound) = bounds
+            .iter()
+            .find(|constraint| !generic_type.satisfies_constraint(constraint))
+          {
+            err(
+              UnsatisfiedTypeConstraint(unsatisfied_bound.clone().into()),
+              source_trace.clone(),
+            )
+          } else {
+            Ok(
+              generic_type
+                .monomorphized_name(
+                  &mut new_program.names.write().unwrap(),
+                  target,
+                )
+                .into(),
+            )
+          }
+        }
+        GenericArgument::Constant => match generic_constant_bindings.get(arg) {
+          Some(value) => Ok(format!("{value}").into()),
+          None => err(CouldntInferTypes, source_trace.clone()),
+        },
+      })
+      .collect::<CompileResult<Vec<Arc<str>>>>()?;
+    monomorphized.name = new_program
+      .names
+      .write()
+      .unwrap()
+      .get_monomorphized_name(self.name.clone(), generic_arg_names);
+    monomorphized.generic_args = vec![];
+    for t in monomorphized
+      .arg_types
+      .iter_mut()
+      .map(|(t, _)| t)
+      .chain(std::iter::once(&mut monomorphized.return_type))
+    {
+      take(t, |t| {
+        t.fill_abstract_generics(
+          &generic_type_bindings
+            .iter()
+            .map(|(a, b)| (a.clone(), AbstractType::Type(b.clone())))
+            .collect::<HashMap<_, _>>(),
+        )
+        .fill_const_generics(&generic_constant_bindings)
+      })
+    }
+    if let FunctionImplementationKind::Composite(monomorphized_fn) =
+      &mut monomorphized.implementation
+    {
+      let mut new_fn = monomorphized_fn.read().unwrap().clone();
+      let replacement_pairs: HashMap<Arc<str>, Type> = generic_type_bindings
+        .iter()
+        .map(|(x, y)| (x.clone(), y.clone()))
+        .collect();
+      new_fn.expression.replace_skolems(&replacement_pairs);
+      new_fn
+        .expression
+        .replace_const_generic_skolems(&generic_constant_bindings);
+      new_fn
+        .expression
+        .monomorphize(base_program, new_program, target)?;
+      std::mem::swap(monomorphized_fn, &mut Arc::new(RwLock::new(new_fn)));
+    } else {
+      panic!("attempted to monomorphize non-composite abstract function")
+    }
+    Ok(monomorphized)
+  }
+  pub fn generate_higher_order_argument_inlined_version(
+    &self,
+    f_name: Arc<str>,
+    argument_index: usize,
+    signature: Arc<RwLock<AbstractFunctionSignature>>,
+    ctx: &mut Program,
+    source_trace: &SourceTrace,
+  ) -> CompileResult<Self> {
+    let mut implementation = self.implementation(source_trace.clone())?;
+    let arg_name = &self.arg_names(source_trace)?[argument_index].0;
+    let inlined_fn_name = &signature.read().unwrap().name;
+    if let TypeState::Known(Type::Function(f)) =
+      &mut implementation.expression.data.kind
+    {
+      f.args[argument_index].0.kind = VariableKind::Var;
+      if signature.read().unwrap().captured_scope.is_some() {
+        f.args[argument_index].0.var_type.ownership =
+          Ownership::MutableReference;
+      }
+      let f_arg = &mut f.args[argument_index].0.var_type.kind;
+      if let TypeState::Known(Type::Function(f_arg)) = f_arg {
+        f_arg.abstract_ancestor = Some(signature.clone());
+      }
+    } else {
+      panic!()
+    }
+    implementation
+      .expression
+      .walk_mut(&mut |exp| -> Result<bool, Never> {
+        match &mut exp.kind {
+          ExpKind::Application(f_name, args) => {
+            let ExpKind::Name(name) = &mut f_name.kind else {
+              panic!()
+            };
+            if let Some(captured_scope) =
+              &signature.read().unwrap().captured_scope
+              && name == arg_name
+            {
+              f_name.data.as_known_mut(|f_type| {
+                let Type::Function(f) = f_type else { panic!() };
+                let new_arg_type = AbstractType::AbstractStruct(Arc::new(
+                  captured_scope.clone(),
+                ))
+                .concretize(&vec![], &ctx.typedefs, f_name.source_trace.clone())
+                .unwrap();
+                args.push(Exp {
+                  data: new_arg_type.clone().known().into(),
+                  kind: ExpKind::Name(name.clone()),
+                  source_trace: f_name.source_trace.clone(),
+                });
+                *name = inlined_fn_name.clone();
+                f.args.push((
+                  Variable {
+                    var_type: new_arg_type.known().into(),
+                    kind: VariableKind::Var,
+                  },
+                  vec![],
+                ));
+                f.abstract_ancestor = Some(signature.clone());
+              });
+            }
+            Ok(true)
+          }
+          ExpKind::Name(name) => {
+            if name == arg_name {
+              exp.data.as_known_mut(|exp_type| {
+                if let Type::Function(f) = exp_type {
+                  if signature.read().unwrap().captured_scope.is_none() {
+                    *name = inlined_fn_name.clone();
+                  }
+                  f.abstract_ancestor = Some(signature.clone());
+                }
+              });
+              exp.data.ownership = Ownership::MutableReference;
+            }
+            Ok(true)
+          }
+          _ => Ok(true),
+        }
+      })
+      .unwrap();
+    let mut arg_types = self.arg_types.clone();
+    let (AbstractType::Type(Type::Function(f)), ownership) =
+      &mut arg_types[argument_index]
+    else {
+      panic!("tried to inline higher order fn for non-fn argument type");
+    };
+    if signature.read().unwrap().captured_scope.is_some() {
+      *ownership = Ownership::MutableReference;
+    }
+    f.abstract_ancestor = Some(signature.clone());
+    Ok(AbstractFunctionSignature {
+      name: ctx
+        .names
+        .write()
+        .unwrap()
+        .get_monomorphized_name(f_name.clone(), vec![inlined_fn_name.clone()]),
+      generic_args: self.generic_args.clone(),
+      arg_types,
+      return_type: self.return_type.clone(),
+      implementation: FunctionImplementationKind::Composite(Arc::new(
+        RwLock::new(implementation),
+      )),
+      associative: self.associative,
+      captured_scope: self.captured_scope.clone(),
+      entry_point: self.entry_point,
+    })
+  }
+  pub fn concretize(
+    f: Arc<RwLock<Self>>,
+    typedefs: &TypeDefs,
+    source_trace: SourceTrace,
+  ) -> CompileResult<FunctionSignature> {
+    let f_borrowed = f.read().unwrap();
+    let (generic_variables, generic_constraints): (
+      HashMap<Arc<str>, ExpTypeInfo>,
+      HashMap<Arc<str>, Vec<TypeConstraint>>,
+    ) = f_borrowed
+      .generic_args
+      .iter()
+      .filter_map(|(name, generic_arg, _)| {
+        if let GenericArgument::Type(bounds) = generic_arg {
+          Some((
+            (name.clone(), TypeState::fresh_unification_variable().into()),
+            (name.clone(), bounds.clone()),
+          ))
+        } else {
+          None
+        }
+      })
+      .collect();
+    let generic_constants: HashMap<Arc<str>, ConstGenericValue> = f_borrowed
+      .generic_args
+      .iter()
+      .filter_map(|(name, generic_arg, _)| {
+        if let GenericArgument::Constant = generic_arg {
+          Some((name.clone(), ConstGenericValue::fresh()))
+        } else {
+          None
+        }
+      })
+      .collect();
+    let mut args: Vec<_> = f_borrowed
+      .arg_types
+      .iter()
+      .map(|(t, ownership)| {
+        let (mut var_type, constraints) = match t {
+          AbstractType::Generic(var_name) => (
+            generic_variables
+              .get(var_name)
+              .expect("unrecognized generic")
+              .clone(),
+            generic_constraints
+              .get(var_name)
+              .expect("unrecognized generic")
+              .clone(),
+          ),
+          AbstractType::Type(t) => (t.clone().known().into(), vec![]),
+          AbstractType::AbstractStruct(s) => (
+            Type::Struct(AbstractStruct::fill_generics(
+              s.clone(),
+              &generic_variables,
+              &generic_constants,
+              typedefs,
+              source_trace.clone(),
+            )?)
+            .known()
+            .into(),
+            vec![],
+          ),
+          AbstractType::AbstractEnum(e) => (
+            Type::Enum(AbstractEnum::fill_generics(
+              e.clone(),
+              &generic_variables,
+              &generic_constants,
+              typedefs,
+              source_trace.clone(),
+            )?)
+            .known()
+            .into(),
+            vec![],
+          ),
+          AbstractType::AbstractArray {
+            size, inner_type, ..
+          } => (
+            Type::Array(
+              Some(size.fill_generics(&generic_constants)),
+              inner_type
+                .fill_generics(
+                  &generic_variables,
+                  &generic_constants,
+                  typedefs,
+                  source_trace.clone(),
+                )?
+                .into(),
+            )
+            .known()
+            .into(),
+            vec![],
+          ),
+          AbstractType::Unit => (TypeState::Known(Type::Unit).into(), vec![]),
+        };
+        var_type.ownership = *ownership;
+        Ok((Variable::immutable(var_type), constraints))
+      })
+      .collect::<CompileResult<_>>()?;
+    let mut return_type = match &f_borrowed.return_type {
+      AbstractType::Generic(var_name) => generic_variables
+        .get(var_name)
+        .expect("unrecognized generic")
+        .clone(),
+      AbstractType::AbstractStruct(s) => {
+        Type::Struct(AbstractStruct::fill_generics(
+          s.clone(),
+          &generic_variables,
+          &generic_constants,
+          typedefs,
+          source_trace,
+        )?)
+        .known()
+        .into()
+      }
+      AbstractType::AbstractEnum(e) => Type::Enum(AbstractEnum::fill_generics(
+        e.clone(),
+        &generic_variables,
+        &generic_constants,
+        typedefs,
+        source_trace,
+      )?)
+      .known()
+      .into(),
+      AbstractType::Type(t) => t.clone().known().into(),
+      AbstractType::AbstractArray {
+        size, inner_type, ..
+      } => Type::Array(
+        Some(size.fill_generics(&generic_constants)),
+        inner_type
+          .fill_generics(
+            &generic_variables,
+            &generic_constants,
+            typedefs,
+            source_trace,
+          )?
+          .into(),
+      )
+      .known()
+      .into(),
+      AbstractType::Unit => TypeState::Known(Type::Unit).into(),
+    };
+    for (v, _) in args.iter_mut() {
+      v.var_type
+        .kind
+        .replace_skolems_with_unification_variables(&generic_variables);
+    }
+    return_type
+      .kind
+      .replace_skolems_with_unification_variables(&generic_variables);
+    Ok(FunctionSignature {
+      args,
+      return_type,
+      abstract_ancestor: Some(f.clone()),
+    })
+  }
+}
+
+#[derive(Debug, Clone)]
+pub struct FunctionSignature {
+  pub abstract_ancestor: Option<Arc<RwLock<AbstractFunctionSignature>>>,
+  pub args: Vec<(Variable, Vec<TypeConstraint>)>,
+  pub return_type: ExpTypeInfo,
+}
+
+impl PartialEq for FunctionSignature {
+  fn eq(&self, other: &Self) -> bool {
+    self.args == other.args && self.return_type == other.return_type
+  }
+}
+
+impl FunctionSignature {
+  pub fn compatible(&self, other: &Self) -> bool {
+    if self.args.len() != other.args.len() {
+      return false;
+    }
+    !self
+      .args
+      .iter()
+      .zip(other.args.iter())
+      .find(|((a_var, a_constraints), (b_var, b_constraints))| {
+        !TypeState::are_compatible(&a_var.var_type, &b_var.var_type)
+          || a_constraints != b_constraints
+      })
+      .is_some()
+  }
+  pub fn are_args_compatible(&self, arg_types: &Vec<TypeState>) -> bool {
+    if arg_types.len() != self.args.len() {
+      if let Some(ancestor) = &self.abstract_ancestor {
+        if ancestor.read().unwrap().associative {
+          if arg_types.len() == 0 {
+            return false;
+          }
+          let (arg, arg_constraints) = &self.args[0];
+          for arg_typestate in arg_types {
+            if !TypeState::are_compatible(arg_typestate, &arg.var_type.kind) {
+              return false;
+            }
+            if let TypeState::Known(t) = arg_typestate {
+              for constraint in arg_constraints.iter() {
+                if !t.satisfies_constraint(constraint) {
+                  return false;
+                }
+              }
+            }
+          }
+          return true;
+        }
+      }
+      return false;
+    }
+    for i in 0..arg_types.len() {
+      let (arg, arg_constraints) = &self.args[i];
+      if !TypeState::are_compatible(&arg.var_type, &arg_types[i]) {
+        return false;
+      }
+      if let TypeState::Known(t) = &arg_types[i] {
+        for constraint in arg_constraints {
+          if !t.satisfies_constraint(constraint) {
+            return false;
+          }
+        }
+      }
+    }
+    true
+  }
+  pub fn mutually_constrain_arguments(
+    &mut self,
+    mut args: Vec<&mut TypeState>,
+    source_trace: SourceTrace,
+    errors: &mut ErrorLog,
+  ) -> bool {
+    if args.len() == self.args.len() {
+      let mut any_arg_changed = false;
+      for i in 0..args.len() {
+        let changed = args[i].mutually_constrain(
+          &mut self.args[i].0.var_type,
+          &source_trace,
+          errors,
+        );
+        any_arg_changed |= changed;
+      }
+      any_arg_changed
+    } else {
+      if let Some(ancestor) = &self.abstract_ancestor {
+        if ancestor.read().unwrap().associative {
+          if args.len() != 0 {
+            let arg_type = &mut self.args.get_mut(0).unwrap().0.var_type;
+            let mut any_arg_changed = false;
+            for i in 0..args.len() {
+              let changed =
+                args[i].mutually_constrain(arg_type, &source_trace, errors);
+              any_arg_changed |= changed;
+            }
+            return any_arg_changed;
+          }
+        }
+      }
+      errors.log(CompileError::new(
+        WrongArity(self.name().map(|n| n.to_string())),
+        source_trace,
+      ));
+      false
+    }
+  }
+  pub fn name(&self) -> Option<Arc<str>> {
+    self
+      .abstract_ancestor
+      .as_ref()
+      .map(|abstract_ancestor| abstract_ancestor.read().unwrap().name.clone())
+  }
+  pub fn effects(&self) -> EffectType {
+    self.effects_with(&mut EffectCache::new())
+  }
+  pub(crate) fn effects_with(&self, cache: &mut EffectCache) -> EffectType {
+    if let Some(abstract_ancestor) = &self.abstract_ancestor {
+      match &abstract_ancestor.read().unwrap().implementation {
+        FunctionImplementationKind::Composite(f) => {
+          let key = Arc::as_ptr(f) as usize;
+          if let Some(effects) = cache.get(&key) {
+            return effects.clone();
+          }
+          let effects = f.read().unwrap().effects_with(cache);
+          cache.insert(key, effects.clone());
+          effects
+        }
+        FunctionImplementationKind::Builtin { effect_type, .. } => {
+          effect_type.clone()
+        }
+        _ => EffectType::empty(),
+      }
+    } else {
+      Effect::InvokesUnknownFunction.into()
+    }
+  }
+  pub fn unwrap_type_signature(&self) -> Vec<Type> {
+    self
+      .args
+      .iter()
+      .map(|a| &a.0.var_type)
+      .chain(std::iter::once(&self.return_type))
+      .map(|t| t.unwrap_known())
+      .collect::<Vec<Type>>()
+  }
+}
+
+pub struct BuiltInFunction {
+  pub name: Arc<str>,
+  pub signature: AbstractFunctionSignature,
+}
+
+impl TopLevelFunction {
+  pub fn compile(
+    self,
+    name: &str,
+    names: &mut NameContext,
+    program: &Program,
+    target: CompilerTarget,
+  ) -> CompileResult<String> {
+    let TypedExp { data, kind, .. } = self.expression;
+    let Type::Function(signature) = data.unwrap_known() else {
+      panic!("attempted to compile function with invalid type data")
+    };
+    let FunctionSignature {
+      args, return_type, ..
+    } = *signature;
+    let (arg_names, body) = if let ExpKind::Function(arg_names, body) = kind {
+      (arg_names, *body)
+    } else {
+      panic!("attempted to compile function with invalid ExpKind {kind:?}")
+    };
+    let effects = body.effects();
+    // WindowInfo counts as disallowed here: any GPU-emitted function has had
+    // its window-info queries rewritten into binding reads by
+    // `extract_gpu_window_info`, so a remaining WindowInfo effect means the
+    // function is only reachable from CPU code (where the queries stay
+    // direct IO calls) and must not be emitted to WGSL or C.
+    let allowed_on_gpu = effects.cpu_exclusive_functions().is_empty()
+      && effects.cpu_resource_globals(program).is_empty()
+      && effects.cpu_exclusive_types().is_empty()
+      && effects.window_info_kinds().is_empty()
+      && effects.gpu_illegal_address_space_writes(program).is_empty();
+
+    let fn_string = || {
+      let args = arg_names
+        .into_iter()
+        .zip(args.into_iter())
+        .zip(self.arg_annotations.into_iter())
+        .map(|(((name, _), (arg, _)), annotation)| match target {
+          CompilerTarget::WGSL => {
+            format!(
+              "{}{}",
+              annotation.attributes.compile(),
+              compile_typed_name(
+                name,
+                arg.var_type.ownership,
+                arg.var_type,
+                target,
+                names
+              )
+            )
+          }
+          CompilerTarget::C => compile_typed_name(
+            name,
+            arg.var_type.ownership,
+            arg.var_type,
+            target,
+            names,
+          ),
+          CompilerTarget::VM => panic!(),
+        })
+        .collect::<Vec<String>>()
+        .join(", ");
+      let return_type_name = return_type.monomorphized_name(names, target);
+      let fn_name = compile_word(name.into());
+      let body = indent(body.compile(
+        if return_type.kind.unwrap_known() == Type::Unit {
+          ExpressionCompilationPosition::InnerLine
+        } else {
+          ExpressionCompilationPosition::Return
+        },
+        names,
+        target,
+      ));
+      match target {
+        CompilerTarget::C => {
+          format!("{return_type_name} {fn_name}({args}) {{{body}\n}}")
+        }
+        CompilerTarget::WGSL => format!(
+          "{}fn {fn_name}({args}){} {{{body}\n}}",
+          self
+            .entry_point
+            .as_ref()
+            .map(|e| e.compile())
+            .unwrap_or(String::new()),
+          if return_type.kind.unwrap_known() == Type::Unit {
+            "".to_string()
+          } else {
+            format!(
+              " -> {}{return_type_name}",
+              self.return_attributes.compile()
+            )
+          },
+        ),
+        CompilerTarget::VM => panic!(),
+      }
+    };
+    Ok(
+      if self
+        .entry_point
+        .map(|entry| entry.should_compile_to_target(target))
+        .unwrap_or(true)
+        && allowed_on_gpu
+      {
+        fn_string()
+      } else {
+        String::new()
+        // DEBUG: uncommenting the following will compile CPU-exclusive
+        // functions as commented-out pseudocode in the final WGSL file
+        // "// ".to_string() + &fn_string().replace("\n", "\n// ")
+      },
+    )
+  }
+  pub fn effects(&self) -> EffectType {
+    self.effects_with(&mut EffectCache::new())
+  }
+  pub(crate) fn effects_with(&self, cache: &mut EffectCache) -> EffectType {
+    if let ExpKind::Function(arg_names, body) = &self.expression.kind {
+      let mut effects = body.effects_with(cache);
+      for (name, _) in arg_names {
+        effects.remove(&Effect::ReadsVar(name.clone()));
+        effects.remove(&Effect::ReadsArrayLength(name.clone()));
+        effects.remove(&Effect::ModifiesLocalVar(name.clone()))
+      }
+      effects.remove(&Effect::Return);
+      effects
+    } else {
+      EffectType::empty()
+    }
+  }
+  pub fn compile_to_bytecode(
+    &self,
+    f_name: &Arc<str>,
+    state: &mut BytecodeCompilationState,
+    ref_arg_positions: &[(usize, u16)],
+  ) {
+    state.open_function(f_name.clone());
+    let Type::Function(f) = self.expression.data.unwrap_known() else {
+      panic!()
+    };
+    for (i, (arg, _)) in f.args.iter().enumerate() {
+      let arg_size =
+        crate::vm::compile::vm_type_size(&arg.var_type.unwrap_known());
+      let arg_slot = if let Some((_, caller_slot)) = ref_arg_positions
+        .iter()
+        .find(|(arg_index, _)| *arg_index == i)
+      {
+        *caller_slot
+      } else {
+        state.take_stack_slot(arg_size)
+      };
+      let current_function = state.current_function.as_mut().unwrap();
+      current_function.arg_positions.push(arg_slot);
+      current_function.arg_sizes.push(arg_size);
+    }
+    self.expression.compile_to_bytecode(false, state);
+    state.close_function();
+  }
+}

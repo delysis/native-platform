@@ -1,0 +1,7 @@
+@cpu
+(defn main []
+  (let [@var x 0i]
+    (for [i 0 (< i 10) (+= i 1)]
+      (+= x i)
+      (print i)
+      (print x))))

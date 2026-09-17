@@ -1,0 +1,108 @@
+; A multiline EASL editor consumer of the same flow, editor and viewport policy.
+; Rust transports input, font/Unicode facts and pixels. No Loom document service
+; or application-specific Rust editor participates in this program.
+(import "contextual_layout.easl")
+
+@external (var multiline-text: [u32])
+@external (var multiline-visible: [u32])
+@external (var multiline-frame: u32)
+@external (var multiline-state: vec4u)
+@external (var multiline-scroll: vec2f)
+(var multiline-seen-text: u32)
+(var multiline-seen-visible: u32)
+
+(var multiline-mode-source: u32)
+(var multiline-direction-facts: [TextDirectionalFact])
+@external (var multiline-contextual: bool)
+
+; The Latin fast path already owns a shaped run. Inspect it without reshaping
+; or mistaking layout controls for missing display glyphs. A missing glyph sends
+; the document through the contextual font cascade, including Latin-only input.
+(defn multiline-needs-fallback []: bool
+  (let [@var fact-index 0u facts (array-length flow-facts)]
+    (for [i (array-length specimen-run)]
+      (let [glyph (specimen-run i)]
+        (when (== glyph.id 0u)
+          (while (< fact-index facts)
+            (when (> (.end (flow-facts fact-index)) glyph.start) (break)) (+= fact-index 1u))
+          (let [@var j fact-index]
+            (while (< j facts)
+              (let [fact (flow-facts j) scalar fact.scalar]
+                (when (>= fact.start glyph.end) (break))
+                (when (not (or (and (>= scalar 9u) (<= scalar 13u))
+                  (or (== scalar 133u) (or (== scalar 8232u) (== scalar 8233u))))) (return true)))
+              (+= j 1u)))))))
+  false)
+
+(defn multiline-layout []
+  (let [source (text-editor-visible demo-editor)]
+    (when (!= multiline-mode-source source.handle)
+      (= multiline-direction-facts (text-directional-facts source 0u))
+      (= multiline-contextual false)
+      (for [i (array-length multiline-direction-facts)]
+        (let [fact (multiline-direction-facts i)]
+          (when (or (!= fact.level 0u) (and (!= fact.script 0u) (!= fact.script (text-script-latin))))
+            (= multiline-contextual true))))
+      (= multiline-mode-source source.handle)))
+  (= flow-status (if multiline-contextual (contextual-layout) (flow-layout)))
+  (when (and (not multiline-contextual) (and (== flow-status 0u) (multiline-needs-fallback)))
+    (= multiline-contextual true) (= flow-status (contextual-layout))))
+
+(defn multiline-reveal []
+  (when (== flow-status 0u)
+    (flow-decorations)
+    (text-widget-reveal flow-widget (flow-widget-layout) demo-caret
+      (min (vec2f 8.) (* demo-viewport 0.25)))
+    (= flow-scroll flow-widget.offset)))
+
+(defn multiline-publish []
+  (when (!= multiline-seen-text demo-editor.current.text.handle)
+    (= multiline-text (text-utf8 demo-editor.current.text))
+    (= multiline-seen-text demo-editor.current.text.handle))
+  (let [visible (text-editor-visible demo-editor)]
+    (when (!= multiline-seen-visible visible.handle)
+      (= multiline-visible (text-utf8 visible)) (= multiline-seen-visible visible.handle)))
+  (= multiline-state (vec4u demo-editor.current.anchor demo-editor.current.focus
+    demo-editor.undo-count demo-editor.redo-count))
+  (= multiline-scroll flow-widget.offset) (= multiline-frame (window-frame-index)))
+
+@cpu
+(defn multiline-frame-step []
+  (let [size (vec2f (window-resolution)) width (max 1. (- size.x 80.))
+        resized (any (!= size demo-viewport))]
+    (= demo-viewport size)
+    (when (!= width flow-width) (= flow-width width) (multiline-layout))
+    (when resized (multiline-reveal)))
+  (= demo-events (text-input-events)) (= demo-input-bytes (text-input-bytes))
+  (for [i (array-length demo-events)]
+    (let [event (demo-events i)
+          payload (text-from-utf8 demo-input-bytes event.text-start event.text-end)
+          status (text-widget-input demo-editor flow-widget (flow-widget-layout)
+            flow-index-at demo-cell-at event payload 8u 4u)]
+      (text-release payload)
+      ; Undo can restore the last successfully drawn source identity. A failed
+      ; later layout still invalidated measurement buffers, so retry it too.
+      (when (or (!= demo-source.handle (.handle (text-editor-visible demo-editor)))
+                (and (!= flow-status 0u) (== status 0u))) (multiline-layout))
+      (when (and (== status 0u) (!= event.kind 6u)) (multiline-reveal))))
+  (when (== flow-status 0u)
+    (let [status (text-widget-pointer demo-editor flow-widget (flow-widget-layout)
+      flow-index-at demo-cell-at (vec2f (mouse-coords)) (mouse-present?)
+      (mouse-just-down?) (mouse-down?) (key-down? "shift"))]
+      (when (== status 0u) (multiline-reveal)))
+    (= flow-scroll flow-widget.offset)
+    (if multiline-contextual (contextual-draw) (flow-draw)))
+  (text-input-area (and flow-widget.focused (== flow-status 0u))
+    (vec4f (- demo-caret.rect.xy flow-scroll) demo-caret.rect.zw))
+  (multiline-publish))
+
+@cpu
+(defn main []
+  (let [seed (make-text "The measure of a page.
+Beautiful type makes space for thought. A steady rhythm, a generous measure, and careful emphasis help the eye settle into a paragraph.
+
+Office, café, affinity. élan stays whole when the measure changes.
+")]
+    (flow-open seed) (line-enable-cascade) (text-release seed))
+  (spawn-window multiline-frame-step)
+  (text-editor-close demo-editor))

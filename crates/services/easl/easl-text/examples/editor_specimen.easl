@@ -1,0 +1,35 @@
+(import "../library/editor.easl")
+(import "font_scene.easl")
+
+; This headless integration specimen deliberately reuses the font specimen's
+; GPU setup. The displayed bytes come from the reusable EASL editor after an
+; edit, undo and redo. It does not stand in for an interactive widget review.
+(var proof-editor: TextEditorState)
+@external (var proof-history-roundtrip: bool)
+
+@cpu
+(defn editor-proof []
+  (prepare)
+  (let [initial (text-from-utf8 specimen-utf8 0u (array-length specimen-utf8))
+        replacement (make-text "Editing and undo, in EASL. Café, office, affinity.")]
+    (text-editor-open proof-editor initial)
+    (text-editor-edit proof-editor (TextEditCommand 0u 0u 0u 0u) (TextBuffer 0u))
+    (text-editor-commit proof-editor replacement)
+    (let [undo-ok (text-editor-history proof-editor false)]
+      (= proof-history-roundtrip (and undo-ok (text-equal proof-editor.current.text initial))))
+    (let [redo-ok (text-editor-history proof-editor true)]
+      (= proof-history-roundtrip
+        (and proof-history-roundtrip (and redo-ok (text-equal proof-editor.current.text replacement)))))
+    (text-release initial) (text-release replacement))
+  (= specimen-utf8 (text-utf8 proof-editor.current.text))
+  (= specimen-run (shape-font-run specimen-font specimen-utf8 (text-script-latin) false))
+  (= specimen-count (array-length specimen-run))
+  (= specimen-quads (zeroed-array specimen-count))
+  (= specimen-advance (text-place-run specimen-count specimen-glyph specimen-metric
+    (vec2f (texture-dimensions specimen-font)) (vec2f 30. 100.) false specimen-emit))
+  (= specimen-target (blank-texture 1200u 180u))
+  (set-render-target specimen-target)
+  (dispatch-render-shaders specimen-background-vertex specimen-background-fragment 3u)
+  (dispatch-render-shaders specimen-vertex specimen-fragment (* specimen-count 6u) 2u)
+  (save-png specimen-target "editor-specimen.png")
+  (text-editor-close proof-editor))

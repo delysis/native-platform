@@ -1,0 +1,124 @@
+{
+  "schema": "delysis.easl-studio-native-acceptance.v1",
+  "date": "2026-09-14",
+  "platform": "macOS aarch64",
+  "identity": {
+    "base_commit": "924ac64ef0a7512327406ec6490c5e017b5112a8",
+    "branch": "codex/loom-easl-studio",
+    "source_tree_sha256": "9c4c94ab05b34b85b160caac95de4b19fb88d69fc8369ba15f2f0559a0fca2d1",
+    "bundle": "/Users/george/.codex/worktrees/native-platform-easl-studio/target/debug/bundle/macos/Loom EASL Review.app",
+    "executable": "/Users/george/.codex/worktrees/native-platform-easl-studio/target/debug/bundle/macos/Loom EASL Review.app/Contents/MacOS/loom-app",
+    "executable_sha256": "24a59c599b11c463527bc0863007b764d2da86f73991ecde3434e353e8dbde48",
+    "bundle_identifier": "app.delysis.loom.easl-review",
+    "frontend": {
+      "products/loom/apps/loom/dist/appearance-bootstrap.js": "21a4f0331f5177ef2b8dfd0ee3509dcf5dc52f63fa900e2dd0b6d5bac7ef07e3",
+      "products/loom/apps/loom/dist/assets/index-ByxQ-BX7.css": "f82cffae96b3c6e359b935cba0c7c29ac8644ad750b65a1940cee2e95bbe5cdc",
+      "products/loom/apps/loom/dist/assets/index-Dnk37qOQ.js": "4b6e778754634cbbd56320ef45f4f27774a73c526e7fd04762a6adaed2f8c2ed",
+      "products/loom/apps/loom/dist/index.html": "9c8df0dfb81da8064f1354a8ab65e71d104e89bfae557f1d44849aefec627e0e"
+    },
+    "acceptance_directory": "/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/loom-easl-acceptance-m19cw9bb",
+    "pid": 78842
+  },
+  "identity_note": "The source tree hash covers all tracked and non-ignored source files at launch, before finalizing the two migration receipts. Executable and frontend sources did not change after the final native replay.",
+  "prior_native_identity": {
+    "base_commit": "924ac64ef0a7512327406ec6490c5e017b5112a8",
+    "branch": "codex/loom-easl-studio",
+    "source_tree_sha256": "c6d2eb7625cb74c7e1d0b446ebdd1c25270a6c6b28f0df8a2656eb205218f3f6",
+    "bundle": "/Users/george/.codex/worktrees/native-platform-easl-studio/target/debug/bundle/macos/Loom EASL Review.app",
+    "executable": "/Users/george/.codex/worktrees/native-platform-easl-studio/target/debug/bundle/macos/Loom EASL Review.app/Contents/MacOS/loom-app",
+    "executable_sha256": "9f7b234469d38b81bae44fc558530592cd81217a7f148aa06e257427425a9798",
+    "bundle_identifier": "app.delysis.loom.easl-review",
+    "frontend": {
+      "products/loom/apps/loom/dist/appearance-bootstrap.js": "21a4f0331f5177ef2b8dfd0ee3509dcf5dc52f63fa900e2dd0b6d5bac7ef07e3",
+      "products/loom/apps/loom/dist/assets/index-C1SCs00d.js": "30d02cb473099c94138ca133f76fbffc29c4a40d0b6b8e5c8976118d4615509a",
+      "products/loom/apps/loom/dist/assets/index-C_rZV9A8.css": "c5bac859816e8e64429774ed23ba306fb4307aa9b33498bb083a696c4c5931e9",
+      "products/loom/apps/loom/dist/index.html": "30008a17619bb5e503750a07c949a8ec7e92c20acf4c719ed2423bd170879ddd"
+    },
+    "acceptance_directory": "/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/loom-easl-acceptance-m19cw9bb",
+    "pid": 44694
+  },
+  "checks": [
+    {
+      "command": "rustup run 1.92.0 bash scripts/check-shell-policy.sh",
+      "result": "passed",
+      "rust_passed": 1568,
+      "rust_ignored": 41,
+      "ci_node_passed": 124,
+      "includes": [
+        "workspace formatting",
+        "workspace tests, all targets",
+        "workspace clippy -D warnings",
+        "xtask policy",
+        "CI planning/workflow tests",
+        "current documentation validation",
+        "native/attachment/information/speech boundaries",
+        "offline frozen lockfile"
+      ],
+      "log": "/tmp/loom-easl-shell-policy-final.log"
+    },
+    {
+      "command": "pnpm --filter @delysis/loom test",
+      "result": "passed",
+      "files": 61,
+      "tests": 451,
+      "log": "/tmp/loom-easl-frontend-test.log"
+    },
+    {
+      "command": "pnpm --filter @delysis/loom check",
+      "result": "passed: zero errors and warnings",
+      "log": "/tmp/loom-easl-svelte-final.log"
+    },
+    {
+      "command": "rustup run 1.92.0 cargo test --locked -p easl-native-host -p loom-app --all-targets; cargo clippy --locked -p easl-native-host -p loom-app --all-targets -- -D warnings",
+      "result": "passed after dialog parenting change: 14 tests, clean clippy",
+      "log": "/tmp/loom-easl-adapter-final.log"
+    },
+    {
+      "command": "rustup run 1.92.0 cargo run --locked -p easl-native-host --example hosted_smoke -- /tmp/loom-easl-smoke-final",
+      "result": "passed: real Cast render, CPU/GPU preview, edit/recompile, resize/input, save/reopen, two rendered panes, isolation, diagnostics, no implicit file write, joined infinite-interpreter close, audio voice replacement, continuous clock, silence on close",
+      "log": "/tmp/loom-easl-smoke-final.log"
+    },
+    {
+      "command": "LOOM_BUILD_MODEL_POLICY=none-v1 pnpm --filter @delysis/loom exec tauri build --debug --bundles app --config /tmp/loom-easl-review-config.json --runner /Users/george/.rustup/toolchains/1.92.0-aarch64-apple-darwin/bin/cargo",
+      "result": "passed with Rust 1.92.0",
+      "log": "/tmp/loom-easl-bundle-final.log"
+    }
+  ],
+  "native_ui": {
+    "final_bundle": [
+      "Verified current-only accessibility control: New EASL Studio pane",
+      "Created Studio pane through title bar",
+      "Edited source from red to green",
+      "Closed with unapplied source draft: native attached Yes/No/Cancel sheet appeared",
+      "Cancelled pane close: unsaved source and pane retained",
+      "Pressed Command-Q: same save sheet appeared; Cancel resumed Loom with source retained",
+      "Chose Yes on close; saved Green.easl through native Save sheet; pane closed",
+      "Opened Green.easl through native Open sheet; green preview and clean file identity returned",
+      "Displayed independent red and green Studio panes beside editable manuscript",
+      "Typed into manuscript while both Studio previews remained visible"
+    ],
+    "earlier_bundle": [
+      "Pointer selection and Space keyboard editing changed the real Cast view",
+      "Compiler diagnostic Invalid name appeared after visual edit",
+      "Audio opened a native output device and changed to Mute; Mute returned to Audio without a diagnostic",
+      "Normal Command-Q exited the first review process"
+    ],
+    "file": {
+      "path": "/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/loom-easl-acceptance-m19cw9bb/Green.easl",
+      "sha256": "06cbccd9b9649454d06df8d386b10166ffae71435f24d871f71a4b072c9cc933"
+    },
+    "evidence": "Native accessibility trees and screenshots in the implementation task; logs and identity paths recorded above."
+  },
+  "fixed_during_replay": [
+    "Process-global slider ShaderModule belonged to the first GPU device; cache now stores WGSL only and creates the module per device. Two rendered sessions verify the repair.",
+    "Unattached system alerts did not expose a reliable close interaction in Loom; EASL dialogs now explicitly use the invoking window as parent. Native Cancel and save-on-close were replayed successfully.",
+    "EASL title button overlapped the outline icon; its width now fits its label."
+  ],
+  "boundaries": [
+    "Local macOS verification; remote CI and Linux/Windows native UI were not run.",
+    "Debug review bundle uses an isolated acceptance directory and no build-time model download. Other running Loom builds were left untouched.",
+    "Studio code is in process, including its imported upstream VM implementation; this is not a sandbox or hard real-time guarantee.",
+    "The audio diagnostic validates samples and voice lifecycle; audible quality and latency were not assessed.",
+    "No push, merge, release, or source-history migration performed."
+  ]
+}

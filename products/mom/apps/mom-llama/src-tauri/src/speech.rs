@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use desktop_speech::{APPLE_BACKEND_ID, CompleteWavError, complete_apple_wav, discover_local_host};
 use mom_llama_runtime::{
     AttachmentPreviewAnchor, AttachmentTranscriptionInput, Blocker, CommandResult, MessageRole,
 };
@@ -6,23 +7,22 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use speech_native_backend_parakeet::{
     PARAKEET_BACKEND_ID, PARAKEET_DEFERRED_LOAD_EVIDENCE_SOURCE_ID, PARAKEET_MODEL_CONTENT_SHA256,
-    PARAKEET_MODEL_ID, ParakeetBackendConfig, ParakeetSpeechBackend,
+    PARAKEET_MODEL_ID,
 };
 use speech_native_host::{SpeechHost, SpeechHostError};
 use speech_native_types::{
     AcceptedAudio, AlignmentGranularity, AudioInput, AudioOutputFormat, AudioOutputKind,
-    DiarizationPolicy, EncodedAudioFormat, NetworkBehavior, PlatformTarget,
-    SpeechBackendDescriptor, SpeechBackendReadiness, SpeechDeadlinePolicy, SpeechError,
-    SpeechErrorClass, SpeechOperationCapability, SpeechPrivacyPolicy, SpeechRequestContext,
-    SpeechRequestId, SpeechRouteProfile, SpeechRouteSelector, SpeechRoutingPolicy, SynthesisInput,
-    SynthesisOutput, SynthesisRequest, SynthesisResponse, TimestampGranularity, TranscriptionInput,
-    TranscriptionRequest, TranscriptionResponse, TranscriptionTask, VoiceSelector,
+    DiarizationPolicy, EncodedAudioFormat, NetworkBehavior, SpeechBackendDescriptor,
+    SpeechBackendReadiness, SpeechDeadlinePolicy, SpeechError, SpeechErrorClass,
+    SpeechOperationCapability, SpeechPrivacyPolicy, SpeechRequestContext, SpeechRequestId,
+    SpeechRouteProfile, SpeechRouteSelector, SpeechRoutingPolicy, SynthesisInput, SynthesisRequest,
+    SynthesisResponse, TimestampGranularity, TranscriptionInput, TranscriptionRequest,
+    TranscriptionResponse, TranscriptionTask, VoiceSelector,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-const APPLE_BACKEND_ID: &str = "apple.av-speech";
 const MOM_SPEECH_CLIENT_ID: &str = "mom-llama";
 const MAX_ACTIVE_SPEECH_OPERATIONS: usize = 4;
 const MAX_PENDING_CANCELS: usize = 32;
@@ -240,22 +240,9 @@ pub struct MomSpeech {
 
 impl MomSpeech {
     pub async fn discover(data_dir: &Path) -> Result<Arc<Self>, String> {
-        let host = Arc::new(SpeechHost::new(PlatformTarget::current()));
-        let parakeet = ParakeetSpeechBackend::discover(ParakeetBackendConfig {
-            model_dir: None,
-            managed_model_root: Some(data_dir.join("speech-models")),
-        })
-        .await;
-        host.register_backend(Arc::new(parakeet))
-            .map_err(|error| format!("Parakeet registration failed: {error}"))?;
-
-        #[cfg(target_os = "macos")]
-        if let Ok(apple) =
-            speech_native_platform::apple_backend::AppleSpeechBackend::discover().await
-        {
-            host.register_backend(Arc::new(apple))
-                .map_err(|error| format!("Apple speech registration failed: {error}"))?;
-        }
+        let host = discover_local_host(Some(data_dir.join("speech-models")))
+            .await
+            .map_err(|error| format!("local speech registration failed: {error}"))?;
 
         Ok(Arc::new(Self {
             executor: Arc::new(HostSpeechExecutor { host }),
@@ -265,7 +252,9 @@ impl MomSpeech {
 
     #[cfg(test)]
     pub fn empty_for_tests() -> Arc<Self> {
-        let host = Arc::new(SpeechHost::new(PlatformTarget::current()));
+        let host = Arc::new(SpeechHost::new(
+            speech_native_types::PlatformTarget::current(),
+        ));
         Arc::new(Self {
             executor: Arc::new(HostSpeechExecutor { host }),
             state: Mutex::new(SpeechState::default()),
@@ -1072,49 +1061,24 @@ fn validate_apple_response(
     request_id: &SpeechRequestId,
     voice_id: &str,
 ) -> Result<(Vec<u8>, Option<u64>), Blocker> {
-    if response.request_id != *request_id
-        || response.route.backend_id != APPLE_BACKEND_ID
-        || response.route.model_id.is_some()
-        || response.route.voice_id.as_deref() != Some(voice_id)
-        || response.route.backend_kind != speech_native_types::SpeechBackendKind::PlatformOnDevice
-        || response.route.network != NetworkBehavior::Never
-    {
-        return Err(speech_provenance_mismatch(
-            "Apple response route did not match the admitted message and voice binding.",
-        ));
-    }
-    let SynthesisOutput::Complete { audio, format } = response.output else {
-        return Err(speech_provenance_mismatch(
-            "Apple synthesis returned streaming state instead of one complete WAV.",
-        ));
-    };
-    if format != AudioOutputFormat::Wav || audio.is_empty() || audio.len() > MAX_COMPLETE_WAV_BYTES
-    {
-        return Err(Blocker::new(
-            "speech_wav_invalid",
-            "Apple synthesis did not return a non-empty bounded complete WAV.",
-            Vec::new(),
-        ));
-    }
-    Ok((audio, response.duration_ms))
+    complete_apple_wav(response, request_id, Some(voice_id), MAX_COMPLETE_WAV_BYTES).map_err(
+        |error| match error {
+            CompleteWavError::RouteMismatch | CompleteWavError::OutputKind => {
+                speech_provenance_mismatch(&error.to_string())
+            }
+            CompleteWavError::ByteLimit | CompleteWavError::OutputFormat => {
+                Blocker::new("speech_wav_invalid", error.to_string(), Vec::new())
+            }
+        },
+    )
 }
 
 fn validate_parakeet_response(
     response: &TranscriptionResponse,
     request_id: &SpeechRequestId,
 ) -> Result<(), Blocker> {
-    if response.request_id != *request_id
-        || response.route.backend_id != PARAKEET_BACKEND_ID
-        || response.route.model_id.as_deref() != Some(PARAKEET_MODEL_ID)
-        || response.route.voice_id.is_some()
-        || response.route.backend_kind != speech_native_types::SpeechBackendKind::EmbeddedModel
-        || response.route.network != NetworkBehavior::Never
-        || !response.usage.real_local_inference
-    {
-        return Err(speech_provenance_mismatch(
-            "Parakeet response provenance did not match the exact admitted local model route.",
-        ));
-    }
+    desktop_speech::validate_parakeet_response(response, request_id)
+        .map_err(|error| speech_provenance_mismatch(&error.to_string()))?;
     if response.text.chars().count() > MAX_TRANSCRIPT_CHARACTERS {
         return Err(Blocker::new(
             "speech_transcript_too_large",
@@ -1243,7 +1207,7 @@ mod tests {
     use speech_native_types::{
         CapabilityAvailability, CapabilityEvidence, EvidenceKind, EvidenceOutcome,
         SpeechBackendKind, SpeechCapability, SpeechCapabilityLimits, SpeechModelDescriptor,
-        SynthesisCapabilities, TranscriptionCapabilities, VoiceDescriptor,
+        SynthesisCapabilities, SynthesisOutput, TranscriptionCapabilities, VoiceDescriptor,
     };
 
     fn runtime_evidence() -> Vec<CapabilityEvidence> {

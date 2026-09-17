@@ -1,0 +1,10 @@
+(defn get-number [n: u32]: u32 (+ n 1u))
+(defn shared-query [count: u32 reader: (Fn [u32] u32) offset: u32 next: bool]: u32
+  (+ (reader count) (if next (+ offset 1u) offset)))
+(defn vertical-query [count: u32 reader: (Fn [u32] u32) offset: u32]: u32
+  (shared-query count reader offset true))
+(defn horizontal-query [count: u32 reader: (Fn [u32] u32) offset: u32]: u32
+  (shared-query count reader offset false))
+(defn f []: vec4u
+  (vec4u (vertical-query 1u get-number 3u) (horizontal-query 2u get-number 4u)
+         (vertical-query 3u get-number 5u) (horizontal-query 4u get-number 6u)))

@@ -1,0 +1,98 @@
+(import "flow.easl")
+(import "runs.easl")
+
+; Staging slots, one per grapheme boundary including the final source edge.
+; Amounts are deposited at cluster ends. Covered/safe describe the following
+; grapheme. Initialize all slots to zero before accumulating a paragraph's runs.
+(struct TextMeasureSlot amount: vec2f covered: bool safe: bool)
+(struct TextShapedPrefix advance: vec2f safe: bool)
+
+; Native grapheme facts form a validated complete logical source partition.
+; Return count for its exclusive source end, or MAX for a non-boundary byte.
+(defn text-measure-boundary [count: u32 fact-at: (Fn [u32] TextGrapheme) byte: u32]: u32
+  (let [@var low 0u @var high count]
+    (while (< low high)
+      (let [middle (+ low (/ (- high low) 2u))]
+        (if (< (.start (fact-at middle)) byte) (= low (+ middle 1u)) (= high middle))))
+    (if (< low count)
+      (if (== (.start (fact-at low)) byte) low 4294967295u)
+      (if (== byte (if (== count 0u) 0u (.end (fact-at (- count 1u))))) count 4294967295u))))
+
+; Accumulate one native logical-cluster-order shaped run, translated once into
+; source bytes. Different runs may arrive in visual order. A dry pass validates
+; every cluster, overlap, capacity and work requirement before changing slots.
+; Native facts and glyph readers remain stable; only the slot reader aliases
+; the writer. Slots are staging storage until text-measure-prefixes succeeds.
+; Status 0 succeeds, 1 rejects malformed/overlapping input, 2 exhausts capacity/work.
+(defn text-measure-run [facts: u32 fact-at: (Fn [u32] TextGrapheme)
+                        glyphs: u32 glyph-at: (Fn [u32] FontShapedGlyph) source-offset: u32
+                        capacity: u32 slot-at: (Fn [u32] TextMeasureSlot)
+                        emit-slot: (Fn [u32 TextMeasureSlot] ()) budget: u32]: TextRunResult
+  (when (or (> facts 65535u) (or (> glyphs 65535u)
+    (or (<= capacity facts) (> budget 1000000u)))) (return (TextRunResult 2u 0u 0u)))
+  (when (> source-offset 1048576u) (return (TextRunResult 1u 0u 0u)))
+  (let [@var total 0u @var reserved 0u]
+    (for [pass 2u]
+      (let [@var cursor 0u @var previous 0u @var groups 0u @var work 0u]
+        (while (< cursor glyphs)
+          (let [glyph (glyph-at cursor) @var amount (vec2f 0.) @var flags 0u]
+            (when (or (<= glyph.end glyph.start) (or (> glyph.end (- 1048576u source-offset))
+              (and (> groups 0u) (!= glyph.start previous)))) (return (TextRunResult 1u 0u work)))
+            (+= work 33u)
+            (when (> work (/ budget 2u)) (return (TextRunResult 2u 0u (* work 2u))))
+            (let [begin (text-measure-boundary facts fact-at (+ source-offset glyph.start))
+                  end (text-measure-boundary facts fact-at (+ source-offset glyph.end))]
+              (when (or (>= begin end) (> end facts)) (return (TextRunResult 1u 0u work)))
+              (while (< cursor glyphs)
+                (let [item (glyph-at cursor)]
+                  (when (!= item.start glyph.start) (break))
+                  (when (or (!= item.end glyph.end) (not (<= (abs item.advance) 10000000.)))
+                    (return (TextRunResult 1u 0u work)))
+                  (+= work 1u)
+                  (when (> work (/ budget 2u)) (return (TextRunResult 2u 0u (* work 2u))))
+                  (= amount (text-flow-add amount item.advance)) (= flags (| flags item.flags)))
+                (+= cursor 1u))
+              ; Individual glyph advances may be signed. Prefix reuse requires
+              ; a nonnegative complete cluster, not a nonnegative mark glyph.
+              (when (not (text-bounded (+ amount.x amount.y) 100000000000000.))
+                (return (TextRunResult 1u 0u work)))
+              (+= work (+ 1u (- end begin)))
+              (when (> work (/ budget 2u)) (return (TextRunResult 2u 0u (* work 2u))))
+              (for [i begin (< i end) (+= i 1u)]
+                (let [slot (slot-at i)]
+                  (when slot.covered (return (TextRunResult 1u 0u work)))
+                  (when (== pass 1u)
+                    (emit-slot i (TextMeasureSlot slot.amount true
+                      (and (== i begin) (== (& flags 1u) 0u)))))))
+              (when (== pass 1u)
+                (let [slot (slot-at end) sum (text-flow-add (text-flow-add slot.amount amount.x) amount.y)]
+                  (emit-slot end (TextMeasureSlot sum slot.covered slot.safe)))))
+            (= previous glyph.end) (+= groups 1u)))
+        (= total groups) (= reserved (* work 2u))))
+    (TextRunResult 0u total reserved)))
+
+; Publish compensated logical prefix widths only after complete coverage.
+; Safe means HarfRust did not mark the boundary unsafe-to-break, and it is not
+; inside a shaped ligature. It says nothing about a change of font/style, script,
+; direction, language, features or source identity. Cache those inputs together.
+(defn text-measure-prefixes [facts: u32 slot-at: (Fn [u32] TextMeasureSlot)
+                             capacity: u32 emit-prefix: (Fn [u32 TextShapedPrefix] ())]: TextRunResult
+  (when (or (> facts 65535u) (<= capacity facts)) (return (TextRunResult 2u 0u 0u)))
+  (for [i (+ facts 1u)]
+    (let [slot (slot-at i)]
+      (when (or (and (< i facts) (not slot.covered))
+        (or (not (<= (abs slot.amount.x) 100000000000000.))
+          (or (not (<= (abs slot.amount.y) 100000000000000.))
+            (not (text-bounded (+ slot.amount.x slot.amount.y) 100000000000000.)))))
+        (return (TextRunResult 1u 0u 0u)))))
+  (when (any (!= (.amount (slot-at 0u)) (vec2f 0.))) (return (TextRunResult 1u 0u 0u)))
+  (for [pass 2u]
+    (let [@var advance (vec2f 0.)]
+      (for [i (+ facts 1u)]
+        (let [slot (slot-at i)]
+          (= advance (text-flow-add (text-flow-add advance slot.amount.x) slot.amount.y))
+          (when (not (text-bounded (+ advance.x advance.y) 100000000000000.))
+            (return (TextRunResult 1u 0u 0u)))
+          (when (== pass 1u)
+            (emit-prefix i (TextShapedPrefix advance (or (or (== i 0u) (== i facts)) slot.safe))))))))
+  (TextRunResult 0u (+ facts 1u) (* 3u (+ facts 1u))))

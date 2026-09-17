@@ -1,0 +1,140 @@
+(import "styles.easl")
+(import "measure.easl")
+(import "decoration.easl")
+
+; Style values use logical pixels. Font facts use the atlas's raster resolution.
+; Shaping must use the selected face, variation instance, features and language.
+; This module never selects a font or changes source bytes.
+(struct TextRichLine status: u32 ascent: f32 descent: f32)
+
+; Tracking disables optional common/contextual ligatures unless the author
+; explicitly supplied those features. Required script ligatures remain intact.
+; Feature ranges stay a caller-owned flat table; this emits one native span's
+; settings after validating the complete input and capacity.
+(defn text-tracking-features [count: u32 feature-at: (Fn [u32] FontFeature)
+    tracking: bool capacity: u32 emit: (Fn [u32 FontFeature] ())]: TextRunResult
+  (when (> count 64u) (return (TextRunResult 2u 0u 0u)))
+  (let [@var liga false @var clig false]
+    (for [i count]
+      (let [f (feature-at i)]
+        (for [j 4u]
+          (let [byte (& (>> f.tag (* j 8u)) 255u)]
+            (when (or (< byte 32u) (> byte 126u)) (return (TextRunResult 1u 0u 0u)))))
+        (for [j i] (when (== (.tag (feature-at j)) f.tag) (return (TextRunResult 1u 0u 0u))))
+        (when (== f.tag 1818847073u) (= liga true))
+        (when (== f.tag 1668049255u) (= clig true))))
+    (let [needed (+ count (if tracking (+ (if liga 0u 1u) (if clig 0u 1u)) 0u))
+          @var cursor count]
+      (when (or (> needed capacity) (> needed 64u)) (return (TextRunResult 2u 0u 0u)))
+      (for [i count] (emit i (feature-at i)))
+      (when (and tracking (not liga)) (emit cursor (FontFeature 1818847073u 0u)) (+= cursor 1u))
+      (when (and tracking (not clig)) (emit cursor (FontFeature 1668049255u 0u)))
+      (TextRunResult 0u needed (+ (* count (+ count 4u)) needed)))))
+
+(defn text-rich-font-valid [metrics: vec4f]: bool
+  (and (all (>= metrics.xy (vec2f 0.)))
+    (and (all (<= (abs metrics.xyz) (vec3f 16384.)))
+      (and (>= metrics.w 1.) (<= metrics.w 256.)))))
+
+; A font strut participates even on an empty line. Half-leading puts every run
+; on the same baseline while respecting each run's requested line height.
+(defn text-rich-line [count: u32 style-at: (Fn [u32] TextRunStyle)
+                      metrics-at: (Fn [u32] vec4f)
+                      strut: TextRunStyle strut-metrics: vec4f]: TextRichLine
+  (when (> count 32766u) (return (TextRichLine 2u 0. 0.)))
+  (let [@var ascent -10000000. @var descent -10000000.]
+    (for [i (+ count 1u)]
+      (let [s (if (== i count) strut (style-at i))
+            m (if (== i count) strut-metrics (metrics-at i))]
+        (when (or (not (text-style-valid s)) (not (text-rich-font-valid m)))
+          (return (TextRichLine 1u 0. 0.)))
+        (let [scale (/ s.size m.w) a (* m.x scale) d (* m.y scale)
+              leading (* (- s.line-height (+ a d)) 0.5)]
+          (= ascent (max ascent (+ a leading)))
+          (= descent (max descent (+ d leading))))))
+    (TextRichLine 0u ascent descent)))
+
+; Transform shaped logical-order glyphs ONCE, before measuring, caching or
+; placing. Tracking is per extended grapheme; word spacing applies to U+0020
+; and U+00A0. Preserve cluster identity, mark order and shaping safety flags.
+; A cluster with negative final advance is explicitly unsupported by the
+; current nonnegative prefix/caret geometry contract (status 4).
+; Readers are stable and do not alias output. Native facts are a complete,
+; validated source partition. Both passes reserve two glyph visits (validation
+; and emission), plus boundary and fact work, before publishing any output.
+(defn text-style-glyphs [facts: u32 fact-at: (Fn [u32] TextGrapheme)
+    glyphs: u32 glyph-at: (Fn [u32] FontShapedGlyph) source-offset: u32
+    style: TextRunStyle raster-em: f32 capacity: u32
+    emit: (Fn [u32 FontShapedGlyph] ()) budget: u32]: TextRunResult
+  (when (or (> facts 65535u) (or (> glyphs 65535u)
+    (or (> glyphs capacity) (> budget 1000000u)))) (return (TextRunResult 2u 0u 0u)))
+  (when (or (not (text-style-valid style))
+    (or (not (and (>= raster-em 1.) (<= raster-em 256.))) (> source-offset 1048576u)))
+    (return (TextRunResult 1u 0u 0u)))
+  (let [scale (/ style.size raster-em) @var total 0u]
+    (for [pass 2u]
+      (let [@var cursor 0u @var previous 0u @var work 0u]
+        (while (< cursor glyphs)
+          (let [first (glyph-at cursor) begin-glyph cursor @var amount (vec2f 0.)]
+            (when (or (<= first.end first.start) (or (> first.end (- 1048576u source-offset))
+              (and (> cursor 0u) (!= first.start previous)))) (return (TextRunResult 1u 0u work)))
+            (+= work 33u)
+            (when (> work (/ budget 2u)) (return (TextRunResult 2u 0u (* work 2u))))
+            (let [begin (text-measure-boundary facts fact-at (+ source-offset first.start))
+                  end (text-measure-boundary facts fact-at (+ source-offset first.end))
+                  @var spacing 0.]
+              (when (or (>= begin end) (> end facts)) (return (TextRunResult 1u 0u work)))
+              (+= work (- end begin))
+              (when (> work (/ budget 2u)) (return (TextRunResult 2u 0u (* work 2u))))
+              (for [i begin (< i end) (+= i 1u)]
+                (let [scalar (.scalar (fact-at i))]
+                  (+= spacing (+ style.letter-spacing
+                    (if (or (== scalar 32u) (== scalar 160u)) style.word-spacing 0.)))))
+              (while (< cursor glyphs)
+                (let [g (glyph-at cursor)]
+                  (when (!= g.start first.start) (break))
+                  (when (or (!= g.end first.end)
+                    (not (all (<= (abs (vec3f g.x g.y g.advance)) (vec3f 10000000.)))))
+                    (return (TextRunResult 1u 0u work)))
+                  (+= work 2u)
+                  (when (> work (/ budget 2u)) (return (TextRunResult 2u 0u (* work 2u))))
+                  (= amount (text-flow-add amount (* g.advance scale))))
+                (+= cursor 1u))
+              (let [advance (+ (+ amount.x amount.y) spacing)]
+                (when (< advance 0.) (return (TextRunResult 4u 0u work)))
+                (when (not (text-bounded advance 100000000000000.)) (return (TextRunResult 1u 0u work))))
+              (when (== pass 1u)
+                (for [i begin-glyph (< i cursor) (+= i 1u)]
+                  (let [g (glyph-at i)]
+                    (emit i (FontShapedGlyph g.id g.start g.end (* g.x scale) (* g.y scale)
+                      (+ (* g.advance scale) (if (== (+ i 1u) cursor) spacing 0.)) g.flags))))))
+            (= previous first.end)))
+        (= total (* work 2u))))
+    (TextRunResult 0u glyphs total)))
+
+; Font-provided offsets are upwards positive. Paint rectangles use downwards
+; positive y. A missing stroke thickness uses 1/16 em; no pixel snapping here,
+; so callers can scale the complete logical layout once for the display.
+(defn text-rich-decorations [style: TextRunStyle raster-em: f32 metrics: vec4f
+    baseline: vec2f advance: f32 capacity: u32
+    emit: (Fn [u32 TextDecoration] ())]: TextRunResult
+  (when (or (not (text-style-valid style))
+    (or (not (and (>= raster-em 1.) (<= raster-em 256.)))
+    (or (not (all (<= (abs metrics) (vec4f 16384.))))
+    (or (any (< metrics.yw (vec2f 0.)))
+    (or (not (all (<= (abs baseline) (vec2f 1000000000.))))
+        (not (text-bounded advance 100000000000000.)))))))
+    (return (TextRunResult 1u 0u 0u)))
+  (let [count (+ (if (!= (& style.flags 2u) 0u) 1u 0u)
+                (if (!= (& style.flags 4u) 0u) 1u 0u))
+        scale (/ style.size raster-em) @var output 0u]
+    (when (> count capacity) (return (TextRunResult 2u 0u 0u)))
+    (for [i 2u]
+      (when (!= (& style.flags (if (== i 0u) 2u 4u)) 0u)
+        (let [offset (if (== i 0u) metrics.x metrics.z)
+              thickness (if (== i 0u) metrics.y metrics.w)]
+          (emit output (TextDecoration
+            (text-decoration-bounds baseline (* offset scale)
+              (if (> thickness 0.) (* thickness scale) (/ style.size 16.)) advance) style.color))
+          (+= output 1u))))
+    (TextRunResult 0u output 2u)))

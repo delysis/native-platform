@@ -1,0 +1,139 @@
+; Rich view styles, independent of document syntax, fonts and persistence.
+; family/features/variations/language index the consumer's immutable resource
+; tables. Language 0xffffffff means unspecified. Flags: italic=1, underline=2,
+; strike=4, keep-all=8, wrap=16. Geometry uses logical pixels.
+(struct TextRunStyle family: u32 size: f32 line-height: f32 weight: f32
+  letter-spacing: f32 word-spacing: f32 features: u32 variations: u32 language: u32
+  color: vec4u flags: u32)
+(struct TextStyleRule flag: u32 properties: u32 style: u32)
+(struct TextStyleInput start: u32 end: u32 style: u32 flags: u32)
+(struct TextStyledSpan start: u32 end: u32 style: TextRunStyle)
+(struct TextStyleResult status: u32 count: u32 work: u32)
+
+(defn text-style-valid [s: TextRunStyle]: bool
+  (and (all (>= (vec4f s.size s.line-height s.weight s.letter-spacing) (vec4f 1. 1. 1. -128.)))
+    (and (all (<= (vec4f s.size s.line-height s.weight s.letter-spacing) (vec4f 512. 2048. 1000. 512.)))
+      (and (and (>= s.word-spacing -128.) (<= s.word-spacing 512.))
+        (and (all (<= s.color (vec4u 255u))) (<= s.flags 31u))))))
+
+(defn text-style-equal [a: TextRunStyle b: TextRunStyle]: bool
+  (and (all (== (vec4u a.family a.features a.variations a.language)
+               (vec4u b.family b.features b.variations b.language)))
+    (and (all (== (vec4f a.size a.line-height a.weight a.letter-spacing)
+                 (vec4f b.size b.line-height b.weight b.letter-spacing)))
+      (and (== a.word-spacing b.word-spacing)
+        (and (== a.flags b.flags) (all (== a.color b.color)))))))
+
+; Project document byte spans into a paragraph/slice, filling gaps with the
+; default style. Empty slices retain an insertion style: a covering/right span
+; wins over a span ending at that byte. No source bytes or resource IDs change.
+; As with text-resolve-styles, callers validate source/grapheme boundaries and
+; resource tables. Readers are stable and do not alias output. Both passes are
+; reserved before publication, including validation outside the selected slice.
+(defn text-project-styles [bytes: u32 count: u32 span-at: (Fn [u32] TextStyledSpan)
+    start: u32 end: u32 default: TextRunStyle capacity: u32
+    emit: (Fn [u32 TextStyledSpan] ()) budget: u32]: TextStyleResult
+  (when (or (> bytes 1048576u) (or (> count 32766u) (> budget 1000000u)))
+    (return (TextStyleResult 2u 0u 0u)))
+  (when (or (> start end) (or (> end bytes) (not (text-style-valid default))))
+    (return (TextStyleResult 1u 0u 0u)))
+  (let [work (+ (* count 2u) 2u) @var needed 0u]
+    (when (> work budget) (return (TextStyleResult 2u 0u work)))
+    (for [pass 2u]
+      (let [@var previous 0u @var cursor start @var output 0u @var insertion default]
+        (for [i count]
+          (let [s (span-at i)]
+            (when (or (< s.start previous) (or (> s.start s.end)
+              (or (> s.end bytes) (not (text-style-valid s.style)))))
+              (return (TextStyleResult 1u 0u work)))
+            (= previous s.end)
+            (when (and (<= s.start start) (>= s.end start)) (= insertion s.style))
+            (let [a (max start s.start) b (min end s.end)]
+              (when (< a b)
+                (when (< cursor a)
+                  (when (== pass 1u) (emit output (TextStyledSpan (- cursor start) (- a start) default)))
+                  (+= output 1u))
+                (when (== pass 1u) (emit output (TextStyledSpan (- a start) (- b start) s.style)))
+                (+= output 1u) (= cursor b)))))
+        (when (< cursor end)
+          (when (== pass 1u) (emit output (TextStyledSpan (- cursor start) (- end start) default)))
+          (+= output 1u))
+        (when (== start end)
+          (when (== pass 1u) (emit output (TextStyledSpan 0u 0u insertion)))
+          (= output 1u))
+        (when (> output capacity) (return (TextStyleResult 2u 0u work)))
+        (= needed output)))
+    (TextStyleResult 0u needed work)))
+
+; Field masks: family=1, size=2, line-height=4, weight=8, italic=16,
+; letter-spacing=32, word-spacing=64, features=128, variations=256,
+; language=512, color=1024, underline=2048, strike=4096, keep-all=8192,
+; wrap=16384. Later selected rules win only for the fields they name.
+(defn text-style-patch [base: TextRunStyle value: TextRunStyle mask: u32]: TextRunStyle
+  (let [@var result base]
+    (when (!= (& mask 1u) 0u) (= result.family value.family))
+    (when (!= (& mask 2u) 0u) (= result.size value.size))
+    (when (!= (& mask 4u) 0u) (= result.line-height value.line-height))
+    (when (!= (& mask 8u) 0u) (= result.weight value.weight))
+    (when (!= (& mask 32u) 0u) (= result.letter-spacing value.letter-spacing))
+    (when (!= (& mask 64u) 0u) (= result.word-spacing value.word-spacing))
+    (when (!= (& mask 128u) 0u) (= result.features value.features))
+    (when (!= (& mask 256u) 0u) (= result.variations value.variations))
+    (when (!= (& mask 512u) 0u) (= result.language value.language))
+    (when (!= (& mask 1024u) 0u) (= result.color value.color))
+    (when (!= (& mask 16u) 0u) (= result.flags (| (& result.flags 4294967294u) (& value.flags 1u))))
+    (when (!= (& mask 2048u) 0u) (= result.flags (| (& result.flags 4294967293u) (& value.flags 2u))))
+    (when (!= (& mask 4096u) 0u) (= result.flags (| (& result.flags 4294967291u) (& value.flags 4u))))
+    (when (!= (& mask 8192u) 0u) (= result.flags (| (& result.flags 4294967287u) (& value.flags 8u))))
+    (when (!= (& mask 16384u) 0u) (= result.flags (| (& result.flags 4294967279u) (& value.flags 16u))))
+    result))
+
+; Resolve and coalesce ordered nonoverlapping byte ranges. Gaps retain the
+; consumer's default style; empty ranges retain insertion/empty-line styles.
+; The consumer validates UTF-8 boundaries and resource IDs against its source
+; and resource tables. This function never reads or edits document bytes.
+; Readers remain stable and do not alias output. Validate all inputs, work and
+; capacity before the first write. Status 0=success, 1=invalid, 2=limit.
+; Work counts validated table entries, spans and tested rules. A selected rule's
+; value read and field patch are part of its unit, not separately counted. This
+; bound does not measure VM instructions or elapsed time.
+(defn text-resolve-styles [bytes: u32 styles: u32 style-at: (Fn [u32] TextRunStyle)
+    rules: u32 rule-at: (Fn [u32] TextStyleRule)
+    spans: u32 span-at: (Fn [u32] TextStyleInput)
+    capacity: u32 emit: (Fn [u32 TextStyledSpan] ()) budget: u32]: TextStyleResult
+  (when (or (> bytes 1048576u) (or (> styles 4096u) (or (> rules 32u)
+    (or (> spans 32766u) (> budget 1000000u))))) (return (TextStyleResult 2u 0u 0u)))
+  (let [work (+ styles (+ rules (* (* 2u spans) (+ rules 1u)))) @var allowed 0u @var count 0u]
+    (when (> work budget) (return (TextStyleResult 2u 0u work)))
+    (for [i styles] (when (not (text-style-valid (style-at i))) (return (TextStyleResult 1u 0u work))))
+    (for [i rules]
+      (let [r (rule-at i)]
+        (when (or (== r.flag 0u) (or (!= (& r.flag (- r.flag 1u)) 0u)
+          (or (!= (& allowed r.flag) 0u) (or (== r.properties 0u)
+          (or (> r.properties 32767u) (>= r.style styles))))))
+          (return (TextStyleResult 1u 0u work)))
+        (= allowed (| allowed r.flag))))
+    (for [pass 2u]
+      (let [@var previous 0u @var output 0u @var pending (TextStyledSpan 0u 0u (TextRunStyle 0u 1. 1. 400. 0. 0. 0u 0u 4294967295u (vec4u 0u) 0u))]
+        (for [i spans]
+          (let [input (span-at i)]
+            (when (or (< input.start previous) (or (> input.start input.end)
+              (or (> input.end bytes) (or (>= input.style styles) (!= (& input.flags allowed) input.flags)))))
+              (return (TextStyleResult 1u 0u work)))
+            (let [@var style (style-at input.style)]
+              (for [j rules]
+                (let [rule (rule-at j)]
+                  (when (!= (& input.flags rule.flag) 0u)
+                    (= style (text-style-patch style (style-at rule.style) rule.properties)))))
+              (if (and (> i 0u) (and (== pending.end input.start) (text-style-equal pending.style style)))
+                (= pending.end input.end)
+                (let []
+                  (when (> i 0u)
+                    (when (== pass 1u) (emit output pending)) (+= output 1u))
+                  (= pending (TextStyledSpan input.start input.end style))))
+              (= previous input.end))))
+        (when (> spans 0u)
+          (when (== pass 1u) (emit output pending)) (+= output 1u))
+        (when (> output capacity) (return (TextStyleResult 2u 0u work)))
+        (= count output)))
+    (TextStyleResult 0u count work)))

@@ -1,0 +1,33 @@
+{
+  "application_source_sha": "5e320795d7348942fd90dcc1a93ff68cbbeaec54",
+  "source_preexisting_files_preserved": 5,
+  "source_auxiliary_files_created": [
+    ".loom/loom.sqlite3-shm",
+    ".loom/loom.sqlite3-wal"
+  ],
+  "private_files_scanned": 5,
+  "export_exact": true,
+  "runs": [
+    {
+      "command": "open",
+      "seconds": 0.054,
+      "exit_code": 0
+    },
+    {
+      "command": "open",
+      "seconds": 0.052,
+      "exit_code": 0
+    },
+    {
+      "command": "open",
+      "seconds": 0.052,
+      "exit_code": 0
+    },
+    {
+      "command": "export",
+      "seconds": 0.083,
+      "exit_code": 0
+    }
+  ],
+  "credential": "real macOS Keychain via stable signed development identity; no injected or environment key"
+}

@@ -1,0 +1,301 @@
+(import "atlas.easl")
+(import "paragraph.easl")
+
+; A flow accepts one already shaped, logical-order, horizontal LTR run. Script
+; itemization, bidi, font fallback and reshaping at selected line edges are the
+; caller's responsibility. In particular, do not pass contextual Arabic runs.
+; Callbacks must be stable, and output storage must have the declared capacity.
+; Source offsets are always UTF-8 bytes. No text is inserted, removed or folded.
+(struct TextFlowSpan
+  start: u32 end: u32 glyph-start: u32 glyph-end: u32
+  advance: f32 break-after: u32 trim: bool tab: bool)
+(struct TextFlowResult status: u32 count: u32)
+(struct TextFlowLine
+  start: u32 end: u32 span-start: u32 span-end: u32
+  quad-start: u32 quad-end: u32 bounds: vec4f)
+
+; Uniform line-relative tab stops. Zero interval and minimum give zero width.
+; A positive interval advances at least minimum beyond the current position.
+; Tab bytes are preserved, with one editable cell and no atlas ink.
+(struct TextTabs interval: f32 minimum: f32)
+; Prefixes exclude tab widths; the table records ordinary advance before each
+; tab, and points carry tab counts at their full and trimmed prefixes.
+(struct TextFlowTab advance: vec2f)
+(struct TextFlowPoint mark: TextBreak tabs: u32 trimmed-tabs: u32)
+
+(defn text-tabs-valid [tabs: TextTabs]: bool
+  (and (text-bounded tabs.interval 10000000.) (text-bounded tabs.minimum tabs.interval)))
+; -1 reports an unrepresentable stop, never a stationary/infinite advance.
+(defn text-tab-after [x: f32 tabs: TextTabs]: f32
+  (when (or (not (text-tabs-valid tabs)) (not (text-bounded x 100000000000000.))) (return -1.))
+  (when (== tabs.interval 0.) (return x))
+  (let [@var stop (* (+ (floor (/ x tabs.interval)) 1.) tabs.interval)]
+    (when (< (- stop x) tabs.minimum) (+= stop tabs.interval))
+    (if (and (> stop x) (text-bounded stop 100000000000000.)) stop -1.)))
+
+; status: 0 success, 1 invalid, 2 capacity, 4 unsupported discretionary hyphen.
+; Discretionary hyphens need explicit line-edge shaping before they can flow.
+(defn text-flow-spans [value: TextBuffer facts: u32 fact-at: (Fn [u32] TextGrapheme)
+                       glyphs: u32 glyph-at: (Fn [u32] FontShapedGlyph)
+                       capacity: u32 emit-span: (Fn [u32 TextFlowSpan] ())]: TextFlowResult
+  (when (or (> facts 65535u) (> glyphs 65535u)) (return (TextFlowResult 2u 0u)))
+  (let [bytes (text-length value) @var covered 0u]
+    (for [i facts]
+      (let [fact (fact-at i)]
+        (when (or (!= fact.start covered) (or (<= fact.end fact.start) (> fact.end bytes)))
+          (return (TextFlowResult 1u 0u)))
+        (when (!= (text-boundary value fact.start 1u) fact.end)
+          (return (TextFlowResult 1u 0u)))
+        (when (> fact.break-after 2u) (return (TextFlowResult 1u 0u)))
+        (when (== fact.scalar 173u)
+          (return (TextFlowResult 4u 0u)))
+        (= covered fact.end)))
+    (when (!= covered bytes) (return (TextFlowResult 1u 0u))))
+  ; Two passes: complete validation and capacity check precede any emission.
+  (let [@var total 0u]
+    (for [pass 2u]
+      (let [@var fact-index 0u @var glyph-index 0u @var output 0u]
+        (while (< fact-index facts)
+          (let [first (fact-at fact-index) begin glyph-index @var last first
+                @var advance 0. @var trim (or (== first.scalar 32u) (== first.break-after 2u))]
+            (when (< glyph-index glyphs)
+              (let [glyph (glyph-at glyph-index)]
+                (when (< glyph.start first.start) (return (TextFlowResult 1u 0u)))
+                (when (== glyph.start first.start)
+                  (when (or (<= glyph.end glyph.start) (> glyph.end (text-length value)))
+                    (return (TextFlowResult 1u 0u)))
+                  (while (< last.end glyph.end)
+                    (when (or (or (== last.break-after 2u) (== last.scalar 9u)) (>= (+ fact-index 1u) facts))
+                      (return (TextFlowResult 1u 0u)))
+                    (+= fact-index 1u) (= last (fact-at fact-index))
+                    (= trim (and trim (== last.scalar 32u))))
+                  (when (or (!= last.end glyph.end)
+                            (and (or (== last.break-after 2u) (== last.scalar 9u)) (!= first.start last.start)))
+                    (return (TextFlowResult 1u 0u)))
+                  (while (< glyph-index glyphs)
+                    (let [item (glyph-at glyph-index)]
+                      (when (!= item.start first.start) (break))
+                      (when (or (!= item.end glyph.end)
+                        (or (not (and (>= item.advance 0.) (<= item.advance 10000000.)))
+                          (or (not (<= (abs item.x) 10000000.)) (not (<= (abs item.y) 10000000.)))))
+                        (return (TextFlowResult 1u 0u)))
+                      (+= advance item.advance) (+= glyph-index 1u))))))
+            (when (and (== begin glyph-index)
+              (not (or (or (== first.break-after 2u) (== first.scalar 9u))
+                (or (and (>= first.scalar 8203u) (<= first.scalar 8205u))
+                  (or (== first.scalar 8288u) (== first.scalar 65279u))))))
+              (return (TextFlowResult 1u 0u)))
+            (when (not (<= advance 10000000.)) (return (TextFlowResult 1u 0u)))
+            (when (>= output capacity) (return (TextFlowResult 2u 0u)))
+            (when (== pass 1u)
+              (emit-span output (TextFlowSpan first.start last.end begin
+                (if (or (== last.break-after 2u) (== first.scalar 9u)) begin glyph-index)
+                (if (or (== last.break-after 2u) (== first.scalar 9u)) 0. advance)
+                last.break-after (and trim (!= first.scalar 9u)) (== first.scalar 9u))))
+            (+= output 1u) (+= fact-index 1u)))
+        (when (!= glyph-index glyphs) (return (TextFlowResult 1u 0u)))
+        (= total output)))
+    (TextFlowResult 0u total)))
+
+; Compensated cumulative advances keep subpixel differences at large offsets.
+(defn text-flow-add [pair: vec2f amount: f32]: vec2f
+  (let [sum (+ pair.x amount) part (- sum pair.x)
+        error (+ (- pair.x (- sum part)) (- amount part))
+        low (+ pair.y error) high (+ sum low)]
+    (vec2f high (- low (- high sum)))))
+
+; Build width-dependent input for text-compose. IDs are exclusive span indices.
+; Strict mode retains Unicode opportunities. Emergency mode fills only overlong
+; unbreakable segments, keeping each shaped cluster whole. Fitting segments keep
+; exactly the same opportunities and paragraph-wide composition. No hyphens or
+; source bytes are inserted. A cluster wider than the measure gets an explicitly
+; authorized overflow edge, including any trailing spaces/separator.
+; Two linear passes validate/count before emitting; work is bounded by spans,
+; and capacity by actual opportunities, not every possible cluster boundary.
+(defn text-flow-points [count: u32 span-at: (Fn [u32] TextFlowSpan)
+                        width: f32 emergency: bool tabs: TextTabs
+                        capacity: u32 emit-point: (Fn [u32 TextFlowPoint] ())
+                        tab-capacity: u32 emit-tab: (Fn [u32 TextFlowTab] ())]: TextFlowResult
+  (when (> count 65535u) (return (TextFlowResult 2u 0u)))
+  (when (or (not (text-tabs-valid tabs)) (not (and (> width 0.) (<= width 10000000.))))
+    (return (TextFlowResult 1u 0u)))
+  (let [@var total 0u]
+    (for [pass 2u]
+      (let [@var advance (vec2f 0.) @var trimmed (vec2f 0.) @var output 1u
+            @var tab-count 0u @var trimmed-tabs 0u
+            @var chunk-start 0u @var chunk-width (vec2f 0.) @var chunk-ink 0.
+            @var overflow-start 4294967295u]
+        (when (== pass 1u)
+          (emit-point 0u (TextFlowPoint (TextBreak 0u advance trimmed 0. 0u 4294967295u) 0u 0u)))
+        (for [i count]
+          (let [span (span-at i)]
+            (when (or (not (text-bounded span.advance 10000000.)) (> span.break-after 2u))
+              (return (TextFlowResult 1u 0u)))
+            (when (and span.tab (or span.trim (or (!= span.advance 0.) (!= span.glyph-start span.glyph-end))))
+              (return (TextFlowResult 1u 0u)))
+            (let [before (+ chunk-width.x chunk-width.y)
+                  @var next (if span.tab (vec2f (text-tab-after before tabs) 0.) (text-flow-add chunk-width span.advance))
+                  @var occupied (+ next.x next.y)]
+              (when (< occupied 0.) (return (TextFlowResult 1u 0u)))
+              (when (and emergency
+                (and (not span.trim) (and (> occupied before)
+                  (and (> chunk-ink 0.) (> occupied (+ width 0.01))))))
+                (when (== pass 1u)
+                  (emit-point output (TextFlowPoint (TextBreak i advance trimmed 0. 0u overflow-start)
+                    tab-count trimmed-tabs)))
+                (+= output 1u) (= chunk-start i) (= chunk-width (vec2f 0.)) (= chunk-ink 0.)
+                (= next (vec2f (if span.tab (text-tab-after 0. tabs) span.advance) 0.))
+                (= occupied next.x)
+                (= overflow-start 4294967295u))
+              (= chunk-width next))
+            (when span.tab
+              (when (== pass 1u) (emit-tab tab-count (TextFlowTab advance)))
+              (+= tab-count 1u))
+            (= advance (text-flow-add advance span.advance))
+            (when (not span.trim)
+              (= trimmed advance) (= trimmed-tabs tab-count) (= chunk-ink (+ chunk-width.x chunk-width.y))
+              (when (and emergency (> (if span.tab (text-tab-after 0. tabs) span.advance) (+ width 0.01)))
+                (= overflow-start chunk-start)))
+            (when (or (!= span.break-after 0u) (== (+ i 1u) count))
+              (when (== pass 1u)
+                (emit-point output (TextFlowPoint (TextBreak (+ i 1u) advance trimmed 0.
+                  (if (or (== span.break-after 2u) (== (+ i 1u) count)) 1u 0u)
+                  overflow-start) tab-count trimmed-tabs)))
+              (+= output 1u) (= chunk-start (+ i 1u)) (= chunk-width (vec2f 0.)) (= chunk-ink 0.)
+              (= overflow-start 4294967295u))
+            (when (== span.break-after 2u) (= trimmed advance) (= trimmed-tabs tab-count))))
+        (when (or (> output capacity) (or (> output 4096u) (> tab-count tab-capacity)))
+          (return (TextFlowResult 2u 0u)))
+        (= total output)))
+    (TextFlowResult 0u total)))
+
+; Ordinary lines remain O(1). Only intervening tabs are visited; each consumes
+; one work unit. Caller supplies points/table from one successful points pass.
+(defn text-flow-measure [start: TextFlowPoint end: TextFlowPoint tabs: TextTabs
+                         tab-count: u32 tab-at: (Fn [u32] TextFlowTab)
+                         budget: u32]: TextLineMeasure
+  (when (or (not (text-tabs-valid tabs))
+    (or (> start.tabs end.tabs) (or (> end.tabs tab-count) (> end.trimmed-tabs end.tabs))))
+    (return (TextLineMeasure 1u 0. 0u)))
+  (let [count (- end.tabs start.tabs)]
+    (when (> count budget) (return (TextLineMeasure 3u 0. 0u)))
+    (when (== count 0u)
+      (return (TextLineMeasure 0u (max 0. (text-line-advance start.mark end.mark)) 0u)))
+    ; Tabs are retained at line ends, so trimming may not remove one.
+    (when (!= end.trimmed-tabs end.tabs) (return (TextLineMeasure 1u 0. 0u)))
+    (let [@var prefix start.mark.advance @var x 0.]
+      (for [i start.tabs (< i end.tabs) (+= i 1u)]
+        (let [item (tab-at i)
+              gap (+ (- item.advance.x prefix.x) (- item.advance.y prefix.y))]
+          (when (not (text-bounded gap 100000000000000.)) (return (TextLineMeasure 1u 0. count)))
+          (= x (text-tab-after (+ x gap) tabs))
+          (when (< x 0.) (return (TextLineMeasure 1u 0. count)))
+          (= prefix item.advance)))
+      (let [tail (+ (- end.mark.trimmed.x prefix.x) (- end.mark.trimmed.y prefix.y))]
+        (when (not (text-bounded tail 100000000000000.)) (return (TextLineMeasure 1u 0. count)))
+        (TextLineMeasure 0u (+ x tail) count)))))
+
+; Place a complete chosen composition. Empty text and a trailing hard separator
+; get an explicit empty final line. Validate the full break list before output.
+; Emergency mode permits chosen shaped-span boundaries, never a split within a
+; cluster or across a hard separator. Use the same mode as text-flow-points.
+; A line's quad range and bounds support viewport culling without reshaping.
+(defn text-flow-place [count: u32 span-at: (Fn [u32] TextFlowSpan)
+                       chosen: u32 break-at: (Fn [u32] u32) emergency: bool tabs: TextTabs
+                       glyph-at: (Fn [u32] FontShapedGlyph)
+                       ink-at: (Fn [u32] FontAtlasGlyph) atlas-size: vec2f
+                       origin: vec2f ascent: f32 line-height: f32
+                       capacity: u32 emit-line: (Fn [u32 TextFlowLine] ())
+                       emit-quad: (Fn [u32 TextGlyphQuad] ())
+                       emit-cluster: (Fn [u32 TextClusterBox] ())]: TextFlowResult
+  (when (not (and (all (> atlas-size (vec2f 0.)))
+                 (all (<= atlas-size (vec2f 10000000.))))) (return (TextFlowResult 1u 0u)))
+  (text-flow-position count span-at chosen break-at emergency tabs glyph-at
+    origin ascent line-height capacity emit-line
+    (fn [i item] (emit-quad i (text-placed-glyph-quad item (ink-at item.glyph.id) atlas-size))) emit-cluster))
+
+; The same validated flow, with page-independent positioned glyphs. Resolve ink
+; only after collecting the complete composition's final glyph requirements.
+(defn text-flow-position [count: u32 span-at: (Fn [u32] TextFlowSpan)
+                       chosen: u32 break-at: (Fn [u32] u32) emergency: bool tabs: TextTabs
+                       glyph-at: (Fn [u32] FontShapedGlyph)
+                       origin: vec2f ascent: f32 line-height: f32
+                       capacity: u32 emit-line: (Fn [u32 TextFlowLine] ())
+                       emit-glyph: (Fn [u32 TextPlacedGlyph] ())
+                       emit-cluster: (Fn [u32 TextClusterBox] ())]: TextFlowResult
+  (when (not (text-tabs-valid tabs)) (return (TextFlowResult 1u 0u)))
+  (when (or (> count 65535u) (> chosen 4096u)) (return (TextFlowResult 2u 0u)))
+  (when (or (not (and (> line-height 0.) (<= line-height 10000000.)))
+    (or (not (and (>= ascent 0.) (<= ascent line-height)))
+      (not (all (<= (abs origin) (vec2f 10000000.))))))
+    (return (TextFlowResult 1u 0u)))
+  (let [@var previous 0u @var hard-index 0u @var checked-advance (vec2f 0.)
+        extra (if (== count 0u) 1u (if (== (.break-after (span-at (- count 1u))) 2u) 1u 0u))
+        lines (+ chosen extra)]
+    (when (or (> lines capacity) (> lines 4096u)) (return (TextFlowResult 2u 0u)))
+    (when (not (<= (+ (abs origin.y) (* (f32 lines) line-height)) 10000000.))
+      (return (TextFlowResult 1u 0u)))
+    ; Derive both sides of each band from shared edges. At large coordinates,
+    ; reject a height too small to remain representable before emitting output.
+    (for [i lines]
+      (let [top (+ origin.y (* (f32 i) line-height))
+            bottom (+ origin.y (* (f32 (+ i 1u)) line-height))]
+        (when (not (> bottom top)) (return (TextFlowResult 1u 0u)))))
+    (for [i chosen]
+      (let [end (break-at i) @var checked-base checked-advance @var checked-tab-x 0.]
+        (when (or (<= end previous) (> end count)) (return (TextFlowResult 1u 0u)))
+        (while (< hard-index end)
+          (when (and (== (.break-after (span-at hard-index)) 2u) (!= (+ hard-index 1u) end))
+            (return (TextFlowResult 1u 0u)))
+          (let [span (span-at hard-index)]
+            (when (and span.tab (or span.trim (or (!= span.advance 0.) (!= span.glyph-start span.glyph-end))))
+              (return (TextFlowResult 1u 0u)))
+            (when (not (text-bounded span.advance 10000000.)) (return (TextFlowResult 1u 0u)))
+            (= checked-advance (text-flow-add checked-advance span.advance))
+            (when span.tab
+              (= checked-tab-x (text-tab-after (+ checked-tab-x
+                (+ (- checked-advance.x checked-base.x) (- checked-advance.y checked-base.y))) tabs))
+              (when (< checked-tab-x 0.) (return (TextFlowResult 1u 0u)))
+              (= checked-base checked-advance)))
+          (+= hard-index 1u))
+        (when (and (not emergency) (and (!= end count) (== (.break-after (span-at (- end 1u))) 0u)))
+          (return (TextFlowResult 1u 0u)))
+        (= previous end)))
+    (when (!= previous count) (return (TextFlowResult 1u 0u)))
+    ; Use the very same compensated global prefixes as measurement. Naively
+    ; adding glyph floats can land on the other side of a tab-stop threshold.
+    (let [@var begin 0u @var quad-index 0u @var advance (vec2f 0.)]
+      (for [line chosen]
+        (let [end (break-at line) @var ink-end end @var x 0. @var base advance @var tab-x 0.
+              top (+ origin.y (* (f32 line) line-height))
+              bottom (+ origin.y (* (f32 (+ line 1u)) line-height))
+              band-height (- bottom top) quad-start quad-index]
+          (while (> ink-end begin)
+            (when (not (.trim (span-at (- ink-end 1u)))) (break))
+            (-= ink-end 1u))
+          (for [i begin (< i end) (+= i 1u)]
+            (let [span (span-at i) left x]
+              (when (< i ink-end)
+                (when span.tab
+                  (= tab-x (text-tab-after x tabs)) (= base advance))
+                (for [j span.glyph-start (< j span.glyph-end) (+= j 1u)]
+                  (let [glyph (glyph-at j)]
+                    (emit-glyph quad-index (TextPlacedGlyph glyph
+                      (vec2f (+ origin.x x) (+ top ascent)) 1.))
+                    (+= quad-index 1u) (+= x glyph.advance))))
+              (= advance (text-flow-add advance span.advance))
+              (when (< i ink-end)
+                (= x (+ tab-x (+ (- advance.x base.x) (- advance.y base.y)))))
+              (emit-cluster i (TextClusterBox (vec4f (+ origin.x left) top (- x left) band-height)
+                span.start span.end line false))))
+          (emit-line line (TextFlowLine (.start (span-at begin)) (.end (span-at (- end 1u)))
+            begin end quad-start quad-index (vec4f origin.x top x band-height)))
+          (= begin end)))
+      (when (!= extra 0u)
+        (let [offset (if (== count 0u) 0u (.end (span-at (- count 1u))))
+              top (+ origin.y (* (f32 chosen) line-height))
+              bottom (+ origin.y (* (f32 (+ chosen 1u)) line-height))
+              bounds (vec4f origin.x top 0. (- bottom top))]
+          (emit-cluster count (TextClusterBox bounds offset offset chosen false))
+          (emit-line chosen (TextFlowLine offset offset count (+ count 1u) quad-index quad-index bounds))))
+      (TextFlowResult 0u lines))))

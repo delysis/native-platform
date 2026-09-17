@@ -1,0 +1,9 @@
+(defn (id-1 T) [x: T]: T
+  x)
+
+(defn (id-2 T) [x: T]: T
+  (id-1 x))
+
+(defn main []
+  (print (id-2 5.))
+  (print (id-2 5u)))

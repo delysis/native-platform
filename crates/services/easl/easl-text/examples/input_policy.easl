@@ -1,0 +1,12 @@
+(import "../library/input.easl")
+(var input-events: [TextInputEvent])
+@external (var input-bytes: [u32])
+@external (var input-decisions: [TextInputDecision])
+@cpu
+(defn main []
+  (= input-events (text-input-events))
+  (= input-bytes (text-input-bytes))
+  (= input-decisions (zeroed-array (array-length input-events)))
+  (for [i (array-length input-events)]
+    (= (input-decisions i) (text-input-decision (input-events i) 8u 4u)))
+  (text-input-area true (vec4f 32. 64. 2. 32.)))

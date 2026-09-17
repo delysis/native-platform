@@ -1,0 +1,151 @@
+(import "line_layout.easl")
+(import "../library/view.easl")
+
+; An ordinary EASL consumer, with a single shaped line. It supplies storage and
+; painting; the imported library owns placement, hit testing and editing policy.
+(var demo-editor: TextEditorState)
+(var demo-view: TextViewState)
+(var demo-source: TextBuffer)
+(var demo-clusters: [TextClusterBox])
+(var demo-cells: [TextCell])
+(var demo-events: [TextInputEvent])
+(var demo-input-bytes: [u32])
+@{group 0 binding 3 address storage} (var demo-rects: [vec4f])
+@{group 0 binding 4 address uniform} (var demo-viewport: vec2f)
+@external (var demo-cell-count: u32)
+@external @{group 0 binding 5 address uniform} (var demo-rect-count: u32)
+@external (var demo-caret: TextHit)
+@external (var demo-proof-ok: bool)
+(var demo-focused: bool)
+
+(defn demo-cluster-at [i: u32]: TextClusterBox (demo-clusters i))
+(defn demo-cell-at [i: u32]: TextCell (demo-cells i))
+(defn demo-emit-cluster [i: u32 item: TextClusterBox] (= (demo-clusters i) item))
+(defn demo-emit-cell [i: u32 item: TextCell] (= (demo-cells i) item))
+(defn demo-emit-rect [i: u32 item: vec4f]
+  (= (demo-rects i)
+    (if demo-editor.composing (vec4f item.x 104. item.z 1.5) item)))
+
+@external (var demo-layout-status: u32)
+@cpu
+(defn demo-layout []
+  (let [source (text-editor-visible demo-editor)]
+    (= demo-layout-status (line-layout source))
+    (when (!= demo-layout-status 0u) (return))
+    (= specimen-quads line-quads) (= specimen-count line-quad-count)
+    (= demo-clusters line-clusters) (= demo-cells line-cells)
+    (= demo-cell-count line-cell-count)
+    (= demo-rects (zeroed-array (+ demo-cell-count 1u)))
+    (= demo-source source)))
+
+@cpu
+(defn demo-decorations []
+  (= demo-rect-count (text-selection-rects demo-cell-count demo-cell-at
+    (if demo-editor.composing demo-editor.preedit-start demo-editor.current.anchor)
+    (if demo-editor.composing demo-editor.preedit-end demo-editor.current.focus) demo-emit-rect))
+  (let [position-byte (if demo-editor.composing
+          (if (== demo-editor.cursor-end 4294967295u) demo-editor.preedit-end
+            (text-boundary demo-source demo-editor.cursor-end 2u)) demo-editor.current.focus)]
+    (= demo-caret (text-caret-at demo-cell-count demo-cell-at position-byte demo-view.affinity))
+    (= (demo-rects demo-rect-count) demo-caret.rect)))
+
+@vertex
+(defn demo-glyph-vertex []: SpecimenVertex
+  (let [index (vertex-index) quad (specimen-quads (/ index 6u)) corner (text-quad-corner index)]
+    (SpecimenVertex (text-quad-position quad corner demo-viewport) (text-quad-uv quad corner))))
+
+@vertex
+(defn demo-selection-vertex []: @{builtin position} vec4f
+  (let [index (vertex-index) box (demo-rects (/ index 6u))]
+    (text-quad-position (TextGlyphQuad box (vec4f 0.) 0u 0u) (text-quad-corner index) demo-viewport)))
+
+@vertex
+(defn demo-caret-vertex []: @{builtin position} vec4f
+  (text-quad-position (TextGlyphQuad (demo-rects demo-rect-count) (vec4f 0.) 0u 0u)
+    (text-quad-corner (vertex-index)) demo-viewport))
+
+@fragment
+(defn demo-selection-fragment []: @{location 0} vec4f (vec4f 0.15 0.35 0.6 0.28))
+@fragment
+(defn demo-caret-fragment []: @{location 0} vec4f (vec4f 0.08 0.10 0.08 1.))
+
+@cpu
+(defn demo-draw []
+  (if (== demo-layout-status 0u) (demo-decorations)
+    (let [] (= demo-rect-count 0u) (= demo-caret (text-no-hit))))
+  (dispatch-render-shaders specimen-background-vertex specimen-background-fragment 3u)
+  (dispatch-render-shaders demo-selection-vertex demo-selection-fragment (* demo-rect-count 6u) 2u)
+  (dispatch-render-shaders demo-glyph-vertex specimen-fragment (* specimen-count 6u) 2u)
+  (when (and demo-focused (== demo-caret.status 0u))
+    (when (or (not demo-editor.composing) (!= demo-editor.cursor-end 4294967295u))
+      (dispatch-render-shaders demo-caret-vertex demo-caret-fragment 6u 2u))))
+
+@cpu
+(defn demo-prepare []
+  (prepare)
+  (let [seed (make-text "Office, café, affinity.")]
+    (text-editor-open demo-editor seed) (text-release seed))
+  (text-view-reset demo-view) (= demo-focused true) (= demo-viewport (vec2f 1200. 180.))
+  (demo-layout))
+
+@cpu
+(defn demo-select-ligature []
+  (let [start (text-caret-at demo-cell-count demo-cell-at 1u 1u)
+        end (text-caret-at demo-cell-count demo-cell-at 4u 0u)
+        pressed (text-view-pointer demo-editor demo-view demo-source demo-cell-count demo-cell-at
+                  start.rect.xy true true true false)
+        dragged (text-view-pointer demo-editor demo-view demo-source demo-cell-count demo-cell-at
+                  end.rect.xy true false true false)
+        released (text-view-pointer demo-editor demo-view demo-source demo-cell-count demo-cell-at
+                  end.rect.xy true false false false)
+        copy (text-editor-copy demo-editor) expected (make-text "ffi")]
+    (= demo-proof-ok (and (and (== pressed 0u) (== dragged 0u)) (and (== released 4u) (text-equal copy expected))))
+    (text-release copy) (text-release expected)))
+
+@cpu
+(defn demo-save []
+  (= specimen-target (blank-texture 1200u 180u))
+  (set-render-target specimen-target) (demo-draw)
+  (save-png specimen-target "view-specimen.png")
+  (text-editor-close demo-editor))
+
+@cpu
+(defn view-selection-proof []
+  (demo-prepare) (demo-select-ligature) (demo-save))
+
+@cpu
+(defn view-preedit-proof []
+  (demo-prepare) (demo-select-ligature)
+  (let [preedit (make-text "é") expected (make-text "Office, café, affinity.")
+        preview (make-text "Oéce, café, affinity.")
+        status (text-view-input demo-editor demo-view demo-source demo-cell-count demo-cell-at
+          (TextInputEvent 3u 0u 0u 0u 3u 0u 3u) preedit 8u 4u)]
+    (= demo-proof-ok (and demo-proof-ok (and (== status 0u)
+      (and (text-equal demo-editor.current.text expected) (text-equal (text-editor-visible demo-editor) preview)))))
+    (text-release preedit) (text-release expected) (text-release preview))
+  (demo-layout) (demo-save))
+
+@cpu
+(defn demo-frame []
+  (= demo-viewport (vec2f (window-resolution)))
+  (= demo-events (text-input-events)) (= demo-input-bytes (text-input-bytes))
+  (for [i (array-length demo-events)]
+    (let [event (demo-events i)
+          payload (text-from-utf8 demo-input-bytes event.text-start event.text-end)]
+      (text-view-input demo-editor demo-view demo-source demo-cell-count demo-cell-at event payload 8u 4u)
+      (when (== event.kind 6u) (= demo-focused false))
+      (text-release payload)
+      (when (or (!= demo-layout-status 0u)
+                (!= demo-source.handle (.handle (text-editor-visible demo-editor)))) (demo-layout))))
+  (when (and (mouse-present?) (mouse-just-down?)) (= demo-focused true))
+  (text-view-pointer demo-editor demo-view demo-source demo-cell-count demo-cell-at
+    (vec2f (mouse-coords)) (mouse-present?) (mouse-just-down?) (mouse-down?) (key-down? "shift"))
+  (demo-draw)
+  (text-input-area (and demo-focused (== demo-caret.status 0u)) demo-caret.rect))
+
+; Standalone window and Studio use the same per-frame EASL view controller.
+@cpu
+(defn view-window []
+  (demo-prepare)
+  (spawn-window demo-frame)
+  (text-editor-close demo-editor))

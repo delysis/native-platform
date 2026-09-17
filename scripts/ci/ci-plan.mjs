@@ -163,6 +163,7 @@ function applyPrimaryGroup(group) {
     case "product-mom":
       flags.mom = presence.mom;
       break;
+    case "service-easl":
     case "product-loom":
       flags.loom = presence.loom;
       break;

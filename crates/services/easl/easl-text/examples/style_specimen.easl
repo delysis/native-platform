@@ -1,0 +1,121 @@
+; Real regular/bold italic instances through the shared rich line consumer.
+; EASL styles control size, tracking, word spacing, ink and font decorations.
+; Resizing/repainting reuses atlases, resolved glyphs, quads and decorations.
+(import "line_layout.easl")
+
+(var style-first: [TextGlyphQuad]) (var style-second: [TextGlyphQuad])
+(var style-first-decorations: [TextDecoration]) (var style-second-decorations: [TextDecoration])
+@{group 0 binding 3 address uniform} (var style-color: vec4f)
+@{group 0 binding 4 address uniform} (var style-offset: vec2f)
+@{group 0 binding 5 address uniform} (var style-viewport: vec2f)
+@{group 0 binding 6 address storage} (var style-current-decorations: [TextDecoration])
+@{group 0 binding 7 address uniform} (var style-face: u32)
+(var style-axes: [FontVariation]) (var style-features: [FontFeature])
+(var style-source: TextBuffer) (var style-language: TextBuffer)
+@external (var style-status: u32)
+
+(defn style-record [face: u32]: TextRunStyle
+  (if (== face 0u)
+    (TextRunStyle 0u 32. 48. 400. 1.25 3. 0u 0u 0u (vec4u 20u 41u 31u 255u) 18u)
+    (TextRunStyle 0u 40. 56. 700. 0. 0. 0u 1u 0u (vec4u 140u 26u 15u 255u) 21u)))
+(defn style-font-for [s: TextRunStyle]: u32
+  (if (and (>= s.weight 700.) (!= (& s.flags 1u) 0u)) 1u 0u))
+
+@cpu
+(defn style-build-run []
+  (let [s (style-record style-face)]
+    (= style-status (line-layout-styled style-source 1u
+      (fn [i] (TextStyledSpan 0u (text-length style-source) s)) style-font-for s (vec2f 0.)))
+    (when (!= style-status 0u) (return))
+    (= specimen-quads (zeroed-array line-quad-count))
+    (for [i line-quad-count] (= (specimen-quads i) (line-quads i)))
+    (= style-current-decorations (zeroed-array line-decoration-count))
+    (for [i line-decoration-count] (= (style-current-decorations i) (line-decorations i)))
+    (= specimen-count line-quad-count) (= specimen-advance line-advance)))
+
+@cpu
+(defn style-close []
+  (line-close)
+  (when (!= style-source.handle 0u) (text-release style-source))
+  (= style-source (TextBuffer 0u))
+  (when (!= style-language.handle 0u) (text-release style-language))
+  (= style-language (TextBuffer 0u)) (= line-languages (zeroed-array 0u)))
+
+@cpu
+(defn style-prepare []
+  (style-close)
+  (= style-axes (zeroed-array 2u)) (= style-features (zeroed-array 1u))
+  ; OpenType tags wght, ital and kern, in network byte order.
+  (= (style-axes 0u) (FontVariation 2003265652u 400.))
+  (= (style-axes 1u) (FontVariation 1769234796u 0.))
+  (= (style-features 0u) (FontFeature 1801810542u 1u))
+  (= specimen-font (open-font "../tests/fonts/shantell-sans-variable.ttf" 40. 0u style-axes))
+  (= specimen-metrics (font-metrics specimen-font)) (= specimen-ink (font-atlas-glyphs specimen-font))
+  (= (style-axes 0u) (FontVariation 2003265652u 700.))
+  (= (style-axes 1u) (FontVariation 1769234796u 1.))
+  (= cascade-second (open-font "../tests/fonts/shantell-sans-variable.ttf" 40. 0u style-axes))
+  (= cascade-second-metrics (font-metrics cascade-second)) (= cascade-second-ink (font-atlas-glyphs cascade-second))
+  (= cascade-enabled true)
+  (= style-language (make-text "en"))
+  (= line-languages (zeroed-array 1u)) (= (line-languages 0u) style-language)
+  (= line-feature-values style-features)
+  (= line-feature-sets (zeroed-array 1u)) (= (line-feature-sets 0u) (vec2u 0u 1u))
+  (= style-face 0u) (= style-source (make-text "A steady measure.")) (style-build-run)
+  (when (!= style-status 0u) (print style-status) (style-close) (return))
+  (= style-first specimen-quads) (= style-first-decorations style-current-decorations)
+  (text-release style-source) (= style-source (TextBuffer 0u)) (= style-face 1u)
+  (= style-source (make-text "An italic accent.")) (style-build-run)
+  (when (!= style-status 0u) (print style-status) (style-close) (return))
+  (= style-second specimen-quads) (= style-second-decorations style-current-decorations)
+  (text-release style-source) (= style-source (TextBuffer 0u)))
+
+@vertex
+(defn style-vertex []: SpecimenVertex
+  (let [index (vertex-index) original (specimen-quads (/ index 6u))
+        quad (TextGlyphQuad (vec4f (+ original.bounds.xy style-offset) original.bounds.zw)
+          original.uv original.start original.end)
+        corner (text-quad-corner index)]
+    (SpecimenVertex (text-quad-position quad corner style-viewport) (text-quad-uv quad corner))))
+
+@fragment
+(defn style-fragment [input: SpecimenVertex]: @{location 0} vec4f
+  (let [regular (.w (texture-sample specimen-font specimen-sampler input.uv))
+        heavy (.w (texture-sample cascade-second specimen-sampler input.uv))
+        coverage (if (== style-face 0u) regular heavy)]
+    (vec4f style-color.xyz (* style-color.w coverage))))
+
+(struct StyleDecorationVertex @{builtin position} clip: vec4f @{location 0} color: vec4f)
+@vertex
+(defn style-decoration-vertex []: StyleDecorationVertex
+  (let [i (vertex-index) d (style-current-decorations (/ i 6u))
+        quad (TextGlyphQuad (vec4f (+ d.bounds.xy style-offset) d.bounds.zw) (vec4f 0.) 0u 0u)]
+    (StyleDecorationVertex (text-quad-position quad (text-quad-corner i) style-viewport)
+      (/ (vec4f d.color) 255.))))
+@fragment
+(defn style-decoration-fragment [input: StyleDecorationVertex]: @{location 0} vec4f input.color)
+
+@cpu
+(defn style-paint []
+  (dispatch-render-shaders specimen-background-vertex specimen-background-fragment 3u)
+  (for [i 2u]
+    (= style-face i)
+    (if (== i 0u)
+      (let [] (= specimen-quads style-first) (= style-current-decorations style-first-decorations))
+      (let [] (= specimen-quads style-second) (= style-current-decorations style-second-decorations)))
+    (= style-offset (vec2f 30. (if (== i 0u) 95. 175.)))
+    (= style-color (/ (vec4f (.color (style-record i))) 255.))
+    (dispatch-render-shaders style-vertex style-fragment (* (array-length specimen-quads) 6u) 2u)
+    (dispatch-render-shaders style-decoration-vertex style-decoration-fragment
+      (* (array-length style-current-decorations) 6u) 2u)))
+
+@cpu
+(defn styled-proof []
+  (style-prepare) (= style-viewport (vec2f 640. 240.))
+  (= specimen-target (blank-texture 640u 240u))
+  (set-render-target specimen-target) (style-paint)
+  (save-png specimen-target "style-specimen.png") (style-close))
+
+@cpu
+(defn main []
+  (style-prepare)
+  (spawn-window (fn [] (= style-viewport (vec2f (window-resolution))) (style-paint))))

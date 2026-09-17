@@ -14,6 +14,7 @@ const model: ModelCapabilitySummary = {
 };
 const template: WorkspaceTemplateSnapshot = {
   enabled: true, document_id: 'settings', revision_id: 'one',
+  source_sha256: 'settings-source', suggestions: null, model_path: null, downloads: {}, google_client_configured: false,
   config: { model: { profile: 'writer-v1' }, panes: {} }, error: null
 };
 
@@ -34,4 +35,10 @@ it('treats configured identity as mandatory and never falls back to a remembered
   expect(workspaceWriterCandidates({ profile: 'missing' }, [discovered], [], model.model_path)).toEqual([]);
   expect(workspaceWriterCandidates({ catalog: 'missing' }, [discovered], [], model.model_path)).toEqual([]);
   expect(workspaceWriterCandidates({ profile: 'writer-v1' }, [{ ...discovered, local: false }], [], model.model_path)).toEqual([]);
+});
+
+it('requires both an explicit model path and named identity when both are configured', () => {
+  expect(workspaceWriterModel([model], null, [], { ...template, model_path: model.model_path }, true)).toBe(model);
+  expect(workspaceWriterModel([model], null, [], { ...template, model_path: '/models/other.gguf' }, true)).toBeUndefined();
+  expect(workspaceWriterModel([model], null, [], { ...template, model_path: '/models/other.gguf', config: { panes: {} } }, true)).toBeUndefined();
 });

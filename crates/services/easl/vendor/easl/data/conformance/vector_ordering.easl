@@ -1,0 +1,6 @@
+; Comparisons are componentwise for every numeric vector width in both CPUs.
+(defn f []: bool
+  (and (all (== (< (vec2f 1. 4.) (vec2f 2. 4.)) (vec2b true false)))
+    (and (all (== (>= (vec3u 1u 2u 3u) (vec3u 2u 2u 2u)) (vec3b false true true)))
+      (and (all (== (> (vec4i -2i 0i 2i 4i) (vec4i -3i 0i 3i 3i)) (vec4b true false false true)))
+        (all (== (<= (vec2f 1. 2.) (vec2f 1. 1.)) (vec2b true false)))))))

@@ -1,0 +1,77 @@
+(import "flow_scene.easl")
+
+@cpu
+(defn flow-prepare []
+  (let [seed (make-text "The measure of a page.
+Beautiful type makes space for thought. A steady rhythm, a generous measure, and careful emphasis help the eye settle into a paragraph.
+
+Office, café, affinity. élan stays whole when the measure changes.
+")]
+    (flow-open seed) (text-release seed)))
+
+@cpu
+(defn flow-select []
+  (let [start (text-caret-at demo-cell-count demo-cell-at 4u 1u)
+        end (text-caret-at demo-cell-count demo-cell-at 51u 0u)
+        pressed (text-view-pointer demo-editor flow-widget.view demo-source demo-cell-count demo-cell-at
+          start.rect.xy true true true false)
+        dragged (text-view-pointer demo-editor flow-widget.view demo-source demo-cell-count demo-cell-at
+          end.rect.xy true false true false)
+        released (text-view-pointer demo-editor flow-widget.view demo-source demo-cell-count demo-cell-at
+          end.rect.xy true false false false)
+        actual (text-editor-copy demo-editor) expected (text-slice demo-source 4u 51u)]
+    (= demo-proof-ok (and (== flow-status 0u) (and (and (== pressed 0u) (== dragged 0u))
+      (and (== released 4u) (text-equal actual expected)))))
+    (text-release actual) (text-release expected)))
+
+@cpu
+(defn flow-proof []
+  (flow-prepare)
+  (when (!= flow-status 0u) (= demo-proof-ok false) (return ()))
+  (flow-select)
+  (let [before demo-editor.current.focus original (text-retain demo-editor.current.text)]
+    ; Reflow changes the visual lines, not selection or manuscript bytes.
+    (= flow-width 410.) (= flow-status (flow-layout))
+    (= demo-proof-ok (and demo-proof-ok (and (== flow-status 0u)
+      (and (== before demo-editor.current.focus) (text-equal original demo-editor.current.text)))))
+    (= flow-width 820.) (= flow-status (flow-layout))
+    (= demo-proof-ok (and demo-proof-ok (and (== flow-status 0u) (== flow-shapes 1u)))) (text-release original)))
+
+@cpu
+(defn flow-save []
+  (= specimen-target (blank-texture 900u 650u))
+  (set-render-target specimen-target) (flow-draw)
+  (save-png specimen-target "flow-specimen.png")
+  (text-editor-close demo-editor))
+
+@cpu
+(defn flow-render-proof []
+  (flow-proof) (if demo-proof-ok (flow-save) (flow-dispose)))
+
+@cpu (defn flow-reflow [] (= flow-status (flow-layout)))
+@cpu (defn flow-dispose [] (text-editor-close demo-editor))
+
+
+@cpu
+(defn flow-scroll-prepare []
+  (flow-proof)
+  (when (not demo-proof-ok) (return ()))
+  (= demo-viewport (vec2f 900. 180.))
+  (text-editor-edit demo-editor (TextEditCommand 3u (text-length demo-source) 0u 0u) (TextBuffer 0u))
+  (= flow-widget.view.affinity 1u) (flow-decorations)
+  (let [last (flow-lines (- flow-line-count 1u))
+        reveal (text-scroll-reveal (vec2f 0.) demo-viewport
+          (vec2f 900. (+ last.bounds.y last.bounds.w)) demo-caret.rect (vec2f 8.))
+        hit (text-indexed-hit flow-line-count flow-index-at demo-cell-at demo-caret.rect.xy)]
+    (= flow-scroll reveal.offset)
+    (= demo-proof-ok (and demo-proof-ok (and (== reveal.status 0u)
+      (and (== hit.byte (text-length demo-source)) (== flow-shapes 1u))))))
+  ())
+@cpu
+(defn flow-scroll-proof []
+  (flow-scroll-prepare)
+  (when (not demo-proof-ok) (flow-dispose) (return ()))
+  (= specimen-target (blank-texture 900u 180u))
+  (set-render-target specimen-target) (flow-draw)
+  (= demo-proof-ok (and demo-proof-ok (and (> flow-visible.x 0u) (== flow-visible.y flow-line-count))))
+  (save-png specimen-target "flow-specimen.png") (flow-dispose))

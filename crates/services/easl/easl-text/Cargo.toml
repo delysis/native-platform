@@ -1,0 +1,30 @@
+[package]
+name = "easl-text"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+gpu = ["easl/window"]
+
+[[example]]
+name = "atlas_specimen"
+required-features = ["gpu"]
+
+[dependencies]
+easl = { path = "../vendor/easl" }
+easl-native-text = { path = "../easl-native-text" }
+thiserror.workspace = true
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[dev-dependencies]
+tempfile.workspace = true
+harfrust = "=0.12.0"
+unicode-bidi = "=0.3.18"

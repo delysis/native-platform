@@ -1,0 +1,14 @@
+(defn f []: f32
+  (let [x 0.
+        x (+ x 1.)
+        x (+ x 2.)
+        y: f32 0
+        y: u32 0]
+    (+ x x)))
+
+(defn g []: f32
+  (let [@var x 0.5]
+    (+= x
+        (let [x 1.]
+          x))
+    x))

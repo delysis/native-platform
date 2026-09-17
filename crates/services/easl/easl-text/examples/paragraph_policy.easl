@@ -1,0 +1,22 @@
+(import "../library/paragraph.easl")
+
+; A normal EASL consumer, with its own state and policy. No native text adapter
+; participates in choosing these lines. Shaped measurements are fixture values.
+(var points: [TextBreak])
+@external (var selected: [u32])
+@external (var result: TextComposition)
+
+@cpu
+(defn main []
+  (= points (into-dynamic-array
+                 [(TextBreak 0u (vec2f 0.) (vec2f 0.) 0. 1u 4294967295u)
+                  (TextBreak 4u (vec2f 4. 0.) (vec2f 3. 0.) 0. 0u 4294967295u)
+                  (TextBreak 7u (vec2f 7. 0.) (vec2f 6. 0.) 0. 0u 4294967295u)
+                  (TextBreak 10u (vec2f 10. 0.) (vec2f 9. 0.) 0. 0u 4294967295u)
+                  (TextBreak 15u (vec2f 15. 0.) (vec2f 15. 0.) 0. 1u 4294967295u)]))
+    (= selected (zeroed-array 5u))
+    (= result (text-compose (array-length points)
+                                (fn [i] (points i))
+                              (fn [start end budget] (text-prefix-measure (points start) (points end)))
+                                6. (text-default-policy)
+                                (fn [i cluster] (= (selected i) cluster)))))

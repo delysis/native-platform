@@ -1,0 +1,71 @@
+; Editing policy over native Unicode/layout facts. No text, font or OS I/O.
+; All positions and lengths are exact UTF-8 byte counts in the displayed buffer.
+(struct TextEditContext
+  length: u32
+  anchor: u32
+  focus: u32
+  grapheme-before: u32
+  grapheme-after: u32
+  word-before: u32
+  word-after: u32)
+
+; kind: 0 select all, 1 collapse start, 2 collapse end, 3 move/extend to a
+; native hit position, 4 backspace, 5 delete, 6/7 word backspace/delete,
+; 8 delete selection, 9 replace selection with amount bytes.
+(struct TextEditCommand
+  kind: u32
+  position: u32
+  amount: u32
+  extend: u32)
+
+; status: 0 success, 1 invalid input, 2 text limit.
+; effect: 0 selection only, 1 replace [start,end) with the caller's bytes.
+(struct TextEditPlan
+  status: u32
+  effect: u32
+  start: u32
+  end: u32
+  anchor: u32
+  focus: u32)
+
+(defn text-edit [context: TextEditContext command: TextEditCommand]: TextEditPlan
+  (let [low (min context.anchor context.focus)
+        high (max context.anchor context.focus)]
+    (when (or (> context.length 1048576u)
+              (> command.amount 1048576u))
+      (return (TextEditPlan 2u 0u 0u 0u 0u 0u)))
+    (when (or (> high context.length)
+              (or (> command.kind 9u)
+                  (or (> context.grapheme-before context.focus)
+                      (or (< context.grapheme-after context.focus)
+                          (or (> context.grapheme-after context.length)
+                              (or (> context.word-before context.focus)
+                                  (or (< context.word-after context.focus)
+                                      (> context.word-after context.length))))))))
+      (return (TextEditPlan 1u 0u 0u 0u 0u 0u)))
+    (when (== command.kind 0u)
+      (return (TextEditPlan 0u 0u low high 0u context.length)))
+    (when (or (== command.kind 1u) (== command.kind 2u))
+      (let [collapse-byte (if (== command.kind 1u) low high)]
+        (return (TextEditPlan 0u 0u low high collapse-byte collapse-byte))
+        ()))
+    (when (== command.kind 3u)
+      (when (> command.position context.length)
+        (return (TextEditPlan 1u 0u 0u 0u 0u 0u)))
+      (return (TextEditPlan 0u 0u low high
+                            (if (== command.extend 0u) command.position context.anchor)
+                            command.position)))
+    (let [@var start low @var end high
+          amount (if (== command.kind 9u) command.amount 0u)]
+      ; A selected range is replaced as a whole, independent of its direction.
+      (when (== low high)
+        (match command.kind
+          4u (= start context.grapheme-before)
+          5u (= end context.grapheme-after)
+          6u (= start context.word-before)
+          7u (= end context.word-after)
+          _ ()))
+      (when (> (+ (- context.length (- end start)) amount) 1048576u)
+        (return (TextEditPlan 2u 0u 0u 0u 0u 0u)))
+      (let [caret (+ start amount)]
+        (TextEditPlan 0u 1u start end caret caret)))))

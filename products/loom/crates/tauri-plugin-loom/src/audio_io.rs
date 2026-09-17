@@ -262,7 +262,7 @@ pub(super) async fn audio_synthesize(
             .map_err(|_| failure("Read aloud is already preparing audio."))?
     };
     #[cfg(target_os = "macos")]
-    return apple::synthesize(text, permit).await;
+    return apple::synthesize(text, permit, Arc::clone(&state.speech_input)).await;
     #[cfg(not(target_os = "macos"))]
     drop(permit);
     #[cfg(not(target_os = "macos"))]
@@ -368,11 +368,10 @@ mod apple {
     use std::sync::Arc;
 
     use speech_native_host::SpeechHost;
-    use speech_native_platform::apple_backend::AppleSpeechBackend;
     use speech_native_types::{
         AlignmentGranularity, AudioOutputFormat, SpeechDeadlinePolicy, SpeechPrivacyPolicy,
         SpeechRequestContext, SpeechRequestId, SpeechRouteProfile, SpeechRouteSelector,
-        SpeechRoutingPolicy, SynthesisInput, SynthesisOutput, SynthesisRequest, VoiceSelector,
+        SpeechRoutingPolicy, SynthesisInput, SynthesisRequest, VoiceSelector,
     };
 
     use super::{AudioSpeech, IpcFailure, failure};
@@ -380,45 +379,39 @@ mod apple {
     pub(super) async fn synthesize(
         text: String,
         permit: tokio::sync::OwnedMutexGuard<()>,
+        service: Arc<super::super::speech_input::SpeechInputService>,
     ) -> Result<AudioSpeech, IpcFailure> {
-        // This owned task always drains its host, including after the caller
-        // navigates away. The native buffer API is not preemptively cancellable.
+        // The task retains the synthesis permit even if the renderer leaves.
+        // The application's speech service owns and drains the shared host.
         tokio::spawn(async move {
             let _permit = permit;
-            let host = SpeechHost::default();
-            let backend = AppleSpeechBackend::discover()
+            let host = service
+                .host()
                 .await
                 .map_err(|error| failure(error.to_string()))?;
-            host.register_backend(Arc::new(backend))
-                .map_err(|error| failure(error.to_string()))?;
-            let result = async {
-                let request = request(text);
-                let ticket = host
-                    .synthesize(request)
-                    .await
-                    .map_err(|error| failure(error.to_string()))?;
-                let response = ticket
-                    .final_response()
-                    .await
-                    .map_err(|error| failure(error.to_string()))?;
-                match response.output {
-                    SynthesisOutput::Complete {
-                        audio,
-                        format: AudioOutputFormat::Wav,
-                    } if audio.len() <= 32 * 1024 * 1024 => Ok(AudioSpeech { wav: audio }),
-                    _ => Err(failure(
-                        "Local synthesis did not return a bounded WAV recording.",
-                    )),
-                }
-            }
-            .await;
-            host.shutdown()
-                .await
-                .map_err(|error| failure(error.to_string()))?;
-            result
+            synthesize_with_host(&host, request(text)).await
         })
         .await
         .map_err(|_| failure("The local speech worker stopped."))?
+    }
+
+    async fn synthesize_with_host(
+        host: &SpeechHost,
+        request: SynthesisRequest,
+    ) -> Result<AudioSpeech, IpcFailure> {
+        let request_id = request.context.request_id.clone();
+        let ticket = host
+            .synthesize(request)
+            .await
+            .map_err(|error| failure(error.to_string()))?;
+        let response = ticket
+            .final_response()
+            .await
+            .map_err(|error| failure(error.to_string()))?;
+        let (wav, _) =
+            desktop_speech::complete_apple_wav(response, &request_id, None, 32 * 1024 * 1024)
+                .map_err(|error| failure(error.to_string()))?;
+        Ok(AudioSpeech { wav })
     }
 
     fn request(text: String) -> SynthesisRequest {
@@ -427,7 +420,7 @@ mod apple {
                 request_id: SpeechRequestId::new(),
                 client_id: "loom.read-aloud".to_owned(),
                 route: SpeechRouteSelector::ExactBackend {
-                    backend_id: "apple.av-speech".to_owned(),
+                    backend_id: desktop_speech::APPLE_BACKEND_ID.to_owned(),
                     model_id: None,
                     voice_id: None,
                 },

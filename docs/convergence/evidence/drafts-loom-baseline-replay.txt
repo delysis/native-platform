@@ -1,0 +1,27 @@
+   Compiling llama-native-engine v0.1.0 (/Users/george/.codex/worktrees/native-platform-converge-runs/crates/native/crates/llama-native-engine)
+   Compiling loom-store v0.1.0 (/Users/george/.codex/worktrees/native-platform-converge-runs/products/loom/crates/loom-store)
+   Compiling llama-native-host v0.1.0 (/Users/george/.codex/worktrees/native-platform-converge-runs/crates/native/crates/llama-native-host)
+   Compiling loom-backend-llama v0.1.0 (/Users/george/.codex/worktrees/native-platform-converge-runs/products/loom/crates/loom-backend-llama)
+   Compiling tauri-plugin-loom v0.1.0 (/Users/george/.codex/worktrees/native-platform-converge-runs/products/loom/crates/tauri-plugin-loom)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.72s
+     Running unittests src/lib.rs (/Users/george/.codex/worktrees/native-platform-mom-loom-convergence/target/debug/deps/tauri_plugin_loom-5bdeb949e8f06988)
+
+running 2 tests
+test tests::draft_ipc_does_not_treat_same_bytes_from_another_base_as_replay ... FAILED
+test tests::draft_ipc_retains_store_exact_lost_ack_replay ... ok
+
+failures:
+
+---- tests::draft_ipc_does_not_treat_same_bytes_from_another_base_as_replay stdout ----
+
+thread 'tests::draft_ipc_does_not_treat_same_bytes_from_another_base_as_replay' (3568616) panicked at products/loom/crates/tauri-plugin-loom/src/lib.rs:14790:26:
+matching bytes do not prove the same write: TransientDraftWriteReceipt { document_id: "01M2FXC304DDK7AF164YAXJQTG", source_revision_id: "01M2FXC30W2TAP9V5C2Q267N8R", blob_id: "20ddcfe42b02ffc60a49dfa02d9499a76efac00f7d782a59de30369721a165e0", version: "3", kind: Prose, updated_at_unix_ms: 1789388000338, replayed: true }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::draft_ipc_does_not_treat_same_bytes_from_another_base_as_replay
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 221 filtered out; finished in 0.24s
+
+error: test failed, to rerun pass `-p tauri-plugin-loom --lib`

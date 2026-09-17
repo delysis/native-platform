@@ -300,11 +300,11 @@ jobs:
           shared-key: loom-linux
           save-if: ${{ matrix.command == 'test' }}
       - if: ${{ matrix.command == 'test' }}
-        run: node scripts/ci/cargo-group.mjs fmt product-loom
+        run: node scripts/ci/cargo-group.mjs fmt product-loom service-easl
       - if: ${{ matrix.command == 'test' }}
-        run: node scripts/ci/cargo-group.mjs test product-loom
+        run: node scripts/ci/cargo-group.mjs test product-loom service-easl
       - if: ${{ matrix.command == 'clippy' }}
-        run: node scripts/ci/cargo-group.mjs clippy product-loom
+        run: node scripts/ci/cargo-group.mjs clippy product-loom service-easl
 
   loom-windows:
     if: ${{ !cancelled() && needs.plan.result == 'success' && (needs.plan.outputs.loom_present == 'true' && (needs.plan.outputs.loom == 'true' || needs.plan.outputs.full == 'true')) }}
@@ -321,7 +321,7 @@ jobs:
           cache-on-failure: true
           shared-key: loom-windows
           cache-directories: ~/AppData/Local/ort.pyke.io/dfbin
-      - run: node scripts/ci/cargo-group.mjs test product-loom
+      - run: node scripts/ci/cargo-group.mjs test product-loom service-easl
 
       - name: Inspect Windows native loader failure
         if: failure()
@@ -411,7 +411,7 @@ jobs:
       - name: Loom macOS
         if: ${{ matrix.component == 'loom' }}
         run: |
-          node scripts/ci/cargo-group.mjs test product-loom
+          node scripts/ci/cargo-group.mjs test product-loom service-easl
           pnpm --filter @delysis/loom run test:browser
           pnpm --filter @delysis/loom exec tauri build --debug
 

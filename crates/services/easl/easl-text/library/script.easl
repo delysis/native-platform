@@ -1,0 +1,163 @@
+; Unicode script itemization policy. Native text-script-facts supplies immutable
+; scalar properties; EASL resolves context and emits logical UTF-8 shaping runs.
+; UScriptCode values index two 128-bit masks. text-script-tag converts a chosen
+; concrete code to the OpenType tag accepted by the native font primitive.
+(struct TextScriptSet low: vec4u high: vec4u)
+(struct TextScriptRun start: u32 end: u32 script-code: u32)
+(struct TextScriptResult status: u32 count: u32 work: u32)
+(struct TextScriptPair pair: u32 script: u32)
+
+(defn text-script-explicit [code: u32]: bool
+  (and (< code 256u) (and (> code 1u) (!= code 103u))))
+(defn text-script-empty [set: TextScriptSet]: bool
+  (and (all (== set.low (vec4u 0u))) (all (== set.high (vec4u 0u)))))
+(defn text-script-has [set: TextScriptSet code: u32]: bool
+  (when (>= code 256u) (return false))
+  (let [word (if (< code 128u) (set.low (/ code 32u))
+                              (set.high (- (/ code 32u) 4u)))]
+    (!= (& word (<< 1u (% code 32u))) 0u)))
+(defn text-script-single [code: u32]: TextScriptSet
+  (let [@var set (TextScriptSet (vec4u 0u) (vec4u 0u))]
+    (when (< code 256u)
+      (if (< code 128u)
+        (= (set.low (/ code 32u)) (<< 1u (% code 32u)))
+        (= (set.high (- (/ code 32u) 4u)) (<< 1u (% code 32u)))))
+    set))
+(defn text-script-options [fact: TextScriptFact]: TextScriptSet
+  ; Common=0, Inherited=1, Unknown=103 become unconstrained in this policy.
+  (TextScriptSet (& fact.extensions-low (vec4u 4294967292u 4294967295u
+    4294967295u 4294967167u)) fact.extensions-high))
+(defn text-script-intersection [a: TextScriptSet b: TextScriptSet]: TextScriptSet
+  (if (text-script-empty a) b
+    (if (text-script-empty b) a
+      (TextScriptSet (& a.low b.low) (& a.high b.high)))))
+(defn text-script-pick [set: TextScriptSet preferred: u32 fallback: u32]: u32
+  (when (text-script-empty set) (return fallback))
+  (when (text-script-has set preferred) (return preferred))
+  (when (text-script-has set fallback) (return fallback))
+  ; At most eight word tests and 32 bit tests, charged by the caller per run.
+  (for [word 8u]
+    (let [bits (if (< word 4u) (set.low word) (set.high (- word 4u)))]
+      (when (!= bits 0u)
+        (for [bit 32u]
+          (when (!= (& bits (<< 1u bit)) 0u) (return (+ (* word 32u) bit)))))))
+  fallback)
+
+; Internal deterministic pass. Dry-run first, then publish using stable readers.
+; Leading weak text acquires the first compatible context; trailing weak text
+; stays with its run. Script_Extensions narrows candidates until they conflict.
+; Inside an extended grapheme, the first explicit primary script wins; when all
+; primaries are implicit, use the first constrained extension set. Never split it.
+(defn text-script-pass [fact-at: (Fn [u32] TextScriptFact) begin: u32 end: u32
+                        fallback: u32 capacity: u32 budget: u32 publish: bool
+                        emit-run: (Fn [u32 TextScriptRun] ())]: TextScriptResult
+  (let [@var cursor begin @var run-start (.start (fact-at begin))
+        @var run-end run-start @var count 0u @var work 0u
+        @var options (TextScriptSet (vec4u 0u) (vec4u 0u))
+        @var preferred 0u @var depth 0u @var pending 0u
+        @var pairs: [128: TextScriptPair] (zeroed-array)]
+    (while (<= cursor end)
+      (let [finished (== cursor end) @var after cursor
+            @var cluster (fact-at (min cursor (- end 1u)))
+            @var selected cluster @var explicit (text-script-explicit cluster.primary)
+            @var next-options (text-script-options selected) @var match-at depth]
+        (when (not finished)
+          (+= after 1u) (+= work 1u)
+          (while (< after end)
+            (let [next (fact-at after)]
+              (when (!= next.grapheme cluster.grapheme) (break))
+              (when (not explicit)
+                (when (or (text-script-explicit next.primary)
+                  (and (text-script-empty next-options)
+                       (not (text-script-empty (text-script-options next)))))
+                  (= selected next) (= next-options (text-script-options next)))
+                (= explicit (text-script-explicit selected.primary)))
+              (+= after 1u) (+= work 1u)))
+          (when (== cluster.bracket 2u)
+            (let [@var search depth]
+              (while (> search 0u)
+                (-= search 1u) (+= work 1u)
+                (when (> work budget) (return (TextScriptResult 2u 0u work)))
+                (when (== (.pair (pairs search)) cluster.pair)
+                  (= match-at search)
+                  (when (and (not explicit) (text-script-explicit (.script (pairs search))))
+                    (= next-options (text-script-single (.script (pairs search)))))
+                  (break))))))
+        (let [intersection (text-script-intersection options next-options)
+              conflict (and (not (text-script-empty options))
+                (and (not (text-script-empty next-options)) (text-script-empty intersection)))]
+          (when (or finished conflict)
+            (+= work 40u)
+            (when (> work budget) (return (TextScriptResult 2u 0u work)))
+            (let [script (text-script-pick options preferred fallback)]
+              ; Only unresolved openings from this run need fixing. Each opening
+              ; is fixed once, even in deeply nested or alternating-script text.
+              (for [i pending (< i depth) (+= i 1u)]
+                (+= work 1u)
+                (when (> work budget) (return (TextScriptResult 2u 0u work)))
+                (= (.script (pairs i)) script))
+              (= pending depth)
+              (when (>= count capacity) (return (TextScriptResult 2u 0u work)))
+              (when publish (emit-run count (TextScriptRun run-start run-end script)))
+              (+= count 1u)
+              (= run-start cluster.start) (= preferred 0u)))
+          (when finished (break))
+          (= options (if conflict next-options intersection))
+          (when (and explicit (or (== preferred 0u) (not (text-script-has options preferred))))
+            (= preferred selected.primary))
+          (= run-end cluster.grapheme-end)
+          (when (< match-at depth)
+            (= depth match-at) (= pending (min pending depth)))
+          (when (== cluster.bracket 1u)
+            (when (>= depth 128u) (return (TextScriptResult 2u 0u work)))
+            (= (pairs depth) (TextScriptPair cluster.pair 0u)) (+= depth 1u))
+          (when (> work budget) (return (TextScriptResult 2u 0u work)))
+          (= cursor after))))
+    (TextScriptResult 0u count work)))
+
+; Logical paragraph scope: selected scalar indices must contain whole extended
+; graphemes. A terminal hard-break grapheme is allowed (including literal CRLF).
+; Bracket context persists across script changes but never across this call.
+; Status: 0 success; 1 invalid facts/range; 2 output, nesting or work limit.
+; Readers must remain stable and output must not alias facts. No output on error.
+(defn text-itemize-scripts [facts: u32 fact-at: (Fn [u32] TextScriptFact)
+                            begin: u32 end: u32 fallback: u32 capacity: u32
+                            emit-run: (Fn [u32 TextScriptRun] ())
+                            budget: u32]: TextScriptResult
+  (when (or (> begin end) (or (> end facts) (not (text-script-explicit fallback))))
+    (return (TextScriptResult 1u 0u 0u)))
+  (let [count (- end begin)]
+    (when (or (> count 65535u) (> budget 1000000u))
+      (return (TextScriptResult 2u 0u 0u)))
+    (when (== count 0u) (return (TextScriptResult 0u 0u 0u)))
+    (when (< budget count) (return (TextScriptResult 2u 0u count)))
+    (let [first (fact-at begin) last (fact-at (- end 1u))
+          @var covered first.start @var cluster first.grapheme
+          @var cluster-end first.grapheme-end]
+      (when (or (!= first.start first.grapheme) (!= last.end last.grapheme-end))
+        (return (TextScriptResult 1u 0u count)))
+      (for [i begin (< i end) (+= i 1u)]
+        (let [fact (fact-at i)
+              raw (TextScriptSet fact.extensions-low fact.extensions-high)]
+          (when (or (!= fact.start covered) (or (<= fact.end fact.start)
+            (or (> fact.end 1048576u) (or (> fact.primary 255u)
+              (or (> fact.bracket 2u) (or (text-script-empty raw)
+                (and (text-script-explicit fact.primary) (not (text-script-has raw fact.primary)))))))))
+            (return (TextScriptResult 1u 0u count)))
+          (when (== fact.start cluster-end)
+            (= cluster fact.start) (= cluster-end fact.grapheme-end))
+          (when (or (!= fact.grapheme cluster) (or (!= fact.grapheme-end cluster-end)
+            (or (> fact.end cluster-end) (> cluster-end last.end))))
+            (return (TextScriptResult 1u 0u count)))
+          (when (and (or (or (== fact.scalar 10u) (== fact.scalar 13u))
+            (or (or (== fact.scalar 11u) (== fact.scalar 12u))
+              (or (== fact.scalar 133u) (or (== fact.scalar 8232u) (== fact.scalar 8233u)))))
+            (!= cluster-end last.end))
+            (return (TextScriptResult 1u 0u count)))
+          (= covered fact.end)))
+      (let [pass-budget (/ (- budget count) 2u)
+            checked (text-script-pass fact-at begin end fallback capacity pass-budget false emit-run)]
+        (when (!= checked.status 0u)
+          (return (TextScriptResult checked.status 0u (+ count checked.work))))
+        (let [written (text-script-pass fact-at begin end fallback capacity pass-budget true emit-run)]
+          (TextScriptResult written.status written.count (+ count (* 2u checked.work))))))))

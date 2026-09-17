@@ -1,0 +1,9 @@
+(struct OrderedFields first: u32 second: u32)
+(var constructor-calls: u32)
+(defn constructor-next []: u32
+  (+= constructor-calls 1u)
+  constructor-calls)
+(defn f []: vec3u
+  (= constructor-calls 0u)
+  (let [fields (OrderedFields (constructor-next) (constructor-next))]
+    (vec3u fields.first fields.second constructor-calls)))

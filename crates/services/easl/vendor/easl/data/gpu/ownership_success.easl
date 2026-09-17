@@ -1,0 +1,27 @@
+(defn (print-ref T)
+      [@ref x: T]
+      (print x))
+
+(defn (print-mut-ref T)
+      [@var @ref x: T]
+      (print x))
+
+#_(defn f1 []
+    (let [x 3.
+          @var y 4.]
+      (print-ref x)
+      (print-mut-ref y)))
+
+(defn f2 [@ref x: f32]
+  (print-ref x))
+
+(defn f3 [@ref @var x: f32]
+  (print-ref x)
+  (print-mut-ref x))
+
+(defn f4 [x: f32]
+  (print-ref x))
+
+#_(defn f5 [@var x: f32]
+    (print-ref x)
+    (print-mut-ref x))

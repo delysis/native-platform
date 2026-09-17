@@ -1,0 +1,3 @@
+@vertex
+(defn v [@{builtin vertex-index} i: u32]: vec4f
+  (vec4f 0.))

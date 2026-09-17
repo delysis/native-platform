@@ -3,6 +3,7 @@
 use loom_types::{ArtifactId, ByteRange, DocumentKind};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+pub use workspace_document::{Document, DocumentPart, MessageRole, PartKind};
 
 mod merge;
 pub mod neural_functions;
@@ -31,7 +32,7 @@ impl DocumentContent {
         Ok(match kind {
             DocumentKind::Hybrid => Self::Hybrid(vec![HybridBlock {
                 kind: HybridBlockKind::Prose,
-                text: canonicalize_prose(&text),
+                text,
             }]),
             DocumentKind::Prose => Self::Prose(text),
             DocumentKind::Verse => Self::Verse(text),
@@ -46,42 +47,52 @@ impl DocumentContent {
         }
     }
 
-    pub fn project_visible(&self) -> Result<VisibleProjection, DocumentError> {
+    /// The same logical content aggregate used for chat transcripts. Layout is
+    /// a projection; changing it never normalizes the author's stored bytes.
+    pub fn document(&self) -> Result<Document<'_, usize, ()>, DocumentError> {
+        let mut document = Document::new();
         match self {
-            Self::Prose(markdown) => Ok(VisibleProjection {
-                bytes: markdown.as_bytes().to_vec(),
-                hybrid_blocks: Vec::new(),
-            }),
-            Self::Verse(text) => Ok(VisibleProjection {
-                bytes: text.as_bytes().to_vec(),
-                hybrid_blocks: Vec::new(),
-            }),
+            Self::Prose(text) => document.push_text(0, text, PartKind::Prose, ())?,
+            Self::Verse(text) => document.push_text(0, text, PartKind::Verse, ())?,
             Self::Hybrid(blocks) => {
-                let mut visible = String::new();
-                let mut metadata = Vec::with_capacity(blocks.len());
-                for block in blocks {
-                    let start = visible.len();
-                    match block.kind {
-                        HybridBlockKind::Prose => {
-                            visible.push_str(&canonicalize_prose(&block.text));
-                        }
-                        HybridBlockKind::Verse => visible.push_str(&block.text),
-                    }
-                    let end = visible.len();
-                    metadata.push(HybridBlockProjection {
-                        kind: block.kind,
-                        byte_range: ByteRange {
-                            start: usize_to_u64(start)?,
-                            end: usize_to_u64(end)?,
-                        },
-                    });
+                for (index, block) in blocks.iter().enumerate() {
+                    let kind = match block.kind {
+                        HybridBlockKind::Prose => PartKind::Prose,
+                        HybridBlockKind::Verse => PartKind::Verse,
+                    };
+                    document.push_text(index, &block.text, kind, ())?;
                 }
-                Ok(VisibleProjection {
-                    bytes: visible.into_bytes(),
-                    hybrid_blocks: metadata,
-                })
             }
         }
+        Ok(document)
+    }
+
+    pub fn project_visible(&self) -> Result<VisibleProjection, DocumentError> {
+        let document = self.document()?;
+        let mut offset = 0;
+        let hybrid_blocks = if matches!(self, Self::Hybrid(_)) {
+            document
+                .parts()
+                .iter()
+                .map(|part| {
+                    let start = offset;
+                    offset += part.text().len() as u64;
+                    HybridBlockProjection {
+                        kind: match part.kind() {
+                            PartKind::Verse => HybridBlockKind::Verse,
+                            _ => HybridBlockKind::Prose,
+                        },
+                        byte_range: ByteRange { start, end: offset },
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(VisibleProjection {
+            bytes: document.text().into_bytes(),
+            hybrid_blocks,
+        })
     }
 }
 
@@ -123,55 +134,39 @@ pub fn project_artifact_slices<'a, F>(
 where
     F: FnMut(ArtifactId) -> Result<&'a [u8], DocumentError>,
 {
-    let mut projected = Vec::new();
+    let mut document = Document::new();
     for slice in slices {
         let bytes = resolve(slice.artifact_id)?;
-        let start = usize::try_from(slice.range.start).map_err(|_| DocumentError::RangeTooLarge)?;
-        let end = usize::try_from(slice.range.end).map_err(|_| DocumentError::RangeTooLarge)?;
-        let selected = bytes
-            .get(start..end)
-            .ok_or(DocumentError::RangeOutsideArtifact {
-                artifact_id: slice.artifact_id,
-                range: slice.range,
-                byte_len: bytes.len(),
+        document
+            .push_slice(
+                slice.artifact_id,
+                bytes,
+                slice.range.start..slice.range.end,
+                PartKind::Prose,
+                (),
+            )
+            .map_err(|error| match error {
+                workspace_document::DocumentError::InvalidRange => {
+                    DocumentError::RangeOutsideArtifact {
+                        artifact_id: slice.artifact_id,
+                        range: slice.range,
+                        byte_len: bytes.len(),
+                    }
+                }
+                workspace_document::DocumentError::InvalidUtf8 => DocumentError::RangeSplitsUtf8 {
+                    artifact_id: slice.artifact_id,
+                    range: slice.range,
+                },
+                error => DocumentError::Content(error),
             })?;
-        if std::str::from_utf8(selected).is_err() {
-            return Err(DocumentError::RangeSplitsUtf8 {
-                artifact_id: slice.artifact_id,
-                range: slice.range,
-            });
-        }
-        projected.extend_from_slice(selected);
     }
-    Ok(projected)
-}
-
-pub fn canonicalize_prose(text: &str) -> String {
-    if !text.contains('\r') {
-        return text.to_owned();
-    }
-
-    let mut canonical = String::with_capacity(text.len());
-    let mut characters = text.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\r' {
-            if characters.peek() == Some(&'\n') {
-                characters.next();
-            }
-            canonical.push('\n');
-        } else {
-            canonical.push(character);
-        }
-    }
-    canonical
-}
-
-fn usize_to_u64(value: usize) -> Result<u64, DocumentError> {
-    u64::try_from(value).map_err(|_| DocumentError::RangeTooLarge)
+    Ok(document.text().into_bytes())
 }
 
 #[derive(Debug, Error)]
 pub enum DocumentError {
+    #[error(transparent)]
+    Content(#[from] workspace_document::DocumentError),
     #[error("document is not valid UTF-8: {0}")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
     #[error("document is too large to represent with 64-bit byte ranges")]
@@ -246,14 +241,14 @@ mod tests {
             },
         ]);
         let projection = content.project_visible().expect("project hybrid");
-        assert_eq!(projection.bytes, b"a\n  b");
+        assert_eq!(projection.bytes, b"a\r\n  b");
         assert_eq!(
             projection.hybrid_blocks[0].byte_range,
-            ByteRange { start: 0, end: 2 }
+            ByteRange { start: 0, end: 3 }
         );
         assert_eq!(
             projection.hybrid_blocks[1].byte_range,
-            ByteRange { start: 2, end: 5 }
+            ByteRange { start: 3, end: 6 }
         );
     }
 }

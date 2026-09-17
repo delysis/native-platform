@@ -1,0 +1,19 @@
+[package]
+name = "desktop-speech"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+speech-native-host.workspace = true
+speech-native-types.workspace = true
+speech-native-backend-parakeet.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+speech-native-platform.workspace = true
+
+[lints]
+workspace = true

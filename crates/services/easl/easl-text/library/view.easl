@@ -1,0 +1,86 @@
+(import "editor.easl")
+(import "geometry.easl")
+
+; Per-view interaction state, separate from document/undo ownership. A geometry
+; source is a borrowed TextBuffer identity, captured when its cells are built.
+; Callers rebuild after visible text or layout changes; stale source returns 5.
+(struct TextViewState affinity: u32 preferred-x: f32 vertical: bool dragging: bool)
+
+(defn text-view-reset [@ref @var view: TextViewState]
+  (= view.affinity 1u) (= view.preferred-x 0.) (= view.vertical false) (= view.dragging false))
+
+(defn text-view-current [@ref editor-state: TextEditorState geometry-source: TextBuffer]: u32
+  (when editor-state.composing (return 3u))
+  (if (== editor-state.current.text.handle geometry-source.handle) 0u 5u))
+
+(defn text-view-apply-hit [@ref @var editor-state: TextEditorState
+                          @ref @var view: TextViewState hit: TextHit extend: bool]: u32
+  (when (!= hit.status 0u) (return hit.status))
+  (let [status (text-editor-edit editor-state
+                (TextEditCommand 3u hit.byte 0u (if extend 1u 0u)) (TextBuffer 0u))]
+    (when (== status 0u) (= view.affinity hit.affinity))
+    status))
+
+; Coordinates are in the cell layout's space. A press must be inside this view;
+; a captured drag can leave it and still clamps to the nearest line/caret.
+(defn text-view-pointer [@ref @var editor-state: TextEditorState
+                         @ref @var view: TextViewState geometry-source: TextBuffer
+                         count: u32 cell-at: (Fn [u32] TextCell) point: vec2f
+                         inside: bool pressed: bool down: bool extend: bool]: u32
+  (when (and (not down) (not pressed)) (= view.dragging false) (return 4u))
+  (when (not (or (and inside pressed) (and view.dragging down))) (return 4u))
+  (let [status (text-view-current editor-state geometry-source)]
+    (when (!= status 0u) (return status)))
+  (let [hit (text-hit-test count cell-at point)
+        status (text-view-apply-hit editor-state view hit (if pressed extend true))]
+    (when (== status 0u)
+      (= view.dragging down) (= view.vertical false) (= view.preferred-x hit.rect.x))
+    status))
+
+; Layout-based navigation consumes the same grapheme cells as drawing/hits.
+; Logical word/document commands continue through editor.easl's shared policy.
+(defn text-view-input [@ref @var editor-state: TextEditorState
+                       @ref @var view: TextViewState geometry-source: TextBuffer
+                       count: u32 cell-at: (Fn [u32] TextCell)
+                       event: TextInputEvent payload: TextBuffer
+                       primary-mask: u32 word-mask: u32]: u32
+  (when (< event.text-end event.text-start) (return 1u))
+  (let [primary (!= (& event.modifiers primary-mask) 0u)
+        word (!= (& event.modifiers word-mask) 0u)
+        shift (!= (& event.modifiers 1u) 0u)
+        altgr (and (== primary-mask 2u) (== (& event.modifiers 6u) 6u))
+        arrow (and (>= event.key 3u) (<= event.key 6u))
+        mac-line (and (== primary-mask 8u) (and primary (or (== event.key 3u) (== event.key 4u))))
+        plain-line (and (not primary) (or (== event.key 7u) (== event.key 8u)))]
+    (when (and (== event.kind 1u) (and (not altgr)
+               (or mac-line (or plain-line (and arrow (and (not primary) (not word)))))))
+      (let [status (text-view-current editor-state geometry-source)]
+        (when (!= status 0u) (return status)))
+      (let [focus-byte editor-state.current.focus anchor-byte editor-state.current.anchor
+            affinity view.affinity
+            caret (text-caret-at count cell-at focus-byte affinity)
+            vertical (or (== event.key 5u) (== event.key 6u))
+            @var target caret]
+        (when (!= caret.status 0u) (return caret.status))
+        (if vertical
+          (let []
+            (when (not view.vertical) (= view.preferred-x caret.rect.x))
+            (let [goal-x view.preferred-x]
+              (= target (text-move-vertical count cell-at caret goal-x (== event.key 6u)))))
+          (if (or mac-line plain-line)
+            (= target (text-hit-line count cell-at caret.line
+                        (if (or (== event.key 3u) (== event.key 7u)) -10000000. 10000000.)))
+            (if (and (not shift) (!= editor-state.current.anchor editor-state.current.focus))
+              (let [anchor (text-caret-at count cell-at anchor-byte 1u)
+                    earlier (or (< anchor.line caret.line)
+                                (and (== anchor.line caret.line) (< anchor.rect.x caret.rect.x)))]
+                (= target (if (== (== event.key 3u) earlier) anchor caret)))
+              (= target (text-move-horizontal count cell-at caret (== event.key 4u))))))
+        (let [status (text-view-apply-hit editor-state view target shift)]
+          (when (== status 0u) (= view.vertical vertical) (= view.dragging false))
+          (return status) ())))
+    (let [status (text-editor-input editor-state event payload primary-mask word-mask)]
+      (when (== status 0u)
+        (= view.vertical false) (= view.affinity 1u)
+        (when (or (== event.kind 5u) (== event.kind 6u)) (= view.dragging false)))
+      status)))

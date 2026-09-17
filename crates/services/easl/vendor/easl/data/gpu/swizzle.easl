@@ -1,0 +1,5 @@
+(defn f [a: vec4f]: vec2f
+  (let [b (.x a)
+        c (.y a)
+        d (.xy a)]
+    d))

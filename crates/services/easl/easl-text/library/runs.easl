@@ -1,0 +1,124 @@
+(import "bidi.easl")
+(import "script.easl")
+
+; A consumer-selected font and shaping style. IDs index the consumer's immutable
+; style/font table; they are not native handles and grant no file authority.
+(struct TextFontRun start: u32 end: u32 font: u32 style: u32)
+(struct TextShapeRun start: u32 end: u32 script-code: u32 font: u32 style: u32
+                     level: u32 context-start: u32 context-end: u32)
+(struct TextRunResult status: u32 count: u32 work: u32)
+
+; The two searches use validated, nonempty logical partitions. The byte belongs
+; to the partition; a right-to-left scan searches end-1, never an exclusive end.
+(defn text-run-script-at [count: u32 item-at: (Fn [u32] TextScriptRun) byte: u32]: u32
+  (let [@var low 0u @var high count]
+    (while (< low high)
+      (let [middle (+ low (/ (- high low) 2u))]
+        (if (<= (.end (item-at middle)) byte) (= low (+ middle 1u)) (= high middle))))
+    low))
+(defn text-run-font-at [count: u32 item-at: (Fn [u32] TextFontRun) byte: u32]: u32
+  (let [@var low 0u @var high count]
+    (while (< low high)
+      (let [middle (+ low (/ (- high low) 2u))]
+        (if (<= (.end (item-at middle)) byte) (= low (+ middle 1u)) (= high middle))))
+    low))
+
+; Internal pass. Level runs are already in visual order. Their script/font
+; intersections run backwards for odd levels, but each emitted byte range stays
+; logical. The shaper receives logical text and handles marks within a cluster.
+(defn text-run-pass [levels: u32 level-at: (Fn [u32] TextBidiRun)
+                     scripts: u32 script-at: (Fn [u32] TextScriptRun)
+                     fonts: u32 font-at: (Fn [u32] TextFontRun)
+                     capacity: u32 budget: u32 publish: bool
+                     emit-run: (Fn [u32 TextShapeRun] ())]: TextRunResult
+  (let [@var output 0u @var work 0u]
+    (for [i levels]
+      ; Each table has <=65535 entries: at most 16 probes per binary search.
+      (+= work 33u)
+      (when (> work budget) (return (TextRunResult 2u 0u work)))
+      (let [level (level-at i) rtl (!= (& level.level 1u) 0u)
+            @var cursor (if rtl level.end level.start)
+            byte (if rtl (- cursor 1u) cursor)
+            @var script-index (text-run-script-at scripts script-at byte)
+            @var font-index (text-run-font-at fonts font-at byte)]
+        (while (if rtl (> cursor level.start) (< cursor level.end))
+          (+= work 1u)
+          (when (or (> work budget) (or (>= output capacity) (>= output 65535u)))
+            (return (TextRunResult 2u 0u work)))
+          (let [script (script-at script-index) font (font-at font-index)
+                next (if rtl (max level.start (max script.start font.start))
+                             (min level.end (min script.end font.end)))]
+            (when publish
+              (emit-run output (TextShapeRun (min cursor next) (max cursor next)
+                script.script-code font.font font.style level.level level.start level.end)))
+            (+= output 1u) (= cursor next)
+            (when (if rtl (> cursor level.start) (< cursor level.end))
+              (if rtl
+                (let []
+                  (when (== cursor script.start) (-= script-index 1u))
+                  (when (== cursor font.start) (-= font-index 1u)))
+                (let []
+                  (when (== cursor script.end) (+= script-index 1u))
+                  (when (== cursor font.end) (+= font-index 1u)))))))))
+    (TextRunResult 0u output work)))
+
+; Plan a selected line within one paragraph TextBuffer. Script and font/style
+; runs partition the WHOLE paragraph in logical order. Level runs come unchanged
+; from one successful text-bidi-order + text-bidi-runs call for this line; this
+; function does not independently verify their permutation or recompute levels.
+; Resolve script context before line selection so rewrapping cannot change it.
+;
+; Preflight all ranges, boundaries, capacity and work before emitting anything.
+; Status: 0 success, 1 malformed partition/range, 2 capacity/work, 3 a bidi level
+; edge inside an extended grapheme. That last case needs fragmented grapheme
+; geometry; do not silently adjust Unicode levels or split editor caret cells.
+; Inputs/readers must remain stable and must not alias the output.
+;
+; Shape against text-slice(value, context-start, context-end), with start/end
+; relative to that context. Font/style edges keep joining context; actual line
+; and level edges stop it (UAX #9 section 3.5). Add run.start ONCE to shaped
+; glyph ranges when placing. Source bytes and paragraph facts never change.
+(defn text-plan-runs [value: TextBuffer levels: u32 level-at: (Fn [u32] TextBidiRun)
+                      scripts: u32 script-at: (Fn [u32] TextScriptRun)
+                      fonts: u32 font-at: (Fn [u32] TextFontRun)
+                      capacity: u32 emit-run: (Fn [u32 TextShapeRun] ())
+                      budget: u32]: TextRunResult
+  (when (or (> levels 65535u) (or (> scripts 65535u)
+    (or (> fonts 65535u) (> budget 1000000u))))
+    (return (TextRunResult 2u 0u 0u)))
+  (let [byte-count (text-length value) validation (+ levels (+ scripts fonts))]
+    (when (> validation budget) (return (TextRunResult 2u 0u validation)))
+    (let [@var covered 0u]
+      (for [i scripts]
+        (let [item (script-at i)]
+          (when (or (!= item.start covered) (or (<= item.end item.start)
+            (or (> item.end byte-count) (not (text-script-explicit item.script-code)))))
+            (return (TextRunResult 1u 0u validation)))
+          (when (!= item.end (text-boundary value item.end 2u))
+            (return (TextRunResult 1u 0u validation)))
+          (= covered item.end)))
+      (when (!= covered byte-count) (return (TextRunResult 1u 0u validation)))
+      (= covered 0u)
+      (for [i fonts]
+        (let [item (font-at i)]
+          (when (or (!= item.start covered) (or (<= item.end item.start) (> item.end byte-count)))
+            (return (TextRunResult 1u 0u validation)))
+          (when (!= item.end (text-boundary value item.end 2u))
+            (return (TextRunResult 1u 0u validation)))
+          (= covered item.end)))
+      (when (!= covered byte-count) (return (TextRunResult 1u 0u validation))))
+    (for [i levels]
+      (let [item (level-at i)]
+        (when (or (>= item.start item.end) (or (> item.end byte-count) (> item.level 126u)))
+          (return (TextRunResult 1u 0u validation)))
+        (when (or (!= item.start (text-boundary value item.start 2u))
+                  (!= item.end (text-boundary value item.end 2u)))
+          (return (TextRunResult 3u 0u validation)))))
+    (let [remaining (/ (- budget validation) 2u)
+          dry (text-run-pass levels level-at scripts script-at fonts font-at
+                capacity remaining false emit-run)]
+      (when (!= dry.status 0u)
+        (return (TextRunResult dry.status 0u (+ validation (* 2u dry.work)))))
+      (text-run-pass levels level-at scripts script-at fonts font-at
+        capacity remaining true emit-run)
+      (TextRunResult 0u dry.count (+ validation (* 2u dry.work))))))

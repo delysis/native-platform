@@ -1,0 +1,178 @@
+(import "atlas.easl")
+
+; One extended grapheme per cell, in arbitrary visual/run order. An empty cell
+; supplies the caret for an empty line. Source ranges count exact UTF-8 bytes.
+(struct TextCell bounds: vec4f start: u32 end: u32 line: u32 rtl: bool)
+(struct TextGeometryResult status: u32 count: u32)
+; Affinity: 0 = trailing edge of previous grapheme, 1 = leading edge of next.
+; It disambiguates one source offset at a wrap or bidi run boundary.
+(struct TextHit status: u32 byte: u32 affinity: u32 line: u32 rect: vec4f)
+
+(defn text-no-hit []: TextHit (TextHit 2u 0u 1u 0u (vec4f 0.)))
+(defn text-geometry-finite [value: f32]: bool
+  (and (>= value -10000000.) (<= value 10000000.)))
+
+; Preflight every input and capacity before emitting. Status 1 is malformed
+; geometry/source; 2 is capacity/work exhaustion. Font GDEF carets are not yet
+; exposed: subdivide a ligature's advance evenly by extended graphemes, never
+; by UTF-8 bytes or scalar values. This fallback is a library layout policy.
+(defn text-build-cells [value: TextBuffer count: u32
+                        cluster-at: (Fn [u32] TextClusterBox) capacity: u32
+                        emit-cell: (Fn [u32 TextCell] ())]: TextGeometryResult
+  (when (> count 65536u) (return (TextGeometryResult 2u 0u)))
+  (let [byte-count (text-length value) @var total 0u]
+    (for [i count]
+      (let [cluster (cluster-at i) box cluster.bounds]
+        (when (or (> cluster.start cluster.end) (> cluster.end byte-count))
+          (return (TextGeometryResult 1u 0u)))
+        (when (or (!= cluster.start (text-boundary value cluster.start 2u))
+                  (!= cluster.end (text-boundary value cluster.end 2u)))
+          (return (TextGeometryResult 1u 0u)))
+        (when (not (and (and (text-geometry-finite box.x) (text-geometry-finite box.y))
+                       (and (and (>= box.z 0.) (<= box.z 10000000.))
+                            (and (> box.w 0.) (<= box.w 10000000.)))) )
+          (return (TextGeometryResult 1u 0u)))
+        (when (not (and (text-geometry-finite (+ box.x box.z))
+                       (text-geometry-finite (+ box.y box.w))))
+          (return (TextGeometryResult 1u 0u)))
+        (let [@var cursor cluster.start]
+          (when (== cursor cluster.end) (+= total 1u))
+          (while (< cursor cluster.end)
+            (= cursor (text-boundary value cursor 1u)) (+= total 1u))
+          (when (or (> total capacity) (> total 1048576u))
+            (return (TextGeometryResult 2u 0u))))))
+    (let [@var output 0u]
+      (for [i count]
+        (let [cluster (cluster-at i) @var cursor cluster.start @var pieces 0u]
+          (while (< cursor cluster.end)
+            (= cursor (text-boundary value cursor 1u)) (+= pieces 1u))
+          (if (== pieces 0u)
+            (let []
+              (emit-cell output (TextCell cluster.bounds cluster.start cluster.end cluster.line cluster.rtl))
+              (+= output 1u))
+            (let [cell-width (/ cluster.bounds.z (f32 pieces))]
+              (= cursor cluster.start)
+              (for [j pieces]
+                (let [end (text-boundary value cursor 1u)
+                      visual (if cluster.rtl (- (- pieces 1u) j) j)]
+                  (emit-cell output (TextCell
+                    (vec4f (+ cluster.bounds.x (* (f32 visual) cell-width)) cluster.bounds.y cell-width cluster.bounds.w)
+                    cursor end cluster.line cluster.rtl))
+                  (= cursor end) (+= output 1u)))))))
+      (TextGeometryResult 0u output))))
+
+(defn text-cell-hit [cell: TextCell trailing: bool]: TextHit
+  (let [right (if trailing (not cell.rtl) cell.rtl)]
+    (TextHit 0u (if trailing cell.end cell.start) (if trailing 0u 1u) cell.line
+      (vec4f (+ cell.bounds.x (if right cell.bounds.z 0.)) cell.bounds.y 1. cell.bounds.w))))
+
+; Shared nearest-edge policy for placed cells and native shaped caret stops.
+; At a shared edge prefer the cluster containing the pointer, preserving which
+; word was clicked. Then prefer downstream affinity. Bounded batches and one
+; complete scan make the same choice. other-x is the owning cluster's far edge.
+(defn text-hit-nearer [candidate: TextHit other-x: f32
+                       best: TextHit best-other-x: f32 point: vec2f]: bool
+  (when (!= best.status 0u) (return true))
+  (let [a candidate.rect b best.rect
+        ay (max 0. (max (- a.y point.y) (- point.y (+ a.y a.w))))
+        by (max 0. (max (- b.y point.y) (- point.y (+ b.y b.w))))
+        ax (abs (- point.x a.x)) bx (abs (- point.x b.x))
+        ac (max 0. (max (- (min a.x other-x) point.x) (- point.x (max a.x other-x))))
+        bc (max 0. (max (- (min b.x best-other-x) point.x) (- point.x (max b.x best-other-x))))]
+    (or (< ay by) (and (== ay by)
+      (or (< ax bx) (and (== ax bx)
+        (or (< ac bc) (and (== ac bc) (> candidate.affinity best.affinity)))))))))
+
+; Geometry consumers use the preflighted cell buffer. Ties choose downstream
+; affinity consistently; pointer coordinates outside a line clamp to its edges.
+(defn text-hit-test [count: u32 cell-at: (Fn [u32] TextCell) point: vec2f]: TextHit
+  (text-hit-test-range 0u count cell-at point))
+
+(defn text-hit-test-range [begin: u32 end: u32 cell-at: (Fn [u32] TextCell) point: vec2f]: TextHit
+  (when (not (and (text-geometry-finite point.x) (text-geometry-finite point.y)))
+    (return (TextHit 1u 0u 1u 0u (vec4f 0.))))
+  (let [@var best (text-no-hit) @var best-other-x 0.]
+    (for [i begin (< i end) (+= i 1u)]
+      (let [cell (cell-at i)]
+        (for [edge 2u]
+          (let [hit (text-cell-hit cell (== edge 1u))
+                other-x (.x (.rect (text-cell-hit cell (!= edge 1u))))]
+            (when (text-hit-nearer hit other-x best best-other-x point)
+              (= best hit) (= best-other-x other-x))))))
+    best))
+
+(defn text-caret-at [count: u32 cell-at: (Fn [u32] TextCell)
+                     position-byte: u32 affinity: u32]: TextHit
+  (let [@var best (text-no-hit)]
+    (for [i count]
+      (let [cell (cell-at i)]
+        (for [edge 2u]
+          (let [hit (text-cell-hit cell (== edge 1u))]
+            (when (== hit.byte position-byte)
+              (= best hit) (when (== hit.affinity affinity) (return hit)))))))
+    best))
+
+(defn text-hit-line [count: u32 cell-at: (Fn [u32] TextCell) line: u32 x: f32]: TextHit
+  (let [@var best (text-no-hit) @var best-distance 100000000.]
+    (for [i count]
+      (let [cell (cell-at i)]
+        (when (== cell.line line)
+          (for [edge 2u]
+            (let [hit (text-cell-hit cell (== edge 1u)) dx (abs (- x hit.rect.x))]
+              (when (or (< dx best-distance) (and (== dx best-distance) (> hit.affinity best.affinity)))
+                (= best hit) (= best-distance dx)))))))
+    best))
+
+(defn text-adjacent-line [count: u32 cell-at: (Fn [u32] TextCell)
+                         line: u32 down: bool]: u32
+  (let [@var next 4294967295u]
+    (for [i count]
+      (let [candidate (.line (cell-at i))]
+        (when (if down (> candidate line) (< candidate line))
+          (when (or (== next 4294967295u) (if down (< candidate next) (> candidate next)))
+            (= next candidate)))))
+    next))
+
+(defn text-move-vertical [count: u32 cell-at: (Fn [u32] TextCell)
+                         caret: TextHit preferred-x: f32 down: bool]: TextHit
+  (when (!= caret.status 0u) (return caret))
+  (let [line (text-adjacent-line count cell-at caret.line down)]
+    (if (== line 4294967295u) caret (text-hit-line count cell-at line preferred-x))))
+
+; Physical left/right movement across cell edges, continuing to adjacent lines.
+(defn text-move-horizontal [count: u32 cell-at: (Fn [u32] TextCell)
+                           caret: TextHit right: bool]: TextHit
+  (when (!= caret.status 0u) (return caret))
+  (let [@var best (text-no-hit) @var best-distance 100000000.]
+    (for [i count]
+      (let [cell (cell-at i)]
+        (when (== cell.line caret.line)
+          ; A zero-advance grapheme is still an editing step. Its source edge
+          ; distinguishes it from the adjacent caret at the same pixel.
+          (when (and (== cell.bounds.z 0.) (!= cell.start cell.end))
+            (let [near (text-cell-hit cell (== right cell.rtl))
+                  far (text-cell-hit cell (!= right cell.rtl))]
+              (when (and (== near.byte caret.byte) (== near.rect.x caret.rect.x))
+                (return far))))
+          (for [edge 2u]
+            (let [hit (text-cell-hit cell (== edge 1u))
+                  dx (if right (- hit.rect.x caret.rect.x) (- caret.rect.x hit.rect.x))]
+              (when (and (> dx 0.) (or (< dx best-distance)
+                          (and (== dx best-distance) (> hit.affinity best.affinity))))
+                (= best hit) (= best-distance dx)))))))
+    (when (== best.status 0u) (return best))
+    (let [line (text-adjacent-line count cell-at caret.line right)]
+      (if (== line 4294967295u) caret
+        (text-hit-line count cell-at line (if right -10000000. 10000000.))))))
+
+; Emit one highlight per selected grapheme cell. Bidi selections can have
+; disjoint rectangles. Empty selections emit nothing; source bytes never change.
+(defn text-selection-rects [count: u32 cell-at: (Fn [u32] TextCell)
+                           anchor: u32 focus: u32 emit-rect: (Fn [u32 vec4f] ())]: u32
+  (let [low (min anchor focus) high (max anchor focus) @var output 0u]
+    (when (== low high) (return 0u))
+    (for [i count]
+      (let [cell (cell-at i)]
+        (when (and (< cell.start high) (> cell.end low))
+          (emit-rect output cell.bounds) (+= output 1u))))
+    output))

@@ -1,0 +1,125 @@
+(import "font_scene.easl")
+(import "../library/fallback.easl")
+(import "../library/pages.easl")
+
+; Explicit portable fixture fonts. Font discovery and application preferences
+; belong to the host; fallback decisions over these candidates belong to EASL.
+@{group 0 binding 8} (var cascade-second: (Texture2D f32))
+@{group 0 binding 9} (var cascade-third: (Texture2D f32))
+(var cascade-second-ink: [FontAtlasGlyph]) (var cascade-third-ink: [FontAtlasGlyph])
+(var cascade-second-metrics: vec4f) (var cascade-third-metrics: vec4f)
+(var cascade-enabled: bool)
+@external (var cascade-probes: u32)
+
+(defn cascade-open []
+  (= cascade-second (open-font "../../easl-native-text/tests/fonts/shantell-sans-regular.ttf" specimen-metrics.w))
+  (= cascade-third (open-font "../tests/fonts/noto-sans-kawi.ttf" specimen-metrics.w))
+  (= cascade-second-ink (font-atlas-glyphs cascade-second))
+  (= cascade-third-ink (font-atlas-glyphs cascade-third))
+  (= cascade-second-metrics (font-metrics cascade-second))
+  (= cascade-third-metrics (font-metrics cascade-third))
+  (= cascade-enabled true))
+
+(defn cascade-metric [font: u32 glyph: u32]: FontAtlasGlyph
+  (if (== font 0u) (specimen-ink glyph)
+    (if (== font 1u) (cascade-second-ink glyph) (cascade-third-ink glyph))))
+(defn cascade-size [font: u32]: vec2f
+  (if (== font 0u) (vec2f (texture-dimensions specimen-font))
+    (if (== font 1u) (vec2f (texture-dimensions cascade-second)) (vec2f (texture-dimensions cascade-third)))))
+(defn cascade-metrics [font: u32]: vec4f
+  (if (== font 0u) specimen-metrics
+    (if (== font 1u) cascade-second-metrics cascade-third-metrics)))
+(defn cascade-decorations [font: u32]: vec4f
+  (if (== font 0u) (font-decoration-metrics specimen-font)
+    (if (== font 1u) (font-decoration-metrics cascade-second) (font-decoration-metrics cascade-third))))
+(defn cascade-strut []: vec4f
+  (if cascade-enabled
+    (vec4f (max specimen-metrics.x (max cascade-second-metrics.x cascade-third-metrics.x))
+      (max specimen-metrics.y (max cascade-second-metrics.y cascade-third-metrics.y))
+      (max specimen-metrics.z (max cascade-second-metrics.z cascade-third-metrics.z)) specimen-metrics.w)
+    specimen-metrics))
+
+(struct CascadeVertex
+  @{builtin position} clip: vec4f
+  @{location 0} uv: vec2f
+  @{location 1 interpolate flat} font: u32)
+
+@fragment
+(defn cascade-fragment [input: CascadeVertex]: @{location 0} vec4f
+  ; Sample unconditionally so implicit derivatives remain in uniform flow.
+  (let [primary (.w (texture-sample specimen-font specimen-sampler input.uv))
+        second (.w (texture-sample cascade-second specimen-sampler input.uv))
+        third (.w (texture-sample cascade-third specimen-sampler input.uv))]
+    (vec4f 0.08 0.10 0.08 (match input.font 0u primary 1u second _ third))))
+
+; Prepare all pages before changing any bound texture or published UVs. A native
+; rasterization error leaves the previous complete view drawable. Unused slots
+; are untouched, including unopened optional faces and independently cached runs.
+(var cascade-next-primary: (Texture2D f32))
+(var cascade-next-second: (Texture2D f32))
+(var cascade-next-third: (Texture2D f32))
+(var cascade-next-primary-ink: [FontAtlasGlyph])
+(var cascade-next-second-ink: [FontAtlasGlyph])
+(var cascade-next-third-ink: [FontAtlasGlyph])
+(var cascade-page-scratch: TextPageScratch)
+(var cascade-page-changes: [3: bool]) (var cascade-page-ready: bool)
+(var cascade-requested: [u32]) (var cascade-resident: [u32])
+(var cascade-page-ids: [u32])
+@external (var cascade-page-builds: u32)
+
+(defn cascade-discard-pages []
+  (= cascade-page-ready false) (= cascade-page-changes [false false false])
+  (= cascade-next-primary (blank-texture 1u 1u))
+  (= cascade-next-second (blank-texture 1u 1u))
+  (= cascade-next-third (blank-texture 1u 1u))
+  (= cascade-next-primary-ink (zeroed-array 0u))
+  (= cascade-next-second-ink (zeroed-array 0u))
+  (= cascade-next-third-ink (zeroed-array 0u)))
+
+(defn cascade-prepare-pages [count: u32 font-at: (Fn [u32] u32)
+                            glyph-at: (Fn [u32] u32)]: u32
+  (cascade-discard-pages)
+  (when (> count 65535u) (return 2u))
+  (for [i count] (when (> (font-at i) 2u) (return 1u)))
+  (for [font 3u]
+    (= cascade-requested (zeroed-array count))
+    (let [@var requested 0u]
+      (for [i count]
+        (when (== (font-at i) font)
+          (= (cascade-requested requested) (glyph-at i)) (+= requested 1u)))
+      (when (> requested 0u)
+        (match font
+          0u (= cascade-resident (font-rasterized-glyphs specimen-font))
+          1u (= cascade-resident (font-rasterized-glyphs cascade-second))
+          _ (= cascade-resident (font-rasterized-glyphs cascade-third)))
+        (= cascade-page-ids (zeroed-array (min requested 4096u)))
+        (let [limit (match font 0u (array-length specimen-ink)
+                      1u (array-length cascade-second-ink) _ (array-length cascade-third-ink))
+              plan (text-page-plan cascade-page-scratch requested (fn [i] (cascade-requested i))
+                (array-length cascade-resident) (fn [i] (cascade-resident i)) limit
+                (array-length cascade-page-ids) (fn [i id] (= (cascade-page-ids i) id)) 1000000u)]
+          (when (!= plan.status 0u) (cascade-discard-pages) (return plan.status))
+          (when plan.rebuild
+            ; Trim duplicates before crossing the native rasterization boundary.
+            (= cascade-requested (zeroed-array plan.count))
+            (for [i plan.count] (= (cascade-requested i) (cascade-page-ids i)))
+            (match font
+              0u (let [] (= cascade-next-primary (rasterize-font specimen-font cascade-requested))
+                (= cascade-next-primary-ink (font-atlas-glyphs cascade-next-primary)))
+              1u (let [] (= cascade-next-second (rasterize-font cascade-second cascade-requested))
+                (= cascade-next-second-ink (font-atlas-glyphs cascade-next-second)))
+              _ (let [] (= cascade-next-third (rasterize-font cascade-third cascade-requested))
+                (= cascade-next-third-ink (font-atlas-glyphs cascade-next-third))))
+            (= (cascade-page-changes font) true) (+= cascade-page-builds 1u))))))
+  (= cascade-page-ready true)
+  0u)
+
+(defn cascade-publish-pages []
+  (when (not cascade-page-ready) (return))
+  (when (cascade-page-changes 0u)
+    (= specimen-font cascade-next-primary) (= specimen-ink cascade-next-primary-ink))
+  (when (cascade-page-changes 1u)
+    (= cascade-second cascade-next-second) (= cascade-second-ink cascade-next-second-ink))
+  (when (cascade-page-changes 2u)
+    (= cascade-third cascade-next-third) (= cascade-third-ink cascade-next-third-ink))
+  (cascade-discard-pages))

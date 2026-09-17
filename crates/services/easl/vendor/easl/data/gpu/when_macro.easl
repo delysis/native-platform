@@ -1,0 +1,15 @@
+(defn sign [a: f32]: f32
+  (let [@var x 0.]
+    (match (> x 0.5)
+      true (= x (- x))
+      false ())
+    (when (> x 0.5)
+      (= x (- x)))
+    (when (> x 0.5)
+      (= x (- x 0.5))
+      (= x (+ x 0.25)))
+    (when (> x 0.5)
+      (= x (- x 0.5))
+      (= x (+ x 0.25))
+      (= x (- x 0.25)))
+    x))

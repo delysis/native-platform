@@ -1,0 +1,17 @@
+(import "navigation.easl")
+@external (var text-navigation-context: TextNavigationContext)
+@external (var text-navigation-command: u32)
+@external (var text-navigation-query: TextNavigationQuery)
+@external (var text-navigation-found: u32)
+@external (var text-navigation-line: TextNavigationLine)
+@external (var text-navigation-target: TextNavigationTarget)
+@cpu
+(defn text-navigation-native []
+  (= text-navigation-query (text-navigation-plan text-navigation-context text-navigation-command)))
+@cpu
+(defn text-navigation-resolve-native []
+  (= text-navigation-query (text-navigation-resolve text-navigation-context text-navigation-command
+                                                  text-navigation-query text-navigation-found)))
+@cpu
+(defn text-navigation-edge-native []
+  (= text-navigation-target (text-navigation-edge text-navigation-query text-navigation-line)))

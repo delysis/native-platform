@@ -1,0 +1,174 @@
+(import "view_specimen.easl")
+(import "../library/flow.easl")
+(import "../library/widget.easl")
+
+; Multiline consumer of the reusable EASL flow and editor modules. The native
+; host only runs this program and exports the texture; it does not choose lines.
+(var flow-positioned: [TextPlacedGlyph])
+(var flow-staged-lines: [TextFlowLine]) (var flow-staged-index: [TextLineCells])
+(var flow-staged-clusters: [TextClusterBox]) (var flow-staged-cells: [TextCell])
+(var flow-staged-quads: [TextGlyphQuad])
+(var flow-facts: [TextGrapheme])
+(var flow-spans: [TextFlowSpan])
+(var flow-points: [TextFlowPoint])
+(var flow-tabs: [TextFlowTab])
+(var flow-tab-policy: TextTabs)
+(var flow-space-run: [FontShapedGlyph])
+(var flow-space-utf8: [u32])
+(var flow-breaks: [u32])
+(var flow-lines: [TextFlowLine])
+(var flow-index: [TextLineCells])
+@{group 0 binding 6 address uniform} (var flow-scroll: vec2f)
+@{group 0 binding 7 address uniform} (var flow-quad-first: u32)
+@external (var flow-visible: vec2u)
+@external (var flow-line-count: u32)
+@external (var flow-width: f32)
+@external (var flow-status: u32)
+@external (var flow-shapes: u32)
+(var flow-measured: TextBuffer)
+(var flow-valid: bool)
+(var flow-span-count: u32)
+(var flow-extent: f32)
+
+(defn flow-index-at [i: u32]: TextLineCells (flow-index i))
+(defn flow-emit-index [i: u32 item: TextLineCells] (= (flow-staged-index i) item))
+(defn flow-fact-at [i: u32]: TextGrapheme (flow-facts i))
+(defn flow-span-at [i: u32]: TextFlowSpan (flow-spans i))
+(defn flow-point-at [i: u32]: TextBreak (.mark (flow-points i)))
+(defn flow-tab-at [i: u32]: TextFlowTab (flow-tabs i))
+(defn flow-emit-tab [i: u32 item: TextFlowTab] (= (flow-tabs i) item))
+(defn flow-measure-line [start: u32 end: u32 budget: u32]: TextLineMeasure
+  (text-flow-measure (flow-points start) (flow-points end) flow-tab-policy
+    (array-length flow-tabs) flow-tab-at budget))
+(defn flow-break-at [i: u32]: u32 (flow-breaks i))
+(defn flow-emit-span [i: u32 item: TextFlowSpan] (= (flow-spans i) item))
+(defn flow-emit-point [i: u32 item: TextFlowPoint] (= (flow-points i) item))
+(defn flow-emit-break [i: u32 item: u32] (= (flow-breaks i) item))
+(defn flow-emit-line [i: u32 item: TextFlowLine] (= (flow-staged-lines i) item))
+
+(defn flow-measure [source: TextBuffer]: u32
+  (= specimen-run (shape-font-span specimen-font source 0u (text-length source) (text-script-latin) false))
+  (+= flow-shapes 1u)
+  (= flow-facts (text-graphemes source))
+  (let [facts (array-length flow-facts) glyphs (array-length specimen-run) capacity (+ facts 1u)]
+    (= flow-spans (zeroed-array facts)) (= flow-tabs (zeroed-array facts))
+    (= flow-points (zeroed-array capacity)) (= flow-breaks (zeroed-array capacity))
+    (let [spans (text-flow-spans source facts flow-fact-at glyphs specimen-glyph facts flow-emit-span)]
+      (when (!= spans.status 0u) (return spans.status))
+      (= flow-span-count spans.count)))
+  (= flow-measured source) (= flow-valid true)
+  0u)
+
+(defn flow-layout []: u32
+  (+= flow-layouts 1u)
+  (when (not (and (> flow-width 0.) (<= flow-width 10000000.))) (return 1u))
+  (let [source (text-editor-visible demo-editor)]
+    (when (or (not flow-valid) (!= flow-measured.handle source.handle))
+      (= flow-valid false)
+      (let [status (flow-measure source)] (when (!= status 0u) (return status))))
+    (let [capacity (+ (array-length flow-facts) 1u)
+          points (text-flow-points flow-span-count flow-span-at flow-width true flow-tab-policy capacity flow-emit-point
+            (array-length flow-tabs) flow-emit-tab)]
+      (when (!= points.status 0u) (return points.status))
+      (let [result (if (== flow-span-count 0u) (TextComposition 0u 0u 0u)
+            (text-compose points.count flow-point-at flow-measure-line flow-width (text-default-policy) flow-emit-break))]
+        (when (!= result.status 0u) (return (+ 10u result.status)))
+        (= flow-staged-lines (zeroed-array (+ result.count 1u)))
+        (= flow-positioned (zeroed-array (array-length specimen-run)))
+        (= flow-staged-clusters (zeroed-array (+ flow-span-count 1u)))
+        (let [height (max 52. (+ specimen-metrics.x specimen-metrics.y)) @var next-extent 0.
+              placed (text-flow-position flow-span-count flow-span-at result.count flow-break-at true flow-tab-policy
+                specimen-glyph
+                (vec2f 40. 24.) specimen-metrics.x height (+ result.count 1u)
+                flow-emit-line (fn [i item] (= (flow-positioned i) item))
+                (fn [i item] (= (flow-staged-clusters i) item)))]
+          (when (!= placed.status 0u) (return (+ 20u placed.status)))
+          (for [i placed.count] (= next-extent (max next-extent (.z (.bounds (flow-staged-lines i))))))
+          (= flow-staged-cells (zeroed-array capacity))
+          (let [next-count (.quad-end (flow-staged-lines (- placed.count 1u)))
+                cells (text-build-cells source
+                  (+ flow-span-count (if (== placed.count result.count) 0u 1u))
+                  (fn [i] (flow-staged-clusters i)) capacity (fn [i item] (= (flow-staged-cells i) item)))]
+            (when (!= cells.status 0u) (return (+ 30u cells.status)))
+            (= flow-staged-index (zeroed-array placed.count))
+            (let [index (text-index-lines cells.count (fn [i] (flow-staged-cells i)) placed.count flow-emit-index)]
+              (when (!= index.status 0u) (return (+ 40u index.status))))
+            (let [status (cascade-prepare-pages next-count (fn [i] 0u)
+                           (fn [i] (.id (.glyph (flow-positioned i)))))]
+              (when (!= status 0u) (return status)))
+            (cascade-publish-pages)
+            (= flow-staged-quads (zeroed-array next-count))
+            (for [i next-count]
+              (let [item (flow-positioned i)]
+                (= (flow-staged-quads i) (text-placed-glyph-quad item (specimen-metric item.glyph.id)
+                  (vec2f (texture-dimensions specimen-font))))))
+            (= specimen-quads flow-staged-quads) (= specimen-count next-count)
+            (= flow-lines flow-staged-lines) (= flow-line-count placed.count) (= flow-extent next-extent)
+            (= flow-index flow-staged-index) (= demo-clusters flow-staged-clusters)
+            (= demo-cells flow-staged-cells) (= demo-cell-count cells.count)
+            (= demo-rects (zeroed-array (+ capacity 1u))) (= demo-source source))))))
+  0u)
+
+(var flow-widget: TextWidgetState)
+(var flow-decoration: TextWidgetDecoration)
+@external (var flow-layouts: u32)
+
+(defn flow-widget-layout []: TextWidgetLayout
+  (let [last (flow-lines (- flow-line-count 1u))]
+    (TextWidgetLayout demo-source demo-cell-count flow-line-count demo-viewport
+      (vec2f (max demo-viewport.x (+ flow-extent 80.)) (+ (+ last.bounds.y last.bounds.w) 24.)))))
+(defn flow-emit-decoration [i: u32 rectangle: vec4f] (= (demo-rects i) rectangle))
+(defn flow-decorations []
+  (= flow-decoration (text-widget-decorations demo-editor flow-widget
+    (flow-widget-layout) demo-cell-at flow-emit-decoration))
+  (= demo-rect-count flow-decoration.count) (= demo-caret flow-decoration.caret)
+  (= (demo-rects demo-rect-count) demo-caret.rect))
+
+(defn flow-open [seed: TextBuffer]
+  (= specimen-font (open-font "../../easl-native-text/tests/fonts/amiri.ttf" 32.))
+  (= specimen-metrics (font-metrics specimen-font))
+  (= specimen-ink (font-atlas-glyphs specimen-font))
+  ; Font setup, independent of document shaping/reflow. Four space advances per
+  ; stop, with at least half a space before the stop. Literal bytes stay intact.
+  (= flow-space-utf8 (into-dynamic-array [32u]))
+  (= flow-space-run (shape-font-run specimen-font flow-space-utf8 (text-script-latin) false))
+  (let [@var space-width 0.]
+    (for [i (array-length flow-space-run)] (+= space-width (.advance (flow-space-run i))))
+    (= flow-tab-policy (TextTabs (* 4. space-width) (* 0.5 space-width))))
+  (text-editor-open demo-editor seed)
+  (text-widget-reset flow-widget) (= flow-widget.focused true)
+  (= demo-viewport (vec2f 900. 650.))
+  (= flow-valid false) (= flow-width 820.) (= flow-status (flow-layout)))
+
+(defn flow-screen-quad [quad: TextGlyphQuad]: TextGlyphQuad
+  (TextGlyphQuad (vec4f (- quad.bounds.xy flow-scroll) quad.bounds.zw) quad.uv quad.start quad.end))
+@vertex
+(defn flow-glyph-vertex []: SpecimenVertex
+  (let [index (vertex-index) quad (flow-screen-quad (specimen-quads (+ flow-quad-first (/ index 6u))))
+        corner (text-quad-corner index)]
+    (SpecimenVertex (text-quad-position quad corner demo-viewport) (text-quad-uv quad corner))))
+@vertex
+(defn flow-selection-vertex []: @{builtin position} vec4f
+  (let [index (vertex-index) quad (flow-screen-quad (TextGlyphQuad (demo-rects (/ index 6u)) (vec4f 0.) 0u 0u))]
+    (text-quad-position quad (text-quad-corner index) demo-viewport)))
+@vertex
+(defn flow-caret-vertex []: @{builtin position} vec4f
+  (text-quad-position (flow-screen-quad (TextGlyphQuad (demo-rects demo-rect-count) (vec4f 0.) 0u 0u))
+    (text-quad-corner (vertex-index)) demo-viewport))
+@cpu
+(defn flow-draw-before []
+  (flow-decorations)
+  (= flow-visible (text-visible-lines flow-line-count flow-index-at flow-scroll.y demo-viewport.y))
+  (dispatch-render-shaders specimen-background-vertex specimen-background-fragment 3u)
+  (dispatch-render-shaders flow-selection-vertex demo-selection-fragment (* demo-rect-count 6u) 2u))
+@cpu
+(defn flow-draw-after []
+  (when flow-decoration.show-caret (dispatch-render-shaders flow-caret-vertex demo-caret-fragment 6u 2u)))
+@cpu
+(defn flow-draw []
+  (flow-draw-before)
+  (when (< flow-visible.x flow-visible.y)
+    (= flow-quad-first (.quad-start (flow-lines flow-visible.x)))
+    (let [last (.quad-end (flow-lines (- flow-visible.y 1u)))]
+      (dispatch-render-shaders flow-glyph-vertex specimen-fragment (* (- last flow-quad-first) 6u) 2u)))
+  (flow-draw-after))

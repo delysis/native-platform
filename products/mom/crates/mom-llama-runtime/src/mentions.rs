@@ -2843,11 +2843,7 @@ pub fn mention_synthesize(
         .map_err(|error| anyhow!(error))?
         .token_ids
         .len();
-    let sampling = host
-        .execution_profile
-        .sampling
-        .clone()
-        .unwrap_or_else(|| settings.sampling_config());
+    let sampling = settings.sampling_for_profile(host.execution_profile.sampling.as_ref())?;
     if prompt_tokens.saturating_add(sampling.max_tokens as usize) > settings.context_tokens as usize
     {
         return Ok(CommandResult::blocked(
@@ -3013,7 +3009,7 @@ where
             ),
         ));
     };
-    let host_snapshot = active_path_messages(&db.conversations[host_index]);
+    let host_snapshot = active_path_messages(&db.conversations[host_index])?;
     let attachment_context =
         match prepare_chat_attachments(&input.conversation_id, &host_snapshot, None)? {
             Ok(context) => context,
@@ -3211,6 +3207,14 @@ where
     let mut planned = Vec::new();
     for (order, target) in targets.iter().enumerate() {
         let snapshot = &snapshots[order];
+        if let Err(blocked) = settings.sampling_for_profile(snapshot.profile.sampling.as_ref()) {
+            invocation.results.push(blocked_target_result(
+                snapshot,
+                GenerationState::Failed,
+                &blocked.blocker.message,
+            ));
+            continue;
+        }
         let model_path = snapshot
             .profile
             .model_path
@@ -3348,20 +3352,18 @@ where
         let status = handle.status();
         let branches = targets
             .iter()
-            .map(|target| BranchRequest {
-                branch_id: target.snapshot.target_id.clone(),
-                label: target.snapshot.label.clone(),
-                instruction: String::new(),
-                sampling: target
-                    .snapshot
-                    .profile
-                    .sampling
-                    .clone()
-                    .unwrap_or_else(|| settings.sampling_config()),
-                messages: target.messages.clone(),
-                cached_prefix: target.cached_prefix.clone(),
+            .map(|target| {
+                Ok(BranchRequest {
+                    branch_id: target.snapshot.target_id.clone(),
+                    label: target.snapshot.label.clone(),
+                    instruction: String::new(),
+                    sampling: settings
+                        .sampling_for_profile(target.snapshot.profile.sampling.as_ref())?,
+                    messages: target.messages.clone(),
+                    cached_prefix: target.cached_prefix.clone(),
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let ticket = handle
             .generate_shared_prefix(SharedPrefixBatchRequest {
                 request_id: invocation_id.clone(),
@@ -3712,7 +3714,7 @@ impl MentionCancelLifecycle {
             let mut registrations = Vec::with_capacity(targets.len());
             for target in targets {
                 let key = (invocation_id.to_string(), target.target_id.clone());
-                let flag = Arc::new(MentionCancelControl::running(quiescing));
+                let flag = Arc::new(MentionCancelControl::new(quiescing));
                 registry.insert(key.clone(), Arc::clone(&flag));
                 registrations.push((key, flag));
             }
@@ -3730,7 +3732,7 @@ impl MentionCancelLifecycle {
     ) -> Result<std::result::Result<Self, Blocker>> {
         scope.with_mention_registry(|registry, quiescing| {
             let key = (invocation_id.to_string(), target_id.to_string());
-            let flag = Arc::new(MentionCancelControl::running(quiescing));
+            let flag = Arc::new(MentionCancelControl::new(quiescing));
             let mut registrations = Vec::new();
             if registry.contains_key(&key) {
                 return Ok(Err(Blocker::new(
@@ -3752,7 +3754,11 @@ impl MentionCancelLifecycle {
         self.registrations
             .iter()
             .find(|(key, _)| key.0 == invocation_id && key.1 == target_id)
-            .is_some_and(|(_, control)| control.arbitrate_terminal())
+            .is_some_and(|(_, control)| {
+                control
+                    .claim_terminal()
+                    .is_some_and(|claim| claim.cancellation_requested)
+            })
     }
 
     fn requested(&self) -> bool {
@@ -3934,7 +3940,7 @@ fn resolve_targets_from_registry(
 }
 
 fn snapshot_target(target: &ResolvedTarget) -> Result<MentionTargetSnapshot> {
-    let source_messages = active_path_messages(&target.conversation);
+    let source_messages = active_path_messages(&target.conversation)?;
     let encoded = serde_json::to_vec(&(
         &target.conversation.id,
         &target.conversation.execution_profile,
@@ -4287,12 +4293,9 @@ fn run_persona_tool_decision(
             vec!["Review the target model and attached tool schemas.".to_string()],
         )
     })?;
-    let mut sampling = target
-        .snapshot
-        .profile
-        .sampling
-        .clone()
-        .unwrap_or_else(|| settings.sampling_config());
+    let mut sampling = settings
+        .sampling_for_profile(target.snapshot.profile.sampling.as_ref())
+        .map_err(|error| error.blocker)?;
     sampling.max_tokens = sampling
         .max_tokens
         .clamp(64, PERSONA_TOOL_DECISION_MAX_TOKENS);
@@ -4554,12 +4557,9 @@ fn prepare_persona_tool_approval(
         model_config: Some(frozen_model_config),
         model_fingerprint,
         chat_template: profile_chat_template(&target.snapshot.profile),
-        sampling: target
-            .snapshot
-            .profile
-            .sampling
-            .clone()
-            .unwrap_or_else(|| settings.sampling_config()),
+        sampling: settings
+            .sampling_for_profile(target.snapshot.profile.sampling.as_ref())
+            .map_err(|error| error.blocker)?,
         messages: target.messages.clone(),
         provisional_output,
         input_schema: binding.contract.input_schema.clone(),
@@ -5420,10 +5420,19 @@ mod tests {
         let model_config_sha256 = super::sha256_json(&model_config).expect("model config hash");
         let arguments = json!({"query": "exact"});
         let arguments_sha256 = sha256_json_value(&arguments).expect("arguments hash");
+        // The linked test runner can exceed the production executable cap.
+        // Supported hosts still bind these approvals through the real native
+        // validator; other hosts retain their opaque state-only identity.
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        let command = PathBuf::from("/usr/bin/true")
+            .canonicalize()
+            .expect("bounded native executable fixture");
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let command = std::env::current_exe().expect("test executable path");
         let frozen_server_config = McpServerConfig {
             executable_sha256: None,
             name: "local".to_string(),
-            command: std::env::current_exe().expect("test executable path"),
+            command,
             args: Vec::new(),
             enabled: true,
         };
@@ -6392,9 +6401,9 @@ mod tests {
     fn cancellation_lifecycle_removes_only_the_exact_registered_target_and_generation() {
         let first_key = ("invocation".to_string(), "first".to_string());
         let second_key = ("invocation".to_string(), "second".to_string());
-        let first = Arc::new(MentionCancelControl::running(false));
-        let replacement = Arc::new(MentionCancelControl::running(false));
-        let second = Arc::new(MentionCancelControl::running(false));
+        let first = Arc::new(MentionCancelControl::new(false));
+        let replacement = Arc::new(MentionCancelControl::new(false));
+        let second = Arc::new(MentionCancelControl::new(false));
         let mut registry = BTreeMap::from([
             (first_key.clone(), Arc::clone(&replacement)),
             (second_key.clone(), Arc::clone(&second)),
@@ -6411,13 +6420,23 @@ mod tests {
 
     #[test]
     fn cancellation_terminal_arbitration_is_monotonic() {
-        let cancelled = MentionCancelControl::running(false);
+        let cancelled = MentionCancelControl::new(false);
         assert!(cancelled.request_cancel());
-        assert!(cancelled.arbitrate_terminal());
+        assert!(
+            cancelled
+                .claim_terminal()
+                .expect("cancelled terminal")
+                .cancellation_requested
+        );
         assert!(!cancelled.request_cancel());
 
-        let completed = MentionCancelControl::running(false);
-        assert!(!completed.arbitrate_terminal());
+        let completed = MentionCancelControl::new(false);
+        assert!(
+            !completed
+                .claim_terminal()
+                .expect("completed terminal")
+                .cancellation_requested
+        );
         assert!(!completed.request_cancel());
     }
 

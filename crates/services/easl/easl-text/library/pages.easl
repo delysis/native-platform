@@ -1,0 +1,72 @@
+; A consumer supplies glyph IDs for one exact font instance and resolution.
+; Resident IDs are sorted and unique, as returned by font-rasterized-glyphs.
+; Reuse the immutable page when it covers every request. Otherwise emit only
+; the unique current requests in first-use order; rasterize-font sorts them.
+; Readers must be stable and not alias output or scratch. Scratch is private
+; reusable working storage; no output writes precede validation.
+; Status: 0 success, 1 invalid input, 2 capacity/work exhausted. Count is the
+; unique required count; output is emitted only when rebuild is true. Empty
+; requests retain the page, allowing other cached layouts to keep using it.
+; Initialize scratch to zero and let only this module mutate it. Each entry
+; packs a 16-bit glyph ID and its occupied hash slot, so subsequent calls clear
+; only used slots, not the whole table. Failed requests remain safely reusable.
+(struct TextPageScratch table: [8192: u32] entries: [4096: u32] count: u32)
+(struct TextPagePlan status: u32 count: u32 rebuild: bool work: u32)
+
+(defn text-page-plan [@ref @var scratch: TextPageScratch count: u32 glyph-at: (Fn [u32] u32)
+    residents: u32 resident-at: (Fn [u32] u32) glyph-limit: u32
+    capacity: u32 emit: (Fn [u32 u32] ()) budget: u32]: TextPagePlan
+  (when (or (== glyph-limit 0u) (> glyph-limit 65536u))
+    (return (TextPagePlan 1u 0u false 0u)))
+  (when (or (> count 65535u) (or (> residents glyph-limit) (> budget 1000000u)))
+    (return (TextPagePlan 2u 0u false 0u)))
+  (let [@var unique 0u @var work 0u @var missing false @var previous 0u]
+    (for [i residents]
+      (when (== work budget) (return (TextPagePlan 2u 0u false work)))
+      (+= work 1u)
+      (let [id (resident-at i)]
+        (when (or (>= id glyph-limit) (and (> i 0u) (<= id previous)))
+          (return (TextPagePlan 1u 0u false work)))
+        (= previous id)))
+    (when (== count 0u) (return (TextPagePlan 0u 0u false work)))
+    (when (> scratch.count 4096u) (return (TextPagePlan 1u 0u false work)))
+    (when (> scratch.count (- budget work)) (return (TextPagePlan 2u 0u false work)))
+    (+= work scratch.count)
+    (for [i scratch.count]
+      (let [slot (>> (scratch.entries i) 16u)]
+        (when (>= slot 8192u) (return (TextPagePlan 1u 0u false work)))
+        (= (scratch.table slot) 0u)))
+    (= scratch.count 0u)
+    (for [i count]
+      (when (== work budget) (return (TextPagePlan 2u 0u false work)))
+      (+= work 1u)
+      (let [id (glyph-at i) @var slot 0u]
+        (when (>= id glyph-limit) (return (TextPagePlan 1u 0u false work)))
+        (= slot (& (* (^ id (>> id 8u)) 4051u) 8191u))
+        (while true
+          (when (== work budget) (return (TextPagePlan 2u 0u false work)))
+          (+= work 1u)
+          (let [key (scratch.table slot)]
+            (when (== key (+ id 1u)) (break))
+            (when (== key 0u)
+              (when (== unique 4096u)
+                (return (TextPagePlan 2u 0u false work)))
+              (= (scratch.table slot) (+ id 1u))
+              (= (scratch.entries unique) (| id (<< slot 16u)))
+              (+= unique 1u) (= scratch.count unique)
+              (let [@var low 0u @var high residents]
+                (while (< low high)
+                  (when (== work budget) (return (TextPagePlan 2u 0u false work)))
+                  (+= work 1u)
+                  (let [middle (+ low (/ (- high low) 2u))]
+                    (if (< (resident-at middle) id) (= low (+ middle 1u)) (= high middle))))
+                (if (== low residents) (= missing true)
+                  (when (!= (resident-at low) id) (= missing true))))
+              (break)))
+          (= slot (& (+ slot 1u) 8191u)))))
+    (when missing
+      (when (> unique capacity) (return (TextPagePlan 2u 0u false work)))
+      (when (> unique (- budget work)) (return (TextPagePlan 2u 0u false work)))
+      (+= work unique)
+      (for [i unique] (let [id (& (scratch.entries i) 65535u)] (emit i id))))
+    (TextPagePlan 0u unique missing work)))

@@ -1,0 +1,4 @@
+(defn next-value [n: u32]: u32 (+ n 1u))
+(defn call-reader [n: u32 input-reader: (Fn [u32] u32)]: u32 (input-reader n))
+(defn f []: vec2u
+  (vec2u (call-reader 1u next-value) (call-reader 4u next-value)))

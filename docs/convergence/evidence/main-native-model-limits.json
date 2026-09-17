@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "source_sha": "6f153711b09d8f8c3b86a4578a762be1f24c77a3",
+  "acceptance_pid": 40266,
+  "receipt": {
+    "run_id": "01M2GFVEZSNK7R3VWGRW5EZTHB",
+    "relative_path": ".loom/function-runs/01M2GFVEZSNK7R3VWGRW5EZTHB.finished.json",
+    "sha256": "fe565e24099c5bb35506dea40b72be15d2b433fb82f46fa8d0ec794dfc6e601c",
+    "status": "completed"
+  },
+  "requested": {
+    "source": ".mine.toml",
+    "sha256": "5437b964c507c0b362e8f44f8885f170b4b267ca1cd27cfe530b52140ad7a8f4",
+    "hash_matches_frozen_generation_profile": true,
+    "model_path": "../models/gemma-4-E2B-base-Q8_0.gguf",
+    "context_tokens": 8192,
+    "batch_tokens": 512,
+    "max_sequences": 4,
+    "workspace_model_profile": "gemma_4_e2b_base_q8_loom_v1"
+  },
+  "verified_model_descriptor": {
+    "model_environment_id": "d99988c3cfedbe800f12ad6d47ca31d7e18c8aa56bb196acdf4eca5097286da3",
+    "stable_model_id": "sha256:aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670",
+    "local_model_id": "gemma-4-E2B-base-Q8_0",
+    "model_file_bytes": 4954576032,
+    "model_sha256": "aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670",
+    "backend": "metal",
+    "context_tokens": 8192,
+    "batch_tokens": 512,
+    "max_parallel_cases": 4,
+    "binding_version": "0.1.154",
+    "build_id": "llama-native-build-v3-60b3660c0f77542915c60fb3e3374a0a114e05f80326c49c757b04707dcc8387"
+  },
+  "policy_mapping": {
+    "profile_id": "gemma_4_e2b_base_q8_loom_v1",
+    "source": "products/loom/model-policies/writer-gemma4-base-v2.json",
+    "basis": "The receipt's verified model SHA-256 and byte length exactly match this pinned policy entry. The requested alias is present at workspace.model.profile in .mine.toml, whose SHA-256 matches the receipt's frozen configuration hash. The function receipt retains that configuration hash and the verified model descriptor rather than serializing the policy alias directly."
+  },
+  "source_proof": [
+    {
+      "path": "products/loom/crates/tauri-plugin-loom/src/terminal.rs",
+      "line": 604,
+      "fact": "RunReceipt.model is cloned from the selected resident VerifiedModelDescriptor."
+    },
+    {
+      "path": "products/loom/crates/loom-backend-llama/src/model.rs",
+      "line": 340,
+      "fact": "verify_model_inspection validates native descriptor and fingerprint identity and consistency before creating the verified descriptor."
+    },
+    {
+      "path": "products/loom/crates/loom-backend-llama/src/model.rs",
+      "line": 370,
+      "fact": "Verified context_tokens, batch_tokens, and max_parallel_cases are copied from native fingerprint context_tokens, batch_tokens, and max_sequences."
+    }
+  ],
+  "privacy": "Curated metadata only. No input, output, conversation history, source document text, or manuscript bytes are included."
+}

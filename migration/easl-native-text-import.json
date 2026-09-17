@@ -1,0 +1,225 @@
+{
+  "schema_version": 1,
+  "status": "experimental_under_verification",
+  "authorization": "Get the renderer to feature and robustness parity or better than https://github.com/chenglou/pretext. We want a Tauri front end replacement that can coexist with the platform web view; native EASL with beautiful flexible text layout.",
+  "destination": "crates/services/easl/easl-native-text",
+  "source_history_imported": false,
+  "parley": {
+    "version": "0.11.1",
+    "repository": "https://github.com/linebender/parley",
+    "reference_commit": "eea3503dd6cf17130cbb07348e0ff2c918300e94",
+    "license": "Apache-2.0 OR MIT",
+    "destination": "crates/services/easl/vendor/parley",
+    "upstream_files": [
+      {
+        "path": "Cargo.toml",
+        "upstream_sha256": "f89d6a436c3809c92092b7f85330f8d6deda619424b96a7c0445df29a7a78cd4"
+      },
+      {
+        "path": "LICENSE-APACHE",
+        "upstream_sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+      },
+      {
+        "path": "LICENSE-MIT",
+        "upstream_sha256": "285111f788d3856f28c164b3760aa151cad55310fa16e19103f36f3052b033f0"
+      },
+      {
+        "path": "README.md",
+        "upstream_sha256": "93b8718c9f4bcdc52150c7b54399c415f7286772d03a5e5c483c0d2bcaf3a892"
+      },
+      {
+        "path": "src/analysis/cluster.rs",
+        "upstream_sha256": "115fce9069faf354fbd8a27894c9098c7032b048d508d701711958c18537f2ce"
+      },
+      {
+        "path": "src/analysis/mod.rs",
+        "upstream_sha256": "1cc8cb767d9110dc9e9d437a8f9687e46faf88a2fa1fd336a36d8fc532f395db"
+      },
+      {
+        "path": "src/bidi.rs",
+        "upstream_sha256": "4247f526dab62e89207908b4287653f0e42f53d331934afced480fbb2e36cc91"
+      },
+      {
+        "path": "src/break_overrides.rs",
+        "upstream_sha256": "5f5d740bb00fe5157fe8470604f48faf6b694039601c7f0406725b0eddb35866"
+      },
+      {
+        "path": "src/builder.rs",
+        "upstream_sha256": "e14b8cf3f6bd2a8c7eb79055448bd6a2de676751bc64e8bb847d1f8ec0831b56"
+      },
+      {
+        "path": "src/context.rs",
+        "upstream_sha256": "bc49e870376ae0642a6e5d0ead7dd0bbf3d9ed6eb401bd6c498d4e863ff29f07"
+      },
+      {
+        "path": "src/convert.rs",
+        "upstream_sha256": "3d8ec71d86d8258f58a96f2704908fe41c1f74441203fdf123f5204d721c9ccb"
+      },
+      {
+        "path": "src/editing/cursor.rs",
+        "upstream_sha256": "cd7237d6c75c495f6aa0941e3ecf9182dc62d33b6f0d4599a6a117765265e156"
+      },
+      {
+        "path": "src/editing/editor.rs",
+        "upstream_sha256": "100c4f0828c195bd407d9bd5d3fbbed853b8feae73bf64aced7be6741537aa25"
+      },
+      {
+        "path": "src/editing/mod.rs",
+        "upstream_sha256": "3e93709ddd495a77c7d6ccca1dd09a55c6823adbf0ecfb205ce8ecbf843cd1d7"
+      },
+      {
+        "path": "src/editing/selection.rs",
+        "upstream_sha256": "e96ab53b7c5c2f0dfeeec4f1f1c0ee568a66163825bf73460a67d0eab3a75faa"
+      },
+      {
+        "path": "src/font.rs",
+        "upstream_sha256": "62f6d126c6169e0cd163c2676de60c7e168df9e990a80303fcead812becc4a32"
+      },
+      {
+        "path": "src/inline_box.rs",
+        "upstream_sha256": "35846b88ec73f0f086113f56901917a05c37222ca5a040ccc2a0393ac7f92753"
+      },
+      {
+        "path": "src/layout/accessibility.rs",
+        "upstream_sha256": "e123f6cba476a1291d94f3bccda621449b59ed7720817367ce7397b588b56c08"
+      },
+      {
+        "path": "src/layout/alignment.rs",
+        "upstream_sha256": "3d1a983556868a4e7d848f047ed31f9777423d5032248d263132e24b7db32ea1"
+      },
+      {
+        "path": "src/layout/cluster.rs",
+        "upstream_sha256": "43795e0d29905679d983080f99ea070d665043601c192cf822550228d10c6899"
+      },
+      {
+        "path": "src/layout/data.rs",
+        "upstream_sha256": "79acbffc247e39bbacafddfdc080e7446f219ada0ead0f5c27f3cdd1dd24c413"
+      },
+      {
+        "path": "src/layout/glyph.rs",
+        "upstream_sha256": "4a5c5a8ca07a7ccf77df63fdca5c5c906f0acf319e71266d7a416a48c1b41d07"
+      },
+      {
+        "path": "src/layout/layout.rs",
+        "upstream_sha256": "3e93583c1af8849ce836aca5f3144aa71d4aaa4cbf4fc57daed6cb0b67a6dd3a"
+      },
+      {
+        "path": "src/layout/line.rs",
+        "upstream_sha256": "1d3af75719fcce44b67c4ab9da03537c44b14fbc905f6ea7db38685e9ae338d3"
+      },
+      {
+        "path": "src/layout/line_break.rs",
+        "upstream_sha256": "a41f56117bb55a0294e9a96d4ad651e7ebaead38b337c96cabc3443efdd697e4"
+      },
+      {
+        "path": "src/layout/mod.rs",
+        "upstream_sha256": "a975e7f26e8fe3dc51c3bb8a3df483e091726c1ab567a0ce954df3a4835a1069"
+      },
+      {
+        "path": "src/layout/run.rs",
+        "upstream_sha256": "ee995a919e1c647130bf840952ee9b27d123caba2c883c586387dd8a55dff02d"
+      },
+      {
+        "path": "src/lib.rs",
+        "upstream_sha256": "41ba16f8e491cdeb7202581d0fb588a1fe9332b7482a7f9ad9e72998458f1fa7"
+      },
+      {
+        "path": "src/lru_cache.rs",
+        "upstream_sha256": "fc5cf96f67e269afa5243c59bddb16f2c39c7bf8ccf60977086a37d0db253ab4"
+      },
+      {
+        "path": "src/resolve/mod.rs",
+        "upstream_sha256": "7fad42cd7d3e4bbc16b5f2a30d6181b912f556bda367ca9e0df216e5b329a1b3"
+      },
+      {
+        "path": "src/resolve/range.rs",
+        "upstream_sha256": "0052c1c446ae8e8ff3e27ff85fe9d2d1b260b1ccbd3de1cc9f68efc040515f50"
+      },
+      {
+        "path": "src/resolve/tree.rs",
+        "upstream_sha256": "302a3f2f3786a1a71f6c10aba5f56fa5f939ce196f458da7e8d70bee4c685bf3"
+      },
+      {
+        "path": "src/setting.rs",
+        "upstream_sha256": "9bd642f3b83da67667b513907e17974bc759fd8c7ce4460ec1923a9c86971057"
+      },
+      {
+        "path": "src/shape/cache.rs",
+        "upstream_sha256": "935c3f9e7224be419930dda89197dc252c77e8dcb43ad197e39fc5f9aedd61fa"
+      },
+      {
+        "path": "src/shape/mod.rs",
+        "upstream_sha256": "4ae56607c41672e0771889174ddc767dca74a8d2a8cc2c2dd56969a459ae70c5"
+      },
+      {
+        "path": "src/style/brush.rs",
+        "upstream_sha256": "d09dfa6e3283c03550186bced5f9f32ce39c4f5798b2979b02f945dc2c55b8e6"
+      },
+      {
+        "path": "src/style/font.rs",
+        "upstream_sha256": "f65a9b1106b618c5301964453f943c59a866a73a5516393400dfbedef23e3d21"
+      },
+      {
+        "path": "src/style/mod.rs",
+        "upstream_sha256": "fdbed2d895b4c381ea4a4555793109a45f033e663477248e3f638e0af2a406c6"
+      },
+      {
+        "path": "src/style/styleset.rs",
+        "upstream_sha256": "cd7851de616865786eea7d72d114abd8ad60b9aa49372cd23c7ab1fe70d88e65"
+      },
+      {
+        "path": "src/tests/mod.rs",
+        "upstream_sha256": "04c5db2bb4d0801c2f228dff7fa458a2439dedec68ecce9c284672a50a13491e"
+      },
+      {
+        "path": "src/tests/test_analysis.rs",
+        "upstream_sha256": "1ab23308b010eb91271635252dc1843ce2e134c38601c36a9d242fd4663de681"
+      },
+      {
+        "path": "src/tests/test_builders.rs",
+        "upstream_sha256": "90768cfc09219a7a3defaa936f9b68a2b6bee84b7aec3c78a74d0061c920c292"
+      },
+      {
+        "path": "src/tests/utils/asserts.rs",
+        "upstream_sha256": "3168268fd5dc0590301a6769672be72de6c440c0cf3dd882232fd31be499b439"
+      },
+      {
+        "path": "src/tests/utils/mod.rs",
+        "upstream_sha256": "daf628eb1a0fc92f611f2d0643d25d7962efcdda3304f06b044789adc2caf6fb"
+      },
+      {
+        "path": "src/util.rs",
+        "upstream_sha256": "fa541354618ebcc115494d969983d316726d6bd37faa32439e47a011bd32d39b"
+      }
+    ]
+  },
+  "pretext": {
+    "repository": "https://github.com/chenglou/pretext",
+    "commit": "cc8619ad5d856190925951545965911458abe29d",
+    "use": "Feature/test-contract reference; no implementation copied. Two SIL OFL test fonts retained with licenses.",
+    "fonts": [
+      {
+        "path": "crates/services/easl/easl-native-text/tests/fonts/amiri.ttf",
+        "sha256": "7f19c4a5dc77b0ef435b430d750759170def15d6e3801006e0704dadc7f220e3"
+      },
+      {
+        "path": "crates/services/easl/easl-native-text/tests/fonts/shantell-sans-regular.ttf",
+        "sha256": "335ce03b4f2e90df95a7e4a383979a817fc4843a33498e8cdb77e692cc740fc4"
+      }
+    ]
+  },
+  "pretext_contract_fixture": {
+    "repository": "https://github.com/chenglou/pretext",
+    "commit": "cc8619ad5d856190925951545965911458abe29d",
+    "license": "MIT",
+    "source": "tests/wrapping/fixtures/retained.json",
+    "sha256": "f618b71cde29e3e0771f5886ae78c57ae095e35f6b1ee10e8276118d4e793c00",
+    "destination": "crates/services/easl/easl-native-text/tests/pretext",
+    "use": "Native invariant replay; not browser geometry equivalence. Implementation not imported.",
+    "utf8_translation": {
+      "unpaired_utf16_units_replaced": 7,
+      "replacement": "U+FFFD at UTF-16 to UTF-8 boundary; surrogate codepoint slots also become U+FFFD",
+      "translated_sha256": "eec2c2861c6f835052668d53463dd293ec470c466380fcbc07cdd8f627a1fd4d"
+    }
+  }
+}

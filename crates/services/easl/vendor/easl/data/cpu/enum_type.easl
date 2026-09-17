@@ -1,0 +1,8 @@
+(enum Option
+  None
+  (Some f32))
+
+@cpu
+(defn main []
+  (print (Some 5.))
+  (print None))

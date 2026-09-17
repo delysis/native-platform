@@ -1,0 +1,11 @@
+(import "viewport.easl")
+@external (var native-scroll-offset: vec2f)
+@external (var native-scroll-viewport: vec2f)
+@external (var native-scroll-extent: vec2f)
+@external (var native-scroll-rect: vec4f)
+@external (var native-scroll-margin: vec2f)
+@external (var native-scroll-result: TextScrollResult)
+@cpu
+(defn native-scroll []
+  (= native-scroll-result (text-scroll-reveal native-scroll-offset native-scroll-viewport
+     native-scroll-extent native-scroll-rect native-scroll-margin)))

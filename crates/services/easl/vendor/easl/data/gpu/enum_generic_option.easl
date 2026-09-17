@@ -1,0 +1,7 @@
+(enum (Option T) None (Some T))
+
+(defn f [x: f32]: (Option f32)
+  (Some x))
+
+(defn f2 [x: f32]: (Option f32)
+  (Some x))

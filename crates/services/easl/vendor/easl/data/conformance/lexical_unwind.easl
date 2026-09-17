@@ -1,0 +1,18 @@
+(struct UnwindRecord number: u32)
+(defn early-return []: u32
+  (let [outside (UnwindRecord 31u)] (return outside.number) ()) 0u)
+(defn loop-return []: u32
+  (for [index 3u] (let [outside (UnwindRecord 42u)] (return outside.number) ())) 0u)
+(defn breaking-loop []: u32
+  (let [@var visited 0u]
+    (for [index 3u]
+      (let [outside (UnwindRecord index)]
+        (+= visited 1u)
+        (when (== index 0u) (continue))
+        (when (== index 1u) (break))))
+    visited))
+(defn f []: bool
+  (let [outside 7u index 9u
+        returned (early-return) looped (loop-return) visited (breaking-loop)]
+    (and (== outside 7u) (and (== index 9u)
+      (and (== returned 31u) (and (== looped 42u) (== visited 2u)))))))

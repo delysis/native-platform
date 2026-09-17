@@ -1,13 +1,12 @@
 use std::collections::BTreeMap;
 use std::future::{Future, poll_fn};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 
 use serde::{Deserialize, Serialize};
-use speech_native_backend_parakeet::{
-    PARAKEET_BACKEND_ID, PARAKEET_MODEL_ID, ParakeetBackendConfig, ParakeetSpeechBackend,
-};
+use speech_native_backend_parakeet::{PARAKEET_BACKEND_ID, PARAKEET_MODEL_ID};
 use speech_native_host::{SpeechHost, SpeechHostError, SpeechHostStatus};
 use speech_native_types::{
     AudioInput, DiarizationPolicy, EncodedAudioFormat, SpeechBackendReadiness,
@@ -162,6 +161,7 @@ impl MicrophoneCapture for NativeMicrophoneCapture {
 #[derive(Debug)]
 pub(crate) struct SpeechInputService {
     host: OnceCell<Arc<SpeechHost>>,
+    host_closed: AtomicBool,
     sessions: Arc<Mutex<BTreeMap<SpeechRequestId, Arc<AsyncMutex<SpeechInputSnapshot>>>>>,
     tasks: Mutex<SpeechInputTasks>,
     microphone: Arc<dyn MicrophoneCapture>,
@@ -181,6 +181,7 @@ impl SpeechInputService {
     pub(crate) fn new(app_local_data_root: Option<PathBuf>) -> Self {
         Self {
             host: OnceCell::new(),
+            host_closed: AtomicBool::new(false),
             sessions: Arc::new(Mutex::new(BTreeMap::new())),
             tasks: Mutex::new(SpeechInputTasks::default()),
             microphone: Arc::new(NativeMicrophoneCapture::new()),
@@ -298,19 +299,18 @@ impl SpeechInputService {
         Ok(snapshot)
     }
 
-    async fn host(&self) -> Result<Arc<SpeechHost>, SpeechInputError> {
+    pub(super) async fn host(&self) -> Result<Arc<SpeechHost>, SpeechInputError> {
+        // Serialize lazy discovery with shutdown. A caller admitted before
+        // close must not create an unowned host after shutdown observed None.
+        let _lifecycle = self.recording_lifecycle.lock().await;
+        if self.host_closed.load(Ordering::Acquire) {
+            return Err(SpeechInputError::Unavailable(
+                "the local speech service is closed".into(),
+            ));
+        }
         self.host
-            .get_or_try_init(|| async {
-                let host = Arc::new(SpeechHost::default());
-                let backend = Arc::new(
-                    ParakeetSpeechBackend::discover(ParakeetBackendConfig {
-                        model_dir: None,
-                        managed_model_root: self.managed_model_root.clone(),
-                    })
-                    .await,
-                );
-                host.register_backend(backend)?;
-                Ok::<_, SpeechHostError>(host)
+            .get_or_try_init(|| {
+                desktop_speech::discover_local_host(self.managed_model_root.clone())
             })
             .await
             .cloned()
@@ -555,6 +555,7 @@ impl SpeechInputService {
     }
 
     pub(crate) async fn shutdown(&self) -> Result<(), SpeechInputError> {
+        self.host_closed.store(true, Ordering::Release);
         let mut failure = None;
         *self.active_scope.lock().unwrap_or_else(|poisoned| {
             failure.get_or_insert(SpeechInputError::State);
@@ -716,6 +717,7 @@ async fn run_transcription(
     request: TranscriptionRequest,
     session: Arc<AsyncMutex<SpeechInputSnapshot>>,
 ) {
+    let request_id = request.context.request_id.clone();
     let Some(started) = admit_transcription(&session, host.transcribe(request)).await else {
         return;
     };
@@ -728,6 +730,10 @@ async fn run_transcription(
     };
     match ticket.final_response().await {
         Ok(response) if response.text.len() <= MAX_TRANSCRIPT_BYTES => {
+            if let Err(error) = desktop_speech::validate_parakeet_response(&response, &request_id) {
+                fail_session(&session, "speech_provenance_mismatch", error.to_string()).await;
+                return;
+            }
             let mut snapshot = session.lock().await;
             if snapshot.phase == SpeechInputPhase::CancelRequested {
                 snapshot.phase = SpeechInputPhase::Cancelled;
@@ -1247,6 +1253,39 @@ mod tests {
             .bind_scope("project".into(), "session".into())
             .expect("bind");
         Arc::new(service)
+    }
+
+    #[tokio::test]
+    async fn shutdown_excludes_a_waiting_lazy_host_initialization() {
+        let mut service = SpeechInputService::new(None);
+        service.microphone = Arc::new(TestMicrophone::default());
+        let lifecycle = service.recording_lifecycle.lock().await;
+        let mut initializing = std::pin::pin!(service.host());
+        assert!(
+            poll_fn(|cx| Poll::Ready(initializing.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        let mut shutdown = std::pin::pin!(service.shutdown());
+        assert!(
+            poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        drop(lifecycle);
+        assert!(matches!(
+            initializing.await,
+            Err(SpeechInputError::Unavailable(_))
+        ));
+        shutdown.await.expect("speech owner drained");
+        assert!(
+            service.host.get().is_none(),
+            "no host was constructed after shutdown"
+        );
+        assert!(matches!(
+            service.host().await,
+            Err(SpeechInputError::Unavailable(_))
+        ));
     }
 
     #[tokio::test]

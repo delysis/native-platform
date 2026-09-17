@@ -96,6 +96,7 @@ mod unix {
         metadata: File,
         runs: File,
         pub(super) path: PathBuf,
+        codec: crate::private_sidecar::PayloadCodec,
     }
 
     impl Directory {
@@ -121,7 +122,15 @@ mod unix {
                 metadata,
                 runs,
                 path: root.join(".loom/function-runs"),
+                codec: crate::private_sidecar::PayloadCodec::open(root).map_err(io_failure)?,
             };
+            let current_root =
+                File::from(open(root, DIRECTORY_FLAGS, Mode::empty()).map_err(io_failure)?);
+            if !same_file(&directory.root, &current_root)? {
+                return Err(failure(
+                    "Project root changed while opening its private codec.",
+                ));
+            }
             directory.ensure_binding()?;
             Ok(directory)
         }
@@ -150,15 +159,18 @@ mod unix {
                 Err(error) => return Err(io_failure(error)),
             };
             let metadata = file.metadata().map_err(io_failure)?;
-            if !metadata.is_file() || metadata.len() > MAX_BYTES as u64 {
+            let limit = self.codec.stored_limit(MAX_BYTES as u64);
+            if !metadata.is_file() || metadata.len() > limit {
                 return Err(failure("Function receipt is not a bounded regular file."));
             }
             let mut bytes = Vec::new();
             (&file)
-                .take(MAX_BYTES as u64 + 1)
+                .take(limit.saturating_add(1))
                 .read_to_end(&mut bytes)
                 .map_err(io_failure)?;
-            validate_bytes(&bytes)?;
+            if bytes.len() as u64 > limit {
+                return Err(failure("Function receipt exceeds its stored byte limit."));
+            }
             let current = File::from(
                 openat(&self.runs, name, READ_FLAGS, Mode::empty()).map_err(io_failure)?,
             );
@@ -166,6 +178,15 @@ mod unix {
                 return Err(failure("Function receipt changed during the read."));
             }
             self.ensure_binding()?;
+            let bytes = self
+                .codec
+                .open_bytes(
+                    &format!(".loom/function-runs/{name}"),
+                    &bytes,
+                    MAX_BYTES as u64,
+                )
+                .map_err(io_failure)?;
+            validate_bytes(&bytes)?;
             Ok(Some(bytes))
         }
     }
@@ -176,10 +197,15 @@ mod unix {
         bytes: &[u8],
         before_publish: impl FnOnce() -> Result<(), IpcFailure>,
     ) -> Result<(), IpcFailure> {
+        validate_bytes(bytes)?;
         let directory = Directory::open(root)?;
         if let Some(existing) = directory.read(name)? {
             return verify_collision(&directory, &existing, bytes);
         }
+        let stored = directory
+            .codec
+            .seal(&format!(".loom/function-runs/{name}"), bytes)
+            .map_err(io_failure)?;
         let temporary = format!(".pending-{}", loom_types::CommandId::new());
         let flags =
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -193,7 +219,7 @@ mod unix {
             .map_err(io_failure)?,
         );
         let result = (|| {
-            file.write_all(bytes).map_err(io_failure)?;
+            file.write_all(&stored).map_err(io_failure)?;
             file.sync_all().map_err(io_failure)?;
             before_publish()?;
             directory.ensure_binding()?;
@@ -258,6 +284,78 @@ mod tests {
         let root = tempfile::tempdir().expect("project root");
         fs::create_dir(root.path().join(".loom")).expect("project metadata");
         root
+    }
+
+    #[test]
+    fn secured_receipts_are_exact_idempotent_and_bound_to_their_run_and_phase() {
+        let root = fixture();
+        desktop_vault::ProjectVault::initialize_with_key(root.path(), [51; 32]).unwrap();
+        let id = loom_types::CommandId::new().to_string();
+        let bytes = br#"{"input":"A private original request","status":"running"}"#;
+        write(root.path(), &id, false, bytes).unwrap();
+        write(root.path(), &id, true, bytes).unwrap();
+        let runs = directory(root.path()).unwrap();
+        let started = runs.join(file_name(&id, false).unwrap());
+        let finished = runs.join(file_name(&id, true).unwrap());
+        let sealed = fs::read(&started).unwrap();
+        assert!(sealed.starts_with(b"MINEENC\x01"));
+        assert!(!sealed.windows(bytes.len()).any(|window| window == bytes));
+        assert_eq!(read(root.path(), &id, false).unwrap().unwrap(), bytes);
+        assert_eq!(read(root.path(), &id, true).unwrap().unwrap(), bytes);
+        write(root.path(), &id, false, bytes).unwrap();
+        assert_eq!(fs::read(&started).unwrap(), sealed);
+
+        fs::write(&finished, &sealed).unwrap();
+        assert!(read(root.path(), &id, true).is_err());
+        let other_id = loom_types::CommandId::new().to_string();
+        fs::write(runs.join(file_name(&other_id, false).unwrap()), &sealed).unwrap();
+        assert!(read(root.path(), &other_id, false).is_err());
+        let mut tampered = sealed;
+        *tampered.last_mut().unwrap() ^= 1;
+        fs::write(&started, tampered).unwrap();
+        assert!(read(root.path(), &id, false).is_err());
+        fs::write(&started, bytes).unwrap();
+        assert!(read(root.path(), &id, false).is_err());
+        assert!(write(root.path(), &id, false, bytes).is_err());
+        assert_eq!(fs::read(&started).unwrap(), bytes);
+    }
+
+    #[test]
+    fn secured_receipt_staging_contains_only_ciphertext_and_plaintext_limit_is_preserved() {
+        let root = fixture();
+        desktop_vault::ProjectVault::initialize_with_key(root.path(), [52; 32]).unwrap();
+        let id = loom_types::CommandId::new().to_string();
+        let name = file_name(&id, false).unwrap();
+        let bytes = br#"{"private":"staging must not leak this source"}"#;
+        let result = unix::write(root.path(), &name, bytes, || {
+            let staging = fs::read_dir(directory(root.path()).unwrap())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap();
+            let stored = fs::read(staging.path()).unwrap();
+            assert!(stored.starts_with(b"MINEENC\x01"));
+            assert!(!stored.windows(bytes.len()).any(|window| window == bytes));
+            Err(failure("injected failure before publication"))
+        });
+        assert!(result.is_err());
+        assert!(read(root.path(), &id, false).unwrap().is_none());
+        assert_eq!(
+            fs::read_dir(directory(root.path()).unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
+
+        let maximum = format!("{{\"body\":\"{}\"}}", "x".repeat(MAX_BYTES - 11)).into_bytes();
+        assert_eq!(maximum.len(), MAX_BYTES);
+        write(root.path(), &id, false, &maximum).unwrap();
+        assert_eq!(read(root.path(), &id, false).unwrap().unwrap(), maximum);
+        let path = directory(root.path()).unwrap().join(name);
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_len(desktop_vault::encrypted_max_len(MAX_BYTES as u64) + 1)
+            .unwrap();
+        assert!(read(root.path(), &id, false).is_err());
     }
 
     #[test]

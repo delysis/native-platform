@@ -1,0 +1,9 @@
+(import "editing.easl")
+
+@external (var text-edit-context: TextEditContext)
+@external (var text-edit-command: TextEditCommand)
+@external (var text-edit-plan: TextEditPlan)
+
+@cpu
+(defn text-edit-native []
+  (= text-edit-plan (text-edit text-edit-context text-edit-command)))

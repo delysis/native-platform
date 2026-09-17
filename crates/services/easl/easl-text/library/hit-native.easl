@@ -1,0 +1,30 @@
+(import "geometry.easl")
+
+; Native adapters stream one indexed line's immutable shaped caret stops in
+; batches of at most 256. Source text never crosses this boundary. Geometry may
+; be larger than the atlas specimen's canvas, but arithmetic remains finite.
+(struct TextHitSample hit: TextHit other-x: f32)
+@external (var text-hit-stops: [TextHitSample])
+@external (var text-hit-point: vec2f)
+@external (var text-hit-best: TextHitSample)
+
+(defn text-hit-finite [v: f32]: bool (and (>= v -1000000000000000000000000000000.) (<= v 1000000000000000000000000000000.)))
+(defn text-hit-valid [hit: TextHit]: bool
+  (and (and (== hit.status 0u) (<= hit.affinity 1u))
+    (and (and (text-hit-finite hit.rect.x) (text-hit-finite hit.rect.y))
+      (and (== hit.rect.z 1.) (and (> hit.rect.w 0.) (text-hit-finite hit.rect.w))))))
+
+@cpu
+(defn text-hit-native []
+  (let [count (array-length text-hit-stops) @var best text-hit-best]
+    (when (or (> count 256u)
+              (not (and (text-hit-finite text-hit-point.x) (text-hit-finite text-hit-point.y))))
+      (= text-hit-best (TextHitSample (TextHit 1u 0u 1u 0u (vec4f 0.)) 0.)) (return))
+    (when (and (!= best.hit.status 2u) (not (and (text-hit-valid best.hit) (text-hit-finite best.other-x))))
+      (= text-hit-best (TextHitSample (TextHit 1u 0u 1u 0u (vec4f 0.)) 0.)) (return))
+    (for [i count]
+      (let [sample (text-hit-stops i) hit sample.hit]
+        (when (not (and (text-hit-valid hit) (text-hit-finite sample.other-x)))
+          (= text-hit-best (TextHitSample (TextHit 1u 0u 1u 0u (vec4f 0.)) 0.)) (return))
+        (when (text-hit-nearer hit sample.other-x best.hit best.other-x text-hit-point) (= best sample))))
+    (= text-hit-best best)))

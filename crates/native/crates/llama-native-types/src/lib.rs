@@ -181,6 +181,13 @@ pub enum SamplerKind {
     Temperature,
 }
 
+impl SamplingConfig {
+    /// Validate a requested sampler without applying clamps or fallback values.
+    pub fn validate(&self) -> Result<(), NativeError> {
+        controlled_generation::validate_sampling(self)
+    }
+}
+
 impl Default for SamplingConfig {
     fn default() -> Self {
         Self {

@@ -1,0 +1,15 @@
+(import "styles.easl")
+
+@external (var style-values: [TextRunStyle])
+@external (var style-rules: [TextStyleRule])
+@external (var style-inputs: [TextStyleInput])
+@external (var style-output: [TextStyledSpan])
+@external (var style-bytes: u32)
+@external (var style-result: TextStyleResult)
+@cpu
+(defn resolve-native-styles []
+  (= style-result (text-resolve-styles style-bytes
+    (array-length style-values) (fn [i] (style-values i))
+    (array-length style-rules) (fn [i] (style-rules i))
+    (array-length style-inputs) (fn [i] (style-inputs i))
+    (array-length style-output) (fn [i span] (= (style-output i) span)) 1000000u)))

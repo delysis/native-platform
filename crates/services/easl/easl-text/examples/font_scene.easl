@@ -1,0 +1,61 @@
+(import "../library/atlas.easl")
+
+@{group 0 binding 0}
+(var specimen-font: (Texture2D f32))
+@{group 0 binding 1}
+(var specimen-sampler: Sampler)
+(var specimen-ink: [FontAtlasGlyph])
+(var specimen-utf8: [u32])
+(var specimen-requested-glyphs: [u32])
+(var specimen-run: [FontShapedGlyph])
+@{group 0 binding 2 address storage}
+(var specimen-quads: [TextGlyphQuad])
+@external (var specimen-advance: f32)
+@external (var specimen-count: u32)
+@external (var specimen-metrics: vec4f)
+@{group 1 binding 0}
+(var specimen-target: (Texture2D f32))
+
+(defn specimen-glyph [i: u32]: FontShapedGlyph (specimen-run i))
+(defn specimen-metric [i: u32]: FontAtlasGlyph (specimen-ink i))
+(defn specimen-emit [i: u32 quad: TextGlyphQuad] (= (specimen-quads i) quad))
+
+@cpu
+(defn prepare []
+  (= specimen-font (open-font "../../easl-native-text/tests/fonts/amiri.ttf" 48.))
+  (= specimen-metrics (font-metrics specimen-font))
+  (= specimen-utf8 (utf8-bytes "The measure of a page. Office, café, affinity."))
+  (= specimen-run (shape-font-run specimen-font specimen-utf8 (text-script-latin) false))
+  (= specimen-count (array-length specimen-run))
+  ; EASL chooses resident glyphs after shaping. Unrelated font glyphs consume
+  ; no bitmap space, and placement uses this immutable page's own UV geometry.
+  (= specimen-requested-glyphs (zeroed-array specimen-count))
+  (for [i specimen-count] (= (specimen-requested-glyphs i) (.id (specimen-run i))))
+  (= specimen-font (rasterize-font specimen-font specimen-requested-glyphs))
+  (= specimen-ink (font-atlas-glyphs specimen-font))
+  (= specimen-quads (zeroed-array specimen-count))
+  (= specimen-advance (text-place-run specimen-count specimen-glyph specimen-metric
+     (vec2f (texture-dimensions specimen-font)) (vec2f 30. 100.) false specimen-emit)))
+
+(struct SpecimenVertex
+  @{builtin position} clip: vec4f
+  @{location 0} uv: vec2f)
+
+@vertex
+(defn specimen-vertex []: SpecimenVertex
+  (let [index (vertex-index)
+        quad (specimen-quads (/ index 6u))
+        corner (text-quad-corner index)]
+    (SpecimenVertex (text-quad-position quad corner (vec2f 1200. 180.))
+                    (text-quad-uv quad corner))))
+
+@fragment
+(defn specimen-fragment [input: SpecimenVertex]: @{location 0} vec4f
+  (let [coverage (.w (texture-sample specimen-font specimen-sampler input.uv))]
+    (vec4f 0.08 0.10 0.08 coverage)))
+
+@vertex
+(defn specimen-background-vertex []: @{builtin position} vec4f
+  (vec4f (match (vertex-index) 0u (vec2f -1. -1.) 1u (vec2f 3. -1.) _ (vec2f -1. 3.)) 0. 1.))
+@fragment
+(defn specimen-background-fragment []: @{location 0} vec4f (vec4f 0.97 0.96 0.93 1.))

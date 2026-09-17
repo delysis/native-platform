@@ -1,0 +1,99 @@
+; Native text-directional-facts resolves paragraph embedding levels and supplies
+; Unicode properties. This module owns per-line L1 resets and L2 visual ordering.
+; Neither stage edits source. Feed logical substrings to shaping, never reversed
+; UTF-8 or reversed scalars. Font fallback/script itemization and shaping still
+; precede glyph placement; these level runs are not complete shaping runs.
+(struct TextBidiSlot fact: u32 level: u32)
+(struct TextBidiResult status: u32 count: u32 work: u32)
+(struct TextBidiRun start: u32 end: u32 level: u32)
+
+; Output slots map visual positions to original fact indices. The same storage
+; supplies both callbacks. It must not alias immutable native facts. Preflight
+; all input, capacity and work before writing. Readers must remain stable except
+; for writes through emit-slot. Status: 0 success, 1 invalid, 2 capacity/work.
+; A selected line is a half-open scalar-index range inside ONE paragraph.
+(defn text-bidi-order [facts: u32 fact-at: (Fn [u32] TextDirectionalFact)
+                       begin: u32 end: u32 capacity: u32
+                       slot-at: (Fn [u32] TextBidiSlot)
+                       emit-slot: (Fn [u32 TextBidiSlot] ())
+                       budget: u32]: TextBidiResult
+  (when (or (> begin end) (> end facts)) (return (TextBidiResult 1u 0u 0u)))
+  (let [count (- end begin)]
+    (when (or (> count 65535u) (or (> count capacity) (> budget 1000000u)))
+      (return (TextBidiResult 2u 0u 0u)))
+    (when (== count 0u) (return (TextBidiResult 0u 0u 0u)))
+    (let [first (fact-at begin) @var covered first.start @var maximum first.base]
+      (when (> first.base 1u) (return (TextBidiResult 1u 0u 0u)))
+      (for [i begin (< i end) (+= i 1u)]
+        (let [fact (fact-at i)]
+          (when (or (!= fact.start covered) (or (<= fact.end fact.start)
+            (or (> fact.end 1048576u) (or (> fact.level 126u) (or (> fact.reset 3u)
+              (or (!= fact.base first.base) (!= fact.paragraph first.paragraph)))))))
+            (return (TextBidiResult 1u 0u 0u)))
+          (= covered fact.end) (= maximum (max maximum fact.level))))
+      ; Reserve linear validation/reset work and every possible level pass.
+      ; Descending all the way to 1 handles base-RTL trailing resets correctly.
+      (let [work (* count (+ 4u (* 2u maximum)))]
+        (when (> work budget) (return (TextBidiResult 2u 0u work)))
+        (let [@var reset-start 0u @var previous first.base]
+          (for [i count]
+            (let [fact (fact-at (+ begin i))
+                  level (if (== fact.reset 3u) previous fact.level)]
+              (emit-slot i (TextBidiSlot (+ begin i) level))
+              (if (== fact.reset 0u)
+                (= reset-start 4294967295u)
+                (when (== reset-start 4294967295u) (= reset-start i)))
+              (when (== fact.reset 2u)
+                (for [j reset-start (<= j i) (+= j 1u)]
+                  (emit-slot j (TextBidiSlot (+ begin j) first.base)))
+                (= reset-start 4294967295u))
+              (= previous (.level (slot-at i)))))
+          (when (!= reset-start 4294967295u)
+            (for [i reset-start (< i count) (+= i 1u)]
+              (emit-slot i (TextBidiSlot (+ begin i) first.base)))))
+        (while (> maximum 0u)
+          (let [@var cursor 0u]
+            (while (< cursor count)
+              (if (< (.level (slot-at cursor)) maximum)
+                (+= cursor 1u)
+                (let [@var left cursor @var right (+ cursor 1u)]
+                  (while (< right count)
+                    (when (< (.level (slot-at right)) maximum) (break))
+                    (+= right 1u))
+                  (= cursor right)
+                  (while (< (+ left 1u) right)
+                    (-= right 1u)
+                    (let [saved (slot-at left)]
+                      (emit-slot left (slot-at right)) (emit-slot right saved))
+                    (+= left 1u))))))
+          (-= maximum 1u))
+        (TextBidiResult 0u count work)))))
+
+; Coalesce the validated visual permutation into level runs. Each range remains
+; in logical UTF-8 order, suitable for script itemization and directional shaping.
+; Counts/indices come from one successful text-bidi-order call. Two passes check
+; capacity before publishing. This does not reverse a combining sequence's bytes.
+(defn text-bidi-runs [count: u32 slot-at: (Fn [u32] TextBidiSlot)
+                      fact-at: (Fn [u32] TextDirectionalFact)
+                      capacity: u32 emit-run: (Fn [u32 TextBidiRun] ())]: TextBidiResult
+  (when (> count 65535u) (return (TextBidiResult 2u 0u 0u)))
+  (let [@var total 0u]
+    (for [pass 2u]
+      (let [@var cursor 0u @var output 0u]
+        (while (< cursor count)
+          (let [first (slot-at cursor) fact (fact-at first.fact)
+                @var start fact.start @var end fact.end @var previous first.fact
+                rtl (!= (& first.level 1u) 0u)]
+            (+= cursor 1u)
+            (while (< cursor count)
+              (let [next (slot-at cursor)]
+                (when (or (!= next.level first.level)
+                  (if rtl (!= (+ next.fact 1u) previous) (!= next.fact (+ previous 1u)))) (break))
+                (let [item (fact-at next.fact)]
+                  (= start (min start item.start)) (= end (max end item.end)))
+                (= previous next.fact) (+= cursor 1u)))
+            (when (== pass 1u) (emit-run output (TextBidiRun start end first.level)))
+            (+= output 1u)))
+        (when (> output capacity) (return (TextBidiResult 2u 0u 0u)))
+        (= total output)))
+    (TextBidiResult 0u total (* count 2u))))

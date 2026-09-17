@@ -1,0 +1,95 @@
+use crate::compiler::{
+  entry::EntryPoint,
+  expression::{ExpKind, Number},
+  program::Program,
+  types::{ConcreteArraySize, Type},
+  vars::{GroupAndBinding, TopLevelVariableKind, VariableAddressSpace},
+};
+
+pub enum TypeInfo {
+  Unit,
+  F32,
+  I32,
+  U32,
+  Bool,
+  Struct(String),
+  Enum(String),
+  Array(Option<ConcreteArraySize>, Box<Self>),
+  InvalidType,
+}
+
+impl From<Type> for TypeInfo {
+  fn from(t: Type) -> Self {
+    use TypeInfo::*;
+    match t {
+      Type::Unit => Unit,
+      Type::F32 => F32,
+      Type::I32 => I32,
+      Type::U32 => U32,
+      Type::Bool => Bool,
+      Type::Struct(s) => Struct(s.name.to_string()),
+      Type::Enum(e) => Enum(e.name.to_string()),
+      Type::Array(array_size, inner_type) => {
+        Array(array_size, Box::new(Self::from(inner_type.unwrap_known())))
+      }
+      _ => InvalidType,
+    }
+  }
+}
+
+pub struct VariableInfo {
+  pub name: String,
+  pub value: Option<String>,
+  pub variable_type: TypeInfo,
+  pub uniform_info: Option<GroupAndBinding>,
+}
+
+pub struct ProgramInfo {
+  pub global_vars: Vec<VariableInfo>,
+  pub fragment_entries: Vec<String>,
+  pub vertex_entries: Vec<String>,
+  pub compute_entries: Vec<String>,
+}
+
+impl From<&Program> for ProgramInfo {
+  fn from(program: &Program) -> Self {
+    Self {
+      global_vars: program
+        .top_level_vars
+        .iter()
+        .map(|var| VariableInfo {
+          name: var.name.to_string(),
+          variable_type: var.var_type.clone().into(),
+          uniform_info: if let TopLevelVariableKind::Var {
+            address_space: VariableAddressSpace::Uniform,
+            group_and_binding,
+          } = &var.kind
+          {
+            group_and_binding.clone()
+          } else {
+            None
+          },
+          value: var
+            .value
+            .clone()
+            .map(|exp| match exp.kind {
+              ExpKind::Name(name) => Some(name.to_string()),
+              ExpKind::NumberLiteral(number) => Some(match number {
+                Number::Int(i) => format!("{i}"),
+                Number::Float(f) => format!("{f:?}"),
+              }),
+              ExpKind::BooleanLiteral(b) => Some(format!("{b}")),
+              _ => None,
+            })
+            .flatten(),
+        })
+        .collect(),
+      fragment_entries: program
+        .find_fn_names_by_entry_point(&|e| e == EntryPoint::Fragment),
+      vertex_entries: program
+        .find_fn_names_by_entry_point(&|e| e == EntryPoint::Vertex),
+      compute_entries: program
+        .find_fn_names_by_entry_point(&|e| matches!(e, EntryPoint::Compute(_))),
+    }
+  }
+}

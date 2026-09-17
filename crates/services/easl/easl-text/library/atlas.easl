@@ -1,0 +1,124 @@
+; Native load-font provides a Texture2D, FontAtlasGlyph records, and shaped
+; FontShapedGlyph runs. This library owns placement and GPU quad generation.
+; Unscaled entry points use atlas pixels. Scaled entry points take logical
+; glyph positions and a separate ink scale; apply display scale once in paint.
+(struct TextGlyphQuad
+  bounds: vec4f
+  uv: vec4f
+  start: u32
+  end: u32)
+
+; Advance geometry is separate from ink: spaces still have an editable area,
+; while accents/overhangs do not move the caret away from the shaped advances.
+(struct TextClusterBox bounds: vec4f start: u32 end: u32 line: u32 rtl: bool)
+(struct TextRunPlacement advance: f32 clusters: u32)
+
+; Keep logical placement independent of bitmap packing. A document can collect
+; every final line's glyphs, choose immutable pages, then resolve all UVs once.
+(struct TextPlacedGlyph glyph: FontShapedGlyph baseline: vec2f scale: f32)
+(defn text-placed-glyph-quad [item: TextPlacedGlyph ink: FontAtlasGlyph
+                             atlas-size: vec2f]: TextGlyphQuad
+  (text-glyph-quad-scaled item.glyph ink item.baseline atlas-size item.scale))
+
+(defn text-script-latin []: u32 1818326126u)
+(defn text-script-arabic []: u32 1634885986u)
+
+(defn text-glyph-quad [glyph: FontShapedGlyph ink: FontAtlasGlyph
+                       baseline: vec2f atlas-size: vec2f]: TextGlyphQuad
+  (text-glyph-quad-scaled glyph ink baseline atlas-size 1.))
+
+; Glyph offsets/advances already use layout units. Scale only the atlas ink;
+; normalized UVs continue to address the original raster resolution.
+(defn text-glyph-quad-scaled [glyph: FontShapedGlyph ink: FontAtlasGlyph
+                       baseline: vec2f atlas-size: vec2f ink-scale: f32]: TextGlyphQuad
+  (let [origin (+ (+ baseline (vec2f glyph.x glyph.y)) (* ink.offset ink-scale))
+        extent (vec2f ink.rect.zw)
+        uv-origin (/ (vec2f ink.rect.xy) atlas-size)
+        uv-end (/ (+ (vec2f ink.rect.xy) extent) atlas-size)]
+    (TextGlyphQuad (vec4f origin (* extent ink-scale)) (vec4f uv-origin uv-end)
+                   glyph.start glyph.end)))
+
+; Emit in visual order. Reverse RTL clusters, preserving mark order within
+; each cluster. Native shaping deliberately returns logical cluster order.
+(defn text-place-run-geometry [count: u32
+                      glyph-at: (Fn [u32] FontShapedGlyph)
+                      ink-at: (Fn [u32] FontAtlasGlyph)
+                      atlas-size: vec2f baseline: vec2f rtl: bool
+                      emit-quad: (Fn [u32 TextGlyphQuad] ())
+                      line: u32 line-band: vec2f source-offset: u32
+                      emit-cluster: (Fn [u32 TextClusterBox] ())]: TextRunPlacement
+  (text-place-scaled-run-geometry count glyph-at ink-at atlas-size baseline 1. rtl
+    emit-quad line line-band source-offset emit-cluster))
+
+(defn text-place-scaled-run-geometry [count: u32
+                      glyph-at: (Fn [u32] FontShapedGlyph)
+                      ink-at: (Fn [u32] FontAtlasGlyph)
+                      atlas-size: vec2f baseline: vec2f ink-scale: f32 rtl: bool
+                      emit-quad: (Fn [u32 TextGlyphQuad] ())
+                      line: u32 line-band: vec2f source-offset: u32
+                      emit-cluster: (Fn [u32 TextClusterBox] ())]: TextRunPlacement
+  (text-position-scaled-run count glyph-at baseline ink-scale rtl
+    (fn [i item] (emit-quad i (text-placed-glyph-quad item (ink-at item.glyph.id) atlas-size)))
+    line line-band source-offset emit-cluster))
+
+(defn text-position-scaled-run [count: u32 glyph-at: (Fn [u32] FontShapedGlyph)
+                      baseline: vec2f ink-scale: f32 rtl: bool
+                      emit-glyph: (Fn [u32 TextPlacedGlyph] ())
+                      line: u32 line-band: vec2f source-offset: u32
+                      emit-cluster: (Fn [u32 TextClusterBox] ())]: TextRunPlacement
+  (let [@var pen baseline @var output 0u @var cursor (if rtl count 0u)
+        @var clusters 0u]
+    (while (< output count)
+      (let [@var begin cursor @var end cursor]
+        (if rtl
+          (let []
+            (-= begin 1u)
+            (let [cluster-start (.start (glyph-at begin))]
+              (while (> begin 0u)
+                (when (!= (.start (glyph-at (- begin 1u))) cluster-start) (break))
+                (-= begin 1u)))
+            (= cursor begin))
+          (let [cluster-start (.start (glyph-at begin))]
+            (while (< end count)
+              (when (!= (.start (glyph-at end)) cluster-start) (break))
+              (+= end 1u))
+            (= cursor end)))
+        (let [left pen.x first (glyph-at begin) @var source-end first.end]
+          (for [i begin (< i end) (+= i 1u)]
+            (let [glyph (glyph-at i) @var placed (TextPlacedGlyph glyph pen ink-scale)]
+              (+= placed.glyph.start source-offset) (+= placed.glyph.end source-offset)
+              (emit-glyph output placed)
+              (= source-end (max source-end glyph.end))
+              (+= pen.x glyph.advance)
+              (+= output 1u)))
+          (emit-cluster clusters
+            (TextClusterBox (vec4f left line-band.x (- pen.x left) line-band.y)
+              (+ source-offset first.start) (+ source-offset source-end) line rtl))
+          (+= clusters 1u))))
+    (TextRunPlacement (- pen.x baseline.x) clusters)))
+
+(defn text-ignore-cluster [index: u32 cluster: TextClusterBox] ())
+
+(defn text-place-run [count: u32 glyph-at: (Fn [u32] FontShapedGlyph)
+                      ink-at: (Fn [u32] FontAtlasGlyph)
+                      atlas-size: vec2f baseline: vec2f rtl: bool
+                      emit-quad: (Fn [u32 TextGlyphQuad] ())]: f32
+  (.advance (text-place-run-geometry count glyph-at ink-at atlas-size baseline rtl
+    emit-quad 0u (vec2f 0. 1.) 0u text-ignore-cluster)))
+
+(defn text-quad-corner [index: u32]: vec2f
+  (match (% index 6u)
+    0u (vec2f 0. 0.)
+    1u (vec2f 1. 0.)
+    2u (vec2f 0. 1.)
+    3u (vec2f 0. 1.)
+    4u (vec2f 1. 0.)
+    _ (vec2f 1. 1.)))
+
+(defn text-quad-position [quad: TextGlyphQuad corner: vec2f viewport: vec2f]: vec4f
+  (let [pixel (+ quad.bounds.xy (* corner quad.bounds.zw))
+        clip (- (* (/ pixel viewport) 2.) 1.)]
+    (vec4f clip.x (- 0. clip.y) 0. 1.)))
+
+(defn text-quad-uv [quad: TextGlyphQuad corner: vec2f]: vec2f
+  (mix quad.uv.xy quad.uv.zw corner))

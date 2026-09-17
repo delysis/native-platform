@@ -1,0 +1,6123 @@
+use std::collections::{HashMap, HashSet};
+
+use std::hash::Hash;
+use std::sync::{Arc, RwLock};
+
+use fsexp::{Ast, document::Document, syntax::EncloserOrOperator};
+use take_mut::take;
+
+use crate::compiler::builtins::{
+  EmulatedFunctionRecord, EmulatedFunctionSignature,
+  built_in_structs_for_target,
+};
+use crate::compiler::types::ExpTypeInfo;
+use crate::compiler::vars::{GroupAndBinding, VariableAddressSpace};
+use crate::parse::EaslMultiDocument;
+use crate::thread_sync::participant;
+use crate::vm::bytecode::{BytecodeProgram, Instruction, Op};
+use crate::vm::compile::{
+  BytecodeCompilationState, PendingFrameFnUsage, PendingRefFnUsage,
+};
+use crate::{
+  Never,
+  compiler::{
+    annotation::extract_annotation,
+    builtins::built_in_functions,
+    effects::{Effect, WindowInfoBindingSource, WindowInfoKind},
+    entry::{
+      BuiltinIOAttribute, EntryPoint, IOAttribute, IOAttributeKind,
+      IOAttributes, InputOrOutput,
+    },
+    enums::{AbstractEnum, UntypedEnum},
+    error::{CompileError, SourceTrace, err},
+    expression::{
+      Accessor, Exp, ExpKind, ExpressionCompilationPosition, Number,
+    },
+    functions::{
+      AbstractFunctionSignature, FunctionArgumentAnnotation, FunctionSignature,
+      Ownership, TopLevelFunction,
+    },
+    structs::{AbstractStructField, UntypedStruct},
+    types::{
+      AbstractArraySize, AbstractType, ConcreteArraySize,
+      ConstGenericResolution, ImmutableProgramLocalContext,
+      NameDefinitionSource, Type, TypeState, UntypedType, Variable,
+      VariableKind, parse_generic_argument,
+    },
+    util::{compile_word, is_valid_name},
+    vars::TopLevelVariableKind,
+  },
+  parse::{EaslSyntax, EaslTree, Encloser, Operator, parse_easl},
+};
+
+use super::{
+  builtins::{
+    ABNORMAL_CONSTRUCTOR_STRUCTS, built_in_structs, built_in_type_aliases,
+  },
+  error::{
+    CompileErrorKind::{self, *},
+    CompileResult, ErrorLog,
+  },
+  expression::TypedExp,
+  functions::FunctionImplementationKind,
+  macros::{Macro, macroexpand},
+  structs::AbstractStruct,
+  vars::TopLevelVar,
+};
+
+pub type EaslDocument = Document<EaslSyntax>;
+
+// This pass needs only shader input lookups, not every variable/resource effect
+// in a CPU editor's call graph. Visit each reachable implementation once, so
+// repeated calls and diamond-shaped helper graphs do not repeat whole subtrees.
+// Analysis is local to this invocation; later compiler rewrites cannot stale it.
+fn builtin_attribute_lookups(
+  root: &Arc<RwLock<TopLevelFunction>>,
+) -> HashSet<BuiltinIOAttribute> {
+  let mut attributes = HashSet::new();
+  let mut visited = HashSet::new();
+  let mut pending = vec![root.clone()];
+  while let Some(function) = pending.pop() {
+    if !visited.insert(Arc::as_ptr(&function)) {
+      continue;
+    }
+    function
+      .read()
+      .unwrap()
+      .expression
+      .walk(&mut |exp| {
+        if let ExpKind::Application(callee, _) = &exp.kind
+          && let Type::Function(signature) = callee.data.unwrap_known()
+          && let Some(ancestor) = &signature.abstract_ancestor
+        {
+          match &ancestor.read().unwrap().implementation {
+            FunctionImplementationKind::Builtin { effect_type, .. } => {
+              attributes.extend(effect_type.looked_up_builtin_attributes());
+            }
+            FunctionImplementationKind::Composite(called) => {
+              pending.push(called.clone());
+            }
+            _ => {}
+          }
+        }
+        Ok::<_, Never>(true)
+      })
+      .unwrap();
+  }
+  attributes
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompilerTarget {
+  C,
+  WGSL,
+  VM,
+}
+
+impl CompilerTarget {
+  fn program_header(self) -> String {
+    match self {
+      CompilerTarget::C => {
+        let mut header =
+          "#include <stdlib.h>\n\
+           #include <stdio.h>\n\
+           #include <stdbool.h>\n\
+           #include <stdint.h>\n\
+           #include <string.h>\n\
+           #include <math.h>\n"
+            .to_string();
+        header += r#"void print_f32(float v) {                                                                     
+  char buf[32];                                                                           
+  snprintf(buf, sizeof(buf), "%f", v);                                                      
+  char *dot = strchr(buf, '.');                                                             
+  if (dot) {                                                                                
+    char *end = buf + strlen(buf) - 1;                                                    
+    while (end > dot && *end == '0') {                      
+      *end-- = '\0';                                                                    
+    }                                                                                   
+  }
+  printf("%s", buf);
+}
+"#;
+        for size in [2, 3, 4] {
+          for (field_type, suffix) in
+            [("float", "f"), ("int32_t", "i"), ("uint32_t", "u")]
+          {
+            header += "typedef struct {\n";
+            for field in ["x", "y", "z", "w"].iter().take(size) {
+              header += &format!("  {field_type} {field};\n")
+            }
+            header += &format!("}} vec{size}{suffix};\n");
+          }
+        }
+        // Matrix types: matNxM has N columns, each a vecM
+        for n in 2..=4 {
+          for m in 2..=4 {
+            for suffix in ["f", "i", "u"] {
+              header += "typedef struct {\n";
+              for i in 0..n {
+                header += &format!("  vec{m}{suffix} c{i};\n");
+              }
+              header += &format!("}} mat{n}x{m}{suffix};\n");
+            }
+          }
+        }
+        for size in [2usize, 3, 4] {
+          for (field_type, suffix) in
+            [("float", "f"), ("int32_t", "i"), ("uint32_t", "u")]
+          {
+            header += &format!(
+              "static inline {field_type} index_vec{size}{suffix}(vec{size}{suffix} v, int32_t i) {{ \
+                 return (&v.x)[i]; \
+               }}\n"
+            );
+          }
+        }
+        for n in 2..=4 {
+          for m in 2..=4 {
+            for suffix in ["f", "i", "u"] {
+              header += &format!(
+                "static inline vec{m}{suffix} index_mat{n}x{m}{suffix}(mat{n}x{m}{suffix} m, int32_t i) {{ \
+                   return (&m.c0)[i]; \
+                 }}\n"
+              );
+            }
+          }
+        }
+        header
+      }
+      .to_string(),
+      _ => String::new(),
+    }
+  }
+}
+
+pub trait EaslDocumentMethods {
+  fn override_def(&mut self, def_name: &str, new_def_value: &str) -> bool;
+}
+impl EaslDocumentMethods for EaslDocument {
+  fn override_def(&mut self, def_name: &str, new_def_value: &str) -> bool {
+    let new_def_document = parse_easl(new_def_value);
+    if let Some(new_value_ast) = new_def_document.syntax_trees.first() {
+      for ast in self.syntax_trees.iter_mut() {
+        if let Ast::Inner(
+          (_, EncloserOrOperator::Encloser(Encloser::Parens)),
+          children,
+        ) = ast
+          && let Some(Ast::Leaf(_, first_leaf)) = children.first()
+          && first_leaf == "def"
+          && let Some(Ast::Inner(
+            (_, EncloserOrOperator::Operator(Operator::TypeAscription)),
+            name_children,
+          )) = children.get(2)
+          && let Some(Ast::Leaf(_, binding_name)) = name_children.first()
+          && binding_name == def_name
+          && let Some(value) = children.get_mut(2)
+        {
+          *value = new_value_ast.clone();
+          return true;
+        }
+      }
+    }
+    false
+  }
+}
+
+thread_local! {
+  pub static DEFAULT_PROGRAM: RwLock<Program> =
+    RwLock::new(
+      Program::empty()
+        .with_functions(built_in_functions())
+        .with_structs(
+          built_in_structs().into_iter().map(|s| Arc::new(s)).collect(),
+        )
+        .with_type_aliases(built_in_type_aliases()));
+}
+
+#[derive(Debug, Clone)]
+pub struct NameContext {
+  user_names: HashSet<Arc<str>>,
+  generated_names: HashSet<Arc<str>>,
+  monomorphized_names: HashMap<(Arc<str>, Vec<Arc<str>>), Arc<str>>,
+}
+
+impl NameContext {
+  fn empty() -> Self {
+    Self {
+      user_names: HashSet::new(),
+      generated_names: HashSet::new(),
+      monomorphized_names: HashMap::new(),
+    }
+  }
+  fn track_all_ast_names(&mut self, ast: &EaslTree) {
+    ast.walk(&mut |ast| {
+      if let EaslTree::Leaf(_, name) = ast {
+        self.track_user_name(name);
+      }
+    });
+  }
+  fn track_user_name(&mut self, name: &str) {
+    self.user_names.insert(name.into());
+    self.user_names.insert(compile_word(name.into()).into());
+  }
+  fn is_taken(&self, name: &str) -> bool {
+    self.user_names.contains(name) || self.generated_names.contains(name)
+  }
+  pub fn gensym(&mut self, base_name: &str) -> Arc<str> {
+    if self.is_taken(base_name) {
+      let mut i = 0;
+      let final_name: Arc<str> = loop {
+        let modified_name = base_name.to_string() + &format!("_{i}");
+        if !self.is_taken(&modified_name) {
+          break modified_name.into();
+        }
+        i += 1;
+      };
+      self.generated_names.insert(final_name.clone());
+      final_name
+    } else {
+      self.generated_names.insert(base_name.into());
+      base_name.into()
+    }
+  }
+  /// Reverse of `get_monomorphized_name`: maps each generated monomorphized
+  /// name back to the base name it was derived from. Names are gensym'd on
+  /// collision at generation time, so this cache-derived mapping is the only
+  /// exact way to recover a base name — recomputing the mangle can diverge.
+  pub(crate) fn monomorphized_to_base_names(
+    &self,
+  ) -> HashMap<Arc<str>, Arc<str>> {
+    self
+      .monomorphized_names
+      .iter()
+      .map(|((base, _), monomorphized)| (monomorphized.clone(), base.clone()))
+      .collect()
+  }
+  pub(crate) fn get_monomorphized_name(
+    &mut self,
+    base_type_name: Arc<str>,
+    generic_arg_names: Vec<Arc<str>>,
+  ) -> Arc<str> {
+    if generic_arg_names.is_empty() {
+      return base_type_name;
+    }
+    let monomorphization_id = (base_type_name, generic_arg_names);
+    self
+      .monomorphized_names
+      .get(&monomorphization_id)
+      .map(|name| name.clone())
+      .unwrap_or_else(|| {
+        let full_name: Arc<str> = monomorphization_id
+          .1
+          .clone()
+          .into_iter()
+          .fold(
+            monomorphization_id.0.to_string(),
+            |full_name, generic_arg_name| full_name + "_" + &generic_arg_name,
+          )
+          .into();
+        let final_name = self.gensym(&full_name);
+        self.generated_names.insert(final_name.clone());
+        self
+          .monomorphized_names
+          .insert(monomorphization_id, final_name.clone());
+        final_name
+      })
+  }
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeDefs {
+  pub structs: Vec<AbstractStruct>,
+  pub enums: Vec<AbstractEnum>,
+  pub type_aliases: Vec<(Arc<str>, Arc<AbstractStruct>)>,
+}
+
+impl TypeDefs {
+  pub fn empty() -> Self {
+    Self {
+      structs: vec![],
+      enums: vec![],
+      type_aliases: vec![],
+    }
+  }
+  pub fn get_attributable_components(
+    &self,
+    t: Type,
+    input_or_output: InputOrOutput,
+    source_trace: SourceTrace,
+    errors: &mut ErrorLog,
+  ) -> Vec<(Arc<AbstractStruct>, Arc<str>, IOAttributes)> {
+    match t {
+      Type::Struct(s) => s
+        .fields
+        .iter()
+        .filter_map(|f| {
+          if f.field_type.unwrap_known().is_attributable() {
+            Some((
+              s.abstract_ancestor.clone(),
+              f.name.clone(),
+              f.attributes.clone(),
+            ))
+          } else {
+            errors.log(CompileError::new(
+              CantAssignAttributesToFieldOfType(f.name.to_string()),
+              source_trace
+                .clone()
+                .insert_as_secondary(s.abstract_ancestor.source_trace.clone()),
+            ));
+            None
+          }
+        })
+        .collect(),
+      Type::Unit => vec![],
+      _ => {
+        errors.log(CompileError::new(
+          EntryInputOrOutputMustBeScalarOrStruct(input_or_output),
+          source_trace,
+        ));
+        vec![]
+      }
+    }
+  }
+}
+
+#[derive(Debug)]
+pub struct Program {
+  pub names: RwLock<NameContext>,
+  pub typedefs: TypeDefs,
+  pub abstract_functions:
+    HashMap<Arc<str>, Vec<Arc<RwLock<AbstractFunctionSignature>>>>,
+  pub top_level_vars: Vec<TopLevelVar>,
+  pub emulated_functions: EmulatedFunctionRecord,
+  pub has_been_validated: bool,
+  /// Implicit uniform bindings generated by `extract_gpu_window_info` for
+  /// window-info queries (`window-time` etc.) used in GPU code. The runtime
+  /// refreshes each of these from the IO manager at the start of every
+  /// frame, so GPU reads see a per-frame snapshot of the ambient state.
+  pub window_info_bindings: Vec<(WindowInfoBindingSource, Arc<str>)>,
+}
+impl Clone for Program {
+  fn clone(&self) -> Self {
+    Self {
+      names: RwLock::new(self.names.read().unwrap().clone()),
+      typedefs: self.typedefs.clone(),
+      abstract_functions: self.abstract_functions.clone(),
+      top_level_vars: self.top_level_vars.clone(),
+      emulated_functions: self.emulated_functions.clone(),
+      has_been_validated: self.has_been_validated,
+      window_info_bindings: self.window_info_bindings.clone(),
+    }
+  }
+}
+
+impl Default for Program {
+  fn default() -> Self {
+    DEFAULT_PROGRAM.with(|lock| lock.read().unwrap().clone())
+  }
+}
+
+impl Program {
+  pub fn empty() -> Self {
+    Self {
+      names: NameContext::empty().into(),
+      typedefs: TypeDefs::empty(),
+      abstract_functions: HashMap::new(),
+      top_level_vars: vec![],
+      emulated_functions: EmulatedFunctionRecord::empty(),
+      has_been_validated: false,
+      window_info_bindings: vec![],
+    }
+  }
+  pub fn add_top_level_var(&mut self, var: TopLevelVar, errors: &mut ErrorLog) {
+    if let Some(previous_var) = self
+      .top_level_vars
+      .iter()
+      .find(|old_var| old_var.name == var.name)
+    {
+      errors.log(CompileError {
+        kind: VariableNameCollision(var.name.to_string()),
+        source_trace: var
+          .source_trace
+          .clone()
+          .insert_as_secondary(previous_var.source_trace.clone()),
+      })
+    }
+    self.names.write().unwrap().track_user_name(&var.name);
+    self.top_level_vars.push(var);
+  }
+  pub fn add_abstract_function(
+    &mut self,
+    signature: Arc<RwLock<AbstractFunctionSignature>>,
+  ) {
+    let name = Arc::clone(&signature.read().unwrap().name);
+    self.names.write().unwrap().track_user_name(&name);
+    if let FunctionImplementationKind::Composite(f) =
+      &signature.read().unwrap().implementation
+    {
+      let f = f.read().unwrap();
+      for (arg_name, _) in f.arg_names.iter() {
+        self.names.write().unwrap().track_user_name(&arg_name);
+      }
+      f.expression
+        .walk(&mut |exp| {
+          if let ExpKind::Name(name) = &exp.kind {
+            self.names.write().unwrap().track_user_name(&name);
+          }
+          Ok::<bool, Never>(true)
+        })
+        .unwrap();
+    }
+    if let Some(bucket) = self.abstract_functions.get_mut(&name) {
+      let mut novel = true;
+      for existing_signature in bucket.iter() {
+        if *existing_signature.read().unwrap() == *signature.read().unwrap() {
+          novel = false;
+          break;
+        }
+      }
+      if novel {
+        bucket.push(signature.into());
+      }
+    } else {
+      self.abstract_functions.insert(name, vec![signature.into()]);
+    }
+  }
+  pub fn with_functions(
+    mut self,
+    functions: Vec<AbstractFunctionSignature>,
+  ) -> Self {
+    for f in functions {
+      self.add_abstract_function(Arc::new(RwLock::new(f)));
+    }
+    self
+  }
+  pub fn with_struct(mut self, s: Arc<AbstractStruct>) -> Self {
+    if !self.typedefs.structs.contains(&s) {
+      if !ABNORMAL_CONSTRUCTOR_STRUCTS.contains(&&*s.name.0) {
+        self.add_abstract_function(Arc::new(RwLock::new(
+          AbstractFunctionSignature {
+            name: s.name.0.clone(),
+            generic_args: s.generic_args.clone(),
+            arg_types: s
+              .fields
+              .iter()
+              .map(|field| (field.field_type.clone(), Ownership::Owned))
+              .collect(),
+            return_type: AbstractType::AbstractStruct(s.clone()),
+            implementation: FunctionImplementationKind::StructConstructor,
+            associative: false,
+            captured_scope: None,
+            entry_point: None,
+          },
+        )));
+      }
+      self.typedefs.structs.push(s.as_ref().clone());
+      self.typedefs.structs.dedup();
+    }
+    self
+  }
+  pub fn with_enum(mut self, e: AbstractEnum) -> Self {
+    if !self.typedefs.enums.contains(&e) {
+      if !ABNORMAL_CONSTRUCTOR_STRUCTS.contains(&&*e.name.0) {
+        for variant in e.variants.iter() {
+          if variant.inner_type != AbstractType::Type(Type::Unit) {
+            self.add_abstract_function(Arc::new(RwLock::new(
+              AbstractFunctionSignature {
+                name: variant.name.clone(),
+                generic_args: e.generic_args.clone(),
+                arg_types: vec![(variant.inner_type.clone(), Ownership::Owned)],
+                return_type: AbstractType::AbstractEnum(e.clone().into()),
+                implementation: FunctionImplementationKind::EnumConstructor(
+                  variant.name.clone(),
+                ),
+                associative: false,
+                captured_scope: None,
+                entry_point: None,
+              },
+            )));
+          }
+        }
+      }
+      self.typedefs.enums.push(e);
+      self.typedefs.enums.dedup();
+    }
+    self
+  }
+  pub fn with_structs(self, structs: Vec<Arc<AbstractStruct>>) -> Self {
+    structs.into_iter().fold(self, |ctx, s| ctx.with_struct(s))
+  }
+  pub fn with_type_aliases(
+    mut self,
+    mut aliases: Vec<(Arc<str>, Arc<AbstractStruct>)>,
+  ) -> Self {
+    self.typedefs.type_aliases.append(&mut aliases);
+    self
+  }
+  pub fn add_monomorphized_struct(&mut self, s: AbstractStruct) {
+    // See add_monomorphized_enum for why name.0 rather than the full
+    // name tuple.
+    if !self.typedefs.structs.iter().any(|existing_struct| {
+      existing_struct.name.0 == s.name.0
+        && existing_struct.filled_generics == s.filled_generics
+    }) {
+      self.typedefs.structs.push(s);
+    }
+  }
+  pub fn add_monomorphized_enum(&mut self, e: AbstractEnum) {
+    // `name.0`, not `name`: the name tuple's SourceTrace is not identity.
+    // The filled-generics comparison is safe against representational
+    // divergence (the same instantiation arriving from different
+    // monomorphization paths) because the type family's `PartialEq` is
+    // semantic — it dereferences resolved unification variables and
+    // ignores abstract ancestors.
+    if !self.typedefs.enums.iter().any(|existing_enum| {
+      existing_enum.name.0 == e.name.0
+        && existing_enum.filled_generics == e.filled_generics
+    }) {
+      self.typedefs.enums.push(e);
+    }
+  }
+  pub fn concrete_signatures(
+    &mut self,
+    fn_name: &Arc<str>,
+    source_trace: SourceTrace,
+  ) -> CompileResult<Option<Vec<Type>>> {
+    if let Some(signatures) = self.abstract_functions.get(fn_name) {
+      signatures
+        .into_iter()
+        .map(|signature| {
+          Ok(Type::Function(Box::new(
+            AbstractFunctionSignature::concretize(
+              Arc::new(RwLock::new(signature.read().unwrap().clone())),
+              &self.typedefs,
+              source_trace.clone(),
+            )?,
+          )))
+        })
+        .collect::<CompileResult<Vec<_>>>()
+        .map(|x| Some(x))
+    } else {
+      Ok(None)
+    }
+  }
+  pub fn abstract_functions_iter(
+    &self,
+  ) -> impl Iterator<Item = &Arc<RwLock<AbstractFunctionSignature>>> {
+    self
+      .abstract_functions
+      .values()
+      .map(|fs| fs.iter())
+      .flatten()
+  }
+  pub fn abstract_functions_iter_mut(
+    &mut self,
+  ) -> impl Iterator<Item = &mut Arc<RwLock<AbstractFunctionSignature>>> {
+    self
+      .abstract_functions
+      .values_mut()
+      .map(|fs| fs.iter_mut())
+      .flatten()
+  }
+  pub fn from_easl_documents(
+    documents: &'_ EaslMultiDocument,
+    macros: Vec<Macro>,
+  ) -> (Self, ErrorLog) {
+    let mut errors = ErrorLog::new();
+    let mut names = NameContext::empty();
+    let all_syntax_trees: Vec<EaslTree> = documents
+      .sources
+      .iter()
+      .map(|(document, _, _)| document.syntax_trees.clone())
+      .flatten()
+      .collect();
+    for tree in all_syntax_trees.iter() {
+      names.track_all_ast_names(tree);
+    }
+    let trees = all_syntax_trees
+      .into_iter()
+      .map(|tree| macroexpand(tree, &macros, &mut names, &mut errors))
+      .collect::<Vec<EaslTree>>();
+
+    let mut non_typedef_trees = vec![];
+    let mut untyped_types = vec![];
+
+    for tree in trees.into_iter() {
+      use crate::parse::Encloser::*;
+      use fsexp::syntax::EncloserOrOperator::*;
+      let (tree_body, annotation) =
+        extract_annotation(tree.clone(), &mut errors);
+      let EaslTree::Inner((position, Encloser(Parens)), children) = &tree_body
+      else {
+        errors.log(CompileError::new(
+          UnrecognizedTopLevelForm(tree_body),
+          tree.position().clone().into(),
+        ));
+        continue;
+      };
+      let source_trace: SourceTrace = position.clone().into();
+      let mut children_iter = children.into_iter();
+      let Some(EaslTree::Leaf(position, first_child)) = children_iter.next()
+      else {
+        errors.log(CompileError::new(
+          UnrecognizedTopLevelForm(tree_body.clone()),
+          source_trace,
+        ));
+        continue;
+      };
+      let source_trace: SourceTrace = position.clone().into();
+      match first_child.as_str() {
+        "struct" | "enum" => {
+          if annotation.is_some() {
+            errors.log(CompileError {
+              kind: AnnotationNotAllowedOnType,
+              source_trace: source_trace.clone(),
+            });
+          }
+          if let Some(struct_name) = children_iter.next() {
+            match struct_name {
+              EaslTree::Leaf(pos, name) => match first_child.as_str() {
+                "struct" => untyped_types.push(UntypedType::Struct(
+                  UntypedStruct::from_field_trees(
+                    (name.clone().into(), pos.into()),
+                    vec![],
+                    children_iter.cloned().collect(),
+                    source_trace,
+                    &mut errors,
+                  ),
+                )),
+                "enum" => match UntypedEnum::from_field_trees(
+                  (name.clone().into(), pos.into()),
+                  vec![],
+                  children_iter.cloned().collect(),
+                  source_trace,
+                ) {
+                  Ok(e) => untyped_types.push(UntypedType::Enum(e)),
+                  Err(e) => errors.log(e),
+                },
+                _ => unreachable!(),
+              },
+              EaslTree::Inner(
+                (position, Encloser(Parens)),
+                signature_children,
+              ) => {
+                let source_trace: SourceTrace = position.clone().into();
+                let mut signature_iter = signature_children.iter().cloned();
+                if let Some(EaslTree::Leaf(name_pos, type_name)) =
+                  signature_iter.next()
+                {
+                  let type_name: Arc<str> = type_name.into();
+                  let type_name_source: SourceTrace = name_pos.into();
+                  match signature_iter
+                    .map(|subtree| {
+                      parse_generic_argument(
+                        subtree,
+                        &TypeDefs::empty(),
+                        &vec![],
+                      )
+                    })
+                    .collect::<CompileResult<Vec<_>>>()
+                  {
+                    Ok(generic_args) => {
+                      if generic_args.is_empty() {
+                        errors.log(CompileError::new(
+                          InvalidTypeName,
+                          source_trace,
+                        ));
+                      } else {
+                        match first_child.as_str() {
+                          "struct" => untyped_types.push(UntypedType::Struct(
+                            UntypedStruct::from_field_trees(
+                              (type_name, type_name_source),
+                              generic_args,
+                              children_iter.cloned().collect(),
+                              source_trace,
+                              &mut errors,
+                            ),
+                          )),
+                          "enum" => {
+                            match UntypedEnum::from_field_trees(
+                              (type_name, type_name_source),
+                              generic_args,
+                              children_iter.cloned().collect(),
+                              source_trace,
+                            ) {
+                              Ok(e) => untyped_types.push(UntypedType::Enum(e)),
+                              Err(e) => errors.log(e),
+                            }
+                          }
+                          _ => unreachable!(),
+                        }
+                      }
+                    }
+                    Err(e) => errors.log(e),
+                  }
+                } else {
+                  errors.log(CompileError::new(InvalidTypeName, source_trace));
+                }
+              }
+              EaslTree::Inner((position, _), _) => {
+                errors.log(CompileError::new(
+                  InvalidTypeName,
+                  position.clone().into(),
+                ));
+              }
+            }
+          } else {
+            errors.log(CompileError::new(InvalidTypeDefinition, source_trace));
+          }
+        }
+        _ => non_typedef_trees.push((annotation, tree_body)),
+      }
+    }
+    let mut program = Program::default();
+    program.names = names.into();
+    match UntypedType::sort_by_references(&untyped_types) {
+      Ok(sorted_untyped_types) => {
+        for name in macros.iter().flat_map(|m| m.reserved_names.iter().cloned())
+        {
+          program.names.write().unwrap().user_names.insert(name);
+        }
+        for untyped_type in sorted_untyped_types {
+          match untyped_type {
+            UntypedType::Struct(untyped_struct) => {
+              match untyped_struct.assign_types(&program.typedefs) {
+                Ok(s) => program = program.with_struct(s.into()),
+                Err(e) => errors.log(e),
+              }
+            }
+            UntypedType::Enum(untyped_enum) => {
+              match untyped_enum.assign_types(&program.typedefs) {
+                Ok(e) => program = program.with_enum(e.into()),
+                Err(e) => errors.log(e),
+              }
+            }
+          }
+        }
+      }
+      Err(e) => {
+        let source_trace = if let Some(first_name) = e.get(0)
+          && let Some(primary_type) =
+            untyped_types.iter().find(|t| t.name() == first_name)
+        {
+          let mut source_trace = primary_type.source_trace().clone();
+          for i in 1..e.len() {
+            if let Some(secondary_type) =
+              untyped_types.iter().find(|t| t.name() == &e[i])
+            {
+              source_trace = source_trace
+                .insert_as_secondary(secondary_type.source_trace().clone());
+            }
+          }
+          source_trace
+        } else {
+          SourceTrace::empty()
+        };
+        errors.log(CompileError::new(
+          TypeDependencyCycle(
+            e.into_iter().map(|name| name.to_string()).collect(),
+          ),
+          source_trace,
+        ));
+      }
+    }
+
+    for (annotation, tree) in non_typedef_trees.into_iter() {
+      use crate::parse::Encloser::*;
+      use fsexp::syntax::EncloserOrOperator::*;
+      if let EaslTree::Inner((parens_position, Encloser(Parens)), children) =
+        tree
+      {
+        let parens_source_trace: SourceTrace = parens_position.clone().into();
+        let mut children_iter = children.into_iter();
+        let first_child = children_iter.next();
+        if let Some(EaslTree::Leaf(first_child_position, first_child)) =
+          first_child
+        {
+          let first_child_source_trace: SourceTrace =
+            first_child_position.clone().into();
+          match first_child.as_str() {
+            "import" => {}
+            "var" | "def" | "override" => {
+              if let Some(var) = TopLevelVar::from_ast(
+                first_child.as_str(),
+                &parens_source_trace,
+                children_iter,
+                &program,
+                annotation,
+                &mut errors,
+              ) {
+                program.add_top_level_var(var, &mut errors);
+              }
+            }
+            "defn" => {
+              if let Some(f) = AbstractFunctionSignature::from_defn_ast(
+                children_iter,
+                first_child_source_trace,
+                parens_source_trace,
+                annotation,
+                &program,
+                &mut errors,
+              ) {
+                program.add_abstract_function(Arc::new(RwLock::new(f)));
+              }
+            }
+            _ => {
+              errors.log(CompileError::new(
+                UnrecognizedTopLevelForm(EaslTree::Leaf(
+                  first_child_position.clone(),
+                  first_child,
+                )),
+                first_child_source_trace,
+              ));
+            }
+          }
+        } else {
+          errors.log(CompileError::new(
+            UnrecognizedTopLevelForm(first_child.unwrap_or(EaslTree::Inner(
+              (
+                parens_position.clone(),
+                EncloserOrOperator::Encloser(Parens),
+              ),
+              vec![],
+            ))),
+            parens_source_trace,
+          ));
+        }
+      } else {
+        errors.log(CompileError::new(
+          UnrecognizedTopLevelForm(tree.clone()),
+          tree.position().clone().into(),
+        ));
+      }
+    }
+    (program, errors)
+  }
+  fn propagate_types(&mut self, errors: &mut ErrorLog) -> bool {
+    let mut base_context = self.clone();
+    let mut anything_changed = false;
+    for var in self.top_level_vars.iter_mut() {
+      if let Some(value_expression) = &mut var.value {
+        let changed = value_expression.data.constrain(
+          &var.var_type.clone().known(),
+          &var.source_trace,
+          errors,
+        );
+        anything_changed |= changed;
+        let changed =
+          value_expression.propagate_types(&mut base_context, errors);
+        anything_changed |= changed;
+      }
+    }
+    for f in self.abstract_functions_iter_mut() {
+      if let FunctionImplementationKind::Composite(implementation) =
+        &f.read().unwrap().implementation
+      {
+        let changed = implementation
+          .write()
+          .unwrap()
+          .expression
+          .propagate_types(&mut base_context, errors);
+        anything_changed |= changed;
+      }
+    }
+    anything_changed
+  }
+  fn find_untyped(&mut self) -> Vec<SourceTrace> {
+    self
+      .abstract_functions_iter()
+      .map(|f| {
+        if let FunctionImplementationKind::Composite(implementation) =
+          &f.read().unwrap().implementation
+        {
+          implementation.write().unwrap().expression.find_untyped()
+        } else {
+          vec![]
+        }
+      })
+      .collect::<Vec<_>>()
+      .into_iter()
+      .chain(self.top_level_vars.iter_mut().map(|v| {
+        if let Some(value) = &mut v.value {
+          value.find_untyped()
+        } else {
+          vec![]
+        }
+        .into_iter()
+        .chain(
+          (!v.var_type.check_is_fully_known())
+            .then(|| v.source_trace.clone())
+            .into_iter(),
+        )
+        .collect()
+      }))
+      .flatten()
+      .collect()
+  }
+  pub fn validate_match_blocks(&self, errors: &mut ErrorLog) {
+    for abstract_function in self.abstract_functions_iter() {
+      if let FunctionImplementationKind::Composite(implementation) =
+        &abstract_function.read().unwrap().implementation
+      {
+        (**implementation)
+          .write()
+          .unwrap()
+          .expression
+          .validate_match_blocks(errors);
+      }
+    }
+  }
+  pub fn catch_illegal_function_type_expressions(&self, errors: &mut ErrorLog) {
+    for abstract_function in self.abstract_functions_iter() {
+      if let FunctionImplementationKind::Composite(implementation) =
+        &abstract_function.read().unwrap().implementation
+      {
+        (**implementation)
+          .write()
+          .unwrap()
+          .expression
+          .catch_illegal_function_type_expressions(errors);
+      }
+    }
+  }
+  pub fn catch_illegal_function_type_user_type_fields(
+    &self,
+    errors: &mut ErrorLog,
+  ) {
+    for s in self.typedefs.structs.iter() {
+      for f in s.fields.iter() {
+        match f.field_type {
+          AbstractType::Type(Type::Function(_)) => {
+            errors.log(CompileError::new(
+              CantStoreFunctionInDataStructure,
+              f.source_trace.clone(),
+            ))
+          }
+          _ => {}
+        }
+      }
+    }
+    for e in self.typedefs.enums.iter() {
+      for v in e.variants.iter() {
+        match v.inner_type {
+          AbstractType::Type(Type::Function(_)) => {
+            errors.log(CompileError::new(
+              CantStoreFunctionInDataStructure,
+              v.source.clone(),
+            ))
+          }
+          _ => {}
+        }
+      }
+    }
+  }
+  pub fn catch_illegal_function_type_variables(&self, errors: &mut ErrorLog) {
+    for v in self.top_level_vars.iter() {
+      if matches!(v.var_type, Type::Function(_)) {
+        errors.log(CompileError::new(
+          CantHaveFunctionTypeVariable,
+          v.source_trace.clone(),
+        ));
+      }
+    }
+  }
+  pub fn fully_infer_types(&mut self, errors: &mut ErrorLog) {
+    loop {
+      let did_type_states_change = self.propagate_types(errors);
+      if !did_type_states_change {
+        let untyped_expressions = self.find_untyped();
+        return if untyped_expressions.is_empty() {
+          break;
+        } else {
+          for source_trace in untyped_expressions {
+            let source_trace = source_trace;
+            errors.log(CompileError::new(CouldntInferTypes, source_trace));
+          }
+        };
+      }
+    }
+  }
+  /// Rewrites pseudo-applications used for indexing data — `(arr i)`, `(v i)`,
+  /// `(m i)` — into a uniform `Access(ArrayIndex(i), subexp)` form. Easl
+  /// reuses the function-application syntax for indexing since the parser
+  /// can't distinguish; this pass is run after type inference, when we know
+  /// which Applications are *actually* indexing arrays/vectors/matrices, and
+  /// converts them so later passes can treat them uniformly as `Access`
+  /// expressions instead of overloading `Application`.
+  pub fn normalize_pseudoapplication_data_accesses(&mut self) {
+    for abstract_f in self.abstract_functions_iter() {
+      let abstract_f = abstract_f.read().unwrap();
+      if let FunctionImplementationKind::Composite(implementation) =
+        &abstract_f.implementation
+      {
+        implementation
+          .write()
+          .unwrap()
+          .expression
+          .walk_mut(&mut |exp| {
+            if let ExpKind::Application(f, _) = &exp.kind {
+              let f_type = f.data.unwrap_known();
+              let is_data_access = matches!(f_type, Type::Array(_, _))
+                || f_type.is_vector()
+                || f_type.is_matrix();
+              if is_data_access {
+                take(&mut exp.kind, |kind| {
+                  let ExpKind::Application(f, mut args) = kind else {
+                    panic!()
+                  };
+                  ExpKind::Access(
+                    Accessor::ArrayIndex(args.remove(0).into()),
+                    f.into(),
+                  )
+                });
+              }
+            }
+            Ok::<bool, Never>(true)
+          })
+          .unwrap();
+      }
+    }
+  }
+  pub fn validate_assignments(&mut self, errors: &mut ErrorLog) {
+    for abstract_f in self.abstract_functions_iter() {
+      let abstract_f = abstract_f.read().unwrap();
+      if let FunctionImplementationKind::Composite(implementation) =
+        &abstract_f.implementation
+      {
+        let implementation = implementation.write().unwrap();
+        if let Err(e) = implementation.expression.validate_assignments(self) {
+          errors.log(e);
+        }
+      }
+    }
+  }
+  pub fn monomorphize(
+    &mut self,
+    errors: &mut ErrorLog,
+    target: CompilerTarget,
+  ) {
+    let mut monomorphized_ctx = Program::default();
+    monomorphized_ctx.names = RwLock::new(self.names.read().unwrap().clone());
+    for f in self.abstract_functions_iter() {
+      if f.read().unwrap().generic_args.is_empty()
+        && let FunctionImplementationKind::Composite(implementation) =
+          &f.read().unwrap().implementation
+      {
+        let mut borrowed_implementation = implementation.write().unwrap();
+        match borrowed_implementation.expression.monomorphize(
+          &self,
+          &mut monomorphized_ctx,
+          target,
+        ) {
+          Ok(_) => {
+            let mut new_f = (**f).read().unwrap().clone();
+            new_f.implementation =
+              FunctionImplementationKind::Composite(implementation.clone());
+            drop(borrowed_implementation);
+            monomorphized_ctx
+              .add_abstract_function(Arc::new(RwLock::new(new_f)));
+          }
+          Err(e) => errors.log(e),
+        }
+      } else {
+        monomorphized_ctx.add_abstract_function(Arc::clone(f));
+      }
+    }
+    for s in self.typedefs.structs.iter() {
+      if s.generic_args.is_empty() {
+        monomorphized_ctx.add_monomorphized_struct(s.clone());
+      }
+    }
+    for e in self.typedefs.enums.iter() {
+      if e.generic_args.is_empty() {
+        monomorphized_ctx.add_monomorphized_enum(e.clone());
+      }
+    }
+    take(self, |old_ctx| {
+      monomorphized_ctx.top_level_vars = old_ctx.top_level_vars;
+      monomorphized_ctx.window_info_bindings = old_ctx.window_info_bindings;
+      monomorphized_ctx
+    });
+  }
+  pub fn extract_non_bound_mutable_references(&mut self) {
+    for f in self.abstract_functions_iter() {
+      let borrowed_f = f.read().unwrap();
+      if borrowed_f.generic_args.is_empty()
+        && !borrowed_f.has_uninlined_higher_order_arguments()
+      {
+        if let FunctionImplementationKind::Composite(implementation) =
+          &borrowed_f.implementation
+        {
+          let mut implementation = implementation.write().unwrap();
+          let exp = &mut implementation.expression;
+          let ExpKind::Function(_, body) = &mut exp.kind else {
+            panic!()
+          };
+          let pending = body.extract_non_bound_mutable_references(&self.names);
+          if !pending.is_empty() {
+            take(&mut **body, |old_body| TypedExp {
+              data: old_body.data.clone(),
+              source_trace: old_body.source_trace.clone(),
+              kind: ExpKind::Let(pending, Box::new(old_body)),
+            });
+          }
+        }
+      }
+    }
+  }
+  pub fn validate_argument_ownership(&mut self, errors: &mut ErrorLog) {
+    for f in self.abstract_functions_iter() {
+      let mut borrowed_f = f.write().unwrap();
+      if let FunctionImplementationKind::Composite(implementation) =
+        &mut borrowed_f.implementation
+      {
+        let mut implementation = implementation.write().unwrap();
+        implementation
+          .expression
+          .walk_mut_with_ctx::<Never>(
+            &mut |exp, ctx| {
+              match &exp.kind {
+                ExpKind::Application(f, args) => {
+                  if let Type::Function(f) = f.data.unwrap_known()
+                    && let Some(abstract_f) = f.abstract_ancestor
+                    && let abstract_f = abstract_f.read().unwrap()
+                    && let FunctionImplementationKind::Composite(_) =
+                      abstract_f.implementation
+                  {
+                    for (i, (_, expected_ownership)) in
+                      abstract_f.arg_types.iter().enumerate()
+                    {
+                      let arg = &args[i];
+                      match expected_ownership {
+                        Ownership::Owned => {
+                          if arg.data.ownership != Ownership::Owned {
+                            errors.log(CompileError::new(
+                              ArgumentMustBeOwnedValue,
+                              arg.source_trace.clone(),
+                            ));
+                          }
+                        }
+                        Ownership::Reference | Ownership::MutableReference => {
+                          if let Some(name) = arg.name_or_inner_accessed_name()
+                          {
+                            let top_level_var = self
+                              .top_level_vars
+                              .iter()
+                              .find(|v| v.name == *name);
+                            if let Some(TopLevelVar {
+                              kind:
+                                TopLevelVariableKind::Var {
+                                  address_space, ..
+                                },
+                              ..
+                            }) = top_level_var
+                              && !address_space.may_be_passed_as_reference()
+                            {
+                              errors.log(CompileError::new(
+                                PassedReferenceFromInvalidAddressSpace(
+                                  *address_space,
+                                ),
+                                arg.source_trace.clone(),
+                              ));
+                            }
+                            if *expected_ownership
+                              == Ownership::MutableReference
+                            {
+                              match arg.data.ownership {
+                                Ownership::Reference => {
+                                  errors.log(CompileError::new(
+                                    ReferenceMustBeMutable,
+                                    arg.source_trace.clone(),
+                                  ));
+                                }
+                                Ownership::Owned => {
+                                  if ctx
+                                    .variables
+                                    .get(&**name)
+                                    .map(|(v, _)| v.kind)
+                                    .or_else(|| {
+                                      top_level_var
+                                        .map(TopLevelVar::variable_kind)
+                                    })
+                                    .unwrap()
+                                    != VariableKind::Var
+                                  {
+                                    errors.log(CompileError::new(
+                                      ImmutableOwnedPassedAsMutableReference,
+                                      arg.source_trace.clone(),
+                                    ));
+                                  }
+                                }
+                                _ => {}
+                              }
+                            }
+                          } else {
+                            errors.log(CompileError::new(
+                              ReferenceArgumentMustBeName,
+                              arg.source_trace.clone(),
+                            ));
+                          }
+                        }
+                        Ownership::Pointer(_) => {
+                          unreachable!(
+                            "unexpected Ownership::Pointer encountered"
+                          )
+                        }
+                      }
+                    }
+                  }
+                }
+                _ => {}
+              }
+              Ok(true)
+            },
+            &mut ImmutableProgramLocalContext::empty(self),
+          )
+          .unwrap();
+      }
+    }
+  }
+  pub fn validate_field_type_constraints(&mut self, errors: &mut ErrorLog) {
+    for v in self.top_level_vars.iter() {
+      if let Type::Struct(s) = &v.var_type {
+        s.check_type_constraints(&v.source_trace, errors);
+      }
+    }
+    for f in self.abstract_functions_iter() {
+      let mut borrowed_f = f.write().unwrap();
+      if let FunctionImplementationKind::Composite(implementation) =
+        &mut borrowed_f.implementation
+      {
+        let implementation = implementation.write().unwrap();
+        implementation
+          .expression
+          .walk::<Never>(&mut |exp| {
+            if let Type::Struct(s) = exp.data.unwrap_known() {
+              s.check_type_constraints(&exp.source_trace, errors);
+            }
+            Ok(true)
+          })
+          .unwrap();
+      }
+    }
+  }
+  pub fn validate_dispatch_function_types_and_mark_implicit_entry_points(
+    &mut self,
+    errors: &mut ErrorLog,
+  ) {
+    for top_level_fn in self.abstract_functions_iter() {
+      if let FunctionImplementationKind::Composite(implementation) =
+        &top_level_fn.read().unwrap().implementation
+      {
+        implementation
+          .read()
+          .unwrap()
+          .expression
+          .walk(&mut |exp| {
+            'breakable: {
+              if let ExpKind::Application(f, args) = &exp.kind
+                && let ExpKind::Name(f_name) = &f.kind
+              {
+                match &**f_name {
+                  "dispatch-compute-shader" => {
+                    if let Type::Function(compute_fn) =
+                      args[0].data.unwrap_known()
+                      && let Some(abstract_compute_fn) =
+                        compute_fn.abstract_ancestor
+                    {
+                      let mut abstract_compute_fn =
+                        abstract_compute_fn.write().unwrap();
+                      if let Some(entry_point) = abstract_compute_fn.entry_point
+                      {
+                        if !matches!(entry_point, EntryPoint::Compute(_)) {
+                          errors.log(CompileError::new(
+                            WrongEntryPointTypeForDispatchComputeShader(
+                              entry_point.name().into(),
+                            ),
+                            exp.source_trace.clone(),
+                          ))
+                        }
+                      } else {
+                        abstract_compute_fn.entry_point =
+                          Some(EntryPoint::Compute(1))
+                      }
+                      for other_abstract_f in self.abstract_functions_iter() {
+                        if let Ok(mut other_abstract_f) =
+                          other_abstract_f.try_write()
+                        {
+                          if other_abstract_f.name == abstract_compute_fn.name
+                            && let FunctionImplementationKind::Composite(
+                              other_f,
+                            ) = &other_abstract_f.implementation
+                          {
+                            other_f.write().unwrap().entry_point =
+                              abstract_compute_fn.entry_point;
+                            other_abstract_f.entry_point =
+                              abstract_compute_fn.entry_point;
+                          }
+                        }
+                      }
+                    }
+                  }
+                  "dispatch-render-shaders" => {
+                    if let Type::Function(vertex_fn) =
+                      args[0].data.unwrap_known()
+                      && let Some(abstract_vertex_fn) =
+                        &vertex_fn.abstract_ancestor
+                      && let Type::Function(fragment_fn) =
+                        args[1].data.unwrap_known()
+                      && let Some(abstract_fragment_fn) =
+                        &fragment_fn.abstract_ancestor
+                    {
+                      let mut abstract_vertex_fn =
+                        abstract_vertex_fn.write().unwrap();
+                      if let Some(entry_point) = abstract_vertex_fn.entry_point
+                      {
+                        if entry_point != EntryPoint::Vertex {
+                          errors.log(CompileError::new(
+                            WrongEntryPointTypeForDispatchVertexShader(
+                              entry_point.name().into(),
+                            ),
+                            exp.source_trace.clone(),
+                          ))
+                        }
+                      } else {
+                        abstract_vertex_fn.entry_point =
+                          Some(EntryPoint::Vertex);
+                        for other_abstract_f in self.abstract_functions_iter() {
+                          if let Ok(mut other_abstract_f) =
+                            other_abstract_f.try_write()
+                          {
+                            if other_abstract_f.name == abstract_vertex_fn.name
+                              && let FunctionImplementationKind::Composite(
+                                other_f,
+                              ) = &other_abstract_f.implementation
+                            {
+                              other_f.write().unwrap().entry_point =
+                                Some(EntryPoint::Vertex);
+                              other_abstract_f.entry_point =
+                                Some(EntryPoint::Vertex);
+                            }
+                          }
+                        }
+                      }
+                      let mut abstract_fragment_fn =
+                        abstract_fragment_fn.write().unwrap();
+                      if let Some(entry_point) =
+                        abstract_fragment_fn.entry_point
+                      {
+                        if entry_point != EntryPoint::Fragment {
+                          errors.log(CompileError::new(
+                            WrongEntryPointTypeForDispatchFragmentShader(
+                              entry_point.name().into(),
+                            ),
+                            exp.source_trace.clone(),
+                          ))
+                        }
+                      } else {
+                        abstract_fragment_fn.entry_point =
+                          Some(EntryPoint::Fragment);
+                        for other_abstract_f in self.abstract_functions_iter() {
+                          if let Ok(mut other_abstract_f) =
+                            other_abstract_f.try_write()
+                          {
+                            if other_abstract_f.name
+                              == abstract_fragment_fn.name
+                              && let FunctionImplementationKind::Composite(
+                                other_f,
+                              ) = &other_abstract_f.implementation
+                            {
+                              other_f.write().unwrap().entry_point =
+                                Some(EntryPoint::Fragment);
+                              other_abstract_f.entry_point =
+                                Some(EntryPoint::Fragment);
+                            }
+                          }
+                        }
+                      }
+
+                      let FunctionImplementationKind::Composite(
+                        frag_implementation,
+                      ) = &abstract_fragment_fn.implementation
+                      else {
+                        errors.log(CompileError::new(
+                          InvalidShaderEntry(
+                            abstract_fragment_fn.name.to_string(),
+                          ),
+                          exp.source_trace.clone(),
+                        ));
+                        break 'breakable;
+                      };
+                      let mut output_locations: HashMap<usize, Type> =
+                        HashMap::new();
+                      vertex_fn
+                        .return_type
+                        .unwrap_known()
+                        .gather_location_annotations(&mut output_locations);
+                      let mut input_locations: HashMap<usize, Type> =
+                        HashMap::new();
+                      for ((arg, _), annotation) in fragment_fn.args.iter().zip(
+                        frag_implementation
+                          .read()
+                          .unwrap()
+                          .arg_annotations
+                          .iter(),
+                      ) {
+                        let arg_type = arg.var_type.unwrap_known();
+                        if let Some((location, _)) =
+                          annotation.attributes.location()
+                        {
+                          input_locations.insert(location, arg_type);
+                        } else {
+                          arg_type
+                            .gather_location_annotations(&mut input_locations);
+                        }
+                      }
+                      if input_locations.len() != output_locations.len()
+                        || input_locations.iter().any(|(location, in_ty)| {
+                          if let Some(out_ty) = output_locations.get(location) {
+                            !in_ty.compatible(out_ty)
+                          } else {
+                            true
+                          }
+                        })
+                      {
+                        errors.log(CompileError::new(
+                          IncompatibleRenderEntryPoints(
+                            abstract_vertex_fn.name.to_string(),
+                            abstract_fragment_fn.name.to_string(),
+                          ),
+                          exp.source_trace.clone(),
+                        ));
+                      }
+                    }
+                  }
+                  "start-audio" => {
+                    if let Type::Function(audio_fn) =
+                      args[0].data.unwrap_known()
+                      && let Some(abstract_audio_fn) =
+                        audio_fn.abstract_ancestor
+                    {
+                      let mut abstract_audio_fn =
+                        abstract_audio_fn.write().unwrap();
+                      if let Some(entry_point) = abstract_audio_fn.entry_point {
+                        if entry_point != EntryPoint::Audio {
+                          errors.log(CompileError::new(
+                            WrongEntryPointTypeForStartAudio(
+                              entry_point.name().into(),
+                            ),
+                            exp.source_trace.clone(),
+                          ))
+                        }
+                      } else {
+                        abstract_audio_fn.entry_point = Some(EntryPoint::Audio);
+                      }
+                      for other_abstract_f in self.abstract_functions_iter() {
+                        if let Ok(mut other_abstract_f) =
+                          other_abstract_f.try_write()
+                        {
+                          if other_abstract_f.name == abstract_audio_fn.name
+                            && let FunctionImplementationKind::Composite(
+                              other_f,
+                            ) = &other_abstract_f.implementation
+                          {
+                            other_f.write().unwrap().entry_point =
+                              abstract_audio_fn.entry_point;
+                            other_abstract_f.entry_point =
+                              abstract_audio_fn.entry_point;
+                          }
+                        }
+                      }
+                    }
+                  }
+                  _ => {}
+                }
+              }
+            }
+            Ok::<bool, Never>(true)
+          })
+          .unwrap()
+      }
+    }
+    // A dispatch can name the registry's own signature. The alias propagation
+    // above skips that locked signature, so it must not be the only path that
+    // marks the implementation. Reconcile after releasing the traversal's read
+    // guards; otherwise anonymous shaders can keep `entry_point = None` while
+    // their signatures acquire vertex/fragment I/O attributes.
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if let Some(entry) = signature.entry_point
+        && let FunctionImplementationKind::Composite(implementation) =
+          &signature.implementation
+      {
+        implementation.write().unwrap().entry_point = Some(entry);
+      }
+    }
+  }
+  /// Emits an error for any closure dispatched to the GPU (via
+  /// `dispatch-compute-shader` / `dispatch-render-shaders`) that mutates a
+  /// variable captured in its scope, whether directly or inside a nested
+  /// closure the scope is forwarded to. A dispatched closure's captured
+  /// scope lives in a read-only storage binding (see
+  /// `extract_dispatched_closure_scopes`) and its body runs once per GPU
+  /// thread, so there's no meaningful semantics for such writes — and
+  /// without this check they'd surface as naga validation failures at
+  /// pipeline-creation time rather than as a compile error.
+  pub fn catch_dispatched_closure_scope_mutations(
+    &self,
+    errors: &mut ErrorLog,
+  ) {
+    let mut checked_closures: HashSet<Arc<str>> = HashSet::new();
+    for f in self.abstract_functions_iter() {
+      let FunctionImplementationKind::Composite(implementation) =
+        f.read().unwrap().implementation.clone()
+      else {
+        continue;
+      };
+      implementation
+        .read()
+        .unwrap()
+        .expression
+        .walk(&mut |exp| {
+          if let ExpKind::Application(applied_f, args) = &exp.kind
+            && let ExpKind::Name(applied_f_name) = &applied_f.kind
+          {
+            let dispatched_fn_count = match &**applied_f_name {
+              "dispatch-compute-shader" => 1,
+              "dispatch-render-shaders" => 2,
+              _ => 0,
+            };
+            for arg in args.iter().take(dispatched_fn_count) {
+              if let Type::Function(signature) = arg.data.unwrap_known()
+                && let Some(ancestor) = signature.abstract_ancestor
+              {
+                self.check_dispatched_closure_scope_mutations(
+                  ancestor,
+                  errors,
+                  &mut checked_closures,
+                );
+              }
+            }
+          }
+          Ok::<bool, Never>(true)
+        })
+        .unwrap();
+    }
+  }
+  /// Checks one dispatched closure's body for mutations of its captured
+  /// scope: any argument rooted at the scope parameter that's passed to a
+  /// mutable-reference parameter counts as a mutation, except the trailing
+  /// scope-forwarding argument of a call to a nested closure, which is
+  /// checked recursively against that closure's own scope instead.
+  fn check_dispatched_closure_scope_mutations(
+    &self,
+    closure: Arc<RwLock<AbstractFunctionSignature>>,
+    errors: &mut ErrorLog,
+    checked_closures: &mut HashSet<Arc<str>>,
+  ) {
+    let (scope_param_name, implementation) = {
+      let closure = closure.read().unwrap();
+      if closure.captured_scope.is_none()
+        || !checked_closures.insert(closure.name.clone())
+      {
+        return;
+      }
+      let FunctionImplementationKind::Composite(implementation) =
+        closure.implementation.clone()
+      else {
+        return;
+      };
+      let Some((scope_param_name, _)) =
+        implementation.read().unwrap().arg_names.last().cloned()
+      else {
+        return;
+      };
+      (scope_param_name, implementation)
+    };
+    // For an access chain rooted at the scope parameter, returns the name of
+    // the captured variable being accessed (the field directly on the scope).
+    let scope_rooted_capture_name = |exp: &TypedExp| -> Option<Arc<str>> {
+      let mut field: Option<Arc<str>> = None;
+      let mut current = exp;
+      loop {
+        match &current.kind {
+          ExpKind::Access(accessor, inner) => {
+            if let Accessor::Field(name) = accessor {
+              field = Some(name.clone());
+            }
+            current = inner;
+          }
+          ExpKind::Name(name) => {
+            return (*name == scope_param_name)
+              .then(|| field.unwrap_or_else(|| name.clone()));
+          }
+          _ => return None,
+        }
+      }
+    };
+    let implementation = implementation.read().unwrap();
+    let ExpKind::Function(_, body) = &implementation.expression.kind else {
+      return;
+    };
+    body
+      .walk(&mut |exp| {
+        if let ExpKind::Application(applied_f, args) = &exp.kind
+          && let TypeState::Known(Type::Function(applied_signature)) =
+            &applied_f.data.kind
+        {
+          let param_ownerships: Vec<Ownership> = if let Some(applied_ancestor) =
+            &applied_signature.abstract_ancestor
+          {
+            applied_ancestor
+              .read()
+              .unwrap()
+              .arg_types
+              .iter()
+              .map(|(_, ownership)| *ownership)
+              .collect()
+          } else {
+            applied_signature
+              .args
+              .iter()
+              .map(|(arg, _)| arg.var_type.ownership)
+              .collect()
+          };
+          for (i, arg) in args.iter().enumerate() {
+            if !matches!(
+              param_ownerships.get(i),
+              Some(Ownership::MutableReference)
+            ) {
+              continue;
+            }
+            let Some(captured_name) = scope_rooted_capture_name(arg) else {
+              continue;
+            };
+            if i + 1 == args.len()
+              && let Some(applied_ancestor) =
+                &applied_signature.abstract_ancestor
+              && applied_ancestor.read().unwrap().captured_scope.is_some()
+            {
+              self.check_dispatched_closure_scope_mutations(
+                applied_ancestor.clone(),
+                errors,
+                checked_closures,
+              );
+              continue;
+            }
+            errors.log(CompileError::new(
+              CantMutateDispatchedClosureCapture(captured_name.to_string()),
+              exp.source_trace.clone(),
+            ));
+          }
+        }
+        Ok::<bool, Never>(true)
+      })
+      .unwrap();
+  }
+  /// Rewrites references to a dispatched closure's captured scope within
+  /// `body` so the scope is accessed as plain data rather than through a
+  /// reference: `Name` nodes referring to `scope_name` are renamed to
+  /// `global_rename` (when the entry's scope has been lifted to a global)
+  /// and become owned, and reference-ownership access chains rooted at the
+  /// scope become owned. Calls that forward the scope (or part of it) to a
+  /// nested closure are converted to pass it by value via
+  /// `valueify_dispatched_callee_scope` — naga doesn't allow storage-space
+  /// pointers as function arguments, and scopes are read-only on the GPU.
+  fn rewrite_dispatched_scope_body(
+    &self,
+    body: &mut TypedExp,
+    scope_name: &Arc<str>,
+    global_rename: Option<&Arc<str>>,
+    valueified_callees: &mut HashSet<Arc<str>>,
+  ) {
+    body
+      .walk_mut(&mut |e| {
+        let scope_rooted = |exp: &TypedExp| {
+          let mut root = exp;
+          loop {
+            match &root.kind {
+              ExpKind::Access(_, inner) => root = inner,
+              ExpKind::Name(name) => {
+                break name == scope_name
+                  || global_rename.map(|g| name == g).unwrap_or(false);
+              }
+              _ => break false,
+            }
+          }
+        };
+        match &mut e.kind {
+          ExpKind::Name(name) if name == scope_name => {
+            if let Some(global_name) = global_rename {
+              *name = global_name.clone();
+              e.data.is_globally_bound = true;
+            }
+            e.data.ownership = Ownership::Owned;
+          }
+          ExpKind::Access(_, _) => {
+            if scope_rooted(e)
+              && matches!(
+                e.data.ownership,
+                Ownership::Reference | Ownership::MutableReference
+              )
+            {
+              e.data.ownership = Ownership::Owned;
+            }
+          }
+          ExpKind::Application(applied_f, args) => {
+            if let TypeState::Known(Type::Function(signature)) =
+              &applied_f.data.kind
+              && let Some(ancestor) = signature.abstract_ancestor.clone()
+              && args.last().map(|arg| scope_rooted(arg)).unwrap_or(false)
+            {
+              self
+                .valueify_dispatched_callee_scope(ancestor, valueified_callees);
+            }
+          }
+          _ => {}
+        }
+        Ok::<bool, Never>(true)
+      })
+      .unwrap();
+  }
+  /// Converts a scoped closure called from within a dispatched GPU entry to
+  /// take its captured scope by value instead of by mutable reference: the
+  /// trailing scope argument's ownership is flipped to owned on the call
+  /// site's signature, every registry copy of the signature, and the
+  /// function's own expression signature, and the body is rewritten (via
+  /// `rewrite_dispatched_scope_body`, recursing into further nested
+  /// closures).
+  fn valueify_dispatched_callee_scope(
+    &self,
+    callsite_ancestor: Arc<RwLock<AbstractFunctionSignature>>,
+    valueified_callees: &mut HashSet<Arc<str>>,
+  ) {
+    let (callee_name, scope_struct_name, callee_implementation) = {
+      let ancestor = callsite_ancestor.read().unwrap();
+      let Some(scope_struct) = &ancestor.captured_scope else {
+        return;
+      };
+      let FunctionImplementationKind::Composite(implementation) =
+        ancestor.implementation.clone()
+      else {
+        return;
+      };
+      (
+        ancestor.name.clone(),
+        scope_struct.name.0.clone(),
+        implementation,
+      )
+    };
+    let mut signatures_to_patch = vec![callsite_ancestor];
+    if let Some(registry_signatures) = self.abstract_functions.get(&callee_name)
+    {
+      signatures_to_patch.extend(registry_signatures.iter().cloned());
+    }
+    for signature in signatures_to_patch {
+      let mut signature = signature.write().unwrap();
+      if let Some((AbstractType::AbstractStruct(s), ownership)) =
+        signature.arg_types.last_mut()
+        && s.name.0 == scope_struct_name
+      {
+        *ownership = Ownership::Owned;
+      }
+    }
+    if !valueified_callees.insert(callee_name) {
+      return;
+    }
+    let mut implementation = callee_implementation.write().unwrap();
+    implementation.expression.data.as_known_mut(|t| {
+      let Type::Function(signature) = t else {
+        panic!("scoped closure had a non-function type")
+      };
+      if let Some((v, _)) = signature.args.last_mut()
+        && let Type::Struct(s) = v.var_type.unwrap_known()
+        && s.name == scope_struct_name
+      {
+        v.var_type.ownership = Ownership::Owned;
+      }
+    });
+    let scope_param_name = implementation.arg_names.last().unwrap().0.clone();
+    let ExpKind::Function(_, body) = &mut implementation.expression.kind else {
+      panic!("scoped closure implementation wasn't a Function")
+    };
+    self.rewrite_dispatched_scope_body(
+      body,
+      &scope_param_name,
+      None,
+      valueified_callees,
+    );
+  }
+  /// Replaces function-typed fields inside a dispatched closure's scope type
+  /// with their representative scope-struct types, recursively. A captured
+  /// closure is stored in the scope binding as its own captured scope's
+  /// data — which is what the emitted WGSL struct declares (see the
+  /// `Type::Function` arm of `monomorphized_name`) and what
+  /// `Value::to_uniform_bytes` uploads.
+  fn substitute_scope_representative_types(&self, t: Type) -> Type {
+    match t {
+      Type::Function(signature) => {
+        let representative = if let Some(ancestor) =
+          &signature.abstract_ancestor
+          && let Some(scope_struct) = &ancestor.read().unwrap().captured_scope
+        {
+          Some(
+            AbstractType::AbstractStruct(Arc::new(scope_struct.clone()))
+              .concretize(&vec![], &self.typedefs, SourceTrace::empty())
+              .unwrap(),
+          )
+        } else {
+          None
+        };
+        match representative {
+          Some(representative) => {
+            self.substitute_scope_representative_types(representative)
+          }
+          None => Type::Function(signature),
+        }
+      }
+      Type::Struct(mut s) => {
+        for field in s.fields.iter_mut() {
+          field.field_type = self
+            .substitute_scope_representative_types(
+              field.field_type.unwrap_known(),
+            )
+            .known()
+            .into();
+        }
+        Type::Struct(s)
+      }
+      other => other,
+    }
+  }
+  /// Rewrites every window-info query (`window-time`, `mouse-coords`,
+  /// `key-down?`, etc.) into a read of an implicit uniform binding, creating
+  /// one binding per distinct query (zero-arg kinds get one binding each;
+  /// key queries get one binding per distinct compile-time key string). The
+  /// runtime refreshes these bindings from the IO manager at the start of
+  /// every frame (see `Program::window_info_bindings`), so every query —
+  /// CPU- or GPU-side — reads the same per-frame snapshot of the ambient
+  /// state, and the GPU code behaves exactly like the hand-written pattern
+  /// of assigning `(window-time)` into a uniform in the frame loop.
+  /// Rewriting unconditionally (rather than only in GPU-reachable
+  /// functions) keeps the semantics local: whether some other call site
+  /// dispatches a helper to the GPU never changes what the helper's CPU
+  /// calls observe.
+  ///
+  /// The one exception is a key query whose argument isn't a string
+  /// literal (e.g. a helper taking a `String` parameter): those can't be
+  /// resolved to a binding at compile time, so they stay live CPU queries —
+  /// and are rejected with a clear error if reachable from GPU code. Must
+  /// run after implicit entry points are marked (so dispatched closures
+  /// count as GPU roots for that check) and before WGSL emission.
+  pub fn extract_gpu_window_info(&mut self) {
+    let mut binding_names: HashMap<WindowInfoBindingSource, Arc<str>> =
+      HashMap::new();
+    let mut used_bindings: HashSet<(u8, u8)> = self
+      .top_level_vars
+      .iter()
+      .filter_map(|v| {
+        if let TopLevelVariableKind::Var {
+          group_and_binding: Some(gb),
+          ..
+        } = v.kind
+        {
+          Some((gb.group, gb.binding))
+        } else {
+          None
+        }
+      })
+      .collect();
+    let mut new_vars: Vec<TopLevelVar> = vec![];
+    let not_equal_ancestor = self
+      .abstract_functions
+      .get("!=")
+      .and_then(|signatures| signatures.first())
+      .expect("builtin != missing from registry")
+      .clone();
+    let functions: Vec<Arc<RwLock<AbstractFunctionSignature>>> =
+      self.abstract_functions_iter().cloned().collect();
+    for f in functions {
+      let FunctionImplementationKind::Composite(implementation) =
+        f.read().unwrap().implementation.clone()
+      else {
+        continue;
+      };
+      implementation
+        .write()
+        .unwrap()
+        .expression
+        .walk_mut(&mut |exp| {
+          let ExpKind::Application(applied_f, args) = &exp.kind else {
+            return Ok::<bool, Never>(true);
+          };
+          let ExpKind::Name(applied_name) = &applied_f.kind else {
+            return Ok(true);
+          };
+          let Some(kind) = WindowInfoKind::from_fn_name(applied_name) else {
+            return Ok(true);
+          };
+          let source = match kind {
+            WindowInfoKind::KeyDown | WindowInfoKind::KeyJustDown => {
+              // Key queries need the key at compile time; non-literal args
+              // stay live CPU queries (rejected below if GPU-reachable).
+              let Some(ExpKind::StringLiteral(key)) =
+                args.first().map(|arg| &arg.kind)
+              else {
+                return Ok(true);
+              };
+              let key: Arc<str> = key.clone();
+              if kind == WindowInfoKind::KeyDown {
+                WindowInfoBindingSource::KeyDown(key)
+              } else {
+                WindowInfoBindingSource::KeyJustDown(key)
+              }
+            }
+            _ => WindowInfoBindingSource::Simple(kind),
+          };
+          let binding_name = binding_names
+            .entry(source.clone())
+            .or_insert_with(|| {
+              let base_name = match &source {
+                WindowInfoBindingSource::Simple(kind) => {
+                  kind.binding_base_name().to_string()
+                }
+                WindowInfoBindingSource::KeyDown(key)
+                | WindowInfoBindingSource::KeyJustDown(key) => {
+                  let sanitized_key: String = key
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                  format!("{}_{}", kind.binding_base_name(), sanitized_key)
+                }
+              };
+              let binding_name: Arc<str> =
+                self.names.write().unwrap().gensym(&base_name);
+              let binding = (0u8..)
+                .find(|binding| !used_bindings.contains(&(0, *binding)))
+                .unwrap();
+              used_bindings.insert((0, binding));
+              let var_type = if kind.is_boolean() {
+                Type::U32
+              } else {
+                // The binding's type is the builtin's own return type.
+                exp.data.unwrap_known()
+              };
+              new_vars.push(TopLevelVar {
+                name: binding_name.clone(),
+                kind: TopLevelVariableKind::Var {
+                  address_space: VariableAddressSpace::Uniform,
+                  group_and_binding: Some(GroupAndBinding {
+                    group: 0,
+                    binding,
+                  }),
+                },
+                var_type,
+                value: None,
+                source_trace: exp.source_trace.clone(),
+                external: false,
+              });
+              binding_name
+            })
+            .clone();
+          if kind.is_boolean() {
+            // Bools aren't host-shareable in WGSL uniforms: the binding is
+            // a u32 and the query becomes `(!= binding 0u)`.
+            let u32_type: ExpTypeInfo = Type::U32.known().into();
+            let mut binding_read_type = u32_type.clone();
+            binding_read_type.is_globally_bound = true;
+            exp.kind = ExpKind::Application(
+              Box::new(Exp {
+                data: Type::Function(Box::new(FunctionSignature {
+                  abstract_ancestor: Some(not_equal_ancestor.clone()),
+                  args: vec![
+                    (Variable::immutable(u32_type.clone()), vec![]),
+                    (Variable::immutable(u32_type.clone()), vec![]),
+                  ],
+                  return_type: Type::Bool.known().into(),
+                }))
+                .known()
+                .into(),
+                kind: ExpKind::Name("!=".into()),
+                source_trace: exp.source_trace.clone(),
+              }),
+              vec![
+                Exp {
+                  data: binding_read_type,
+                  kind: ExpKind::Name(binding_name),
+                  source_trace: exp.source_trace.clone(),
+                },
+                Exp {
+                  data: u32_type,
+                  kind: ExpKind::NumberLiteral(Number::Int(0)),
+                  source_trace: exp.source_trace.clone(),
+                },
+              ],
+            );
+          } else {
+            exp.kind = ExpKind::Name(binding_name);
+            exp.data.is_globally_bound = true;
+          }
+          Ok(true)
+        })
+        .unwrap();
+    }
+    self.top_level_vars.extend(new_vars);
+    let mut recorded: Vec<(WindowInfoBindingSource, Arc<str>)> =
+      binding_names.into_iter().collect();
+    recorded.sort_by_key(|(source, _)| match source {
+      WindowInfoBindingSource::Simple(kind) => (
+        WindowInfoKind::ALL.iter().position(|k| k == kind).unwrap(),
+        Arc::from(""),
+      ),
+      WindowInfoBindingSource::KeyDown(key) => (usize::MAX - 1, key.clone()),
+      WindowInfoBindingSource::KeyJustDown(key) => (usize::MAX, key.clone()),
+    });
+    self.window_info_bindings = recorded;
+  }
+  /// Rejects any window-info effect still present in a GPU-reachable
+  /// function after `extract_gpu_window_info`: that can only be a key query
+  /// with a non-literal key, which has no binding to read from on the GPU.
+  /// Runs after implicit entry points are marked, so dispatched closures
+  /// count as GPU roots.
+  pub fn validate_gpu_window_info(&mut self, errors: &mut ErrorLog) {
+    let by_name: HashMap<Arc<str>, Arc<RwLock<AbstractFunctionSignature>>> =
+      self
+        .abstract_functions_iter()
+        .map(|f| (f.read().unwrap().name.clone(), f.clone()))
+        .collect();
+    let mut reachable: HashSet<Arc<str>> = HashSet::new();
+    let mut queue: Vec<Arc<RwLock<AbstractFunctionSignature>>> = self
+      .abstract_functions_iter()
+      .filter(|f| {
+        matches!(
+          f.read().unwrap().entry_point,
+          Some(
+            EntryPoint::Vertex | EntryPoint::Fragment | EntryPoint::Compute(_)
+          )
+        )
+      })
+      .cloned()
+      .collect();
+    for f in queue.iter() {
+      reachable.insert(f.read().unwrap().name.clone());
+    }
+    while let Some(f) = queue.pop() {
+      let FunctionImplementationKind::Composite(implementation) =
+        f.read().unwrap().implementation.clone()
+      else {
+        continue;
+      };
+      let mut found: Vec<Arc<str>> = vec![];
+      implementation
+        .read()
+        .unwrap()
+        .expression
+        .walk(&mut |exp| {
+          if let ExpKind::Name(name) = &exp.kind
+            && by_name.contains_key(name)
+          {
+            found.push(name.clone());
+          }
+          if let ExpKind::Application(applied_f, _) = &exp.kind
+            && let TypeState::Known(Type::Function(signature)) =
+              &applied_f.data.kind
+            && let Some(ancestor) = &signature.abstract_ancestor
+          {
+            found.push(ancestor.read().unwrap().name.clone());
+          }
+          Ok::<bool, Never>(true)
+        })
+        .unwrap();
+      for name in found {
+        if let Some(target) = by_name.get(&name)
+          && reachable.insert(name)
+        {
+          queue.push(target.clone());
+        }
+      }
+    }
+    for name in reachable {
+      let Some(f) = by_name.get(&name) else {
+        continue;
+      };
+      let FunctionImplementationKind::Composite(implementation) =
+        f.read().unwrap().implementation.clone()
+      else {
+        continue;
+      };
+      let implementation = implementation.read().unwrap();
+      let remaining = implementation.effects().window_info_kinds();
+      for kind in remaining {
+        errors.log(CompileError {
+          kind: GpuKeyQueryRequiresLiteralString(kind.fn_name().to_string()),
+          source_trace: implementation.expression.source_trace.clone(),
+        });
+      }
+    }
+  }
+  /// Dispatched GPU closures (e.g. a lambda passed to
+  /// `dispatch-compute-shader` that captured local variables) can't receive
+  /// their captured scope as a function argument — WGSL entry points only
+  /// accept builtin-annotated arguments. This pass converts each dispatched
+  /// closure's scope argument into an implicit binding: the scope struct
+  /// becomes a top-level read-only storage var named
+  /// `<scope-struct-name>_data`, the entry function's trailing scope
+  /// argument is removed from its
+  /// signatures, and its body reads the global instead. At dispatch time the
+  /// interpreter writes the closure's captured scope value into that global
+  /// (see the `dispatch-compute-shader` handler in interpreter.rs) so the
+  /// ordinary dirty-binding upload machinery ships the captured values to the
+  /// GPU before the dispatch executes.
+  pub fn extract_dispatched_closure_scopes(&mut self) {
+    let mut used_bindings: HashSet<(u8, u8)> = self
+      .top_level_vars
+      .iter()
+      .filter_map(|v| {
+        if let TopLevelVariableKind::Var {
+          group_and_binding: Some(gb),
+          ..
+        } = v.kind
+        {
+          Some((gb.group, gb.binding))
+        } else {
+          None
+        }
+      })
+      .collect();
+    let mut new_vars: Vec<TopLevelVar> = vec![];
+    let mut processed_entries: HashSet<Arc<str>> = HashSet::new();
+    let mut valueified_callees: HashSet<Arc<str>> = HashSet::new();
+    for f in self.abstract_functions_iter() {
+      let FunctionImplementationKind::Composite(implementation) =
+        f.read().unwrap().implementation.clone()
+      else {
+        continue;
+      };
+      implementation
+        .read()
+        .unwrap()
+        .expression
+        .walk(&mut |exp| {
+          if let ExpKind::Application(applied_f, args) = &exp.kind
+            && let ExpKind::Name(applied_f_name) = &applied_f.kind
+          {
+            let dispatched_fn_count = match &**applied_f_name {
+              "dispatch-compute-shader" => 1,
+              "dispatch-render-shaders" => 2,
+              _ => 0,
+            };
+            for arg in args.iter().take(dispatched_fn_count) {
+              let Type::Function(signature) = arg.data.unwrap_known() else {
+                continue;
+              };
+              let Some(ancestor) = signature.abstract_ancestor else {
+                continue;
+              };
+              let (entry_name, scope_struct, entry_implementation) = {
+                let ancestor = ancestor.read().unwrap();
+                let Some(scope_struct) = ancestor.captured_scope.clone() else {
+                  continue;
+                };
+                let FunctionImplementationKind::Composite(implementation) =
+                  ancestor.implementation.clone()
+                else {
+                  continue;
+                };
+                (ancestor.name.clone(), scope_struct, implementation)
+              };
+              let scope_struct_name = scope_struct.name.0.clone();
+              let global_name: Arc<str> =
+                format!("{scope_struct_name}_data").into();
+              // Drop the trailing scope arg from this call site's ancestor
+              // signature and from every registry copy of the entry's
+              // signature. The name-match guard makes this idempotent when
+              // the same signature Arc is reachable through multiple paths.
+              let mut signatures_to_patch = vec![ancestor.clone()];
+              if let Some(registry_signatures) =
+                self.abstract_functions.get(&entry_name)
+              {
+                signatures_to_patch.extend(registry_signatures.iter().cloned());
+              }
+              for signature in signatures_to_patch {
+                let mut signature = signature.write().unwrap();
+                if let Some((AbstractType::AbstractStruct(s), _)) =
+                  signature.arg_types.last()
+                  && s.name.0 == scope_struct_name
+                {
+                  signature.arg_types.pop();
+                }
+              }
+              if !processed_entries.insert(entry_name.clone()) {
+                continue;
+              }
+              let mut entry_implementation =
+                entry_implementation.write().unwrap();
+              let concrete_scope_type = {
+                let mut popped_type = None;
+                entry_implementation.expression.data.as_known_mut(|t| {
+                  let Type::Function(signature) = t else {
+                    panic!("dispatched closure had a non-function type")
+                  };
+                  if let Some((v, _)) = signature.args.last()
+                    && let Type::Struct(s) = v.var_type.unwrap_known()
+                    && s.name == scope_struct_name
+                  {
+                    popped_type = signature
+                      .args
+                      .pop()
+                      .map(|(v, _)| v.var_type.unwrap_known());
+                  }
+                });
+                popped_type
+              };
+              let Some(concrete_scope_type) = concrete_scope_type else {
+                continue;
+              };
+              let concrete_scope_type =
+                self.substitute_scope_representative_types(concrete_scope_type);
+              let scope_arg_name =
+                entry_implementation.arg_names.pop().unwrap().0;
+              entry_implementation.arg_annotations.pop();
+              let ExpKind::Function(fn_arg_names, body) =
+                &mut entry_implementation.expression.kind
+              else {
+                panic!("dispatched closure implementation wasn't a Function")
+              };
+              fn_arg_names.pop();
+              self.rewrite_dispatched_scope_body(
+                body,
+                &scope_arg_name,
+                Some(&global_name),
+                &mut valueified_callees,
+              );
+              let binding = (0u8..=u8::MAX)
+                .find(|b| !used_bindings.contains(&(0, *b)))
+                .expect("no free binding for dispatched closure scope");
+              used_bindings.insert((0, binding));
+              new_vars.push(TopLevelVar {
+                name: global_name,
+                kind: TopLevelVariableKind::Var {
+                  // Read-only storage rather than uniform: storage has
+                  // relaxed layout rules, so nested scope structs (e.g. a
+                  // captured closure's scope embedded as a field) keep the
+                  // packed layout that `Value::to_uniform_bytes` produces.
+                  // Uniform would demand 16-byte alignment for struct
+                  // members, which neither the emitted structs nor the CPU
+                  // serializer satisfy.
+                  address_space: VariableAddressSpace::StorageRead,
+                  group_and_binding: Some(GroupAndBinding {
+                    group: 0,
+                    binding,
+                  }),
+                },
+                var_type: concrete_scope_type,
+                value: None,
+                source_trace: exp.source_trace.clone(),
+                external: false,
+              });
+            }
+          }
+          Ok::<bool, Never>(true)
+        })
+        .unwrap();
+    }
+    self.top_level_vars.extend(new_vars);
+  }
+  pub fn monomorphize_reference_address_spaces(&mut self) {
+    loop {
+      let mut monomorphized_ctx = Program::default();
+      monomorphized_ctx.names = RwLock::new(self.names.read().unwrap().clone());
+      monomorphized_ctx.typedefs = self.typedefs.clone();
+      let mut changed = false;
+      for f in self.abstract_functions_iter() {
+        let borrowed_f = f.read().unwrap();
+        if let FunctionImplementationKind::Composite(implementation) =
+          &f.read().unwrap().implementation
+        {
+          if borrowed_f.reference_arg_positions().is_empty() {
+            let mut borrowed_implementation = implementation.write().unwrap();
+            changed |= borrowed_implementation
+              .expression
+              .monomorphize_reference_address_spaces(
+                &self,
+                &mut monomorphized_ctx,
+              );
+            let mut new_f = (**f).read().unwrap().clone();
+            new_f.implementation =
+              FunctionImplementationKind::Composite(implementation.clone());
+            drop(borrowed_implementation);
+            monomorphized_ctx
+              .add_abstract_function(Arc::new(RwLock::new(new_f)));
+          }
+        } else {
+          monomorphized_ctx.add_abstract_function(f.clone());
+        }
+      }
+      take(self, |old_ctx| {
+        monomorphized_ctx.top_level_vars = old_ctx.top_level_vars;
+        monomorphized_ctx.window_info_bindings = old_ctx.window_info_bindings;
+        monomorphized_ctx
+      });
+      if !changed {
+        break;
+      }
+    }
+  }
+  pub fn extract_builtin_attribute_lookup_functions(
+    &mut self,
+    errors: &mut ErrorLog,
+  ) {
+    let mut used_attributes: HashSet<BuiltinIOAttribute> = HashSet::new();
+    for f in self.abstract_functions_iter() {
+      let borrowed_f = f.read().unwrap();
+      if let FunctionImplementationKind::Composite(implementation) =
+        &borrowed_f.implementation
+      {
+        let attributes = builtin_attribute_lookups(implementation);
+        let mut implementation = implementation.write().unwrap();
+        let Type::Function(signature) =
+          implementation.expression.data.unwrap_known()
+        else {
+          panic!()
+        };
+        for attribute in attributes {
+          used_attributes.insert(attribute);
+          if let Some(entry_point) = borrowed_f.entry_point {
+            if !attribute.is_valid_input_for_stage(&entry_point) {
+              errors.log(CompileError::new(
+                InvalidBuiltinForEntryPoint(
+                  attribute.name().into(),
+                  InputOrOutput::Input,
+                  entry_point.name().into(),
+                ),
+                implementation.name_source_trace.clone(),
+              ));
+            }
+            let global_var_name = attribute.compiled_name();
+            let value_type_info: ExpTypeInfo =
+              attribute.value_type().known().into();
+            let assignment_value = if let Some(arg_name) = implementation
+              .arg_annotations
+              .iter()
+              .zip(implementation.arg_names.iter())
+              .find_map(|(annotation, arg_name)| {
+                if annotation.attributes.has_builtin_io_attribute(attribute) {
+                  Some(arg_name.0.clone())
+                } else {
+                  None
+                }
+              }) {
+              Exp {
+                data: value_type_info.clone(),
+                kind: ExpKind::Name(arg_name),
+                source_trace: SourceTrace::empty(),
+              }
+            } else if let Some((struct_type, arg_name, field_name)) = signature
+              .args
+              .iter()
+              .zip(implementation.arg_names.iter())
+              .find_map(|((arg, _), (name, _))| {
+                if let Type::Struct(s) = arg.var_type.unwrap_known() {
+                  s.fields.iter().find_map(|field| {
+                    if field.attributes.has_builtin_io_attribute(attribute) {
+                      Some((s.clone(), name.clone(), field.name.clone()))
+                    } else {
+                      None
+                    }
+                  })
+                } else {
+                  None
+                }
+              })
+            {
+              Exp {
+                data: value_type_info.clone(),
+                kind: ExpKind::Access(
+                  Accessor::Field(field_name),
+                  Exp {
+                    data: Type::Struct(struct_type).known().into(),
+                    kind: ExpKind::Name(arg_name),
+                    source_trace: SourceTrace::empty(),
+                  }
+                  .into(),
+                ),
+                source_trace: SourceTrace::empty(),
+              }
+            } else {
+              let arg_name =
+                self.names.write().unwrap().gensym(&global_var_name);
+              implementation
+                .arg_annotations
+                .push(FunctionArgumentAnnotation {
+                  var: false,
+                  ownership: Ownership::Owned,
+                  attributes: IOAttributes {
+                    attributes: vec![IOAttribute {
+                      kind: IOAttributeKind::Builtin(attribute),
+                      source_trace: SourceTrace::empty(),
+                    }],
+                    attributed_source: SourceTrace::empty(),
+                  },
+                });
+              let ExpKind::Function(args, _) =
+                &mut implementation.expression.kind
+              else {
+                panic!()
+              };
+              args.push((arg_name.clone(), SourceTrace::empty()));
+              implementation.expression.data.as_known_mut(|t| {
+                let Type::Function(signature) = t else {
+                  panic!()
+                };
+                signature.args.push((
+                  Variable {
+                    kind: VariableKind::Let,
+                    var_type: attribute.value_type().known().into(),
+                  },
+                  vec![],
+                ));
+              });
+              Exp {
+                data: value_type_info.clone(),
+                kind: ExpKind::Name(arg_name),
+                source_trace: SourceTrace::empty(),
+              }
+            };
+            let ExpKind::Function(_, body) =
+              &mut implementation.expression.kind
+            else {
+              panic!()
+            };
+            *body = Exp {
+              data: body.data.clone(),
+              kind: ExpKind::Block(vec![
+                Exp {
+                  data: Type::Unit.known().into(),
+                  kind: ExpKind::Application(
+                    TypedExp::assignment_function(value_type_info.clone())
+                      .into(),
+                    vec![
+                      Exp {
+                        data: value_type_info.clone(),
+                        kind: ExpKind::Name(global_var_name.into()),
+                        source_trace: SourceTrace::empty(),
+                      },
+                      assignment_value,
+                    ],
+                  ),
+                  source_trace: SourceTrace::empty(),
+                },
+                *body.clone(),
+              ]),
+              source_trace: body.source_trace.clone(),
+            }
+            .into();
+          }
+        }
+      }
+    }
+    for attribute in used_attributes {
+      self.top_level_vars.push(TopLevelVar {
+        name: attribute.compiled_name().into(),
+        kind: TopLevelVariableKind::Var {
+          address_space: VariableAddressSpace::Private,
+          group_and_binding: None,
+        },
+        var_type: attribute.value_type(),
+        value: None,
+        source_trace: SourceTrace::empty(),
+        external: false,
+      })
+    }
+  }
+  pub fn propagate_abstract_function_signatures(&mut self) {
+    loop {
+      let mut changed = false;
+      let copy_program = self.clone();
+      for top_level_f in self.abstract_functions_iter() {
+        let mut borrowed_f = top_level_f.write().unwrap();
+        match &borrowed_f.implementation {
+          FunctionImplementationKind::Composite(implementation) => {
+            let mut borrowed_implementation = implementation.write().unwrap();
+            borrowed_implementation
+              .expression
+              .walk_mut_with_ctx(
+                &mut |exp, ctx| {
+                  exp.data.as_known_mut(|t| {
+                    if let Type::Function(f) = t
+                      && f.abstract_ancestor.is_none()
+                    {
+                      match &exp.kind {
+                        ExpKind::Name(name) => {
+                          if let Some((v, _)) = ctx.variables.get(name)
+                            && let Type::Function(bound_f) =
+                              v.var_type.unwrap_known()
+                            && let Some(abstract_ancestor) =
+                              bound_f.abstract_ancestor
+                          {
+                            f.abstract_ancestor = Some(abstract_ancestor);
+                            changed = true;
+                          }
+                        }
+                        ExpKind::Application(applied_f_exp, _) => {
+                          if let ExpKind::Name(applied_f_name) =
+                            &applied_f_exp.kind
+                            && let Type::Function(applied_f_sig) =
+                              applied_f_exp.data.unwrap_known()
+                            && applied_f_sig.abstract_ancestor.is_some()
+                            && let Type::Function(_) =
+                              applied_f_sig.return_type.unwrap_known()
+                            && let Some(signatures) =
+                              self.abstract_functions.get(applied_f_name)
+                            && let Some(signature) = signatures.get(0)
+                            && let AbstractType::Type(Type::Function(
+                              returned_f,
+                            )) = &signature.read().unwrap().return_type
+                            && let Some(returned_abstract_ancestor) =
+                              &returned_f.abstract_ancestor
+                          {
+                            f.abstract_ancestor =
+                              Some(returned_abstract_ancestor.clone());
+                            changed = true;
+                          }
+                        }
+                        _ => {}
+                      }
+                    }
+                    Ok::<bool, Never>(true)
+                  })
+                },
+                &mut ImmutableProgramLocalContext::empty(&copy_program),
+              )
+              .unwrap();
+            borrowed_implementation
+              .expression
+              .walk_mut(&mut |exp| {
+                exp.data.as_known_mut(|t| {
+                  if let Type::Function(f) = t
+                    && f.abstract_ancestor.is_none()
+                    && let Some(inner_exp) = match &exp.kind {
+                      ExpKind::Let(_, body) => Some(body.as_ref()),
+                      ExpKind::Block(exps) => exps.last(),
+                      _ => None,
+                    }
+                    && let Type::Function(inner_f) =
+                      inner_exp.data.unwrap_known()
+                    && let Some(inner_abstract_ancestor) =
+                      inner_f.abstract_ancestor
+                  {
+                    f.abstract_ancestor = Some(inner_abstract_ancestor.clone());
+                    changed = true;
+                  }
+                });
+                Ok::<bool, Never>(true)
+              })
+              .unwrap();
+            let inner_abstract_ancestor = if let ExpKind::Function(_, body) =
+              &borrowed_implementation.expression.kind
+              && let Type::Function(inner_f) = body.data.unwrap_known()
+              && let Some(ancestor) = inner_f.abstract_ancestor
+            {
+              Some(ancestor)
+            } else {
+              None
+            };
+            borrowed_implementation
+              .expression
+              .data
+              .with_dereferenced_mut(|ts| {
+                if let TypeState::Known(Type::Function(signature)) = ts {
+                  signature.return_type.with_dereferenced_mut(|rt| {
+                    if let TypeState::Known(Type::Function(return_signature)) =
+                      rt
+                      && let Some(anc) = inner_abstract_ancestor.clone()
+                      && return_signature.abstract_ancestor.is_none()
+                    {
+                      return_signature.abstract_ancestor = Some(anc);
+                      changed = true;
+                    }
+                  });
+                }
+              });
+            drop(borrowed_implementation);
+            if let AbstractType::Type(Type::Function(f)) =
+              &mut borrowed_f.return_type
+              && f.abstract_ancestor.is_none()
+            {
+              if let Some(inner_abstract_ancestor) = inner_abstract_ancestor {
+                f.abstract_ancestor = Some(inner_abstract_ancestor);
+                changed = true;
+              }
+            }
+          }
+          _ => {}
+        }
+      }
+      if !changed {
+        break;
+      }
+    }
+  }
+  pub fn inline_local_bound_function_applications(&mut self) {
+    let mut representative_structs = vec![];
+    for f in self.abstract_functions_iter() {
+      let borrowed_f = f.read().unwrap();
+      match &borrowed_f.implementation {
+        FunctionImplementationKind::Composite(implementation) => implementation
+          .write()
+          .unwrap()
+          .expression
+          .walk_mut_with_ctx(
+            &mut |exp, ctx| match &mut exp.kind {
+              ExpKind::Application(f, args) => {
+                if let Type::Function(_) = f.data.unwrap_known() {
+                  // Applying a closure held in a captured-scope field — the
+                  // form a nested closure's inner call takes after
+                  // extract_inner_functions rewrites capture references:
+                  // `((. scope inner) args...)`. Same rewrite as the
+                  // local-binding case below, with the Access expression
+                  // itself appended as the trailing scope argument:
+                  // `(inner_fn args... (. scope inner))`.
+                  if let ExpKind::Access(Accessor::Field(_), _) = &f.kind {
+                    // The Access expression's own function type never gets
+                    // an abstract ancestor (the signature-propagation pass
+                    // only fills Name and Application expressions) — the
+                    // ancestor lives on the scope struct's field type.
+                    let ancestor = {
+                      let ExpKind::Access(
+                        Accessor::Field(field_name),
+                        accessed,
+                      ) = &f.kind
+                      else {
+                        unreachable!()
+                      };
+                      if let Type::Struct(s) = accessed.data.unwrap_known() {
+                        s.fields
+                          .iter()
+                          .find(|field| field.name == *field_name)
+                          .and_then(|field| {
+                            match field.field_type.unwrap_known() {
+                              Type::Function(sig) => {
+                                sig.abstract_ancestor.clone()
+                              }
+                              _ => None,
+                            }
+                          })
+                      } else {
+                        None
+                      }
+                    };
+                    if let Some(ancestor) = ancestor {
+                      let abstract_fn = ancestor.read().unwrap();
+                      let new_name = abstract_fn.name.clone();
+                      if let Some(captured_scope) =
+                        abstract_fn.captured_scope.as_ref()
+                      {
+                        let scope_type = Type::Struct(
+                          AbstractStruct::concretize(
+                            Arc::new(captured_scope.clone()),
+                            &self.typedefs,
+                            &vec![],
+                            f.source_trace.clone(),
+                          )
+                          .unwrap(),
+                        );
+                        let mut scope_arg = (**f).clone();
+                        scope_arg.data = scope_type.clone().known().into();
+                        // The scope argument is a reference-rooted place
+                        // (its root is the enclosing closure's scope
+                        // param) — the backends' argument emission keys
+                        // explicit derefs off this ownership.
+                        scope_arg.data.ownership = Ownership::MutableReference;
+                        args.push(scope_arg);
+                        // Keep the callee's static signature in sync with
+                        // the appended argument, so per-arg ownership zips
+                        // downstream (interpreter write-back, reference
+                        // address-space monomorphization) see the scope
+                        // param.
+                        let mut var_type: ExpTypeInfo =
+                          scope_type.known().into();
+                        var_type.ownership = Ownership::MutableReference;
+                        if let TypeState::Known(Type::Function(sig)) =
+                          &mut f.data.kind
+                        {
+                          sig.args.push((
+                            Variable {
+                              kind: VariableKind::Var,
+                              var_type,
+                            },
+                            vec![],
+                          ));
+                        }
+                        representative_structs.push(captured_scope.clone());
+                      }
+                      drop(abstract_fn);
+                      // Stamp the ancestor onto the rewritten callee — the
+                      // HoF inliner, effects computation, and the backends
+                      // all read it.
+                      if let TypeState::Known(Type::Function(sig)) =
+                        &mut f.data.kind
+                      {
+                        sig.abstract_ancestor = Some(ancestor);
+                      }
+                      f.kind = ExpKind::Name(new_name);
+                    }
+                    return Ok(true);
+                  }
+                  let ExpKind::Name(original_name) = &mut f.kind else {
+                    panic!(
+                      "non-name fn being applied: callee kind = {:?}",
+                      f.kind
+                    )
+                  };
+                  match ctx.get_name_definition_source(&original_name) {
+                    Some(source) => match source {
+                      NameDefinitionSource::LocalBinding(_) => {
+                        let Type::Function(bound_signature) = ctx
+                          .variables
+                          .get(original_name)
+                          .unwrap()
+                          .0
+                          .var_type
+                          .unwrap_known()
+                        else {
+                          panic!()
+                        };
+                        if let Some(abstract_fn) =
+                          bound_signature.abstract_ancestor
+                        {
+                          let abstract_fn = abstract_fn.read().unwrap();
+                          let new_name = abstract_fn.name.clone();
+                          if let Some(captured_scope) =
+                            abstract_fn.captured_scope.as_ref()
+                          {
+                            args.push(Exp {
+                              data: Type::Struct(
+                                AbstractStruct::concretize(
+                                  Arc::new(captured_scope.clone()),
+                                  &self.typedefs,
+                                  &vec![],
+                                  f.source_trace.clone(),
+                                )
+                                .unwrap(),
+                              )
+                              .known()
+                              .into(),
+                              kind: ExpKind::Name(original_name.clone()),
+                              source_trace: f.source_trace.clone(),
+                            });
+                            representative_structs.push(captured_scope.clone());
+                          }
+                          *original_name = new_name;
+                        }
+                      }
+                      _ => {}
+                    },
+                    None => {}
+                  }
+                }
+                Ok(true)
+              }
+              _ => Ok::<bool, Never>(true),
+            },
+            &mut ImmutableProgramLocalContext::empty(self),
+          )
+          .unwrap(),
+        _ => {}
+      }
+    }
+    for s in representative_structs {
+      self.add_monomorphized_struct(s);
+    }
+  }
+  pub fn catch_duplicate_closures_capturing_mutable_variables(
+    &mut self,
+    errors: &mut ErrorLog,
+  ) {
+    for f in self.abstract_functions_iter() {
+      let borrowed_f = f.read().unwrap();
+      if let FunctionImplementationKind::Composite(implementation) =
+        &borrowed_f.implementation
+      {
+        let exp = &mut implementation.write().unwrap().expression;
+        let ExpKind::Function(_, body) = &mut exp.kind else {
+          panic!()
+        };
+        body.catch_duplicate_closures_capturing_mutable_variables(self, errors);
+      }
+    }
+  }
+  pub fn extract_inner_functions(&mut self, errors: &mut ErrorLog) -> bool {
+    let mut any_extracted = false;
+    loop {
+      let mut new_signatures: Vec<AbstractFunctionSignature> = vec![];
+      let mut new_structs: Vec<AbstractStruct> = vec![];
+      for f in self.abstract_functions_iter() {
+        let borrowed_f = f.read().unwrap();
+        if !borrowed_f.generic_args.is_empty()
+          || borrowed_f.has_uninlined_higher_order_arguments()
+        {
+          continue;
+        }
+        match &borrowed_f.implementation {
+          FunctionImplementationKind::Composite(implementation) => {
+            let mut root_encountered = false;
+            implementation
+              .write()
+              .unwrap()
+              .expression
+              .walk_mut_with_ctx(
+                &mut |exp, ctx| {
+                  if !root_encountered {
+                    root_encountered = true;
+                    return Ok(true);
+                  }
+                  // Only closures need capture analysis. Computing transitive
+                  // effects for every enclosing expression repeatedly walks the
+                  // same call graph before the editor can render its first frame.
+                  if !matches!(exp.kind, ExpKind::Function(..)) {
+                    return Ok(true);
+                  }
+                  let effects = exp.effects();
+                  if let ExpKind::Function(arg_names, body) = &mut exp.kind {
+                    // If any captured variable is a function whose abstract
+                    // ancestor hasn't been resolved yet, defer extraction until
+                    // propagate_abstract_function_signatures has set it.
+                    if effects.0.iter().any(|e| {
+                      if let Effect::ReadsVar(var_name) = e
+                        && let Some((var, _)) = ctx.variables.get(var_name)
+                        && let Type::Function(f) = var.var_type.unwrap_known()
+                      {
+                        f.abstract_ancestor.is_none()
+                      } else {
+                        false
+                      }
+                    }) {
+                      return Ok(true);
+                    }
+                    let name = self.names.write().unwrap().gensym("inner_fn");
+                    let Type::Function(f_signature) = exp.data.unwrap_known()
+                    else {
+                      panic!()
+                    };
+                    let mut unitlike_fn_substitutions: HashMap<
+                      Arc<str>,
+                      (Arc<str>, Arc<RwLock<AbstractFunctionSignature>>),
+                    > = HashMap::new();
+                    let captured_vars: Vec<(&Arc<str>, Type, Ownership)> =
+                      effects
+                        .0
+                        .iter()
+                        .map(|e| match e {
+                          Effect::ReadsVar(var_name)
+                          | Effect::ReadsArrayLength(var_name) => {
+                            Ok(match ctx.variables.get(var_name) {
+                              Some((var, _)) => {
+                                let var_type = var.var_type.unwrap_known();
+                                if matches!(var_type, Type::Function(_))
+                                  && var_type.is_unitlike(
+                                    &mut *self.names.write().unwrap(),
+                                  )
+                                {
+                                  if let Type::Function(sig) = var_type
+                                    && let Some(ancestor) =
+                                      &sig.abstract_ancestor
+                                  {
+                                    unitlike_fn_substitutions.insert(
+                                      var_name.clone(),
+                                      (
+                                        ancestor.read().unwrap().name.clone(),
+                                        ancestor.clone(),
+                                      ),
+                                    );
+                                  }
+                                  None
+                                } else {
+                                  Some((
+                                    var_name,
+                                    var.var_type.unwrap_known(),
+                                    var.var_type.ownership,
+                                  ))
+                                }
+                              }
+                              None => None,
+                            })
+                          }
+
+                          Effect::ModifiesLocalVar(_)
+                          | Effect::CPUExclusiveFunction(_)
+                          | Effect::CPUExclusiveType(_)
+                          | Effect::WindowInfo(_)
+                          | Effect::FragmentExclusiveFunction(_)
+                          | Effect::Print
+                          | Effect::FileWrite
+                          | Effect::HostResource
+                          | Effect::ModifiesGlobalVar(_)
+                          | Effect::Window
+                          | Effect::LookupBuiltinAttribute(_)
+                          | Effect::InvokesUnknownFunction => Ok(None),
+                          _ => err(
+                            IllegalEffectsInClosure(format!("{e:?}")),
+                            body.source_trace.clone(),
+                          ),
+                        })
+                        .collect::<CompileResult<Vec<_>>>()
+                        .unwrap_or_else(|e| {
+                          errors.log(e);
+                          vec![]
+                        })
+                        .into_iter()
+                        .filter_map(|x| x)
+                        .collect();
+                    // A variable read both by element access and by
+                    // `array-length` contributes two effects — capture it
+                    // only once.
+                    let mut seen_captured_names: HashSet<&Arc<str>> =
+                      HashSet::new();
+                    let captured_vars: Vec<(&Arc<str>, Type, Ownership)> =
+                      captured_vars
+                        .into_iter()
+                        .filter(|(name, _, _)| seen_captured_names.insert(name))
+                        .collect();
+                    let captured_scope = if captured_vars.is_empty() {
+                      None
+                    } else {
+                      Some(AbstractStruct {
+                        name: (
+                          self
+                            .names
+                            .write()
+                            .unwrap()
+                            .gensym(&format!("{name}_scope"))
+                            .into(),
+                          exp.source_trace.clone(),
+                        ),
+                        filled_generics: HashMap::new(),
+                        fields: captured_vars
+                          .iter()
+                          .map(|(name, t, _)| AbstractStructField {
+                            attributes: IOAttributes::empty(
+                              exp.source_trace.clone(),
+                            ),
+                            name: (**name).clone(),
+                            field_type: AbstractType::Type(t.clone()),
+                            source_trace: exp.source_trace.clone(),
+                          })
+                          .collect(),
+                        generic_args: vec![],
+                        abstract_ancestor: None,
+                        source_trace: exp.source_trace.clone(),
+                        opaque: false,
+                      })
+                    };
+                    let mut arg_types: Vec<(AbstractType, Ownership)> =
+                      f_signature
+                        .args
+                        .iter()
+                        .map(|(arg, _)| {
+                          (
+                            AbstractType::Type(arg.var_type.unwrap_known()),
+                            Ownership::Owned,
+                          )
+                        })
+                        .collect();
+                    let captured_scope = captured_scope.map(|captured_scope| {
+                      (
+                        captured_scope.clone(),
+                        AbstractType::AbstractStruct(Arc::new(captured_scope))
+                          .concretize(
+                            &vec![],
+                            &self.typedefs,
+                            exp.source_trace.clone(),
+                          )
+                          .unwrap(),
+                        self.names.write().unwrap().gensym("scope"),
+                      )
+                    });
+                    if let Some((
+                      captured_scope,
+                      concrete_captured_scope_type,
+                      scope_name,
+                    )) = &captured_scope
+                    {
+                      arg_names
+                        .push((scope_name.clone(), exp.source_trace.clone()));
+                      exp.data.as_known_mut(|t| {
+                        let Type::Function(f) = t else {
+                          panic!();
+                        };
+                        let mut var_type: ExpTypeInfo =
+                          concrete_captured_scope_type.clone().known().into();
+                        var_type.ownership = Ownership::MutableReference;
+                        f.args.push((
+                          Variable {
+                            kind: VariableKind::Var,
+                            var_type,
+                          },
+                          vec![],
+                        ));
+                      });
+                      arg_types.push((
+                        AbstractType::AbstractStruct(Arc::new(
+                          captured_scope.clone(),
+                        )),
+                        Ownership::MutableReference,
+                      ));
+                    }
+                    let signature = AbstractFunctionSignature {
+                      name: name.clone(),
+                      generic_args: vec![],
+                      associative: false,
+                      entry_point: None,
+                      arg_types,
+                      return_type: AbstractType::Type(
+                        f_signature.return_type.unwrap_known(),
+                      ),
+                      implementation: FunctionImplementationKind::Composite(
+                        Arc::new(RwLock::new(TopLevelFunction {
+                          name_source_trace: exp.source_trace.clone(),
+                          arg_names: arg_names.clone(),
+                          arg_annotations: arg_names
+                            .iter()
+                            .map(|(_, arg_source_trace)| {
+                              FunctionArgumentAnnotation::empty(
+                                arg_source_trace.clone(),
+                              )
+                            })
+                            .collect(),
+                          return_attributes: IOAttributes::empty(
+                            exp.source_trace.clone(),
+                          ),
+                          entry_point: None,
+                          expression: {
+                            let mut new_exp = exp.clone();
+                            if !unitlike_fn_substitutions.is_empty() {
+                              let ExpKind::Function(_, body) =
+                                &mut new_exp.kind
+                              else {
+                                panic!()
+                              };
+                              body
+                                .walk_mut(&mut |e| -> Result<bool, Never> {
+                                  if let ExpKind::Name(name) = &mut e.kind {
+                                    if let Some((concrete_name, signature)) =
+                                      unitlike_fn_substitutions
+                                        .get(name.as_ref())
+                                    {
+                                      *name = concrete_name.clone();
+                                      e.data.as_known_mut(|t| {
+                                        if let Type::Function(f) = t {
+                                          f.abstract_ancestor =
+                                            Some(signature.clone());
+                                        }
+                                      });
+                                    }
+                                  }
+                                  Ok(true)
+                                })
+                                .unwrap();
+                            }
+                            if let Some((
+                              _,
+                              concrete_captured_scope_type,
+                              scope_name,
+                            )) = &captured_scope
+                            {
+                              let ExpKind::Function(_, body) =
+                                &mut new_exp.kind
+                              else {
+                                panic!()
+                              };
+                              body
+                                .walk_mut(&mut |e| {
+                                  if let ExpKind::Name(name) = &mut e.kind {
+                                    if captured_vars
+                                      .iter()
+                                      .any(|(arg_name, _, _)| *arg_name == name)
+                                    {
+                                      let name = name.clone();
+                                      let mut t: ExpTypeInfo =
+                                        concrete_captured_scope_type
+                                          .clone()
+                                          .known()
+                                          .into();
+                                      t.ownership = Ownership::MutableReference;
+                                      e.kind = ExpKind::Access(
+                                        Accessor::Field(name.clone()),
+                                        Box::new(Exp {
+                                          data: t,
+                                          kind: ExpKind::Name(
+                                            scope_name.clone(),
+                                          ),
+                                          source_trace: exp
+                                            .source_trace
+                                            .clone(),
+                                        }),
+                                      );
+                                    }
+                                  }
+                                  Ok::<bool, Never>(true)
+                                })
+                                .unwrap();
+                            }
+                            new_exp
+                          },
+                        })),
+                      ),
+                      captured_scope: captured_scope
+                        .as_ref()
+                        .map(|(s, _, _)| s.clone()),
+                    };
+                    new_signatures.push(signature.clone());
+                    if let Some((s, _, _)) = &captured_scope {
+                      new_structs.push(s.clone());
+                    }
+                    *exp = Exp {
+                      data: Type::Function(Box::new(FunctionSignature {
+                        abstract_ancestor: Some(Arc::new(RwLock::new(
+                          signature,
+                        ))),
+                        args: f_signature.args,
+                        return_type: f_signature.return_type,
+                      }))
+                      .known()
+                      .into(),
+                      kind: if let Some((
+                        captured_scope,
+                        concrete_captured_scope_type,
+                        _,
+                      )) = captured_scope
+                      {
+                        ExpKind::Application(
+                          Box::new(Exp {
+                            data: Type::Function(Box::new(FunctionSignature {
+                              // The scope construction is, at the value
+                              // level, a construction of the scope struct —
+                              // its callee gets the struct's constructor as
+                              // an explicit ancestor, exactly like any other
+                              // struct-constructor application. (The
+                              // closure-ness of the node lives in the
+                              // expression's own type: a function type whose
+                              // ancestor is the extracted inner fn.)
+                              abstract_ancestor: Some(Arc::new(RwLock::new(
+                                AbstractFunctionSignature {
+                                  name: captured_scope.name.0.clone(),
+                                  generic_args: vec![],
+                                  arg_types: captured_vars
+                                    .iter()
+                                    .map(|(_, t, _)| {
+                                      (
+                                        AbstractType::Type(t.clone()),
+                                        Ownership::Owned,
+                                      )
+                                    })
+                                    .collect(),
+                                  return_type: AbstractType::Type(
+                                    concrete_captured_scope_type.clone(),
+                                  ),
+                                  implementation:
+                                    FunctionImplementationKind::StructConstructor,
+                                  associative: false,
+                                  captured_scope: None,
+                                  entry_point: None,
+                                },
+                              ))),
+                              args: captured_vars
+                                .iter()
+                                .map(|(_, t, _)| {
+                                  (
+                                    Variable {
+                                      kind: VariableKind::Let,
+                                      var_type: t.clone().known().into(),
+                                    },
+                                    vec![],
+                                  )
+                                })
+                                .collect(),
+                              return_type: exp.data.clone(),
+                            }))
+                            .known()
+                            .into(),
+                            kind: ExpKind::Name(captured_scope.name.0.clone()),
+                            source_trace: exp.source_trace.clone(),
+                          }),
+                          captured_vars
+                            .into_iter()
+                            .map(|(name, t, ownership)| {
+                              let mut data: ExpTypeInfo = t.known().into();
+                              data.ownership = ownership;
+                              Exp {
+                                data,
+                                kind: ExpKind::Name(name.clone()),
+                                source_trace: exp.source_trace.clone(),
+                              }
+                            })
+                            .collect(),
+                        )
+                      } else {
+                        ExpKind::Name(name)
+                      },
+                      source_trace: exp.source_trace.clone(),
+                    };
+
+                    Ok(true)
+                  } else {
+                    Ok::<bool, Never>(true)
+                  }
+                },
+                &mut ImmutableProgramLocalContext::empty(self),
+              )
+              .unwrap();
+          }
+          _ => {}
+        }
+      }
+      if new_signatures.is_empty() {
+        break;
+      }
+      any_extracted = true;
+      for s in new_signatures {
+        self.add_abstract_function(Arc::new(RwLock::new(s)));
+      }
+      for s in new_structs {
+        self.add_monomorphized_struct(s);
+      }
+    }
+    any_extracted
+  }
+  pub fn inline_all_higher_order_arguments(
+    &mut self,
+    errors: &mut ErrorLog,
+  ) -> bool {
+    let mut any_inlined = false;
+    loop {
+      let changed = self.inline_higher_order_arguments(errors);
+      if !errors.is_empty() || !changed {
+        break;
+      }
+      any_inlined = true;
+    }
+    any_inlined
+  }
+  pub fn inline_higher_order_arguments(
+    &mut self,
+    errors: &mut ErrorLog,
+  ) -> bool {
+    let mut changed = false;
+    let mut inlined_ctx = Program::default();
+    inlined_ctx.names = RwLock::new(self.names.read().unwrap().clone());
+    inlined_ctx.typedefs = self.typedefs.clone();
+    for f in self.abstract_functions_iter() {
+      let borrowed_f = f.read().unwrap();
+      if !borrowed_f.has_uninlined_higher_order_arguments() {
+        match &borrowed_f.implementation {
+          FunctionImplementationKind::Composite(implementation) => {
+            let mut borrowed_implementation = implementation.write().unwrap();
+            match borrowed_implementation
+              .expression
+              .inline_higher_order_arguments(&mut inlined_ctx)
+            {
+              Ok(added_new_function) => {
+                changed |= added_new_function;
+                let mut new_f = borrowed_f.clone();
+                drop(borrowed_implementation);
+                new_f.implementation =
+                  FunctionImplementationKind::Composite(implementation.clone());
+                inlined_ctx.add_abstract_function(Arc::new(RwLock::new(new_f)));
+              }
+              Err(e) => errors.log(e),
+            }
+          }
+          FunctionImplementationKind::EnumConstructor(_) => {
+            inlined_ctx.add_abstract_function(Arc::clone(f));
+          }
+          _ => {}
+        }
+      }
+    }
+    take(self, |old_ctx| {
+      inlined_ctx.top_level_vars = old_ctx.top_level_vars;
+      inlined_ctx.window_info_bindings = old_ctx.window_info_bindings;
+      inlined_ctx
+    });
+    changed
+  }
+  pub fn remove_unitlike_values(&mut self) {
+    // Call-site signatures may share one specialized implementation. Prune its
+    // body/argument names once, while updating every call's signature and args.
+    let mut pruned_implementations = HashSet::new();
+    let mut names = NameContext::empty();
+    std::mem::swap(&mut names, &mut self.names.write().unwrap());
+    take(&mut self.typedefs.structs, |structs| {
+      structs
+        .into_iter()
+        .filter(|s| !s.is_unitlike(&mut names))
+        .collect()
+    });
+    for f in self.abstract_functions_iter_mut() {
+      let f = f.write().unwrap();
+      if let FunctionImplementationKind::Composite(implementation) =
+        &f.implementation
+      {
+        let mut implementation = implementation.write().unwrap();
+        implementation
+          .expression
+          .walk_mut(&mut |exp| match &mut exp.kind {
+            ExpKind::Name(_) => {
+              if exp.data.unwrap_known() == Type::Unit {
+                exp.kind = ExpKind::Unit;
+              }
+              Ok(true)
+            }
+            ExpKind::Application(applied_f, args) => {
+              applied_f.data.with_dereferenced_mut(|t| match t {
+                TypeState::Known(t) => match t {
+                  Type::Function(applied_f_signature) => {
+                    let mut args_to_remove = vec![];
+                    if let Some(applied_f_abstract_signature) =
+                      &mut applied_f_signature.abstract_ancestor
+                    {
+                      let cloned_sig =
+                        applied_f_abstract_signature.read().unwrap().clone();
+                      let composite_f =
+                        if let FunctionImplementationKind::Composite(ref f) =
+                          cloned_sig.implementation
+                        {
+                          Some(Arc::clone(f))
+                        } else {
+                          None
+                        };
+                      if let Some(f) = composite_f {
+                        args_to_remove = (0..args.len())
+                          .rev()
+                          .filter(|i| {
+                            args[*i].data.unwrap_known().is_unitlike(&mut names)
+                          })
+                          .collect();
+                        let new_sig = Arc::new(RwLock::new(cloned_sig));
+                        let prune_body =
+                          pruned_implementations.insert(Arc::as_ptr(&f));
+                        if prune_body {
+                          new_sig
+                            .write()
+                            .unwrap()
+                            .remove_unitlike_arguments(&mut names);
+                        } else {
+                          new_sig
+                            .write()
+                            .unwrap()
+                            .arg_types
+                            .retain(|(ty, _)| !ty.is_unitlike(&mut names));
+                        }
+                        applied_f_signature.abstract_ancestor =
+                          Some(Arc::clone(&new_sig));
+                        if prune_body {
+                          let mut f = f.write().unwrap();
+                          for i in args_to_remove.iter() {
+                            f.arg_names.remove(*i);
+                            f.arg_annotations.remove(*i);
+                          }
+                        }
+                      } else {
+                        args_to_remove = (0..args.len())
+                          .rev()
+                          .filter(|i| {
+                            let arg_type = args[*i].data.unwrap_known();
+                            if matches!(arg_type, Type::Function(_)) {
+                              false
+                            } else {
+                              arg_type.is_unitlike(&mut names)
+                            }
+                          })
+                          .collect();
+                      }
+                    }
+                    for i in args_to_remove {
+                      args.remove(i);
+                      applied_f_signature.args.remove(i);
+                    }
+                  }
+                  _ => {}
+                },
+                _ => {}
+              });
+
+              Ok(true)
+            }
+            ExpKind::Let(bindings, _) => {
+              take(bindings, |bindings| {
+                bindings
+                  .into_iter()
+                  .filter(|(_, _, _, value_exp)| {
+                    !(value_exp.data.unwrap_known().is_unitlike(&mut names)
+                      && value_exp.effects().is_side_effect_free())
+                  })
+                  .collect()
+              });
+              Ok(true)
+            }
+            _ => Ok::<bool, Never>(true),
+          })
+          .unwrap();
+      }
+    }
+    std::mem::swap(&mut names, &mut self.names.write().unwrap());
+  }
+  // Higher-order specialization can encounter the same named function through
+  // several callers while rebuilding the function map. Point every named call
+  // at the registered implementation before subsequent passes mutate bodies;
+  // otherwise an unregistered copy can retain calls with the old argument list.
+  fn canonicalize_specialized_function_references(&mut self) {
+    let functions = self.abstract_functions.clone();
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      let FunctionImplementationKind::Composite(implementation) =
+        &signature.implementation
+      else {
+        continue;
+      };
+      implementation
+        .write()
+        .unwrap()
+        .expression
+        .walk_mut(&mut |exp| {
+          if let ExpKind::Name(name) = &exp.kind
+            && let Some(candidates) = functions.get(name)
+            && let [canonical] = candidates.as_slice()
+            && matches!(
+              canonical.read().unwrap().implementation,
+              FunctionImplementationKind::Composite(_)
+            )
+          {
+            exp.data.with_dereferenced_mut(|data| {
+              if let TypeState::Known(Type::Function(function)) = data {
+                function.abstract_ancestor = Some(Arc::clone(canonical));
+              }
+            });
+          }
+          Ok::<bool, Never>(true)
+        })
+        .unwrap();
+    }
+  }
+  pub fn compile_to_target(
+    self,
+    target: CompilerTarget,
+  ) -> CompileResult<String> {
+    let mut names = self.names.write().unwrap();
+    let mut compiled_string = target.program_header();
+    for v in self.top_level_vars.iter() {
+      // Host-only dynamic values have no WGSL resource declaration. Entry
+      // validation rejects direct and transitive shader references to them.
+      if target == CompilerTarget::WGSL && v.is_unbound_cpu_resource() {
+        continue;
+      }
+      compiled_string += &v.clone().compile(&mut names, target);
+      compiled_string += ";\n";
+    }
+    compiled_string += "\n";
+    let default_structs = built_in_structs_for_target(target);
+    for s in self.typedefs.structs.iter() {
+      if !s.opaque
+        && !default_structs.contains(&s)
+        && let Some(compiled_struct) = s.clone().compile_if_non_generic(
+          &self.typedefs,
+          &mut names,
+          target,
+        )?
+      {
+        compiled_string += &compiled_struct;
+        compiled_string += "\n\n";
+      }
+    }
+    for e in self.typedefs.enums.iter().cloned() {
+      if let Some(compiled_enum) =
+        e.compile_if_non_generic(&self.typedefs, &mut names, target)?
+      {
+        compiled_string += &compiled_enum;
+        compiled_string += "\n\n";
+      }
+    }
+    for f in self.abstract_functions_iter() {
+      let f = f.read().unwrap().clone();
+      if f.generic_args.is_empty() && !f.has_uninlined_higher_order_arguments()
+      {
+        match f.implementation {
+          FunctionImplementationKind::EnumConstructor(
+            original_variant_name,
+          ) => {
+            let variant_name = compile_word(f.name);
+            let AbstractType::AbstractEnum(e) = f.return_type else {
+              unreachable!("EnumConstructor fn had a non-enum type")
+            };
+            let (discriminant, variant) = e
+              .variants
+              .iter()
+              .enumerate()
+              .find(|(_, v)| v.name == original_variant_name)
+              .expect("EnumConstructor fn name didn't match any variant");
+            let AbstractType::Type(inner_type) = &variant.inner_type else {
+              unreachable!()
+            };
+            let args_str = if *inner_type == Type::Unit {
+              String::new()
+            } else {
+              let inner_type_name =
+                inner_type.monomorphized_name(&mut names, target);
+              match target {
+                CompilerTarget::WGSL => {
+                  format!("value: {inner_type_name}")
+                }
+                CompilerTarget::C => format!("{inner_type_name} value"),
+                CompilerTarget::VM => panic!(),
+              }
+            };
+            let enum_name = compile_word(
+              e.original_ancestor().monomorphized_name(
+                &e.variants
+                  .iter()
+                  .map(|variant| {
+                    let AbstractType::Type(t) = &variant.inner_type else {
+                      unreachable!()
+                    };
+                    t.clone()
+                  })
+                  .collect(),
+                &mut names,
+                target,
+              ),
+            );
+            compiled_string += &match target {
+              CompilerTarget::WGSL => {
+                let bitcast_inner_values = inner_type
+                  .bitcastable_chunk_accessors("value".into())
+                  .into_iter()
+                  .map(|exp| {
+                    format!(
+                      "bitcast<u32>({})",
+                      exp.compile(
+                        ExpressionCompilationPosition::InnerExpression,
+                        &mut names,
+                        target
+                      )
+                    )
+                  })
+                  .chain(std::iter::repeat("0u".into()))
+                  .take(e.inner_data_size_in_u32s()?)
+                  .collect::<Vec<String>>()
+                  .join(", ");
+                format!(
+                  "fn {variant_name}({args_str}) -> {enum_name} {{\n  \
+                    return {enum_name}({discriminant}u, array({bitcast_inner_values}));\n\
+                  }}"
+                )
+              }
+              CompilerTarget::C => {
+                let memcpy_lines = inner_type
+                  .bitcastable_chunk_accessors("value".into())
+                  .into_iter()
+                  .enumerate()
+                  .map(|(i, exp)| {
+                    format!(
+                      "memcpy(&result.data[{i}], &{}, sizeof(uint32_t));",
+                      exp.compile(
+                        ExpressionCompilationPosition::InnerExpression,
+                        &mut names,
+                        target
+                      )
+                    )
+                  })
+                  .collect::<Vec<String>>()
+                  .join("\n  ");
+                format!(
+                  "{enum_name} {variant_name}({args_str}) {{\n  \
+                  {enum_name} result = {{{discriminant}}};\n  \
+                  {memcpy_lines}\n  \
+                  return result;\n\
+                }}"
+                )
+              }
+              CompilerTarget::VM => panic!(),
+            };
+            compiled_string += "\n\n";
+          }
+          _ => {}
+        }
+      }
+    }
+    for chunk in self.emulated_functions.helper_chunks.iter() {
+      compiled_string += &chunk;
+      compiled_string += "\n\n";
+    }
+    for (f_name, implementation) in self.composite_functions_in_usage_order() {
+      {
+        let implementation = implementation.read().unwrap();
+        let Type::Function(signature) =
+          implementation.expression.data.unwrap_known()
+        else {
+          panic!()
+        };
+        let return_type = signature.return_type.unwrap_known();
+        if matches!(return_type, Type::Function(_))
+          && return_type.is_unitlike(&mut names)
+        {
+          continue;
+        }
+      }
+      compiled_string += &implementation
+        .read()
+        .unwrap()
+        .clone()
+        .compile(&f_name, &mut names, &self, target)?;
+      compiled_string += "\n\n";
+    }
+    Ok(compiled_string)
+  }
+  pub fn expand_associative_applications(&mut self) {
+    for f in self
+      .abstract_functions
+      .iter_mut()
+      .map(|(_, fns)| fns.into_iter())
+      .flatten()
+    {
+      if let FunctionImplementationKind::Composite(f) =
+        &f.read().unwrap().implementation
+      {
+        f.write()
+          .unwrap()
+          .expression
+          .walk_mut::<()>(&mut |exp| {
+            loop {
+              let mut needs_another_loop = false;
+              take(&mut exp.kind, |exp_kind| {
+                if let ExpKind::Application(f, args) = exp_kind {
+                  if let ExpKind::Name(_) = &f.kind
+                    && let Type::Function(x) = f.data.kind.unwrap_known()
+                    && let Some(abstract_ancestor) = &x.abstract_ancestor
+                    && abstract_ancestor.read().unwrap().associative
+                    && args.len() != 2
+                  {
+                    let mut args_iter = args.into_iter();
+                    let mut new_exp = args_iter.next().unwrap();
+                    if args_iter.len() == 0 {
+                      needs_another_loop = true;
+                    } else {
+                      while let Some(next_arg) = args_iter.next() {
+                        new_exp = Exp {
+                          kind: ExpKind::Application(
+                            f.clone(),
+                            vec![new_exp, next_arg],
+                          ),
+                          data: exp.data.clone(),
+                          source_trace: exp.source_trace.clone(),
+                        };
+                      }
+                    }
+                    new_exp.kind
+                  } else {
+                    ExpKind::Application(f, args)
+                  }
+                } else {
+                  exp_kind
+                }
+              });
+              if !needs_another_loop {
+                break;
+              }
+            }
+            Ok(true)
+          })
+          .unwrap();
+      }
+    }
+  }
+  fn deshadow(&mut self, errors: &mut ErrorLog) {
+    let globally_bound_names: Vec<Arc<str>> = self
+      .top_level_vars
+      .iter()
+      .map(|v| Arc::clone(&v.name))
+      .chain(
+        self
+          .abstract_functions
+          .iter()
+          .map(|(name, _)| Arc::clone(name)),
+      )
+      .collect();
+    for (_, signatures) in self.abstract_functions.iter_mut() {
+      for signature in signatures.iter_mut() {
+        let mut signature = signature.write().unwrap();
+        if let FunctionImplementationKind::Composite(f) =
+          &mut signature.implementation
+        {
+          f.write().unwrap().expression.deshadow(
+            &globally_bound_names,
+            errors,
+            &mut self.names.write().unwrap(),
+          );
+        }
+      }
+    }
+  }
+  fn wrap_mutable_function_args(&mut self) {
+    for signature in self.abstract_functions_iter() {
+      if let FunctionImplementationKind::Composite(implementation) =
+        &signature.read().unwrap().implementation
+      {
+        let mut implementation = implementation.write().unwrap();
+        if let Type::Function(f) =
+          &mut implementation.expression.data.unwrap_known()
+          && let ExpKind::Function(arg_names, body) =
+            &mut implementation.expression.kind
+        {
+          let mutable_args: Vec<_> = f
+            .args
+            .iter()
+            .zip(arg_names.iter())
+            .filter_map(|((var, _), arg_name)| {
+              if var.kind == VariableKind::Var
+                && var.var_type.ownership == Ownership::Owned
+              {
+                Some((arg_name.clone(), var.var_type.clone()))
+              } else {
+                None
+              }
+            })
+            .collect();
+          if mutable_args.len() > 0 {
+            take(body, |body| {
+              TypedExp {
+                data: body.data.clone(),
+                source_trace: body.source_trace.clone(),
+                kind: ExpKind::Let(
+                  mutable_args
+                    .into_iter()
+                    .map(|((arg_name, _), arg_type)| {
+                      (
+                        arg_name.clone(),
+                        SourceTrace::empty(),
+                        VariableKind::Var,
+                        TypedExp {
+                          data: arg_type.clone(),
+                          kind: ExpKind::Name(arg_name),
+                          source_trace: body.source_trace.clone(),
+                        },
+                      )
+                    })
+                    .collect(),
+                  body,
+                ),
+              }
+              .into()
+            });
+          }
+        }
+      }
+    }
+  }
+  fn validate_names(&self, errors: &mut ErrorLog) {
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if let FunctionImplementationKind::Composite(implementation) =
+        &signature.implementation
+      {
+        let implementation = implementation.read().unwrap();
+        if !is_valid_name(&signature.name) {
+          errors.log(CompileError::new(
+            CompileErrorKind::InvalidName,
+            implementation.name_source_trace.clone(),
+          ))
+        }
+        for (generic_name, _, source_trace) in signature.generic_args.iter() {
+          if !is_valid_name(generic_name) {
+            errors.log(CompileError::new(
+              CompileErrorKind::InvalidName,
+              source_trace.clone(),
+            ))
+          }
+        }
+        implementation
+          .expression
+          .walk(&mut |exp| {
+            let names: Vec<_> = match &exp.kind {
+              ExpKind::Let(items, _) => items
+                .iter()
+                .map(|(name, source, _, _)| (name, source))
+                .collect(),
+              ExpKind::Match(_, arms) => arms
+                .iter()
+                .flat_map(|(pattern, _)| {
+                  if let ExpKind::Application(_, args) = &pattern.kind {
+                    args
+                      .iter()
+                      .filter_map(|arg| {
+                        if let ExpKind::Name(name) = &arg.kind {
+                          Some((name, &arg.source_trace))
+                        } else {
+                          None
+                        }
+                      })
+                      .collect()
+                  } else {
+                    vec![]
+                  }
+                })
+                .collect(),
+              ExpKind::ForLoop {
+                increment_variable_name,
+                ..
+              } => {
+                vec![(&increment_variable_name.0, &increment_variable_name.1)]
+              }
+              _ => vec![],
+            };
+            for (name, source) in names {
+              if !is_valid_name(name) {
+                errors.log(CompileError::new(
+                  CompileErrorKind::InvalidName,
+                  source.clone(),
+                ));
+              }
+            }
+            Ok::<bool, Never>(true)
+          })
+          .unwrap();
+      }
+    }
+    for e in self.typedefs.enums.iter() {
+      if !is_valid_name(&e.name.0) {
+        errors.log(CompileError::new(
+          CompileErrorKind::InvalidName,
+          e.name.1.clone(),
+        ));
+      }
+      for (name, _, source) in e.generic_args.iter() {
+        if !is_valid_name(name) {
+          errors.log(CompileError::new(
+            CompileErrorKind::InvalidName,
+            source.clone(),
+          ));
+        }
+      }
+      for variant in e.variants.iter() {
+        if !is_valid_name(&variant.name) {
+          errors.log(CompileError::new(
+            CompileErrorKind::InvalidName,
+            variant.source.clone(),
+          ));
+        }
+      }
+    }
+    for s in self.typedefs.structs.iter() {
+      if !is_valid_name(&s.name.0) {
+        errors.log(CompileError::new(
+          CompileErrorKind::InvalidName,
+          s.name.1.clone(),
+        ));
+      }
+      for (name, _, source) in s.generic_args.iter() {
+        if !is_valid_name(name) {
+          errors.log(CompileError::new(
+            CompileErrorKind::InvalidName,
+            source.clone(),
+          ));
+        }
+      }
+      for field in s.fields.iter() {
+        if !is_valid_name(&field.name) {
+          errors.log(CompileError::new(
+            CompileErrorKind::InvalidName,
+            field.source_trace.clone(),
+          ));
+        }
+      }
+    }
+  }
+  fn validate_associative_signatures(&self, errors: &mut ErrorLog) {
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if signature.associative
+        && (signature.arg_types.len() != 2
+          || signature.arg_types[0] != signature.arg_types[1]
+          || signature.arg_types[0].0 != signature.return_type)
+      {
+        if let FunctionImplementationKind::Composite(implementation) =
+          &signature.implementation
+        {
+          errors.log(CompileError {
+            kind: CompileErrorKind::InvalidAssociativeSignature,
+            source_trace: implementation
+              .read()
+              .unwrap()
+              .expression
+              .source_trace
+              .clone(),
+          });
+        }
+      }
+    }
+  }
+  fn catch_duplicate_signatures(&self, errors: &mut ErrorLog) {
+    for (name, signatures) in self.abstract_functions.iter() {
+      let mut normalized_signatures: Vec<(Option<SourceTrace>, _)> = vec![];
+      for signature in signatures {
+        if let FunctionImplementationKind::Builtin { .. }
+        | FunctionImplementationKind::StructConstructor =
+          signature.read().unwrap().implementation
+        {
+          let normalized = signature.read().unwrap().normalized_signature();
+          normalized_signatures.push((None, normalized));
+        }
+      }
+      for signature in signatures {
+        if let FunctionImplementationKind::Composite(f) =
+          &signature.read().unwrap().implementation
+        {
+          let source = f.read().unwrap().expression.source_trace.clone();
+          let normalized = signature.read().unwrap().normalized_signature();
+          for (previous_signature, previous_normalized) in
+            normalized_signatures.iter()
+          {
+            if *previous_normalized == normalized {
+              if let Some(previous_source) = previous_signature {
+                errors.log(CompileError {
+                  kind: CompileErrorKind::DuplicateFunctionSignature(
+                    name.to_string(),
+                  ),
+                  source_trace: source
+                    .clone()
+                    .insert_as_secondary(previous_source.clone()),
+                });
+              } else {
+                errors.log(CompileError {
+                  kind: CompileErrorKind::FunctionSignatureConflictsWithBuiltin(
+                    name.to_string(),
+                  ),
+                  source_trace: source.clone(),
+                });
+              }
+            }
+          }
+          normalized_signatures.push((Some(source), normalized));
+        }
+      }
+    }
+  }
+  fn catch_globally_shadowing_fn_args(&self, errors: &mut ErrorLog) {
+    for (_, signatures) in self.abstract_functions.iter() {
+      for signature in signatures {
+        if let FunctionImplementationKind::Composite(f) =
+          &signature.read().unwrap().implementation
+        {
+          let f = f.read().unwrap();
+          for (arg_name, _) in f.arg_names.iter() {
+            if self.abstract_functions.get(arg_name).is_some()
+              || self
+                .top_level_vars
+                .iter()
+                .find(|v| v.name == *arg_name)
+                .is_some()
+            {
+              errors.log(CompileError::new(
+                CantShadowTopLevelBinding(arg_name.to_string()),
+                f.expression.source_trace.clone(),
+              ))
+            }
+          }
+        }
+      }
+    }
+  }
+  fn catch_duplicate_struct_fields(&self, errors: &mut ErrorLog) {
+    for s in self.typedefs.structs.iter() {
+      let mut names_so_far = HashSet::new();
+      for field in s.fields.iter() {
+        let name = &field.name;
+        if names_so_far.contains(name) {
+          errors.log(CompileError::new(
+            CompileErrorKind::DuplicateStructFieldName,
+            field.source_trace.clone(),
+          ));
+        } else {
+          names_so_far.insert(name);
+        }
+      }
+    }
+  }
+  fn catch_duplicate_enum_variants(&self, errors: &mut ErrorLog) {
+    for e in self.typedefs.enums.iter() {
+      let mut names_so_far = HashSet::new();
+      for variant in e.variants.iter() {
+        let name = &variant.name;
+        if names_so_far.contains(name) {
+          errors.log(CompileError::new(
+            CompileErrorKind::DuplicateEnumVariantName,
+            variant.source.clone(),
+          ));
+        } else {
+          names_so_far.insert(name);
+        }
+      }
+    }
+  }
+  fn catch_top_level_function_and_var_name_collisions(
+    &self,
+    errors: &mut ErrorLog,
+  ) {
+    for var in self.top_level_vars.iter() {
+      if self.abstract_functions.get(&var.name).is_some() {
+        errors.log(CompileError {
+          kind: VariableFunctionNameCollision(var.name.to_string()),
+          source_trace: var.source_trace.clone(),
+        })
+      }
+    }
+  }
+  fn ensure_no_typeless_bindings(&self, errors: &mut ErrorLog) {
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if let FunctionImplementationKind::Composite(implementation) =
+        &signature.implementation
+      {
+        implementation
+          .read()
+          .unwrap()
+          .expression
+          .walk(&mut |exp| {
+            match &exp.kind {
+              ExpKind::Let(items, _) => {
+                for (_, source_trace, _, value) in items.iter() {
+                  if Type::Unit.known() == value.data.kind {
+                    errors.log(CompileError {
+                      kind: CompileErrorKind::TypelessBinding,
+                      source_trace: source_trace.clone(),
+                    });
+                  }
+                }
+              }
+              _ => {}
+            }
+            Ok::<_, Never>(true)
+          })
+          .unwrap();
+      }
+    }
+  }
+  pub fn validate_control_flow(&mut self, errors: &mut ErrorLog) {
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if let FunctionImplementationKind::Composite(f) =
+        &signature.implementation
+      {
+        f.read()
+          .unwrap()
+          .expression
+          .validate_control_flow(errors, 0);
+      }
+    }
+  }
+  pub fn deexpressionify(&mut self, target: CompilerTarget) {
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if let FunctionImplementationKind::Composite(f) =
+        &signature.implementation
+      {
+        let mut f = f.write().unwrap();
+        f.expression.throw_away_inner_values_in_blocks(self);
+        f.expression.deexpressionify(self, target);
+      }
+    }
+  }
+  pub fn separate_overloaded_fns(&mut self, target: CompilerTarget) {
+    let mut renames = HashMap::new();
+    for (_, signatures) in self.abstract_functions.iter() {
+      if signatures.len() > 1 {
+        for s in signatures.iter() {
+          let mut s = s.write().unwrap();
+          let base_name = s.name.clone();
+          let type_signature = if s.generic_args.is_empty()
+            && let FunctionImplementationKind::Composite(f) =
+              &mut s.implementation
+            && let Type::Function(f) =
+              f.read().unwrap().expression.data.unwrap_known()
+          {
+            f.unwrap_type_signature()
+          } else {
+            continue;
+          };
+          let suffix_types: Vec<&Type> = if type_signature
+            .iter()
+            .any(|t| matches!(t, Type::Function(_)))
+          {
+            let non_fn: Vec<&Type> = type_signature
+              .iter()
+              .filter(|t| !matches!(t, Type::Function(_)))
+              .collect();
+            if non_fn.is_empty() {
+              continue;
+            }
+            non_fn
+          } else {
+            type_signature.iter().collect()
+          };
+          let new_name = base_name.to_string()
+            + "_"
+            + &suffix_types
+              .iter()
+              .map(|t| {
+                t.monomorphized_name(&mut self.names.write().unwrap(), target)
+              })
+              .collect::<Vec<String>>()
+              .join("_");
+          let new_name: Arc<str> = new_name.into();
+          s.name = new_name.clone();
+          if !renames.contains_key(&base_name) {
+            renames.insert(base_name.clone(), vec![]);
+          }
+          renames
+            .get_mut(&base_name)
+            .unwrap()
+            .push((type_signature, new_name));
+        }
+      }
+    }
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if let FunctionImplementationKind::Composite(f) =
+        &signature.implementation
+      {
+        f.write()
+          .unwrap()
+          .expression
+          .walk_mut(&mut |exp| {
+            if let ExpKind::Name(name) = &mut exp.kind {
+              if let Some(renames) = renames.get(name)
+                && let Type::Function(f) = exp.data.unwrap_known()
+              {
+                let f_signature = f.unwrap_type_signature();
+                for (signature, rename) in renames.iter() {
+                  if signature == &f_signature {
+                    *name = rename.clone();
+                  }
+                }
+              }
+              Ok::<bool, Never>(false)
+            } else {
+              Ok(true)
+            }
+          })
+          .unwrap();
+      }
+    }
+    // Rebuild abstract_functions to use new function names
+    if renames.is_empty() {
+      return;
+    }
+    let old_abstract_functions = std::mem::take(&mut self.abstract_functions);
+    for sig in old_abstract_functions.into_values().flatten() {
+      let name = sig.read().unwrap().name.clone();
+      self.abstract_functions.entry(name).or_default().push(sig);
+    }
+  }
+  pub fn inline_def_array_sizes(&mut self) {
+    let u32_constants: HashMap<Arc<str>, u32> = self
+      .top_level_vars
+      .iter()
+      .filter_map(|v| {
+        if (v.var_type == Type::U32 || v.var_type == Type::I32)
+          && v.kind == TopLevelVariableKind::Const
+          && let Some(TypedExp {
+            kind: ExpKind::NumberLiteral(Number::Int(n)),
+            ..
+          }) = v.value
+          && let Ok(n) = n.try_into()
+        {
+          Some((v.name.clone(), n))
+        } else {
+          None
+        }
+      })
+      .collect();
+    for v in self.top_level_vars.iter_mut() {
+      v.var_type.inline_def_array_sizes(&u32_constants);
+    }
+    for s in self.typedefs.structs.iter_mut() {
+      for field in s.fields.iter_mut() {
+        field
+          .field_type
+          .walk_mut(&mut |t| {
+            if let AbstractType::AbstractArray { size, .. } = t
+              && let AbstractArraySize::Constant(constant_name) = size
+              && let Some(n) = u32_constants.get(constant_name)
+            {
+              *size = AbstractArraySize::Literal(*n);
+            }
+            Ok::<bool, Never>(true)
+          })
+          .unwrap();
+      }
+    }
+    for f in self.abstract_functions_iter_mut() {
+      let mut f = f.write().unwrap();
+
+      f.inline_def_array_sizes(&u32_constants);
+
+      if let FunctionImplementationKind::Composite(f) = &f.implementation {
+        f.write()
+          .unwrap()
+          .expression
+          .walk_mut(&mut |exp| {
+            if let TypeState::Known(t) = &mut exp.data.kind {
+              t.inline_def_array_sizes(&u32_constants);
+            }
+            Ok::<bool, Never>(true)
+          })
+          .unwrap();
+      }
+    }
+  }
+  pub fn inline_static_array_length_calls(&mut self) {
+    for f in self.abstract_functions_iter_mut() {
+      if let FunctionImplementationKind::Composite(f) =
+        &f.write().unwrap().implementation
+      {
+        f.write()
+          .unwrap()
+          .expression
+          .walk_mut(&mut |exp| {
+            if let ExpKind::Application(f, args) = &exp.kind
+              && let ExpKind::Name(f_name) = &f.kind
+              && &**f_name == "array-length"
+              && let Type::Array(Some(size), _) = args[0].data.unwrap_known()
+              && size != ConcreteArraySize::Unsized
+            {
+              let size = match size {
+                ConcreteArraySize::Literal(x) => Some(x),
+                ConcreteArraySize::UnificationVariable(const_generic_value) => {
+                  match &*const_generic_value.value.read().unwrap() {
+                    Some(ConstGenericResolution::Literal(n)) => Some(*n),
+                    _ => None,
+                  }
+                }
+                ConcreteArraySize::Skolem(_) => None,
+                _ => panic!("can't handle this kind of ConcreteArraySize here"),
+              };
+              if let Some(size) = size {
+                *exp = TypedExp {
+                  data: Type::U32.known().into(),
+                  kind: ExpKind::NumberLiteral(Number::Int(size as i64)),
+                  source_trace: exp.source_trace.clone(),
+                }
+              }
+            }
+            Ok::<bool, Never>(true)
+          })
+          .unwrap();
+      }
+    }
+  }
+  pub fn desugar_swizzle_assignments(&mut self) {
+    let mut names = self.names.write().unwrap();
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if let FunctionImplementationKind::Composite(f) =
+        &signature.implementation
+      {
+        f.write()
+          .unwrap()
+          .expression
+          .walk_mut(&mut |exp| {
+            exp.desugar_swizzle_assignments(&mut names);
+            Ok::<_, Never>(true)
+          })
+          .unwrap();
+      }
+    }
+  }
+  pub fn validate_top_level_fn_effects(&mut self, errors: &mut ErrorLog) {
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if let FunctionImplementationKind::Composite(f) =
+        &signature.implementation
+      {
+        let f = f.read().unwrap();
+        if let Some(entry_point) = f.entry_point {
+          let ExpKind::Function(_, body) = &f.expression.kind else {
+            unreachable!()
+          };
+          let effects = body.effects();
+          if let EntryPoint::Vertex
+          | EntryPoint::Compute(_)
+          | EntryPoint::Fragment = entry_point
+          {
+            for f_name in effects.cpu_exclusive_functions() {
+              errors.log(CompileError {
+                kind: CPUExclusiveFunctionInGPUEntryPoint(f_name.to_string()),
+                source_trace: f.expression.source_trace.clone(),
+              });
+            }
+            for type_name in effects.cpu_exclusive_types() {
+              errors.log(CompileError {
+                kind: CPUExclusiveTypeInGPUEntryPoint(type_name.to_string()),
+                source_trace: f.expression.source_trace.clone(),
+              });
+            }
+            for name in effects.cpu_resource_globals(self) {
+              errors.log(CompileError {
+                kind: CPUExclusiveTypeInGPUEntryPoint(format!(
+                  "unbound CPU resource {name}"
+                )),
+                source_trace: f.expression.source_trace.clone(),
+              });
+            }
+            for effect in effects.0.iter() {
+              if let Effect::ModifiesGlobalVar(name) = effect
+                && let Some(top_level_var) =
+                  self.top_level_vars.iter().find(|v| v.name == *name)
+                && let TopLevelVariableKind::Var { address_space, .. } =
+                  top_level_var.kind
+                && !address_space.may_write_from_gpu()
+              {
+                errors.log(CompileError {
+                  kind: IllegalAddressSpaceGpuWrite(
+                    name.to_string(),
+                    address_space,
+                  ),
+                  source_trace: f.expression.source_trace.clone(),
+                });
+              }
+            }
+          }
+          if let EntryPoint::Vertex | EntryPoint::Compute(_) = entry_point {
+            for e in effects.0.iter() {
+              match e {
+                Effect::Discard => {
+                  errors.log(CompileError {
+                    kind: DiscardOutsideFragment,
+                    source_trace: f.expression.source_trace.clone(),
+                  });
+                }
+                Effect::FragmentExclusiveFunction(name) => {
+                  errors.log(CompileError {
+                    kind: FragmentExclusiveFunctionOutsideFragment(
+                      name.to_string(),
+                    ),
+                    source_trace: f.expression.source_trace.clone(),
+                  });
+                }
+                _ => {}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  pub fn validate_entry_points(&mut self, errors: &mut ErrorLog) {
+    let mut inferred_struct_field_locations: Vec<(
+      Arc<AbstractStruct>,
+      Arc<str>,
+      usize,
+    )> = vec![];
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if let FunctionImplementationKind::Composite(f) =
+        &signature.implementation
+      {
+        let mut f = f.write().unwrap();
+        let f_source = f.expression.source_trace.clone();
+        if let Some(entry) = f.entry_point {
+          let Type::Function(signature) = f.expression.data.unwrap_known()
+          else {
+            unreachable!()
+          };
+          match entry {
+            EntryPoint::Vertex => {
+              if signature.return_type.unwrap_known().is_vec4f()
+                && f.return_attributes.is_empty()
+              {
+                let return_source =
+                  f.return_attributes.attributed_source.clone();
+                f.return_attributes.try_add_attribute(
+                  IOAttribute {
+                    kind: IOAttributeKind::Builtin(
+                      BuiltinIOAttribute::Position,
+                    ),
+                    source_trace: return_source,
+                  },
+                  errors,
+                );
+              }
+            }
+            EntryPoint::Compute(_) => {
+              let mut errored = false;
+              if Type::Unit != signature.return_type.unwrap_known() {
+                errors.log(CompileError::new(
+                  ComputeEntryReturnType,
+                  f.expression.source_trace.clone(),
+                ));
+                errored = true;
+              }
+              if !f.return_attributes.is_empty() {
+                errors.log(CompileError::new(
+                  ComputeEntryReturnType,
+                  f.expression.source_trace.clone(),
+                ));
+                errored = true;
+              }
+              if errored {
+                continue;
+              }
+            }
+            EntryPoint::Fragment => {}
+            EntryPoint::Cpu => {
+              let mut errored = false;
+              if Type::Unit != signature.return_type.unwrap_known() {
+                errors.log(CompileError::new(
+                  CpuEntryHasReturnType,
+                  f.expression.source_trace.clone(),
+                ));
+                errored = true;
+              }
+              if !signature.args.is_empty() {
+                errors.log(CompileError::new(
+                  CpuEntryHasArguments,
+                  f.expression.source_trace.clone(),
+                ));
+                errored = true;
+              }
+              if errored {
+                continue;
+              }
+            }
+            EntryPoint::Audio => {
+              let mut errored = false;
+              if Type::F32 != signature.return_type.unwrap_known() {
+                errors.log(CompileError::new(
+                  AudioEntryHasWrongReturnType,
+                  f.expression.source_trace.clone(),
+                ));
+                errored = true;
+              }
+              if signature.args.len() != 2
+                || signature.args[0].0.var_type.unwrap_known() != Type::F32
+                || signature.args[1].0.var_type.unwrap_known() != Type::F32
+              {
+                errors.log(CompileError::new(
+                  AudioEntryHasWrongArgumentTypes,
+                  f.expression.source_trace.clone(),
+                ));
+                errored = true;
+              }
+              if errored {
+                continue;
+              }
+            }
+          }
+
+          let check_for_duplicate_builtins =
+            |attributables: &Vec<(
+              Type,
+              Result<
+                &mut IOAttributes,
+                (Arc<AbstractStruct>, Arc<str>, IOAttributes),
+              >,
+            )>|
+             -> Vec<(String, SourceTrace)> {
+              let mut duplicates = HashSet::new();
+              let mut builtins = HashSet::new();
+              for (_, attributable) in attributables.iter() {
+                let attribute = match attributable {
+                  Ok(a) => &*a,
+                  Err((_, _, a)) => a,
+                };
+                if let Some((builtin, source_trace)) = attribute.builtin() {
+                  if builtins.contains(builtin) {
+                    duplicates.insert((
+                      builtin.name().to_string(),
+                      source_trace.clone(),
+                    ));
+                  } else {
+                    builtins.insert(builtin.clone());
+                  }
+                }
+              }
+              duplicates.into_iter().collect()
+            };
+
+          let mut handle_inout_attributables =
+            |attributables: Vec<(
+              Type,
+              Result<
+                &mut IOAttributes,
+                (Arc<AbstractStruct>, Arc<str>, IOAttributes),
+              >,
+            )>,
+             input_or_output: InputOrOutput,
+             errors: &mut ErrorLog|
+             -> (
+              HashMap<usize, (SourceTrace, Result<Type, Arc<AbstractStruct>>)>,
+              HashMap<BuiltinIOAttribute, Result<Type, AbstractType>>,
+            ) {
+              for (name, source) in check_for_duplicate_builtins(&attributables)
+              {
+                errors.log(CompileError::new(
+                  DuplicateBuiltinAttribute(input_or_output, name),
+                  source,
+                ))
+              }
+              let mut used_locations: HashMap<
+                usize,
+                (SourceTrace, Result<Type, Arc<AbstractStruct>>),
+              > = HashMap::new();
+              let mut used_builtins: HashMap<
+                BuiltinIOAttribute,
+                Result<Type, AbstractType>,
+              > = HashMap::new();
+              for (t, attributable) in attributables.iter() {
+                let attributes = match attributable {
+                  Ok(a) => &*a,
+                  Err((_, _, a)) => a,
+                };
+                if let Some((builtin, source)) = attributes.builtin() {
+                  if match input_or_output {
+                    InputOrOutput::Input => {
+                      !builtin.is_valid_input_for_stage(&entry)
+                    }
+                    InputOrOutput::Output => {
+                      !builtin.is_valid_output_for_stage(&entry)
+                    }
+                  } {
+                    errors.log(CompileError::new(
+                      InvalidBuiltinForEntryPoint(
+                        builtin.name().to_string(),
+                        input_or_output,
+                        entry.name().to_string(),
+                      ),
+                      source.clone(),
+                    ));
+                  } else {
+                    used_builtins.insert(
+                      *builtin,
+                      match attributable {
+                        Ok(_) => Ok(t.clone()),
+                        Err((s, field_name, _)) => Err(
+                          s.fields
+                            .iter()
+                            .find_map(|f| {
+                              (f.name == *field_name)
+                                .then(|| f.field_type.clone())
+                            })
+                            .unwrap()
+                            .clone(),
+                        ),
+                      },
+                    );
+                  }
+                  let t = match attributable {
+                    Ok(_) => t,
+                    Err((s, field_name, _)) => &s
+                      .fields
+                      .iter()
+                      .find(|f| f.name == *field_name)
+                      .unwrap()
+                      .field_type
+                      .concretize(&vec![], &self.typedefs, SourceTrace::empty())
+                      .unwrap(),
+                  };
+                  if !builtin.is_type_compatible(t) {
+                    errors.log(CompileError::new(
+                      InvalidBuiltinType(builtin.name().to_string()),
+                      attributes.attributed_source.clone(),
+                    ))
+                  }
+                } else {
+                  if let Some((location, source)) = attributes.location() {
+                    used_locations.insert(location, (source, Ok(t.clone())));
+                  }
+                }
+              }
+              for (t, attributable) in attributables {
+                let attributes = match &attributable {
+                  Ok(a) => &*a,
+                  Err((_, _, a)) => a,
+                };
+                if attributes.builtin().is_none()
+                  && attributes.location().is_none()
+                {
+                  let untaken_location =
+                    (0..).find(|i| !used_locations.contains_key(i)).unwrap();
+                  match attributable {
+                    Ok(a) => {
+                      if t.is_location_attributable() {
+                        let source_trace = a.attributed_source.clone();
+                        a.try_add_attribute(
+                          IOAttribute {
+                            kind: IOAttributeKind::Location(untaken_location),
+                            source_trace: source_trace.clone(),
+                          },
+                          errors,
+                        );
+                        used_locations
+                          .insert(untaken_location, (source_trace, Ok(t)));
+                      } else {
+                        errors.log(CompileError::new(
+                          InvalidTypeForEntryPoint(t.into(), input_or_output),
+                          f_source.clone(),
+                        ));
+                      }
+                    }
+                    Err((t, field_name, a)) => {
+                      inferred_struct_field_locations.push((
+                        t.clone(),
+                        field_name.clone(),
+                        untaken_location,
+                      ));
+                      used_locations.insert(
+                        untaken_location,
+                        (a.attributed_source, Err(t.clone())),
+                      );
+                    }
+                  }
+                }
+              }
+              (used_locations, used_builtins)
+            };
+
+          let input_attributables: Vec<(
+            Type,
+            Result<
+              &mut IOAttributes,
+              (Arc<AbstractStruct>, Arc<str>, IOAttributes),
+            >,
+          )> = f
+            .arg_annotations
+            .iter_mut()
+            .enumerate()
+            .flat_map(|(i, annotation)| {
+              let arg = &signature.args[i];
+              let arg_type = arg.0.var_type.unwrap_known();
+              if arg_type.is_attributable() {
+                vec![(arg_type, Ok(&mut annotation.attributes))]
+              } else {
+                if let Some(source) =
+                  annotation.attributes.source_trace_if_not_empty()
+                {
+                  errors
+                    .log(CompileError::new(CantAssignAttributesToType, source));
+                  vec![]
+                } else {
+                  self
+                    .typedefs
+                    .get_attributable_components(
+                      arg_type.clone(),
+                      InputOrOutput::Input,
+                      f_source.clone(),
+                      errors,
+                    )
+                    .into_iter()
+                    .map(|(t, field_name, attributes)| {
+                      (arg_type.clone(), Err((t, field_name, attributes)))
+                    })
+                    .collect()
+                }
+              }
+            })
+            .collect();
+          handle_inout_attributables(
+            input_attributables,
+            InputOrOutput::Input,
+            errors,
+          );
+
+          let return_type = signature.return_type.unwrap_known();
+          let output_attributables: Vec<(
+            Type,
+            Result<
+              &mut IOAttributes,
+              (Arc<AbstractStruct>, Arc<str>, IOAttributes),
+            >,
+          )> = if return_type.is_attributable() {
+            vec![(return_type, Ok(&mut f.return_attributes))]
+          } else {
+            if let Some(source) =
+              f.return_attributes.source_trace_if_not_empty()
+            {
+              errors.log(CompileError::new(CantAssignAttributesToType, source));
+              vec![]
+            } else {
+              self
+                .typedefs
+                .get_attributable_components(
+                  return_type.clone(),
+                  InputOrOutput::Output,
+                  f_source.clone(),
+                  errors,
+                )
+                .into_iter()
+                .map(|(t, field_name, attributes)| {
+                  (return_type.clone(), Err((t, field_name, attributes)))
+                })
+                .collect()
+            }
+          };
+          let (used_output_locations, used_output_builtins) =
+            handle_inout_attributables(
+              output_attributables,
+              InputOrOutput::Output,
+              errors,
+            );
+
+          match entry {
+            EntryPoint::Vertex => {
+              if let Some(t) =
+                used_output_builtins.get(&BuiltinIOAttribute::Position)
+              {
+                if match t {
+                  Ok(t) => !t.is_vec4f(),
+                  Err(t) => !t.is_vec4f(),
+                } {
+                  errors.log(CompileError::new(
+                    VertexPositionOutputInvalidType,
+                    f_source,
+                  ));
+                }
+              } else {
+                errors.log(CompileError::new(
+                  VertexMustHavePositionOutput,
+                  f_source,
+                ));
+              }
+            }
+            EntryPoint::Fragment => {
+              if let Some((_, t)) = used_output_locations.get(&0) {
+                if let Ok(Type::Struct(s)) = t
+                  && &*s.name == "vec4"
+                  && {
+                    let field_type = s.fields[0].field_type.unwrap_known();
+                    field_type == Type::F32
+                      || field_type == Type::U32
+                      || field_type == Type::I32
+                  }
+                {
+                } else if let Err(s) = t
+                  && &*s.name.0 == "vec4"
+                  && {
+                    match s.fields[0].field_type {
+                      AbstractType::Type(Type::F32 | Type::U32 | Type::I32) => {
+                        true
+                      }
+                      _ => false,
+                    }
+                  }
+                {
+                } else {
+                  errors.log(CompileError::new(
+                    Fragment0OutputInvalidType,
+                    f_source,
+                  ));
+                }
+              } else {
+                errors.log(CompileError::new(
+                  FragmentMustHaveLocation0Output,
+                  f_source,
+                ));
+              }
+            }
+            _ => {}
+          }
+        } else {
+          for attributes in f
+            .arg_annotations
+            .iter()
+            .map(|a| &a.attributes)
+            .chain(std::iter::once(&f.return_attributes))
+          {
+            if let Some(source_trace) = attributes.source_trace_if_not_empty() {
+              errors
+                .log(CompileError::new(IOAttributesOnNonEntry, source_trace));
+            }
+          }
+        }
+      }
+    }
+    while let Some((s, field_name, location)) =
+      inferred_struct_field_locations.pop()
+    {
+      let struct_source_trace = s.source_trace.clone();
+      let mut field_locations = vec![(field_name, location)];
+      let mut remaining_inferred_struct_field_locations = vec![];
+      for (other_s, field_name, location) in inferred_struct_field_locations {
+        if s == other_s {
+          let location = (field_name, location);
+          if !field_locations.contains(&location) {
+            field_locations.push(location);
+          }
+        } else {
+          remaining_inferred_struct_field_locations
+            .push((other_s, field_name, location));
+        }
+      }
+      let s = self
+        .typedefs
+        .structs
+        .iter_mut()
+        .find(|existing_s| *s == **existing_s)
+        .unwrap();
+      for (field_name, location) in field_locations {
+        s.fields
+          .iter_mut()
+          .find(|f| f.name == field_name)
+          .unwrap()
+          .attributes
+          .try_add_attribute(
+            IOAttribute {
+              kind: IOAttributeKind::Location(location),
+              source_trace: struct_source_trace.clone(),
+            },
+            errors,
+          );
+      }
+      inferred_struct_field_locations =
+        remaining_inferred_struct_field_locations;
+    }
+  }
+  pub fn catch_bind_group_collisions(&self, errors: &mut ErrorLog) {
+    let mut existing_groups_and_bindings: HashMap<GroupAndBinding, String> =
+      HashMap::new();
+    for var in self.top_level_vars.iter() {
+      if let TopLevelVariableKind::Var {
+        group_and_binding: Some(group_and_binding),
+        ..
+      } = var.kind
+      {
+        if let Some(prior_name) =
+          existing_groups_and_bindings.get(&group_and_binding)
+        {
+          errors.log(CompileError::new(
+            BindGroupCollision(prior_name.clone(), var.name.to_string()),
+            var.source_trace.clone(),
+          ));
+        } else {
+          existing_groups_and_bindings
+            .insert(group_and_binding, var.name.to_string());
+        }
+      }
+    }
+  }
+  pub fn catch_non_constructible_bindings(&self, errors: &mut ErrorLog) {
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if let FunctionImplementationKind::Composite(f) =
+        &signature.implementation
+      {
+        f.read()
+          .unwrap()
+          .expression
+          .walk(&mut |exp| {
+            match &exp.kind {
+              ExpKind::Let(bindings, _) => {
+                for (_, _, _, value) in bindings {
+                  if !value.data.unwrap_known().is_constructible() {
+                    errors.log(CompileError::new(
+                      CantBindNonConstructible,
+                      exp.source_trace.clone(),
+                    ));
+                  }
+                }
+              }
+              _ => {}
+            }
+            Ok::<bool, Never>(true)
+          })
+          .unwrap();
+      }
+    }
+  }
+  pub fn track_emulated_builtins(&mut self, target: CompilerTarget) {
+    let mut names = self.names.write().unwrap();
+    let mut emulated_functions = EmulatedFunctionRecord::empty();
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if let FunctionImplementationKind::Composite(f) =
+        &signature.implementation
+      {
+        f.write()
+          .unwrap()
+          .expression
+          .walk_mut(&mut |exp| {
+            if let ExpKind::Application(f, args) = &mut exp.kind
+              && let ExpKind::Name(f_name) = &mut f.kind
+              && let Type::Function(f) = f.data.unwrap_known()
+              && let Some(abstract_f) = f.abstract_ancestor
+              && let FunctionImplementationKind::Builtin {
+                target_specific_emulations,
+                ..
+              } = &abstract_f.read().unwrap().implementation
+              && target_specific_emulations.contains(&target)
+            {
+              let arg_types = args
+                .iter()
+                .map(|a| {
+                  a.data.unwrap_known().monomorphized_name(&mut names, target)
+                })
+                .collect();
+              let return_type =
+                f.return_type.monomorphized_name(&mut names, target);
+              let emulated_signature = EmulatedFunctionSignature {
+                name: f_name.to_string(),
+                arg_types,
+                return_type,
+              };
+
+              *f_name = emulated_functions
+                .track_emulated_builtin(
+                  emulated_signature.clone(),
+                  target,
+                  &mut names,
+                )
+                .into();
+            }
+            Ok::<bool, Never>(true)
+          })
+          .unwrap();
+      }
+    }
+    self.emulated_functions = emulated_functions;
+  }
+  pub fn catch_expressions_after_control_flow(
+    &mut self,
+    errors: &mut ErrorLog,
+  ) {
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      if let FunctionImplementationKind::Composite(implementation) =
+        &signature.implementation
+      {
+        implementation
+          .read()
+          .unwrap()
+          .expression
+          .walk(&mut |exp| {
+            match &exp.kind {
+              ExpKind::Block(children) => {
+                let mut encountered_control_flow_operator = None;
+                for child in children.iter() {
+                  match child.kind {
+                    ExpKind::Break
+                    | ExpKind::Continue
+                    | ExpKind::Discard
+                    | ExpKind::Return(_) => {
+                      encountered_control_flow_operator =
+                        Some(match child.kind {
+                          ExpKind::Break => "break".to_string(),
+                          ExpKind::Continue => "continue".to_string(),
+                          ExpKind::Discard => "discard".to_string(),
+                          ExpKind::Return(_) => "return".to_string(),
+                          _ => unreachable!(),
+                        });
+                    }
+                    ExpKind::Unit => {}
+                    _ => {
+                      if let Some(name) = &encountered_control_flow_operator {
+                        errors.log(CompileError::new(
+                          ExpressionAfterControlFlow(name.clone()),
+                          child.source_trace.clone(),
+                        ))
+                      }
+                    }
+                  }
+                }
+              }
+              _ => {}
+            }
+            Ok::<_, Never>(true)
+          })
+          .unwrap();
+      }
+    }
+  }
+  pub fn validate_raw_program(&mut self, target: CompilerTarget) -> ErrorLog {
+    if self.has_been_validated {
+      return ErrorLog::new();
+    }
+    let mut errors = ErrorLog::new();
+    self.validate_names(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.validate_associative_signatures(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.wrap_mutable_function_args();
+    self.deshadow(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.catch_globally_shadowing_fn_args(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.catch_top_level_function_and_var_name_collisions(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.catch_duplicate_struct_fields(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.catch_duplicate_enum_variants(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.inline_def_array_sizes();
+    self.fully_infer_types(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.validate_control_flow(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.ensure_no_typeless_bindings(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.expand_associative_applications();
+    self.validate_assignments(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.catch_duplicate_signatures(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.validate_match_blocks(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.catch_illegal_function_type_expressions(&mut errors);
+    self.catch_illegal_function_type_user_type_fields(&mut errors);
+    self.catch_illegal_function_type_variables(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.desugar_swizzle_assignments();
+    self.deexpressionify(target);
+    self.normalize_pseudoapplication_data_accesses();
+    self.deshadow(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.monomorphize(&mut errors, target);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.separate_overloaded_fns(target);
+    self.catch_duplicate_closures_capturing_mutable_variables(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    loop {
+      let extracted = self.extract_inner_functions(&mut errors);
+      if !errors.is_empty() {
+        return errors;
+      }
+      self.propagate_abstract_function_signatures();
+      self.inline_local_bound_function_applications();
+      let inlined = self.inline_all_higher_order_arguments(&mut errors);
+      if !errors.is_empty() {
+        return errors;
+      }
+      if !extracted && !inlined {
+        break;
+      }
+    }
+    self.canonicalize_specialized_function_references();
+    self.remove_unitlike_values();
+    self.extract_non_bound_mutable_references();
+    // Rewrites window-info queries into binding reads before effect
+    // validation, so GPU entries no longer contain the queries (or the
+    // String key literals they take).
+    self.extract_gpu_window_info();
+    self.validate_top_level_fn_effects(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.catch_expressions_after_control_flow(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.validate_argument_ownership(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.validate_field_type_constraints(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.catch_dispatched_closure_scope_mutations(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.extract_dispatched_closure_scopes();
+    // Entry-point marking must happen before the reference-address-space
+    // rebuild: that rebuild drops functions with reference args from the
+    // registry — including a spawn-window frame closure with captured scope
+    // (its trailing scope param) — and dispatch calls inside such a closure
+    // are the only place implicitly-dispatched entry points are named. The
+    // rebuild clones the signatures it keeps, so markings set here survive
+    // it.
+    self.validate_dispatch_function_types_and_mark_implicit_entry_points(
+      &mut errors,
+    );
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.monomorphize_reference_address_spaces();
+    self.inline_static_array_length_calls();
+    self.validate_gpu_window_info(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.extract_builtin_attribute_lookup_functions(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.validate_entry_points(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.catch_bind_group_collisions(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.catch_non_constructible_bindings(&mut errors);
+    if !errors.is_empty() {
+      return errors;
+    }
+    self.track_emulated_builtins(target);
+    self.has_been_validated = true;
+    errors
+  }
+  pub fn gather_type_annotations(&self) -> Vec<(SourceTrace, TypeState)> {
+    let mut type_annotations = vec![];
+    for signature in self.abstract_functions_iter() {
+      let signature = signature.read().unwrap();
+      let FunctionImplementationKind::Composite(implementation) =
+        &signature.implementation
+      else {
+        continue;
+      };
+      implementation
+        .read()
+        .unwrap()
+        .expression
+        .walk(&mut |exp: &TypedExp| {
+          type_annotations
+            .push((exp.source_trace.clone(), exp.data.kind.clone()));
+          if let ExpKind::Let(bindings, _) = &exp.kind {
+            for (_, source_trace, _, bound_exp) in bindings.iter() {
+              type_annotations
+                .push((source_trace.clone(), bound_exp.data.kind.clone()))
+            }
+          }
+          Ok::<_, Never>(true)
+        })
+        .unwrap();
+    }
+    type_annotations
+  }
+  pub fn gather_name_definition_sites(
+    &self,
+  ) -> HashMap<Vec<usize>, NameDefinitionSource> {
+    let mut top_level_name_definitions = HashMap::new();
+    for e in self.typedefs.enums.iter() {
+      let e = e.original_ancestor();
+      top_level_name_definitions.insert(
+        e.name.0.clone(),
+        NameDefinitionSource::Enum(e.name.1.primary_path()),
+      );
+    }
+    for t in self.typedefs.enums.iter() {
+      let t = t.original_ancestor();
+      top_level_name_definitions.insert(
+        t.name.0.clone(),
+        NameDefinitionSource::Enum(t.name.1.primary_path()),
+      );
+    }
+    let mut defn_locations: HashMap<Arc<str>, Vec<Vec<usize>>> = HashMap::new();
+    for f in self.abstract_functions_iter() {
+      let f = f.read().unwrap();
+      if let FunctionImplementationKind::Composite(implementation) =
+        &f.implementation
+      {
+        if !defn_locations.contains_key(&f.name) {
+          defn_locations.insert(f.name.clone(), vec![]);
+        }
+        defn_locations.get_mut(&f.name).unwrap().push(
+          implementation
+            .read()
+            .unwrap()
+            .name_source_trace
+            .primary_path(),
+        );
+      }
+    }
+    for (name, sources) in defn_locations {
+      top_level_name_definitions
+        .insert(name, NameDefinitionSource::Defn(sources));
+    }
+    let mut sites = HashMap::new();
+    for f in self.abstract_functions_iter() {
+      let f = f.read().unwrap();
+      if let FunctionImplementationKind::Composite(f) = &f.implementation {
+        f.read()
+          .unwrap()
+          .expression
+          .walk_with_ctx(
+            &mut |exp, ctx| {
+              match &exp.kind {
+                ExpKind::Name(name) => {
+                  if let Some(definition_source) = top_level_name_definitions
+                    .get(name)
+                    .cloned()
+                    .or_else(|| ctx.get_name_definition_source(name))
+                  {
+                    sites.insert(
+                      exp.source_trace.primary_path(),
+                      definition_source,
+                    );
+                  }
+                }
+                _ => {}
+              }
+              Ok::<bool, Never>(true)
+            },
+            &mut ImmutableProgramLocalContext::empty(self),
+          )
+          .unwrap();
+      }
+    }
+    sites
+  }
+  pub fn find_fn_names_by_entry_point(
+    &self,
+    entry_kind_predicate: impl Fn(EntryPoint) -> bool,
+  ) -> Vec<String> {
+    self
+      .abstract_functions_iter()
+      .filter_map(|abstract_f| {
+        let abstract_f = abstract_f.read().unwrap();
+        if let FunctionImplementationKind::Composite(f) =
+          &abstract_f.implementation
+          && let Some(entry_point) = f.read().unwrap().entry_point
+          && entry_kind_predicate(entry_point)
+        {
+          Some(abstract_f.name.to_string())
+        } else {
+          None
+        }
+      })
+      .collect()
+  }
+  pub fn cpu_entry_points(
+    &self,
+  ) -> Vec<Arc<RwLock<AbstractFunctionSignature>>> {
+    self
+      .abstract_functions_iter()
+      .filter(|f| {
+        let f = f.read().unwrap();
+        if let FunctionImplementationKind::Composite(comp) = &f.implementation {
+          comp.read().unwrap().entry_point == Some(EntryPoint::Cpu)
+        } else {
+          false
+        }
+      })
+      .cloned()
+      .collect()
+  }
+  pub fn find_definition(
+    &self,
+    name: &str,
+    path: &Vec<usize>,
+  ) -> Option<NameDefinitionSource> {
+    for e in self.typedefs.enums.iter() {
+      let e = e.original_ancestor();
+      if &*e.name.0 == name {
+        return Some(NameDefinitionSource::Enum(e.name.1.primary_path()));
+      }
+    }
+    for t in self.typedefs.enums.iter() {
+      let t = t.original_ancestor();
+      if &*t.name.0 == name {
+        return Some(NameDefinitionSource::Enum(t.name.1.primary_path()));
+      }
+    }
+    let mut defn_locations: HashSet<Vec<usize>> = HashSet::new();
+    for f in self.abstract_functions_iter() {
+      let f = f.read().unwrap();
+      if &*f.name == name {
+        if let FunctionImplementationKind::Composite(f) = &f.implementation {
+          defn_locations
+            .insert(f.read().unwrap().name_source_trace.primary_path());
+        }
+      }
+    }
+    if !defn_locations.is_empty() {
+      return Some(NameDefinitionSource::Defn(
+        defn_locations.into_iter().collect(),
+      ));
+    }
+    for f in self.abstract_functions_iter() {
+      let f = f.read().unwrap();
+      if let FunctionImplementationKind::Composite(f) = &f.implementation {
+        let mut definition_source: Option<NameDefinitionSource> = None;
+        fn is_prefix(a: &Vec<usize>, b: &Vec<usize>) -> bool {
+          a.len() < b.len()
+            && a.iter().zip(b.iter()).find(|(a, b)| a != b).is_none()
+        }
+        f.read()
+          .unwrap()
+          .expression
+          .walk(&mut |exp| {
+            let exp_path = exp.source_trace.primary_path();
+            if is_prefix(&exp_path, path) {
+              return Ok(false);
+            }
+            match &exp.kind {
+              ExpKind::ForLoop {
+                increment_variable_name,
+                ..
+              } => {
+                if &*increment_variable_name.0 == name {
+                  definition_source = Some(NameDefinitionSource::LocalBinding(
+                    increment_variable_name.1.primary_path(),
+                  ))
+                }
+              }
+              ExpKind::Let(bindings, _) => {
+                let bindings_to_consider = if path[exp_path.len()] == 1 {
+                  // path being searched for is inside bindings
+                  if let Some(internal_binding_index) =
+                    path.get(exp_path.len() + 1)
+                    && internal_binding_index % 2 == 1
+                  {
+                    let internal_binding_index = internal_binding_index / 2;
+                    internal_binding_index.checked_sub(1).unwrap_or(0)
+                  } else {
+                    0
+                  }
+                } else {
+                  // path being searched for is inside body
+                  bindings.len()
+                };
+                for (binding_name, binding_source_trace, _, _) in
+                  bindings.iter().take(bindings_to_consider).rev()
+                {
+                  if &**binding_name == name {
+                    definition_source =
+                      Some(NameDefinitionSource::LocalBinding(
+                        binding_source_trace.primary_path(),
+                      ));
+                    break;
+                  }
+                }
+              }
+              ExpKind::Match(_, arms) => {
+                for (pattern, arm_body) in arms.iter() {
+                  if is_prefix(&arm_body.source_trace.primary_path(), path) {
+                    match &pattern.kind {
+                      ExpKind::Name(pattern_name) => {
+                        if &**pattern_name == name {
+                          definition_source =
+                            Some(NameDefinitionSource::LocalBinding(
+                              pattern.source_trace.primary_path(),
+                            ));
+                        }
+                      }
+                      ExpKind::Application(_, args) => {
+                        for arg in args.iter() {
+                          if let ExpKind::Name(pattern_name) = &arg.kind {
+                            if &**pattern_name == name {
+                              Some(NameDefinitionSource::LocalBinding(
+                                arg.source_trace.primary_path(),
+                              ));
+                            }
+                          }
+                        }
+                      }
+                      _ => {}
+                    }
+                  }
+                }
+              }
+              _ => {}
+            }
+            Ok::<bool, Never>(true)
+          })
+          .unwrap();
+      }
+    }
+    None
+  }
+  pub fn composite_functions_in_usage_order(
+    &self,
+  ) -> Vec<(Arc<str>, Arc<RwLock<TopLevelFunction>>)> {
+    self.composite_functions_in_usage_order_with_discovery(false)
+  }
+  /// With `discover_scope_closures`, also includes composite functions
+  /// reachable only through type-level ancestor references (closures used
+  /// exclusively via scope constructions, which the reference-address-space
+  /// rebuild drops from the registry). The VM CPU runtime needs those
+  /// compiled; WGSL/C/audio emission must not see them.
+  pub fn composite_functions_in_usage_order_with_discovery(
+    &self,
+    discover_scope_closures: bool,
+  ) -> Vec<(Arc<str>, Arc<RwLock<TopLevelFunction>>)> {
+    let mut dependencies: HashMap<Arc<str>, HashSet<Arc<str>>> = HashMap::new();
+    let mut fns: Vec<(Arc<str>, Arc<RwLock<TopLevelFunction>>)> = vec![];
+    for f in self.abstract_functions_iter() {
+      let f = f.read().unwrap().clone();
+      if f.generic_args.is_empty()
+        && !f.has_uninlined_higher_order_arguments()
+        && let FunctionImplementationKind::Composite(implementation) =
+          f.implementation
+      {
+        fns.push((f.name.clone(), implementation.clone()));
+        dependencies.insert(f.name.clone(), HashSet::new());
+      }
+    }
+    // Closures referenced only through scope constructions aren't in the
+    // abstract-function registry (reference-address-space monomorphization
+    // rebuilds the program from name-called functions only); they're
+    // reachable exclusively through type-level ancestor Arcs, like the
+    // interpreter reaches them. Discover those transitively.
+    if discover_scope_closures {
+      let mut queue: Vec<Arc<RwLock<TopLevelFunction>>> =
+        fns.iter().map(|(_, f)| f.clone()).collect();
+      while let Some(f) = queue.pop() {
+        let mut discovered: Vec<(Arc<str>, Arc<RwLock<TopLevelFunction>>)> =
+          vec![];
+        f.read()
+          .unwrap()
+          .expression
+          .walk(&mut |exp| {
+            if let ExpKind::Application(_, _) = &exp.kind
+              && let TypeState::Known(Type::Function(signature)) =
+                &exp.data.kind
+              && let Some(ancestor) = &signature.abstract_ancestor
+            {
+              let ancestor = ancestor.read().unwrap();
+              if let FunctionImplementationKind::Composite(implementation) =
+                &ancestor.implementation
+                && !dependencies.contains_key(&ancestor.name)
+              {
+                discovered
+                  .push((ancestor.name.clone(), implementation.clone()));
+              }
+            }
+            Ok::<bool, Never>(true)
+          })
+          .unwrap();
+        for (name, implementation) in discovered {
+          dependencies.insert(name.clone(), HashSet::new());
+          queue.push(implementation.clone());
+          fns.push((name, implementation));
+        }
+      }
+    }
+    for (f_name, f) in fns.iter() {
+      f.read()
+        .unwrap()
+        .expression
+        .walk(&mut |exp| {
+          if let ExpKind::Name(other_f_name) = &exp.kind {
+            if dependencies.contains_key(other_f_name) {
+              dependencies
+                .get_mut(f_name)
+                .unwrap()
+                .insert(other_f_name.clone());
+            }
+          }
+          // A closure's scope construction references the closure only
+          // through its expression *type* (the applied name is the scope
+          // struct's constructor), so also count type-level function
+          // ancestors as usages.
+          if let ExpKind::Application(_, _) = &exp.kind
+            && let TypeState::Known(Type::Function(signature)) = &exp.data.kind
+            && let Some(ancestor) = &signature.abstract_ancestor
+          {
+            let ancestor_name = ancestor.read().unwrap().name.clone();
+            if dependencies.contains_key(&ancestor_name) {
+              dependencies.get_mut(f_name).unwrap().insert(ancestor_name);
+            }
+          }
+          Ok::<bool, Never>(true)
+        })
+        .unwrap();
+    }
+    let mut final_fns: Vec<(Arc<str>, Arc<RwLock<TopLevelFunction>>)> = vec![];
+    while !fns.is_empty() {
+      let mut broke = false;
+      for i in 0..fns.len() {
+        if dependencies.get(&fns[i].0).unwrap().is_empty() {
+          let (name, implementation) = fns.remove(i);
+          for remaining_dependencies in dependencies.values_mut() {
+            remaining_dependencies.remove(&name);
+          }
+          final_fns.push((name, implementation));
+          broke = true;
+          break;
+        }
+      }
+      if !broke {
+        panic!(
+          "Couldn't find topological sort of user functions.\n\
+           If you're seeing this, there's a compiler bug; an earlier compiler \
+           stage should have caught the dependency loop "
+        )
+      }
+    }
+    final_fns
+  }
+  /// Statically determines which top-level vars are shared across CPU
+  /// threads: touched (read or written) by code reachable from more than
+  /// one thread root. Thread roots today are the `@cpu` entry points (the
+  /// main thread — GPU work dispatched from main attributes to main, since
+  /// the GPU syncs against main's replica through its own machinery) and
+  /// the `@audio` entry points (the start-audio thread). Reachability
+  /// follows function references — names and type-level function ancestors,
+  /// so scoped closures count — EXCEPT the function argument of
+  /// `start-audio`: that reference is where the other thread *begins*, not
+  /// a main-thread use of the function.
+  ///
+  /// Returns the shared variable names sorted, so every compiled artifact
+  /// of the program carries the same index-aligned list (the runtime's
+  /// `ThreadSharedTable` slots are addressed by these indices).
+  /// The thread-shared globals with their audience masks (see
+  /// `thread_sync::participant`), sorted by name. A var is shared when
+  /// it's reachable from both the `@cpu` and `@audio` entry roots, or when
+  /// it's marked `@external` (embedder access is invisible to static
+  /// analysis, so the annotation forces membership). The sorted order
+  /// index-aligns every artifact's `Code::shared_vars`, the env's
+  /// `shared_globals`, `ExternalVars` handles, and the
+  /// `ThreadSharedTable`'s slots.
+  pub fn thread_shared_globals(&self) -> Vec<(Arc<str>, u32)> {
+    use crate::compiler::expression::ExpKind;
+    let var_names: HashSet<Arc<str>> =
+      self.top_level_vars.iter().map(|v| v.name.clone()).collect();
+    let globals_reachable_from = |root_entry: fn(&EntryPoint) -> bool| {
+      let mut visited: HashSet<Arc<str>> = HashSet::new();
+      let mut queue: Vec<Arc<RwLock<TopLevelFunction>>> = vec![];
+      for f in self.abstract_functions_iter() {
+        let f = f.read().unwrap();
+        if f.entry_point.map(|e| root_entry(&e)).unwrap_or(false)
+          && let FunctionImplementationKind::Composite(implementation) =
+            &f.implementation
+          && visited.insert(f.name.clone())
+        {
+          queue.push(implementation.clone());
+        }
+      }
+      let mut globals: HashSet<Arc<str>> = HashSet::new();
+      while let Some(f) = queue.pop() {
+        let f = f.read().unwrap();
+        let (reads, writes) = f.effects().read_and_written_globals();
+        globals.extend(
+          reads
+            .into_iter()
+            .chain(writes.into_iter())
+            .filter(|name| var_names.contains(name)),
+        );
+        let mut discovered: Vec<(Arc<str>, Arc<RwLock<TopLevelFunction>>)> =
+          vec![];
+        f.expression
+          .walk(&mut |exp| {
+            // the function argument of `start-audio` belongs to the audio
+            // thread, not to whichever thread calls `start-audio`
+            if let ExpKind::Application(applied_f, _) = &exp.kind
+              && let ExpKind::Name(applied_name) = &applied_f.kind
+              && &**applied_name == "start-audio"
+            {
+              return Ok::<bool, Never>(false);
+            }
+            // any function-typed expression carrying a composite ancestor
+            // is a reference this thread could invoke (covers plain names,
+            // application callees, and scope constructions)
+            if let TypeState::Known(Type::Function(signature)) = &exp.data.kind
+              && let Some(ancestor) = &signature.abstract_ancestor
+            {
+              let ancestor = ancestor.read().unwrap();
+              if let FunctionImplementationKind::Composite(implementation) =
+                &ancestor.implementation
+                && !visited.contains(&ancestor.name)
+              {
+                discovered
+                  .push((ancestor.name.clone(), implementation.clone()));
+              }
+            }
+            Ok(true)
+          })
+          .unwrap();
+        for (name, implementation) in discovered {
+          if visited.insert(name) {
+            queue.push(implementation);
+          }
+        }
+      }
+      globals
+    };
+    let main_globals = globals_reachable_from(|e| matches!(e, EntryPoint::Cpu));
+    let audio_globals =
+      globals_reachable_from(|e| matches!(e, EntryPoint::Audio));
+    let external_globals: HashSet<Arc<str>> = self
+      .top_level_vars
+      .iter()
+      .filter(|v| v.external)
+      .map(|v| v.name.clone())
+      .collect();
+    let mut shared: Vec<(Arc<str>, u32)> = var_names
+      .iter()
+      .filter_map(|name| {
+        let audience = if main_globals.contains(name) {
+          participant::MAIN
+        } else {
+          0
+        } | if audio_globals.contains(name) {
+          participant::AUDIO
+        } else {
+          0
+        } | if external_globals.contains(name) {
+          participant::EXTERNAL
+        } else {
+          0
+        };
+        let statically_shared = audience
+          & (participant::MAIN | participant::AUDIO)
+          == participant::MAIN | participant::AUDIO;
+        (statically_shared || audience & participant::EXTERNAL != 0)
+          .then(|| (name.clone(), audience))
+      })
+      .collect();
+    shared.sort();
+    shared
+  }
+  /// Audio-mode bytecode compilation: pure math only, CPU-exclusive
+  /// functions skipped, no host calls emitted.
+  pub fn compile_to_bytecode_program(self) -> (BytecodeProgram, Vec<Arc<str>>) {
+    self.compile_to_bytecode_program_impl(false)
+  }
+  /// CPU-runtime-mode bytecode compilation: compiles the `@cpu` entry and
+  /// its transitive callees, lowering CPU-exclusive builtins to host ops and
+  /// emitting explicit GPU↔CPU sync instructions from effect analysis.
+  pub fn compile_to_bytecode_program_cpu(
+    self,
+  ) -> (BytecodeProgram, Vec<Arc<str>>) {
+    self.compile_to_bytecode_program_impl(true)
+  }
+  fn compile_to_bytecode_program_impl(
+    self,
+    cpu_mode: bool,
+  ) -> (BytecodeProgram, Vec<Arc<str>>) {
+    use crate::vm::bytecode::{
+      HostBinding, HostBindingStorage, SharedVarInfo, SharedVarStorage,
+    };
+    let mut state = BytecodeCompilationState::new();
+    state.cpu_mode = cpu_mode;
+    state.monomorphized_to_base_names =
+      self.names.read().unwrap().monomorphized_to_base_names();
+    // Thread-shared globals: same sorted list in every compiled artifact,
+    // so `MarkSharedDirty` indices and `ThreadSharedTable` slots agree
+    // between the main program and the audio program.
+    let shared_globals = self.thread_shared_globals();
+    state.shared_vars = vec![None; shared_globals.len()];
+    state.shared_var_indices = shared_globals
+      .iter()
+      .enumerate()
+      .map(|(index, (name, _))| (name.clone(), index as u16))
+      .collect();
+    let shared_var_audiences: HashMap<Arc<str>, u32> =
+      shared_globals.into_iter().collect();
+    let mut dyn_memory_count: u16 = 0;
+    for v in self.top_level_vars.iter() {
+      let is_dynamic_array = matches!(
+        &v.var_type,
+        Type::Array(Some(ConcreteArraySize::Unsized), _)
+      );
+      let is_texture = matches!(
+        v.kind,
+        TopLevelVariableKind::Var {
+          address_space: VariableAddressSpace::Handle,
+          ..
+        }
+      );
+      let binding_info = if cpu_mode
+        && let TopLevelVariableKind::Var {
+          address_space,
+          group_and_binding: Some(gb),
+        } = v.kind
+        && matches!(
+          address_space,
+          VariableAddressSpace::Uniform
+            | VariableAddressSpace::StorageRead
+            | VariableAddressSpace::StorageReadWrite
+            | VariableAddressSpace::Handle
+        ) {
+        Some((gb, address_space))
+      } else {
+        None
+      };
+      if is_dynamic_array {
+        // Runtime-sized arrays live in the VM's flat dynamic memory
+        // (`BytecodeProgram::dyn_memory`), outside the u16-addressed stack;
+        // element and length accesses compile to the direct `Dyn*` opcodes.
+        // This applies in audio mode too: a program with an `@audio` entry
+        // may declare runtime-sized globals its audio code never touches,
+        // and they must not break the (eager) audio compile. They may or
+        // may not be GPU-bound (a plain `(var x: [f32])` is legal).
+        let Type::Array(_, element_type) = &v.var_type else {
+          unreachable!()
+        };
+        let element_stride = element_type
+          .unwrap_known()
+          .data_size_in_u32s(&v.source_trace)
+          .unwrap() as u16;
+        let memory = dyn_memory_count;
+        dyn_memory_count += 1;
+        state
+          .dynamic_array_memory
+          .insert(v.name.clone(), (memory, element_stride));
+        state.dynamic_array_types.insert(memory, v.var_type.clone());
+        if let Some(shared_index) =
+          state.shared_var_indices.get(&v.name).copied()
+        {
+          state.shared_vars[shared_index as usize] = Some(SharedVarInfo {
+            name: v.name.clone(),
+            ty: v.var_type.clone(),
+            audience: shared_var_audiences[&v.name],
+            storage: SharedVarStorage::DynMemory {
+              region: memory,
+              stride: element_stride,
+            },
+          });
+        }
+        if cpu_mode {
+          // host-binding entry for GPU sync bookkeeping and whole-array
+          // printing
+          let index = state.host_bindings.len() as u16;
+          state.host_bindings.push(HostBinding {
+            name: v.name.clone(),
+            ty: v.var_type.clone(),
+            storage: HostBindingStorage::DynamicMemory { memory },
+            gpu: binding_info
+              .map(|(gb, address_space)| (gb.group, gb.binding, address_space)),
+          });
+          state.binding_indices.insert(v.name.clone(), index);
+          state.dynamic_globals.insert(v.name.clone(), index);
+        }
+        continue;
+      }
+      if is_texture {
+        if cpu_mode {
+          // Textures live host-side as `Value`s; VM code accesses them
+          // through host ops, so they get no slots.
+          let index = state.host_bindings.len() as u16;
+          state.host_bindings.push(HostBinding {
+            name: v.name.clone(),
+            ty: v.var_type.clone(),
+            storage: HostBindingStorage::Dynamic,
+            gpu: binding_info
+              .map(|(gb, address_space)| (gb.group, gb.binding, address_space)),
+          });
+          state.binding_indices.insert(v.name.clone(), index);
+          state.dynamic_globals.insert(v.name.clone(), index);
+        }
+        // audio mode: texture accesses are CPU-exclusive, so audio-reachable
+        // code can never touch this global — skip it entirely
+        continue;
+      }
+      let position = state.consumed_stack_space as u16;
+      let size = v.var_type.data_size_in_u32s(&v.source_trace).unwrap() as u16;
+      state.globals.insert(v.name.clone(), position);
+      state.global_slots.push((v.name.clone(), position, size));
+      state.global_types.push(v.var_type.clone());
+      if let Some(shared_index) = state.shared_var_indices.get(&v.name).copied()
+      {
+        state.shared_vars[shared_index as usize] = Some(SharedVarInfo {
+          name: v.name.clone(),
+          ty: v.var_type.clone(),
+          audience: shared_var_audiences[&v.name],
+          storage: SharedVarStorage::Slots { position, size },
+        });
+      }
+      state.consumed_stack_space += size;
+      if let Some((gb, address_space)) = binding_info {
+        let index = state.host_bindings.len() as u16;
+        state.host_bindings.push(HostBinding {
+          name: v.name.clone(),
+          ty: v.var_type.clone(),
+          storage: HostBindingStorage::Slots { position, size },
+          gpu: Some((gb.group, gb.binding, address_space)),
+        });
+        state.binding_indices.insert(v.name.clone(), index);
+      }
+    }
+    // If any top-level var has an initializer expression, compile a
+    // synthetic "$init_globals" function that computes each one and Moves it
+    // into the corresponding global slot. `BytecodeProgram::from_code` runs
+    // it once at construction so globals are live before any user code.
+    let init_function_index =
+      if self.top_level_vars.iter().any(|v| v.value.is_some()) {
+        state.open_function("$init_globals".into());
+        for v in self.top_level_vars.iter() {
+          if let Some(value_exp) = &v.value {
+            let value_slot =
+              value_exp.compile_to_bytecode(false, &mut state).unwrap();
+            let var_size =
+              v.var_type.data_size_in_u32s(&v.source_trace).unwrap() as u16;
+            let global_slot = *state.globals.get(&v.name).unwrap();
+            state.push_instruction(Instruction {
+              op: Op::Move,
+              arg_positions: [value_slot, var_size, 0],
+              return_position: global_slot,
+            });
+          }
+        }
+        state.close_function();
+        Some(state.finished_functions.len() - 1)
+      } else {
+        None
+      };
+    let ordered_functions =
+      self.composite_functions_in_usage_order_with_discovery(cpu_mode);
+    // CPU mode compiles only functions actually reachable from `@cpu`
+    // entries. Anything referenced solely from GPU entry points (e.g. the
+    // callbacks a compute shader invokes) must not be compiled for the CPU —
+    // it may legally do GPU-only things like passing storage-array elements
+    // by reference to atomics.
+    let cpu_reachable: Option<HashSet<Arc<str>>> = if cpu_mode {
+      let by_name: HashMap<Arc<str>, Arc<RwLock<TopLevelFunction>>> =
+        ordered_functions
+          .iter()
+          .map(|(n, f)| (n.clone(), f.clone()))
+          .collect();
+      let is_cpu_compilable = |f: &Arc<RwLock<TopLevelFunction>>| {
+        f.read()
+          .unwrap()
+          .entry_point
+          .map(|e| matches!(e, EntryPoint::Cpu))
+          .unwrap_or(true)
+      };
+      let mut reachable: HashSet<Arc<str>> = HashSet::new();
+      let mut queue: Vec<Arc<RwLock<TopLevelFunction>>> = vec![];
+      for (name, f) in &ordered_functions {
+        let is_cpu_entry = f
+          .read()
+          .unwrap()
+          .entry_point
+          .map(|e| matches!(e, EntryPoint::Cpu))
+          .unwrap_or(false);
+        if is_cpu_entry && reachable.insert(name.clone()) {
+          queue.push(f.clone());
+        }
+      }
+      while let Some(f) = queue.pop() {
+        let mut found: Vec<Arc<str>> = vec![];
+        f.read()
+          .unwrap()
+          .expression
+          .walk(&mut |exp| {
+            if let ExpKind::Name(name) = &exp.kind
+              && by_name.contains_key(name)
+            {
+              found.push(name.clone());
+            }
+            if let ExpKind::Application(_, _) = &exp.kind
+              && let TypeState::Known(Type::Function(signature)) =
+                &exp.data.kind
+              && let Some(ancestor) = &signature.abstract_ancestor
+            {
+              found.push(ancestor.read().unwrap().name.clone());
+            }
+            Ok::<bool, Never>(true)
+          })
+          .unwrap();
+        for name in found {
+          if let Some(target) = by_name.get(&name)
+            && is_cpu_compilable(target)
+            && reachable.insert(name)
+          {
+            queue.push(target.clone());
+          }
+        }
+      }
+      Some(reachable)
+    } else {
+      None
+    };
+    for (f_name, implementation) in ordered_functions {
+      if let Some(reachable) = &cpu_reachable
+        && !reachable.contains(&f_name)
+      {
+        continue;
+      }
+      // Filter the same way the C backend does in
+      // `TopLevelFunction::compile`: skip entry points whose kind doesn't
+      // compile to VM (right now that's everything except `@audio`), and
+      // skip any function whose effects include a CPU-exclusive call or
+      // type. The second filter catches helper functions that are only
+      // reachable through the `@cpu` entry — without it, `compile_to_
+      // bytecode` would hit `todo!()` on `spawn-window` / `window-frame-
+      // index` / etc.
+      {
+        let implementation_read = implementation.read().unwrap();
+        // Ref-arg detection keys off signature-level ownership, not
+        // arg_annotations: annotations only reflect user-written `@ref`
+        // args, while params created by lowering (closure scope args from
+        // extract_inner_functions) are reference-typed only in the
+        // signature.
+        let Type::Function(f_signature) =
+          implementation_read.expression.data.unwrap_known()
+        else {
+          panic!()
+        };
+        let has_ref_args = f_signature
+          .args
+          .iter()
+          .any(|(v, _)| v.var_type.ownership != Ownership::Owned);
+        if has_ref_args {
+          state
+            .ref_arg_functions
+            .push((f_name, implementation.clone()));
+          continue;
+        }
+        let skip = if cpu_mode {
+          // CPU mode: compile `@cpu` entries and plain functions; skip GPU
+          // and audio entry points, plus any helper that's only meaningful
+          // inside a shader (fragment-exclusive calls, GPU builtin-attribute
+          // lookups like `global-invocation-id`) — those are reachable only
+          // from GPU entries, and compiling them would hit shader-only
+          // builtins.
+          let is_non_cpu_entry = implementation_read
+            .entry_point
+            .map(|e| !matches!(e, EntryPoint::Cpu))
+            .unwrap_or(false);
+          let gpu_only = implementation_read.effects().0.iter().any(|e| {
+            matches!(
+              e,
+              Effect::FragmentExclusiveFunction(_)
+                | Effect::LookupBuiltinAttribute(_)
+            )
+          });
+          is_non_cpu_entry || gpu_only
+        } else {
+          let skip_for_entry_point = implementation_read
+            .entry_point
+            .map(|e| !e.should_compile_to_target(CompilerTarget::VM))
+            .unwrap_or(false);
+          let effects = implementation_read.effects();
+          let has_cpu_exclusive = !effects.cpu_exclusive_functions().is_empty()
+            || !effects.cpu_exclusive_types().is_empty()
+            || !effects.window_info_kinds().is_empty()
+            // `print` has no audio-target implementation; a printing
+            // function can only be meant for the CPU side. (A frame closure
+            // that never calls a CPU-exclusive builtin would otherwise slip
+            // through this filter and hit the `todo!()` on `print`.)
+            || effects.0.contains(&Effect::Print);
+          skip_for_entry_point || has_cpu_exclusive
+        };
+        if skip {
+          continue;
+        }
+      }
+      implementation.read().unwrap().compile_to_bytecode(
+        &f_name,
+        &mut state,
+        &[],
+      );
+      while !state.pending_ref_arg_function_usages.is_empty()
+        || !state.pending_frame_fn_usages.is_empty()
+      {
+        for PendingRefFnUsage {
+          name,
+          fn_dispatch_position,
+          arg_move_positions,
+          return_move_position,
+          arg_positions,
+        } in state
+          .pending_ref_arg_function_usages
+          .drain(..)
+          .collect::<Vec<_>>()
+        {
+          state.instructions[fn_dispatch_position as usize].arg_positions[0] =
+            state.finished_functions.len() as u16;
+          let f = state
+            .ref_arg_functions
+            .iter()
+            .find_map(|(f_name, f)| (name == *f_name).then(|| f))
+            .unwrap()
+            .clone();
+          let f = f.read().unwrap();
+          let Type::Function(f_signature) = f.expression.data.unwrap_known()
+          else {
+            panic!()
+          };
+          let mut owned_arg_indeces = vec![];
+          let mut ref_arg_positions = vec![];
+          for (i, (v, _)) in f_signature.args.iter().enumerate() {
+            if v.var_type.ownership == Ownership::Owned {
+              owned_arg_indeces.push(i);
+            } else {
+              ref_arg_positions.push((i, arg_positions[i]));
+            }
+          }
+          f.compile_to_bytecode(&name, &mut state, &ref_arg_positions);
+          let bytecode_fn = state.finished_functions.last().unwrap();
+          for owned_arg_index in owned_arg_indeces {
+            let move_instruction = &mut state.instructions
+              [arg_move_positions[owned_arg_index] as usize];
+            move_instruction.arg_positions[0] = arg_positions[owned_arg_index];
+            move_instruction.arg_positions[1] =
+              bytecode_fn.arg_sizes[owned_arg_index];
+            move_instruction.return_position =
+              bytecode_fn.arg_positions[owned_arg_index];
+          }
+          state.instructions[return_move_position as usize].arg_positions[0] =
+            bytecode_fn.stack_frame_start;
+        }
+        for PendingFrameFnUsage {
+          name,
+          host_op_index,
+          scope_slot,
+        } in state.pending_frame_fn_usages.drain(..).collect::<Vec<_>>()
+        {
+          let f = state
+            .ref_arg_functions
+            .iter()
+            .find_map(|(f_name, f)| (name == *f_name).then(|| f))
+            .unwrap()
+            .clone();
+          let f = f.read().unwrap();
+          let Type::Function(f_signature) = f.expression.data.unwrap_known()
+          else {
+            panic!()
+          };
+          // The scope param is by construction the frame fn's trailing arg;
+          // bind it directly to the slots materialized at the spawn-window
+          // site, then point the HostOp at the specialized copy.
+          let scope_arg_index = f_signature.args.len() - 1;
+          f.compile_to_bytecode(
+            &name,
+            &mut state,
+            &[(scope_arg_index, scope_slot)],
+          );
+          let frame_fn = (state.finished_functions.len() - 1) as u16;
+          state.host_ops[host_op_index] =
+            crate::vm::bytecode::HostOp::SpawnWindow { frame_fn };
+        }
+      }
+    }
+    state.finalize(init_function_index)
+  }
+}

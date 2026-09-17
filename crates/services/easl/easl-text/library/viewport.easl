@@ -1,0 +1,91 @@
+(import "geometry.easl")
+
+; Cells must be grouped into consecutive visual lines numbered from zero.
+; Bands may have gaps but may not overlap. Cells within a line may be bidi.
+(struct TextLineCells first: u32 end: u32 top: f32 height: f32)
+(struct TextScrollResult status: u32 offset: vec2f)
+
+; Validate the entire index before publishing. Keep this index with the exact
+; cell layout that produced it; reflow invalidates both, scrolling neither.
+(defn text-index-lines [count: u32 cell-at: (Fn [u32] TextCell)
+                        capacity: u32 emit-index: (Fn [u32 TextLineCells] ())]: TextGeometryResult
+  (when (> count 1048576u) (return (TextGeometryResult 2u 0u)))
+  (let [@var total 0u]
+    (for [pass 2u]
+      (let [@var cursor 0u @var line 0u @var previous-bottom -10000000.]
+        (while (< cursor count)
+          (let [first cursor cell (cell-at cursor) top cell.bounds.y height cell.bounds.w]
+            (when (or (!= cell.line line)
+              (or (not (and (> height 0.) (text-geometry-finite height)))
+                (or (not (text-geometry-finite top))
+                  (or (< top previous-bottom) (not (text-geometry-finite (+ top height)))))))
+              (return (TextGeometryResult 1u 0u)))
+            (when (or (>= line capacity) (>= line 65536u)) (return (TextGeometryResult 2u 0u)))
+            (while (< cursor count)
+              (let [item (cell-at cursor)]
+                (when (!= item.line line) (break))
+                (when (or (!= item.bounds.y top) (!= item.bounds.w height))
+                  (return (TextGeometryResult 1u 0u)))
+                (+= cursor 1u)))
+            (when (== pass 1u) (emit-index line (TextLineCells first cursor top height)))
+            (= previous-bottom (+ top height)) (+= line 1u)))
+        (= total line)))
+    (TextGeometryResult 0u total)))
+
+; Return the half-open range of lines intersecting the viewport in content
+; coordinates. Binary searches examine only logarithmically many line records.
+(defn text-visible-lines [count: u32 line-at: (Fn [u32] TextLineCells)
+                          top: f32 height: f32]: vec2u
+  (when (or (not (text-geometry-finite top))
+    (or (not (and (> height 0.) (text-geometry-finite height)))
+      (not (text-geometry-finite (+ top height)))))
+    (return (vec2u 0u)))
+  (let [@var low 0u @var high count]
+    (while (< low high)
+      (let [middle (+ low (/ (- high low) 2u)) item (line-at middle)]
+        (if (<= (+ item.top item.height) top) (= low (+ middle 1u)) (= high middle))))
+    (let [first low]
+      (= high count)
+      (while (< low high)
+        (let [middle (+ low (/ (- high low) 2u)) item (line-at middle)]
+          (if (< item.top (+ top height)) (= low (+ middle 1u)) (= high middle))))
+      (vec2u first low))))
+
+; Clamp out-of-content pointers to the closest line, then inspect only that
+; line's cells. A tie in the gap between two bands chooses the following line.
+(defn text-indexed-hit [count: u32 line-at: (Fn [u32] TextLineCells)
+                        cell-at: (Fn [u32] TextCell) point: vec2f]: TextHit
+  (when (== count 0u) (return (text-no-hit)))
+  (when (not (and (text-geometry-finite point.x) (text-geometry-finite point.y)))
+    (return (TextHit 1u 0u 1u 0u (vec4f 0.))))
+  (let [@var low 0u @var high count]
+    (while (< low high)
+      (let [middle (+ low (/ (- high low) 2u)) item (line-at middle)]
+        (if (<= item.top point.y) (= low (+ middle 1u)) (= high middle))))
+    (let [@var selected (if (== low 0u) 0u (- low 1u))]
+      (when (and (> low 0u) (< low count))
+        (let [before (line-at selected) after (line-at low)
+              below (max 0. (- point.y (+ before.top before.height)))
+              above (- after.top point.y)]
+          (when (>= below above) (= selected low))))
+      (let [item (line-at selected)] (text-hit-test-range item.first item.end cell-at point)))))
+
+; Return a clamped scroll offset that reveals a content-space rectangle. This
+; function owns scroll policy only; it does not touch native windows or input.
+(defn text-scroll-reveal [offset: vec2f viewport: vec2f extent: vec2f
+                          rectangle: vec4f margin: vec2f]: TextScrollResult
+  (when (not (all (<= (abs offset) (vec2f 10000000.))))
+    (return (TextScrollResult 1u offset)))
+  (when (or (not (all (> viewport (vec2f 0.)))) (not (all (<= viewport (vec2f 10000000.)))))
+    (return (TextScrollResult 1u offset)))
+  (when (or (not (all (>= extent (vec2f 0.)))) (not (all (<= extent (vec2f 10000000.)))))
+    (return (TextScrollResult 1u offset)))
+  (when (or (not (all (<= (abs rectangle) (vec4f 10000000.)))) (not (all (>= rectangle.zw (vec2f 0.)))))
+    (return (TextScrollResult 1u offset)))
+  (when (or (not (all (>= margin (vec2f 0.)))) (not (all (<= margin (* viewport 0.5)))))
+    (return (TextScrollResult 1u offset)))
+  (let [padding (min margin (* viewport 0.5))
+        low (- rectangle.xy padding) high (+ (+ rectangle.xy rectangle.zw) padding)
+        @var result (max offset (- high viewport))]
+    (= result (min result low))
+    (TextScrollResult 0u (clamp result (vec2f 0.) (max (vec2f 0.) (- extent viewport))))))

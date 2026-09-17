@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+workspace-document.workspace = true
 loom-types = { path = "../loom-types" }
 serde.workspace = true
 similar.workspace = true

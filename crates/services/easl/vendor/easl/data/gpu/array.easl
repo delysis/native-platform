@@ -1,0 +1,31 @@
+@{group 0
+  binding 0
+  address uniform}
+(var a: [256: vec4f])
+
+@{group 0
+  binding 1
+  address storage}
+(var b: [vec4f])
+
+(def c: [4: u32]
+     [1 2 3 4])
+
+(def d: [4: u32]
+     (zeroed-array))
+
+(defn e []: f32
+  (let [arr (zeroed-array): [3: f32]]
+    (arr 0u)))
+
+(defn e2 []: f32
+  (let [arr (zeroed-array): [3u: f32]]
+    (arr 0u)))
+
+(defn f [i: u32]: vec4f
+  (+ (a (- i 1)) (a (+ i 1))))
+
+(defn f2 []: f32
+  (let [arr [0.]]
+    (arr 0i)))
+

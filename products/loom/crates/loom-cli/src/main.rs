@@ -44,9 +44,18 @@ enum Command {
         path: PathBuf,
         #[arg(long)]
         name: String,
+        /// Protect private history, drafts and inference data using Keychain.
+        #[arg(long)]
+        encrypted: bool,
     },
     /// Inspect a project and record an open receipt.
     Open { path: PathBuf },
+    /// Make a protected copy; preserve the original project and ordinary files.
+    ProtectCopy {
+        project: PathBuf,
+        #[arg(long)]
+        to: PathBuf,
+    },
     /// Checkpoint an existing visible manuscript file.
     Checkpoint {
         project: PathBuf,
@@ -65,6 +74,16 @@ enum Command {
         #[arg(long, value_enum)]
         kind: CliDocumentKind,
         #[arg(long, default_value = "human import")]
+        reason: String,
+    },
+    /// Import a self-contained snapshot, retaining all branches as source evidence.
+    /// The selected transcript is explicitly written to a readable manuscript.
+    ImportSnapshot {
+        project: PathBuf,
+        source: PathBuf,
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long, default_value = "explicit document snapshot import")]
         reason: String,
     },
     /// Export the latest checkpointed visible manuscript.
@@ -226,8 +245,20 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
-        Command::Init { path, name } => {
-            let (store, receipt) = ProjectStore::initialize(path, name)?;
+        Command::ProtectCopy { project, to } => {
+            let store = ProjectStore::open_for_protected_copy(project)?;
+            print_json(&store.export_encrypted_copy(to)?)?;
+        }
+        Command::Init {
+            path,
+            name,
+            encrypted,
+        } => {
+            let (store, receipt) = if encrypted {
+                ProjectStore::initialize_encrypted(path, name)?
+            } else {
+                ProjectStore::initialize(path, name)?
+            };
             print_json(&ProjectView {
                 root: store.root(),
                 manifest: store.manifest(),
@@ -265,6 +296,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let mut store = ProjectStore::open(project)?;
             print_json(&store.import_file(source, to, kind.into(), reason)?)?;
+        }
+        Command::ImportSnapshot {
+            project,
+            source,
+            to,
+            reason,
+        } => {
+            let snapshot = read_bounded_utf8_file(&source)?;
+            let mut store = ProjectStore::open(project)?;
+            print_json(&store.import_document_snapshot_if_absent(to, &snapshot, reason)?)?;
         }
         Command::Export { project, file, to } => {
             let mut store = ProjectStore::open(project)?;

@@ -1,0 +1,10 @@
+(import "font_scene.easl")
+
+@cpu
+(defn main []
+  (prepare)
+  (= specimen-target (blank-texture 1200u 180u))
+  (set-render-target specimen-target)
+  (dispatch-render-shaders specimen-background-vertex specimen-background-fragment 3u)
+  (dispatch-render-shaders specimen-vertex specimen-fragment (* specimen-count 6u) 2u)
+  (save-png specimen-target "font-atlas-specimen.png"))

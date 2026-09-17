@@ -1,0 +1,9 @@
+[package]
+name = "fsexp"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+take_mut = "0.2.2"
+unicode-segmentation = "1.11.0"

@@ -37,7 +37,7 @@ describe('source import cancellation', () => {
     });
     const onUse = vi.fn(() => use.promise);
     const component = mount(ImportSources, { target, props: {
-      projectId: 'project-a', sessionId: 'session-a', documentTitle: 'Draft', onUse
+      projectId: 'project-a', sessionId: 'session-a', documentTitle: 'Draft', onUse, onSettings: vi.fn()
     } });
     const retained = {
       id: 'a'.repeat(64), file_name: 'Retained source.md', byte_count: 14,

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::Cursor;
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -12,6 +12,11 @@ use attachment_native_types::{
     AttachmentReceipt, AudioPreparationPolicy, Coverage, DetectedFormat, MediaFamily,
     PreparationPlan, PreparationPolicy, PreparedPart, TargetCapabilities,
 };
+use desktop_context::{
+    ContextExcerptEvidence, ContextSource, render_source, select_excerpts, trailing_utf8,
+};
+#[cfg(test)]
+use desktop_context::{EXCERPT_CHUNK_BYTES, excerpt_chunk_ranges};
 use image::{ImageDecoder as _, ImageEncoder as _};
 use llama_native_types::{MediaInput, MediaKind};
 use same_file::Handle as FileIdentityHandle;
@@ -20,6 +25,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 const MAX_ATTACHMENT_BYTES: u64 = 128 * 1024 * 1024;
+// Includes JSON escaping of retained canonical text and per-document contexts.
+const MAX_PRIVATE_METADATA_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CONTEXT_ATTACHMENTS: usize = 32;
 const MAX_CANONICAL_TEXT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_MANUAL_CONTEXT_BYTES: usize = 256 * 1024;
@@ -27,7 +34,6 @@ const MAX_NATIVE_MEDIA_OBJECTS: usize = 32;
 const MAX_NATIVE_MEDIA_OBJECT_BYTES: u64 = MAX_ATTACHMENT_BYTES;
 const MAX_NATIVE_MEDIA_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 const CONTEXT_QUERY_BYTES: usize = 16 * 1024;
-const EXCERPT_CHUNK_BYTES: usize = 2 * 1024;
 const PROMPT_OVERHEAD_TOKENS: u32 = 1_024;
 const RETRIEVAL_REBALANCE_BYTES: usize = 16 * 1024;
 const PREAMBLE_CACHE_ENTRIES: usize = 8;
@@ -148,10 +154,12 @@ struct AttachmentManifest {
     processing_receipt: AttachmentReceipt,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct DocumentContexts {
     schema: String,
     documents: BTreeMap<String, DocumentContext>,
+    #[serde(default)]
+    applied_co_writers: BTreeMap<String, crate::co_writer::AppliedCoWriter>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -159,15 +167,6 @@ struct DocumentContexts {
 struct DocumentContext {
     instructions: String,
     materials: Vec<ContextMaterial>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct ContextExcerptEvidence {
-    attachment_id: String,
-    source_text_sha256: String,
-    start_byte: u64,
-    end_byte: u64,
-    excerpt_sha256: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -614,11 +613,19 @@ pub(crate) fn prepare_provided(
         temporary: temporary_sibling(&destination),
         destination,
     };
+    let bytes = serde_json::to_vec_pretty(&manifest)?;
+    if bytes.len() as u64 > MAX_PRIVATE_METADATA_BYTES {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    // Bind staged ciphertext to the published path, never its temporary name.
+    let namespace = crate::private_sidecar::namespace(project_root, &staged.destination)?;
+    let stored =
+        crate::private_sidecar::PayloadCodec::open(project_root)?.seal(&namespace, &bytes)?;
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&staged.temporary)?;
-    serde_json::to_writer_pretty(&mut file, &manifest)?;
+    file.write_all(&stored)?;
     file.sync_all()?;
     let mut result = attachment;
     result.media_markdown = editor_media_markdown(&result, &manifest.media);
@@ -682,6 +689,56 @@ pub(crate) fn set_document_context_snapshot_with_materials(
     attachment_ids: &[String],
     materials: Option<&[ContextMaterial]>,
 ) -> Result<DocumentContextSnapshot, ContextAttachmentError> {
+    set_context_snapshot(
+        project_root,
+        document_id,
+        markdown,
+        attachment_ids,
+        materials,
+        None,
+    )
+}
+
+pub(crate) fn applied_co_writer(
+    project_root: &Path,
+    document_id: &str,
+) -> Result<Option<crate::co_writer::AppliedCoWriter>, ContextAttachmentError> {
+    Ok(read_contexts(project_root)?
+        .applied_co_writers
+        .remove(document_id))
+}
+
+pub(crate) fn set_document_context_with_co_writer(
+    project_root: &Path,
+    document_id: &str,
+    frozen: &crate::co_writer::AppliedCoWriter,
+) -> Result<DocumentContextSnapshot, ContextAttachmentError> {
+    let markdown = frozen
+        .markdown()
+        .map_err(|_| ContextAttachmentError::ContextInvalid)?;
+    set_context_snapshot(
+        project_root,
+        document_id,
+        markdown,
+        &frozen.context.metadata().attachment_ids,
+        Some(&frozen.context.metadata().materials),
+        Some(frozen),
+    )
+}
+
+fn set_context_snapshot(
+    project_root: &Path,
+    document_id: &str,
+    markdown: &str,
+    attachment_ids: &[String],
+    materials: Option<&[ContextMaterial]>,
+    co_writer: Option<&crate::co_writer::AppliedCoWriter>,
+) -> Result<DocumentContextSnapshot, ContextAttachmentError> {
+    if let Some(co_writer) = co_writer {
+        co_writer
+            .validate()
+            .map_err(|_| ContextAttachmentError::ContextInvalid)?;
+    }
     if markdown.len() > MAX_MANUAL_CONTEXT_BYTES {
         return Err(ContextAttachmentError::ManualTextLimit);
     }
@@ -736,6 +793,11 @@ pub(crate) fn set_document_context_snapshot_with_materials(
             materials: selected,
         },
     );
+    if let Some(co_writer) = co_writer {
+        contexts
+            .applied_co_writers
+            .insert(document_id.to_owned(), co_writer.clone());
+    }
     write_contexts(project_root, &contexts)?;
     snapshot_from_contexts(project_root, &contexts, document_id)
 }
@@ -1234,8 +1296,9 @@ fn check_object_metadata(
     }
     let metadata =
         fs::symlink_metadata(attachment_root(project_root)?.join("objects").join(sha256))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != expected_bytes
-    {
+    let stored_bytes =
+        crate::private_sidecar::PayloadCodec::open(project_root)?.stored_limit(expected_bytes);
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != stored_bytes {
         return Err(ContextAttachmentError::ContextInvalid);
     }
     Ok(())
@@ -1431,33 +1494,34 @@ fn assemble_generation_context(
     }
 
     for (index, (id, attachment, source_text)) in sources.iter().enumerate() {
+        #[cfg(test)]
+        SOURCE_WORK.with(|counter| {
+            let mut work = counter.get();
+            work.hashed += source_text.len();
+            counter.set(work);
+        });
         let separator = usize::from(!rendered.is_empty()) * 2;
         let remaining = context_budget.saturating_sub(rendered.len() + separator);
         let remaining_sources = sources.len().saturating_sub(index).max(1);
-        let header = format!(
-            "[BEGIN UNTRUSTED ATTACHMENT EXCERPTS id={} name={:?} coverage={}]\n",
-            id,
-            attachment.file_name,
-            if attachment.coverage_complete {
-                "complete"
-            } else {
-                "partial"
-            }
-        );
-        let footer = format!("\n[END UNTRUSTED ATTACHMENT EXCERPTS id={id}]");
         let fair_share = remaining / remaining_sources;
-        let payload_budget = fair_share.saturating_sub(header.len() + footer.len());
-        let (selected, mut selected_evidence) =
-            select_excerpts(id, source_text, query, payload_budget);
+        let (selected, mut selected_evidence) = render_source(
+            ContextSource {
+                id,
+                name: &attachment.file_name,
+                root_sha256: &attachment.id,
+                complete: attachment.coverage_complete,
+                text: source_text,
+            },
+            query,
+            fair_share,
+        );
         if selected.is_empty() {
             continue;
         }
         if !rendered.is_empty() {
             rendered.push_str("\n\n");
         }
-        rendered.push_str(&header);
         rendered.push_str(&selected);
-        rendered.push_str(&footer);
         evidence.append(&mut selected_evidence);
     }
     debug_assert!(rendered.len() <= context_budget);
@@ -1489,201 +1553,6 @@ fn middle_out_manuscript(text: &str, budget: usize) -> (String, Option<(usize, u
     rendered.push_str(tail);
     (rendered, Some((head_end, tail_start)))
 }
-
-fn select_excerpts(
-    source_id: &str,
-    text: &str,
-    query: &str,
-    budget: usize,
-) -> (String, Vec<ContextExcerptEvidence>) {
-    if text.is_empty() || budget == 0 {
-        return (String::new(), Vec::new());
-    }
-    #[cfg(test)]
-    if source_id != "manual" {
-        SOURCE_WORK.with(|counter| {
-            let mut work = counter.get();
-            work.hashed += text.len();
-            counter.set(work);
-        });
-    }
-    let source_text_sha256 = format!("{:x}", Sha256::digest(text.as_bytes()));
-    if text.len() <= budget {
-        return (
-            text.to_owned(),
-            vec![excerpt_evidence(
-                source_id,
-                &source_text_sha256,
-                0,
-                text.len(),
-                text,
-            )],
-        );
-    }
-
-    let terms = query_terms(query);
-    let ranges = excerpt_chunk_ranges(text);
-    let mut ranked = ranges
-        .iter()
-        .copied()
-        .map(|(start, end)| {
-            let score = lexical_score(&text[start..end], &terms);
-            (score, start, end)
-        })
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
-    if let Some(first) = ranked.iter().position(|(_, start, _)| *start == 0) {
-        let front = ranked.remove(first);
-        ranked.insert(0, front);
-    }
-    if ranked.iter().all(|(score, _, _)| *score == 0)
-        && let Some(last) = ranges.last().copied()
-        && let Some(last_index) = ranked
-            .iter()
-            .position(|(_, start, end)| (*start, *end) == last)
-        && last_index > 1
-    {
-        let tail = ranked.remove(last_index);
-        ranked.insert(1.min(ranked.len()), tail);
-    }
-
-    let mut chosen = Vec::new();
-    let mut used = 0_usize;
-    for (_, start, end) in ranked {
-        let marker = excerpt_marker(start, end, text.len());
-        let addition = marker.len() + end.saturating_sub(start) + usize::from(!chosen.is_empty());
-        if used.saturating_add(addition) > budget {
-            continue;
-        }
-        used += addition;
-        chosen.push((start, end));
-    }
-    chosen.sort_unstable();
-
-    let mut rendered = String::with_capacity(used);
-    let mut evidence = Vec::with_capacity(chosen.len());
-    for (index, (start, end)) in chosen.into_iter().enumerate() {
-        if index > 0 {
-            rendered.push('\n');
-        }
-        rendered.push_str(&excerpt_marker(start, end, text.len()));
-        let excerpt = &text[start..end];
-        rendered.push_str(excerpt);
-        evidence.push(excerpt_evidence(
-            source_id,
-            &source_text_sha256,
-            start,
-            end,
-            excerpt,
-        ));
-    }
-    (rendered, evidence)
-}
-
-fn excerpt_evidence(
-    source_id: &str,
-    source_text_sha256: &str,
-    start: usize,
-    end: usize,
-    excerpt: &str,
-) -> ContextExcerptEvidence {
-    ContextExcerptEvidence {
-        attachment_id: source_id.to_owned(),
-        source_text_sha256: source_text_sha256.to_owned(),
-        start_byte: start as u64,
-        end_byte: end as u64,
-        excerpt_sha256: format!("{:x}", Sha256::digest(excerpt.as_bytes())),
-    }
-}
-
-fn excerpt_marker(start: usize, end: usize, total: usize) -> String {
-    format!("[EXCERPT bytes {start}..{end} of {total}]\n")
-}
-
-fn excerpt_chunk_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut start = 0_usize;
-    while start < text.len() {
-        let mut end = (start + EXCERPT_CHUNK_BYTES).min(text.len());
-        while end > start && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        if end == start {
-            end = text[start..]
-                .char_indices()
-                .nth(1)
-                .map_or(text.len(), |(offset, _)| start + offset);
-        }
-        if end < text.len() {
-            let mut floor = start + (end - start) / 2;
-            while !text.is_char_boundary(floor) {
-                floor -= 1;
-            }
-            if let Some(relative) = text[floor..end].rfind("\n\n") {
-                let paragraph_end = floor + relative + 2;
-                if paragraph_end > start {
-                    end = paragraph_end;
-                }
-            } else if let Some(relative) = text[floor..end].rfind('\n') {
-                let line_end = floor + relative + 1;
-                if line_end > start {
-                    end = line_end;
-                }
-            }
-        }
-        ranges.push((start, end));
-        start = end;
-    }
-    ranges
-}
-
-fn query_terms(query: &str) -> BTreeSet<String> {
-    let mut terms = BTreeSet::new();
-    for word in query.rsplit(|character: char| !character.is_alphanumeric()) {
-        if word.chars().count() < 4 {
-            continue;
-        }
-        let word = word.to_lowercase();
-        if CONTEXT_STOP_WORDS.contains(&word.as_str()) {
-            continue;
-        }
-        terms.insert(word);
-        if terms.len() == 128 {
-            break;
-        }
-    }
-    terms
-}
-
-fn lexical_score(text: &str, terms: &BTreeSet<String>) -> usize {
-    if terms.is_empty() {
-        return 0;
-    }
-    text.split(|character: char| !character.is_alphanumeric())
-        .filter(|word| word.chars().count() >= 4)
-        .map(str::to_lowercase)
-        .filter(|word| terms.contains(word))
-        .collect::<BTreeSet<_>>()
-        .len()
-}
-
-fn trailing_utf8(text: &str, max_bytes: usize) -> &str {
-    if text.len() <= max_bytes {
-        return text;
-    }
-    let mut start = text.len() - max_bytes;
-    while start < text.len() && !text.is_char_boundary(start) {
-        start += 1;
-    }
-    &text[start..]
-}
-
-const CONTEXT_STOP_WORDS: &[&str] = &[
-    "about", "after", "again", "also", "been", "before", "being", "between", "could", "from",
-    "have", "into", "just", "more", "most", "other", "over", "same", "some", "such", "than",
-    "that", "their", "them", "then", "there", "these", "they", "this", "those", "through", "under",
-    "very", "what", "when", "where", "which", "while", "with", "would", "your",
-];
 
 fn image_as_png(bytes: &[u8]) -> Result<Vec<u8>, String> {
     const MAX_PNG_BYTES: usize = 16 * 1024 * 1024;
@@ -1881,7 +1750,7 @@ fn install_object(
     }
     let root = attachment_root(project_root)?;
     let path = root.join("objects").join(sha256);
-    install_immutable(&path, bytes)
+    install_immutable(project_root, &path, bytes)
 }
 
 fn read_object(
@@ -1893,32 +1762,31 @@ fn read_object(
         return Err(ContextAttachmentError::ContextInvalid);
     }
     let path = attachment_root(project_root)?.join("objects").join(sha256);
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() != expected_bytes
-    {
-        return Err(ContextAttachmentError::ContextInvalid);
-    }
-    let file = File::open(&path)?;
-    let identity = FileIdentityHandle::from_file(file.try_clone()?)?;
-    let mut bytes = Vec::new();
-    file.take(expected_bytes + 1).read_to_end(&mut bytes)?;
-    if FileIdentityHandle::from_path(&path)? != identity
-        || fs::symlink_metadata(&path)?.file_type().is_symlink()
-        || bytes.len() as u64 != expected_bytes
-        || format!("{:x}", Sha256::digest(&bytes)) != sha256
-    {
+    let bytes =
+        crate::private_sidecar::read(project_root, &path, expected_bytes)?.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "attachment object does not exist",
+            )
+        })?;
+    if bytes.len() as u64 != expected_bytes || format!("{:x}", Sha256::digest(&bytes)) != sha256 {
         return Err(ContextAttachmentError::ContextInvalid);
     }
     Ok(bytes)
 }
 
-pub(crate) fn original_path(
+pub(crate) fn original_for_export(
     project_root: &Path,
     id: &str,
-) -> Result<PathBuf, ContextAttachmentError> {
+) -> Result<(String, Vec<u8>), ContextAttachmentError> {
     let manifest = read_manifest_metadata(project_root, id)?;
-    let _ = read_object(project_root, id, manifest.attachment.byte_count)?;
-    Ok(attachment_root(project_root)?.join("objects").join(id))
+    let bytes = read_object(project_root, id, manifest.attachment.byte_count)?;
+    Ok((manifest.attachment.file_name, bytes))
+}
+
+#[cfg(test)]
+fn original_bytes(project_root: &Path, id: &str) -> Result<Vec<u8>, ContextAttachmentError> {
+    original_for_export(project_root, id).map(|(_, bytes)| bytes)
 }
 
 /// Acquisition provenance is separate from the offline processing receipt.
@@ -1932,7 +1800,7 @@ pub(crate) fn record_import_origin(
     let path = attachment_root(project_root)?
         .join("manifests")
         .join(format!("source-{hash}.json"));
-    install_immutable(&path, &bytes)
+    install_immutable(project_root, &path, &bytes)
 }
 
 #[cfg(test)]
@@ -1967,10 +1835,10 @@ fn read_manifest_if_present(
     let path = attachment_root(project_root)?
         .join("manifests")
         .join(format!("{id}.json"));
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    let Some(bytes) =
+        crate::private_sidecar::read(project_root, &path, MAX_PRIVATE_METADATA_BYTES)?
+    else {
+        return Ok(None);
     };
     let manifest: AttachmentManifest = serde_json::from_slice(&bytes)?;
     let expected_media_kinds = manifest
@@ -2079,15 +1947,14 @@ fn read_contexts(project_root: &Path) -> Result<DocumentContexts, ContextAttachm
         schema: String,
     }
     let path = attachment_root(project_root)?.join("document-context.json");
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DocumentContexts {
-                schema: CONTEXT_SCHEMA.to_owned(),
-                documents: BTreeMap::new(),
-            });
-        }
-        Err(error) => return Err(error.into()),
+    let Some(bytes) =
+        crate::private_sidecar::read(project_root, &path, MAX_PRIVATE_METADATA_BYTES)?
+    else {
+        return Ok(DocumentContexts {
+            schema: CONTEXT_SCHEMA.to_owned(),
+            documents: BTreeMap::new(),
+            applied_co_writers: BTreeMap::new(),
+        });
     };
     // Mixed-text historical formats cannot prove which bytes were instructions.
     // Reject without rewriting or promoting any existing source material.
@@ -2096,6 +1963,10 @@ fn read_contexts(project_root: &Path) -> Result<DocumentContexts, ContextAttachm
     }
     let contexts: DocumentContexts = serde_json::from_slice(&bytes)?;
     if contexts.schema != CONTEXT_SCHEMA
+        || contexts
+            .applied_co_writers
+            .values()
+            .any(|preset| preset.validate().is_err())
         || contexts.documents.values().any(|context| {
             context.instructions.len() > MAX_MANUAL_CONTEXT_BYTES
                 || context
@@ -2133,28 +2004,40 @@ fn write_contexts(
     contexts: &DocumentContexts,
 ) -> Result<(), ContextAttachmentError> {
     let path = attachment_root(project_root)?.join("document-context.json");
-    replace_atomically(&path, &serde_json::to_vec_pretty(contexts)?)
+    replace_atomically(project_root, &path, &serde_json::to_vec_pretty(contexts)?)
 }
 
-fn install_immutable(path: &Path, bytes: &[u8]) -> Result<(), ContextAttachmentError> {
-    if let Ok(existing) = fs::read(path) {
+fn install_immutable(
+    project_root: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), ContextAttachmentError> {
+    if bytes.len() as u64 > MAX_PRIVATE_METADATA_BYTES {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    if let Some(existing) = crate::private_sidecar::read(project_root, path, bytes.len() as u64)? {
         return if existing == bytes {
             Ok(())
         } else {
             Err(ContextAttachmentError::ContextInvalid)
         };
     }
+    let namespace = crate::private_sidecar::namespace(project_root, path)?;
+    let stored =
+        crate::private_sidecar::PayloadCodec::open(project_root)?.seal(&namespace, bytes)?;
     let temp = temporary_sibling(path);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp)?;
-    file.write_all(bytes)?;
+    file.write_all(&stored)?;
     file.sync_all()?;
     match fs::hard_link(&temp, path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if fs::read(path)? != bytes {
+            if crate::private_sidecar::read(project_root, path, bytes.len() as u64)?.as_deref()
+                != Some(bytes)
+            {
                 let _ = fs::remove_file(&temp);
                 return Err(ContextAttachmentError::ContextInvalid);
             }
@@ -2168,12 +2051,22 @@ fn install_immutable(path: &Path, bytes: &[u8]) -> Result<(), ContextAttachmentE
     Ok(())
 }
 
-fn replace_atomically(path: &Path, bytes: &[u8]) -> Result<(), ContextAttachmentError> {
+fn replace_atomically(
+    project_root: &Path,
+    path: &Path,
+    bytes: &[u8],
+) -> Result<(), ContextAttachmentError> {
+    if bytes.len() as u64 > MAX_PRIVATE_METADATA_BYTES {
+        return Err(ContextAttachmentError::ContextInvalid);
+    }
+    let namespace = crate::private_sidecar::namespace(project_root, path)?;
+    let stored =
+        crate::private_sidecar::PayloadCodec::open(project_root)?.seal(&namespace, bytes)?;
     if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(ContextAttachmentError::ContextInvalid);
     }
     let mut file = AtomicWriteFile::options().open(path)?;
-    file.write_all(bytes)?;
+    file.write_all(&stored)?;
     file.commit()?;
     if let Some(parent) = path.parent() {
         #[cfg(unix)]
@@ -2200,6 +2093,88 @@ fn is_sha256(value: &str) -> bool {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    #[cfg(unix)]
+    fn secured_context_retains_exact_original_text_audio_and_private_metadata() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join(".loom")).unwrap();
+        desktop_vault::ProjectVault::initialize_with_key(project.path(), [31; 32]).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let text = "Private orchard notes, never a public sidecar payload.";
+        let source_path = source.path().join("orchard.txt");
+        fs::write(&source_path, text).unwrap();
+        let attachment = import_path(project.path(), &source_path).unwrap();
+        let wav = wav_fixture();
+        let audio = import_recorded_wav(project.path(), "private.wav".into(), &wav).unwrap();
+        let audio_manifest = read_manifest(project.path(), &audio.id).unwrap();
+        assert_eq!(
+            read_context_media(project.path(), &audio.id, &audio_manifest.media[0].sha256)
+                .unwrap()
+                .bytes,
+            wav
+        );
+        set_document_context_snapshot(project.path(), "doc", "A private co-writer voice.", &[])
+            .unwrap();
+        record_import_origin(
+            project.path(),
+            &serde_json::json!({"source": "Private orchard acquisition"}),
+        )
+        .unwrap();
+
+        let root = attachment_root(project.path()).unwrap();
+        for directory in [root.join("objects"), root.join("manifests")] {
+            for entry in fs::read_dir(directory).unwrap() {
+                let bytes = fs::read(entry.unwrap().path()).unwrap();
+                assert!(bytes.starts_with(b"MINEENC\x01"));
+                assert!(
+                    !bytes
+                        .windows(text.len())
+                        .any(|window| window == text.as_bytes())
+                );
+                assert_ne!(bytes, wav);
+            }
+        }
+        let context_bytes = fs::read(root.join("document-context.json")).unwrap();
+        assert!(context_bytes.starts_with(b"MINEENC\x01"));
+        assert!(serde_json::from_slice::<serde_json::Value>(&context_bytes).is_err());
+        assert_eq!(
+            original_bytes(project.path(), &attachment.id).unwrap(),
+            text.as_bytes()
+        );
+        assert_eq!(
+            original_for_export(project.path(), &attachment.id)
+                .unwrap()
+                .0,
+            "orchard.txt"
+        );
+        assert_eq!(
+            read_canonical_text(
+                project.path(),
+                &read_manifest(project.path(), &attachment.id).unwrap()
+            )
+            .unwrap(),
+            text
+        );
+        assert_eq!(
+            document_context_snapshot(project.path(), "doc")
+                .unwrap()
+                .markdown,
+            "A private co-writer voice."
+        );
+
+        // Immutable publication compares authenticated plaintext, never random
+        // ciphertext nonces, and therefore remains idempotent after reopening.
+        let before = fs::read(root.join("objects").join(&attachment.id)).unwrap();
+        assert_eq!(
+            import_path(project.path(), &source_path).unwrap().id,
+            attachment.id
+        );
+        assert_eq!(
+            fs::read(root.join("objects").join(&attachment.id)).unwrap(),
+            before
+        );
+    }
 
     #[test]
     fn explicit_material_edits_preserve_instructions_and_exact_source_identity() {
@@ -2257,6 +2232,32 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn secured_attachment_objects_fail_closed_on_tamper_plaintext_and_wrong_lengths() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join(".loom")).unwrap();
+        desktop_vault::ProjectVault::initialize_with_key(project.path(), [32; 32]).unwrap();
+        let bytes = b"retained original with private source bytes";
+        let id = format!("{:x}", Sha256::digest(bytes));
+        install_object(project.path(), &id, bytes).unwrap();
+        let path = attachment_root(project.path())
+            .unwrap()
+            .join("objects")
+            .join(&id);
+        let sealed = fs::read(&path).unwrap();
+        assert!(read_object(project.path(), &id, bytes.len() as u64 - 1).is_err());
+        assert!(read_object(project.path(), &id, bytes.len() as u64 + 1).is_err());
+        let mut tampered = sealed.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        fs::write(&path, tampered).unwrap();
+        assert!(read_object(project.path(), &id, bytes.len() as u64).is_err());
+        fs::write(&path, bytes).unwrap();
+        assert!(read_object(project.path(), &id, bytes.len() as u64).is_err());
+        assert!(install_object(project.path(), &id, bytes).is_err());
+        assert_eq!(fs::read(path).unwrap(), bytes);
     }
 
     #[test]
@@ -2412,7 +2413,7 @@ mod tests {
         );
         fs::remove_file(&path).unwrap();
         assert_eq!(
-            fs::read(original_path(project.path(), &attachment.id).unwrap()).unwrap(),
+            original_bytes(project.path(), &attachment.id).unwrap(),
             bytes
         );
         let snapshot = add_document_context_snapshot(
@@ -2487,7 +2488,7 @@ mod tests {
                 let decoded = image::load_from_memory(&resolved.media[0].bytes).unwrap();
                 assert_eq!((decoded.width(), decoded.height()), (2, 2));
                 assert_eq!(
-                    fs::read(original_path(project.path(), &attachment.id).unwrap()).unwrap(),
+                    original_bytes(project.path(), &attachment.id).unwrap(),
                     bytes
                 );
             }
@@ -2499,7 +2500,7 @@ mod tests {
             assert!(truncated.media_kinds.is_empty());
             assert!(truncated.media_markdown.is_none());
             assert_eq!(
-                fs::read(original_path(project.path(), &truncated.id).unwrap()).unwrap(),
+                original_bytes(project.path(), &truncated.id).unwrap(),
                 bytes[..bytes.len() - 1]
             );
         }
@@ -2539,7 +2540,7 @@ mod tests {
             for _ in 0..2 {
                 let attachment = import_path(project.path(), &path).expect(extension);
                 assert_eq!(
-                    fs::read(original_path(project.path(), &attachment.id).unwrap()).unwrap(),
+                    original_bytes(project.path(), &attachment.id).unwrap(),
                     fs::read(&path).unwrap()
                 );
                 let markdown = attachment.editable_markdown.as_deref().expect(extension);
@@ -2886,7 +2887,7 @@ mod tests {
         assert!(
             resolved
                 .context_preamble
-                .contains("[BEGIN UNTRUSTED ATTACHMENT EXCERPTS")
+                .contains("[BEGIN UNTRUSTED ATTACHMENT DATA")
         );
         assert!(!resolved.context_preamble.contains("AUTHOR STEERING"));
 

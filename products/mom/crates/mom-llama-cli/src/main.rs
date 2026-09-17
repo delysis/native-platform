@@ -594,6 +594,8 @@ enum AttachmentCommand {
 
 #[derive(Debug, Clone, ValueEnum)]
 enum ExportFormatArg {
+    /// Full shared document snapshot, including inactive branches and metadata.
+    Document,
     Json,
     Markdown,
 }
@@ -1410,6 +1412,7 @@ fn run() -> Result<()> {
                 mom_llama_runtime::conversation_export(
                     &conversation,
                     match format {
+                        ExportFormatArg::Document => ConversationExportFormat::Document,
                         ExportFormatArg::Json => ConversationExportFormat::Json,
                         ExportFormatArg::Markdown => ConversationExportFormat::Markdown,
                     },

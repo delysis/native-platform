@@ -1,0 +1,305 @@
+{
+  "created_at": "2026-09-17T05:17:42.153861+00:00",
+  "status": "experimental; full parity incomplete",
+  "platform": "local macOS arm64",
+  "toolchain": "Rust 1.92.0",
+  "tests": {
+    "passed": 279,
+    "failed": 0,
+    "existing_manual_ignored": 2,
+    "suites": 29
+  },
+  "checks": {
+    "tests": {
+      "exit": 0,
+      "seconds": 174.382,
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--profile",
+        "native-view",
+        "-p",
+        "loom-markdown",
+        "-p",
+        "loom-easl-interface",
+        "-p",
+        "easl-text",
+        "-p",
+        "easl-native-text",
+        "-p",
+        "fsexp",
+        "--features",
+        "easl-text/gpu",
+        "--lib",
+        "--test",
+        "boundary",
+        "--test",
+        "code_blocks",
+        "--test",
+        "contracts",
+        "--test",
+        "cross_container",
+        "--test",
+        "editing",
+        "--test",
+        "formatting_selection",
+        "--test",
+        "indentation",
+        "--test",
+        "input_rules",
+        "--test",
+        "normalization",
+        "--test",
+        "paragraphs",
+        "--test",
+        "structure",
+        "--test",
+        "tracked_selections",
+        "--test",
+        "typing",
+        "--test",
+        "formatting_links",
+        "--test",
+        "native_viewport",
+        "--test",
+        "ime_geometry",
+        "--test",
+        "editor_reflow",
+        "--test",
+        "editor_navigation",
+        "--test",
+        "paragraph_editor",
+        "--test",
+        "rich_editor",
+        "--test",
+        "page_navigation",
+        "--test",
+        "pretext_corpus"
+      ]
+    },
+    "clippy": {
+      "exit": 0,
+      "seconds": 8.747,
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "--locked",
+        "--profile",
+        "native-view",
+        "-p",
+        "loom-markdown",
+        "-p",
+        "loom-easl-interface",
+        "-p",
+        "easl-text",
+        "-p",
+        "easl-native-text",
+        "--features",
+        "easl-text/gpu",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ]
+    },
+    "focused-final": {
+      "exit": 0,
+      "seconds": 37.772,
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--profile",
+        "native-view",
+        "-p",
+        "loom-markdown",
+        "-p",
+        "loom-easl-interface",
+        "-p",
+        "easl-text",
+        "-p",
+        "easl-native-text",
+        "-p",
+        "fsexp",
+        "--features",
+        "easl-text/gpu",
+        "--lib",
+        "format_destination_and_enabled_link_commands_follow_the_palette_tab_order"
+      ]
+    },
+    "pixels-final": {
+      "exit": 0,
+      "seconds": 4.831,
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--profile",
+        "native-view",
+        "-p",
+        "loom-markdown",
+        "-p",
+        "loom-easl-interface",
+        "-p",
+        "easl-text",
+        "-p",
+        "easl-native-text",
+        "-p",
+        "fsexp",
+        "--features",
+        "easl-text/gpu",
+        "--lib",
+        "render_appearance_review",
+        "--",
+        "--ignored",
+        "--exact",
+        "renderer::tests::render_appearance_review",
+        "--nocapture"
+      ]
+    },
+    "doc": {
+      "exit": 0,
+      "seconds": 32.91,
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "--profile",
+        "native-view",
+        "-p",
+        "loom-markdown",
+        "-p",
+        "loom-easl-interface",
+        "-p",
+        "easl-text",
+        "-p",
+        "easl-native-text",
+        "-p",
+        "fsexp",
+        "--features",
+        "easl-text/gpu",
+        "--doc"
+      ]
+    },
+    "policy": {
+      "exit": 0,
+      "seconds": 0.835,
+      "command": [
+        "cargo",
+        "run",
+        "--offline",
+        "--locked",
+        "--profile",
+        "native-view",
+        "-p",
+        "xtask",
+        "--",
+        "policy"
+      ]
+    },
+    "fmt": {
+      "exit": 0,
+      "seconds": 6.715,
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ]
+    },
+    "current-docs": {
+      "exit": 0,
+      "seconds": 0.184,
+      "command": [
+        "node",
+        "scripts/ci/validate-current-docs.mjs"
+      ]
+    },
+    "diff": {
+      "exit": 0,
+      "seconds": 0.035,
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ]
+    },
+    "vendor-fmt": {
+      "exit": 0,
+      "seconds": 0.046,
+      "command": [
+        "rustfmt",
+        "--edition",
+        "2024",
+        "--check",
+        "crates/services/easl/vendor/parley/src/editing/editor.rs"
+      ]
+    }
+  },
+  "final_increment_source_hashes": {
+    "crates/services/easl/easl-native-text/tests/ime_geometry.rs": "9fc13c8caf69700313ca7fc67dc90302776dd716988de3f138d4a72760df801c",
+    "crates/services/easl/easl-text/library/viewport-native.easl": "36614a43d4a2a0b2c55b50688dcf20ad067eeab1ef833fb08c32e7de397ebe71",
+    "crates/services/easl/easl-text/src/lib.rs": "edc2d57a4c20d4b44f37fbb88056cf2f1a11274f6b586efb9ee6001a886d2099",
+    "crates/services/easl/easl-text/src/viewport.rs": "fe051bcd93fb9283c55113fc4784df0b85fe229aed081eefe8186e019409eec6",
+    "crates/services/easl/easl-text/tests/native_viewport.rs": "a8d0feb822ad2eee295a77963883c3bce31f2883848ca2f470f20702abff605e",
+    "crates/services/easl/vendor/parley/src/editing/editor.rs": "5e43fe570d49bafd3316b0ee5f53881d0eedda5d4d9f930fc28a3f5a703dc461",
+    "products/loom/apps/loom/src/App.svelte": "3d45a082bb51a6f11a06b865e5e6c5a198e1c836dbb58fe3ded8562d931a1725",
+    "products/loom/apps/loom/src/app.css": "033cb7338db5f570352b7ea29f9406ce6c0482c1758cf34c49395cc949339bea",
+    "products/loom/crates/loom-markdown/src/editing.rs": "60c68a48310b90103b5478a498b138bb39fd06a96dc7d94e8bb19a14a03aae7e",
+    "products/loom/crates/loom-markdown/src/transaction/formatting.rs": "feaa39d123e78abb88ad78f0b6e66152dae9e0f9401aaf4abca20bee6dd76dd6",
+    "products/loom/crates/loom-markdown/tests/formatting_links.rs": "4f76f36d2f82e7a1b504b59a52e585ad02e140ff67c4a72d907041cf25f9c103",
+    "products/loom/experiments/easl-interface/src/accessibility.rs": "2676fd927e091e39caa4e857201a534076d24f566fc69e8f94829a464385e39f",
+    "products/loom/experiments/easl-interface/src/focus.rs": "b7d2177df8238b781577d355f493d6b4b350daeaffe39fb790f485215001a29a",
+    "products/loom/experiments/easl-interface/src/formatting.rs": "59fe957ef7ada42493d1bd9ce8a5b09b49ade430a365310d3350e43f6473fc43",
+    "products/loom/experiments/easl-interface/src/input_field.rs": "d6675ffb3be5d0b97cc39ba4c4bd11e35666689494ce637c9ea7d738373f64af",
+    "products/loom/experiments/easl-interface/src/interface.rs": "29d6f66a8bebc4d8d240e8c12436e6fe813157bae1160fda77b7a39ede2b1bcf",
+    "products/loom/experiments/easl-interface/src/keyboard.rs": "97355f86379ffe2403c3ce084880c77d099ee0929918d81b3427a741f1314298",
+    "products/loom/experiments/easl-interface/src/lib.rs": "e42830de092bf5f43d885822fb8d360c2779368dbbf19a1564565e01996f234d",
+    "products/loom/experiments/easl-interface/src/pane_divider.rs": "3696956336cae56e51ee9c537076dfdb9957f236b66a6f417826e1b708ada80a",
+    "products/loom/experiments/easl-interface/src/renderer.rs": "742c743728416af933db749772da455f028c7431feaed7b088e97311818f4c09",
+    "products/loom/experiments/easl-interface/src/text_field.rs": "dfec252f0ba78ce39370d7dff2cee716121e71bc44a993b31e67970e28e0e6e2",
+    "products/loom/experiments/easl-interface/ui/loom.easl": "4a2db6a80282e3c121ffd39cacbbc8f80debc6b45d330f7e5c869d829e932a4b"
+  },
+  "test_only_followup": {
+    "changed_after_behavior_gate": [
+      "products/loom/experiments/easl-interface/src/focus.rs",
+      "products/loom/experiments/easl-interface/src/renderer.rs"
+    ],
+    "reason": "Test-only struct initialization, unnecessary format allocation removal, and lint rationale; production code unchanged. Changed focus test and offscreen review rerun; all targets linted."
+  },
+  "pixels": {
+    "final_images_identical_to_visually_reviewed_images": {
+      "dark-format.ppm": true,
+      "dark-link.ppm": true,
+      "dark.ppm": true,
+      "light-format.ppm": true,
+      "light-link.ppm": true,
+      "light.ppm": true
+    },
+    "offscreen_only": true,
+    "native_acceptance": false
+  },
+  "studio_exclusion": {
+    "historical_revisions": 15,
+    "distinct_removed_source_blobs": 153,
+    "current_exact_blob_matches": {},
+    "scope": "Exact source/config blob matches across removed local package history and current HEAD; path and lockfile policy are checked separately."
+  },
+  "acceptance": {
+    "foreground_native_ui": false,
+    "packaged_signed_relaunch": false,
+    "real_os_ime": false,
+    "mixed_webview_accessibility": false,
+    "remote_ci": false,
+    "full_pretext_parity": false,
+    "full_loom_parity": false
+  },
+  "scope": "Final increment plus affected native editor/Markdown/view consumers. Earlier compiler/GPU/application checks are historical, not rerun here."
+}

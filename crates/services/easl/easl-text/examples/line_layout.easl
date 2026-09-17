@@ -1,0 +1,331 @@
+(import "font_cascade.easl")
+(import "../library/runs.easl")
+(import "../library/geometry.easl")
+(import "../library/paragraph.easl")
+(import "../library/rich.easl")
+
+; Single-line consumer. EASL owns script/style/run planning, placement and cells;
+; native primitives supply Unicode paragraph facts, font shaping and atlas ink.
+; Default to the supplied primary font. line-enable-cascade adds explicit
+; fallback fonts; reusable EASL policy chooses whole graphemes from real shaping.
+; This scene does not discover system fonts or own application preferences.
+(var line-scripts: [TextScriptRun]) (var line-facts: [TextScriptFact])
+(var line-directions: [TextDirectionalFact]) (var line-slots: [TextBidiSlot])
+(var line-levels: [TextBidiRun]) (var line-runs: [TextShapeRun])
+(var line-glyphs: [FontShapedGlyph])
+(var line-fonts: [TextFontRun]) (var line-font-count: u32)
+(var line-fallback-facts: [TextGrapheme]) (var line-choices: [TextFontChoice])
+(var line-staged-fonts: [TextFontRun])
+(var line-quad-fonts: [u32])
+(var line-styles: [TextRunStyle]) (var line-strut-style: TextRunStyle)
+(var line-strut-font: u32)
+(var line-raw-glyphs: [FontShapedGlyph])
+(var line-shape-status: u32) (var line-style-work: u32)
+(var line-quad-colors: [vec4u]) (var line-decorations: [TextDecoration])
+(var line-decoration-count: u32)
+; Immutable consumer tables. Feature ID zero means defaults if the table is
+; empty; MAX language means unspecified. Other IDs must exist in these tables.
+(var line-feature-sets: [vec2u]) (var line-feature-values: [FontFeature])
+(var line-languages: [TextBuffer])
+(var line-selected-features: [FontFeature]) (var line-selected-language: TextBuffer)
+(var line-staged-features: [FontFeature])
+(var line-empty-language: TextBuffer)
+@external (var line-unresolved-graphemes: u32)
+(var line-positioned: [TextPlacedGlyph])
+(var line-quads: [TextGlyphQuad]) (var line-clusters: [TextClusterBox])
+(var line-cells: [TextCell])
+(var line-prepared: u32) (var line-script-count: u32)
+@external (var line-advance: f32)
+(var line-byte-count: u32) (var line-quad-count: u32) (var line-cluster-count: u32)
+@external (var line-cell-count: u32)
+@external (var line-run-count: u32)
+@external (var line-rtl-runs: u32)
+@external (var line-missing-glyphs: u32)
+
+(defn line-fact-at [i: u32]: TextScriptFact (line-facts i))
+(defn line-script-at [i: u32]: TextScriptRun (line-scripts i))
+(defn line-direction-at [i: u32]: TextDirectionalFact (line-directions i))
+(defn line-slot-at [i: u32]: TextBidiSlot (line-slots i))
+(defn line-level-at [i: u32]: TextBidiRun (line-levels i))
+(defn line-font-at [i: u32]: TextFontRun (line-fonts i))
+(defn line-fallback-fact [i: u32]: TextGrapheme (line-fallback-facts i))
+(defn line-choice-at [i: u32]: TextFontChoice (line-choices i))
+(defn line-emit-choice [i: u32 item: TextFontChoice] (= (line-choices i) item))
+(defn line-emit-font [i: u32 item: TextFontRun] (= (line-staged-fonts i) item))
+(defn line-enable-cascade [] (cascade-open) (= line-prepared 0u))
+(defn line-emit-script [i: u32 item: TextScriptRun] (= (line-scripts i) item))
+(defn line-emit-slot [i: u32 item: TextBidiSlot] (= (line-slots i) item))
+(defn line-emit-level [i: u32 item: TextBidiRun] (= (line-levels i) item))
+(defn line-emit-run [i: u32 item: TextShapeRun] (= (line-runs i) item))
+(defn line-glyph-at [i: u32]: FontShapedGlyph (line-glyphs i))
+(defn line-raw-glyph-at [i: u32]: FontShapedGlyph (line-raw-glyphs i))
+(defn line-feature-at [i: u32]: FontFeature (line-selected-features i))
+(defn line-emit-feature [i: u32 f: FontFeature] (= (line-staged-features i) f))
+(defn line-emit-styled-glyph [i: u32 glyph: FontShapedGlyph] (= (line-glyphs i) glyph))
+(defn line-emit-decoration [i: u32 item: TextDecoration]
+  (= (line-decorations (+ line-decoration-count i)) item))
+(defn line-cluster-at [i: u32]: TextClusterBox (line-clusters i))
+(defn line-emit-positioned [i: u32 item: TextPlacedGlyph]
+  (= (line-positioned (+ line-quad-count i)) item))
+(defn line-emit-cluster [i: u32 item: TextClusterBox] (= (line-clusters (+ line-cluster-count i)) item))
+(defn line-emit-cell [i: u32 item: TextCell] (= (line-cells i) item))
+(defn line-close []
+  (= line-prepared 0u)
+  (when (!= line-empty-language.handle 0u) (text-release line-empty-language))
+  (= line-empty-language (TextBuffer 0u)))
+
+; Prepare immutable paragraph facts once. A selected line reuses the paragraph's
+; script context and native levels. This specimen caps scalars/runs/glyphs/cells
+; at 4096. Tabs/hard breaks need the document consumer's separate flow handling.
+(defn line-default-style []: TextRunStyle
+  (let [metrics (cascade-strut)]
+    (TextRunStyle 0u specimen-metrics.w (max 52. (+ metrics.x metrics.y))
+      400. 0. 0. 0u 0u 4294967295u (vec4u 20u 26u 20u 255u) 16u)))
+(defn line-prepare [value: TextBuffer]: u32
+  (let [body (line-default-style)]
+    (line-prepare-styled value 0u (fn [i] (TextStyledSpan 0u 0u body)) (fn [s] 0u) body)))
+
+; Explicit rich spans cover the complete paragraph at whole-grapheme edges.
+; The caller supplies font instances matching each style. This fixed scene has
+; three font slots; system discovery and general font-pool integration remain open.
+; A zero span count means the supplied strut covers the whole paragraph.
+(defn line-prepare-styled [value: TextBuffer count: u32
+    span-at: (Fn [u32] TextStyledSpan) font-for-style: (Fn [TextRunStyle] u32)
+    strut: TextRunStyle]: u32
+  (= line-prepared 0u)
+  (when (or (> count 4096u) (not (text-style-valid strut))) (return 1u))
+  (= line-strut-style strut)
+  (= line-strut-font (font-for-style strut))
+  (when (or (> line-strut-font 2u) (and (> line-strut-font 0u) (not cascade-enabled))) (return 1u))
+  (when (== line-empty-language.handle 0u) (= line-empty-language (make-text "")))
+  (= line-byte-count (text-length value))
+  (= line-facts (text-script-facts value))
+  (let [facts (array-length line-facts)]
+    (when (> facts 4096u) (return 2u))
+    (for [i facts]
+      (let [scalar (.scalar (line-facts i))]
+        (when (or (and (>= scalar 9u) (<= scalar 13u))
+          (or (== scalar 133u) (or (== scalar 8232u) (== scalar 8233u)))) (return 4u))))
+    (= line-directions (text-directional-facts value 0u))
+    (= line-scripts (zeroed-array facts)) (= line-slots (zeroed-array facts))
+    (= line-levels (zeroed-array facts)) (= line-runs (zeroed-array facts))
+    (let [scripts (text-itemize-scripts facts line-fact-at 0u facts 25u facts line-emit-script 1000000u)]
+      (when (!= scripts.status 0u) (return scripts.status))
+      (= line-script-count scripts.count)))
+  (= line-font-count (if (== line-byte-count 0u) 0u (max 1u count)))
+  (= line-styles (zeroed-array (max 1u count))) (= (line-styles 0u) strut)
+  (= line-fonts (zeroed-array line-font-count))
+  (= line-fallback-facts (text-graphemes value))
+  (when (and (== line-byte-count 0u) (> count 1u)) (return 1u))
+  (let [@var previous 0u]
+    (for [i (max 1u count)]
+      (let [span (if (== count 0u) (TextStyledSpan 0u line-byte-count strut) (span-at i))
+            style span.style font (font-for-style style)]
+        (when (or (not (text-style-valid style))
+          (or (!= span.start previous) (or (< span.end span.start)
+            (or (and (== span.end span.start) (> line-byte-count 0u)) (> span.end line-byte-count)))))
+          (return 1u))
+        (when (or (> font 2u) (and (> font 0u) (not cascade-enabled))) (return 1u))
+        (let [facts (array-length line-fallback-facts)]
+          (when (or (> (text-measure-boundary facts line-fallback-fact span.start) facts)
+                    (> (text-measure-boundary facts line-fallback-fact span.end) facts)) (return 4u)))
+        (when (or (and (== (array-length line-feature-sets) 0u) (!= style.features 0u))
+          (and (> (array-length line-feature-sets) 0u) (>= style.features (array-length line-feature-sets))))
+          (return 1u))
+        (when (> (array-length line-feature-sets) 0u)
+          (let [range (line-feature-sets style.features)]
+            (when (or (> range.x range.y) (or (> range.y (array-length line-feature-values))
+              (> (- range.y range.x) 64u))) (return 1u))))
+        (when (and (!= style.language 4294967295u) (>= style.language (array-length line-languages)))
+          (return 1u))
+        (= (line-styles i) style)
+        (if (== line-byte-count 0u)
+          (let [] (= line-strut-style style) (= line-strut-font font))
+          (= (line-fonts i) (TextFontRun span.start span.end font i)))
+        (= previous span.end)))
+    (when (!= previous line-byte-count) (return 1u)))
+  (= line-unresolved-graphemes 0u)
+  (= line-prepared value.handle)
+  ; Ordered fallback is for the default style. Explicit rich spans already
+  ; carry the caller's chosen face/instance, which must not be replaced here.
+  (when (and cascade-enabled (== count 0u))
+    (let [status (line-select-fonts value)]
+      (when (!= status 0u) (= line-prepared 0u) (return status))))
+  0u)
+
+; Exact scalar-index line scope, keeping the previously resolved script runs.
+; Report policy work so contextual composition can share one bounded budget.
+(defn line-plan [value: TextBuffer begin: u32 end: u32 budget: u32]: TextRunResult
+  (when (!= value.handle line-prepared) (return (TextRunResult 1u 0u 0u)))
+  (let [facts (array-length line-facts)
+        ordered (text-bidi-order facts line-direction-at begin end facts line-slot-at line-emit-slot budget)]
+    (when (!= ordered.status 0u) (return (TextRunResult ordered.status 0u ordered.work)))
+    (when (> (* ordered.count 2u) (- budget ordered.work))
+      (return (TextRunResult 2u 0u ordered.work)))
+    (let [levels (text-bidi-runs ordered.count line-slot-at line-direction-at facts line-emit-level)
+          work (+ ordered.work levels.work)]
+      (when (!= levels.status 0u) (return (TextRunResult levels.status 0u work)))
+      (let [runs (text-plan-runs value levels.count line-level-at line-script-count line-script-at
+                    line-font-count line-font-at facts line-emit-run (- budget work))]
+        (when (!= runs.status 0u) (return (TextRunResult runs.status 0u (+ work runs.work))))
+        (= line-run-count runs.count)
+        (TextRunResult 0u runs.count (+ work runs.work))))))
+
+(defn line-shape-in-font [value: TextBuffer run: TextShapeRun font: u32]
+  (= line-shape-status 0u)
+  (let [context (text-slice value run.context-start run.context-end)
+        begin (- run.start run.context-start) end (- run.end run.context-start)
+        script (text-script-tag run.script-code) rtl (!= (& run.level 1u) 0u)
+        style (line-styles run.style)]
+    (let [range (if (== (array-length line-feature-sets) 0u) (vec2u 0u) (line-feature-sets style.features))]
+      (= line-selected-features (zeroed-array (- range.y range.x)))
+      (for [i (- range.y range.x)] (= (line-selected-features i) (line-feature-values (+ range.x i)))))
+    (when (!= style.letter-spacing 0.)
+      (= line-staged-features (zeroed-array 64u))
+      (let [features (text-tracking-features (array-length line-selected-features)
+              line-feature-at true 64u line-emit-feature)]
+        (when (!= features.status 0u)
+          (= line-shape-status features.status) (text-release context) (return))
+        (= line-selected-features (zeroed-array features.count))
+        (for [i features.count] (= (line-selected-features i) (line-staged-features i)))))
+    (= line-selected-language (if (== style.language 4294967295u) line-empty-language (line-languages style.language)))
+    (match font
+      0u (= line-glyphs (shape-font-span specimen-font context begin end script rtl line-selected-features line-selected-language))
+      1u (= line-glyphs (shape-font-span cascade-second context begin end script rtl line-selected-features line-selected-language))
+      2u (= line-glyphs (shape-font-span cascade-third context begin end script rtl line-selected-features line-selected-language))
+      _ (= line-glyphs (zeroed-array 0u)))
+    (text-release context)))
+(defn line-shape [value: TextBuffer run: TextShapeRun]
+  (line-shape-budget value run 1000000u))
+(defn line-shape-budget [value: TextBuffer run: TextShapeRun budget: u32]
+  (= line-style-work 0u)
+  (line-shape-in-font value run run.font)
+  (when (!= line-shape-status 0u) (return))
+  ; Native output already validates glyphs. The ordinary style is an identity;
+  ; retain that bulk result without copying or walking it twice in EASL.
+  (let [s (line-styles run.style)]
+    (when (and (== s.size (.w (cascade-metrics run.font)))
+      (and (== s.letter-spacing 0.) (== s.word-spacing 0.))) (return)))
+  (= line-raw-glyphs line-glyphs) (= line-glyphs (zeroed-array (array-length line-raw-glyphs)))
+  (let [styled (text-style-glyphs (array-length line-fallback-facts) line-fallback-fact
+      (array-length line-raw-glyphs) line-raw-glyph-at run.start (line-styles run.style)
+      (.w (cascade-metrics run.font)) (array-length line-glyphs) line-emit-styled-glyph budget)]
+    (= line-shape-status styled.status) (= line-style-work styled.work)))
+
+; Shape each script/level span against candidates in order. Stop probing a span
+; once every grapheme is covered. Selection is staged; width-only line planning
+; reuses it, and final runs are reshaped with their actual font and line context.
+(defn line-select-fonts [value: TextBuffer]: u32
+  (= line-fallback-facts (text-graphemes value))
+  (let [facts (array-length line-fallback-facts)
+        planned (line-plan value 0u (array-length line-facts) 1000000u)
+        @var work planned.work]
+    (when (!= planned.status 0u) (return planned.status))
+    (= line-choices (zeroed-array facts)) (= line-staged-fonts (zeroed-array facts))
+    (for [i facts] (= (line-choices i) (text-font-unset)))
+    (for [i planned.count]
+      (let [run (line-runs i)
+            begin (text-measure-boundary facts line-fallback-fact run.start)
+            end (text-measure-boundary facts line-fallback-fact run.end)]
+        (when (or (>= begin end) (> end facts)) (return 1u))
+        (for [font 3u]
+          (let [charge (+ 33u (+ (- run.end run.start) (- end begin)))]
+            (when (> charge (- 1000000u work)) (return 2u)) (+= work charge))
+          (line-shape-in-font value run font) (+= cascade-probes 1u)
+          (when (!= line-shape-status 0u) (return line-shape-status))
+          (let [considered (text-font-consider facts line-fallback-fact (array-length line-glyphs) line-glyph-at
+                  run.start run.end font facts line-choice-at line-emit-choice (- 1000000u work))
+                @var complete true]
+            (when (!= considered.status 0u) (return considered.status))
+            (+= work considered.work)
+            (for [j begin (< j end) (+= j 1u)]
+              (when (!= (.missing (line-choices j)) 0u) (= complete false)))
+            (when complete (break))))))
+    (let [selected (text-font-runs facts line-fallback-fact line-choice-at (fn [i] 0u) facts line-emit-font (- 1000000u work))]
+      (when (!= selected.status 0u) (return selected.status))
+      (= line-fonts line-staged-fonts) (= line-font-count selected.count)
+      (= line-unresolved-graphemes selected.missing)))
+  0u)
+
+; Place the current plan into staging buffers at an explicit baseline/line and
+; source offset. Native font errors abort the callback, keeping the prior frame.
+; Callers publish these buffers only after every line and caret check succeeds.
+(defn line-place [value: TextBuffer baseline: vec2f number: u32 source-offset: u32]: u32
+  (line-place-with baseline number source-offset (fn [run] (line-shape value run))))
+
+(defn line-current-metrics []: TextRichLine
+  (text-rich-line line-run-count (fn [i] (line-styles (.style (line-runs i))))
+    (fn [i] (cascade-metrics (.font (line-runs i)))) line-strut-style (cascade-metrics line-strut-font)))
+
+; A consumer may supply shaping-safe cached glyphs instead. The callback must
+; replace line-glyphs with the exact run's span-relative logical-order records.
+(defn line-place-with [baseline: vec2f number: u32 source-offset: u32
+                       supply: (Fn [TextShapeRun] ())]: u32
+  (= line-positioned (zeroed-array 4096u)) (= line-quad-fonts (zeroed-array 4096u))
+  (= line-quad-colors (zeroed-array 4096u))
+  (= line-decorations (zeroed-array (* line-run-count 2u))) (= line-decoration-count 0u)
+  (= line-clusters (zeroed-array 4096u))
+  (= line-quad-count 0u) (= line-cluster-count 0u)
+  (= line-rtl-runs 0u) (= line-missing-glyphs 0u)
+  (let [@var x baseline.x
+        metrics (line-current-metrics)
+        band (vec2f (- baseline.y metrics.ascent) (+ metrics.ascent metrics.descent))]
+    (when (!= metrics.status 0u) (return metrics.status))
+    (for [i line-run-count]
+      (let [run (line-runs i) rtl (!= (& run.level 1u) 0u) style (line-styles run.style)
+            scale (/ style.size (.w (cascade-metrics run.font)))]
+        (= line-shape-status 0u) (supply run)
+        (when (!= line-shape-status 0u) (return line-shape-status))
+        (let [glyphs (array-length line-glyphs)]
+          (when (or (> glyphs (- 4096u line-quad-count))
+                    (> glyphs (- 4096u line-cluster-count))) (return 2u))
+          (for [j glyphs]
+            (when (== (.id (line-glyphs j)) 0u) (+= line-missing-glyphs 1u))
+            (= (line-quad-fonts (+ line-quad-count j)) run.font))
+          (for [j glyphs] (= (line-quad-colors (+ line-quad-count j)) style.color))
+          (when rtl (+= line-rtl-runs 1u))
+          (let [placed (text-position-scaled-run glyphs line-glyph-at
+                          (vec2f x baseline.y) scale rtl line-emit-positioned
+                          number band (+ source-offset run.start) line-emit-cluster)]
+            (let [decorated (text-rich-decorations style (.w (cascade-metrics run.font))
+                  (cascade-decorations run.font) (vec2f x baseline.y) placed.advance
+                  (- (array-length line-decorations) line-decoration-count) line-emit-decoration)]
+              (when (!= decorated.status 0u) (return decorated.status))
+              (+= line-decoration-count decorated.count))
+            (+= x placed.advance) (+= line-cluster-count placed.clusters) (+= line-quad-count glyphs)))))
+    (= line-advance (- x baseline.x)))
+  0u)
+
+; Standalone single-line wrapper: build cells against this paragraph's bytes.
+(defn line-layout [value: TextBuffer]: u32
+  (let [prepared (line-prepare value)] (when (!= prepared 0u) (return prepared)))
+  (line-layout-prepared value (vec2f 30. 100.)))
+
+(defn line-layout-styled [value: TextBuffer count: u32 span-at: (Fn [u32] TextStyledSpan)
+    font-for-style: (Fn [TextRunStyle] u32) strut: TextRunStyle baseline: vec2f]: u32
+  (let [prepared (line-prepare-styled value count span-at font-for-style strut)]
+    (when (!= prepared 0u) (return prepared)))
+  (line-layout-prepared value baseline))
+
+(defn line-layout-prepared [value: TextBuffer baseline: vec2f]: u32
+  (let [planned (line-plan value 0u (array-length line-facts) 1000000u)]
+    (when (!= planned.status 0u) (return planned.status)))
+  (let [placed (line-place value baseline 0u 0u)] (when (!= placed 0u) (return placed)))
+  (when (== line-byte-count 0u)
+    (let [metrics (line-current-metrics)]
+      (= (line-clusters 0u) (TextClusterBox
+        (vec4f baseline.x (- baseline.y metrics.ascent) 0. (+ metrics.ascent metrics.descent)) 0u 0u 0u false)))
+    (= line-cluster-count 1u))
+  (= line-cells (zeroed-array 4096u))
+  (let [cells (text-build-cells value line-cluster-count line-cluster-at 4096u line-emit-cell)]
+    (when (!= cells.status 0u) (return cells.status))
+    (= line-cell-count cells.count))
+  (let [status (cascade-prepare-pages line-quad-count (fn [i] (line-quad-fonts i))
+                 (fn [i] (.id (.glyph (line-positioned i)))))]
+    (when (!= status 0u) (return status)))
+  (cascade-publish-pages)
+  (= line-quads (zeroed-array line-quad-count))
+  (for [i line-quad-count]
+    (let [item (line-positioned i) font (line-quad-fonts i)]
+      (= (line-quads i) (text-placed-glyph-quad item (cascade-metric font item.glyph.id) (cascade-size font)))))
+  0u)

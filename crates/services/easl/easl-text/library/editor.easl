@@ -1,0 +1,198 @@
+(import "input.easl")
+
+; Own one state per widget and pass it by mutable reference. TextBuffer values
+; are immutable native UTF-8 resources. This module owns their lifetimes, history,
+; selection and composition policy; it has no filesystem or product authority.
+(struct TextSnapshot text: TextBuffer anchor: u32 focus: u32)
+(struct TextEditorState
+  current: TextSnapshot
+  preview: TextBuffer
+  composing: bool
+  preedit-start: u32
+  preedit-end: u32
+  cursor-start: u32
+  cursor-end: u32
+  undo: [64: TextSnapshot]
+  redo: [64: TextSnapshot]
+  undo-count: u32
+  redo-count: u32
+  undo-bytes: u32
+  redo-bytes: u32
+  generation: u32)
+
+(defn text-empty-snapshot []: TextSnapshot (TextSnapshot (TextBuffer 0u) 0u 0u))
+
+(defn text-history-clear [@ref @var stack: [64: TextSnapshot]
+                          @ref @var count: u32 @ref @var bytes: u32]
+  (for [i count] (text-release (.text (stack i))) (= (stack i) (text-empty-snapshot)))
+  (= count 0u) (= bytes 0u))
+
+(defn text-history-push [@ref @var stack: [64: TextSnapshot]
+                         @ref @var count: u32 @ref @var bytes: u32
+                         @ref snapshot: TextSnapshot]
+  (let [size (text-length snapshot.text)]
+    (while (and (> count 0u) (or (== count 64u) (> (+ bytes size) 8388608u)))
+      (-= bytes (text-length (.text (stack 0u))))
+      (text-release (.text (stack 0u)))
+      (-= count 1u)
+      (for [i count] (= (stack i) (stack (+ i 1u)))))
+    (= (stack count) snapshot)
+    (+= count 1u) (+= bytes size)))
+
+(defn text-history-pop [@ref @var stack: [64: TextSnapshot]
+                        @ref @var count: u32 @ref @var bytes: u32]: TextSnapshot
+  (-= count 1u)
+  (let [snapshot (stack count)]
+    (-= bytes (text-length snapshot.text))
+    (= (stack count) (text-empty-snapshot))
+    snapshot))
+
+(defn text-editor-cancel [@ref @var text-state: TextEditorState]
+  (when text-state.composing (text-release text-state.preview))
+  (= text-state.preview (TextBuffer 0u)) (= text-state.composing false)
+  (= text-state.preedit-start 0u) (= text-state.preedit-end 0u)
+  (= text-state.cursor-start 4294967295u) (= text-state.cursor-end 4294967295u))
+
+(defn text-editor-close [@ref @var text-state: TextEditorState]
+  (text-editor-cancel text-state)
+  (text-release text-state.current.text)
+  (text-history-clear text-state.undo text-state.undo-count text-state.undo-bytes)
+  (text-history-clear text-state.redo text-state.redo-count text-state.redo-bytes)
+  (= text-state.current (text-empty-snapshot)))
+
+; Initialize a zeroed state or replace an existing widget's document. Input is
+; borrowed; the editor retains its own handle. Selection starts at byte zero.
+(defn text-editor-open [@ref @var text-state: TextEditorState value: TextBuffer]
+  (let [owned (text-retain value)]
+    (text-editor-close text-state)
+    (= text-state.current (TextSnapshot owned 0u 0u))
+    (+= text-state.generation 1u)))
+
+(defn text-editor-visible [@ref text-state: TextEditorState]: TextBuffer
+  (if text-state.composing text-state.preview text-state.current.text))
+
+(defn text-editor-context [@ref snapshot: TextSnapshot word: bool]: TextEditContext
+  (TextEditContext (text-length snapshot.text) snapshot.anchor snapshot.focus
+    (text-boundary snapshot.text snapshot.focus 0u)
+    (text-boundary snapshot.text snapshot.focus 1u)
+    (if word (text-boundary snapshot.text snapshot.focus 4u) snapshot.focus)
+    (if word (text-boundary snapshot.text snapshot.focus 5u) snapshot.focus)))
+
+; Returns the existing text-edit status, or 3 while a preedit is active. The
+; insertion is borrowed and must match command.amount for replacement commands.
+(defn text-editor-edit [@ref @var text-state: TextEditorState
+                        command: TextEditCommand insert: TextBuffer]: u32
+  (when text-state.composing (return 3u))
+  (when (and (== command.kind 9u) (!= command.amount (text-length insert))) (return 1u))
+  (let [plan (text-edit (text-editor-context text-state.current
+                         (or (== command.kind 6u) (== command.kind 7u))) command)]
+    (when (!= plan.status 0u) (return plan.status))
+    (when (== plan.effect 0u)
+      (when (or (!= plan.anchor (text-boundary text-state.current.text plan.anchor 2u))
+                (!= plan.focus (text-boundary text-state.current.text plan.focus 2u))) (return 1u))
+      (= text-state.current.anchor plan.anchor) (= text-state.current.focus plan.focus)
+      (return 0u))
+    (let [value (text-replace text-state.current.text plan.start plan.end
+                   (if (== command.kind 9u) insert (TextBuffer 0u)))
+          anchor (text-boundary value plan.anchor 3u)
+          focus (text-boundary value plan.focus 3u)]
+      (if (text-equal value text-state.current.text)
+        (text-release value)
+        (let []
+          (text-history-clear text-state.redo text-state.redo-count text-state.redo-bytes)
+          (text-history-push text-state.undo text-state.undo-count text-state.undo-bytes text-state.current)
+          (= text-state.current.text value)
+          (+= text-state.generation 1u)))
+      (= text-state.current.anchor anchor) (= text-state.current.focus focus)))
+  0u)
+
+(defn text-editor-commit [@ref @var text-state: TextEditorState insert: TextBuffer]: u32
+  (text-editor-cancel text-state)
+  (text-editor-edit text-state (TextEditCommand 9u 0u (text-length insert) 0u) insert))
+
+; Preedit never enters history or committed text. The native input primitive
+; validates cursor byte offsets; UINT_MAX denotes no visible composition cursor.
+(defn text-editor-preedit [@ref @var text-state: TextEditorState insert: TextBuffer
+                           start: u32 end: u32]: u32
+  (let [byte-count (text-length insert)
+        low (min text-state.current.anchor text-state.current.focus)
+        high (max text-state.current.anchor text-state.current.focus)]
+    (when (or (and (!= start 4294967295u) (> start byte-count))
+              (or (and (!= end 4294967295u) (> end byte-count)) (> start end))) (return 1u))
+    (when (!= (== start 4294967295u) (== end 4294967295u)) (return 1u))
+    (when (!= start 4294967295u)
+      (when (or (!= start (text-boundary insert start 8u))
+                (!= end (text-boundary insert end 8u))) (return 1u)))
+    (when (== byte-count 0u) (text-editor-cancel text-state) (return 0u))
+    (when (> (+ (- (text-length text-state.current.text) (- high low)) byte-count) 1048576u) (return 2u))
+    (let [preview (text-replace text-state.current.text low high insert)]
+      (text-editor-cancel text-state)
+      (= text-state.preview preview) (= text-state.composing true)
+      (= text-state.preedit-start low) (= text-state.preedit-end (+ low byte-count))
+      (= text-state.cursor-start (if (== start 4294967295u) start (+ low start)))
+      (= text-state.cursor-end (if (== end 4294967295u) end (+ low end)))))
+  0u)
+
+(defn text-editor-history [@ref @var text-state: TextEditorState redo: bool]: bool
+  (text-editor-cancel text-state)
+  (if redo
+    (let []
+      (when (== text-state.redo-count 0u) (return false))
+      (text-history-push text-state.undo text-state.undo-count text-state.undo-bytes text-state.current)
+      (= text-state.current (text-history-pop text-state.redo text-state.redo-count text-state.redo-bytes)))
+    (let []
+      (when (== text-state.undo-count 0u) (return false))
+      (text-history-push text-state.redo text-state.redo-count text-state.redo-bytes text-state.current)
+      (= text-state.current (text-history-pop text-state.undo text-state.undo-count text-state.undo-bytes))))
+  (+= text-state.generation 1u)
+  true)
+
+; Copy is a new owned value. The caller can pass it to another editor or a host
+; clipboard adapter, then release it. Cut and paste use the same edit/commit API.
+(defn text-editor-copy [@ref text-state: TextEditorState]: TextBuffer
+  (text-slice text-state.current.text (min text-state.current.anchor text-state.current.focus)
+                                 (max text-state.current.anchor text-state.current.focus)))
+
+; Logical horizontal/line navigation. Up/down and visual bidi hit positions
+; require layout geometry and enter through the existing MoveTo edit command.
+(defn text-editor-navigate [@ref @var text-state: TextEditorState key: u32
+                            primary: bool word: bool extend: bool]: u32
+  (text-editor-cancel text-state)
+  (let [backwards (or (== key 3u) (== key 7u))
+        low (min text-state.current.anchor text-state.current.focus)
+        high (max text-state.current.anchor text-state.current.focus)
+        @var target text-state.current.focus]
+    (if (and (not extend) (and (!= low high) (or (== key 3u) (== key 4u))))
+      (= target (if backwards low high))
+      (if (and primary (or (== key 7u) (== key 8u)))
+        (= target (if backwards 0u (text-length text-state.current.text)))
+        (let [mode (if (or (== key 7u) (== key 8u)) (if backwards 6u 7u)
+                      (if word (if backwards 4u 5u) (if backwards 0u 1u)))]
+          (= target (text-boundary text-state.current.text target mode)))))
+    (text-editor-edit text-state (TextEditCommand 3u target 0u (if extend 1u 0u)) (TextBuffer 0u))))
+
+; Payload is borrowed from the event's exact byte range. 4 means unhandled;
+; callers may implement layout navigation or clipboard actions with this API.
+(defn text-editor-input [@ref @var text-state: TextEditorState event: TextInputEvent
+                         payload: TextBuffer primary-mask: u32 word-mask: u32]: u32
+  (when (< event.text-end event.text-start) (return 1u))
+  (when (or (== event.kind 0u) (== event.kind 3u))
+    (when (!= (- event.text-end event.text-start) (text-length payload)) (return 1u)))
+  (let [decision (text-input-decision event primary-mask word-mask)
+        primary (!= (& event.modifiers primary-mask) 0u)
+        word (!= (& event.modifiers word-mask) 0u)
+        shift (!= (& event.modifiers 1u) 0u)]
+    (when (== decision.kind 2u)
+      (return (text-editor-preedit text-state payload event.cursor-start event.cursor-end)))
+    (when (== decision.kind 3u) (text-editor-cancel text-state) (return 0u))
+    (when (== decision.kind 1u)
+      (when (== event.kind 0u) (return (text-editor-commit text-state payload)))
+      (return (text-editor-edit text-state decision.command payload)))
+    (when (== event.kind 1u)
+      (when (and (== primary-mask 2u) (== (& event.modifiers 6u) 6u)) (return 4u))
+      (when (== event.key 13u) (text-editor-cancel text-state) (return 0u))
+      (when (and primary (or (== event.key 18u) (== event.key 19u)))
+        (text-editor-history text-state (or shift (== event.key 19u))) (return 0u))
+      (when (or (or (== event.key 3u) (== event.key 4u)) (or (== event.key 7u) (== event.key 8u)))
+        (return (text-editor-navigate text-state event.key primary word shift))))
+    4u))

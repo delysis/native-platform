@@ -2,7 +2,14 @@
   "schema_version": 1,
   "primary": {
     "desktop": [
-      "desktop-model-defaults"
+      "desktop-vault",
+      "desktop-context",
+      "desktop-generation-policy",
+      "desktop-model-defaults",
+      "desktop-model-discovery",
+      "desktop-speech",
+      "operation-lifecycle",
+      "workspace-document"
     ],
     "native": [
       "llama-native-cache",
@@ -63,24 +70,35 @@
       "loom-app",
       "loom-backend-llama",
       "loom-cli",
+      "loom-config",
       "loom-document",
       "loom-host",
       "loom-store",
       "loom-types",
-      "tauri-plugin-loom"
+      "tauri-plugin-loom",
+      "loom-markdown",
+      "loom-text-session",
+      "loom-easl-interface"
     ],
     "diagnostic": [
       "xtask"
+    ],
+    "service-easl": [
+      "easl-native-text",
+      "easl-text"
     ]
   },
   "secondary": {
     "portable": [
-      "desktop-model-defaults",
       "attachment-native-document",
       "attachment-native-host",
       "attachment-native-inspect",
       "attachment-native-plan",
       "attachment-native-types",
+      "desktop-context",
+      "desktop-generation-policy",
+      "desktop-model-defaults",
+      "desktop-model-discovery",
       "fte-loopback",
       "fte-protocols",
       "fte-providers",
@@ -102,14 +120,19 @@
       "information-native-types",
       "llama-native-cache",
       "llama-native-types",
+      "loom-config",
       "loom-document",
       "loom-host",
       "loom-store",
       "loom-types",
       "mom-llama-runtime",
+      "operation-lifecycle",
       "speech-native-host",
       "speech-native-router",
-      "speech-native-types"
+      "speech-native-types",
+      "workspace-document",
+      "loom-markdown",
+      "loom-text-session"
     ],
     "platform-linux": [
       "free-token-energy",
@@ -117,9 +140,13 @@
       "llama-native-host",
       "loom-app",
       "loom-backend-llama",
-      "mom-llama-app"
+      "mom-llama-app",
+      "easl-native-text",
+      "easl-text",
+      "loom-easl-interface"
     ],
     "platform-macos": [
+      "desktop-speech",
       "free-token-energy",
       "llama-native-engine",
       "llama-native-host",
@@ -127,7 +154,10 @@
       "loom-backend-llama",
       "mom-llama-app",
       "speech-native-backend-parakeet",
-      "speech-native-platform"
+      "speech-native-platform",
+      "easl-native-text",
+      "easl-text",
+      "loom-easl-interface"
     ],
     "platform-windows": [
       "free-token-energy",
@@ -135,7 +165,10 @@
       "llama-native-host",
       "loom-app",
       "loom-backend-llama",
-      "mom-llama-app"
+      "mom-llama-app",
+      "easl-native-text",
+      "easl-text",
+      "loom-easl-interface"
     ],
     "frontend": [
       "free-token-energy",

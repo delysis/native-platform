@@ -1,0 +1,75 @@
+; Layout navigation policy, independent of a host, source buffer or painter.
+; Commands: 0 up, 1 down, 2 page up, 3 page down, 4/5 logical line start/end,
+; 6/7 document start/end. Pointer/keyboard hit choice shares geometry.easl.
+(struct TextNavigationContext
+  line: u32 lines: u32 x: f32 top: f32 height: f32
+  viewport: f32 extent: f32 preferred-x: f32 has-preferred: u32)
+; kind: 0 read indexed line, 1 spatially locate y then resolve the index.
+; edge: 0 nearest caret at x, 1 source start, 2 end before a hard separator,
+; 3 complete source end (document end). preserve-x stores x after applying.
+(struct TextNavigationQuery
+  status: u32 kind: u32 line: u32 x: f32 y: f32 edge: u32 preserve-x: u32)
+(struct TextNavigationLine start: u32 end: u32 separator: u32)
+(struct TextNavigationTarget status: u32 byte: u32 affinity: u32)
+
+(defn text-navigation-invalid []: TextNavigationQuery
+  (TextNavigationQuery 1u 0u 0u 0. 0. 0u 0u))
+(defn text-navigation-finite [v: f32]: bool
+  (and (>= v -1000000000000000000000000000000.) (<= v 1000000000000000000000000000000.)))
+(defn text-navigation-context-valid [c: TextNavigationContext]: bool
+  (and (and (> c.lines 0u) (<= c.lines 1048577u))
+    (and (and (< c.line c.lines) (<= c.has-preferred 1u))
+      (and (and (text-navigation-finite c.x) (text-navigation-finite c.preferred-x))
+        (and (and (>= c.top 0.) (< c.top c.extent))
+          (and (and (> c.height 0.) (text-navigation-finite c.height))
+            (and (and (>= c.viewport 0.) (text-navigation-finite c.viewport))
+              (and (> c.extent 0.) (text-navigation-finite c.extent)))))))))
+
+(defn text-navigation-adjacent [c: TextNavigationContext down: bool x: f32]: TextNavigationQuery
+  (if down
+    (if (< (+ c.line 1u) c.lines)
+      (TextNavigationQuery 0u 0u (+ c.line 1u) x 0. 0u 1u)
+      (TextNavigationQuery 0u 0u c.line x 0. 2u 0u))
+    (if (> c.line 0u)
+      (TextNavigationQuery 0u 0u (- c.line 1u) x 0. 0u 1u)
+      (TextNavigationQuery 0u 0u 0u x 0. 1u 0u))))
+
+(defn text-navigation-plan [c: TextNavigationContext command: u32]: TextNavigationQuery
+  (when (or (> command 7u) (not (text-navigation-context-valid c)))
+    (return (text-navigation-invalid)))
+  (let [x (if (== c.has-preferred 1u) c.preferred-x c.x)
+        down (or (== command 1u) (== command 3u))]
+    (when (< command 2u) (return (text-navigation-adjacent c down x)))
+    (when (< command 4u)
+      (let [page-step (max c.height (- c.viewport c.height))
+            y (+ (+ c.top (* c.height 0.5)) (if down page-step (- page-step)))]
+        (when (< y 0.) (return (TextNavigationQuery 0u 0u 0u x 0. 1u 0u)))
+        (when (>= y c.extent)
+          (return (TextNavigationQuery 0u 0u (- c.lines 1u) x 0. 2u 0u)))
+        (return (TextNavigationQuery 0u 1u c.line x y 0u 1u)) ()))
+    (TextNavigationQuery 0u 0u
+      (if (== command 6u) 0u (if (== command 7u) (- c.lines 1u) c.line))
+      c.x 0. (if (== command 7u) 3u (if (== command 5u) 2u 1u)) 0u)))
+
+; Paragraph gaps or a very tall line can leave the spatial query on the same
+; line. A page command must still progress by at least one line when possible.
+(defn text-navigation-resolve [c: TextNavigationContext command: u32
+                               query: TextNavigationQuery found: u32]: TextNavigationQuery
+  (when (not (text-navigation-context-valid c)) (return (text-navigation-invalid)))
+  (when (not (or (== command 2u) (== command 3u))) (return (text-navigation-invalid)))
+  (when (or (>= found c.lines) (or (!= query.status 0u) (!= query.kind 1u)))
+    (return (text-navigation-invalid)))
+  (when (not (and (text-navigation-finite query.x) (text-navigation-finite query.y)))
+    (return (text-navigation-invalid)))
+  (if (== found c.line)
+    (text-navigation-adjacent c (== command 3u) query.x)
+    (TextNavigationQuery 0u 0u found query.x 0. 0u 1u)))
+
+(defn text-navigation-edge [query: TextNavigationQuery line: TextNavigationLine]: TextNavigationTarget
+  (when (or (!= query.status 0u) (or (!= query.kind 0u)
+    (or (< query.edge 1u) (or (> query.edge 3u)
+      (or (> line.start line.separator) (> line.separator line.end))))))
+    (return (TextNavigationTarget 1u 0u 1u)))
+  (TextNavigationTarget 0u
+    (if (== query.edge 1u) line.start (if (== query.edge 2u) line.separator line.end))
+    (if (or (== query.edge 1u) (and (== query.edge 2u) (< line.separator line.end))) 1u 0u)))

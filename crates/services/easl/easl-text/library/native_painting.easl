@@ -1,0 +1,22 @@
+; Bulk transport only. Glyph placement and decoration policy are shared EASL.
+(import "painting.easl")
+@external (var paint-input: [TextPaintGlyph])
+@external (var paint-output: [TextPlacedGlyph])
+@external (var paint-origin: vec2f)
+@external (var paint-result: TextPaintResult)
+@external (var paint-advance: f32)
+@external (var paint-metrics: vec4f)
+@external (var paint-overrides: vec4f)
+@external (var paint-options: u32)
+@external (var paint-colors: [vec4u])
+@external (var paint-decorations: [TextDecoration])
+@external (var paint-decorated: TextDecorationResult)
+
+@cpu (defn text-paint-native []
+  (= paint-result (text-position-glyphs (array-length paint-input)
+    (fn [i] (paint-input i)) paint-origin (array-length paint-output)
+    (fn [i g] (= (paint-output i) g)) 262140u)))
+@cpu (defn text-decorations-native []
+  (= paint-decorated (text-paint-decorations paint-origin paint-advance paint-metrics
+    paint-overrides paint-options (fn [i] (paint-colors i)) (array-length paint-decorations)
+    (fn [i d] (= (paint-decorations i) d)))))

@@ -1,0 +1,15 @@
+(import "../library/editing.easl")
+
+@external (var erased: TextEditPlan)
+@external (var extended: TextEditPlan)
+
+; A consumer composes its own behavior from the library's selection reducer.
+(defn select-prefix [snapshot: TextEditContext]: TextEditPlan
+  (text-edit snapshot (TextEditCommand 3u 0u 0u 1u)))
+
+@cpu
+(defn main []
+  ; Native Unicode facts for A + an astronaut emoji + a combining sequence + CRLF.
+  (let [snapshot (TextEditContext 21u 16u 16u 1u 19u 0u 19u)]
+    (= erased (text-edit snapshot (TextEditCommand 4u 0u 0u 0u)))
+    (= extended (select-prefix snapshot))))

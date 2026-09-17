@@ -1,0 +1,65 @@
+(import "decoration.easl")
+
+; Glyphs have already been shaped and ordered visually. These offsets and
+; advances are logical pixels, y downwards. Font resources stay with the host.
+(struct TextPaintGlyph id: u32 offset: vec2f advance: f32)
+(struct TextPlacedGlyph id: u32 point: vec2f)
+(struct TextPaintResult status: u32 count: u32 pen: f32)
+(struct TextDecorationResult status: u32 count: u32 work: u32)
+
+; Two passes validate the complete run before publication. The returned pen is
+; absolute, so bounded batches preserve exactly the same f32 accumulation as a
+; single run. Readers remain stable and do not alias output.
+(defn text-position-glyphs [count: u32 glyph-at: (Fn [u32] TextPaintGlyph)
+    origin: vec2f capacity: u32 emit: (Fn [u32 TextPlacedGlyph] ())
+    budget: u32]: TextPaintResult
+  (when (or (> count 65535u) (or (> count capacity) (> (* count 4u) budget)))
+    (return (TextPaintResult 2u 0u origin.x)))
+  (when (not (all (<= (abs origin) (vec2f 1000000000.))))
+    (return (TextPaintResult 1u 0u origin.x)))
+  (let [@var final origin.x]
+    (for [pass 2u]
+      (let [@var pen origin.x]
+        (for [i count]
+          (let [g (glyph-at i) point (+ (vec2f pen origin.y) g.offset)]
+            (when (or (> g.id 65535u)
+              (or (not (all (<= (abs (vec3f g.offset g.advance)) (vec3f 1000000000.))))
+                  (not (all (<= (abs point) (vec2f 1000000000.))))))
+              (return (TextPaintResult 1u 0u origin.x)))
+            (+= pen g.advance)
+            (when (not (<= (abs pen) 1000000000.)) (return (TextPaintResult 1u 0u origin.x)))
+            (when (== pass 1u) (emit i (TextPlacedGlyph g.id point)))))
+        (= final pen)))
+    (TextPaintResult 0u count final)))
+
+; Native logical font metrics can already contain the host's resolved defaults.
+; Per decoration, three option bits select enabled / offset override / thickness
+; override. Explicit zero thickness stays zero. Colors may differ from glyph ink.
+(defn text-paint-decorations [origin: vec2f advance: f32 metrics: vec4f overrides: vec4f
+    options: u32 color-at: (Fn [u32] vec4u) capacity: u32
+    emit: (Fn [u32 TextDecoration] ())]: TextDecorationResult
+  (when (or (> options 63u)
+    (or (not (all (<= (abs origin) (vec2f 1000000000.))))
+        (not (<= (abs advance) 1000000000.)))) (return (TextDecorationResult 1u 0u 0u)))
+  (let [count (+ (if (!= (& options 1u) 0u) 1u 0u)
+                (if (!= (& options 8u) 0u) 1u 0u))]
+    (when (> count capacity) (return (TextDecorationResult 2u 0u 0u)))
+    (for [pass 2u]
+      (let [@var output 0u]
+        (for [i 2u]
+          (let [flags (& (>> options (* i 3u)) 7u)]
+            (when (and (== (& flags 1u) 0u) (!= flags 0u)) (return (TextDecorationResult 1u 0u 0u)))
+            (when (!= (& flags 1u) 0u)
+              (let [defaults (if (== i 0u) metrics.xy metrics.zw)
+                    explicit (if (== i 0u) overrides.xy overrides.zw)
+                    offset (if (!= (& flags 2u) 0u) explicit.x defaults.x)
+                    size (if (!= (& flags 4u) 0u) explicit.y defaults.y)
+                    ink (color-at i)
+                    bounds (text-decoration-bounds origin offset size advance)]
+                (when (or (not (and (>= size 0.) (<= size 1000000000.)))
+                  (or (not (<= (abs offset) 1000000000.))
+                  (or (not (all (<= (abs bounds) (vec4f 1000000000.))))
+                    (any (> ink (vec4u 255u)))))) (return (TextDecorationResult 1u 0u 0u)))
+                (when (== pass 1u) (emit output (TextDecoration bounds ink)))
+                (+= output 1u)))))))
+    (TextDecorationResult 0u count 4u)))

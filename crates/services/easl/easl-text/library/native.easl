@@ -1,0 +1,16 @@
+(import "paragraph.easl")
+
+; Bulk typed exchange for native consumers. The algorithm is in paragraph.easl.
+@external (var text-points: [TextBreak])
+@external (var text-width: f32)
+@external (var text-policy: TextPolicy)
+@external (var text-output: [u32])
+@external (var text-result: TextComposition)
+
+@cpu
+(defn text-compose-native []
+  (= text-result (text-compose (array-length text-points)
+                              (fn [i] (text-points i))
+                              (fn [start end budget] (text-prefix-measure (text-points start) (text-points end)))
+                              text-width text-policy
+                              (fn [i cluster] (= (text-output i) cluster)))))

@@ -1,0 +1,36 @@
+
+running 3 tests
+test loom::convergence_regressions::identical_public_ids_and_sequences_do_not_cross_supervisor_owners ... FAILED
+test mom::convergence_regressions::operation_handles_do_not_target_other_owners_or_reused_public_ids ... FAILED
+test mom::convergence_regressions::shutdown_waits_for_a_join_already_owned_by_another_thread ... FAILED
+
+failures:
+
+---- loom::convergence_regressions::identical_public_ids_and_sequences_do_not_cross_supervisor_owners stdout ----
+
+thread 'loom::convergence_regressions::identical_public_ids_and_sequences_do_not_cross_supervisor_owners' (3456667) panicked at /tmp/native-platform-convergence-runs-baseline/src/loom.rs:909:9:
+assertion `left == right` failed
+  left: Ok(())
+ right: Err(StaleLease)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- mom::convergence_regressions::operation_handles_do_not_target_other_owners_or_reused_public_ids stdout ----
+
+thread 'mom::convergence_regressions::operation_handles_do_not_target_other_owners_or_reused_public_ids' (3456668) panicked at /tmp/native-platform-convergence-runs-baseline/src/mom.rs:1009:9:
+assertion `left == right` failed
+  left: Ok(())
+ right: Err(StaleLease)
+
+---- mom::convergence_regressions::shutdown_waits_for_a_join_already_owned_by_another_thread stdout ----
+
+thread 'mom::convergence_regressions::shutdown_waits_for_a_join_already_owned_by_another_thread' (3456669) panicked at /tmp/native-platform-convergence-runs-baseline/src/mom.rs:1083:9:
+shutdown returned before the owner joined
+
+
+failures:
+    loom::convergence_regressions::identical_public_ids_and_sequences_do_not_cross_supervisor_owners
+    mom::convergence_regressions::operation_handles_do_not_target_other_owners_or_reused_public_ids
+    mom::convergence_regressions::shutdown_waits_for_a_join_already_owned_by_another_thread
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+

@@ -1,0 +1,3719 @@
+use core::fmt::Debug;
+use std::{
+  collections::{HashMap, HashSet},
+  fmt::Display,
+  ops::{Deref, DerefMut},
+};
+
+use std::sync::{Arc, RwLock};
+
+use fsexp::{document::DocumentPosition, syntax::EncloserOrOperator};
+use take_mut::take;
+
+use crate::{
+  compiler::{
+    builtins::scalar_bitcast,
+    enums::{AbstractEnum, Enum, UntypedEnum},
+    error::{CompileError, CompileErrorKind},
+    expression::{Accessor, ExpKind, Number, TypedExp},
+    functions::{
+      AbstractFunctionSignature, FunctionImplementationKind, Ownership,
+      extract_mat_size as extract_mat_size_from_name,
+    },
+    program::{CompilerTarget, NameContext, TypeDefs},
+    structs::UntypedStruct,
+    vars::VariableAddressSpace,
+  },
+  parse::{EaslTree, Encloser, Operator},
+};
+
+use super::{
+  error::{CompileErrorKind::*, CompileResult, ErrorLog, SourceTrace, err},
+  functions::FunctionSignature,
+  program::Program,
+  structs::{AbstractStruct, Struct},
+  util::compile_word,
+};
+
+pub fn contains_name_leaf(name: &Arc<str>, tree: &EaslTree) -> bool {
+  match &tree {
+    EaslTree::Leaf(_, leaf) => leaf == &**name,
+    EaslTree::Inner(_, children) => children
+      .iter()
+      .fold(false, |acc, child| acc || contains_name_leaf(name, child)),
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum UntypedType {
+  Struct(UntypedStruct),
+  Enum(UntypedEnum),
+}
+impl UntypedType {
+  pub fn references_type_name(&self, name: &Arc<str>) -> bool {
+    match self {
+      UntypedType::Struct(untyped_struct) => {
+        untyped_struct.references_type_name(name)
+      }
+      UntypedType::Enum(untyped_enum) => {
+        untyped_enum.references_type_name(name)
+      }
+    }
+  }
+
+  pub fn name(&self) -> &Arc<str> {
+    match self {
+      UntypedType::Struct(untyped_struct) => &untyped_struct.name.0,
+      UntypedType::Enum(untyped_enum) => &untyped_enum.name.0,
+    }
+  }
+
+  pub fn source_trace(&self) -> &SourceTrace {
+    match self {
+      UntypedType::Struct(untyped_struct) => &untyped_struct.source_trace,
+      UntypedType::Enum(untyped_enum) => &untyped_enum.source_trace,
+    }
+  }
+
+  pub fn sort_by_references(
+    unsorted_types: &Vec<Self>,
+  ) -> Result<Vec<Self>, Vec<Arc<str>>> {
+    let mut sorted = Vec::new();
+    let mut sorted_names = HashSet::new();
+
+    while sorted.len() < unsorted_types.len() {
+      let start_len = sorted.len();
+
+      for typ in unsorted_types {
+        if sorted_names.contains(typ.name()) {
+          continue;
+        }
+
+        let mut can_add = true;
+        for other in unsorted_types {
+          if typ.references_type_name(other.name())
+            && !sorted_names.contains(other.name())
+          {
+            can_add = false;
+            break;
+          }
+        }
+
+        if can_add {
+          sorted.push(typ.clone());
+          sorted_names.insert(typ.name().clone());
+        }
+      }
+
+      if sorted.len() == start_len {
+        for typ in unsorted_types {
+          if !sorted_names.contains(typ.name()) {
+            if let Some(cycle_path) =
+              Self::find_cycle_path(typ, &unsorted_types, &sorted_names)
+            {
+              return Err(cycle_path);
+            }
+          }
+        }
+        return Err(vec![]);
+      }
+    }
+
+    Ok(sorted)
+  }
+
+  fn find_cycle_path(
+    start: &Self,
+    all_types: &[Self],
+    already_added: &HashSet<Arc<str>>,
+  ) -> Option<Vec<Arc<str>>> {
+    let mut visited = HashSet::new();
+    let mut path = Vec::new();
+
+    fn trace_dependencies(
+      current_name: &Arc<str>,
+      all_types: &[UntypedType],
+      already_added: &HashSet<Arc<str>>,
+      visited: &mut HashSet<Arc<str>>,
+      path: &mut Vec<Arc<str>>,
+    ) -> Option<Vec<Arc<str>>> {
+      if let Some(cycle_start_idx) = path.iter().position(|n| n == current_name)
+      {
+        let mut cycle = path[cycle_start_idx..].to_vec();
+        cycle.push(current_name.clone());
+        return Some(cycle);
+      }
+
+      if already_added.contains(current_name) || visited.contains(current_name)
+      {
+        return None;
+      }
+
+      path.push(current_name.clone());
+      visited.insert(current_name.clone());
+
+      if let Some(typ) = all_types.iter().find(|t| t.name() == current_name) {
+        for other in all_types {
+          if typ.references_type_name(other.name()) {
+            if let Some(cycle) = trace_dependencies(
+              other.name(),
+              all_types,
+              already_added,
+              visited,
+              path,
+            ) {
+              return Some(cycle);
+            }
+          }
+        }
+      }
+
+      path.pop();
+      None
+    }
+
+    trace_dependencies(
+      start.name(),
+      all_types,
+      already_added,
+      &mut visited,
+      &mut path,
+    )
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AbstractType {
+  Unit,
+  Generic(Arc<str>),
+  Type(Type),
+  AbstractStruct(Arc<AbstractStruct>),
+  AbstractEnum(Arc<AbstractEnum>),
+  AbstractArray {
+    size: AbstractArraySize,
+    inner_type: Box<Self>,
+    source_trace: SourceTrace,
+  },
+}
+
+impl AbstractType {
+  pub(crate) fn track_generic_names(&self, names: &mut Vec<Arc<str>>) {
+    match self {
+      AbstractType::Generic(name) => names.push(name.clone()),
+      AbstractType::AbstractArray { inner_type, .. } => {
+        inner_type.track_generic_names(names)
+      }
+      AbstractType::AbstractStruct(abstract_struct) => {
+        for f in abstract_struct.fields.iter() {
+          f.field_type.track_generic_names(names);
+        }
+      }
+      _ => {}
+    }
+  }
+  pub fn walk_mut<E>(
+    &mut self,
+    prewalk_handler: &mut impl FnMut(&mut Self) -> Result<bool, E>,
+  ) -> Result<(), E> {
+    if !prewalk_handler(self)? {
+      return Ok(());
+    }
+    match self {
+      AbstractType::AbstractStruct(s) => {
+        for field in Arc::make_mut(s).fields.iter_mut() {
+          field.field_type.walk_mut(prewalk_handler)?;
+        }
+      }
+      AbstractType::AbstractEnum(e) => {
+        for variant in Arc::make_mut(e).variants.iter_mut() {
+          variant.inner_type.walk_mut(prewalk_handler)?;
+        }
+      }
+      AbstractType::AbstractArray { inner_type, .. } => {
+        inner_type.walk_mut(prewalk_handler)?;
+      }
+      _ => {}
+    }
+    Ok(())
+  }
+  pub fn fill_generics(
+    &self,
+    generics: &HashMap<Arc<str>, ExpTypeInfo>,
+    generic_constants: &HashMap<Arc<str>, ConstGenericValue>,
+    typedefs: &TypeDefs,
+    source_trace: SourceTrace,
+  ) -> CompileResult<ExpTypeInfo> {
+    Ok(match self {
+      AbstractType::Unit => TypeState::Known(Type::Unit).into(),
+      AbstractType::Generic(var_name) => generics
+        .get(var_name)
+        .expect("unrecognized generic name")
+        .clone(),
+      AbstractType::Type(t) => t.clone().known().into(),
+      AbstractType::AbstractStruct(s) => {
+        Type::Struct(AbstractStruct::fill_generics(
+          s.clone(),
+          generics,
+          generic_constants,
+          typedefs,
+          source_trace,
+        )?)
+        .known()
+        .into()
+      }
+      AbstractType::AbstractEnum(e) => Type::Enum(AbstractEnum::fill_generics(
+        e.clone(),
+        generics,
+        generic_constants,
+        typedefs,
+        source_trace,
+      )?)
+      .known()
+      .into(),
+      AbstractType::AbstractArray {
+        size, inner_type, ..
+      } => Type::Array(
+        Some(size.fill_generics(generic_constants)),
+        inner_type
+          .fill_generics(generics, generic_constants, typedefs, source_trace)?
+          .into(),
+      )
+      .known()
+      .into(),
+    })
+  }
+  pub fn concretize(
+    &self,
+    skolems: &Vec<(Arc<str>, Vec<TypeConstraint>)>,
+    typedefs: &TypeDefs,
+    source_trace: SourceTrace,
+  ) -> CompileResult<Type> {
+    match self {
+      AbstractType::Unit => Ok(Type::Unit),
+      AbstractType::Generic(name) => {
+        if let Some(constraints) =
+          skolems.iter().find_map(|(skolem_name, constraints)| {
+            (skolem_name == name).then(|| constraints.clone())
+          })
+        {
+          Ok(Type::Skolem(Arc::clone(name), constraints))
+        } else {
+          err(UnrecognizedGeneric(name.to_string()), source_trace)
+        }
+      }
+      AbstractType::AbstractStruct(s) => Ok(Type::Struct(
+        AbstractStruct::concretize(s.clone(), typedefs, skolems, source_trace)?,
+      )),
+      AbstractType::AbstractEnum(e) => Ok(Type::Enum(
+        AbstractEnum::concretize(e.clone(), typedefs, skolems, source_trace)?,
+      )),
+      AbstractType::Type(t) => Ok(t.clone()),
+      AbstractType::AbstractArray {
+        size, inner_type, ..
+      } => Ok(Type::Array(
+        Some(size.concretize(skolems)),
+        Box::new(
+          inner_type
+            .concretize(skolems, typedefs, source_trace)?
+            .known()
+            .into(),
+        ),
+      )),
+    }
+  }
+  pub fn fill_abstract_generics(
+    self,
+    generics: &HashMap<Arc<str>, AbstractType>,
+  ) -> Self {
+    match self {
+      AbstractType::Unit => AbstractType::Unit,
+      AbstractType::Generic(var_name) => generics
+        .iter()
+        .find_map(|(name, t)| (*name == var_name).then(|| t))
+        .expect("unrecognized generic name in struct")
+        .clone(),
+      AbstractType::Type(t) => AbstractType::Type(t),
+      AbstractType::AbstractStruct(s) => {
+        AbstractType::AbstractStruct(Arc::new(
+          (*s)
+            .clone()
+            .partially_fill_abstract_generics(generics.clone()),
+        ))
+      }
+      AbstractType::AbstractEnum(e) => AbstractType::AbstractEnum(Arc::new(
+        (*e)
+          .clone()
+          .partially_fill_abstract_generics(generics.clone()),
+      )),
+      AbstractType::AbstractArray {
+        size,
+        inner_type,
+        source_trace,
+      } => AbstractType::AbstractArray {
+        size,
+        source_trace,
+        inner_type: inner_type.fill_abstract_generics(generics).into(),
+      },
+    }
+  }
+  pub fn fill_const_generics(self, bindings: &HashMap<Arc<str>, u32>) -> Self {
+    match self {
+      AbstractType::AbstractArray {
+        size,
+        inner_type,
+        source_trace,
+      } => {
+        let inner = inner_type.fill_const_generics(bindings);
+        match size {
+          AbstractArraySize::Generic(ref name) => {
+            if let Some(&value) = bindings.get(name) {
+              AbstractType::Type(Type::Array(
+                Some(ConcreteArraySize::Literal(value)),
+                Box::new(
+                  match inner {
+                    AbstractType::Type(t) => t,
+                    _ => panic!(
+                      "expected concrete inner type after fill_const_generics"
+                    ),
+                  }
+                  .known()
+                  .into(),
+                ),
+              ))
+            } else {
+              AbstractType::AbstractArray {
+                size,
+                inner_type: Box::new(inner),
+                source_trace,
+              }
+            }
+          }
+          _ => AbstractType::AbstractArray {
+            size,
+            inner_type: Box::new(inner),
+            source_trace,
+          },
+        }
+      }
+      AbstractType::AbstractStruct(s) => {
+        let mut s = Arc::unwrap_or_clone(s);
+        for f in s.fields.iter_mut() {
+          take(&mut f.field_type, |t| t.fill_const_generics(bindings))
+        }
+        AbstractType::AbstractStruct(Arc::new(s))
+      }
+      AbstractType::AbstractEnum(e) => {
+        let mut e = Arc::unwrap_or_clone(e);
+        for v in e.variants.iter_mut() {
+          take(&mut v.inner_type, |t| t.fill_const_generics(bindings));
+        }
+        AbstractType::AbstractEnum(Arc::new(e))
+      }
+      other => other,
+    }
+  }
+  pub fn compile(
+    self,
+    typedefs: &TypeDefs,
+    names: &mut NameContext,
+    source_trace: &SourceTrace,
+    target: CompilerTarget,
+  ) -> CompileResult<String> {
+    Ok(match self {
+      AbstractType::Unit => {
+        return Err(CompileError::new(
+          CompileErrorKind::TriedToCompileUnit,
+          source_trace.clone(),
+        ));
+      }
+      AbstractType::Generic(_) => {
+        panic!("attempted to compile generic struct field")
+      }
+      AbstractType::Type(t) => t.monomorphized_name(names, target),
+      AbstractType::AbstractStruct(t) => {
+        let concrete = AbstractStruct::concretize(
+          t,
+          typedefs,
+          &vec![],
+          source_trace.clone(),
+        )?;
+        Type::Struct(concrete).monomorphized_name(names, target)
+      }
+      AbstractType::AbstractEnum(e) => {
+        let concrete =
+          AbstractEnum::concretize(e, typedefs, &vec![], source_trace.clone())?;
+        Type::Enum(concrete).monomorphized_name(names, target)
+      }
+      AbstractType::AbstractArray {
+        size, inner_type, ..
+      } => {
+        let size_str = size.compile_type();
+        let inner =
+          inner_type.compile(typedefs, names, source_trace, target)?;
+        if size_str.is_empty() {
+          format!("array<{inner}>")
+        } else {
+          format!("array<{inner}, {size_str}>")
+        }
+      }
+    })
+  }
+  pub fn from_easl_tree(
+    tree: EaslTree,
+    typedefs: &TypeDefs,
+    skolems: &Vec<(Arc<str>, Vec<TypeConstraint>)>,
+  ) -> CompileResult<Self> {
+    match tree {
+      EaslTree::Leaf(position, leaf) => {
+        let leaf_rc: Arc<str> = leaf.into();
+        Ok(
+          if skolems.iter().find(|(name, _)| *name == leaf_rc).is_some() {
+            AbstractType::Generic(leaf_rc)
+          } else {
+            AbstractType::Type(Type::from_name(
+              leaf_rc,
+              position.clone(),
+              typedefs,
+              skolems,
+            )?)
+          },
+        )
+      }
+      EaslTree::Inner(
+        (position, EncloserOrOperator::Encloser(Encloser::Parens)),
+        children,
+      ) => {
+        if children.is_empty() {
+          return Ok(Self::Unit);
+        }
+        let mut children_iter = children.iter();
+        let generic_struct_name =
+          if let Some(EaslTree::Leaf(_, leaf)) = children_iter.next() {
+            leaf
+          } else {
+            return err(InvalidTypeName, position.into());
+          };
+        if generic_struct_name.as_str() == "Fn" {
+          Ok(AbstractType::Type(Type::from_easl_tree(
+            EaslTree::Inner(
+              (position, EncloserOrOperator::Encloser(Encloser::Parens)),
+              children,
+            ),
+            typedefs,
+            skolems,
+          )?))
+        } else {
+          let mut children_iter = children.into_iter();
+          let generic_type_name =
+            if let EaslTree::Leaf(_, leaf) = children_iter.next().unwrap() {
+              leaf
+            } else {
+              unreachable!()
+            };
+          match (
+            typedefs
+              .structs
+              .iter()
+              .find(|s| &*s.name.0 == generic_type_name.as_str()),
+            typedefs
+              .enums
+              .iter()
+              .find(|e| &*e.name.0 == generic_type_name.as_str()),
+          ) {
+            (Some(generic_struct), None) => {
+              let (type_args, const_args) = parse_type_and_const_generic_args(
+                children_iter,
+                &generic_struct.generic_args,
+                typedefs,
+                skolems,
+                &position,
+              )?;
+              let mut s =
+                generic_struct.clone().fill_abstract_generics(type_args);
+              if !const_args.is_empty() {
+                s = s.fill_const_generics(&const_args);
+              }
+              Ok(AbstractType::AbstractStruct(Arc::new(s)))
+            }
+            (None, Some(generic_enum)) => {
+              let (type_args, const_args) = parse_type_and_const_generic_args(
+                children_iter,
+                &generic_enum.generic_args,
+                typedefs,
+                skolems,
+                &position,
+              )?;
+              let mut e =
+                generic_enum.clone().fill_abstract_generics(type_args);
+              if !const_args.is_empty() {
+                e = e.fill_const_generics(&const_args);
+              }
+              Ok(AbstractType::AbstractEnum(Arc::new(e)))
+            }
+            (None, None) => {
+              return Err(CompileError::new(
+                NoTypeNamed(generic_type_name.clone().into()),
+                position.into(),
+              ));
+            }
+            (Some(_), Some(_)) => panic!("duplicate type name encountered"),
+          }
+        }
+      }
+      EaslTree::Inner(
+        (position, EncloserOrOperator::Encloser(Encloser::Square)),
+        array_children,
+      ) => {
+        let source_trace: SourceTrace = position.into();
+        let array_type = parse_array_type_tree(
+          array_children,
+          source_trace.clone(),
+          typedefs,
+          skolems,
+        )?;
+        // If the array has a Skolem size, it's a const-generic array that needs
+        // to stay abstract until monomorphization.
+        if let Type::Array(Some(ConcreteArraySize::Skolem(name)), inner) =
+          array_type
+        {
+          Ok(AbstractType::AbstractArray {
+            size: AbstractArraySize::Generic(name),
+            inner_type: Box::new(AbstractType::Type(inner.unwrap_known())),
+            source_trace,
+          })
+        } else {
+          Ok(AbstractType::Type(array_type))
+        }
+      }
+      _ => err(InvalidStructFieldType, tree.position().clone().into()),
+    }
+  }
+  pub fn from_name(
+    name: Arc<str>,
+    position: DocumentPosition,
+    typedefs: &TypeDefs,
+    generic_args: &Vec<Arc<str>>,
+    skolems: &Vec<(Arc<str>, Vec<TypeConstraint>)>,
+  ) -> CompileResult<Self> {
+    Ok(if generic_args.contains(&name) {
+      AbstractType::Generic(name.into())
+    } else {
+      AbstractType::Type(Type::from_name(name, position, typedefs, skolems)?)
+    })
+  }
+  pub fn extract_generic_bindings(
+    &self,
+    concrete_type: &Type,
+    type_bindings: &mut HashMap<Arc<str>, Type>,
+    constant_bindings: &mut HashMap<Arc<str>, u32>,
+  ) {
+    match self {
+      AbstractType::Generic(generic) => {
+        type_bindings.insert(generic.clone(), concrete_type.clone());
+      }
+      AbstractType::AbstractStruct(abstract_struct) => {
+        if let Type::Struct(s) = concrete_type {
+          abstract_struct.extract_generic_bindings(
+            s,
+            type_bindings,
+            constant_bindings,
+          );
+        } else {
+          panic!("incompatible types in extract_generic_bindings")
+        }
+      }
+      AbstractType::AbstractEnum(abstract_enum) => {
+        if let Type::Enum(e) = concrete_type {
+          abstract_enum.extract_generic_bindings(
+            e,
+            type_bindings,
+            constant_bindings,
+          );
+        } else {
+          panic!("incompatible types in extract_generic_bindings")
+        }
+      }
+      AbstractType::AbstractArray {
+        size, inner_type, ..
+      } => {
+        if let Type::Array(Some(concrete_size), inner) = concrete_type {
+          if let AbstractArraySize::Generic(name) = size
+            && let Some(lit) = concrete_size.as_literal()
+          {
+            constant_bindings.insert(name.clone(), lit);
+          }
+          inner_type.extract_generic_bindings(
+            &inner.unwrap_known(),
+            type_bindings,
+            constant_bindings,
+          );
+        } else {
+          panic!(
+            "incompatible types in extract_generic_bindings: expected Array"
+          )
+        }
+      }
+      AbstractType::Type(t) => {
+        t.extract_skolem_bindings(
+          concrete_type,
+          type_bindings,
+          constant_bindings,
+        );
+      }
+      AbstractType::Unit => {}
+    }
+  }
+  pub fn rename_generic(self, old_name: &str, new_name: &str) -> Self {
+    match self {
+      AbstractType::Generic(name) => {
+        AbstractType::Generic(if &*name == old_name {
+          new_name.into()
+        } else {
+          name
+        })
+      }
+      AbstractType::AbstractStruct(s) => {
+        let mut s = Arc::unwrap_or_clone(s);
+        s.generic_args = s
+          .generic_args
+          .into_iter()
+          .map(|(name, arg, source)| {
+            (
+              if &*name == old_name {
+                new_name.into()
+              } else {
+                name
+              },
+              arg,
+              source,
+            )
+          })
+          .collect();
+        s.fields = s
+          .fields
+          .into_iter()
+          .map(|mut f| {
+            f.field_type = f.field_type.rename_generic(old_name, new_name);
+            f
+          })
+          .collect();
+        AbstractType::AbstractStruct(Arc::new(s))
+      }
+      other => other,
+    }
+  }
+  pub fn data_size_in_u32s(
+    &self,
+    source_trace: &SourceTrace,
+  ) -> CompileResult<usize> {
+    Ok(match self {
+      AbstractType::Unit => 0,
+      AbstractType::Generic(_) => panic!(
+        "encountered Generic while calculating data_size_in_u32s, this should \
+        never happen"
+      ),
+      AbstractType::Type(t) => t.data_size_in_u32s(source_trace)?,
+      AbstractType::AbstractStruct(s) => s
+        .fields
+        .iter()
+        .map(|f| f.field_type.data_size_in_u32s(source_trace))
+        .collect::<CompileResult<Vec<usize>>>()?
+        .into_iter()
+        .sum::<usize>(),
+      AbstractType::AbstractEnum(e) => e.inner_data_size_in_u32s()? + 1,
+      AbstractType::AbstractArray {
+        size,
+        inner_type,
+        source_trace,
+      } => {
+        inner_type.data_size_in_u32s(source_trace)?
+          * match size {
+            AbstractArraySize::Literal(x) => *x as usize,
+            _ => {
+              return Err(CompileError::new(
+                CompileErrorKind::CantCalculateSize,
+                source_trace.clone(),
+              ));
+            }
+          }
+      }
+    })
+  }
+  pub fn is_vec4f(&self) -> bool {
+    match self {
+      AbstractType::Type(t) => t.is_vec4f(),
+      AbstractType::AbstractStruct(s) => s.is_vec4f(),
+      _ => false,
+    }
+  }
+  pub fn is_unitlike(&self, names: &mut NameContext) -> bool {
+    match self {
+      AbstractType::Unit => true,
+      AbstractType::Generic(_) => false,
+      AbstractType::Type(t) => t.is_unitlike(names),
+      AbstractType::AbstractStruct(abstract_struct) => {
+        !abstract_struct.opaque
+          && !abstract_struct
+            .fields
+            .iter()
+            .any(|f| !f.field_type.is_unitlike(names))
+      }
+      AbstractType::AbstractEnum(abstract_enum) => {
+        if abstract_enum.variants.len() <= 1 {
+          abstract_enum
+            .variants
+            .get(0)
+            .map(|v| v.inner_type.is_unitlike(names))
+            .unwrap_or(true)
+        } else {
+          false
+        }
+      }
+      AbstractType::AbstractArray {
+        size, inner_type, ..
+      } => {
+        inner_type.is_unitlike(names)
+          || match size {
+            AbstractArraySize::Literal(s) => *s == 0,
+            _ => false,
+          }
+      }
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum AbstractArraySize {
+  Literal(u32),
+  Constant(Arc<str>),
+  Generic(Arc<str>),
+  Unsized,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConcreteArraySize {
+  Literal(u32),
+  Constant(Arc<str>),
+  Skolem(Arc<str>),
+  UnificationVariable(ConstGenericValue),
+  Unsized,
+}
+
+impl AbstractArraySize {
+  pub fn compile_type(&self) -> String {
+    match self {
+      AbstractArraySize::Literal(size) => format!("{size}"),
+      AbstractArraySize::Constant(name) => {
+        compile_word(format!("{name}").into())
+      }
+      AbstractArraySize::Unsized => String::new(),
+      AbstractArraySize::Generic(_) => {
+        panic!(
+          "compiling AbstractArraySize generic, this should have been replaced"
+        )
+      }
+    }
+  }
+  pub fn fill_generics(
+    &self,
+    generics: &HashMap<Arc<str>, ConstGenericValue>,
+  ) -> ConcreteArraySize {
+    match self {
+      AbstractArraySize::Literal(x) => ConcreteArraySize::Literal(*x),
+      AbstractArraySize::Unsized => ConcreteArraySize::Unsized,
+      AbstractArraySize::Constant(x) => ConcreteArraySize::Constant(x.clone()),
+      AbstractArraySize::Generic(x) => ConcreteArraySize::UnificationVariable(
+        generics
+          .get(x)
+          .expect("unrecognized generic constant name")
+          .clone(),
+      ),
+    }
+  }
+  pub fn concretize(
+    &self,
+    skolems: &Vec<(Arc<str>, Vec<TypeConstraint>)>,
+  ) -> ConcreteArraySize {
+    match self {
+      AbstractArraySize::Literal(value) => ConcreteArraySize::Literal(*value),
+      AbstractArraySize::Unsized => ConcreteArraySize::Unsized,
+      AbstractArraySize::Constant(name) => {
+        ConcreteArraySize::Constant(name.clone())
+      }
+      AbstractArraySize::Generic(name) => {
+        if skolems
+          .iter()
+          .find(|(skolem_name, _)| *skolem_name == *name)
+          .is_some()
+        {
+          ConcreteArraySize::Skolem(name.clone())
+        } else {
+          panic!("unrecognized generic constant name")
+        }
+      }
+    }
+  }
+}
+
+impl ConcreteArraySize {
+  pub fn as_literal(&self) -> Option<u32> {
+    match self {
+      ConcreteArraySize::Literal(n) => Some(*n),
+      ConcreteArraySize::UnificationVariable(v) => {
+        match &*v.value.read().unwrap() {
+          Some(ConstGenericResolution::Literal(n)) => Some(*n),
+          _ => None,
+        }
+      }
+      _ => None,
+    }
+  }
+  pub fn compile_type(&self) -> String {
+    match self {
+      ConcreteArraySize::Literal(size) => format!("{size}"),
+      ConcreteArraySize::Constant(name) => {
+        compile_word(format!("{name}").into())
+      }
+      ConcreteArraySize::Unsized => String::new(),
+      ConcreteArraySize::UnificationVariable(value) => {
+        let guard = value.value.read().unwrap();
+        match &*guard {
+          Some(ConstGenericResolution::Literal(n)) => format!("{n}"),
+          Some(ConstGenericResolution::Skolem(_)) => {
+            panic!(
+              "compiling UnificationVariable resolved to skolem, \
+              this should have been replaced"
+            )
+          }
+          None => {
+            panic!("ConcreteArraySize unification var wasn't unified")
+          }
+        }
+      }
+      ConcreteArraySize::Skolem(_) => {
+        panic!(
+          "compiling ConcreteArraySize skolem, this should have been replaced"
+        )
+      }
+    }
+  }
+  pub fn constrain(
+    &mut self,
+    other: &Self,
+    source_trace: &SourceTrace,
+  ) -> CompileResult<bool> {
+    match (&self, other) {
+      (ConcreteArraySize::Literal(a), ConcreteArraySize::Literal(b)) => {
+        if a == b {
+          Ok(false)
+        } else {
+          err(
+            IncompatibleArraySize(self.clone().into(), other.clone().into()),
+            source_trace.clone(),
+          )
+        }
+      }
+      (ConcreteArraySize::Constant(a), ConcreteArraySize::Constant(b)) => {
+        if a == b {
+          Ok(false)
+        } else {
+          err(
+            IncompatibleArraySize(self.clone().into(), other.clone().into()),
+            source_trace.clone(),
+          )
+        }
+      }
+      (ConcreteArraySize::Skolem(a), ConcreteArraySize::Skolem(b)) => {
+        if a == b {
+          Ok(false)
+        } else {
+          err(
+            IncompatibleArraySize(self.clone().into(), other.clone().into()),
+            source_trace.clone(),
+          )
+        }
+      }
+      (ConcreteArraySize::Unsized, ConcreteArraySize::Unsized) => Ok(false),
+      (
+        ConcreteArraySize::UnificationVariable(var),
+        ConcreteArraySize::Literal(value),
+      ) => {
+        let mut unification_value = var.value.write().unwrap();
+        match &*unification_value {
+          Some(ConstGenericResolution::Literal(existing)) => {
+            if existing == value {
+              Ok(false)
+            } else {
+              err(
+                IncompatibleArraySize(
+                  self.clone().into(),
+                  other.clone().into(),
+                ),
+                source_trace.clone(),
+              )
+            }
+          }
+          Some(ConstGenericResolution::Skolem(_)) => Ok(false),
+          None => {
+            *unification_value = Some(ConstGenericResolution::Literal(*value));
+            Ok(true)
+          }
+        }
+      }
+      (
+        ConcreteArraySize::UnificationVariable(var),
+        ConcreteArraySize::Skolem(name),
+      )
+      | (
+        ConcreteArraySize::Skolem(name),
+        ConcreteArraySize::UnificationVariable(var),
+      ) => {
+        let mut unification_value = var.value.write().unwrap();
+        match &*unification_value {
+          Some(_) => Ok(false),
+          None => {
+            *unification_value =
+              Some(ConstGenericResolution::Skolem(name.clone()));
+            Ok(true)
+          }
+        }
+      }
+      (ConcreteArraySize::UnificationVariable(_), _)
+      | (_, ConcreteArraySize::UnificationVariable(_)) => Ok(false),
+      _ => err(
+        IncompatibleArraySize(self.clone().into(), other.clone().into()),
+        source_trace.clone(),
+      ),
+    }
+  }
+  pub fn are_compatible(a: &Self, b: &Self) -> bool {
+    match (a, b) {
+      (ConcreteArraySize::Literal(a), ConcreteArraySize::Literal(b)) => a == b,
+      (ConcreteArraySize::Constant(a), ConcreteArraySize::Constant(b)) => {
+        a == b
+      }
+      (ConcreteArraySize::Skolem(a), ConcreteArraySize::Skolem(b)) => a == b,
+      (ConcreteArraySize::Unsized, ConcreteArraySize::Unsized) => true,
+      (ConcreteArraySize::UnificationVariable(u), other)
+      | (other, ConcreteArraySize::UnificationVariable(u)) => match other {
+        ConcreteArraySize::Literal(x) => match &*u.value.read().unwrap() {
+          Some(ConstGenericResolution::Literal(u_value)) => u_value == x,
+          _ => true,
+        },
+        ConcreteArraySize::UnificationVariable(other_u) => {
+          match (&*u.value.read().unwrap(), &*other_u.value.read().unwrap()) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+          }
+        }
+        ConcreteArraySize::Skolem(_) => true,
+        _ => false,
+      },
+      _ => false,
+    }
+  }
+}
+
+/// Parse an array-size token that may carry a `u` or `i` numeric suffix
+/// (e.g. `"3u"`, `"16i"`) into a `ConcreteArraySize`. Suffixed literals are
+/// treated identically to their bare counterparts; an unparseable token is
+/// returned as a `Constant` (named-constant reference).
+fn parse_array_size(
+  num_str: &str,
+  skolems: &Vec<(Arc<str>, Vec<TypeConstraint>)>,
+) -> ConcreteArraySize {
+  if let Ok(n) = num_str
+    .trim_end_matches(|c| c == 'u' || c == 'i')
+    .parse::<u32>()
+  {
+    ConcreteArraySize::Literal(n)
+  } else if skolems.iter().any(|(name, _)| &**name == num_str) {
+    ConcreteArraySize::Skolem(num_str.into())
+  } else {
+    ConcreteArraySize::Constant(num_str.into())
+  }
+}
+
+fn parse_array_type_tree(
+  array_children: Vec<EaslTree>,
+  source_trace: SourceTrace,
+  typedefs: &TypeDefs,
+  skolems: &Vec<(Arc<str>, Vec<TypeConstraint>)>,
+) -> CompileResult<Type> {
+  if array_children.len() != 1 {
+    return err(InvalidArraySignature, source_trace);
+  }
+  let child = array_children.into_iter().next().unwrap();
+  match child {
+    EaslTree::Inner(
+      (position, EncloserOrOperator::Operator(Operator::TypeAscription)),
+      mut type_annotation_children,
+    ) => {
+      let source_trace: SourceTrace = position.into();
+      if let EaslTree::Leaf(_, num_str) = type_annotation_children.remove(0) {
+        let inner_type = Type::from_easl_tree(
+          type_annotation_children.remove(0),
+          typedefs,
+          skolems,
+        )?;
+        Ok(Type::Array(
+          Some(parse_array_size(&num_str, skolems)),
+          Box::new(inner_type.known().into()),
+        ))
+      } else {
+        err(InvalidArraySignature, source_trace)
+      }
+    }
+    other => {
+      let inner_type = Type::from_easl_tree(other, typedefs, skolems)?;
+      Ok(Type::Array(
+        Some(ConcreteArraySize::Unsized),
+        Box::new(inner_type.known().into()),
+      ))
+    }
+  }
+}
+
+fn parse_type_and_const_generic_args(
+  children_iter: impl Iterator<Item = EaslTree>,
+  generic_arg_defs: &[(Arc<str>, GenericArgument, SourceTrace)],
+  typedefs: &TypeDefs,
+  skolems: &Vec<(Arc<str>, Vec<TypeConstraint>)>,
+  position: &DocumentPosition,
+) -> CompileResult<(Vec<AbstractType>, HashMap<Arc<str>, u32>)> {
+  let mut type_args = vec![];
+  let mut const_args = HashMap::new();
+  for (subtree, (name, generic_arg, _)) in
+    children_iter.zip(generic_arg_defs.iter())
+  {
+    match generic_arg {
+      GenericArgument::Type(_) => {
+        type_args
+          .push(AbstractType::from_easl_tree(subtree, typedefs, skolems)?);
+      }
+      GenericArgument::Constant => {
+        if let EaslTree::Leaf(pos, value_str) = &subtree {
+          if let Ok(n) = value_str
+            .trim_end_matches(|c: char| c == 'u' || c == 'i')
+            .parse::<u32>()
+          {
+            const_args.insert(name.clone(), n);
+          } else if skolems.iter().any(|(s, _)| **s == **value_str) {
+            // Skolem forwarding — leave unfilled, monomorphization handles it later
+          } else {
+            return err(
+              UnrecognizedTypeName(value_str.to_string()),
+              pos.clone().into(),
+            );
+          }
+        } else {
+          return err(InvalidTypeName, position.clone().into());
+        }
+      }
+    }
+  }
+  Ok((type_args, const_args))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConstGenericResolution {
+  Literal(u32),
+  Skolem(Arc<str>),
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstGenericValue {
+  pub(crate) value: Arc<RwLock<Option<ConstGenericResolution>>>,
+}
+impl PartialEq for ConstGenericValue {
+  fn eq(&self, other: &Self) -> bool {
+    *self.value.read().unwrap() == *other.value.read().unwrap()
+  }
+}
+
+impl ConstGenericValue {
+  pub fn fresh() -> Self {
+    Self {
+      value: Arc::new(RwLock::new(None)),
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Type {
+  Unit,
+  F32,
+  I32,
+  U32,
+  Bool,
+  String,
+  Struct(Struct),
+  Enum(Enum),
+  Function(Box<FunctionSignature>),
+  Skolem(Arc<str>, Vec<TypeConstraint>),
+  Array(Option<ConcreteArraySize>, Box<ExpTypeInfo>),
+}
+impl Type {
+  pub fn c_printf_statements(
+    &self,
+    arg_str: &str,
+    names: &mut NameContext,
+    target: CompilerTarget,
+  ) -> String {
+    match self {
+      Type::Unit => format!("\nprintf(\"()\");"),
+      Type::F32 => format!("\nprint_f32({arg_str});"),
+      Type::I32 => format!("\nprintf(\"%di\", {arg_str});"),
+      Type::U32 => format!("\nprintf(\"%uu\", {arg_str});"),
+      Type::Bool => format!("\nprintf(\"%s\", {arg_str});"),
+      Type::String => format!("\nprintf(\"\\\"%s\\\"\", {arg_str});"),
+      Type::Struct(s) => {
+        let mut output = format!("\nprintf(\"({}\");", s.name);
+        for f in s.fields.iter() {
+          output += "\nprintf(\" \");";
+          let sub_arg_str = arg_str.to_string() + "." + &f.name;
+          output += &f.field_type.unwrap_known().c_printf_statements(
+            &sub_arg_str,
+            names,
+            target,
+          );
+        }
+        output += "\nprintf(\")\");";
+        output
+      }
+      Type::Enum(_) => todo!(),
+      Type::Function(_) => format!("<fn>"),
+      Type::Array(_, _) => todo!(),
+      Type::Skolem(_, _) => panic!(),
+    }
+  }
+  pub fn is_constructible(&self) -> bool {
+    match self {
+      Type::F32 | Type::I32 | Type::U32 | Type::Bool => true,
+      Type::Struct(s) => match &*s.name {
+        "Atomic" | "Texture2D" | "Sampler" => false,
+        _ => s
+          .fields
+          .iter()
+          .all(|f| f.field_type.unwrap_known().is_constructible()),
+      },
+      Type::Enum(e) => e
+        .variants
+        .iter()
+        .all(|v| v.inner_type.unwrap_known().is_constructible()),
+      Type::Array(size, inner) => {
+        size.is_some() && inner.unwrap_known().is_constructible()
+      }
+      Type::Unit | Type::Function(_) | Type::String | Type::Skolem(_, _) => {
+        true
+      }
+    }
+  }
+  pub fn gather_location_annotations(
+    &self,
+    annotations: &mut HashMap<usize, Type>,
+  ) {
+    let Type::Struct(s) = self else {
+      return;
+    };
+    for f in s.fields.iter() {
+      if let Some((location, _)) = f.attributes.location() {
+        annotations.insert(location, f.field_type.unwrap_known());
+      }
+    }
+  }
+  pub fn tag(&self) -> &str {
+    match self {
+      Type::Unit => "Unit",
+      Type::F32 => "F32",
+      Type::I32 => "I32",
+      Type::U32 => "U32",
+      Type::Bool => "Bool",
+      Type::String => "String",
+      Type::Struct(_) => "Struct",
+      Type::Enum(_) => "Enum",
+      Type::Function(_) => "Function",
+      Type::Skolem(_, _) => "Skolem",
+      Type::Array(_, _) => "Array",
+    }
+  }
+  pub fn is_unitlike(&self, names: &mut NameContext) -> bool {
+    match self {
+      Type::Unit => true,
+      Type::Struct(s) => {
+        !s.abstract_ancestor.opaque
+          && !s.fields.iter().any(|f| {
+            !f.field_type.kind.with_dereferenced(|f| match f {
+              TypeState::Known(t) => t.is_unitlike(names),
+              _ => false,
+            })
+          })
+      }
+      Type::Enum(e) => {
+        if e.variants.len() <= 1 {
+          e.variants
+            .get(0)
+            .map(|v| {
+              v.inner_type.kind.with_dereferenced(|f| match f {
+                TypeState::Known(t) => t.is_unitlike(names),
+                _ => false,
+              })
+            })
+            .unwrap_or(true)
+        } else {
+          false
+        }
+      }
+      Type::Function(function_signature) => function_signature
+        .abstract_ancestor
+        .as_ref()
+        .map(|f| {
+          f.read()
+            .unwrap()
+            .representative_type(names)
+            .is_unitlike(names)
+        })
+        .unwrap_or(false),
+      Type::Array(array_size, inner_type) => {
+        inner_type.kind.with_dereferenced(|f| match f {
+          TypeState::Known(t) => t.is_unitlike(names),
+          _ => false,
+        }) || match array_size {
+          Some(size) => match size {
+            ConcreteArraySize::Literal(size) => *size == 0,
+            _ => false,
+          },
+          None => false,
+        }
+      }
+      _ => false,
+    }
+  }
+  pub fn inline_def_array_sizes(
+    &mut self,
+    u32_constants: &HashMap<Arc<str>, u32>,
+  ) {
+    self.walk_mut(&|t| {
+      if let Type::Function(f) = t
+        && let Some(f) = &f.abstract_ancestor
+      {
+        f.write().unwrap().inline_def_array_sizes(&u32_constants);
+      }
+      if let Type::Array(Some(size), _) = t
+        && let ConcreteArraySize::Constant(constant_name) = size
+        && let Some(n) = u32_constants.get(constant_name)
+      {
+        *size = ConcreteArraySize::Literal(*n);
+      }
+    });
+  }
+  pub fn data_size_in_u32s(
+    &self,
+    source_trace: &SourceTrace,
+  ) -> CompileResult<usize> {
+    Ok(match self {
+      Type::Unit => 0,
+      Type::F32 | Type::I32 | Type::U32 | Type::Bool => 1,
+      Type::Struct(s) => {
+        // Matrices are nominally one-field-of-T opaque structs, but their
+        // VM and GPU storage is N*M elements. Special-case so size queries
+        // see the true storage.
+        if let Some((cols, rows)) = extract_mat_size_from_name(&s.name)
+          && let Some(elem) =
+            s.fields.first().map(|f| f.field_type.unwrap_known())
+        {
+          cols * rows * elem.data_size_in_u32s(source_trace)?
+        } else {
+          s.fields
+            .iter()
+            .map(|f| {
+              f.field_type.unwrap_known().data_size_in_u32s(source_trace)
+            })
+            .collect::<CompileResult<Vec<usize>>>()?
+            .into_iter()
+            .sum::<usize>()
+        }
+      }
+      Type::Enum(e) => e.inner_data_size_in_u32s()? + 1,
+      Type::Function(_) => {
+        return err(UninlinableHigherOrderFunction, source_trace.clone());
+      }
+      Type::Skolem(_, _) => panic!("tried to calculate size of skolem"),
+      Type::Array(size, inner_type) => {
+        inner_type.unwrap_known().data_size_in_u32s(source_trace)?
+          * match size {
+            Some(ConcreteArraySize::Literal(x)) => *x as usize,
+            _ => {
+              return Err(CompileError::new(
+                CompileErrorKind::CantCalculateSize,
+                source_trace.clone(),
+              ));
+            }
+          }
+      }
+      Type::String => {
+        return err(CantComputeSizeOfString, source_trace.clone());
+      }
+    })
+  }
+  /// Returns the WGSL AlignOf for this type, in u32s (bytes / 4).
+  /// See https://www.w3.org/TR/WGSL/#alignment-and-size
+  pub fn wgsl_alignment_in_u32s(&self) -> usize {
+    match self {
+      Type::F32 | Type::I32 | Type::U32 | Type::Bool => 1,
+      Type::Struct(s) => match &*s.name {
+        "vec2" => 2,
+        "vec3" | "vec4" => 4,
+        _ => s
+          .fields
+          .iter()
+          .map(|f| f.field_type.unwrap_known().wgsl_alignment_in_u32s())
+          .max()
+          .unwrap_or(1),
+      },
+      Type::Array(_, inner) => inner.unwrap_known().wgsl_alignment_in_u32s(),
+      _ => 1,
+    }
+  }
+  /// Returns the WGSL SizeOf for this type, in u32s (bytes / 4).
+  /// For vec3, this is 3 (12 bytes), NOT rounded up to its AlignOf of 16.
+  /// For user-defined structs and arrays, inter-field / stride padding IS
+  /// included.
+  /// See https://www.w3.org/TR/WGSL/#alignment-and-size
+  pub fn wgsl_data_size_in_u32s(&self) -> usize {
+    fn round_up(align: usize, size: usize) -> usize {
+      if align == 0 {
+        return size;
+      }
+      ((size + align - 1) / align) * align
+    }
+    match self {
+      Type::F32 | Type::I32 | Type::U32 | Type::Bool => 1,
+      Type::Unit => 0,
+      Type::Struct(s) => match &*s.name {
+        // For vec types, SizeOf != round_up(AlignOf, SizeOf).
+        // vec3 SizeOf = 12 bytes (3 u32s), AlignOf = 16 bytes (4 u32s).
+        "vec2" => 2,
+        "vec3" => 3,
+        "vec4" => 4,
+        _ => {
+          let mut offset = 0usize;
+          for field in &s.fields {
+            let ft = field.field_type.unwrap_known();
+            offset = round_up(ft.wgsl_alignment_in_u32s(), offset);
+            offset += ft.wgsl_data_size_in_u32s();
+          }
+          round_up(self.wgsl_alignment_in_u32s(), offset)
+        }
+      },
+      Type::Enum(e) => {
+        // Compiled as struct { discriminant: u32, data: array<u32, N> }
+        e.inner_data_size_in_u32s().unwrap_or(0) + 1
+      }
+      Type::Array(size, inner_type) => {
+        let inner_ty = inner_type.unwrap_known();
+        let stride = round_up(
+          inner_ty.wgsl_alignment_in_u32s(),
+          inner_ty.wgsl_data_size_in_u32s(),
+        );
+        match size {
+          Some(ConcreteArraySize::Literal(x)) => stride * *x as usize,
+          _ => 0,
+        }
+      }
+      _ => 0,
+    }
+  }
+  pub fn satisfies_constraint(&self, constraint: &TypeConstraint) -> bool {
+    if let Type::Skolem(_, skolem_constraints) = self {
+      skolem_constraints.contains(&constraint)
+    } else {
+      match constraint.kind {
+        TypeConstraintKind::Scalar => {
+          *self == Type::I32 || *self == Type::F32 || *self == Type::U32
+        }
+        TypeConstraintKind::ScalarOrBool => {
+          *self == Type::I32
+            || *self == Type::F32
+            || *self == Type::U32
+            || *self == Type::Bool
+        }
+        TypeConstraintKind::Integer => *self == Type::I32 || *self == Type::U32,
+        TypeConstraintKind::Function => matches!(self, Type::Function(_)),
+      }
+    }
+  }
+  pub fn from_easl_tree(
+    tree: EaslTree,
+    typedefs: &TypeDefs,
+    skolems: &Vec<(Arc<str>, Vec<TypeConstraint>)>,
+  ) -> CompileResult<Self> {
+    match tree {
+      EaslTree::Leaf(position, type_name) => {
+        Type::from_name(type_name.into(), position, typedefs, skolems)
+      }
+      EaslTree::Inner(
+        (position, EncloserOrOperator::Encloser(Encloser::Parens)),
+        type_signature_children,
+      ) => {
+        let source_trace: SourceTrace = position.into();
+        let mut signature_leaves = type_signature_children.into_iter();
+        match signature_leaves.next() {
+          None => Ok(Self::Unit),
+          Some(EaslTree::Leaf(_, struct_name))
+            if struct_name.as_str() == "Fn" =>
+          {
+            match (
+              signature_leaves.len(),
+              signature_leaves.next(),
+              signature_leaves.next(),
+            ) {
+              (
+                2,
+                Some(EaslTree::Inner(
+                  (_, EncloserOrOperator::Encloser(Encloser::Square)),
+                  arg_type_asts,
+                )),
+                Some(return_type_ast),
+              ) => Ok(Self::Function(Box::new(FunctionSignature {
+                abstract_ancestor: None,
+                args: arg_type_asts
+                  .into_iter()
+                  .map(|arg_type_ast| {
+                    Ok((
+                      Variable::immutable(
+                        Self::from_easl_tree(arg_type_ast, typedefs, skolems)?
+                          .known()
+                          .into(),
+                      ),
+                      vec![],
+                    ))
+                  })
+                  .collect::<CompileResult<Vec<_>>>()?,
+                return_type: Self::from_easl_tree(
+                  return_type_ast,
+                  typedefs,
+                  skolems,
+                )?
+                .known()
+                .into(),
+              }))),
+              _ => err(InvalidFunctionType, source_trace),
+            }
+          }
+          Some(EaslTree::Leaf(_, type_name)) => {
+            if signature_leaves.len() == 0 {
+              return err(InvalidTypeName, source_trace);
+            } else {
+              let generic_args: Vec<GenericArgumentValue> = signature_leaves
+                .map(|signature_arg| {
+                  Ok(GenericArgumentValue::Type(
+                    AbstractType::from_easl_tree(
+                      signature_arg,
+                      typedefs,
+                      skolems,
+                    )?
+                    .concretize(skolems, typedefs, source_trace.clone())?
+                    .known()
+                    .into(),
+                  ))
+                })
+                .collect::<CompileResult<Vec<GenericArgumentValue>>>()?;
+              if let Some(s) =
+                typedefs.structs.iter().find(|s| &*s.name.0 == type_name)
+              {
+                Ok(Type::Struct(AbstractStruct::fill_generics_ordered(
+                  Arc::new(s.clone()),
+                  generic_args,
+                  typedefs,
+                  source_trace.clone(),
+                )?))
+              } else if let Some(e) =
+                typedefs.enums.iter().find(|e| &*e.name.0 == type_name)
+              {
+                Ok(Type::Enum(AbstractEnum::fill_generics_ordered(
+                  e.clone().into(),
+                  generic_args,
+                  typedefs,
+                  source_trace.clone(),
+                )?))
+              } else {
+                return err(NoTypeNamed(type_name.into()), source_trace);
+              }
+            }
+          }
+          _ => return err(InvalidTypeName, source_trace),
+        }
+      }
+      EaslTree::Inner(
+        (position, EncloserOrOperator::Encloser(Encloser::Square)),
+        array_children,
+      ) => parse_array_type_tree(
+        array_children,
+        position.into(),
+        typedefs,
+        skolems,
+      ),
+      other => {
+        let source_trace = other.position().clone().into();
+        return err(InvalidType(other), source_trace);
+      }
+    }
+  }
+  pub fn compatible(&self, other: &Self) -> bool {
+    let b = match (self, other) {
+      (Type::Function(a), Type::Function(b)) => a.compatible(b),
+      (Type::Struct(a), Type::Struct(b)) => a.compatible(b),
+      (Type::Enum(a), Type::Enum(b)) => a.compatible(b),
+      (Type::Array(size_a, a), Type::Array(size_b, b)) => {
+        TypeState::are_compatible(a, b)
+          && match (size_a, size_b) {
+            (Some(a), Some(b)) => ConcreteArraySize::are_compatible(a, b),
+            _ => true,
+          }
+      }
+      (a, b) => a == b,
+    };
+    b
+  }
+  pub fn compatible_with_any(&self, others: &[Self]) -> bool {
+    others.iter().find(|x| self.compatible(x)).is_some()
+  }
+  pub fn filter_compatibles(&self, others: &[Self]) -> Vec<Self> {
+    others
+      .iter()
+      .filter(|x| self.compatible(x))
+      .cloned()
+      .collect()
+  }
+  pub fn from_name(
+    name: Arc<str>,
+    source_position: DocumentPosition,
+    typedefs: &TypeDefs,
+    skolems: &Vec<(Arc<str>, Vec<TypeConstraint>)>,
+  ) -> CompileResult<Self> {
+    use Type::*;
+    let source_trace: SourceTrace = source_position.into();
+    Ok(match &*name {
+      "None" => Unit,
+      "F32" | "f32" => F32,
+      "I32" | "i32" => I32,
+      "U32" | "u32" => U32,
+      "Bool" | "bool" => Bool,
+      _ => {
+        if let Some(constraints) =
+          skolems.iter().find_map(|(skolem_name, constraints)| {
+            (name == *skolem_name).then(|| constraints.clone())
+          })
+        {
+          Skolem(name, constraints)
+        } else if let Some(s) =
+          typedefs.structs.iter().find(|s| s.name.0 == name)
+        {
+          Struct(AbstractStruct::fill_generics_with_unification_variables(
+            Arc::new(s.clone()),
+            &typedefs,
+            source_trace.clone(),
+          )?)
+        } else if let Some(e) = typedefs.enums.iter().find(|e| e.name.0 == name)
+        {
+          Enum(AbstractEnum::fill_generics_with_unification_variables(
+            e.clone().into(),
+            &typedefs,
+            source_trace.clone(),
+          )?)
+        } else if let Some(s) = typedefs
+          .type_aliases
+          .iter()
+          .find_map(|(alias, s)| (*alias == name).then(|| s))
+        {
+          Struct(AbstractStruct::fill_generics_with_unification_variables(
+            s.clone(),
+            &typedefs,
+            source_trace.clone(),
+          )?)
+        } else {
+          return err(UnrecognizedTypeName(name.to_string()), source_trace);
+        }
+      }
+    })
+  }
+  pub fn monomorphized_name(
+    &self,
+    names: &mut NameContext,
+    target: CompilerTarget,
+  ) -> String {
+    match target {
+      CompilerTarget::WGSL | CompilerTarget::VM => match self {
+        Type::Unit => "Unit".to_string(),
+        Type::F32 => "f32".to_string(),
+        Type::I32 => "i32".to_string(),
+        Type::U32 => "u32".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::Struct(s) => match &*s.name {
+          "Texture2D" => format!(
+            "texture_2d<{}>",
+            s.fields[0]
+              .field_type
+              .unwrap_known()
+              .monomorphized_name(names, target)
+          ),
+          "Sampler" => "sampler".to_string(),
+          "Atomic" => format!(
+            "atomic<{}>",
+            s.fields[0]
+              .field_type
+              .unwrap_known()
+              .monomorphized_name(names, target)
+          ),
+          _ => compile_word(s.monomorphized_name(names, target)),
+        },
+        Type::Enum(e) => compile_word(e.monomorphized_name(names, target)),
+        Type::Array(size, inner_type) => {
+          let inner = inner_type.monomorphized_name(names, target);
+          let size_str = size
+            .clone()
+            .map(|size| size.compile_type())
+            .unwrap_or_default();
+          if size_str.is_empty() {
+            format!("array<{inner}>")
+          } else {
+            format!("array<{inner}, {size_str}>")
+          }
+        }
+        Type::Function(f) => {
+          let Some(f) = &f.abstract_ancestor else {
+            panic!(
+              "Attempted to compile ConcreteFunction type with no abstract ancestor"
+            );
+          };
+          f.read()
+            .unwrap()
+            .representative_type(names)
+            .name
+            .0
+            .to_string()
+        }
+        Type::Skolem(name, _) => {
+          panic!("Attempted to compile Skolem \"{name}\"")
+        }
+        Type::String => "String".into(),
+      },
+      CompilerTarget::C => match self {
+        Type::Unit => "void".to_string(),
+        Type::F32 => "float".to_string(),
+        Type::I32 => "int32_t".to_string(),
+        Type::U32 => "uint32_t".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::Struct(s) => match &*s.name {
+          "Texture2D" => format!(
+            "texture_2d<{}>",
+            s.fields[0]
+              .field_type
+              .unwrap_known()
+              .monomorphized_name(names, target)
+          ),
+          "Sampler" => "sampler".to_string(),
+          "Atomic" => format!(
+            "atomic<{}>",
+            s.fields[0]
+              .field_type
+              .unwrap_known()
+              .monomorphized_name(names, target)
+          ),
+          _ => compile_word(s.monomorphized_name(names, target)),
+        },
+        Type::Enum(e) => compile_word(e.monomorphized_name(names, target)),
+        Type::Array(size, inner_type) => {
+          format!(
+            "{}[{}]",
+            inner_type.monomorphized_name(names, target),
+            size
+              .clone()
+              .map(|size| format!("{}", size.compile_type()))
+              .unwrap_or(String::new())
+          )
+        }
+        Type::Function(f) => {
+          let Some(f) = &f.abstract_ancestor else {
+            panic!(
+              "Attempted to compile ConcreteFunction type with no abstract ancestor"
+            );
+          };
+          f.read()
+            .unwrap()
+            .representative_type(names)
+            .name
+            .0
+            .to_string()
+        }
+        Type::Skolem(name, _) => {
+          panic!("Attempted to compile Skolem \"{name}\"")
+        }
+        Type::String => "String".into(),
+      },
+    }
+  }
+  /// Extract generic bindings from a Type that may contain Skolems, by
+  /// walking it in parallel with the corresponding concrete type.
+  pub fn extract_skolem_bindings(
+    &self,
+    concrete: &Type,
+    type_bindings: &mut HashMap<Arc<str>, Type>,
+    constant_bindings: &mut HashMap<Arc<str>, u32>,
+  ) {
+    match (self, concrete) {
+      (Type::Skolem(name, _), _) => {
+        type_bindings.insert(name.clone(), concrete.clone());
+      }
+      (Type::Function(abstract_f), Type::Function(concrete_f)) => {
+        for (i, (abs_arg, _)) in abstract_f.args.iter().enumerate() {
+          if let Some((conc_arg, _)) = concrete_f.args.get(i) {
+            if let (TypeState::Known(abs_t), TypeState::Known(conc_t)) =
+              (&abs_arg.var_type.kind, &conc_arg.var_type.kind)
+            {
+              abs_t.extract_skolem_bindings(
+                conc_t,
+                type_bindings,
+                constant_bindings,
+              );
+            }
+          }
+        }
+        if let (TypeState::Known(abs_ret), TypeState::Known(conc_ret)) =
+          (&abstract_f.return_type.kind, &concrete_f.return_type.kind)
+        {
+          abs_ret.extract_skolem_bindings(
+            conc_ret,
+            type_bindings,
+            constant_bindings,
+          );
+        }
+      }
+      (
+        Type::Array(abs_size, abs_inner),
+        Type::Array(conc_size, conc_inner),
+      ) => {
+        if let (Some(ConcreteArraySize::Skolem(name)), Some(conc_size)) =
+          (abs_size, conc_size)
+        {
+          if let Some(lit) = conc_size.as_literal() {
+            constant_bindings.insert(name.clone(), lit);
+          }
+        }
+        if let (TypeState::Known(abs_t), TypeState::Known(conc_t)) =
+          (&abs_inner.kind, &conc_inner.kind)
+        {
+          abs_t.extract_skolem_bindings(
+            conc_t,
+            type_bindings,
+            constant_bindings,
+          );
+        }
+      }
+      (Type::Struct(abs_s), Type::Struct(conc_s)) => {
+        for (abs_field, conc_field) in
+          abs_s.fields.iter().zip(conc_s.fields.iter())
+        {
+          if let (TypeState::Known(abs_t), TypeState::Known(conc_t)) =
+            (&abs_field.field_type.kind, &conc_field.field_type.kind)
+          {
+            abs_t.extract_skolem_bindings(
+              conc_t,
+              type_bindings,
+              constant_bindings,
+            );
+          }
+        }
+      }
+      (Type::Enum(abs_e), Type::Enum(conc_e)) => {
+        for (abs_v, conc_v) in abs_e.variants.iter().zip(conc_e.variants.iter())
+        {
+          if let (TypeState::Known(abs_t), TypeState::Known(conc_t)) =
+            (&abs_v.inner_type.kind, &conc_v.inner_type.kind)
+          {
+            abs_t.extract_skolem_bindings(
+              conc_t,
+              type_bindings,
+              constant_bindings,
+            );
+          }
+        }
+      }
+      _ => {}
+    }
+  }
+  pub fn replace_skolems(&mut self, skolems: &HashMap<Arc<str>, Type>) {
+    if let Type::Skolem(s, _) = &self {
+      std::mem::swap(self, &mut skolems.get(s).unwrap().clone())
+    } else {
+      match self {
+        Type::Struct(s) => {
+          for field in s.fields.iter_mut() {
+            field
+              .field_type
+              .as_known_mut(|t| t.replace_skolems(skolems));
+          }
+        }
+        Type::Enum(e) => {
+          for variant in e.variants.iter_mut() {
+            variant
+              .inner_type
+              .as_known_mut(|t| t.replace_skolems(skolems));
+          }
+        }
+        Type::Function(f) => {
+          f.return_type.as_known_mut(|t| t.replace_skolems(skolems));
+          for (arg, _) in f.args.iter_mut() {
+            arg.var_type.as_known_mut(|t| t.replace_skolems(skolems))
+          }
+        }
+        Type::Array(_, inner_type) => {
+          inner_type.as_known_mut(|t| t.replace_skolems(skolems));
+        }
+        _ => {}
+      }
+    }
+  }
+  pub fn replace_const_generic_skolems(
+    &mut self,
+    bindings: &HashMap<Arc<str>, u32>,
+  ) {
+    match self {
+      Type::Array(size, inner_type) => {
+        if let Some(concrete_size) = size {
+          match concrete_size {
+            ConcreteArraySize::Skolem(name) => {
+              if let Some(&value) = bindings.get(name) {
+                *size = Some(ConcreteArraySize::Literal(value));
+              }
+            }
+            ConcreteArraySize::UnificationVariable(v) => {
+              let resolved_name =
+                if let Some(ConstGenericResolution::Skolem(name)) =
+                  &*v.value.read().unwrap()
+                {
+                  bindings.get(name).copied()
+                } else {
+                  None
+                };
+              if let Some(value) = resolved_name {
+                *size = Some(ConcreteArraySize::Literal(value));
+              }
+            }
+            _ => {}
+          }
+        }
+        inner_type.as_known_mut(|t| t.replace_const_generic_skolems(bindings));
+      }
+      Type::Struct(s) => {
+        for field in s.fields.iter_mut() {
+          field
+            .field_type
+            .as_known_mut(|t| t.replace_const_generic_skolems(bindings));
+        }
+      }
+      Type::Enum(e) => {
+        for variant in e.variants.iter_mut() {
+          variant
+            .inner_type
+            .as_known_mut(|t| t.replace_const_generic_skolems(bindings));
+        }
+      }
+      Type::Function(f) => {
+        f.return_type
+          .as_known_mut(|t| t.replace_const_generic_skolems(bindings));
+        for (arg, _) in f.args.iter_mut() {
+          arg
+            .var_type
+            .as_known_mut(|t| t.replace_const_generic_skolems(bindings))
+        }
+      }
+      _ => {}
+    }
+  }
+  pub fn bitcastable_chunk_accessors(
+    &self,
+    value_name: Arc<str>,
+  ) -> Vec<TypedExp> {
+    match self {
+      Type::Unit => vec![],
+      Type::F32 | Type::I32 | Type::U32 | Type::Bool => vec![TypedExp {
+        data: self.clone().known().into(),
+        kind: ExpKind::Name(value_name),
+        source_trace: SourceTrace::empty(),
+      }],
+      Type::Struct(s) => s.bitcastable_chunk_accessors(value_name),
+      Type::Enum(e) => {
+        let data_array_length = e.inner_data_size_in_u32s().unwrap();
+        std::iter::once(TypedExp {
+          data: Type::U32.known().into(),
+          kind: ExpKind::Access(
+            Accessor::Field("discriminant".into()),
+            TypedExp {
+              data: self.clone().known().into(),
+              kind: ExpKind::Name(value_name.clone()),
+              source_trace: SourceTrace::empty(),
+            }
+            .into(),
+          ),
+          source_trace: SourceTrace::empty(),
+        })
+        .chain((0..data_array_length).map(|i| {
+          TypedExp {
+            data: Type::U32.known().into(),
+            kind: ExpKind::Application(
+              TypedExp {
+                data: Type::Array(
+                  Some(ConcreteArraySize::Literal(data_array_length as u32)),
+                  Box::new(Type::U32.known().into()),
+                )
+                .known()
+                .into(),
+                kind: ExpKind::Access(
+                  Accessor::Field("data".into()),
+                  TypedExp {
+                    data: self.clone().known().into(),
+                    kind: ExpKind::Name(value_name.clone()),
+                    source_trace: SourceTrace::empty(),
+                  }
+                  .into(),
+                ),
+                source_trace: SourceTrace::empty(),
+              }
+              .into(),
+              vec![TypedExp {
+                data: Type::U32.known().into(),
+                kind: ExpKind::NumberLiteral(Number::Int(i as i64)),
+                source_trace: SourceTrace::empty(),
+              }],
+            ),
+            source_trace: SourceTrace::empty(),
+          }
+        }))
+        .collect()
+      }
+      Type::Array(array_size, inner_type) => match array_size {
+        Some(ConcreteArraySize::Literal(n)) => (0..*n)
+          .map(|i| TypedExp {
+            data: *inner_type.clone(),
+            kind: ExpKind::Application(
+              TypedExp {
+                data: self.clone().known().into(),
+                kind: ExpKind::Name(value_name.clone()),
+                source_trace: SourceTrace::empty(),
+              }
+              .into(),
+              vec![TypedExp {
+                data: Type::U32.known().into(),
+                kind: ExpKind::NumberLiteral(Number::Int(i as i64)),
+                source_trace: SourceTrace::empty(),
+              }],
+            ),
+            source_trace: SourceTrace::empty(),
+          })
+          .collect(),
+        Some(_) | None => {
+          panic!("called bitcastable_chunk_accessors on unsized Array")
+        }
+      },
+      _ => {
+        panic!("called bitcastable_chunk_accessors on invalid type")
+      }
+    }
+  }
+  fn bitcasted_from_enum_data_inner(
+    &self,
+    enum_value_name: &Arc<str>,
+    enum_type: &Enum,
+    current_index: usize,
+    names: &mut NameContext,
+    target: CompilerTarget,
+  ) -> (TypedExp, usize) {
+    let data_array_access = |offset: usize| TypedExp {
+      data: Type::U32.known().into(),
+      kind: ExpKind::Application(
+        TypedExp {
+          data: Type::Array(
+            Some(ConcreteArraySize::Literal(
+              enum_type.inner_data_size_in_u32s().unwrap() as u32,
+            )),
+            Box::new(Type::U32.known().into()),
+          )
+          .known()
+          .into(),
+          kind: ExpKind::Access(
+            Accessor::Field("data".into()),
+            TypedExp {
+              data: Type::Enum(enum_type.clone()).known().into(),
+              kind: ExpKind::Name(enum_value_name.clone()),
+              source_trace: SourceTrace::empty(),
+            }
+            .into(),
+          ),
+          source_trace: SourceTrace::empty(),
+        }
+        .into(),
+        vec![TypedExp {
+          data: Type::U32.known().into(),
+          kind: ExpKind::NumberLiteral(Number::Int(
+            (current_index + offset) as i64,
+          )),
+          source_trace: SourceTrace::empty(),
+        }],
+      ),
+      source_trace: SourceTrace::empty(),
+    };
+    let (kind, consumed_indeces) = match self {
+      Type::Unit => (ExpKind::Unit, 0),
+      Type::F32 | Type::I32 | Type::U32 | Type::Bool => (
+        ExpKind::Application(
+          TypedExp {
+            data: Type::Function(
+              FunctionSignature {
+                abstract_ancestor: Some(RwLock::new(scalar_bitcast()).into()),
+                args: vec![(
+                  Variable::immutable(Type::U32.known().into()),
+                  vec![],
+                )],
+                return_type: self.clone().known().into(),
+              }
+              .into(),
+            )
+            .known()
+            .into(),
+            kind: ExpKind::Name(
+              format!("bitcast<{}>", self.monomorphized_name(names, target))
+                .into(),
+            ),
+            source_trace: SourceTrace::empty(),
+          }
+          .into(),
+          vec![data_array_access(0)],
+        ),
+        1,
+      ),
+      Type::Enum(e) => {
+        let name = e.monomorphized_name(names, target);
+        let inner_data_array_type: ExpTypeInfo = Type::Array(
+          Some(ConcreteArraySize::Literal(
+            e.inner_data_size_in_u32s().unwrap() as u32,
+          )),
+          Box::new(Type::U32.known().into()),
+        )
+        .known()
+        .into();
+        let inner_data_size = e.inner_data_size_in_u32s().unwrap();
+        (
+          ExpKind::Application(
+            TypedExp {
+              data: Type::Function(
+                FunctionSignature {
+                  // A nested enum value is reconstructed by calling its
+                  // WGSL backing struct's constructor (discriminant +
+                  // data array).
+                  abstract_ancestor: Some(Arc::new(RwLock::new(
+                    AbstractFunctionSignature {
+                      name: name.clone().into(),
+                      generic_args: vec![],
+                      arg_types: vec![
+                        (AbstractType::Type(Type::U32), Ownership::Owned),
+                        (
+                          AbstractType::Type(
+                            inner_data_array_type.unwrap_known(),
+                          ),
+                          Ownership::Owned,
+                        ),
+                      ],
+                      return_type: AbstractType::Type(Type::Enum(e.clone())),
+                      implementation:
+                        FunctionImplementationKind::StructConstructor,
+                      associative: false,
+                      captured_scope: None,
+                      entry_point: None,
+                    },
+                  ))),
+                  args: vec![
+                    (Variable::immutable(Type::U32.known().into()), vec![]),
+                    (
+                      Variable::immutable(inner_data_array_type.clone()),
+                      vec![],
+                    ),
+                  ],
+                  return_type: Type::Enum(e.clone()).known().into(),
+                }
+                .into(),
+              )
+              .known()
+              .into(),
+              kind: ExpKind::Name(name.into()),
+              source_trace: SourceTrace::empty(),
+            }
+            .into(),
+            vec![
+              data_array_access(0),
+              TypedExp {
+                data: inner_data_array_type,
+                kind: ExpKind::ArrayLiteral(
+                  (0..inner_data_size)
+                    .map(|i| data_array_access(i + 1))
+                    .collect(),
+                ),
+                source_trace: SourceTrace::empty(),
+              },
+            ],
+          ),
+          inner_data_size + 1,
+        )
+      }
+      Type::Struct(s) => {
+        let (constructor_args, consumed_indeces) = s.fields.iter().fold(
+          (vec![], 0),
+          |(mut constructor_args, consumed_indeces), field| {
+            let (arg, arg_consumed_indeces) = field
+              .field_type
+              .unwrap_known()
+              .bitcasted_from_enum_data_inner(
+                enum_value_name,
+                enum_type,
+                current_index + consumed_indeces,
+                names,
+                target,
+              );
+            constructor_args.push(arg);
+            (constructor_args, consumed_indeces + arg_consumed_indeces)
+          },
+        );
+        (
+          ExpKind::Application(
+            TypedExp {
+              data: Type::Function(Box::new(FunctionSignature {
+                abstract_ancestor: Some(Arc::new(RwLock::new(
+                  AbstractFunctionSignature {
+                    name: s.name.clone(),
+                    generic_args: vec![],
+                    arg_types: s
+                      .fields
+                      .iter()
+                      .map(|field| {
+                        (
+                          AbstractType::Type(field.field_type.unwrap_known()),
+                          Ownership::Owned,
+                        )
+                      })
+                      .collect(),
+                    return_type: AbstractType::Type(Type::Struct(s.clone())),
+                    implementation:
+                      FunctionImplementationKind::StructConstructor,
+                    associative: false,
+                    captured_scope: None,
+                    entry_point: None,
+                  },
+                ))),
+                args: s
+                  .fields
+                  .iter()
+                  .map(|field| {
+                    (Variable::immutable(field.field_type.clone()), vec![])
+                  })
+                  .collect(),
+                return_type: Type::Struct(s.clone()).known().into(),
+              }))
+              .known()
+              .into(),
+              kind: ExpKind::Name(s.name.clone()),
+              source_trace: SourceTrace::empty(),
+            }
+            .into(),
+            constructor_args,
+          ),
+          consumed_indeces,
+        )
+      }
+      Type::Array(size, inner_type) => {
+        let Some(ConcreteArraySize::Literal(size)) = size else {
+          panic!("tried to construct unsized array form enum data")
+        };
+        let size = *size as usize;
+        let inner_type = inner_type.unwrap_known();
+        let inner_type_size =
+          inner_type.data_size_in_u32s(&SourceTrace::empty()).unwrap();
+        (
+          ExpKind::ArrayLiteral(
+            (0..size)
+              .map(|i| {
+                inner_type
+                  .bitcasted_from_enum_data_inner(
+                    enum_value_name,
+                    enum_type,
+                    current_index + i * inner_type_size,
+                    names,
+                    target,
+                  )
+                  .0
+              })
+              .collect(),
+          ),
+          size * inner_type_size,
+        )
+      }
+      _ => {
+        panic!("called bitcasted_from_enum_data_inner on invalid type")
+      }
+    };
+    (
+      TypedExp {
+        data: self.clone().known().into(),
+        kind,
+        source_trace: SourceTrace::empty(),
+      },
+      consumed_indeces,
+    )
+  }
+  pub fn bitcasted_from_enum_data(
+    &self,
+    enum_value_name: Arc<str>,
+    enum_type: &Enum,
+    names: &mut NameContext,
+    target: CompilerTarget,
+  ) -> TypedExp {
+    self
+      .bitcasted_from_enum_data_inner(
+        &enum_value_name,
+        enum_type,
+        0,
+        names,
+        target,
+      )
+      .0
+  }
+  pub fn replace_skolems_with_unification_variables(
+    &mut self,
+    replacements: &HashMap<Arc<str>, ExpTypeInfo>,
+  ) {
+    match self {
+      Type::Struct(s) => {
+        for f in s.fields.iter_mut() {
+          f.field_type
+            .replace_skolems_with_unification_variables(replacements);
+        }
+      }
+      Type::Enum(e) => {
+        for v in e.variants.iter_mut() {
+          v.inner_type
+            .replace_skolems_with_unification_variables(replacements);
+        }
+      }
+      Type::Function(f) => {
+        for (arg, _) in f.args.iter_mut() {
+          arg
+            .var_type
+            .replace_skolems_with_unification_variables(replacements);
+        }
+        f.return_type
+          .replace_skolems_with_unification_variables(replacements);
+      }
+      Type::Array(_, t) => {
+        t.replace_skolems_with_unification_variables(replacements)
+      }
+      _ => {}
+    }
+  }
+  pub fn known(self) -> TypeState {
+    TypeState::Known(self)
+  }
+  pub fn required_address_space(&self) -> Option<VariableAddressSpace> {
+    if let Type::Struct(s) = self
+      && (&*s.name == "Texture2D" || &*s.name == "Sampler")
+    {
+      Some(VariableAddressSpace::Handle)
+    } else {
+      None
+    }
+  }
+  pub fn check_is_fully_known(&self) -> bool {
+    match self {
+      Type::Struct(s) => !s
+        .fields
+        .iter()
+        .find(|field| !field.field_type.check_is_fully_known())
+        .is_some(),
+      Type::Enum(e) => !e
+        .variants
+        .iter()
+        .find(|variant| !variant.inner_type.check_is_fully_known())
+        .is_some(),
+      Type::Function(function_signature) => {
+        function_signature.args.iter().fold(
+          function_signature.return_type.check_is_fully_known(),
+          |typed_so_far, (arg_var, _)| {
+            typed_so_far && arg_var.var_type.check_is_fully_known()
+          },
+        )
+      }
+      Type::Array(size, inner_type) => {
+        size.is_some() && inner_type.check_is_fully_known()
+      }
+      _ => true,
+    }
+  }
+  pub fn is_attributable(&self) -> bool {
+    match self {
+      Type::F32 | Type::I32 | Type::U32 | Type::Bool => true,
+      Type::Struct(s) => match &*s.abstract_ancestor.original_ancestor().name.0
+      {
+        "vec2" | "vec3" | "vec4" => {
+          match s.fields.first().unwrap().field_type.unwrap_known() {
+            Type::F32 | Type::I32 | Type::U32 => true,
+            _ => false,
+          }
+        }
+        _ => false,
+      },
+      _ => false,
+    }
+  }
+  pub fn is_location_attributable(&self) -> bool {
+    *self != Type::Bool && self.is_attributable()
+  }
+  pub fn is_vector(&self) -> bool {
+    if let Type::Struct(s) = self
+      && (&*s.name == "vec2" || &*s.name == "vec3" || &*s.name == "vec4")
+    {
+      true
+    } else {
+      false
+    }
+  }
+  pub fn is_matrix(&self) -> bool {
+    if let Type::Struct(s) = self {
+      crate::compiler::functions::extract_mat_size(&s.name).is_some()
+    } else {
+      false
+    }
+  }
+  pub fn matrix_dimensions(&self) -> Option<(usize, usize)> {
+    if let Type::Struct(s) = self {
+      crate::compiler::functions::extract_mat_size(&s.name)
+    } else {
+      None
+    }
+  }
+  pub fn vector_element_type(&self) -> Option<Type> {
+    if let Type::Struct(s) = self
+      && crate::compiler::functions::extract_vec_size(&s.name).is_some()
+    {
+      s.fields
+        .first()?
+        .field_type
+        .with_dereferenced(|ts| match ts {
+          TypeState::Known(t) => Some(t.clone()),
+          _ => None,
+        })
+    } else {
+      None
+    }
+  }
+  pub fn matrix_scalar_type(&self) -> Option<Type> {
+    if let Type::Struct(s) = self
+      && crate::compiler::functions::extract_mat_size(&s.name).is_some()
+    {
+      s.fields
+        .first()?
+        .field_type
+        .with_dereferenced(|ts| match ts {
+          TypeState::Known(t) => Some(t.clone()),
+          _ => None,
+        })
+    } else {
+      None
+    }
+  }
+  pub fn is_vec3u(&self) -> bool {
+    if let Type::Struct(s) = self
+      && &*s.name == "vec3"
+      && s
+        .fields
+        .get(0)
+        .map(|f| f.field_type.unwrap_known() == Type::U32)
+        .unwrap_or(false)
+    {
+      true
+    } else {
+      false
+    }
+  }
+  pub fn is_vec4f(&self) -> bool {
+    if let Type::Struct(s) = self
+      && &*s.name == "vec4"
+      && s
+        .fields
+        .get(0)
+        .map(|f| f.field_type.unwrap_known() == Type::F32)
+        .unwrap_or(false)
+    {
+      true
+    } else {
+      false
+    }
+  }
+  pub fn walk_mut(&mut self, f: &impl Fn(&mut Self)) {
+    f(self);
+    match self {
+      Type::Struct(s) => {
+        for field in s.fields.iter_mut() {
+          field.field_type.try_as_known_mut(|t| t.walk_mut(f));
+        }
+      }
+      Type::Enum(e) => {
+        for variant in e.variants.iter_mut() {
+          variant.inner_type.try_as_known_mut(|t| t.walk_mut(f));
+        }
+      }
+      Type::Function(signature) => {
+        signature.return_type.try_as_known_mut(|t| t.walk_mut(f));
+        for (arg, _) in signature.args.iter_mut() {
+          arg.var_type.try_as_known_mut(|t| t.walk_mut(f));
+        }
+      }
+      Type::Array(_, inner_type) => {
+        inner_type.try_as_known_mut(|t| t.walk_mut(f));
+      }
+      _ => {}
+    }
+  }
+}
+
+pub fn extract_type_annotation_ast(
+  exp: EaslTree,
+) -> (Option<EaslTree>, EaslTree) {
+  if let EaslTree::Inner(
+    (_, EncloserOrOperator::Operator(Operator::TypeAscription)),
+    mut children,
+  ) = exp
+  {
+    (Some(children.remove(1)), children.remove(0))
+  } else {
+    (None, exp)
+  }
+}
+
+pub fn extract_type_annotation(
+  exp: EaslTree,
+  typedefs: &TypeDefs,
+  skolems: &Vec<(Arc<str>, Vec<TypeConstraint>)>,
+) -> CompileResult<(Option<AbstractType>, EaslTree)> {
+  let (t, value) = extract_type_annotation_ast(exp);
+  Ok((
+    t.map(|t| AbstractType::from_easl_tree(t, typedefs, skolems))
+      .map_or(Ok(None), |v| v.map(Some))?,
+    value,
+  ))
+}
+
+#[derive(Debug, Clone)]
+pub struct ExpTypeInfo {
+  pub kind: TypeState,
+  pub ownership: Ownership,
+  pub is_globally_bound: bool,
+  pub subtree_fully_typed: bool,
+  pub errored: bool,
+  pub fully_known_cached: bool,
+  pub already_constrained_against_signatures: bool,
+  pub already_match_breaks_extracted: bool,
+}
+
+impl PartialEq for ExpTypeInfo {
+  /// Only the type itself, its ownership, and global-boundedness are
+  /// identity; the remaining fields are traversal memoization state and two
+  /// values differing only there denote the same type.
+  fn eq(&self, other: &Self) -> bool {
+    self.kind == other.kind
+      && self.ownership == other.ownership
+      && self.is_globally_bound == other.is_globally_bound
+  }
+}
+
+impl Deref for ExpTypeInfo {
+  type Target = TypeState;
+
+  fn deref(&self) -> &Self::Target {
+    &self.kind
+  }
+}
+
+impl DerefMut for ExpTypeInfo {
+  fn deref_mut(&mut self) -> &mut Self::Target {
+    &mut self.kind
+  }
+}
+
+impl From<TypeState> for ExpTypeInfo {
+  fn from(kind: TypeState) -> Self {
+    ExpTypeInfo {
+      kind,
+      ownership: Ownership::Owned,
+      subtree_fully_typed: false,
+      fully_known_cached: false,
+      is_globally_bound: false,
+      errored: false,
+      already_constrained_against_signatures: false,
+      already_match_breaks_extracted: false,
+    }
+  }
+}
+
+impl ExpTypeInfo {
+  pub fn is_fully_known(&mut self) -> bool {
+    if self.fully_known_cached {
+      return true;
+    }
+    if self.check_is_fully_known() {
+      self.fully_known_cached = true;
+    }
+    self.fully_known_cached
+  }
+}
+
+#[derive(Debug, Clone)]
+pub enum TypeState {
+  Unknown,
+  OneOf(Vec<Type>),
+  Known(Type),
+  UnificationVariable(Arc<RwLock<TypeState>>),
+}
+impl PartialEq for TypeState {
+  /// Equality is semantic, not structural: both sides are fully
+  /// dereferenced first, so a resolved `UnificationVariable` compares equal
+  /// to the bare state it resolves to. Representation details of how a type
+  /// arrived (through unification or directly) are not part of its
+  /// identity.
+  fn eq(&self, other: &Self) -> bool {
+    self.with_dereferenced(|a| {
+      other.with_dereferenced(|b| match (a, b) {
+        (TypeState::Unknown, TypeState::Unknown) => true,
+        (TypeState::OneOf(a), TypeState::OneOf(b)) => a == b,
+        (TypeState::Known(a), TypeState::Known(b)) => a == b,
+        (TypeState::UnificationVariable(_), _)
+        | (_, TypeState::UnificationVariable(_)) => {
+          unreachable!("with_dereferenced yielded a unification variable")
+        }
+        _ => false,
+      })
+    })
+  }
+}
+
+impl TypeState {
+  pub fn as_fn_type_if_known(
+    &mut self,
+    err_fn: impl Fn() -> CompileError,
+  ) -> CompileResult<Option<&mut FunctionSignature>> {
+    if let TypeState::Known(t) = self {
+      if let Type::Function(signature) = t {
+        Ok(Some(signature))
+      } else {
+        Err(err_fn())
+      }
+    } else {
+      Ok(None)
+    }
+  }
+  pub fn check_is_fully_known(&self) -> bool {
+    self.with_dereferenced(|typestate| {
+      if let TypeState::Known(t) = typestate {
+        t.check_is_fully_known()
+      } else {
+        false
+      }
+    })
+  }
+  pub fn unwrap_known(&self) -> Type {
+    self.with_dereferenced(|typestate| {
+      if let TypeState::Known(t) = typestate {
+        t.clone()
+      } else {
+        panic!("unwrapped non-Known TypeState \"{typestate:?}\"")
+      }
+    })
+  }
+  pub fn as_known_mut<O>(&mut self, f: impl FnOnce(&mut Type) -> O) -> O {
+    self.with_dereferenced_mut(|typestate| {
+      if let TypeState::Known(t) = typestate {
+        f(t)
+      } else {
+        panic!("as_known_mut on a non-Known TypeState")
+      }
+    })
+  }
+  pub fn try_as_known_mut<O>(
+    &mut self,
+    f: impl FnOnce(&mut Type) -> O,
+  ) -> Option<O> {
+    self.with_dereferenced_mut(|typestate| {
+      if let TypeState::Known(t) = typestate {
+        Some(f(t))
+      } else {
+        None
+      }
+    })
+  }
+  pub fn any_of(possibilities: Vec<TypeState>) -> Self {
+    let mut type_possibilities = vec![];
+    for possibility in possibilities {
+      match possibility {
+        TypeState::Unknown => {}
+        TypeState::OneOf(mut new_possibilities) => {
+          type_possibilities.append(&mut new_possibilities);
+        }
+        TypeState::Known(t) => type_possibilities.push(t),
+        TypeState::UnificationVariable(_) => {
+          panic!("can't handle UnificationVariable in any_of :(")
+        }
+      }
+    }
+    Self::OneOf(type_possibilities).simplified()
+  }
+  pub fn fresh_unification_variable() -> Self {
+    TypeState::UnificationVariable(Arc::new(RwLock::new(TypeState::Unknown)))
+  }
+  pub fn with_dereferenced<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+    match self {
+      TypeState::UnificationVariable(var) => {
+        (&*var.read().unwrap()).with_dereferenced(f)
+      }
+      other => f(other),
+    }
+  }
+  pub fn with_dereferenced_mut<T>(
+    &mut self,
+    f: impl FnOnce(&mut Self) -> T,
+  ) -> T {
+    match self {
+      TypeState::UnificationVariable(var) => {
+        (&mut *var.write().unwrap()).with_dereferenced_mut(f)
+      }
+      other => f(other),
+    }
+  }
+  pub fn are_compatible<'a>(a: &'a Self, b: &'a Self) -> bool {
+    use TypeState::*;
+    a.with_dereferenced(|a| {
+      b.with_dereferenced(|b| match (a, b) {
+        (Unknown, _) => true,
+        (_, Unknown) => true,
+        (UnificationVariable(_), _) => unreachable!(),
+        (_, UnificationVariable(_)) => unreachable!(),
+        (Known(a), Known(b)) => a.compatible(b),
+        (OneOf(a), Known(b)) => b.compatible_with_any(a),
+        (Known(a), OneOf(b)) => a.compatible_with_any(b),
+        (OneOf(a), OneOf(b)) => {
+          a.iter().find(|a| a.compatible_with_any(b)).is_some()
+        }
+      })
+    })
+  }
+  pub fn constrain(
+    &mut self,
+    other: &TypeState,
+    source_trace: &SourceTrace,
+    errors: &mut ErrorLog,
+  ) -> bool {
+    if *self == *other {
+      return false;
+    }
+    self.with_dereferenced_mut(move |mut this| {
+      other.with_dereferenced(|other| {
+        let result = match (&mut this, &other) {
+          (TypeState::UnificationVariable(_), _)
+          | (_, TypeState::UnificationVariable(_)) => unreachable!(),
+          (_, TypeState::Unknown) => false,
+          (TypeState::Unknown, _) => {
+            std::mem::swap(this, &mut other.clone());
+            true
+          }
+          (TypeState::Known(current_type), TypeState::Known(other_type)) => {
+            if !current_type.compatible(&other_type) {
+              errors.log(CompileError::new(
+                IncompatibleTypes(this.clone().into(), other.clone().into()),
+                source_trace.clone(),
+              ));
+              false
+            } else {
+              match (current_type, other_type) {
+                (
+                  Type::Function(signature),
+                  Type::Function(other_signature),
+                ) => {
+                  let mut anything_changed = signature.return_type.constrain(
+                    &other_signature.return_type.kind,
+                    source_trace,
+                    errors,
+                  );
+                  for ((t, _), (other_t, _)) in
+                    signature.args.iter_mut().zip(other_signature.args.iter())
+                  {
+                    let changed = t.var_type.constrain(
+                      &other_t.var_type.kind,
+                      source_trace,
+                      errors,
+                    );
+                    anything_changed |= changed;
+                  }
+                  anything_changed
+                }
+                (Type::Struct(s), Type::Struct(other_s)) => {
+                  let mut anything_changed = false;
+                  for (t, other_t) in
+                    s.fields.iter_mut().zip(other_s.fields.iter())
+                  {
+                    let changed = t.field_type.constrain(
+                      &other_t.field_type.kind,
+                      source_trace,
+                      errors,
+                    );
+                    anything_changed |= changed;
+                  }
+                  anything_changed
+                }
+                (Type::Enum(e), Type::Enum(other_e)) => {
+                  let mut anything_changed = false;
+                  for (v, other_v) in
+                    e.variants.iter_mut().zip(other_e.variants.iter())
+                  {
+                    let changed = v.inner_type.constrain(
+                      &other_v.inner_type.kind,
+                      source_trace,
+                      errors,
+                    );
+                    anything_changed |= changed;
+                  }
+                  anything_changed
+                }
+                (
+                  Type::Array(size, inner_type),
+                  Type::Array(other_size, other_inner_type),
+                ) => {
+                  let mut anything_changed = inner_type.constrain(
+                    &other_inner_type.kind,
+                    source_trace,
+                    errors,
+                  );
+                  if let Some(other_size) = other_size {
+                    if let Some(size) = size.as_mut() {
+                      match size.constrain(other_size, source_trace) {
+                        Ok(changed) => {
+                          anything_changed |= changed;
+                        }
+                        Err(e) => errors.log(e),
+                      }
+                    } else {
+                      std::mem::swap(size, &mut Some(other_size.clone()))
+                    }
+                  }
+                  anything_changed
+                }
+                _ => false,
+              }
+            }
+          }
+          (
+            TypeState::OneOf(possibilities),
+            TypeState::OneOf(other_possibilities),
+          ) => {
+            let mut new_possibilities = vec![];
+            let mut changed = false;
+            for possibility in possibilities {
+              if possibility.compatible_with_any(other_possibilities) {
+                new_possibilities.push(possibility.clone());
+              } else {
+                changed = true;
+              }
+            }
+            std::mem::swap(
+              this,
+              &mut TypeState::OneOf(new_possibilities).simplified(),
+            );
+            changed
+          }
+          (TypeState::OneOf(possibilities), TypeState::Known(t)) => {
+            let compatible = t.filter_compatibles(&possibilities);
+            if !compatible.is_empty() {
+              std::mem::swap(
+                this,
+                &mut TypeState::OneOf(compatible).simplified(),
+              );
+              true
+            } else {
+              errors.log(CompileError::new(
+                IncompatibleTypes(this.clone().into(), other.clone().into()),
+                source_trace.clone(),
+              ));
+              false
+            }
+          }
+          (TypeState::Known(t), TypeState::OneOf(possibilities)) => {
+            if !t.compatible_with_any(&possibilities) {
+              errors.log(CompileError::new(
+                IncompatibleTypes(this.clone().into(), other.clone().into()),
+                source_trace.clone(),
+              ));
+            }
+            false
+          }
+        };
+        this.simplify();
+        result
+      })
+    })
+  }
+  pub fn mutually_constrain(
+    &mut self,
+    other: &mut TypeState,
+    source_trace: &SourceTrace,
+    errors: &mut ErrorLog,
+  ) -> bool {
+    let self_changed = self.constrain(other, source_trace, errors);
+    let other_changed = other.constrain(self, source_trace, errors);
+    self_changed || other_changed
+  }
+  pub fn constrain_fn_by_argument_types(
+    &mut self,
+    mut arg_types: Vec<&mut TypeState>,
+    source_trace: &SourceTrace,
+    errors: &mut ErrorLog,
+  ) -> bool {
+    self.with_dereferenced_mut(|typestate| match typestate {
+      TypeState::OneOf(possibilities) => {
+        let mut anything_changed = false;
+        let mut new_possibilities: Vec<Type> = vec![];
+        for possibility in possibilities {
+          match possibility {
+            Type::Function(signature) => {
+              if signature.are_args_compatible(
+                &arg_types.iter().map(|t| (*t).clone()).collect(),
+              ) {
+                new_possibilities.push(Type::Function(signature.clone()))
+              } else {
+                anything_changed = true;
+              }
+            }
+            Type::Array(size, inner_type) => {
+              if arg_types.len() == 1
+                && TypeState::are_compatible(
+                  &arg_types[0],
+                  &TypeState::OneOf(vec![Type::U32, Type::I32]),
+                )
+              {
+                new_possibilities
+                  .push(Type::Array(size.clone(), inner_type.clone()))
+              } else {
+                anything_changed = true;
+              }
+            }
+            Type::Struct(_)
+              if possibility.is_vector() || possibility.is_matrix() =>
+            {
+              if arg_types.len() == 1
+                && TypeState::are_compatible(
+                  &arg_types[0],
+                  &TypeState::OneOf(vec![Type::U32, Type::I32]),
+                )
+              {
+                new_possibilities.push(possibility.clone())
+              } else {
+                anything_changed = true;
+              }
+            }
+            _ => errors.log(CompileError::new(
+              ExpectedFunctionFoundNonFunction,
+              source_trace.clone(),
+            )),
+          }
+        }
+        if new_possibilities.is_empty() {
+          errors.log(CompileError::new(
+            FunctionArgumentTypesIncompatible {
+              f: typestate.clone().into(),
+              args: arg_types.into_iter().map(|t| t.clone().into()).collect(),
+            },
+            source_trace.clone(),
+          ));
+          false
+        } else {
+          std::mem::swap(
+            typestate,
+            &mut TypeState::OneOf(new_possibilities).simplified(),
+          );
+          anything_changed
+        }
+      }
+      TypeState::Known(t) => match t {
+        Type::Function(signature) => {
+          if !signature.are_args_compatible(
+            &arg_types.iter().map(|t| (*t).clone()).collect(),
+          ) {
+            errors.log(CompileError::new(
+              FunctionArgumentTypesIncompatible {
+                f: typestate.clone().into(),
+                args: arg_types.into_iter().map(|t| t.clone().into()).collect(),
+              },
+              source_trace.clone(),
+            ));
+            false
+          } else {
+            signature.mutually_constrain_arguments(
+              arg_types,
+              source_trace.clone(),
+              errors,
+            )
+          }
+        }
+        Type::Array(_, _) => {
+          if arg_types.len() == 1 {
+            arg_types[0].constrain(
+              &TypeState::OneOf(vec![Type::I32, Type::U32]),
+              source_trace,
+              errors,
+            )
+          } else {
+            errors.log(CompileError::new(
+              ArrayLookupInvalidArity(arg_types.len()),
+              source_trace.clone(),
+            ));
+            false
+          }
+        }
+        Type::Struct(_) if t.is_vector() || t.is_matrix() => {
+          if arg_types.len() == 1 {
+            arg_types[0].constrain(
+              &TypeState::OneOf(vec![Type::I32, Type::U32]),
+              source_trace,
+              errors,
+            )
+          } else {
+            errors.log(CompileError::new(
+              ArrayLookupInvalidArity(arg_types.len()),
+              source_trace.clone(),
+            ));
+            false
+          }
+        }
+        _ => {
+          errors.log(CompileError::new(
+            ExpectedFunctionFoundNonFunction,
+            source_trace.clone(),
+          ));
+          false
+        }
+      },
+      TypeState::Unknown => false,
+      TypeState::UnificationVariable(_) => unreachable!(),
+    })
+  }
+  pub fn simplify(&mut self) {
+    if let TypeState::OneOf(possibilities) = self {
+      if possibilities.len() == 1 {
+        *self = possibilities.remove(0).known();
+      }
+    }
+  }
+  pub fn simplified(mut self) -> Self {
+    self.simplify();
+    self
+  }
+  pub fn monomorphized_name(
+    &self,
+    names: &mut NameContext,
+    target: CompilerTarget,
+  ) -> String {
+    self.unwrap_known().monomorphized_name(names, target)
+  }
+  pub fn replace_skolems_with_unification_variables(
+    &mut self,
+    replacements: &HashMap<Arc<str>, ExpTypeInfo>,
+  ) {
+    if let Some(replacement) =
+      self.with_dereferenced_mut(|typestate| match typestate {
+        TypeState::OneOf(types) => {
+          for t in types.iter_mut() {
+            t.replace_skolems_with_unification_variables(replacements);
+          }
+          None
+        }
+        TypeState::Known(t) => {
+          if let Type::Skolem(name, _) = t
+            && let Some(replacement) = replacements.get(name)
+          {
+            Some(replacement.kind.clone())
+          } else {
+            t.replace_skolems_with_unification_variables(replacements);
+            None
+          }
+        }
+        _ => None,
+      })
+    {
+      *self = replacement;
+    }
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VariableKind {
+  Let,
+  Var,
+  Override,
+}
+
+impl VariableKind {
+  pub fn compile(self) -> &'static str {
+    match self {
+      VariableKind::Let => "let",
+      VariableKind::Var => "var",
+      VariableKind::Override => "override",
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Variable {
+  pub kind: VariableKind,
+  pub var_type: ExpTypeInfo,
+}
+
+impl Variable {
+  pub fn immutable(var_type: ExpTypeInfo) -> Self {
+    Self {
+      var_type,
+      kind: VariableKind::Let,
+    }
+  }
+  pub fn mutable(var_type: ExpTypeInfo) -> Self {
+    Self {
+      var_type,
+      kind: VariableKind::Var,
+    }
+  }
+  pub fn with_kind(mut self, kind: VariableKind) -> Self {
+    self.kind = kind;
+    self
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypeConstraintKind {
+  Scalar,
+  ScalarOrBool,
+  Integer,
+  Function,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeConstraint {
+  kind: TypeConstraintKind,
+  args: Vec<Vec<TypeConstraint>>,
+}
+
+impl TypeConstraint {
+  pub fn name(&self) -> String {
+    match self.kind {
+      TypeConstraintKind::Scalar => "Scalar",
+      TypeConstraintKind::ScalarOrBool => "ScalarOrBool",
+      TypeConstraintKind::Integer => "Integer",
+      TypeConstraintKind::Function => "Function",
+    }
+    .to_string()
+  }
+  pub fn scalar() -> Self {
+    Self {
+      kind: TypeConstraintKind::Scalar,
+      args: vec![],
+    }
+  }
+  pub fn scalar_or_bool() -> Self {
+    Self {
+      kind: TypeConstraintKind::ScalarOrBool,
+      args: vec![],
+    }
+  }
+  pub fn integer() -> Self {
+    Self {
+      kind: TypeConstraintKind::Integer,
+      args: vec![],
+    }
+  }
+  pub fn function() -> Self {
+    Self {
+      kind: TypeConstraintKind::Function,
+      args: vec![],
+    }
+  }
+}
+
+pub fn parse_type_constraint(
+  ast: EaslTree,
+  _typedefs: &TypeDefs,
+  _generic_args: &Vec<Arc<str>>,
+) -> CompileResult<TypeConstraint> {
+  match ast {
+    EaslTree::Leaf(position, name) => match name.as_str() {
+      "Scalar" => Ok(TypeConstraint::scalar()),
+      "ScalarOrBool" => Ok(TypeConstraint::scalar_or_bool()),
+      "Integer" => Ok(TypeConstraint::integer()),
+      _ => err(TypeConstraintsNotYetSupported, position.into()),
+    },
+    EaslTree::Inner(
+      (position, EncloserOrOperator::Operator(Operator::TypeAscription)),
+      _children,
+    ) => {
+      err(TypeConstraintsNotYetSupported, position.into())
+      /*let source_trace: SourceTrace = position.into();
+      let mut children_iter = children.into_iter();
+      let name = if let EaslTree::Leaf(_, name) =
+        children_iter.next().ok_or_else(|| {
+          CompileError::new(InvalidTypeConstraint, source_trace.clone())
+        })? {
+        name.into()
+      } else {
+        return err(InvalidTypeConstraint, source_trace);
+      };
+      let args = children_iter
+        .map(|child_ast| {
+          AbstractType::from_easl_tree(
+            child_ast,
+            structs,
+            aliases,
+            generic_args,
+          )
+        })
+        .collect::<CompileResult<Vec<AbstractType>>>()?;
+      Ok(TypeConstraint { name, args })*/
+    }
+    _ => err(InvalidTypeConstraint, ast.position().clone().into()),
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GenericArgument {
+  Type(Vec<TypeConstraint>),
+  Constant,
+}
+
+impl GenericArgument {
+  pub fn type_constraints(&self) -> Vec<TypeConstraint> {
+    match self {
+      GenericArgument::Type(type_constraints) => type_constraints.clone(),
+      GenericArgument::Constant => vec![],
+    }
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GenericArgumentValue {
+  Type(ExpTypeInfo),
+  Constant(ConstGenericValue),
+}
+
+pub fn parse_generic_argument(
+  ast: EaslTree,
+  typedefs: &TypeDefs,
+  generic_args: &Vec<Arc<str>>,
+) -> CompileResult<(Arc<str>, GenericArgument, SourceTrace)> {
+  match ast {
+    EaslTree::Leaf(pos, generic_name) => Ok((
+      generic_name.into(),
+      GenericArgument::Type(vec![]),
+      pos.into(),
+    )),
+    EaslTree::Inner(
+      (position, EncloserOrOperator::Operator(Operator::TypeAscription)),
+      mut children,
+    ) => {
+      if children.len() < 2 {
+        return err(
+          InvalidDefn("Invalid generic name".into()),
+          position.into(),
+        );
+      }
+      let bounds_tree = children.remove(1);
+      if let EaslTree::Leaf(_, generic_name) = children.remove(0) {
+        if let EaslTree::Leaf(ref pos, ref constraint_name) = bounds_tree {
+          if constraint_name == "u32" {
+            return Ok((
+              generic_name.into(),
+              GenericArgument::Constant,
+              pos.clone().into(),
+            ));
+          }
+        }
+        match bounds_tree {
+          EaslTree::Inner(
+            (pos, EncloserOrOperator::Encloser(Encloser::Square)),
+            bound_children,
+          ) => Ok((
+            generic_name.into(),
+            GenericArgument::Type(
+              bound_children
+                .into_iter()
+                .map(|child_ast| {
+                  parse_type_constraint(child_ast, typedefs, generic_args)
+                })
+                .collect::<CompileResult<_>>()?,
+            ),
+            pos.into(),
+          )),
+          other => {
+            let pos = other.position().into();
+            Ok((
+              generic_name.into(),
+              GenericArgument::Type(vec![parse_type_constraint(
+                other,
+                typedefs,
+                generic_args,
+              )?]),
+              pos,
+            ))
+          }
+        }
+      } else {
+        err(InvalidDefn("Invalid generic name".into()), position.into())
+      }
+    }
+    _ => err(
+      InvalidDefn("Invalid generic name".into()),
+      ast.position().clone().into(),
+    ),
+  }
+}
+
+#[derive(Debug)]
+pub struct LocalContext<P: Deref<Target = Program>> {
+  pub variables: HashMap<Arc<str>, (Variable, SourceTrace)>,
+  pub enclosing_function_types: Vec<TypeState>,
+  pub inside_pattern: bool,
+  pub program: P,
+}
+
+impl<P: Deref<Target = Program>> LocalContext<P> {
+  pub fn empty(program: P) -> Self {
+    Self {
+      variables: HashMap::new(),
+      enclosing_function_types: vec![],
+      inside_pattern: false,
+      program,
+    }
+  }
+  pub fn push_enclosing_function_type(&mut self, typestate: TypeState) {
+    self.enclosing_function_types.push(typestate);
+  }
+  pub fn pop_enclosing_function_type(&mut self) {
+    self.enclosing_function_types.pop();
+  }
+  pub fn enclosing_function_type(&mut self) -> Option<&mut TypeState> {
+    self.enclosing_function_types.last_mut()
+  }
+  pub fn bind(&mut self, name: &str, v: Variable, s: SourceTrace) {
+    self.variables.insert(name.into(), (v, s));
+  }
+  pub fn unbind(&mut self, name: &str) -> Option<Variable> {
+    self
+      .variables
+      .remove(name)
+      //.unwrap_or_else(|| panic!("failed to unbind {name}"))
+      .map(|x| x.0)
+  }
+  pub fn is_bound(&self, name: &str) -> bool {
+    let name_rc: Arc<str> = name.to_string().into();
+    self.variables.contains_key(name)
+      || self.program.abstract_functions.contains_key(&name_rc)
+      || self
+        .program
+        .top_level_vars
+        .iter()
+        .find(|top_level_var| &*top_level_var.name == name)
+        .is_some()
+      || self
+        .program
+        .typedefs
+        .enums
+        .iter()
+        .find(|e| e.has_unit_variant_named(name))
+        .is_some()
+  }
+  pub fn is_globally_bound(&self, name: &str) -> bool {
+    let name_rc: Arc<str> = name.to_string().into();
+    self.program.abstract_functions.contains_key(&name_rc)
+      || self
+        .program
+        .top_level_vars
+        .iter()
+        .find(|top_level_var| &*top_level_var.name == name)
+        .is_some()
+      || self
+        .program
+        .typedefs
+        .enums
+        .iter()
+        .find(|e| e.has_unit_variant_named(name))
+        .is_some()
+  }
+  pub fn get_variable_kind(&self, name: &str) -> VariableKind {
+    self
+      .variables
+      .get(name)
+      .map(|(var, _)| var.kind.clone())
+      .or(
+        self
+          .program
+          .top_level_vars
+          .iter()
+          .find_map(|v| (&*v.name == name).then(|| v.variable_kind())),
+      )
+      .unwrap()
+  }
+  pub fn get_name_definition_source(
+    &self,
+    name: &str,
+  ) -> Option<NameDefinitionSource> {
+    self
+      .variables
+      .get(name)
+      .map(|(_, source_trace)| {
+        NameDefinitionSource::LocalBinding(source_trace.primary_path())
+      })
+      .or(self.program.top_level_vars.iter().find_map(|v| {
+        (&*v.name == name).then(|| {
+          NameDefinitionSource::GlobalBinding(v.source_trace.primary_path())
+        })
+      }))
+  }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum NameDefinitionSource {
+  BuiltInFunction(Vec<usize>),
+  Defn(Vec<Vec<usize>>),
+  Struct(Vec<usize>),
+  Enum(Vec<usize>),
+  GlobalBinding(Vec<usize>),
+  LocalBinding(Vec<usize>),
+}
+
+pub type ImmutableProgramLocalContext<'p> = LocalContext<&'p Program>;
+
+pub type MutableProgramLocalContext<'p> = LocalContext<&'p mut Program>;
+impl<'p> MutableProgramLocalContext<'p> {
+  pub fn get_variable_ownership(&self, name: &str) -> Option<Ownership> {
+    if let Some((var, _)) = self.variables.get(name) {
+      Some(var.var_type.ownership)
+    } else {
+      None
+    }
+  }
+  fn get_typestate_mut(
+    &mut self,
+    name: &str,
+    source_trace: SourceTrace,
+  ) -> CompileResult<Result<&mut TypeState, TypeState>> {
+    if let Some((var, _)) = self.variables.get_mut(name) {
+      Ok(Ok(&mut var.var_type))
+    } else if let Some(top_level_var) = self
+      .program
+      .top_level_vars
+      .iter_mut()
+      .find(|var| &*var.name == name)
+    {
+      Ok(Err(top_level_var.var_type.clone().known()))
+    } else if let Some(e) = self
+      .program
+      .typedefs
+      .enums
+      .iter()
+      .find(|e| e.has_unit_variant_named(name))
+    {
+      Ok(Err(
+        Type::Enum(AbstractEnum::fill_generics_with_unification_variables(
+          e.clone().into(),
+          &self.program.typedefs,
+          source_trace,
+        )?)
+        .known(),
+      ))
+    } else {
+      Err(CompileError::new(UnboundName(name.into()), source_trace))
+    }
+  }
+  pub fn constrain_name_type(
+    &mut self,
+    name: &Arc<str>,
+    source_trace: &SourceTrace,
+    t: &mut ExpTypeInfo,
+    errors: &mut ErrorLog,
+  ) -> bool {
+    if self.program.abstract_functions.get(name).is_some() {
+      if t.already_constrained_against_signatures {
+        return false;
+      }
+      t.already_constrained_against_signatures = true;
+      match self.program.concrete_signatures(name, source_trace.clone()) {
+        Err(e) => {
+          errors.log(e);
+          false
+        }
+        Ok(Some(signatures)) => {
+          t.constrain(&TypeState::OneOf(signatures), source_trace, errors)
+        }
+        Ok(None) => panic!(),
+      }
+    } else {
+      match self.get_typestate_mut(name, source_trace.clone()) {
+        Ok(typestate) => match typestate {
+          Ok(typestate) => {
+            t.mutually_constrain(typestate, source_trace, errors)
+          }
+          Err(mut typestate) => {
+            t.mutually_constrain(&mut typestate, source_trace, errors)
+          }
+        },
+        Err(e) => {
+          errors.log(e);
+          false
+        }
+      }
+    }
+  }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ConcreteArraySizeDescription {
+  Literal(u32),
+  Constant(String),
+  Skolem(String),
+  UnificationVariable(Option<u32>),
+  Unsized,
+}
+
+impl From<ConcreteArraySize> for ConcreteArraySizeDescription {
+  fn from(value: ConcreteArraySize) -> Self {
+    match value {
+      ConcreteArraySize::Literal(x) => Self::Literal(x),
+      ConcreteArraySize::Constant(x) => Self::Constant(x.to_string()),
+      ConcreteArraySize::Skolem(x) => Self::Skolem(x.to_string()),
+      ConcreteArraySize::UnificationVariable(value) => {
+        Self::UnificationVariable(
+          if let Some(ConstGenericResolution::Literal(n)) =
+            value.value.read().unwrap().clone()
+          {
+            Some(n)
+          } else {
+            None
+          },
+        )
+      }
+      ConcreteArraySize::Unsized => Self::Unsized,
+    }
+  }
+}
+
+impl Display for ConcreteArraySizeDescription {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    f.write_fmt(core::format_args!(
+      "{}",
+      match self {
+        Self::Literal(size) => format!("{size}"),
+        Self::Constant(name) => compile_word((**name).into()),
+        Self::Unsized => String::new(),
+        Self::Skolem(name) => format!("SKOLEM<{name}>"),
+        Self::UnificationVariable(value) => format!(
+          "UNIFICATION_VAR<{}>",
+          match value {
+            Some(x) => format!("{x}"),
+            None => "???".to_string(),
+          }
+        ),
+      }
+    ))
+  }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TypeDescription {
+  Unit,
+  F32,
+  I32,
+  U32,
+  Bool,
+  String,
+  Struct(String),
+  Enum(String),
+  Function {
+    arg_types: Vec<(TypeStateDescription, Vec<TypeConstraintDescription>)>,
+    return_type: Box<TypeStateDescription>,
+  },
+  Skolem(String),
+  Array(
+    Option<ConcreteArraySizeDescription>,
+    Box<TypeStateDescription>,
+  ),
+}
+impl From<Type> for TypeDescription {
+  fn from(t: Type) -> Self {
+    match t {
+      Type::Unit => Self::Unit,
+      Type::F32 => Self::F32,
+      Type::I32 => Self::I32,
+      Type::U32 => Self::U32,
+      Type::Bool => Self::Bool,
+      Type::String => Self::String,
+      Type::Struct(s) => Self::Struct(match &*s.name {
+        "Texture2D" => format!(
+          "(Texture2D {})",
+          TypeStateDescription::from(s.fields[0].field_type.kind.clone())
+            .to_string()
+        ),
+        _ => {
+          compile_word(s.name)
+          // todo! this should display a name more like the above one for
+          // Texture2D, using a kind of type-level function application syntax
+        }
+      }),
+      Type::Function(f) => Self::Function {
+        arg_types: f
+          .args
+          .into_iter()
+          .map(|(var, constraints)| {
+            (
+              TypeStateDescription::from(var.var_type.kind),
+              constraints
+                .into_iter()
+                .map(TypeConstraintDescription::from)
+                .collect(),
+            )
+          })
+          .collect(),
+        return_type: TypeStateDescription::from(f.return_type.kind).into(),
+      },
+      Type::Skolem(name, _) => Self::Skolem(name.to_string()),
+      Type::Array(array_size, t) => Self::Array(
+        array_size.map(|size| size.into()),
+        TypeStateDescription::from(t.kind).into(),
+      ),
+      Type::Enum(e) => Self::Enum(e.name.to_string()),
+    }
+  }
+}
+impl Display for TypeDescription {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}",
+      match self {
+        Self::Unit => "()".to_string(),
+        Self::F32 => "f32".to_string(),
+        Self::I32 => "i32".to_string(),
+        Self::U32 => "u32".to_string(),
+        Self::Bool => "bool".to_string(),
+        Self::String => "String".to_string(),
+        Self::Struct(name) => name.clone(),
+        Self::Enum(name) => name.clone(),
+        Self::Array(size, inner_type) => {
+          if let Some(size) = size {
+            format!("[{}: {}]", size, inner_type.to_string())
+          } else {
+            format!("[{}]", inner_type.to_string())
+          }
+        }
+        Self::Function {
+          arg_types,
+          return_type,
+        } => {
+          format!(
+            "(Fn [{}]: {})",
+            arg_types
+              .iter()
+              .map(|(t, _)| t.to_string())
+              .collect::<Vec<String>>()
+              .join(" "),
+            return_type.to_string()
+          )
+        }
+        Self::Skolem(name) => name.to_string(),
+      }
+    )
+  }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum TypeStateDescription {
+  Unknown,
+  OneOf(Vec<TypeDescription>),
+  Known(TypeDescription),
+}
+impl From<TypeState> for TypeStateDescription {
+  fn from(typestate: TypeState) -> Self {
+    typestate.with_dereferenced(|typestate| match typestate {
+      TypeState::Unknown => Self::Unknown,
+      TypeState::OneOf(items) => {
+        Self::OneOf(items.iter().cloned().map(TypeDescription::from).collect())
+      }
+      TypeState::Known(t) => Self::Known(TypeDescription::from(t.clone())),
+      TypeState::UnificationVariable(_) => unreachable!(),
+    })
+  }
+}
+impl Display for TypeStateDescription {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}",
+      match self {
+        Self::Unknown => "?".to_string(),
+        Self::OneOf(items) => items
+          .into_iter()
+          .map(|t| t.to_string())
+          .collect::<Vec<String>>()
+          .join(" or "),
+        Self::Known(t) => t.to_string(),
+      }
+    )
+  }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct TypeConstraintDescription {
+  pub name: String,
+  pub args: Vec<String>,
+}
+impl From<TypeConstraint> for TypeConstraintDescription {
+  fn from(constraint: TypeConstraint) -> Self {
+    Self {
+      name: constraint.name().to_string(),
+      args: (0..constraint.args.len())
+        .map(|i| ((65 + (i as u8)) as char).to_string().into())
+        .collect(),
+    }
+  }
+}
+impl Display for TypeConstraintDescription {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(
+      f,
+      "{}",
+      if self.args.len() == 0 {
+        format!(
+          "({} {})",
+          self.name,
+          self
+            .args
+            .iter()
+            .map(|arg| arg.to_string())
+            .collect::<Vec<String>>()
+            .join(" ")
+        )
+      } else {
+        self.name.clone().to_string()
+      }
+    )
+  }
+}

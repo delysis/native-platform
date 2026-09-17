@@ -1,6 +1,18 @@
 [workspace]
 members = [
+    "crates/services/easl/easl-native-text",
+    "crates/services/easl/easl-text",
+    "products/loom/crates/loom-markdown",
+    "products/loom/crates/loom-text-session",
+    "products/loom/experiments/easl-interface",
+    "crates/desktop-vault",
+    "crates/desktop-context",
     "crates/desktop-model-defaults",
+    "crates/desktop-speech",
+    "crates/operation-lifecycle",
+    "crates/workspace-document",
+    "crates/desktop-model-discovery",
+    "crates/desktop-generation-policy",
     "crates/native/crates/llama-native-cache",
     "crates/native/crates/llama-native-engine",
     "crates/native/crates/llama-native-host",
@@ -42,6 +54,7 @@ members = [
     "products/loom/apps/loom/src-tauri",
     "products/loom/crates/loom-backend-llama",
     "products/loom/crates/loom-cli",
+    "products/loom/crates/loom-config",
     "products/loom/crates/loom-document",
     "products/loom/crates/loom-host",
     "products/loom/crates/loom-store",
@@ -52,7 +65,7 @@ members = [
     "products/mom/crates/mom-llama-runtime",
     "xtask",
 ]
-exclude = ["crates/services/attachment/fuzz", "vendor/glib", "vendor/ort-sys"]
+exclude = ["crates/services/easl/vendor/easl", "crates/services/easl/vendor/fsexp", "crates/services/easl/vendor/parley", "crates/services/easl/vendor/harfrust", "crates/services/attachment/fuzz", "vendor/glib", "vendor/ort-sys"]
 resolver = "3"
 
 [workspace.package]
@@ -64,7 +77,15 @@ repository = "https://github.com/delysis/native-platform"
 publish = false
 
 [workspace.dependencies]
+desktop-vault = { path = "crates/desktop-vault" }
+desktop-context = { path = "crates/desktop-context" }
+desktop-speech = { path = "crates/desktop-speech" }
+operation-lifecycle = { path = "crates/operation-lifecycle" }
+loom-config = { path = "products/loom/crates/loom-config" }
+desktop-model-discovery = { path = "crates/desktop-model-discovery" }
+desktop-generation-policy = { path = "crates/desktop-generation-policy" }
 desktop-model-defaults = { path = "crates/desktop-model-defaults" }
+workspace-document = { path = "crates/workspace-document" }
 anyhow = "1.0.100"
 async-stream = "0.3.6"
 async-trait = "0.1.89"
@@ -91,7 +112,7 @@ rand = "0.9"
 rand_chacha = "0.9.0"
 rand_core = "0.9.5"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }
-rusqlite = { version = "=0.39.0", features = ["bundled"] }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
 same-file = "1.0.6"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
@@ -199,7 +220,14 @@ codegen-units = 1
 strip = "symbols"
 
 [patch.crates-io]
+harfrust = { path = "crates/services/easl/vendor/harfrust" }
+parley = { path = "crates/services/easl/vendor/parley" }
 # GTK3 still requires the 0.18 API. Backport the upstream VariantStrIter fix.
 glib = { path = "vendor/glib" }
 # Keep verified ONNX Runtime DLLs beside Windows test/example executables.
 ort-sys = { path = "vendor/ort-sys" }
+
+# Native text and raster loops need optimization during interactive development.
+[profile.native-view]
+inherits = "dev"
+opt-level = 3

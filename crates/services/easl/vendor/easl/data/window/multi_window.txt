@@ -1,0 +1,23 @@
+spawn-window
+dispatch-render-shaders v1 f1 3
+dispatch-render-shaders v1 f1 3
+dispatch-render-shaders v1 f1 3
+dispatch-render-shaders v1 f1 3
+dispatch-render-shaders v1 f1 3
+dispatch-render-shaders v1 f1 3
+dispatch-render-shaders v1 f1 3
+dispatch-render-shaders v1 f1 3
+dispatch-render-shaders v1 f1 3
+dispatch-render-shaders v1 f1 3
+print: 1.
+spawn-window
+dispatch-render-shaders v2 f1 3
+dispatch-render-shaders v2 f1 3
+dispatch-render-shaders v2 f1 3
+dispatch-render-shaders v2 f1 3
+dispatch-render-shaders v2 f1 3
+dispatch-render-shaders v2 f1 3
+dispatch-render-shaders v2 f1 3
+dispatch-render-shaders v2 f1 3
+dispatch-render-shaders v2 f1 3
+dispatch-render-shaders v2 f1 3

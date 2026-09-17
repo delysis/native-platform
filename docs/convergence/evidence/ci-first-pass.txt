@@ -1,0 +1,17 @@
+✔ Cargo metadata supplies changed packages and the complete local reverse closure (10.787792ms)
+✔ a reverse-edge mutation deterministically changes the generated closure (0.296833ms)
+✔ resolved and declared local edges are conservatively unioned (0.246583ms)
+✔ explicit non-graph asset, workflow, platform, and documentation classes stay explicit (0.790167ms)
+✔ unknown additions and deletions fail closed to the complete workspace (0.209834ms)
+✔ metadata unavailability is an unconditional full-selection result (0.120417ms)
+✔ missing resolve evidence fails instead of silently dropping reverse edges (0.371833ms)
+✔ every checked-in workspace package class is accepted by deterministic metadata (1.417667ms)
+✔ checked-in exceptions are narrow, evidenced, deterministic, and group-valid (0.417041ms)
+ℹ tests 9
+ℹ suites 0
+ℹ pass 9
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 20.660875

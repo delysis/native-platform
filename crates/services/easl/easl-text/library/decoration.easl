@@ -1,0 +1,4 @@
+; Shared logical decoration geometry, independent of shaping and line layout.
+(struct TextDecoration bounds: vec4f color: vec4u)
+(defn text-decoration-bounds [baseline: vec2f offset: f32 thickness: f32 advance: f32]: vec4f
+  (vec4f baseline.x (- baseline.y offset) advance thickness))

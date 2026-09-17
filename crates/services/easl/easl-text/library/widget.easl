@@ -1,0 +1,109 @@
+(import "view.easl")
+(import "viewport.easl")
+(import "navigation.easl")
+
+; View state is independent of the document/editor and the consumer's storage.
+; Layout is a borrowed snapshot published with the cells and their line index.
+; Rebuild after text/width/font changes, before processing another navigation
+; event. Scrolling and focus do not invalidate the layout or repeat shaping.
+(struct TextWidgetState view: TextViewState offset: vec2f focused: bool)
+(struct TextWidgetLayout
+  source: TextBuffer cells: u32 lines: u32 viewport: vec2f extent: vec2f)
+(struct TextWidgetDecoration status: u32 count: u32 caret: TextHit show-caret: bool)
+
+(defn text-widget-reset [@ref @var widget: TextWidgetState]
+  (text-view-reset widget.view) (= widget.offset (vec2f 0.)) (= widget.focused false))
+
+(defn text-widget-pointer [@ref @var editor: TextEditorState
+                           @ref @var widget: TextWidgetState layout: TextWidgetLayout
+                           line-at: (Fn [u32] TextLineCells) cell-at: (Fn [u32] TextCell)
+                           point: vec2f inside: bool pressed: bool down: bool extend: bool]: u32
+  (when (and inside pressed) (= widget.focused true))
+  (when (and (not down) (not pressed)) (= widget.view.dragging false) (return 4u))
+  (when (not (or (and inside pressed) (and widget.view.dragging down))) (return 4u))
+  (let [status (text-view-current editor layout.source)]
+    (when (!= status 0u) (return status)))
+  (let [hit (text-indexed-hit layout.lines line-at cell-at (+ point widget.offset))
+        status (text-view-apply-hit editor widget.view hit (if pressed extend true))]
+    (when (== status 0u)
+      (= widget.view.dragging down) (= widget.view.vertical false)
+      (= widget.view.preferred-x hit.rect.x))
+    status))
+
+; Page movement preserves the same preferred x as vertical arrows and moves by
+; one viewport, retaining a line of overlap. All other commands share view.easl.
+; Text commits alone insert bytes, including line separators; physical Enter
+; must not synthesize an extra insertion before its platform text commit.
+(defn text-widget-input [@ref @var editor: TextEditorState
+                         @ref @var widget: TextWidgetState layout: TextWidgetLayout
+                         line-at: (Fn [u32] TextLineCells) cell-at: (Fn [u32] TextCell)
+                         event: TextInputEvent payload: TextBuffer
+                         primary-mask: u32 word-mask: u32]: u32
+  (when (< event.text-end event.text-start) (return 1u))
+  (when (== event.kind 6u) (= widget.focused false) (= widget.view.dragging false))
+  (let [page (and (== event.kind 1u) (or (== event.key 9u) (== event.key 10u)))
+        modifiers (& event.modifiers 14u)]
+    (when (and page (== modifiers 0u))
+      (let [status (text-view-current editor layout.source)]
+        (when (!= status 0u) (return status)))
+      (when (not (and (> layout.viewport.y 0.) (text-geometry-finite layout.viewport.y))) (return 1u))
+      (let [focus-byte editor.current.focus affinity widget.view.affinity
+            caret (text-caret-at layout.cells cell-at focus-byte affinity)]
+        (when (!= caret.status 0u) (return caret.status))
+        (let [preferred widget.view.preferred-x
+              context (TextNavigationContext caret.line layout.lines caret.rect.x caret.rect.y caret.rect.w
+                        layout.viewport.y layout.extent.y preferred (if widget.view.vertical 1u 0u))
+              command (if (== event.key 10u) 3u 2u)
+              @var query (text-navigation-plan context command)]
+          (when (!= query.status 0u) (return query.status))
+          (when (== query.kind 1u)
+            (let [probe (text-indexed-hit layout.lines line-at cell-at (vec2f query.x query.y))]
+              (when (!= probe.status 0u) (return probe.status))
+              (= query (text-navigation-resolve context command query probe.line))))
+          (when (!= query.status 0u) (return query.status))
+          (let [band (line-at query.line)
+                target (if (== query.edge 0u)
+                  (text-hit-test-range band.first band.end cell-at (vec2f query.x (+ band.top (* band.height 0.5))))
+                  (text-caret-at layout.cells cell-at
+                    (if (== query.edge 1u) 0u (text-length layout.source))
+                    (if (== query.edge 1u) 1u 0u)))
+                status (text-view-apply-hit editor widget.view target (!= (& event.modifiers 1u) 0u))]
+            (when (== status 0u)
+              (= widget.view.preferred-x query.x) (= widget.view.vertical (== query.preserve-x 1u))
+              (= widget.view.dragging false))
+            (return status) ()))))
+    (text-view-input editor widget.view layout.source layout.cells cell-at
+      event payload primary-mask word-mask)))
+
+; Selection and composition use identical content-space geometry. Composition
+; underlines sit at each selected line's bottom, never at a fixed screen y.
+; The caller chooses ink and subtracts widget.offset when painting/calling IME.
+(defn text-widget-decorations [@ref editor: TextEditorState @ref widget: TextWidgetState
+                               layout: TextWidgetLayout cell-at: (Fn [u32] TextCell)
+                               emit-rect: (Fn [u32 vec4f] ())]: TextWidgetDecoration
+  (when (!= (.handle (text-editor-visible editor)) layout.source.handle)
+    (return (TextWidgetDecoration 5u 0u (text-no-hit) false)))
+  (let [affinity widget.view.affinity
+        position-byte (if editor.composing
+          (if (== editor.cursor-end 4294967295u) editor.preedit-end
+            (text-boundary layout.source editor.cursor-end 2u)) editor.current.focus)
+        caret (text-caret-at layout.cells cell-at position-byte affinity)]
+    (when (!= caret.status 0u) (return (TextWidgetDecoration caret.status 0u caret false)))
+    (let [composing editor.composing
+          count (text-selection-rects layout.cells cell-at
+            (if composing editor.preedit-start editor.current.anchor)
+            (if composing editor.preedit-end editor.current.focus)
+            (fn [i: u32 rectangle: vec4f]
+              (let [thickness (min rectangle.w 1.5)]
+                (emit-rect i (if composing
+                  (vec4f rectangle.x (- (+ rectangle.y rectangle.w) thickness) rectangle.z thickness)
+                  rectangle)))))]
+      (TextWidgetDecoration 0u count caret
+        (and widget.focused (or (not composing) (!= editor.cursor-end 4294967295u)))))))
+
+(defn text-widget-reveal [@ref @var widget: TextWidgetState layout: TextWidgetLayout
+                          caret: TextHit margin: vec2f]: u32
+  (when (!= caret.status 0u) (return caret.status))
+  (let [offset widget.offset result (text-scroll-reveal offset layout.viewport layout.extent caret.rect margin)]
+    (when (== result.status 0u) (= widget.offset result.offset))
+    result.status))
