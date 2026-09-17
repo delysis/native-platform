@@ -201,8 +201,10 @@ pub(super) fn resolve_references(
             .map_err(IpcFailure::store)?;
         bytes += loaded.text.len();
         if bytes > MAX_CONTEXT_BYTES {
-            return Err(limit_failure(
+            return Err(IpcFailure::new(
+                "document_reference_budget_exceeded",
                 "Referenced documents exceed 64 KiB. Choose fewer or smaller documents.",
+                false,
             ));
         }
         resolved.push(ResolvedDocument {
@@ -473,7 +475,7 @@ mod tests {
             resolve(&store, &["large"])
                 .expect_err("too many bytes")
                 .code,
-            "document_reference_limit"
+            "document_reference_budget_exceeded"
         );
         for index in 0..=MAX_DOCUMENTS {
             create(&mut store, &format!("folder/{index}.md"), "small");

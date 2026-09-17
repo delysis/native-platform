@@ -91,6 +91,10 @@ pub(super) struct ContextPlan {
     pub byte_budget: usize,
     pub omitted_evidence: BTreeMap<String, Vec<String>>,
     pub unresolved_references: BTreeMap<String, String>,
+    /// Resolved inputs that automatic writing could not fit. Retain their
+    /// identity and bytes without claiming they were supplied to the writer.
+    #[serde(default)]
+    pub budget_omissions: BTreeMap<String, Value>,
 }
 
 #[derive(Clone, Copy)]
@@ -153,9 +157,13 @@ fn failure(message: impl Into<String>) -> IpcFailure {
     IpcFailure::new("material_context_invalid", message, false)
 }
 
+fn budget_failure(message: impl Into<String>) -> IpcFailure {
+    IpcFailure::new("material_context_budget_exceeded", message, false)
+}
+
 pub(super) fn bounded(text: String) -> Result<String, IpcFailure> {
     if text.len() > MAX_BYTES {
-        return Err(failure(
+        return Err(budget_failure(
             "The exact material exceeds 64 KiB. Select a passage or search it with find().",
         ));
     }
@@ -402,7 +410,7 @@ pub(super) fn consult_with_budget_and_cancel(
     } = consulted
     else {
         if exact(&consulted)?.len() > budget {
-            return Err(failure(
+            return Err(budget_failure(
                 "The referenced document does not fit the remaining context. Select a smaller passage.",
             ));
         }
@@ -425,7 +433,7 @@ pub(super) fn consult_with_budget_and_cancel(
         }
     }
     if used > budget || (selected.is_empty() && !omitted.is_empty()) {
-        return Err(failure(
+        return Err(budget_failure(
             "No whole source passage fits the remaining context. Select a smaller passage or shorten the writing prefix.",
         ));
     }
@@ -476,11 +484,13 @@ pub(super) fn markdown_plan_with_budget(
                 if matches!(requirement, ReferenceRequirement::AvailableForWriting)
                     && matches!(
                         error.code,
-                        "document_reference_missing" | "document_reference_ambiguous"
+                        "document_reference_missing"
+                            | "document_reference_ambiguous"
+                            | "document_reference_budget_exceeded"
                     ) =>
             {
-                // A typo must not turn off writing. Keep the omission in the
-                // shared family receipt; explicit calls still require every input.
+                // Unavailable context must not turn off writing. Keep the
+                // reason in the family receipt; explicit calls require every input.
                 plan.unresolved_references
                     .insert(reference.name, error.message);
                 continue;
@@ -490,13 +500,29 @@ pub(super) fn markdown_plan_with_budget(
         folder_budget.admit(&value)?;
         let header = format!("\n--- Referenced material {:?} ---\n", reference.name);
         let footer = "\n--- End material ---\n";
-        let remaining = plan
-            .byte_budget
-            .saturating_sub(plan.text.len() + header.len() + footer.len());
-        let (consulted, omitted) =
-            consult_with_budget_and_cancel(store, &value, query, remaining, &scan_budget, &|| {
-                false
-            })?;
+        let remaining = plan.byte_budget.saturating_sub(plan.text.len());
+        let consultation = if let Some(remaining) =
+            remaining.checked_sub(header.len() + footer.len())
+        {
+            consult_with_budget_and_cancel(store, &value, query, remaining, &scan_budget, &|| false)
+        } else {
+            Err(budget_failure(
+                "The source labels exceed the remaining context budget.",
+            ))
+        };
+        let (consulted, omitted) = match consultation {
+            Ok(result) => result,
+            Err(error)
+                if matches!(requirement, ReferenceRequirement::AvailableForWriting)
+                    && error.code == "material_context_budget_exceeded" =>
+            {
+                // Suggestions remain available while the manuscript grows.
+                // Explicit function calls still require their declared inputs.
+                plan.budget_omissions.insert(reference.name, value);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if !omitted.is_empty() {
             plan.omitted_evidence
                 .insert(reference.name.clone(), omitted);
@@ -511,7 +537,7 @@ pub(super) fn markdown_plan_with_budget(
     }
     plan.text = bounded(plan.text)?;
     if plan.text.len() > plan.byte_budget {
-        return Err(failure(
+        return Err(budget_failure(
             "The source labels exceed the remaining context budget.",
         ));
     }

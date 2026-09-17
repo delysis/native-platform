@@ -332,6 +332,131 @@ fn small_context_retrieves_whole_pdf_passages_without_shortening_exact_arguments
 }
 
 #[test]
+fn writing_defers_oversized_pdf_evidence_but_keeps_later_context_and_exact_receipts() {
+    let (_directory, mut store) = project();
+    let source = pdf_source(&mut store, &"The nightjar sings in moonlight. ".repeat(100));
+    let retained = materials::read(&store, &source.id)
+        .unwrap()
+        .evidence
+        .remove(0);
+    document(&mut store, "Notes.md", "A small useful note.");
+    let name = format!("evidence/{}", retained.id);
+    let markdown = format!("[@Paper](loom-evidence:{}) @Notes", retained.id);
+    let plan = markdown_plan_with_budget(
+        &store,
+        &markdown,
+        "nightjar",
+        600,
+        ReferenceRequirement::AvailableForWriting,
+    )
+    .unwrap();
+    assert!(plan.text.contains("A small useful note."));
+    assert!(!plan.text.contains("nightjar"));
+    assert!(plan.text.len() <= 600);
+    assert!(plan.evidence.is_empty());
+    assert!(!plan.bindings.contains_key(&name));
+    assert!(
+        native_media(&store, plan.bindings.values())
+            .unwrap()
+            .is_empty()
+    );
+    let Value::Evidence { evidence, .. } = &plan.budget_omissions[&name] else {
+        panic!("the frozen, unconsumed evidence must remain in the receipt")
+    };
+    assert_eq!(evidence[0].id, retained.id);
+    assert_eq!(evidence[0].text, retained.text);
+    let receipt: ContextPlan =
+        serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+    assert_eq!(
+        exact(&receipt.budget_omissions[&name]).unwrap(),
+        evidence_text(std::slice::from_ref(&retained)).unwrap()
+    );
+    assert_eq!(
+        markdown_plan_with_budget(
+            &store,
+            &markdown,
+            "nightjar",
+            600,
+            ReferenceRequirement::All
+        )
+        .unwrap_err()
+        .code,
+        "material_context_budget_exceeded"
+    );
+    let full = markdown_plan_with_budget(
+        &store,
+        &markdown,
+        "nightjar",
+        MAX_BYTES,
+        ReferenceRequirement::All,
+    )
+    .unwrap();
+    assert_eq!(full.evidence[0].text, retained.text);
+    assert!(full.budget_omissions.is_empty());
+
+    fs::write(
+        store
+            .root()
+            .join(".loom/materials/evidence")
+            .join(format!("{}.json", retained.id)),
+        b"{}",
+    )
+    .unwrap();
+    assert_eq!(
+        markdown_plan_with_budget(
+            &store,
+            &markdown,
+            "nightjar",
+            600,
+            ReferenceRequirement::AvailableForWriting,
+        )
+        .unwrap_err()
+        .code,
+        "material_failed"
+    );
+}
+
+#[test]
+fn writing_with_no_context_room_or_a_large_document_still_has_a_valid_plan() {
+    let (_directory, mut store) = project();
+    document(&mut store, "Empty.md", "");
+    document(&mut store, "Long.md", &"prose ".repeat(MAX_BYTES));
+    for (name, budget, code) in [
+        ("Empty", 0, "material_context_budget_exceeded"),
+        ("Long", 4000, "document_reference_budget_exceeded"),
+    ] {
+        let markdown = format!("@{name}");
+        let plan = markdown_plan_with_budget(
+            &store,
+            &markdown,
+            "write on",
+            budget,
+            ReferenceRequirement::AvailableForWriting,
+        )
+        .unwrap();
+        assert!(plan.text.is_empty());
+        assert!(plan.bindings.is_empty());
+        if name == "Empty" {
+            assert!(plan.budget_omissions.contains_key(name));
+        } else {
+            assert!(plan.unresolved_references[name].contains("64 KiB"));
+        }
+        assert_eq!(
+            markdown_plan_with_budget(
+                &store,
+                &markdown,
+                "write on",
+                budget,
+                ReferenceRequirement::All
+            )
+            .unwrap_err()
+            .code,
+            code
+        );
+    }
+}
+
+#[test]
 fn ordinary_budgeted_consultation_reports_zero_matches_explicitly() {
     let (_directory, mut store) = project();
     let source = attachment(&mut store, "Research", &"Quiet prose. ".repeat(1000));
