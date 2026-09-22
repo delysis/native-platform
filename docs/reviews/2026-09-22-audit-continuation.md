@@ -1,5 +1,7 @@
 # Audit remediation continuation — 22 September 2026
 
+**POST-PROMOTION UPDATE:** the genuine implementation stack was subsequently merged through PR #72. Main is `f38a842d8ddea0a97a69b2f3d3efbd5d39ffa27d`, tree `412fee9338828f9a179ab0275039511318257dd0`, matching the locally tested integration tree. Ghost/Loompad artifact acceptance remains open for the exact failure recorded below.
+
 ## Target-Mac integration follow-up
 
 The published Astra continuation was subsequently exercised on the target Mac. Its focused frontend, Svelte, Swift-helper, and pinned Rust `loom-app` checks passed. Integration replaced the acceptance incognito WebView with a stable directory-scoped custom WebKit data store: this preserves isolation from the normal profile without erasing the preferences that the required same-artifact relaunch must verify. Exact packaged two-launch behavior remains an artifact acceptance obligation.
@@ -8,7 +10,7 @@ The obsolete no-model autocomplete/Shuttle helper and the real writer-load-to-pr
 
 The exact follow-up candidate at `4299647a` advanced the real-model boundary: the approved model loaded on Metal, suggestions were enabled in Ghost mode, and one exact four-run family produced 192 text deltas, four candidates, and four completed terminals. The accessibility monitor nevertheless observed no correlated pre-terminal WYSIWYG ghost before terminal completion (`family_terminal_before_live_witness`, 654 polls). Generation and project-busy guards remained clean. This narrows V04 to terminal hydration/family presentation versus an over-strict pre-terminal observer; it does not close Ghost or Loompad acceptance.
 
-**NOT PROMOTABLE.** Implementation was pushed to PR #72, but no current macOS artifact or approved-model writing journey was executed. No PR was merged or rebased.
+**HISTORICAL ASTRA DELIVERY STATE:** implementation had been pushed to PR #72, but no current macOS artifact or approved-model writing journey had yet been executed at that point.
 
 Implementation: `7ed336545cfd8df4489d4db1615bf2a5033699e2`
 Implementation tree: `bee8c361981180abbcaba4fc782996c76db575d8`
