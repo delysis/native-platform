@@ -906,7 +906,7 @@ fn retain_evidence(
     let path = storage(store)?
         .join("evidence")
         .join(format!("{}.json", evidence.id));
-    install_evidence(&path, &bytes)?;
+    install_evidence(store, &path, &bytes)?;
     Ok(evidence)
 }
 pub(crate) fn read_evidence(
@@ -932,10 +932,15 @@ fn load_evidence(store: &ProjectStore, id: &str) -> Result<MaterialEvidence> {
     if !valid_hash(id) {
         return Err(invalid("invalid evidence identity"));
     }
-    let bytes = read_safe(
+    // Authenticate before parsing or checking the canonical plaintext digest.
+    let bytes = crate::private_sidecar::read(
+        store.root(),
         &storage(store)?.join("evidence").join(format!("{id}.json")),
         MAX_EVIDENCE_BYTES,
-    )?;
+    )?
+    .ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "retained evidence is missing")
+    })?;
     if digest(&bytes) != id {
         return Err(invalid("retained evidence identity mismatch"));
     }
@@ -983,15 +988,11 @@ fn read_safe(path: &Path, max: u64) -> Result<Vec<u8>> {
 }
 fn read_bindings(store: &ProjectStore) -> Result<Bindings> {
     let path = storage(store)?.join("bindings.json");
-    let bytes = match read_safe(&path, MAX_STATE_BYTES) {
-        Ok(bytes) => bytes,
-        Err(MaterialError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Bindings {
-                schema: SCHEMA.into(),
-                items: Vec::new(),
-            });
-        }
-        Err(e) => return Err(e),
+    let Some(bytes) = crate::private_sidecar::read(store.root(), &path, MAX_STATE_BYTES)? else {
+        return Ok(Bindings {
+            schema: SCHEMA.into(),
+            items: Vec::new(),
+        });
     };
     let bindings: Bindings = serde_json::from_slice(&bytes)?;
     if bindings.schema != SCHEMA || bindings.items.len() > MAX_BINDINGS {
@@ -1023,13 +1024,16 @@ fn write_bindings(store: &ProjectStore, bindings: &Bindings) -> Result<()> {
         return Err(invalid("workspace material metadata limit reached"));
     }
     let path = storage(store)?.join("bindings.json");
-    if let Ok(metadata) = fs::symlink_metadata(&path)
-        && (!metadata.is_file() || metadata.file_type().is_symlink())
-    {
-        return Err(invalid("unsafe material bindings file"));
+    // Never repair a plaintext downgrade or corrupt envelope by overwriting it.
+    let previous = crate::private_sidecar::read(store.root(), &path, MAX_STATE_BYTES)?;
+    if previous.as_deref() == Some(bytes.as_slice()) {
+        return Ok(());
     }
+    let namespace = crate::private_sidecar::namespace(store.root(), &path)?;
+    let stored =
+        crate::private_sidecar::PayloadCodec::open(store.root())?.seal(&namespace, &bytes)?;
     let mut file = AtomicWriteFile::open(&path)?;
-    file.write_all(&bytes)?;
+    file.write_all(&stored)?;
     file.commit()?;
     Ok(())
 }
@@ -1062,28 +1066,54 @@ fn file_version(path: &Path) -> Result<String> {
     ))
 }
 
-fn install_evidence(path: &Path, bytes: &[u8]) -> Result<()> {
-    if path.try_exists()? {
-        if read_safe(path, MAX_EVIDENCE_BYTES)? != bytes {
-            return Err(invalid("retained evidence identity mismatch"));
-        }
-        return Ok(());
+fn install_evidence(store: &ProjectStore, path: &Path, bytes: &[u8]) -> Result<()> {
+    install_evidence_with(store, path, bytes, |_, _| Ok(()))
+}
+
+// The hook precedes the real hard-link boundary; tests do not replace publication.
+fn install_evidence_with(
+    store: &ProjectStore,
+    path: &Path,
+    bytes: &[u8],
+    before_publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
+    if bytes.len() as u64 > MAX_EVIDENCE_BYTES {
+        return Err(invalid("source evidence exceeds retained evidence limit"));
     }
+    let maximum = bytes.len() as u64;
+    if let Some(existing) = crate::private_sidecar::read(store.root(), path, maximum)? {
+        return if existing == bytes {
+            Ok(())
+        } else {
+            Err(invalid("retained evidence identity mismatch"))
+        };
+    }
+    // Randomized storage is not the content identity. Even unpublished staging
+    // is sealed for its final destination, never for the temporary filename.
+    let namespace = crate::private_sidecar::namespace(store.root(), path)?;
+    let stored =
+        crate::private_sidecar::PayloadCodec::open(store.root())?.seal(&namespace, bytes)?;
     let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let temp = path.with_extension(format!("{}.{sequence}.tmp", std::process::id()));
-    let mut created = false;
+    let mut temporary = EvidenceTemporary {
+        path: path.with_extension(format!("{}.{sequence}.tmp", std::process::id())),
+        created: false,
+    };
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&temp)?;
-        created = true;
-        file.write_all(bytes)?;
+            .open(&temporary.path)?;
+        temporary.created = true;
+        file.write_all(&stored)?;
         file.sync_all()?;
-        match fs::hard_link(&temp, path) {
+        drop(file);
+        before_publish(&temporary.path, path)?;
+        match fs::hard_link(&temporary.path, path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if read_safe(path, MAX_EVIDENCE_BYTES)? != bytes {
+                if crate::private_sidecar::read(store.root(), path, maximum)?.as_deref()
+                    != Some(bytes)
+                {
                     return Err(invalid("retained evidence identity mismatch"));
                 }
             }
@@ -1095,11 +1125,34 @@ fn install_evidence(path: &Path, bytes: &[u8]) -> Result<()> {
         }
         Ok(())
     })();
-    if created {
-        let _ = fs::remove_file(temp);
-    }
-    result
+    result.and(temporary.remove().map_err(MaterialError::from))
 }
+
+// Own only the sibling successfully created by this operation. Drop also runs
+// during unwinding; neither failures nor cleanup ever remove the published name.
+struct EvidenceTemporary {
+    path: PathBuf,
+    created: bool,
+}
+
+impl EvidenceTemporary {
+    fn remove(&mut self) -> std::io::Result<()> {
+        if self.created {
+            fs::remove_file(&self.path)?;
+            self.created = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for EvidenceTemporary {
+    fn drop(&mut self) {
+        let _ = self.remove();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod privacy_tests;
 
 // These integration fixtures require the supported private project store.
 #[cfg(all(test, unix))]

@@ -195,9 +195,14 @@ impl ProjectStore {
                     if let Some(draft) = owners.drafts.get(relative) {
                         validate_draft_bytes(draft, &plain)?;
                     }
-                    if let Some(id) = namespace.strip_prefix("loom/blob/") {
-                        let expected: BlobId =
-                            id.parse().map_err(|_| refused("Invalid CAS identity"))?;
+                    if let Some(id) = namespace.strip_prefix("loom/blob/").or_else(|| {
+                        namespace
+                            .strip_prefix(".loom/materials/evidence/")
+                            .and_then(|name| name.strip_suffix(".json"))
+                    }) {
+                        let expected: BlobId = id
+                            .parse()
+                            .map_err(|_| refused("Invalid content identity"))?;
                         let actual = BlobId::digest(&plain);
                         if actual != expected {
                             return Err(StoreError::CorruptBlob {
@@ -533,6 +538,7 @@ fn payload_kind(relative: &str, owners: &CopyOwners) -> Result<PayloadKind> {
         || relative == ".loom/attachments/document-context.json"
         || known_attachment_payload(relative)
         || known_function_receipt(relative)
+        || known_material_payload(relative)
     {
         return Ok(PayloadKind::Protected(relative.into()));
     }
@@ -557,6 +563,16 @@ fn known_attachment_payload(relative: &str) -> bool {
         .strip_prefix(".loom/attachments/manifests/")
         .and_then(|name| name.strip_suffix(".json"))
         .is_some_and(|name| canonical_blob_name(name.strip_prefix("source-").unwrap_or(name)))
+}
+
+// Only committed material names are portable payloads. Unknown files and
+// interrupted staging must still fail closed, never be swept up by a prefix.
+fn known_material_payload(relative: &str) -> bool {
+    relative == ".loom/materials/bindings.json"
+        || relative
+            .strip_prefix(".loom/materials/evidence/")
+            .and_then(|name| name.strip_suffix(".json"))
+            .is_some_and(canonical_blob_name)
 }
 
 fn known_function_receipt(relative: &str) -> bool {
@@ -659,6 +675,87 @@ mod tests {
 
     const VISIBLE: &str = "Ordinary writing\r\n尾  ";
 
+    #[test]
+    fn material_copy_classification_rejects_staging_and_unknown_names() {
+        let owners = CopyOwners::default();
+        let id = BlobId::digest(b"private material evidence");
+        for relative in [
+            ".loom/materials/bindings.json".to_owned(),
+            format!(".loom/materials/evidence/{id}.json"),
+        ] {
+            assert!(matches!(
+                payload_kind(&relative, &owners).unwrap(),
+                PayloadKind::Protected(namespace) if namespace == relative
+            ));
+        }
+        for relative in [
+            ".loom/materials/bindings.json.tmp".to_owned(),
+            ".loom/materials/unknown.json".to_owned(),
+            ".loom/materials/evidence/not-a-digest.json".to_owned(),
+            format!(".loom/materials/evidence/{id}.1.2.tmp"),
+            format!(".loom/materials/evidence/nested/{id}.json"),
+            format!(
+                ".loom/materials/evidence/{}.json",
+                id.to_string().to_uppercase()
+            ),
+        ] {
+            assert!(payload_kind(&relative, &owners).is_err(), "{relative}");
+        }
+    }
+
+    #[test]
+    fn protected_copy_refuses_plaintext_materials_in_an_already_secured_source() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("source");
+        let source = source_project(&root, true);
+        let relative = ".loom/materials/bindings.json";
+        create_copy_parents(&root, relative).unwrap();
+        let leaked = b"{\"schema\":\"loom.materials.v1\",\"items\":[]}";
+        fs::write(root.join(relative), leaked).unwrap();
+        let destination = parent.path().join("protected");
+        assert!(
+            source
+                .protected_copy_with_key(&destination, [73; 32])
+                .is_err()
+        );
+        assert_eq!(fs::read(root.join(relative)).unwrap(), leaked);
+        assert!(!destination.exists());
+        assert!(!parent.path().read_dir().unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".mine-protected-copy-")
+        }));
+    }
+
+    #[test]
+    fn protected_copy_rejects_material_evidence_digest_mismatch() {
+        for encrypted in [false, true] {
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("source");
+            let source = source_project(&root, encrypted);
+            let id = BlobId::digest(b"original evidence");
+            let relative = format!(".loom/materials/evidence/{id}.json");
+            create_copy_parents(&root, &relative).unwrap();
+            crate::private_io::write(
+                source.vault.as_ref(),
+                &root.join(&relative),
+                &relative,
+                b"changed evidence",
+            )
+            .unwrap();
+            let before = fs::read(root.join(&relative)).unwrap();
+            let destination = parent.path().join("protected");
+            assert!(matches!(
+                source.protected_copy_with_key(&destination, [73; 32]),
+                Err(StoreError::CorruptBlob { .. })
+            ));
+            assert_eq!(fs::read(root.join(relative)).unwrap(), before);
+            assert!(!destination.exists());
+        }
+    }
+
     fn source_with_draft(
         root: &Path,
         encrypted: bool,
@@ -691,6 +788,19 @@ mod tests {
         (source, draft, saved.revision_id)
     }
 
+    fn private_payload_paths(attachment_id: BlobId) -> [String; 8] {
+        [
+            format!(".loom/function-runs/{}.finished.json", CommandId::new()),
+            ".loom/co-writers.json".into(),
+            ".loom/attachments/document-context.json".into(),
+            format!(".loom/attachments/manifests/{attachment_id}.json"),
+            format!(".loom/attachments/manifests/source-{attachment_id}.json"),
+            format!(".loom/attachments/objects/{attachment_id}"),
+            ".loom/materials/bindings.json".into(),
+            format!(".loom/materials/evidence/{attachment_id}.json"),
+        ]
+    }
+
     #[test]
     fn nested_copy_preserves_drafts_cas_and_each_private_namespace_from_either_source_format() {
         for encrypted in [false, true] {
@@ -702,14 +812,7 @@ mod tests {
             let blob = source.put_blob(evidence).unwrap();
             let receipt = b"{\"private\":\"A private response\"}";
             let attachment_id = BlobId::digest(receipt);
-            let receipt_paths = [
-                format!(".loom/function-runs/{}.finished.json", CommandId::new()),
-                ".loom/co-writers.json".into(),
-                ".loom/attachments/document-context.json".into(),
-                format!(".loom/attachments/manifests/{attachment_id}.json"),
-                format!(".loom/attachments/manifests/source-{attachment_id}.json"),
-                format!(".loom/attachments/objects/{attachment_id}"),
-            ];
+            let receipt_paths = private_payload_paths(attachment_id);
             let mut source_bytes = BTreeMap::new();
             for relative in &receipt_paths {
                 create_copy_parents(&root, relative).unwrap();

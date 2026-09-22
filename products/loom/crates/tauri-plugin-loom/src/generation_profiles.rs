@@ -207,6 +207,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn material_plan_and_retrieval_materials_have_distinct_roundtrip_keys() {
+        let evidence = ProfiledContextEvidence {
+            retrieval: crate::context_attachments::ContextRetrievalEvidence::default(),
+            material_plan: Some(crate::material_context::ContextPlan {
+                text: "Exact material café 雨.\r\n".into(),
+                byte_budget: 4096,
+                ..Default::default()
+            }),
+            generation_profile: None,
+            applied_co_writer: None,
+            loompad: None,
+            request_sampling: None,
+        };
+        let bytes = serde_json::to_vec(&evidence).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value["materials"].is_array());
+        assert!(value["material_plan"].is_object());
+        assert_eq!(
+            value["material_plan"]["text"],
+            "Exact material café 雨.\r\n"
+        );
+        let restored: ProfiledContextEvidence = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&restored.retrieval).unwrap(),
+            serde_json::to_vec(&evidence.retrieval).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(restored.material_plan).unwrap(),
+            value["material_plan"]
+        );
+        // A plan in the vector's slot is the former collision shape. Explicit
+        // null is invalid too; never guess or mutate historical evidence.
+        for collision in [value["material_plan"].clone(), serde_json::Value::Null] {
+            let mut previous = value.clone();
+            previous.as_object_mut().unwrap().remove("material_plan");
+            previous["materials"] = collision;
+            assert!(serde_json::from_value::<ProfiledContextEvidence>(previous).is_err());
+        }
+    }
+
+    #[test]
     fn frozen_profile_changes_actual_case_sampling_and_preserves_task_admission() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join(".mine.toml"), "[generation]\nautomatic_prose='voice'\n[profiles.voice.sampling]\nseed=77\ntemperature=0.25\nmax_tokens=32").unwrap();
