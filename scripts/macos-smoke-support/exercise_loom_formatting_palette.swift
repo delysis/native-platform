@@ -231,27 +231,39 @@ if actionName == "Link" {
             destination,
             kAXFocusedAttribute as CFString,
             kCFBooleanTrue
-          ) == .success,
-          let selectAllDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-          let selectAllUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+          ) == .success else {
         fputs("could not focus Loom's exact Link destination field through Accessibility\n", stderr)
         exit(1)
     }
-    selectAllDown.flags = [.maskCommand]
-    selectAllUp.flags = [.maskCommand]
-    selectAllDown.postToPid(pid)
-    selectAllUp.postToPid(pid)
-    for character in linkDestination {
-        var utf16 = Array(String(character).utf16)
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+    // WebKit exposes native form controls through AX. Prefer that authority;
+    // PID-targeted CGEvents can be dropped while the popover is opening.
+    let axValueSet = AXUIElementSetAttributeValue(
+        destination,
+        kAXValueAttribute as CFString,
+        linkDestination as CFTypeRef
+    ) == .success
+    if !axValueSet {
+        guard let selectAllDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+              let selectAllUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
             fputs("could not construct Loom's PID-targeted Link destination input\n", stderr)
             exit(1)
         }
-        down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-        down.postToPid(pid)
-        up.postToPid(pid)
-        Thread.sleep(forTimeInterval: 0.01)
+        selectAllDown.flags = [.maskCommand]
+        selectAllUp.flags = [.maskCommand]
+        selectAllDown.postToPid(pid)
+        selectAllUp.postToPid(pid)
+        for character in linkDestination {
+            var utf16 = Array(String(character).utf16)
+            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+                fputs("could not construct Loom's PID-targeted Link destination input\n", stderr)
+                exit(1)
+            }
+            down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
+            down.postToPid(pid)
+            up.postToPid(pid)
+            Thread.sleep(forTimeInterval: 0.01)
+        }
     }
     let valueDeadline = Date().addingTimeInterval(5)
     while Date() < valueDeadline {
