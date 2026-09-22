@@ -27,9 +27,10 @@ func descendants() -> [AXUIElement] {
     return queue
 }
 
-func button(named needle: String) -> AXUIElement? {
+func control(named needle: String) -> AXUIElement? {
     descendants().first { element in
-        guard stringAttribute(element, kAXRoleAttribute as CFString) == kAXButtonRole as String else {
+        let role = stringAttribute(element, kAXRoleAttribute as CFString)
+        guard role == kAXButtonRole as String || role == kAXMenuItemRole as String else {
             return false
         }
         return [
@@ -40,12 +41,18 @@ func button(named needle: String) -> AXUIElement? {
     }
 }
 
-guard let window = (attribute(application, kAXWindowsAttribute as CFString) as? [AXUIElement])?.first,
-      let create = button(named: "New document") else {
+guard let window = (attribute(application, kAXWindowsAttribute as CFString) as? [AXUIElement])?.first else {
     fputs("could not bind the new-document check to Loom's exact accessible window\n", stderr)
     exit(1)
 }
 let beforeTitle = stringAttribute(window, kAXTitleAttribute as CFString)
+if let add = control(named: "Add") {
+    _ = AXUIElementPerformAction(add, kAXPressAction as CFString)
+}
+guard let create = control(named: "New document") else {
+    fputs("could not bind the new-document check to Loom's exact accessible window\n", stderr)
+    exit(1)
+}
 guard AXUIElementPerformAction(create, kAXPressAction as CFString) == .success else {
     fputs("could not press Loom's new-document control\n", stderr)
     exit(1)
