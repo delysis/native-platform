@@ -5523,6 +5523,7 @@ mod tests {
                 sampling: SamplingConfig::default(),
                 messages: Vec::new(),
                 provisional_output: GenerationOutput {
+                    first_word_choice: None,
                     request_id: "invocation".to_string(),
                     branch_id: "persona".to_string(),
                     input_index: 0,

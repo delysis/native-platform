@@ -5,6 +5,14 @@ export type LoompadLength = 'word' | 'phrase' | 'sentence' | 'paragraph';
 export interface LoompadChord { choices: string[] }
 export const emptyLoompadChord = (): LoompadChord => ({ choices: [] });
 
+/** Choice identity is the next word, not the independently sampled tail. */
+export function loompadWordKey(text: string): string | null {
+  const prefix = nextSuggestionWord(text);
+  if (!prefix) return null;
+  const word = prefix.match(/[\p{L}\p{N}\p{M}_]+(?:['’\-][\p{L}\p{N}\p{M}_]+)*/u)?.[0];
+  return (word ?? prefix.trim()).normalize('NFC').toLowerCase();
+}
+
 /** Only an explicit Option chord promotes text; repeats and ordinary typing do not. */
 export function loompadKey(state: LoompadChord, code: string, down: boolean, repeat = false, alt = false): {
   state: LoompadChord; handled: boolean; choice: number | null; length: LoompadLength | null; accept: boolean;

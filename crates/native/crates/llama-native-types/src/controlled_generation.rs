@@ -1766,6 +1766,7 @@ struct StrictTokenDistributionObservationWire {
 impl From<StrictGenerationOutputWire> for GenerationOutput {
     fn from(value: StrictGenerationOutputWire) -> Self {
         Self {
+            first_word_choice: None,
             request_id: value.request_id,
             branch_id: value.branch_id,
             input_index: value.input_index,
@@ -3537,6 +3538,7 @@ mod tests {
 
     fn fixture_generation(request_id: &str, case_id: &str) -> GenerationOutput {
         GenerationOutput {
+            first_word_choice: None,
             request_id: request_id.to_string(),
             branch_id: case_id.to_string(),
             input_index: 0,
@@ -4041,6 +4043,7 @@ mod tests {
     #[test]
     fn legacy_generation_json_remains_control_neutral() {
         let legacy = crate::GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "legacy".to_string(),
             model_id: "writer".to_string(),
             media: Vec::new(),

@@ -1168,6 +1168,7 @@ fn is_disabled_control_baseline(request: &ControlledGenerationBatchRequest) -> b
 
 fn as_exact_legacy_request(request: &ControlledGenerationBatchRequest) -> GenerationBatchRequest {
     GenerationBatchRequest {
+        first_word_choices: None,
         request_id: request.request_id().to_string(),
         model_id: request.control().writer().fingerprint().model_id.clone(),
         media: Vec::new(),
@@ -1229,6 +1230,7 @@ fn execute_disabled_baseline(
             reasoning_forces: &reasoning,
         },
         BatchSequenceState {
+            first_word_choices: None,
             fingerprint: request.control().writer().fingerprint(),
             tracking,
             resident: None,
@@ -1655,6 +1657,7 @@ fn execute_active_controls(
             completion_tokens as f64 / (duration_ms as f64 / 1000.0)
         };
         let output = GenerationOutput {
+            first_word_choice: None,
             request_id: request.request_id().to_string(),
             branch_id: case.case_id().to_string(),
             input_index: case_index,
@@ -3515,6 +3518,7 @@ mod tests {
     fn disabled_baseline_authority_requires_exact_sampler_site_trace() {
         let request = request(Vec::new(), Vec::new(), Vec::new());
         let output = GenerationOutput {
+            first_word_choice: None,
             request_id: request.request_id().to_string(),
             branch_id: "case-0".to_string(),
             input_index: 0,
@@ -4135,6 +4139,7 @@ mod tests {
         )
         .expect("declaration");
         let generation = GenerationOutput {
+            first_word_choice: None,
             request_id: request.request_id().to_string(),
             branch_id: request.cases()[0].case_id().to_string(),
             input_index: 0,
@@ -4308,6 +4313,7 @@ mod tests {
 
         let legacy = handle
             .generate_batch(GenerationBatchRequest {
+                first_word_choices: None,
                 request_id: "real-legacy-baseline".to_string(),
                 model_id: identity.fingerprint().model_id.clone(),
                 media: Vec::new(),

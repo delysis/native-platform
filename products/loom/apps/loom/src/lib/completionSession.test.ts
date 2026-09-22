@@ -3,6 +3,7 @@ import {
   advanceCompletionExhaustionLatch,
   acceptedCompletionText,
   completionPresentation,
+  completionRollbackText,
   compatibleCompletionPresentations,
   mergeCompatibleCompletionCandidates,
   consumeCompletionText,
@@ -29,6 +30,17 @@ const candidates: CompletionCandidate[] = [
 ];
 
 describe('cached completion session', () => {
+  it('requests fresh choices after reversing into a retired sampling family', () => {
+    const accepted = consumeCompletionWord(startCompletionSession('scope', candidates, 'run-a')!)!.session;
+    const retired = { ...accepted, presentationsRetired: true };
+    expect(completionShouldRequestNextBatch(retired, true, false)).toBe(false);
+    expect(completionShouldRequestNextBatch(retired, false, false)).toBe(true);
+    const reversed = unconsumeCompletionWord(retired)!;
+    expect(reversed.text).toBe(' one ');
+    expect(remainingCompletionText(reversed.session)).toBe(' one two');
+    expect(completionShouldRequestNextBatch(reversed.session, false, false)).toBe(true);
+  });
+
   it('keeps a compatible sibling and original undo when a fresh partial arrives after selected exhaustion', () => {
     const original = [
       { ...candidates[0], text: ' one' },
@@ -222,6 +234,34 @@ describe('cached completion session', () => {
     });
     expect(handedOff.candidates).toEqual(fresh);
     expect(unconsumeCompletionWord(handedOff)).toBeNull();
+  });
+
+  it('keeps refill reversal through a missing family without authorizing stale insertions', () => {
+    const accepted = consumeCompletionText(
+      startCompletionSession('doc:visual', candidates, 'run-a')!, ' one'
+    )!.session;
+    const fresh = ['silver', 'amber', 'blue', 'green'].map((word, index) => ({
+      candidateId: `next-${index}`, presentationKey: `next-${index}:1`,
+      runId: `next-run-${index}`, text: ` ${word} light`, targetByte: 9,
+      insertsOnAccept: true
+    }));
+    const refilled = synchronizeCompletionCandidates(accepted, fresh, true, true)!;
+    const hidden = synchronizeCompletionCandidates(refilled, [])!;
+    expect(completionRollbackText(hidden)).toBe(' one');
+    expect(remainingCompletionText(hidden)).toBe('');
+    expect(hidden.candidates).toEqual([{ ...fresh[0], text: '' }]);
+    expect(consumeCompletionWord(hidden)).toBeNull();
+    expect(consumeCompletionText(hidden, ' silver')).toBeNull();
+    expect(synchronizeCompletionCandidates(hidden, [])).toBe(hidden);
+    const reversed = unconsumeCompletionWord(hidden)!;
+    expect(removeBeforeUtf8Boundary('Hello one', 9, reversed.text)).toBe('Hello');
+    expect(reversed.session.candidates).toEqual(candidates);
+
+    const restored = synchronizeCompletionCandidates(hidden, fresh)!;
+    expect(restored.candidates).toEqual(fresh);
+    expect(unconsumeCompletionWord(restored)?.text).toBe(' one');
+    expect(synchronizeCompletionCandidates(hidden,
+      fresh.map(candidate => ({ ...candidate, targetByte: 10 })))).toBeNull();
   });
 
   it('re-arms the same exhaustion identity after rollback', () => {

@@ -10,6 +10,7 @@ import {
   invalidateCompletionNavigation,
   observeTextMutation,
   reconcileCompletionController,
+  retireCompletionCandidates,
   setCompletionSchedule,
   settleCompletionNavigation,
   shuttleScheduleKey
@@ -69,6 +70,29 @@ function insert(
 }
 
 describe('pure completion controller', () => {
+  it('retires a sampling policy without exposing its tails or losing exact reversal', () => {
+    expect(retireCompletionCandidates(readyController()).session).toBeNull();
+    const first = insert('option_word', ' one ');
+    const state = retireCompletionCandidates(observeTextMutation(first.state, 'Hello one ', manuscript, false).state);
+    const view = completionControllerView(state, contextKey, []);
+    expect(view.activeFamily).toEqual([]);
+    expect(view.selected).toMatchObject({ text: '', targetByte: 10 });
+    expect(view.unconsumeText).toBe(' one ');
+    expect(state.session?.candidates).toBe(first.state.session?.candidates);
+    const undo = authorizeCompletionUnconsume(state, {
+      eligible: view.selected, candidateId: view.selected!.candidateId,
+      presentationKey: view.selected!.presentationKey, text: view.unconsumeText,
+      manuscriptText: 'Hello one '
+    });
+    expect(undo.authorized).toBe(true);
+    expect(undo.state.pendingText).toBe(manuscript);
+    const restored = observeTextMutation(undo.state, manuscript, 'Hello one ', false).state;
+    expect(completionControllerView(restored, contextKey, []).activeFamily).toEqual([]);
+    const fresh = family.map((candidate, index) => ({ ...candidate,
+      runId: `fresh-${index}`, candidateId: `fresh-${index}`, presentationKey: `fresh-${index}` }));
+    const refilled = reconcileCompletionController(restored, contextKey, fresh, true, true);
+    expect(completionControllerView(refilled, contextKey, fresh).activeFamily).toEqual(fresh);
+  });
   it('cycles compatible cached ghost suffixes in both directions without changing prior prose', () => {
     const shared = [suggestion('run-a', 'a', ' one alpha'), suggestion('run-b', 'b', ' one beta'), suggestion('run-c', 'c', ' other')];
     let state = reconcileCompletionController(initialCompletionControllerState(), contextKey, shared);

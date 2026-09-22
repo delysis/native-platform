@@ -846,7 +846,7 @@ mod automatic_writer_authority {
             build_policy: &BuildModelPolicy,
         ) -> Result<Self, IpcFailure> {
             let kind = match &policy {
-                ValidatedWeavePolicy::AutomaticV2 | ValidatedWeavePolicy::LoompadV1 { .. } => {
+                ValidatedWeavePolicy::AutomaticV2 | ValidatedWeavePolicy::LoompadV2 { .. } => {
                     AuthorizedWeaveModelKind::Automatic(AutomaticSuggestionAuthority::bind(
                         loaded,
                         build_policy,
@@ -859,6 +859,12 @@ mod automatic_writer_authority {
 
         pub(super) fn branch_count(&self) -> u32 {
             self.policy.branch_count()
+        }
+
+        pub(super) fn first_word_choices(
+            &self,
+        ) -> Option<llama_native_types::FirstWordChoicePolicy> {
+            self.policy.first_word_choices()
         }
 
         pub(super) fn bind_document_kind(
@@ -900,7 +906,8 @@ mod automatic_writer_authority {
             prompt_recipe: PromptRecipe,
             cases: Vec<ContinuationCase>,
         ) -> AuthorizedWeaveRequest {
-            let Self { policy: _, kind } = self;
+            let Self { policy, kind } = self;
+            let first_word_choices = policy.first_word_choices();
             let (model, authority) = match kind {
                 AuthorizedWeaveModelKind::Automatic(writer) => writer.into_request_parts(),
                 AuthorizedWeaveModelKind::Manual(loaded) => {
@@ -914,6 +921,7 @@ mod automatic_writer_authority {
                     exact_manuscript_prefix,
                     context_preamble,
                     media,
+                    first_word_choices,
                     prompt_recipe,
                     cases,
                 },
@@ -944,6 +952,7 @@ use automatic_writer_authority::AutomaticSuggestionAuthority;
 
 #[derive(Clone, Debug)]
 struct GenerationResultBinding {
+    first_word_choices: Option<llama_native_types::FirstWordChoicePolicy>,
     exact_prompt_blob_id: BlobId,
     context_binding: ContinuationContextBinding,
     model_environment: ModelEnvironment,
@@ -2885,7 +2894,7 @@ pub struct WeaveStarted {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum WeavePolicySnapshot {
     AutomaticV2 {},
-    LoompadV1 {
+    LoompadV2 {
         sample_target: u32,
         batch_offset: u32,
     },
@@ -2898,7 +2907,7 @@ enum WeavePolicySnapshot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WeavePreset {
-    LoompadV1,
+    LoompadV2,
     AutomaticProseV2,
     AutomaticVerseV2,
     ManualV2,
@@ -2915,7 +2924,7 @@ struct ResolvedWeavePolicy {
 #[derive(Debug, PartialEq)]
 enum ValidatedWeavePolicy {
     AutomaticV2,
-    LoompadV1 {
+    LoompadV2 {
         sample_target: u32,
         batch_offset: u32,
     },
@@ -8101,13 +8110,13 @@ fn replay_weave_if_recorded(
         }
         let policy_matches = match (policy, &speculation) {
             (
-                ValidatedWeavePolicy::LoompadV1 {
+                ValidatedWeavePolicy::LoompadV2 {
                     sample_target,
                     batch_offset,
                 },
                 Some(batch),
             ) => *sample_target == batch.sample_target && *batch_offset == batch.batch_offset,
-            (ValidatedWeavePolicy::LoompadV1 { .. }, None) | (_, Some(_)) => false,
+            (ValidatedWeavePolicy::LoompadV2 { .. }, None) | (_, Some(_)) => false,
             (_, None) => true,
         };
         let family_matches = policy_matches
@@ -8397,7 +8406,7 @@ fn weave_start_inner<R: Runtime>(
         return Ok(replay);
     }
     let loompad_request = match &policy {
-        ValidatedWeavePolicy::LoompadV1 {
+        ValidatedWeavePolicy::LoompadV2 {
             sample_target,
             batch_offset,
         } => {
@@ -8575,7 +8584,7 @@ fn weave_start_inner<R: Runtime>(
             let context = continuation_context_binding(&attachment_context.context_preamble, &attachment_context.media)
                 .map_err(|error| IpcFailure::backend(&error))?;
             let identity = serde_json::to_vec(&serde_json::json!({
-                "policy": "loompad_v1", "project": store.manifest().project_id,
+                "policy": "loompad_v2", "project": store.manifest().project_id,
                 "session": active_session_id, "document": document_id, "revision": source_revision_id,
                 "cursor": cursor_byte, "prompt": BlobId::digest(exact_prefix.as_bytes()),
                 "context": context, "model": model_environment,
@@ -8872,6 +8881,7 @@ fn weave_start_inner<R: Runtime>(
     let context_binding = continuation_context_binding(&context_preamble, &media)
         .map_err(|error| IpcFailure::backend(&error))?;
     let result_binding = GenerationResultBinding {
+        first_word_choices: authorized_model.first_word_choices(),
         exact_prompt_blob_id,
         context_binding,
         model_environment: model_environment.clone(),
@@ -9068,7 +9078,9 @@ fn generation_seed(command_id: CommandId, index: u32, preset: WeavePreset) -> u3
     // The low two bits are a lossless policy-version tag. For one command and
     // case index, no two current presets can ever share a seed, even if every
     // other sampling field happens to match.
-    (entropy & !0b11) | preset.seed_tag()
+    let seed = (entropy & !0b11) | preset.seed_tag();
+    // llama.cpp reserves MAX for random seeding. Keep the tag and reproducibility.
+    if seed == u32::MAX { seed - 4 } else { seed }
 }
 
 impl WeavePreset {
@@ -9077,7 +9089,7 @@ impl WeavePreset {
             Self::AutomaticProseV2 => 0,
             Self::AutomaticVerseV2 => 1,
             Self::ManualV2 => 2,
-            Self::LoompadV1 => 3,
+            Self::LoompadV2 => 3,
         }
     }
 }
@@ -9085,7 +9097,7 @@ impl WeavePreset {
 fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePolicy, IpcFailure> {
     let validated = match policy {
         WeavePolicySnapshot::AutomaticV2 {} => ValidatedWeavePolicy::AutomaticV2,
-        WeavePolicySnapshot::LoompadV1 {
+        WeavePolicySnapshot::LoompadV2 {
             sample_target,
             batch_offset,
         } => {
@@ -9099,7 +9111,7 @@ fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePo
                     false,
                 ));
             }
-            ValidatedWeavePolicy::LoompadV1 {
+            ValidatedWeavePolicy::LoompadV2 {
                 sample_target,
                 batch_offset,
             }
@@ -9139,9 +9151,16 @@ fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePo
 }
 
 impl ValidatedWeavePolicy {
+    const fn first_word_choices(&self) -> Option<llama_native_types::FirstWordChoicePolicy> {
+        match self {
+            Self::LoompadV2 { .. } => Some(llama_native_types::FirstWordChoicePolicy::DistinctV2),
+            Self::AutomaticV2 | Self::ManualV2 { .. } => None,
+        }
+    }
+
     const fn branch_count(&self) -> u32 {
         match self {
-            Self::AutomaticV2 | Self::LoompadV1 { .. } => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
+            Self::AutomaticV2 | Self::LoompadV2 { .. } => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
             Self::ManualV2 { branch_count, .. } => *branch_count,
         }
     }
@@ -9149,14 +9168,14 @@ impl ValidatedWeavePolicy {
     const fn max_tokens(&self) -> u32 {
         match self {
             Self::AutomaticV2 => AUTOMATIC_WEAVE_MAX_TOKENS_V2,
-            Self::LoompadV1 { .. } => 128,
+            Self::LoompadV2 { .. } => 128,
             Self::ManualV2 { max_tokens, .. } => *max_tokens,
         }
     }
 
     const fn temperature(&self) -> f32 {
         match self {
-            Self::AutomaticV2 | Self::LoompadV1 { .. } => AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            Self::AutomaticV2 | Self::LoompadV2 { .. } => AUTOMATIC_WEAVE_TEMPERATURE_V2,
             Self::ManualV2 { temperature, .. } => *temperature,
         }
     }
@@ -9172,7 +9191,7 @@ impl ValidatedWeavePolicy {
                     false,
                 ));
             }
-            (Self::LoompadV1 { .. }, _) => WeavePreset::LoompadV1,
+            (Self::LoompadV2 { .. }, _) => WeavePreset::LoompadV2,
             (Self::ManualV2 { .. }, _) => WeavePreset::ManualV2,
         };
         Ok(ResolvedWeavePolicy {
@@ -9193,7 +9212,7 @@ fn sampling_for_weave_case(
 ) -> SamplingConfig {
     let repetition_resistant_prose = matches!(
         preset,
-        WeavePreset::AutomaticProseV2 | WeavePreset::LoompadV1
+        WeavePreset::AutomaticProseV2 | WeavePreset::LoompadV2
     );
     SamplingConfig {
         seed: generation_seed(command_id, index, preset),
@@ -9201,8 +9220,14 @@ fn sampling_for_weave_case(
         dynamic_temperature_range: 0.0,
         dynamic_temperature_exponent: 1.0,
         top_k: 40,
-        top_p: 0.95,
-        min_p: if repetition_resistant_prose {
+        // Keep enough support for distinct words. Retries use this exact saved
+        // sampler; they never secretly widen a narrowed distribution.
+        top_p: if preset == WeavePreset::LoompadV2 {
+            1.0
+        } else {
+            0.95
+        },
+        min_p: if preset == WeavePreset::AutomaticProseV2 {
             0.05
         } else {
             0.0
@@ -9212,8 +9237,8 @@ fn sampling_for_weave_case(
         xtc_threshold: 0.1,
         repeat_last_n: 64,
         // Prompt penalties operate over the full rendered Gemma chat scaffold,
-        // not merely generated prose. Keep them neutral; the model and min-p
-        // filter provide diversity without distorting the first word.
+        // not merely generated prose. Keep them neutral; distinct first words
+        // are selected by the explicit family policy.
         repeat_penalty: 1.0,
         frequency_penalty: 0.0,
         presence_penalty: 0.0,
@@ -9536,6 +9561,7 @@ fn persist_generation_result<R: Runtime>(
     let rebuilt_environment = model_environment_from_verified(&result.model)
         .map_err(|error| IpcFailure::backend(&error))?;
     if result.request_id != identity.request_id
+        || result.first_word_choices != binding.first_word_choices
         || result.exact_prompt_blob_id != binding.exact_prompt_blob_id
         || BlobId::digest(result.exact_manuscript_prefix.as_bytes()) != binding.exact_prompt_blob_id
         || result.context_binding != binding.context_binding
@@ -9590,6 +9616,7 @@ fn persist_generation_result<R: Runtime>(
             &binding.context_binding,
             &binding.model,
             input_index,
+            binding.first_word_choices,
         )
         .map_err(|error| {
             IpcFailure::new(
@@ -13699,7 +13726,7 @@ mod tests {
     #[test]
     fn loompad_policy_bounds_each_native_batch_and_total_target() {
         for target in [4, 16, 64, 256] {
-            let policy = validate_weave_policy(WeavePolicySnapshot::LoompadV1 {
+            let policy = validate_weave_policy(WeavePolicySnapshot::LoompadV2 {
                 sample_target: target,
                 batch_offset: target - 4,
             })
@@ -13716,7 +13743,7 @@ mod tests {
             (256, u32::MAX),
         ] {
             assert!(
-                validate_weave_policy(WeavePolicySnapshot::LoompadV1 {
+                validate_weave_policy(WeavePolicySnapshot::LoompadV2 {
                     sample_target: target,
                     batch_offset: offset,
                 })

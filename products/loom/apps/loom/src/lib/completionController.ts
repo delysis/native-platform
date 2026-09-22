@@ -2,6 +2,7 @@ import {
   acceptedCompletionText,
   advanceCompletionExhaustionLatch,
   completionPresentation,
+  completionRollbackText,
   completionSessionMatchesPresentation,
   consumeCompletionText,
   cycleCompletionSession,
@@ -30,6 +31,7 @@ import {
   type SuggestionAlternative
 } from './suggestionInteraction';
 import type { VerseNewlineKind } from './verseCodec';
+import { loompadWordKey } from './loompad';
 
 export interface AutocompleteRetryTicket {
   projectId: string;
@@ -131,6 +133,27 @@ export function clearCompletionSession(
   return { ...state, session: null, pendingText: null };
 }
 
+/** Retire a sampling policy's tails without revoking already accepted prose. */
+export function retireCompletionCandidates(
+  state: CompletionControllerState
+): CompletionControllerState {
+  const session = state.session;
+  if (!session) return state;
+  const selected = selectedCompletionCandidate(session);
+  if (!selected || (!session.acceptedChunks.length && !session.rollbackSessions?.length)) {
+    return { ...state, session: null };
+  }
+  return {
+    ...state,
+    session: {
+      ...session,
+      presentationsRetired: true,
+      rollbackSessions: session.rollbackSessions?.map(witness => ({ ...witness, presentationsRetired: true })),
+      authorityFrozen: session.acceptedChunks.length > 0
+    }
+  };
+}
+
 export function resetCompletionSurface(
   state: CompletionControllerState
 ): CompletionControllerState {
@@ -188,7 +211,8 @@ export function reconcileCompletionController(
   state: CompletionControllerState,
   contextKey: string,
   family: readonly InlineGhostSuggestion[],
-  forkAtCurrentCaret = true
+  forkAtCurrentCaret = true,
+  refillLoompad = false
 ): CompletionControllerState {
   let session = state.session;
   let pendingText = state.pendingText;
@@ -200,7 +224,10 @@ export function reconcileCompletionController(
     if (!session && family.length > 0) {
       session = startCompletionSession(contextKey, family, family[0].runId);
     } else if (session) {
-      session = synchronizeCompletionCandidates(session, family, forkAtCurrentCaret && pendingText === null);
+      const completeRefill = refillLoompad && pendingText === null && family.length >= 4 &&
+        new Set(family.map(candidate => loompadWordKey(candidate.text)).filter(Boolean)).size >= 4;
+      session = synchronizeCompletionCandidates(session, family,
+        forkAtCurrentCaret && pendingText === null, completeRefill);
       if (!session) pendingText = null;
     }
   }
@@ -225,8 +252,9 @@ export function completionControllerView(
 ): CompletionControllerView {
   const boundSession = state.session?.contextKey === contextKey ? state.session : null;
   const activeFamily = completionActiveFamily(boundSession, state.pendingText, baseFamily, sharedPrefixAlternatives);
+  const retired = boundSession?.presentationsRetired ? completionPresentation(boundSession) : null;
   const selected = activeFamily.find((candidate) => candidate.runId === state.activeRunId) ??
-    activeFamily[0] ?? null;
+    activeFamily[0] ?? (retired ? { ...retired, text: '' } : null);
   const witnessSelected = boundSession
     ? selectedCompletionCandidate(boundSession) as InlineGhostSuggestion | null
     : null;
@@ -240,7 +268,7 @@ export function completionControllerView(
       text: candidate.text,
       runId: candidate.runId
     })),
-    unconsumeText: boundSession?.acceptedChunks.at(-1) ?? '',
+    unconsumeText: boundSession ? completionRollbackText(boundSession) : '',
     witnessSelected
   };
 }
@@ -253,6 +281,7 @@ function completionActiveFamily(
 ): InlineGhostSuggestion[] {
   if (pendingText !== null) return [];
   if (!session) return [...baseFamily];
+  if (session.presentationsRetired) return [];
   if (session.acceptedChunks.length === 0) {
     return session.candidates as InlineGhostSuggestion[];
   }

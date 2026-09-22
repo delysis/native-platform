@@ -3,6 +3,8 @@ mod build_identity;
 pub mod control_math;
 mod controlled_runtime;
 mod embedding_runtime;
+mod first_word_choices;
+mod first_word_runtime;
 mod generation_admission;
 mod memory_estimate;
 mod operation_registry;
@@ -42,7 +44,8 @@ use llama_native_types::{
     EmbeddingCapabilities, EmbeddingNormalization, EmbeddingNormalizationSupport,
     EmbeddingOutputConfig, EmbeddingPooling, EmbeddingPoolingSupport, EmbeddingTransportEvidence,
     EmbeddingVectorOutput, ExactModelCapabilities, ExactTokenBatchBudgetError,
-    ExactTokenBatchCellBudget, GenerationBatchCapabilities, GenerationBatchRequest,
+    ExactTokenBatchCellBudget, FIRST_WORD_CHOICE_MAX_CASES, FirstWordChoiceEvidence,
+    FirstWordChoicePolicy, GenerationBatchCapabilities, GenerationBatchRequest,
     GenerationCacheMetrics, GenerationCase, GenerationEvent, GenerationEventKind, GenerationInput,
     GenerationMetrics, GenerationOutput, GenerationOutputCapabilities, GenerationRequest,
     GenerationState, MAX_EMBEDDING_BATCH_INPUTS, MAX_EMBEDDING_BATCH_VALUES,
@@ -1423,6 +1426,7 @@ impl NativeModelHandle {
         };
         self.submit_generation_batch(
             GenerationBatchRequest {
+                first_word_choices: None,
                 request_id,
                 model_id,
                 media: Vec::new(),
@@ -2474,6 +2478,7 @@ fn run_worker(
                                     reasoning_forces: &reasoning_forces,
                                 },
                                 BatchSequenceState {
+                                    first_word_choices: request.first_word_choices,
                                     fingerprint: &fingerprint,
                                     tracking: SequenceTracking {
                                         token_counts: &mut sequence_token_counts,
@@ -2598,6 +2603,7 @@ fn run_worker(
                         reasoning_forces: &reasoning_forces,
                     },
                     BatchSequenceState {
+                        first_word_choices: None,
                         fingerprint: &fingerprint,
                         tracking: SequenceTracking {
                             token_counts: &mut sequence_token_counts,
@@ -3544,8 +3550,9 @@ fn generate_batch(
     state: BatchSequenceState<'_>,
 ) -> NativeResult<GeneratedBatchExecution> {
     let BatchSequenceState {
+        first_word_choices,
         fingerprint,
-        tracking,
+        mut tracking,
         mut resident,
     } = state;
     let retain_token_piece_traces = supervision.retain_token_piece_traces;
@@ -3815,10 +3822,12 @@ fn generate_batch(
             let mut sampler = build_sampler(model, &branch.sampling);
             sampler.accept_many(token_sets[index].iter());
             ActiveBranch {
+                first_word_choice: None,
                 sequence_id: index as i32,
                 request: branch,
                 sampler,
                 decoder: UTF_8.new_decoder(),
+                decoder_finalized: false,
                 text: String::new(),
                 generated_token_ids: Vec::with_capacity(branch.sampling.max_tokens as usize),
                 token_piece_trace: retain_token_piece_traces.then(|| {
@@ -3846,121 +3855,141 @@ fn generate_batch(
         );
         branch.event_index += 1;
     }
-    loop {
-        let mut next_tokens = Vec::<(usize, LlamaToken)>::new();
-        for (index, branch) in branches.iter_mut().enumerate() {
-            if branch.state != GenerationState::Generating {
-                continue;
-            }
-            if supervision.cancellations[index].load(Ordering::Acquire) {
-                branch.state = GenerationState::Cancelled;
-                branch.finish_reason = "cancelled".to_string();
-                let _ = context.clear_kv_cache_seq(Some(index as u32), None, None);
-                continue;
-            }
-            if supervision.reasoning_forces[index].load(Ordering::Acquire) {
-                supervision.mark_unrecorded_control();
-                if branch.forced_tokens.is_empty()
-                    && let Some(end_marker) = active_reasoning_end_marker(&branch.text)
-                {
-                    let tokens =
-                        model
-                            .str_to_token(end_marker, AddBos::Never)
-                            .map_err(|error| {
-                                NativeError::new(
-                                    NativeErrorCode::ModelInvalid,
-                                    format!("failed to tokenize the reasoning end marker: {error}"),
-                                )
-                            })?;
-                    branch.forced_tokens.extend(tokens);
-                    supervision.reasoning_forces[index].store(false, Ordering::Release);
+    if let Some(policy) = first_word_choices {
+        first_word_runtime::generate(
+            model,
+            context,
+            first_word_runtime::WordChoiceExecution {
+                request,
+                branches: &mut branches,
+                policy,
+                started,
+            },
+            &mut supervision,
+            &mut tracking,
+        )?;
+    } else {
+        loop {
+            let mut next_tokens = Vec::<(usize, LlamaToken)>::new();
+            for (index, branch) in branches.iter_mut().enumerate() {
+                if branch.state != GenerationState::Generating {
+                    continue;
+                }
+                if supervision.cancellations[index].load(Ordering::Acquire) {
+                    branch.state = GenerationState::Cancelled;
+                    branch.finish_reason = "cancelled".to_string();
+                    let _ = context.clear_kv_cache_seq(Some(index as u32), None, None);
+                    continue;
+                }
+                if supervision.reasoning_forces[index].load(Ordering::Acquire) {
+                    supervision.mark_unrecorded_control();
+                    if branch.forced_tokens.is_empty()
+                        && let Some(end_marker) = active_reasoning_end_marker(&branch.text)
+                    {
+                        let tokens =
+                            model
+                                .str_to_token(end_marker, AddBos::Never)
+                                .map_err(|error| {
+                                    NativeError::new(
+                                        NativeErrorCode::ModelInvalid,
+                                        format!(
+                                            "failed to tokenize the reasoning end marker: {error}"
+                                        ),
+                                    )
+                                })?;
+                        branch.forced_tokens.extend(tokens);
+                        supervision.reasoning_forces[index].store(false, Ordering::Release);
+                    }
+                }
+                let token = if let Some(token) = branch.forced_tokens.pop_front() {
+                    branch.sampler.accept(token);
+                    token
+                } else {
+                    branch.sampler.sample(context, branch.logit_index)
+                };
+                let terminal = model.is_eog_token(token);
+                supervision.record_runtime_sample(
+                    index,
+                    branch.generated_token_ids.len(),
+                    token.0,
+                    terminal,
+                );
+                if terminal {
+                    branch.state = GenerationState::Completed;
+                    branch.finish_reason = "end_of_generation".to_string();
+                    branch.terminal_sampled_token_id = Some(token.0);
+                    continue;
+                }
+                branch.generated_token_ids.push(token.0);
+                let bytes = generated_token_piece(model, token).map_err(|error| {
+                    NativeError::new(
+                        NativeErrorCode::DecodeFailed,
+                        format!("failed to decode generated token: {error}"),
+                    )
+                })?;
+                if let Some(trace) = &mut branch.token_piece_trace {
+                    trace.push_piece(&bytes)?;
+                }
+                let piece = decode_generated_utf8_piece(&mut branch.decoder, &bytes, false)?;
+                if branch.first_token_ms.is_none() {
+                    branch.first_token_ms = Some(started.elapsed().as_millis());
+                }
+                append_generated_utf8_piece(&mut branch.text, &piece)?;
+                branch.generated += 1;
+                if !piece.is_empty() {
+                    supervision.emit(GenerationEvent {
+                        request_id: request.request_id.clone(),
+                        branch_id: branch.request.branch_id.clone(),
+                        sequence_id: branch.sequence_id,
+                        input_index: index,
+                        event_index: branch.event_index,
+                        event: GenerationEventKind::Delta { text: piece },
+                    });
+                    branch.event_index += 1;
+                }
+                if apply_stop_sequences(&mut branch.text, &branch.request.sampling.stop) {
+                    branch.state = GenerationState::Completed;
+                    branch.finish_reason = "stop_sequence".to_string();
+                } else if branch.generated >= branch.request.sampling.max_tokens as usize {
+                    branch.state = GenerationState::Completed;
+                    branch.finish_reason = "max_tokens".to_string();
+                } else {
+                    next_tokens.push((index, token));
                 }
             }
-            let token = if let Some(token) = branch.forced_tokens.pop_front() {
-                branch.sampler.accept(token);
-                token
-            } else {
-                branch.sampler.sample(context, branch.logit_index)
-            };
-            let terminal = model.is_eog_token(token);
-            supervision.record_runtime_sample(
-                index,
-                branch.generated_token_ids.len(),
-                token.0,
-                terminal,
-            );
-            if terminal {
-                branch.state = GenerationState::Completed;
-                branch.finish_reason = "end_of_generation".to_string();
-                branch.terminal_sampled_token_id = Some(token.0);
-                continue;
+            if next_tokens.is_empty() {
+                break;
             }
-            branch.generated_token_ids.push(token.0);
-            let bytes = generated_token_piece(model, token).map_err(|error| {
-                NativeError::new(
-                    NativeErrorCode::DecodeFailed,
-                    format!("failed to decode generated token: {error}"),
-                )
-            })?;
-            if let Some(trace) = &mut branch.token_piece_trace {
-                trace.push_piece(&bytes)?;
+            let mut batch = LlamaBatch::new(next_tokens.len(), 1);
+            for (logit_index, (branch_index, token)) in next_tokens.iter().enumerate() {
+                let branch = &mut branches[*branch_index];
+                batch
+                    .add(*token, branch.next_position, &[branch.sequence_id], true)
+                    .map_err(|error| {
+                        native_decode_error("failed to build generation batch", error)
+                    })?;
+                branch.logit_index = logit_index as i32;
+                branch.next_position += 1;
+                tracking
+                    .token_counts
+                    .insert(branch.sequence_id, branch.next_position as usize);
+                tracking
+                    .token_ids
+                    .entry(branch.sequence_id)
+                    .or_default()
+                    .push(token.0);
             }
-            let piece = decode_generated_utf8_piece(&mut branch.decoder, &bytes, false)?;
-            if branch.first_token_ms.is_none() {
-                branch.first_token_ms = Some(started.elapsed().as_millis());
-            }
-            append_generated_utf8_piece(&mut branch.text, &piece)?;
-            branch.generated += 1;
-            if !piece.is_empty() {
-                supervision.emit(GenerationEvent {
-                    request_id: request.request_id.clone(),
-                    branch_id: branch.request.branch_id.clone(),
-                    sequence_id: branch.sequence_id,
-                    input_index: index,
-                    event_index: branch.event_index,
-                    event: GenerationEventKind::Delta { text: piece },
-                });
-                branch.event_index += 1;
-            }
-            if apply_stop_sequences(&mut branch.text, &branch.request.sampling.stop) {
-                branch.state = GenerationState::Completed;
-                branch.finish_reason = "stop_sequence".to_string();
-            } else if branch.generated >= branch.request.sampling.max_tokens as usize {
-                branch.state = GenerationState::Completed;
-                branch.finish_reason = "max_tokens".to_string();
-            } else {
-                next_tokens.push((index, token));
-            }
+            context
+                .decode(&mut batch)
+                .map_err(|error| native_decode_error("failed to decode generation batch", error))?;
         }
-        if next_tokens.is_empty() {
-            break;
-        }
-        let mut batch = LlamaBatch::new(next_tokens.len(), 1);
-        for (logit_index, (branch_index, token)) in next_tokens.iter().enumerate() {
-            let branch = &mut branches[*branch_index];
-            batch
-                .add(*token, branch.next_position, &[branch.sequence_id], true)
-                .map_err(|error| native_decode_error("failed to build generation batch", error))?;
-            branch.logit_index = logit_index as i32;
-            branch.next_position += 1;
-            tracking
-                .token_counts
-                .insert(branch.sequence_id, branch.next_position as usize);
-            tracking
-                .token_ids
-                .entry(branch.sequence_id)
-                .or_default()
-                .push(token.0);
-        }
-        context
-            .decode(&mut batch)
-            .map_err(|error| native_decode_error("failed to decode generation batch", error))?;
     }
     for branch in &mut branches {
-        let piece = finalize_generated_text(
+        let piece = finalize_generated_text_once(
             &mut branch.decoder,
             &mut branch.text,
             branch.finish_reason == "stop_sequence",
+            &mut branch.decoder_finalized,
         )?;
         if !piece.is_empty() {
             supervision.emit(GenerationEvent {
@@ -4003,6 +4032,7 @@ fn generate_batch(
             token_piece_traces.push(trace);
         }
         outputs.push(GenerationOutput {
+            first_word_choice: branch.first_word_choice,
             request_id: request.request_id.clone(),
             branch_id: branch.request.branch_id.clone(),
             input_index: branch.sequence_id as usize,
@@ -4067,7 +4097,7 @@ fn generate_multimodal_batch(
     multimodal: Option<&MtmdContext>,
     request: &GenerationBatchRequest,
     mut supervision: BatchSupervision<'_>,
-    tracking: SequenceTracking<'_>,
+    mut tracking: SequenceTracking<'_>,
 ) -> NativeResult<GeneratedBatchExecution> {
     let Some(multimodal) = multimodal else {
         return Err(NativeError::new(
@@ -4196,10 +4226,12 @@ fn generate_multimodal_batch(
         .iter()
         .enumerate()
         .map(|(index, branch)| ActiveBranch {
+            first_word_choice: None,
             sequence_id: index as i32,
             request: branch,
             sampler: build_sampler(model, &branch.sampling),
             decoder: UTF_8.new_decoder(),
+            decoder_finalized: false,
             text: String::new(),
             generated_token_ids: Vec::with_capacity(branch.sampling.max_tokens as usize),
             token_piece_trace: retain_token_piece_traces
@@ -4230,124 +4262,141 @@ fn generate_multimodal_batch(
         branch.event_index += 1;
     }
 
-    loop {
-        let mut next_tokens = Vec::<(usize, LlamaToken)>::new();
-        for (index, branch) in branches.iter_mut().enumerate() {
-            if branch.state != GenerationState::Generating {
-                continue;
-            }
-            if supervision.cancellations[index].load(Ordering::Acquire) {
-                branch.state = GenerationState::Cancelled;
-                branch.finish_reason = "cancelled".to_string();
-                let _ = context.clear_kv_cache_seq(Some(index as u32), None, None);
-                continue;
-            }
-            if supervision.reasoning_forces[index].load(Ordering::Acquire) {
-                supervision.mark_unrecorded_control();
-                if branch.forced_tokens.is_empty()
-                    && let Some(end_marker) = active_reasoning_end_marker(&branch.text)
-                {
-                    let tokens =
-                        model
-                            .str_to_token(end_marker, AddBos::Never)
-                            .map_err(|error| {
-                                NativeError::new(
-                                    NativeErrorCode::ModelInvalid,
-                                    format!("failed to tokenize the reasoning end marker: {error}"),
-                                )
-                            })?;
-                    branch.forced_tokens.extend(tokens);
-                    supervision.reasoning_forces[index].store(false, Ordering::Release);
+    if let Some(policy) = request.first_word_choices {
+        first_word_runtime::generate(
+            model,
+            context,
+            first_word_runtime::WordChoiceExecution {
+                request: &normalized,
+                branches: &mut branches,
+                policy,
+                started,
+            },
+            &mut supervision,
+            &mut tracking,
+        )?;
+    } else {
+        loop {
+            let mut next_tokens = Vec::<(usize, LlamaToken)>::new();
+            for (index, branch) in branches.iter_mut().enumerate() {
+                if branch.state != GenerationState::Generating {
+                    continue;
+                }
+                if supervision.cancellations[index].load(Ordering::Acquire) {
+                    branch.state = GenerationState::Cancelled;
+                    branch.finish_reason = "cancelled".to_string();
+                    let _ = context.clear_kv_cache_seq(Some(index as u32), None, None);
+                    continue;
+                }
+                if supervision.reasoning_forces[index].load(Ordering::Acquire) {
+                    supervision.mark_unrecorded_control();
+                    if branch.forced_tokens.is_empty()
+                        && let Some(end_marker) = active_reasoning_end_marker(&branch.text)
+                    {
+                        let tokens =
+                            model
+                                .str_to_token(end_marker, AddBos::Never)
+                                .map_err(|error| {
+                                    NativeError::new(
+                                        NativeErrorCode::ModelInvalid,
+                                        format!(
+                                            "failed to tokenize the reasoning end marker: {error}"
+                                        ),
+                                    )
+                                })?;
+                        branch.forced_tokens.extend(tokens);
+                        supervision.reasoning_forces[index].store(false, Ordering::Release);
+                    }
+                }
+                let token = if let Some(token) = branch.forced_tokens.pop_front() {
+                    branch.sampler.accept(token);
+                    token
+                } else {
+                    branch.sampler.sample(context, branch.logit_index)
+                };
+                let terminal = model.is_eog_token(token);
+                supervision.record_runtime_sample(
+                    index,
+                    branch.generated_token_ids.len(),
+                    token.0,
+                    terminal,
+                );
+                if terminal {
+                    branch.state = GenerationState::Completed;
+                    branch.finish_reason = "end_of_generation".to_string();
+                    branch.terminal_sampled_token_id = Some(token.0);
+                    continue;
+                }
+                branch.generated_token_ids.push(token.0);
+                let bytes = generated_token_piece(model, token).map_err(|error| {
+                    NativeError::new(
+                        NativeErrorCode::DecodeFailed,
+                        format!("failed to decode generated token: {error}"),
+                    )
+                })?;
+                if let Some(trace) = &mut branch.token_piece_trace {
+                    trace.push_piece(&bytes)?;
+                }
+                let piece = decode_generated_utf8_piece(&mut branch.decoder, &bytes, false)?;
+                if branch.first_token_ms.is_none() {
+                    branch.first_token_ms = Some(started.elapsed().as_millis());
+                }
+                append_generated_utf8_piece(&mut branch.text, &piece)?;
+                branch.generated += 1;
+                if !piece.is_empty() {
+                    supervision.emit(GenerationEvent {
+                        request_id: request.request_id.clone(),
+                        branch_id: branch.request.branch_id.clone(),
+                        sequence_id: branch.sequence_id,
+                        input_index: index,
+                        event_index: branch.event_index,
+                        event: GenerationEventKind::Delta { text: piece },
+                    });
+                    branch.event_index += 1;
+                }
+                if apply_stop_sequences(&mut branch.text, &branch.request.sampling.stop) {
+                    branch.state = GenerationState::Completed;
+                    branch.finish_reason = "stop_sequence".to_string();
+                } else if branch.generated >= branch.request.sampling.max_tokens as usize {
+                    branch.state = GenerationState::Completed;
+                    branch.finish_reason = "max_tokens".to_string();
+                } else {
+                    next_tokens.push((index, token));
                 }
             }
-            let token = if let Some(token) = branch.forced_tokens.pop_front() {
-                branch.sampler.accept(token);
-                token
-            } else {
-                branch.sampler.sample(context, branch.logit_index)
-            };
-            let terminal = model.is_eog_token(token);
-            supervision.record_runtime_sample(
-                index,
-                branch.generated_token_ids.len(),
-                token.0,
-                terminal,
-            );
-            if terminal {
-                branch.state = GenerationState::Completed;
-                branch.finish_reason = "end_of_generation".to_string();
-                branch.terminal_sampled_token_id = Some(token.0);
-                continue;
+            if next_tokens.is_empty() {
+                break;
             }
-            branch.generated_token_ids.push(token.0);
-            let bytes = generated_token_piece(model, token).map_err(|error| {
-                NativeError::new(
-                    NativeErrorCode::DecodeFailed,
-                    format!("failed to decode generated token: {error}"),
-                )
+            let mut batch = LlamaBatch::new(next_tokens.len(), 1);
+            for (logit_index, (branch_index, token)) in next_tokens.iter().enumerate() {
+                let branch = &mut branches[*branch_index];
+                batch
+                    .add(*token, branch.next_position, &[branch.sequence_id], true)
+                    .map_err(|error| {
+                        native_decode_error("failed to build multimodal generation batch", error)
+                    })?;
+                branch.logit_index = logit_index as i32;
+                branch.next_position += 1;
+                tracking
+                    .token_counts
+                    .insert(branch.sequence_id, branch.next_position as usize);
+                tracking
+                    .token_ids
+                    .entry(branch.sequence_id)
+                    .or_default()
+                    .push(token.0);
+            }
+            context.decode(&mut batch).map_err(|error| {
+                native_decode_error("failed to decode multimodal generation batch", error)
             })?;
-            if let Some(trace) = &mut branch.token_piece_trace {
-                trace.push_piece(&bytes)?;
-            }
-            let piece = decode_generated_utf8_piece(&mut branch.decoder, &bytes, false)?;
-            if branch.first_token_ms.is_none() {
-                branch.first_token_ms = Some(started.elapsed().as_millis());
-            }
-            append_generated_utf8_piece(&mut branch.text, &piece)?;
-            branch.generated += 1;
-            if !piece.is_empty() {
-                supervision.emit(GenerationEvent {
-                    request_id: request.request_id.clone(),
-                    branch_id: branch.request.branch_id.clone(),
-                    sequence_id: branch.sequence_id,
-                    input_index: index,
-                    event_index: branch.event_index,
-                    event: GenerationEventKind::Delta { text: piece },
-                });
-                branch.event_index += 1;
-            }
-            if apply_stop_sequences(&mut branch.text, &branch.request.sampling.stop) {
-                branch.state = GenerationState::Completed;
-                branch.finish_reason = "stop_sequence".to_string();
-            } else if branch.generated >= branch.request.sampling.max_tokens as usize {
-                branch.state = GenerationState::Completed;
-                branch.finish_reason = "max_tokens".to_string();
-            } else {
-                next_tokens.push((index, token));
-            }
         }
-        if next_tokens.is_empty() {
-            break;
-        }
-        let mut batch = LlamaBatch::new(next_tokens.len(), 1);
-        for (logit_index, (branch_index, token)) in next_tokens.iter().enumerate() {
-            let branch = &mut branches[*branch_index];
-            batch
-                .add(*token, branch.next_position, &[branch.sequence_id], true)
-                .map_err(|error| {
-                    native_decode_error("failed to build multimodal generation batch", error)
-                })?;
-            branch.logit_index = logit_index as i32;
-            branch.next_position += 1;
-            tracking
-                .token_counts
-                .insert(branch.sequence_id, branch.next_position as usize);
-            tracking
-                .token_ids
-                .entry(branch.sequence_id)
-                .or_default()
-                .push(token.0);
-        }
-        context.decode(&mut batch).map_err(|error| {
-            native_decode_error("failed to decode multimodal generation batch", error)
-        })?;
     }
-
     for branch in &mut branches {
-        let piece = finalize_generated_text(
+        let piece = finalize_generated_text_once(
             &mut branch.decoder,
             &mut branch.text,
             branch.finish_reason == "stop_sequence",
+            &mut branch.decoder_finalized,
         )?;
         if !piece.is_empty() {
             supervision.emit(GenerationEvent {
@@ -4391,6 +4440,7 @@ fn generate_multimodal_batch(
             token_piece_traces.push(trace);
         }
         outputs.push(GenerationOutput {
+            first_word_choice: branch.first_word_choice,
             request_id: request.request_id.clone(),
             branch_id: branch.request.branch_id.clone(),
             input_index: branch.sequence_id as usize,
@@ -4496,6 +4546,7 @@ fn is_statically_sealable_generation_batch(
     admission: GenerationBatchAdmission,
 ) -> bool {
     admission == GenerationBatchAdmission::ExactBatch
+        && request.first_word_choices.is_none()
         && request.media.is_empty()
         && is_exact_token_generation_batch(request)
         && request
@@ -4880,6 +4931,22 @@ fn finalize_generated_text(
     if !stopped {
         append_generated_utf8_piece(text, &piece)?;
     }
+    Ok(piece)
+}
+
+/// Word admission may finish UTF-8 at EOG before the common terminal-event
+/// path runs. encoding_rs forbids reusing a finished decoder, even with no bytes.
+fn finalize_generated_text_once(
+    decoder: &mut encoding_rs::Decoder,
+    text: &mut String,
+    stopped: bool,
+    finalized: &mut bool,
+) -> NativeResult<String> {
+    if *finalized {
+        return Ok(String::new());
+    }
+    let piece = finalize_generated_text(decoder, text, stopped)?;
+    *finalized = true;
     Ok(piece)
 }
 
@@ -5415,6 +5482,7 @@ fn generate_multimodal(
     emit_generation_state(supervision.event_tx, request, event_index, state);
     let duration_ms = started.elapsed().as_millis();
     Ok(GenerationOutput {
+        first_word_choice: None,
         request_id: request.request_id.clone(),
         branch_id: "assistant".to_string(),
         input_index: 0,
@@ -5449,6 +5517,7 @@ struct SequenceTracking<'a> {
 }
 
 struct BatchSequenceState<'a> {
+    first_word_choices: Option<FirstWordChoicePolicy>,
     fingerprint: &'a ModelFingerprint,
     tracking: SequenceTracking<'a>,
     resident: Option<(
@@ -5817,10 +5886,12 @@ fn emit_generation_state(
 }
 
 struct ActiveBranch<'a> {
+    first_word_choice: Option<FirstWordChoiceEvidence>,
     sequence_id: i32,
     request: &'a BranchRequest,
     sampler: LlamaSampler,
     decoder: encoding_rs::Decoder,
+    decoder_finalized: bool,
     text: String,
     generated_token_ids: Vec<i32>,
     token_piece_trace: Option<TokenPieceTrace>,
@@ -6441,6 +6512,29 @@ fn validate_generation_batch_request(
     request: &GenerationBatchRequest,
     status: &ResidentModelStatus,
 ) -> NativeResult<()> {
+    if request.first_word_choices.is_some() {
+        if request.cases.len() > FIRST_WORD_CHOICE_MAX_CASES
+            || request
+                .cases
+                .iter()
+                .any(|case| case.sampling.seed == u32::MAX)
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "distinct first-word batches require at most four cases and explicit deterministic seeds",
+            ));
+        }
+        if request
+            .cases
+            .iter()
+            .any(|case| case.cached_prefix.is_some())
+        {
+            return Err(NativeError::new(
+                NativeErrorCode::UnsupportedParameter,
+                "distinct first-word batches do not accept caller-supplied sequence state",
+            ));
+        }
+    }
     if request.model_id != status.model_id {
         return Err(NativeError::new(
             NativeErrorCode::ModelNotLoaded,
@@ -8118,6 +8212,7 @@ mod tests {
             ("case-b", vec![1, 2, 4], 18, "beta"),
         ];
         let request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "verified-request".to_string(),
             model_id: "model".to_string(),
             media: Vec::new(),
@@ -8144,6 +8239,7 @@ mod tests {
             .enumerate()
             .map(
                 |(index, (case_id, prompt_tokens, _, text))| GenerationOutput {
+                    first_word_choice: None,
                     request_id: request.request_id.clone(),
                     branch_id: (*case_id).to_string(),
                     input_index: index,
@@ -10115,6 +10211,7 @@ mod tests {
     #[test]
     fn generation_cases_validate_independent_sampling_and_identity() {
         let request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "request".to_string(),
             model_id: "model".to_string(),
             media: Vec::new(),
@@ -10132,12 +10229,41 @@ mod tests {
     }
 
     #[test]
+    fn first_word_policy_requires_explicit_seeds_and_cannot_claim_legacy_authority() {
+        let mut request = GenerationBatchRequest {
+            first_word_choices: Some(FirstWordChoicePolicy::DistinctV2),
+            request_id: "word-choices".to_string(),
+            model_id: "model".to_string(),
+            media: Vec::new(),
+            cases: vec![completion_case("first", 41), completion_case("second", 42)],
+        };
+        assert!(validate_generation_batch_request(&request, &test_status(4)).is_ok());
+        assert!(!is_statically_sealable_generation_batch(
+            &request,
+            GenerationBatchAdmission::ExactBatch
+        ));
+        request.cases[0].sampling.seed = u32::MAX;
+        assert_eq!(
+            validate_generation_batch_request(&request, &test_status(4))
+                .expect_err("random sentinel must fail")
+                .code,
+            NativeErrorCode::InvalidConfig
+        );
+        request.first_word_choices = None;
+        assert!(
+            validate_generation_batch_request(&request, &test_status(4)).is_ok(),
+            "ordinary independent behavior is unchanged"
+        );
+    }
+
+    #[test]
     fn exact_token_preflight_accounts_for_the_whole_batch_at_the_context_boundary() {
         let mut first = completion_case("first", 1);
         first.sampling.max_tokens = 6;
         let mut second = completion_case("second", 2);
         second.sampling.max_tokens = 6;
         let request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "request".to_string(),
             model_id: "model".to_string(),
             media: Vec::new(),
@@ -10147,6 +10273,7 @@ mod tests {
         assert_eq!(budget.required_cells(), 14);
         for case in &request.cases {
             let one_case = GenerationBatchRequest {
+                first_word_choices: None,
                 request_id: "single".to_string(),
                 model_id: request.model_id.clone(),
                 media: Vec::new(),
@@ -10192,6 +10319,7 @@ mod tests {
         };
         second.sampling.max_tokens = 3;
         let request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "request".to_string(),
             model_id: "model".to_string(),
             media: Vec::new(),
@@ -10256,6 +10384,7 @@ mod tests {
             ],
         };
         let request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "request".to_string(),
             model_id: "model".to_string(),
             media: Vec::new(),
@@ -10270,6 +10399,7 @@ mod tests {
     #[test]
     fn bounded_event_stream_reserves_one_terminal_for_every_case() {
         let request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "request".to_string(),
             model_id: "model".to_string(),
             media: Vec::new(),
@@ -10564,6 +10694,7 @@ mod tests {
             let mut tokens = state.token_ids.clone();
             tokens.push(42);
             GenerationBatchRequest {
+                first_word_choices: None,
                 request_id: id.into(),
                 model_id: config.model_id.clone(),
                 media: Vec::new(),
@@ -10748,6 +10879,7 @@ mod tests {
         let handle = owner.handle();
         let model_id = handle.status().model_id;
         let family = |request_id: &str, prompt: &str| GenerationBatchRequest {
+            first_word_choices: None,
             request_id: request_id.to_owned(),
             model_id: model_id.clone(),
             media: Vec::new(),
@@ -10883,6 +11015,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "native-real-multimodal-family".to_string(),
             model_id: status.model_id,
             media: vec![
@@ -11042,6 +11175,7 @@ mod tests {
         }
 
         let family_request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "native-raw-family".to_string(),
             model_id: descriptor.model_id.clone(),
             media: Vec::new(),
@@ -11163,6 +11297,7 @@ mod tests {
         }
 
         let default_seed_request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "native-default-seed-strict".to_string(),
             model_id: descriptor.model_id.clone(),
             media: Vec::new(),
@@ -11212,6 +11347,7 @@ mod tests {
             .find(|token_id| *token_id != exact_tokens[0])
             .expect("alternate text must contain a token distinct from the target prefix");
         let cache_source_request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "native-forged-cache-source".to_string(),
             model_id: descriptor.model_id.clone(),
             media: Vec::new(),
@@ -11242,6 +11378,7 @@ mod tests {
         forged_cache.token_ids = vec![exact_tokens[0]];
 
         let forged_request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "native-forged-cache-strict".to_string(),
             model_id: descriptor.model_id.clone(),
             media: Vec::new(),
@@ -11373,6 +11510,7 @@ mod tests {
         assert!(!prompt_tokens.is_empty());
 
         let request = GenerationBatchRequest {
+            first_word_choices: None,
             request_id: "native-real-strict-mixed-cancel".to_string(),
             model_id: status.model_id,
             media: Vec::new(),

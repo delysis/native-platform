@@ -287,6 +287,7 @@
     rejectVisualPresentation,
     resetCompletionDiscovery,
     resetCompletionSurface,
+    retireCompletionCandidates,
     setCompletionSchedule,
     setDismissedCompletionCandidates,
     settleCompletionNavigation,
@@ -790,8 +791,9 @@
     document?.summary.document_id, document?.summary.revision_id, document?.visible_blob_id,
     mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte, currentWriter?.model_id,
     contextEpoch, documentEpoch, completionController.intentEpoch, editVersion]);
+  // An ordinary ghost family is not a batch of distinct first-word choices.
   $: loompadFamilyIds = loompadActive && loompadReservoir?.key === loompadSnapshotKey
-    ? loompadReservoir.familyIds : undefined;
+    ? loompadReservoir.familyIds : loompadActive ? [] : undefined;
   let cancellingRunIds: string[] = [];
   let cancellationCommandByRun: Record<string, string> = {};
   let promotionArmedCandidateId: string | null = null;
@@ -1258,7 +1260,7 @@
     : mode === 'source'
       ? sourceFamilyEvaluation
       : null;
-  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, true);
+  $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, true, loompadActive);
   $: completionView = completionControllerView(
     completionController,
     completionContextKey,
@@ -5648,6 +5650,10 @@
     if (suggestionsChanging) return;
     const enabled = suggestionInteraction !== next || !suggestionsEnabled;
     if (shuttleEnabled) await setShuttleEnabled(false);
+    if (next === 'loompad' && suggestionInteraction !== next) {
+      completionController = retireCompletionCandidates(completionController);
+      loompadReservoir = null;
+    }
     suggestionInteraction = next;
     await setSuggestionsEnabled(enabled);
     if (enabled && next === 'loompad') {
@@ -5682,9 +5688,11 @@
         : sourceEditor?.acceptLoompadText(candidate.candidateId, candidate.presentationKey, text);
       if (accepted) {
         await tick();
-        // Keep admitted tails growing; refill only after a pause or exhaustion.
-        if (loompadActive) scheduleAutomaticSuggestions(editVersion,
-          activeSuggestionFamily.length ? 5_000 : 250, 'document_edit');
+        // Retained tails stay usable while a fresh family grows at this caret.
+        if (loompadActive) {
+          if (activeBranchCount > 0) void cancelActiveBranches();
+          scheduleAutomaticSuggestions(editVersion, 250, 'document_edit');
+        }
       }
     } finally { loompadAccepting = false; }
   }
@@ -7722,13 +7730,15 @@
   function reconcileVisibleCompletionController(
     contextKey: string,
     family: readonly InlineGhostSuggestion[],
-    forkAtCurrentCaret = false
+    forkAtCurrentCaret = false,
+    refillLoompad = false
   ): void {
     const reconciled = reconcileCompletionController(
       completionController,
       contextKey,
       family,
-      forkAtCurrentCaret
+      forkAtCurrentCaret,
+      refillLoompad
     );
     if (reconciled !== completionController) completionController = reconciled;
   }
@@ -8566,7 +8576,7 @@
         expectedVisibleBlobId: captured.visibleBlobId,
         cursorByte: captured.cursorByte,
         policy: captured.speculation
-          ? { kind: 'loompad_v1', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
+          ? { kind: 'loompad_v2', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
           : { kind: 'automatic_v2' }
       });
       if (installWeaveSnapshot(started, captured)) {
