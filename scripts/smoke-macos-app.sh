@@ -1196,6 +1196,10 @@ run_once() {
       return 1
     fi
     if [ -n "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
+      if ! foreground_loom_process "$ACTIVE_PID"; then
+        echo "the exact Loom process could not be foregrounded before changing suggestion policy" >&2
+        return 1
+      fi
       if ! RUN_1_AUTOCOMPLETE_OFF_EVIDENCE=$(set_loom_completion_toggle \
         "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"); then
         echo "could not establish autocomplete off before real-completion typing" >&2
@@ -1252,6 +1256,10 @@ run_once() {
         "$RUN_1_EDITOR_SENTINEL" "launch-1-live-stream-monitor" \
         "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"; then
         echo "could not initialize the pre-terminal WYSIWYG live-stream observer" >&2
+        return 1
+      fi
+      if ! foreground_loom_process "$ACTIVE_PID"; then
+        echo "the exact Loom process could not be foregrounded before enabling suggestions" >&2
         return 1
       fi
       if ! RUN_1_AUTOCOMPLETE_ENABLE_EVIDENCE=$(set_loom_completion_toggle \
