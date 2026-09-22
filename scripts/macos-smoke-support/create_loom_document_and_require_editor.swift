@@ -49,7 +49,14 @@ let beforeTitle = stringAttribute(window, kAXTitleAttribute as CFString)
 if let add = control(named: "Add") {
     _ = AXUIElementPerformAction(add, kAXPressAction as CFString)
 }
-guard let create = control(named: "New document") else {
+let createDeadline = Date().addingTimeInterval(5)
+var create: AXUIElement?
+repeat {
+    create = control(named: "New document")
+    if create != nil { break }
+    Thread.sleep(forTimeInterval: 0.05)
+} while Date() < createDeadline
+guard let create else {
     fputs("could not bind the new-document check to Loom's exact accessible window\n", stderr)
     exit(1)
 }
