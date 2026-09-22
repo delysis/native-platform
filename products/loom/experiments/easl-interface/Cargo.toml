@@ -6,6 +6,17 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["native-app"]
+native-app = []
+# Compiles the same library for offscreen/component tests; cannot launch run().
+review-only = []
+
+[[bin]]
+name = "loom-easl-interface"
+path = "src/main.rs"
+required-features = ["native-app"]
+
 [dependencies]
 easl = { path = "../../../../crates/services/easl/vendor/easl", features = ["window"] }
 loom-text-session = { path = "../../crates/loom-text-session" }

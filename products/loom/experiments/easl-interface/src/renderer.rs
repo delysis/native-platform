@@ -65,18 +65,21 @@ impl Renderer {
     }
     pub fn prepare_assets(&mut self) -> Result<(), easl_native_text::Error> {
         if self.icons.is_empty() {
-            let icons: Vec<String> = serde_json::from_str(TITLEBAR_ICONS)
-                .map_err(|_| easl_native_text::Error::InvalidGeometry)?;
-            let mut parsed = icons
+            let icons: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(TITLEBAR_ICONS)
+                    .map_err(|_| easl_native_text::Error::InvalidGeometry)?;
+            if icons.len() != crate::icon::KEYS.len() {
+                return Err(easl_native_text::Error::InvalidGeometry);
+            }
+            self.icons = crate::icon::KEYS
                 .iter()
-                .map(|svg| easl_native_text::VectorIcon::parse(svg))
+                .map(|key| {
+                    let svg = icons
+                        .get(*key)
+                        .ok_or(easl_native_text::Error::InvalidGeometry)?;
+                    easl_native_text::VectorIcon::parse(svg)
+                })
                 .collect::<Result<Vec<_>, _>>()?;
-            // The web reference delegates this affordance to the platform's
-            // select widget. A vector avoids font-dependent missing glyphs.
-            parsed.push(easl_native_text::VectorIcon::parse(
-                r#"<svg viewBox="0 0 24 24"><path d="M7 10L12 15L17 10"/></svg>"#,
-            )?);
-            self.icons = parsed;
         }
         Ok(())
     }
@@ -199,6 +202,9 @@ impl Renderer {
                             })
                             .unwrap_or_default(),
                         200..=247 => docs.pane_text(*id),
+                        514..=516 | 913..=915 => crate::chrome_state::unavailable_reason(*id - 512)
+                            .unwrap_or_default()
+                            .into(),
                         _ => String::new(),
                     };
                     label(

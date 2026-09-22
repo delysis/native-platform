@@ -46,7 +46,8 @@ impl App {
         };
         let scale = native.window.scale_factor();
         let scene = &self.scene;
-        let readonly = self.docs.transitioning() || self.docs.workspace.menu.is_some();
+        let add_open = self.add_menu.is_open();
+        let readonly = self.docs.transitioning() || self.docs.workspace.menu.is_some() || add_open;
         let docs = &mut self.docs;
         let system = &mut self.renderer.text;
         let next_id = &mut self.next_access_id;
@@ -58,7 +59,9 @@ impl App {
                 tree_id: TreeId::ROOT,
                 nodes: vec![],
                 tree: Some(Tree::new(NodeId(1))),
-                focus: if self.state[2] == 0. {
+                focus: if self.state[2] == 0.
+                    || self.focus.chrome == Some(crate::focus::Target::Window)
+                {
                     NodeId(1)
                 } else {
                     NodeId(9 + u64::from(crate::interface::id(self.state[2]).unwrap_or_default()))
@@ -73,9 +76,12 @@ impl App {
             );
             let mut menu = Node::new(Role::ListBox);
             menu.set_label("Pane");
+            let mut add_menu = Node::new(Role::Menu);
+            add_menu.set_label("Add");
             for control in &scene.controls {
                 let id = NodeId(1000 + u64::from(control.key));
                 let mut node = control_node(control, &docs.workspace, scale);
+                decorate_chrome(&mut node, control.key, self.state[0] > 0., add_open);
                 if control.input
                     && let Some(palette) = palette.as_mut()
                     && let Some(Draw::Input(view)) = scene
@@ -96,7 +102,9 @@ impl App {
                     update.focus = id;
                 }
                 let option = control.label_slot.filter(|slot| (240..248).contains(slot));
-                if let Some(slot) = option {
+                if (400..404).contains(&control.key) {
+                    add_menu.push_child(id);
+                } else if let Some(slot) = option {
                     let highlighted = (slot - 240) as usize == docs.workspace.menu_cursor();
                     node.set_selected(highlighted);
                     if highlighted {
@@ -111,6 +119,10 @@ impl App {
             if docs.workspace.menu.is_some() {
                 root.push_child(NodeId(40));
                 update.nodes.push((NodeId(40), menu));
+            }
+            if add_open {
+                root.push_child(NodeId(41));
+                update.nodes.push((NodeId(41), add_menu));
             }
             for draw in &scene.draws {
                 if let Draw::Editor(rect, style, _) = draw {
@@ -205,7 +217,7 @@ impl App {
                         return;
                     };
                     let id = u32::try_from(req.target_node.0 - 9).unwrap_or_default();
-                    if self.docs.workspace.menu.is_some() || !self.scene.draws.iter().any(|draw| {
+                    if self.add_menu.is_open() || self.docs.workspace.menu.is_some() || !self.scene.draws.iter().any(|draw| {
                         matches!(draw, Draw::Editor(_, style, _) if crate::interface::id(style[2]).ok() == Some(id))
                     }) {
                         return;
@@ -295,6 +307,8 @@ fn control_node(
         Role::ComboBox
     } else if option.is_some() {
         Role::ListBoxOption
+    } else if (400..404).contains(&control.key) {
+        Role::MenuItem
     } else {
         Role::Button
     });
@@ -322,9 +336,26 @@ fn control_node(
     } else {
         node.set_disabled();
     }
+    if !control.enabled
+        && let Some(reason) = crate::chrome_state::unavailable_reason(control.key)
+    {
+        node.set_description(reason);
+    }
     node.set_bounds(bounds(control.rect.0, scale));
     node
 }
+
+fn decorate_chrome(node: &mut Node, key: u32, outline_open: bool, add_open: bool) {
+    match key {
+        1 => node.set_expanded(outline_open),
+        2 => node.set_expanded(add_open),
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+#[path = "accessibility_tests.rs"]
+mod current_chrome_tests;
 
 #[cfg(test)]
 mod tests {

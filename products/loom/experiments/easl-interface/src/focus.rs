@@ -10,6 +10,8 @@ pub enum Target {
     Editor(u32),
     Control(u32),
     Divider(DividerId),
+    /// No editor authority; Tab/pointer input can choose a new visible target.
+    Window,
 }
 
 #[derive(Debug)]
@@ -84,15 +86,31 @@ impl Focus {
         }
     }
     pub fn reconcile(&mut self, scene: &Scene) -> bool {
-        if self
-            .chrome
-            .is_some_and(|target| !targets(scene).contains(&target))
-        {
-            self.record("reconcile missing target");
-            self.clear();
-            return true;
+        let Some(target) = self.chrome else {
+            return false;
+        };
+        let present = match target {
+            Target::Control(key) => scene.controls.iter().any(|control| control.key == key),
+            Target::Divider(id) => scene.dividers.iter().any(|divider| divider.id == id),
+            Target::Editor(id) => scene.draws.iter().any(|draw| {
+                matches!(draw, Draw::Editor(_, style, _) if crate::interface::id(style[2]).ok() == Some(id))
+            }),
+            Target::Window => true,
+        };
+        if present {
+            // Becoming disabled removes a control from traversal, not from its
+            // focus lease. Ordinary typing must still not reach the manuscript.
+            return false;
         }
-        false
+        self.record("reconcile missing target");
+        self.chrome = Some(
+            targets(scene)
+                .into_iter()
+                .find(|target| matches!(target, Target::Control(_)))
+                .unwrap_or(Target::Window),
+        );
+        self.visible = true;
+        true
     }
 }
 
@@ -104,16 +122,40 @@ pub fn contains(rect: Rect, point: [f32; 2]) -> bool {
 /// Current Loom's document order: titlebar, outline, main, right, bottom. Stable
 /// view/control IDs keep focus attached when labels and sibling controls change.
 pub fn targets(scene: &Scene) -> Vec<Target> {
+    if scene
+        .controls
+        .iter()
+        .any(|control| (400..404).contains(&control.key))
+    {
+        return scene
+            .controls
+            .iter()
+            .filter(|control| control.enabled && (400..404).contains(&control.key))
+            .map(|control| Target::Control(control.key))
+            .collect();
+    }
     let right = scene
         .dividers
         .iter()
         .find(|d| d.id == DividerId::Right)
-        .map(|d| d.rect.0[0]);
+        .map(|d| d.rect.0[0])
+        .or_else(|| {
+            scene.draws.iter().find_map(|draw| match draw {
+                Draw::Slot(rect, _, 201) => Some(rect.0[0]),
+                _ => None,
+            })
+        });
     let bottom = scene
         .dividers
         .iter()
         .find(|d| d.id == DividerId::Bottom)
-        .map(|d| d.rect.0[1]);
+        .map(|d| d.rect.0[1])
+        .or_else(|| {
+            scene.draws.iter().find_map(|draw| match draw {
+                Draw::Slot(rect, _, 202) => Some(rect.0[1]),
+                _ => None,
+            })
+        });
     let mut entries = Vec::new();
     for control in scene.controls.iter().filter(|control| control.enabled) {
         let lane = match control.key {
@@ -186,7 +228,7 @@ impl crate::App {
             .find(|control| control.enabled && contains(control.rect, self.pointer))
         {
             self.focus_target(Target::Control(control.key), false);
-        } else if self.docs.workspace.menu.is_none() {
+        } else if self.docs.workspace.menu.is_none() && !self.add_menu.is_open() {
             self.clear_chrome_focus();
         }
     }
@@ -327,12 +369,13 @@ mod tests {
         let scene = ui.step(input).unwrap();
         let order = targets(&scene);
         assert_eq!(
-            &order[..4],
+            &order[..5],
             &[
                 Target::Control(1),
                 Target::Control(2),
                 Target::Control(211),
-                Target::Control(212)
+                Target::Control(212),
+                Target::Control(210),
             ]
         );
         assert!(order.contains(&Target::Control(100)));
@@ -419,7 +462,7 @@ mod tests {
         }
         focus.chrome = Some(Target::Control(100));
         assert!(focus.reconcile(&after));
-        assert!(focus.chrome.is_none());
+        assert_eq!(focus.control(), Some(1));
     }
 
     #[test]
@@ -427,10 +470,18 @@ mod tests {
         let (mut ui, input) = scene();
         assert!(ui.step(input).is_ok());
         let duplicate = SOURCE.replace(
-            "(control new-button (if overlay 0. 1.) 2.)",
-            "(control new-button (if overlay 0. 1.) 1.)",
+            "(control new-button can-add 2.)",
+            "(control new-button can-add 1.)",
         );
-        assert!(Interface::compile(&duplicate).unwrap().step(input).is_err());
+        assert_ne!(
+            duplicate, SOURCE,
+            "negative-control anchor must actually change"
+        );
+        let error = Interface::compile(&duplicate)
+            .unwrap()
+            .step(input)
+            .unwrap_err();
+        assert!(error.contains("duplicate control identity"), "{error}");
     }
 
     #[test]

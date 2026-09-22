@@ -129,9 +129,12 @@ impl Workspace {
             .unwrap_or(0)
     }
     pub fn toggle(&mut self, project: &ProjectInfo, position: usize) -> Result<(), String> {
-        if position == 0 || self.pane(project, position).is_none() {
+        if position >= POSITIONS.len() || (position != 0 && self.pane(project, position).is_none())
+        {
             return Err("Unknown pane".into());
         }
+        // Visibility never owns an editor, a selection, an undo stack or a run.
+        // The default manuscript is a main pane even without a configuration.
         self.hidden[position] = !self.hidden[position];
         self.menu = None;
         Ok(())
@@ -208,6 +211,7 @@ impl Workspace {
         input[40] = f32::from(self.view_id(project, 1));
         input[41] = f32::from(self.view_id(project, 2));
         input[42] = self.outline_width;
+        input[50] = f32::from(!self.visible(0));
     }
     pub fn open_target(
         &self,
@@ -234,7 +238,16 @@ impl Workspace {
         }
         let position = (slot % 10) as usize;
         let Some((id, pane)) = self.pane(project, position) else {
-            return String::new();
+            return if slot == 210 {
+                if self.visible(0) {
+                    "Collapse main pane"
+                } else {
+                    "Show main pane"
+                }
+                .into()
+            } else {
+                String::new()
+            };
         };
         let title = pane.title.as_deref().unwrap_or(id);
         match slot / 10 {
@@ -242,7 +255,7 @@ impl Workspace {
             21 => format!(
                 "{} {title}",
                 if self.visible(position) {
-                    "Hide"
+                    "Collapse"
                 } else {
                     "Show"
                 }
@@ -424,7 +437,7 @@ document = "@document"
         assert!(
             open.controls
                 .iter()
-                .find(|c| c.label == "New document")
+                .find(|c| c.label == "Add")
                 .is_some_and(|c| !c.enabled)
         );
         docs.workspace.menu_key(&docs.project, 14).unwrap();

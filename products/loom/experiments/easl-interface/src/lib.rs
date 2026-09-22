@@ -1,19 +1,27 @@
 #![forbid(unsafe_code)]
 //! Experimental EASL-authored native Loom interface.
 mod accessibility;
+mod actions;
+mod chrome;
+mod chrome_state;
 #[cfg(target_os = "macos")]
 mod companion;
+#[cfg(test)]
+mod current_ui_tests;
 mod document;
 mod focus;
 mod formatting;
+mod icon;
 mod input_field;
 mod interface;
 mod keyboard;
 mod pane_divider;
 mod renderer;
 mod text_field;
+mod theme;
 mod workspace;
 
+use actions::Action;
 use document::Documents;
 use easl_native_text::EditCommand;
 use interface::{Draw, Interface, Scene};
@@ -79,6 +87,7 @@ struct App {
     modifiers: ModifiersState,
     text: String,
     key: u32,
+    repeat_guard: chrome_state::RepeatGuard<winit::keyboard::PhysicalKey>,
     scroll: f32,
     dragging: bool,
     divider: pane_divider::Interaction,
@@ -88,6 +97,7 @@ struct App {
     last_click: Option<(Instant, [f32; 2])>,
     clicks: u8,
     format_palette: Option<formatting::Palette>,
+    add_menu: chrome_state::AddMenu,
     zero_advance: f32,
 }
 impl App {
@@ -165,13 +175,27 @@ impl App {
         input[43] = self.focus.divider().map_or(0., |id| f32::from(id as u16));
         input[44] = self.focus.control().map_or(0., interface::small_number);
         input[45] = f32::from(self.focus.visible);
+        input[48] = f32::from(self.add_menu.is_open());
+        input[49] = f32::from(self.focus.chrome == Some(focus::Target::Window));
+        // 51 is Ghost until an actual native assistance service supplies the
+        // mode. A view projection does not grant model authority.
+        input[52] = f32::from(self.docs.transitioning());
+        input[53] = f32::from(!self.add_available());
+        let theme = &self.docs.project.settings.config.theme;
+        let (mask, colors) = theme::project([
+            theme.canvas.as_deref(),
+            theme.text.as_deref(),
+            theme.accent.as_deref(),
+        ]);
+        input[54] = f32::from(mask);
+        input[55..64].copy_from_slice(&colors);
         input
     }
     fn command(&self) -> bool {
         if cfg!(target_os = "macos") {
             self.modifiers.super_key()
         } else {
-            self.modifiers.control_key()
+            self.modifiers.control_key() && !self.modifiers.alt_key()
         }
     }
     fn error(&mut self, message: impl Into<String>) {
@@ -188,7 +212,16 @@ impl App {
             native.window.request_redraw();
         }
     }
+    fn step_scene(&mut self, event: u32) -> Result<Scene, String> {
+        let input = self.input(event);
+        let scene = self.ui.step(input)?;
+        actions::admit(event, &scene.actions)?;
+        Ok(scene)
+    }
     fn refresh_scene(&mut self, event: u32, loop_: &ActiveEventLoop) -> bool {
+        if self.add_menu.is_open() && !self.add_available() {
+            self.dismiss_add();
+        }
         self.reconcile_formatting();
         self.move_divider();
         let event = if self.divider.dragging() && event == 5 {
@@ -198,14 +231,18 @@ impl App {
         };
         let previous = self.scene.clone();
         let mut changed;
-        match self.ui.step(self.input(event)) {
+        match self.step_scene(event) {
             Ok(mut scene) => {
                 self.state = scene.state;
+                // The full batch was validated by step_scene before installing
+                // either presentation state or an externally visible command.
                 let actions = std::mem::take(&mut scene.actions);
                 self.scene = scene;
                 changed = !actions.is_empty();
-                for (action, arg) in actions {
-                    if let Err(error) = self.perform(action, arg, loop_) {
+                for (kind, argument) in actions {
+                    let action = Action::from_wire(kind, argument)
+                        .expect("step_scene admitted the complete batch");
+                    if let Err(error) = self.perform(action, loop_) {
                         self.error(error);
                     }
                 }
@@ -213,7 +250,7 @@ impl App {
                 // Reevaluate only when a host action may have changed the view's
                 // inputs. Hover/layout events already produced their final scene.
                 if changed {
-                    match self.ui.step(self.input(0)) {
+                    match self.step_scene(0) {
                         Ok(scene) => {
                             self.state = scene.state;
                             self.scene = scene;
@@ -227,9 +264,12 @@ impl App {
                 changed = true;
             }
         }
-        if self.docs.workspace.menu.is_none() && self.focus.reconcile(&self.scene) {
+        if self.docs.workspace.menu.is_none()
+            && !self.add_menu.is_open()
+            && self.focus.reconcile(&self.scene)
+        {
             self.divider.release();
-            match self.ui.step(self.input(0)) {
+            match self.step_scene(0) {
                 Ok(scene) => {
                     self.state = scene.state;
                     self.scene = scene;
@@ -275,6 +315,8 @@ impl App {
         };
         self.docs
             .begin_transition(destination, disposition, &mut self.renderer.text)?;
+        self.dismiss_add();
+        self.docs.workspace.menu = None;
         self.close_formatting();
         self.clear_chrome_focus();
         Ok(())
@@ -331,17 +373,33 @@ impl App {
         }
         Ok(())
     }
-    fn perform(&mut self, action: u32, arg: u32, _loop: &ActiveEventLoop) -> Result<(), String> {
-        if self.docs.transitioning() && !matches!(action, 3 | 9 | 13 | 15) {
+    fn perform(&mut self, action: Action, _loop: &ActiveEventLoop) -> Result<(), String> {
+        if self.docs.transitioning()
+            && !matches!(
+                action,
+                Action::Scroll(_) | Action::Reload | Action::Appearance(_) | Action::DragWindow
+            )
+        {
             return Ok(());
         }
+        if self.add_menu.is_open()
+            && !matches!(
+                action,
+                Action::AddMenu(_) | Action::AddNew | Action::Close | Action::Reload
+            )
+        {
+            return Err("The Add menu owns input until it closes".into());
+        }
+        let (kind, arg) = action.wire();
         match action {
-            1 if arg == 0 => {}
-            1 if self.focus.chrome.is_none() => self.edit(arg)?,
-            1 => {}
-            2 | 3 | 10 => self.pointer_edit(action, arg)?,
-            4 => self.docs.save(&mut self.renderer.text)?,
-            5 => {
+            Action::Edit(0) => {}
+            Action::Edit(_) if self.focus.chrome.is_none() => self.edit(arg)?,
+            Action::Edit(_) => {}
+            Action::Click(_) | Action::Scroll(_) | Action::Drag(_) => {
+                self.pointer_edit(kind, arg)?
+            }
+            Action::Save => self.docs.save(&mut self.renderer.text)?,
+            Action::OpenProject => {
                 let Some(native) = &self.native else {
                     return Ok(());
                 };
@@ -356,27 +414,33 @@ impl App {
                     self.transition(document::Destination::Project(path))?;
                 }
             }
-            6 => self.transition(document::Destination::NewDocument)?,
-            16 => self.open_auxiliary(arg)?,
-            17..=21 => self.pane_action(action, arg)?,
-            22 => self.begin_resize(arg)?,
-            23 => self.resize_key(arg),
-            24 => self.pointer_input(arg)?,
+            Action::NewDocument => self.transition(document::Destination::NewDocument)?,
+            Action::Auxiliary(_) => self.open_auxiliary(arg)?,
+            Action::TogglePane(_)
+            | Action::PaneMenu(_)
+            | Action::SelectPane(_)
+            | Action::OpenPane(_)
+            | Action::PaneKey(_) => self.pane_action(kind, arg)?,
+            Action::Resize(_) => self.begin_resize(arg)?,
+            Action::ResizeKey(_) => self.resize_key(arg),
+            Action::InputPointer(_) => self.pointer_input(arg)?,
+            Action::AddMenu(_) | Action::AddNew => self.add_action(kind, arg)?,
 
-            7 => self.transition(document::Destination::Close)?,
-            8 => {
+            Action::Close => self.transition(document::Destination::Close)?,
+            Action::SelectDocument(_) => {
                 if arg as usize != self.docs.selected {
                     self.transition(document::Destination::Document(arg as usize))?;
                 }
             }
-            9 => {
+            Action::Reload => {
                 let source = read_source(&self.ui_path)?;
                 let mut candidate = Interface::compile(&source)?;
-                candidate.step(self.input(0))?;
+                let scene = candidate.step(self.input(0))?;
+                actions::admit(0, &scene.actions)?;
                 self.ui = candidate;
                 self.docs.status = "Reloaded EASL interface · writing preserved".into();
             }
-            11 => {
+            Action::Source(_) => {
                 self.close_formatting();
                 let id = if arg == 0 {
                     interface::id(self.state[2])?
@@ -387,7 +451,7 @@ impl App {
                     .field(id, &mut self.renderer.text)?
                     .toggle_source(&mut self.renderer.text)?;
             }
-            12 => {
+            Action::Format(_) => {
                 if self.composing_field == Some(formatting::DESTINATION) {
                     return Ok(());
                 }
@@ -402,8 +466,8 @@ impl App {
                         .format(&mut self.renderer.text, arg)?;
                 }
             }
-            13 => self.set_appearance(arg)?,
-            14 => {
+            Action::Appearance(_) => self.set_appearance(arg)?,
+            Action::FormatMenu(_) => {
                 if arg == 0 {
                     self.close_formatting();
                 } else if self.focus.chrome.is_none() {
@@ -413,12 +477,11 @@ impl App {
                     self.focus_target(focus::Target::Control(300), true);
                 }
             }
-            15 => {
+            Action::DragWindow => {
                 if let Some(native) = &self.native {
                     native.window.drag_window().map_err(|e| e.to_string())?;
                 }
             }
-            _ => return Err(format!("Unsupported native action {action}")),
         }
         Ok(())
     }
@@ -530,6 +593,26 @@ impl App {
     }
     fn keyboard_input(&mut self, event: winit::event::KeyEvent, loop_: &ActiveEventLoop) {
         self.key = key_id(&event.logical_key);
+        let activation = (self.key == 2 || event.text.as_deref() == Some(" "))
+            && (self.add_menu.is_open()
+                || self.focus.control().is_some_and(|key| {
+                    self.scene
+                        .controls
+                        .iter()
+                        .any(|control| control.key == key && !control.input)
+                }));
+        let one_shot = chrome_state::one_shot(
+            self.key,
+            self.command(),
+            self.modifiers.shift_key(),
+            activation,
+        );
+        if self
+            .repeat_guard
+            .suppress(event.physical_key, event.repeat, one_shot)
+        {
+            return;
+        }
         self.focus.record(if self.command() {
             "command key"
         } else {
@@ -537,14 +620,14 @@ impl App {
         });
         // Keep recovery available even when a reloaded VM has faulted.
         if self.key == 15 {
-            if let Err(error) = self.perform(9, 0, loop_) {
+            if let Err(error) = self.perform(Action::Reload, loop_) {
                 self.error(error);
             }
             self.update(0, loop_);
             return;
         }
         self.text = event.text.map_or_else(String::new, |t| t.to_string());
-        if !self.chrome_key(loop_) {
+        if !self.add_key(loop_) && !self.chrome_key(loop_) {
             self.update(2, loop_);
         }
     }
@@ -553,7 +636,10 @@ impl App {
             self.input_ime(event, loop_);
             return;
         }
-        if self.docs.workspace.menu.is_some() || self.focus.chrome.is_some() || self.state[2] == 0.
+        if self.add_menu.is_open()
+            || self.docs.workspace.menu.is_some()
+            || self.focus.chrome.is_some()
+            || self.state[2] == 0.
         {
             return;
         }
@@ -738,7 +824,14 @@ impl ApplicationHandler<NativeEvent> for App {
             NativeEvent::StorageAvailable => self.storage_tick(loop_),
         }
     }
-    fn window_event(&mut self, loop_: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, loop_: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+        if self
+            .native
+            .as_ref()
+            .is_none_or(|native| native.window.id() != window_id)
+        {
+            return;
+        }
         if let Some(native) = &mut self.native {
             native.access.process_event(&native.window, &event);
         }
@@ -763,12 +856,19 @@ impl ApplicationHandler<NativeEvent> for App {
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::Focused(false) => {
+                self.dismiss_add();
+                let before = self.docs.workspace.menu.take();
+                self.focus.menu_changed(before, None);
                 self.focus.record("window blurred");
                 self.modifiers = ModifiersState::empty();
                 self.dragging = false;
                 self.divider.release();
+                self.update(0, loop_);
             }
-            WindowEvent::Focused(true) => self.focus.record("window focused"),
+            WindowEvent::Focused(true) => {
+                self.focus.record("window focused");
+                self.update(0, loop_);
+            }
             WindowEvent::ThemeChanged(theme) => {
                 self.preferences.system_dark = theme == Theme::Dark;
                 self.update(0, loop_);
@@ -822,6 +922,9 @@ impl ApplicationHandler<NativeEvent> for App {
                 self.update(3, loop_);
             }
             WindowEvent::Ime(event) => self.ime(event, loop_),
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
+                self.repeat_guard.release(&event.physical_key);
+            }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && self.composing_field.is_none() =>
             {
@@ -952,10 +1055,15 @@ fn options() -> Result<Options, String> {
     })
 }
 pub fn run() -> Result<(), String> {
+    // Keep the entire host type-checked in review builds, but exit before any
+    // options, project, event loop, dialog, webview or foreground window exists.
+    if cfg!(feature = "review-only") {
+        return Err("Review-only builds cannot launch the native application".into());
+    }
     if std::env::args_os().any(|arg| arg == "--build-info") {
         println!(
             "{}",
-            serde_json::json!({"package":"loom-easl-interface","source_commit":option_env!("EASL_BUILD_COMMIT").unwrap_or("unrecorded development build"),"interface_source":interface::SOURCE_PATH,"interface_reference":env!("LOOM_UI_REFERENCE"),"interface_reference_sha256":env!("LOOM_UI_REFERENCE_SHA256"),"native_text":"Parley 0.11.1 EASL fork + Vello CPU 0.2.0","companion_webview":"optional Wry 0.55.1 on macOS"})
+            serde_json::json!({"package":"loom-easl-interface","source_commit":option_env!("EASL_BUILD_COMMIT").unwrap_or("unrecorded development build"),"interface_source":interface::SOURCE_PATH,"interface_reference":env!("LOOM_UI_REFERENCE"),"interface_reference_sha256":env!("LOOM_UI_REFERENCE_SHA256"),"reference_manifest":serde_json::from_str::<serde_json::Value>(include_str!(concat!(env!("OUT_DIR"), "/loom_ui_reference.json"))).expect("build-generated reference manifest"),"native_text":"Parley 0.11.1 EASL fork + Vello CPU 0.2.0","companion_webview":"optional Wry 0.55.1 on macOS"})
         );
         return Ok(());
     }
@@ -1004,6 +1112,7 @@ pub fn run() -> Result<(), String> {
         modifiers: ModifiersState::empty(),
         text: String::new(),
         key: 0,
+        repeat_guard: chrome_state::RepeatGuard::default(),
         scroll: 0.,
         dragging: false,
         divider: pane_divider::Interaction::default(),
@@ -1016,8 +1125,38 @@ pub fn run() -> Result<(), String> {
         last_click: None,
         clicks: 0,
         format_palette: None,
+        add_menu: chrome_state::AddMenu::default(),
         zero_advance,
     };
     event_loop.run_app(&mut app).map_err(|e| e.to_string())?;
     app.startup_error.map_or(Ok(()), Err)
+}
+
+#[cfg(all(test, feature = "review-only"))]
+mod review_build_tests {
+    #[test]
+    fn public_entrypoint_refuses_to_open_an_application() {
+        assert_eq!(
+            super::run().unwrap_err(),
+            "Review-only builds cannot launch the native application"
+        );
+    }
+
+    #[test]
+    fn review_manifest_is_explicitly_unqualified_and_reports_expected_hash() {
+        let value: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("OUT_DIR"),
+            "/loom_ui_reference.json"
+        )))
+        .unwrap();
+        assert_eq!(value["qualification"], "unqualified-review-only");
+        assert_eq!(
+            value["expected_app_sha256"],
+            env!("LOOM_UI_EXPECTED_APP_SHA256")
+        );
+        assert_eq!(
+            value["icons"].as_object().unwrap().len(),
+            crate::icon::KEYS.len()
+        );
+    }
 }

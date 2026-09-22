@@ -198,6 +198,7 @@ impl crate::App {
             let input_focused = self.focus.control() == Some(crate::formatting::DESTINATION)
                 && self.format_palette.is_some();
             let ime_allowed = self.docs.workspace.menu.is_none()
+                && !self.add_menu.is_open()
                 && (input_focused || (self.focus.chrome.is_none() && self.state[2] != 0.))
                 && (self.composing_field != Some(crate::formatting::DESTINATION) || input_focused);
             if native.ime_allowed != ime_allowed {
@@ -267,7 +268,7 @@ mod tests {
                 click
                     .controls
                     .iter()
-                    .filter(|c| c.label == "New document" || c.label_slot == Some(201))
+                    .filter(|c| c.label == "Add" || c.label_slot == Some(201))
                     .all(|c| c.enabled)
             );
             input[2] = 5.;

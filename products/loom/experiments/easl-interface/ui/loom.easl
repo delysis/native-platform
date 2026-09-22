@@ -2,23 +2,37 @@
 ; The original interface is the specification. Do not invent replacement chrome.
 ; Icons are extracted from the original title-bar SVGs by build.rs.
 ; Input 24: active formatting mask. Inputs 46/47: Link/Remove enabled.
+; Inputs 48/49: Add open/neutral window focus; 50: main hidden; 51: suggestion mode (read-only).
+; Inputs 52/53: document transition/Add unavailable; 54: theme token presence mask.
+; Stable icon IDs resolve through src/icon.rs, not DOM position: outline=0, add=1,
+; record=2, ghost=3, loompad=4, right=5, bottom=6, selector=7, main=8.
 ; Input 21: measured Iowan "0" advance; 22: format menu; 23: native fullscreen.
 @external
-(var input: [48: f32] (zeroed-array))
-(defn chrome-focus []: bool (or (> (input 43u) 0.) (> (input 44u) 0.)))
+(var input: [64: f32] (zeroed-array))
+(defn chrome-focus []: bool (or (> (input 49u) 0.) (or (> (input 48u) 0.) (or (> (input 43u) 0.) (> (input 44u) 0.)))))
 (defn dark []: bool (> (input 19u) 0.))
-(defn paper []: vec4f (if (dark) (vec4f (/ 41. 255.) (/ 43. 255.) (/ 39. 255.) 1.) (vec4f (/ 251. 255.) (/ 249. 255.) (/ 244. 255.) 1.)))
-(defn wash []: vec4f (if (dark) (vec4f (/ 34. 255.) (/ 36. 255.) (/ 32. 255.) 1.) (vec4f (/ 244. 255.) (/ 240. 255.) (/ 232. 255.) 1.)))
-(defn chrome []: vec4f (if (dark) (vec4f (/ 45. 255.) (/ 46. 255.) (/ 45. 255.) 1.) (vec4f (/ 236. 255.) (/ 235. 255.) (/ 234. 255.) 1.)))
-(defn outline-paper []: vec4f (if (dark) (vec4f (/ 38. 255.) (/ 39. 255.) (/ 38. 255.) 1.) (vec4f (/ 241. 255.) (/ 240. 255.) (/ 238. 255.) 1.)))
-(defn line []: vec4f (if (dark) (vec4f (/ 69. 255.) (/ 71. 255.) (/ 65. 255.) 1.) (vec4f (/ 220. 255.) (/ 214. 255.) (/ 202. 255.) 1.)))
-(defn soft-line []: vec4f (if (dark) (vec4f (/ 59. 255.) (/ 61. 255.) (/ 56. 255.) 1.) (vec4f (/ 232. 255.) (/ 227. 255.) (/ 218. 255.) 1.)))
+; Inputs 54..63 project validated #RRGGBB tokens; geometry/mixes stay in EASL.
+(defn theme-present [bit: u32]: bool (!= (& (u32 (input 54u)) bit) 0u))
+(defn paper []: vec4f
+  (if (theme-present 1u) (vec4f (input 55u) (input 56u) (input 57u) 1.)
+    (if (dark) (vec4f (/ 32. 255.) (/ 32. 255.) (/ 32. 255.) 1.) (vec4f 1. 1. 1. 1.))))
 ; For labels, w selects a font role; for vector paint it is opacity.
-(defn ink [kind: f32]: vec4f (if (dark) (vec4f (/ 231. 255.) (/ 229. 255.) (/ 223. 255.) kind) (vec4f (/ 41. 255.) (/ 43. 255.) (/ 41. 255.) kind)))
-(defn muted [kind: f32]: vec4f (if (dark) (vec4f (/ 176. 255.) (/ 175. 255.) (/ 168. 255.) kind) (vec4f (/ 116. 255.) (/ 116. 255.) (/ 110. 255.) kind)))
-(defn moss []: vec4f (if (dark) (vec4f (/ 145. 255.) (/ 177. 255.) (/ 154. 255.) 0.) (vec4f (/ 82. 255.) (/ 109. 255.) (/ 91. 255.) 0.)))
-(defn hover []: vec4f (if (dark) (vec4f (/ 58. 255.) (/ 59. 255.) (/ 58. 255.) 1.) (vec4f (/ 222. 255.) (/ 221. 255.) (/ 219. 255.) 1.)))
-(defn selection []: vec4f (if (dark) (vec4f (/ 83. 255.) (/ 106. 255.) (/ 89. 255.) 1.) (vec4f (/ 203. 255.) (/ 217. 255.) (/ 205. 255.) 1.)))
+(defn ink [kind: f32]: vec4f
+  (if (theme-present 2u) (vec4f (input 58u) (input 59u) (input 60u) kind)
+    (let [c (if (dark) (/ 237. 255.) (/ 36. 255.))] (vec4f c c c kind))))
+(defn accent []: vec4f
+  (if (theme-present 4u) (vec4f (input 61u) (input 62u) (input 63u) 0.)
+    (let [c (if (dark) (/ 198. 255.) (/ 73. 255.))] (vec4f c c c 0.))))
+(defn wash []: vec4f (+ (* (paper) 0.95) (* (ink 1.) 0.05)))
+(defn chrome []: vec4f (+ (* (paper) 0.92) (* (ink 1.) 0.08)))
+(defn outline-paper []: vec4f (wash))
+(defn line []: vec4f (+ (* (paper) 0.78) (* (ink 1.) 0.22)))
+(defn soft-line []: vec4f (+ (* (paper) 0.88) (* (ink 1.) 0.12)))
+(defn muted [kind: f32]: vec4f
+  (let [c (+ (* (ink 1.) 0.74) (* (paper) 0.26))] (vec4f c.x c.y c.z kind)))
+(defn hover []: vec4f (+ (* (paper) 0.85) (* (ink 1.) 0.15)))
+(defn selection []: vec4f
+  (let [c (accent)] (+ (* (vec4f c.x c.y c.z 1.) 0.25) (* (paper) 0.75))))
 (defn rect [box: vec4f color: vec4f] (print "rect") (print box) (print color))
 (defn round [box: vec4f color: vec4f radius: f32] (print "round") (print box) (print color) (print (vec4f radius 0. 0. 0.)))
 (defn label [box: vec4f color: vec4f] (print "text") (print box) (print color))
@@ -31,7 +45,7 @@
 ; control must be followed by the original accessible label; it paints no text.
 (defn focus-ring [box: vec4f identity: f32]
   (when (and (== (input 44u) identity) (> (input 45u) 0.))
-    (let [c (moss) color (vec4f c.x c.y c.z 0.72)]
+    (let [c (accent) color (vec4f c.x c.y c.z 0.72)]
       (rect (vec4f (- box.x 5.) (- box.y 5.) (+ box.z 10.) 3.) color)
       (rect (vec4f (- box.x 5.) (+ (+ box.y box.w) 2.) (+ box.z 10.) 3.) color)
       (rect (vec4f (- box.x 5.) (- box.y 2.) 3. (+ box.w 4.)) color)
@@ -41,11 +55,19 @@
   (print "control") (print box) (print (vec4f enabled 0. identity 0.)))
 (defn icon [box: vec4f identity: f32 stroke: f32 filled: f32 opacity: f32]
   (print "icon") (print (vec4f (+ box.x (* 0.5 (- box.z 15.))) (+ box.y 4.5) 15. 15.))
-  (print (if (inside box) (ink opacity) (muted opacity))) (print (vec4f identity stroke filled 0.)))
+  (print (if (or (inside box) (and (== identity 0.) (> (input 8u) 0.))) (ink opacity) (muted opacity))) (print (vec4f identity stroke filled 0.)))
 (defn button [box: vec4f command: f32 argument: f32 enabled: f32]
   (when (> enabled 0.)
     (when (inside box) (round box (hover) 6.))
     (when (and (> command 0.) (clicked box)) (action command argument))))
+; Tooltip text is a native-owned reason slot, shared with accessibility.
+(defn disabled-help [box: vec4f y: f32 identity: f32]
+  (when (inside box)
+    (let [width (min 300. (- (input 0u) 16.))
+          x (max 8. (min box.x (- (- (input 0u) width) 8.)))]
+      (round (vec4f x y width 30.) (line) 6.)
+      (round (vec4f (+ x 1.) (+ y 1.) (- width 2.) 28.) (paper) 5.)
+      (slot (vec4f (+ x 8.) (+ y 8.) (- width 16.) 11.) (ink 0.) (+ 512. identity)))))
 ; app.css: --paper-deep = color-mix(in srgb, --paper 95%, --ink).
 (defn format-fill []: vec4f (+ (* (paper) 0.95) (* (ink 1.) 0.05)))
 (defn format-button [box: vec4f format: f32]
@@ -100,13 +122,19 @@
   (print (vec4f identity size minimum maximum)) (print (vec4f enabled 0. 0. 0.))
   (when (> enabled 0.)
     (when (or (inside box) (== (input 43u) identity))
-      (let [color (moss)] (rect box (vec4f color.x color.y color.z 0.35))))
+      (let [color (accent)] (rect box (vec4f color.x color.y color.z 0.35))))
     (when (clicked box) (action 22. identity))))
 
 ; Configured panes use native string slots; authored text never enters this VM.
 (defn named-control [box: vec4f enabled: f32 identity: f32]
   (focus-ring box identity)
   (print "control-slot") (print box) (print (vec4f enabled identity identity 0.)))
+(defn pane-toggle [box: vec4f pane-offset: f32 visible: bool enabled: f32 image: f32]
+  (button box 17. pane-offset enabled)
+  (focus-ring box (+ 210. pane-offset))
+  (print "toggle-slot") (print box)
+  (print (vec4f enabled (+ 210. pane-offset) (+ 210. pane-offset) (if visible 1. 0.)))
+  (icon box image 1.45 0. (if (> enabled 0.) 1. 0.45)))
 (defn pane-content [panel: vec4f pane-position: f32 binding: f32 field: f32 focus: f32 enabled: f32 blocked: bool]
   (let [header (vec4f panel.x panel.y panel.z 30.)
         content (vec4f (+ panel.x 12.) (+ panel.y 42.) (max 1. (- panel.z 24.)) (max 1. (- panel.w 42.)))
@@ -131,41 +159,46 @@
   (let [w (input 0u) h (input 1u) event (input 2u) key (input 5u) cmd (> (input 6u) 0.)
         @var side (input 8u) context (input 25u) @var focus (input 10u) text-size 19.
         leading (if (> (input 23u) 0.) 8. 76.)
+        outline-present (> (input 12u) 0.)
+        add-visible (== (input 52u) 0.) add-open (> (input 48u) 0.)
+        left-count (+ (if outline-present 1. 0.) (if add-visible 1. 0.))
+        left-width (max 0. (- (* left-count 29.) 5.))
         side-button (vec4f leading 2.5 24. 24.)
-        new-button (vec4f (+ leading 29.) 2.5 24. 24.)
-        right (- w 90.)
+        new-button (vec4f (+ leading (if outline-present 29. 0.)) 2.5 24. 24.)
         main-binding (input 26u) right-binding (input 27u) bottom-binding (input 28u)
+        main-visible (== (input 50u) 0.) main-configured (> (input 33u) 0.)
         right-present (> right-binding 0.) bottom-present (> bottom-binding 0.)
         right-visible (and right-present (> (input 29u) 0.))
         bottom-visible (and bottom-present (> (input 30u) 0.))
         right-field (if (> (input 40u) 0.) (input 40u) 3.)
         bottom-field (if (> (input 41u) 0.) (input 41u) 4.)
-        enabled (input 38u) pane-menu (input 31u)
-        pane-start (- right (* 29. (+ (if right-present 1. 0.) (if bottom-present 1. 0.))))
-        right-toggle (vec4f pane-start 2.5 24. 24.)
-        bottom-toggle (vec4f (- right 29.) 2.5 24. 24.)
-        microphone-box (vec4f right 2.5 24. 24.)
-        suggestion-group (vec4f (+ right 29.) 0.5 53. 28.)
-        suggestions-box (vec4f (+ right 31.) 2.5 24. 24.)
-        loompad-box (vec4f (+ right 56.) 2.5 24. 24.)
-        drag-box (vec4f (+ leading 53.) 0. (max 28. (- pane-start (+ leading 53.))) 29.)
-        format-box (vec4f right 2.5 0. 0.)
-        format-open (and (> (input 22u) 0.) (== (input 16u) 0.))
-        popup (vec4f (- (+ right 30.) 280.) 32. 280. 172.)]
-    (when (and (clicked side-button) (== pane-menu 0.)) (= side (- 1. side)))
+        enabled (input 38u) pane-menu (if add-open 0. (input 31u))
+        pane-count (+ 1. (+ (if right-present 1. 0.) (if bottom-present 1. 0.)))
+        pane-start (- (- w 61.) (* pane-count 29.))
+        main-toggle (vec4f (+ pane-start (if main-configured 0. (* (- pane-count 1.) 29.))) 2.5 24. 24.)
+        right-toggle (vec4f (+ pane-start (if main-configured 29. 0.)) 2.5 24. 24.)
+        bottom-toggle (vec4f (+ pane-start (* 29. (+ (if main-configured 1. 0.) (if right-present 1. 0.)))) 2.5 24. 24.)
+        microphone-box (vec4f (- w 61.) 2.5 24. 24.)
+        suggestions-box (vec4f (- w 32.) 2.5 24. 24.)
+        drag-box (vec4f (+ leading left-width) 0. (max 0. (- pane-start (+ leading left-width))) 29.)
+        format-box (vec4f (- w 61.) 2.5 0. 0.)
+        format-open (and (not add-open) (and (> (input 22u) 0.) (== (input 16u) 0.)))
+        popup (vec4f (max 8. (- w 288.)) 32. 280. 172.)
+        add-box (vec4f (max 8. (min (+ new-button.x 5.) (- w 178.))) 30. 170. 128.)]
+    (when (and outline-present (not add-open) (and (clicked side-button) (== pane-menu 0.))) (= side (- 1. side)))
     (when (== event 4.) (action 7. 0.))
     (when (and (== focus 2.) (or (== context 0.) right-visible)) (= focus 0.))
-    (when (and (== focus 1.) (> main-binding 1.)) (= focus 0.))
+    (when (and (== focus 1.) (or (not main-visible) (> main-binding 1.))) (= focus 0.))
     (when (and (>= focus 3.)
       (not (or (and right-visible (and (== right-binding 1.) (== focus right-field)))
                (and bottom-visible (and (== bottom-binding 1.) (== focus bottom-field)))))) (= focus 0.))
     (when (== focus 0.)
-      (if (<= main-binding 1.) (= focus 1.)
+      (if (and main-visible (<= main-binding 1.)) (= focus 1.)
         (if (and right-visible (== right-binding 1.)) (= focus right-field)
           (when (and bottom-visible (== bottom-binding 1.)) (= focus bottom-field)))))
     (when (and (== event 2.) (> pane-menu 0.)) (action 21. key))
-    (when (and (and (== event 2.) (== pane-menu 0.)) (and (> (input 43u) 0.) (not cmd))) (action 23. key))
-    (when (and (and (== event 2.) (== pane-menu 0.)) (or (not (chrome-focus)) cmd))
+    (when (and (not add-open) (and (== event 2.) (== pane-menu 0.)) (and (> (input 43u) 0.) (not cmd))) (action 23. key))
+    (when (and (not add-open) (and (== event 2.) (== pane-menu 0.)) (or (not (chrome-focus)) cmd))
       (when cmd
         (when (== key 21.) (action 4. 0.))
         (when (== key 22.) (action 5. 0.))
@@ -175,21 +208,24 @@
         (when (and (== key 26.) (not (chrome-focus))) (action 12. 5.))
         (when (and (== key 28.) (> (input 7u) 0.)) (action 11. 0.))
         (when (and (== key 29.) (> (input 7u) 0.)) (action 14. (- 1. (input 22u))))
-        (when (and (< key 21.) (not (chrome-focus))) (action 1. focus)))
+        (when (and (> focus 0.) (and (< key 21.) (not (chrome-focus)))) (action 1. focus)))
       (when (not cmd)
         (when (== key 15.) (action 9. 0.))
-        (when (!= key 15.) (action 1. focus))))
+        (when (and (> focus 0.) (!= key 15.)) (action 1. focus))))
     (when (and (== event 1.) format-open (not (inside popup)) (not (inside format-box))) (action 14. 0.))
     (let [outline-limit (max 150. (* w 0.35))
           sidebar (if (> side 0.) (min (if (> (input 42u) 0.) (input 42u) 220.) outline-limit) 0.)
           web (> (input 15u) 0.)
           side-present (or right-visible (and (not right-present) (or (> context 0.) web)))
-          right-limit (max 180. (- (- w sidebar) 200.))
+          right-limit (if (< (- w sidebar) 380.) (* (- w sidebar) 0.5) (max 180. (- (- w sidebar) 200.)))
           bottom-limit (max 100. (* (- h 30.) 0.6))
-          pane-width (if side-present (min (if (> (input 36u) 0.) (input 36u) 320.) right-limit) 0.)
-          bottom-height (if bottom-visible (min (if (> (input 37u) 0.) (input 37u) 240.) bottom-limit) 0.)
-          writing-width (- (- w sidebar) pane-width)
-          main-height (- (- h 30.) bottom-height)
+          pane-width (if side-present
+            (if main-visible (min (if (> (input 36u) 0.) (input 36u) 320.) right-limit) (- w sidebar)) 0.)
+          bottom-only (and bottom-visible (and (not main-visible) (not side-present)))
+          bottom-height (if bottom-visible
+            (if bottom-only (- h 30.) (min (if (> (input 37u) 0.) (input 37u) 240.) bottom-limit)) 0.)
+          writing-width (if main-visible (- (- w sidebar) pane-width) 0.)
+          main-height (if bottom-only 0. (- (- h 30.) bottom-height))
           main-panel (vec4f sidebar 30. writing-width main-height)
           right-panel (vec4f (- w pane-width) 30. pane-width main-height)
           right-native (vec4f right-panel.x right-panel.y right-panel.z (if (and web right-visible) (* main-height 0.5) main-height))
@@ -212,20 +248,20 @@
           outline-divider (vec4f (- sidebar 7.) 30. 7. (- h 30.))
           right-divider (vec4f right-panel.x right-panel.y 7. right-panel.w)
           bottom-divider (vec4f bottom-panel.x bottom-panel.y bottom-panel.z 7.)
-          overlay (or (> pane-menu 0.) (and format-open (inside popup)))
+          overlay (or add-open (or (> pane-menu 0.) (and format-open (inside popup))))
           divider-hit (or (and (> side 0.) (inside outline-divider))
-            (or (and side-present (inside right-divider)) (and bottom-visible (inside bottom-divider))))
+            (or (and main-visible (and side-present (inside right-divider))) (and (not bottom-only) (and bottom-visible (inside bottom-divider)))))
           covered (or overlay divider-hit)]
-      (when (and (clicked body) (and (<= main-binding 1.) (not covered))) (= focus 1.) (action 2. 1.))
+      (when (and main-visible (and (clicked body) (and (<= main-binding 1.) (not covered)))) (= focus 1.) (action 2. 1.))
       (when (and right-visible (and (== right-binding 1.) (and (clicked right-body) (not covered)))) (= focus right-field) (action 2. right-field))
       (when (and bottom-visible (and (== bottom-binding 1.) (and (clicked bottom-body) (not covered)))) (= focus bottom-field) (action 2. bottom-field))
       (when (and (not right-present) (and (> context 0.) (and (clicked notes) (not covered)))) (= focus 2.) (action 2. 2.))
       (when (and (== event 3.) (not covered))
-        (when (and (inside body) (<= main-binding 1.)) (action 3. 1.))
+        (when (and main-visible (and (inside body) (<= main-binding 1.))) (action 3. 1.))
         (when (and right-visible (and (== right-binding 1.) (inside right-body))) (action 3. right-field))
         (when (and bottom-visible (and (== bottom-binding 1.) (inside bottom-body))) (action 3. bottom-field))
         (when (and (not right-present) (and (> context 0.) (inside notes))) (action 3. 2.)))
-      (when (and (and (== event 5.) (not overlay)) (not (chrome-focus))) (action 10. focus))
+      (when (and (> focus 0.) (and (and (== event 5.) (not overlay)) (not (chrome-focus)))) (action 10. focus))
       (print "typography")
       (print (vec4f 1. text-size (* text-size 1.72) 400.))
       (print (vec4f 0. 0. 0. 0.))
@@ -267,13 +303,14 @@
         (for [i 0u (< i (u32 (min 16. (input 12u)))) (+= i 1u)]
           (let [row (vec4f 8. (+ 84. (* (f32 i) 52.)) (- sidebar 16.) 50.)]
             (when (or (== (f32 i) (input 13u)) (inside row)) (round row (paper) 8.))
-            (label (vec4f 17. (+ row.y 10.) 18. 16.) (moss)) (print "¶")
+            (label (vec4f 17. (+ row.y 10.) 18. 16.) (accent)) (print "¶")
             (slot (vec4f 44. (+ row.y 9.) (- sidebar 92.) 13.) (ink 4.) (+ 100. (f32 i)))
             (named-control row (if overlay 0. enabled) (+ 100. (f32 i)))
             (when (and (clicked row) (not covered)) (action 8. (f32 i))))))
-      (if (> main-binding 0.)
-        (pane-content main-panel 0. main-binding 1. focus (if overlay 0. enabled) divider-hit)
-        (editor body text-size (* text-size 1.72) 1. focus))
+      (when main-visible
+        (if (> main-binding 0.)
+          (pane-content main-panel 0. main-binding 1. focus (if overlay 0. enabled) divider-hit)
+          (editor body text-size (* text-size 1.72) 1. focus)))
       (when side-present
         (rect right-panel (paper))
         (when right-visible (pane-content right-native 1. right-binding right-field focus (if overlay 0. enabled) divider-hit))
@@ -288,31 +325,45 @@
         (rect (vec4f sidebar bottom-panel.y (- w sidebar) 1.) (line)))
       (when (> sidebar 0.)
         (divider outline-divider 1. sidebar 150. outline-limit (if overlay 0. enabled)))
-      (when side-present
-        (divider right-divider 2. pane-width 180. right-limit (if overlay 0. enabled)))
-      (when bottom-visible
+      (when (and main-visible side-present)
+        (divider right-divider 2. pane-width (min 180. right-limit) right-limit (if overlay 0. enabled)))
+      (when (and bottom-visible (not bottom-only))
         (divider bottom-divider 3. bottom-height 100. bottom-limit (if overlay 0. enabled)))
       (rect (vec4f 0. 0. w 30.) (chrome))
       (rect (vec4f 0. 29. w 1.) (soft-line))
-      (button side-button 0. 0. 1.)
-      (control side-button (if overlay 0. 1.) 1.) (if (> side 0.) (print "Close manuscript outline") (print "Open manuscript outline"))
-      (icon side-button 0. 1.45 0. 1.)
-      (button new-button 6. 0. (if overlay 0. 1.)) (control new-button (if overlay 0. 1.) 2.) (print "New document")
-      (icon new-button 1. 1.45 0. 1.)
+      (when outline-present
+        (when (> side 0.) (round side-button (wash) 6.))
+        (button side-button 0. 0. (if overlay 0. 1.))
+        (control side-button (if overlay 0. 1.) 1.)
+        (if (> side 0.) (print "Close manuscript outline") (print "Open manuscript outline"))
+        (icon side-button 0. 1.45 0. 1.))
+      (when add-visible
+        (let [can-add (if (or (> pane-menu 0.) (> (input 53u) 0.)) 0. 1.)]
+          (button new-button 25. (if add-open 0. 1.) can-add)
+          (control new-button can-add 2.) (print "Add")
+          (icon new-button 1. 1.45 0. (if (> can-add 0.) 1. 0.45))))
       (print "drag") (print drag-box)
       (when (and (clicked drag-box) (not covered)) (action 15. 0.))
-      (slot (vec4f drag-box.x 9. drag-box.z 12.) (ink 2.) 0.)
+      (when (> drag-box.z 0.)
+        (let [title-width (min drag-box.z (min (* w 0.52) 420.))]
+          (slot (vec4f (+ drag-box.x (* 0.5 (- drag-box.z title-width))) 9. title-width 12.) (ink 2.) 0.)))
+      (when main-configured
+        (pane-toggle main-toggle 0. main-visible (if overlay 0. enabled) 8.))
       (when right-present
-        (button right-toggle 17. 1. (if overlay 0. enabled))
-        (named-control right-toggle (if overlay 0. enabled) 211.) (icon right-toggle 5. 1.45 0. 1.))
+        (pane-toggle right-toggle 1. right-visible (if overlay 0. enabled) 5.))
       (when bottom-present
-        (button bottom-toggle 17. 2. (if overlay 0. enabled))
-        (named-control bottom-toggle (if overlay 0. enabled) 212.) (icon bottom-toggle 6. 1.45 0. 1.))
-      (control microphone-box 0. 3.) (print "Record audio") (icon microphone-box 2. 1.45 0. 0.45)
-      (round suggestion-group (line) 7.)
-      (round (vec4f (+ suggestion-group.x 1.) (+ suggestion-group.y 1.) 51. 26.) (chrome) 6.)
-      (control suggestions-box 0. 4.) (print "Ghost text") (icon suggestions-box 3. 1.2 1. 0.45)
-      (control loompad-box 0. 5.) (print "Loompad") (icon loompad-box 4. 1.45 0. 0.45)
+        (pane-toggle bottom-toggle 2. bottom-visible (if overlay 0. enabled) 6.))
+      (when (not main-configured)
+        (pane-toggle main-toggle 0. main-visible (if overlay 0. enabled) 8.))
+      (control microphone-box 0. 3.) (print "Record audio")
+      (icon microphone-box 2. 1.45 0. 0.45)
+      ; One mode control, not two disconnected toggles. Until real generation
+      ; admission is connected, neither a click nor an AX action can enable it.
+      (control suggestions-box 0. 4.)
+      (when (> (input 51u) 0.)
+        (print "Loompad") (icon suggestions-box 4. 1.45 0. 0.45))
+      (when (<= (input 51u) 0.)
+        (print "Ghost text") (icon suggestions-box 3. 1.2 1. 0.45))
       (when format-open
         (sans-role 30. 11. 400. 0.)
         (sans-role 31. 13. 400. 0.)
@@ -353,4 +404,31 @@
             (named-control row enabled (+ 240. (f32 i)))
             (slot (vec4f (+ row.x 8.) (+ row.y 9.) (max 1. (- row.z 16.)) 11.) (ink 0.) (+ 240. (f32 i)))))
         (when (and (== event 1.) (not (inside menu-box))) (action 18. 3.)))
+      (when add-open
+        (round add-box (line) 6.)
+        (round (vec4f (+ add-box.x 1.) (+ add-box.y 1.) (- add-box.z 2.) (- add-box.w 2.)) (paper) 5.)
+        (for [i 0u (< i 4u) (+= i 1u)]
+          (let [row (vec4f (+ add-box.x 4.) (+ (+ add-box.y 4.) (* (f32 i) 30.)) (- add-box.z 8.) 30.)
+                callable (if (and (== i 0u) (== (input 53u) 0.)) 1. 0.)
+                c (+ (* (ink 1.) 0.45) (* (paper) 0.55))]
+            (button row 26. (f32 i) callable)
+            (control row callable (+ 400. (f32 i)))
+            (if (== i 0u) (print "New document")
+              (if (== i 1u) (print "Add files…")
+                (if (== i 2u) (print "Open library…") (print "Connect sources…"))))
+            (label (vec4f (+ row.x 9.) (+ row.y 7.) (- row.z 18.) 16.)
+              (if (> callable 0.) (ink 0.) (vec4f c.x c.y c.z 0.)))
+            (if (== i 0u) (print "New document")
+              (if (== i 1u) (print "Add files…")
+                (if (== i 2u) (print "Open library…") (print "Connect sources…"))))))
+        (for [i 1u (< i 4u) (+= i 1u)]
+          (disabled-help
+            (vec4f (+ add-box.x 4.) (+ (+ add-box.y 4.) (* (f32 i) 30.)) (- add-box.z 8.) 30.)
+            (+ (+ add-box.y add-box.w) 5.) (+ 400. (f32 i))))
+        (when (and (== event 1.) (and (not (inside add-box)) (not (inside new-button))))
+          (action 25. 0.)))
+      (when (not add-open)
+        (when (and add-visible (> (input 53u) 0.)) (disabled-help new-button 34. 2.))
+        (disabled-help microphone-box 34. 3.)
+        (disabled-help suggestions-box 34. 4.))
       (print "state") (print (vec4f side context focus text-size)))))

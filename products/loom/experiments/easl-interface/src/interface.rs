@@ -16,7 +16,7 @@ use serde::Serialize;
 pub const SOURCE: &str = include_str!("../ui/loom.easl");
 pub const SOURCE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/ui/loom.easl");
 pub const MAX_SOURCE: usize = 64 * 1024;
-pub const INPUT_COUNT: usize = 48;
+pub const INPUT_COUNT: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 pub struct Rect(pub [f32; 4]);
@@ -343,23 +343,28 @@ fn decode(lines: &[String]) -> Result<Scene, String> {
                 validate_rect(Rect(a))?;
                 scene.draws.push(Draw::WebView(Rect(a)));
             }
-            "control" | "control-slot" => {
+            "control" | "control-slot" | "toggle-slot" => {
                 if scene.controls.len() >= 64 {
                     return Err("Too many controls".into());
                 }
                 let state = vec4(lines.next().ok_or("Missing control state")?)?;
-                let label_slot = if kind == "control-slot" {
+                let slot_toggle = kind == "toggle-slot";
+                let label_slot = if kind != "control" {
                     Some(id(state[1])?)
                 } else {
                     None
                 };
                 if label_slot
                     .is_some_and(|slot| !((100..116).contains(&slot) || (200..248).contains(&slot)))
+                    || (slot_toggle && !label_slot.is_some_and(|slot| (210..=212).contains(&slot)))
                 {
                     return Err("Unknown control label slot".into());
                 }
-                if ![0., 1.].contains(&state[3])
-                    || (state[3] > 0. && (label_slot.is_some() || ![0., 1.].contains(&state[1])))
+                if ![0., 1.].contains(&state[0])
+                    || ![0., 1.].contains(&state[3])
+                    || (!slot_toggle
+                        && state[3] > 0.
+                        && (label_slot.is_some() || ![0., 1.].contains(&state[1])))
                 {
                     return Err("Invalid control toggle state".into());
                 }
@@ -372,7 +377,11 @@ fn decode(lines: &[String]) -> Result<Scene, String> {
                         String::new()
                     },
                     enabled: state[0] > 0.,
-                    toggled: (state[3] > 0.).then_some(state[1] > 0.),
+                    toggled: if slot_toggle {
+                        Some(state[3] > 0.)
+                    } else {
+                        (state[3] > 0.).then_some(state[1] > 0.)
+                    },
                     input: false,
                     label_slot,
                 });
@@ -432,7 +441,7 @@ fn decode(lines: &[String]) -> Result<Scene, String> {
             "icon" => {
                 let color = vec4(lines.next().ok_or("Missing icon color")?)?;
                 let style = vec4(lines.next().ok_or("Missing icon style")?)?;
-                if id(style[0])? >= 8
+                if id(style[0])? as usize >= crate::icon::KEYS.len()
                     || !(0. ..=32.).contains(&style[1])
                     || ![0., 1.].contains(&style[2])
                 {
@@ -465,11 +474,18 @@ fn decode(lines: &[String]) -> Result<Scene, String> {
                 scene.typography.push((id(a[0])?, style));
             }
             "state" => {
+                if has_state {
+                    return Err("Duplicate interface state".into());
+                }
                 scene.state = a;
                 has_state = true;
             }
             "action" => {
-                scene.actions.push((id(a[0])?, id(a[1])?));
+                if a[2] != 0. || a[3] != 0. {
+                    return Err("Nonzero reserved action channels".into());
+                }
+                let action = crate::actions::Action::from_wire(id(a[0])?, id(a[1])?)?;
+                scene.actions.push(action.wire());
             }
             "rect" | "text" | "slot" | "editor" => {
                 let b = vec4(lines.next().ok_or("Missing style")?)?;
@@ -646,11 +662,7 @@ mod tests {
             i[3] = f32::from(x);
             assert_eq!(ui.step(i).unwrap(), baseline);
         }
-        let control = baseline
-            .controls
-            .iter()
-            .find(|c| c.label == "New document")
-            .unwrap();
+        let control = baseline.controls.iter().find(|c| c.label == "Add").unwrap();
         i[3] = control.rect.0[0] + 10.;
         i[4] = control.rect.0[1] + 10.;
         let hovered = ui.step(i).unwrap();
@@ -818,24 +830,32 @@ mod tests {
                 scene
                     .controls
                     .iter()
-                    .filter(|c| c.key < 300)
+                    .filter(|c| c.key < 300 && !(210..=212).contains(&c.key))
                     .all(|c| c.toggled.is_none())
             );
         }
-        for state in ["(1, 2, 300, 1)", "(1, 0, 300, 2)"] {
-            assert!(
-                decode(
-                    &[
-                        "control",
-                        "(0, 0, 20, 20)",
-                        state,
-                        "Body",
-                        "state",
-                        "(0, 0, 1, 19)"
-                    ]
-                    .map(str::to_owned)
-                )
-                .is_err()
+        let control = |state: &str| {
+            [
+                "control",
+                "(vec4f 0 0 20 20)",
+                state,
+                "Body",
+                "state",
+                "(vec4f 0 0 0 19)",
+            ]
+            .map(str::to_owned)
+        };
+        // The positive control proves that these fixtures reach toggle-state
+        // validation, not an unrelated vec4 parser or missing-editor failure.
+        assert!(decode(&control("(vec4f 1 0 300 1)")).is_ok());
+        for state in [
+            "(vec4f 1 2 300 1)",
+            "(vec4f 1 0 300 2)",
+            "(vec4f 2 0 300 1)",
+        ] {
+            assert_eq!(
+                decode(&control(state)).unwrap_err(),
+                "Invalid control toggle state"
             );
         }
     }
@@ -938,8 +958,11 @@ mod tests {
     #[test]
     fn rejects_bad_reload_and_bounded_infinite_execution() {
         assert!(Interface::compile("(").is_err());
-        let source = "@external (var input: [48: f32] (zeroed-array)) @cpu (defn main [] (print (input 0u)) (while true ()))";
-        let mut ui = Interface::compile(source).unwrap();
-        assert!(ui.step(input()).is_err());
+        let source = format!(
+            "@external (var input: [{INPUT_COUNT}: f32] (zeroed-array)) @cpu (defn main [] (print (input 0u)) (while true ()))"
+        );
+        let mut ui = Interface::compile(&source).unwrap();
+        let error = ui.step(input()).unwrap_err();
+        assert!(error.contains("instruction budget exhausted"), "{error}");
     }
 }
