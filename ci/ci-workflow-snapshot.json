@@ -35,6 +35,7 @@
     ],
     "macos_component_superset": [
       "release",
+      "native",
       "root",
       "mom",
       "attachment",

@@ -2,7 +2,8 @@
 //! No directory walking, new index, recursive references, or implicit media.
 use super::{
     MAX_CONTEXT_CHARS, MAX_HITS, MAX_QUERY_BYTES, MaterialEntry, MaterialEvidence, MaterialKind,
-    MaterialSearch, Result, digest, invalid, reference, retain_evidence, select_passages,
+    MaterialRetention, MaterialSearch, Result, digest, invalid, reference, retain_evidence,
+    select_passages,
 };
 use crate::document_bindings::FolderSnapshot;
 use loom_store::{ProjectStore, StoreError};
@@ -57,6 +58,7 @@ fn owner(folder: &FolderSnapshot) -> Result<MaterialEntry> {
         name: folder.prefix.trim_end_matches('/').into(),
         reference: reference(&folder.prefix)?,
         kind: MaterialKind::Folder,
+        retention: MaterialRetention::Ordinary,
         pinned: false,
         available: true,
         source_path: Some(folder.prefix.clone()),
@@ -149,6 +151,7 @@ pub(crate) fn search_folder(
                 complete: passage.complete,
                 warnings: vec!["A selected passage from registered writing, not the complete folder.".into()],
                 id: String::new(), reference: String::new(), material_id: material.id.clone(),
+                retention: material.retention,
                 title: member.title.clone(), text: text.into(), source_revision: folder.source_revision.clone(), text_sha256: digest(text.as_bytes()),
                 locator: json!({"kind":"document_revision", "project_id":folder.project_id, "document_id":member.document_id,
                     "revision_id":member.revision_id,"blob_id":loaded.blob_id,"artifact_id":loaded.artifact_id,"path":member.path,

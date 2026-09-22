@@ -439,6 +439,16 @@ test("Loom's required macOS lane runs the headless WebKit editor interactions", 
   assert.match(required, /^\s{6}- platform-macos$/m);
 });
 
+test("native macOS lane runs all native tests, separate doctests, and strict Clippy", () => {
+  const workflow = read(".github/workflows/ci-pr.yml");
+  const macos = workflow.match(/^  platform-macos:[\s\S]*?(?=^  dependency-graph:)/m)?.[0];
+  assert.ok(macos, "platform-macos job block is missing");
+  assert.match(macos, /matrix\.component == 'native'/);
+  assert.match(macos, /cargo-group\.mjs test native/);
+  assert.match(macos, /cargo test --locked --doc[\s\S]*llama-native-cache[\s\S]*llama-native-engine[\s\S]*llama-native-host[\s\S]*llama-native-types/);
+  assert.match(macos, /cargo-group\.mjs clippy native/);
+});
+
 test("stable macOS packaging adds only the real distribution gates", () => {
   const release = read(releaseScriptPath);
   assert.match(release, /candidate\|stable/);

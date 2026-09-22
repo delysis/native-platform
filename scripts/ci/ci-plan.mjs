@@ -265,6 +265,7 @@ function macosMatrixFor(selectedFlags) {
   const matrix = [];
   if (selectedFlags.platform_macos || selectedFlags.full) {
     matrix.push("release");
+    if (selectedFlags.native || selectedFlags.full) matrix.push("native");
     if (selectedFlags.root || selectedFlags.native || selectedFlags.gateway || selectedFlags.full) {
       matrix.push("root");
     }

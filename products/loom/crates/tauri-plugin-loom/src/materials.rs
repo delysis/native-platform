@@ -73,6 +73,16 @@ pub(crate) enum MaterialKind {
     Folder,
 }
 
+/// Storage promise attached to every serialized material and evidence record.
+/// Loom currently owns a Unix-permission boundary, not encrypted retention.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MaterialRetention {
+    #[default]
+    Ordinary,
+    Protected,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MaterialEntry {
@@ -80,6 +90,8 @@ pub(crate) struct MaterialEntry {
     pub(crate) name: String,
     pub(crate) reference: String,
     pub(crate) kind: MaterialKind,
+    #[serde(default)]
+    pub(crate) retention: MaterialRetention,
     pub(crate) pinned: bool,
     pub(crate) available: bool,
     pub(crate) source_path: Option<String>,
@@ -95,6 +107,8 @@ struct Binding {
     name: String,
     pinned: bool,
     source: Source,
+    #[serde(default)]
+    retention: MaterialRetention,
     #[serde(default)]
     workspace_path: Option<String>,
 }
@@ -119,6 +133,8 @@ pub(crate) struct MaterialEvidence {
     pub(crate) id: String,
     pub(crate) reference: String,
     pub(crate) material_id: String,
+    #[serde(default)]
+    pub(crate) retention: MaterialRetention,
     pub(crate) title: String,
     pub(crate) text: String,
     pub(crate) source_revision: String,
@@ -218,6 +234,14 @@ fn grants() -> &'static Mutex<LibraryGrants> {
 fn invalid(message: impl Into<String>) -> MaterialError {
     MaterialError::Invalid(message.into())
 }
+fn require_supported_retention(retention: MaterialRetention) -> Result<()> {
+    match retention {
+        MaterialRetention::Ordinary => Ok(()),
+        MaterialRetention::Protected => Err(invalid(
+            "protected material retention requires an existing encrypted storage boundary",
+        )),
+    }
+}
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -265,6 +289,7 @@ fn entry(store: &ProjectStore, binding: &Binding) -> Result<MaterialEntry> {
         name: binding.name.clone(),
         reference: reference(&qualified(binding))?,
         kind,
+        retention: binding.retention,
         pinned: binding.pinned,
         available,
         source_path,
@@ -339,7 +364,7 @@ fn binding(store: &ProjectStore, id: &str) -> Result<Binding> {
         .ok_or_else(|| MaterialError::NotFound(id.into()))
 }
 fn save_binding(store: &ProjectStore, source: Source, name: &str) -> Result<Binding> {
-    save_binding_at_path(store, source, name, None)
+    save_binding_at_path(store, source, name, None, MaterialRetention::Ordinary)
 }
 
 fn binding_identity(source: &Source, workspace_path: Option<&str>) -> Result<String> {
@@ -369,7 +394,9 @@ fn save_binding_at_path(
     source: Source,
     name: &str,
     workspace_path: Option<&str>,
+    retention: MaterialRetention,
 ) -> Result<Binding> {
+    require_supported_retention(retention)?;
     validate_name(name)?;
     let _lock = WRITE_LOCK
         .lock()
@@ -387,6 +414,7 @@ fn save_binding_at_path(
         name: name.to_owned(),
         pinned: false,
         source,
+        retention,
         workspace_path: workspace_path.map(str::to_owned),
     };
     bindings.items.push(binding.clone());
@@ -398,13 +426,25 @@ pub(crate) fn bind_attachment(
     attachment_id: &str,
     name: Option<&str>,
 ) -> Result<MaterialEntry> {
+    bind_attachment_with_retention(store, attachment_id, name, MaterialRetention::Ordinary)
+}
+
+pub(crate) fn bind_attachment_with_retention(
+    store: &ProjectStore,
+    attachment_id: &str,
+    name: Option<&str>,
+    retention: MaterialRetention,
+) -> Result<MaterialEntry> {
+    require_supported_retention(retention)?;
     let source = context_attachments::describe_source(store.root(), attachment_id)?;
-    let binding = save_binding(
+    let binding = save_binding_at_path(
         store,
         Source::Attachment {
             attachment_id: attachment_id.into(),
         },
         name.unwrap_or(&source.file_name),
+        None,
+        retention,
     )?;
     entry(store, &binding)
 }
@@ -424,6 +464,7 @@ pub(crate) fn bind_workspace_attachment(
         },
         relative_path.rsplit('/').next().unwrap_or(relative_path),
         Some(relative_path),
+        MaterialRetention::Ordinary,
     )?;
     entry(store, &binding)
 }
@@ -605,6 +646,7 @@ pub(crate) fn read(store: &ProjectStore, id: &str) -> Result<MaterialRead> {
                     id: String::new(),
                     reference: String::new(),
                     material_id: id.into(),
+                    retention: material.retention,
                     title: material.name.clone(),
                     text_sha256: digest(text.as_bytes()),
                     text: text.clone(),
@@ -742,6 +784,7 @@ fn search_library(
                 id: String::new(),
                 reference: String::new(),
                 material_id: material.id.clone(),
+                retention: material.retention,
                 title: hit.title.clone(),
                 text_sha256: digest(text.as_bytes()),
                 text,
@@ -787,6 +830,7 @@ fn search_attachment(
             complete: presentation.coverage_complete && passage.complete,
             warnings: if passage.complete { presentation.warnings.clone() } else { vec!["This is a bounded passage from the source.".into()] },
             id: String::new(), reference: String::new(), material_id: material.id.clone(), title: material.name.clone(),
+            retention: material.retention,
             text: text.into(), text_sha256: digest(text.as_bytes()), source_revision: presentation.source_revision.clone(),
             locator: json!({"kind":"attachment_text", "attachment_id":attachment_id,"start_byte":passage.range.start,"end_byte":passage.range.end,
                 "pdf_pages":presentation.pdf_pages.iter().filter(|page| page.start_byte < passage.range.end && page.end_byte > passage.range.start).collect::<Vec<_>>() }), source_evidence: None,
@@ -897,6 +941,7 @@ fn retain_evidence(
     store: &ProjectStore,
     mut evidence: MaterialEvidence,
 ) -> Result<MaterialEvidence> {
+    require_supported_retention(evidence.retention)?;
     let bytes = evidence_payload(&evidence)?;
     if bytes.len() as u64 > MAX_EVIDENCE_BYTES {
         return Err(invalid("source evidence exceeds retained evidence limit"));
@@ -940,6 +985,7 @@ fn load_evidence(store: &ProjectStore, id: &str) -> Result<MaterialEvidence> {
         return Err(invalid("retained evidence identity mismatch"));
     }
     let mut evidence: MaterialEvidence = serde_json::from_slice(&bytes)?;
+    require_supported_retention(evidence.retention)?;
     if digest(evidence.text.as_bytes()) != evidence.text_sha256 {
         return Err(invalid("retained evidence text mismatch"));
     }
@@ -949,6 +995,8 @@ fn load_evidence(store: &ProjectStore, id: &str) -> Result<MaterialEvidence> {
 }
 
 fn storage(store: &ProjectStore) -> Result<PathBuf> {
+    loom_store::ensure_private_storage_supported()
+        .map_err(|error| invalid(format!("material storage is unsupported: {error}")))?;
     let root = store.root().join(".loom").join("materials");
     for path in [
         store.root().join(".loom"),
@@ -958,9 +1006,10 @@ fn storage(store: &ProjectStore) -> Result<PathBuf> {
         match fs::symlink_metadata(&path) {
             Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
             Ok(_) => return Err(invalid("material storage must be ordinary directories")),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&path)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_private_directory(&path)?,
             Err(e) => return Err(e.into()),
         }
+        harden_private_directory(&path)?;
     }
     Ok(root)
 }
@@ -999,6 +1048,7 @@ fn read_bindings(store: &ProjectStore) -> Result<Bindings> {
     }
     let mut ids = std::collections::BTreeSet::new();
     for binding in &bindings.items {
+        require_supported_retention(binding.retention)?;
         validate_name(&binding.name)?;
         if binding.id != binding_identity(&binding.source, binding.workspace_path.as_deref())?
             || !ids.insert(&binding.id)
@@ -1028,7 +1078,15 @@ fn write_bindings(store: &ProjectStore, bindings: &Bindings) -> Result<()> {
     {
         return Err(invalid("unsafe material bindings file"));
     }
-    let mut file = AtomicWriteFile::open(&path)?;
+    let options = AtomicWriteFile::options();
+    #[cfg(unix)]
+    let options = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut options = options;
+        options.mode(0o600);
+        options
+    };
+    let mut file = options.open(&path)?;
     file.write_all(&bytes)?;
     file.commit()?;
     Ok(())
@@ -1073,10 +1131,14 @@ fn install_evidence(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp = path.with_extension(format!("{}.{sequence}.tmp", std::process::id()));
     let mut created = false;
     let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp)?;
         created = true;
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -1101,6 +1163,27 @@ fn install_evidence(path: &Path, bytes: &[u8]) -> Result<()> {
     result
 }
 
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    let builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut builder = builder;
+        builder.mode(0o700);
+        builder
+    };
+    builder.create(path)
+}
+
+fn harden_private_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 // These integration fixtures require the supported private project store.
 #[cfg(all(test, unix))]
 mod tests {
@@ -1121,6 +1204,79 @@ mod tests {
         fs::write(&path, text).unwrap();
         let source = context_attachments::import_path(store.root(), &path).unwrap();
         bind_attachment(store, &source.id, Some(name)).unwrap()
+    }
+
+    #[test]
+    fn protected_retention_fails_before_plaintext_binding_or_evidence_publication() {
+        let (_temp, store) = project();
+        let source_path = store.root().join("protected-source.txt");
+        fs::write(&source_path, "protected sentinel").unwrap();
+        let attachment = context_attachments::import_path(store.root(), &source_path).unwrap();
+        let material_storage = store.root().join(".loom/materials");
+        assert!(!material_storage.exists());
+
+        let error = bind_attachment_with_retention(
+            &store,
+            &attachment.id,
+            Some("Protected"),
+            MaterialRetention::Protected,
+        )
+        .expect_err("plaintext material retention must fail closed");
+        assert!(error.to_string().contains("encrypted storage boundary"));
+        assert!(!material_storage.exists());
+
+        let error = retain_evidence(
+            &store,
+            MaterialEvidence {
+                complete: true,
+                warnings: Vec::new(),
+                id: String::new(),
+                reference: String::new(),
+                material_id: "material-protected".into(),
+                retention: MaterialRetention::Protected,
+                title: "Protected".into(),
+                text: "protected sentinel".into(),
+                source_revision: "revision".into(),
+                text_sha256: digest(b"protected sentinel"),
+                locator: json!({"kind":"test"}),
+                source_evidence: None,
+            },
+        )
+        .expect_err("protected evidence cannot enter plaintext retention");
+        assert!(error.to_string().contains("encrypted storage boundary"));
+        assert!(!material_storage.exists());
+    }
+
+    #[test]
+    fn ordinary_retention_is_serialized_under_private_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_temp, store) = project();
+        let entry = source(&store, "ordinary sentinel", "Ordinary");
+        assert_eq!(entry.retention, MaterialRetention::Ordinary);
+        let evidence = read(&store, &entry.id).unwrap().evidence.remove(0);
+        assert_eq!(evidence.retention, MaterialRetention::Ordinary);
+
+        let root = storage(&store).unwrap();
+        for directory in [&root, &root.join("evidence")] {
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        let bindings = root.join("bindings.json");
+        let evidence_path = root.join("evidence").join(format!("{}.json", evidence.id));
+        for file in [&bindings, &evidence_path] {
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            let value: Value = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+            assert!(
+                value.to_string().contains("ordinary"),
+                "serialized record must name its retention class"
+            );
+        }
     }
     #[cfg(unix)]
     #[test]
