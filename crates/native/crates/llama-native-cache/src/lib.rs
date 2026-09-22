@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+mod fingerprint;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheTier {
@@ -50,41 +52,6 @@ pub struct CacheFingerprint {
     pub device: String,
     pub rope_config_sha256: String,
     pub kv_layout_sha256: String,
-}
-
-impl CacheFingerprint {
-    #[must_use]
-    pub fn stable_id(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(format!("{:?}", self.prompt_form).as_bytes());
-        hasher.update([0]);
-        hasher.update(format!("{:?}", self.prompt_token_policy).as_bytes());
-        hasher.update([0]);
-        hasher.update(self.model_sha256.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.binding_version.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.build_id.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.tokenizer_sha256.as_bytes());
-        hasher.update([0]);
-        hasher.update(self.chat_template_sha256.as_bytes());
-        hasher.update([0]);
-        if let Some(projector) = &self.multimodal_projector_sha256 {
-            hasher.update(projector.as_bytes());
-        }
-        for adapter in &self.lora_adapters_sha256 {
-            hasher.update([0]);
-            hasher.update(adapter.as_bytes());
-        }
-        hasher.update(self.context_tokens.to_le_bytes());
-        hasher.update(self.batch_tokens.to_le_bytes());
-        hasher.update(self.max_sequences.to_le_bytes());
-        hasher.update(self.device.as_bytes());
-        hasher.update(self.rope_config_sha256.as_bytes());
-        hasher.update(self.kv_layout_sha256.as_bytes());
-        format!("{:x}", hasher.finalize())
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
