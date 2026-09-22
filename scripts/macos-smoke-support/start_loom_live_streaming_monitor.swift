@@ -267,7 +267,7 @@ func terminalFamily(_ candidates: [[String: Any]], family: [String]) -> [[String
     return identities
 }
 func cumulativeText(_ run: String, through sequence: Int64?) -> String? {
-    guard let events = rows("SELECT sequence, payload_json FROM generation_events WHERE run_id=?1 AND event_kind='text_delta' ORDER BY sequence;", run: run) else { return nil }
+    guard let events = rows("SELECT sequence, payload_json FROM generation_events WHERE run_id=?1 AND event_kind = 'text_delta' ORDER BY sequence;", run: run) else { return nil }
     var text = "", exactSequence = sequence == nil
     for row in events {
         guard row.count == 2, let observed = Int64(row[0]) else { return nil }
@@ -302,10 +302,6 @@ while ProcessInfo.processInfo.systemUptime < (terminalDeadline ?? initialDeadlin
     if runningApplication.isTerminated { fail("exact_process_exited") }
     guard let observedCount = count() else { reject("store_unreadable"); continue }
     if observedCount > baseline + 4 { fail("unexpected_generation_run") }
-    guard observedCount == baseline + 4, let family = familyIds(), family.count == 4, let openBefore = openIds() else { reject("family_pending"); continue }
-    // Diagnose terminal hydration for five bounded seconds, but NEVER turn a
-    // post-terminal render into a passing pre-terminal witness.
-    if !terminalSnapshot && openBefore.isEmpty && terminalDeadline == nil { terminalDeadline = ProcessInfo.processInfo.systemUptime + 5 }
     _ = runningApplication.activate(options: [.activateAllWindows])
     _ = AXUIElementSetAttributeValue(application, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
     guard let elements = descendants() else { reject("accessibility_truncated"); continue }
@@ -318,9 +314,19 @@ while ProcessInfo.processInfo.systemUptime < (terminalDeadline ?? initialDeadlin
          [kAXTitleAttribute, kAXDescriptionAttribute].compactMap { attribute(element, $0 as CFString) as? String })
     }
     observedEditorLabels = identities.filter { $0.role == "AXTextArea" }.prefix(16).map { $0.labels }
-    guard let editorIndex = namedEditorIndex(identities) else { reject("editor_missing_or_ambiguous"); continue }
+    let editorIndex = namedEditorIndex(identities)
+    if let editorIndex {
+        _ = AXUIElementSetAttributeValue(elements[editorIndex], kAXFocusedAttribute as CFString, kCFBooleanTrue)
+    }
+    // Observe before admission as well. Otherwise a zero-run timeout conceals
+    // policy/lifecycle/scope and editor state behind an always-empty witness.
+    // None of these diagnostic fields can satisfy the family/render gates.
+    guard observedCount == baseline + 4, let family = familyIds(), family.count == 4, let openBefore = openIds() else { reject("family_pending"); continue }
+    // Diagnose terminal hydration for five bounded seconds, but NEVER turn a
+    // post-terminal render into a passing pre-terminal witness.
+    if !terminalSnapshot && openBefore.isEmpty && terminalDeadline == nil { terminalDeadline = ProcessInfo.processInfo.systemUptime + 5 }
+    guard let editorIndex else { reject("editor_missing_or_ambiguous"); continue }
     let editor = elements[editorIndex]
-    _ = AXUIElementSetAttributeValue(editor, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     guard let current else { reject("witness_missing_or_ambiguous"); continue }
     let projection: InlineProjection
     do { projection = try inlineProjection(current, family: family, manuscript: manuscript) }

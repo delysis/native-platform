@@ -1355,6 +1355,26 @@
     session_cached: Boolean(boundCompletionSession),
     family_count: boundCompletionSession?.candidates.length ?? 0,
     family_phase: activeFamilyEvaluation?.phase ?? { kind: 'inactive' },
+    // Diagnostic state exists before a family. It never grants insertion or
+    // inference authority and is not a substitute for a rendered observation.
+    pre_admission: {
+      project_id: project?.project_id ?? '',
+      session_id: project?.session_id ?? '',
+      project_root: project?.root ?? '',
+      document_id: document?.summary.document_id ?? '',
+      revision_id: document?.summary.revision_id ?? '',
+      visible_blob_id: document?.visible_blob_id ?? '',
+      context_key: completionContextKey,
+      lifecycle: completionLifecycle,
+      generation_intent: completionController.generationIntent,
+      scheduled: completionController.scheduled?.kind ?? null,
+      edit_version: editVersion,
+      saved_version: savedVersion,
+      caret_byte: mode === 'visual' ? visualSelectionByte : sourceGhostTargetByte,
+      window_focused: windowFocused,
+      surface_visible: completionSurfaceVisible,
+      workspace_folder_count: visibleWorkspaceFolders.length
+    },
     candidates: boundCompletionSession?.candidates.map((candidate) => ({
       candidate_id: candidate.candidateId,
       presentation_key: candidate.presentationKey,
@@ -5608,6 +5628,16 @@
           // The backend gate remains authoritative if browser persistence is unavailable.
         }
       }
+      // Scheduling/model preparation read legacy reactive policy and writer
+      // projections. Let the acknowledged policy reach those projections first;
+      // otherwise a resident writer can lose its only explicit-enable schedule.
+      await tick();
+      if (
+        !componentMounted ||
+        !applicationAllowsModelPreparation(applicationClosePhase) ||
+        project?.project_id !== boundProject.project_id ||
+        project.session_id !== boundProject.session_id
+      ) return;
       if (!automationEnabled) {
         clearPreferredWriterRequest();
         scheduleActiveBranchPoll();

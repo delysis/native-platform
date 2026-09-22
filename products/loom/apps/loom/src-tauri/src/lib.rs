@@ -8,6 +8,7 @@ use loom_types::BuildModelPolicy;
 use tauri::menu::{
     AboutMetadata, HELP_SUBMENU_ID, Menu, MenuItem, PredefinedMenuItem, Submenu, WINDOW_SUBMENU_ID,
 };
+use tauri::utils::config::WindowConfig;
 use tauri::{AppHandle, Runtime};
 
 const EMBEDDED_BUILD_MODEL_POLICY: &[u8] =
@@ -42,6 +43,7 @@ pub fn run() {
         .with_build_model_policy(build_model_policy)
         .with_app_local_data_root(acceptance_app_local_data_root)
         .with_isolated_model_discovery(isolate_model_discovery);
+    let (context, acceptance_windows) = application_context(acceptance_data_store);
     tauri::Builder::default()
         // Tauri's stock macOS Quit item calls AppKit `terminate:` directly and
         // bypasses RunEvent::ExitRequested. Loom owns a regular Cmd+Q menu item
@@ -50,21 +52,44 @@ pub fn run() {
         .menu(build_desktop_menu)
         .plugin(tauri_plugin_dialog::init())
         .plugin(loom_plugin.build())
-        .run(application_context(acceptance_data_store))
+        .setup(move |app| {
+            if let Some(identifier) = acceptance_data_store {
+                for window in &acceptance_windows {
+                    // Tauri 2.11.5 drops this field in WebviewAttributes::from
+                    // WindowConfig. Use the explicit runtime builder setter.
+                    tauri::WebviewWindowBuilder::from_config(app, window)?
+                        .data_store_identifier(identifier)
+                        .build()?;
+                }
+            }
+            Ok(())
+        })
+        .run(context)
         .unwrap_or_else(|error| eprintln!("Loom could not start: {error}"));
 }
 
-// Native project isolation does not isolate WebKit localStorage. A stable custom
-// data store keeps each acceptance directory separate from the normal profile and
-// from other runs while still preserving preferences across the required relaunch.
-fn application_context(acceptance_data_store: Option<[u8; 16]>) -> tauri::Context<tauri::Wry> {
+// Native project storage and renderer storage are independent. Acceptance
+// defers only the automatically created windows, then creates them once in
+// setup with the explicit persistent-store setter. Normal startup is unchanged.
+fn application_context(
+    acceptance_data_store: Option<[u8; 16]>,
+) -> (tauri::Context<tauri::Wry>, Vec<WindowConfig>) {
     let mut context = tauri::generate_context!();
-    if let Some(identifier) = acceptance_data_store {
-        for window in &mut context.config_mut().app.windows {
-            window.data_store_identifier = Some(identifier);
-        }
+    let windows = if acceptance_data_store.is_some() {
+        defer_acceptance_windows(&mut context.config_mut().app.windows)
+    } else {
+        Vec::new()
+    };
+    (context, windows)
+}
+
+fn defer_acceptance_windows(windows: &mut [WindowConfig]) -> Vec<WindowConfig> {
+    let mut deferred = Vec::new();
+    for window in windows.iter_mut().filter(|window| window.create) {
+        deferred.push(window.clone());
+        window.create = false;
     }
-    context
+    deferred
 }
 
 fn acceptance_data_store_identifier(root: &Path) -> [u8; 16] {
@@ -358,38 +383,63 @@ mod tests {
         }
     }
 
+    // These tests exercise window ownership, not WebKit persistence. The
+    // native two-directory/relaunch check must verify actual stored values.
     #[test]
-    fn acceptance_context_requests_a_distinct_persistent_webview_store() {
+    fn acceptance_windows_are_deferred_once_without_changing_their_configuration() {
         let identifier = acceptance_data_store_identifier(Path::new("/tmp/loom-acceptance"));
-        let normal = application_context(None);
-        let isolated = application_context(Some(identifier));
-        let normal_windows = &normal.config().app.windows;
-        let isolated_windows = &isolated.config().app.windows;
+        let (normal, normal_deferred) = application_context(None);
+        let (isolated, deferred) = application_context(Some(identifier));
+        assert!(normal_deferred.is_empty());
+        let automatic: Vec<_> = normal
+            .config()
+            .app
+            .windows
+            .iter()
+            .filter(|window| window.create)
+            .collect();
+        assert!(!automatic.is_empty(), "the real app must create a window");
+        assert_eq!(automatic.len(), deferred.len());
         assert!(
-            !normal_windows.is_empty(),
-            "the real application must create a window"
+            isolated
+                .config()
+                .app
+                .windows
+                .iter()
+                .all(|window| !window.create)
         );
-        assert_eq!(normal_windows.len(), isolated_windows.len());
-        for (normal, isolated) in normal_windows.iter().zip(isolated_windows) {
-            assert!(
-                normal.data_store_identifier.is_none(),
-                "normal navigation must retain the default data store"
-            );
-            assert!(
-                !isolated.incognito,
-                "acceptance preferences must survive the required relaunch"
-            );
-            assert_eq!(isolated.data_store_identifier, Some(identifier));
-            assert_eq!(normal.label, isolated.label);
-            assert_eq!(normal.url, isolated.url);
-            assert_eq!(normal.title, isolated.title);
+        for (normal, deferred) in automatic.into_iter().zip(&deferred) {
+            assert!(deferred.create);
+            assert!(!deferred.incognito, "acceptance must preserve preferences");
+            assert_eq!(normal.label, deferred.label);
+            assert_eq!(normal.url, deferred.url);
+            assert_eq!(normal.title, deferred.title);
+            assert_eq!(normal.width.to_bits(), deferred.width.to_bits());
+            assert_eq!(normal.height.to_bits(), deferred.height.to_bits());
         }
     }
 
     #[test]
+    fn deferral_does_not_create_template_windows_or_duplicate_ownership() {
+        let mut windows = [
+            WindowConfig::default(),
+            WindowConfig {
+                label: "template".to_owned(),
+                create: false,
+                ..WindowConfig::default()
+            },
+        ];
+        let deferred = defer_acceptance_windows(&mut windows);
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].label, windows[0].label);
+        assert!(windows.iter().all(|window| !window.create));
+        assert!(defer_acceptance_windows(&mut windows).is_empty());
+    }
+
+    #[test]
     fn acceptance_context_preserves_application_identity() {
-        let normal = application_context(None);
-        let isolated = application_context(Some([7; 16]));
+        let (normal, _) = application_context(None);
+        let (isolated, _) = application_context(Some([7; 16]));
         assert_eq!(normal.config().identifier, isolated.config().identifier);
         assert_eq!(normal.config().product_name, isolated.config().product_name);
         assert_eq!(normal.package_info().name, isolated.package_info().name);

@@ -46,7 +46,11 @@ function completionWitness(): Record<string, any> {
 }
 function glyph(): string | null { return document.querySelector('.loom-visual-ghost')?.textContent ?? null; }
 
-it.each([false, true])('drives real App hydration without duplicate admission (unusable last partial: %s)', async (unusableLastPartial) => {
+it.each([
+  { unusableLastPartial: false, reenable: false },
+  { unusableLastPartial: true, reenable: false },
+  { unusableLastPartial: false, reenable: true }
+])('drives real App hydration and loaded-writer enable (unusable partial: $unusableLastPartial; re-enable: $reenable)', async ({ unusableLastPartial, reenable }) => {
   restoreStorage = Object.entries(localStorage); localStorage.clear();
   restoreNative = Object.getOwnPropertyDescriptor(window, '__TAURI_INTERNALS__');
   Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });
@@ -73,12 +77,13 @@ it.each([false, true])('drives real App hydration without duplicate admission (u
   const partials = texts.map((text, index) => unusableLastPartial && index === 3 ? ' ' : text);
   let admission: WeaveStarted | null = null;
   let populated = 0, terminal = false, admissions = 0, snapshotReads = 0, bodyReads = 0;
+  let expectedAdmissions = 1;
   let releaseBodies!: () => void;
   const bodiesReady = new Promise<void>(resolve => { releaseBodies = resolve; });
   const unexpected: string[] = [];
   function branches(): BranchCard[] {
     return (admission?.branches ?? []).map((branch, index) => terminal ? {
-      ...branch, status: 'ready', candidate_id: `candidate-${index}`, output_blob_id: hashes[index],
+      ...branch, status: 'ready', candidate_id: `${admissions === 1 ? 'candidate' : 'reenabled-candidate'}-${index}`, output_blob_id: hashes[index],
       output_byte_len: new TextEncoder().encode(texts[index]).byteLength
     } : { ...branch, status: 'generating' });
   }
@@ -122,7 +127,7 @@ it.each([false, true])('drives real App hydration without duplicate admission (u
         return admission ? { ...admission, branches: branches() } satisfies WeaveStarted : null;
       case 'plugin:loom|weave_start': {
         admissions += 1;
-        expect(admissions, 'no second native admission while this exact family is being used').toBe(1);
+        expect(admissions, 'only an explicit enable may replace this completed fixture family').toBe(expectedAdmissions);
         expect(args.sourceRevisionId).toBe(opened.summary.revision_id);
         expect(args.expectedVisibleBlobId).toBe(sourceBlob);
         expect(args.cursorByte).toBe(5);
@@ -132,7 +137,8 @@ it.each([false, true])('drives real App hydration without duplicate admission (u
           session_id: project.session_id, document_id: opened.summary.document_id, source_revision_id: 'revision-1',
           exact_prompt_blob_id: sourceBlob,
           branches: texts.map((_, index): BranchCard => ({
-            run_id: `run-${index}`, branch_id: `branch-${index}`, weave_command_id: args.commandId,
+            run_id: `${admissions === 1 ? 'run' : 'reenabled-run'}-${index}`,
+            branch_id: `${admissions === 1 ? 'branch' : 'reenabled-branch'}-${index}`, weave_command_id: args.commandId,
             document_id: opened.summary.document_id, candidate_id: null, source_revision_id: 'revision-1',
             target_start_byte: 5, target_end_byte: 5, text: '', output_blob_id: null, output_byte_len: null,
             status: 'queued', seed: String(index), model_id: model.model_id, selection: null,
@@ -145,7 +151,7 @@ it.each([false, true])('drives real App hydration without duplicate admission (u
         bodyReads += 1;
         await bodiesReady;
         const branch = branches().find(item => item.run_id === args.runId)!;
-        const index = Number(branch.run_id.split('-')[1]);
+        const index = Number(branch.run_id.split('-').at(-1));
         return {
           run_id: branch.run_id, branch_id: branch.branch_id, document_id: branch.document_id,
           candidate_id: branch.candidate_id!, source_revision_id: branch.source_revision_id,
@@ -162,7 +168,8 @@ it.each([false, true])('drives real App hydration without duplicate admission (u
     const envelope: DesktopGenerationEnvelope = {
       project_id: active.project_id, session_id: active.session_id, document_id: active.document_id,
       request_id: active.request_id, event: { event: 'generation', payload: {
-        event_id: `event-${populated}-${terminal}`, run_id: 'run-0', branch_id: 'branch-0', sequence: 7,
+        event_id: `event-${admissions}-${populated}-${terminal}`,
+        run_id: active.branches[0].run_id, branch_id: active.branches[0].branch_id, sequence: 7,
         kind: { kind: 'text_delta', text: 'wake only; snapshot owns projection' }, occurred_at_ms: 1
       } }
     };
@@ -213,5 +220,37 @@ it.each([false, true])('drives real App hydration without duplicate admission (u
     expect(admissions).toBe(1);
     expect(unexpected).toEqual([]); // Includes all hidden writes, extra work, and hosted fallback.
     expect(transport.invoke.mock.calls.some(([command]) => String(command).includes('checkpoint'))).toBe(false);
+    if (reenable) {
+      // Cold startup/model discovery may rescue a lost schedule. Toggle with the
+      // SAME already-loaded writer, no edit or model load to rescue this path.
+      const editor = page.getByRole('textbox', { name: 'Untitled, manuscript editor', exact: true }).element();
+      const toggle = () => editor.dispatchEvent(new KeyboardEvent('keydown', {
+        key: 'G', code: 'KeyG', metaKey: true, shiftKey: true, bubbles: true, cancelable: true
+      }));
+      toggle();
+      await expect.poll(() => completionWitness().autocomplete_enabled).toBe(false);
+      await expect.poll(() => completionWitness().session_cached).toBe(false);
+      expect(admissions).toBe(1);
+      expect(completionWitness().writer_id).toBe(model.model_id);
+      const disabledWitness = completionWitness();
+      expectedAdmissions = 2;
+      admission = null; populated = 0; terminal = false;
+      toggle();
+      await expect.poll(() => completionWitness().autocomplete_enabled).toBe(true);
+      await expect.poll(() => admissions, { timeout: 10000 }).toBe(2);
+      expect(disabledWitness.pre_admission?.scheduled).toBeNull();
+      expect(disabledWitness.pre_admission?.project_root).toBe(project.root);
+      expect(disabledWitness.pre_admission?.lifecycle?.reason).toBe('automation_disabled');
+      expect(completionWitness().writer_id).toBe(model.model_id);
+      populated = 4; wake();
+      await expect.poll(glyph).toBe(texts[0]);
+      await expect.poll(() => completionWitness().selected_presentation_key).toMatch(/^stream:reenabled-run-0:7/);
+      expect(completionWitness().candidates).toHaveLength(4);
+      terminal = true; wake();
+      await expect.poll(() => completionWitness().selected_presentation_key).toBe(`reenabled-candidate-0:${hashes[0]}`);
+      expect(glyph()).toBe(texts[0]);
+      expect(admissions).toBe(2);
+      expect(unexpected).toEqual([]); // Also rejects model-load, writes and hosted fallback.
+    }
   } finally { releaseBodies(); }
 }, 20000);

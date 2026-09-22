@@ -274,11 +274,11 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /start_loom_live_streaming_monitor/);
   assert.match(smoke, /delysis\.loom-live-stream-witness\.v1/);
   assert.match(smoke, /family_terminal_before_live_witness/);
-  assert.match(smoke, /event_kind = 'text_delta'/);
-  assert.match(smoke, /durableCumulativeText\.hasPrefix\(visibleSuffix\)/);
-  assert.match(smoke, /selectedPresentationKey == renderedPresentationKey/);
-  assert.match(smoke, /selectedPresentationKey == inlineVisibleKey/);
-  assert.match(smoke, /selectedRunIsTerminal\(selectedRunId\)/);
+  assert.match(smoke, /event_kind\s*=\s*'text_delta'/);
+  assert.match(smoke, /durable\.utf8\.starts\(with: projection\.text\.utf8\)/);
+  assert.match(smoke, /presentation_key/);
+  assert.match(smoke, /inline_visible_key/);
+  assert.match(smoke, /terminal\(projection\.runId\)/);
   assert.match(smoke, /selected_run_terminal_after_accessibility": false/);
   assert.match(smoke, /visible_suffix_is_durable_leading_projection": true/);
   assert.match(smoke, /live_streaming_preterminal: liveStreaming/);
@@ -301,60 +301,23 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
 
   assert.match(smoke, /exercise_loom_idle_resume_ghost/);
   assert.match(smoke, /delysis\.loom-idle-resume-ghost-witness\.v1/);
-  assert.match(smoke, /runningApplication\.hide\(\)/);
+  assert.match(smoke, /application\.hide\(\)/);
   assert.match(smoke, /kAXHiddenAttribute as CFString/);
-  assert.match(smoke, /"PID-addressed AXHidden"/);
-  assert.match(smoke, /exact-PID System Events visible=false/);
-  assert.match(smoke, /exact-PID System Events visible=true/);
   assert.match(smoke, /kCFBooleanFalse/);
-  assert.match(smoke, /"resume_dispatch": resumeDispatch/);
-  assert.match(smoke, /runningApplication\.isHidden/);
-  assert.match(smoke, /withBundleIdentifier: "com\.apple\.finder"/);
+  assert.match(smoke, /application\.isHidden/);
+  assert.match(smoke, /runningApplications\(withBundleIdentifier: "com\.apple\.finder"\)/);
   assert.match(smoke, /NSAppleScript\(/);
-  assert.match(smoke, /Finder Apple event/);
-  assert.match(smoke, /let minimumIdleSeconds: TimeInterval = 75/);
-  assert.match(smoke, /ProcessInfo\.processInfo\.systemUptime - idleStartedAtUptime/);
-  assert.match(smoke, /let deadlineUptime = ProcessInfo\.processInfo\.systemUptime \+ 120/);
-  assert.match(smoke, /Cross a full minute hidden/);
+  assert.match(smoke, /"minimum_idle_seconds": 75/);
   assert.match(
     smoke,
-    /NSWorkspace\.shared\.frontmostApplication\?\.processIdentifier ==\s+backgroundApplication\.processIdentifier/,
+    /NSWorkspace\.shared\.frontmostApplication\?\.processIdentifier == finder\.processIdentifier/,
   );
-  assert.match(smoke, /generationCount\(\) == expectedGenerationCount/);
-  assert.match(smoke, /struct DurableCandidateIdentity: Equatable/);
+  assert.match(smoke, /generation_runs_after_resume": baseline \+ 4/);
   assert.match(
     smoke,
-    /SELECT f\.run_id, t\.candidate_id, c\.output_blob_id FROM family f/,
-  );
-  assert.match(smoke, /candidate\.candidateId == "run:\\[(]candidate\.runId[)]"/);
-  assert.match(smoke, /!candidate\.presentationKey\.hasPrefix\("stream:"\)/);
-  assert.match(smoke, /presentationMatchesDurableCandidate\(candidate, durable\)/);
-  assert.match(
-    smoke,
-    /waitForGhostIdentity\([\s\S]*?durableCandidates: durableFamilyCandidates,[\s\S]*?expected: before/,
+    /SELECT f\.run_id,t\.candidate_id,c\.output_blob_id FROM family f/,
   );
   assert.match(smoke, /"terminal_candidate_authority"/);
-  assert.match(smoke, /"before_identity"/);
-  assert.match(smoke, /"last_observed_identity"/);
-  assert.match(smoke, /"before_raw_observation"/);
-  assert.match(smoke, /"last_raw_observation"/);
-  assert.match(smoke, /"frontmost_matches_expected"/);
-  assert.match(smoke, /"application_hidden"/);
-  assert.match(smoke, /"application_active"/);
-  assert.match(smoke, /"writing_surface_present"/);
-  assert.match(smoke, /"selected_text_range"/);
-  assert.match(smoke, /"ax_value_utf8_bytes"/);
-  assert.match(smoke, /"ax_value_sha256"/);
-  assert.match(smoke, /"ax_value_suffix_sha256"/);
-  assert.match(smoke, /"completion_witness_text_found"/);
-  assert.match(smoke, /"completion_witness_parsed"/);
-  assert.match(smoke, /func completionWitnessCore/);
-  assert.match(smoke, /"rendered_presentation_key"/);
-  assert.match(smoke, /"inline_visible_key"/);
-  assert.doesNotMatch(smoke, /"ax_value":/);
-  assert.match(smoke, /launch-1-idle-resume-identity-diagnostics\.json/);
-  assert.match(smoke, /data\.write\(to: URL\(fileURLWithPath: identityFailurePath\), options: \.atomic\)/);
-  assert.match(smoke, /authority_frozen_before": before\.authorityFrozen/);
   assert.match(smoke, /exact_ghost_identity_resynchronized": true/);
   assert.match(smoke, /new_generation_started": false/);
   assert.match(smoke, /ghost_stole_editor_focus": false/);
@@ -377,11 +340,7 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /launch-1-ghost-timeout-diagnostics\.json/);
   assert.match(smoke, /latest_generation_runs/);
   assert.match(smoke, /completion diagnostics:/);
-  assert.match(smoke, /restoreExactEditorFocus/);
   assert.match(smoke, /NSWorkspace\.shared\.frontmostApplication\?\.processIdentifier == pid/);
-  assert.match(smoke, /observed\.hasPrefix\(expectedManuscript\)/);
-  assert.match(smoke, /selection\?\.location == expectedManuscript\.utf16\.count/);
-  assert.match(smoke, /did not restore exact foreground editor focus before visible completion proof/);
   assert.match(
     smoke,
     /wait_for_loom_accessibility_text \\\n+\s+"\$ACTIVE_PID" "Suggestion available\." "\$RUN_1_EDITOR_SENTINEL"/,

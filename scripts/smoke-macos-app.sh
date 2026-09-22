@@ -661,6 +661,21 @@ wait_for_loom_live_streaming_monitor() {
   fi
 }
 
+require_loom_live_streaming_preterminal() {
+  live_evidence=$1
+  DELYSIS_LIVE_STREAMING_EVIDENCE="$live_evidence" node <<'NODE'
+const evidence = JSON.parse(process.env.DELYSIS_LIVE_STREAMING_EVIDENCE || '{}');
+if (
+  evidence.schema !== 'delysis.loom-live-stream-witness.v1' ||
+  evidence.selected_run_terminal_after_accessibility !== false ||
+  evidence.visible_suffix_is_durable_leading_projection !== true
+) {
+  console.error('family_terminal_before_live_witness: live witness was not proven pre-terminal');
+  process.exit(1);
+}
+NODE
+}
+
 exercise_loom_idle_resume_ghost() {
   target_pid=$1
   database=$2
@@ -1279,6 +1294,10 @@ run_once() {
         return 1
       fi
       RUN_1_LIVE_STREAMING_EVIDENCE=$(cat "$LOOM_LIVE_STREAM_MONITOR_OUTPUT")
+      if ! require_loom_live_streaming_preterminal "$RUN_1_LIVE_STREAMING_EVIDENCE"; then
+        echo "family_terminal_before_live_witness: invalid live-stream witness" >&2
+        return 1
+      fi
       if ! RUN_1_REAL_GENERATION_EVIDENCE=$(wait_for_loom_generation_family \
         "$loom_database" \
         "$loom_generation_count_before_batch"); then
