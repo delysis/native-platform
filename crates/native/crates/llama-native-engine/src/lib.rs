@@ -6064,10 +6064,7 @@ fn apply_model_chat_template(
                 // cannot represent Gemma 4 using its older `gemma` renderer.
                 // Google's embedded canonical template defaults thinking off.
                 let source = template.to_str().unwrap_or_default();
-                if !source.contains("enable_thinking | default(false)")
-                    || !source.contains("<|turn>")
-                    || !source.contains("<turn|>")
-                {
+                if !is_supported_gemma4_template(source) {
                     return Err(NativeError::new(
                         NativeErrorCode::ModelInvalid,
                         "Gemma 4 requires a supported canonical embedded chat template or an explicit template choice",
@@ -6127,6 +6124,16 @@ fn apply_model_chat_template(
                 })
         }
     }
+}
+
+// Exact tokenizer.chat_template identity from the frozen Gemma 4 canonical
+// fixture. Recognizing a few marker substrings is unsafe: a behaviorally
+// different Jinja program can retain every marker while changing framing.
+const GEMMA4_CANONICAL_TEMPLATE_SHA256: &str =
+    "2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f57529f1d707c28b5828c";
+
+fn is_supported_gemma4_template(source: &str) -> bool {
+    format!("{:x}", Sha256::digest(source.as_bytes())) == GEMMA4_CANONICAL_TEMPLATE_SHA256
 }
 
 fn render_gemma4_non_thinking(
@@ -6250,9 +6257,19 @@ fn role_name(role: ChatRole) -> &'static str {
 }
 
 fn build_sampler(model: &LlamaModel, config: &SamplingConfig) -> LlamaSampler {
-    if config.temperature <= 0.0 {
-        return LlamaSampler::greedy();
-    }
+    finish_sampling_chain(build_sampling_transforms(model, config), config)
+}
+
+fn finish_sampling_chain(mut samplers: Vec<LlamaSampler>, config: &SamplingConfig) -> LlamaSampler {
+    samplers.push(if config.temperature <= 0.0 {
+        LlamaSampler::greedy()
+    } else {
+        LlamaSampler::dist(config.seed)
+    });
+    LlamaSampler::chain_simple(samplers)
+}
+
+fn build_sampling_transforms(model: &LlamaModel, config: &SamplingConfig) -> Vec<LlamaSampler> {
     let mut samplers = Vec::new();
     for kind in &config.sampler_order {
         match kind {
@@ -6305,15 +6322,14 @@ fn build_sampler(model: &LlamaModel, config: &SamplingConfig) -> LlamaSampler {
                         config.dynamic_temperature_range,
                         config.dynamic_temperature_exponent,
                     ));
-                } else {
+                } else if config.temperature > 0.0 {
                     samplers.push(LlamaSampler::temp(config.temperature));
                 }
             }
             _ => {}
         }
     }
-    samplers.push(LlamaSampler::dist(config.seed));
-    LlamaSampler::chain_simple(samplers)
+    samplers
 }
 
 fn longest_common_prefix(token_sets: &[Vec<LlamaToken>]) -> usize {
@@ -6491,6 +6507,7 @@ fn validate_batch_request(
     }
     let mut ids = std::collections::HashSet::new();
     for branch in &request.branches {
+        branch.sampling.validate()?;
         if branch.branch_id.trim().is_empty() || !ids.insert(branch.branch_id.as_str()) {
             return Err(NativeError::new(
                 NativeErrorCode::InvalidConfig,
@@ -6531,6 +6548,7 @@ fn validate_generation_request(
         ));
     }
     validate_multimodal_input(&request.input, request.media.len())?;
+    request.sampling.validate()?;
     if request.cached_prefix.is_some() {
         return Err(NativeError::new(
             NativeErrorCode::UnsupportedParameter,
@@ -6604,6 +6622,7 @@ fn validate_generation_batch_request(
     }
     let mut case_ids = std::collections::HashSet::with_capacity(request.cases.len());
     for (index, case) in request.cases.iter().enumerate() {
+        case.sampling.validate()?;
         if case.case_id.trim().is_empty() || !case_ids.insert(case.case_id.as_str()) {
             return Err(NativeError::new(
                 NativeErrorCode::InvalidConfig,
@@ -7176,6 +7195,8 @@ fn native_decode_error(context: &str, error: impl std::fmt::Display) -> NativeEr
 mod tests {
     use super::*;
     use crate::generation_admission::{AdmissionClock, SPECULATIVE_PREEMPTION_LIMIT};
+    use llama_cpp_2::token::data::LlamaTokenData;
+    use llama_cpp_2::token::data_array::LlamaTokenDataArray;
     use llama_native_types::EmbeddingInput;
     use std::sync::{Barrier, Mutex, atomic::AtomicU64};
 
@@ -7340,6 +7361,46 @@ mod tests {
                 true
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn gemma4_template_dispatch_rejects_marker_preserving_behavior_changes() {
+        let changed = concat!(
+            "{% set enable_thinking = enable_thinking | default(false) %}",
+            "<|turn>{{ messages | reverse }}<turn|>"
+        );
+        assert!(
+            !is_supported_gemma4_template(changed),
+            "marker substrings are not a template identity"
+        );
+    }
+
+    #[test]
+    fn greedy_selector_runs_after_requested_penalties() {
+        let config = SamplingConfig {
+            temperature: 0.0,
+            repeat_last_n: 16,
+            repeat_penalty: 2.0,
+            frequency_penalty: 0.0,
+            presence_penalty: 0.0,
+            ..SamplingConfig::default()
+        };
+        let mut sampler =
+            finish_sampling_chain(vec![LlamaSampler::penalties(16, 2.0, 0.0, 0.0)], &config);
+        sampler.accept(LlamaToken::new(1));
+        let mut candidates = LlamaTokenDataArray::from_iter(
+            [
+                LlamaTokenData::new(LlamaToken::new(1), 1.5, 0.0),
+                LlamaTokenData::new(LlamaToken::new(2), 1.4, 0.0),
+            ],
+            false,
+        );
+        sampler.apply(&mut candidates);
+        assert_eq!(
+            candidates.selected_token(),
+            Some(LlamaToken::new(2)),
+            "the penalty must be able to change the greedy winner"
         );
     }
 
