@@ -64,6 +64,8 @@ func waitForShuttle(_ expected: Bool) -> Bool {
     return false
 }
 func toggleShuttle() -> Bool {
+    _ = running.activate(options: [])
+    Thread.sleep(forTimeInterval: 0.1)
     guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
           let down = CGEvent(keyboardEventSource: nil, virtualKey: 38, keyDown: true),
           let up = CGEvent(keyboardEventSource: nil, virtualKey: 38, keyDown: false) else { return false }
