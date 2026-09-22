@@ -258,6 +258,68 @@ Relevant files in that directory:
 - Do not extend waits as a substitute for diagnosing the duplicate admission.
 - Do not inject fixture completions into the native smoke.
 - Do not change the approved Gemma model or add hosted inference fallback.
+
+## Pro handoff: latest native smoke remains genuinely broken (2026-09-22)
+
+The local agent stopped after the exact approved-Gemma smoke remained visually
+empty and the supplied screenshot showed an ugly repeated list of temporary
+`/private/var/folders/.../delysis-loom-...` directories in the app's folder
+search UI. This is a bounded failure handoff, not a product acceptance receipt.
+
+### Exact attempted artifact
+
+- Tested commit before the smoke: `034f8f94474d66aa09c027a526c96653b0b75403`.
+- Tested tree before the smoke: `4625df45ab85fffc90a5f292b8cd541ccb1c52b5`.
+- Candidate:
+  `/Users/george/.codex/worktrees/native-platform-pr75-astra-20260922/dist/macos/loom-v0.1.0-034f8f94474d-20260922T203135Z`.
+- Smoke evidence:
+  `/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/delysis-loom-smoke.XXXXXX.p23c0Dgk0k`.
+- User screenshot:
+  `/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/codex-clipboard-67bbf759-95c1-4bb1-b8a9-1cae94e661a8.png`.
+
+### Exact result
+
+The run was bounded and stopped at the user's direction; it did not reach the
+four-run guard. The monitor observed 2,226 polls with:
+
+- `reason: no_correlated_inline_render`
+- `generation_run_count: 0`
+- `family_run_ids: []`
+- `last_witness: {}`
+- `post_terminal_observation: {}`
+- `observed_editor_labels: []`
+- `rejected_stages: { family_pending: 2226 }`
+- control state: `Ghost text`, enabled, suggestions enabled
+
+This latest artifact did not reach durable generation admission before the live
+monitor failed. It does not prove the cached model is bad; it does prove the
+packaged product path is still not rendering or admitting a completion in this
+run. Do not call this a model-loading pass.
+
+### Pro-owned next actions
+
+1. Inspect the preserved smoke directory and application stderr first. Explain
+   why the latest run has zero `generation_runs` despite the cached model and an
+   enabled `Ghost text` control.
+2. Explain the repeated temporary-folder entries visible in the screenshot.
+   Determine whether acceptance directories are exposed as project/search
+   results, whether launches share or leak the wrong persistent WebKit store, or
+   whether this is a separate filesystem-root presentation defect. Fix only with
+   direct evidence.
+3. Reconcile this zero-admission result with the earlier artifact, which had two
+   command families and eight durable runs. Do not infer that the hydration repair
+   caused or fixed the old second family without a command/run/event trace.
+4. Re-run one bounded exact artifact smoke after diagnosis. Require actual
+   pre-terminal multi-frame Ghost and then the full Visual and Source/Loompad
+   journeys already specified above.
+
+### Stop conditions
+
+- Do not spend time on broad redesign or old PR rebases in this handoff.
+- Do not raise the four-run guard, extend deadlines, inject completions, or use
+  hosted fallback.
+- Missing evidence is `BLOCKED`, never `PASS`.
+- Native product acceptance and promotion remain OPEN.
 - Do not reset the project, rewrite historical receipts, or perform a silent
   database migration.
 - Do not claim acceptance from the green browser suite, native self-tests,
