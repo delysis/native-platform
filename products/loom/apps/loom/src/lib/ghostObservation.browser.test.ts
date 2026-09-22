@@ -36,7 +36,7 @@ async function render() {
   mounted = editor;
   await expect.poll(() => editor.focusAtDocumentEnd()).toBe(true);
   editor.refreshGhostPresentation();
-  await expect.poll(() => witness.inline?.text).toBe(' world');
+  await expect.poll(() => witness.inline?.text).toBe(' world again');
   const glyph = pane.querySelector<HTMLElement>('.loom-visual-ghost')!;
   return { editor, outer, pane, glyph, witness: () => witness,
     changes: () => changes, insertions: () => insertions };
@@ -45,9 +45,9 @@ async function render() {
 describe('rendered inline ghost witness', () => {
   it('observes only painted preview text while keeping the multiword buffer out of manuscript state', async () => {
     const state = await render();
-    expect(state.glyph.textContent).toBe(' world');
+    expect(state.glyph.textContent).toBe(' world again');
     expect(state.glyph.getAttribute('aria-hidden')).toBe('true');
-    expect(state.witness().inline).toEqual({ presentationKey: 'stream:r1:7', text: ' world', utf8Bytes: 6 });
+    expect(state.witness().inline).toEqual({ presentationKey: 'stream:r1:7', text: ' world again', utf8Bytes: 12 });
     expect(state.glyph.getBoundingClientRect().width).toBeGreaterThan(0);
     expect(state.changes()).toBe(0);
     expect(state.insertions()).toBe(0);
@@ -55,7 +55,7 @@ describe('rendered inline ghost witness', () => {
 
   it('refuses blank or substituted glyphs with a still-current presentation key', async () => {
     const state = await render();
-    for (const text of ['', ' forged']) {
+    for (const text of ['', ' forged', ' world']) {
       state.glyph.textContent = text;
       // Observe synchronously, before ProseMirror has a chance to repair DOM.
       window.dispatchEvent(new Event('resize'));
@@ -86,7 +86,7 @@ it('Source uses the same exact-glyph authority while retaining its own insertion
     initialValue: 'hello', completionCandidates: [{ runId: 'r1', candidateId: 'run:r1',
       presentationKey: 'stream:r1:7', targetByte: 5, text: ' world again', insertsOnAccept: true }]
   } });
-  await expect.poll(() => outer.querySelector('.loom-source-ghost-text')?.textContent).toBe(' world');
+  await expect.poll(() => outer.querySelector('.loom-source-ghost-text')?.textContent).toBe(' world again');
   const glyph = outer.querySelector<HTMLElement>('.loom-source-ghost-text')!;
   const editor = outer.querySelector('textarea')!;
   const markdown = () => outer.querySelector('[aria-label="Source Markdown"]')?.textContent;
@@ -97,7 +97,7 @@ it('Source uses the same exact-glyph authority while retaining its own insertion
     glyph.textContent = text;
     accept();
     expect(markdown()).toBe('hello');
-    glyph.textContent = ' world';
+    glyph.textContent = ' world again';
   }
   outer.style.visibility = 'hidden';
   accept();

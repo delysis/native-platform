@@ -148,8 +148,8 @@ export function updateCompletionCandidate(
   presentationKey: string,
   allowFrozenAppend = false
 ): CompletionSession | null {
-  // Default frozen authority cannot change. Loompad may grow an exact existing
-  // prefix under a new presentation identity; it never rewrites any prior byte.
+  // Default frozen authority cannot change. A live refresh may grow an exact
+  // existing prefix under a new identity; it never rewrites any prior byte.
   const accepted = acceptedCompletionText(session);
   if (session.authorityFrozen) {
     const previous = session.candidates.find(candidate => candidate.runId === runId);

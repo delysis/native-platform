@@ -58,7 +58,7 @@ func inlineProjection(_ witness: [String: Any], family: [String], manuscript: St
     guard string(inline, "presentationKey") == key,
           text.rangeOfCharacter(from: .whitespacesAndNewlines.inverted) != nil,
           integer(inline, "utf8Bytes") == text.utf8.count,
-          text.utf8.count <= candidateBytes
+          text.utf8.count == candidateBytes
     else { throw Rejection.glyph }
     guard integer(candidate, "target_byte") == manuscript.utf8.count else { throw Rejection.boundary }
     var sequence: Int64?
@@ -77,22 +77,31 @@ func inlineProjection(_ witness: [String: Any], family: [String], manuscript: St
 func editorValueMatches(_ value: String, manuscript: String, glyph: String) -> Bool {
     // WebKit may exclude aria-hidden decoration from AXValue. This is correct:
     // glyph evidence comes from the DOM observation, not from manuscript bytes.
-    let withoutAXLineBreak = value.replacingOccurrences(of: "[\\r\\n]+$", with: "", options: .regularExpression)
+    let withoutAXLineBreak = value.replacingOccurrences(of: "[\r\n]+$", with: "", options: .regularExpression)
     return withoutAXLineBreak.utf8.elementsEqual(manuscript.utf8) ||
         withoutAXLineBreak.utf8.elementsEqual((manuscript + glyph).utf8)
 }
 
+// The smoke owns Untitled.md. Labels are AX title/description, never editor contents.
+func namedEditorIndex(_ elements: [(role: String, labels: [String])]) -> Int? {
+    let matches = elements.indices.filter {
+        elements[$0].role == "AXTextArea" && elements[$0].labels.contains("Untitled, manuscript editor")
+    }
+    return matches.count == 1 ? matches[0] : nil
+}
+
 func selfTest() {
     var assertions = 0
+    var failures = 0
     func check(_ condition: Bool, _ message: String) {
-        guard condition else { fputs("live observer contract failed: \(message)\n", stderr); exit(1) }
+        if !condition { fputs("live observer contract failed: \(message)\n", stderr); failures += 1 }
         assertions += 1
     }
     let family = ["r1", "r2", "r3", "r4"]
     let key = "stream:r1:7"
     let visual: [String: Any] = ["available": true, "inlineHidden": false, "fanVisible": false,
         "selectedCandidateId": "run:r1", "selectedPresentationKey": key,
-        "inline": ["presentationKey": key, "text": "world", "utf8Bytes": 5]]
+        "inline": ["presentationKey": key, "text": "world again", "utf8Bytes": 11]]
     let witness: [String: Any] = ["schema": "delysis.loom-completion-witness.v1", "mode": "visual", "session_cached": true, "autocomplete_enabled": true,
         "shuttle_enabled": false, "accepted_chunk_count": 0, "authority_frozen": false,
         "selected_run_id": "r1", "selected_candidate_id": "run:r1", "selected_presentation_key": key,
@@ -102,7 +111,7 @@ func selfTest() {
     func accepts(_ value: [String: Any], _ ids: [String] = family) -> Bool {
         (try? inlineProjection(value, family: ids, manuscript: "hello ")) != nil
     }
-    check(accepts(witness), "one visible word from a multiword candidate")
+    check(accepts(witness), "complete multiword preview")
     check(editorValueMatches("hello ", manuscript: "hello ", glyph: "world"), "aria-hidden glyph absent from AXValue")
     check(editorValueMatches("hello world", manuscript: "hello ", glyph: "world"), "glyph exposed in AXValue")
     check(!editorValueMatches("hello forged", manuscript: "hello ", glyph: "world"), "unrelated AX text")
@@ -116,6 +125,7 @@ func selfTest() {
     }
     for inline: [String: Any] in [[:], ["presentationKey": key, "text": "", "utf8Bytes": 0],
         ["presentationKey": key, "text": "world", "utf8Bytes": 11],
+        ["presentationKey": key, "text": "world", "utf8Bytes": 5],
         ["presentationKey": "stale", "text": "world", "utf8Bytes": 5]] {
         var changed = witness; var v = visual; v["inline"] = inline; changed["visual"] = v
         check(!accepts(changed), "missing or inconsistent DOM observation")
@@ -143,8 +153,15 @@ func selfTest() {
         check(!accepts(changed), "missing visual false flag \(field)")
     }
     let projection = try! inlineProjection(witness, family: family, manuscript: "hello ")
-    check(projection.sequence == 7 && projection.candidateBytes == 11 && projection.text.utf8.count == 5,
-          "buffer bytes and rendered bytes remain separate")
+    check(projection.sequence == 7 && projection.candidateBytes == 11 && projection.text.utf8.count == 11,
+          "full-prefix rendered bytes equal the authorized projection")
+    check(namedEditorIndex([("AXTextArea", ["Untitled, manuscript editor"])]) == 0, "actual App editor label")
+    check(namedEditorIndex([("AXTextArea", ["Context editor"]), ("AXTextArea", ["Untitled, manuscript editor"])]) == 1, "exclude unrelated editor")
+    check(namedEditorIndex([("AXButton", ["Untitled, manuscript editor"])]) == nil, "wrong accessibility role")
+    check(namedEditorIndex([("AXTextArea", ["Manuscript editor"])]) == nil, "unscoped legacy name")
+    check(namedEditorIndex([("AXTextArea", ["Other, manuscript editor"])]) == nil, "different manuscript")
+    check(namedEditorIndex([("AXTextArea", ["Untitled, manuscript editor"]), ("AXTextArea", ["Untitled, manuscript editor"])]) == nil, "ambiguous named editors")
+    if failures > 0 { fputs("\(failures)/\(assertions) assertions failed\n", stderr); exit(1) }
     print("\(assertions) live-observer contract assertions passed (not native acceptance)")
 }
 
@@ -181,6 +198,7 @@ sqlite3_busy_timeout(database, 50)
 let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 var polls = 0, rejected: [String: Int] = [:], lastWitness: [String: Any] = [:]
 var postTerminal: [String: Any] = [:]
+var observedEditorLabels: [[String]] = []
 
 func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
     var value: CFTypeRef?
@@ -268,6 +286,7 @@ func fail(_ reason: String) -> Never {
     let evidence: [String: Any] = ["schema": "delysis.loom-live-stream-failure.v1", "pid": pid, "reason": reason,
         "polls": polls, "generation_run_count": count() ?? -1, "family_run_ids": familyIds() ?? [],
         "open_run_ids": openIds() ?? [], "rejected_stages": rejected, "last_witness": lastWitness,
+        "observed_editor_labels": observedEditorLabels,
         "post_terminal_observation": postTerminal, "observed_at_ms": Int64(Date().timeIntervalSince1970 * 1000)]
     do { try JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys]).write(to: URL(fileURLWithPath: failurePath), options: [.atomic]) }
     catch { fputs("cannot write failure evidence: \(error)\n", stderr) }
@@ -292,12 +311,17 @@ while ProcessInfo.processInfo.systemUptime < (terminalDeadline ?? initialDeadlin
     guard let elements = descendants() else { reject("accessibility_truncated"); continue }
     // Focus is a presentation prerequisite, not evidence. Restore it before
     // requiring a glyph; doing this only after a glyph exists can deadlock.
-    guard let editor = elements.first(where: {
-        (attribute($0, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String && strings($0).contains("Manuscript editor")
-    }) else { reject("editor_missing"); continue }
+    let current = witness(in: elements)
+    if let current { lastWitness = current }
+    let identities: [(role: String, labels: [String])] = elements.map { element in
+        ((attribute(element, kAXRoleAttribute as CFString) as? String) ?? "",
+         [kAXTitleAttribute, kAXDescriptionAttribute].compactMap { attribute(element, $0 as CFString) as? String })
+    }
+    observedEditorLabels = identities.filter { $0.role == "AXTextArea" }.prefix(16).map { $0.labels }
+    guard let editorIndex = namedEditorIndex(identities) else { reject("editor_missing_or_ambiguous"); continue }
+    let editor = elements[editorIndex]
     _ = AXUIElementSetAttributeValue(editor, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-    guard let current = witness(in: elements) else { reject("witness_missing_or_ambiguous"); continue }
-    lastWitness = current
+    guard let current else { reject("witness_missing_or_ambiguous"); continue }
     let projection: InlineProjection
     do { projection = try inlineProjection(current, family: family, manuscript: manuscript) }
     catch { reject("projection_\((error as? Rejection)?.rawValue ?? "invalid")"); continue }

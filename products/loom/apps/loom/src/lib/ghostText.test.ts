@@ -378,7 +378,15 @@ describe('visual ghost widget', () => {
     expect(state.doc.textContent).toBe('A waits');
   });
 
-  it('chooses the highlighted alternative with Option-Return while the inline ghost remains visible', () => {
+  it.each([
+    ['exact widget', ' for rain.', 'current', 40, 40, true],
+    ['missing text witness', undefined, 'current', 40, 40, false],
+    ['truncated widget', ' for', 'current', 40, 40, false],
+    ['rewritten widget', ' until dawn.', 'current', 40, 40, false],
+    ['stale key', ' for rain.', 'stale', 40, 40, false],
+    ['offscreen caret', ' for rain.', 'current', 500, 40, false],
+    ['offscreen widget', ' for rain.', 'current', 40, 500, false]
+  ] as const)('gates Option-Return on the exact visible widget: %s', (_label, textContent, key, caretLeft, widgetLeft, allowed) => {
     const inserted: string[] = [];
     const modifierStates: boolean[] = [];
     const plugin = createGhostTextPlugin({
@@ -426,28 +434,28 @@ describe('visual ghost widget', () => {
       closest: () => ({ getBoundingClientRect: () => clip })
     };
     widget = {
-      textContent: ' for',
       isConnected: true,
       hidden: false,
       ownerDocument,
       parentElement: dom,
-      getAttribute: () => suggestion.presentationKey,
-      getBoundingClientRect: () => ({ left: 40, top: 40, right: 120, bottom: 60 })
+      textContent,
+      getAttribute: () => key === 'current' ? suggestion.presentationKey : 'stale',
+      getBoundingClientRect: () => ({ left: widgetLeft, top: 40, right: widgetLeft + 80, bottom: 60 })
     };
     const view = {
       get state() { return state; },
       dom,
-      coordsAtPos: () => ({ left: 40, top: 40, right: 40, bottom: 60 }),
+      coordsAtPos: () => ({ left: caretLeft, top: 40, right: caretLeft, bottom: 60 }),
       dispatch(transaction: Parameters<EditorState['apply']>[0]) { state = state.apply(transaction); }
     } as unknown as EditorView;
     const handled = plugin.props.handleKeyDown?.call(plugin, view, {
       key: 'Enter', altKey: true, metaKey: false, ctrlKey: false,
       isComposing: false, keyCode: 13, preventDefault() {}
     } as unknown as KeyboardEvent);
-    expect(handled).toBe(true);
-    expect(modifierStates).toEqual([true]);
-    expect(inserted).toEqual([' for rain.']);
-    expect(state.doc.textContent).toBe('A waits for rain.');
+    expect(handled).toBe(allowed);
+    expect(modifierStates).toEqual([allowed]);
+    expect(inserted).toEqual(allowed ? [' for rain.'] : []);
+    expect(state.doc.textContent).toBe(allowed ? 'A waits for rain.' : 'A waits');
   });
 
   it('keeps an explicitly pinned lens open when transient Option state releases', () => {

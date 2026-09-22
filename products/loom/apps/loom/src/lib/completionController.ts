@@ -305,11 +305,12 @@ export function refreshCompletionCandidate(
   expected: CompletionSession,
   runId: string,
   text: string,
-  presentationKey: string,
-  allowFrozenAppend = false
+  presentationKey: string
 ): CompletionControllerState {
-  if (state.session !== expected) return state;
-  const session = updateCompletionCandidate(expected, runId, text, presentationKey, allowFrozenAppend);
+  if (state.session !== expected || state.pendingText !== null || expected.presentationsRetired) return state;
+  // Accepting freezes the existing bytes and run identity, not future streaming.
+  // The session permits only a strict append under a new presentation identity.
+  const session = updateCompletionCandidate(expected, runId, text, presentationKey, true);
   if (session === state.session) return state;
   return {
     ...state,

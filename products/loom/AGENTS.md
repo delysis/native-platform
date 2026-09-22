@@ -9,12 +9,16 @@
 
 ## Completion is a product invariant
 
-Read [the completion boundary record](../../docs/reviews/2026-09-22-ghost-observation.md)
-before changing rendering, completion, model activation, workspace/panes or
-native acceptance automation. Run the real-App browser regression as well as
-focused unit tests. Keep display text, immutable candidate bytes and editor
-insertion bytes distinct. A key, label or controller state is not a visible
-glyph. Observer changes need a negative control for the old wrong decision.
-Model fixtures and browser tests do not authorize native product acceptance.
-Do not promote a completion-affecting tree until its exact artifact has passed
-the approved native Visual/Source/Ghost/Loompad journey and restart/quit checks.
+Read [the streaming contract](docs/streaming-completion.md) and
+[the hydration/admission continuation](../../docs/reviews/2026-09-22-hydration-admission.md)
+before changing completion, rendering, model activation, panes or acceptance automation.
+Full authorized previews must stream; word-sized acceptance is a separate operation.
+A ready terminal row is not a verified candidate body. Do not spend the retry budget
+on an unusable partial while terminal SHA hydration is outstanding.
+
+Run the real-App delayed-body regression and focused unit/browser tests. Assert actual
+DOM text and exact insertion bytes, not just keys, labels or controller state. Changes
+to an observer need a negative control for its old wrong decision. Fixtures and
+component counts never establish native inference or visible product acceptance.
+Do not promote a completion-affecting tree until its exact artifact has passed the
+approved Visual/Source/Ghost/Loompad journey, including owned-worker quit and relaunch.

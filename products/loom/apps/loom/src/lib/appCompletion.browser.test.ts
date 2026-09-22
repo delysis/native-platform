@@ -1,4 +1,4 @@
-import { mount, unmount } from 'svelte';
+import { mount, tick, unmount } from 'svelte';
 import { afterEach, expect, it, vi } from 'vitest';
 import { page } from 'vitest/browser';
 import type { BranchBody, BranchCard, CompletionSnapshot, DesktopGenerationEnvelope, ModelCapabilitySummary, OpenDocument, ProjectSnapshot, WeaveStarted } from './types';
@@ -46,7 +46,7 @@ function completionWitness(): Record<string, any> {
 }
 function glyph(): string | null { return document.querySelector('.loom-visual-ghost')?.textContent ?? null; }
 
-it('drives the actual App from admission through staggered events, visible glyphs and delayed durable hydration', async () => {
+it.each([false, true])('drives real App hydration without duplicate admission (unusable last partial: %s)', async (unusableLastPartial) => {
   restoreStorage = Object.entries(localStorage); localStorage.clear();
   restoreNative = Object.getOwnPropertyDescriptor(window, '__TAURI_INTERNALS__');
   Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });
@@ -70,6 +70,7 @@ it('drives the actual App from admission through staggered events, visible glyph
   };
   const texts = [' world again', ' there friend', ' onward together', ' outside today'];
   const hashes = await Promise.all(texts.map(sha256));
+  const partials = texts.map((text, index) => unusableLastPartial && index === 3 ? ' ' : text);
   let admission: WeaveStarted | null = null;
   let populated = 0, terminal = false, admissions = 0, snapshotReads = 0, bodyReads = 0;
   let releaseBodies!: () => void;
@@ -92,8 +93,8 @@ it('drives the actual App from admission through staggered events, visible glyph
         phase: 'running', cancellation_requested: false, authoritative_terminal: null, final_projection: null,
         progress_sequences: ['7'], branches: current.map((branch, index) => ({
           run_id: branch.run_id, branch_id: branch.branch_id,
-          partial_text: index < populated ? { text: texts[index], sequence: '7',
-            utf8_byte_len: String(new TextEncoder().encode(texts[index]).byteLength) } : null
+          partial_text: index < populated ? { text: partials[index], sequence: '7',
+            utf8_byte_len: String(new TextEncoder().encode(partials[index]).byteLength) } : null
         }))
       }]
     };
@@ -117,9 +118,11 @@ it('drives the actual App from admission through staggered events, visible glyph
       case 'plugin:loom|suggestions_set':
       case 'plugin:loom|focus_mode_set': return;
       case 'plugin:loom|completion_snapshot': return snapshot();
-      case 'plugin:loom|weave_status': return snapshot();
+      case 'plugin:loom|weave_status':
+        return admission ? { ...admission, branches: branches() } satisfies WeaveStarted : null;
       case 'plugin:loom|weave_start': {
         admissions += 1;
+        expect(admissions, 'no second native admission while this exact family is being used').toBe(1);
         expect(args.sourceRevisionId).toBe(opened.summary.revision_id);
         expect(args.expectedVisibleBlobId).toBe(sourceBlob);
         expect(args.cursorByte).toBe(5);
@@ -168,31 +171,45 @@ it('drives the actual App from admission through staggered events, visible glyph
   const target = document.createElement('div'); document.body.append(target);
   mounted = mount(App, { target });
   try {
-    await expect.element(page.getByRole('textbox', { name: 'Manuscript editor' })).toBeVisible();
+    await expect.element(page.getByRole('textbox', { name: 'Untitled, manuscript editor', exact: true })).toBeVisible();
     await expect.poll(() => admissions, { timeout: 10000 }).toBe(1);
     expect(glyph()).toBeNull();
     populated = 3; const before = snapshotReads; wake();
     await expect.poll(() => snapshotReads).toBeGreaterThan(before);
     expect(glyph()).toBeNull(); // Three arrivals cannot publish a four-choice family.
     populated = 4; wake();
-    await expect.poll(glyph).toBe(' world');
-    await expect.poll(() => completionWitness().visual?.inline?.text).toBe(' world');
-    expect(completionWitness().candidates).toHaveLength(4);
-    expect(completionWitness().selected_presentation_key).toMatch(/^stream:run-0:7/);
-    expect(completionWitness().candidates[0].text_utf8_bytes).toBe(12);
-    const editor = page.getByRole('textbox', { name: 'Manuscript editor' }).element();
-    for (const key of ['ArrowDown', 'ArrowUp']) {
-      editor.dispatchEvent(new KeyboardEvent('keydown', { key, altKey: true, bubbles: true, cancelable: true }));
-      await expect.poll(() => completionWitness().selected_run_id).toBe(key === 'ArrowDown' ? 'run-1' : 'run-0');
+    if (unusableLastPartial) {
+      await expect.poll(() => completionWitness().family_phase?.kind).toBe('pending');
+      expect(glyph()).toBeNull();
+    } else {
+      await expect.poll(glyph).toBe(texts[0]);
+      await expect.poll(() => completionWitness().visual?.inline?.text).toBe(texts[0]);
+      expect(completionWitness().candidates).toHaveLength(4);
+      expect(completionWitness().selected_presentation_key).toMatch(/^stream:run-0:7/);
+      expect(completionWitness().candidates[0].text_utf8_bytes).toBe(12);
+      const editor = page.getByRole('textbox', { name: 'Untitled, manuscript editor', exact: true }).element();
+      for (const key of ['ArrowDown', 'ArrowUp']) {
+        editor.dispatchEvent(new KeyboardEvent('keydown', { key, altKey: true, bubbles: true, cancelable: true }));
+        await expect.poll(() => completionWitness().selected_run_id).toBe(key === 'ArrowDown' ? 'run-1' : 'run-0');
+      }
+      editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'Alt', code: 'AltLeft', bubbles: true }));
     }
-    editor.dispatchEvent(new KeyboardEvent('keyup', { key: 'Alt', code: 'AltLeft', bubbles: true }));
     terminal = true; wake();
     await expect.poll(() => bodyReads).toBeGreaterThan(0);
-    expect(glyph()).toBe(' world'); // Delayed SHA hydration must not blank the live family.
+    await tick();
+    if (unusableLastPartial) {
+      await expect.poll(() => completionWitness().family_phase?.kind).toBe('awaiting_hydration');
+      expect(glyph()).toBeNull();
+    } else {
+      expect(glyph()).toBe(texts[0]); // A good live family does not blink during SHA hydration.
+    }
+    // The Source-mode unit regression executes the production retry planner
+    // against this pending-body phase; this App test verifies its real wiring.
+    expect(admissions).toBe(1);
     releaseBodies();
     await expect.poll(() => completionWitness().selected_presentation_key).toBe(`candidate-0:${hashes[0]}`);
-    await expect.poll(() => completionWitness().visual?.inline?.text).toBe(' world');
-    expect(glyph()).toBe(' world');
+    await expect.poll(() => completionWitness().visual?.inline?.text).toBe(texts[0]);
+    expect(glyph()).toBe(texts[0]);
     expect(admissions).toBe(1);
     expect(unexpected).toEqual([]); // Includes all hidden writes, extra work, and hosted fallback.
     expect(transport.invoke.mock.calls.some(([command]) => String(command).includes('checkpoint'))).toBe(false);

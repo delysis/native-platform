@@ -1,5 +1,3 @@
-import { nextSuggestionWord } from './suggestionInteraction';
-
 export const GHOST_PRESENTATION_ATTRIBUTE = 'data-loom-ghost-presentation';
 
 export interface GhostClientRect {
@@ -17,7 +15,9 @@ export interface InlineGhostObservation {
 }
 
 export function inlineGhostPreview(text: string): string {
-  return nextSuggestionWord(text)?.trimEnd() ?? '';
+  // The caller already selected the editor-safe prefix. Preview bytes are not
+  // the word-sized acceptance action; neither whitespace nor tails may vanish.
+  return text;
 }
 
 function validRect(rect: GhostClientRect, allowZeroWidth = false): boolean {

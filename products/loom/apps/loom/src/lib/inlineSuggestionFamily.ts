@@ -1,4 +1,4 @@
-import type { VerifiedBranchBody } from './branchBodyProof';
+import { verifiedBodyMatchesBranch, type VerifiedBranchBody } from './branchBodyProof';
 import { candidateTextIsSurfaceable } from './candidateSurface';
 import { completionTextAtBoundary } from './completionSession';
 import {
@@ -231,7 +231,13 @@ export function evaluateInlineSuggestionFamily(
         terminalShortfall.push({ candidateId, reason: 'invalid' });
         continue;
       }
-      const verified = verifiedGhostSuggestion(branch, state.verifiedBodyByRun[branch.run_id]);
+      const body = state.verifiedBodyByRun[branch.run_id];
+      // Terminal metadata can arrive before its immutable body. A usable live
+      // projection may remain visible, but a partial cannot prove exhaustion
+      // and spend a retry while the complete candidate is still being verified.
+      if (branch.status === 'ready' && branch.output_blob_id &&
+          !verifiedBodyMatchesBranch(body, branch)) awaitingHydration.add(branch.run_id);
+      const verified = verifiedGhostSuggestion(branch, body);
       const liveText = state.liveTextByRun[branch.run_id];
       const liveSequence = state.liveTextSequenceByRun?.[branch.run_id];
       const hasLiveProjection = liveText !== undefined && liveSequence !== undefined;
@@ -239,9 +245,7 @@ export function evaluateInlineSuggestionFamily(
       if (!rawText) {
         if (branch.status === 'queued' || branch.status === 'generating') {
           pending.add(branch.run_id);
-        } else if (branch.status === 'ready' && branch.output_blob_id) {
-          awaitingHydration.add(branch.run_id);
-        } else {
+        } else if (!awaitingHydration.has(branch.run_id)) {
           terminalShortfall.push({ candidateId, reason: 'invalid' });
         }
         continue;
