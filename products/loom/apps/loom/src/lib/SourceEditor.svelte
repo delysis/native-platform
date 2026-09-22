@@ -251,6 +251,7 @@
       !candidate ||
       !viewport ||
       !ghostSpan ||
+      ghostSpan.textContent !== candidate.text ||
       ghostHidden ||
       viewport.hidden ||
       ghostSpan.hidden ||
@@ -979,7 +980,7 @@
   <div class="source-ghost-viewport" aria-hidden="true" hidden={!plan} bind:this={viewport}>
     <div class="source-ghost-mirror" bind:this={mirror}>
       {#if plan}
-        <span>{plan.prefix}</span><span class:ghost-text-hidden={ghostHidden} class="loom-source-ghost-text" bind:this={ghostSpan}>{ghostHidden ? '' : nextSuggestionWord(plan.text)?.trimEnd() ?? ''}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
+        <span>{plan.prefix}</span><span class:ghost-text-hidden={ghostHidden} class="loom-source-ghost-text" bind:this={ghostSpan}>{ghostHidden ? '' : plan.text}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
       {/if}
     </div>
   </div>

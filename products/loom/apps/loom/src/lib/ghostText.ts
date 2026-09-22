@@ -522,6 +522,7 @@ function ghostWidgetPresentationKeyInViewport(
   );
   if (
     !widget?.isConnected ||
+    widget.textContent !== plan.text ||
     widget.hidden ||
     plan.hidden ||
     !elementAndAncestorsAreVisible(
@@ -577,7 +578,7 @@ function ghostWidget(
   widget.contentEditable = 'false';
   widget.draggable = false;
   widget.spellcheck = false;
-  widget.textContent = plan.hidden ? '' : (nextVisualSuggestionWord(plan.text)?.trimEnd() ?? '');
+  widget.textContent = plan.hidden ? '' : plan.text;
   container.append(widget);
 
   if (plan.alternatives.length > 1) {
@@ -670,7 +671,7 @@ function synchronizeGhostWidgetDom(
   const container = view.dom.querySelector<HTMLElement>('.loom-ghost-widget');
   const widget = container?.querySelector<HTMLElement>('.loom-visual-ghost');
   if (!container || !widget) return;
-  widget.textContent = plan.hidden ? '' : (nextVisualSuggestionWord(plan.text)?.trimEnd() ?? '');
+  widget.textContent = plan.hidden ? '' : plan.text;
   widget.classList.toggle('ghost-text-hidden', plan.hidden);
   widget.setAttribute(GHOST_PRESENTATION_ATTRIBUTE, plan.presentationKey);
   container.classList.toggle('fan-visible', plan.fanVisible);

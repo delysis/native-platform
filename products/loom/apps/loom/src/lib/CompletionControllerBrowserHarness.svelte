@@ -12,7 +12,8 @@
     cycleCompletion,
     initialCompletionControllerState,
     observeTextMutation,
-    reconcileCompletionController
+    reconcileCompletionController,
+    refreshCompletionCandidate
   } from './completionController';
   import { completionPresentation } from './completionSession';
   import type { InlineGhostSuggestion } from './inlineSuggestionFamily';
@@ -104,6 +105,14 @@
   export function installRefill(candidates: InlineGhostSuggestion[]): void {
     family = candidates;
     controller = reconcileCompletionController(controller, contextKey, family, true, loompad);
+  }
+
+  // Feed a transport update through the production live-refresh transition.
+  // This harness tests editor/controller integration, not native inference.
+  export function appendStream(runId: string, text: string, presentationKey: string): void {
+    if (controller.session) controller = refreshCompletionCandidate(
+      controller, controller.session, runId, text, presentationKey
+    );
   }
 
   function chooseLoompad(candidate: InlineGhostSuggestion): void {

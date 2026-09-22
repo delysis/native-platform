@@ -75,3 +75,42 @@ Start from the pushed commit below. Review this file and the packet's
 `LOCAL-AGENT-PROMPT.md`, `COMPLETION-TRACE.md`, and `NEXT-TODO.md`. Treat all
 portable results above as component evidence only, and return native receipts
 for any acceptance claim.
+
+## Streaming-preview repair follow-up — 2026-09-22
+
+Packet: `/Users/george/Downloads/native-platform-streaming-preview-repair-20260922`
+
+The packet was applied onto this branch after the prior control-driver commit.
+It changes the Loom streaming-preview/controller/editor path and adds the
+packet's browser regressions and contract documentation. The packet's safe
+apply utility passed 9/9, and `pnpm --filter @delysis/loom check` passed with
+zero Svelte diagnostics.
+
+Focused execution found unresolved regressions, so this revision is not a
+product or test-suite acceptance claim:
+
+- Unit suite: 121 passed, 1 failed in `ghostText.test.ts` (`Option-Return`
+  requires the new exact visible-widget witness in a legacy mock).
+- WebKit suite: 85 passed, 3 failed. Two new growing-prefix cases remain at
+  the old preview (`one two`) after `appendStream`; one existing exact-byte
+  case cannot find the full-text widget by its old word-level locator.
+- The packet's portable probes and source syntax receipts remain historical
+  component evidence; they do not override these current failures.
+
+Queued work for Chat 6 Pro:
+
+1. Diagnose why the browser harness refresh does not publish the new
+   presentation identity/text into the mounted editor, without weakening the
+   strict prefix, stale-session, pending-insertion, retired-policy, or actual
+   DOM-text guards.
+2. Repair the exact-widget witness test seam (or production behavior if the
+   browser reproduction proves it) so Option-Return remains authorized only
+   when the real widget text/key/geometry agree.
+3. Re-run the focused unit and real-WebKit suites, then the consolidated Rust,
+   policy, frontend, and workflow gates on one settled commit.
+4. Only after those pass, build a fresh macOS artifact and run the packet's
+   approved Gemma 4 Visual and Source journeys. Native acceptance, signing,
+   model identity, relaunch, lifecycle joins, and rendered multi-frame proof
+   remain open.
+5. Do not infer bounded four-way speculative scheduling from this repair; the
+   packet explicitly does not implement that separate scheduler.

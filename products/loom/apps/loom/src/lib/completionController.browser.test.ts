@@ -1,4 +1,4 @@
-import { mount, unmount } from 'svelte';
+import { mount, tick, unmount } from 'svelte';
 import { afterEach, describe, expect, it } from 'vitest';
 import { page, userEvent } from 'vitest/browser';
 import '../app.css';
@@ -20,6 +20,56 @@ function render(mode: 'visual' | 'source', loompad = false, insertsOnAccept = tr
 }
 
 describe('completion controller and editor callback ordering', () => {
+  it.each(['visual', 'source'] as const)('refuses a truncated %s DOM preview even with the right presentation key', async (mode) => {
+    render(mode);
+    const editor = page.getByRole('textbox');
+    await editor.click();
+    const selector = mode === 'visual' ? '.loom-visual-ghost' : '.loom-source-ghost-text';
+    await expect.poll(() => document.querySelector(selector)?.textContent).toBe(' one two');
+    const widget = document.querySelector(selector)!;
+    // Keep the authentic key/geometry but reproduce the old rendering defect.
+    // Dispatch in the same task so a later repair cannot conceal the bad frame.
+    widget.textContent = ' one';
+    editor.element().dispatchEvent(new KeyboardEvent('keydown', {
+      key: 'ArrowRight', code: 'ArrowRight', altKey: true, bubbles: true, cancelable: true
+    }));
+    await tick();
+    expect(page.getByRole('status', { name: 'Controller Actions' }).element().textContent).toBe('0');
+    expect(page.getByRole('status', { name: 'Controller Markdown' }).element().textContent).toBe('Hello');
+  });
+  it.each(['visual', 'source'] as const)('renders growing %s prefixes before and after word acceptance', async (mode) => {
+    const harness = render(mode);
+    await page.getByRole('textbox').click();
+    const selector = mode === 'visual' ? '.loom-visual-ghost' : '.loom-source-ghost-text';
+    const visible = () => document.querySelector(selector)?.textContent;
+    const manuscript = () => page.getByRole('status', { name: 'Controller Markdown' }).element().textContent;
+    await expect.poll(visible).toBe(' one two');
+    harness.appendStream('run-a', ' one two café', 'stream:run-a:2');
+    await expect.poll(visible).toBe(' one two café');
+    harness.appendStream('run-a', ' one two café keeps growing', 'stream:run-a:3');
+    await expect.poll(visible).toBe(' one two café keeps growing');
+    expect(manuscript()).toBe('Hello');
+
+    await userEvent.keyboard('{Tab}');
+    const accepted = mode === 'visual' ? 'Hello one' : 'Hello one ';
+    await expect.poll(manuscript).toBe(accepted);
+    harness.appendStream('run-a', ' one two café keeps growing after acceptance', 'stream:run-a:4');
+    await expect.poll(visible).toBe(mode === 'visual'
+      ? ' two café keeps growing after acceptance'
+      : 'two café keeps growing after acceptance');
+    expect(manuscript()).toBe(accepted);
+    await expect.element(page.getByRole('status', { name: 'Controller Actions' })).toHaveTextContent('1');
+
+    await userEvent.keyboard('{Alt>}{ArrowLeft}{/Alt}');
+    await expect.poll(manuscript).toBe('Hello');
+    await expect.poll(visible).toBe(' one two café keeps growing after acceptance');
+    // A manual edit revokes the old family; subsequent deltas must not revive it.
+    await userEvent.keyboard('!');
+    await expect.poll(manuscript).toBe('Hello!');
+    harness.appendStream('run-a', ' one two café keeps growing after acceptance late', 'stream:run-a:5');
+    await expect.poll(() => document.querySelector(selector)?.textContent ?? '').toBe('');
+    expect(manuscript()).toBe('Hello!');
+  });
   it.each(['visual', 'source'] as const)('reverses an accepted %s word while a refilled family is temporarily unavailable', async (mode) => {
     const keyboard = userEvent.setup();
     const harness = render(mode, true);
@@ -41,11 +91,11 @@ describe('completion controller and editor callback ordering', () => {
     await expect.poll(manuscript).toBe('Hello');
     await keyboard.cleanup();
   });
-  it.each([['visual', true], ['visual', false], ['source', true], ['source', false]] as const)('Tab accepts only the visible %s word and retains its suffix (initial insertion: %s)', async (mode, insertsOnAccept) => {
+  it.each([['visual', true], ['visual', false], ['source', true], ['source', false]] as const)('Tab accepts one %s word from the full preview and retains its suffix (initial insertion: %s)', async (mode, insertsOnAccept) => {
     render(mode, false, insertsOnAccept);
     await page.getByRole('textbox').click();
     const selector = mode === 'visual' ? '.loom-visual-ghost' : '.loom-source-ghost-text';
-    await expect.poll(() => document.querySelector(selector)?.textContent).toBe(' one');
+    await expect.poll(() => document.querySelector(selector)?.textContent).toBe(' one two');
     await userEvent.keyboard('{Tab}');
     await expect.element(page.getByRole('status', { name: 'Controller Markdown' })).toHaveTextContent('Hello one');
     expect(page.getByRole('status', { name: 'Controller Markdown' }).element().textContent).toBe(mode === 'visual' ? 'Hello one' : 'Hello one ');
@@ -66,7 +116,7 @@ describe('completion controller and editor callback ordering', () => {
       render(mode);
       const editor = page.getByRole('textbox');
       await editor.click();
-      await expect.element(page.getByText('one', { exact: true }).first()).toBeVisible();
+      await expect.element(page.getByText('one two', { exact: true }).first()).toBeVisible();
 
       await keyboard.keyboard('{Alt>}{ArrowRight}{/Alt}');
       await expect.element(page.getByRole('status', { name: 'Controller Markdown' }))
