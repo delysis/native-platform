@@ -152,3 +152,113 @@ Key files:
 ## Working-tree warning
 
 The active worktree may show the three generated Tauri schema files as modified while builds run. They are build-generated evidence from the release defect, not unrelated user edits. Do not discard them blindly. Review against `/tmp/native-platform-f8588b3e-acceptance/build-generated-schema.diff`, then either commit the authoritative generated output with its source change or regenerate it deterministically on the repair branch.
+
+## Astra continuation: PR #75 qualification state (2026-09-22)
+
+This section records the latest exact qualification state. It supersedes no
+acceptance requirement above; native product acceptance remains OPEN.
+
+### Tested source and artifact
+
+- PR #75 source was fetched from GitHub into a clean separate worktree.
+- Qualification worktree: `/Users/george/.codex/worktrees/native-platform-pr75-ghost`.
+- Original PR tip: `2fb08be8846cc00c3b58d4e3fbefecc37e26352f`.
+- Latest local qualification commit: `e98e6cdc57be9e336ece5803282e63db10ee6fb7`.
+- Latest local qualification tree: `90feed84a62bd72d5dd318f4960ff191604964c3`.
+- The local commit only repairs browser-test fixtures exposed by the new
+  production identity checks: `onGhostPresentationRejected`, the exact
+  `weave-${commandId}` request identity, and the expected `weave_status` read.
+- Clean candidate directory:
+  `/Users/george/.codex/worktrees/native-platform-pr75-ghost/dist/macos/loom-v0.1.0-e98e6cdc57be-20260922T191416Z`.
+- Candidate archive:
+  `/Users/george/.codex/worktrees/native-platform-pr75-ghost/dist/macos/loom-v0.1.0-e98e6cdc57be-20260922T191416Z/Loom.app.zip`.
+- Candidate receipt:
+  `/Users/george/.codex/worktrees/native-platform-pr75-ghost/dist/macos/loom-v0.1.0-e98e6cdc57be-20260922T191416Z/release-receipt.json`.
+
+### Green qualification evidence
+
+- Focused frontend unit suite: 73 tests passed.
+- Full frontend unit suite during release: 70 files, 515 tests passed.
+- Prescribed browser suite: 19 files, 148 tests passed.
+- `svelte-check`: 0 errors, 0 warnings.
+- Pinned `rustup run 1.92.0 cargo run --locked -p xtask -- macos-smoke-support`
+  passed 9 insertion assertions, 31 live-observer assertions, and compiled
+  18 macOS helpers.
+- Clean macOS Tauri build and ad-hoc signing completed successfully.
+- These are component/build receipts only. They do not establish native
+  product acceptance.
+
+### Latest real-model failure and preserved evidence
+
+The exact archive smoke was run with:
+
+- `DELYSIS_ACCEPTANCE_SOURCE_SHA=e98e6cdc57be9e336ece5803282e63db10ee6fb7`
+- `LOOM_SMOKE_GGUF_MODEL_PATH=/Users/george/.cache/fiction-harness/models/gemma-4-E2B-base-Q8_0.gguf`
+
+Preserved smoke directory:
+
+`/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/delysis-loom-smoke.XXXXXX.99o0hBJfyk`
+
+The run proves model/backend activity but fails native acceptance:
+
+- Metal initialized.
+- `generation_run_count` reached 8; the guard permits at most 4.
+- The first four-run family IDs were recorded in
+  `launch-1-live-stream-diagnostics.json`.
+- A fifth generation was admitted while the first ghost/cache family was in
+  use; the guard reports `asynchronous_guard_failed`.
+- `last_witness` and `post_terminal_observation` are both `{}`.
+- Rejected stages were `family_pending: 325` and `editor_missing: 41`.
+- No correlated pre-terminal WYSIWYG ghost was observed.
+- No product acceptance, model acceptance, or promotion claim is allowed.
+
+Relevant files in that directory:
+
+- `launch-1-live-stream-diagnostics.json`
+- `launch-1-live-stream-monitor.failure.json`
+- `launch-1-generation-family-guard.failure.json`
+- `launch-1-generation-family-guard.stderr.log`
+- `launch-1.stderr.log`
+
+### Unresolved to-dos for Astra
+
+1. Start from the exact latest qualification commit/tree above and inspect
+   the preserved smoke directory before editing code.
+2. Trace why the app admits a second four-run family before the first family
+   has produced a correlated visual/source witness. Establish whether this is
+   duplicate automatic scheduling, family teardown/retry, stale scope
+   invalidation followed by an unauthorized retry, or another admission path.
+   Do not raise the generation guard and do not suppress the guard failure.
+3. Correlate each of the eight run IDs through admission, durable event
+   publication, terminal candidate, family evaluation, and editor projection.
+   Use source revision/blob/cursor identity, not labels or readiness flags.
+4. Explain the `editor_missing` observations from the live diagnostics. Verify
+   the packaged app is attached to the intended named editor and native caret;
+   do not replace this with a controller-only or screenshot-only assertion.
+5. Determine whether a ghost is painted after terminal hydration. If yes,
+   retain the proof and separately decide whether streaming-before-terminal is
+   the intended product contract. If no, fix the actual projection/presentation
+   path and preserve the negative controls.
+6. After the narrow fix, rerun focused unit/browser tests, pinned observer
+   self-tests, and one clean release. Then rerun the exact archive smoke with
+   the approved Gemma model and preserve the complete smoke directory.
+7. If the smoke reaches a live witness, complete both Visual and Source
+   journeys: true in-caret Ghost, four distinct stable Loompad W/A/S/D choices,
+   unchanged manuscript while cycling, exact accept/unconsume/ordinary undo,
+   stale-scope invalidation, active-work quit with owned-worker joins, and
+   same-artifact/project relaunch with exact persisted bytes and fresh native
+   completion.
+8. Only promote after the exact tested tree passes those journeys and all
+   artifact/model/source hashes are recorded. Keep hosted credentials,
+   microphones, and unexercised authorities explicitly out of the result.
+
+### Explicit non-goals
+
+- Do not weaken or remove a predicate to obtain a green receipt.
+- Do not extend waits as a substitute for diagnosing the duplicate admission.
+- Do not inject fixture completions into the native smoke.
+- Do not change the approved Gemma model or add hosted inference fallback.
+- Do not reset the project, rewrite historical receipts, or perform a silent
+  database migration.
+- Do not claim acceptance from the green browser suite, native self-tests,
+  Metal initialization, generation-run creation, or a ready label.
