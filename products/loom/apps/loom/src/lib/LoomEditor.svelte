@@ -178,6 +178,8 @@
   let formattingRestoreDeadline = 0;
   let reportedCompletionAccessibilityIdentity = '';
   let reportedSelectionAccessibilityIdentity = '';
+  let pendingRejectedPresentationIdentity = '';
+  let rejectionFrame: number | undefined;
   let selectionAccessibilityEpoch = 0;
 
   function reportCompletionAccessibility(): void {
@@ -320,15 +322,44 @@
       snapshot.surfaceKey &&
       exactAnchor &&
       !faithful &&
-      reportedRejectedPresentationIdentity !== rejectionIdentity
+      reportedRejectedPresentationIdentity !== rejectionIdentity &&
+      pendingRejectedPresentationIdentity !== rejectionIdentity
     ) {
-      reportedRejectedPresentationIdentity = rejectionIdentity;
-      onGhostPresentationRejected(
-        snapshot.candidateId,
-        snapshot.presentationKey,
-        snapshot.surfaceKey,
-        provenAnchorByteOffset
-      );
+      pendingRejectedPresentationIdentity = rejectionIdentity;
+      if (rejectionFrame !== undefined) window.cancelAnimationFrame(rejectionFrame);
+      rejectionFrame = window.requestAnimationFrame(() => {
+        rejectionFrame = undefined;
+        if (pendingRejectedPresentationIdentity !== rejectionIdentity || !view || view.isDestroyed) return;
+        pendingRejectedPresentationIdentity = '';
+        const current = currentGhostPresentationSnapshot();
+        const currentAnchor = current.anchorByteOffset;
+        const currentExactAnchor = currentAnchor !== null &&
+          selectionBoundary(view.state) === currentAnchor;
+        const currentFaithful = currentExactAnchor && (
+          (current.text === '' && current.unconsumeText !== '') ||
+          visualGhostTextIsFaithfulAtSelection(
+            view.state,
+            lastEmitted,
+            currentAnchor ?? -1,
+            current.text
+          )
+        );
+        if (
+          current.candidateId !== snapshot.candidateId ||
+          current.presentationKey !== snapshot.presentationKey ||
+          current.surfaceKey !== snapshot.surfaceKey ||
+          currentAnchor !== provenAnchorByteOffset ||
+          currentFaithful ||
+          reportedRejectedPresentationIdentity === rejectionIdentity
+        ) return;
+        reportedRejectedPresentationIdentity = rejectionIdentity;
+        onGhostPresentationRejected(
+          snapshot.candidateId,
+          snapshot.presentationKey,
+          snapshot.surfaceKey,
+          provenAnchorByteOffset
+        );
+      });
     }
     const presentation: GhostTextPresentation | null = snapshot.presentationKey &&
       snapshot.surfaceKey &&
@@ -1253,6 +1284,7 @@
     clearFormattingSelection();
     if (projectionTimer !== undefined) window.clearTimeout(projectionTimer);
     if (normalizationTimer !== undefined) window.clearTimeout(normalizationTimer);
+    if (rejectionFrame !== undefined) window.cancelAnimationFrame(rejectionFrame);
     if (visibilityFrame !== undefined) window.cancelAnimationFrame(visibilityFrame);
     if (ghostSynchronizationFrame !== undefined) {
       window.cancelAnimationFrame(ghostSynchronizationFrame);
