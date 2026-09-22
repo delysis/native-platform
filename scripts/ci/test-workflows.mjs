@@ -205,7 +205,9 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /row\.generated_span_artifact_id === row\.output_artifact_id/);
   assert.match(smoke, /completion control state:/);
   assert.match(smoke, /var pressed = false/);
-  assert.match(smoke, /if description\.contains\(alreadyName\) \{/);
+  assert.match(smoke, /guard matches\.count <= 1/);
+  assert.match(smoke, /down\.postToPid\(pid\)/);
+  assert.match(smoke, /"Ghost text", "Loompad"/);
   assert.match(smoke, /guard pressed \|\| !requirePress/);
   assert.match(smoke, /suggestionLabelPattern/);
   assert.match(smoke, /strings\(element\)\.contains\("Completion suggestions"\)/);
