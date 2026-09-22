@@ -1,0 +1,10 @@
+; Layout belongs to EASL. The host supplies a bounded logical viewport, not a
+; window, a document, an event loop, or authority to open any of those resources.
+@external (var viewport: vec2f)
+@external (var field-one: vec4f)
+@external (var field-two: vec4f)
+@cpu (defn main []
+  (let [field-width (- viewport.x 32.)
+        field-height (/ (- viewport.y 48.) 2.)]
+    (= field-one (vec4f 16. 16. field-width field-height))
+    (= field-two (vec4f 16. (+ 32. field-height) field-width field-height))))

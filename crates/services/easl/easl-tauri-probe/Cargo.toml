@@ -1,0 +1,40 @@
+[package]
+name = "easl-tauri-probe"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+# No window, clipboard, or application runtime in the default component suite.
+native-probe = ["dep:tauri", "dep:tauri-runtime-wry", "dep:softbuffer", "dep:arboard"]
+
+[dependencies]
+easl = { path = "../vendor/easl" }
+easl-text = { path = "../easl-text" }
+easl-native-text = { path = "../easl-native-text" }
+thiserror.workspace = true
+serde_json.workspace = true
+tauri = { version = "=2.11.5", default-features = false, features = ["wry"], optional = true }
+tauri-runtime-wry = { version = "=2.11.4", optional = true }
+softbuffer = { version = "=0.4.8", optional = true }
+arboard = { version = "=3.6.1", default-features = false, optional = true }
+
+[[example]]
+name = "easl-tauri-two-fields"
+path = "examples/two_fields.rs"
+required-features = ["native-probe"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"

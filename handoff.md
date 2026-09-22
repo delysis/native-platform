@@ -192,3 +192,49 @@ hash. No app was launched, no native parity was claimed, and no Tauri adapter
 was implemented. The packet's architecture slice remains a tested source
 continuation only; the next owner must handle the separate native host, IME,
 accessibility, signed-bundle and source-parity work already described above.
+
+## Local receipt for `easl-tauri-next-f721ec2d` (candidate commit)
+
+Applied in a fresh detached worktree at exact base `f721ec2d907916744d9c590f86b65c3bfb1264e8`.
+Packet tooling passed **25/25** (`preflight`, icon, delivery); full-source
+preflight and apply passed. Rust toolchain: `rustc 1.92.0 (ded5c06cf 2025-12-08)`,
+Cargo `1.92.0 (344c4567c 2025-10-21)`, all Cargo commands used
+`--offline --locked --profile native-view`, one process at a time.
+
+Two demonstrated compile/lint repairs were made:
+
+- `layout.rs`: matched the current `IOManager::record_compute` signature.
+- `native/surface.rs`: handled Tao's non-exhaustive `MouseScrollDelta`.
+- `build.rs` and `native/keys.rs`: fixed Clippy markdown diagnostics.
+
+The new build-script digest was reviewed and updated in `ci/ignored-tests.json`
+to `0244d518564753ca1f12b37f78e9db15a4c7089360a48fa87a13020233a20d3b`.
+The registry test's reviewed-build-script count was updated from 8 to 9; the
+ignored-test inventory remains **46** entries with no ignored test added.
+
+### Executed gates
+
+- `easl-tauri-probe` default: **16 passed** (7 unit + 9 integration).
+- `easl-tauri-probe --features native-probe --all-targets`: **21 passed**
+  (12 unit + 9 integration).
+- Probe default and native-feature Clippy with `-D warnings`: **PASS**.
+- Loom review-only: **120 passed, 0 failed, 2 ignored** (manual renderer tests).
+- Loom review-only Clippy with `-D warnings`: **PASS**.
+- Reusable `easl-native-text`, `easl-text`, `loom-markdown`, and
+  `loom-text-session`: **PASS** across all tests and doctests.
+- Repository CI metadata/planner/required/ignored-tests/backup/workflow/current-doc
+  suite: **136/136 PASS**.
+- `cargo fmt --all -- --check` and `git diff --check`: **PASS**.
+
+Warnings are pre-existing: unused `harfrust::shape` and duplicate `specimen`
+example output names. No foreground application was launched and no foreground
+probe authorization was assumed. The native example remains unqualified:
+IME/preedit/candidate-rectangle behavior, OS accessibility, production window
+registration/close veto, WebView removal, Loom service/storage integration,
+source parity, signed packaging, and visual/lifecycle acceptance remain open.
+
+This candidate is suitable for draft-PR review/component promotion only. Do not
+update Loom App/CSS hashes, mark PR #73 ready, merge, or promote to main from
+these receipts. Next work order: authorized focused probe interaction and
+lifetime evidence; real composition bridge; platform accessibility tree; then
+reusable Tauri-managed surface integration with an existing Loom writing owner.

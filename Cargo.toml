@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/services/easl/easl-native-text",
+    "crates/services/easl/easl-tauri-probe",
     "crates/services/easl/easl-text",
     "products/loom/crates/loom-markdown",
     "products/loom/crates/loom-text-session",
