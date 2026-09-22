@@ -4028,6 +4028,7 @@ name = "loom-app"
 version = "0.1.0"
 dependencies = [
  "loom-types",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

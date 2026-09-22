@@ -1,5 +1,11 @@
 # Audit remediation continuation — 22 September 2026
 
+## Target-Mac integration follow-up
+
+The published Astra continuation was subsequently exercised on the target Mac. Its focused frontend, Svelte, Swift-helper, and pinned Rust `loom-app` checks passed. Integration replaced the acceptance incognito WebView with a stable directory-scoped custom WebKit data store: this preserves isolation from the normal profile without erasing the preferences that the required same-artifact relaunch must verify. Exact packaged two-launch behavior remains an artifact acceptance obligation.
+
+The obsolete no-model autocomplete/Shuttle helper and the real writer-load-to-presentation failure remain open. Neither is converted into a pass by these focused checks.
+
 **NOT PROMOTABLE.** Implementation was pushed to PR #72, but no current macOS artifact or approved-model writing journey was executed. No PR was merged or rebased.
 
 Implementation: `7ed336545cfd8df4489d4db1615bf2a5033699e2`
@@ -11,7 +17,7 @@ Branch: `codex/audit-release-gates`
 
 Remembered workspace labels now show exact paths, while root strings and native document-relative paths remain unchanged. Same-title roots are not discarded. Long path labels round-trip through the bounded navigation history. The actual Mac filesystem relationship still needs inspection; a genuine nested `writing/` directory must not be stripped or relocated.
 
-A validated acceptance-directory launch now requests non-persistent WebViews. The intended boundary is isolation of renderer history from normal-profile localStorage without changing native manuscript storage or normal launches. Two Rust configuration tests were added but **not compiled or executed here**. Actual WebKit isolation remains a native acceptance check.
+A validated acceptance-directory launch now requests a stable directory-scoped WebKit data store. The intended boundary is isolation of renderer history from normal-profile localStorage without changing native manuscript storage or normal launches, while preserving preferences across the required acceptance relaunch. The configuration tests now pass on the target Mac. Actual packaged WebKit isolation remains a native acceptance check.
 
 The real-completion toggle now identifies the current `Ghost text` / `Loompad` button and its exact state fields, and uses the existing Cmd+Shift+G policy shortcut rather than mistaking mode switching for on/off. Matching fails closed on ambiguous, incomplete, or unbounded traversal. Diagnostics reuse the same observation-only matcher. The old two-string arguments remain only because the current shell caller still supplies them; they are not searched for in the UI.
 

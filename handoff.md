@@ -4,6 +4,19 @@ Date: 2026-09-22
 Repository: `delysis/native-platform`  
 Do not promote the current tip until the product regressions in **Immediate blockers** are repaired and exercised in the exact macOS artifact.
 
+## Mac continuation after Astra's `b73e2e22`
+
+Astra's implementation and receipt commits were fast-forwarded and independently exercised on the target Mac. The genuine navigation and current-control changes are retained. Focused current-tree checks passed: 507 frontend unit tests, Svelte check with zero diagnostics, 21 Swift completion-control contract assertions across 18 compiled helpers, and pinned Rust 1.92 `loom-app` tests plus strict Clippy.
+
+One acceptance-only regression was found during integration: Astra selected an incognito WebView to isolate acceptance localStorage, but a nonpersistent store cannot prove the required preference-preserving relaunch. The follow-up replaces it with a stable, directory-scoped custom WebKit data-store identifier. Normal launches continue to use the default store; separate acceptance directories cannot share navigation preferences; an acceptance relaunch can retain them. This needs confirmation in the exact packaged two-launch journey.
+
+The serious remaining work is intentionally narrow:
+
+1. `scripts/macos-smoke-support/exercise_loom_completion_controls.swift` still encodes retired autocomplete/Shuttle controls. Rewrite it around the exact `Ghost text`/`Loompad` control and Cmd+Shift+G policy shortcut, or retire the obsolete no-model assertion if its ownership is fully covered elsewhere.
+2. Build one clean candidate from the settled tree and run the real-model journey. Prior evidence reached Metal initialization but created zero `generation_runs`; diagnose writer load -> admission -> event -> presentation from the preserved logs and fresh bounded diagnostics.
+3. Require actual Ghost and four-word Loompad rendering in both Visual and Source, exact accept/unconsume/ordinary undo, stale invalidation, joined active-work quit, and exact-content relaunch. If native generation still stalls, preserve model/backend/application logs plus database and accessibility state and hand that bounded failure to Pro; do not redesign unrelated systems.
+4. Use local CI as promotion authority while GitHub Actions are payment-blocked. Iterate with focused tests, then run one consolidated pinned 1.92 gate asynchronously. Promote the stack only from the exact tested tree.
+
 ## Current stack
 
 The implementation is a linear, pushed PR stack based on refreshed `origin/main` at `c0bcc42d8e274c9f428d3e19508709d7fa6e23ae`:
