@@ -46,8 +46,22 @@ pub fn run() {
         .menu(build_desktop_menu)
         .plugin(tauri_plugin_dialog::init())
         .plugin(loom_plugin.build())
-        .run(tauri::generate_context!())
+        .run(application_context(isolate_model_discovery))
         .unwrap_or_else(|error| eprintln!("Loom could not start: {error}"));
+}
+
+// Native project isolation does not isolate WebKit localStorage. A non-persistent
+// WebView prevents an acceptance run from reading or overwriting normal navigation
+// history. The manuscript and model registry still belong to the validated native
+// acceptance directory and survive an ordinary same-project relaunch.
+fn application_context(isolated_acceptance: bool) -> tauri::Context<tauri::Wry> {
+    let mut context = tauri::generate_context!();
+    if isolated_acceptance {
+        for window in &mut context.config_mut().app.windows {
+            window.incognito = true;
+        }
+    }
+    context
 }
 
 fn acceptance_app_local_data_root() -> Result<Option<PathBuf>, String> {
@@ -330,6 +344,42 @@ mod tests {
                 "missing native file menu label {label}"
             );
         }
+    }
+
+    #[test]
+    fn acceptance_context_requests_nonpersistent_webviews() {
+        let normal = application_context(false);
+        let isolated = application_context(true);
+        let normal_windows = &normal.config().app.windows;
+        let isolated_windows = &isolated.config().app.windows;
+        assert!(
+            !normal_windows.is_empty(),
+            "the real application must create a window"
+        );
+        assert_eq!(normal_windows.len(), isolated_windows.len());
+        for (normal, isolated) in normal_windows.iter().zip(isolated_windows) {
+            assert!(
+                !normal.incognito,
+                "normal navigation must remain persistent"
+            );
+            assert!(
+                isolated.incognito,
+                "acceptance must not reuse normal localStorage"
+            );
+            assert_eq!(normal.label, isolated.label);
+            assert_eq!(normal.url, isolated.url);
+            assert_eq!(normal.title, isolated.title);
+        }
+    }
+
+    #[test]
+    fn acceptance_context_preserves_application_identity() {
+        let normal = application_context(false);
+        let isolated = application_context(true);
+        assert_eq!(normal.config().identifier, isolated.config().identifier);
+        assert_eq!(normal.config().product_name, isolated.config().product_name);
+        assert_eq!(normal.package_info().name, isolated.package_info().name);
+        assert_eq!(normal.package_info().version, isolated.package_info().version);
     }
 
     #[test]
