@@ -1,4 +1,5 @@
 import ApplicationServices
+import AppKit
 import Foundation
 
 let pid = Int32(CommandLine.arguments[1])!
