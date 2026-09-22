@@ -67,7 +67,11 @@ mod tests {
     fn optional_tokens_do_not_borrow_another_tokens_presence() {
         let (mask, values) = project([None, Some("#ff0000"), None]);
         assert_eq!(mask, 2);
-        assert_eq!(values, [0., 0., 0., 1., 0., 0., 0., 0., 0.]);
-        assert_eq!(project([None; 3]), (0, [0.; 9]));
+        // Zero and one are exact protocol values, not approximate measurements.
+        let expected: [f32; 9] = [0., 0., 0., 1., 0., 0., 0., 0., 0.];
+        assert_eq!(values.map(f32::to_bits), expected.map(f32::to_bits));
+        let (mask, values) = project([None; 3]);
+        assert_eq!(mask, 0);
+        assert_eq!(values.map(f32::to_bits), [0_f32.to_bits(); 9]);
     }
 }

@@ -555,7 +555,27 @@ impl Documents {
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
         while self.busy() || self.transitioning() || self.save_requested {
             if Instant::now() >= deadline {
-                return Err("Storage response timeout".into());
+                let (stage, ticket) = self.flight.as_ref().map_or(("idle", None), |flight| {
+                    let stage = match &flight.kind {
+                        FlightKind::Auxiliary => "auxiliary",
+                        FlightKind::Transition => "transition",
+                        FlightKind::Writes(batch) => match batch.mode {
+                            WriteMode::Journal => "journal",
+                            WriteMode::Checkpoint => "checkpoint",
+                            WriteMode::Discard => "discard",
+                        },
+                    };
+                    (stage, Some(flight.ticket))
+                });
+                // Never Debug-print Flight/Batch: their captures contain text.
+                return Err(format!(
+                    "Storage response timeout: stage={stage}, ticket={ticket:?}, \
+                     transition={}, save_requested={}, retry={}, composing={}",
+                    self.transitioning(),
+                    self.save_requested,
+                    self.retry.is_some(),
+                    self.is_composing(),
+                ));
             }
             self.tick(fonts, now)?;
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -568,7 +588,7 @@ impl Documents {
     }
 }
 fn admission(text: &str, kind: loom_types::DocumentKind) -> Result<(), String> {
-    TextField::with_kind(text, true, kind == loom_types::DocumentKind::Verse).map(|_| ())
+    crate::document_model::create(text, kind == loom_types::DocumentKind::Verse).map(|_| ())
 }
 fn fields(snapshot: &Snapshot) -> Result<(TextField, TextField), String> {
     let mut manuscript = TextField::with_kind(
@@ -728,6 +748,67 @@ mod tests {
     }
 
     #[test]
+    fn discard_handles_a_journal_reply_already_queued_before_transition() {
+        let directory = tempfile::tempdir().unwrap();
+        loom_store::ProjectStore::initialize(directory.path(), "Journal ordering fixture").unwrap();
+        let (notify, ready) = std::sync::mpsc::sync_channel(8);
+        let mut docs = Documents::open_with_notify(directory.path(), move || {
+            let _ = notify.try_send(());
+        })
+        .unwrap();
+        let mut fonts = TextSystem::new();
+        docs.manuscript.toggle_source(&mut fonts).unwrap();
+        let original_id = docs.identities[0].unwrap();
+        insert(&mut docs.manuscript, &mut fonts, "saved\r\n");
+        docs.save(&mut fonts).unwrap();
+        ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("checkpoint acknowledgement was not published");
+        docs.settle(&mut fonts).unwrap();
+        let original_path = docs.path();
+        insert(&mut docs.manuscript, &mut fonts, "unsaved");
+        let now = Instant::now();
+        docs.tick(&mut fonts, now).unwrap();
+        docs.tick(
+            &mut fonts,
+            now + loom_text_session::autosave::DRAFT_INTERVAL,
+        )
+        .unwrap();
+        ready
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("journal acknowledgement was not published");
+        // Notification follows reply publication. The client has deliberately
+        // not drained it yet: this is a known interleaving, not a sleep race.
+        assert!(docs.busy());
+        assert!(matches!(
+            docs.flight.as_ref().map(|flight| &flight.kind),
+            Some(FlightKind::Writes(batch)) if batch.mode == WriteMode::Journal
+        ));
+        docs.begin_transition(Destination::NewDocument, Disposition::Discard, &mut fonts)
+            .unwrap();
+        docs.settle(&mut fonts).unwrap();
+        assert_eq!(
+            std::fs::read(&original_path).unwrap().as_slice(),
+            b"saved\r\n"
+        );
+        let original = docs
+            .project
+            .entries()
+            .iter()
+            .position(|entry| entry.document_id == original_id)
+            .unwrap();
+        docs.begin_transition(
+            Destination::Document(original),
+            Disposition::Save,
+            &mut fonts,
+        )
+        .unwrap();
+        docs.settle(&mut fonts).unwrap();
+        assert_eq!(docs.manuscript.source().as_bytes(), b"saved\r\n");
+        assert!(!docs.dirty());
+    }
+
+    #[test]
     fn discard_waits_for_an_accepted_journal_and_leaves_only_the_saved_source() {
         let directory = tempfile::tempdir().unwrap();
         let mut fonts = TextSystem::new();
@@ -819,7 +900,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&context).unwrap(), "external");
         docs.tick(
             &mut fonts,
-            Instant::now() + std::time::Duration::from_secs(60),
+            Instant::now() + std::time::Duration::from_mins(1),
         )
         .unwrap();
         assert!(!docs.busy()); // A failure cannot cause an automatic retry loop.

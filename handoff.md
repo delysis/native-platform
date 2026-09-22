@@ -136,3 +136,59 @@ do not constitute macOS native product acceptance.
    timeout rather than increasing its deadline.
 5. Rerun the selected full local/remote matrix, then complete live macOS native
    UI, focus, IME, bundle, and identity acceptance before marking the PR ready.
+
+## Local continuation receipt for packet `easl-native-next-fa931bf1`
+
+Executed in a new detached worktree at `fa931bf13f788a0c093e977685f37c2d12efac06`
+with Rust 1.92.0 (`rustc 1.92.0 (ded5c06cf 2025-12-08)`, Cargo
+`1.92.0 (344c4567c 2025-10-21)`) and `--offline --locked --profile native-view`.
+The 17-test packet preflight passed, then applied the packet with no source/hash
+relaxation. `cargo fmt --all -- --check` and `git diff --check` pass.
+
+Two narrow repairs were required by executable gates:
+
+- `interface_fault_tests.rs` now uses the repository-proven unconditional
+  infinite-loop budget fixture; the original input-conditioned loop returned
+  normally and could not test VM poisoning.
+- `chrome_state::ADD_LABELS` is `#[cfg(test)]`; it is test data and otherwise
+  triggered the owned-crate `-D warnings` dead-code gate. Runtime behavior is
+  unchanged.
+
+### Command results
+
+- Focused packet tests: document model **6/6**, input geometry **4/4**, VM
+  faults **4/4**, frame state **2/2**, queued journal acknowledgement **1/1**.
+- Full review-only EASL target: **120 passed, 0 failed, 2 ignored** (the two
+  manual renderer tests).
+- Review-only owned-code Clippy with `-D warnings`: **PASS**.
+- Ignored-test registry: **24/24 PASS**; catalog count remains unchanged at 46.
+- Repository CI policy/workflow/current-doc suite: **136/136 PASS**; current-doc
+  validation reports `surfaces=2`, `documents=7`, `current_paths=5`,
+  `retired_edges=2`.
+- Reusable suite (`easl-native-text`, `easl-text`, `loom-markdown`,
+  `loom-text-session`): **PASS** across all unit, integration and doc tests.
+  Cargo reports only the pre-existing duplicate `specimen` example output-name
+  warning for the two EASL packages, plus the pre-existing unused `harfrust`
+  `shape` warning.
+
+### Intentional remaining failure
+
+The ordinary native-app gate was run separately:
+
+```text
+rustup run 1.92.0 cargo check --offline --locked --profile native-view \
+  -p loom-easl-interface
+```
+
+It correctly rejects the unchanged strict interface reference:
+
+```text
+actual App.svelte: 6667474039c166a5a33b1f4e2cd23e5cca79353962c73b1df4ac0e5c3552709a
+expected guard:     3d45a082bb51a6f11a06b865e5e6c5a198e1c836dbb58fe3ded8562d931a1725
+```
+
+This is an expected **native qualification failure**, not a reason to update the
+hash. No app was launched, no native parity was claimed, and no Tauri adapter
+was implemented. The packet's architecture slice remains a tested source
+continuation only; the next owner must handle the separate native host, IME,
+accessibility, signed-bundle and source-parity work already described above.

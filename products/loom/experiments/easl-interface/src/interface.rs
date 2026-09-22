@@ -215,19 +215,25 @@ impl Interface {
         if self.faulted {
             return Err("EASL runtime faulted; reload a valid interface".into());
         }
-        if let Ok(result) =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.step_inner(input)))
-        {
-            result
-        } else {
-            self.faulted = true;
-            Err("EASL runtime fault; writing and last scene retained".into())
+        // Invalid host facts did not execute the VM and cannot poison it.
+        if input.iter().any(|value| !value.is_finite()) {
+            return Err("Nonfinite interface input".into());
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.step_inner(input))) {
+            Ok(Ok(scene)) => Ok(scene),
+            Ok(Err(error)) => {
+                // Execution or decoding can fail after VM mutation. Never
+                // resume that partially executed state on the next event.
+                self.faulted = true;
+                Err(error)
+            }
+            Err(_) => {
+                self.faulted = true;
+                Err("EASL runtime fault; writing and last scene retained".into())
+            }
         }
     }
     fn step_inner(&mut self, input: [f32; crate::interface::INPUT_COUNT]) -> Result<Scene, String> {
-        if input.iter().any(|v| !v.is_finite()) {
-            return Err("Nonfinite interface input".into());
-        }
         let words = input.map(f32::to_bits);
         self.external
             .write_external_var_raw("input", &words)
@@ -349,10 +355,10 @@ fn decode(lines: &[String]) -> Result<Scene, String> {
                 }
                 let state = vec4(lines.next().ok_or("Missing control state")?)?;
                 let slot_toggle = kind == "toggle-slot";
-                let label_slot = if kind != "control" {
-                    Some(id(state[1])?)
-                } else {
+                let label_slot = if kind == "control" {
                     None
+                } else {
+                    Some(id(state[1])?)
                 };
                 if label_slot
                     .is_some_and(|slot| !((100..116).contains(&slot) || (200..248).contains(&slot)))
@@ -609,6 +615,10 @@ pub fn small_number(value: u32) -> f32 {
 pub fn logical_pixels(value: f64) -> f32 {
     value as f32
 }
+
+#[cfg(test)]
+#[path = "interface_fault_tests.rs"]
+mod fault_tests;
 
 #[cfg(test)]
 mod tests {

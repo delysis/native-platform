@@ -9,12 +9,17 @@ mod companion;
 #[cfg(test)]
 mod current_ui_tests;
 mod document;
+mod document_model;
 mod focus;
 mod formatting;
+#[cfg(test)]
+mod frame_tests;
 mod icon;
 mod input_field;
+mod input_geometry;
 mod interface;
 mod keyboard;
+mod native_events;
 mod pane_divider;
 mod renderer;
 mod text_field;
@@ -27,16 +32,11 @@ use easl_native_text::EditCommand;
 use interface::{Draw, Interface, Scene};
 use loom_config::WorkspaceThemeMode as Appearance;
 use renderer::Renderer;
-use std::{
-    num::NonZeroU32,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{num::NonZeroU32, path::PathBuf, sync::Arc, time::Instant};
 use winit::{
     application::ApplicationHandler,
-    dpi::{LogicalSize, PhysicalPosition},
-    event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent},
+    dpi::LogicalSize,
+    event::{ElementState, Ime, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
     keyboard::{Key, ModifiersState, NamedKey},
     window::{Theme, Window, WindowId},
@@ -65,6 +65,11 @@ struct Native {
 struct FrameState {
     pointer_pending: bool,
     dirty: bool,
+}
+impl FrameState {
+    fn queue_pointer(&mut self) -> bool {
+        !std::mem::replace(&mut self.pointer_pending, true)
+    }
 }
 struct PreferenceView {
     appearance_preview: Option<Appearance>,
@@ -358,7 +363,8 @@ impl App {
         let x = self.pointer[0] - rect.0[0];
         let y = self.pointer[1] - rect.0[1] + field.editor.scroll;
         if action == 3 {
-            field.editor.scroll = (field.editor.scroll + self.scroll * 24.).max(0.);
+            field.editor.scroll =
+                (field.editor.scroll + self.scroll * input_geometry::SCROLL_LINE_PIXELS).max(0.);
             field.editor.reveal_caret = false;
         } else {
             let edit = if action == 10 {
@@ -396,24 +402,10 @@ impl App {
             Action::Edit(_) if self.focus.chrome.is_none() => self.edit(arg)?,
             Action::Edit(_) => {}
             Action::Click(_) | Action::Scroll(_) | Action::Drag(_) => {
-                self.pointer_edit(kind, arg)?
+                self.pointer_edit(kind, arg)?;
             }
             Action::Save => self.docs.save(&mut self.renderer.text)?,
-            Action::OpenProject => {
-                let Some(native) = &self.native else {
-                    return Ok(());
-                };
-                let chosen = rfd::FileDialog::new()
-                    .set_parent(native.window.as_ref())
-                    .set_title("Open a Loom project folder")
-                    .set_directory(self.docs.root())
-                    .pick_folder();
-                if let Some(path) = chosen
-                    && path != self.docs.root()
-                {
-                    self.transition(document::Destination::Project(path))?;
-                }
-            }
+            Action::OpenProject => self.open_project()?,
             Action::NewDocument => self.transition(document::Destination::NewDocument)?,
             Action::Auxiliary(_) => self.open_auxiliary(arg)?,
             Action::TogglePane(_)
@@ -432,14 +424,7 @@ impl App {
                     self.transition(document::Destination::Document(arg as usize))?;
                 }
             }
-            Action::Reload => {
-                let source = read_source(&self.ui_path)?;
-                let mut candidate = Interface::compile(&source)?;
-                let scene = candidate.step(self.input(0))?;
-                actions::admit(0, &scene.actions)?;
-                self.ui = candidate;
-                self.docs.status = "Reloaded EASL interface · writing preserved".into();
-            }
+            Action::Reload => self.reload_interface()?,
             Action::Source(_) => {
                 self.close_formatting();
                 let id = if arg == 0 {
@@ -483,6 +468,31 @@ impl App {
                 }
             }
         }
+        Ok(())
+    }
+    fn open_project(&mut self) -> Result<(), String> {
+        let Some(native) = &self.native else {
+            return Ok(());
+        };
+        let chosen = rfd::FileDialog::new()
+            .set_parent(native.window.as_ref())
+            .set_title("Open a Loom project folder")
+            .set_directory(self.docs.root())
+            .pick_folder();
+        if let Some(path) = chosen
+            && path != self.docs.root()
+        {
+            self.transition(document::Destination::Project(path))?;
+        }
+        Ok(())
+    }
+    fn reload_interface(&mut self) -> Result<(), String> {
+        let source = read_source(&self.ui_path)?;
+        let mut candidate = Interface::compile(&source)?;
+        let scene = candidate.step(self.input(0))?;
+        actions::admit(0, &scene.actions)?;
+        self.ui = candidate;
+        self.docs.status = "Reloaded EASL interface · writing preserved".into();
         Ok(())
     }
     fn open_auxiliary(&mut self, index: u32) -> Result<(), String> {
@@ -837,20 +847,7 @@ impl ApplicationHandler<NativeEvent> for App {
         }
         match event {
             WindowEvent::CloseRequested => self.update(4, loop_),
-            WindowEvent::RedrawRequested => {
-                if self.frame.pointer_pending {
-                    self.frame.pointer_pending = false;
-                    self.frame.dirty |=
-                        self.refresh_scene(if self.dragging { 5 } else { 0 }, loop_);
-                    if !self.frame.dirty {
-                        return;
-                    }
-                }
-                self.frame.dirty = false;
-                if let Err(e) = self.paint() {
-                    self.error(e);
-                }
-            }
+            WindowEvent::RedrawRequested => self.redraw(loop_),
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.update(0, loop_);
             }
@@ -873,54 +870,13 @@ impl ApplicationHandler<NativeEvent> for App {
                 self.preferences.system_dark = theme == Theme::Dark;
                 self.update(0, loop_);
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                let scale = self.native.as_ref().map_or(1., |n| n.window.scale_factor());
-                let pos: PhysicalPosition<f64> = position;
-                self.pointer = [
-                    interface::logical_pixels(pos.x / scale),
-                    interface::logical_pixels(pos.y / scale),
-                ];
-                // Coalesce high-frequency pointer events at the redraw boundary.
-                // The EASL program decides whether the hover actually changed.
-                self.frame.pointer_pending = true;
-                if let Some(native) = &self.native {
-                    native.window.request_redraw();
-                }
-            }
+            WindowEvent::CursorMoved { position, .. } => self.cursor_moved(position),
             WindowEvent::MouseInput {
                 state,
                 button: MouseButton::Left,
                 ..
-            } => {
-                if state == ElementState::Pressed {
-                    self.focus_from_pointer();
-                    let now = Instant::now();
-                    let repeated = self.last_click.is_some_and(|(time, pos)| {
-                        now.duration_since(time) < Duration::from_millis(450)
-                            && (pos[0] - self.pointer[0]).abs() < 4.
-                            && (pos[1] - self.pointer[1]).abs() < 4.
-                    });
-                    self.clicks = if repeated { self.clicks % 3 + 1 } else { 1 };
-                    self.last_click = Some((now, self.pointer));
-                    self.update(1, loop_);
-                } else {
-                    // Commit the final coalesced pointer position while capture
-                    // still belongs to the drag, even if no redraw arrived yet.
-                    if self.frame.pointer_pending && (self.dragging || self.divider.dragging()) {
-                        self.update(5, loop_);
-                    }
-                    self.dragging = false;
-                    self.divider.release();
-                    self.update_pointer_cursor();
-                }
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                self.scroll = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -y,
-                    MouseScrollDelta::PixelDelta(p) => -interface::logical_pixels(p.y / 24.),
-                };
-                self.update(3, loop_);
-            }
+            } => self.left_button(state, loop_),
+            WindowEvent::MouseWheel { delta, .. } => self.wheel(delta, loop_),
             WindowEvent::Ime(event) => self.ime(event, loop_),
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Released => {
                 self.repeat_guard.release(&event.physical_key);

@@ -76,25 +76,7 @@ impl TextField {
             .into(),
             ..TextStyle::default()
         };
-        let mut document = EditorDocument::new(
-            text,
-            if verse {
-                Dialect::PlainText
-            } else {
-                Dialect::Loom
-            },
-        )
-        .map_err(|e| e.to_string())?;
-        document
-            .set_admission_check(|source, projection| {
-                if projection.spans().len() + 1 > easl_native_text::MAX_EDITOR_SPANS {
-                    return Err(loom_markdown::Error::Limit);
-                }
-                easl_native_text::validate_text(source)
-                    .and_then(|()| easl_native_text::validate_text(projection.text()))
-                    .map_err(|_| loom_markdown::Error::Limit)
-            })
-            .map_err(|e| e.to_string())?;
+        let mut document = crate::document_model::create(text, verse)?;
         let editor = TextEditor::new(document.projection().text(), body.clone())
             .map_err(|e| e.to_string())?;
         let selection = document

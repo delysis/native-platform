@@ -3,6 +3,7 @@
 
 pub const ADD_CONTROL: u32 = 2;
 pub const FIRST_ADD_ITEM: u32 = 400;
+#[cfg(test)]
 pub const ADD_LABELS: [&str; 4] = [
     "New document",
     "Add files…",

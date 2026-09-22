@@ -39,6 +39,46 @@ fn editor_node(field_id: u32, readonly: bool, rect: [f32; 4], scale: f64) -> Nod
     node
 }
 
+struct EditorNodes<'a> {
+    docs: &'a mut crate::document::Documents,
+    system: &'a mut easl_native_text::TextSystem,
+    next_id: &'a mut u64,
+}
+
+impl EditorNodes<'_> {
+    fn append(
+        &mut self,
+        scene: &crate::interface::Scene,
+        root: &mut Node,
+        update: &mut TreeUpdate,
+        readonly: bool,
+        scale: f64,
+    ) {
+        for draw in &scene.draws {
+            if let Draw::Editor(rect, style, _) = draw {
+                let field_id = crate::interface::id(style[2]).unwrap_or_default();
+                let Ok(field) = self.docs.field(field_id, self.system) else {
+                    continue;
+                };
+                let id = NodeId(9 + u64::from(field_id));
+                let mut node = editor_node(field_id, readonly, rect.0, scale);
+                field.editor.accessibility(
+                    self.system,
+                    update,
+                    &mut node,
+                    self.next_id,
+                    [
+                        f64::from(rect.0[0]),
+                        f64::from(rect.0[1] - field.editor.scroll),
+                    ],
+                );
+                root.push_child(id);
+                update.nodes.push((id, node));
+            }
+        }
+    }
+}
+
 impl App {
     pub(crate) fn update_accessibility(&mut self) {
         let Some(native) = &mut self.native else {
@@ -124,28 +164,12 @@ impl App {
                 root.push_child(NodeId(41));
                 update.nodes.push((NodeId(41), add_menu));
             }
-            for draw in &scene.draws {
-                if let Draw::Editor(rect, style, _) = draw {
-                    let field_id = crate::interface::id(style[2]).unwrap_or_default();
-                    let Ok(field) = docs.field(field_id, system) else {
-                        continue;
-                    };
-                    let id = NodeId(9 + u64::from(field_id));
-                    let mut node = editor_node(field_id, readonly, rect.0, scale);
-                    field.editor.accessibility(
-                        system,
-                        &mut update,
-                        &mut node,
-                        next_id,
-                        [
-                            f64::from(rect.0[0]),
-                            f64::from(rect.0[1] - field.editor.scroll),
-                        ],
-                    );
-                    root.push_child(id);
-                    update.nodes.push((id, node));
-                }
+            EditorNodes {
+                docs,
+                system,
+                next_id,
             }
+            .append(scene, &mut root, &mut update, readonly, scale);
             update.nodes.push((NodeId(1), root));
             update
         });
