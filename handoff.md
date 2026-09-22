@@ -2,7 +2,11 @@
 
 Date: 2026-09-22  
 Repository: `delysis/native-platform`  
-Do not promote the current tip until the product regressions in **Immediate blockers** are repaired and exercised in the exact macOS artifact.
+The genuine implementation stack has been promoted to `main`; do not claim Ghost/Loompad product acceptance until the remaining presentation failure is repaired and exercised in the exact macOS artifact.
+
+## Promotion status
+
+PRs #64, #66, #67, #68, #69, #70, #71, and #72 were merged in order using the green local gate as authority while GitHub Actions were payment-blocked. Final promoted main commit: `f38a842d8ddea0a97a69b2f3d3efbd5d39ffa27d`. Final main tree: `412fee9338828f9a179ab0275039511318257dd0`, exactly matching the tested and reviewed integration tree.
 
 ## Mac continuation after Astra's `b73e2e22`
 
