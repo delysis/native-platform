@@ -88,6 +88,154 @@ proposals. Historical policy references and provenance metadata are not source
 imports. Do not add vendor workspaces, dependencies, lockfiles, or a second
 application owner inside EASL.
 
+## Full task queue
+
+Work through as many of these as the attached source can support. Group related
+changes into small reviewable patches, and stop a patch at a real ownership or
+missing-source boundary. A proposed patch may be accompanied by a precise
+follow-up patch plan; do not turn missing execution evidence into a reason to
+omit source review.
+
+### P0 — correctness, privacy and replay
+
+1. Finish the protected material-evidence/bindings path described above.
+2. Inventory every `.loom/materials` write, temporary file, manifest, object,
+   binding, folder, grant, search index and receipt path. Mark each as ordinary
+   or private and identify the codec/namespace owner.
+3. Check every private-sidecar caller for authenticate-before-parse,
+   expected-length bounds, digest verification, symlink/final-component races,
+   atomic publication, no-clobber behavior and cleanup after interruption.
+4. Check protected-copy and migration behavior. Existing plaintext projects must
+   remain readable and must not be silently rewritten, erased or “upgraded.”
+5. Verify source and evidence IDs are derived from canonical plaintext, while
+   encrypted representations remain randomized and authenticated.
+6. Finish the `material_plan`/flattened `materials` schema separation. Add
+   backward-compatibility or explicit rejection behavior for any evidence shape
+   already capable of being written by the published branch.
+7. Audit generation and terminal replay for frozen configuration, persona bytes,
+   sampling, function recipe, material plan, retrieval evidence, media grants,
+   model identity, server/native route, cancellation and request fingerprints.
+8. Check every idempotency key for stable request identity, collision handling,
+   retry semantics and exact replay. Add negative cases for same command IDs with
+   changed source, settings, cursor, pane, model, materials or policy.
+9. Audit failure atomicity: failed import, failed encryption, failed publication,
+   cancellation, worker panic, shutdown and lost acknowledgement must not leave a
+   false receipt or partial private artifact.
+10. Check external-edit, stale-revision, deleted-document, lease and recovery
+    behavior against ordinary source bytes and immutable history.
+
+### P1 — current Loom interface and service ownership
+
+11. Build a source-derived control/state matrix from current `App.svelte` and
+    `app.css`: Add menu, titlebar, pane toggles, Ghost/Loompad, recording,
+    materials, imports, settings, model status, errors, focus, disabled and busy
+    states. Identify every native EASL input and missing state.
+12. Port the actual Add menu actions and dismissal behavior. Do not label a
+    direct-new-document button “Add.”
+13. Port main/right/bottom pane visibility, fallback geometry, mounted-state
+    preservation, pane-local selection/scroll and busy-pane cancellation.
+14. Port the single conditional Ghost/Loompad control, including icon, label,
+    tooltip, enabled state and service action. Keep it disabled when authority is
+    absent; do not fake streaming.
+15. Port theme tokens, titlebar dimensions, title truncation, hover/focus/pressed/
+    disabled states, dark/light appearance and useful content-area sizing.
+16. Replace positional SVG extraction with explicit keyed branch extraction and
+    source/hash tests for every current conditional icon.
+17. Audit App/Svelte merge behavior: imports, setup, materials, workspace panes,
+    completion surfaces, settings refresh, error banners and callbacks. Remove
+    stale props and keep browser fixtures aligned with real component contracts.
+18. Keep all persistence, credentials, model lifecycle, acquisition, grants,
+    cancellation and provenance in shared Rust/native-kit services. Identify any
+    duplicate authority accidentally reintroduced in the view.
+19. Complete document lifecycle gaps visible in the source: create, rename,
+    delete, export, reveal, folder warnings, watcher/reconcile, large-folder
+    behavior, fatal-worker recovery and exact source preservation.
+20. Complete outline/search/tree presentation and keyboard traversal for long
+    documents, including truncation, drag, selection and empty/error states.
+21. Bind chat, terminal, page-preview, import, material, attachment, recording,
+    retry and transcript controls to existing owners. A control may remain
+    explicitly disabled, but its state and reason must be honest.
+
+### P1 — reusable EASL text/editor ecosystem
+
+22. Map the reusable EASL APIs and identify the one production Loom pane that can
+    consume them without creating a second document/history owner.
+23. Integrate EASL shaping, rich-style resolution, line/cell geometry, glyph
+    placement, hit testing, caret, selection and decorations behind a comparison
+    oracle. Publish replacement geometry only after validation against the current
+    source/history boundary.
+24. Keep `EditPlan` snapshot-relative: bind and revalidate document, revision,
+    pane and selection before applying an asynchronous result.
+25. Complete font loading/matching, fallback, color emoji, variable fonts,
+    multi-page atlas packing, eviction, immutable texture residency and font
+    lifecycle across platforms.
+26. Cover grapheme-safe editing, combining marks, CJK, dead keys, IME preedit,
+    bidi, script runs, ligature caret stops, tabs, discretionary hyphenation,
+    negative advances, whitespace marks, entity/source mapping and malformed
+    Unicode. Unsupported cases must preserve source and expose recovery.
+27. Add retained multi-paragraph layout and edit invalidation with explicit
+    resource limits. Measure compiler, VM, transfer, shaping, allocation and
+    paint costs independently; do not call bounded specimens unlimited.
+28. Make clipboard, word/line/granular selection, wheel/pointer behavior and
+    generic input/accessibility transport reusable across EASL consumers.
+29. Improve EASL module/API ergonomics and compiler startup for nested arrays,
+    namespaces, large programs and repeated hot reloads. Keep product policy out
+    of the reusable library.
+
+### P2 — layout quality, differential behavior and performance
+
+30. Compare the pinned Pretext revision against equivalent fonts, options, rich
+    items, no-break behavior and actual line choices. Distinguish browser
+    geometry equivalence from native invariant tests.
+31. If claiming Butterick/TeX-level typography, specify and implement dictionary
+    hyphenation, Knuth–Plass glue/fitness, optical margins, protrusion,
+    microtypography and paragraph-breaking policy. Otherwise label the current
+    implementation accurately as a foundation.
+32. Design multilingual, variable-font, emoji, long-document, pathological-line,
+    malformed-font and capacity-exhaustion corpora with accepting and rejecting
+    cases.
+33. Measure cold startup, initial layout, typing-to-display, navigation,
+    selection, scroll, resize, palette opening, repeated clicks and sustained
+    editing at multiple scales. Report p50/p95, allocations, cache hit rates and
+    host/compiler boundary costs.
+34. Reduce CPU repaint cost with damage caching or GPU composition only where
+    measurements justify it. Preserve deterministic offscreen review images.
+35. Add fuzz/property/roundtrip/failure-atomicity coverage for text, fonts,
+    ranges, edits, reload, released resources, cache invalidation and malformed
+    display-list input.
+
+### P2 — native acceptance and packaging preparation
+
+36. Define a signed macOS review-bundle procedure with source SHA, executable
+    hash, bundle ID, embedded assets, signing identity, PID and current-only
+    accessibility evidence.
+37. Prepare foreground test scripts for pointer, keyboard, Tab/Shift-Tab,
+    splitters, palette dismissal, Add menu, panes, copy/cut/paste, undo, Return,
+    stale selections, long URLs, CJK/IME, dead keys, candidate positioning and
+    Retina geometry. These remain proposed until George authorizes interaction.
+38. Qualify native/Wry focus transfer, shortcuts, IME ownership and the combined
+    accessibility tree. Keep platform-webview coexistence explicit.
+39. Prepare signed save/quit/relaunch, encrypted history, external edit,
+    recovery, lease, shutdown and model-cancellation acceptance scenarios.
+40. Prepare Linux/Windows component/runtime qualification separately from macOS;
+    never transfer native OS evidence between platforms.
+
+### P3 — repository hygiene and release evidence
+
+41. Re-run the forbidden-source/published-ancestry audit. Explain every remaining
+    Studio/Cast/Hollow string as policy, provenance or documentation, and reject
+    actual source/dependency imports.
+42. Check manifests, permissions, generated schemas, lockfiles, vendor boundaries,
+    feature unions and build guards for stale or duplicated authority.
+43. Keep exact source SHA, patch SHA, toolchain, target, features, test counts,
+    ignored/manual tests, warnings, environment blockers and artifact identity in
+    machine-readable receipts.
+44. Separate specification, correspondence, production binding, component tests,
+    packaged runtime and live native acceptance. Never promote one evidence class
+    into another.
+45. Produce a final prioritized TODO ledger with owners, dependencies, exact
+    files, proposed commands, acceptance evidence and a clear “not run here” list.
+
 ## Output format
 
 Return these sections:
