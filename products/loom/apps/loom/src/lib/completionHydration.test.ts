@@ -17,6 +17,8 @@ function fixture(text = ' world again'): { state: InlineSuggestionState; bodies:
   }));
   const bodies: BranchBody[] = branches.map(branch => ({
     ...branch, candidate_id: branch.candidate_id!, output_blob_id: blob,
+    seed: branch.seed!,
+    model_id: branch.model_id!,
     byte_len: Buffer.byteLength(text), text
   }));
   return { bodies, state: {
