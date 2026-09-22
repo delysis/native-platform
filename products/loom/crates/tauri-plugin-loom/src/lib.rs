@@ -18,7 +18,6 @@ mod materials;
 mod microphone_capture;
 mod model_catalog;
 mod model_download;
-mod reference_diagnostics;
 mod server_weave;
 mod shader_preview;
 mod speech_input;
