@@ -104,7 +104,7 @@ guard let writingSurface = editor() else {
     fputs("could not bind Loom's exact editor for Select-All\n", stderr)
     exit(1)
 }
-NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateIgnoringOtherApps])
+NSRunningApplication(processIdentifier: pid)?.activate(options: [])
 
 let deadline = Date().addingTimeInterval(5)
 var observed: CanonicalSelection?
@@ -137,7 +137,7 @@ repeat {
         exactSelectionSince = nil
         exactSelectionEpoch = nil
         if Date() >= nextDispatch {
-            NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateIgnoringOtherApps])
+            NSRunningApplication(processIdentifier: pid)?.activate(options: [])
             guard AXUIElementSetAttributeValue(
                 writingSurface,
                 kAXFocusedAttribute as CFString,
