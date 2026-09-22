@@ -41,6 +41,7 @@ impl CacheFingerprint {
             PromptTokenPolicy::NoBosParseSpecial => 1,
             PromptTokenPolicy::AddBosParseSpecial => 2,
             PromptTokenPolicy::ExactTokenIds => 3,
+            PromptTokenPolicy::FillInMiddleModelTokens => 4,
         }]);
         for value in [
             model_sha256,
@@ -80,9 +81,7 @@ fn frame(hasher: &mut Sha256, value: &str) {
 
 #[cfg(test)]
 mod tests {
-    use crate::{
-        CacheFingerprint, CacheTier, PrefixCacheMetadata, longest_compatible_prefix,
-    };
+    use crate::{CacheFingerprint, CacheTier, PrefixCacheMetadata, longest_compatible_prefix};
     use llama_native_types::{PromptForm, PromptTokenPolicy};
 
     fn fingerprint() -> CacheFingerprint {
@@ -185,7 +184,8 @@ mod tests {
             0,
         );
         assert!(
-            longest_compatible_prefix(std::slice::from_ref(&entry), &original, &[1, 2, 3]).is_some()
+            longest_compatible_prefix(std::slice::from_ref(&entry), &original, &[1, 2, 3])
+                .is_some()
         );
         let mut changed = original;
         changed.device.push('r');
@@ -222,6 +222,7 @@ mod tests {
                 PromptTokenPolicy::NoBosParseSpecial,
                 PromptTokenPolicy::AddBosParseSpecial,
                 PromptTokenPolicy::ExactTokenIds,
+                PromptTokenPolicy::FillInMiddleModelTokens,
             ] {
                 let mut value = fingerprint();
                 value.prompt_form = form;
@@ -229,6 +230,6 @@ mod tests {
                 assert!(identities.insert(value.stable_id()));
             }
         }
-        assert_eq!(identities.len(), 12);
+        assert_eq!(identities.len(), 15);
     }
 }
