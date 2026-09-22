@@ -104,7 +104,7 @@ guard let writingSurface = editor() else {
     fputs("could not bind Loom's exact editor for Select-All\n", stderr)
     exit(1)
 }
-NSRunningApplication(processIdentifier: pid)?.activate(options: [])
+NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateIgnoringOtherApps])
 
 func setFullSelection(_ element: AXUIElement) -> Bool {
     var range = CFRange(location: 0, length: expected.utf16.count)
@@ -147,6 +147,7 @@ repeat {
         exactSelectionSince = nil
         exactSelectionEpoch = nil
         if Date() >= nextDispatch {
+            NSRunningApplication(processIdentifier: pid)?.activate(options: [.activateIgnoringOtherApps])
             guard AXUIElementSetAttributeValue(
                 writingSurface,
                 kAXFocusedAttribute as CFString,
