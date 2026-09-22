@@ -994,7 +994,7 @@ wait_for_readiness() {
         loom_root="$PRODUCT_STATE/writing"
         if [ -f "$loom_root/.loom/project.json" ] &&
           [ -f "$loom_root/.loom/loom.sqlite3" ] &&
-          [ -f "$loom_root/manuscript/Untitled.md" ]; then
+          [ -f "$loom_root/Untitled.md" ]; then
           open_count=$(sqlite3 "$loom_root/.loom/loom.sqlite3" \
             "SELECT count(*) FROM command_receipts WHERE command_kind = 'open_project';" 2>/dev/null || echo 0)
           [ "$open_count" -ge "$run_number" ] && return 0
@@ -1188,7 +1188,7 @@ run_once() {
     esac
   fi
   if [ "$COMPONENT" = loom ] && [ "$run_number" -eq 1 ]; then
-    loom_manuscript="$PRODUCT_STATE/writing/manuscript/Untitled.md"
+    loom_manuscript="$PRODUCT_STATE/writing/Untitled.md"
     loom_database="$PRODUCT_STATE/writing/.loom/loom.sqlite3"
     if ! start_loom_project_busy_monitor "$ACTIVE_PID" "launch-1-project-busy-monitor"; then
       echo "could not start the exact-PID project_busy alert monitor" >&2
@@ -1196,6 +1196,10 @@ run_once() {
       return 1
     fi
     if [ -n "$LOOM_SMOKE_REAL_COMPLETIONS" ]; then
+      if ! foreground_loom_process "$ACTIVE_PID"; then
+        echo "the exact Loom process could not be foregrounded before changing suggestion policy" >&2
+        return 1
+      fi
       if ! RUN_1_AUTOCOMPLETE_OFF_EVIDENCE=$(set_loom_completion_toggle \
         "$ACTIVE_PID" "Turn autocomplete off" "Turn autocomplete on"); then
         echo "could not establish autocomplete off before real-completion typing" >&2
@@ -1252,6 +1256,10 @@ run_once() {
         "$RUN_1_EDITOR_SENTINEL" "launch-1-live-stream-monitor" \
         "$LOOM_GENERATION_GUARD_FAILURE" "$LOOM_PROJECT_BUSY_MONITOR_FAILURE"; then
         echo "could not initialize the pre-terminal WYSIWYG live-stream observer" >&2
+        return 1
+      fi
+      if ! foreground_loom_process "$ACTIVE_PID"; then
+        echo "the exact Loom process could not be foregrounded before enabling suggestions" >&2
         return 1
       fi
       if ! RUN_1_AUTOCOMPLETE_ENABLE_EVIDENCE=$(set_loom_completion_toggle \
@@ -1600,7 +1608,7 @@ NODE
       return 1
     fi
     if ! RUN_1_NEW_DOCUMENT_PATH=$(require_loom_new_manuscript_text \
-      "$PRODUCT_STATE/writing/manuscript" \
+      "$PRODUCT_STATE/writing" \
       "$loom_manuscript" \
       "$RUN_1_NEW_DOCUMENT_SENTINEL"); then
       echo "application logs: $stdout_log and $stderr_log" >&2
@@ -1621,7 +1629,7 @@ NODE
     require_equal "manuscript SHA-256 after titlebar drag" \
       "$RUN_1_MANUSCRIPT_SHA256_BEFORE" "$RUN_1_MANUSCRIPT_SHA256_AFTER"
   elif [ "$COMPONENT" = loom ] && [ "$run_number" -eq 2 ]; then
-    loom_manuscript="$PRODUCT_STATE/writing/manuscript/Untitled.md"
+    loom_manuscript="$PRODUCT_STATE/writing/Untitled.md"
     if ! require_loom_manuscript_text "$loom_manuscript" "$RUN_1_FORMATTED_SENTINEL"; then
       echo "persisted editor input did not reopen on the second exact-bundle launch" >&2
       return 1

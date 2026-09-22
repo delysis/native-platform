@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -34,6 +35,9 @@ pub fn run() {
         }
     };
     let isolate_model_discovery = acceptance_app_local_data_root.is_some();
+    let acceptance_data_store = acceptance_app_local_data_root
+        .as_deref()
+        .map(acceptance_data_store_identifier);
     let loom_plugin = tauri_plugin_loom::Builder::new()
         .with_build_model_policy(build_model_policy)
         .with_app_local_data_root(acceptance_app_local_data_root)
@@ -46,8 +50,30 @@ pub fn run() {
         .menu(build_desktop_menu)
         .plugin(tauri_plugin_dialog::init())
         .plugin(loom_plugin.build())
-        .run(tauri::generate_context!())
+        .run(application_context(acceptance_data_store))
         .unwrap_or_else(|error| eprintln!("Loom could not start: {error}"));
+}
+
+// Native project isolation does not isolate WebKit localStorage. A stable custom
+// data store keeps each acceptance directory separate from the normal profile and
+// from other runs while still preserving preferences across the required relaunch.
+fn application_context(acceptance_data_store: Option<[u8; 16]>) -> tauri::Context<tauri::Wry> {
+    let mut context = tauri::generate_context!();
+    if let Some(identifier) = acceptance_data_store {
+        for window in &mut context.config_mut().app.windows {
+            window.data_store_identifier = Some(identifier);
+        }
+    }
+    context
+}
+
+fn acceptance_data_store_identifier(root: &Path) -> [u8; 16] {
+    let mut digest = Sha256::new();
+    digest.update(b"delysis-loom-acceptance-webview-v1\0");
+    digest.update(root.to_string_lossy().as_bytes());
+    digest.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 prefix has a fixed length")
 }
 
 fn acceptance_app_local_data_root() -> Result<Option<PathBuf>, String> {
@@ -330,6 +356,60 @@ mod tests {
                 "missing native file menu label {label}"
             );
         }
+    }
+
+    #[test]
+    fn acceptance_context_requests_a_distinct_persistent_webview_store() {
+        let identifier = acceptance_data_store_identifier(Path::new("/tmp/loom-acceptance"));
+        let normal = application_context(None);
+        let isolated = application_context(Some(identifier));
+        let normal_windows = &normal.config().app.windows;
+        let isolated_windows = &isolated.config().app.windows;
+        assert!(
+            !normal_windows.is_empty(),
+            "the real application must create a window"
+        );
+        assert_eq!(normal_windows.len(), isolated_windows.len());
+        for (normal, isolated) in normal_windows.iter().zip(isolated_windows) {
+            assert!(
+                normal.data_store_identifier.is_none(),
+                "normal navigation must retain the default data store"
+            );
+            assert!(
+                !isolated.incognito,
+                "acceptance preferences must survive the required relaunch"
+            );
+            assert_eq!(isolated.data_store_identifier, Some(identifier));
+            assert_eq!(normal.label, isolated.label);
+            assert_eq!(normal.url, isolated.url);
+            assert_eq!(normal.title, isolated.title);
+        }
+    }
+
+    #[test]
+    fn acceptance_context_preserves_application_identity() {
+        let normal = application_context(None);
+        let isolated = application_context(Some([7; 16]));
+        assert_eq!(normal.config().identifier, isolated.config().identifier);
+        assert_eq!(normal.config().product_name, isolated.config().product_name);
+        assert_eq!(normal.package_info().name, isolated.package_info().name);
+        assert_eq!(
+            normal.package_info().version,
+            isolated.package_info().version
+        );
+    }
+
+    #[test]
+    fn acceptance_data_store_identity_is_stable_and_directory_scoped() {
+        let first = acceptance_data_store_identifier(Path::new("/tmp/loom-a"));
+        assert_eq!(
+            first,
+            acceptance_data_store_identifier(Path::new("/tmp/loom-a"))
+        );
+        assert_ne!(
+            first,
+            acceptance_data_store_identifier(Path::new("/tmp/loom-b"))
+        );
     }
 
     #[test]

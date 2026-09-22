@@ -205,7 +205,9 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /row\.generated_span_artifact_id === row\.output_artifact_id/);
   assert.match(smoke, /completion control state:/);
   assert.match(smoke, /var pressed = false/);
-  assert.match(smoke, /if description\.contains\(alreadyName\) \{/);
+  assert.match(smoke, /guard matches\.count <= 1/);
+  assert.match(smoke, /down\.postToPid\(pid\)/);
+  assert.match(smoke, /"Ghost text", "Loompad"/);
   assert.match(smoke, /guard pressed \|\| !requirePress/);
   assert.match(smoke, /suggestionLabelPattern/);
   assert.match(smoke, /strings\(element\)\.contains\("Completion suggestions"\)/);
@@ -451,6 +453,7 @@ test("native macOS lane runs all native tests, separate doctests, and strict Cli
 
 test("stable macOS packaging adds only the real distribution gates", () => {
   const release = read(releaseScriptPath);
+  const smoke = read(smokeScriptPath);
   assert.match(release, /candidate\|stable/);
   assert.match(release, /stable releases require the exact annotated tag/);
   assert.match(release, /git cat-file -t "refs\/tags\/\$RELEASE_TAG"/);
@@ -460,6 +463,9 @@ test("stable macOS packaging adds only the real distribution gates", () => {
   assert.match(release, /xcrun stapler validate/);
   assert.match(release, /spctl --assess --type execute/);
   assert.match(release, /scripts\/smoke-macos-app\.sh" "\$COMPONENT" "\$ARCHIVE"/);
+  assert.match(release, /the Tauri build changed checked-in source/);
+  assert.doesNotMatch(smoke, /writing\/manuscript\/Untitled\.md/);
+  assert.match(smoke, /writing\/Untitled\.md/);
   assert.match(release, /delysis\.macos-release-receipt\.v2/);
   assert.doesNotMatch(release, /windows|linux/i);
 });

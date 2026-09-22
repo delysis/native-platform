@@ -4,6 +4,36 @@ Date: 2026-09-22
 Repository: `delysis/native-platform`  
 Do not promote the current tip until the product regressions in **Immediate blockers** are repaired and exercised in the exact macOS artifact.
 
+## Mac continuation after Astra's `b73e2e22`
+
+Astra's implementation and receipt commits were fast-forwarded and independently exercised on the target Mac. The genuine navigation and current-control changes are retained. Focused current-tree checks passed: 507 frontend unit tests, Svelte check with zero diagnostics, 21 Swift completion-control contract assertions across 18 compiled helpers, and pinned Rust 1.92 `loom-app` tests plus strict Clippy.
+
+One acceptance-only regression was found during integration: Astra selected an incognito WebView to isolate acceptance localStorage, but a nonpersistent store cannot prove the required preference-preserving relaunch. The follow-up replaces it with a stable, directory-scoped custom WebKit data-store identifier. Normal launches continue to use the default store; separate acceptance directories cannot share navigation preferences; an acceptance relaunch can retain them. This needs confirmation in the exact packaged two-launch journey.
+
+The serious remaining work is intentionally narrow:
+
+1. `scripts/macos-smoke-support/exercise_loom_completion_controls.swift` still encodes retired autocomplete/Shuttle controls. Rewrite it around the exact `Ghost text`/`Loompad` control and Cmd+Shift+G policy shortcut, or retire the obsolete no-model assertion if its ownership is fully covered elsewhere.
+2. Build one clean candidate from the settled tree and run the real-model journey. Prior evidence reached Metal initialization but created zero `generation_runs`; diagnose writer load -> admission -> event -> presentation from the preserved logs and fresh bounded diagnostics.
+3. Require actual Ghost and four-word Loompad rendering in both Visual and Source, exact accept/unconsume/ordinary undo, stale invalidation, joined active-work quit, and exact-content relaunch. If native generation still stalls, preserve model/backend/application logs plus database and accessibility state and hand that bounded failure to Pro; do not redesign unrelated systems.
+4. Use local CI as promotion authority while GitHub Actions are payment-blocked. Iterate with focused tests, then run one consolidated pinned 1.92 gate asynchronously. Promote the stack only from the exact tested tree.
+
+### Exact real-model failure after the Mac continuation
+
+Commit `4299647a24b39ae6f1100e9753db50fc6f156815` built a clean, ad-hoc-signed candidate and passed the complete local gate inherited from `24682e62` plus the focused post-gate workflow/shell checks. The approved Gemma model loaded on Metal and the repaired control automation proved `Ghost text`, actionable and suggestions enabled. The exact family created four runs, 192 `text_delta` events, four nonempty candidates, and four `completed` terminals with no generation-guard or project-busy failure.
+
+The product journey still failed: after 654 accessibility polls, the monitor reported `family_terminal_before_live_witness`. No correlated pre-terminal WYSIWYG ghost was observed before all four runs became terminal. This is now a presentation/observation problem, not the earlier selector or writer-load failure.
+
+Preserved evidence:
+
+- local gate: `/tmp/native-platform-local-ci-24682e62-v2/` (`FAILURES=0`)
+- release: `/tmp/native-platform-4299647a-acceptance/release-loom-candidate.log`
+- smoke: `/tmp/native-platform-4299647a-acceptance/smoke-real-model.log`
+- retained isolated run: `/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/delysis-loom-smoke.XXXXXX.0mtLzZBF7E`
+- failure receipt: `launch-1-live-stream-monitor.failure.json`
+- full diagnostic: `launch-1-live-stream-diagnostics.json`
+
+For Pro: first determine whether the terminal ghost actually renders after hydration and the monitor exits too early, or whether `InlineFamilyEvaluation` never publishes it. Add a bounded post-terminal accessibility/DOM observation before changing product behavior. If the final ghost is absent, trace the exact four run IDs from generation event -> terminal candidate -> durable hydration -> family evaluation -> editor presentation key. If it is present only after terminal, retain that proof and separately decide whether live streaming is a required product contract or an over-strict smoke assertion. Then exercise Ghost and Loompad in both editor modes; do not touch executor/cache/sampler systems without evidence that this presentation failure originates there.
+
 ## Current stack
 
 The implementation is a linear, pushed PR stack based on refreshed `origin/main` at `c0bcc42d8e274c9f428d3e19508709d7fa6e23ae`:

@@ -36,6 +36,13 @@ pub fn run(root: &Path, arguments: &[String]) -> Result<()> {
             "Swift compilation failed: {}",
             source.display()
         );
+        if name == "set_loom_completion_toggle" {
+            let status = Command::new(&executable)
+                .arg("--self-test")
+                .status()
+                .context("check current Loom accessibility control contract")?;
+            ensure!(status.success(), "Loom control-contract checks failed");
+        }
     }
     println!("compiled {} macOS smoke helpers", sources.len());
     Ok(())

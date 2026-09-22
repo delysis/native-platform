@@ -193,6 +193,11 @@ if [ "$COMPONENT" = loom ]; then
 fi
 
 run env MACOSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS" CMAKE_OSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS" LOOM_BUILD_MODEL_POLICY="$LOOM_POLICY_NAME" pnpm --dir "$PRODUCT_DIR" exec tauri build --bundles app -- --locked
+if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+  echo "the Tauri build changed checked-in source; regenerate and commit build metadata before releasing" >&2
+  git status --short >&2
+  exit 1
+fi
 record_check "$PACKAGE::tauri-build"
 
 if [ ! -d "$BUNDLE" ] || [ ! -x "$EXECUTABLE" ]; then

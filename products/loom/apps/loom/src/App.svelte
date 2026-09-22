@@ -9668,6 +9668,8 @@
     // retain their state, so a busy pane must never trap its owner on screen.
     const next = new Set(hiddenPaneSlots);
     if (next.has(position)) next.delete(position); else next.add(position);
+    if (position === 'main' && next.has('main') && !rightPaneOpen) return;
+    if (position === 'right' && next.has('right') && !mainPaneOpen) next.delete('main');
     hiddenPaneSlots = next;
     if (position === 'main' && next.has('main')) {
       cancelSuggestionTimer();
@@ -9761,7 +9763,7 @@
             <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/>{#if slot.position === 'right'}<path d="M10 2.5v11"/>{:else if slot.position === 'bottom'}<path d="M2 10h12"/>{:else}<path d="M5 2.5v11M11 2.5v11"/>{/if}</svg>
           </button>
         {/each}
-        {#if project && !mainPane}
+        {#if project && !mainPane && rightPaneOpen}
           <button class="titlebar-button" class:active={mainPaneOpen} type="button" aria-label={mainPaneOpen ? 'Collapse main pane' : 'Show main pane'} aria-pressed={mainPaneOpen} title="Main pane" on:click={() => togglePane('main')}>
             <svg aria-hidden="true" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="2"/><path d="M5 2.5v11M11 2.5v11"/></svg>
           </button>
