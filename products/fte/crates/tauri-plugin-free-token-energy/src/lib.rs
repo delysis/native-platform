@@ -1,10 +1,14 @@
 //! Rust-only Tauri 2 embedding surface for Free Token Energy.
 
+mod storage;
+
 use fte_loopback::{LoopbackConfig, LoopbackServer};
 #[cfg(feature = "hosted-providers")]
 use fte_providers::{HostedProviderBackend, HostedProviderConfig};
 use fte_router::{Gateway, GatewayDefaults};
-use fte_store::{ResponseStore, SecretResolver, SqliteStore};
+use fte_store::{ResponseStore, SecretResolver};
+#[cfg(test)]
+use fte_store::SqliteStore;
 use fte_types::{
     CancelTarget, GatewayBackend, GatewayError, GatewayEvent, GatewayRequest, GatewayResponse,
     GatewayStatus, LoopbackStatus, ModelDescriptor, RequestId,
@@ -135,7 +139,8 @@ impl Builder {
     }
 
     /// Overrides the plugin-owned response database and loopback-token root.
-    /// The embedding application is responsible for validating this path.
+    /// The plugin checks support and secures this root before default storage
+    /// access. Injecting a store without default loopback leaves it untouched.
     #[must_use]
     pub fn with_app_data_dir(mut self, app_data_dir: PathBuf) -> Self {
         self.app_data_dir = Some(app_data_dir);
@@ -166,20 +171,15 @@ impl Builder {
                 loopback_rotate_token,
             ])
             .setup(move |app, _api| {
-                let app_data_dir = match app_data_dir {
-                    Some(app_data_dir) => app_data_dir,
-                    None => app.path().app_data_dir()?,
-                };
-                std::fs::create_dir_all(&app_data_dir)?;
-                let store: Arc<dyn ResponseStore> = match store {
-                    Some(store) => store,
-                    None => Arc::new(SqliteStore::open(app_data_dir.join("gateway-v2.db"))?),
-                };
+                let storage = storage::prepare(store, loopback_config, default_loopback, || {
+                    match app_data_dir {
+                        Some(path) => Ok(path),
+                        None => Ok(app.path().app_data_dir()?),
+                    }
+                })?;
+                let store = storage.store;
+                let loopback_config = storage.loopback;
                 gateway.bind_response_store(Arc::clone(&store))?;
-                let loopback_config = loopback_config.or_else(|| {
-                    default_loopback
-                        .then(|| LoopbackConfig::app_private(app_data_dir.join("loopback-token")))
-                });
                 app.manage(PluginState {
                     gateway,
                     store,
