@@ -2300,8 +2300,7 @@ mod tests {
             );
         }
         assert_eq!(
-            fs::read(original_path(project.path(), &attachment.id).expect("original path"))
-                .expect("original"),
+            original_bytes(project.path(), &attachment.id).expect("original bytes"),
             original
         );
         let again = import_path(project.path(), &path).expect("repeat import");
@@ -2309,6 +2308,122 @@ mod tests {
             read_source(project.path(), &again.id).expect("same source"),
             (presentation, text)
         );
+    }
+
+    #[test]
+    fn original_export_retains_exact_bytes_and_rejects_changed_plaintext() {
+        let project = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let text = "Private café 雨.\r\nNo normalization.\n";
+        let source_path = source.path().join("source.txt");
+        fs::write(&source_path, text).unwrap();
+        let attachment = import_path(project.path(), &source_path).unwrap();
+        let (name, bytes) = original_for_export(project.path(), &attachment.id).unwrap();
+        assert_eq!(name, "source.txt");
+        assert_eq!(bytes, text.as_bytes());
+        let object = attachment_root(project.path())
+            .unwrap()
+            .join("objects")
+            .join(&attachment.id);
+        assert_eq!(fs::read(&object).unwrap(), bytes);
+
+        let mut changed = bytes;
+        changed[0] ^= 1;
+        fs::write(&object, &changed).unwrap();
+        assert!(matches!(
+            original_for_export(project.path(), &attachment.id),
+            Err(ContextAttachmentError::ContextInvalid)
+        ));
+        assert_eq!(fs::read(&object).unwrap(), changed);
+        assert_eq!(fs::read(&source_path).unwrap(), text.as_bytes());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn secured_original_export_rejects_invalid_payloads_without_rewriting_them() {
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir(project.path().join(".loom")).unwrap();
+        // Synthetic test key only; production key acquisition is unchanged.
+        desktop_vault::ProjectVault::initialize_with_key(project.path(), [37; 32]).unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let text = "Private café 雨.\r\nNo normalization.\n";
+        let source_path = source.path().join("source.txt");
+        fs::write(&source_path, text).unwrap();
+        let attachment = import_path(project.path(), &source_path).unwrap();
+        let root = attachment_root(project.path()).unwrap();
+        let object = root.join("objects").join(&attachment.id);
+        let manifest = root
+            .join("manifests")
+            .join(format!("{}.json", attachment.id));
+        let stored = fs::read(&object).unwrap();
+        let stored_manifest = fs::read(&manifest).unwrap();
+        assert!(stored.starts_with(b"MINEENC\x01"));
+        assert!(stored_manifest.starts_with(b"MINEENC\x01"));
+        assert!(
+            !stored
+                .windows(text.len())
+                .any(|bytes| bytes == text.as_bytes())
+        );
+        assert_eq!(
+            original_for_export(project.path(), &attachment.id).unwrap(),
+            ("source.txt".to_owned(), text.as_bytes().to_vec())
+        );
+        assert_eq!(
+            import_path(project.path(), &source_path).unwrap().id,
+            attachment.id
+        );
+        assert_eq!(fs::read(&object).unwrap(), stored);
+        assert_eq!(fs::read(&manifest).unwrap(), stored_manifest);
+
+        // Equal plaintext lengths keep rebinding independent of size rejection.
+        let other_text = text.replace("Private", "Another");
+        assert_eq!(other_text.len(), text.len());
+        let other_path = source.path().join("other.txt");
+        fs::write(&other_path, &other_text).unwrap();
+        let other = import_path(project.path(), &other_path).unwrap();
+        let rebound = fs::read(root.join("objects").join(&other.id)).unwrap();
+        let mut tampered = stored.clone();
+        *tampered.last_mut().unwrap() ^= 1;
+        for (case, replacement) in [
+            ("tampered ciphertext", tampered),
+            ("rebound ciphertext", rebound),
+            ("plaintext downgrade", text.as_bytes().to_vec()),
+        ] {
+            fs::write(&object, &stored).unwrap();
+            assert_eq!(
+                original_bytes(project.path(), &attachment.id).unwrap(),
+                text.as_bytes()
+            );
+            fs::write(&object, &replacement).unwrap();
+            assert!(
+                original_for_export(project.path(), &attachment.id).is_err(),
+                "{case}"
+            );
+            assert_eq!(fs::read(&object).unwrap(), replacement, "{case}");
+            assert_eq!(fs::read(&manifest).unwrap(), stored_manifest, "{case}");
+        }
+        fs::write(&object, &stored).unwrap();
+
+        // A readable JSON manifest is not an authenticated manifest.
+        let plain_manifest =
+            serde_json::to_vec(&read_manifest_metadata(project.path(), &attachment.id).unwrap())
+                .unwrap();
+        fs::write(&manifest, &plain_manifest).unwrap();
+        assert!(original_for_export(project.path(), &attachment.id).is_err());
+        assert_eq!(fs::read(&manifest).unwrap(), plain_manifest);
+        fs::write(&manifest, &stored_manifest).unwrap();
+        assert_eq!(
+            original_bytes(project.path(), &attachment.id).unwrap(),
+            text.as_bytes()
+        );
+
+        // Losing the vault descriptor must not turn ciphertext into plain input.
+        fs::remove_file(project.path().join(".loom/vault.json")).unwrap();
+        assert!(original_for_export(project.path(), &attachment.id).is_err());
+        assert_eq!(fs::read(&object).unwrap(), stored);
+        assert_eq!(fs::read(&manifest).unwrap(), stored_manifest);
+        assert_eq!(fs::read(&source_path).unwrap(), text.as_bytes());
+        assert_eq!(fs::read(&other_path).unwrap(), other_text.as_bytes());
     }
 
     #[test]

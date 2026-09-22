@@ -19,8 +19,8 @@ async function render(googleClientConfigured: boolean) {
   const target = document.createElement('div'); document.body.append(target);
   const onSettings = vi.fn();
   mounted = mount(ImportSources, { target, props: {
-    projectId: 'project', sessionId: 'session', documentTitle: 'My writing',
-    googleClientConfigured, onSettings, onUse: vi.fn()
+    projectId: 'project', sessionId: 'session', googleClientConfigured, onSettings,
+    onOpen: vi.fn(), onImported: vi.fn()
   } });
   await page.getByText('Import sources', { exact: true }).click();
   return { onSettings };

@@ -508,10 +508,10 @@ mod tests {
                 .message
                 .contains("1 completed sources remain available")
         );
-        let retained =
-            crate::context_attachments::original_path(project.path(), &report.imported[0].id)
+        let (_, retained) =
+            crate::context_attachments::original_for_export(project.path(), &report.imported[0].id)
                 .unwrap();
-        assert_eq!(fs::read(retained).unwrap(), b"Original a.\n");
+        assert_eq!(retained, b"Original a.\n");
         // Even an already prepared file cannot cross the latched Stop boundary.
         let late =
             prepare_path_bounded(project.path(), &source.path().join("b.txt"), 1024).unwrap();
@@ -577,10 +577,10 @@ mod tests {
                 .message
                 .contains("1 discovered sources were not attempted")
         );
-        let original =
-            crate::context_attachments::original_path(project.path(), &report.imported[0].id)
+        let (_, original) =
+            crate::context_attachments::original_for_export(project.path(), &report.imported[0].id)
                 .unwrap();
-        assert_eq!(fs::read(original).unwrap(), first.as_bytes());
+        assert_eq!(original, first.as_bytes());
         assert!(report.imported[0].editable_markdown.is_none());
     }
 

@@ -121,8 +121,11 @@ pub(super) fn reserve_context(
 pub(super) struct ProfiledContextEvidence {
     #[serde(flatten)]
     pub retrieval: crate::context_attachments::ContextRetrievalEvidence,
+    // `ContextRetrievalEvidence` is flattened and already owns the `materials`
+    // key for selected attachment descriptors. Keep the richer material plan
+    // under a distinct key so old retrieval evidence remains decodable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub materials: Option<crate::material_context::ContextPlan>,
+    pub material_plan: Option<crate::material_context::ContextPlan>,
     #[serde(default)]
     pub generation_profile: Option<FrozenGenerationProfile>,
     #[serde(default)]
@@ -251,7 +254,7 @@ mod tests {
         let profile = freeze(store.root(), GenerationTask::ManualWriting).unwrap();
         let evidence = ProfiledContextEvidence {
             retrieval: crate::context_attachments::ContextRetrievalEvidence::default(),
-            materials: None,
+            material_plan: None,
             generation_profile: Some(profile),
             applied_co_writer: None,
             loompad: None,

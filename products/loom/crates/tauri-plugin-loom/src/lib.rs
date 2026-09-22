@@ -8777,7 +8777,7 @@ fn weave_start_inner<R: Runtime>(
         let retrieval_evidence_blob_id = {
             let identity = serde_json::to_vec(&generation_profiles::ProfiledContextEvidence {
                 retrieval: attachment_context.retrieval_evidence.clone(),
-                materials: Some(material_plan.clone()),
+                material_plan: Some(material_plan.clone()),
                 generation_profile: Some(generation_profile.clone()),
                 applied_co_writer,
                 loompad: speculation.clone(),

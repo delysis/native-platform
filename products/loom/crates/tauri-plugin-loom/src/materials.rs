@@ -1199,7 +1199,8 @@ mod tests {
     #[test]
     fn removing_binding_preserves_source_and_exact_retained_evidence() {
         let (_temp, store) = project();
-        let entry = source(&store, "A line with café 🦉.\r\nSecond line.\n", "Notes");
+        let original = "A line with café 🦉.\r\nSecond line.\n";
+        let entry = source(&store, original, "Notes");
         let read = read(&store, &entry.id).unwrap();
         let before = read.evidence[0].clone();
         set_pinned(&store, &entry.id, true).unwrap();
@@ -1210,14 +1211,13 @@ mod tests {
             read_evidence(&store, &entry.id, &before.id).unwrap().text,
             read.text
         );
-        assert!(
-            context_attachments::original_path(
-                store.root(),
-                entry.attachment_id.as_deref().unwrap()
-            )
-            .unwrap()
-            .is_file()
-        );
+        let (file_name, retained) = context_attachments::original_for_export(
+            store.root(),
+            entry.attachment_id.as_deref().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(file_name, "fixture.txt");
+        assert_eq!(retained, original.as_bytes());
     }
     #[test]
     fn sqlite_search_preserves_source_and_retains_evidence_after_source_change() {
