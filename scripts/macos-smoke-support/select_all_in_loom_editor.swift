@@ -106,6 +106,16 @@ guard let writingSurface = editor() else {
 }
 NSRunningApplication(processIdentifier: pid)?.activate(options: [])
 
+func setFullSelection(_ element: AXUIElement) -> Bool {
+    var range = CFRange(location: 0, length: expected.utf16.count)
+    guard let value = AXValueCreate(.cfRange, &range) else { return false }
+    return AXUIElementSetAttributeValue(
+        element,
+        kAXSelectedTextRangeAttribute as CFString,
+        value
+    ) == .success
+}
+
 let deadline = Date().addingTimeInterval(5)
 var observed: CanonicalSelection?
 var observedSelectionWitness: [String: Any]?
@@ -141,7 +151,12 @@ repeat {
                 writingSurface,
                 kAXFocusedAttribute as CFString,
                 kCFBooleanTrue
-            ) == .success,
+            ) == .success else {
+                fputs("could not refocus Loom's exact editor for Select-All\n", stderr)
+                exit(1)
+            }
+            _ = setFullSelection(writingSurface)
+            guard
                   let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
                   let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
                 fputs("could not refocus Loom's exact editor for Select-All\n", stderr)
