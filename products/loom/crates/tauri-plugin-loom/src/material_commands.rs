@@ -1,7 +1,9 @@
 //! Product-owned material commands, bound to the live workspace session.
 
 use super::*;
-use crate::materials::{self, MaterialEntry, MaterialEvidence, MaterialRead, MaterialSearch};
+use crate::materials::{
+    self, MaterialEntry, MaterialEvidence, MaterialRead, MaterialRetention, MaterialSearch,
+};
 
 fn grant_root(state: &PluginState) -> Result<Option<PathBuf>, IpcFailure> {
     state
@@ -105,10 +107,21 @@ pub(super) async fn material_bind_attachment(
     session_id: String,
     attachment_id: String,
     name: Option<String>,
+    retention: Option<MaterialRetention>,
     state: State<'_, PluginState>,
 ) -> Result<MaterialEntry, IpcFailure> {
     with_store(&state, &project_id, &session_id, |store| {
-        materials::bind_attachment(store, &attachment_id, name.as_deref())
+        match retention.unwrap_or_default() {
+            MaterialRetention::Ordinary => {
+                materials::bind_attachment(store, &attachment_id, name.as_deref())
+            }
+            protected @ MaterialRetention::Protected => materials::bind_attachment_with_retention(
+                store,
+                &attachment_id,
+                name.as_deref(),
+                protected,
+            ),
+        }
     })
 }
 

@@ -193,6 +193,12 @@
       "evidence": "Loom documentation is policy-only"
     },
     {
+      "path": ".github/workflows/release-macos.yml",
+      "kind": "platform",
+      "effects": ["platform_macos", "release"],
+      "evidence": "release workflow changes must schedule the macOS release lane"
+    },
+    {
       "prefix": "release",
       "kind": "platform",
       "effects": ["force_full", "release"],

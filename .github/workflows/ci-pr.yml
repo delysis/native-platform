@@ -439,6 +439,16 @@ jobs:
       - name: Root platform graph
         if: ${{ matrix.component == 'root' }}
         run: cargo check --locked --workspace --all-targets
+      - name: Native macOS tests, doctests, and strict Clippy
+        if: ${{ matrix.component == 'native' }}
+        run: |
+          node scripts/ci/cargo-group.mjs test native
+          cargo test --locked --doc \
+            --package llama-native-cache \
+            --package llama-native-engine \
+            --package llama-native-host \
+            --package llama-native-types
+          node scripts/ci/cargo-group.mjs clippy native
       - name: Mom macOS parity
         if: ${{ matrix.component == 'mom' }}
         run: |

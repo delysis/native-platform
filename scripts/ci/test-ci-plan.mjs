@@ -197,6 +197,15 @@ test("CI policy changes use root Linux and macOS without expanding to full", () 
   assert.deepEqual(result.macos_matrix, ["release", "root"]);
 });
 
+test("release workflow changes select the exact macOS release lane", () => {
+  const { result } = fixture(".github/workflows/release-macos.yml");
+  assert.equal(result.risk, "release");
+  assert.equal(result.flags.platform_macos, true);
+  assert.equal(result.flags.full, false);
+  assert.deepEqual(result.jobs, ["policy", "platform-macos", "ignored-tests"]);
+  assert.deepEqual(result.macos_matrix, ["release"]);
+});
+
 test("macOS release tooling selects only policy and the macOS syntax lane", () => {
   for (const relativePath of [
     "scripts/release-macos.sh",
@@ -223,7 +232,7 @@ test("Native changes require root, Native, and macOS product coverage", () => {
   assert.equal(result.flags.platform_macos, true);
   assert.ok(!("platform_windows" in result.flags));
   assert.ok(result.jobs.includes("native-linux"));
-  assert.deepEqual(result.macos_matrix, ["release", "root"]);
+  assert.deepEqual(result.macos_matrix, ["release", "native", "root"]);
 });
 
 test("Attachment inspection changes select Attachment and fuzz only", () => {
@@ -502,6 +511,7 @@ test("root Cargo metadata forces the complete present graph", () => {
   assert.ok(!result.jobs.includes("platform-windows"));
   assert.deepEqual(result.macos_matrix, [
     "release",
+    "native",
     "root",
     "mom",
     "attachment",
@@ -546,6 +556,7 @@ test("metadata unavailability forces the unchanged complete job and macOS matric
   assert.equal(result.flags.full, true);
   assert.deepEqual(result.macos_matrix, [
     "release",
+    "native",
     "root",
     "attachment",
     "information",

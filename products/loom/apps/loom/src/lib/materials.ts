@@ -6,6 +6,7 @@ export interface MaterialEntry {
   name: string;
   reference: string;
   kind: 'attachment' | 'library' | 'folder';
+  retention?: 'ordinary' | 'protected';
   pinned: boolean;
   available: boolean;
   source_path: string | null;
@@ -16,6 +17,7 @@ export interface MaterialEvidence {
   id: string;
   reference: string;
   material_id: string;
+  retention?: 'ordinary' | 'protected';
   title: string;
   text: string;
   source_revision: string;
