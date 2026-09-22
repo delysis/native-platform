@@ -56,9 +56,12 @@ repeat {
     Thread.sleep(forTimeInterval: 0.05)
 } while Date() < addDeadline
 if let add {
-    guard AXUIElementPerformAction(add, kAXPressAction as CFString) == .success else {
-        fputs("could not open Loom's Add menu\n", stderr)
-        exit(1)
+    let expanded = (attribute(add, kAXExpandedAttribute as CFString) as? Bool) == true
+    if !expanded {
+        guard AXUIElementPerformAction(add, kAXPressAction as CFString) == .success else {
+            fputs("could not open Loom's Add menu\n", stderr)
+            exit(1)
+        }
     }
 } else {
     fputs("could not bind Loom's Add menu control\n", stderr)
