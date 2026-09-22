@@ -1,16 +1,9 @@
-// The immutable contract feature exercises the complete compositional surface.
-// Product builds use the same registry through worker admission and shutdown,
-// but do not call every hierarchy and observation method directly.
-#![allow(dead_code)]
-
 use llama_native_types::{NativeError, NativeErrorCode};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak, mpsc};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 type NativeResult<T> = Result<T, NativeError>;
 const DEFAULT_PROGRESS_CAPACITY: usize = 64;
@@ -150,6 +143,7 @@ impl ActiveRequest {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> RequestSnapshot {
         let lifecycle = self
             .lifecycle
@@ -211,6 +205,7 @@ struct RequestLifecycle {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) struct RequestSnapshot {
     pub(crate) identity: RequestIdentity,
     pub(crate) phase: RequestPhase,
@@ -227,23 +222,9 @@ struct RegistryState {
     progress_capacity: usize,
     active: HashMap<String, Arc<ActiveRequest>>,
     attempts: BTreeMap<u64, Arc<ActiveRequest>>,
-    operations: HashMap<String, OperationEntry>,
-    workers: BTreeMap<String, WorkerEntry>,
     expected_worker_ids: Vec<String>,
-    exited_worker_ids: Vec<String>,
     joined_worker_ids: Vec<String>,
     shutdown: Option<RegistryShutdownOutcome>,
-}
-
-#[derive(Debug)]
-struct OperationEntry {
-    cancellation_requested: bool,
-    attempts: BTreeMap<u64, Arc<ActiveRequest>>,
-}
-
-#[derive(Debug)]
-struct WorkerEntry {
-    join: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -260,25 +241,7 @@ pub(crate) struct RegistryShutdownOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestRegistryPhase {
-    Running,
-    Quiescing,
     Closed,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct RequestOperation {
-    operation_id: String,
-    registry: Weak<RequestRegistry>,
-}
-
-#[derive(Clone)]
-pub(crate) struct ControlledRequest(Arc<ControlledRequestInner>);
-
-struct ControlledRequestInner {
-    lease: RequestLease,
-    worker_id: String,
-    terminal: mpsc::SyncSender<RequestTerminalClass>,
-    exit: mpsc::SyncSender<()>,
 }
 
 #[derive(Debug)]
@@ -302,10 +265,7 @@ impl RequestRegistry {
                 progress_capacity,
                 active: HashMap::new(),
                 attempts: BTreeMap::new(),
-                operations: HashMap::new(),
-                workers: BTreeMap::new(),
                 expected_worker_ids: Vec::new(),
-                exited_worker_ids: Vec::new(),
                 joined_worker_ids: Vec::new(),
                 shutdown: None,
             }),
@@ -379,7 +339,6 @@ impl RequestRegistry {
             RequestLease {
                 registry: Arc::clone(self),
                 entry,
-                authority: Arc::new(()),
             },
         ))
     }
@@ -389,145 +348,6 @@ impl RequestRegistry {
             .active
             .get(request_id)
             .cloned()
-    }
-
-    pub(crate) fn create_operation(
-        self: &Arc<Self>,
-        operation_id: &str,
-    ) -> NativeResult<RequestOperation> {
-        if operation_id.is_empty() {
-            return Err(registry_error("native operation ID cannot be empty"));
-        }
-        let mut state = self.lock_recovering_poison();
-        if state.phase != RegistryPhase::Running {
-            return Err(admission_closed());
-        }
-        if state.active.contains_key(operation_id) || state.operations.contains_key(operation_id) {
-            return Err(duplicate_operation(operation_id));
-        }
-        state.operations.insert(
-            operation_id.to_owned(),
-            OperationEntry {
-                cancellation_requested: false,
-                attempts: BTreeMap::new(),
-            },
-        );
-        Ok(RequestOperation {
-            operation_id: operation_id.to_owned(),
-            registry: Arc::downgrade(self),
-        })
-    }
-
-    pub(crate) fn start_attempt(
-        self: &Arc<Self>,
-        operation: &RequestOperation,
-    ) -> NativeResult<RequestLease> {
-        let Some(owner) = operation.registry.upgrade() else {
-            return Err(stale_lease());
-        };
-        if !Arc::ptr_eq(&owner, self) {
-            return Err(stale_lease());
-        }
-        let mut state = self.lock_recovering_poison();
-        if state.phase != RegistryPhase::Running {
-            return Err(admission_closed());
-        }
-        let sequence = state.next_nonce;
-        let next = sequence.checked_add(1).ok_or_else(sequence_exhausted)?;
-        let operation_entry = state
-            .operations
-            .get(&operation.operation_id)
-            .ok_or_else(stale_lease)?;
-        let cancellation = Arc::new(AtomicBool::new(operation_entry.cancellation_requested));
-        let entry = Arc::new(ActiveRequest {
-            request_id: operation.operation_id.clone(),
-            class: RequestClass::Embedding,
-            controls: RequestControls::Embedding { cancellation },
-            reservation_nonce: sequence,
-            identity: RequestIdentity {
-                operation_id: operation.operation_id.clone(),
-                attempt_id: format!("{}#attempt-{sequence}", operation.operation_id),
-                sequence,
-            },
-            lifecycle: Mutex::new(RequestLifecycle {
-                phase: RequestPhase::Running,
-                terminal: None,
-                progress: VecDeque::new(),
-            }),
-        });
-        state.next_nonce = next;
-        state.attempts.insert(sequence, Arc::clone(&entry));
-        state
-            .operations
-            .get_mut(&operation.operation_id)
-            .ok_or_else(stale_lease)?
-            .attempts
-            .insert(sequence, Arc::clone(&entry));
-        Ok(RequestLease {
-            registry: Arc::clone(self),
-            entry,
-            authority: Arc::new(()),
-        })
-    }
-
-    pub(crate) fn request_operation_cancel(
-        &self,
-        operation: &RequestOperation,
-    ) -> NativeResult<()> {
-        self.require_operation_owner(operation)?;
-        let attempts = {
-            let mut state = self.lock_recovering_poison();
-            let entry = state
-                .operations
-                .get_mut(&operation.operation_id)
-                .ok_or_else(stale_lease)?;
-            entry.cancellation_requested = true;
-            entry.attempts.values().cloned().collect::<Vec<_>>()
-        };
-        for attempt in attempts {
-            attempt.cancel_all();
-        }
-        Ok(())
-    }
-
-    pub(crate) fn finish_operation(&self, operation: &RequestOperation) -> NativeResult<()> {
-        self.require_operation_owner(operation)?;
-        let mut state = self.lock_recovering_poison();
-        let entry = state
-            .operations
-            .get(&operation.operation_id)
-            .ok_or_else(stale_lease)?;
-        if !entry.attempts.is_empty() {
-            return Err(invalid_transition());
-        }
-        state.operations.remove(&operation.operation_id);
-        Ok(())
-    }
-
-    pub(crate) fn operation_active(&self, operation: &RequestOperation) -> bool {
-        if self.require_operation_owner(operation).is_err() {
-            return false;
-        }
-        self.lock_recovering_poison()
-            .operations
-            .contains_key(&operation.operation_id)
-    }
-
-    pub(crate) fn operation_attempts(&self, operation: &RequestOperation) -> Vec<RequestIdentity> {
-        if self.require_operation_owner(operation).is_err() {
-            return Vec::new();
-        }
-        self.lock_recovering_poison()
-            .operations
-            .get(&operation.operation_id)
-            .map(|entry| {
-                entry
-                    .attempts
-                    .values()
-                    .map(|attempt| attempt.identity())
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 
     pub(crate) fn queue(&self, lease: &RequestLease) -> NativeResult<()> {
@@ -601,72 +421,14 @@ impl RequestRegistry {
         Ok(())
     }
 
-    pub(crate) fn release(&self, lease: &RequestLease) -> NativeResult<()> {
-        let mut state = self.lock_recovering_poison();
-        let current = state
-            .attempts
-            .get(&lease.entry.reservation_nonce)
-            .is_some_and(|entry| Arc::ptr_eq(entry, &lease.entry));
-        if !current {
-            return Err(stale_lease());
-        }
-        let mut lifecycle = lease
-            .entry
-            .lifecycle
-            .lock()
-            .map_err(|_| registry_error("native request lifecycle is poisoned"))?;
-        if lifecycle.phase != RequestPhase::Terminal {
-            return Err(invalid_transition());
-        }
-        state.attempts.remove(&lease.entry.reservation_nonce);
-        if state
-            .active
-            .get(lease.entry.request_id())
-            .is_some_and(|entry| {
-                Arc::ptr_eq(entry, &lease.entry)
-                    && entry.reservation_nonce == lease.entry.reservation_nonce
-            })
-        {
-            state.active.remove(lease.entry.request_id());
-        }
-        if let Some(operation) = state.operations.get_mut(lease.entry.request_id()) {
-            operation.attempts.remove(&lease.entry.reservation_nonce);
-        }
-        lifecycle.phase = RequestPhase::Released;
-        #[cfg(test)]
-        self.releases.fetch_add(1, Ordering::AcqRel);
-        drop(lifecycle);
-        drop(state);
-        self.drained.notify_all();
-        Ok(())
-    }
-
-    pub(crate) fn snapshot(&self, lease: &RequestLease) -> Option<RequestSnapshot> {
-        Some(lease.entry.snapshot())
-    }
-
-    pub(crate) fn current_snapshot(&self, operation_id: &str) -> Option<RequestSnapshot> {
-        self.active(operation_id).map(|entry| entry.snapshot())
-    }
-
+    #[cfg(test)]
     pub(crate) fn active_count(&self) -> usize {
         self.lock_recovering_poison().attempts.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn retained_task_count(&self) -> usize {
-        self.lock_recovering_poison().workers.len()
-    }
-
-    pub(crate) fn progress_capacity(&self) -> usize {
-        self.lock_recovering_poison().progress_capacity
-    }
-
-    pub(crate) fn phase(&self) -> RequestRegistryPhase {
-        match self.lock_recovering_poison().phase {
-            RegistryPhase::Running => RequestRegistryPhase::Running,
-            RegistryPhase::Quiescing => RequestRegistryPhase::Quiescing,
-            RegistryPhase::Closed => RequestRegistryPhase::Closed,
-        }
+        0
     }
 
     pub(crate) fn begin_quiesce_and_cancel_all(&self) {
@@ -676,238 +438,12 @@ impl RequestRegistry {
                 return;
             }
             state.phase = RegistryPhase::Quiescing;
-            for operation in state.operations.values_mut() {
-                operation.cancellation_requested = true;
-            }
             state.attempts.values().cloned().collect::<Vec<_>>()
         };
         for entry in active {
             entry.cancel_all();
         }
         self.drained.notify_all();
-    }
-
-    pub(crate) fn spawn_controlled(
-        self: &Arc<Self>,
-        operation_id: &str,
-    ) -> NativeResult<ControlledRequest> {
-        let (_ticket, lease) = self.reserve(
-            operation_id,
-            RequestClass::Embedding,
-            RequestControls::Embedding {
-                cancellation: Arc::new(AtomicBool::new(false)),
-            },
-        )?;
-        self.queue(&lease)?;
-        self.start(&lease)?;
-        let worker_id = format!("native-request-worker-{}", lease.entry.reservation_nonce);
-        let thread_lease = lease.clone();
-        let registry = Arc::clone(self);
-        let thread_worker_id = worker_id.clone();
-        let (terminal_tx, terminal_rx) = mpsc::sync_channel(1);
-        let (exit_tx, exit_rx) = mpsc::sync_channel(1);
-        let join = thread::Builder::new()
-            .name(worker_id.clone())
-            .spawn(move || {
-                if let Ok(class) = terminal_rx.recv() {
-                    let _ = registry
-                        .terminal(&thread_lease, class)
-                        .and_then(|()| registry.release(&thread_lease));
-                }
-                let _ = exit_rx.recv();
-                registry.record_worker_exit(&thread_worker_id);
-            })
-            .map_err(|error| {
-                registry_error(format!("failed to spawn native request worker: {error}"))
-            })?;
-        {
-            let mut state = self.lock_recovering_poison();
-            state.expected_worker_ids.push(worker_id.clone());
-            state
-                .workers
-                .insert(worker_id.clone(), WorkerEntry { join: Some(join) });
-        }
-        Ok(ControlledRequest(Arc::new(ControlledRequestInner {
-            lease,
-            worker_id,
-            terminal: terminal_tx,
-            exit: exit_tx,
-        })))
-    }
-
-    pub(crate) fn spawn_panicking(
-        self: &Arc<Self>,
-        operation_id: &str,
-    ) -> NativeResult<ControlledRequest> {
-        let (ticket, lease) = self.reserve(
-            operation_id,
-            RequestClass::Embedding,
-            RequestControls::Embedding {
-                cancellation: Arc::new(AtomicBool::new(false)),
-            },
-        )?;
-        drop(ticket);
-        self.queue(&lease)?;
-        self.start(&lease)?;
-        let worker_id = format!("native-request-worker-{}", lease.entry.reservation_nonce);
-        let thread_lease = lease.clone();
-        let registry = Arc::clone(self);
-        let thread_worker_id = worker_id.clone();
-        let (terminal_tx, _terminal_rx) = mpsc::sync_channel(1);
-        let (exit_tx, _exit_rx) = mpsc::sync_channel(1);
-        let join = thread::Builder::new()
-            .name(worker_id.clone())
-            .spawn(move || {
-                let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    panic!("controlled native request panic")
-                }))
-                .is_err();
-                if panicked {
-                    let _ = registry
-                        .terminal(&thread_lease, RequestTerminalClass::Failed)
-                        .and_then(|()| registry.release(&thread_lease));
-                }
-                registry.record_worker_exit(&thread_worker_id);
-            })
-            .map_err(|error| {
-                registry_error(format!("failed to spawn native panic worker: {error}"))
-            })?;
-        {
-            let mut state = self.lock_recovering_poison();
-            state.expected_worker_ids.push(worker_id.clone());
-            state
-                .workers
-                .insert(worker_id.clone(), WorkerEntry { join: Some(join) });
-        }
-        Ok(ControlledRequest(Arc::new(ControlledRequestInner {
-            lease,
-            worker_id,
-            terminal: terminal_tx,
-            exit: exit_tx,
-        })))
-    }
-
-    pub(crate) fn request_controlled_terminal(
-        &self,
-        operation: &ControlledRequest,
-        class: RequestTerminalClass,
-    ) -> NativeResult<()> {
-        operation
-            .0
-            .terminal
-            .try_send(class)
-            .map_err(|_| invalid_transition())
-    }
-
-    pub(crate) fn controlled_snapshot(&self, operation: &ControlledRequest) -> RequestSnapshot {
-        operation.0.lease.entry.snapshot()
-    }
-
-    pub(crate) fn publish_controlled_progress(
-        &self,
-        operation: &ControlledRequest,
-        sequence: u64,
-    ) -> NativeResult<()> {
-        self.publish_progress(&operation.0.lease, sequence)
-    }
-
-    pub(crate) fn cancellation_requested_by_id(&self, operation_id: &str) -> bool {
-        self.active(operation_id)
-            .is_some_and(|entry| entry.controls.cancellation_requested())
-    }
-
-    pub(crate) fn wait_terminal_timeout(
-        &self,
-        entry: &Arc<ActiveRequest>,
-        timeout: Duration,
-    ) -> bool {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.lock_recovering_poison();
-        loop {
-            if entry
-                .lifecycle
-                .lock()
-                .map(|lifecycle| lifecycle.terminal.is_some())
-                .unwrap_or(true)
-            {
-                return true;
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return false;
-            };
-            let (next, wait) = self
-                .drained
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next;
-            if wait.timed_out() {
-                return false;
-            }
-        }
-    }
-
-    pub(crate) fn wait_controlled_released(
-        &self,
-        operation: &ControlledRequest,
-        timeout: Duration,
-    ) -> NativeResult<RequestSnapshot> {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.lock_recovering_poison();
-        loop {
-            let snapshot = operation.0.lease.entry.snapshot();
-            if snapshot.phase == RequestPhase::Released {
-                return Ok(snapshot);
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(registry_error(format!(
-                    "native request {:?} release timed out",
-                    operation.0.lease.entry.request_id()
-                )));
-            };
-            let (next, wait) = self
-                .drained
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next;
-            if wait.timed_out() {
-                return Err(registry_error(format!(
-                    "native request {:?} release timed out",
-                    operation.0.lease.entry.request_id()
-                )));
-            }
-        }
-    }
-
-    pub(crate) fn allow_controlled_exit(&self, operation: &ControlledRequest) -> NativeResult<()> {
-        operation
-            .0
-            .exit
-            .try_send(())
-            .map_err(|_| invalid_transition())?;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut state = self.lock_recovering_poison();
-        while !state
-            .exited_worker_ids
-            .iter()
-            .any(|worker| worker == &operation.0.worker_id)
-        {
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(registry_error("native request worker exit timed out"));
-            };
-            let (next, wait) = self
-                .drained
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next;
-            if wait.timed_out() {
-                return Err(registry_error("native request worker exit timed out"));
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn reap_controlled(&self, operation: &ControlledRequest) -> NativeResult<()> {
-        self.reap_worker(&operation.0.worker_id)
     }
 
     pub(crate) fn shutdown(&self) -> RegistryShutdownOutcome {
@@ -918,34 +454,13 @@ impl RequestRegistry {
                 return outcome.clone();
             }
         }
-        loop {
-            let mut state = self.lock_recovering_poison();
-            while !state.attempts.is_empty() {
-                state = self
-                    .drained
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            if state.workers.is_empty() {
-                break;
-            }
-            let exited = state
-                .exited_worker_ids
-                .iter()
-                .find(|worker| state.workers.contains_key(*worker))
-                .cloned();
-            if let Some(worker_id) = exited {
-                drop(state);
-                let _ = self.reap_worker(&worker_id);
-                continue;
-            }
-            drop(
-                self.drained
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-        }
         let mut state = self.lock_recovering_poison();
+        while !state.attempts.is_empty() {
+            state = self
+                .drained
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
         state.phase = RegistryPhase::Closed;
         let expected_worker_ids = state.expected_worker_ids.clone();
         let joined_worker_ids = state.joined_worker_ids.clone();
@@ -953,7 +468,7 @@ impl RequestRegistry {
             phase: RequestRegistryPhase::Closed,
             state_poisoned: self.state.is_poisoned(),
             active_operations: state.attempts.len(),
-            retained_tasks: state.workers.len(),
+            retained_tasks: 0,
             expected_workers: expected_worker_ids.len(),
             joined_workers: joined_worker_ids.len(),
             expected_worker_ids,
@@ -974,40 +489,6 @@ impl RequestRegistry {
             state.joined_worker_ids.push(worker_id.to_owned());
         }
         self.drained.notify_all();
-    }
-
-    fn record_worker_exit(&self, worker_id: &str) {
-        let mut state = self.lock_recovering_poison();
-        if !state
-            .exited_worker_ids
-            .iter()
-            .any(|worker| worker == worker_id)
-        {
-            state.exited_worker_ids.push(worker_id.to_owned());
-        }
-        self.drained.notify_all();
-    }
-
-    fn reap_worker(&self, worker_id: &str) -> NativeResult<()> {
-        let join = {
-            let mut state = self.lock_recovering_poison();
-            let Some(mut worker) = state.workers.remove(worker_id) else {
-                if state
-                    .joined_worker_ids
-                    .iter()
-                    .any(|joined| joined == worker_id)
-                {
-                    return Ok(());
-                }
-                return Err(registry_error("native request worker is unknown"));
-            };
-            worker.join.take()
-        };
-        if let Some(join) = join {
-            let _ = join.join();
-        }
-        self.record_external_worker_joined(worker_id);
-        Ok(())
     }
 
     pub(crate) fn mark_closed(&self) -> NativeResult<()> {
@@ -1055,6 +536,7 @@ impl RequestRegistry {
         self.releases.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     fn release_if_current(&self, entry: &Arc<ActiveRequest>) {
         let mut state = self.lock_recovering_poison();
         let current_matches = state
@@ -1068,9 +550,6 @@ impl RequestRegistry {
                 state.active.remove(entry.request_id());
             }
             state.attempts.remove(&entry.reservation_nonce);
-            if let Some(operation) = state.operations.get_mut(entry.request_id()) {
-                operation.attempts.remove(&entry.reservation_nonce);
-            }
             #[cfg(test)]
             self.releases.fetch_add(1, Ordering::AcqRel);
         }
@@ -1108,9 +587,6 @@ impl RequestRegistry {
         }) {
             state.active.remove(entry.request_id());
         }
-        if let Some(operation) = state.operations.get_mut(entry.request_id()) {
-            operation.attempts.remove(&entry.reservation_nonce);
-        }
         lifecycle.phase = RequestPhase::Released;
         #[cfg(test)]
         self.releases.fetch_add(1, Ordering::AcqRel);
@@ -1126,15 +602,6 @@ impl RequestRegistry {
             .get(&lease.entry.reservation_nonce)
             .is_some_and(|entry| Arc::ptr_eq(entry, &lease.entry));
         if current { Ok(()) } else { Err(stale_lease()) }
-    }
-
-    fn require_operation_owner(&self, operation: &RequestOperation) -> NativeResult<()> {
-        let owner = operation.registry.upgrade().ok_or_else(stale_lease)?;
-        if std::ptr::eq(Arc::as_ptr(&owner), self) {
-            Ok(())
-        } else {
-            Err(stale_lease())
-        }
     }
 
     fn lock_recovering_poison(&self) -> MutexGuard<'_, RegistryState> {
@@ -1161,20 +628,6 @@ fn registry_error(message: impl Into<String>) -> NativeError {
     NativeError::new(NativeErrorCode::Internal, message)
 }
 
-fn admission_closed() -> NativeError {
-    NativeError::new(
-        NativeErrorCode::WorkerStopped,
-        "native request admission is closed",
-    )
-}
-
-fn duplicate_operation(operation_id: &str) -> NativeError {
-    NativeError::new(
-        NativeErrorCode::DuplicateActiveRequest,
-        format!("native request ID {operation_id:?} is already active"),
-    )
-}
-
 fn stale_lease() -> NativeError {
     registry_error("native request lease is stale")
 }
@@ -1183,24 +636,17 @@ fn invalid_transition() -> NativeError {
     registry_error("native request lifecycle transition is invalid")
 }
 
-fn sequence_exhausted() -> NativeError {
-    registry_error("native request reservation sequence overflowed")
-}
-
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct RequestLease {
     registry: Arc<RequestRegistry>,
     entry: Arc<ActiveRequest>,
-    authority: Arc<()>,
 }
 
 impl Drop for RequestLease {
     fn drop(&mut self) {
-        // Request identity belongs to the executor command. Ticket drop only
-        // requests cancellation; terminal publication lets this lease fall.
-        if Arc::strong_count(&self.authority) == 1 {
-            self.registry.abandon_if_current(&self.entry);
-        }
+        // The non-clonable executor authority is released exactly once, after
+        // the worker has attempted its final result publication.
+        self.registry.abandon_if_current(&self.entry);
     }
 }
 
@@ -1223,8 +669,7 @@ impl RequestLease {
     }
 
     pub(crate) fn finished(&self, class: RequestTerminalClass) -> NativeResult<()> {
-        self.registry.terminal(self, class)?;
-        self.registry.release(self)
+        self.registry.terminal(self, class)
     }
 
     pub(crate) fn completed_or_failed(&self, succeeded: bool) -> NativeResult<()> {
@@ -1255,7 +700,7 @@ impl RequestLease {
             });
             lifecycle.phase = RequestPhase::Terminal;
         }
-        self.registry.release(self)
+        Ok(()) // Keep executor identity through the final result send attempt.
     }
 }
 
@@ -1269,6 +714,32 @@ mod tests {
         RequestControls::Generation {
             cancellations: vec![("case".to_owned(), Arc::new(AtomicBool::new(false)))],
             reasoning_forces: vec![("case".to_owned(), Arc::new(AtomicBool::new(false)))],
+        }
+    }
+
+    #[test]
+    fn terminal_recording_retains_identity_until_publication_owner_drops() {
+        for queued in [true, false] {
+            let registry = Arc::new(RequestRegistry::new());
+            let (_, lease) = registry
+                .reserve("request", RequestClass::Generation, controls())
+                .expect("reserve");
+            lease.queued().expect("queued");
+            if queued {
+                lease.cancel_queued().expect("queued cancellation");
+            } else {
+                lease.running().expect("running");
+                lease.completed_or_failed(true).expect("completed");
+            }
+            assert_eq!(registry.active_count(), 1);
+            assert!(
+                registry
+                    .reserve("request", RequestClass::Generation, controls())
+                    .is_err()
+            );
+            drop(lease); // The executor drops this only after its final send attempt.
+            assert_eq!(registry.active_count(), 0);
+            assert_eq!(registry.release_count(), 1);
         }
     }
 
