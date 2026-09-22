@@ -3540,6 +3540,13 @@ fn record_embedding_capability(
     }
 }
 
+fn selected_cached_prefix<'a>(
+    shared: Option<&'a SequenceStateBlob>,
+    branch: &'a BranchRequest,
+) -> Option<&'a SequenceStateBlob> {
+    shared.or(branch.cached_prefix.as_ref())
+}
+
 fn generate_batch(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
@@ -3610,17 +3617,7 @@ fn generate_batch(
     let cached_states = request
         .branches
         .iter()
-        .enumerate()
-        .map(|(index, branch)| {
-            if index == 0 && request.branches.len() == 1 {
-                request
-                    .cached_prefix
-                    .as_ref()
-                    .or(branch.cached_prefix.as_ref())
-            } else {
-                branch.cached_prefix.as_ref()
-            }
-        })
+        .map(|branch| selected_cached_prefix(request.cached_prefix.as_ref(), branch))
         .collect::<Vec<_>>();
     let mut prefix_lengths = vec![0_usize; request.branches.len()];
     let mut replayed_prefix_lengths = vec![0_usize; request.branches.len()];
@@ -7181,6 +7178,31 @@ mod tests {
     use crate::generation_admission::{AdmissionClock, SPECULATIVE_PREEMPTION_LIMIT};
     use llama_native_types::EmbeddingInput;
     use std::sync::{Barrier, Mutex, atomic::AtomicU64};
+
+    #[test]
+    fn request_level_cache_is_selected_for_every_shared_prefix_branch() {
+        let shared = SequenceStateBlob {
+            sequence_id: 0,
+            token_count: 1,
+            token_ids: vec![1],
+            bytes: vec![1].into(),
+        };
+        let branch = BranchRequest {
+            branch_id: "case".to_string(),
+            label: "case".to_string(),
+            instruction: String::new(),
+            sampling: SamplingConfig::default(),
+            messages: Vec::new(),
+            cached_prefix: None,
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                selected_cached_prefix(Some(&shared), &branch),
+                Some(&shared)
+            );
+        }
+        assert!(selected_cached_prefix(None, &branch).is_none());
+    }
 
     #[test]
     fn prefill_observes_cancellation_before_each_decode_chunk() {
