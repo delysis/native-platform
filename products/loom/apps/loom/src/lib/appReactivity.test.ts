@@ -25,33 +25,33 @@ describe('App ghost reactivity wiring', () => {
   });
 
   it('tracks late branch hydration and caret changes in both ghost effects', () => {
+    const visualEvaluation = dependencyThunkFor(compiled, '$.set(visualFamilyEvaluation');
+    expect(visualEvaluation).toContain('verifiedBranchBodyByRun');
+    expect(visualEvaluation).toContain('branches');
+    expect(visualEvaluation).toContain('visualGhostTargetByte');
+    expect(visualEvaluation).toContain('branchPromotionReady');
+
     const visual = dependencyThunkFor(compiled, '$.set(visualAutocompleteDisposition');
-    expect(visual).toContain('verifiedBranchBodyByRun');
-    expect(visual).toContain('currentReadyBranches');
-    expect(visual).toContain('visualGhostTargetByte');
-    expect(visual).toContain('branchPromotionReady');
+    expect(visual).toContain('visualFamilyEvaluation');
+
+    const sourceEvaluation = dependencyThunkFor(compiled, '$.set(sourceFamilyEvaluation');
+    expect(sourceEvaluation).toContain('verifiedBranchBodyByRun');
+    expect(sourceEvaluation).toContain('branches');
+    expect(sourceEvaluation).toContain('sourceGhostTargetByte');
+    expect(sourceEvaluation).toContain('branchPromotionReady');
 
     const sourceGhost = dependencyThunkFor(compiled, '$.set(sourceAutocompleteDisposition');
-    expect(sourceGhost).toContain('verifiedBranchBodyByRun');
-    expect(sourceGhost).toContain('currentReadyBranches');
-    expect(sourceGhost).toContain('sourceGhostTargetByte');
-    expect(sourceGhost).toContain('branchPromotionReady');
+    expect(sourceGhost).toContain('sourceFamilyEvaluation');
 
     const retry = dependencyThunkFor(compiled, '$.set(retryEvaluationSnapshot');
     expect(retry).toContain('visualAutocompleteDisposition');
     expect(retry).toContain('sourceAutocompleteDisposition');
 
     const visualFamily = dependencyThunkFor(compiled, '$.set(visualSuggestionFamily');
-    expect(visualFamily).toContain('branches');
-    expect(visualFamily).toContain('verifiedBranchBodyByRun');
-    expect(visualFamily).toContain('liveBranchTextByRun');
-    expect(visualFamily).toContain('liveBranchTextSequenceByRun');
-    expect(visualFamily).toContain('currentWriter');
-    expect(visualFamily).toContain('branchPromotionReady');
-    expect(visualFamily).toContain('documentText');
+    expect(visualFamily).toContain('visualFamilyEvaluation');
 
     const sourceFamily = dependencyThunkFor(compiled, '$.set(sourceSuggestionFamily');
-    expect(sourceFamily).toContain('sourceDisplayText');
+    expect(sourceFamily).toContain('sourceFamilyEvaluation');
     expect(source).not.toContain('A private strand is ready');
   });
 

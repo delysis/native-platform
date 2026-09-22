@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  evaluateInlineSuggestionFamily,
   inlineSuggestionFamily,
   authoritativeInlineFamilyId,
   projectInlineCandidateText,
@@ -11,6 +12,7 @@ import {
   startCompletionSession,
   updateCompletionCandidate
 } from './completionSession';
+import { emptyAutocompleteRetryLedger, planAutocompleteRetry } from './autocompleteRetry';
 import type { BranchCard, ModelCapabilitySummary, OpenDocument } from './types';
 
 const FAMILY_ONE = '01K00000000000000000000001';
@@ -97,6 +99,42 @@ function state(manuscriptText: string): InlineSuggestionState {
 }
 
 describe('inline suggestion family', () => {
+  it('uses one evaluation for atomic rendering and terminal recovery', () => {
+    const selection = state('hello');
+    selection.branches = selection.branches.map((branch) => ({ ...branch, status: 'ready' }));
+    selection.liveTextByRun['run-4'] = '\n\nA heading cannot be an inline visual ghost.';
+
+    const evaluation = evaluateInlineSuggestionFamily(5, 'visual', selection);
+    expect(evaluation.candidates).toEqual([]);
+    expect(evaluation.phase).toEqual({
+      kind: 'terminal_shortfall',
+      candidates: [{ candidateId: 'run:run-4', reason: 'unpresentable' }]
+    });
+    expect(evaluation.disposition).toEqual({
+      kind: 'exhausted',
+      candidates: [{ candidateId: 'run:run-4', reason: 'unpresentable' }]
+    });
+    expect(planAutocompleteRetry(emptyAutocompleteRetryLedger(), {
+      disposition: evaluation.disposition,
+      budgetKey: 'document:revision:model',
+      activeBranchCount: 0,
+      weaveStarting: false,
+      maximumRetries: 1
+    }).kind).toBe('schedule');
+  });
+
+  it('does not regenerate a family merely because its published choices were dismissed', () => {
+    const selection = state('hello');
+    selection.dismissedCandidateIds = selection.branches.map((branch) => `run:${branch.run_id}`);
+    const evaluation = evaluateInlineSuggestionFamily(5, 'visual', selection);
+    expect(evaluation.candidates).toEqual([]);
+    expect(evaluation.phase).toEqual({
+      kind: 'dismissed',
+      candidateIds: selection.dismissedCandidateIds
+    });
+    expect(evaluation.disposition).toEqual({ kind: 'exhausted', candidates: [] });
+  });
+
   it('publishes all four samples together despite staggered streaming delivery', () => {
     const selection = state('hello');
     selection.liveTextByRun = {};
