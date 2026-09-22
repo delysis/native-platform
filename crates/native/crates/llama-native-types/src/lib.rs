@@ -170,6 +170,70 @@ pub struct SamplingConfig {
     pub stop: Vec<String>,
 }
 
+impl SamplingConfig {
+    /// Validate shared numeric domains before any native sampler constructor.
+    /// Non-positive temperature/top-k and -1 history windows remain supported
+    /// compatibility sentinels; controlled requests add their tighter bounds.
+    pub fn validate(&self) -> Result<(), NativeError> {
+        let invalid = |message: String| NativeError::new(NativeErrorCode::InvalidConfig, message);
+        for (name, value) in [
+            ("temperature", self.temperature),
+            ("frequency_penalty", self.frequency_penalty),
+            ("presence_penalty", self.presence_penalty),
+        ] {
+            if !value.is_finite() {
+                return Err(invalid(format!("sampling {name} must be finite")));
+            }
+        }
+        for (name, value) in [
+            ("dynamic_temperature_range", self.dynamic_temperature_range),
+            ("dry_multiplier", self.dry_multiplier),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(invalid(format!(
+                    "sampling {name} must be finite and non-negative"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("repeat_penalty", self.repeat_penalty),
+            (
+                "dynamic_temperature_exponent",
+                self.dynamic_temperature_exponent,
+            ),
+            ("dry_base", self.dry_base),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(invalid(format!(
+                    "sampling {name} must be finite and positive"
+                )));
+            }
+        }
+        for (name, value) in [
+            ("top_p", self.top_p),
+            ("min_p", self.min_p),
+            ("typical_p", self.typical_p),
+            ("xtc_probability", self.xtc_probability),
+            ("xtc_threshold", self.xtc_threshold),
+        ] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(invalid(format!(
+                    "sampling {name} must be finite and between 0 and 1"
+                )));
+            }
+        }
+        if self.repeat_last_n < -1 || self.dry_penalty_last_n < -1 || self.dry_allowed_length < 0 {
+            return Err(invalid(
+                "invalid sampling history window or DRY allowed length".to_string(),
+            ));
+        }
+        if self.max_tokens == 0 {
+            return Err(invalid("max_tokens must be positive".to_string()));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SamplerKind {
@@ -3112,6 +3176,44 @@ pub enum NativeErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sampling_validation_rejects_invalid_numeric_domains() {
+        let invalid = [
+            SamplingConfig {
+                temperature: f32::NAN,
+                ..SamplingConfig::default()
+            },
+            SamplingConfig {
+                top_p: 1.1,
+                ..SamplingConfig::default()
+            },
+            SamplingConfig {
+                repeat_penalty: 0.0,
+                ..SamplingConfig::default()
+            },
+            SamplingConfig {
+                repeat_last_n: -2,
+                ..SamplingConfig::default()
+            },
+            SamplingConfig {
+                max_tokens: 0,
+                ..SamplingConfig::default()
+            },
+        ];
+        for config in invalid {
+            assert_eq!(
+                config
+                    .validate()
+                    .expect_err("invalid domain must fail")
+                    .code,
+                NativeErrorCode::InvalidConfig
+            );
+        }
+        SamplingConfig::default()
+            .validate()
+            .expect("the default sampling configuration must remain valid");
+    }
 
     fn test_model_fingerprint() -> ModelFingerprint {
         ModelFingerprint {

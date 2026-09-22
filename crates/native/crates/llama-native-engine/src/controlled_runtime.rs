@@ -7,8 +7,8 @@
 
 use super::*;
 use crate::control_math::{
-    PowerTemperature, ValidatedLogits, VocabularyIdentity, classifier_free_guidance,
-    power_temperature_transform,
+    PowerTemperature, ValidatedLogits, VocabularyIdentity, apply_sparse_logit_bias,
+    classifier_free_guidance, eta_cutoff_mask, power_temperature_transform, top_n_sigma_mask,
 };
 use llama_cpp_2::json_schema_to_grammar;
 use llama_cpp_2::token::data::LlamaTokenData;
@@ -1827,65 +1827,7 @@ fn build_case_samplers(
 }
 
 fn build_transform_sampler(model: &LlamaModel, config: &SamplingConfig) -> Option<LlamaSampler> {
-    let mut samplers = Vec::new();
-    for kind in &config.sampler_order {
-        match kind {
-            SamplerKind::Penalties
-                if config.repeat_penalty != 1.0
-                    || config.frequency_penalty != 0.0
-                    || config.presence_penalty != 0.0 =>
-            {
-                samplers.push(LlamaSampler::penalties(
-                    config.repeat_last_n,
-                    config.repeat_penalty,
-                    config.frequency_penalty,
-                    config.presence_penalty,
-                ));
-            }
-            SamplerKind::Dry if config.dry_multiplier > 0.0 => {
-                samplers.push(LlamaSampler::dry(
-                    model,
-                    config.dry_multiplier,
-                    config.dry_base,
-                    config.dry_allowed_length,
-                    config.dry_penalty_last_n,
-                    ["\n", ":", "\"", "*"],
-                ));
-            }
-            SamplerKind::TopK if config.top_k > 0 => {
-                samplers.push(LlamaSampler::top_k(config.top_k));
-            }
-            SamplerKind::TypicalP if config.typical_p < 1.0 => {
-                samplers.push(LlamaSampler::typical(config.typical_p, 1));
-            }
-            SamplerKind::TopP if config.top_p < 1.0 => {
-                samplers.push(LlamaSampler::top_p(config.top_p, 1));
-            }
-            SamplerKind::MinP if config.min_p > 0.0 => {
-                samplers.push(LlamaSampler::min_p(config.min_p, 1));
-            }
-            SamplerKind::Xtc if config.xtc_probability > 0.0 => {
-                samplers.push(LlamaSampler::xtc(
-                    config.xtc_probability,
-                    config.xtc_threshold,
-                    1,
-                    config.seed,
-                ));
-            }
-            SamplerKind::Temperature => {
-                if config.dynamic_temperature_range > 0.0 {
-                    samplers.push(LlamaSampler::temp_ext(
-                        config.temperature,
-                        config.dynamic_temperature_range,
-                        config.dynamic_temperature_exponent,
-                    ));
-                } else if config.temperature > 0.0 {
-                    samplers.push(LlamaSampler::temp(config.temperature));
-                }
-            }
-            _ => {}
-        }
-    }
+    let samplers = build_sampling_transforms(model, config);
     (!samplers.is_empty()).then(|| LlamaSampler::chain_simple(samplers))
 }
 
@@ -2260,7 +2202,8 @@ fn sample_controlled_token(
 ) -> NativeResult<(LlamaToken, Option<TokenDistributionObservation>)> {
     runtime_ledger.begin_decision(case_index, generated_index)?;
     let _ = ValidatedLogits::new(conditional_logits, vocabulary).map_err(control_math_error)?;
-    let raw = DistributionSnapshot::all(conditional_logits.to_vec());
+    let observe = !request.control().observations().is_disabled();
+    let raw = observe.then(|| DistributionSnapshot::all(conditional_logits.to_vec()));
     let constraint_mask = constraint_mask(conditional_logits, samplers.grammar.as_ref())?;
     if request.control().constraint().is_some() {
         let effective = constraint_mask.iter().any(|allowed| !*allowed);
@@ -2273,10 +2216,10 @@ fn sample_controlled_token(
             &constraint_evidence_digest(conditional_logits, &constraint_mask),
         )?;
     }
-    let post_constraint = DistributionSnapshot {
+    let post_constraint = observe.then(|| DistributionSnapshot {
         logits: conditional_logits.to_vec(),
         allowed: constraint_mask.clone(),
-    };
+    });
 
     let mut guided = conditional_logits.to_vec();
     for control in request.control().guidance() {
@@ -2338,15 +2281,15 @@ fn sample_controlled_token(
             }
         }
     }
-    let post_guidance = DistributionSnapshot {
+    let post_guidance = observe.then(|| DistributionSnapshot {
         logits: guided.clone(),
         allowed: constraint_mask.clone(),
-    };
+    });
     let extended = request.control().extended_samplers().as_slice();
     let mut first_extended = 0;
     if let Some(ExtendedSampler::SparseLogitBias { biases }) = extended.first() {
         let before = guided.clone();
-        apply_sparse_bias_logits(&mut guided, &constraint_mask, biases.as_slice())?;
+        apply_sparse_bias_logits(&mut guided, &constraint_mask, biases.as_slice(), vocabulary)?;
         let (effective, evidence) =
             distribution_transition_evidence(&before, &guided, &constraint_mask)?;
         runtime_ledger.record(
@@ -2425,32 +2368,35 @@ fn sample_controlled_token(
         true,
         &terminal_candidate_evidence(&candidates, token, generated_index),
     )?;
-    let post_sampler =
-        DistributionSnapshot::from_candidates(vocabulary.vocabulary_size(), &candidates);
-    if !post_sampler
-        .allowed
-        .get(token.0 as usize)
-        .copied()
-        .unwrap_or(false)
+    if !candidates
+        .data
+        .iter()
+        .any(|candidate| candidate.id() == token)
     {
         return Err(NativeError::new(
             NativeErrorCode::DecodeFailed,
             "controlled terminal token is absent from its final distribution",
         ));
     }
-    let observation = if request.control().observations().is_disabled() {
-        None
-    } else {
+    let observation = if observe {
+        let post_sampler =
+            DistributionSnapshot::from_candidates(vocabulary.vocabulary_size(), &candidates);
         Some(build_distribution_observation(
             model,
             request.control().observations(),
             generated_index,
             token,
-            &raw,
-            &post_constraint,
-            &post_guidance,
+            raw.as_ref().expect("observation snapshot is present"),
+            post_constraint
+                .as_ref()
+                .expect("observation snapshot is present"),
+            post_guidance
+                .as_ref()
+                .expect("observation snapshot is present"),
             &post_sampler,
         )?)
+    } else {
+        None
     };
     if let Some(observation) = &observation {
         runtime_ledger.record(
@@ -2544,31 +2490,35 @@ fn apply_sparse_bias_logits(
     logits: &mut [f32],
     allowed: &[bool],
     biases: &[llama_native_types::TokenLogitBias],
+    vocabulary: &VocabularyIdentity,
 ) -> NativeResult<()> {
     if logits.len() != allowed.len() {
         return Err(generation_verification_error(
             "sparse logit bias received a dimensionally invalid constraint mask",
         ));
     }
+    let mut applicable = Vec::with_capacity(biases.len());
     for bias in biases {
-        let index = usize::try_from(bias.token_id).map_err(|_| {
+        let token_id = usize::try_from(bias.token_id).map_err(|_| {
             NativeError::new(
                 NativeErrorCode::InvalidConfig,
                 "sparse logit bias token ID does not fit the resident vocabulary",
             )
         })?;
-        if !allowed.get(index).copied().unwrap_or(false) {
+        if !allowed.get(token_id).copied().unwrap_or(false) {
             continue;
         }
-        let value = logits[index] + bias.bias;
-        if !value.is_finite() {
-            return Err(NativeError::new(
-                NativeErrorCode::DecodeFailed,
-                "sparse logit bias produced a non-finite value",
-            ));
-        }
-        logits[index] = value;
+        applicable.push((token_id, bias.bias));
     }
+    if applicable.is_empty() {
+        return Ok(());
+    }
+    let biased = apply_sparse_logit_bias(
+        ValidatedLogits::new(logits, vocabulary).map_err(control_math_error)?,
+        &applicable,
+    )
+    .map_err(control_math_error)?;
+    logits.copy_from_slice(&biased);
     Ok(())
 }
 
@@ -2706,41 +2656,18 @@ fn apply_eta_cutoff(candidates: &mut LlamaTokenDataArray, eta: f32) -> NativeRes
             "eta cutoff received no candidates",
         ));
     }
-    let max = candidates
+    let logits = candidates
         .data
         .iter()
         .map(LlamaTokenData::logit)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let weights = candidates
-        .data
-        .iter()
-        .map(|candidate| (f64::from(candidate.logit()) - f64::from(max)).exp())
         .collect::<Vec<_>>();
-    let sum = weights.iter().sum::<f64>();
-    if !sum.is_finite() || sum <= 0.0 {
-        return Err(NativeError::new(
-            NativeErrorCode::DecodeFailed,
-            "eta cutoff could not normalize the controlled distribution",
-        ));
-    }
-    let probabilities = weights
-        .iter()
-        .map(|weight| weight / sum)
-        .collect::<Vec<_>>();
-    let entropy = probabilities
-        .iter()
-        .filter(|probability| **probability > 0.0)
-        .map(|probability| -probability * probability.ln())
-        .sum::<f64>();
-    let eta = f64::from(eta);
-    let threshold = eta.min(eta.sqrt() * (-entropy).exp());
-    retain_by_mask(
-        candidates,
-        probabilities
-            .iter()
-            .map(|probability| *probability >= threshold)
-            .collect(),
+    let vocabulary = candidate_order_identity(logits.len())?;
+    let mask = eta_cutoff_mask(
+        ValidatedLogits::new(&logits, &vocabulary).map_err(control_math_error)?,
+        eta,
     )
+    .map_err(control_math_error)?;
+    retain_by_mask(candidates, mask.as_slice().to_vec())
 }
 
 fn apply_top_n_sigma(candidates: &mut LlamaTokenDataArray, n: f32) -> NativeResult<()> {
@@ -2750,35 +2677,27 @@ fn apply_top_n_sigma(candidates: &mut LlamaTokenDataArray, n: f32) -> NativeResu
             "top-n-sigma received no candidates",
         ));
     }
-    let count = candidates.data.len() as f64;
-    let mean = candidates
-        .data
-        .iter()
-        .map(|candidate| f64::from(candidate.logit()))
-        .sum::<f64>()
-        / count;
-    let deviation = (candidates
-        .data
-        .iter()
-        .map(|candidate| {
-            let centered = f64::from(candidate.logit()) - mean;
-            centered * centered
-        })
-        .sum::<f64>()
-        / count)
-        .sqrt();
-    let max = candidates
+    let logits = candidates
         .data
         .iter()
         .map(LlamaTokenData::logit)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let threshold = f64::from(max) - f64::from(n) * deviation;
-    let mask = candidates
-        .data
-        .iter()
-        .map(|candidate| f64::from(candidate.logit()) >= threshold)
-        .collect();
-    retain_by_mask(candidates, mask)
+        .collect::<Vec<_>>();
+    let vocabulary = candidate_order_identity(logits.len())?;
+    let mask = top_n_sigma_mask(
+        ValidatedLogits::new(&logits, &vocabulary).map_err(control_math_error)?,
+        n,
+    )
+    .map_err(control_math_error)?;
+    retain_by_mask(candidates, mask.as_slice().to_vec())
+}
+
+fn candidate_order_identity(size: usize) -> NativeResult<VocabularyIdentity> {
+    VocabularyIdentity::new(
+        "controlled-candidate-order",
+        "controlled-candidate-order",
+        size,
+    )
+    .map_err(control_math_error)
 }
 
 fn retain_by_mask(candidates: &mut LlamaTokenDataArray, mut mask: Vec<bool>) -> NativeResult<()> {

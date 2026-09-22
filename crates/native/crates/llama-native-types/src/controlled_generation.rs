@@ -537,6 +537,7 @@ impl TryFrom<ControlledGenerationCaseWire> for ControlledGenerationCase {
 }
 
 fn validate_sampling(sampling: &SamplingConfig) -> Result<(), NativeError> {
+    sampling.validate()?;
     let bounded = [
         ("temperature", sampling.temperature, 0.0, 100.0),
         (
