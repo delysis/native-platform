@@ -1,3 +1,5 @@
+import { GHOST_PRESENTATION_ATTRIBUTE, observeInlineGhost, inlineGhostPreview, type InlineGhostObservation } from './inlineGhostObservation';
+export { visualGhostInsertionIsVisible, type GhostClientRect } from './inlineGhostObservation';
 import { defaultMarkdownParser, defaultMarkdownSerializer } from 'prosemirror-markdown';
 import { Plugin, PluginKey, NodeSelection, TextSelection, type EditorState, type Transaction } from 'prosemirror-state';
 import { Decoration, DecorationSet, type EditorView } from 'prosemirror-view';
@@ -79,13 +81,6 @@ export interface GhostTextHandlers {
   ) => boolean;
 }
 
-export interface GhostClientRect {
-  left: number;
-  top: number;
-  right: number;
-  bottom: number;
-}
-
 type GhostTextMeta =
   | { kind: 'set'; presentation: GhostTextPresentation }
   | { kind: 'clear' }
@@ -99,7 +94,6 @@ export const VISUAL_TAB_INDENT = '\t';
 // manuscript while remaining literal text under the CommonMark serializer.
 // We still reject a collision rather than guessing.
 const CARET_BOUNDARY_WITNESS = '\uE000LOOM_CARET_BOUNDARY_7F3A9D2C\uE001';
-const GHOST_PRESENTATION_ATTRIBUTE = 'data-loom-ghost-presentation';
 
 interface AttributeTarget {
   setAttribute(name: string, value: string): void;
@@ -452,109 +446,27 @@ export function currentGhostTextPlan(state: EditorState): GhostTextPlan | null {
   return planGhostText(state, ghostTextPluginKey.getState(state) ?? null);
 }
 
-function validRect(rect: GhostClientRect, allowZeroWidth = false): boolean {
-  return [rect.left, rect.top, rect.right, rect.bottom].every(Number.isFinite) &&
-    (allowZeroWidth ? rect.right >= rect.left : rect.right > rect.left) &&
-    rect.bottom > rect.top;
-}
-
-function verticallyIntersects(left: GhostClientRect, right: GhostClientRect): boolean {
-  return Math.min(left.bottom, right.bottom) > Math.max(left.top, right.top);
-}
-
-/**
- * Require both the actual ProseMirror caret and the ghost's first rendered
- * fragment to begin inside the clipping viewport. Later wrapped fragments can
- * never authorize an offscreen insertion boundary.
- */
-export function visualGhostInsertionIsVisible(
-  caret: GhostClientRect,
-  firstGhostFragment: GhostClientRect,
-  clip: GhostClientRect,
-  direction: 'ltr' | 'rtl'
-): boolean {
-  if (
-    !validRect(caret, true) ||
-    !validRect(firstGhostFragment, true) ||
-    !validRect(clip)
-  ) return false;
-  const caretEdge = direction === 'rtl' ? caret.right : caret.left;
-  const ghostEdge = direction === 'rtl' ? firstGhostFragment.right : firstGhostFragment.left;
-  return caretEdge >= clip.left &&
-    caretEdge < clip.right &&
-    ghostEdge >= clip.left &&
-    ghostEdge < clip.right &&
-    verticallyIntersects(caret, clip) &&
-    verticallyIntersects(firstGhostFragment, clip);
-}
-
-function elementAndAncestorsAreVisible(
-  element: HTMLElement,
-  root: HTMLElement,
-  allowHiddenElement = false
-): boolean {
-  for (let current: HTMLElement | null = element; current; current = current.parentElement) {
-    const style = current.ownerDocument.defaultView?.getComputedStyle(current);
-    if (!style) return false;
-    if (
-      style.display === 'none' ||
-      (!allowHiddenElement || current !== element) && (
-        style.visibility === 'hidden' ||
-        style.visibility === 'collapse'
-      ) ||
-      Number.parseFloat(style.opacity) <= 0
-    ) return false;
-    if (current === root) return true;
-  }
-  return false;
-}
-
-function ghostWidgetPresentationKeyInViewport(
-  view: EditorView,
-  allowFanHiddenWidget: boolean
-): string {
+/** Observe actual DOM glyphs; plan/controller readiness alone is insufficient. */
+export function visibleGhostWidgetObservation(view: EditorView): InlineGhostObservation | null {
   const plan = currentGhostTextPlan(view.state);
-  if (!plan) return '';
-  const widget = Array.from(
+  if (!plan || plan.hidden) return null;
+  const widgets = Array.from(
     view.dom.querySelectorAll<HTMLElement>(`[${GHOST_PRESENTATION_ATTRIBUTE}]`)
-  ).find((candidate) =>
-    candidate.getAttribute(GHOST_PRESENTATION_ATTRIBUTE) === plan.presentationKey
-  );
-  if (
-    !widget?.isConnected ||
-    widget.hidden ||
-    plan.hidden ||
-    !elementAndAncestorsAreVisible(
-      widget,
-      view.dom,
-      allowFanHiddenWidget && plan.fanVisible
-    )
-  ) return '';
+  ).filter((candidate) => candidate.getAttribute(GHOST_PRESENTATION_ATTRIBUTE) === plan.presentationKey);
+  // Multiple matching widgets are ambiguous, not evidence of one exact glyph.
+  if (widgets.length !== 1) return null;
   const clip = view.dom.closest<HTMLElement>('.editor-pane')?.getBoundingClientRect();
-  if (!clip) return '';
-  // The union rectangle is authoritative for a text widget that can begin
-  // with paragraph whitespace. WebKit may expose only zero-height fragment
-  // rects for those leading newlines even while the prose glyphs are visible.
-  const renderedGhost = widget.getBoundingClientRect();
-  let caret: ReturnType<EditorView['coordsAtPos']>;
+  if (!clip) return null;
   try {
-    caret = view.coordsAtPos(plan.position);
+    return observeInlineGhost(widgets[0], plan.presentationKey, inlineGhostPreview(plan.text),
+      view.coordsAtPos(plan.position), clip);
   } catch {
-    return '';
+    return null;
   }
-  const direction = widget.ownerDocument.defaultView?.getComputedStyle(widget).direction;
-  if (!visualGhostInsertionIsVisible(
-    caret,
-    renderedGhost,
-    clip,
-    direction === 'rtl' ? 'rtl' : 'ltr'
-  )) return '';
-  return plan.presentationKey;
 }
 
-/** Return the key only when the exact visible inline widget is connected and on screen. */
 export function visibleGhostWidgetPresentationKey(view: EditorView): string {
-  return ghostWidgetPresentationKeyInViewport(view, false);
+  return visibleGhostWidgetObservation(view)?.presentationKey ?? '';
 }
 
 function ghostWidget(
@@ -577,7 +489,7 @@ function ghostWidget(
   widget.contentEditable = 'false';
   widget.draggable = false;
   widget.spellcheck = false;
-  widget.textContent = plan.hidden ? '' : (nextVisualSuggestionWord(plan.text)?.trimEnd() ?? '');
+  widget.textContent = plan.hidden ? '' : inlineGhostPreview(plan.text);
   container.append(widget);
 
   if (plan.alternatives.length > 1) {
@@ -670,7 +582,7 @@ function synchronizeGhostWidgetDom(
   const container = view.dom.querySelector<HTMLElement>('.loom-ghost-widget');
   const widget = container?.querySelector<HTMLElement>('.loom-visual-ghost');
   if (!container || !widget) return;
-  widget.textContent = plan.hidden ? '' : (nextVisualSuggestionWord(plan.text)?.trimEnd() ?? '');
+  widget.textContent = plan.hidden ? '' : inlineGhostPreview(plan.text);
   widget.classList.toggle('ghost-text-hidden', plan.hidden);
   widget.setAttribute(GHOST_PRESENTATION_ATTRIBUTE, plan.presentationKey);
   container.classList.toggle('fan-visible', plan.fanVisible);
@@ -884,7 +796,7 @@ export function createGhostTextPlugin(
           !event.ctrlKey;
         const exactAnchorVisible = Boolean(plan && (
           plan.fanVisible
-            ? ghostWidgetPresentationKeyInViewport(view, true) === plan.presentationKey
+            ? visibleGhostWidgetPresentationKey(view) === plan.presentationKey
             : handlers.visible(
                 plan.presentationKey,
                 plan.surfaceKey,
@@ -1169,7 +1081,7 @@ export function createGhostTextPlugin(
         const plan = currentGhostTextPlan(editorView.state);
         if (!plan) return;
         if (
-          ghostWidgetPresentationKeyInViewport(editorView, true) !== plan.presentationKey
+          visibleGhostWidgetPresentationKey(editorView) !== plan.presentationKey
         ) {
           // A fixed popup must never outlive the inline insertion witness that
           // gives it meaning. Clear both the modifier projection and fan state

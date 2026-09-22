@@ -23,6 +23,7 @@
     setGhostText,
     visualCaretBoundaryProof,
     visibleGhostWidgetPresentationKey,
+    visibleGhostWidgetObservation,
     type GhostTextPresentation,
     type VisualCaretBoundaryFailure,
     visualGhostTextIsFaithfulAtSelection
@@ -38,6 +39,7 @@
     type SuggestionAlternative
   } from './suggestionInteraction';
   import {
+    unavailableVisualCompletionWitness,
     unavailableVisualSelectionWitness,
     type VisualCompletionAccessibilityWitness,
     type VisualSelectionAccessibilityWitness
@@ -186,6 +188,7 @@
       fanVisible: Boolean(plan?.fanVisible),
       lensPinned: completionLens.pinned,
       inlineHidden: Boolean(plan?.hidden),
+      inline: view ? visibleGhostWidgetObservation(view) : null,
       selectedCandidateId: plan?.candidateId ?? '',
       selectedPresentationKey: plan?.presentationKey ?? '',
       alternativeCandidateIds: plan?.alternatives.map((item) => item.candidateId) ?? [],
@@ -240,6 +243,8 @@
 
   function reportGhostVisibility(): void {
     const presentationKey = view ? visibleGhostWidgetPresentationKey(view) : '';
+    // Layout/scroll changes can invalidate glyphs without changing the plan.
+    reportCompletionAccessibility();
     if (reportedGhostPresentationKey === presentationKey) return;
     reportedGhostPresentationKey = presentationKey;
     onGhostVisibilityChange(presentationKey);
@@ -1256,18 +1261,7 @@
     if (composing) onCompositionChange(false);
     onSelectionChange(null, 'selection_settling', null);
     if (reportedGhostPresentationKey) onGhostVisibilityChange('');
-    onCompletionAccessibilityChange({
-      available: false,
-      optionHeld: false,
-      fanVisible: false,
-      lensPinned: false,
-      inlineHidden: true,
-      selectedCandidateId: '',
-      selectedPresentationKey: '',
-      alternativeCandidateIds: [],
-      alternativePresentationKeys: [],
-      alternativeRunIds: []
-    });
+    onCompletionAccessibilityChange(unavailableVisualCompletionWitness());
     invalidateSelectionAccessibility();
     window.removeEventListener('resize', reportGhostVisibility);
     window.removeEventListener('focus', handleWindowFocus);

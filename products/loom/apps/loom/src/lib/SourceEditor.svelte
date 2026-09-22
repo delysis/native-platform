@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
+  import { observeInlineGhost, inlineGhostPreview } from './inlineGhostObservation';
   import { completionOptionAccessibleLabel } from './ghostText';
   import { allocateCompletionPopupDomIds, placeCompletionPopup } from './completionPopup';
   import {
@@ -179,7 +180,7 @@
       !plan ||
       !ghostSpan?.isConnected
     ) return;
-    if (!visibleSourceGhostPlan(plan, true)) {
+    if (!visibleSourceGhostPlan(plan)) {
       // Viewport clamping cannot supply the missing insertion witness. Close
       // the fixed fan when its mirrored caret has scrolled out of view.
       optionHeld = false;
@@ -243,56 +244,19 @@
     setCompletionLensPinned(!completionLens.pinned);
   }
 
-  function renderedGhostPresentationKey(
-    candidate: SourceGhostPlan | null,
-    allowFanHiddenGhost = false
-  ): string {
-    if (
-      !candidate ||
-      !viewport ||
-      !ghostSpan ||
-      ghostHidden ||
-      viewport.hidden ||
-      ghostSpan.hidden ||
-      !viewport.isConnected ||
-      !ghostSpan.isConnected
-    ) return '';
-
-    const viewportStyle = getComputedStyle(viewport);
-    const ghostStyle = getComputedStyle(ghostSpan);
-    const ignoreFanVisibility = allowFanHiddenGhost && lensVisible;
-    if (
-      viewportStyle.display === 'none' ||
-      viewportStyle.visibility === 'hidden' ||
-      viewportStyle.visibility === 'collapse' ||
-      Number.parseFloat(viewportStyle.opacity) === 0 ||
-      ghostStyle.display === 'none' ||
-      (!ignoreFanVisibility && (
-        ghostStyle.visibility === 'hidden' ||
-        ghostStyle.visibility === 'collapse'
-      )) ||
-      Number.parseFloat(ghostStyle.opacity) === 0
-    ) return '';
-
-    // The first client rect is the continuation's insertion edge. Using the
-    // union bounding box would let a long completion reach back into view and
-    // falsely authorize an offscreen caret.
+  function renderedGhostPresentationKey(candidate: SourceGhostPlan | null): string {
+    if (!candidate || !viewport || !ghostSpan || ghostHidden || viewport.hidden || !viewport.isConnected) return '';
+    // Mirror geometry proves the insertion edge; the shared DOM observer
+    // additionally requires the exact glyphs, key, positive area and ancestors.
     const firstGhostRect = ghostSpan.getClientRects().item(0);
-    if (
-      !firstGhostRect ||
-      !sourceGhostRectIntersectsViewport(firstGhostRect, viewport.getBoundingClientRect())
-    ) return '';
-    return candidate.presentationKey;
+    const clip = viewport.getBoundingClientRect();
+    if (!firstGhostRect || !sourceGhostRectIntersectsViewport(firstGhostRect, clip)) return '';
+    return observeInlineGhost(ghostSpan, candidate.presentationKey, inlineGhostPreview(candidate.text),
+      firstGhostRect, clip)?.presentationKey ?? '';
   }
 
-  function visibleSourceGhostPlan(
-    candidate: SourceGhostPlan | null,
-    allowFanHiddenGhost = false
-  ): SourceGhostPlan | null {
-    const livePresentationKey = renderedGhostPresentationKey(
-      candidate,
-      allowFanHiddenGhost
-    );
+  function visibleSourceGhostPlan(candidate: SourceGhostPlan | null): SourceGhostPlan | null {
+    const livePresentationKey = renderedGhostPresentationKey(candidate);
     return candidate &&
       renderedSourceGhostPresentationKey(candidate, viewport ? Boolean(viewport.hidden) : true) ===
         candidate.presentationKey &&
@@ -529,7 +493,7 @@
 
   function handleKeydown(event: KeyboardEvent): void {
     const candidate = currentPlan();
-    const visible = visibleSourceGhostPlan(candidate, lensVisible);
+    const visible = visibleSourceGhostPlan(candidate);
     if (lensVisible && !visible) completionLens = CLOSED_COMPLETION_LENS;
     if (
       (event.key === 'Alt' || event.altKey) &&
@@ -702,7 +666,7 @@
 
   function handleWindowOptionDown(event: KeyboardEvent): void {
     const candidate = currentPlan();
-    const visible = visibleSourceGhostPlan(candidate, optionFanVisible);
+    const visible = visibleSourceGhostPlan(candidate);
     if (
       (event.key === 'Alt' || (event.altKey && !event.metaKey && !event.ctrlKey)) &&
       visible &&
@@ -979,7 +943,7 @@
   <div class="source-ghost-viewport" aria-hidden="true" hidden={!plan} bind:this={viewport}>
     <div class="source-ghost-mirror" bind:this={mirror}>
       {#if plan}
-        <span>{plan.prefix}</span><span class:ghost-text-hidden={ghostHidden} class="loom-source-ghost-text" bind:this={ghostSpan}>{ghostHidden ? '' : nextSuggestionWord(plan.text)?.trimEnd() ?? ''}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
+        <span>{plan.prefix}</span><span class:ghost-text-hidden={ghostHidden} class="loom-source-ghost-text" data-loom-ghost-presentation={plan.presentationKey} bind:this={ghostSpan}>{ghostHidden ? '' : inlineGhostPreview(plan.text)}</span><span>{plan.suffix}</span><span class="source-ghost-sentinel">&#8203;</span>
       {/if}
     </div>
   </div>

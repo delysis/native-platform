@@ -1,9 +1,12 @@
+import type { InlineGhostObservation } from './inlineGhostObservation';
+
 export interface VisualCompletionAccessibilityWitness {
   available: boolean;
   optionHeld: boolean;
   fanVisible: boolean;
   lensPinned: boolean;
   inlineHidden: boolean;
+  inline: InlineGhostObservation | null;
   selectedCandidateId: string;
   selectedPresentationKey: string;
   alternativeCandidateIds: string[];
@@ -30,6 +33,7 @@ export function unavailableVisualCompletionWitness(): VisualCompletionAccessibil
     fanVisible: false,
     lensPinned: false,
     inlineHidden: true,
+    inline: null,
     selectedCandidateId: '',
     selectedPresentationKey: '',
     alternativeCandidateIds: [],

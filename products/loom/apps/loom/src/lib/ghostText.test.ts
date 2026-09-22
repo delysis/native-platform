@@ -426,6 +426,7 @@ describe('visual ghost widget', () => {
       closest: () => ({ getBoundingClientRect: () => clip })
     };
     widget = {
+      textContent: ' for',
       isConnected: true,
       hidden: false,
       ownerDocument,

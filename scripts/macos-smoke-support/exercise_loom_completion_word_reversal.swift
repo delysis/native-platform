@@ -1,9 +1,49 @@
+import Foundation
+
+func exactInsertedCandidatePrefix(original: Data, observed: Data, candidate: Data, insertedBytes: Int, whole: Bool) -> Bool {
+    guard insertedBytes > 0, insertedBytes <= candidate.count,
+          !whole || insertedBytes == candidate.count else { return false }
+    var expected = original
+    expected.append(candidate.prefix(insertedBytes))
+    return observed == expected
+}
+
+func insertionContractTests() {
+    let original = Data("hello ".utf8), candidate = Data("world again".utf8)
+    var checks = 0
+    func check(_ condition: Bool, _ name: String) {
+        guard condition else { fputs("insertion contract failed: \(name)\n", stderr); exit(1) }
+        checks += 1
+    }
+    func accepts(_ text: String, _ length: Int, _ whole: Bool = false) -> Bool {
+        exactInsertedCandidatePrefix(original: original, observed: Data(text.utf8), candidate: candidate, insertedBytes: length, whole: whole)
+    }
+    check(accepts("hello world", 5), "exact selected prefix")
+    check(!accepts("hello wrong", 5), "same-size substituted bytes")
+    check(!accepts("Hello world", 5), "changed original bytes")
+    check(!accepts("hello world", 5, true), "partial is not whole remainder")
+    check(accepts("hello world again", 11, true), "exact whole remainder")
+    check(!accepts("hello ", 0), "empty acceptance")
+    check(!accepts("hello world", -1), "negative length")
+    check(!accepts("hello world again!", 12), "beyond candidate")
+    check(!exactInsertedCandidatePrefix(original: Data(), observed: Data("é".utf8), candidate: Data("e\u{301}".utf8), insertedBytes: 3, whole: true), "Unicode byte identity")
+    print("\(checks) insertion-contract assertions passed (not native acceptance)")
+}
+
+if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--self-test" {
+    insertionContractTests(); exit(0)
+}
+
+#if os(macOS)
 import AppKit
 import ApplicationServices
 import CryptoKit
 import Foundation
 
-let pid = Int32(CommandLine.arguments[1])!
+guard CommandLine.arguments.count == 6, let pid = Int32(CommandLine.arguments[1]), pid > 0 else {
+    fputs("usage: exercise_loom_completion_word_reversal <pid> <manuscript> <prefix> <generation-failure> <project-failure>\n", stderr)
+    exit(2)
+}
 let manuscript = CommandLine.arguments[2]
 let prefix = CommandLine.arguments[3]
 let asynchronousFailurePaths = [CommandLine.arguments[4], CommandLine.arguments[5]]
@@ -46,7 +86,7 @@ func descendants() -> [AXUIElement] {
 
 func editor() -> AXUIElement? {
     descendants().first { element in
-        stringAttribute(element, kAXRoleAttribute as CFString) == kAXTextAreaRole as String
+        stringAttribute(element, kAXRoleAttribute as CFString) == kAXTextAreaRole as String && strings(element).contains("Manuscript editor")
     }
 }
 
@@ -74,31 +114,14 @@ func completionWitness() -> [String: Any]? {
     return nil
 }
 
-func supportsPress(_ element: AXUIElement) -> Bool {
-    var names: CFArray?
-    guard AXUIElementCopyActionNames(element, &names) == .success,
-          let actions = names as? [String] else { return false }
-    return actions.contains(kAXPressAction as String)
-}
-
-func button(named name: String) -> AXUIElement? {
-    descendants().first { element in
-        strings(element).contains(where: { $0.contains(name) }) &&
-            supportsPress(element) &&
-            (attribute(element, kAXEnabledAttribute as CFString) as? Bool) != false
-    }
-}
-
-func pressButton(named name: String, timeout: TimeInterval = 10) -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    repeat {
-        if let control = button(named: name),
-           AXUIElementPerformAction(control, kAXPressAction as CFString) == .success {
-            return true
-        }
-        Thread.sleep(forTimeInterval: 0.05)
-    } while Date() < deadline
-    return false
+// These are production shortcuts, not retired titlebar labels. The witness
+// below must prove the resulting transition; dispatch alone never passes.
+func completionShortcut(_ key: CGKeyCode, field: String, from expected: Bool) -> Bool {
+    guard !asynchronousGuardFailed(),
+          NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+          let witness = completionWitness(), witness[field] as? Bool == expected else { return false }
+    return postKey(key, down: true, flags: [.maskCommand, .maskShift]) &&
+        postKey(key, down: false, flags: [.maskCommand, .maskShift])
 }
 
 func visual(_ witness: [String: Any]) -> [String: Any] {
@@ -338,7 +361,7 @@ guard let writingSurface = editor(),
     fputs("could not focus Loom's exact writing surface for completion reversal\n", stderr)
     exit(1)
 }
-guard let original = readManuscript() else {
+guard let original = readManuscript(), original == Data(prefix.utf8), prefix.last?.isWhitespace == true else {
     fputs("could not read Loom's isolated manuscript before completion reversal\n", stderr)
     exit(1)
 }
@@ -359,6 +382,43 @@ guard let initial = waitForWitness(timeout: 30, { witness in
     fputs("Loom did not expose one exact cached four-choice completion witness\n", stderr)
     exit(1)
 }
+// The isolated journey uses root-level writing/Untitled.md. Its baseline
+// ends in whitespace, so presentation never adds an editor-owned separator.
+// Bind expected inserted bytes to the SHA-verified immutable candidate, not
+// to a length reported by the same controller that performed the insertion.
+func verifiedCandidateBytes(_ candidate: [String: Any]) -> Data? {
+    let parts = string(candidate, "presentation_key").components(separatedBy: ":")
+    guard parts.count == 2 || parts.count == 4, parts[0] != "stream", !parts[0].isEmpty,
+          parts[1].count == 64, parts[1].allSatisfy({ "0123456789abcdef".contains($0) }) else { return nil }
+    let hash = parts[1], length = integer(candidate, "text_utf8_bytes")
+    if parts.count == 4 && (parts[2] != "prose-prefix" || Int(parts[3]) != length) { return nil }
+    let path = URL(fileURLWithPath: manuscript).deletingLastPathComponent()
+        .appendingPathComponent(".loom/blobs/sha256").appendingPathComponent(String(hash.prefix(2)))
+        .appendingPathComponent(String(hash.dropFirst(2)))
+    guard let file = try? FileHandle(forReadingFrom: path) else { return nil }
+    defer { try? file.close() }
+    guard let bytes = try? file.read(upToCount: 256 * 1024 + 1), bytes.count <= 256 * 1024,
+          sha256(bytes) == hash, length > 0, length <= bytes.count else { return nil }
+    let projected = Data(bytes.prefix(length))
+    guard String(data: projected, encoding: .utf8) != nil else { return nil }
+    return projected
+}
+var expectedCandidates: [String: Data] = [:]
+for candidate in initial["candidates"] as? [[String: Any]] ?? [] {
+    let run = string(candidate, "run_id")
+    guard !run.isEmpty, expectedCandidates[run] == nil, let bytes = verifiedCandidateBytes(candidate) else {
+        fputs("could not bind expected insertion to one immutable candidate blob\n", stderr); exit(1)
+    }
+    expectedCandidates[run] = bytes
+}
+guard expectedCandidates.count == 4 else { fputs("four exact candidate blobs are required\n", stderr); exit(1) }
+func exactInsertion(_ observed: Data, witness: [String: Any], whole: Bool = false) -> Bool {
+    let action = lastAction(witness)
+    guard let candidate = expectedCandidates[string(action, "run_id")] else { return false }
+    return exactInsertedCandidatePrefix(original: original, observed: observed, candidate: candidate,
+        insertedBytes: integer(action, "inserted_utf8_bytes"), whole: whole)
+}
+
 let context = string(initial, "context_key")
 let runIds = familyRunIds(initial)
 let initialRunId = string(initial, "selected_run_id")
@@ -462,7 +522,8 @@ guard let wordAccepted = waitForWitness(timeout: 10, { witness in
     releaseOptionAndFail("Option-Right did not retain physical Option and exact cached-session authority")
 }
 
-guard postKey(123, down: true, flags: [.maskAlternate]),
+guard exactInsertion(accepted, witness: wordAccepted),
+      postKey(123, down: true, flags: [.maskAlternate]),
       postKey(123, down: false, flags: [.maskAlternate]) else {
     releaseOptionAndFail("could not construct Loom's Option-Left events")
 }
@@ -495,7 +556,7 @@ guard let optionReleased = waitForWitness(timeout: 10, { witness in
     exit(1)
 }
 
-guard pressButton(named: "Turn Shuttle on") else {
+guard completionShortcut(38, field: "shuttle_enabled", from: false) else {
     fputs("could not enable Shuttle on the cached completion session\n", stderr)
     exit(1)
 }
@@ -533,13 +594,12 @@ guard let shuttleAcceptedBytes = waitForChangedManuscript(from: original, timeou
     fputs("Shuttle did not consume exactly one word from the same hidden cached family\n", stderr)
     exit(1)
 }
-let shuttleAction = lastAction(shuttleAccepted)
-guard shuttleAcceptedBytes.count - original.count == integer(shuttleAction, "inserted_utf8_bytes") else {
+guard exactInsertion(shuttleAcceptedBytes, witness: shuttleAccepted) else {
     fputs("Shuttle's persisted byte delta did not equal its authorized cached word\n", stderr)
     exit(1)
 }
 
-guard pressButton(named: "Turn Shuttle off") else {
+guard completionShortcut(38, field: "shuttle_enabled", from: true) else {
     fputs("could not stop Shuttle after its first cached word\n", stderr)
     exit(1)
 }
@@ -629,7 +689,7 @@ guard postKey(36, down: true, flags: [.maskAlternate]),
     releaseOptionAndFail("fan Return did not persist the selected cached remainder")
 }
 let returnAction = lastAction(returnAccepted)
-guard returnAcceptedBytes.count - original.count == integer(returnAction, "inserted_utf8_bytes"),
+guard exactInsertion(returnAcceptedBytes, witness: returnAccepted, whole: true),
       integer(returnAction, "accepted_utf8_bytes") == integer(returnAction, "inserted_utf8_bytes"),
       (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
       postKey(123, down: true, flags: [.maskAlternate]),
@@ -696,7 +756,7 @@ guard postKey(48, down: true, flags: [.maskAlternate]),
     releaseOptionAndFail("fan Tab did not persist the selected cached remainder")
 }
 let tabAction = lastAction(tabAccepted)
-guard tabAcceptedBytes.count - original.count == integer(tabAction, "inserted_utf8_bytes"),
+guard exactInsertion(tabAcceptedBytes, witness: tabAccepted, whole: true),
       integer(tabAction, "accepted_utf8_bytes") == integer(tabAction, "inserted_utf8_bytes"),
       (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
       postKey(123, down: true, flags: [.maskAlternate]),
@@ -723,7 +783,7 @@ guard let tabReleased = waitForWitness(timeout: 10, { witness in
     exit(1)
 }
 
-guard pressButton(named: "Turn autocomplete off") else {
+guard completionShortcut(5, field: "autocomplete_enabled", from: true) else {
     fputs("could not turn the shared completion engine off after cached checks\n", stderr)
     exit(1)
 }
@@ -746,6 +806,7 @@ let evidence: [String: Any] = [
     "accepted_sha256": sha256(accepted),
     "rollback_sha256": sha256(readManuscript()!),
     "accepted_then_exactly_reversed": true,
+    "insertions_match_immutable_candidate_bytes": true,
     "context_key": context,
     "family_run_ids": runIds,
     "initial_selected_run_id": initialRunId,
@@ -778,3 +839,8 @@ let evidence: [String: Any] = [
 ]
 let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
 print(String(data: data, encoding: .utf8)!)
+
+#else
+fputs("native completion interaction requires macOS; only --self-test is portable\n", stderr)
+exit(2)
+#endif
