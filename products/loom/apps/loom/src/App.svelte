@@ -9806,7 +9806,6 @@
         {#if document && mode === 'visual' && canUseVisual && (!contextPaneOpen || canUseVisualMarkdown(contextText, true))}
           <VisualFormatMenu
             bind:this={formatMenu}
-            hiddenTrigger
             editor={contextPaneOpen ? contextVisualEditor : visualEditor}
             formatting={contextPaneOpen ? contextFormatting : visualFormatting}
             onCommandResult={(action, applied) => {
