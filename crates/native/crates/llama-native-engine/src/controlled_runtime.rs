@@ -1004,23 +1004,46 @@ impl RuntimeControlLedger {
         Ok(())
     }
 
+    #[cfg(test)]
     fn finalize(
         self,
         request: &ControlledGenerationBatchRequest,
         runtime_cost: ControlledRuntimeCostEvidence,
     ) -> NativeResult<FinalizedRuntimeControlEvidence> {
+        self.finalize_with_cancellations(request, runtime_cost, &vec![false; request.cases().len()])
+    }
+
+    fn finalize_with_cancellations(
+        self,
+        request: &ControlledGenerationBatchRequest,
+        runtime_cost: ControlledRuntimeCostEvidence,
+        cancelled: &[bool],
+    ) -> NativeResult<FinalizedRuntimeControlEvidence> {
         if self.operations.is_empty()
-            || self.decisions_by_case.contains(&0)
+            || cancelled.len() != request.cases().len()
+            || self.decisions_by_case.len() != cancelled.len()
+            || self.next_operation_by_case.len() != cancelled.len()
             || self
-                .next_operation_by_case
+                .decisions_by_case
                 .iter()
-                .any(|index| usize::from(*index) != self.operations.len())
+                .zip(&self.next_operation_by_case)
+                .zip(cancelled)
+                .any(|((decisions, next), cancelled)| {
+                    if *decisions == 0 {
+                        !*cancelled || *next != 0
+                    } else {
+                        usize::from(*next) != self.operations.len()
+                    }
+                })
         {
             return Err(generation_verification_error(
-                "controlled runtime did not execute a complete operation plan for every case",
+                "controlled runtime did not complete every started decision or account for cancellation",
             ));
         }
-        let mut ledger = StableEvidenceDigest::new("controlled-runtime-ledger-v1");
+        let mut ledger = StableEvidenceDigest::new("controlled-runtime-ledger-v2");
+        for cancelled_case in cancelled {
+            ledger.bool(*cancelled_case);
+        }
         ledger.text(&request.fingerprint_sha256());
         ledger.u64(self.next_runtime_ordinal);
         ledger.u64(self.decisions_by_case.len() as u64);
@@ -1033,7 +1056,7 @@ impl RuntimeControlLedger {
         ledger.u64(runtime_cost.reserved_physical_context_cells);
         ledger.u32(runtime_cost.sequence_slots);
         let mut reports = Vec::with_capacity(self.operations.len());
-        let mut every_requested_operation_effective = true;
+        let mut every_requested_operation_effective = !cancelled.iter().any(|value| *value);
         let mut ineffective_operations = Vec::new();
         for operation in self.operations {
             if operation.invocations_by_case != self.decisions_by_case {
@@ -1462,6 +1485,7 @@ fn execute_active_controls(
         &conditional_tokens,
         &unconditional_tokens,
         &mut tracking,
+        cancellations,
     )?;
     let mut cases = request
         .cases()
@@ -1543,8 +1567,12 @@ fn execute_active_controls(
                     None,
                     None,
                 );
+                tracking.token_counts.remove(&active.conditional_sequence);
+                tracking.token_ids.remove(&active.conditional_sequence);
                 if let Some(sequence) = active.unconditional_sequence {
                     let _ = context.clear_kv_cache_seq(Some(sequence as u32), None, None);
+                    tracking.token_counts.remove(&sequence);
+                    tracking.token_ids.remove(&sequence);
                 }
                 continue;
             }
@@ -1867,8 +1895,10 @@ fn prefill_controlled_batch(
     conditional: &[Vec<LlamaToken>],
     unconditional: &[Option<Vec<LlamaToken>>],
     tracking: &mut SequenceTracking<'_>,
+    cancellations: &[Arc<AtomicBool>],
 ) -> NativeResult<ControlledPrefillLayout> {
     if conditional.len() != request.cases().len()
+        || cancellations.len() != request.cases().len()
         || unconditional.len() != request.cases().len()
         || conditional.iter().any(Vec::is_empty)
     {
@@ -1916,6 +1946,10 @@ fn prefill_controlled_batch(
         ));
     }
 
+    require_batch_capacity(
+        conditional.len() + unconditional_sets.len(),
+        context.n_batch(),
+    )?;
     context.clear_kv_cache();
     tracking.token_counts.clear();
     tracking.token_ids.clear();
@@ -1925,6 +1959,7 @@ fn prefill_controlled_batch(
         &conditional_sequences,
         conditional_shared_prefix,
         "conditional",
+        cancellations,
     )?;
     if cfg {
         prefill_controlled_group(
@@ -1933,15 +1968,19 @@ fn prefill_controlled_batch(
             &unconditional_sequences,
             unconditional_shared_prefix,
             "unconditional",
+            cancellations,
         )?;
     }
 
     let sequence_count = conditional.len() + unconditional_sets.len();
     let mut final_batch = LlamaBatch::new(sequence_count, 1);
-    let mut conditional_logit_indexes = Vec::with_capacity(conditional.len());
+    let mut conditional_logit_indexes = vec![-1_i32; conditional.len()];
     let mut unconditional_logit_indexes = vec![None; conditional.len()];
     let mut logit_index = 0_i32;
     for (case_index, tokens) in conditional.iter().enumerate() {
+        if cancellations[case_index].load(Ordering::Acquire) {
+            continue;
+        }
         let sequence = conditional_sequences[case_index];
         final_batch
             .add(
@@ -1953,16 +1992,15 @@ fn prefill_controlled_batch(
             .map_err(|error| {
                 native_decode_error("failed to build controlled conditional prompt", error)
             })?;
-        conditional_logit_indexes.push(logit_index);
+        conditional_logit_indexes[case_index] = logit_index;
         logit_index = logit_index.checked_add(1).ok_or_else(|| {
             generation_verification_error("controlled prompt logit index overflow")
         })?;
-        tracking.token_counts.insert(sequence, tokens.len());
-        tracking
-            .token_ids
-            .insert(sequence, tokens.iter().map(|token| token.0).collect());
     }
     for (case_index, tokens) in unconditional_sets.iter().enumerate() {
+        if cancellations[case_index].load(Ordering::Acquire) {
+            continue;
+        }
         let sequence = unconditional_sequences[case_index];
         final_batch
             .add(
@@ -1978,14 +2016,30 @@ fn prefill_controlled_batch(
         logit_index = logit_index.checked_add(1).ok_or_else(|| {
             generation_verification_error("controlled prompt logit index overflow")
         })?;
-        tracking.token_counts.insert(sequence, tokens.len());
-        tracking
-            .token_ids
-            .insert(sequence, tokens.iter().map(|token| token.0).collect());
     }
-    context
-        .decode(&mut final_batch)
-        .map_err(|error| native_decode_error("failed to decode controlled prompt batch", error))?;
+    if logit_index > 0 {
+        context.decode(&mut final_batch).map_err(|error| {
+            native_decode_error("failed to decode controlled prompt batch", error)
+        })?;
+        for (case_index, tokens) in conditional.iter().enumerate() {
+            if conditional_logit_indexes[case_index] >= 0 {
+                let sequence = conditional_sequences[case_index];
+                tracking.token_counts.insert(sequence, tokens.len());
+                tracking
+                    .token_ids
+                    .insert(sequence, tokens.iter().map(|token| token.0).collect());
+            }
+        }
+        for (case_index, tokens) in unconditional_sets.iter().enumerate() {
+            if unconditional_logit_indexes[case_index].is_some() {
+                let sequence = unconditional_sequences[case_index];
+                tracking.token_counts.insert(sequence, tokens.len());
+                tracking
+                    .token_ids
+                    .insert(sequence, tokens.iter().map(|token| token.0).collect());
+            }
+        }
+    }
     Ok(ControlledPrefillLayout {
         cfg,
         conditional_shared_prefix,
@@ -2000,29 +2054,47 @@ fn prefill_controlled_group(
     sequences: &[i32],
     shared_prefix: usize,
     label: &str,
+    cancellations: &[Arc<AtomicBool>],
 ) -> NativeResult<()> {
-    if token_sets.len() != sequences.len() || token_sets.iter().any(Vec::is_empty) {
+    if token_sets.len() != sequences.len()
+        || token_sets.len() != cancellations.len()
+        || token_sets.iter().any(Vec::is_empty)
+    {
         return Err(generation_verification_error(format!(
             "controlled {label} prefix group is dimensionally invalid",
         )));
     }
-    if token_sets.is_empty() {
+    let Some(source) = cancellations
+        .iter()
+        .position(|flag| !flag.load(Ordering::Acquire))
+    else {
         return Ok(());
-    }
+    };
     if shared_prefix > 0 {
-        decode_tokens_chunked(
+        let shared_result = decode_tokens_chunked_cancellable(
             context,
-            &token_sets[0][..shared_prefix],
-            sequences[0],
+            &token_sets[source][..shared_prefix],
+            sequences[source],
             0,
             false,
-        )?;
+            || {
+                cancellations
+                    .iter()
+                    .all(|flag| flag.load(Ordering::Acquire))
+            },
+        );
+        if let Err(error) = shared_result {
+            return ignore_prefill_cancellation(Err(error));
+        }
         let shared_prefix = u32::try_from(shared_prefix).map_err(|_| {
             generation_verification_error("controlled shared prefix does not fit u32")
         })?;
-        for destination in sequences.iter().copied().skip(1) {
+        for (index, destination) in sequences.iter().copied().enumerate() {
+            if index == source || cancellations[index].load(Ordering::Acquire) {
+                continue;
+            }
             context
-                .copy_kv_cache_seq(sequences[0], destination, Some(0), Some(shared_prefix))
+                .copy_kv_cache_seq(sequences[source], destination, Some(0), Some(shared_prefix))
                 .map_err(|error| {
                     NativeError::new(
                         NativeErrorCode::DecodeFailed,
@@ -2031,11 +2103,16 @@ fn prefill_controlled_group(
                 })?;
         }
     }
-    for (tokens, sequence) in token_sets.iter().zip(sequences) {
+    for (index, (tokens, sequence)) in token_sets.iter().zip(sequences).enumerate() {
         let suffix = &tokens[shared_prefix..tokens.len() - 1];
-        if !suffix.is_empty() {
-            decode_tokens_chunked(context, suffix, *sequence, shared_prefix as i32, false)?;
-        }
+        ignore_prefill_cancellation(decode_tokens_chunked_cancellable(
+            context,
+            suffix,
+            *sequence,
+            shared_prefix as i32,
+            false,
+            || cancellations[index].load(Ordering::Acquire),
+        ))?;
     }
     Ok(())
 }
@@ -2924,7 +3001,12 @@ pub(crate) fn finalize_controlled_completion(
         runtime_ledger,
         runtime_cost,
     } = execution;
-    let runtime_evidence = runtime_ledger.finalize(&request, runtime_cost)?;
+    let cancelled = outputs
+        .iter()
+        .map(|output| output.generation().state == GenerationState::Cancelled)
+        .collect::<Vec<_>>();
+    let runtime_evidence =
+        runtime_ledger.finalize_with_cancellations(&request, runtime_cost, &cancelled)?;
     let event_sha256 = event_stream_digest(&events);
     let participant_reports = participant_reports(&request, &fingerprint)?;
     let declaration = UnverifiedBackendControlDeclaration::new(
@@ -2937,7 +3019,15 @@ pub(crate) fn finalize_controlled_completion(
         runtime_evidence.reports.clone(),
     )?;
     let output = ControlledGenerationBatchOutput::new(request, outputs, declaration)?;
-    let authority = strict_precheck.and_then(|()| {
+    let completion_precheck = if cancelled.iter().any(|value| *value) {
+        Err(NativeError::new(
+            NativeErrorCode::Cancelled,
+            "controlled generation was cancelled; diagnostic output remains available",
+        ))
+    } else {
+        strict_precheck
+    };
+    let authority = completion_precheck.and_then(|()| {
         verify_controlled_authority(
             model,
             &output,
@@ -3919,6 +4009,30 @@ mod tests {
     }
 
     #[test]
+    fn zero_decision_cancellation_preserves_a_diagnostic_ledger_not_authority() {
+        let request = request(Vec::new(), Vec::new(), Vec::new());
+        let cost = controlled_runtime_cost(&request).expect("cost");
+        assert!(
+            RuntimeControlLedger::new(&request)
+                .finalize(&request, cost)
+                .is_err()
+        );
+        let diagnostic = RuntimeControlLedger::new(&request)
+            .finalize_with_cancellations(&request, cost, &[true])
+            .expect("zero-decision cancellation is a diagnostic outcome");
+        assert!(!diagnostic.every_requested_operation_effective);
+        assert_eq!(
+            diagnostic.reports.len(),
+            request.control().expected_application_plan().len()
+        );
+        assert!(
+            RuntimeControlLedger::new(&request)
+                .finalize_with_cancellations(&request, cost, &[])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn runtime_ledger_rejects_skipped_operations_and_marks_noops_ineligible() {
         let request = request(Vec::new(), Vec::new(), Vec::new());
         let mut skipped = RuntimeControlLedger::new(&request);
@@ -4540,14 +4654,57 @@ mod tests {
             )?],
             cancelled_program,
         )?;
+        let (pause_tx, pause_rx) = bounded(0);
+        handle.inner.send_command(
+            WorkerCommand::Snapshot {
+                sequence_id: 0,
+                response: pause_tx,
+            },
+            "placing the cancellation test queue barrier",
+        )?;
+        let cancelled_ticket = handle.generate_controlled(ControlledGenerationSubmission::new(
+            cancelled_request.clone(),
+            None,
+        )?)?;
+        assert_eq!(cancelled_ticket.cancel_all(), 1);
+        let _ = pause_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("release owner queue");
+        let diagnostic = cancelled_ticket.wait()?;
+        assert_eq!(diagnostic.cases().len(), 1);
+        assert_eq!(
+            diagnostic.cases()[0].generation().state,
+            GenerationState::Cancelled
+        );
+        assert_eq!(
+            handle
+                .snapshot_sequence(0)
+                .expect_err("cancelled sequence is not exportable")
+                .code,
+            NativeErrorCode::CacheIncompatible,
+        );
+        let (pause_tx, pause_rx) = bounded(0);
+        handle.inner.send_command(
+            WorkerCommand::Snapshot {
+                sequence_id: 0,
+                response: pause_tx,
+            },
+            "placing the verified cancellation test queue barrier",
+        )?;
         let cancelled_ticket = handle.generate_controlled(ControlledGenerationSubmission::new(
             cancelled_request,
             None,
         )?)?;
         assert_eq!(cancelled_ticket.cancel_all(), 1);
-        assert!(
-            cancelled_ticket.wait_verified().is_err(),
-            "cancelled controlled work cannot mint strict authority"
+        let _ = pause_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("release owner queue");
+        assert_eq!(
+            cancelled_ticket
+                .wait_verified()
+                .expect_err("cancelled work cannot mint authority")
+                .code,
+            NativeErrorCode::Cancelled,
         );
 
         for (request_id, selector, sampler) in [

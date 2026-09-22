@@ -5923,6 +5923,44 @@ fn active_reasoning_end_marker(text: &str) -> Option<&'static str> {
     })
 }
 
+fn require_batch_capacity(rows: usize, native_batch_tokens: u32) -> NativeResult<()> {
+    if rows > native_batch_tokens as usize {
+        return Err(NativeError::new(
+            NativeErrorCode::InvalidConfig,
+            format!(
+                "batch needs {rows} simultaneous logit rows; native n_batch is {native_batch_tokens}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn ignore_prefill_cancellation(result: NativeResult<()>) -> NativeResult<()> {
+    match result {
+        Err(error) if error.code == NativeErrorCode::Cancelled => Ok(()),
+        result => result,
+    }
+}
+
+fn for_each_prefill_chunk<T>(
+    tokens: &[T],
+    chunk_size: usize,
+    cancelled: impl Fn() -> bool,
+    mut decode: impl FnMut(usize, &[T]) -> NativeResult<()>,
+) -> NativeResult<()> {
+    let chunk_size = chunk_size.max(1);
+    for (chunk_index, chunk) in tokens.chunks(chunk_size).enumerate() {
+        if cancelled() {
+            return Err(NativeError::new(
+                NativeErrorCode::Cancelled,
+                "generation cancelled during prompt prefill",
+            ));
+        }
+        decode(chunk_index * chunk_size, chunk)?;
+    }
+    Ok(())
+}
+
 fn decode_tokens_chunked(
     context: &mut LlamaContext<'_>,
     tokens: &[LlamaToken],
@@ -5930,11 +5968,29 @@ fn decode_tokens_chunked(
     start_position: i32,
     final_logits: bool,
 ) -> NativeResult<()> {
+    decode_tokens_chunked_cancellable(
+        context,
+        tokens,
+        sequence_id,
+        start_position,
+        final_logits,
+        || false,
+    )
+}
+
+fn decode_tokens_chunked_cancellable(
+    context: &mut LlamaContext<'_>,
+    tokens: &[LlamaToken],
+    sequence_id: i32,
+    start_position: i32,
+    final_logits: bool,
+    cancelled: impl Fn() -> bool,
+) -> NativeResult<()> {
     let chunk_size = context.n_batch().max(1) as usize;
-    for (chunk_index, chunk) in tokens.chunks(chunk_size).enumerate() {
+    for_each_prefill_chunk(tokens, chunk_size, cancelled, |chunk_start, chunk| {
         let mut batch = LlamaBatch::new(chunk.len(), 1);
         for (offset, token) in chunk.iter().enumerate() {
-            let absolute_offset = chunk_index * chunk_size + offset;
+            let absolute_offset = chunk_start + offset;
             batch
                 .add(
                     *token,
@@ -5946,9 +6002,8 @@ fn decode_tokens_chunked(
         }
         context
             .decode(&mut batch)
-            .map_err(|error| native_decode_error("failed to decode prompt batch", error))?;
-    }
-    Ok(())
+            .map_err(|error| native_decode_error("failed to decode prompt batch", error))
+    })
 }
 
 fn render_branch_prompts(
@@ -7128,6 +7183,55 @@ mod tests {
     use std::sync::{Barrier, Mutex, atomic::AtomicU64};
 
     #[test]
+    fn prefill_observes_cancellation_before_each_decode_chunk() {
+        let cancelled = AtomicBool::new(false);
+        let mut chunks = Vec::new();
+        let result = for_each_prefill_chunk(
+            &[1, 2, 3, 4, 5],
+            2,
+            || cancelled.load(Ordering::Acquire),
+            |start, chunk| {
+                chunks.push((start, chunk.to_vec()));
+                cancelled.store(true, Ordering::Release);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            result.expect_err("cancel after first chunk").code,
+            NativeErrorCode::Cancelled
+        );
+        assert_eq!(chunks, vec![(0, vec![1, 2])]);
+        let result = for_each_prefill_chunk(
+            &[1],
+            1,
+            || true,
+            |_, _| panic!("cancelled prefill must not call native decode"),
+        );
+        assert_eq!(
+            result.expect_err("already cancelled").code,
+            NativeErrorCode::Cancelled
+        );
+    }
+
+    #[test]
+    fn prefill_errors_are_not_misclassified_as_cancellation() {
+        let error = NativeError::new(NativeErrorCode::DecodeFailed, "injected decode failure");
+        assert_eq!(
+            ignore_prefill_cancellation(Err(error))
+                .expect_err("propagate")
+                .code,
+            NativeErrorCode::DecodeFailed
+        );
+        assert!(require_batch_capacity(2, 2).is_ok());
+        assert_eq!(
+            require_batch_capacity(3, 2)
+                .expect_err("too many live logits")
+                .code,
+            NativeErrorCode::InvalidConfig
+        );
+    }
+
+    #[test]
     fn raw_media_prefix_preserves_text_and_bos_policy_without_chat_roles() {
         let text = "  Sound: café • 界\n";
         let marker = mtmd_default_marker();
@@ -7898,6 +8002,9 @@ mod tests {
                 },
             )
             .expect("request reserves");
+        request_lease
+            .queued()
+            .expect("production commands enter the queued phase");
         let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
         let (result_tx, result_rx) = bounded(0);
         let cancellations = request
@@ -8483,8 +8590,8 @@ mod tests {
         let branch_id = "branch".to_owned();
         let old_cancel = Arc::new(AtomicBool::new(false));
         let old_reasoning = Arc::new(AtomicBool::new(false));
-        let old_registry = Arc::new(RequestRegistry::new());
-        let (old_control, old_lease) = old_registry
+        let registry = Arc::new(RequestRegistry::new());
+        let (old_control, old_lease) = registry
             .reserve(
                 request_id.clone(),
                 RequestClass::Generation,
@@ -8507,15 +8614,9 @@ mod tests {
             control: old_control,
         };
 
-        match old_ticket.try_wait().expect("completed result") {
-            TryWaitOutcome::Ready(outputs) => assert!(outputs.is_empty()),
-            TryWaitOutcome::Pending(_) => panic!("completed result cannot remain pending"),
-        }
-
         let new_cancel = Arc::new(AtomicBool::new(false));
         let new_reasoning = Arc::new(AtomicBool::new(false));
-        let new_registry = Arc::new(RequestRegistry::new());
-        let (_new_control, _new_lease) = new_registry
+        let (_new_control, _new_lease) = registry
             .reserve(
                 request_id,
                 RequestClass::Generation,
@@ -8525,9 +8626,10 @@ mod tests {
                 },
             )
             .expect("new request reserves");
+        drop(old_ticket);
         assert!(!new_cancel.load(Ordering::Acquire));
         assert!(!new_reasoning.load(Ordering::Acquire));
-        assert_eq!(new_registry.active_count(), 1);
+        assert_eq!(registry.active_count(), 1);
     }
 
     #[test]
