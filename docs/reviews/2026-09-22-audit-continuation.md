@@ -6,6 +6,8 @@ The published Astra continuation was subsequently exercised on the target Mac. I
 
 The obsolete no-model autocomplete/Shuttle helper and the real writer-load-to-presentation failure remain open. Neither is converted into a pass by these focused checks.
 
+The exact follow-up candidate at `4299647a` advanced the real-model boundary: the approved model loaded on Metal, suggestions were enabled in Ghost mode, and one exact four-run family produced 192 text deltas, four candidates, and four completed terminals. The accessibility monitor nevertheless observed no correlated pre-terminal WYSIWYG ghost before terminal completion (`family_terminal_before_live_witness`, 654 polls). Generation and project-busy guards remained clean. This narrows V04 to terminal hydration/family presentation versus an over-strict pre-terminal observer; it does not close Ghost or Loompad acceptance.
+
 **NOT PROMOTABLE.** Implementation was pushed to PR #72, but no current macOS artifact or approved-model writing journey was executed. No PR was merged or rebased.
 
 Implementation: `7ed336545cfd8df4489d4db1615bf2a5033699e2`
