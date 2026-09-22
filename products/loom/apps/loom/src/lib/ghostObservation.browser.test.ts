@@ -30,6 +30,7 @@ async function render() {
     ghostAnchorByteOffset: 5, ghostInsertsOnAccept: true, surfaceKey: 'test:document:revision',
     onChange: () => { changes += 1; },
     onGhostInsert: () => { insertions += 1; return false; },
+    onGhostPresentationRejected: () => {},
     onCompletionAccessibilityChange: (next: VisualCompletionAccessibilityWitness) => { witness = next; }
   } });
   mounted = editor;

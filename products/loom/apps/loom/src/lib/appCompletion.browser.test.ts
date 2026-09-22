@@ -117,6 +117,7 @@ it('drives the actual App from admission through staggered events, visible glyph
       case 'plugin:loom|suggestions_set':
       case 'plugin:loom|focus_mode_set': return;
       case 'plugin:loom|completion_snapshot': return snapshot();
+      case 'plugin:loom|weave_status': return snapshot();
       case 'plugin:loom|weave_start': {
         admissions += 1;
         expect(args.sourceRevisionId).toBe(opened.summary.revision_id);
@@ -124,7 +125,7 @@ it('drives the actual App from admission through staggered events, visible glyph
         expect(args.cursorByte).toBe(5);
         expect(args.policy.kind).toBe('automatic_v2');
         admission = {
-          command_id: args.commandId, request_id: `request-${admissions}`, project_id: project.project_id,
+          command_id: args.commandId, request_id: `weave-${args.commandId}`, project_id: project.project_id,
           session_id: project.session_id, document_id: opened.summary.document_id, source_revision_id: 'revision-1',
           exact_prompt_blob_id: sourceBlob,
           branches: texts.map((_, index): BranchCard => ({
