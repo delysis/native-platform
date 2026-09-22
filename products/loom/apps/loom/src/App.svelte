@@ -8551,6 +8551,11 @@
     if (loompadBackgroundPaused() || terminalIsBusy() || weaveStarting || !project || !document || !currentWriter) return false;
     const startingEditVersion = editVersion;
     if (compositionActive || !flushEditors()) return false;
+    // A checkpoint receipt changes the source revision and visible blob. Do
+    // not admit a family against the pre-checkpoint identity: otherwise the
+    // runs can complete successfully while the live presentation correctly
+    // rejects them as stale scope.
+    if (!(await flushCurrentDocument())) return false;
     if (editVersion !== startingEditVersion) {
       scheduleAutomaticSuggestions(editVersion, suggestionsIdleDelayMs, 'retry');
       return false;
