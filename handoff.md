@@ -238,3 +238,64 @@ update Loom App/CSS hashes, mark PR #73 ready, merge, or promote to main from
 these receipts. Next work order: authorized focused probe interaction and
 lifetime evidence; real composition bridge; platform accessibility tree; then
 reusable Tauri-managed surface integration with an existing Loom writing owner.
+
+## Local continuation receipt for packet `easl-managed-next-a386e671`
+
+Applied in a new clean detached worktree at exact base
+`a386e6715e6276795734b844ed866b31b517b3b1`.
+
+### Source correspondence
+
+- Packet tooling: **33 passed, 0 failed, 0 skipped**.
+- Read-only preflight and controlled `--apply`: **PASS**; 11 packet paths
+  applied with no source-hash relaxation, three-way merge, lockfile
+  regeneration, guard update, or packet mutation.
+- The required mechanical/API repairs were retained in the candidate:
+  `generate_context!` is expanded once per example binary; native close
+  requests box the large `tauri::Window` enum variant; identical cleanup arms
+  are merged.
+- No foreground Loom/probe launch, PR mutation, merge, or source-reference
+  update occurred.
+
+### Rust/component results
+
+Rust 1.92.0 (`rustc 1.92.0 (ded5c06cf 2025-12-08)`, Cargo
+`1.92.0 (344c4567c 2025-10-21)`), always `--offline --locked
+--profile native-view`, one Cargo process at a time.
+
+- Managed lifecycle integration: **6/6 passed**.
+- Default probe package: **22/22 passed** (7 unit, 6 managed lifecycle, 9
+  editor integration).
+- Native-feature all-targets package: **29/29 passed** (14 unit, 6 managed
+  lifecycle, 9 editor integration; example target built with zero tests).
+- Default and native-feature probe Clippy with `-D warnings`: **PASS**.
+- `cargo fmt --all -- --check` and `git diff --check`: **PASS**.
+- The only emitted warning is the pre-existing vendored
+  `harfrust::shape` dead-code warning; it is outside this candidate.
+
+### Hidden native lifecycle
+
+The built binary was resolved from Cargo metadata and executed once with
+`--check-native-lifecycle`; exit status **0**. Receipt validator: schema valid;
+it explicitly does not claim to verify native execution.
+
+- Evidence: `/Users/george/.codex/evidence/easl-managed-next-a386e671/`
+- Binary SHA-256:
+  `08ef2a0c091cad36f427292363128179005e42d7f8cab7ead3727738eefb808c`.
+- Primary window: **3 attachments / 3 releases**, 4 presented frames, 2 exact
+  source/selection/undo checks, destroyed callback and Manager removal observed.
+- Peer window: **2 attachments / 2 releases**, 3 presented frames, 2 exact
+  source/selection/undo checks, destroyed callback and Manager removal observed.
+- Close veto, application-exit veto, renderer reattachment, positive
+  presentation, retained editor state, and peer isolation all reported true.
+- Evidence remains `qualified:false`; visual pixels, IME/preedit,
+  accessibility, Loom integration, storage, packaging, and latency remain
+  unexecuted.
+
+### Still-unexecuted product/selected gates
+
+The repository policy/current-doc/workflow/ignored-test suites, Loom review-only
+and reusable-consumer suites, affected dependency consumers, and the expected
+ordinary Loom native-app App.svelte guard failure were not replayed in this
+continuation. The historical receipts above remain historical. PR #73 remains
+draft and no promotion or product-acceptance claim is made.

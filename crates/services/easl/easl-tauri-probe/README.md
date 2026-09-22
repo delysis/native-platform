@@ -1,30 +1,34 @@
 # EASL / Tauri native surface probe
 
-A single-window integration experiment: two ephemeral plain-text editors use one
+A managed-window integration experiment: each pair of ephemeral editors uses one
 EASL edit-policy instance and one native font/layout context. A small embedded
 EASL program lays out the fields. The same buffers edited by the native input
 adapter are shaped and painted through `easl-native-text` into Softbuffer.
 
 There are no Loom dependencies, documents, projects, generation, network
 requests, IPC commands, or WebView creation calls. Tauri owns the event loop and
-raw native window. **Wry/WebView dependencies remain linked.** This is not a new
+managed native windows. **Wry/WebView dependencies remain linked.** This is not a new
 Tauri runtime or a production frontend API.
 
 ## Boundaries
 
-The pinned APIs are Tauri 2.11.5, tauri-runtime-wry 2.11.4 and Tao 0.35.3. The
-existing `App::wry_plugin` hook receives raw Tao events; `create_tao_window`
-creates a runtime-owned raw window without a WebView. This raw window is not a
-high-level `tauri::Window` registered in the application Manager. Both facts
-matter when eventually adding menus, window commands, plugins and ACL policy.
+The pinned APIs are Tauri 2.11.5, tauri-runtime 2.11.3, tauri-runtime-wry 2.11.4
+and Tao 0.35.3. The existing `App::wry_plugin` hook receives raw Tao events;
+`WindowBuilder` creates managed native windows without creating WebViews. The
+`unstable` feature is required for this reviewed native API. Manager registration,
+window dispatch and close/exit callbacks now participate in the same runtime.
 
-The hook owns no native state and is Send. The single native surface lives on
-the event-loop thread in a thread-local slot, avoiding unsafe Send/Sync wrappers.
-The slot rejects foreign and closed identities, coalesces redraw requests and
-drops the actual resources on close. The hook always returns false so it cannot
-swallow Tauri's lifecycle. The app uses `run_return` so post-loop cleanup and
-recorded failure reporting execute instead of being skipped by process exit. Close/exit vetoes are intentionally not supported in
-this standalone probe; do not install this code in a product with vetoes.
+The hook owns no native state and is Send. One interactive surface or two hidden
+check surfaces live in bounded thread-local slots on the event-loop thread,
+avoiding unsafe Send/Sync wrappers. Exact runtime IDs own routing. Close/exit
+intentions suspend OS render targets but retain editor text, selections, history
+and fonts. Only actual destruction removes a logical owner. The hook returns
+false, preserving Tauri callbacks and vetoes. `run_return` permits failure
+reporting after the event loop; post-run verification calls no Tauri getters.
+
+See [managed lifecycle](MANAGED-LIFECYCLE.md) for the explicit hidden-window
+exercise and the non-reentrant callback restriction. This is not yet attachable
+to arbitrary applications, plugins or modal event loops.
 
 Tao's public event enum includes `ReceivedImeText`, and its macOS implementation
 can emit it before an ordinary key's identical text. The adapter retains one
@@ -37,7 +41,8 @@ Tao does expose `set_ime_position`; the probe has not bound it to a complete
 composition/candidate-geometry contract. **OS accessibility attachment, IME/candidate rectangles, multiclick
 selection, timed drag autoscroll, caret blinking, touch, and mobile are not
 implemented here.** The underlying text library's facilities do not qualify a
-missing OS binding. Do not enter valuable text: closing discards both buffers.
+missing OS binding. Do not enter valuable text: accepted destruction discards
+the ephemeral buffers.
 
 Clipboard access is explicit Copy/Cut/Paste. Cut writes the clipboard before
 changing text; failed writes do not delete. Text admission is bounded, but
@@ -61,26 +66,34 @@ rustup run 1.92.0 cargo test --offline --locked --profile native-view -p easl-ta
 rustup run 1.92.0 cargo clippy --offline --locked --profile native-view -p easl-tauri-probe --all-targets -- -D warnings
 ```
 
-On macOS also compile the actual hook/example and run its pure key-mapping tests:
+On macOS also compile the actual hook/example and run its component tests:
 
 ```sh
 rustup run 1.92.0 cargo test --offline --locked --profile native-view -p easl-tauri-probe --all-targets --features native-probe
 rustup run 1.92.0 cargo clippy --offline --locked --profile native-view -p easl-tauri-probe --all-targets --features native-probe -- -D warnings
 ```
 
-The example main requires exactly `--open-probe` to construct Tauri. `--build-info`
+The example accepts exactly `--open-probe` for the foreground probe or
+`--check-native-lifecycle` for the two-hidden-window runtime check. `--build-info`
 prints source-level metadata without constructing a context, VM, window or buffer.
-Neither command is invoked by component tests. The full macOS workflow compiles
-the native feature and runs its tests, not its application main.
+None of these modes is invoked by component tests. The full macOS workflow
+compiles the native feature and runs its tests, not its application main.
 
 `build.rs` supplies Cargo's OUT_DIR and target triple for the ordinary
 `generate_context!` macro. This no-IPC probe uses codegen's empty-ACL defaults,
 not tauri-build's source-tree schema generation. Adding commands or production
 capabilities requires revisiting that boundary, not importing a dummy manifest.
 
-## Separately authorized native check
+## Separately authorized native checks
 
-Only after compilation passes and foreground testing is authorized:
+After compilation, explicitly invoke the same identified example binary with
+`--check-native-lifecycle` in a working GUI session. This executes actual close
+and exit veto callbacks using hidden windows and fixed in-memory text. It is not
+a foreground test, but still initializes a native application. Retain command,
+exit status, executable/source identities and the emitted receipt. Hidden native
+lifecycle evidence does not qualify visible pixels or native text input.
+
+Only after foreground testing is separately authorized:
 
 ```sh
 rustup run 1.92.0 cargo run --offline --locked --profile native-view -p easl-tauri-probe --features native-probe --example easl-tauri-two-fields -- --open-probe

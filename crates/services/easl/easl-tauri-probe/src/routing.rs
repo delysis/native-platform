@@ -1,10 +1,12 @@
 //! Actual native-resource ownership and redraw coalescing, independent of an OS.
-//! Closing takes the resource, not just a boolean flag. Late events cannot revive it.
+//! A close request suspends native resources, not the editor. Only destruction
+//! takes the editor; a veto resumes the same owner and a closed slot stays closed.
 #[derive(Debug)]
 pub struct SurfaceSlot<Id, T> {
     id: Id,
     value: Option<T>,
     redraw_pending: bool,
+    suspended: bool,
 }
 impl<Id: Eq, T> SurfaceSlot<Id, T> {
     pub fn new(id: Id, value: T) -> Self {
@@ -12,13 +14,14 @@ impl<Id: Eq, T> SurfaceSlot<Id, T> {
             id,
             value: Some(value),
             redraw_pending: false,
+            suspended: false,
         }
     }
     pub fn owner(&self) -> &Id {
         &self.id
     }
     pub fn get_mut(&mut self, id: &Id) -> Option<&mut T> {
-        if id == &self.id {
+        if id == &self.id && !self.suspended {
             self.value.as_mut()
         } else {
             None
@@ -26,7 +29,7 @@ impl<Id: Eq, T> SurfaceSlot<Id, T> {
     }
     /// True means the caller must issue the one missing native redraw request.
     pub fn invalidate(&mut self, id: &Id) -> bool {
-        if id != &self.id || self.value.is_none() || self.redraw_pending {
+        if id != &self.id || self.value.is_none() || self.suspended || self.redraw_pending {
             return false;
         }
         self.redraw_pending = true;
@@ -34,18 +37,62 @@ impl<Id: Eq, T> SurfaceSlot<Id, T> {
     }
     /// OS exposure may require repaint even without our own pending request.
     pub fn redraw(&mut self, id: &Id) -> Option<&mut T> {
-        if id != &self.id {
+        if id != &self.id || self.suspended {
             return None;
         }
         self.redraw_pending = false;
         self.value.as_mut()
     }
-    /// Release buffers/context/window references before the runtime closes its window.
+    /// Inspect the retained owner without admitting input during a close decision.
+    pub fn retained(&self, id: &Id) -> Option<&T> {
+        if id == &self.id {
+            self.value.as_ref()
+        } else {
+            None
+        }
+    }
+    pub fn is_suspended(&self) -> bool {
+        self.suspended
+    }
+    /// The caller releases OS-bound resources before the framework processes a
+    /// close/exit intention. Text, history and owner identity remain untouched.
+    pub fn suspend(&mut self, id: &Id, release: impl FnOnce(&mut T)) -> bool {
+        if id != &self.id || self.suspended {
+            return false;
+        }
+        let Some(value) = self.value.as_mut() else {
+            return false;
+        };
+        self.suspended = true;
+        self.redraw_pending = false;
+        release(value);
+        true
+    }
+    /// Call only after the framework has processed the intention and the same
+    /// native owner is positively known to remain live. Never recreate an owner.
+    pub fn resume(&mut self, id: &Id) -> bool {
+        if id != &self.id || !self.suspended || self.value.is_none() {
+            return false;
+        }
+        self.suspended = false;
+        self.redraw_pending = true;
+        true
+    }
+    /// Batch-end flush: unlike a genuine OS expose, idle input batches do not paint.
+    pub fn take_redraw(&mut self, id: &Id) -> Option<&mut T> {
+        if id != &self.id || self.suspended || !self.redraw_pending {
+            return None;
+        }
+        self.redraw_pending = false;
+        self.value.as_mut()
+    }
+    /// Terminal destruction, not a cancellable close request.
     pub fn close(&mut self, id: &Id) -> bool {
         if id != &self.id {
             return false;
         }
         self.redraw_pending = false;
+        self.suspended = false;
         self.value.take().is_some()
     }
 }

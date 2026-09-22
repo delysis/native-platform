@@ -2,28 +2,59 @@ use super::keys::{self, Command};
 use crate::TwoFields;
 use easl_native_text::RasterSurface;
 use easl_text::EditAction;
-use std::{num::NonZeroU32, sync::Arc};
+use std::num::NonZeroU32;
+use tauri::Window;
 use tauri_runtime_wry::tao::{
     event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     keyboard::ModifiersState,
-    window::Window,
 };
 
 type Result<T> = std::result::Result<T, &'static str>;
 
+// Only this bundle holds OS-dependent raster resources. A close intention can
+// drop it without dropping the editor, its histories, policy VM or font context.
+struct RenderTarget {
+    pixels: softbuffer::Surface<Window, Window>,
+    _context: softbuffer::Context<Window>,
+}
+impl RenderTarget {
+    fn new(window: &Window) -> Result<Self> {
+        let context = softbuffer::Context::new(window.clone()).map_err(|_| "surface-context")?;
+        let pixels =
+            softbuffer::Surface::new(&context, window.clone()).map_err(|_| "surface-buffer")?;
+        Ok(Self {
+            pixels,
+            _context: context,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Statistics {
+    pub frames: u64,
+    pub presented_attachment: u64,
+    pub attachments: u64,
+    pub releases: u64,
+    pub history_checks: u64,
+    pub geometry_resolutions: u64,
+}
+
 pub(super) struct Surface {
-    // Declaration order deliberately drops native buffers before context/window.
-    pixels: softbuffer::Surface<Arc<Window>, Arc<Window>>,
-    _context: softbuffer::Context<Arc<Window>>,
-    pub window: Arc<Window>,
+    // Drop native buffers before the dispatcher handle. Unlike Arc<TaoWindow>,
+    // a Tauri Window is not a second strong owner of the native window object.
+    target: Option<RenderTarget>,
+    pub window: Window,
     view: TwoFields,
     raster: Option<RasterSurface>,
     modifiers: ModifiersState,
     pointer: Option<[f32; 2]>,
     pointer_pending: bool,
     viewport: Option<[f32; 2]>,
+    physical_size: tauri::PhysicalSize<u32>,
+    scale: f64,
+    geometry_dirty: bool,
     pub failed: bool,
-    frames: u64,
+    statistics: Statistics,
     text_events: crate::text_events::TextEvents,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,13 +64,10 @@ pub(super) enum Effect {
     Close,
 }
 impl Surface {
-    pub fn new(window: Arc<Window>) -> Result<Self> {
-        let context = softbuffer::Context::new(window.clone()).map_err(|_| "surface-context")?;
-        let pixels =
-            softbuffer::Surface::new(&context, window.clone()).map_err(|_| "surface-buffer")?;
+    pub fn new(window: Window) -> Result<Self> {
+        let target = Some(RenderTarget::new(&window)?);
         let mut this = Self {
-            pixels,
-            _context: context,
+            target,
             window,
             view: TwoFields::new().map_err(|_| "editor-init")?,
             raster: None,
@@ -47,15 +75,52 @@ impl Surface {
             pointer: None,
             pointer_pending: false,
             viewport: None,
+            physical_size: tauri::PhysicalSize::new(0, 0),
+            scale: 1.,
+            geometry_dirty: true,
             failed: false,
-            frames: 0,
+            statistics: Statistics {
+                attachments: 1,
+                ..Statistics::default()
+            },
             text_events: crate::text_events::TextEvents::default(),
         };
         this.resize()?;
         Ok(this)
     }
+    pub fn statistics(&self) -> Statistics {
+        self.statistics
+    }
+    pub fn native_attached(&self) -> bool {
+        self.target.is_some()
+    }
+    pub fn suspend(&mut self) {
+        self.finish_text_batch();
+        if let Err(stage) = self.flush_pointer() {
+            self.failed = true;
+            super::reject(stage);
+        }
+        self.view.pointer_up();
+        self.modifiers = ModifiersState::empty();
+        self.pointer = None;
+        if self.target.take().is_some() {
+            self.statistics.releases = self.statistics.releases.saturating_add(1);
+        }
+    }
+    pub fn resume(&mut self) -> Result<()> {
+        // The host positively checked this same dispatcher's liveness after
+        // Tauri's close/exit callbacks. Never run this after actual destruction.
+        let focused = self.window.is_focused().map_err(|_| "resume-focus")?;
+        self.view.set_window_focus(focused);
+        if self.target.is_none() {
+            self.target = Some(RenderTarget::new(&self.window)?);
+            self.statistics.attachments = self.statistics.attachments.saturating_add(1);
+        }
+        self.geometry_dirty = true;
+        Ok(())
+    }
     fn scale(&self) -> Result<f64> {
-        let scale = self.window.scale_factor();
+        let scale = self.scale;
         if scale.is_finite() && (0.25..=8.).contains(&scale) {
             Ok(scale)
         } else {
@@ -63,17 +128,33 @@ impl Surface {
         }
     }
     fn resize(&mut self) -> Result<bool> {
-        let size = self.window.inner_size().to_logical::<f32>(self.scale()?);
-        if size.width < 64. || size.height < 96. {
-            self.viewport = None;
-            return Ok(false);
+        if !self.geometry_dirty {
+            return Ok(self.viewport.is_some());
         }
+        // Managed-window getters cross a dispatcher. Resolve them only after a
+        // geometry event, never on every pointer move/key or unchanged repaint.
+        let scale = self.window.scale_factor().map_err(|_| "display-scale")?;
+        if !scale.is_finite() || !(0.25..=8.).contains(&scale) {
+            return Err("display-scale");
+        }
+        let physical = self.window.inner_size().map_err(|_| "window-size")?;
+        let size = physical.to_logical::<f32>(scale);
         let next = [size.width, size.height];
-        if self.viewport.map(|size| size.map(f32::to_bits)) != Some(next.map(f32::to_bits)) {
-            self.view.resize(next).map_err(|_| "editor-layout")?;
+        let drawable = size.width >= 64. && size.height >= 96.;
+        if drawable {
+            if self.viewport.map(|size| size.map(f32::to_bits)) != Some(next.map(f32::to_bits)) {
+                self.view.resize(next).map_err(|_| "editor-layout")?;
+            }
             self.viewport = Some(next);
+        } else {
+            self.viewport = None;
         }
-        Ok(true)
+        self.physical_size = physical;
+        self.scale = scale;
+        self.geometry_dirty = false;
+        self.statistics.geometry_resolutions =
+            self.statistics.geometry_resolutions.saturating_add(1);
+        Ok(drawable)
     }
     pub fn event(&mut self, event: &WindowEvent<'_>) -> Result<Effect> {
         if self.failed {
@@ -92,6 +173,7 @@ impl Surface {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 // The hook runs BEFORE Tao/Tauri applies the event's new size.
                 // Resolve window geometry at the next input/redraw, never here.
+                self.geometry_dirty = true;
                 self.pointer = None;
                 self.pointer_pending = false;
                 self.view.pointer_up();
@@ -229,12 +311,47 @@ impl Surface {
         }
         Ok(Effect::Redraw)
     }
+    pub fn seed_lifecycle_fixture(&mut self, index: usize) -> Result<()> {
+        let texts = fixture_text(index)?;
+        self.view.set_window_focus(true);
+        for text in texts {
+            self.view
+                .edit(EditAction::Replace(text))
+                .map_err(|_| "fixture-edit")?;
+            self.view.cycle_focus();
+        }
+        self.view.cycle_focus();
+        self.view.set_window_focus(false);
+        self.verify_lifecycle_fixture(index, false)
+    }
+    pub fn verify_lifecycle_fixture(&mut self, index: usize, check_undo: bool) -> Result<()> {
+        let texts = fixture_text(index)?;
+        verify_text(&self.view, texts)?;
+        if check_undo {
+            let focused = self.view.focused();
+            self.view.set_window_focus(true);
+            let result = (|| {
+                self.view.undo(false).map_err(|_| "fixture-undo")?;
+                if !self.view.text(1).map_err(|_| "fixture-read")?.is_empty()
+                    || self.view.text(0).map_err(|_| "fixture-read")? != texts[0]
+                {
+                    return Err("fixture-undo-isolation");
+                }
+                self.view.undo(true).map_err(|_| "fixture-redo")?;
+                verify_text(&self.view, texts)
+            })();
+            self.view.set_window_focus(focused);
+            result?;
+            self.statistics.history_checks = self.statistics.history_checks.saturating_add(1);
+        }
+        Ok(())
+    }
     pub fn paint(&mut self) -> Result<()> {
         if self.failed || !self.resize()? {
             return Ok(());
         }
         self.flush_pointer()?;
-        let size = self.window.inner_size();
+        let size = self.physical_size;
         let (Some(width), Some(height)) =
             (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
         else {
@@ -259,10 +376,12 @@ impl Surface {
             .map_err(|_| "raster-background")?;
         self.view.paint(raster).map_err(|_| "editor-paint")?;
         let rgba = raster.finish();
-        self.pixels
+        let target = self.target.as_mut().ok_or("surface-suspended")?;
+        target
+            .pixels
             .resize(width, height)
             .map_err(|_| "surface-resize")?;
-        let mut pixels = self.pixels.buffer_mut().map_err(|_| "surface-acquire")?;
+        let mut pixels = target.pixels.buffer_mut().map_err(|_| "surface-acquire")?;
         if pixels.len().checked_mul(4) != Some(rgba.len()) {
             return Err("raster-size");
         }
@@ -270,7 +389,8 @@ impl Surface {
             *pixel = (u32::from(color[0]) << 16) | (u32::from(color[1]) << 8) | u32::from(color[2]);
         }
         pixels.present().map_err(|_| "surface-present")?;
-        self.frames = self.frames.saturating_add(1);
+        self.statistics.frames = self.statistics.frames.saturating_add(1);
+        self.statistics.presented_attachment = self.statistics.attachments;
         Ok(())
     }
 }
@@ -278,7 +398,29 @@ impl Drop for Surface {
     fn drop(&mut self) {
         eprintln!(
             "{}",
-            serde_json::json!({"schema":"delysis.easl-tauri-probe.shutdown.v1", "presented_frames":self.frames, "renderer_faulted":self.failed, "qualified":false})
+            serde_json::json!({"schema":"delysis.easl-tauri-probe.shutdown.v1", "presented_frames":self.statistics.frames, "native_attachments":self.statistics.attachments, "native_releases":self.statistics.releases, "renderer_faulted":self.failed, "qualified":false})
         );
     }
+}
+
+fn fixture_text(index: usize) -> Result<[&'static str; 2]> {
+    match index {
+        0 => Ok(["first window café", "first window 日本語"]),
+        1 => Ok(["second window café", "second window Ελληνικά"]),
+        _ => Err("fixture-owner"),
+    }
+}
+fn verify_text(view: &TwoFields, texts: [&str; 2]) -> Result<()> {
+    if view.active() != 1 {
+        return Err("fixture-focus-owner");
+    }
+    for (index, expected) in texts.into_iter().enumerate() {
+        if view.text(index).map_err(|_| "fixture-read")? != expected
+            || view.selection(index).map_err(|_| "fixture-selection")?
+                != (expected.len(), expected.len())
+        {
+            return Err("fixture-source-or-selection");
+        }
+    }
+    Ok(())
 }

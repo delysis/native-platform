@@ -9,7 +9,7 @@ publish = false
 [features]
 default = []
 # No window, clipboard, or application runtime in the default component suite.
-native-probe = ["dep:tauri", "dep:tauri-runtime-wry", "dep:softbuffer", "dep:arboard"]
+native-probe = ["dep:tauri", "dep:tauri-runtime-wry", "dep:tauri-runtime", "dep:softbuffer", "dep:arboard"]
 
 [dependencies]
 easl = { path = "../vendor/easl" }
@@ -17,7 +17,8 @@ easl-text = { path = "../easl-text" }
 easl-native-text = { path = "../easl-native-text" }
 thiserror.workspace = true
 serde_json.workspace = true
-tauri = { version = "=2.11.5", default-features = false, features = ["wry"], optional = true }
+tauri = { version = "=2.11.5", default-features = false, features = ["wry", "unstable"], optional = true }
+tauri-runtime = { version = "=2.11.3", optional = true }
 tauri-runtime-wry = { version = "=2.11.4", optional = true }
 softbuffer = { version = "=0.4.8", optional = true }
 arboard = { version = "=3.6.1", default-features = false, optional = true }

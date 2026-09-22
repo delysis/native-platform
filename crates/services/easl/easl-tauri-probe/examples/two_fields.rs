@@ -6,8 +6,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", easl_tauri_probe::native::build_info());
         return Ok(());
     }
-    if args.len() != 1 || args[0] != "--open-probe" {
-        return Err("Usage: easl-tauri-two-fields --build-info | --open-probe (ephemeral, no IME/OS accessibility qualification)".into());
+    if args.len() != 1 {
+        return Err("Usage: easl-tauri-two-fields --build-info | --check-native-lifecycle | --open-probe (ephemeral, no IME/OS accessibility qualification)".into());
     }
-    easl_tauri_probe::native::run(tauri::generate_context!("tauri.conf.json"))
+    let context = tauri::generate_context!("tauri.conf.json");
+    if args[0] == "--check-native-lifecycle" {
+        let evidence = easl_tauri_probe::native::check_lifecycle(context)?;
+        println!("{evidence}");
+        return Ok(());
+    }
+    if args[0] != "--open-probe" {
+        return Err("Usage: easl-tauri-two-fields --build-info | --check-native-lifecycle | --open-probe (ephemeral, no IME/OS accessibility qualification)".into());
+    }
+    easl_tauri_probe::native::run(context)
 }
