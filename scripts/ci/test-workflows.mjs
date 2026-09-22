@@ -451,6 +451,7 @@ test("native macOS lane runs all native tests, separate doctests, and strict Cli
 
 test("stable macOS packaging adds only the real distribution gates", () => {
   const release = read(releaseScriptPath);
+  const smoke = read(smokeScriptPath);
   assert.match(release, /candidate\|stable/);
   assert.match(release, /stable releases require the exact annotated tag/);
   assert.match(release, /git cat-file -t "refs\/tags\/\$RELEASE_TAG"/);
@@ -460,6 +461,9 @@ test("stable macOS packaging adds only the real distribution gates", () => {
   assert.match(release, /xcrun stapler validate/);
   assert.match(release, /spctl --assess --type execute/);
   assert.match(release, /scripts\/smoke-macos-app\.sh" "\$COMPONENT" "\$ARCHIVE"/);
+  assert.match(release, /the Tauri build changed checked-in source/);
+  assert.doesNotMatch(smoke, /writing\/manuscript\/Untitled\.md/);
+  assert.match(smoke, /writing\/Untitled\.md/);
   assert.match(release, /delysis\.macos-release-receipt\.v2/);
   assert.doesNotMatch(release, /windows|linux/i);
 });
