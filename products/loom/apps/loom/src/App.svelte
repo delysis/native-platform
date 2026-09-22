@@ -116,7 +116,6 @@
   import { sourceCaretByte } from './lib/sourceCaret';
   import { canUseVisualMarkdown } from './lib/markdownSafety';
   import {
-    autocompleteDisposition,
     verifiedGhostSuggestion,
     type AutocompleteDisposition
   } from './lib/ghostSuggestion';
@@ -128,17 +127,14 @@
   import {
     candidateTextIsSurfaceable
   } from './lib/candidateSurface';
-  import { sourceGhostPresentationCompatible } from './lib/sourceGhostText';
   import {
+    evaluateInlineSuggestionFamily,
     inlineSuggestionFamily,
     projectInlineCandidateText,
     projectedInlinePresentationKey,
     type InlineGhostSuggestion
   } from './lib/inlineSuggestionFamily';
-  import {
-    visualGhostTextMayBePlainProse,
-    type VisualCaretBoundaryFailure
-  } from './lib/ghostText';
+  import { type VisualCaretBoundaryFailure } from './lib/ghostText';
   import { isExtendedGraphemeBoundary } from './lib/graphemeBoundary';
   import {
     verifyBranchBody,
@@ -1216,7 +1212,7 @@
     sourceCodec
   );
   $: sourceGhostNewline = sourceCodec?.newline ?? null;
-  $: visualSuggestionFamily = inlineSuggestionFamily(visualGhostTargetByte, 'visual', {
+  $: visualFamilyEvaluation = evaluateInlineSuggestionFamily(visualGhostTargetByte, 'visual', {
     branches,
     authoritativeFamilyId: authoritativeCompletionFamilyId,
     authoritativeFamilyIds: loompadFamilyIds,
@@ -1233,7 +1229,8 @@
     manuscriptText: documentText,
     sourceNewline: sourceGhostNewline
   });
-  $: sourceSuggestionFamily = inlineSuggestionFamily(sourceGhostTargetByte, 'source', {
+  $: visualSuggestionFamily = visualFamilyEvaluation.candidates;
+  $: sourceFamilyEvaluation = evaluateInlineSuggestionFamily(sourceGhostTargetByte, 'source', {
     branches,
     authoritativeFamilyId: authoritativeCompletionFamilyId,
     authoritativeFamilyIds: loompadFamilyIds,
@@ -1250,11 +1247,17 @@
     manuscriptText: sourceDisplayText,
     sourceNewline: sourceGhostNewline
   });
+  $: sourceSuggestionFamily = sourceFamilyEvaluation.candidates;
   $: baseSuggestionFamily = mode === 'visual'
     ? visualSuggestionFamily
     : mode === 'source'
       ? sourceSuggestionFamily
       : [];
+  $: activeFamilyEvaluation = mode === 'visual'
+    ? visualFamilyEvaluation
+    : mode === 'source'
+      ? sourceFamilyEvaluation
+      : null;
   $: reconcileVisibleCompletionController(completionContextKey, baseSuggestionFamily, true);
   $: completionView = completionControllerView(
     completionController,
@@ -1349,6 +1352,7 @@
     context_key: boundCompletionSession?.contextKey ?? '',
     session_cached: Boolean(boundCompletionSession),
     family_count: boundCompletionSession?.candidates.length ?? 0,
+    family_phase: activeFamilyEvaluation?.phase ?? { kind: 'inactive' },
     candidates: boundCompletionSession?.candidates.map((candidate) => ({
       candidate_id: candidate.candidateId,
       presentation_key: candidate.presentationKey,
@@ -1395,25 +1399,8 @@
       ? `${boundCompletionSession.contextKey}:${boundCompletionSession.selectedRunId}:${acceptedCompletionText(boundCompletionSession).length}`
       : '';
   $: finishCompletionIfExhausted(completionExhaustionKey);
-  $: visualAutocompleteDisposition = autocompleteDisposition({
-    active: mode === 'visual' && completionAutomationActive && !visualMutationPending && branchPromotionReady,
-    branches: currentReadyBranches,
-    verifiedBodyByRun: verifiedBranchBodyByRun,
-    dismissedCandidateIds,
-    unpresentablePresentationKeys: unpresentableVisualGhostPresentationKeys,
-    targetByte: visualGhostTargetByte,
-    presentationCompatible: visualGhostTextMayBePlainProse
-  });
-  $: sourceAutocompleteDisposition = autocompleteDisposition({
-    active: mode === 'source' && completionAutomationActive && !sourceDirty && !compositionActive && branchPromotionReady,
-    branches: currentReadyBranches,
-    verifiedBodyByRun: verifiedBranchBodyByRun,
-    dismissedCandidateIds,
-    unpresentablePresentationKeys: [],
-    targetByte: sourceGhostTargetByte,
-    presentationCompatible: (text) =>
-      sourceGhostPresentationCompatible(sourceDisplayText, text, sourceGhostNewline)
-  });
+  $: visualAutocompleteDisposition = visualFamilyEvaluation.disposition;
+  $: sourceAutocompleteDisposition = sourceFamilyEvaluation.disposition;
   $: suggestionMenuState = suggestionsChanging
     ? '…'
     : modelLoading || modelChoosing || modelUnloading || modelDownloadStarting || activeModelDownloads.length > 0
@@ -7225,23 +7212,25 @@
     ) return null;
     const targetByte = mode === 'visual' ? visualGhostTargetByte : sourceGhostTargetByte;
     if (targetByte !== ticket.targetByte) return null;
-    return autocompleteDisposition({
-      active: true,
-      branches: currentReadyBranches,
+    return evaluateInlineSuggestionFamily(targetByte, mode, {
+      branches,
+      authoritativeFamilyId: authoritativeCompletionFamilyId,
+      authoritativeFamilyIds: loompadFamilyIds,
+      requireExplicitFamily: requireExplicitCompletionFamily,
       verifiedBodyByRun: verifiedBranchBodyByRun,
+      liveTextByRun: liveBranchTextByRun,
+      liveTextSequenceByRun: liveBranchTextSequenceByRun,
+      currentModel: currentWriter,
+      document,
+      suggestionsEnabled: true,
+      promotionReady: true,
       dismissedCandidateIds,
-      unpresentablePresentationKeys: mode === 'visual'
+      unpresentableVisualKeys: mode === 'visual'
         ? unpresentableVisualGhostPresentationKeys
         : [],
-      targetByte,
-      presentationCompatible: mode === 'source'
-        ? (text) => sourceGhostPresentationCompatible(
-          sourceDisplayText,
-          text,
-          ticket.sourceNewline
-        )
-        : undefined
-    });
+      manuscriptText: mode === 'visual' ? documentText : sourceDisplayText,
+      sourceNewline: ticket.sourceNewline
+    }).disposition;
   }
 
   function loompadBackgroundPaused(): boolean {

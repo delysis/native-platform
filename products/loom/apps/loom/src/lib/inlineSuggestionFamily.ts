@@ -1,7 +1,11 @@
 import type { VerifiedBranchBody } from './branchBodyProof';
 import { candidateTextIsSurfaceable } from './candidateSurface';
 import { completionTextAtBoundary } from './completionSession';
-import { verifiedGhostSuggestion } from './ghostSuggestion';
+import {
+  verifiedGhostSuggestion,
+  type AutocompleteDisposition,
+  type AutocompleteExhaustionReason
+} from './ghostSuggestion';
 import { visualGhostTextMayBePlainProse, visualGhostTextSafePrefix } from './ghostText';
 import { sourceGhostPresentationCompatible } from './sourceGhostText';
 import type { SuggestionAlternative } from './suggestionInteraction';
@@ -41,6 +45,28 @@ export interface InlineSuggestionState {
 }
 
 const WEAVE_FAMILY_SIZE = 4;
+
+export type InlineFamilyPhase =
+  | { kind: 'inactive' }
+  | { kind: 'stale_scope' }
+  | { kind: 'awaiting_family' }
+  | { kind: 'awaiting_hydration'; runIds: readonly string[] }
+  | { kind: 'pending'; runIds: readonly string[] }
+  | { kind: 'ready' }
+  | { kind: 'dismissed'; candidateIds: readonly string[] }
+  | {
+      kind: 'terminal_shortfall';
+      candidates: readonly {
+        candidateId: string;
+        reason: AutocompleteExhaustionReason;
+      }[];
+    };
+
+export interface InlineFamilyEvaluation {
+  candidates: InlineGhostSuggestion[];
+  phase: InlineFamilyPhase;
+  disposition: AutocompleteDisposition;
+}
 
 function branchBelongsToSuggestionScope(
   branch: BranchCard,
@@ -132,13 +158,30 @@ export function inlineSuggestionFamily(
   editorMode: 'visual' | 'source',
   state: InlineSuggestionState
 ): InlineGhostSuggestion[] {
+  return evaluateInlineSuggestionFamily(targetByte, editorMode, state).candidates;
+}
+
+/**
+ * Evaluate one exact presentation surface once. Rendering and recovery consume
+ * this same value so a partially presentable terminal family cannot disappear
+ * while an easier branch-only predicate reports that a suggestion is available.
+ */
+export function evaluateInlineSuggestionFamily(
+  targetByte: number | null,
+  editorMode: 'visual' | 'source',
+  state: InlineSuggestionState
+): InlineFamilyEvaluation {
   if (
     !state.suggestionsEnabled ||
     !state.promotionReady ||
     targetByte === null ||
     !state.document ||
     !state.currentModel
-  ) return [];
+  ) return {
+    candidates: [],
+    phase: { kind: 'inactive' },
+    disposition: { kind: 'inactive' }
+  };
 
   let familyIds: Set<string>;
   if (state.authoritativeFamilyIds !== undefined) {
@@ -148,26 +191,61 @@ export function inlineSuggestionFamily(
     const familyId = authoritativeInlineFamilyId(targetByte, state);
     familyIds = new Set(familyId ? [familyId] : []);
   }
-  if (!familyIds.size) return [];
+  if (!familyIds.size) {
+    const requestedIds = state.authoritativeFamilyIds ??
+      (state.authoritativeFamilyId ? [state.authoritativeFamilyId] : []);
+    const matching = requestedIds.some((familyId) => state.branches.some((branch) =>
+      branch.weave_command_id === familyId && branchBelongsToSuggestionScope(branch, targetByte, state)
+    ));
+    return {
+      candidates: [],
+      phase: { kind: requestedIds.length > 0 && !matching ? 'stale_scope' : 'awaiting_family' },
+      disposition: { kind: 'awaiting_candidates' }
+    };
+  }
 
   const family: InlineGhostSuggestion[] = [];
+  const awaitingHydration = new Set<string>();
+  const pending = new Set<string>();
+  const terminalShortfall: Array<{
+    candidateId: string;
+    reason: AutocompleteExhaustionReason;
+  }> = [];
+  const dismissed = new Set<string>();
   for (const familyId of familyIds) {
     const batch: InlineGhostSuggestion[] = [];
-    for (const branch of state.branches) {
+    const branches = state.branches.filter((branch) =>
+      branch.weave_command_id === familyId && branchBelongsToSuggestionScope(branch, targetByte, state)
+    );
+    for (const branch of branches) {
       if (
-        branch.weave_command_id !== familyId ||
-        !branchBelongsToSuggestionScope(branch, targetByte, state) ||
         branch.selection === 'promote' ||
-        branch.selection === 'reject' ||
-        !['queued', 'generating', 'ready'].includes(branch.status)
-      ) continue;
+        branch.selection === 'reject'
+      ) {
+        dismissed.add(`run:${branch.run_id}`);
+        continue;
+      }
 
       const candidateId = `run:${branch.run_id}`;
+      if (!['queued', 'generating', 'ready'].includes(branch.status)) {
+        terminalShortfall.push({ candidateId, reason: 'invalid' });
+        continue;
+      }
       const verified = verifiedGhostSuggestion(branch, state.verifiedBodyByRun[branch.run_id]);
       const liveText = state.liveTextByRun[branch.run_id];
       const liveSequence = state.liveTextSequenceByRun?.[branch.run_id];
       const hasLiveProjection = liveText !== undefined && liveSequence !== undefined;
       const rawText = verified?.text ?? (hasLiveProjection ? liveText : branch.text);
+      if (!rawText) {
+        if (branch.status === 'queued' || branch.status === 'generating') {
+          pending.add(branch.run_id);
+        } else if (branch.status === 'ready' && branch.output_blob_id) {
+          awaitingHydration.add(branch.run_id);
+        } else {
+          terminalShortfall.push({ candidateId, reason: 'invalid' });
+        }
+        continue;
+      }
       const text = projectInlineCandidateText(
         targetByte,
         editorMode,
@@ -175,14 +253,28 @@ export function inlineSuggestionFamily(
         rawText,
         state.sourceNewline
       );
-      if (!text) continue;
+      if (!text) {
+        if (branch.status === 'queued' || branch.status === 'generating') {
+          pending.add(branch.run_id);
+        } else {
+          terminalShortfall.push({ candidateId, reason: 'unpresentable' });
+        }
+        continue;
+      }
       const rawPresentationKey = verified?.presentationKey ??
         (hasLiveProjection ? `stream:${branch.run_id}:${liveSequence}` : `branch:${branch.branch_id}`);
       const presentationKey = projectedInlinePresentationKey(rawPresentationKey, rawText, text);
       if (editorMode === 'visual') {
         if (
           state.unpresentableVisualKeys.includes(presentationKey)
-        ) continue;
+        ) {
+          if (branch.status === 'queued' || branch.status === 'generating') {
+            pending.add(branch.run_id);
+          } else {
+            terminalShortfall.push({ candidateId, reason: 'unpresentable' });
+          }
+          continue;
+        }
       }
 
       batch.push({
@@ -197,8 +289,42 @@ export function inlineSuggestionFamily(
     // A weave is a four-sample choice, not four independently arriving choices.
     // Keep incomplete streaming families private until every slot can be shown.
     if (batch.length === WEAVE_FAMILY_SIZE) {
-      family.push(...batch.filter(candidate => !state.dismissedCandidateIds.includes(candidate.candidateId)));
+      const visible = batch.filter((candidate) => {
+        const isDismissed = state.dismissedCandidateIds.includes(candidate.candidateId);
+        if (isDismissed) dismissed.add(candidate.candidateId);
+        return !isDismissed;
+      });
+      family.push(...visible);
     }
   }
-  return family;
+  if (family.length > 0) return {
+    candidates: family,
+    phase: { kind: 'ready' },
+    disposition: { kind: 'available', suggestion: family[0] }
+  };
+  if (awaitingHydration.size > 0) return {
+    candidates: [],
+    phase: { kind: 'awaiting_hydration', runIds: [...awaitingHydration] },
+    disposition: { kind: 'awaiting_hydration', runIds: [...awaitingHydration] }
+  };
+  if (pending.size > 0) return {
+    candidates: [],
+    phase: { kind: 'pending', runIds: [...pending] },
+    disposition: { kind: 'awaiting_candidates' }
+  };
+  if (terminalShortfall.length > 0) return {
+    candidates: [],
+    phase: { kind: 'terminal_shortfall', candidates: terminalShortfall },
+    disposition: { kind: 'exhausted', candidates: terminalShortfall }
+  };
+  if (dismissed.size > 0) return {
+    candidates: [],
+    phase: { kind: 'dismissed', candidateIds: [...dismissed] },
+    disposition: { kind: 'exhausted', candidates: [] }
+  };
+  return {
+    candidates: [],
+    phase: { kind: 'awaiting_family' },
+    disposition: { kind: 'awaiting_candidates' }
+  };
 }
