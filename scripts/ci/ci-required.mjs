@@ -111,6 +111,16 @@ if (plan.flags?.full === true) {
   for (const job of fullJobs) {
     if (!plan.jobs.includes(job)) failures.push(`full plan omitted ${job}`);
   }
+  // A successful matrix aggregate covers only the children actually scheduled.
+  // Validate full-plan membership independently of the planner's derived flags.
+  const fullMacos = ["release", "root", "attachment", "information", "speech"];
+  if (plan.presence?.mom === true) fullMacos.push("mom");
+  if (plan.presence?.loom === true) fullMacos.push("loom");
+  for (const entry of fullMacos) {
+    if (!Array.isArray(plan.macos_matrix) || !plan.macos_matrix.includes(entry)) {
+      failures.push(`full plan omitted required macOS matrix entry ${entry}`);
+    }
+  }
 }
 
 // Keep portability coverage in the plan, but never wait for it to develop on macOS.
