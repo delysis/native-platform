@@ -252,6 +252,20 @@ pub fn longest_compatible_prefix_for_scope(
         })
 }
 
+/// Complete cache-admission result. Store failures remain typed errors at the
+/// host boundary; policy and authority refusals are explicit outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CacheInsertOutcome {
+    Disabled,
+    InvalidRejected,
+    OwnerRejected,
+    Stored {
+        memory_resident: bool,
+        persistent_resident: bool,
+        evicted: Vec<String>,
+    },
+}
+
 #[derive(Debug)]
 struct CachedPrefix {
     value: Arc<PrefixCacheValue>,
@@ -310,17 +324,17 @@ impl MemoryPrefixCache {
         self.values.contains_key(id)
     }
 
-    pub fn insert(&mut self, value: PrefixCacheValue) -> Vec<String> {
+    pub fn insert(&mut self, value: PrefixCacheValue) -> CacheInsertOutcome {
         let Some(value) = ValidatedPrefixCacheValue::new(value) else {
-            return Vec::new();
+            return CacheInsertOutcome::InvalidRejected;
         };
         self.insert_validated(value)
     }
 
-    pub fn insert_validated(&mut self, value: ValidatedPrefixCacheValue) -> Vec<String> {
+    pub fn insert_validated(&mut self, value: ValidatedPrefixCacheValue) -> CacheInsertOutcome {
         let mut value = value.0;
         if value.metadata.state_bytes > self.capacity_bytes {
-            return Vec::new();
+            return CacheInsertOutcome::InvalidRejected;
         }
         value.metadata.tier = CacheTier::MemoryLru;
         let id = value.metadata.id.clone();
@@ -352,7 +366,11 @@ impl MemoryPrefixCache {
                 evicted.push(oldest);
             }
         }
-        evicted
+        CacheInsertOutcome::Stored {
+            memory_resident: true,
+            persistent_resident: false,
+            evicted,
+        }
     }
 
     pub fn lookup(
@@ -626,6 +644,27 @@ mod tests {
     }
 
     #[test]
+    fn checked_insert_distinguishes_invalid_capacity_and_admitted() {
+        let mut cache = MemoryPrefixCache::new(4);
+        let mut malformed = value("bad", CacheTier::MemoryLru, &[1], 4, 0);
+        malformed.sequence.token_count = 2;
+        assert_eq!(cache.insert(malformed), CacheInsertOutcome::InvalidRejected);
+        assert_eq!(
+            cache.insert(value("big", CacheTier::MemoryLru, &[1], 8, 0)),
+            CacheInsertOutcome::InvalidRejected
+        );
+        assert!(cache.is_empty());
+        assert_eq!(
+            cache.insert(value("fits", CacheTier::MemoryLru, &[1], 4, 0)),
+            CacheInsertOutcome::Stored {
+                memory_resident: true,
+                persistent_resident: false,
+                evicted: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
     fn longest_token_exact_compatible_prefix_wins() {
         let entries = [
             value("short", CacheTier::PersonaPack, &[1, 2], 3, 1).metadata,
@@ -768,23 +807,23 @@ mod tests {
     #[test]
     fn memory_tier_is_bounded_lru_and_hits_promote_entries() {
         let mut cache = MemoryPrefixCache::new(8);
-        assert!(
-            cache
-                .insert(value("a", CacheTier::PersonaPack, &[1], 4, 1))
-                .is_empty()
-        );
-        assert!(
-            cache
-                .insert(value("b", CacheTier::PersonaPack, &[2], 4, 2))
-                .is_empty()
-        );
+        assert!(matches!(
+            cache.insert(value("a", CacheTier::PersonaPack, &[1], 4, 1)),
+            CacheInsertOutcome::Stored { evicted, .. } if evicted.is_empty()
+        ));
+        assert!(matches!(
+            cache.insert(value("b", CacheTier::PersonaPack, &[2], 4, 2)),
+            CacheInsertOutcome::Stored { evicted, .. } if evicted.is_empty()
+        ));
         assert!(
             cache
                 .lookup(&fingerprint(), &[1, 9], 3)
                 .is_some_and(|hit| hit.metadata.id == "a")
         );
-        let evicted = cache.insert(value("c", CacheTier::PersonaPack, &[3], 4, 4));
-        assert_eq!(evicted, vec!["b"]);
+        assert!(matches!(
+            cache.insert(value("c", CacheTier::PersonaPack, &[3], 4, 4)),
+            CacheInsertOutcome::Stored { evicted, .. } if evicted == vec!["b"]
+        ));
         assert!(cache.lookup(&fingerprint(), &[2, 9], 5).is_none());
         assert!(cache.lookup(&fingerprint(), &[1, 9], 5).is_some());
         assert!(cache.lookup(&fingerprint(), &[3, 9], 5).is_some());
@@ -812,7 +851,7 @@ mod tests {
         let mut cache = MemoryPrefixCache::new(64);
         let mut corrupt = value("corrupt", CacheTier::PersonaPack, &[1, 2], 4, 1);
         corrupt.metadata.token_sha256 = "wrong".to_string();
-        assert!(cache.insert(corrupt).is_empty());
+        assert_eq!(cache.insert(corrupt), CacheInsertOutcome::InvalidRejected);
         assert!(cache.is_empty());
     }
 }

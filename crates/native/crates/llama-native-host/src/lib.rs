@@ -7,8 +7,8 @@
 //! handles.
 
 use llama_native_cache::{
-    CacheFingerprint, CacheOwnerScope, MemoryPrefixCache, PrefixCacheMetadata, PrefixCacheValue,
-    ValidatedPrefixCacheValue,
+    CacheFingerprint, CacheInsertOutcome, CacheOwnerScope, MemoryPrefixCache, PrefixCacheMetadata,
+    PrefixCacheValue, ValidatedPrefixCacheValue,
 };
 use llama_native_engine::{
     GenerationTicket, JoinedNativeModel, NativeModelHandle, NativeModelOwner,
@@ -22,7 +22,7 @@ use llama_native_types::{
     NativeErrorCode, NativeModelConfig, NativeModelDescriptor, ResidentModelStatus,
     SharedPrefixBatchRequest,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -48,6 +48,11 @@ impl HostClock for SystemClock {
 /// The host never decides how data is encrypted or where it is stored. A
 /// product may inject an authenticated implementation; routers may inject a
 /// database-backed implementation; tests may inject an in-memory store.
+///
+/// Mutations and restoration are serialized within one host/namespace. A store
+/// must coordinate separate hosts/processes itself, and must make `save` atomic:
+/// a reported failure must not replace the previous durable entry. Callbacks may
+/// inspect host state, but must not re-enter cache mutation methods on that host.
 pub trait PrefixCacheStore: Send + Sync {
     fn list(&self, namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError>;
     fn load_entry(
@@ -353,6 +358,9 @@ pub struct NativeHost {
     config: NativeHostConfig,
     state: Mutex<HostState>,
     load_gate: Mutex<()>,
+    // Never hold `state` across injected storage callbacks. This gate orders the
+    // memory/persistent transaction for this host's single cache namespace.
+    cache_gate: Mutex<()>,
     clock: Arc<dyn HostClock>,
     persistent_cache: Option<Arc<dyn PrefixCacheStore>>,
 }
@@ -414,6 +422,7 @@ impl NativeHost {
                 joined_worker_count: 0,
             }),
             load_gate: Mutex::new(()),
+            cache_gate: Mutex::new(()),
             config,
             clock,
             persistent_cache,
@@ -988,14 +997,26 @@ impl NativeHost {
         )
     }
 
-    pub fn cache_insert(&self, mut value: PrefixCacheValue) -> Result<Vec<String>, NativeError> {
-        if !self.config.cache_policy.allows_memory() {
-            return Ok(Vec::new());
+    /// Persists a valid value before publishing it in memory. Oversized entries
+    /// are disk-only when a persistent store is enabled; otherwise admission is
+    /// rejected without changing either tier.
+    pub fn cache_insert(
+        &self,
+        mut value: PrefixCacheValue,
+    ) -> Result<CacheInsertOutcome, NativeError> {
+        if !self.config.cache_policy.allows_memory()
+            && !self.config.cache_policy.allows_persistent()
+        {
+            return Ok(CacheInsertOutcome::Disabled);
         }
         if !value.is_valid() {
-            return Ok(Vec::new());
+            return Ok(CacheInsertOutcome::InvalidRejected);
         }
         value.bind_reconstruction();
+        let Some(validated) = ValidatedPrefixCacheValue::new(value.clone()) else {
+            return Ok(CacheInsertOutcome::InvalidRejected);
+        };
+        let _cache_guard = self.cache_gate.lock().map_err(host_poisoned)?;
         let owner_generation = value.metadata.owner_id.as_deref().map(|owner_id| {
             self.state
                 .lock()
@@ -1011,32 +1032,56 @@ impl NativeHost {
                 let Some(lease) =
                     store.acquire_owner_promotion_lease(&self.config.cache_namespace, owner_id)?
                 else {
-                    return Ok(Vec::new());
+                    return Ok(CacheInsertOutcome::OwnerRejected);
                 };
                 Some(lease)
             }
             _ => None,
         };
-        if self.config.cache_policy.allows_persistent()
-            && let Some(store) = &self.persistent_cache
-        {
+        let persistent =
+            self.config.cache_policy.allows_persistent() && self.persistent_cache.is_some();
+        if value.metadata.state_bytes > self.config.memory_cache_bytes && !persistent {
+            return Ok(CacheInsertOutcome::InvalidRejected);
+        }
+        if let Some(store) = self.persistent_cache.as_ref().filter(|_| persistent) {
             store.save(&self.config.cache_namespace, &value)?;
         }
         if let Some(lease) = &promotion_lease {
             lease.validate()?;
         }
         let owner_id = value.metadata.owner_id.clone();
-        let Some(value) = ValidatedPrefixCacheValue::new(value) else {
-            return Ok(Vec::new());
-        };
+        let id = value.metadata.id.clone();
         let mut state = self.state.lock().map_err(host_poisoned)?;
         if let (Some(owner_id), Some(expected_generation)) = (owner_id.as_deref(), owner_generation)
             && cache_owner_generation(&state, owner_id) != expected_generation
         {
-            return Ok(Vec::new());
+            return Ok(CacheInsertOutcome::OwnerRejected);
         }
-        let evicted = state.cache.insert_validated(value);
-        Ok(evicted)
+        if value.metadata.state_bytes > self.config.memory_cache_bytes {
+            let evicted = state
+                .cache
+                .invalidate(&id)
+                .then_some(id)
+                .into_iter()
+                .collect();
+            return Ok(CacheInsertOutcome::Stored {
+                memory_resident: false,
+                persistent_resident: true,
+                evicted,
+            });
+        }
+        match state.cache.insert_validated(validated) {
+            CacheInsertOutcome::Stored {
+                memory_resident,
+                evicted,
+                ..
+            } => Ok(CacheInsertOutcome::Stored {
+                memory_resident,
+                persistent_resident: persistent,
+                evicted,
+            }),
+            _ => Ok(CacheInsertOutcome::InvalidRejected),
+        }
     }
 
     /// Evicts only live in-memory prefix capabilities for one exact owner.
@@ -1053,6 +1098,8 @@ impl NativeHost {
         Ok(removed.len())
     }
 
+    /// Returns the number of loaded entries still resident after LRU eviction,
+    /// not the number examined or temporarily admitted.
     pub fn restore_persistent_cache(&self) -> Result<usize, NativeError> {
         if !self.config.cache_policy.allows_persistent() {
             return Ok(0);
@@ -1060,8 +1107,9 @@ impl NativeHost {
         let Some(store) = &self.persistent_cache else {
             return Ok(0);
         };
+        let _cache_guard = self.cache_gate.lock().map_err(host_poisoned)?;
         let values = store.list(&self.config.cache_namespace)?;
-        let mut restored = 0;
+        let mut restored = BTreeSet::new();
         for candidate in values {
             if !candidate.is_valid() {
                 continue;
@@ -1122,6 +1170,7 @@ impl NativeHost {
                 value
             };
             let owner_id = value.metadata.owner_id.clone();
+            let id = value.metadata.id.clone();
             let Some(value) = ValidatedPrefixCacheValue::new(value) else {
                 continue;
             };
@@ -1135,28 +1184,38 @@ impl NativeHost {
             {
                 continue;
             }
-            state.cache.insert_validated(value);
-            restored += 1;
+            match state.cache.insert_validated(value) {
+                CacheInsertOutcome::Stored { evicted, .. } => {
+                    for evicted_id in evicted {
+                        restored.remove(&evicted_id);
+                    }
+                    restored.insert(id);
+                }
+                CacheInsertOutcome::InvalidRejected => {
+                    state.cache.invalidate(&id);
+                    restored.remove(&id);
+                }
+                CacheInsertOutcome::Disabled | CacheInsertOutcome::OwnerRejected => {
+                    unreachable!("memory cache has no policy or owner boundary")
+                }
+            }
         }
-        Ok(restored)
+        Ok(restored.len())
     }
 
-    /// Clears both host-owned prefix tiers for this namespace.
-    ///
-    /// Persistent deletion is attempted even when lookup is currently disabled,
-    /// so a runtime policy change cannot strand reusable state behind an "off"
-    /// switch.
+    /// Clears both tiers under the same cache gate, including when caching is
+    /// disabled. Memory is cleared only after durable deletion reports success.
+    /// A store implementing a non-atomic `clear` must report partial deletion as
+    /// an error; callers must not mistake an error for a completed clear.
     pub fn clear_cache(&self) -> Result<usize, NativeError> {
-        let memory_entries = {
-            let mut state = self.state.lock().map_err(host_poisoned)?;
-            let entries = state.cache.len();
-            state.cache.clear();
-            entries
+        let _cache_guard = self.cache_gate.lock().map_err(host_poisoned)?;
+        let persistent_entries = match &self.persistent_cache {
+            Some(store) => store.clear(&self.config.cache_namespace)?,
+            None => 0,
         };
-        let Some(store) = &self.persistent_cache else {
-            return Ok(memory_entries);
-        };
-        let persistent_entries = store.clear(&self.config.cache_namespace)?;
+        let mut state = self.state.lock().map_err(host_poisoned)?;
+        let memory_entries = state.cache.len();
+        state.cache.clear();
         Ok(memory_entries.saturating_add(persistent_entries))
     }
 }
@@ -2014,6 +2073,260 @@ mod tests {
         assert!(!debug.contains("RESIDENT_PATH_SENTINEL"));
     }
 
+    struct BlockingStore {
+        inner: TestPrefixStore,
+        block_load: bool,
+        first: std::sync::atomic::AtomicBool,
+        entered: std::sync::mpsc::SyncSender<()>,
+        resume: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl BlockingStore {
+        fn pause_once(&self) {
+            if self.first.swap(false, Ordering::AcqRel) {
+                self.entered.send(()).expect("notify test");
+                self.resume
+                    .lock()
+                    .expect("resume lock")
+                    .recv()
+                    .expect("resume operation");
+            }
+        }
+    }
+
+    impl PrefixCacheStore for BlockingStore {
+        fn list(&self, namespace: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
+            let values = self.inner.list(namespace)?;
+            if self.block_load {
+                self.pause_once();
+            }
+            Ok(values)
+        }
+
+        fn load_entry(
+            &self,
+            namespace: &str,
+            id: &str,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            self.inner.load_entry(namespace, id)
+        }
+
+        fn load_reconstruction(
+            &self,
+            namespace: &str,
+            expected: &PrefixCacheMetadata,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            self.inner.load_reconstruction(namespace, expected)
+        }
+
+        fn save(&self, namespace: &str, value: &PrefixCacheValue) -> Result<(), NativeError> {
+            if !self.block_load {
+                self.pause_once();
+            }
+            self.inner.save(namespace, value)
+        }
+
+        fn delete(&self, namespace: &str, id: &str) -> Result<(), NativeError> {
+            self.inner.delete(namespace, id)
+        }
+    }
+
+    #[test]
+    fn overlapping_saves_and_restore_clear_are_ordered_across_both_tiers() {
+        for block_load in [false, true] {
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+            let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+            let store = Arc::new(BlockingStore {
+                inner: TestPrefixStore::default(),
+                block_load,
+                first: std::sync::atomic::AtomicBool::new(true),
+                entered: entered_tx,
+                resume: Mutex::new(resume_rx),
+            });
+            let first = cache_value("same", 1);
+            if block_load {
+                store.inner.save("llama-native-host", &first).expect("seed");
+            }
+            let host = Arc::new(NativeHost::with_dependencies(
+                NativeHostConfig::default(),
+                Arc::new(SystemClock),
+                Some(store.clone()),
+            ));
+            let a_host = Arc::clone(&host);
+            let a = thread::spawn(move || {
+                if block_load {
+                    a_host.restore_persistent_cache().expect("restore");
+                } else {
+                    a_host.cache_insert(first).expect("first insert");
+                }
+            });
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("store callback entered");
+            // The mutation gate spans the callback, but unrelated host state
+            // remains inspectable: never hold the global mutex across storage.
+            assert!(host.cache_gate.try_lock().is_err());
+            assert!(host.state.try_lock().is_ok());
+            let b_host = Arc::clone(&host);
+            let (b_started_tx, b_started_rx) = std::sync::mpsc::sync_channel(0);
+            let b = thread::spawn(move || {
+                b_started_tx.send(()).expect("second operation started");
+                if block_load {
+                    b_host.clear_cache().expect("clear");
+                } else {
+                    b_host
+                        .cache_insert(cache_value("same", 2))
+                        .expect("second insert");
+                }
+            });
+            b_started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("second caller");
+            resume_tx.send(()).expect("release first store operation");
+            a.join().expect("first worker");
+            b.join().expect("second worker");
+            let fingerprint = cache_value("same", 2).metadata.fingerprint;
+            if block_load {
+                assert!(
+                    store
+                        .inner
+                        .load("llama-native-host")
+                        .expect("load")
+                        .is_empty()
+                );
+                assert!(host.cache_lookup(&fingerprint, &[1, 3]).is_none());
+            } else {
+                assert_eq!(
+                    store.inner.load("llama-native-host").expect("load"),
+                    vec![cache_value("same", 2)]
+                );
+                assert!(host.cache_lookup(&fingerprint, &[2, 3]).is_some());
+                assert!(host.cache_lookup(&fingerprint, &[1, 3]).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_cache_insert_does_not_replace_either_tier() {
+        let store = Arc::new(TestPrefixStore::default());
+        let host = NativeHost::with_dependencies(
+            NativeHostConfig::default(),
+            Arc::new(SystemClock),
+            Some(store.clone()),
+        );
+        let original = cache_value("same", 1);
+        host.cache_insert(original.clone()).expect("initial insert");
+        let mut malformed = cache_value("same", 2);
+        malformed.sequence.token_count = 7;
+        assert_eq!(
+            host.cache_insert(malformed).expect("typed rejection"),
+            CacheInsertOutcome::InvalidRejected
+        );
+        assert_eq!(
+            store.load("llama-native-host").expect("load"),
+            vec![original.clone()]
+        );
+        assert!(
+            host.cache_lookup(&original.metadata.fingerprint, &[1, 3])
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn oversized_persistent_replacement_invalidates_old_memory_value() {
+        let store = Arc::new(TestPrefixStore::default());
+        let host = NativeHost::with_dependencies(
+            NativeHostConfig {
+                memory_cache_bytes: 8,
+                ..NativeHostConfig::default()
+            },
+            Arc::new(SystemClock),
+            Some(store.clone()),
+        );
+        let original = cache_value("same", 1);
+        host.cache_insert(original.clone()).expect("initial insert");
+        let mut large = cache_value("same", 2);
+        Arc::make_mut(&mut large.sequence.bytes).resize(16, 9);
+        large.metadata.state_bytes = 16;
+        assert_eq!(
+            host.cache_insert(large.clone()).expect("disk-only insert"),
+            CacheInsertOutcome::Stored {
+                memory_resident: false,
+                persistent_resident: true,
+                evicted: vec!["same".to_string()],
+            }
+        );
+        assert!(
+            host.cache_lookup(&original.metadata.fingerprint, &[1, 3])
+                .is_none()
+        );
+        large.bind_reconstruction();
+        assert_eq!(store.load("llama-native-host").expect("load"), vec![large]);
+        assert_eq!(host.restore_persistent_cache().expect("restore"), 0);
+    }
+
+    #[test]
+    fn persistent_restore_counts_only_entries_still_resident() {
+        let store = Arc::new(TestPrefixStore::default());
+        store
+            .save("llama-native-host", &cache_value("a", 1))
+            .expect("seed");
+        store
+            .save("llama-native-host", &cache_value("b", 2))
+            .expect("seed");
+        let host = NativeHost::with_dependencies(
+            NativeHostConfig {
+                memory_cache_bytes: 8,
+                ..NativeHostConfig::default()
+            },
+            Arc::new(SystemClock),
+            Some(store),
+        );
+        assert_eq!(host.restore_persistent_cache().expect("restore"), 1);
+    }
+
+    struct FailingStore;
+
+    impl PrefixCacheStore for FailingStore {
+        fn list(&self, _: &str) -> Result<Vec<PrefixCacheMetadata>, NativeError> {
+            Ok(Vec::new())
+        }
+        fn load_entry(&self, _: &str, _: &str) -> Result<Option<PrefixCacheValue>, NativeError> {
+            Ok(None)
+        }
+        fn load_reconstruction(
+            &self,
+            _: &str,
+            _: &PrefixCacheMetadata,
+        ) -> Result<Option<PrefixCacheValue>, NativeError> {
+            Ok(None)
+        }
+        fn save(&self, _: &str, _: &PrefixCacheValue) -> Result<(), NativeError> {
+            Err(NativeError::new(
+                NativeErrorCode::Internal,
+                "injected save failure",
+            ))
+        }
+        fn delete(&self, _: &str, _: &str) -> Result<(), NativeError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_persistent_save_does_not_publish_to_memory() {
+        let host = NativeHost::with_dependencies(
+            NativeHostConfig::default(),
+            Arc::new(SystemClock),
+            Some(Arc::new(FailingStore)),
+        );
+        let value = cache_value("failed", 1);
+        assert!(host.cache_insert(value.clone()).is_err());
+        assert!(
+            host.cache_lookup(&value.metadata.fingerprint, &[1, 2])
+                .is_none()
+        );
+    }
+
     #[test]
     fn memory_lru_eviction_does_not_delete_the_persistent_tier() {
         let store = Arc::new(TestPrefixStore::default());
@@ -2029,7 +2342,11 @@ mod tests {
         assert_eq!(
             host.cache_insert(cache_value("second", 2))
                 .expect("second insert"),
-            vec!["first".to_string()]
+            CacheInsertOutcome::Stored {
+                memory_resident: true,
+                persistent_resident: true,
+                evicted: vec!["first".to_string()],
+            }
         );
         assert_eq!(
             store
@@ -2129,10 +2446,9 @@ mod tests {
             Some(store.clone()),
         );
         let value = cache_value("disabled", 1);
-        assert!(
-            host.cache_insert(value.clone())
-                .expect("disabled insert")
-                .is_empty()
+        assert_eq!(
+            host.cache_insert(value.clone()).expect("disabled insert"),
+            CacheInsertOutcome::Disabled
         );
         assert!(
             host.cache_lookup(&value.metadata.fingerprint, &[1, 2])
@@ -2248,12 +2564,12 @@ mod tests {
             0
         );
         release_save.wait();
-        assert!(
+        assert_eq!(
             worker
                 .join()
                 .expect("cache insertion worker")
-                .expect("cache insertion result")
-                .is_empty()
+                .expect("cache insertion result"),
+            CacheInsertOutcome::OwnerRejected
         );
         assert!(
             host.cache_lookup_for_owner(
