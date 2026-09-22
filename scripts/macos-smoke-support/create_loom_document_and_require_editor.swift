@@ -46,8 +46,22 @@ guard let window = (attribute(application, kAXWindowsAttribute as CFString) as? 
     exit(1)
 }
 let beforeTitle = stringAttribute(window, kAXTitleAttribute as CFString)
-if let add = control(named: "Add") {
-    _ = AXUIElementPerformAction(add, kAXPressAction as CFString)
+NSRunningApplication(processIdentifier: pid)?.activate(options: [])
+let addDeadline = Date().addingTimeInterval(5)
+var add: AXUIElement?
+repeat {
+    add = control(named: "Add")
+    if add != nil { break }
+    Thread.sleep(forTimeInterval: 0.05)
+} while Date() < addDeadline
+if let add {
+    guard AXUIElementPerformAction(add, kAXPressAction as CFString) == .success else {
+        fputs("could not open Loom's Add menu\n", stderr)
+        exit(1)
+    }
+} else {
+    fputs("could not bind Loom's Add menu control\n", stderr)
+    exit(1)
 }
 let createDeadline = Date().addingTimeInterval(5)
 var create: AXUIElement?
