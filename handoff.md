@@ -106,3 +106,33 @@ review-only --tests -- -D warnings` still fails with these actionable findings:
 
 Do not add blanket `allow(clippy::...)` attributes: this package opts into
 pedantic Clippy and the requested delivery gate uses `-D warnings`.
+
+## Local CI receipt on takeover commit `f2c1dc0c`
+
+These commands were run locally on macOS after the takeover branch was pushed.
+They are a substitute for unavailable/billing-gated remote capacity only; they
+do not constitute macOS native product acceptance.
+
+| Gate | Result | Evidence / consequence |
+| --- | --- | --- |
+| Packet preflight unit tests | PASS | `node /Users/george/Downloads/loom-easl-next-5b34e054/tools/preflight.test.mjs`: 8/8. |
+| Packet exact-base validation and apply | PASS | Both read-only export and `--apply` verified base `5b34e054`, source blobs, fragments, recipes, and candidate hashes. |
+| Current service documentation | PASS | `node scripts/ci/validate-current-docs.mjs` emitted `surfaces=2`, `documents=7`, `current_paths=5`. |
+| PR policy/unit suite | FAIL | 130/132 passed. The changed `products/loom/experiments/easl-interface/build.rs` hashes to `ce2c6517b12743e88a38124630936b605ac41dc3de4a838db12ae563364a6cea`, but `ci/ignored-tests.json` records `7eae63b51f0272f1490c5408f932f332b5ca331438bec6a06724fb6d7abd181a`. Review the build script, then update its reviewed catalog digest and rerun the suite. The second failure is only the test cascade from this first catalog failure. |
+| Local CI planner | PASS, full matrix selected | With base `c0bcc42d` and head `f2c1dc0c`, risk is `dependency`; it selects policy, root/native/gateway/attachment/information/speech/Mom/Loom Linux, selected Windows, frontend, macOS, ignored-test, dependency-graph, and fuzz jobs. This branch predates current `main`, so it cannot claim a Loom-only CI scope. |
+| Full portable workspace test gate | FAIL | `cargo test --locked --workspace --all-targets --no-fail-fast` compiled broadly, then stopped in `loom-easl-interface` build.rs on the same strict App.svelte reference-hash mismatch documented above. No downstream workspace-test success claim is valid. |
+| Review-only EASL suite | NOT PROMOTABLE | Complete receipt: 102 pass, 2 ignored, 1 journal timeout; focused rerun of that one test passed in 14.79s. Treat as an unresolved timing/contention defect until a clean full receipt exists. |
+| Formatting | PASS | `cargo fmt --all -- --check`. |
+| Review-only Clippy | FAIL | The seven findings listed in the preceding section remain. |
+
+### Promotion order
+
+1. Review and reconcile the current Loom App source with the native EASL port;
+   update the strict reference hash only when that source review justifies it.
+2. Independently review `build.rs`, update the reviewed build-script digest in
+   the ignored-test catalog, and make the 132-test policy suite pass.
+3. Fix the seven review-only Clippy findings without broad lint suppression.
+4. Obtain a clean complete review-only suite, diagnosing the accepted-journal
+   timeout rather than increasing its deadline.
+5. Rerun the selected full local/remote matrix, then complete live macOS native
+   UI, focus, IME, bundle, and identity acceptance before marking the PR ready.
