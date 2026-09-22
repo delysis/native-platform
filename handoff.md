@@ -1,116 +1,111 @@
-# Loom audit-next integration handoff
+# Loom streaming-preview continuation
 
 Date: 2026-09-22
-Branch: `codex/loom-audit-next-87939f38`
-Base: `87939f3873977ef2670ddab9e869ca9d5d7d1739` (`origin/main`)
-Source packet: `/Users/george/Downloads/loom-audit-next-87939f38`
+Branch: `codex/loom-streaming-preview-repair-20260922`
+Follow-up base: `38ed1f26b31544d9bc76e064d2d21e795784614a`
+Base tree: `1dde36011de939b8f1eb2d7c34170890e46c59c0`
 
-## Integrated
+**Native acceptance remains open. Do not promote from portable checks.**
+The prior handoff and raw Mac results remain in Git history at the base above.
+No historical receipt, production renderer/controller, native engine, dependency,
+schema, acceptance gate or user data is changed by this follow-up.
 
-Applied the packet patch `patches/0001-current-completion-control-driver.patch`
-with the packet's exact preparation tool. It changes only:
+## Disposition of the four reported failures
 
-- `scripts/macos-smoke-support/README.md`
-- `scripts/macos-smoke-support/exercise_loom_completion_controls.swift`
-- `scripts/macos-smoke-support/set_loom_completion_toggle.swift`
+The two growing-prefix failures originate in the test harness lifecycle. It
+admitted a fixture session before the mounted editor established its end caret.
+The initial Visual selection report, or Source focus before setting the end
+selection, invalidated that session. `completionControllerView` could still show
+the unchanged fallback family, concealing the lost session. `appendStream` then
+silently did nothing because it requires a live session.
 
-The patch replaces obsolete no-model control automation with the shared current-
-control driver, enforces one input per observed transition, and adds bounded,
-read-only completion-witness diagnostics. It does not change generation,
-renderer behavior, storage, schemas, dependencies, release gates, or EASL.
+The harness now admits its fixture family only after the real editor focuses its
+end caret. Manual text changes and caret navigation retire both the session and
+its fixture source. The stream method reports whether the production transition
+actually applied; browser regressions require a bound session, full multi-frame
+DOM growth, growth after word acceptance, exact unconsume, and no resurrection
+after manual edits or a move away and back. These checks do not inject native
+model output or replace the artifact journey.
 
-## Verification performed
+The Option-Return unit's positive DOM mock lacked `textContent`, so the strict
+production widget predicate correctly rejected it. The fixture now supplies the
+full expected text. Six negative variants retain rejection for missing,
+truncated or rewritten text, a stale key, an offscreen caret and an offscreen
+widget. The production guard is unchanged.
 
-- `node --test /Users/george/Downloads/loom-audit-next-87939f38/tests/*.test.mjs`
-  — 11 passed, 1 intentional Linux non-macOS refusal skipped.
-- `rustup run 1.92.0 cargo run --offline --locked -p xtask -- macos-smoke-support ...`
-  — compiled all support helpers successfully.
-- Generated `set_loom_completion_toggle --self-test` — 344 assertions passed;
-  reports `native_acceptance: false`.
-- `node --test scripts/ci/test-workflows.mjs` — 49 passed.
-- `rustup run 1.92.0 cargo fmt --all -- --check` — passed.
-- `rustup run 1.92.0 cargo run --offline --locked -p xtask -- policy` — passed.
-- `git diff --check` — passed.
+The terminal-space browser test supplied `lingers here` but searched for a
+standalone `lingers` node. It now requires the actual widget's entire `lingers
+here` text and visibility, retaining the exact `Something lingers` insertion
+and `here` remainder assertions. There is no one-word render cap.
 
-The packet's Node tests also rejected five compiling behavioral mutants:
-duplicate input, numeric Boolean, metadata-as-proof, wrong mode action, and
-retired labels.
+## Executed here; not a replacement for the Mac runs
 
-## Explicit non-claims
+The editing runtime was Linux with Node 22.16.0 and TypeScript 5.8.3, not the
+repository's pinned TypeScript 6.0.3. It had no pnpm, Vitest, Svelte, WebKit or
+Rust toolchain; registry access also failed. No full unit/browser/typecheck,
+Rust, release, signing or model run is claimed.
 
-This is not product acceptance. No native AX/DOM observation, foreground app
-journey, pixel-level visible in-caret Ghost proof, real-model generation,
-artifact/signing identity, relaunch, shutdown-join, or Visual/Source editor
-acceptance was run. The Linux test intentionally exercises refusal behavior,
-not native success. The completion witness remains diagnostic and must not be
-treated as proof that a Ghost is visible.
+- Source-script lifecycle replay: 4 failures on the original harness, 4 passes
+  after repair. It executes the actual harness script and production controller
+  with explicit simulated editor focus callbacks; it does not compile Svelte.
+- Three executable harness mutations were rejected by assertion failures:
+  early admission, retained revoked fallback, and a dropped stream update.
+- Existing streaming-controller test bodies: 12 passes through the Node test
+  registration adapter against the production modules, not pinned Vitest.
+- Unchanged production widget predicate: 7 synthetic DOM/geometry cases pass;
+  this is not ProseMirror keyboard dispatch, real DOM or native visibility.
+- Changed TypeScript/script syntax and `git diff --check`: pass.
 
-## Serious remaining work and findings
+The conversation follow-up bundle preserves commands, raw logs, test adapters,
+source identities and the patch. Do not count its portable checks as extra
+product gates or rerun them instead of the real suites below.
 
-1. Run the helper against one clean, committed macOS artifact in an isolated
-   acceptance session. Verify policy off/on, Ghost/Loompad transitions, busy and
-   delayed acknowledgements, wrong/frontmost PID, multiple windows, and
-   missing/ambiguous controls. Preserve strict failures; do not add retries.
-2. Add the bounded post-terminal AX/DOM observation described in
-   `COMPLETION-TRACE.md`, correlated to durable candidate identity and the
-   canonical manuscript. Keep pre-terminal failure evidence separate.
-3. Only after that observation identifies the falsified hydration/publication
-   edge, add a failing regression and repair the implicated renderer/controller
-   boundary. Do not infer a renderer fix from helper metadata.
-4. Prove both Visual and Source journeys: true in-caret Ghost, four distinct
-   Loompad choices, cycling without a hidden fifth run, exact accept, separate
-   unconsume and ordinary undo, stale-scope rejection, worker joins, and
-   exact-content preference-preserving relaunch.
-5. Finish artifact hashes/signing/model identity and the settled Rust/frontend/
-   policy gates. Keep Linux and Windows evidence separate from macOS evidence.
+## Local execution: focused first
 
-All 37 inherited audit findings remain recorded in the packet's
-`FINDING-EVIDENCE.json`; this follow-up requalifies only the control-driver and
-diagnostic portions of F12, V04, and V07. It does not close those findings or
-the other rows.
+Preserve unrelated work. Fetch this branch, inspect status and fast-forward the
+existing clean repair worktree; use a new worktree if it contains other changes.
+Do not reset, overwrite or reapply the previous 13-file packet.
 
-## Next agent request
+From the repository root, use the existing pinned pnpm installation:
 
-Start from the pushed commit below. Review this file and the packet's
-`LOCAL-AGENT-PROMPT.md`, `COMPLETION-TRACE.md`, and `NEXT-TODO.md`. Treat all
-portable results above as component evidence only, and return native receipts
-for any acceptance claim.
+```sh
+pnpm --filter @delysis/loom check
+pnpm --filter @delysis/loom exec vitest run \
+  src/lib/ghostText.test.ts src/lib/completionStreaming.test.ts \
+  src/lib/completionController.test.ts src/lib/completionSession.test.ts \
+  --maxWorkers=4
+pnpm --filter @delysis/loom exec vitest run \
+  --config vitest.browser.config.ts \
+  src/lib/completionController.browser.test.ts \
+  src/lib/editorInteractions.browser.test.ts \
+  src/lib/loompadStreaming.browser.test.ts
+```
 
-## Streaming-preview repair follow-up — 2026-09-22
+If a real suite fails, retain its exact test name, assertion, screenshot and
+source revision. For a stuck preview report the bound session, selected run,
+presentation key, actual DOM text and caret before/after the delta. Do not add
+arbitrary sleeps, waive the DOM check, or change a full-prefix assertion to one
+word. Once focused tests pass, run one settled consolidated local gate using
+`rustup run 1.92.0 cargo ...` for Rust; do not trust old-tree counts. GitHub billing
+failures are not product-test results.
 
-Packet: `/Users/george/Downloads/native-platform-streaming-preview-repair-20260922`
+## Native acceptance and promotion
 
-The packet was applied onto this branch after the prior control-driver commit.
-It changes the Loom streaming-preview/controller/editor path and adds the
-packet's browser regressions and contract documentation. The packet's safe
-apply utility passed 9/9, and `pnpm --filter @delysis/loom check` passed with
-zero Svelte diagnostics.
+Build one clean identified candidate. Use the existing native smoke and writing
+journeys with the approved Gemma model, never fixture text or hosted fallback:
 
-Focused execution found unresolved regressions, so this revision is not a
-product or test-suite acceptance claim:
+- Path: `/Users/george/.cache/fiction-harness/models/gemma-4-E2B-base-Q8_0.gguf`
+- Size: `4954576032`
+- SHA-256: `aa0a9a03993440f45176f19f8189a2e84c210ff8628ec13dc6edf42d017f7670`
 
-- Unit suite: 121 passed, 1 failed in `ghostText.test.ts` (`Option-Return`
-  requires the new exact visible-widget witness in a legacy mock).
-- WebKit suite: 85 passed, 3 failed. Two new growing-prefix cases remain at
-  the old preview (`one two`) after `appendStream`; one existing exact-byte
-  case cannot find the full-text widget by its old word-level locator.
-- The packet's portable probes and source syntax receipts remain historical
-  component evidence; they do not override these current failures.
+Require correlated pre-terminal multi-frame in-caret Ghost in Visual and Source,
+four distinct stable Loompad choices with growing tails and fixed W/A/S/D
+identity, unchanged-manuscript cycling without hidden extra work, exact insertion,
+separate unconsume/ordinary undo, stale-scope refusal, active-work quit with owned
+worker joins, and exact persisted bytes plus fresh completion on relaunch.
+A bounded post-terminal diagnostic may explain a failure; it must not convert a
+failed pre-terminal gate into PASS. Preserve raw logs and source/artifact/model
+hashes. Promotion belongs to the local agent only after the exact tree passes.
 
-Queued work for Chat 6 Pro:
-
-1. Diagnose why the browser harness refresh does not publish the new
-   presentation identity/text into the mounted editor, without weakening the
-   strict prefix, stale-session, pending-insertion, retired-policy, or actual
-   DOM-text guards.
-2. Repair the exact-widget witness test seam (or production behavior if the
-   browser reproduction proves it) so Option-Return remains authorized only
-   when the real widget text/key/geometry agree.
-3. Re-run the focused unit and real-WebKit suites, then the consolidated Rust,
-   policy, frontend, and workflow gates on one settled commit.
-4. Only after those pass, build a fresh macOS artifact and run the packet's
-   approved Gemma 4 Visual and Source journeys. Native acceptance, signing,
-   model identity, relaunch, lifecycle joins, and rendered multi-frame proof
-   remain open.
-5. Do not infer bounded four-way speculative scheduling from this repair; the
-   packet explicitly does not implement that separate scheduler.
+The exhaustive four-way lookahead scheduler is separate and is not implemented
+here. See `products/loom/docs/streaming-completion.md` for the current contract.

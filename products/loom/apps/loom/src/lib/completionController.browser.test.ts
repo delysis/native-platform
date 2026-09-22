@@ -44,16 +44,17 @@ describe('completion controller and editor callback ordering', () => {
     const visible = () => document.querySelector(selector)?.textContent;
     const manuscript = () => page.getByRole('status', { name: 'Controller Markdown' }).element().textContent;
     await expect.poll(visible).toBe(' one two');
-    harness.appendStream('run-a', ' one two café', 'stream:run-a:2');
+    await expect.element(page.getByRole('status', { name: 'Controller Session' })).toHaveTextContent('bound');
+    expect(harness.appendStream('run-a', ' one two café', 'stream:run-a:2')).toBe(true);
     await expect.poll(visible).toBe(' one two café');
-    harness.appendStream('run-a', ' one two café keeps growing', 'stream:run-a:3');
+    expect(harness.appendStream('run-a', ' one two café keeps growing', 'stream:run-a:3')).toBe(true);
     await expect.poll(visible).toBe(' one two café keeps growing');
     expect(manuscript()).toBe('Hello');
 
     await userEvent.keyboard('{Tab}');
     const accepted = mode === 'visual' ? 'Hello one' : 'Hello one ';
     await expect.poll(manuscript).toBe(accepted);
-    harness.appendStream('run-a', ' one two café keeps growing after acceptance', 'stream:run-a:4');
+    expect(harness.appendStream('run-a', ' one two café keeps growing after acceptance', 'stream:run-a:4')).toBe(true);
     await expect.poll(visible).toBe(mode === 'visual'
       ? ' two café keeps growing after acceptance'
       : 'two café keeps growing after acceptance');
@@ -66,9 +67,30 @@ describe('completion controller and editor callback ordering', () => {
     // A manual edit revokes the old family; subsequent deltas must not revive it.
     await userEvent.keyboard('!');
     await expect.poll(manuscript).toBe('Hello!');
-    harness.appendStream('run-a', ' one two café keeps growing after acceptance late', 'stream:run-a:5');
+    await expect.element(page.getByRole('status', { name: 'Controller Session' })).toHaveTextContent('none');
+    expect(harness.appendStream('run-a', ' one two café keeps growing after acceptance late', 'stream:run-a:5')).toBe(false);
     await expect.poll(() => document.querySelector(selector)?.textContent ?? '').toBe('');
     expect(manuscript()).toBe('Hello!');
+  });
+  it.each(['visual', 'source'] as const)('revokes the %s family on real caret navigation, including its fallback', async (mode) => {
+    const harness = render(mode);
+    const editor = page.getByRole('textbox');
+    const session = page.getByRole('status', { name: 'Controller Session' });
+    const selector = mode === 'visual' ? '.loom-visual-ghost' : '.loom-source-ghost-text';
+    await editor.click();
+    await expect.poll(() => document.querySelector(selector)?.textContent).toBe(' one two');
+    await expect.element(session).toHaveTextContent('bound');
+    await userEvent.keyboard('{ArrowLeft}');
+    await expect.element(session).toHaveTextContent('none');
+    expect(harness.appendStream('run-a', ' one two late', 'stream:run-a:2')).toBe(false);
+    await expect.poll(() => document.querySelector(selector)?.textContent ?? '').toBe('');
+    await expect.element(page.getByRole('status', { name: 'Controller Remainder' })).toHaveTextContent('none');
+    // Returning to the old byte offset is not authority to resurrect that run.
+    await userEvent.keyboard('{ArrowRight}');
+    await expect.element(session).toHaveTextContent('none');
+    await expect.poll(() => document.querySelector(selector)?.textContent ?? '').toBe('');
+    expect(page.getByRole('status', { name: 'Controller Markdown' }).element().textContent).toBe('Hello');
+    expect(page.getByRole('status', { name: 'Controller Actions' }).element().textContent).toBe('0');
   });
   it.each(['visual', 'source'] as const)('reverses an accepted %s word while a refilled family is temporarily unavailable', async (mode) => {
     const keyboard = userEvent.setup();

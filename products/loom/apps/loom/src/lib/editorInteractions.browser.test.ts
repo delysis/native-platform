@@ -600,7 +600,8 @@ describe('real WebKit editor interactions', () => {
     render('Something ', [
       { candidateId: 'a', presentationKey: 'a:1', text: 'lingers here', runId: 'run-a', targetByte: 10, insertsOnAccept: true }
     ]);
-    await expect.element(page.getByText('lingers', { exact: true }).first()).toBeVisible();
+    await expect.poll(() => document.querySelector('.loom-visual-ghost')?.textContent).toBe('lingers here');
+    await expect.element(page.getByText('lingers here', { exact: true }).first()).toBeVisible();
     await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
     await expect.poll(serializedMarkdown).toBe('Something lingers');
     await expect.element(page.getByText('here', { exact: true }).first()).toBeVisible();

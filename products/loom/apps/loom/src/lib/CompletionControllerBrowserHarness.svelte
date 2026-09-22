@@ -23,7 +23,7 @@
   export let loompad = false;
   export let insertsOnAccept = true;
 
-  let family: InlineGhostSuggestion[] = [
+  const initialFamily: InlineGhostSuggestion[] = [
     {
       candidateId: 'candidate-a',
       presentationKey: 'candidate-a:presentation',
@@ -57,6 +57,7 @@
       insertsOnAccept
     }
   ];
+  let family: InlineGhostSuggestion[] = [];
   const contextKey = `browser-session:browser-document:1:${mode}`;
   let markdown = 'Hello';
   let visualEditor: LoomEditor;
@@ -64,11 +65,7 @@
   let sourceTextarea: HTMLTextAreaElement;
   let ready = false;
   let invalidations = 0;
-  let controller = reconcileCompletionController(
-    initialCompletionControllerState(),
-    contextKey,
-    family
-  );
+  let controller = initialCompletionControllerState();
 
   $: controllerView = completionControllerView(controller, contextKey, family);
   $: selected = ready ? controllerView.selected : null;
@@ -109,10 +106,14 @@
 
   // Feed a transport update through the production live-refresh transition.
   // This harness tests editor/controller integration, not native inference.
-  export function appendStream(runId: string, text: string, presentationKey: string): void {
-    if (controller.session) controller = refreshCompletionCandidate(
+  export function appendStream(runId: string, text: string, presentationKey: string): boolean {
+    if (!controller.session) return false;
+    const next = refreshCompletionCandidate(
       controller, controller.session, runId, text, presentationKey
     );
+    const applied = next !== controller;
+    controller = next;
+    return applied;
   }
 
   function chooseLoompad(candidate: InlineGhostSuggestion): void {
@@ -138,12 +139,14 @@
   function observe(next: string): void {
     const mutation = observeTextMutation(controller, next, markdown, false);
     controller = mutation.state;
+    if (next !== markdown && !mutation.completionOwned) family = [];
     markdown = next;
   }
 
   function invalidateIfManualMutation(): void {
     if (controller.pendingText !== null) return;
     invalidations += 1;
+    family = [];
     controller = clearCompletionSession(controller);
   }
 
@@ -154,6 +157,7 @@
       : controllerView.selected?.targetByte ?? controller.generationIntent?.anchorByte ?? null;
     if (expected !== null && targetByte !== expected) {
       invalidations += 1;
+      family = [];
       controller = clearCompletionSession(controller);
     }
   }
@@ -165,8 +169,12 @@
 
   onMount(async () => {
     await tick();
-    if (mode === 'visual') visualEditor.focusAtDocumentEnd();
-    else sourceEditor.focusAtDocumentEnd();
+    // Mounting reports the initial caret; Source focus also precedes its end
+    // selection. Admit the family only after the real editor owns that caret.
+    const editor = mode === 'visual' ? visualEditor : sourceEditor;
+    if (!editor.focusAtDocumentEnd()) throw new Error('completion harness could not focus its editor');
+    family = initialFamily;
+    controller = reconcileCompletionController(controller, contextKey, family);
     ready = true;
   });
 </script>
@@ -220,6 +228,7 @@
       scope={contextKey} visual={mode === 'visual'} onChoose={chooseLoompad}
       onAccept={(candidate, length) => void acceptLoompad(candidate, length)} />
   {/if}
+  <output aria-label="Controller Session">{controllerView.boundSession ? 'bound' : 'none'}</output>
   <output aria-label="Controller Frozen">{controller.session?.authorityFrozen ? 'yes' : 'no'}</output>
   <output aria-label="Controller Actions">{controller.actionSequence}</output>
   <output aria-label="Controller Action Kind">{controller.lastAction?.kind ?? 'none'}</output>

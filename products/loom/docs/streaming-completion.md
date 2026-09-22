@@ -37,6 +37,13 @@ not a status label or the length of a hidden candidate. Controller/editor fixtur
 are component evidence, never native inference evidence. Harness counters count
 regeneration intents, not backend generation runs.
 
+Mount the real editor and establish its caret before admitting a fixture family.
+Assert that the displayed stream is bound to a controller session and that each
+transport update actually changes that session. Revoking a scope must retire
+both its session and its fixture source; fallback text must not mask a missing
+session or resurrect a revoked run. Keep DOM locators aligned with the complete
+preview, and include missing-text, stale-key and offscreen negative witnesses.
+
 Before changing these expectations, reproduce the intended defect. A one-word
 render cap, a blocked accepted stream, and acceptance of truncated DOM text must
 each fail their corresponding browser/controller regression. Do not replace the
