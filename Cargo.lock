@@ -13,6 +13,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "accesskit_xplat"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb69cd9e9ca89e4bb0ac98821c509849d5e51c6ae8c96bddf7b0c97579b839a"
+dependencies = [
+ "accesskit",
+ "accesskit_macos",
+ "accesskit_windows",
+ "android-activity",
+ "raw-window-handle",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -36,10 +49,13 @@ dependencies = [
 name = "easl-tauri-probe"
 version = "0.0.0"
 dependencies = [
+ "accesskit",
+ "accesskit_xplat",
  "arboard",
  "easl",
  "easl-native-text",
  "easl-text",
+ "raw-window-handle",
  "serde_json",
  "softbuffer",
  "tauri",
