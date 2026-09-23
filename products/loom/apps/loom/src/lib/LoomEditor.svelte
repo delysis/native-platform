@@ -64,6 +64,7 @@
   } from './attachments';
 
   const formattingSelectionRestoreMeta = 'loomFormattingSelectionRestore';
+  const capturedCaretRestoreMeta = 'loomCapturedCaretRestore';
   const completionPopupDomIds = allocateCompletionPopupDomIds('visual');
 
   interface GhostPresentationSnapshot {
@@ -448,11 +449,13 @@
     return true;
   }
 
-  export function focusAtDocumentEnd(): boolean {
+  export function focusAtDocumentEnd(suppressCaretNavigation = false): boolean {
     if (!view || readonly) return false;
     const end = Selection.atEnd(view.state.doc);
     if (!view.state.selection.eq(end)) {
-      view.dispatch(view.state.tr.setSelection(end));
+      const transaction = view.state.tr.setSelection(end);
+      if (suppressCaretNavigation) transaction.setMeta(capturedCaretRestoreMeta, true);
+      view.dispatch(transaction);
     }
     view.focus();
     return view.hasFocus();
@@ -1126,7 +1129,8 @@
             view.hasFocus() &&
             selectionMoved &&
             !protectedSelectionDrift &&
-            transaction.getMeta(formattingSelectionRestoreMeta) !== true
+            transaction.getMeta(formattingSelectionRestoreMeta) !== true &&
+            transaction.getMeta(capturedCaretRestoreMeta) !== true
           ) onCaretNavigation();
           if (selectionMoved) {
             invalidateSelectionAccessibility();

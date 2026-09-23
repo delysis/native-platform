@@ -271,6 +271,7 @@ it.each([
       terminal = true; wake();
       await expect.poll(() => completionWitness().selected_presentation_key).toBe(`reenabled-candidate-0:${hashes[0]}`);
       expect(glyph()).toBe(texts[0]);
+      await new Promise(resolve => window.setTimeout(resolve, 2_100));
       expect(admissions).toBe(2);
       expect(unexpected).toEqual([]); // Also rejects model-load, writes and hosted fallback.
     }

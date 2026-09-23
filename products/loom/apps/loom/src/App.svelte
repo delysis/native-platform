@@ -587,7 +587,7 @@
   let contextCompositionActive = false;
   let contextVisualEditor: {
     flushPending: () => boolean;
-    focusAtDocumentEnd: () => boolean;
+    focusAtDocumentEnd: (suppressCaretNavigation?: boolean) => boolean;
     focusPreservingSelection: () => boolean;
     captureFormattingSelection: (focusTransitionFrom?: EventTarget | null) => boolean;
     clearFormattingSelection: () => void;
@@ -829,7 +829,7 @@
   let visualEditor: {
     captureTerminalSourceRange: () => TerminalSourceRange | null;
     flushPending: () => boolean;
-    focusAtDocumentEnd: () => boolean;
+    focusAtDocumentEnd: (suppressCaretNavigation?: boolean) => boolean;
     focusCurrentSelection: () => boolean;
     focusPreservingSelection: () => boolean;
     captureFormattingSelection: () => boolean;
@@ -5575,7 +5575,11 @@
     completionController = cancelCompletionSchedule(completionController);
   }
 
-  async function setSuggestionsEnabled(enabled: boolean, persist = true): Promise<void> {
+  async function setSuggestionsEnabled(
+    enabled: boolean,
+    persist = true,
+    afterPolicyUpdate: (() => void) | null = null
+  ): Promise<void> {
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
       !project ||
@@ -5638,6 +5642,8 @@
         project?.project_id !== boundProject.project_id ||
         project.session_id !== boundProject.session_id
       ) return;
+      afterPolicyUpdate?.();
+      await tick();
       if (!automationEnabled) {
         clearPreferredWriterRequest();
         scheduleActiveBranchPoll();
@@ -5691,20 +5697,20 @@
         : sourceSelectionStart === sourceSelectionEnd &&
           sourceSelectionEnd === sourceDisplayText.length
     };
-    await setSuggestionsEnabled(!suggestionsEnabled);
-    await tick();
-    if (
-      !restoreWritingSurface ||
-      project?.project_id !== captured.projectId ||
-      project?.session_id !== captured.sessionId ||
-      document?.summary.document_id !== captured.documentId ||
-      documentEpoch !== captured.documentEpoch ||
-      editVersion !== captured.editVersion ||
-      mode !== captured.mode
-    ) return;
-    const editor = mode === 'source' ? sourceEditor : visualEditor;
-    if (captured.caretAtEnd) editor?.focusAtDocumentEnd();
-    else editor?.focusCurrentSelection();
+    await setSuggestionsEnabled(!suggestionsEnabled, true, () => {
+      if (
+        !restoreWritingSurface ||
+        project?.project_id !== captured.projectId ||
+        project?.session_id !== captured.sessionId ||
+        document?.summary.document_id !== captured.documentId ||
+        documentEpoch !== captured.documentEpoch ||
+        editVersion !== captured.editVersion ||
+        mode !== captured.mode
+      ) return;
+      const editor = mode === 'source' ? sourceEditor : visualEditor;
+      if (captured.caretAtEnd) editor?.focusAtDocumentEnd(true);
+      else editor?.focusCurrentSelection();
+    });
   }
 
   async function setSuggestionInteraction(next: 'ghost' | 'loompad'): Promise<void> {
