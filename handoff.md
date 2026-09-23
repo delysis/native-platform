@@ -350,3 +350,8 @@ Raw evidence is in the directory above (`native-ax.stderr.log`, empty
 stdout/stderr). Diagnose the real AppKit/AccessKit tree publication boundary
 before claiming native AX or readiness. Do not synthesize a receipt or weaken
 the helper's bounded tree checks.
+
+Subsequent bounded retries tolerated role-less descendants and the specific
+`kAXErrorCannotComplete` children response, while continuing to reject other
+AX errors and enforce traversal limits. The exact journey still exited 1 at
+`accessibility-tree-unreadable`; this remains unresolved native evidence.

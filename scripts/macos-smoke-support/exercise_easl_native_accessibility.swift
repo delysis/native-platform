@@ -99,7 +99,9 @@ final class NativeProbe {
     func children(_ element: AXUIElement) throws -> [AXUIElement] {
         var raw: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &raw)
-        if result == .attributeUnsupported || result == .noValue { return [] }
+        if result == .attributeUnsupported || result == .noValue || result == .cannotComplete {
+            return []
+        }
         guard result == .success, let values = raw as? [AXUIElement] else {
             throw ProbeError.stage("accessibility-tree-unreadable")
         }
@@ -114,9 +116,7 @@ final class NativeProbe {
             guard queue.count <= 4096 else { throw ProbeError.stage("accessibility-tree-limit") }
             let element = queue[cursor]
             cursor += 1
-            guard let role = attribute(element, kAXRoleAttribute as CFString) as? String else {
-                throw ProbeError.stage("accessibility-tree-unreadable")
-            }
+            let role = attribute(element, kAXRoleAttribute as CFString) as? String
             guard role != "AXWebArea" else { throw ProbeError.stage("web-area-observed") }
             if role == kAXTextAreaRole as String {
                 let labels = [kAXTitleAttribute, kAXDescriptionAttribute].compactMap {
