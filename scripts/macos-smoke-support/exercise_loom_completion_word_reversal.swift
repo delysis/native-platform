@@ -60,6 +60,36 @@ func stringAttribute(_ element: AXUIElement, _ name: CFString) -> String {
     attribute(element, name) as? String ?? ""
 }
 
+func pointAttribute(_ element: AXUIElement, _ name: CFString) -> CGPoint? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cgPoint else { return nil }
+    var point = CGPoint.zero
+    return AXValueGetValue(value, .cgPoint, &point) ? point : nil
+}
+
+func sizeAttribute(_ element: AXUIElement, _ name: CFString) -> CGSize? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cgSize else { return nil }
+    var size = CGSize.zero
+    return AXValueGetValue(value, .cgSize, &size) ? size : nil
+}
+
+func clickCenter(_ element: AXUIElement) -> Bool {
+    guard let origin = pointAttribute(element, kAXPositionAttribute as CFString),
+          let size = sizeAttribute(element, kAXSizeAttribute as CFString),
+          size.width >= 100, size.height >= 40 else { return false }
+    let point = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
+    guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
+                             mouseCursorPosition: point, mouseButton: .left),
+          let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp,
+                           mouseCursorPosition: point, mouseButton: .left) else { return false }
+    down.postToPid(pid)
+    up.postToPid(pid)
+    return true
+}
+
 let stringAttributes = [
     kAXValueAttribute,
     kAXTitleAttribute,
@@ -369,6 +399,9 @@ func focusWritingSurface(timeout: TimeInterval) -> AXUIElement? {
                kAXFocusedAttribute as CFString,
                kCFBooleanTrue
             )
+            if (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) != true {
+                _ = clickCenter(writingSurface)
+            }
             if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
                (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true {
                 return writingSurface
