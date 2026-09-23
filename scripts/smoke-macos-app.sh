@@ -1234,7 +1234,7 @@ run_once() {
     # A closed declarative sentence invites a new paragraph or markup from a
     # base model, which the visual editor must correctly reject and therefore
     # cannot prove a four-choice inline presentation.
-    RUN_1_EDITOR_CORE_SENTINEL='Loom native smoke prose: The lantern crossed the quiet room and'
+    RUN_1_EDITOR_CORE_SENTINEL='Loom native smoke prose: The lantern crossed the quiet room, casting a narrow pool of light across the'
     RUN_1_EDITOR_INPUT_SENTINEL="$RUN_1_EDITOR_CORE_SENTINEL "
     RUN_1_EDITOR_SENTINEL=$RUN_1_EDITOR_INPUT_SENTINEL
     if ! RUN_1_EDITOR_EVIDENCE=$(type_into_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_INPUT_SENTINEL"); then
