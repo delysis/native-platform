@@ -74,10 +74,15 @@ impl Cursor {
     ) -> Option<Self> {
         let span_path = layout_access.span_paths_by_access_id.get(&pos.node)?;
         let run = span_path.run(layout)?;
-        let index = run
-            .get(span_path.logical_index() + pos.character_index)
-            .map(|cluster| cluster.text_range().start)
-            .unwrap_or(layout.data.text_len);
+        let index = if pos.character_index == 0 {
+            run.get(span_path.logical_index())
+                .map(|cluster| cluster.text_range().start)
+                .unwrap_or(layout.data.text_len)
+        } else {
+            run.get(span_path.logical_index() + pos.character_index - 1)
+                .map(|cluster| cluster.text_range().end)
+                .unwrap_or(layout.data.text_len)
+        };
         Some(Self::from_byte_index(layout, index, Affinity::Downstream))
     }
 

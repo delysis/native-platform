@@ -52,7 +52,6 @@ final class NativeProbe {
     let arguments: ProbeArguments
     let application: AXUIElement
     let running: NSRunningApplication
-    let launched: Date
     let executable: URL
     let expected = ["First text field", "Second text field"]
     private(set) var checks = 0
@@ -61,12 +60,10 @@ final class NativeProbe {
         self.arguments = arguments
         guard AXIsProcessTrusted() else { throw ProbeError.stage("accessibility-permission") }
         guard let running = NSRunningApplication(processIdentifier: arguments.pid),
-              !running.isTerminated, let executable = running.executableURL,
-              let launched = running.launchDate else {
+              !running.isTerminated, let executable = running.executableURL else {
             throw ProbeError.stage("exact-process")
         }
         self.running = running
-        self.launched = launched
         self.executable = executable.resolvingSymlinksInPath()
         self.application = AXUIElementCreateApplication(arguments.pid)
         let data = try Data(contentsOf: executable.resolvingSymlinksInPath(), options: [.mappedIfSafe])
@@ -80,7 +77,7 @@ final class NativeProbe {
     func owner() throws {
         guard !running.isTerminated,
               let current = NSRunningApplication(processIdentifier: arguments.pid),
-              !current.isTerminated, current.launchDate == launched,
+              !current.isTerminated,
               current.executableURL?.resolvingSymlinksInPath() == executable else {
             throw ProbeError.stage("exact-process-exited-or-replaced")
         }

@@ -310,27 +310,41 @@ contract tooling passed **44/44**. Pinned Rust 1.92.0 was available.
 
 - `easl-native-accessibility`: **14/14 unit tests passed**; its Clippy gate
   passed after the narrow `Debug::finish_non_exhaustive` repair.
-- `easl-tauri-probe` default/native-feature compilation reached the new AX
-  tests. Existing probe tests and most new accessibility tests passed, but the
-  full package test failed in two authored behavioral assertions:
-  `unicode_selection_uses_published_character_positions_not_utf8_offsets` and
-  `consecutive_absolute_selections_share_source_authority_but_publish_new_presentations`.
-  Both returned `Outcome::Changed` while the real editor selection remained
-  `(0, 0)`; no assertion was removed or weakened.
+- `easl-tauri-probe`: **16 unit, 17 accessibility, 6 managed lifecycle and 9
+  editor tests passed**. The two selection failures were repaired in the
+  vendored Parley AccessKit boundary by mapping a nonzero character position
+  to the preceding cluster's byte end; no assertion was removed or weakened.
 - Native-feature Clippy exposed a narrow `EventLoopProxy` needless
   pass-by-value defect; the candidate now passes the proxy by reference and
   borrows it at host construction. The affected native-feature Clippy rerun
   then passed.
+- `xtask macos-smoke-support`: **PASS**, 19 helpers compiled and 14 portable
+  helper assertions passed. `xtask policy`: **PASS**.
 - Formatting and `git diff --check`: **PASS** after the final correction.
-  `xtask macos-smoke-support`, `xtask policy`, hidden lifecycle and native AX
-  were not run for this candidate.
 
-### Follow-up blocker
+### Hidden native lifecycle
 
-The two selection failures are a major correctness blocker for native AX: the
-projection accepts valid AccessKit positions but does not move the existing
-editor selection. Diagnose the AccessKit node-to-editor selection mapping
-against the real EASL layout before any native AX claim or readiness decision.
-Do not replace the real editor with a fixture, change the expected selection
-assertions, or synthesize a receipt. The current packet remains an unqualified
-draft continuation with no native process evidence.
+The candidate binary was built after the selection repair and executed once
+with `--check-native-lifecycle`; exit status **0**. Receipt validator: schema
+valid and explicitly not a native-execution certificate.
+
+- Evidence: `/Users/george/.codex/evidence/easl-accessibility-next-53e7b7ba/`
+- Binary SHA-256:
+  `10ecbf7c6d5385b42a6afa00a7ae4c4f28c55c95f689d9def2034639a81cb4e8`.
+- Primary: **3/3** attachments/releases; peer: **2/2**; both destroyed
+  callbacks and Manager removals observed; both retained two exact
+  source/selection/undo checks.
+- `qualified`, visual, IME and accessibility fields remain false.
+
+### Native AX blocker
+
+The exact foreground probe launch was retained with PID and executable hash.
+The helper passed exact-process admission after a narrow correction removing
+the unavailable `NSRunningApplication.launchDate` requirement, but exited 1 at
+`accessibility-tree-unreadable`; no AX receipt was emitted. The exact child was
+then cleaned up by its own PID and exited 143 from that authorized cleanup.
+Raw evidence is in the directory above (`native-ax.stderr.log`, empty
+`native-ax.json`, `native-ax.exit-status`, `probe.exit-status`, and probe
+stdout/stderr). Diagnose the real AppKit/AccessKit tree publication boundary
+before claiming native AX or readiness. Do not synthesize a receipt or weaken
+the helper's bounded tree checks.
