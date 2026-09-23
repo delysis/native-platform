@@ -182,7 +182,7 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /exercise_loom_completion_word_reversal/);
   assert.match(smoke, /kAXValueAttribute as CFString/);
   assert.match(smoke, /kAXSelectedTextRangeAttribute as CFString/);
-  assert.match(smoke, /virtualKey: 49/);
+  assert.match(smoke, /guard postKey\(49\)/);
   assert.match(smoke, /"terminal_space_key_event": terminalSpace/);
   assert.match(smoke, /event\.postToPid\(pid\)/);
   assert.match(smoke, /native Accessibility input did not stabilize at the exact value and collapsed end caret/);
