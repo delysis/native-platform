@@ -208,6 +208,9 @@ final class NativeProbe {
     }
     func run() throws {
         // Caller must open a fresh ephemeral probe. Never replace existing writing.
+        guard AXUIElementSetAttributeValue(application, kAXFrontmostAttribute as CFString, kCFBooleanTrue) == .success else {
+            throw ProbeError.stage("foreground-request")
+        }
         var discovered: [AXUIElement]? = nil
         try wait("native-tree-activation") {
             do { discovered = try self.fields(); return true }

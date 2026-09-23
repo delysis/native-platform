@@ -340,9 +340,11 @@ valid and explicitly not a native-execution certificate.
 
 The exact foreground probe launch was retained with PID and executable hash.
 The helper passed exact-process admission after a narrow correction removing
-the unavailable `NSRunningApplication.launchDate` requirement, but exited 1 at
-`accessibility-tree-unreadable`; no AX receipt was emitted. The exact child was
-then cleaned up by its own PID and exited 143 from that authorized cleanup.
+the unavailable `NSRunningApplication.launchDate` requirement. A second run
+also requested AppKit frontmost status before tree discovery, but still exited
+1 at `accessibility-tree-unreadable`; no AX receipt was emitted. The exact
+children were then cleaned up by their own PIDs and exited 143 from that
+authorized cleanup.
 Raw evidence is in the directory above (`native-ax.stderr.log`, empty
 `native-ax.json`, `native-ax.exit-status`, `probe.exit-status`, and probe
 stdout/stderr). Diagnose the real AppKit/AccessKit tree publication boundary
