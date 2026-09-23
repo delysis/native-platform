@@ -350,3 +350,21 @@ close and process exit. Evidence is retained in
 `native-ax.json`, `native-ax.stderr.log`, `native-ax.exit-status`,
 `probe.exit-status`, and probe stdout/stderr. The receipt remains
 `qualified:false`; IME and VoiceOver remain unexercised.
+
+### Reusable and repository gates
+
+- Reusable consumer suite (`easl-native-text`, `easl-text`, `loom-markdown`,
+  `loom-text-session`): **PASS** under Rust 1.92.0, offline/locked,
+  `native-view`.
+- Loom review-only suite: **120 passed, 2 ignored, 0 failed**.
+- Loom review-only Clippy with `-D warnings`: **PASS**.
+- Repository policy/current-doc/workflow suite: **136/136 passed**; current-doc
+  validator reported 2 surfaces, 7 documents, 5 current paths and 2 retired
+  edges.
+- The ignored-test validator reached the intentional ordinary Loom app guard
+  and failed only because the current `App.svelte` hash is
+  `666747...2709a` while the committed guard expects `3d45...1725`. This hash
+  was not changed.
+
+These results do not promote the ordinary Loom app, change the strict CSS/App
+guard, qualify the native evidence, or change PR #73 from draft.
