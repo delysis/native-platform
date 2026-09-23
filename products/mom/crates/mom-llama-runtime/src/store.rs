@@ -1,3 +1,8 @@
+#[cfg(any(target_os = "macos", test))]
+mod installation_key;
+#[cfg(target_os = "macos")]
+use installation_key::load_or_create_macos_key;
+
 use anyhow::{Context, Result, anyhow};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
@@ -473,73 +478,6 @@ impl RuntimeStore {
         Ok(result)
     }
 
-    /// Mutate two encrypted documents under one immediate SQLite transaction.
-    ///
-    /// This is the narrow boundary for product facts that must become visible
-    /// together, while retaining a separate typed owner for each document.
-    #[cfg(test)]
-    pub(crate) fn mutate_pair<A, B, R>(
-        &self,
-        first_namespace: &str,
-        first_default: impl FnOnce() -> A,
-        second_namespace: &str,
-        second_default: impl FnOnce() -> B,
-        mutation: impl FnOnce(&mut A, &mut B) -> Result<R>,
-    ) -> Result<R>
-    where
-        A: Serialize + DeserializeOwned,
-        B: Serialize + DeserializeOwned,
-    {
-        if first_namespace == second_namespace {
-            anyhow::bail!("paired encrypted document namespaces must be distinct");
-        }
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let first_encrypted = transaction
-            .query_row(
-                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
-                [first_namespace],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()?;
-        let second_encrypted = transaction
-            .query_row(
-                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
-                [second_namespace],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()?;
-        let mut first = match first_encrypted {
-            Some((nonce, ciphertext)) => self.decrypt_json(first_namespace, &nonce, &ciphertext)?,
-            None => first_default(),
-        };
-        let mut second = match second_encrypted {
-            Some((nonce, ciphertext)) => {
-                self.decrypt_json(second_namespace, &nonce, &ciphertext)?
-            }
-            None => second_default(),
-        };
-        let result = mutation(&mut first, &mut second)?;
-        let (first_nonce, first_ciphertext) = self.encrypt_json(first_namespace, &first)?;
-        let (second_nonce, second_ciphertext) = self.encrypt_json(second_namespace, &second)?;
-        for (namespace, nonce, ciphertext) in [
-            (first_namespace, first_nonce, first_ciphertext),
-            (second_namespace, second_nonce, second_ciphertext),
-        ] {
-            transaction.execute(
-                "INSERT INTO encrypted_documents(namespace, nonce, ciphertext, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(namespace) DO UPDATE SET
-                   nonce = excluded.nonce,
-                   ciphertext = excluded.ciphertext,
-                   updated_at = excluded.updated_at",
-                params![namespace, nonce, ciphertext, timestamp_i64()],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(result)
-    }
-
     pub(crate) fn mutate_documents<T, R>(
         &self,
         namespace: &str,
@@ -908,24 +846,6 @@ pub(crate) fn prepare_secure_store_retry() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn load_or_create_macos_key(account: &str) -> Result<[u8; 32]> {
-    const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
-    match security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, account) {
-        Ok(key) => key
-            .try_into()
-            .map_err(|_| anyhow!("Keychain key is not 32 bytes")),
-        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => {
-            let mut key = [0_u8; 32];
-            getrandom::fill(&mut key)
-                .map_err(|error| anyhow!("store key generation failed: {error}"))?;
-            security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, account, &key)?;
-            Ok(key)
-        }
-        Err(error) => Err(error.into()),
-    }
-}
-
-#[cfg(target_os = "macos")]
 fn keychain_account(data_dir: &Path) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data_dir.to_string_lossy().as_bytes());
@@ -1216,18 +1136,22 @@ mod tests {
                 values: vec!["second-old".to_string()],
             },
         )?;
-        let failed: Result<()> = store.mutate_pair(
-            "first",
-            SecretDocument::default,
-            "second",
-            SecretDocument::default,
-            |first, second| {
+        let failed: Result<()> =
+            store.mutate_documents("first", SecretDocument::default, |first, documents| {
+                let mut second = documents
+                    .get::<SecretDocument>("second")?
+                    .ok_or_else(|| anyhow!("second document missing"))?;
                 first.values = vec!["first-rolled-back".to_string()];
                 second.values = vec!["second-rolled-back".to_string()];
+                documents.put_bytes("second", &serde_json::to_vec(&second)?)?;
                 Err(anyhow!("force paired rollback"))
-            },
+            });
+        assert_eq!(
+            failed
+                .expect_err("staged document changes must roll back")
+                .to_string(),
+            "force paired rollback"
         );
-        assert!(failed.is_err());
         assert_eq!(
             store.get::<SecretDocument>("first")?.expect("first"),
             SecretDocument {
@@ -1241,17 +1165,17 @@ mod tests {
             }
         );
 
-        store.mutate_pair(
-            "first",
-            SecretDocument::default,
-            "second",
-            SecretDocument::default,
-            |first, second| {
-                first.values = vec!["first-new".to_string()];
-                second.values = vec!["second-new".to_string()];
-                Ok(())
-            },
-        )?;
+        store.mutate_documents("first", SecretDocument::default, |first, documents| {
+            let mut second = documents
+                .get::<SecretDocument>("second")?
+                .ok_or_else(|| anyhow!("second document missing"))?;
+            first.values = vec!["first-new".to_string()];
+            second.values = vec!["second-new".to_string()];
+            documents.put_bytes("second", &serde_json::to_vec(&second)?)?;
+            Ok(())
+        })?;
+        drop(store);
+        let store = RuntimeStore::open_with_key(&data_dir, [31_u8; 32])?;
         assert_eq!(
             store.get::<SecretDocument>("first")?.expect("first"),
             SecretDocument {

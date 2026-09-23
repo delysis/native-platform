@@ -199,10 +199,21 @@ let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 var polls = 0, rejected: [String: Int] = [:], lastWitness: [String: Any] = [:]
 var postTerminal: [String: Any] = [:]
 var observedEditorLabels: [[String]] = []
+// Two bounded, read-only snapshots distinguish arrival with a zero caret from
+// a later change. These diagnostics never authorize a generation or a pass.
+var firstAdmissionObservation: [String: Any] = [:]
+var lastAdmissionObservation: [String: Any] = [:]
 
 func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
     var value: CFTypeRef?
     return AXUIElementCopyAttributeValue(element, name, &value) == .success ? value : nil
+}
+func diagnosticSelection(_ element: AXUIElement) -> CFRange? {
+    guard let raw = attribute(element, kAXSelectedTextRangeAttribute as CFString),
+          CFGetTypeID(raw) == AXValueGetTypeID(),
+          AXValueGetType(raw as! AXValue) == .cfRange else { return nil }
+    var selection = CFRange()
+    return AXValueGetValue(raw as! AXValue, .cfRange, &selection) ? selection : nil
 }
 func strings(_ element: AXUIElement) -> [String] {
     [kAXValueAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute]
@@ -287,6 +298,8 @@ func fail(_ reason: String) -> Never {
         "polls": polls, "generation_run_count": count() ?? -1, "family_run_ids": familyIds() ?? [],
         "open_run_ids": openIds() ?? [], "rejected_stages": rejected, "last_witness": lastWitness,
         "observed_editor_labels": observedEditorLabels,
+        "first_admission_observation": firstAdmissionObservation,
+        "last_admission_observation": lastAdmissionObservation,
         "post_terminal_observation": postTerminal, "observed_at_ms": Int64(Date().timeIntervalSince1970 * 1000)]
     do { try JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys]).write(to: URL(fileURLWithPath: failurePath), options: [.atomic]) }
     catch { fputs("cannot write failure evidence: \(error)\n", stderr) }
@@ -302,11 +315,9 @@ while ProcessInfo.processInfo.systemUptime < (terminalDeadline ?? initialDeadlin
     if runningApplication.isTerminated { fail("exact_process_exited") }
     guard let observedCount = count() else { reject("store_unreadable"); continue }
     if observedCount > baseline + 4 { fail("unexpected_generation_run") }
-    _ = runningApplication.activate(options: [.activateAllWindows])
-    _ = AXUIElementSetAttributeValue(application, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
     guard let elements = descendants() else { reject("accessibility_truncated"); continue }
-    // Focus is a presentation prerequisite, not evidence. Restore it before
-    // requiring a glyph; doing this only after a glyph exists can deadlock.
+    // Focus is a measured prerequisite. The smoke driver establishes it;
+    // this observer must not change focus/caret between witness and AX reads.
     let current = witness(in: elements)
     if let current { lastWitness = current }
     let identities: [(role: String, labels: [String])] = elements.map { element in
@@ -315,9 +326,35 @@ while ProcessInfo.processInfo.systemUptime < (terminalDeadline ?? initialDeadlin
     }
     observedEditorLabels = identities.filter { $0.role == "AXTextArea" }.prefix(16).map { $0.labels }
     let editorIndex = namedEditorIndex(identities)
-    if let editorIndex {
-        _ = AXUIElementSetAttributeValue(elements[editorIndex], kAXFocusedAttribute as CFString, kCFBooleanTrue)
-    }
+    let observedEditor = editorIndex.map { elements[$0] }
+    let observedSelection = observedEditor.flatMap { diagnosticSelection($0) }
+    let observedFocus = observedEditor.flatMap { attribute($0, kAXFocusedAttribute as CFString) as? Bool }
+    let observedValue = observedEditor.flatMap { attribute($0, kAXValueAttribute as CFString) as? String }
+    let internalSelection = current?["editor_selection"] as? [String: Any]
+    let preAdmission = current?["pre_admission"] as? [String: Any]
+    let lifecycle = preAdmission?["lifecycle"] as? [String: Any] ?? [:]
+    let observation: [String: Any] = [
+        "poll": polls, "generation_run_count": observedCount,
+        "frontmost": NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+        "editor_present": observedEditor != nil, "ax_focus_available": observedFocus != nil,
+        "ax_focused": observedFocus ?? false,
+        "ax_selection_available": observedSelection != nil,
+        "ax_caret_utf16": observedSelection?.location ?? -1,
+        "ax_selection_length_utf16": observedSelection?.length ?? -1,
+        "ax_value_available": observedValue != nil,
+        "ax_matches_manuscript": observedValue.map { editorValueMatches($0, manuscript: manuscript, glyph: "") } ?? false,
+        "expected_caret_utf16": manuscript.utf16.count, "expected_caret_byte": manuscript.utf8.count,
+        "witness_present": current != nil, "internal_selection_present": internalSelection != nil,
+        "internal_selection_available": bool(internalSelection ?? [:], "available"),
+        "internal_caret_byte": integer(internalSelection ?? [:], "caret_byte_offset"),
+        "pre_admission_present": preAdmission != nil,
+        "lifecycle_reason": String(string(lifecycle, "reason").prefix(80)),
+        "scheduled_present": preAdmission?["scheduled"] is String,
+        "scheduled_kind": String(string(preAdmission ?? [:], "scheduled").prefix(80)),
+        "scheduler_caret_byte": integer(preAdmission ?? [:], "caret_byte")
+    ]
+    if firstAdmissionObservation.isEmpty { firstAdmissionObservation = observation }
+    lastAdmissionObservation = observation
     // Observe before admission as well. Otherwise a zero-run timeout conceals
     // policy/lifecycle/scope and editor state behind an always-empty witness.
     // None of these diagnostic fields can satisfy the family/render gates.

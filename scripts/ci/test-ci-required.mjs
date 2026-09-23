@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import test from "node:test";
+import "./release-gate-cases.mjs";
+import "./passive-observer-cases.mjs";
 
 const aggregator = path.resolve(import.meta.dirname, "ci-required.mjs");
 
@@ -261,4 +263,40 @@ test("the gate completes while selected advisory jobs are absent or still runnin
     if (advisory) needs["root-linux"] = { result: advisory };
     assert.equal(run(plan, needs).status, 0, advisory);
   }
+});
+
+test("full plans cannot borrow a passing aggregate from an incomplete macOS matrix", () => {
+  const full = {
+    ...docsPlan,
+    risk: "dependency",
+    flags: { full: true },
+    presence: { mom: true, loom: true },
+    jobs: [
+      "policy", "root-linux", "native-linux", "gateway-linux", "attachment-linux",
+      "information-linux", "information-windows", "speech-linux", "frontend",
+      "platform-macos", "ignored-tests", "dependency-graph", "fuzz-build",
+      "mom-linux", "mom-windows", "loom-linux", "loom-windows",
+    ],
+    macos_matrix: ["release", "root", "mom", "attachment", "information", "speech", "loom"],
+  };
+  const needs = {
+    plan: { result: "success" }, policy: { result: "success" },
+    frontend: { result: "success" }, "platform-macos": { result: "success" },
+  };
+  assert.equal(run(full, needs).status, 0);
+  for (const missing of full.macos_matrix) {
+    const incomplete = { ...full, macos_matrix: full.macos_matrix.filter((entry) => entry !== missing) };
+    const result = run(incomplete, needs);
+    assert.notEqual(result.status, 0, `missing macOS ${missing} must not pass`);
+    assert.match(result.stderr, /full plan omitted.*macOS/);
+  }
+  const missingMatrix = { ...full };
+  delete missingMatrix.macos_matrix;
+  assert.notEqual(run(missingMatrix, needs).status, 0);
+  const withoutProducts = {
+    ...full,
+    presence: { mom: false, loom: false },
+    macos_matrix: full.macos_matrix.filter((entry) => entry !== "mom" && entry !== "loom"),
+  };
+  assert.equal(run(withoutProducts, needs).status, 0);
 });

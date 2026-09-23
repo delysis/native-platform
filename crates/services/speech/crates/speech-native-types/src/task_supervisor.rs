@@ -613,9 +613,21 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_completion_faults_without_manufacturing_join_evidence() {
-        let supervisor = TaskSupervisor::default();
-        let worker_id = supervisor.admit("manual").expect("admit manual task");
-        supervisor.finish(worker_id.clone(), Ok(()));
+        let supervisor = Arc::new(TaskSupervisor::default());
+        supervisor
+            .spawn("once", async { Ok(()) })
+            .expect("spawn a real supervised worker");
+        supervisor
+            .wait_for_idle()
+            .await
+            .expect("join first completion");
+        let completed = supervisor.snapshot().expect("first completion is valid");
+        assert_eq!(completed.active, 0);
+        assert_eq!(completed.completed_tasks, 1);
+        assert_eq!(completed.joined_worker_ids.len(), 1);
+        assert!(!supervisor.diagnostic_faulted());
+
+        let worker_id = completed.joined_worker_ids[0].clone();
         supervisor.finish(worker_id, Ok(()));
 
         assert_eq!(
