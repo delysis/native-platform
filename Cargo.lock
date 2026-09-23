@@ -2462,6 +2462,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "easl-native-accessibility"
+version = "0.0.0"
+dependencies = [
+ "accesskit",
+ "accesskit_macos",
+ "libc",
+ "raw-window-handle",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "easl-native-text"
 version = "0.0.0"
 dependencies = [
@@ -2479,8 +2490,10 @@ dependencies = [
 name = "easl-tauri-probe"
 version = "0.0.0"
 dependencies = [
+ "accesskit",
  "arboard",
  "easl",
+ "easl-native-accessibility",
  "easl-native-text",
  "easl-text",
  "serde_json",

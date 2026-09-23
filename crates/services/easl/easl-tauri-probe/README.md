@@ -38,9 +38,11 @@ focus/event-batch boundary emits a fixed diagnostic and latches keyboard input
 closed until the probe restarts. It ignores synthetic focus-replay key presses.
 Preedit/cancellation ownership is still missing; this is not qualified IME input.
 Tao does expose `set_ime_position`; the probe has not bound it to a complete
-composition/candidate-geometry contract. **OS accessibility attachment, IME/candidate rectangles, multiclick
-selection, timed drag autoscroll, caret blinking, touch, and mobile are not
-implemented here.** The underlying text library's facilities do not qualify a
+composition/candidate-geometry contract. macOS now has an AccessKit attachment
+over the real text buffers; native qualification is described in
+[accessibility](ACCESSIBILITY.md). **IME/candidate rectangles, non-macOS OS
+accessibility, multiclick selection, timed drag autoscroll, caret blinking, touch,
+and mobile are not implemented here.** The underlying text library's facilities do not qualify a
 missing OS binding. Do not enter valuable text: accepted destruction discards
 the ephemeral buffers.
 
@@ -106,7 +108,9 @@ executable hash and source/dirty-patch identity. Retain a native failure as a
 failure. A shutdown frame count is diagnostic, never a parity certificate.
 
 The next upstream-facing work is an actual per-window composition/candidate
-rectangle bridge and a safe platform accessibility adapter. Only then attempt the
-full two-field qualification, followed by a real Loom service-bound writing pane.
+rectangle bridge. Qualify the attached macOS accessibility path and preserve the
+managed lifecycle check before attempting the full two-field qualification and
+a real Loom service-bound writing pane. Component passes alone do not close either
+the OS-accessibility or IME boundary.
 The existing Loom App/CSS reference guard is neither changed nor bypassed by this
 separate experiment.

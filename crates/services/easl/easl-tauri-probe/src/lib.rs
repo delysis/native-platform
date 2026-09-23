@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Isolated two-field integration proof. No Loom documents, grants or services.
-//! This is not a qualified editor: the Tao host lacks composition and OS AX binding.
+//! Native accessibility shares these buffers; Tao composition is still unbound.
+pub mod accessibility;
 mod layout;
 #[cfg(feature = "native-probe")]
 pub mod native;
@@ -22,6 +23,8 @@ pub enum Error {
     NotFocused,
     #[error("Unknown text field")]
     Field,
+    #[error("Accessibility ownership or revision is invalid")]
+    Accessibility,
     #[error(transparent)]
     Text(#[from] easl_native_text::Error),
     #[error(transparent)]
@@ -67,6 +70,9 @@ pub struct TwoFields {
     active: usize,
     window_focused: bool,
     capture: Option<usize>,
+    identity: u64,
+    revision: u64,
+    presentation: u64,
 }
 impl std::fmt::Debug for TwoFields {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -79,6 +85,11 @@ impl std::fmt::Debug for TwoFields {
 }
 impl TwoFields {
     pub fn new() -> Result<Self, Error> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_VIEW: AtomicU64 = AtomicU64::new(1);
+        let identity = NEXT_VIEW
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| Error::Accessibility)?;
         let style = TextStyle {
             size: 18.,
             line_height: 26.,
@@ -98,7 +109,26 @@ impl TwoFields {
             active: 0,
             window_focused: false,
             capture: None,
+            identity,
+            revision: 0,
+            presentation: 0,
         })
+    }
+    /// Text, geometry and focus-owner changes revoke queued text-run authority.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    /// Caret/scroll updates repaint and republish without changing source authority.
+    pub fn presentation_revision(&self) -> u64 {
+        self.presentation
+    }
+    fn touch(&mut self) {
+        self.presentation = self.presentation.saturating_add(1);
+    }
+    fn invalidate(&mut self) {
+        // MAX is permanently unpublished, so exhaustion cannot recycle authority.
+        self.revision = self.revision.saturating_add(1);
+        self.touch();
     }
     pub fn text(&self, field: usize) -> Result<String, Error> {
         self.fields
@@ -133,6 +163,7 @@ impl TwoFields {
     }
     pub fn resize(&mut self, size: [f32; 2]) -> Result<(), Error> {
         let boxes = self.layout.boxes(size)?;
+        self.invalidate();
         for (field, rect) in self.fields.iter_mut().zip(boxes) {
             let content = rect.content();
             field.ensure_layout(&mut self.system, &self.style, content.0[2], content.0[3])?;
@@ -141,6 +172,9 @@ impl TwoFields {
         Ok(())
     }
     pub fn set_window_focus(&mut self, focused: bool) {
+        if self.window_focused != focused {
+            self.invalidate();
+        }
         self.window_focused = focused;
         if !focused {
             self.capture = None;
@@ -148,6 +182,7 @@ impl TwoFields {
     }
     pub fn cycle_focus(&mut self) {
         if self.window_focused {
+            self.invalidate();
             self.active = 1 - self.active;
             self.capture = None;
         }
@@ -162,18 +197,22 @@ impl TwoFields {
         let plan = self.policy.plan_for(field, &mut self.system, action)?;
         if let Some(range) = plan.replacement() {
             field.replace_range(&mut self.system, range, text, plan.selection())?;
+            self.invalidate();
         } else {
             field.select_range(&mut self.system, plan.selection())?;
+            self.touch();
         }
         Ok(())
     }
     pub fn move_caret(&mut self, movement: Movement, extend: bool) -> Result<(), Error> {
         self.require_focus()?;
         self.fields[self.active].command(&mut self.system, EditCommand::Move(movement, extend))?;
+        self.touch();
         Ok(())
     }
     pub fn undo(&mut self, redo: bool) -> Result<(), Error> {
         self.require_focus()?;
+        self.invalidate();
         self.fields[self.active].command(
             &mut self.system,
             if redo {
@@ -205,6 +244,11 @@ impl TwoFields {
                 extend,
             ),
         )?;
+        if self.active == index {
+            self.touch();
+        } else {
+            self.invalidate();
+        }
         self.active = index;
         self.capture = Some(index);
         Ok(true)
@@ -224,6 +268,7 @@ impl TwoFields {
                 point[1] - content.0[1] + field.scroll,
             ),
         )?;
+        self.touch();
         Ok(true)
     }
     pub fn pointer_up(&mut self) {
@@ -240,6 +285,7 @@ impl TwoFields {
         else {
             return Ok(false);
         };
+        self.touch();
         let field = &mut self.fields[index];
         field.scroll = (field.scroll + delta).max(0.);
         field.reveal_caret = false;

@@ -38,6 +38,7 @@ struct Hook;
 impl PluginBuilder<EventLoopMessage> for HookBuilder {
     type Plugin = Hook;
     fn build(self, context: Context<EventLoopMessage>) -> Hook {
+        let proxy = context.proxy.clone();
         let result = context.run_threaded(|main| {
             let main = main.ok_or("attachment-not-on-main-thread")?;
             // Labels resolve only during attachment. Later routing uses the exact
@@ -63,7 +64,7 @@ impl PluginBuilder<EventLoopMessage> for HookBuilder {
                     .collect::<NativeResult<Vec<_>>>()?
             };
             // No runtime window-store borrow survives native surface creation.
-            let host = Host::new(ids, self.windows, self.observations)?;
+            let host = Host::new(ids, self.windows, self.observations, &proxy)?;
             HOST.with(|cell| {
                 let mut slot = cell.try_borrow_mut().map_err(|_| "attachment-borrow")?;
                 if slot.is_some() {
@@ -97,9 +98,10 @@ impl Plugin<EventLoopMessage> for Hook {
                 return Ok(Vec::new());
             };
             if host.check_expired() {
-                host.suspend_all();
+                let requests = host.suspend_all();
                 *control_flow = ControlFlow::Exit;
-                return Err("lifecycle-check-timeout");
+                reject("lifecycle-check-timeout");
+                return Ok(requests);
             }
             let requests = host.event(event, &context.window_id_map)?;
             if let Some(deadline) = host.check_deadline() {
@@ -134,16 +136,32 @@ fn reject(stage: &'static str) {
     );
 }
 fn clear() {
-    HOST.with(|cell| {
+    let host = HOST.with(|cell| {
         if let Ok(mut value) = cell.try_borrow_mut() {
-            if let Some(mut host) = value.take() {
-                host.suspend_all();
-                drop(host);
-            }
+            value.take()
         } else {
             reject("cleanup-borrow");
+            None
         }
     });
+    if let Some(mut host) = host {
+        // Retire native AX children, then release the adapter outside HOST's borrow.
+        // Reentrant callbacks see no editor owner during final cleanup.
+        for request in host.suspend_all() {
+            #[cfg(target_os = "macos")]
+            if let host::Request::Notify(notifications) = request {
+                notifications.raise();
+            } else {
+                reject("unexpected-cleanup-request");
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = request;
+                reject("unexpected-cleanup-request");
+            }
+        }
+        drop(host);
+    }
 }
 
 fn setup(
@@ -258,9 +276,10 @@ pub fn build_info() -> serde_json::Value {
         "reviewed_api_versions":{"tauri":"2.11.5", "tauri_runtime":"2.11.3", "tauri_runtime_wry":"2.11.4", "tao":"0.35.3"},
         "implementation":"managed WindowBuilder + exact runtime-ID event hook + EASL layout/editing",
         "webviews_requested":0, "webview_dependencies_removed":false,
+        "accessibility":"macOS AccessKit attachment over the real native text buffers; unqualified",
         "data":"ephemeral buffers; no project storage or model",
         "lifecycle_check":"explicit --check-native-lifecycle; hidden native windows, not a component mock",
-        "missing":["native IME/preedit and candidate rectangle binding", "OS accessibility adapter", "Loom service integration", "native visual acceptance"],
+        "missing":["native IME/preedit and candidate rectangle binding", "macOS accessibility native qualification", "non-macOS accessibility adapter", "Loom service integration", "native visual acceptance"],
         "qualified":false
     })
 }

@@ -57,7 +57,7 @@ fn repeated_and_foreign_close_intentions_do_not_release_other_owners() {
     assert!(slot.suspend(&7, View::suspend));
     assert!(!slot.suspend(&7, |_| panic!("duplicate suspension")));
     assert_eq!(drops.get(), 1);
-    assert!(slot.close(&7));
+    assert!(slot.take(&7).is_some());
     assert!(!slot.resume(&7));
     assert!(slot.retained(&7).is_none());
     assert!(slot.take_redraw(&7).is_none());
@@ -69,7 +69,7 @@ fn accepted_destruction_is_terminal_even_after_a_pending_repaint() {
     let drops = Rc::new(Cell::new(0));
     let mut slot = fixture(&drops);
     assert!(slot.invalidate(&7));
-    assert!(slot.close(&7));
+    assert!(slot.take(&7).is_some());
     assert_eq!(drops.get(), 1);
     assert!(!slot.suspend(&7, |_| panic!("dead editor revived")));
     assert!(!slot.resume(&7));

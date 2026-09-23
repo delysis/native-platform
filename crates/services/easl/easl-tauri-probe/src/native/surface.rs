@@ -43,6 +43,14 @@ pub(super) struct Surface {
     // Drop native buffers before the dispatcher handle. Unlike Arc<TaoWindow>,
     // a Tauri Window is not a second strong owner of the native window object.
     target: Option<RenderTarget>,
+    // AccessKit retains its NSView independently of raster attachment. Preserve
+    // this binding through close/exit vetoes; release only at actual destruction.
+    #[cfg(target_os = "macos")]
+    access: easl_native_accessibility::Bridge,
+    #[cfg(target_os = "macos")]
+    retiring_access: Option<easl_native_accessibility::Notifications>,
+    #[cfg(target_os = "macos")]
+    accessibility: crate::accessibility::Accessibility,
     pub window: Window,
     view: TwoFields,
     raster: Option<RasterSurface>,
@@ -64,10 +72,32 @@ pub(super) enum Effect {
     Close,
 }
 impl Surface {
-    pub fn new(window: Window) -> Result<Self> {
+    pub fn new(
+        window: Window,
+        proxy: tauri_runtime_wry::tao::event_loop::EventLoopProxy<
+            tauri_runtime_wry::Message<tauri::EventLoopMessage>,
+        >,
+    ) -> Result<Self> {
+        #[cfg(target_os = "macos")]
+        let access = easl_native_accessibility::Bridge::attach(&window, move || {
+            // Always enqueue. run_on_main_thread may execute inline, which would
+            // not wake an idle event loop after an AX callback.
+            proxy
+                .send_event(tauri_runtime_wry::Message::Task(Box::new(|| {})))
+                .is_ok()
+        })
+        .map_err(|_| "accessibility-attach")?;
+        #[cfg(not(target_os = "macos"))]
+        let _ = proxy;
         let target = Some(RenderTarget::new(&window)?);
         let mut this = Self {
             target,
+            #[cfg(target_os = "macos")]
+            access,
+            #[cfg(target_os = "macos")]
+            retiring_access: None,
+            #[cfg(target_os = "macos")]
+            accessibility: crate::accessibility::Accessibility::default(),
             window,
             view: TwoFields::new().map_err(|_| "editor-init")?,
             raster: None,
@@ -95,6 +125,10 @@ impl Surface {
         self.target.is_some()
     }
     pub fn suspend(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            self.retiring_access = Some(self.access.suspend());
+        }
         self.finish_text_batch();
         if let Err(stage) = self.flush_pointer() {
             self.failed = true;
@@ -107,6 +141,10 @@ impl Surface {
             self.statistics.releases = self.statistics.releases.saturating_add(1);
         }
     }
+    #[cfg(target_os = "macos")]
+    pub fn take_retiring_access(&mut self) -> Option<easl_native_accessibility::Notifications> {
+        self.retiring_access.take()
+    }
     pub fn resume(&mut self) -> Result<()> {
         // The host positively checked this same dispatcher's liveness after
         // Tauri's close/exit callbacks. Never run this after actual destruction.
@@ -117,6 +155,8 @@ impl Surface {
             self.statistics.attachments = self.statistics.attachments.saturating_add(1);
         }
         self.geometry_dirty = true;
+        #[cfg(target_os = "macos")]
+        self.access.mailbox().set_accepting(true);
         Ok(())
     }
     fn scale(&self) -> Result<f64> {
@@ -138,6 +178,9 @@ impl Surface {
             return Err("display-scale");
         }
         let physical = self.window.inner_size().map_err(|_| "window-size")?;
+        // Also invalidate AX coordinates for scale-only changes and zero-size
+        // transitions even when logical line wrapping happens to be unchanged.
+        self.view.invalidate();
         let size = physical.to_logical::<f32>(scale);
         let next = [size.width, size.height];
         let drawable = size.width >= 64. && size.height >= 96.;
@@ -257,8 +300,74 @@ impl Surface {
 
     pub fn finish_text_batch(&mut self) {
         if let Err(stage) = self.text_events.barrier() {
+            self.failed = true;
             super::reject(stage);
         }
+    }
+    #[cfg(target_os = "macos")]
+    pub fn accessibility_actions(&mut self) -> Result<(bool, bool)> {
+        self.access
+            .mailbox()
+            .begin_batch()
+            .map_err(|_| "accessibility-callback")?;
+        if self.failed || self.target.is_none() || !self.resize()? {
+            self.access.mailbox().set_accepting(false);
+            return Ok((false, false));
+        }
+        self.access.mailbox().set_accepting(true);
+        let mut changed = false;
+        let mut focus = false;
+        for _ in 0..easl_native_accessibility::MAX_ACTIONS {
+            let Some(action) = self
+                .access
+                .mailbox()
+                .pop()
+                .map_err(|_| "accessibility-callback")?
+            else {
+                break;
+            };
+            match self
+                .accessibility
+                .apply(&mut self.view, action.revision, &action.request)
+                .map_err(|_| "accessibility-action")?
+            {
+                crate::accessibility::Outcome::Ignored => {}
+                crate::accessibility::Outcome::Changed => changed = true,
+                crate::accessibility::Outcome::FocusWindow => {
+                    changed = true;
+                    focus = true;
+                }
+            }
+        }
+        Ok((changed, focus))
+    }
+    #[cfg(target_os = "macos")]
+    pub fn accessibility_update(
+        &mut self,
+    ) -> Result<Option<easl_native_accessibility::Notifications>> {
+        if self.failed
+            || self.viewport.is_none()
+            || self.target.is_none()
+            || !self
+                .access
+                .mailbox()
+                .needs_update(self.view.presentation_revision())
+        {
+            return Ok(None);
+        }
+        let snapshot = self
+            .accessibility
+            .snapshot(&mut self.view, self.scale)
+            .map_err(|_| "accessibility-tree")?;
+        self.access
+            .publish(
+                snapshot.generation,
+                snapshot.revision,
+                snapshot.update,
+                self.view.focused(),
+            )
+            .map(Some)
+            .map_err(|_| "accessibility-publication")
     }
     fn key(&mut self, event: &KeyEvent) -> Result<Effect> {
         self.flush_pointer()?;

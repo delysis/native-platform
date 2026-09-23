@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/services/easl/easl-native-accessibility",
     "crates/services/easl/easl-native-text",
     "crates/services/easl/easl-tauri-probe",
     "crates/services/easl/easl-text",

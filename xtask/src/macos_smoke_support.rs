@@ -36,6 +36,16 @@ pub fn run(root: &Path, arguments: &[String]) -> Result<()> {
             "Swift compilation failed: {}",
             source.display()
         );
+        if name == "exercise_easl_native_accessibility" {
+            let status = Command::new(&executable)
+                .arg("--self-test")
+                .status()
+                .context("check native EASL AX helper argument/byte contract")?;
+            ensure!(
+                status.success(),
+                "native EASL AX helper component checks failed"
+            );
+        }
     }
     println!("compiled {} macOS smoke helpers", sources.len());
     Ok(())

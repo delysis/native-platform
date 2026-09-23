@@ -86,14 +86,15 @@ impl<Id: Eq, T> SurfaceSlot<Id, T> {
         self.redraw_pending = false;
         self.value.as_mut()
     }
-    /// Terminal destruction, not a cancellable close request.
-    pub fn close(&mut self, id: &Id) -> bool {
+    /// Terminal destruction, not a cancellable close request. Return the owner
+    /// so destructors that may invoke native callbacks run outside the host borrow.
+    pub fn take(&mut self, id: &Id) -> Option<T> {
         if id != &self.id {
-            return false;
+            return None;
         }
         self.redraw_pending = false;
         self.suspended = false;
-        self.value.take().is_some()
+        self.value.take()
     }
 }
 
@@ -112,18 +113,54 @@ mod tests {
     fn closing_releases_real_resources_once_and_rejects_late_events() {
         let drops = Rc::new(Cell::new(0));
         let mut slot = SurfaceSlot::new(7, Resource(drops.clone()));
-        assert!(!slot.close(&8));
+        assert!(slot.take(&8).is_none());
         assert!(slot.get_mut(&8).is_none());
         assert_eq!(drops.get(), 0);
-        assert!(slot.close(&7));
+        assert!(slot.take(&7).is_some());
         assert_eq!(drops.get(), 1);
-        assert!(!slot.close(&7));
+        assert!(slot.take(&7).is_none());
         assert!(slot.get_mut(&7).is_none());
         assert!(slot.redraw(&7).is_none());
         assert!(!slot.invalidate(&7));
         drop(slot);
         assert_eq!(drops.get(), 1);
     }
+    #[test]
+    fn terminal_take_defers_destructor_callbacks_until_after_the_host_borrow() {
+        use std::cell::RefCell;
+        struct CallbackResource {
+            host: Rc<RefCell<()>>,
+            drops: Rc<Cell<u32>>,
+        }
+        impl Drop for CallbackResource {
+            fn drop(&mut self) {
+                assert!(self.host.try_borrow_mut().is_ok());
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+        let host = Rc::new(RefCell::new(()));
+        let drops = Rc::new(Cell::new(0));
+        let mut slot = SurfaceSlot::new(
+            7,
+            CallbackResource {
+                host: host.clone(),
+                drops: drops.clone(),
+            },
+        );
+        let borrowed = host.borrow_mut();
+        assert!(slot.take(&8).is_none());
+        let resource = slot.take(&7).unwrap();
+        assert_eq!(drops.get(), 0);
+        assert!(slot.get_mut(&7).is_none());
+        assert!(slot.take(&7).is_none());
+        assert!(!slot.resume(&7));
+        assert!(!slot.invalidate(&7));
+        drop(slot);
+        drop(borrowed);
+        drop(resource);
+        assert_eq!(drops.get(), 1);
+    }
+
     #[test]
     fn repeated_invalidations_request_one_redraw_but_exposure_still_paints() {
         let mut slot = SurfaceSlot::new(7, 0);

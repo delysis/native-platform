@@ -15,6 +15,11 @@ use tauri_runtime_wry::{
 pub(super) enum Request {
     Close(Box<tauri::Window>),
     Exit,
+    Release(Box<Surface>),
+    #[cfg(target_os = "macos")]
+    Focus(Box<tauri::Window>),
+    #[cfg(target_os = "macos")]
+    Notify(easl_native_accessibility::Notifications),
 }
 impl Request {
     pub fn send(
@@ -23,6 +28,19 @@ impl Request {
     ) -> NativeResult<()> {
         match self {
             Self::Close(window) => window.close().map_err(|_| "managed-close-request"),
+            Self::Release(surface) => {
+                drop(surface);
+                Ok(())
+            }
+            #[cfg(target_os = "macos")]
+            Self::Focus(window) => window
+                .set_focus()
+                .map_err(|_| "accessibility-focus-request"),
+            #[cfg(target_os = "macos")]
+            Self::Notify(notifications) => {
+                notifications.raise();
+                Ok(())
+            }
             Self::Exit => proxy
                 .send_event(Message::RequestExit(lifecycle::EXIT_CHECK_CODE))
                 .map_err(|_| "managed-exit-request"),
@@ -40,6 +58,7 @@ impl Host {
         ids: Vec<WindowId>,
         windows: Vec<tauri::Window>,
         observations: Option<Arc<lifecycle::Observations>>,
+        proxy: &tauri_runtime_wry::tao::event_loop::EventLoopProxy<Message<EventLoopMessage>>,
     ) -> NativeResult<Self> {
         if ids.len() != windows.len()
             || ids.is_empty()
@@ -51,7 +70,7 @@ impl Host {
         let app = windows[0].app_handle().clone();
         let mut slots = Vec::with_capacity(ids.len());
         for (index, (id, window)) in ids.into_iter().zip(windows).enumerate() {
-            let mut surface = Surface::new(window)?;
+            let mut surface = Surface::new(window, proxy.clone())?;
             if observations.is_some() {
                 surface.seed_lifecycle_fixture(index)?;
             }
@@ -67,18 +86,13 @@ impl Host {
     fn slot(&mut self, id: WindowId) -> Option<&mut Slot> {
         self.slots.iter_mut().find(|slot| *slot.owner() == id)
     }
-    fn suspend(&mut self, id: WindowId) {
-        if let Some(slot) = self.slot(id) {
-            slot.suspend(&id, Surface::suspend);
-        }
+    fn suspend(&mut self, id: WindowId) -> Vec<Request> {
+        self.slot(id).and_then(suspend_slot).into_iter().collect()
     }
-    pub fn suspend_all(&mut self) {
-        for slot in &mut self.slots {
-            let id = *slot.owner();
-            slot.suspend(&id, Surface::suspend);
-        }
+    pub fn suspend_all(&mut self) -> Vec<Request> {
+        self.slots.iter_mut().filter_map(suspend_slot).collect()
     }
-    fn destroyed(&mut self, id: WindowId) {
+    fn destroyed(&mut self, id: WindowId) -> Vec<Request> {
         let statistics = self
             .slot(id)
             .and_then(|slot| slot.retained(&id))
@@ -94,9 +108,11 @@ impl Host {
         {
             check.destroyed(id, statistics);
         }
-        if let Some(slot) = self.slot(id) {
-            slot.close(&id);
-        }
+        self.slot(id)
+            .and_then(|slot| slot.take(&id))
+            .map(|surface| Request::Release(Box::new(surface)))
+            .into_iter()
+            .collect()
     }
     pub fn check_deadline(&self) -> Option<Instant> {
         self.check.as_ref().map(lifecycle::Check::deadline)
@@ -124,8 +140,8 @@ impl Host {
                     return Ok(Vec::new());
                 };
                 match event {
-                    WindowEvent::CloseRequested => self.suspend(id),
-                    WindowEvent::Destroyed => self.destroyed(id),
+                    WindowEvent::CloseRequested => return Ok(self.suspend(id)),
+                    WindowEvent::Destroyed => return Ok(self.destroyed(id)),
                     _ => return self.window_event(id, event),
                 }
             }
@@ -133,9 +149,11 @@ impl Host {
                 id,
                 WindowMessage::Close | WindowMessage::Destroy,
             )) => {
-                self.suspend(*id);
+                return Ok(self.suspend(*id));
             }
-            Event::UserEvent(Message::RequestExit(_)) | Event::LoopDestroyed => self.suspend_all(),
+            Event::UserEvent(Message::RequestExit(_)) | Event::LoopDestroyed => {
+                return Ok(self.suspend_all());
+            }
             Event::RedrawRequested(tao_id) => {
                 if let Some(id) = ids.get(tao_id)
                     && let Some(surface) = self.slot(id).and_then(|slot| slot.redraw(&id))
@@ -169,6 +187,7 @@ impl Host {
         Ok(Vec::new())
     }
     fn finish_batch(&mut self) -> NativeResult<Vec<Request>> {
+        let mut requests = Vec::new();
         for slot in &mut self.slots {
             let id = *slot.owner();
             if slot.is_suspended() {
@@ -187,18 +206,53 @@ impl Host {
             }
             if let Some(surface) = slot.get_mut(&id) {
                 surface.finish_text_batch();
+                #[cfg(target_os = "macos")]
+                {
+                    let (changed, focus) = surface.accessibility_actions()?;
+                    if focus {
+                        requests.push(Request::Focus(Box::new(surface.window.clone())));
+                    }
+                    if changed {
+                        slot.invalidate(&id);
+                    }
+                }
             }
             // Public Tauri Window has no request_redraw. Flush one dirty frame
             // after the event batch; real OS exposures use the separate path above.
             if let Some(surface) = slot.take_redraw(&id) {
                 paint(surface)?;
             }
+            #[cfg(target_os = "macos")]
+            if let Some(surface) = slot.get_mut(&id)
+                && let Some(notifications) = surface.accessibility_update()?
+            {
+                requests.push(Request::Notify(notifications));
+            }
         }
         if let Some(check) = &mut self.check {
-            check.advance(&mut self.slots)
-        } else {
-            Ok(Vec::new())
+            requests.extend(check.advance(&mut self.slots)?);
         }
+        Ok(requests)
+    }
+}
+fn suspend_slot(slot: &mut Slot) -> Option<Request> {
+    let id = *slot.owner();
+    #[cfg(target_os = "macos")]
+    let mut notification = None;
+    slot.suspend(&id, |surface| {
+        surface.suspend();
+        #[cfg(target_os = "macos")]
+        {
+            notification = surface.take_retiring_access().map(Request::Notify);
+        }
+    });
+    #[cfg(target_os = "macos")]
+    {
+        notification
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 fn paint(surface: &mut Surface) -> NativeResult<()> {

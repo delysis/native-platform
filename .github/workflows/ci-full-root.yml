@@ -52,6 +52,8 @@ jobs:
       - name: Component-test EASL native Tauri integration without launching
         if: runner.os == 'macOS'
         run: |
+          cargo test --locked -p easl-native-accessibility
+          cargo clippy --locked -p easl-native-accessibility --all-targets -- -D warnings
           cargo test --locked -p easl-tauri-probe --all-targets --features native-probe
           cargo clippy --locked -p easl-tauri-probe --all-targets --features native-probe -- -D warnings
       - run: cargo test --locked --workspace --all-targets --no-fail-fast

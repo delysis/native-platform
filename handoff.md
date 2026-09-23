@@ -299,3 +299,38 @@ and reusable-consumer suites, affected dependency consumers, and the expected
 ordinary Loom native-app App.svelte guard failure were not replayed in this
 continuation. The historical receipts above remain historical. PR #73 remains
 draft and no promotion or product-acceptance claim is made.
+
+## Accessibility continuation receipt for packet `easl-accessibility-next-53e7b7ba`
+
+Applied in a clean temporary branch/worktree at exact base
+`53e7b7ba08c43286f85d6b0c780f333c6ce8469d`. Packet preparation and Swift
+contract tooling passed **44/44**. Pinned Rust 1.92.0 was available.
+
+### Executed component results
+
+- `easl-native-accessibility`: **14/14 unit tests passed**; its Clippy gate
+  passed after the narrow `Debug::finish_non_exhaustive` repair.
+- `easl-tauri-probe` default/native-feature compilation reached the new AX
+  tests. Existing probe tests and most new accessibility tests passed, but the
+  full package test failed in two authored behavioral assertions:
+  `unicode_selection_uses_published_character_positions_not_utf8_offsets` and
+  `consecutive_absolute_selections_share_source_authority_but_publish_new_presentations`.
+  Both returned `Outcome::Changed` while the real editor selection remained
+  `(0, 0)`; no assertion was removed or weakened.
+- Native-feature Clippy exposed a narrow `EventLoopProxy` needless
+  pass-by-value defect; the candidate now passes the proxy by reference and
+  borrows it at host construction. The final affected clippy rerun was
+  interrupted by the preceding compile correction and must be rerun.
+- Formatting and `git diff --check` were not yet re-established after the last
+  correction. `xtask macos-smoke-support`, `xtask policy`, hidden lifecycle and
+  native AX were not run for this candidate.
+
+### Follow-up blocker
+
+The two selection failures are a major correctness blocker for native AX: the
+projection accepts valid AccessKit positions but does not move the existing
+editor selection. Diagnose the AccessKit node-to-editor selection mapping
+against the real EASL layout before any native AX claim or readiness decision.
+Do not replace the real editor with a fixture, change the expected selection
+assertions, or synthesize a receipt. The current packet remains an unqualified
+draft continuation with no native process evidence.

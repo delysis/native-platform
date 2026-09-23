@@ -84,7 +84,9 @@
       "xtask"
     ],
     "service-easl": [
+      "easl-native-accessibility",
       "easl-native-text",
+      "easl-tauri-probe",
       "easl-text"
     ]
   },
@@ -141,7 +143,9 @@
       "loom-app",
       "loom-backend-llama",
       "mom-llama-app",
+      "easl-native-accessibility",
       "easl-native-text",
+      "easl-tauri-probe",
       "easl-text",
       "loom-easl-interface"
     ],
@@ -155,7 +159,9 @@
       "mom-llama-app",
       "speech-native-backend-parakeet",
       "speech-native-platform",
+      "easl-native-accessibility",
       "easl-native-text",
+      "easl-tauri-probe",
       "easl-text",
       "loom-easl-interface"
     ],
@@ -166,7 +172,9 @@
       "loom-app",
       "loom-backend-llama",
       "mom-llama-app",
+      "easl-native-accessibility",
       "easl-native-text",
+      "easl-tauri-probe",
       "easl-text",
       "loom-easl-interface"
     ],

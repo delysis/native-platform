@@ -9,9 +9,11 @@ publish = false
 [features]
 default = []
 # No window, clipboard, or application runtime in the default component suite.
-native-probe = ["dep:tauri", "dep:tauri-runtime-wry", "dep:tauri-runtime", "dep:softbuffer", "dep:arboard"]
+native-probe = ["dep:tauri", "dep:tauri-runtime-wry", "dep:tauri-runtime", "dep:softbuffer", "dep:arboard", "dep:easl-native-accessibility"]
 
 [dependencies]
+accesskit = "=0.24.1"
+easl-native-accessibility = { path = "../easl-native-accessibility", optional = true }
 easl = { path = "../vendor/easl" }
 easl-text = { path = "../easl-text" }
 easl-native-text = { path = "../easl-native-text" }
