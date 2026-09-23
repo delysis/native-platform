@@ -1044,12 +1044,12 @@
     if (view) setGhostFanPinned(view, completionLens.pinned);
   }
 
-  function editorHasExactFocus(): boolean {
+  export function hasExactFocus(): boolean {
     return Boolean(view && !view.isDestroyed && view.hasFocus());
   }
 
   function handleWindowKeyDown(event: KeyboardEvent): void {
-    if (!editorHasExactFocus()) {
+    if (!hasExactFocus()) {
       setOptionHeld(false);
       return;
     }
@@ -1063,7 +1063,7 @@
   }
 
   function handleWindowKeyUp(event: KeyboardEvent): void {
-    if (!editorHasExactFocus() || event.key === 'Alt' || !event.altKey) setOptionHeld(false);
+    if (!hasExactFocus() || event.key === 'Alt' || !event.altKey) setOptionHeld(false);
   }
 
   function releaseOptionState(): void {

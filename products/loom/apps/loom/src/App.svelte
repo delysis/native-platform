@@ -830,6 +830,7 @@
     captureTerminalSourceRange: () => TerminalSourceRange | null;
     flushPending: () => boolean;
     caretAtDocumentEnd: () => boolean;
+    hasExactFocus: () => boolean;
     focusAtDocumentEnd: (suppressCaretNavigation?: boolean) => boolean;
     focusCurrentSelection: () => boolean;
     focusPreservingSelection: () => boolean;
@@ -5687,7 +5688,7 @@
     const active = window.document.activeElement;
     const restoreWritingSurface = [active, shortcutTarget].some(
       (target) => target instanceof Element && Boolean(target.closest('.editor-stage'))
-    );
+    ) || (mode === 'visual' && (visualEditor?.hasExactFocus() ?? false));
     const captured = {
       projectId: project?.project_id ?? null,
       sessionId: project?.session_id ?? null,

@@ -232,7 +232,7 @@ it.each([
       // Cold startup/model discovery may rescue a lost schedule. Toggle with the
       // SAME already-loaded writer, no edit or model load to rescue this path.
       const editor = page.getByRole('textbox', { name: 'Untitled, manuscript editor', exact: true }).element();
-      const toggle = () => editor.dispatchEvent(new KeyboardEvent('keydown', {
+      const toggle = (target: EventTarget = editor) => target.dispatchEvent(new KeyboardEvent('keydown', {
         key: 'G', code: 'KeyG', metaKey: true, shiftKey: true, bubbles: true, cancelable: true
       }));
       toggle();
@@ -244,7 +244,7 @@ it.each([
       expectedAdmissions = 2;
       admission = null; populated = 0; terminal = false;
       deferSuggestionPolicy = true;
-      toggle();
+      toggle(window);
       await expect.poll(() => releaseSuggestionPolicy).not.toBeNull();
       const text = editor.querySelector('p')?.firstChild;
       expect(text).not.toBeNull();
