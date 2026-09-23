@@ -363,15 +363,16 @@ func focusWritingSurface(timeout: TimeInterval) -> AXUIElement? {
             kAXFrontmostAttribute as CFString,
             kCFBooleanTrue
         )
-        if let writingSurface = editor(),
-           AXUIElementSetAttributeValue(
+        if let writingSurface = editor() {
+            _ = AXUIElementSetAttributeValue(
                writingSurface,
                kAXFocusedAttribute as CFString,
                kCFBooleanTrue
-           ) == .success,
-           NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
-           (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true {
-            return writingSurface
+            )
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+               (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true {
+                return writingSurface
+            }
         }
         Thread.sleep(forTimeInterval: 0.05)
     } while ProcessInfo.processInfo.systemUptime < deadline
@@ -636,11 +637,7 @@ guard let shuttleDisabled = waitForWitness(timeout: 10, { witness in
     exit(1)
 }
 
-guard AXUIElementSetAttributeValue(
-        writingSurface,
-        kAXFocusedAttribute as CFString,
-        kCFBooleanTrue
-      ) == .success,
+guard focusWritingSurface(timeout: 5) != nil,
       postKey(58, down: true, flags: [.maskAlternate]),
       postKey(123, down: true, flags: [.maskAlternate]),
       postKey(123, down: false, flags: [.maskAlternate]) else {
