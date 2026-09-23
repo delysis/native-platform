@@ -829,6 +829,7 @@
   let visualEditor: {
     captureTerminalSourceRange: () => TerminalSourceRange | null;
     flushPending: () => boolean;
+    caretAtDocumentEnd: () => boolean;
     focusAtDocumentEnd: (suppressCaretNavigation?: boolean) => boolean;
     focusCurrentSelection: () => boolean;
     focusPreservingSelection: () => boolean;
@@ -5682,9 +5683,11 @@
     }
   }
 
-  async function toggleSuggestionsFromShortcut(): Promise<void> {
+  async function toggleSuggestionsFromShortcut(shortcutTarget: EventTarget | null): Promise<void> {
     const active = window.document.activeElement;
-    const restoreWritingSurface = active instanceof Element && Boolean(active.closest('.editor-stage'));
+    const restoreWritingSurface = [active, shortcutTarget].some(
+      (target) => target instanceof Element && Boolean(target.closest('.editor-stage'))
+    );
     const captured = {
       projectId: project?.project_id ?? null,
       sessionId: project?.session_id ?? null,
@@ -5693,7 +5696,7 @@
       editVersion,
       mode,
       caretAtEnd: mode === 'visual'
-        ? visualSelectionAccessibility.caretAtEnd
+        ? visualEditor?.caretAtDocumentEnd() ?? visualSelectionAccessibility.caretAtEnd
         : sourceSelectionStart === sourceSelectionEnd &&
           sourceSelectionEnd === sourceDisplayText.length
     };
@@ -8307,7 +8310,7 @@
     if (modifier && event.shiftKey && !event.altKey && !event.isComposing) {
       const key = event.key.toLowerCase();
       if (key === 'c' && document) { event.preventDefault(); if (materialsOpen) closeMaterial(); else openMaterialConnections(); return; }
-      if (key === 'g') { event.preventDefault(); void toggleSuggestionsFromShortcut(); return; }
+      if (key === 'g') { event.preventDefault(); void toggleSuggestionsFromShortcut(event.target); return; }
       if (key === 'p') { event.preventDefault(); openModelManager(window.document.activeElement as HTMLElement); return; }
       if (key === 'u') { event.preventDefault(); void readAloud(); return; }
       if (event.code === 'Comma') { event.preventDefault(); void refreshWorkspaceTemplate(true); return; }

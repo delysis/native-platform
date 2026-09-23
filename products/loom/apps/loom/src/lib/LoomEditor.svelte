@@ -449,6 +449,10 @@
     return true;
   }
 
+  export function caretAtDocumentEnd(): boolean {
+    return Boolean(view && !view.isDestroyed && view.state.selection.eq(Selection.atEnd(view.state.doc)));
+  }
+
   export function focusAtDocumentEnd(suppressCaretNavigation = false): boolean {
     if (!view || readonly) return false;
     const end = Selection.atEnd(view.state.doc);
