@@ -77,6 +77,7 @@ func sizeAttribute(_ element: AXUIElement, _ name: CFString) -> CGSize? {
 }
 
 func clickCenter(_ element: AXUIElement) -> Bool {
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return false }
     guard let origin = pointAttribute(element, kAXPositionAttribute as CFString),
           let size = sizeAttribute(element, kAXSizeAttribute as CFString),
           size.width >= 100, size.height >= 40 else { return false }
@@ -85,8 +86,9 @@ func clickCenter(_ element: AXUIElement) -> Bool {
                              mouseCursorPosition: point, mouseButton: .left),
           let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp,
                            mouseCursorPosition: point, mouseButton: .left) else { return false }
-    down.postToPid(pid)
-    up.postToPid(pid)
+    down.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.03)
+    up.post(tap: .cghidEventTap)
     return true
 }
 
@@ -394,6 +396,11 @@ func focusWritingSurface(timeout: TimeInterval) -> AXUIElement? {
             kCFBooleanTrue
         )
         if let writingSurface = editor() {
+            _ = AXUIElementSetAttributeValue(
+                application,
+                kAXFocusedUIElementAttribute as CFString,
+                writingSurface
+            )
             _ = AXUIElementSetAttributeValue(
                writingSurface,
                kAXFocusedAttribute as CFString,
