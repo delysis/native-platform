@@ -5676,6 +5676,37 @@
     }
   }
 
+  async function toggleSuggestionsFromShortcut(): Promise<void> {
+    const active = window.document.activeElement;
+    const restoreWritingSurface = active instanceof Element && Boolean(active.closest('.editor-stage'));
+    const captured = {
+      projectId: project?.project_id ?? null,
+      sessionId: project?.session_id ?? null,
+      documentId: document?.summary.document_id ?? null,
+      documentEpoch,
+      editVersion,
+      mode,
+      caretAtEnd: mode === 'visual'
+        ? visualSelectionAccessibility.caretAtEnd
+        : sourceSelectionStart === sourceSelectionEnd &&
+          sourceSelectionEnd === sourceDisplayText.length
+    };
+    await setSuggestionsEnabled(!suggestionsEnabled);
+    await tick();
+    if (
+      !restoreWritingSurface ||
+      project?.project_id !== captured.projectId ||
+      project?.session_id !== captured.sessionId ||
+      document?.summary.document_id !== captured.documentId ||
+      documentEpoch !== captured.documentEpoch ||
+      editVersion !== captured.editVersion ||
+      mode !== captured.mode
+    ) return;
+    const editor = mode === 'source' ? sourceEditor : visualEditor;
+    if (captured.caretAtEnd) editor?.focusAtDocumentEnd();
+    else editor?.focusCurrentSelection();
+  }
+
   async function setSuggestionInteraction(next: 'ghost' | 'loompad'): Promise<void> {
     if (suggestionsChanging) return;
     const enabled = suggestionInteraction !== next || !suggestionsEnabled;
@@ -8270,7 +8301,7 @@
     if (modifier && event.shiftKey && !event.altKey && !event.isComposing) {
       const key = event.key.toLowerCase();
       if (key === 'c' && document) { event.preventDefault(); if (materialsOpen) closeMaterial(); else openMaterialConnections(); return; }
-      if (key === 'g') { event.preventDefault(); void setSuggestionsEnabled(!suggestionsEnabled); return; }
+      if (key === 'g') { event.preventDefault(); void toggleSuggestionsFromShortcut(); return; }
       if (key === 'p') { event.preventDefault(); openModelManager(window.document.activeElement as HTMLElement); return; }
       if (key === 'u') { event.preventDefault(); void readAloud(); return; }
       if (event.code === 'Comma') { event.preventDefault(); void refreshWorkspaceTemplate(true); return; }

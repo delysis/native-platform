@@ -78,6 +78,8 @@ it.each([
   let admission: WeaveStarted | null = null;
   let populated = 0, terminal = false, admissions = 0, snapshotReads = 0, bodyReads = 0;
   let expectedAdmissions = 1;
+  let deferSuggestionPolicy = false;
+  let releaseSuggestionPolicy: (() => void) | null = null;
   let releaseBodies!: () => void;
   const bodiesReady = new Promise<void>(resolve => { releaseBodies = resolve; });
   const unexpected: string[] = [];
@@ -121,6 +123,12 @@ it.each([
       case 'plugin:loom|material_list':
       case 'plugin:loom|co_writer_list': return [];
       case 'plugin:loom|suggestions_set':
+        if (deferSuggestionPolicy) {
+          deferSuggestionPolicy = false;
+          await new Promise<void>(resolve => { releaseSuggestionPolicy = resolve; });
+          releaseSuggestionPolicy = null;
+        }
+        return;
       case 'plugin:loom|focus_mode_set': return;
       case 'plugin:loom|completion_snapshot': return snapshot();
       case 'plugin:loom|weave_status':
@@ -235,9 +243,23 @@ it.each([
       const disabledWitness = completionWitness();
       expectedAdmissions = 2;
       admission = null; populated = 0; terminal = false;
+      deferSuggestionPolicy = true;
       toggle();
+      await expect.poll(() => releaseSuggestionPolicy).not.toBeNull();
+      const text = editor.querySelector('p')?.firstChild;
+      expect(text).not.toBeNull();
+      const start = document.createRange();
+      start.setStart(text!, 0);
+      start.collapse(true);
+      const selection = window.getSelection();
+      selection?.removeAllRanges();
+      selection?.addRange(start);
+      document.dispatchEvent(new Event('selectionchange'));
+      await expect.poll(() => completionWitness().pre_admission?.caret_byte).toBe(0);
+      (releaseSuggestionPolicy as (() => void) | null)?.();
       await expect.poll(() => completionWitness().autocomplete_enabled).toBe(true);
       await expect.poll(() => admissions, { timeout: 10000 }).toBe(2);
+      await expect.poll(() => completionWitness().pre_admission?.caret_byte).toBe(sourceText.length);
       expect(disabledWitness.pre_admission?.scheduled).toBeNull();
       expect(disabledWitness.pre_admission?.project_root).toBe(project.root);
       expect(disabledWitness.pre_admission?.lifecycle?.reason).toBe('automation_disabled');
