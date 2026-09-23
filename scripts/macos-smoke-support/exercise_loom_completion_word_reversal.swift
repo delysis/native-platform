@@ -1,5 +1,9 @@
 import Foundation
 
+func isOwnedManuscriptEditor(role: String, labels: [String]) -> Bool {
+    role == "AXTextArea" && labels.contains("Untitled, manuscript editor")
+}
+
 func exactInsertedCandidatePrefix(original: Data, observed: Data, candidate: Data, insertedBytes: Int, whole: Bool) -> Bool {
     guard insertedBytes > 0, insertedBytes <= candidate.count,
           !whole || insertedBytes == candidate.count else { return false }
@@ -27,6 +31,10 @@ func insertionContractTests() {
     check(!accepts("hello world", -1), "negative length")
     check(!accepts("hello world again!", 12), "beyond candidate")
     check(!exactInsertedCandidatePrefix(original: Data(), observed: Data("é".utf8), candidate: Data("e\u{301}".utf8), insertedBytes: 3, whole: true), "Unicode byte identity")
+    check(isOwnedManuscriptEditor(role: "AXTextArea", labels: ["Untitled, manuscript editor"]), "owned editor label")
+    check(!isOwnedManuscriptEditor(role: "AXTextArea", labels: ["Manuscript editor"]), "reject unscoped legacy editor")
+    check(!isOwnedManuscriptEditor(role: "AXTextArea", labels: ["Other, manuscript editor"]), "reject different manuscript")
+    check(!isOwnedManuscriptEditor(role: "AXButton", labels: ["Untitled, manuscript editor"]), "reject wrong editor role")
     print("\(checks) insertion-contract assertions passed (not native acceptance)")
 }
 
@@ -76,6 +84,25 @@ func sizeAttribute(_ element: AXUIElement, _ name: CFString) -> CGSize? {
     return AXValueGetValue(value, .cgSize, &size) ? size : nil
 }
 
+func selectedRange(_ element: AXUIElement) -> CFRange? {
+    guard let raw = attribute(element, kAXSelectedTextRangeAttribute as CFString),
+          CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cfRange else { return nil }
+    var range = CFRange()
+    return AXValueGetValue(value, .cfRange, &range) ? range : nil
+}
+
+func setCollapsedEndSelection(_ element: AXUIElement) -> Bool {
+    var range = CFRange(location: prefix.utf16.count, length: 0)
+    guard let value = AXValueCreate(.cfRange, &range) else { return false }
+    return AXUIElementSetAttributeValue(
+        element,
+        kAXSelectedTextRangeAttribute as CFString,
+        value
+    ) == .success
+}
+
 func clickCenter(_ element: AXUIElement) -> Bool {
     guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return false }
     guard let origin = pointAttribute(element, kAXPositionAttribute as CFString),
@@ -118,7 +145,10 @@ func descendants() -> [AXUIElement] {
 
 func editor() -> AXUIElement? {
     descendants().first { element in
-        stringAttribute(element, kAXRoleAttribute as CFString) == kAXTextAreaRole as String && strings(element).contains("Manuscript editor")
+        isOwnedManuscriptEditor(
+            role: stringAttribute(element, kAXRoleAttribute as CFString),
+            labels: strings(element)
+        )
     }
 }
 
@@ -409,8 +439,16 @@ func focusWritingSurface(timeout: TimeInterval) -> AXUIElement? {
             if (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) != true {
                 _ = clickCenter(writingSurface)
             }
+            _ = setCollapsedEndSelection(writingSurface)
+            _ = AXUIElementSetAttributeValue(
+                writingSurface,
+                kAXFocusedAttribute as CFString,
+                kCFBooleanTrue
+            )
             if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
-               (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true {
+               (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
+               let range = selectedRange(writingSurface),
+               range.location == prefix.utf16.count, range.length == 0 {
                 return writingSurface
             }
         }
