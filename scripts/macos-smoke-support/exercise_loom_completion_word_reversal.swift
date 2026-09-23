@@ -351,13 +351,34 @@ func waitForExactManuscript(_ expected: Data, timeout: TimeInterval) -> Bool {
     return false
 }
 
-NSRunningApplication(processIdentifier: pid)?.activate(options: [])
-guard let writingSurface = editor(),
-      AXUIElementSetAttributeValue(
-        writingSurface,
-        kAXFocusedAttribute as CFString,
-        kCFBooleanTrue
-      ) == .success else {
+func focusWritingSurface(timeout: TimeInterval) -> AXUIElement? {
+    guard let runningApplication = NSRunningApplication(processIdentifier: pid) else { return nil }
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    repeat {
+        if asynchronousGuardFailed() || runningApplication.isTerminated { return nil }
+        runningApplication.unhide()
+        _ = runningApplication.activate(options: [.activateAllWindows])
+        _ = AXUIElementSetAttributeValue(
+            application,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+        )
+        if let writingSurface = editor(),
+           AXUIElementSetAttributeValue(
+               writingSurface,
+               kAXFocusedAttribute as CFString,
+               kCFBooleanTrue
+           ) == .success,
+           NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+           (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true {
+            return writingSurface
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return nil
+}
+
+guard let writingSurface = focusWritingSurface(timeout: 5) else {
     fputs("could not focus Loom's exact writing surface for completion reversal\n", stderr)
     exit(1)
 }
