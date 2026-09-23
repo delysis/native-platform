@@ -319,11 +319,11 @@ contract tooling passed **44/44**. Pinned Rust 1.92.0 was available.
   `(0, 0)`; no assertion was removed or weakened.
 - Native-feature Clippy exposed a narrow `EventLoopProxy` needless
   pass-by-value defect; the candidate now passes the proxy by reference and
-  borrows it at host construction. The final affected clippy rerun was
-  interrupted by the preceding compile correction and must be rerun.
-- Formatting and `git diff --check` were not yet re-established after the last
-  correction. `xtask macos-smoke-support`, `xtask policy`, hidden lifecycle and
-  native AX were not run for this candidate.
+  borrows it at host construction. The affected native-feature Clippy rerun
+  then passed.
+- Formatting and `git diff --check`: **PASS** after the final correction.
+  `xtask macos-smoke-support`, `xtask policy`, hidden lifecycle and native AX
+  were not run for this candidate.
 
 ### Follow-up blocker
 
