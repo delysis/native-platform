@@ -321,6 +321,9 @@ contract tooling passed **44/44**. Pinned Rust 1.92.0 was available.
 - `xtask macos-smoke-support`: **PASS**, 19 helpers compiled and 14 portable
   helper assertions passed. `xtask policy`: **PASS**.
 - Formatting and `git diff --check`: **PASS** after the final correction.
+- The foreground-only probe exit path now requests application exit after its
+  sole window's actual destruction; hidden two-window lifecycle coordination is
+  unchanged. The helper refreshes `NSRunningApplication` during exit polling.
 
 ### Hidden native lifecycle
 
@@ -330,28 +333,20 @@ valid and explicitly not a native-execution certificate.
 
 - Evidence: `/Users/george/.codex/evidence/easl-accessibility-next-53e7b7ba/`
 - Binary SHA-256:
-  `10ecbf7c6d5385b42a6afa00a7ae4c4f28c55c95f689d9def2034639a81cb4e8`.
+  `8c5215623e7105ad3d153b0c65565f629ab3bb6087aa7d4ffc4984a347ad630b`.
 - Primary: **3/3** attachments/releases; peer: **2/2**; both destroyed
   callbacks and Manager removals observed; both retained two exact
   source/selection/undo checks.
 - `qualified`, visual, IME and accessibility fields remain false.
 
-### Native AX blocker
+### Native AX execution
 
-The exact foreground probe launch was retained with PID and executable hash.
-The helper passed exact-process admission after a narrow correction removing
-the unavailable `NSRunningApplication.launchDate` requirement. A second run
-also requested AppKit frontmost status before tree discovery, but still exited
-1 at `accessibility-tree-unreadable`; no AX receipt was emitted. The exact
-children were then cleaned up by their own PIDs and exited 143 from that
-authorized cleanup.
-Raw evidence is in the directory above (`native-ax.stderr.log`, empty
-`native-ax.json`, `native-ax.exit-status`, `probe.exit-status`, and probe
-stdout/stderr). Diagnose the real AppKit/AccessKit tree publication boundary
-before claiming native AX or readiness. Do not synthesize a receipt or weaken
-the helper's bounded tree checks.
-
-Subsequent bounded retries tolerated role-less descendants and the specific
-`kAXErrorCannotComplete` children response, while continuing to reject other
-AX errors and enforce traversal limits. The exact journey still exited 1 at
-`accessibility-tree-unreadable`; this remains unresolved native evidence.
+The final rebuilt binary then completed the real foreground journey: helper
+exit **0**, exact child exit **0**, **63/63** assertions, and AX receipt
+validator schema valid. It proved two unique native editors, exact UTF-8
+roundtrips, UTF-16 selection, native key undo/redo, peer isolation, native
+close and process exit. Evidence is retained in
+`/Users/george/.codex/evidence/easl-accessibility-next-53e7b7ba/` as
+`native-ax.json`, `native-ax.stderr.log`, `native-ax.exit-status`,
+`probe.exit-status`, and probe stdout/stderr. The receipt remains
+`qualified:false`; IME and VoiceOver remain unexercised.

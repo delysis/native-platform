@@ -99,7 +99,11 @@ final class NativeProbe {
     func children(_ element: AXUIElement) throws -> [AXUIElement] {
         var raw: CFTypeRef?
         let result = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &raw)
-        if result == .attributeUnsupported || result == .noValue || result == .cannotComplete {
+        if result == .attributeUnsupported
+            || result == .noValue
+            || result == .cannotComplete
+            || result == .invalidUIElement
+        {
             return []
         }
         guard result == .success, let values = raw as? [AXUIElement] else {
@@ -199,10 +203,13 @@ final class NativeProbe {
               buttonOwner == arguments.pid else { throw ProbeError.stage("native-close-owner") }
         try require(AXUIElementPerformAction(button, kAXPressAction as CFString) == .success, "native-close-request")
         let deadline = ProcessInfo.processInfo.systemUptime + 8
-        while !running.isTerminated && ProcessInfo.processInfo.systemUptime < deadline {
+        func terminated() -> Bool {
+            NSRunningApplication(processIdentifier: arguments.pid)?.isTerminated ?? true
+        }
+        while !terminated() && ProcessInfo.processInfo.systemUptime < deadline {
             Thread.sleep(forTimeInterval: 0.04)
         }
-        try require(running.isTerminated, "native-process-exit")
+        try require(terminated(), "native-process-exit")
         // Termination alone is not a clean-exit certificate. The launching agent
         // must independently wait for this exact child and require exit status 0.
     }

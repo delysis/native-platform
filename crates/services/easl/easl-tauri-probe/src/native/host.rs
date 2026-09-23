@@ -108,11 +108,25 @@ impl Host {
         {
             check.destroyed(id, statistics);
         }
-        self.slot(id)
+        let mut requests = self
+            .slot(id)
             .and_then(|slot| slot.take(&id))
             .map(|surface| Request::Release(Box::new(surface)))
             .into_iter()
-            .collect()
+            .collect::<Vec<_>>();
+        // The foreground probe has one window and no application owner beyond
+        // the event loop. End that explicit probe after its sole native window
+        // is genuinely destroyed; lifecycle checks retain their own exit
+        // coordinator and must observe the full two-window sequence.
+        if self.check.is_none()
+            && self
+                .slots
+                .iter()
+                .all(|slot| slot.retained(slot.owner()).is_none())
+        {
+            requests.push(Request::Exit);
+        }
+        requests
     }
     pub fn check_deadline(&self) -> Option<Instant> {
         self.check.as_ref().map(lifecycle::Check::deadline)
