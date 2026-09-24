@@ -190,7 +190,17 @@
   // DOM-observer transaction may have no input event at all. Never log data.
   let boundaryInputSequence = 0;
   let lastBoundaryInput: { sequence: number; at: number; type: string; trusted: boolean; composing: boolean } | null = null;
-  let lastBoundaryKey: { sequence: number; at: number; kind: string; trusted: boolean } | null = null;
+  let lastBoundaryKey: {
+    sequence: number;
+    at: number;
+    kind: string;
+    code: string;
+    alt: boolean;
+    ctrl: boolean;
+    meta: boolean;
+    shift: boolean;
+    trusted: boolean;
+  } | null = null;
 
   function noteBoundaryInput(event: Event): void {
     if (!onBoundaryObservation) return;
@@ -1187,6 +1197,11 @@
             key_sequence: lastBoundaryKey?.sequence ?? null,
             key_at_ms: lastBoundaryKey?.at ?? null,
             key_kind: lastBoundaryKey?.kind ?? null,
+            key_code: lastBoundaryKey?.code ?? null,
+            key_alt: lastBoundaryKey?.alt ?? null,
+            key_ctrl: lastBoundaryKey?.ctrl ?? null,
+            key_meta: lastBoundaryKey?.meta ?? null,
+            key_shift: lastBoundaryKey?.shift ?? null,
             key_trusted: lastBoundaryKey?.trusted ?? null
           });
           invalidateSelectionAccessibility();
@@ -1267,7 +1282,9 @@
         keydown(_view, event) {
           if (onBoundaryObservation) lastBoundaryKey = {
             sequence: ++boundaryInputSequence, at: Date.now(),
-            kind: boundaryKeyKind(event), trusted: event.isTrusted
+            kind: boundaryKeyKind(event), code: event.code.slice(0, 64),
+            alt: event.altKey, ctrl: event.ctrlKey, meta: event.metaKey,
+            shift: event.shiftKey, trusted: event.isTrusted
           };
           // A focused editor key event starts a new interaction epoch. Any
           // delayed WebKit repair belongs to the palette activation that came
