@@ -11,7 +11,6 @@ import {
   observeTextMutation,
   rejectVisualPresentation,
   reconcileCompletionController,
-  rejectVisualPresentation,
   retireCompletionCandidates,
   setCompletionSchedule,
   settleCompletionNavigation,
@@ -72,65 +71,6 @@ function insert(
 }
 
 describe('pure completion controller', () => {
-  it('advances an untouched family after exact visual rejection without changing candidate authority', () => {
-    const initial = readyController();
-    const first = completionControllerView(initial, contextKey, family).selected!;
-    const rejected = rejectVisualPresentation(initial, {
-      mode: 'visual', eligible: first, candidateId: first.candidateId,
-      presentationKey: first.presentationKey, surfaceKey: 'surface',
-      currentSurfaceKey: 'surface', anchorByte: first.targetByte
-    });
-    const view = completionControllerView(rejected, contextKey, family);
-    expect(rejected.session?.candidates).toEqual(initial.session?.candidates);
-    expect(rejected.session?.selectedRunId).toBe('run-b');
-    expect(rejected.activeRunId).toBe('run-b');
-    expect(view.selected?.runId).toBe('run-b');
-    expect(view.witnessSelected?.runId).toBe('run-b');
-    expect(view.activeFamily.map(candidate => candidate.runId))
-      .toEqual(['run-b', 'run-c', 'run-d']);
-    expect(rejected.lastAction).toBeNull();
-    expect(rejected.pendingText).toBeNull();
-  });
-
-  it('does not override an explicit candidate choice after visual rejection', () => {
-    const cycled = cycleCompletion(readyController(), family, 1).state;
-    const selected = completionControllerView(cycled, contextKey, family).selected!;
-    const rejected = rejectVisualPresentation(cycled, {
-      mode: 'visual', eligible: selected, candidateId: selected.candidateId,
-      presentationKey: selected.presentationKey, surfaceKey: 'surface',
-      currentSurfaceKey: 'surface', anchorByte: selected.targetByte
-    });
-    const view = completionControllerView(rejected, contextKey, family);
-    expect(rejected.session?.selectedRunId).toBe('run-b');
-    expect(rejected.activeRunId).toBe('run-b');
-    expect(view.selected).toBeNull();
-    expect(view.witnessSelected).toBeNull();
-    expect(view.activeFamily.map(candidate => candidate.runId))
-      .toEqual(['run-a', 'run-c', 'run-d']);
-    const next = cycleCompletion(rejected, view.activeFamily, 1).state;
-    expect(next.session?.selectedRunId).toBe('run-c');
-    expect(completionControllerView(next, contextKey, family).selected?.runId).toBe('run-c');
-  });
-
-  it('settles with no visual selection after every untouched candidate is rejected', () => {
-    let state = readyController();
-    for (const expectedRunId of ['run-a', 'run-b', 'run-c', 'run-d']) {
-      const selected = completionControllerView(state, contextKey, family).selected!;
-      expect(selected.runId).toBe(expectedRunId);
-      state = rejectVisualPresentation(state, {
-        mode: 'visual', eligible: selected, candidateId: selected.candidateId,
-        presentationKey: selected.presentationKey, surfaceKey: 'surface',
-        currentSurfaceKey: 'surface', anchorByte: selected.targetByte
-      });
-    }
-    const view = completionControllerView(state, contextKey, family);
-    expect(view.activeFamily).toEqual([]);
-    expect(view.selected).toBeNull();
-    expect(view.witnessSelected).toBeNull();
-    expect(state.session?.candidates).toEqual(readyController().session?.candidates);
-    expect(state.pendingText).toBeNull();
-    expect(state.lastAction).toBeNull();
-  });
   it('retires a sampling policy without exposing its tails or losing exact reversal', () => {
     expect(retireCompletionCandidates(readyController()).session).toBeNull();
     const first = insert('option_word', ' one ');
@@ -243,6 +183,9 @@ describe('pure completion controller', () => {
     expect(view.selected).toBeNull();
     expect(view.witnessSelected).toBeNull();
     expect(view.alternatives.map((candidate) => candidate.runId)).toEqual(['run-a', 'run-c', 'run-d']);
+    state = cycleCompletion(state, view.activeFamily, 1).state;
+    expect(state.session?.selectedRunId).toBe('run-c');
+    expect(completionControllerView(state, contextKey, family, true, true).selected?.runId).toBe('run-c');
   });
 
   it('settles with no visual selection after every default family member is rejected', () => {

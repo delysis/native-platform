@@ -20,12 +20,21 @@ function render(mode: 'visual' | 'source', loompad = false, insertsOnAccept = tr
 }
 
 describe('completion controller and editor callback ordering', () => {
-  it('advances a mounted visual editor after its exact first presentation is rejected', async () => {
+  it('advances a mounted visual editor past an HTML-led first presentation without writing', async () => {
     const harness = render('visual');
     const ghost = () => document.querySelector('.loom-visual-ghost')?.textContent;
     await expect.poll(ghost).toBe(' one two');
-    harness.rejectVisibleVisualPresentation();
-    await expect.poll(ghost).toBe(' another path');
+    harness.installRefill([
+      { candidateId: 'candidate-a', presentationKey: 'candidate-a:html', runId: 'run-a',
+        targetByte: 5, text: '<strong>model markup</strong> must not be salvaged', insertsOnAccept: true },
+      { candidateId: 'candidate-b', presentationKey: 'candidate-b:plain', runId: 'run-b',
+        targetByte: 5, text: ' exact later prose', insertsOnAccept: true },
+      { candidateId: 'candidate-c', presentationKey: 'candidate-c:plain', runId: 'run-c',
+        targetByte: 5, text: ' third road', insertsOnAccept: true },
+      { candidateId: 'candidate-d', presentationKey: 'candidate-d:plain', runId: 'run-d',
+        targetByte: 5, text: ' final turn', insertsOnAccept: true }
+    ]);
+    await expect.poll(ghost).toBe(' exact later prose');
     expect(page.getByRole('status', { name: 'Controller Markdown' }).element().textContent).toBe('Hello');
     expect(page.getByRole('status', { name: 'Controller Actions' }).element().textContent).toBe('0');
   });
