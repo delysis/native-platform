@@ -39,6 +39,7 @@ pub fn run(root: &Path, arguments: &[String]) -> Result<()> {
         if name == "set_loom_completion_toggle"
             || name == "start_loom_live_streaming_monitor"
             || name == "exercise_loom_completion_word_reversal"
+            || name == "exercise_loom_idle_resume_ghost"
         {
             let status = Command::new(&executable)
                 .arg("--self-test")

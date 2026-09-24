@@ -3,6 +3,33 @@ import ApplicationServices
 import Foundation
 import SQLite3
 
+func serviceMainRunLoop(for seconds: TimeInterval = 0.05) {
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: seconds))
+}
+
+if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--self-test" {
+    var timerFired = false
+    let timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: false) { _ in
+        timerFired = true
+    }
+    Thread.sleep(forTimeInterval: 0.1)
+    guard !timerFired else {
+        fputs("sleep-only wait unexpectedly serviced the default run loop\n", stderr)
+        exit(1)
+    }
+    let deadline = ProcessInfo.processInfo.systemUptime + 1
+    while !timerFired && ProcessInfo.processInfo.systemUptime < deadline {
+        serviceMainRunLoop()
+    }
+    timer.invalidate()
+    guard timerFired else {
+        fputs("run-loop wait did not deliver its default-mode timer\n", stderr)
+        exit(1)
+    }
+    print("idle/resume run-loop contract passed")
+    exit(0)
+}
+
 // Reuse the native DOM/candidate observer instead of equating a one-word
 // decoration (possibly aria-hidden) with the entire AXValue candidate buffer.
 guard CommandLine.arguments.count == 8, let pid = Int32(CommandLine.arguments[1]), pid > 0,
@@ -26,12 +53,29 @@ var stage = "before_idle"
 var before: [String: Any] = [:], after: [String: Any] = [:]
 var observerAttempt = 0
 var observerStem = diagnostic + ".observer"
+var lastVisibilityActions: [String: Any] = [:]
+
+func axBoolean(_ name: CFString) -> Bool? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(ax, name, &value) == .success else { return nil }
+    return value as? Bool
+}
 
 func fail(_ reason: String) -> Never {
+    let frontmostPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
     let result: [String: Any] = ["schema": "delysis.loom-idle-resume-failure.v1", "stage": stage,
         "reason": reason, "pid": pid, "before": before, "after": after,
         "observer_failure": observerStem + ".failure.json",
-        "observer_stderr": observerStem + ".stderr.log"]
+        "observer_stderr": observerStem + ".stderr.log",
+        "observed_state": [
+            "appkit_hidden": application.isHidden,
+            "ax_hidden": axBoolean(kAXHiddenAttribute as CFString).map { $0 as Any } ?? NSNull(),
+            "frontmost_pid": frontmostPid.map { Int($0) as Any } ?? NSNull(),
+            "finder_pid": finder.processIdentifier,
+            "application_terminated": application.isTerminated,
+            "guard_paths_present": guardPaths.filter { manager.fileExists(atPath: $0) }
+        ],
+        "last_visibility_actions": lastVisibilityActions]
     if let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) {
         try? data.write(to: URL(fileURLWithPath: diagnostic), options: [.atomic])
     }
@@ -79,7 +123,7 @@ func snapshot() -> [String: Any]? {
     child.standardOutput = stdout; child.standardError = stderr
     do { try child.run() } catch { return nil }
     let deadline = ProcessInfo.processInfo.systemUptime + 8
-    while child.isRunning && guardsHold() && ProcessInfo.processInfo.systemUptime < deadline { Thread.sleep(forTimeInterval: 0.05) }
+    while child.isRunning && guardsHold() && ProcessInfo.processInfo.systemUptime < deadline { serviceMainRunLoop() }
     if child.isRunning { child.terminate(); child.waitUntilExit(); return nil } // Only this owned observer, never the app.
     child.waitUntilExit()
     guard child.terminationStatus == 0, let data = try? Data(contentsOf: URL(fileURLWithPath: stdoutPath)), data.count <= 65536,
@@ -97,7 +141,7 @@ func waitSnapshot(matching expected: Data? = nil) -> [String: Any]? {
     repeat {
         guard guardsHold() else { return nil }
         if let value = snapshot(), let identity = identityBytes(value), expected == nil || identity == expected { return value }
-        Thread.sleep(forTimeInterval: 0.05)
+        serviceMainRunLoop()
     } while ProcessInfo.processInfo.systemUptime < deadline
     return nil
 }
@@ -106,18 +150,35 @@ func waitFor(_ predicate: () -> Bool, seconds: TimeInterval = 10) -> Bool {
     repeat {
         guard guardsHold() else { return false }
         if predicate() { return true }
-        Thread.sleep(forTimeInterval: 0.05)
+        serviceMainRunLoop()
     } while ProcessInfo.processInfo.systemUptime < deadline
     return false
 }
 func setVisible(_ visible: Bool) {
-    if visible { application.unhide(); _ = application.activate(options: [.activateAllWindows]) }
-    else { _ = application.hide() }
-    _ = AXUIElementSetAttributeValue(ax, kAXHiddenAttribute as CFString, visible ? kCFBooleanFalse : kCFBooleanTrue)
+    let appkitVisibilityResult = visible ? application.unhide() : application.hide()
+    let appkitActivationResult = visible
+        ? application.activate(options: [.activateAllWindows])
+        : false
+    let axHiddenResult = AXUIElementSetAttributeValue(
+        ax,
+        kAXHiddenAttribute as CFString,
+        visible ? kCFBooleanFalse : kCFBooleanTrue
+    )
     // Same PID-only fallback as the original runner; never address Loom by name.
     var error: NSDictionary?
-    _ = NSAppleScript(source: "tell application \"System Events\" to set visible of first application process whose unix id is \(pid) to \(visible ? "true" : "false")")?.executeAndReturnError(&error)
-    if visible { _ = AXUIElementSetAttributeValue(ax, kAXFrontmostAttribute as CFString, kCFBooleanTrue) }
+    let appleScriptResult = NSAppleScript(source: "tell application \"System Events\" to set visible of first application process whose unix id is \(pid) to \(visible ? "true" : "false")")?.executeAndReturnError(&error)
+    let axFrontmostResult = visible
+        ? AXUIElementSetAttributeValue(ax, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        : .success
+    lastVisibilityActions = [
+        "requested_visible": visible,
+        "appkit_visibility_result": appkitVisibilityResult,
+        "appkit_activation_result": appkitActivationResult,
+        "ax_hidden_error": axHiddenResult.rawValue,
+        "ax_frontmost_error": axFrontmostResult.rawValue,
+        "apple_script_returned_value": appleScriptResult != nil,
+        "apple_script_error": error.map { $0.description as Any } ?? NSNull()
+    ]
 }
 guard let stableStore = storeIdentity(), let initial = waitSnapshot(), let stableIdentity = identityBytes(initial) else { fail("no_correlated_terminal_glyph") }
 before = initial
@@ -134,9 +195,12 @@ while ProcessInfo.processInfo.systemUptime - started < 75 {
     guard guardsHold(), application.isHidden,
           NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier,
           storeIdentity() == stableStore else { fail("focus_process_generation_or_terminal_identity_changed") }
-    Thread.sleep(forTimeInterval: 0.05)
+    serviceMainRunLoop()
 }
 let elapsed = ProcessInfo.processInfo.systemUptime - started
+guard guardsHold(), application.isHidden,
+      NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier,
+      storeIdentity() == stableStore else { fail("final_idle_invariant_changed") }
 stage = "after_resume"
 setVisible(true)
 var resumeAttempts = 0
