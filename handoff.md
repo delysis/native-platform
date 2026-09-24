@@ -1,3 +1,11 @@
+# Current entry point
+
+Start with the [24 September integration map](docs/reviews/2026-09-24-integration-map.md)
+and [development workflow](docs/browser-development.md). The continuation below
+is retained as historical evidence; do not reset to its older commits or reapply
+its already-integrated patches. Paid GitHub Actions are unavailable: use local
+source-bound validation without claiming unexecuted native or platform checks.
+
 # Native-platform audit remediation handoff
 
 Date: 2026-09-22  

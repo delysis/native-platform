@@ -1,4 +1,10 @@
-# ChatGPT Pro handoff: Loom zero-admission isolation repair
+# Historical ChatGPT Pro handoff: Loom zero-admission isolation repair
+
+This record predates the current integrated candidate. Start with the
+[24 September integration map](docs/reviews/2026-09-24-integration-map.md) and
+[current development workflow](docs/browser-development.md). The commit IDs,
+commands and results below are preserved historical evidence, not the current
+checkout or instructions to replay an old packet.
 
 ## Objective
 
