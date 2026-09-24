@@ -82,6 +82,7 @@ export interface CompletionControllerState {
   intentEpoch: number;
   dismissedCandidateIds: string[];
   unpresentableVisualKeys: string[];
+  selectionWasExplicit: boolean;
   scheduled: CompletionSchedule | null;
 }
 
@@ -122,6 +123,7 @@ export function initialCompletionControllerState(): CompletionControllerState {
     intentEpoch: 0,
     dismissedCandidateIds: [],
     unpresentableVisualKeys: [],
+    selectionWasExplicit: false,
     scheduled: null
   };
 }
@@ -129,8 +131,12 @@ export function initialCompletionControllerState(): CompletionControllerState {
 export function clearCompletionSession(
   state: CompletionControllerState
 ): CompletionControllerState {
-  if (state.session === null && state.pendingText === null) return state;
-  return { ...state, session: null, pendingText: null };
+  if (
+    state.session === null &&
+    state.pendingText === null &&
+    !state.selectionWasExplicit
+  ) return state;
+  return { ...state, session: null, pendingText: null, selectionWasExplicit: false };
 }
 
 /** Retire a sampling policy's tails without revoking already accepted prose. */
@@ -160,7 +166,8 @@ export function resetCompletionSurface(
   const cleared = clearCompletionSession(state);
   if (
     cleared.lastAction === null &&
-    cleared.unpresentableVisualKeys.length === 0
+    cleared.unpresentableVisualKeys.length === 0 &&
+    !cleared.selectionWasExplicit
   ) return cleared;
   return {
     ...cleared,
@@ -176,14 +183,16 @@ export function resetCompletionDiscovery(
     state.session === null &&
     state.pendingText === null &&
     state.dismissedCandidateIds.length === 0 &&
-    state.unpresentableVisualKeys.length === 0
+    state.unpresentableVisualKeys.length === 0 &&
+    !state.selectionWasExplicit
   ) return state;
   return {
     ...state,
     session: null,
     pendingText: null,
     dismissedCandidateIds: [],
-    unpresentableVisualKeys: []
+    unpresentableVisualKeys: [],
+    selectionWasExplicit: false
   };
 }
 
@@ -216,13 +225,16 @@ export function reconcileCompletionController(
 ): CompletionControllerState {
   let session = state.session;
   let pendingText = state.pendingText;
+  let selectionWasExplicit = state.selectionWasExplicit;
   if (session?.contextKey !== contextKey) {
     session = null;
     pendingText = null;
+    selectionWasExplicit = false;
   }
   if (contextKey) {
     if (!session && family.length > 0) {
       session = startCompletionSession(contextKey, family, family[0].runId);
+      selectionWasExplicit = false;
     } else if (session) {
       const completeRefill = refillLoompad && pendingText === null && family.length >= 4 &&
         new Set(family.map(candidate => loompadWordKey(candidate.text)).filter(Boolean)).size >= 4;
@@ -236,12 +248,14 @@ export function reconcileCompletionController(
       !activeFamily.some((candidate) => candidate.runId === state.activeRunId)
     ? activeFamily[0].runId
     : state.activeRunId;
+  if (activeRunId !== state.activeRunId) selectionWasExplicit = false;
   if (
     session === state.session &&
     pendingText === state.pendingText &&
-    activeRunId === state.activeRunId
+    activeRunId === state.activeRunId &&
+    selectionWasExplicit === state.selectionWasExplicit
   ) return state;
-  return { ...state, session, pendingText, activeRunId };
+  return { ...state, session, pendingText, activeRunId, selectionWasExplicit };
 }
 
 export function completionControllerView(
@@ -251,7 +265,13 @@ export function completionControllerView(
   sharedPrefixAlternatives = true
 ): CompletionControllerView {
   const boundSession = state.session?.contextKey === contextKey ? state.session : null;
-  const activeFamily = completionActiveFamily(boundSession, state.pendingText, baseFamily, sharedPrefixAlternatives);
+  const activeFamily = completionActiveFamily(
+    boundSession,
+    state.pendingText,
+    baseFamily,
+    sharedPrefixAlternatives,
+    state.unpresentableVisualKeys
+  );
   const unconsumeText = boundSession ? completionRollbackText(boundSession) : '';
   const presentation = boundSession && state.pendingText === null
     ? completionPresentation(boundSession) : null;
@@ -259,11 +279,19 @@ export function completionControllerView(
   // candidate identity and end offset for reversal at the editor boundary.
   const rollback = presentation && (boundSession?.presentationsRetired ||
     (presentation.text === '' && unconsumeText !== '')) ? presentation : null;
-  const selected = activeFamily.find((candidate) => candidate.runId === state.activeRunId) ??
-    activeFamily[0] ?? (rollback ? { ...rollback, text: '' } : null);
-  const witnessSelected = boundSession
-    ? selectedCompletionCandidate(boundSession) as InlineGhostSuggestion | null
-    : null;
+  const activePresentationRejected = Boolean(boundSession?.candidates.some((candidate) =>
+    candidate.runId === state.activeRunId &&
+    state.unpresentableVisualKeys.includes(candidate.presentationKey)
+  ));
+  const selected = activePresentationRejected
+    ? null
+    : activeFamily.find((candidate) => candidate.runId === state.activeRunId) ??
+      activeFamily[0] ?? (rollback ? { ...rollback, text: '' } : null);
+  const witnessSelected = activePresentationRejected
+    ? null
+    : boundSession
+      ? selectedCompletionCandidate(boundSession) as InlineGhostSuggestion | null
+      : null;
   return {
     boundSession,
     activeFamily,
@@ -283,13 +311,16 @@ function completionActiveFamily(
   session: CompletionSession | null,
   pendingText: string | null,
   baseFamily: readonly InlineGhostSuggestion[],
-  sharedPrefixAlternatives = true
+  sharedPrefixAlternatives = true,
+  unpresentableVisualKeys: readonly string[] = []
 ): InlineGhostSuggestion[] {
   if (pendingText !== null) return [];
   if (!session) return [...baseFamily];
   if (session.presentationsRetired) return [];
   if (session.acceptedChunks.length === 0) {
-    return session.candidates as InlineGhostSuggestion[];
+    return session.candidates.filter(
+      candidate => !unpresentableVisualKeys.includes(candidate.presentationKey)
+    ) as InlineGhostSuggestion[];
   }
   if (sharedPrefixAlternatives) return compatibleCompletionPresentations(session);
   const presentation = completionPresentation(session) as InlineGhostSuggestion | null;
@@ -444,13 +475,36 @@ export function cycleCompletion(
   sharedPrefixAlternatives = true
 ): CompletionControllerTransition {
   if (state.session) {
+    if (state.session.acceptedChunks.length === 0 && family.length > 0) {
+      const current = family.findIndex(candidate => candidate.runId === state.activeRunId);
+      const next = cycleSuggestionIndex(family.length, current, offset);
+      if (next < 0) return { state, effects: [] };
+      const selectedRunId = family[next].runId;
+      return {
+        state: {
+          ...state,
+          session: { ...state.session, selectedRunId },
+          activeRunId: selectedRunId,
+          selectionWasExplicit: true
+        },
+        effects: [{
+          kind: 'announce',
+          message: `Suggestion ${next + 1} of ${family.length}`
+        }]
+      };
+    }
     const session = cycleCompletionSession(state.session, offset, sharedPrefixAlternatives);
     if (session === state.session) return { state, effects: [] };
     const index = session.candidates.findIndex(
       (candidate) => candidate.runId === session.selectedRunId
     );
     return {
-      state: { ...state, session, activeRunId: session.selectedRunId },
+      state: {
+        ...state,
+        session,
+        activeRunId: session.selectedRunId,
+        selectionWasExplicit: true
+      },
       effects: [{
         kind: 'announce',
         message: `Suggestion ${index + 1} of ${session.candidates.length}`
@@ -462,7 +516,7 @@ export function cycleCompletion(
   const next = cycleSuggestionIndex(family.length, current, offset);
   if (next < 0) return { state, effects: [] };
   return {
-    state: { ...state, activeRunId: family[next].runId },
+    state: { ...state, activeRunId: family[next].runId, selectionWasExplicit: true },
     effects: [{
       kind: 'announce',
       message: `Suggestion ${next + 1} of ${family.length}`
@@ -523,12 +577,38 @@ export function rejectVisualPresentation(
     input.surfaceKey !== input.currentSurfaceKey ||
     state.unpresentableVisualKeys.includes(input.presentationKey)
   ) return state;
+  const unpresentableVisualKeys = [
+    ...state.unpresentableVisualKeys,
+    input.presentationKey
+  ].slice(-64);
+  const session = state.session;
+  if (
+    !state.selectionWasExplicit &&
+    state.pendingText === null &&
+    session &&
+    session.acceptedChunks.length === 0 &&
+    !session.authorityFrozen &&
+    session.selectedRunId === input.eligible.runId &&
+    state.activeRunId === input.eligible.runId
+  ) {
+    const selectedIndex = session.candidates.findIndex(
+      candidate => candidate.runId === session.selectedRunId
+    );
+    const next = session.candidates
+      .map((_, offset) => session.candidates[(selectedIndex + offset + 1) % session.candidates.length])
+      .find(candidate => !unpresentableVisualKeys.includes(candidate.presentationKey));
+    if (next) {
+      return {
+        ...state,
+        session: { ...session, selectedRunId: next.runId },
+        activeRunId: next.runId,
+        unpresentableVisualKeys
+      };
+    }
+  }
   return {
     ...state,
-    unpresentableVisualKeys: [
-      ...state.unpresentableVisualKeys,
-      input.presentationKey
-    ].slice(-64)
+    unpresentableVisualKeys
   };
 }
 

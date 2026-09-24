@@ -13,6 +13,7 @@
     initialCompletionControllerState,
     observeTextMutation,
     reconcileCompletionController,
+    rejectVisualPresentation,
     refreshCompletionCandidate
   } from './completionController';
   import { completionPresentation } from './completionSession';
@@ -97,6 +98,23 @@
     });
     controller = authorization.state;
     return authorization.authorized;
+  }
+
+  function rejectVisual(
+    candidateId: string,
+    presentationKey: string,
+    surfaceKey: string,
+    anchorByte: number
+  ): void {
+    controller = rejectVisualPresentation(controller, {
+      mode,
+      eligible: selected,
+      candidateId,
+      presentationKey,
+      surfaceKey,
+      currentSurfaceKey: contextKey,
+      anchorByte
+    });
   }
 
   export function installRefill(candidates: InlineGhostSuggestion[]): void {
@@ -199,7 +217,7 @@
         onSelectionChange={(targetByte) => reportCaret(targetByte)}
         onGhostInsert={insert}
         onGhostUnconsume={unconsume}
-        onGhostPresentationRejected={() => {}}
+        onGhostPresentationRejected={rejectVisual}
       />
     </div>
   {:else}

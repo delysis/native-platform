@@ -345,13 +345,22 @@ export function exactMarkdownByteOffsetAtSelection(
  * Cheap context-neutral screen used while choosing among branch candidates.
  * The exact document-context proof below remains authoritative.
  */
+function beginsWithHtmlTag(text: string): boolean {
+  return /^\s*<\/?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?>/u.test(text);
+}
+
 export function visualGhostTextMayBePlainProse(text: string): boolean {
   // Visual completion insertion uses one ProseMirror text transaction. A
   // newline in that transaction would create text bytes that serialize as
   // blocks without actually creating those block nodes, breaking the mounted
   // document's parse/serialize identity. Source mode remains the explicit
   // surface for multiline completion.
-  if (!text || !/\S/u.test(text) || /[\r\n]/u.test(text)) return false;
+  if (
+    !text ||
+    !/\S/u.test(text) ||
+    /[\r\n]/u.test(text) ||
+    beginsWithHtmlTag(text)
+  ) return false;
 
   try {
     const left = '\uE100LOOM_LEFT\uE101';
@@ -387,7 +396,7 @@ export function visualGhostTextMayBePlainProse(text: string): boolean {
  */
 export function visualGhostTextSafePrefix(text: string): string | null {
   if (visualGhostTextMayBePlainProse(text)) return text;
-  if (!text || !/\S/u.test(text)) return null;
+  if (!text || !/\S/u.test(text) || beginsWithHtmlTag(text)) return null;
 
   const boundaries = new Set<number>();
   for (const match of text.matchAll(/\n|[\s,.;:!?—]+/gu)) {
