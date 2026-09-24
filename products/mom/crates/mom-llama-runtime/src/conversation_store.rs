@@ -138,7 +138,6 @@ pub struct Message {
     pub branch_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribution: Option<MessageAttribution>,
-    #[serde(default)]
     pub attachment_ids: Vec<String>,
 }
 
@@ -241,7 +240,6 @@ pub struct DraftDb {
 pub struct DraftMessage {
     pub conversation_id: Option<String>,
     pub message: String,
-    #[serde(default)]
     pub attachment_ids: Vec<String>,
     pub updated_at: String,
 }
@@ -1249,75 +1247,6 @@ fn split_reserved_attribution_prefix(value: &str) -> Option<(&str, &str)> {
     Some((handle, remainder[separator + 1..].trim_start()))
 }
 
-fn repair_inline_attribution_prefixes(db: &mut ConversationDb) -> bool {
-    let mut changed = false;
-    for conversation in &mut db.conversations {
-        let lineage = conversation
-            .messages
-            .iter()
-            .map(|message| {
-                (
-                    message.id.clone(),
-                    (
-                        message.parent_id.clone(),
-                        message
-                            .attribution
-                            .as_ref()
-                            .map(|attribution| attribution.handle.clone()),
-                    ),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        for message in &mut conversation.messages {
-            if message.role != MessageRole::Assistant {
-                continue;
-            }
-            let Some((handle, content)) = split_reserved_attribution_prefix(&message.content)
-            else {
-                continue;
-            };
-            let handle = handle.to_string();
-            let content = content.to_string();
-            let matches_own_attribution = message
-                .attribution
-                .as_ref()
-                .is_some_and(|attribution| attribution.handle.eq_ignore_ascii_case(&handle));
-            let matches_attributed_ancestor = message.attribution.is_none()
-                && attributed_ancestor_matches(message.parent_id.as_deref(), &handle, &lineage);
-            if matches_own_attribution || matches_attributed_ancestor {
-                message.content = content;
-                changed = true;
-            }
-        }
-    }
-    changed
-}
-
-fn attributed_ancestor_matches(
-    parent_id: Option<&str>,
-    handle: &str,
-    lineage: &HashMap<String, (Option<String>, Option<String>)>,
-) -> bool {
-    let mut current = parent_id.map(str::to_string);
-    let mut seen = HashSet::new();
-    while let Some(message_id) = current {
-        if !seen.insert(message_id.clone()) {
-            return false;
-        }
-        let Some((parent, attribution)) = lineage.get(&message_id) else {
-            return false;
-        };
-        if attribution
-            .as_deref()
-            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(handle))
-        {
-            return true;
-        }
-        current = parent.clone();
-    }
-    false
-}
-
 pub fn active_leaf_id(conversation: &Conversation) -> Option<String> {
     conversation
         .active_leaf_message_id
@@ -1444,30 +1373,7 @@ fn descendant_ids(conversation: &Conversation, message_id: &str) -> HashSet<Stri
 pub fn load_db() -> Result<ConversationDb> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    let mut db = store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default();
-    let repaired = repair_inline_attribution_prefixes(&mut db);
-    let normalized = normalize_db_model_paths(&mut db);
-    if !repaired && !normalized {
-        return Ok(db);
-    }
-    store.mutate_documents(
-        CONVERSATIONS_NAMESPACE,
-        ConversationDb::default,
-        |current, documents| {
-            repair_inline_attribution_prefixes(current);
-            normalize_db_model_paths(current);
-            crate::personas::reject_removed_conversation_writes_from_documents(current, documents)?;
-            Ok(current.clone())
-        },
-    )
-}
-
-fn normalize_db_model_paths(db: &mut ConversationDb) -> bool {
-    let mut changed = false;
-    for conversation in &mut db.conversations {
-        changed |= normalize_conversation_model_paths(conversation);
-    }
-    changed
+    Ok(store.get(CONVERSATIONS_NAMESPACE)?.unwrap_or_default())
 }
 
 fn normalize_conversation_model_paths(conversation: &mut Conversation) -> bool {
@@ -1655,9 +1561,8 @@ fn draft_key(conversation_id: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Conversation, ConversationDb, ConversationExecutionProfile, ConversationKind, Message,
-        MessageAttribution, MessageRole, MessageSpeakerKind, project_conversation,
-        repair_inline_attribution_prefixes, strip_reserved_attribution_prefix,
+        Conversation, ConversationExecutionProfile, ConversationKind, Message, MessageRole,
+        project_conversation, strip_reserved_attribution_prefix,
     };
     use std::path::PathBuf;
 
@@ -1683,21 +1588,15 @@ mod tests {
     }
 
     #[test]
-    fn pre_attachment_messages_deserialize_with_an_empty_attachment_set() {
-        let mut encoded = serde_json::to_value(message(
-            "legacy",
-            None,
-            MessageRole::User,
-            "before attachment linkage",
-        ))
-        .expect("encode legacy message fixture");
+    fn stored_messages_require_current_attachment_linkage() {
+        let mut encoded =
+            serde_json::to_value(message("current", None, MessageRole::User, "source"))
+                .expect("encode message");
         encoded
             .as_object_mut()
-            .expect("message fixture must be an object")
+            .expect("message object")
             .remove("attachment_ids");
-        let decoded: Message =
-            serde_json::from_value(encoded).expect("legacy message must remain readable");
-        assert!(decoded.attachment_ids.is_empty());
+        assert!(serde_json::from_value::<Message>(encoded).is_err());
     }
 
     #[test]
@@ -1712,62 +1611,6 @@ mod tests {
             strip_reserved_attribution_prefix("A normal response from @default-chat: remains."),
             "A normal response from @default-chat: remains."
         );
-    }
-
-    #[test]
-    fn legacy_copied_prefix_is_repaired_only_when_structural_attribution_supports_it() {
-        let mut attributed = message("a", None, MessageRole::Assistant, "First answer");
-        attributed.attribution = Some(MessageAttribution {
-            kind: MessageSpeakerKind::LiveChat,
-            source_id: "source".to_string(),
-            handle: "default-chat".to_string(),
-            label: "Default chat".to_string(),
-            version: 1,
-            invocation_id: "invocation".to_string(),
-            target_order: 0,
-        });
-        let user = message("u", Some("a"), MessageRole::User, "Follow up");
-        let copied = message(
-            "b",
-            Some("u"),
-            MessageRole::Assistant,
-            "Response from @default-chat: A direct host answer",
-        );
-        let unrelated = message(
-            "c",
-            None,
-            MessageRole::Assistant,
-            "Response from @unrelated-chat: Preserve this unverified literal",
-        );
-        let mut db = ConversationDb {
-            conversations: vec![Conversation {
-                id: "host".to_string(),
-                title: "Host".to_string(),
-                created_at: "1".to_string(),
-                updated_at: "4".to_string(),
-                kind: ConversationKind::Chat,
-                execution_profile: ConversationExecutionProfile::default(),
-                selected_model_path: None,
-                source_conversation_id: None,
-                source_message_id: None,
-                branch_root_message_id: None,
-                active_leaf_message_id: Some("b".to_string()),
-                current_skill_ids: Vec::new(),
-                messages: vec![attributed, user, copied, unrelated],
-            }],
-            selected_conversation_id: Some("host".to_string()),
-        };
-
-        assert!(repair_inline_attribution_prefixes(&mut db));
-        assert_eq!(
-            db.conversations[0].messages[2].content,
-            "A direct host answer"
-        );
-        assert_eq!(
-            db.conversations[0].messages[3].content,
-            "Response from @unrelated-chat: Preserve this unverified literal"
-        );
-        assert!(!repair_inline_attribution_prefixes(&mut db));
     }
 
     #[test]

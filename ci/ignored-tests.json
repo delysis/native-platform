@@ -1,6 +1,6 @@
 {
   "schema": "native-platform.ignored-tests.v2",
-  "expected_test_count": 44,
+  "expected_test_count": 43,
   "cargo_targets": [
     {
       "package": "llama-native-engine",
@@ -171,22 +171,6 @@
       ],
       "src_path": "products/loom/crates/loom-backend-llama/src/lib.rs",
       "manifest_path": "products/loom/crates/loom-backend-llama/Cargo.toml",
-      "platforms": [
-        "linux",
-        "macos",
-        "windows"
-      ],
-      "harness": "libtest"
-    },
-    {
-      "package": "loom-store",
-      "selector": "test:legacy_python_fixture",
-      "name": "legacy_python_fixture",
-      "kinds": [
-        "test"
-      ],
-      "src_path": "products/loom/crates/loom-store/tests/legacy_python_fixture.rs",
-      "manifest_path": "products/loom/crates/loom-store/Cargo.toml",
       "platforms": [
         "linux",
         "macos",
@@ -785,23 +769,6 @@
       "required_environment": [],
       "evidence_class": "real-model-discovery",
       "promotion_prohibition": "Discovery alone cannot promote executable inference, editor UX, packaged-app, or release readiness.",
-      "platforms": [
-        "linux",
-        "macos",
-        "windows"
-      ]
-    },
-    {
-      "test_id": "preserved_python_assemblies_reconstruct_or_fail_on_empty_spans",
-      "package": "loom-store",
-      "target": "test:legacy_python_fixture",
-      "source": "products/loom/crates/loom-store/tests/legacy_python_fixture.rs",
-      "prerequisite": "requires LOOM_LEGACY_FIXTURE_ROOT pointing at the preserved Python lab",
-      "required_environment": [
-        "LOOM_LEGACY_FIXTURE_ROOT"
-      ],
-      "evidence_class": "historical-corpus-compatibility",
-      "promotion_prohibition": "Passing preserved-fixture reconstruction cannot promote current product migration, editor behavior, or release readiness.",
       "platforms": [
         "linux",
         "macos",

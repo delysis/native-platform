@@ -22,9 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use uuid::Uuid;
 
-const ATTACHMENTS_NAMESPACE_V2: &str = "attachments.v2";
 const ATTACHMENTS_NAMESPACE: &str = "attachments.v3";
-const ATTACHMENT_DB_SCHEMA: &str = "mom_llama.attachments.v3";
 const ATTACHMENT_MANIFEST_SCHEMA: &str = "mom_llama.attachment_manifest.v1";
 const ATTACHMENT_PREVIEW_CATALOG_SCHEMA: &str = "mom_llama.attachment_preview_catalog.v1";
 const ATTACHMENT_PREVIEW_CONTENT_SCHEMA: &str = "mom_llama.attachment_preview_content.v1";
@@ -56,20 +54,17 @@ pub enum AttachmentKind {
 
 static ATTACHMENT_LIFECYCLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachmentState {
     Staged,
     Committed,
-    #[default]
-    LegacyCommitted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AttachmentRecord {
     pub id: String,
     pub conversation_id: String,
-    #[serde(default)]
     pub message_id: String,
     pub kind: AttachmentKind,
     pub file_name: String,
@@ -79,41 +74,29 @@ pub struct AttachmentRecord {
     pub bytes: u64,
     pub sha256: String,
     pub created_at: String,
-    #[serde(default)]
     pub state: AttachmentState,
-    #[serde(default)]
     pub root_object_id: Option<String>,
-    #[serde(default)]
     pub detected_format: Option<DetectedFormat>,
-    #[serde(default)]
     pub coverage: Option<Coverage>,
-    #[serde(default)]
     pub manifest_namespace: Option<String>,
-    #[serde(default)]
     pub policy_fingerprint: Option<String>,
-    #[serde(default)]
     pub artifact_count: usize,
-    #[serde(default)]
     pub canonical_text_bytes: u64,
-    #[serde(default)]
     pub media_objects: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AttachmentDb {
-    #[serde(default = "attachment_db_schema")]
-    pub schema: String,
-    #[serde(default)]
+    schema: AttachmentDbSchema,
     pub attachments: Vec<AttachmentRecord>,
 }
 
-impl Default for AttachmentDb {
-    fn default() -> Self {
-        Self {
-            schema: attachment_db_schema(),
-            attachments: Vec::new(),
-        }
-    }
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+enum AttachmentDbSchema {
+    #[default]
+    #[serde(rename = "mom_llama.attachments.v3")]
+    Current,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,7 +106,6 @@ struct AttachmentManifest {
     graph: AttachmentGraph,
     artifacts: Vec<CanonicalArtifact>,
     policy_fingerprint: String,
-    #[serde(default)]
     receipt: Option<AttachmentReceipt>,
 }
 
@@ -1042,12 +1024,12 @@ pub(crate) fn commit_generated_exchange(
     let _lifecycle = lock_attachment_lifecycle()?;
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    let migrated_conversation_db = load_db().unwrap_or(fallback_db);
-    let migrated_attachment_db = load_attachment_db()?;
-    let migrated_drafts = load_drafts()?;
+    let conversation_snapshot = load_db().unwrap_or(fallback_db);
+    let attachment_snapshot = load_attachment_db()?;
+    let draft_snapshot = load_drafts()?;
     store.mutate_documents(
         CONVERSATIONS_NAMESPACE,
-        || migrated_conversation_db,
+        || conversation_snapshot,
         |conversation_db, documents| {
             crate::personas::reject_removed_conversation_id_from_documents(
                 &conversation.id,
@@ -1066,7 +1048,7 @@ pub(crate) fn commit_generated_exchange(
 
             let mut attachment_db = documents
                 .get(ATTACHMENTS_NAMESPACE)?
-                .unwrap_or(migrated_attachment_db);
+                .unwrap_or(attachment_snapshot);
             for attachment_id in staged_ids {
                 let record = attachment_db
                     .attachments
@@ -1085,7 +1067,7 @@ pub(crate) fn commit_generated_exchange(
                 record.state = AttachmentState::Committed;
                 record.message_id = user_message_id.to_string();
             }
-            let mut drafts = documents.get(DRAFTS_NAMESPACE)?.unwrap_or(migrated_drafts);
+            let mut drafts = documents.get(DRAFTS_NAMESPACE)?.unwrap_or(draft_snapshot);
             consume_exact_draft(&mut drafts, expected_draft, staged_ids);
             documents.put_bytes(ATTACHMENTS_NAMESPACE, &serde_json::to_vec(&attachment_db)?)?;
             documents.put_bytes(DRAFTS_NAMESPACE, &serde_json::to_vec(&drafts)?)?;
@@ -1120,14 +1102,14 @@ where
     // transaction. The authoritative reads still happen through that same
     // transaction below, so another process cannot be overwritten with a
     // stale pre-transaction snapshot.
-    let migrated_conversation_db = load_db().unwrap_or(fallback_db);
-    let migrated_attachment_db = load_attachment_db()?;
-    let migrated_drafts = load_drafts()?;
+    let conversation_snapshot = load_db().unwrap_or(fallback_db);
+    let attachment_snapshot = load_attachment_db()?;
+    let draft_snapshot = load_drafts()?;
     let result =
         store.mutate_documents(journal_namespace, journal_default, |journal, documents| {
             let mut conversation_db = documents
                 .get(CONVERSATIONS_NAMESPACE)?
-                .unwrap_or(migrated_conversation_db);
+                .unwrap_or(conversation_snapshot);
             crate::personas::reject_removed_conversation_id_from_documents(
                 &conversation.id,
                 documents,
@@ -1145,7 +1127,7 @@ where
 
             let mut attachment_db = documents
                 .get(ATTACHMENTS_NAMESPACE)?
-                .unwrap_or(migrated_attachment_db);
+                .unwrap_or(attachment_snapshot);
             for attachment_id in staged_ids {
                 let record = attachment_db
                     .attachments
@@ -1165,7 +1147,7 @@ where
                 record.message_id = user_message_id.to_string();
             }
 
-            let mut drafts = documents.get(DRAFTS_NAMESPACE)?.unwrap_or(migrated_drafts);
+            let mut drafts = documents.get(DRAFTS_NAMESPACE)?.unwrap_or(draft_snapshot);
             consume_exact_draft(&mut drafts, expected_draft, staged_ids);
 
             let result = journal_mutation(journal)?;
@@ -1208,10 +1190,10 @@ pub(crate) fn snapshot_message_attachments(
     messages: &mut [Message],
 ) -> Result<()> {
     let _lifecycle = lock_attachment_lifecycle()?;
-    let migrated = load_attachment_db()?;
+    let snapshot = load_attachment_db()?;
     RuntimeStore::current()?.mutate_documents(
         ATTACHMENTS_NAMESPACE,
-        || migrated,
+        || snapshot,
         |db, documents| {
             snapshot_message_attachments_in_documents(
                 target_conversation_id,
@@ -1449,11 +1431,6 @@ pub(crate) fn remove_persona_draft_attachments_from_documents(
             {
                 retained_objects.extend(manifest_object_ids(manifest));
             }
-            _ if record.state == AttachmentState::LegacyCommitted
-                && record.root_object_id.is_none()
-                && !record
-                    .stored_path
-                    .starts_with("encrypted://attachment.object.") => {}
             _ => {
                 object_gc_is_safe = false;
                 if let Some(root) = &record.root_object_id {
@@ -1565,7 +1542,7 @@ fn persist_state_with_attachment_gc(state: AttachmentGcState<'_>) -> Result<Path
                         .contains(&record.conversation_id);
                 let managed_state = match state.mode {
                     AttachmentGcMode::StagedOnly => record.state == AttachmentState::Staged,
-                    AttachmentGcMode::Managed => record.state != AttachmentState::LegacyCommitted,
+                    AttachmentGcMode::Managed => true,
                 };
                 let manifest = record
                     .manifest_namespace
@@ -1607,15 +1584,9 @@ fn persist_state_with_attachment_gc(state: AttachmentGcState<'_>) -> Result<Path
                     {
                         retained_objects.extend(manifest_object_ids(manifest));
                     }
-                    _ if record.state == AttachmentState::LegacyCommitted
-                        && record.root_object_id.is_none()
-                        && !record
-                            .stored_path
-                            .starts_with("encrypted://attachment.object.") => {}
                     _ => {
-                        // A non-legacy record without a trustworthy manifest,
-                        // or a migrated record pointing into the content store,
-                        // could hold derived objects we cannot enumerate. Keep
+                        // A record without a trustworthy manifest could hold
+                        // derived objects we cannot enumerate. Keep
                         // object blobs rather than guessing.
                         object_gc_is_safe = false;
                         if let Some(root) = &record.root_object_id {
@@ -1738,8 +1709,8 @@ fn validated_preview_manifest(
 ) -> Result<std::result::Result<AttachmentManifest, PreviewProblem>> {
     let Some(namespace) = record.manifest_namespace.as_deref() else {
         return Ok(Err(PreviewProblem::new(
-            "attachment_preview_legacy_metadata_only",
-            "This historical attachment has no canonical manifest and remains metadata-only.",
+            "attachment_preview_manifest_missing",
+            "The attachment has no canonical manifest.",
         )));
     };
     let Some(manifest) = store.get::<AttachmentManifest>(namespace)? else {
@@ -2443,19 +2414,9 @@ fn preview_blocker(code: &str, message: String) -> Blocker {
 pub fn load_attachment_db() -> Result<AttachmentDb> {
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
-    if let Some(mut db) = store.get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)? {
-        if db.schema != ATTACHMENT_DB_SCHEMA {
-            db.schema = attachment_db_schema();
-            store.put(ATTACHMENTS_NAMESPACE, &db)?;
-        }
-        return Ok(db);
-    }
-    let mut db = store
-        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE_V2)?
-        .unwrap_or_default();
-    db.schema = attachment_db_schema();
-    store.put(ATTACHMENTS_NAMESPACE, &db)?;
-    Ok(db)
+    Ok(store
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default())
 }
 
 fn attachment_host() -> Result<AttachmentHost> {
@@ -2515,10 +2476,6 @@ pub(crate) fn lock_attachment_lifecycle() -> Result<MutexGuard<'static, ()>> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .map_err(|_| anyhow!("attachment lifecycle lock is poisoned"))
-}
-
-fn attachment_db_schema() -> String {
-    ATTACHMENT_DB_SCHEMA.to_string()
 }
 
 fn stage_in_draft(db: &mut DraftDb, conversation_id: &str, attachment_id: &str) {
@@ -2587,7 +2544,7 @@ fn resolve_attachment_set(
         let Some(namespace) = record.manifest_namespace.as_deref() else {
             return Ok(Err(context_blocker(
                 "attachment_manifest_missing",
-                "A legacy attachment has no canonical manifest and cannot enter a model prompt."
+                "The attachment has no canonical manifest and cannot enter a model prompt."
                     .to_string(),
             )));
         };
@@ -3128,50 +3085,80 @@ mod tests {
     }
 
     #[test]
-    fn v2_records_deserialize_without_losing_legacy_linkage() {
-        let raw = r#"{
-            "attachments":[{
-                "id":"legacy","conversation_id":"chat","message_id":"message",
-                "kind":"text","file_name":"note.txt","source_path":"/note.txt",
-                "stored_path":"encrypted://attachment.blob.legacy","mime":"text/plain",
-                "bytes":3,"sha256":"abc","created_at":"1"
-            }]
-        }"#;
-        let mut db: AttachmentDb = serde_json::from_str(raw).expect("v2 record must migrate");
-        db.schema = attachment_db_schema();
-        assert_eq!(db.attachments[0].state, AttachmentState::LegacyCommitted);
-        assert_eq!(db.attachments[0].message_id, "message");
-        assert!(db.attachments[0].root_object_id.is_none());
-        assert_eq!(db.schema, ATTACHMENT_DB_SCHEMA);
+    fn conversation_load_does_not_rewrite_stored_text_or_paths() {
+        let _session = TestDataDir::new("conversation-read-only");
+        let conversation = new_conversation("Exact source");
+        let mut db = load_db().expect("conversation db");
+        let current = db
+            .conversations
+            .iter_mut()
+            .find(|item| item.id == conversation.id)
+            .expect("conversation");
+        let mut source = message("source", Vec::new());
+        source.role = crate::conversation_store::MessageRole::Assistant;
+        source.content = "Response from @source: Keep these exact stored bytes".to_string();
+        source.attribution = Some(crate::conversation_store::MessageAttribution {
+            kind: crate::conversation_store::MessageSpeakerKind::LiveChat,
+            source_id: "source".to_string(),
+            handle: "source".to_string(),
+            label: "Source".to_string(),
+            version: 1,
+            invocation_id: "invocation".to_string(),
+            target_order: 0,
+        });
+        current.messages.push(source);
+        current.selected_model_path = Some(PathBuf::from("   "));
+        let store = RuntimeStore::current().expect("store");
+        store
+            .put(CONVERSATIONS_NAMESPACE, &db)
+            .expect("persist current record");
+        let before = store
+            .get_bytes(CONVERSATIONS_NAMESPACE)
+            .expect("stored bytes");
+        assert_eq!(load_db().expect("read current record"), db);
+        assert_eq!(
+            store
+                .get_bytes(CONVERSATIONS_NAMESPACE)
+                .expect("unchanged stored bytes"),
+            before
+        );
     }
 
     #[test]
-    fn encrypted_v2_to_v3_migration_is_additive_and_idempotent() {
-        let _session = TestDataDir::new("v2-migration");
-        let raw = r#"{
-            "attachments":[{
-                "id":"legacy","conversation_id":"chat","message_id":"message",
-                "kind":"text","file_name":"note.txt","source_path":"/note.txt",
-                "stored_path":"encrypted://attachment.blob.legacy","mime":"text/plain",
-                "bytes":3,"sha256":"abc","created_at":"1"
-            }]
-        }"#;
-        let legacy: AttachmentDb = serde_json::from_str(raw).expect("legacy attachment db");
+    fn incompatible_attachment_database_is_rejected_without_rewriting() {
+        let _session = TestDataDir::new("invalid-attachment-schema");
         let store = RuntimeStore::current().expect("store");
-        store
-            .put(ATTACHMENTS_NAMESPACE_V2, &legacy)
-            .expect("write v2 fixture");
-        let first = load_attachment_db().expect("first migration");
-        let second = load_attachment_db().expect("second migration");
-        assert_eq!(first, second);
-        assert_eq!(first.schema, ATTACHMENT_DB_SCHEMA);
-        assert_eq!(first.attachments.len(), 1);
-        assert!(
+        for bytes in [
+            br#"{"schema":"unsupported","attachments":[]}"#.as_slice(),
+            br#"{"attachments":[]}"#.as_slice(),
+            br#"{"schema":"mom_llama.attachments.v3","attachments":[],"unexpected":true}"#
+                .as_slice(),
+        ] {
             store
-                .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE_V2)
-                .expect("read preserved v2")
-                .is_some()
-        );
+                .put_bytes(ATTACHMENTS_NAMESPACE, bytes)
+                .expect("write fixture");
+            assert!(load_attachment_db().is_err());
+            assert_eq!(
+                store
+                    .get_bytes(ATTACHMENTS_NAMESPACE)
+                    .expect("read unchanged bytes"),
+                Some(bytes.to_vec())
+            );
+        }
+    }
+
+    #[test]
+    fn current_attachment_record_requires_explicit_lifecycle_state() {
+        let scope = crate::OperationScope::detached();
+        let _session = TestDataDir::new("attachment-required-state");
+        let record = attachment_import_pasted_text(&scope, "chat", "Current source".to_string())
+            .expect("import")
+            .result
+            .expect("result")
+            .attachment;
+        let mut encoded = serde_json::to_value(&record).expect("serialize");
+        encoded.as_object_mut().expect("record").remove("state");
+        assert!(serde_json::from_value::<AttachmentRecord>(encoded).is_err());
     }
 
     #[test]
@@ -4004,12 +3991,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_attachment_records_fail_conservative_during_message_gc() {
-        let _session = TestDataDir::new("legacy-attachment-gc");
-        let conversation = new_conversation("Legacy attachment");
-        let attachment_id = "legacy-attachment".to_string();
+    fn missing_manifest_preserves_attachment_blobs_during_message_gc() {
+        let _session = TestDataDir::new("incomplete-attachment-gc");
+        let conversation = new_conversation("Incomplete attachment");
+        let attachment_id = "incomplete-attachment".to_string();
         let blob_namespace = format!("attachment.blob.{attachment_id}");
-        let mut attached = message("legacy-message", vec![attachment_id.clone()]);
+        let mut attached = message("incomplete-message", vec![attachment_id.clone()]);
         attached.conversation_id = conversation.id.clone();
         let mut conversation_db = load_db().expect("conversation db");
         let stored = conversation_db
@@ -4019,20 +4006,20 @@ mod tests {
             .expect("stored conversation");
         stored.active_leaf_message_id = Some(attached.id.clone());
         stored.messages.push(attached.clone());
-        crate::conversation_store::save_db(&conversation_db).expect("write legacy message");
-        let legacy = AttachmentRecord {
+        crate::conversation_store::save_db(&conversation_db).expect("write incomplete message");
+        let incomplete = AttachmentRecord {
             id: attachment_id.clone(),
             conversation_id: conversation.id.clone(),
             message_id: attached.id.clone(),
             kind: AttachmentKind::Text,
-            file_name: "legacy.txt".to_string(),
-            source_path: "/legacy.txt".to_string(),
+            file_name: "incomplete.txt".to_string(),
+            source_path: "/incomplete.txt".to_string(),
             stored_path: format!("encrypted://{blob_namespace}"),
             mime: "text/plain".to_string(),
             bytes: 6,
-            sha256: "legacy-hash".to_string(),
+            sha256: "incomplete-hash".to_string(),
             created_at: "1".to_string(),
-            state: AttachmentState::LegacyCommitted,
+            state: AttachmentState::Committed,
             root_object_id: None,
             detected_format: None,
             coverage: None,
@@ -4044,30 +4031,32 @@ mod tests {
         };
         let store = RuntimeStore::current().expect("store");
         store
-            .put_bytes(&blob_namespace, b"legacy")
-            .expect("write legacy blob");
+            .put_bytes(&blob_namespace, b"incomplete")
+            .expect("write incomplete blob");
         store
             .put(
                 ATTACHMENTS_NAMESPACE,
                 &AttachmentDb {
-                    schema: attachment_db_schema(),
-                    attachments: vec![legacy.clone()],
+                    schema: AttachmentDbSchema::Current,
+                    attachments: vec![incomplete.clone()],
                 },
             )
-            .expect("write legacy attachment record");
+            .expect("write incomplete attachment record");
 
         crate::conversation_store::message_delete(&conversation.id, &attached.id)
-            .expect("delete legacy attachment message");
+            .expect("delete incomplete attachment message");
         assert!(
             load_attachment_db()
                 .expect("attachment db")
                 .attachments
-                .contains(&legacy),
-            "legacy metadata must not be auto-deleted without a canonical manifest"
+                .contains(&incomplete),
+            "incomplete metadata must not be auto-deleted without a canonical manifest"
         );
         assert_eq!(
-            store.get_bytes(&blob_namespace).expect("read legacy blob"),
-            Some(b"legacy".to_vec())
+            store
+                .get_bytes(&blob_namespace)
+                .expect("read incomplete blob"),
+            Some(b"incomplete".to_vec())
         );
     }
 

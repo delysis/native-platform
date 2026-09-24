@@ -199,7 +199,6 @@ pub struct MentionInvocation {
     pub host_context: Vec<Message>,
     pub targets: Vec<MentionTargetSnapshot>,
     pub results: Vec<MentionTargetResult>,
-    #[serde(default)]
     pub tool_approvals: Vec<MentionToolApproval>,
     #[serde(default)]
     pub synthesis_message_id: Option<String>,
@@ -245,7 +244,7 @@ struct PersonaToolDeadlineClock {
 struct StoredMentionInvocation {
     #[serde(flatten)]
     invocation: MentionInvocation,
-    #[serde(default, rename = "_frozen_tool_continuations")]
+    #[serde(rename = "_frozen_tool_continuations")]
     frozen_tool_continuations: Vec<FrozenMentionToolContinuation>,
 }
 
@@ -1470,7 +1469,7 @@ fn persona_tool_approval_preflight(
     let Some(model_config) = continuation.model_config.clone() else {
         return Ok(Err(Blocker::new(
             "mention_tool_approval_frozen_model_config_missing",
-            "This legacy Persona approval does not contain the exact private model configuration needed for safe resume.",
+            "This Persona approval does not contain the exact private model configuration needed for safe resume.",
             vec!["Run a new Persona invocation.".to_string()],
         )));
     };
@@ -1649,7 +1648,7 @@ fn validate_frozen_persona_tool_approval(
     let Some(model_config) = continuation.model_config.as_ref() else {
         return Ok(Some(Blocker::new(
             "mention_tool_approval_frozen_model_config_missing",
-            "The exact private model configuration is missing from this legacy approval.",
+            "The exact private model configuration is missing from this approval.",
             vec!["Run a new Persona invocation.".to_string()],
         )));
     };
@@ -1657,7 +1656,7 @@ fn validate_frozen_persona_tool_approval(
     let Some(frozen_server_config) = continuation.mcp_server_config.as_ref() else {
         return Ok(Some(Blocker::new(
             "mention_tool_approval_frozen_server_missing",
-            "The reviewed staged MCP executable is missing from this legacy approval.",
+            "The reviewed staged MCP executable is missing from this approval.",
             vec!["Run a new Persona invocation.".to_string()],
         )));
     };
@@ -6592,18 +6591,16 @@ mod tests {
     }
 
     #[test]
-    fn legacy_mention_invocation_records_migrate_with_no_continuation_authority() {
+    fn stored_invocations_require_current_continuation_fields() {
         let stored = frozen_approval_record(1_000);
-        let mut legacy = serde_json::to_value(&stored).expect("legacy invocation JSON");
-        let object = legacy.as_object_mut().expect("invocation object");
-        object.remove("tool_approvals");
-        object.remove("_frozen_tool_continuations");
-        let migrated: StoredMentionInvocation =
-            serde_json::from_value(legacy).expect("legacy invocation migration");
-        assert_eq!(migrated.id, stored.id);
-        assert_eq!(migrated.targets, stored.targets);
-        assert!(migrated.tool_approvals.is_empty());
-        assert!(migrated.frozen_tool_continuations.is_empty());
+        for field in ["tool_approvals", "_frozen_tool_continuations"] {
+            let mut encoded = serde_json::to_value(&stored).expect("invocation JSON");
+            encoded
+                .as_object_mut()
+                .expect("invocation object")
+                .remove(field);
+            assert!(serde_json::from_value::<StoredMentionInvocation>(encoded).is_err());
+        }
     }
 
     #[test]

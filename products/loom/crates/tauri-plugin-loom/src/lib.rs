@@ -2356,7 +2356,6 @@ impl IpcFailure {
             ContextAttachmentError::ContextLimit => "attachment_context_limit",
             ContextAttachmentError::ManualTextLimit => "attachment_context_text_limit",
             ContextAttachmentError::ContextInvalid => "attachment_context_invalid",
-            ContextAttachmentError::ContextFormat => "attachment_context_format",
             ContextAttachmentError::Io(_) => "attachment_storage_failed",
             ContextAttachmentError::Json(_) => "attachment_metadata_invalid",
         };

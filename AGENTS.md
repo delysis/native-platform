@@ -2,8 +2,9 @@ Use safe, idiomatic Rust with explicit ownership and narrow authority.
 Read the owning product contract before changing behavior. Preserve source,
 user data, and provenance; fixture output never establishes runtime acceptance.
 
-These products are unreleased. Remove unused compatibility and migration code;
-accept current formats and reject incompatible data without silently rewriting it.
+These products are unreleased. Do not retain legacy on-disk formats, compatibility
+readers or migrations. Keep one current schema for each stored representation;
+reject incompatible data without silently rewriting or deleting it.
 Avoid speculative abstractions and duplicate sources of truth.
 
 Use `docs/browser-development.md` for the browser-chat and GitHub CI workflow.
