@@ -359,6 +359,11 @@
     TerminalRunRequest
   } from './lib/types';
 
+  import {
+    appendCompletionBoundaryObservation, emptyCompletionBoundaryTrace, textBoundaryDelta,
+    type BoundaryObservation
+  } from './lib/completionBoundaryDiagnostics';
+
   type VisualTextInsertionAnchor = {
     surfaceKey: string;
     markdown: string;
@@ -381,6 +386,16 @@
   let project: ProjectSnapshot | null = null;
   let document: OpenDocument | null = null;
   let documentText = '';
+  let completionBoundaryTrace = emptyCompletionBoundaryTrace();
+
+  function observeCompletionBoundary(observation: BoundaryObservation): void {
+    completionBoundaryTrace = appendCompletionBoundaryObservation(completionBoundaryTrace, observation, {
+      session_id: project?.session_id ?? '', document_id: document?.summary.document_id ?? '',
+      document_epoch: documentEpoch, edit_version: editVersion,
+      source_revision_id: document?.summary.revision_id ?? '',
+      visible_blob_id: document?.visible_blob_id ?? ''
+    }, Date.now());
+  }
   let mode: EditorMode = 'visual';
   let preferredProseMode: EditorMode = 'visual';
   let saveState: SaveState = 'clean';
@@ -1413,7 +1428,14 @@
       caret_at_end: visualSelectionAccessibility.caretAtEnd,
       caret_byte_offset: visualSelectionAccessibility.caretByteOffset
     },
-    last_action: completionController.lastAction
+    last_action: completionController.lastAction,
+    boundary_trace: completionBoundaryTrace,
+    shuttle_schedule: {
+      key: shuttleTimerKey,
+      armed: shuttleTimer !== undefined,
+      window_focused: windowFocused,
+      terminal_busy: terminalBusy
+    }
   });
   $: completionExhaustionKey = boundCompletionSession && completionShouldRequestNextBatch(
     boundCompletionSession,
@@ -6885,7 +6907,11 @@
     }
   }
 
-  function updateText(text: string): void {
+  function updateText(text: string, origin: 'visual' | 'source' | 'workspace', paneId: string | null = null): void {
+    observeCompletionBoundary({ kind: 'app_update_text', delta: textBoundaryDelta(documentText, text), facts: {
+      transition, mode, origin, pane_id: paneId, pending_completion_matches: completionController.pendingText === text,
+      visual_mutation_pending: visualMutationPending
+    } });
     if (transition !== 'idle') return;
     const mutationWasInvalidated = visualMutationPending;
     const mutation = observeTextMutation(
@@ -6925,6 +6951,7 @@
   }
 
   function setSourceDocument(text: string): void {
+    completionBoundaryTrace = emptyCompletionBoundaryTrace();
     completionController = resetCompletionSurface(completionController);
     if (sourceProjectionTimer !== undefined) {
       window.clearTimeout(sourceProjectionTimer);
@@ -7154,7 +7181,7 @@
     if (document?.summary.kind === 'hybrid') return;
     sourceDirty = false;
     if (!sourceCodec?.editable) return;
-    updateText(encodeSourceFromEditor(sourceDisplayText, sourceCodec));
+    updateText(encodeSourceFromEditor(sourceDisplayText, sourceCodec), 'source');
   }
 
   function setVisualComposition(active: boolean): void {
@@ -7927,6 +7954,19 @@
       manuscriptText: documentText,
       promotionReady: branchPromotionReady
     });
+    const eligible = eligibleGhostForCurrentMode();
+    observeCompletionBoundary({ kind: 'controller_insertion', facts: {
+      action, authorized: authorization.authorized,
+      candidate_id: candidateId, presentation_key: presentationKey,
+      eligible_present: Boolean(eligible), candidate_matches: eligible?.candidateId === candidateId,
+      presentation_matches: eligible?.presentationKey === presentationKey,
+      text_prefix_matches: Boolean(eligible?.text.startsWith(text)),
+      requested_utf8_bytes: new TextEncoder().encode(text).byteLength,
+      pending_text: completionController.pendingText !== null,
+      session_present: Boolean(completionController.session),
+      session_context_matches: completionController.session?.contextKey === completionContextKey,
+      promotion_ready: branchPromotionReady, family_count: activeSuggestionFamily.length
+    } });
     completionController = authorization.state;
     return authorization.authorized;
   }
@@ -8045,13 +8085,27 @@
     if (shuttleTimer !== undefined) window.clearTimeout(shuttleTimer);
     shuttleTimer = undefined;
     shuttleTimerKey = key;
+    observeCompletionBoundary({ kind: 'shuttle_schedule', facts: { key, armed: Boolean(key) } });
     if (!key) return;
     shuttleTimer = window.setTimeout(() => {
       shuttleTimer = undefined;
-      if (shuttleTimerKey !== key || !windowFocused || !shuttleEnabled || terminalIsBusy()) return;
+      // Preserve short-circuit evaluation and every existing refusal. These
+      // reason strings are observations, never a reason to retry faster.
+      const blocked = shuttleTimerKey !== key ? 'key_changed'
+        : !windowFocused ? 'window_unfocused'
+        : !shuttleEnabled ? 'disabled'
+        : terminalIsBusy() ? 'terminal_busy' : null;
+      observeCompletionBoundary({ kind: 'shuttle_fire', facts: {
+        key, mode, result: blocked ?? 'attempting',
+        editor_present: mode === 'visual' ? Boolean(visualEditor) : Boolean(sourceEditor)
+      } });
+      if (blocked) return;
       const accepted = mode === 'visual'
         ? visualEditor?.acceptGhostWord(false) ?? false
         : sourceEditor?.acceptGhostWord(false) ?? false;
+      observeCompletionBoundary({ kind: 'shuttle_fire', facts: {
+        key, mode, result: accepted ? 'inserted' : 'editor_rejected'
+      } });
       if (!accepted) {
         shuttleTimerKey = '';
         syncShuttleTimer(key);
@@ -10334,7 +10388,8 @@
                       ghostHidden={ghostTextHidden}
                       {ghostUnconsumeText}
                       surfaceKey={visualGhostSurfaceKey}
-                      onChange={updateText}
+                      onChange={(text) => updateText(text, 'visual')}
+                      onBoundaryObservation={observeCompletionBoundary}
                       onImageAttachments={storeImageAttachments}
                       onImageAttachmentsCommitted={reportImageAttachmentsCommitted}
                       onImageAttachmentError={reportImageAttachmentError}
@@ -10393,6 +10448,7 @@
                   ghostAlternatives={ghostAlternatives}
                   ghostHidden={ghostTextHidden}
                   {ghostUnconsumeText}
+                  onBoundaryObservation={observeCompletionBoundary}
                   onCompositionStart={beginSourceComposition}
                   onCompositionEnd={finishSourceComposition}
                   onValueInput={(textarea) => {
@@ -10458,7 +10514,7 @@
               selectionDisabled={busyPaneSlots.has(slot.position)} onSelect={(id) => selectPane(slot.position, id)} onCollapse={() => togglePane(slot.position)} />
             {#each slot.choices as [paneId, paneConfig] (paneId)}
               <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
-            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={updateText} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
+            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={(text) => updateText(text, 'workspace', paneId)} beforeRun={preparePaneRun} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
               </div>
             {/each}
           </aside>

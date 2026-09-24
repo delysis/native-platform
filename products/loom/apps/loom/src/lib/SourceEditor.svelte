@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount, tick } from 'svelte';
+  import { textBoundaryDelta, type BoundaryObservation } from './completionBoundaryDiagnostics';
   import { observeInlineGhost, inlineGhostPreview } from './inlineGhostObservation';
   import { completionOptionAccessibleLabel } from './ghostText';
   import { allocateCompletionPopupDomIds, placeCompletionPopup } from './completionPopup';
@@ -60,6 +61,7 @@
   export let onImageAttachmentsCommitted: (count: number) => void = () => {};
   export let onImageAttachmentError: (message: string) => void = () => {};
   export let onValueInput: (textarea: HTMLTextAreaElement) => void = () => {};
+  export let onBoundaryObservation: ((observation: BoundaryObservation) => void) | undefined = undefined;
   export let onSelectionChange: (textarea: HTMLTextAreaElement) => void = () => {};
   export let onCompositionStart: () => void = () => {};
   export let onCompositionEnd: (textarea: HTMLTextAreaElement) => void = () => {};
@@ -407,7 +409,16 @@
     suppressCurrentGhost();
   }
 
-  function handleInput(): void {
+  function handleInput(event: Event): void {
+    if (element) onBoundaryObservation?.({
+      kind: 'source_input', delta: textBoundaryDelta(value, element.value),
+      facts: {
+        input_type: event instanceof InputEvent ? event.inputType.slice(0, 64) : null,
+        input_trusted: event.isTrusted, composing, focused,
+        dom_focused: document.activeElement === element,
+        selection_start: element.selectionStart, selection_end: element.selectionEnd
+      }
+    });
     suppressCurrentGhost();
     readSelection(false, false);
     if (element) onValueInput(element);
@@ -817,16 +828,25 @@
 
   export function acceptGhostWord(requireVisible = true): boolean {
     const candidate = currentPlan();
-    if (
-      !focused ||
-      !candidate ||
-      (requireVisible && renderedGhostPresentationKey(candidate) !== candidate.presentationKey)
-    ) return false;
+    const result = (reason: string): boolean => {
+      onBoundaryObservation?.({ kind: 'source_shuttle_attempt', facts: {
+        result: reason, require_visible: requireVisible, focused,
+        dom_focused: Boolean(element && document.activeElement === element),
+        editor_present: Boolean(element), readonly, composing, exact_geometry: exactGeometry,
+        selection_start: element?.selectionStart ?? -1, selection_end: element?.selectionEnd ?? -1
+      } });
+      return reason === 'inserted';
+    };
+    if (!focused) return result('editor_unfocused');
+    if (!candidate) return result('plan_unavailable');
+    if (requireVisible && renderedGhostPresentationKey(candidate) !== candidate.presentationKey) {
+      return result('render_unverified');
+    }
     const word = nextSuggestionWord(candidate.text);
-    if (!word) return false;
+    if (!word) return result('word_unavailable');
     const accepted = insertVisibleGhostText(candidate, word, 'shuttle_word');
     if (accepted) suppressCurrentGhost();
-    return accepted;
+    return result(accepted ? 'inserted' : 'insertion_rejected');
   }
 
   export function acceptLoompadText(candidateId: string, presentationKey: string, text: string): boolean {
