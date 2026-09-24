@@ -183,6 +183,9 @@ describe('pure completion controller', () => {
     expect(view.selected).toBeNull();
     expect(view.witnessSelected).toBeNull();
     expect(view.alternatives.map((candidate) => candidate.runId)).toEqual(['run-a', 'run-c', 'run-d']);
+    state = cycleCompletion(state, view.activeFamily, 1).state;
+    expect(state.session?.selectedRunId).toBe('run-c');
+    expect(completionControllerView(state, contextKey, family, true, true).selected?.runId).toBe('run-c');
   });
 
   it('settles with no visual selection after every default family member is rejected', () => {

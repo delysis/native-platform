@@ -707,6 +707,23 @@ describe('faithful visual ghost projection', () => {
     expect(visualGhostTextSafePrefix(' ordinary prose')).toBe(' ordinary prose');
   });
 
+  it('never salvages prose from a markup-led stored candidate', () => {
+    for (const observed of [
+      '<strong>I’m going to college</strong> moreover prose follows.',
+      '  </em> prose follows.',
+      '<x-card/> prose follows.',
+      '<strong class="lead"',
+      '<!-- model comment',
+      '<!DOCTYPE html>',
+      '<?xml version="1.0"?>'
+    ]) {
+      expect(visualGhostTextMayBePlainProse(observed), observed).toBe(false);
+      expect(visualGhostTextSafePrefix(observed), observed).toBeNull();
+    }
+    expect(visualGhostTextSafePrefix('<3 forever')).toBe('<3 forever');
+    expect(visualGhostTextSafePrefix('< word')).toBe('< word');
+  });
+
   it('rejects candidate edges that join a human grapheme', () => {
     const cases = [
       { markdown: 'e', text: '\u0301 morning' },
