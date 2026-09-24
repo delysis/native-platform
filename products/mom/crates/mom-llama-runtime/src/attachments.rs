@@ -1098,9 +1098,8 @@ where
     let settings = resolve_settings()?;
     let store = RuntimeStore::open(&settings.data_dir)?;
 
-    // Complete one-time imports and schema repair before opening the journal
-    // transaction. The authoritative reads still happen through that same
-    // transaction below, so another process cannot be overwritten with a
+    // Prepare fallbacks for absent documents. Authoritative reads happen in the
+    // journal transaction, so another process cannot be overwritten with a
     // stale pre-transaction snapshot.
     let conversation_snapshot = load_db().unwrap_or(fallback_db);
     let attachment_snapshot = load_attachment_db()?;

@@ -2127,14 +2127,14 @@ fn finalize_persona_tool_approval(
     approval_state: MentionToolApprovalState,
     effect_receipt: Option<&CommandResult<McpCallToolOutput>>,
 ) -> Result<MentionInvocation> {
-    let migrated_conversations = load_db()?;
+    let conversation_snapshot = load_db()?;
     RuntimeStore::current()?.mutate_documents(
         INVOCATIONS_NAMESPACE,
         MentionInvocationDb::default,
         |db, documents| {
             let mut conversations = documents
                 .get(CONVERSATIONS_NAMESPACE)?
-                .unwrap_or(migrated_conversations);
+                .unwrap_or(conversation_snapshot);
             let stored = db
                 .invocations
                 .iter_mut()
@@ -2494,7 +2494,7 @@ fn reconcile_persona_tool_approval_set(
         .iter()
         .map(|approval| approval.invocation_id.clone())
         .collect::<BTreeSet<_>>();
-    let migrated_conversations = store
+    let conversation_snapshot = store
         .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?
         .unwrap_or_default();
     store.mutate_documents(
@@ -2503,7 +2503,7 @@ fn reconcile_persona_tool_approval_set(
         |db, documents| {
             let mut conversations = documents
                 .get(CONVERSATIONS_NAMESPACE)?
-                .unwrap_or(migrated_conversations);
+                .unwrap_or(conversation_snapshot);
             let mut changed = false;
             for stored in db
                 .invocations
