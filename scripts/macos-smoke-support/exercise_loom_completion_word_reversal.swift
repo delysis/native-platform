@@ -29,6 +29,12 @@ func remainingFanMatches(expected: [String], observed: [String], visible: Bool) 
     expected == observed && visible == (expected.count > 1)
 }
 
+func manuscriptEndCaret(original: Data, expected: Data) -> Int? {
+    guard expected.starts(with: original),
+          let text = String(data: expected, encoding: .utf8) else { return nil }
+    return text.utf16.count
+}
+
 func insertionContractTests() {
     let original = Data("hello ".utf8), candidate = Data("world again".utf8)
     var checks = 0
@@ -66,6 +72,11 @@ func insertionContractTests() {
     check(remainingCandidateIds(original: original, observed: Data("Hello one".utf8), runIds: ids, candidates: bodies) == nil, "reject changed manuscript prefix")
     check(remainingCandidateIds(original: original, observed: Data("hello one".utf8), runIds: ["missing"], candidates: bodies) == nil, "reject unverified candidate")
     check(remainingCandidateIds(original: original, observed: Data("hello one two".utf8), runIds: ids, candidates: bodies) == [], "exhausted candidates are not alternatives")
+    check(manuscriptEndCaret(original: original, expected: original) == 6, "initial manuscript end")
+    check(manuscriptEndCaret(original: original, expected: Data("hello one".utf8)) == 9, "accepted word moves the expected caret")
+    check(manuscriptEndCaret(original: original, expected: Data("hello 🜁".utf8)) == 8, "caret uses UTF-16 rather than bytes")
+    check(manuscriptEndCaret(original: original, expected: Data("Hello one".utf8)) == nil, "reject changed original at refocus")
+    check(manuscriptEndCaret(original: Data(), expected: Data([0xff])) == nil, "reject invalid manuscript encoding")
     print("\(checks) insertion-contract assertions passed (not native acceptance)")
 }
 
@@ -124,8 +135,8 @@ func selectedRange(_ element: AXUIElement) -> CFRange? {
     return AXValueGetValue(value, .cfRange, &range) ? range : nil
 }
 
-func setCollapsedEndSelection(_ element: AXUIElement) -> Bool {
-    var range = CFRange(location: prefix.utf16.count, length: 0)
+func setCollapsedEndSelection(_ element: AXUIElement, caret: Int) -> Bool {
+    var range = CFRange(location: caret, length: 0)
     guard let value = AXValueCreate(.cfRange, &range) else { return false }
     return AXUIElementSetAttributeValue(
         element,
@@ -449,11 +460,12 @@ func waitForExactManuscript(_ expected: Data, timeout: TimeInterval) -> Bool {
     return false
 }
 
-func focusWritingSurface(timeout: TimeInterval) -> AXUIElement? {
-    guard let runningApplication = NSRunningApplication(processIdentifier: pid) else { return nil }
+func focusWritingSurface(expected: Data, timeout: TimeInterval) -> AXUIElement? {
+    guard let caret = manuscriptEndCaret(original: Data(prefix.utf8), expected: expected),
+          let runningApplication = NSRunningApplication(processIdentifier: pid) else { return nil }
     let deadline = ProcessInfo.processInfo.systemUptime + timeout
     repeat {
-        if asynchronousGuardFailed() || runningApplication.isTerminated { return nil }
+        if asynchronousGuardFailed() || runningApplication.isTerminated || readManuscript() != expected { return nil }
         runningApplication.unhide()
         _ = runningApplication.activate(options: [.activateAllWindows])
         _ = AXUIElementSetAttributeValue(
@@ -475,7 +487,7 @@ func focusWritingSurface(timeout: TimeInterval) -> AXUIElement? {
             if (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) != true {
                 _ = clickCenter(writingSurface)
             }
-            _ = setCollapsedEndSelection(writingSurface)
+            _ = setCollapsedEndSelection(writingSurface, caret: caret)
             _ = AXUIElementSetAttributeValue(
                 writingSurface,
                 kAXFocusedAttribute as CFString,
@@ -484,7 +496,7 @@ func focusWritingSurface(timeout: TimeInterval) -> AXUIElement? {
             if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
                (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
                let range = selectedRange(writingSurface),
-               range.location == prefix.utf16.count, range.length == 0 {
+               range.location == caret, range.length == 0 {
                 return writingSurface
             }
         }
@@ -493,7 +505,7 @@ func focusWritingSurface(timeout: TimeInterval) -> AXUIElement? {
     return nil
 }
 
-guard let writingSurface = focusWritingSurface(timeout: 5) else {
+guard let writingSurface = focusWritingSurface(expected: Data(prefix.utf8), timeout: 5) else {
     fputs("could not focus Loom's exact writing surface for completion reversal\n", stderr)
     exit(1)
 }
@@ -758,7 +770,7 @@ guard let shuttleDisabled = waitForWitness(timeout: 10, { witness in
     exit(1)
 }
 
-guard focusWritingSurface(timeout: 5) != nil,
+guard focusWritingSurface(expected: shuttleAcceptedBytes, timeout: 5) != nil,
       postKey(58, down: true, flags: [.maskAlternate]),
       postKey(123, down: true, flags: [.maskAlternate]),
       postKey(123, down: false, flags: [.maskAlternate]) else {

@@ -1089,7 +1089,8 @@ wait_for_clean_exit() {
         # LaunchServices can retain a just-exited PID after the process has
         # drained. Wait for our own registration to disappear before relaunch;
         # never ignore a different process with the same bundle identifier.
-        if ! running_bundle_pids | grep -Fxq "$target_pid"; then break; fi
+        remaining_bundle_pids=$(running_bundle_pids) || return 1
+        if ! printf '%s\n' "$remaining_bundle_pids" | grep -Fxq "$target_pid"; then break; fi
         ;;
     esac
     attempt=$((attempt + 1))

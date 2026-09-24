@@ -31,6 +31,37 @@ function read(file) {
   return fs.readFileSync(file, "utf8");
 }
 
+test("native relaunch waits for its owned registration and propagates lookup failures", {
+  skip: process.platform === "win32",
+}, () => {
+  const helper = read(smokeScriptPath).match(/wait_for_clean_exit\(\) \{[\s\S]*?\n\}/)?.[0];
+  assert.ok(helper);
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "native-registration-test-"));
+  const counter = path.join(directory, "calls");
+  const environment = { ...process.env, COUNTER: counter };
+  const mocks = "ps() { printf '\\n'; }\nsleep() { :; }\nwait() { :; }\n";
+  try {
+    fs.writeFileSync(counter, "0");
+    for (const [name, body, expected] of [
+      ["owned registration drains", `
+running_bundle_pids() {
+  n=$(cat "$COUNTER"); n=$((n+1)); echo "$n" > "$COUNTER"
+  if [ "$n" -lt 3 ]; then echo 123; fi
+}
+wait_for_clean_exit 123 999 && [ "$(cat "$COUNTER")" -eq 3 ]`, 0],
+      ["stale registration times out", "running_bundle_pids() { echo 123; }\nwait_for_clean_exit 123 999", 1],
+      ["lookup failure is not absence", "running_bundle_pids() { return 2; }\nwait_for_clean_exit 123 999", 1],
+    ]) {
+      const result = spawnSync("/bin/sh", [], {
+        input: `${mocks}${helper}\n${body}`, encoding: "utf8", env: environment,
+      });
+      assert.equal(result.status, expected, `${name}: ${result.stderr}`);
+    }
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 function workflowJobIds(source) {
   const jobs = source.slice(source.indexOf("\njobs:\n") + "\njobs:\n".length);
   return [...jobs.matchAll(/^  ([a-z][a-z0-9-]+):$/gm)].map((match) => match[1]);
