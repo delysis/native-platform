@@ -130,6 +130,23 @@ describe('real WebKit editor interactions', () => {
     return Boolean(fan && getComputedStyle(fan).display !== 'none' && fan.getClientRects().length > 0);
   }
 
+  it('reserves automatic text completion for Loom while retaining spellcheck', async () => {
+    render('hello');
+    const visual = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await expect.element(visual).toHaveAttribute('autocorrect', 'off');
+    await expect.element(visual).toHaveAttribute('autocomplete', 'off');
+    await expect.element(visual).toHaveAttribute('spellcheck', 'true');
+
+    if (mounted) await unmount(mounted);
+    mounted = null;
+    document.body.replaceChildren();
+    renderSource('hello', []);
+    const source = page.getByRole('textbox', { name: 'Markdown source editor' });
+    await expect.element(source).toHaveAttribute('autocorrect', 'off');
+    await expect.element(source).toHaveAttribute('autocomplete', 'off');
+    await expect.element(source).toHaveAttribute('spellcheck', 'true');
+  });
+
   async function paintTwice(): Promise<void> {
     await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
     await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
@@ -600,7 +617,8 @@ describe('real WebKit editor interactions', () => {
     render('Something ', [
       { candidateId: 'a', presentationKey: 'a:1', text: 'lingers here', runId: 'run-a', targetByte: 10, insertsOnAccept: true }
     ]);
-    await expect.element(page.getByText('lingers', { exact: true }).first()).toBeVisible();
+    await expect.poll(() => document.querySelector('.loom-visual-ghost')?.textContent).toBe('lingers here');
+    await expect.element(page.getByText('lingers here', { exact: true }).first()).toBeVisible();
     await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
     await expect.poll(serializedMarkdown).toBe('Something lingers');
     await expect.element(page.getByText('here', { exact: true }).first()).toBeVisible();
@@ -942,14 +960,14 @@ describe('real WebKit editor interactions', () => {
       .toBe('[linked words](https://new.example)');
   });
 
-  it('renders, consumes, and reverses a cached ghost without new inference', async () => {
+  it('renders, consumes, and reverses a cached ghost without a regeneration intent', async () => {
     render('hello', [
       { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
       { candidateId: 'b', presentationKey: 'b:1', text: ' there friend', runId: 'run-b', targetByte: 5, insertsOnAccept: true },
       { candidateId: 'c', presentationKey: 'c:1', text: ' from here', runId: 'run-c', targetByte: 5, insertsOnAccept: true },
       { candidateId: 'd', presentationKey: 'd:1', text: ' and onward', runId: 'run-d', targetByte: 5, insertsOnAccept: true }
     ]);
-    const ghost = page.getByText(' world', { exact: true }).first();
+    const ghost = page.getByText(' world again', { exact: true }).first();
     await expect.element(ghost).toBeVisible();
 
     await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}');
@@ -965,7 +983,7 @@ describe('real WebKit editor interactions', () => {
     await userEvent.keyboard('{Alt>}{ArrowLeft}{/Alt}');
     await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
       .toHaveTextContent('hello');
-    await expect.element(page.getByText(' world', { exact: true }).first())
+    await expect.element(page.getByText(' world again', { exact: true }).first())
       .toBeVisible();
     expect(page.getByRole('listbox', { name: 'Completion suggestions' }).query()).toBeNull();
     await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
@@ -975,7 +993,7 @@ describe('real WebKit editor interactions', () => {
     expect(paragraph?.firstChild?.textContent).toBe('hello');
   });
 
-  it('updates the next visible word while retaining the complete streamed presentation', async () => {
+  it('renders the complete growing prefix in the existing ghost widget', async () => {
     const candidate = (presentationKey: string, text: string): CompletionCandidate => ({
       candidateId: 'streaming-a',
       presentationKey,
@@ -1008,11 +1026,11 @@ describe('real WebKit editor interactions', () => {
       .toHaveTextContent('1');
 
     await advance.click();
-    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
     await expect.element(page.getByRole('status', { name: 'Completion Stream Frame' }))
       .toHaveTextContent('2');
     expect(Array.from(editor.querySelectorAll('.loom-visual-ghost')).map((node) => node.textContent))
-      .toEqual([' world']);
+      .toEqual([' world again']);
     await expect.element(page.getByRole('status', { name: 'Completion Presentation' }))
       .toHaveTextContent('5:streaming-a:3: world again');
     await expect.poll(serializedMarkdown).toBe('hello');
@@ -1171,13 +1189,13 @@ describe('real WebKit editor interactions', () => {
       { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
       { candidateId: 'b', presentationKey: 'b:1', text: ' there friend', runId: 'run-b', targetByte: 5, insertsOnAccept: true }
     ]);
-    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
 
     await keyboard.keyboard('{Alt>}{ArrowRight}{ArrowLeft}{/Alt}');
 
     await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
       .toHaveTextContent('hello');
-    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
     await expect.element(page.getByRole('status', { name: 'Generation Requests' }))
       .toHaveTextContent('0');
     await keyboard.cleanup();
@@ -1188,7 +1206,7 @@ describe('real WebKit editor interactions', () => {
       { candidateId: 'a', presentationKey: 'a:1', text: ' world again', runId: 'run-a', targetByte: 5, insertsOnAccept: true },
       { candidateId: 'b', presentationKey: 'b:1', text: ' there friend', runId: 'run-b', targetByte: 5, insertsOnAccept: true }
     ]);
-    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
 
     await userEvent.keyboard('{Alt>}{ArrowRight}{/Alt}{Escape}');
 
@@ -1201,11 +1219,11 @@ describe('real WebKit editor interactions', () => {
       .toHaveTextContent('0');
   });
 
-  it('cycles the visible word with Option arrows without a prior modifier or fan event', async () => {
+  it('cycles the full visible preview with Option arrows without a prior modifier or fan event', async () => {
     render('hello', fourChoiceCompletion().map((candidate) => ({
       ...candidate, text: `${candidate.text} stays cached`
     })));
-    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByText(' world stays cached', { exact: true }).first()).toBeVisible();
     const editor = page.getByRole('textbox', { name: 'Manuscript editor' }).element();
     expect(completionFanIsVisible()).toBe(false);
     const down = new KeyboardEvent('keydown', {
@@ -1213,7 +1231,7 @@ describe('real WebKit editor interactions', () => {
     });
     editor.dispatchEvent(down);
     expect(down.defaultPrevented).toBe(true);
-    await expect.element(page.getByText(' there', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByText(' there stays cached', { exact: true }).first()).toBeVisible();
     expect(serializedMarkdown()).toBe('hello');
     dispatchOptionUp(editor);
     await expect.poll(completionFanIsVisible).toBe(false);
@@ -1223,39 +1241,42 @@ describe('real WebKit editor interactions', () => {
     });
     editor.dispatchEvent(up);
     expect(up.defaultPrevented).toBe(true);
-    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByText(' world stays cached', { exact: true }).first()).toBeVisible();
     dispatchOptionUp(editor);
     await expect.poll(completionFanIsVisible).toBe(false);
     await userEvent.keyboard('{Tab}');
     await expect.element(page.getByRole('status', { name: 'Serialized Markdown' })).toHaveTextContent('hello world');
     expect(serializedMarkdown()).toBe('hello world');
-    await expect.element(page.getByText(' stays', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByText(' stays cached', { exact: true }).first()).toBeVisible();
   });
 
   for (const mode of ['visual', 'source'] as const) {
-    it(`cycles compatible ${mode} ghost words in both directions after accepting a word`, async () => {
+    it(`cycles compatible ${mode} ghost previews in both directions after accepting a word`, async () => {
       const choices = [' one alpha tail', ' one beta tail', ' other gamma'].map((text, index) => ({
         candidateId: `choice-${index}`, presentationKey: `choice-${index}:1`, text,
         runId: `run-${index}`, targetByte: 5, insertsOnAccept: true
       }));
       if (mode === 'visual') render('hello', choices);
       else renderSource('hello', choices);
-      await expect.element(page.getByText(' one', { exact: true }).first()).toBeVisible();
+      await expect.element(page.getByText(' one alpha tail', { exact: true }).first()).toBeVisible();
+      const editor = page.getByRole('textbox', {
+        name: mode === 'visual' ? 'Manuscript editor' : 'Markdown source editor'
+      }).element();
+      await expect.poll(() => document.activeElement === editor).toBe(true);
       await userEvent.keyboard('{Tab}');
       const output = page.getByRole('status', { name: mode === 'visual' ? 'Serialized Markdown' : 'Source Markdown' });
       await expect.element(output).toHaveTextContent('hello one');
       const prose = output.element().textContent;
-      const editor = page.getByRole('textbox', { name: mode === 'visual' ? 'Manuscript editor' : 'Markdown source editor' }).element();
       const visibleWord = () => document.querySelector(mode === 'visual' ? '.loom-visual-ghost' : '.loom-source-ghost-text')?.textContent?.trim();
-      await expect.poll(visibleWord).toBe('alpha');
+      await expect.poll(visibleWord).toBe('alpha tail');
       dispatchKey(editor, 'keydown', 'ArrowDown', 'ArrowDown', true);
-      await expect.poll(visibleWord).toBe('beta');
+      await expect.poll(visibleWord).toBe('beta tail');
       expect(output.element().textContent).toBe(prose);
       dispatchKey(editor, 'keydown', 'ArrowUp', 'ArrowUp', true);
-      await expect.poll(visibleWord).toBe('alpha');
+      await expect.poll(visibleWord).toBe('alpha tail');
       expect(output.element().textContent).toBe(prose);
       dispatchKey(editor, 'keydown', 'ArrowUp', 'ArrowUp', true);
-      await expect.poll(visibleWord).toBe('beta');
+      await expect.poll(visibleWord).toBe('beta tail');
       // Wrapping visits only candidates that begin with the exact accepted bytes.
       expect(output.element().textContent).toBe(prose);
       dispatchOptionUp(editor);
@@ -1370,6 +1391,8 @@ describe('real WebKit editor interactions', () => {
     await expect.poll(serializedMarkdown).toBe('hello there');
     await expect.element(page.getByRole('status', { name: 'Completion Presentation' }))
       .toHaveTextContent('b:1:session:6');
+    await paintTwice();
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
 
     // Option remains physically held throughout. The exhausted presentation
     // is intentionally hidden, but it is still exact rollback authority and
@@ -1577,7 +1600,7 @@ describe('real WebKit editor interactions', () => {
     ]);
     const context = page.getByRole('status', { name: 'Completion Context' });
     await expect.element(context).toHaveTextContent('browser-session:browser-document:1:visual');
-    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
 
     await keyboard.keyboard('{Alt>}{ArrowRight}{/Alt}');
     await expect.element(page.getByRole('status', { name: 'Serialized Markdown' }))
@@ -1620,7 +1643,7 @@ describe('real WebKit editor interactions', () => {
       { candidateId: 'c', presentationKey: 'c:1', text: ' from here', runId: 'run-c', targetByte: 5, insertsOnAccept: true },
       { candidateId: 'd', presentationKey: 'd:1', text: ' and onward', runId: 'run-d', targetByte: 5, insertsOnAccept: true }
     ]);
-    await expect.element(page.getByText(' world', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByText(' world again', { exact: true }).first()).toBeVisible();
 
     await keyboard.keyboard('{Alt>}{ArrowDown}{ArrowRight}{/Alt}');
     await expect.poll(
@@ -1635,7 +1658,7 @@ describe('real WebKit editor interactions', () => {
     await keyboard.keyboard('{Alt>}{ArrowLeft}{/Alt}');
     await expect.element(page.getByRole('status', { name: 'Source Markdown' }))
       .toHaveTextContent('hello');
-    await expect.element(page.getByText(' there', { exact: true }).first()).toBeVisible();
+    await expect.element(page.getByText(' there friend', { exact: true }).first()).toBeVisible();
     await expect.element(page.getByRole('status', { name: 'Source Generation Requests' }))
       .toHaveTextContent('0');
     await keyboard.cleanup();

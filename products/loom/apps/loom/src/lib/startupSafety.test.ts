@@ -118,8 +118,8 @@ describe('acquireStartupProject', () => {
 });
 
 describe('shouldDiscoverModelsOnStartup', () => {
-  it('keeps the local model library cold until a project opts into suggestions', () => {
-    expect(shouldDiscoverModelsOnStartup(false)).toBe(false);
+  it('prepares the local model library before a project opts into suggestions', () => {
+    expect(shouldDiscoverModelsOnStartup(false)).toBe(true);
     expect(shouldDiscoverModelsOnStartup(true)).toBe(true);
   });
 });

@@ -67,27 +67,52 @@ record_check() {
   CHECKS="${CHECKS}${CHECKS:+|}$1"
 }
 
+# Select the actual binaries, not only rustup's proxy override: a standalone
+# Homebrew Cargo earlier on PATH would otherwise escape the pin inside Tauri.
+pin_rust_toolchain() {
+  toolchain_cargo=$(rustup which --toolchain 1.92.0 cargo) || return $?
+  toolchain_bin=$(dirname "$toolchain_cargo")
+  for tool in cargo rustc rustdoc; do
+    if [ ! -x "$toolchain_bin/$tool" ]; then
+      echo "pinned toolchain is missing $tool: $toolchain_bin" >&2
+      return 1
+    fi
+  done
+  PATH="$toolchain_bin:$PATH"
+  CARGO="$toolchain_bin/cargo"
+  RUSTC="$toolchain_bin/rustc"
+  RUSTDOC="$toolchain_bin/rustdoc"
+  RUSTUP_TOOLCHAIN=1.92.0
+  export PATH CARGO RUSTC RUSTDOC RUSTUP_TOOLCHAIN
+}
+
 run_exact_test() {
   package=$1
   target_kind=$2
   target_name=$3
   test_name=$4
-  test_list=$(mktemp -t delysis-release-tests.XXXXXX)
-  if [ "$target_kind" = lib ]; then
-    rustup run 1.92.0 cargo test --locked -p "$package" --lib -- --list > "$test_list"
-  else
-    rustup run 1.92.0 cargo test --locked -p "$package" --bin "$target_name" -- --list > "$test_list"
+  case "$target_kind" in
+    lib) set -- --lib ;;
+    bin) set -- --bin "$target_name" ;;
+    *) echo "unsupported release test target: $target_kind" >&2; return 2 ;;
+  esac
+  # An exact filter may exit successfully with an ignored or nonexistent test.
+  # Require one executed pass, not just discovery or Cargo's exit status.
+  test_status=0
+  test_output=$(run rustup run 1.92.0 cargo test --locked -p "$package" "$@" "$test_name" -- --exact --format pretty --color never) || test_status=$?
+  printf '%s\n' "$test_output"
+  if [ "$test_status" -ne 0 ]; then
+    return "$test_status"
   fi
-  if ! grep -Fqx "$test_name: test" "$test_list"; then
-    rm -f "$test_list"
-    echo "release check no longer exists: $package $test_name" >&2
-    exit 1
-  fi
-  rm -f "$test_list"
-  if [ "$target_kind" = lib ]; then
-    run rustup run 1.92.0 cargo test --locked -p "$package" --lib "$test_name" -- --exact
-  else
-    run rustup run 1.92.0 cargo test --locked -p "$package" --bin "$target_name" "$test_name" -- --exact
+  if ! printf '%s\n' "$test_output" | awk '
+    /^test result:/ {
+      summaries++
+      if ($0 ~ /^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in /) passed++
+    }
+    END { exit !(summaries == 1 && passed == 1) }
+  '; then
+    echo "release check did not execute exactly one passing test: $package $test_name" >&2
+    return 1
   fi
   record_check "$package::$test_name"
 }
@@ -152,16 +177,17 @@ if [ "$RELEASE_KIND" = stable ]; then
   fi
 fi
 
+pin_rust_toolchain
+
 run pnpm install --frozen-lockfile --offline
 
 case "$COMPONENT" in
   mom)
-    run_exact_test mom-llama-runtime lib unused store::tests::prior_logical_store_import_cleans_plaintext_and_reopens_with_fixture_only_key
+    run_exact_test mom-llama-runtime lib unused store::tests::unrelated_files_are_not_store_inputs_or_rewritten
     run_exact_test mom-llama-runtime lib unused kv_cache::tests::persistent_cache_corruption_invalidates_and_falls_back_after_reopen
     run_exact_test mom-llama-app bin mom-llama-app app_runtime::tests::direct_native_operation_drains_before_final_join
     ;;
   loom)
-    run_exact_test loom-store lib unused generation::tests::exact_boundary_suggestion_promotion_survives_store_reopen
     run_exact_test loom-store lib unused generation::tests::exact_boundary_suggestion_promotion_survives_store_reopen
     run_exact_test tauri-plugin-loom lib unused tests::close_cancels_active_family_waits_for_terminal_release_and_replays
     run pnpm --dir "$PRODUCT_DIR" test

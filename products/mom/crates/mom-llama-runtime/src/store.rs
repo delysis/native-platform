@@ -1,3 +1,8 @@
+#[cfg(any(target_os = "macos", test))]
+mod installation_key;
+#[cfg(target_os = "macos")]
+use installation_key::load_or_create_macos_key;
+
 use anyhow::{Context, Result, anyhow};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
@@ -217,7 +222,6 @@ impl RuntimeStore {
     }
 
     pub(crate) fn open(data_dir: &Path) -> Result<Self> {
-        reject_legacy_plaintext(data_dir)?;
         fs::create_dir_all(data_dir)?;
         let key = resolve_store_key(data_dir)?;
         Self::open_with_key(data_dir, key)
@@ -232,7 +236,6 @@ impl RuntimeStore {
         key: [u8; 32],
         before_creation: impl FnOnce(),
     ) -> Result<Self> {
-        reject_legacy_plaintext(data_dir)?;
         fs::create_dir_all(data_dir)?;
         let store = Self {
             path: data_dir.join(DATABASE_FILE),
@@ -473,73 +476,6 @@ impl RuntimeStore {
         Ok(result)
     }
 
-    /// Mutate two encrypted documents under one immediate SQLite transaction.
-    ///
-    /// This is the narrow boundary for product facts that must become visible
-    /// together, while retaining a separate typed owner for each document.
-    #[cfg(test)]
-    pub(crate) fn mutate_pair<A, B, R>(
-        &self,
-        first_namespace: &str,
-        first_default: impl FnOnce() -> A,
-        second_namespace: &str,
-        second_default: impl FnOnce() -> B,
-        mutation: impl FnOnce(&mut A, &mut B) -> Result<R>,
-    ) -> Result<R>
-    where
-        A: Serialize + DeserializeOwned,
-        B: Serialize + DeserializeOwned,
-    {
-        if first_namespace == second_namespace {
-            anyhow::bail!("paired encrypted document namespaces must be distinct");
-        }
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let first_encrypted = transaction
-            .query_row(
-                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
-                [first_namespace],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()?;
-        let second_encrypted = transaction
-            .query_row(
-                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
-                [second_namespace],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-            )
-            .optional()?;
-        let mut first = match first_encrypted {
-            Some((nonce, ciphertext)) => self.decrypt_json(first_namespace, &nonce, &ciphertext)?,
-            None => first_default(),
-        };
-        let mut second = match second_encrypted {
-            Some((nonce, ciphertext)) => {
-                self.decrypt_json(second_namespace, &nonce, &ciphertext)?
-            }
-            None => second_default(),
-        };
-        let result = mutation(&mut first, &mut second)?;
-        let (first_nonce, first_ciphertext) = self.encrypt_json(first_namespace, &first)?;
-        let (second_nonce, second_ciphertext) = self.encrypt_json(second_namespace, &second)?;
-        for (namespace, nonce, ciphertext) in [
-            (first_namespace, first_nonce, first_ciphertext),
-            (second_namespace, second_nonce, second_ciphertext),
-        ] {
-            transaction.execute(
-                "INSERT INTO encrypted_documents(namespace, nonce, ciphertext, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(namespace) DO UPDATE SET
-                   nonce = excluded.nonce,
-                   ciphertext = excluded.ciphertext,
-                   updated_at = excluded.updated_at",
-                params![namespace, nonce, ciphertext, timestamp_i64()],
-            )?;
-        }
-        transaction.commit()?;
-        Ok(result)
-    }
-
     pub(crate) fn mutate_documents<T, R>(
         &self,
         namespace: &str,
@@ -763,30 +699,6 @@ fn disposable_cache_quarantine_namespace(
     )
 }
 
-const LEGACY_PLAINTEXT_FILES: &[&str] = &[
-    "settings.json",
-    "conversations.json",
-    "drafts.json",
-    "attachments.json",
-    "mcp-servers.json",
-    "skills.json",
-];
-
-fn reject_legacy_plaintext(data_dir: &Path) -> Result<()> {
-    for name in LEGACY_PLAINTEXT_FILES {
-        let path = data_dir.join(name);
-        match fs::symlink_metadata(&path) {
-            Ok(_) => anyhow::bail!(
-                "Unsupported legacy plaintext store at {}. Move this file out of the product directory before opening the current encrypted store; automatic migration is not supported.",
-                path.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
 fn resolve_store_key(data_dir: &Path) -> Result<[u8; 32]> {
     // Only this crate's unit-test binary may derive its fixture key. Changing
     // a data directory never changes the credential policy of a release build.
@@ -905,24 +817,6 @@ pub(crate) fn prepare_secure_store_retry() -> Result<()> {
         clear_cached_installation_key_failure(&account, &INSTALLATION_KEYS)?;
     }
     Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn load_or_create_macos_key(account: &str) -> Result<[u8; 32]> {
-    const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
-    match security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, account) {
-        Ok(key) => key
-            .try_into()
-            .map_err(|_| anyhow!("Keychain key is not 32 bytes")),
-        Err(error) if error.code() == ERR_SEC_ITEM_NOT_FOUND => {
-            let mut key = [0_u8; 32];
-            getrandom::fill(&mut key)
-                .map_err(|error| anyhow!("store key generation failed: {error}"))?;
-            security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, account, &key)?;
-            Ok(key)
-        }
-        Err(error) => Err(error.into()),
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1216,18 +1110,22 @@ mod tests {
                 values: vec!["second-old".to_string()],
             },
         )?;
-        let failed: Result<()> = store.mutate_pair(
-            "first",
-            SecretDocument::default,
-            "second",
-            SecretDocument::default,
-            |first, second| {
+        let failed: Result<()> =
+            store.mutate_documents("first", SecretDocument::default, |first, documents| {
+                let mut second = documents
+                    .get::<SecretDocument>("second")?
+                    .ok_or_else(|| anyhow!("second document missing"))?;
                 first.values = vec!["first-rolled-back".to_string()];
                 second.values = vec!["second-rolled-back".to_string()];
+                documents.put_bytes("second", &serde_json::to_vec(&second)?)?;
                 Err(anyhow!("force paired rollback"))
-            },
+            });
+        assert_eq!(
+            failed
+                .expect_err("staged document changes must roll back")
+                .to_string(),
+            "force paired rollback"
         );
-        assert!(failed.is_err());
         assert_eq!(
             store.get::<SecretDocument>("first")?.expect("first"),
             SecretDocument {
@@ -1241,17 +1139,17 @@ mod tests {
             }
         );
 
-        store.mutate_pair(
-            "first",
-            SecretDocument::default,
-            "second",
-            SecretDocument::default,
-            |first, second| {
-                first.values = vec!["first-new".to_string()];
-                second.values = vec!["second-new".to_string()];
-                Ok(())
-            },
-        )?;
+        store.mutate_documents("first", SecretDocument::default, |first, documents| {
+            let mut second = documents
+                .get::<SecretDocument>("second")?
+                .ok_or_else(|| anyhow!("second document missing"))?;
+            first.values = vec!["first-new".to_string()];
+            second.values = vec!["second-new".to_string()];
+            documents.put_bytes("second", &serde_json::to_vec(&second)?)?;
+            Ok(())
+        })?;
+        drop(store);
+        let store = RuntimeStore::open_with_key(&data_dir, [31_u8; 32])?;
         assert_eq!(
             store.get::<SecretDocument>("first")?.expect("first"),
             SecretDocument {
@@ -1462,20 +1360,16 @@ mod tests {
     }
 
     #[test]
-    fn legacy_plaintext_is_refused_before_database_creation() -> Result<()> {
-        for name in LEGACY_PLAINTEXT_FILES {
-            let dir = test_dir(name);
-            fs::create_dir_all(&dir)?;
-            let path = dir.join(name);
-            fs::write(&path, b"private legacy source")?;
-            let error = RuntimeStore::open_with_key(&dir, [7; 32])
-                .err()
-                .expect("legacy refused");
-            assert!(error.to_string().contains(name));
-            assert_eq!(fs::read(&path)?, b"private legacy source");
-            assert!(!dir.join(DATABASE_FILE).exists());
-            fs::remove_dir_all(dir)?;
-        }
+    fn unrelated_files_are_not_store_inputs_or_rewritten() -> Result<()> {
+        let dir = test_dir("unrelated-file");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("settings.json");
+        fs::write(&path, b"not an application store")?;
+        let store = RuntimeStore::open_with_key(&dir, [7; 32])?;
+        store.put("current", &"value")?;
+        assert_eq!(store.get::<String>("current")?.as_deref(), Some("value"));
+        assert_eq!(fs::read(&path)?, b"not an application store");
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 

@@ -1116,7 +1116,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plaintext_settings_are_rejected_without_import_or_source_mutation() -> Result<()> {
+    fn adjacent_settings_file_is_not_imported_or_rewritten() -> Result<()> {
         let data_dir =
             std::env::temp_dir().join(format!("mom-plaintext-settings-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&data_dir)?;
@@ -1130,10 +1130,10 @@ mod tests {
         let database_created = data_dir.join("runtime.sqlite3").exists();
         fs::remove_dir_all(&data_dir)?;
 
-        let error = result.expect_err("plaintext settings must not be silently imported");
-        assert!(error.to_string().contains("settings.json"));
+        let settings = result?;
+        assert_eq!(settings.default_max_tokens, DEFAULT_MAX_TOKENS);
         assert_eq!(preserved_source, source);
-        assert!(!database_created);
+        assert!(database_created);
         Ok(())
     }
 

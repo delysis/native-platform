@@ -1,3 +1,11 @@
+# Current entry point
+
+Start with the [24 September integration map](docs/reviews/2026-09-24-integration-map.md)
+and [development workflow](docs/browser-development.md). The continuation below
+is retained as historical evidence; do not reset to its older commits or reapply
+its already-integrated patches. Paid GitHub Actions are unavailable: use local
+source-bound validation without claiming unexecuted native or platform checks.
+
 # Native-platform audit remediation handoff
 
 Date: 2026-09-22  
@@ -152,3 +160,175 @@ Key files:
 ## Working-tree warning
 
 The active worktree may show the three generated Tauri schema files as modified while builds run. They are build-generated evidence from the release defect, not unrelated user edits. Do not discard them blindly. Review against `/tmp/native-platform-f8588b3e-acceptance/build-generated-schema.diff`, then either commit the authoritative generated output with its source change or regenerate it deterministically on the repair branch.
+
+## Astra continuation: PR #75 qualification state (2026-09-22)
+
+This section records the latest exact qualification state. It supersedes no
+acceptance requirement above; native product acceptance remains OPEN.
+
+### Tested source and artifact
+
+- PR #75 source was fetched from GitHub into a clean separate worktree.
+- Qualification worktree: `/Users/george/.codex/worktrees/native-platform-pr75-ghost`.
+- Original PR tip: `2fb08be8846cc00c3b58d4e3fbefecc37e26352f`.
+- Latest local qualification commit: `e98e6cdc57be9e336ece5803282e63db10ee6fb7`.
+- Latest local qualification tree: `90feed84a62bd72d5dd318f4960ff191604964c3`.
+- The local commit only repairs browser-test fixtures exposed by the new
+  production identity checks: `onGhostPresentationRejected`, the exact
+  `weave-${commandId}` request identity, and the expected `weave_status` read.
+- Clean candidate directory:
+  `/Users/george/.codex/worktrees/native-platform-pr75-ghost/dist/macos/loom-v0.1.0-e98e6cdc57be-20260922T191416Z`.
+- Candidate archive:
+  `/Users/george/.codex/worktrees/native-platform-pr75-ghost/dist/macos/loom-v0.1.0-e98e6cdc57be-20260922T191416Z/Loom.app.zip`.
+- Candidate receipt:
+  `/Users/george/.codex/worktrees/native-platform-pr75-ghost/dist/macos/loom-v0.1.0-e98e6cdc57be-20260922T191416Z/release-receipt.json`.
+
+### Green qualification evidence
+
+- Focused frontend unit suite: 73 tests passed.
+- Full frontend unit suite during release: 70 files, 515 tests passed.
+- Prescribed browser suite: 19 files, 148 tests passed.
+- `svelte-check`: 0 errors, 0 warnings.
+- Pinned `rustup run 1.92.0 cargo run --locked -p xtask -- macos-smoke-support`
+  passed 9 insertion assertions, 31 live-observer assertions, and compiled
+  18 macOS helpers.
+- Clean macOS Tauri build and ad-hoc signing completed successfully.
+- These are component/build receipts only. They do not establish native
+  product acceptance.
+
+### Latest real-model failure and preserved evidence
+
+The exact archive smoke was run with:
+
+- `DELYSIS_ACCEPTANCE_SOURCE_SHA=e98e6cdc57be9e336ece5803282e63db10ee6fb7`
+- `LOOM_SMOKE_GGUF_MODEL_PATH=/Users/george/.cache/fiction-harness/models/gemma-4-E2B-base-Q8_0.gguf`
+
+Preserved smoke directory:
+
+`/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/delysis-loom-smoke.XXXXXX.99o0hBJfyk`
+
+The run proves model/backend activity but fails native acceptance:
+
+- Metal initialized.
+- `generation_run_count` reached 8; the guard permits at most 4.
+- The first four-run family IDs were recorded in
+  `launch-1-live-stream-diagnostics.json`.
+- A fifth generation was admitted while the first ghost/cache family was in
+  use; the guard reports `asynchronous_guard_failed`.
+- `last_witness` and `post_terminal_observation` are both `{}`.
+- Rejected stages were `family_pending: 325` and `editor_missing: 41`.
+- No correlated pre-terminal WYSIWYG ghost was observed.
+- No product acceptance, model acceptance, or promotion claim is allowed.
+
+Relevant files in that directory:
+
+- `launch-1-live-stream-diagnostics.json`
+- `launch-1-live-stream-monitor.failure.json`
+- `launch-1-generation-family-guard.failure.json`
+- `launch-1-generation-family-guard.stderr.log`
+- `launch-1.stderr.log`
+
+### Unresolved to-dos for Astra
+
+1. Start from the exact latest qualification commit/tree above and inspect
+   the preserved smoke directory before editing code.
+2. Trace why the app admits a second four-run family before the first family
+   has produced a correlated visual/source witness. Establish whether this is
+   duplicate automatic scheduling, family teardown/retry, stale scope
+   invalidation followed by an unauthorized retry, or another admission path.
+   Do not raise the generation guard and do not suppress the guard failure.
+3. Correlate each of the eight run IDs through admission, durable event
+   publication, terminal candidate, family evaluation, and editor projection.
+   Use source revision/blob/cursor identity, not labels or readiness flags.
+4. Explain the `editor_missing` observations from the live diagnostics. Verify
+   the packaged app is attached to the intended named editor and native caret;
+   do not replace this with a controller-only or screenshot-only assertion.
+5. Determine whether a ghost is painted after terminal hydration. If yes,
+   retain the proof and separately decide whether streaming-before-terminal is
+   the intended product contract. If no, fix the actual projection/presentation
+   path and preserve the negative controls.
+6. After the narrow fix, rerun focused unit/browser tests, pinned observer
+   self-tests, and one clean release. Then rerun the exact archive smoke with
+   the approved Gemma model and preserve the complete smoke directory.
+7. If the smoke reaches a live witness, complete both Visual and Source
+   journeys: true in-caret Ghost, four distinct stable Loompad W/A/S/D choices,
+   unchanged manuscript while cycling, exact accept/unconsume/ordinary undo,
+   stale-scope invalidation, active-work quit with owned-worker joins, and
+   same-artifact/project relaunch with exact persisted bytes and fresh native
+   completion.
+8. Only promote after the exact tested tree passes those journeys and all
+   artifact/model/source hashes are recorded. Keep hosted credentials,
+   microphones, and unexercised authorities explicitly out of the result.
+
+### Explicit non-goals
+
+- Do not weaken or remove a predicate to obtain a green receipt.
+- Do not extend waits as a substitute for diagnosing the duplicate admission.
+- Do not inject fixture completions into the native smoke.
+- Do not change the approved Gemma model or add hosted inference fallback.
+
+## Pro handoff: latest native smoke remains genuinely broken (2026-09-22)
+
+The local agent stopped after the exact approved-Gemma smoke remained visually
+empty and the supplied screenshot showed an ugly repeated list of temporary
+`/private/var/folders/.../delysis-loom-...` directories in the app's folder
+search UI. This is a bounded failure handoff, not a product acceptance receipt.
+
+### Exact attempted artifact
+
+- Tested commit before the smoke: `034f8f94474d66aa09c027a526c96653b0b75403`.
+- Tested tree before the smoke: `4625df45ab85fffc90a5f292b8cd541ccb1c52b5`.
+- Candidate:
+  `/Users/george/.codex/worktrees/native-platform-pr75-astra-20260922/dist/macos/loom-v0.1.0-034f8f94474d-20260922T203135Z`.
+- Smoke evidence:
+  `/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/delysis-loom-smoke.XXXXXX.p23c0Dgk0k`.
+- User screenshot:
+  `/var/folders/t0/4s921_v11fv9vlymtx6g5qgm0000gn/T/codex-clipboard-67bbf759-95c1-4bb1-b8a9-1cae94e661a8.png`.
+
+### Exact result
+
+The run was bounded and stopped at the user's direction; it did not reach the
+four-run guard. The monitor observed 2,226 polls with:
+
+- `reason: no_correlated_inline_render`
+- `generation_run_count: 0`
+- `family_run_ids: []`
+- `last_witness: {}`
+- `post_terminal_observation: {}`
+- `observed_editor_labels: []`
+- `rejected_stages: { family_pending: 2226 }`
+- control state: `Ghost text`, enabled, suggestions enabled
+
+This latest artifact did not reach durable generation admission before the live
+monitor failed. It does not prove the cached model is bad; it does prove the
+packaged product path is still not rendering or admitting a completion in this
+run. Do not call this a model-loading pass.
+
+### Pro-owned next actions
+
+1. Inspect the preserved smoke directory and application stderr first. Explain
+   why the latest run has zero `generation_runs` despite the cached model and an
+   enabled `Ghost text` control.
+2. Explain the repeated temporary-folder entries visible in the screenshot.
+   Determine whether acceptance directories are exposed as project/search
+   results, whether launches share or leak the wrong persistent WebKit store, or
+   whether this is a separate filesystem-root presentation defect. Fix only with
+   direct evidence.
+3. Reconcile this zero-admission result with the earlier artifact, which had two
+   command families and eight durable runs. Do not infer that the hydration repair
+   caused or fixed the old second family without a command/run/event trace.
+4. Re-run one bounded exact artifact smoke after diagnosis. Require actual
+   pre-terminal multi-frame Ghost and then the full Visual and Source/Loompad
+   journeys already specified above.
+
+### Stop conditions
+
+- Do not spend time on broad redesign or old PR rebases in this handoff.
+- Do not raise the four-run guard, extend deadlines, inject completions, or use
+  hosted fallback.
+- Missing evidence is `BLOCKED`, never `PASS`.
+- Native product acceptance and promotion remain OPEN.
+- Do not reset the project, rewrite historical receipts, or perform a silent
+  database migration.
+- Do not claim acceptance from the green browser suite, native self-tests,
+  Metal initialization, generation-run creation, or a ready label.

@@ -276,10 +276,10 @@ export function visualFormatCommand(
     }
     case 'unlink': {
       if (state.selection.empty) return null;
-      return (_state, dispatch) => {
+      return withTrimmedInlineSelection((_state, dispatch) => {
         dispatch?.(_state.tr.removeMark(_state.selection.from, _state.selection.to, schema.marks.link));
         return true;
-      };
+      });
     }
   }
 }

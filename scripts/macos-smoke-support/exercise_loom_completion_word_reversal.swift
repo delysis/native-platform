@@ -1,9 +1,99 @@
+import Foundation
+
+func isOwnedManuscriptEditor(role: String, labels: [String]) -> Bool {
+    role == "AXTextArea" && labels.contains("Untitled, manuscript editor")
+}
+
+func exactInsertedCandidatePrefix(original: Data, observed: Data, candidate: Data, insertedBytes: Int, whole: Bool) -> Bool {
+    guard insertedBytes > 0, insertedBytes <= candidate.count,
+          !whole || insertedBytes == candidate.count else { return false }
+    var expected = original
+    expected.append(candidate.prefix(insertedBytes))
+    return observed == expected
+}
+
+// Derive the remaining fan from persisted bytes and independently SHA-verified
+// candidates, not from the controller's assertion about its own alternatives.
+func remainingCandidateIds(original: Data, observed: Data, runIds: [String], candidates: [String: Data]) -> [String]? {
+    guard observed.count > original.count, observed.starts(with: original),
+          Set(runIds).count == runIds.count,
+          runIds.allSatisfy({ candidates[$0] != nil }) else { return nil }
+    let accepted = observed.dropFirst(original.count)
+    return runIds.filter { id in
+        guard let candidate = candidates[id] else { return false }
+        return candidate.count > accepted.count && candidate.starts(with: accepted)
+    }
+}
+
+func remainingFanMatches(expected: [String], observed: [String], visible: Bool) -> Bool {
+    expected == observed && visible == (expected.count > 1)
+}
+
+func manuscriptEndCaret(original: Data, expected: Data) -> Int? {
+    guard expected.starts(with: original),
+          let text = String(data: expected, encoding: .utf8) else { return nil }
+    return text.utf16.count
+}
+
+func insertionContractTests() {
+    let original = Data("hello ".utf8), candidate = Data("world again".utf8)
+    var checks = 0
+    func check(_ condition: Bool, _ name: String) {
+        guard condition else { fputs("insertion contract failed: \(name)\n", stderr); exit(1) }
+        checks += 1
+    }
+    func accepts(_ text: String, _ length: Int, _ whole: Bool = false) -> Bool {
+        exactInsertedCandidatePrefix(original: original, observed: Data(text.utf8), candidate: candidate, insertedBytes: length, whole: whole)
+    }
+    check(accepts("hello world", 5), "exact selected prefix")
+    check(!accepts("hello wrong", 5), "same-size substituted bytes")
+    check(!accepts("Hello world", 5), "changed original bytes")
+    check(!accepts("hello world", 5, true), "partial is not whole remainder")
+    check(accepts("hello world again", 11, true), "exact whole remainder")
+    check(!accepts("hello ", 0), "empty acceptance")
+    check(!accepts("hello world", -1), "negative length")
+    check(!accepts("hello world again!", 12), "beyond candidate")
+    check(!exactInsertedCandidatePrefix(original: Data(), observed: Data("é".utf8), candidate: Data("e\u{301}".utf8), insertedBytes: 3, whole: true), "Unicode byte identity")
+    check(isOwnedManuscriptEditor(role: "AXTextArea", labels: ["Untitled, manuscript editor"]), "owned editor label")
+    check(!isOwnedManuscriptEditor(role: "AXTextArea", labels: ["Manuscript editor"]), "reject unscoped legacy editor")
+    check(!isOwnedManuscriptEditor(role: "AXTextArea", labels: ["Other, manuscript editor"]), "reject different manuscript")
+    check(!isOwnedManuscriptEditor(role: "AXButton", labels: ["Untitled, manuscript editor"]), "reject wrong editor role")
+    let ids = ["a", "b", "c", "d"]
+    let bodies = ["a": Data("one two".utf8), "b": Data("one three".utf8),
+                  "c": Data("one four".utf8), "d": Data("another turn".utf8)]
+    let remaining = remainingCandidateIds(original: original, observed: Data("hello one".utf8), runIds: ids, candidates: bodies)
+    check(remaining == ["a", "b", "c"], "preserve compatible original order")
+    check(remainingFanMatches(expected: remaining!, observed: ["a", "b", "c"], visible: true), "held Option retains compatible fan")
+    check(!remainingFanMatches(expected: remaining!, observed: ["a", "b", "c"], visible: false), "reject old hidden-fan decision")
+    check(!remainingFanMatches(expected: remaining!, observed: ids, visible: true), "reject incompatible sibling")
+    check(!remainingFanMatches(expected: remaining!, observed: ["b", "a", "c"], visible: true), "reject reordered mapping")
+    check(remainingFanMatches(expected: ["d"], observed: ["d"], visible: false), "singleton has no fan")
+    check(!remainingFanMatches(expected: ["d"], observed: ["d"], visible: true), "reject singleton fan")
+    check(remainingCandidateIds(original: original, observed: Data("Hello one".utf8), runIds: ids, candidates: bodies) == nil, "reject changed manuscript prefix")
+    check(remainingCandidateIds(original: original, observed: Data("hello one".utf8), runIds: ["missing"], candidates: bodies) == nil, "reject unverified candidate")
+    check(remainingCandidateIds(original: original, observed: Data("hello one two".utf8), runIds: ids, candidates: bodies) == [], "exhausted candidates are not alternatives")
+    check(manuscriptEndCaret(original: original, expected: original) == 6, "initial manuscript end")
+    check(manuscriptEndCaret(original: original, expected: Data("hello one".utf8)) == 9, "accepted word moves the expected caret")
+    check(manuscriptEndCaret(original: original, expected: Data("hello 🜁".utf8)) == 8, "caret uses UTF-16 rather than bytes")
+    check(manuscriptEndCaret(original: original, expected: Data("Hello one".utf8)) == nil, "reject changed original at refocus")
+    check(manuscriptEndCaret(original: Data(), expected: Data([0xff])) == nil, "reject invalid manuscript encoding")
+    print("\(checks) insertion-contract assertions passed (not native acceptance)")
+}
+
+if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--self-test" {
+    insertionContractTests(); exit(0)
+}
+
+#if os(macOS)
 import AppKit
 import ApplicationServices
 import CryptoKit
 import Foundation
 
-let pid = Int32(CommandLine.arguments[1])!
+guard CommandLine.arguments.count == 6, let pid = Int32(CommandLine.arguments[1]), pid > 0 else {
+    fputs("usage: exercise_loom_completion_word_reversal <pid> <manuscript> <prefix> <generation-failure> <project-failure>\n", stderr)
+    exit(2)
+}
 let manuscript = CommandLine.arguments[2]
 let prefix = CommandLine.arguments[3]
 let asynchronousFailurePaths = [CommandLine.arguments[4], CommandLine.arguments[5]]
@@ -18,6 +108,57 @@ func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
 
 func stringAttribute(_ element: AXUIElement, _ name: CFString) -> String {
     attribute(element, name) as? String ?? ""
+}
+
+func pointAttribute(_ element: AXUIElement, _ name: CFString) -> CGPoint? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cgPoint else { return nil }
+    var point = CGPoint.zero
+    return AXValueGetValue(value, .cgPoint, &point) ? point : nil
+}
+
+func sizeAttribute(_ element: AXUIElement, _ name: CFString) -> CGSize? {
+    guard let raw = attribute(element, name), CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cgSize else { return nil }
+    var size = CGSize.zero
+    return AXValueGetValue(value, .cgSize, &size) ? size : nil
+}
+
+func selectedRange(_ element: AXUIElement) -> CFRange? {
+    guard let raw = attribute(element, kAXSelectedTextRangeAttribute as CFString),
+          CFGetTypeID(raw) == AXValueGetTypeID() else { return nil }
+    let value = raw as! AXValue
+    guard AXValueGetType(value) == .cfRange else { return nil }
+    var range = CFRange()
+    return AXValueGetValue(value, .cfRange, &range) ? range : nil
+}
+
+func setCollapsedEndSelection(_ element: AXUIElement, caret: Int) -> Bool {
+    var range = CFRange(location: caret, length: 0)
+    guard let value = AXValueCreate(.cfRange, &range) else { return false }
+    return AXUIElementSetAttributeValue(
+        element,
+        kAXSelectedTextRangeAttribute as CFString,
+        value
+    ) == .success
+}
+
+func clickCenter(_ element: AXUIElement) -> Bool {
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return false }
+    guard let origin = pointAttribute(element, kAXPositionAttribute as CFString),
+          let size = sizeAttribute(element, kAXSizeAttribute as CFString),
+          size.width >= 100, size.height >= 40 else { return false }
+    let point = CGPoint(x: origin.x + size.width / 2, y: origin.y + size.height / 2)
+    guard let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
+                             mouseCursorPosition: point, mouseButton: .left),
+          let up = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp,
+                           mouseCursorPosition: point, mouseButton: .left) else { return false }
+    down.post(tap: .cghidEventTap)
+    Thread.sleep(forTimeInterval: 0.03)
+    up.post(tap: .cghidEventTap)
+    return true
 }
 
 let stringAttributes = [
@@ -46,7 +187,10 @@ func descendants() -> [AXUIElement] {
 
 func editor() -> AXUIElement? {
     descendants().first { element in
-        stringAttribute(element, kAXRoleAttribute as CFString) == kAXTextAreaRole as String
+        isOwnedManuscriptEditor(
+            role: stringAttribute(element, kAXRoleAttribute as CFString),
+            labels: strings(element)
+        )
     }
 }
 
@@ -74,31 +218,14 @@ func completionWitness() -> [String: Any]? {
     return nil
 }
 
-func supportsPress(_ element: AXUIElement) -> Bool {
-    var names: CFArray?
-    guard AXUIElementCopyActionNames(element, &names) == .success,
-          let actions = names as? [String] else { return false }
-    return actions.contains(kAXPressAction as String)
-}
-
-func button(named name: String) -> AXUIElement? {
-    descendants().first { element in
-        strings(element).contains(where: { $0.contains(name) }) &&
-            supportsPress(element) &&
-            (attribute(element, kAXEnabledAttribute as CFString) as? Bool) != false
-    }
-}
-
-func pressButton(named name: String, timeout: TimeInterval = 10) -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    repeat {
-        if let control = button(named: name),
-           AXUIElementPerformAction(control, kAXPressAction as CFString) == .success {
-            return true
-        }
-        Thread.sleep(forTimeInterval: 0.05)
-    } while Date() < deadline
-    return false
+// These are production shortcuts, not retired titlebar labels. The witness
+// below must prove the resulting transition; dispatch alone never passes.
+func completionShortcut(_ key: CGKeyCode, field: String, from expected: Bool) -> Bool {
+    guard !asynchronousGuardFailed(),
+          NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+          let witness = completionWitness(), witness[field] as? Bool == expected else { return false }
+    return postKey(key, down: true, flags: [.maskCommand, .maskShift]) &&
+        postKey(key, down: false, flags: [.maskCommand, .maskShift])
 }
 
 func visual(_ witness: [String: Any]) -> [String: Any] {
@@ -203,7 +330,8 @@ func fanAccessibility() -> (
         observations.append(accessibilityObservation(listbox))
         for element in subtree(listbox) {
             for label in strings(element) {
-                guard let ordinal = suggestionOrdinal(label), ordinal.count == 4 else { continue }
+                guard let ordinal = suggestionOrdinal(label), (2...4).contains(ordinal.count),
+                      (1...ordinal.count).contains(ordinal.index) else { continue }
                 let option: [String: Any] = [
                     "index": ordinal.index,
                     "count": ordinal.count,
@@ -223,16 +351,20 @@ func fanAccessibility() -> (
 func exactAccessibleFan(_ witness: [String: Any]) -> [[String: Any]]? {
     let fan = fanAccessibility()
     let candidates = witness["candidates"] as? [[String: Any]] ?? []
+    let alternatives = stringArray(visual(witness), "alternativeRunIds")
     guard fan.listbox,
-          fan.options.count == 4,
+          (2...4).contains(alternatives.count),
+          Set(alternatives).count == alternatives.count,
+          fan.options.count == alternatives.count,
           candidates.count == 4 else {
         return nil
     }
     var enriched: [[String: Any]] = []
     for option in fan.options.sorted(by: { integer($0, "index") < integer($1, "index") }) {
         let index = integer(option, "index")
-        guard index == enriched.count + 1 else { return nil }
-        let candidate = candidates[index - 1]
+        guard index == enriched.count + 1,
+              integer(option, "count") == alternatives.count,
+              let candidate = candidates.first(where: { string($0, "run_id") == alternatives[index - 1] }) else { return nil }
         var joined = option
         joined["run_id"] = string(candidate, "run_id")
         joined["candidate_id"] = string(candidate, "candidate_id")
@@ -328,17 +460,56 @@ func waitForExactManuscript(_ expected: Data, timeout: TimeInterval) -> Bool {
     return false
 }
 
-NSRunningApplication(processIdentifier: pid)?.activate(options: [])
-guard let writingSurface = editor(),
-      AXUIElementSetAttributeValue(
-        writingSurface,
-        kAXFocusedAttribute as CFString,
-        kCFBooleanTrue
-      ) == .success else {
+func focusWritingSurface(expected: Data, timeout: TimeInterval) -> AXUIElement? {
+    guard let caret = manuscriptEndCaret(original: Data(prefix.utf8), expected: expected),
+          let runningApplication = NSRunningApplication(processIdentifier: pid) else { return nil }
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    repeat {
+        if asynchronousGuardFailed() || runningApplication.isTerminated || readManuscript() != expected { return nil }
+        runningApplication.unhide()
+        _ = runningApplication.activate(options: [.activateAllWindows])
+        _ = AXUIElementSetAttributeValue(
+            application,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+        )
+        if let writingSurface = editor() {
+            _ = AXUIElementSetAttributeValue(
+                application,
+                kAXFocusedUIElementAttribute as CFString,
+                writingSurface
+            )
+            _ = AXUIElementSetAttributeValue(
+               writingSurface,
+               kAXFocusedAttribute as CFString,
+               kCFBooleanTrue
+            )
+            if (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) != true {
+                _ = clickCenter(writingSurface)
+            }
+            _ = setCollapsedEndSelection(writingSurface, caret: caret)
+            _ = AXUIElementSetAttributeValue(
+                writingSurface,
+                kAXFocusedAttribute as CFString,
+                kCFBooleanTrue
+            )
+            if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid,
+               (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
+               let range = selectedRange(writingSurface),
+               range.location == caret, range.length == 0 {
+                return writingSurface
+            }
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    } while ProcessInfo.processInfo.systemUptime < deadline
+    return nil
+}
+
+guard let writingSurface = focusWritingSurface(expected: Data(prefix.utf8), timeout: 5) else {
     fputs("could not focus Loom's exact writing surface for completion reversal\n", stderr)
     exit(1)
 }
-guard let original = readManuscript() else {
+guard let original = readManuscript(), original == Data(prefix.utf8), prefix.last?.isWhitespace == true else {
     fputs("could not read Loom's isolated manuscript before completion reversal\n", stderr)
     exit(1)
 }
@@ -359,6 +530,43 @@ guard let initial = waitForWitness(timeout: 30, { witness in
     fputs("Loom did not expose one exact cached four-choice completion witness\n", stderr)
     exit(1)
 }
+// The isolated journey uses root-level writing/Untitled.md. Its baseline
+// ends in whitespace, so presentation never adds an editor-owned separator.
+// Bind expected inserted bytes to the SHA-verified immutable candidate, not
+// to a length reported by the same controller that performed the insertion.
+func verifiedCandidateBytes(_ candidate: [String: Any]) -> Data? {
+    let parts = string(candidate, "presentation_key").components(separatedBy: ":")
+    guard parts.count == 2 || parts.count == 4, parts[0] != "stream", !parts[0].isEmpty,
+          parts[1].count == 64, parts[1].allSatisfy({ "0123456789abcdef".contains($0) }) else { return nil }
+    let hash = parts[1], length = integer(candidate, "text_utf8_bytes")
+    if parts.count == 4 && (parts[2] != "prose-prefix" || Int(parts[3]) != length) { return nil }
+    let path = URL(fileURLWithPath: manuscript).deletingLastPathComponent()
+        .appendingPathComponent(".loom/blobs/sha256").appendingPathComponent(String(hash.prefix(2)))
+        .appendingPathComponent(String(hash.dropFirst(2)))
+    guard let file = try? FileHandle(forReadingFrom: path) else { return nil }
+    defer { try? file.close() }
+    guard let bytes = try? file.read(upToCount: 256 * 1024 + 1), bytes.count <= 256 * 1024,
+          sha256(bytes) == hash, length > 0, length <= bytes.count else { return nil }
+    let projected = Data(bytes.prefix(length))
+    guard String(data: projected, encoding: .utf8) != nil else { return nil }
+    return projected
+}
+var expectedCandidates: [String: Data] = [:]
+for candidate in initial["candidates"] as? [[String: Any]] ?? [] {
+    let run = string(candidate, "run_id")
+    guard !run.isEmpty, expectedCandidates[run] == nil, let bytes = verifiedCandidateBytes(candidate) else {
+        fputs("could not bind expected insertion to one immutable candidate blob\n", stderr); exit(1)
+    }
+    expectedCandidates[run] = bytes
+}
+guard expectedCandidates.count == 4 else { fputs("four exact candidate blobs are required\n", stderr); exit(1) }
+func exactInsertion(_ observed: Data, witness: [String: Any], whole: Bool = false) -> Bool {
+    let action = lastAction(witness)
+    guard let candidate = expectedCandidates[string(action, "run_id")] else { return false }
+    return exactInsertedCandidatePrefix(original: original, observed: observed, candidate: candidate,
+        insertedBytes: integer(action, "inserted_utf8_bytes"), whole: whole)
+}
+
 let context = string(initial, "context_key")
 let runIds = familyRunIds(initial)
 let initialRunId = string(initial, "selected_run_id")
@@ -380,8 +588,16 @@ defer { postKey(58, down: false, flags: []) }
 
 func releaseOptionAndFail(_ message: String) -> Never {
     let fan = fanAccessibility()
+    let surface = editor()
+    let selection = surface.flatMap { selectedRange($0) }
     let diagnostic: [String: Any] = [
         "completion_witness": completionWitness() ?? [:],
+        "frontmost_pid": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1,
+        "editor_focused": surface.map {
+            (attribute($0, kAXFocusedAttribute as CFString) as? Bool) == true
+        } ?? false,
+        "editor_selection": ["location": selection?.location ?? -1,
+                             "length": selection?.length ?? -1],
         "fan_listbox_observed": fan.listbox,
         "fan_options": fan.options,
         "fan_observations": fan.observations
@@ -389,7 +605,7 @@ func releaseOptionAndFail(_ message: String) -> Never {
     if JSONSerialization.isValidJSONObject(diagnostic),
        let data = try? JSONSerialization.data(withJSONObject: diagnostic, options: [.sortedKeys]),
        let json = String(data: data, encoding: .utf8) {
-        fputs("completion fan diagnostics: \(json)\n", stderr)
+        fputs("completion interaction diagnostics: \(json)\n", stderr)
     }
     postKey(58, down: false, flags: [])
     fputs("\(message)\n", stderr)
@@ -446,6 +662,11 @@ guard postKey(124, down: true, flags: [.maskAlternate]),
 guard let accepted = waitForChangedManuscript(from: original, timeout: 30) else {
     releaseOptionAndFail("Option-Right did not persist one cached completion word")
 }
+guard let expectedRemainingIds = remainingCandidateIds(
+    original: original, observed: accepted, runIds: runIds, candidates: expectedCandidates
+) else {
+    releaseOptionAndFail("accepted manuscript could not be bound to the verified candidate family")
+}
 guard let wordAccepted = waitForWitness(timeout: 10, { witness in
     let rendered = visual(witness)
     let action = lastAction(witness)
@@ -454,7 +675,9 @@ guard let wordAccepted = waitForWitness(timeout: 10, { witness in
         integer(witness, "accepted_chunk_count") == 1 &&
         bool(witness, "authority_frozen") &&
         bool(rendered, "optionHeld") &&
-        !bool(rendered, "fanVisible") &&
+        remainingFanMatches(expected: expectedRemainingIds,
+            observed: stringArray(rendered, "alternativeRunIds"), visible: bool(rendered, "fanVisible")) &&
+        (expectedRemainingIds.count < 2 || exactAccessibleFan(witness) != nil) &&
         string(action, "kind") == "option_word" &&
         string(action, "run_id") == initialRunId &&
         integer(action, "sequence") > initialActionSequence
@@ -462,7 +685,8 @@ guard let wordAccepted = waitForWitness(timeout: 10, { witness in
     releaseOptionAndFail("Option-Right did not retain physical Option and exact cached-session authority")
 }
 
-guard postKey(123, down: true, flags: [.maskAlternate]),
+guard exactInsertion(accepted, witness: wordAccepted),
+      postKey(123, down: true, flags: [.maskAlternate]),
       postKey(123, down: false, flags: [.maskAlternate]) else {
     releaseOptionAndFail("could not construct Loom's Option-Left events")
 }
@@ -495,7 +719,7 @@ guard let optionReleased = waitForWitness(timeout: 10, { witness in
     exit(1)
 }
 
-guard pressButton(named: "Turn Shuttle on") else {
+guard completionShortcut(38, field: "shuttle_enabled", from: false) else {
     fputs("could not enable Shuttle on the cached completion session\n", stderr)
     exit(1)
 }
@@ -511,8 +735,7 @@ guard let shuttleEnabled = waitForWitness(timeout: 10, { witness in
         !bool(rendered, "optionHeld") &&
         !bool(rendered, "fanVisible")
 }) else {
-    fputs("Shuttle did not hide the inline presentation while retaining the exact cached family\n", stderr)
-    exit(1)
+    releaseOptionAndFail("Shuttle did not hide the inline presentation while retaining the exact cached family")
 }
 guard let shuttleAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
       let shuttleAccepted = waitForWitness(timeout: 10, { witness in
@@ -530,16 +753,14 @@ guard let shuttleAcceptedBytes = waitForChangedManuscript(from: original, timeou
               integer(action, "accepted_utf8_bytes") == integer(witness, "accepted_utf8_bytes") &&
               integer(action, "sequence") > integer(lastAction(wordAccepted), "sequence")
       }) else {
-    fputs("Shuttle did not consume exactly one word from the same hidden cached family\n", stderr)
-    exit(1)
+    releaseOptionAndFail("Shuttle did not consume exactly one word from the same hidden cached family")
 }
-let shuttleAction = lastAction(shuttleAccepted)
-guard shuttleAcceptedBytes.count - original.count == integer(shuttleAction, "inserted_utf8_bytes") else {
+guard exactInsertion(shuttleAcceptedBytes, witness: shuttleAccepted) else {
     fputs("Shuttle's persisted byte delta did not equal its authorized cached word\n", stderr)
     exit(1)
 }
 
-guard pressButton(named: "Turn Shuttle off") else {
+guard completionShortcut(38, field: "shuttle_enabled", from: true) else {
     fputs("could not stop Shuttle after its first cached word\n", stderr)
     exit(1)
 }
@@ -555,11 +776,7 @@ guard let shuttleDisabled = waitForWitness(timeout: 10, { witness in
     exit(1)
 }
 
-guard AXUIElementSetAttributeValue(
-        writingSurface,
-        kAXFocusedAttribute as CFString,
-        kCFBooleanTrue
-      ) == .success,
+guard focusWritingSurface(expected: shuttleAcceptedBytes, timeout: 5) != nil,
       postKey(58, down: true, flags: [.maskAlternate]),
       postKey(123, down: true, flags: [.maskAlternate]),
       postKey(123, down: false, flags: [.maskAlternate]) else {
@@ -629,7 +846,7 @@ guard postKey(36, down: true, flags: [.maskAlternate]),
     releaseOptionAndFail("fan Return did not persist the selected cached remainder")
 }
 let returnAction = lastAction(returnAccepted)
-guard returnAcceptedBytes.count - original.count == integer(returnAction, "inserted_utf8_bytes"),
+guard exactInsertion(returnAcceptedBytes, witness: returnAccepted, whole: true),
       integer(returnAction, "accepted_utf8_bytes") == integer(returnAction, "inserted_utf8_bytes"),
       (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
       postKey(123, down: true, flags: [.maskAlternate]),
@@ -696,7 +913,7 @@ guard postKey(48, down: true, flags: [.maskAlternate]),
     releaseOptionAndFail("fan Tab did not persist the selected cached remainder")
 }
 let tabAction = lastAction(tabAccepted)
-guard tabAcceptedBytes.count - original.count == integer(tabAction, "inserted_utf8_bytes"),
+guard exactInsertion(tabAcceptedBytes, witness: tabAccepted, whole: true),
       integer(tabAction, "accepted_utf8_bytes") == integer(tabAction, "inserted_utf8_bytes"),
       (attribute(writingSurface, kAXFocusedAttribute as CFString) as? Bool) == true,
       postKey(123, down: true, flags: [.maskAlternate]),
@@ -723,7 +940,7 @@ guard let tabReleased = waitForWitness(timeout: 10, { witness in
     exit(1)
 }
 
-guard pressButton(named: "Turn autocomplete off") else {
+guard completionShortcut(5, field: "autocomplete_enabled", from: true) else {
     fputs("could not turn the shared completion engine off after cached checks\n", stderr)
     exit(1)
 }
@@ -746,6 +963,7 @@ let evidence: [String: Any] = [
     "accepted_sha256": sha256(accepted),
     "rollback_sha256": sha256(readManuscript()!),
     "accepted_then_exactly_reversed": true,
+    "insertions_match_immutable_candidate_bytes": true,
     "context_key": context,
     "family_run_ids": runIds,
     "initial_selected_run_id": initialRunId,
@@ -778,3 +996,8 @@ let evidence: [String: Any] = [
 ]
 let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
 print(String(data: data, encoding: .utf8)!)
+
+#else
+fputs("native completion interaction requires macOS; only --self-test is portable\n", stderr)
+exit(2)
+#endif

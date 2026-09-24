@@ -163,6 +163,7 @@ struct AttachmentManifest {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct DocumentContexts {
     schema: String,
     documents: BTreeMap<String, DocumentContext>,
@@ -256,10 +257,6 @@ pub(crate) enum ContextAttachmentError {
     ManualTextLimit,
     #[error("the attachment context is corrupt or no longer matches its content identity")]
     ContextInvalid,
-    #[error(
-        "saved context uses an earlier mixed-text format; its unchanged file is .loom/attachments/document-context.json. Move that file aside to retain it, then select materials afresh. Your manuscript is still editable"
-    )]
-    ContextFormat,
     #[error("attachment storage failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("attachment metadata failed: {0}")]
@@ -2224,10 +2221,6 @@ fn read_canonical_text(
 }
 
 fn read_contexts(project_root: &Path) -> Result<DocumentContexts, ContextAttachmentError> {
-    #[derive(Deserialize)]
-    struct Header {
-        schema: String,
-    }
     let path = attachment_root(project_root)?.join("document-context.json");
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -2239,11 +2232,6 @@ fn read_contexts(project_root: &Path) -> Result<DocumentContexts, ContextAttachm
         }
         Err(error) => return Err(error.into()),
     };
-    // Mixed-text historical formats cannot prove which bytes were instructions.
-    // Reject without rewriting or promoting any existing source material.
-    if serde_json::from_slice::<Header>(&bytes)?.schema != CONTEXT_SCHEMA {
-        return Err(ContextAttachmentError::ContextFormat);
-    }
     let contexts: DocumentContexts = serde_json::from_slice(&bytes)?;
     if contexts.schema != CONTEXT_SCHEMA
         || contexts.documents.values().any(|context| {
@@ -2849,16 +2837,21 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_context_is_rejected_without_rewriting_saved_bytes() {
+    fn incompatible_context_is_rejected_without_rewriting_saved_bytes() {
         let project = tempfile::tempdir().unwrap();
         let path = attachment_root(project.path())
             .unwrap()
             .join("document-context.json");
-        let bytes = br#"{"schema":"loom.document-context.v3","documents":{},"manual_text":{"doc":"Author words mixed with imported words"},"text_imports":{}}"#;
-        fs::write(&path, bytes).unwrap();
-        assert!(document_context_snapshot(project.path(), "doc").is_err());
-        assert!(set_document_context_snapshot(project.path(), "doc", "new", &[]).is_err());
-        assert_eq!(fs::read(path).unwrap(), bytes);
+        for bytes in [
+            br#"{"schema":"unsupported","documents":{}}"#.as_slice(),
+            br#"{"schema":"loom.document-context.v4","documents":{},"unexpected":"source text"}"#.as_slice(),
+            br#"{"schema":"loom.document-context.v4","documents":{"doc":{"instructions":"keep me"}}}"#.as_slice(),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            assert!(document_context_snapshot(project.path(), "doc").is_err());
+            assert!(set_document_context_snapshot(project.path(), "doc", "new", &[]).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]

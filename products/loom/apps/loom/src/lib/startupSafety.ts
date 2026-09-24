@@ -29,8 +29,11 @@ export async function restoreBeforeBackgroundWork<T>(operations: {
   await operations.background(restored);
 }
 
-export function shouldDiscoverModelsOnStartup(suggestionsEnabled: boolean): boolean {
-  return suggestionsEnabled;
+export function shouldDiscoverModelsOnStartup(_suggestionsEnabled: boolean): boolean {
+  // Loading a verified local writer is preparation, not a request to generate.
+  // Keep it independent of the per-project suggestion preference so a writer
+  // is resident before the author elects to ask for completion.
+  return true;
 }
 
 export type StartupProjectAcquisition<T> = {

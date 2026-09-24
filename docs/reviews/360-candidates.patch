@@ -1,0 +1,161 @@
+diff --git a/crates/services/speech/crates/speech-native-types/src/task_supervisor.rs b/crates/services/speech/crates/speech-native-types/src/task_supervisor.rs
+index 376ab2d1009645edccfdde19bdaa3f099dc3fb81..89f6493c54909f1b6bb50001400a614083d53368 100644
+--- a/crates/services/speech/crates/speech-native-types/src/task_supervisor.rs
++++ b/crates/services/speech/crates/speech-native-types/src/task_supervisor.rs
+@@ -613,9 +613,18 @@ mod tests {
+ 
+     #[tokio::test]
+     async fn duplicate_completion_faults_without_manufacturing_join_evidence() {
+-        let supervisor = TaskSupervisor::default();
+-        let worker_id = supervisor.admit("manual").expect("admit manual task");
+-        supervisor.finish(worker_id.clone(), Ok(()));
++        let supervisor = Arc::new(TaskSupervisor::default());
++        supervisor
++            .spawn("once", async { Ok(()) })
++            .expect("spawn a real supervised worker");
++        supervisor.wait_for_idle().await.expect("join first completion");
++        let completed = supervisor.snapshot().expect("first completion is valid");
++        assert_eq!(completed.active, 0);
++        assert_eq!(completed.completed_tasks, 1);
++        assert_eq!(completed.joined_worker_ids.len(), 1);
++        assert!(!supervisor.diagnostic_faulted());
++
++        let worker_id = completed.joined_worker_ids[0].clone();
+         supervisor.finish(worker_id, Ok(()));
+ 
+         assert_eq!(
+diff --git a/products/mom/crates/mom-llama-runtime/src/store.rs b/products/mom/crates/mom-llama-runtime/src/store.rs
+index 0b9fcaf73401d6ccfcc01834cc611ea363709890..561b056e5871e693c995605357676c3b2ba35bb1 100644
+--- a/products/mom/crates/mom-llama-runtime/src/store.rs
++++ b/products/mom/crates/mom-llama-runtime/src/store.rs
+@@ -473,73 +473,6 @@ impl RuntimeStore {
+         Ok(result)
+     }
+ 
+-    /// Mutate two encrypted documents under one immediate SQLite transaction.
+-    ///
+-    /// This is the narrow boundary for product facts that must become visible
+-    /// together, while retaining a separate typed owner for each document.
+-    #[cfg(test)]
+-    pub(crate) fn mutate_pair<A, B, R>(
+-        &self,
+-        first_namespace: &str,
+-        first_default: impl FnOnce() -> A,
+-        second_namespace: &str,
+-        second_default: impl FnOnce() -> B,
+-        mutation: impl FnOnce(&mut A, &mut B) -> Result<R>,
+-    ) -> Result<R>
+-    where
+-        A: Serialize + DeserializeOwned,
+-        B: Serialize + DeserializeOwned,
+-    {
+-        if first_namespace == second_namespace {
+-            anyhow::bail!("paired encrypted document namespaces must be distinct");
+-        }
+-        let mut connection = self.connection()?;
+-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+-        let first_encrypted = transaction
+-            .query_row(
+-                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
+-                [first_namespace],
+-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+-            )
+-            .optional()?;
+-        let second_encrypted = transaction
+-            .query_row(
+-                "SELECT nonce, ciphertext FROM encrypted_documents WHERE namespace = ?1",
+-                [second_namespace],
+-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+-            )
+-            .optional()?;
+-        let mut first = match first_encrypted {
+-            Some((nonce, ciphertext)) => self.decrypt_json(first_namespace, &nonce, &ciphertext)?,
+-            None => first_default(),
+-        };
+-        let mut second = match second_encrypted {
+-            Some((nonce, ciphertext)) => {
+-                self.decrypt_json(second_namespace, &nonce, &ciphertext)?
+-            }
+-            None => second_default(),
+-        };
+-        let result = mutation(&mut first, &mut second)?;
+-        let (first_nonce, first_ciphertext) = self.encrypt_json(first_namespace, &first)?;
+-        let (second_nonce, second_ciphertext) = self.encrypt_json(second_namespace, &second)?;
+-        for (namespace, nonce, ciphertext) in [
+-            (first_namespace, first_nonce, first_ciphertext),
+-            (second_namespace, second_nonce, second_ciphertext),
+-        ] {
+-            transaction.execute(
+-                "INSERT INTO encrypted_documents(namespace, nonce, ciphertext, updated_at)
+-                 VALUES (?1, ?2, ?3, ?4)
+-                 ON CONFLICT(namespace) DO UPDATE SET
+-                   nonce = excluded.nonce,
+-                   ciphertext = excluded.ciphertext,
+-                   updated_at = excluded.updated_at",
+-                params![namespace, nonce, ciphertext, timestamp_i64()],
+-            )?;
+-        }
+-        transaction.commit()?;
+-        Ok(result)
+-    }
+-
+     pub(crate) fn mutate_documents<T, R>(
+         &self,
+         namespace: &str,
+@@ -1216,18 +1149,25 @@ mod tests {
+                 values: vec!["second-old".to_string()],
+             },
+         )?;
+-        let failed: Result<()> = store.mutate_pair(
++        let failed: Result<()> = store.mutate_documents(
+             "first",
+             SecretDocument::default,
+-            "second",
+-            SecretDocument::default,
+-            |first, second| {
++            |first, documents| {
++                let mut second = documents
++                    .get::<SecretDocument>("second")?
++                    .ok_or_else(|| anyhow!("second document missing"))?;
+                 first.values = vec!["first-rolled-back".to_string()];
+                 second.values = vec!["second-rolled-back".to_string()];
++                documents.put_bytes("second", &serde_json::to_vec(&second)?)?;
+                 Err(anyhow!("force paired rollback"))
+             },
+         );
+-        assert!(failed.is_err());
++        assert_eq!(
++            failed
++                .expect_err("staged document changes must roll back")
++                .to_string(),
++            "force paired rollback"
++        );
+         assert_eq!(
+             store.get::<SecretDocument>("first")?.expect("first"),
+             SecretDocument {
+@@ -1241,17 +1181,21 @@ mod tests {
+             }
+         );
+ 
+-        store.mutate_pair(
++        store.mutate_documents(
+             "first",
+             SecretDocument::default,
+-            "second",
+-            SecretDocument::default,
+-            |first, second| {
++            |first, documents| {
++                let mut second = documents
++                    .get::<SecretDocument>("second")?
++                    .ok_or_else(|| anyhow!("second document missing"))?;
+                 first.values = vec!["first-new".to_string()];
+                 second.values = vec!["second-new".to_string()];
++                documents.put_bytes("second", &serde_json::to_vec(&second)?)?;
+                 Ok(())
+             },
+         )?;
++        drop(store);
++        let store = RuntimeStore::open_with_key(&data_dir, [31_u8; 32])?;
+         assert_eq!(
+             store.get::<SecretDocument>("first")?.expect("first"),
+             SecretDocument {

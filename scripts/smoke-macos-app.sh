@@ -332,6 +332,11 @@ foreground_loom_process() {
   "$SMOKE_HELPERS/foreground_loom_process" "$target_pid"
 }
 
+position_window_right() {
+  target_pid=$1
+  "$SMOKE_HELPERS/position_window_right" "$target_pid"
+}
+
 wait_for_window() {
   target_pid=$1
   "$SMOKE_HELPERS/wait_for_window" "$target_pid"
@@ -659,6 +664,21 @@ wait_for_loom_live_streaming_monitor() {
     echo "Loom live-stream observer produced no pre-terminal evidence" >&2
     return 1
   fi
+}
+
+require_loom_live_streaming_preterminal() {
+  live_evidence=$1
+  DELYSIS_LIVE_STREAMING_EVIDENCE="$live_evidence" node <<'NODE'
+const evidence = JSON.parse(process.env.DELYSIS_LIVE_STREAMING_EVIDENCE || '{}');
+if (
+  evidence.schema !== 'delysis.loom-live-stream-witness.v1' ||
+  evidence.selected_run_terminal_after_accessibility !== false ||
+  evidence.visible_suffix_is_durable_leading_projection !== true
+) {
+  console.error('family_terminal_before_live_witness: live witness was not proven pre-terminal');
+  process.exit(1);
+}
+NODE
 }
 
 exercise_loom_idle_resume_ghost() {
@@ -1070,7 +1090,13 @@ wait_for_clean_exit() {
   while :; do
     process_state=$(ps -p "$target_pid" -o state= | tr -d ' ')
     case "$process_state" in
-      ""|Z*) break ;;
+      ""|Z*)
+        # LaunchServices can retain a just-exited PID after the process has
+        # drained. Wait for our own registration to disappear before relaunch;
+        # never ignore a different process with the same bundle identifier.
+        remaining_bundle_pids=$(running_bundle_pids) || return 1
+        if ! printf '%s\n' "$remaining_bundle_pids" | grep -Fxq "$target_pid"; then break; fi
+        ;;
     esac
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 300 ]; then
@@ -1172,6 +1198,11 @@ run_once() {
     echo "application logs: $stdout_log and $stderr_log" >&2
     return 1
   fi
+  if ! window_position=$(position_window_right "$ACTIVE_PID"); then
+    echo "the exact $COMPONENT process could not be positioned on the right before native interaction" >&2
+    return 1
+  fi
+  echo "+ $COMPONENT window positioned on the right: $window_position"
   if ! wait_for_readiness "$run_number" "$ACTIVE_PID" "$stderr_log"; then
     echo "application logs: $stdout_log and $stderr_log" >&2
     return 1
@@ -1215,7 +1246,11 @@ run_once() {
         return 1
       fi
     fi
-    RUN_1_EDITOR_CORE_SENTINEL='Loom native smoke: editor persistence.'
+    # Exercise raw completion with an authored, unfinished prose boundary.
+    # A closed declarative sentence invites a new paragraph or markup from a
+    # base model, which the visual editor must correctly reject and therefore
+    # cannot prove a four-choice inline presentation.
+    RUN_1_EDITOR_CORE_SENTINEL='Loom native smoke prose: The lantern crossed the quiet room, casting a narrow pool of light across the'
     RUN_1_EDITOR_INPUT_SENTINEL="$RUN_1_EDITOR_CORE_SENTINEL "
     RUN_1_EDITOR_SENTINEL=$RUN_1_EDITOR_INPUT_SENTINEL
     if ! RUN_1_EDITOR_EVIDENCE=$(type_into_loom_editor "$ACTIVE_PID" "$RUN_1_EDITOR_INPUT_SENTINEL"); then
@@ -1279,6 +1314,10 @@ run_once() {
         return 1
       fi
       RUN_1_LIVE_STREAMING_EVIDENCE=$(cat "$LOOM_LIVE_STREAM_MONITOR_OUTPUT")
+      if ! require_loom_live_streaming_preterminal "$RUN_1_LIVE_STREAMING_EVIDENCE"; then
+        echo "family_terminal_before_live_witness: invalid live-stream witness" >&2
+        return 1
+      fi
       if ! RUN_1_REAL_GENERATION_EVIDENCE=$(wait_for_loom_generation_family \
         "$loom_database" \
         "$loom_generation_count_before_batch"); then

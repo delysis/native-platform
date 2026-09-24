@@ -9,6 +9,7 @@ import {
   initialCompletionControllerState,
   invalidateCompletionNavigation,
   observeTextMutation,
+  rejectVisualPresentation,
   reconcileCompletionController,
   retireCompletionCandidates,
   setCompletionSchedule,
@@ -145,6 +146,65 @@ describe('pure completion controller', () => {
     ]);
   });
 
+  it('advances an untouched visual selection past an acknowledged rejected presentation', () => {
+    let state = readyController();
+    const first = completionControllerView(state, contextKey, family, true, true);
+    state = rejectVisualPresentation(state, {
+      mode: 'visual', eligible: first.selected, candidateId: first.selected!.candidateId,
+      presentationKey: first.selected!.presentationKey, surfaceKey: 'surface',
+      currentSurfaceKey: 'surface', anchorByte: first.selected!.targetByte
+    });
+    const advanced = completionControllerView(state, contextKey, family, true, true);
+    expect(state.activeRunId).toBe('run-b');
+    expect(state.session?.selectedRunId).toBe('run-b');
+    expect(advanced.selected?.runId).toBe('run-b');
+    expect(advanced.witnessSelected?.runId).toBe('run-b');
+    expect(advanced.alternatives.map((candidate) => candidate.runId)).toEqual(['run-b', 'run-c', 'run-d']);
+    expect(state.session?.candidates).toEqual(family);
+    expect(state.lastAction).toBeNull();
+    expect(rejectVisualPresentation(state, {
+      mode: 'visual', eligible: first.selected, candidateId: first.selected!.candidateId,
+      presentationKey: first.selected!.presentationKey, surfaceKey: 'surface',
+      currentSurfaceKey: 'surface', anchorByte: first.selected!.targetByte
+    })).toBe(state);
+  });
+
+  it('records rejected visual presentations without overriding a writer selection', () => {
+    let state = cycleCompletion(readyController(), family, 1).state;
+    const selected = completionControllerView(state, contextKey, family, true, true).selected!;
+    state = rejectVisualPresentation(state, {
+      mode: 'visual', eligible: selected, candidateId: selected.candidateId,
+      presentationKey: selected.presentationKey, surfaceKey: 'surface',
+      currentSurfaceKey: 'surface', anchorByte: selected.targetByte
+    });
+    const view = completionControllerView(state, contextKey, family, true, true);
+    expect(state.activeRunId).toBe('run-b');
+    expect(state.session?.selectedRunId).toBe('run-b');
+    expect(view.selected).toBeNull();
+    expect(view.witnessSelected).toBeNull();
+    expect(view.alternatives.map((candidate) => candidate.runId)).toEqual(['run-a', 'run-c', 'run-d']);
+  });
+
+  it('settles with no visual selection after every default family member is rejected', () => {
+    let state = readyController();
+    for (const expectedRunId of ['run-a', 'run-b', 'run-c', 'run-d']) {
+      const view = completionControllerView(state, contextKey, family, true, true);
+      expect(view.selected?.runId).toBe(expectedRunId);
+      state = rejectVisualPresentation(state, {
+        mode: 'visual', eligible: view.selected, candidateId: view.selected!.candidateId,
+        presentationKey: view.selected!.presentationKey, surfaceKey: 'surface',
+        currentSurfaceKey: 'surface', anchorByte: view.selected!.targetByte
+      });
+    }
+    const settled = completionControllerView(state, contextKey, family, true, true);
+    expect(state.activeRunId).toBeNull();
+    expect(settled.selected).toBeNull();
+    expect(settled.witnessSelected).toBeNull();
+    expect(settled.alternatives).toEqual([]);
+    expect(state.session?.candidates).toEqual(family);
+    expect(state.lastAction).toBeNull();
+  });
+
   it.each<CompletionInsertionAction>([
     'option_word',
     'fan_return',
@@ -244,6 +304,31 @@ describe('pure completion controller', () => {
     expect(second.authorized).toBe(true);
     expect(second.state.pendingText).toBe('Hello one two');
     expect(second.state.session?.acceptedChunks).toEqual([' one ', 'two']);
+  });
+
+  it('retains hidden rollback authority after the full remainder is accepted', () => {
+    const inserted = insert('fan_return');
+    expect(inserted.authorized).toBe(true);
+    const accepted = `${manuscript}${family[0].text}`;
+    const state = observeTextMutation(inserted.state, accepted, manuscript, false).state;
+    const view = completionControllerView(state, contextKey, []);
+    expect(view.activeFamily).toEqual([]);
+    expect(view.alternatives).toEqual([]);
+    expect(view.selected).toMatchObject({
+      candidateId: 'candidate-a', text: '', targetByte: 13
+    });
+    expect(view.unconsumeText).toBe(family[0].text);
+    const reversed = authorizeCompletionUnconsume(state, {
+      eligible: view.selected, candidateId: view.selected!.candidateId,
+      presentationKey: view.selected!.presentationKey, text: view.unconsumeText,
+      manuscriptText: accepted
+    });
+    expect(reversed.authorized).toBe(true);
+    expect(reversed.state.pendingText).toBe(manuscript);
+    expect(completionControllerView(reversed.state, contextKey, []).selected).toBeNull();
+    expect(completionControllerView(state, 'another-context', []).selected).toBeNull();
+    const restored = observeTextMutation(reversed.state, manuscript, accepted, false).state;
+    expect(completionControllerView(restored, contextKey, []).activeFamily).toHaveLength(4);
   });
 
   it('edge-triggers exhaustion while preserving immediate rollback authority', () => {

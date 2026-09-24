@@ -105,14 +105,15 @@
 {#if modifierHeld && focused && !blocked && visibleSlots.some(Boolean)}
 <div class="loompad" role="group" aria-label="Loompad">
   {#each visibleSlots as candidate, index}
+    {@const prefix = candidate ? loompadPrefix(candidate.text, 'word', visual) : null}
     <button class="loompad-choice" class:selected={candidate?.runId === selectedRunId}
       class:held={chord.choices.at(-1) === LOOMPAD_KEYS[index]}
       data-direction={LOOMPAD_KEYS[index].slice(3).toLowerCase()}
       type="button" disabled={!focused || blocked || !candidate?.text}
-      aria-label={`${LOOMPAD_KEYS[index].slice(3)}: ${candidate ? loompadPrefix(candidate.text, 'word', visual) ?? '' : 'Unavailable'}`}
+      aria-label={`${LOOMPAD_KEYS[index].slice(3)}: ${prefix ?? 'Unavailable'}`}
       on:mouseenter={() => { if (candidate) onChoose(candidate); }} on:mousedown|preventDefault on:click={() => { if (candidate) onAccept(candidate, 'word'); }}>
       <kbd class="loompad-key">{LOOMPAD_KEYS[index].slice(3)}</kbd>
-      <span>{candidate ? loompadPrefix(candidate.text, 'word', visual) ?? '…' : '—'}</span>
+      <span class="loompad-continuation"><span class="loompad-word">{prefix ?? '—'}</span>{#if candidate && prefix}<span class="loompad-tail">{candidate.text.slice(prefix.length)}</span>{/if}</span>
     </button>
   {/each}
 </div>

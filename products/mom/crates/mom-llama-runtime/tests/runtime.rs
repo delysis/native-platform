@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use llama_native_types::{
     CompletionPrompt, GenerationInput as NativeGenerationInput,
     GenerationRequest as NativeGenerationRequest, GenerationState, SamplingConfig,
@@ -903,13 +903,25 @@ fn conversation_import_validates_or_safely_assigns_mention_handles() -> Result<(
 }
 
 #[test]
-fn legacy_plaintext_conversations_are_reported_without_import_or_deletion() -> Result<()> {
-    let session = TestSession::new("legacy-plaintext-refused")?;
+fn adjacent_conversation_file_is_not_imported_or_rewritten() -> Result<()> {
+    let session = TestSession::new("adjacent-conversation-file")?;
     let path = session.path().join("conversations.json");
-    fs::write(&path, b"private legacy conversation")?;
-    let error = mom_llama_runtime::conversation_list().expect_err("legacy refused");
-    assert!(error.to_string().contains("conversations.json"));
-    assert_eq!(fs::read(path)?, b"private legacy conversation");
+    fs::write(&path, b"private adjacent conversation")?;
+    assert!(
+        mom_llama_runtime::conversation_list()?
+            .result
+            .context("conversation list")?
+            .is_empty()
+    );
+    let created = mom_llama_runtime::conversation_new(Some("Current store".to_string()))?
+        .result
+        .context("created conversation")?;
+    let reopened = mom_llama_runtime::conversation_list()?
+        .result
+        .context("reopened list")?;
+    assert_eq!(reopened.len(), 1);
+    assert_eq!(reopened[0].id, created.id);
+    assert_eq!(fs::read(path)?, b"private adjacent conversation");
     Ok(())
 }
 

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod local_ci;
 mod macos_smoke_support;
 mod model_check;
 mod no_python;
@@ -26,12 +27,13 @@ fn main() -> Result<()> {
     let command = arguments.next().unwrap_or_else(|| "policy".to_owned());
     match command.as_str() {
         "policy" => check_policy(&workspace_root()),
+        "local-ci" => local_ci::run(&workspace_root(), &arguments.collect::<Vec<_>>()),
         "model-check" => model_check::run(&workspace_root(), &arguments.collect::<Vec<_>>()),
         "omp2" => omp2::run(&workspace_root(), &arguments.collect::<Vec<_>>()),
         "macos-smoke-support" => {
             macos_smoke_support::run(&workspace_root(), &arguments.collect::<Vec<_>>())
         }
-        _ => bail!("usage: cargo xtask <policy|model-check|macos-smoke-support|omp2>"),
+        _ => bail!("usage: cargo xtask <policy|local-ci|model-check|macos-smoke-support|omp2>"),
     }
 }
 

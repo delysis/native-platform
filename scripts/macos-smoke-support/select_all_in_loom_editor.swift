@@ -137,11 +137,16 @@ repeat {
         exactSelectionSince = nil
         exactSelectionEpoch = nil
         if Date() >= nextDispatch {
+            NSRunningApplication(processIdentifier: pid)?.activate(options: [])
             guard AXUIElementSetAttributeValue(
                 writingSurface,
                 kAXFocusedAttribute as CFString,
                 kCFBooleanTrue
-            ) == .success,
+            ) == .success else {
+                fputs("could not refocus Loom's exact editor for Select-All\n", stderr)
+                exit(1)
+            }
+            guard
                   let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
                   let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
                 fputs("could not refocus Loom's exact editor for Select-All\n", stderr)

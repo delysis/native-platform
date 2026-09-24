@@ -185,9 +185,14 @@ func textField(named needle: String) -> AXUIElement? {
     }
 }
 
-guard let editor = descendants().first(where: {
-    (attribute($0, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String
-}),
+func manuscriptEditor() -> AXUIElement? {
+    descendants().first { element in
+        (attribute(element, kAXRoleAttribute as CFString) as? String) ==
+            kAXTextAreaRole as String
+    }
+}
+
+guard let editor = manuscriptEditor(),
       let beforeSelection = canonicalSelection(editor),
       let beforeSelectionWitness = editorSelectionWitness(),
       bool(beforeSelectionWitness, "available"),
@@ -231,27 +236,39 @@ if actionName == "Link" {
             destination,
             kAXFocusedAttribute as CFString,
             kCFBooleanTrue
-          ) == .success,
-          let selectAllDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-          let selectAllUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+          ) == .success else {
         fputs("could not focus Loom's exact Link destination field through Accessibility\n", stderr)
         exit(1)
     }
-    selectAllDown.flags = [.maskCommand]
-    selectAllUp.flags = [.maskCommand]
-    selectAllDown.postToPid(pid)
-    selectAllUp.postToPid(pid)
-    for character in linkDestination {
-        var utf16 = Array(String(character).utf16)
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+    // WebKit exposes native form controls through AX. Prefer that authority;
+    // PID-targeted CGEvents can be dropped while the popover is opening.
+    let axValueSet = AXUIElementSetAttributeValue(
+        destination,
+        kAXValueAttribute as CFString,
+        linkDestination as CFTypeRef
+    ) == .success
+    if !axValueSet {
+        guard let selectAllDown = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+              let selectAllUp = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
             fputs("could not construct Loom's PID-targeted Link destination input\n", stderr)
             exit(1)
         }
-        down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
-        down.postToPid(pid)
-        up.postToPid(pid)
-        Thread.sleep(forTimeInterval: 0.01)
+        selectAllDown.flags = [.maskCommand]
+        selectAllUp.flags = [.maskCommand]
+        selectAllDown.postToPid(pid)
+        selectAllUp.postToPid(pid)
+        for character in linkDestination {
+            var utf16 = Array(String(character).utf16)
+            guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else {
+                fputs("could not construct Loom's PID-targeted Link destination input\n", stderr)
+                exit(1)
+            }
+            down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
+            down.postToPid(pid)
+            up.postToPid(pid)
+            Thread.sleep(forTimeInterval: 0.01)
+        }
     }
     let valueDeadline = Date().addingTimeInterval(5)
     while Date() < valueDeadline {
@@ -278,8 +295,16 @@ var editorFocused = false
 var exactSelectionSince: Date?
 var exactSelectionEpoch: Int?
 repeat {
-    editorFocused = (attribute(editor, kAXFocusedAttribute as CFString) as? Bool) == true
-    afterSelection = canonicalSelection(editor)
+    // WebKit may replace the native AX text-area object when a paragraph is
+    // structurally rewritten even though the contenteditable DOM owner is
+    // unchanged. Rebind the current accessible manuscript on every sample;
+    // querying the detached pre-command object manufactures focus=false and
+    // a 0:0 selection while the live editor remains correctly focused.
+    let currentEditor = manuscriptEditor()
+    editorFocused = currentEditor.flatMap {
+        attribute($0, kAXFocusedAttribute as CFString) as? Bool
+    } == true
+    afterSelection = currentEditor.flatMap(canonicalSelection)
     afterSelectionWitness = editorSelectionWitness()
     if editorFocused,
        let currentAX = afterSelection,

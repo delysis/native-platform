@@ -98,14 +98,16 @@ func jsonObject(in text: String, schema: String) -> [String: Any]? {
     return object
 }
 
-func editorSelectionWitness() -> [String: Any]? {
+func completionWitness() -> [String: Any]? {
     descendants().flatMap { element in
         strings(element).compactMap { value in
             jsonObject(in: value, schema: "delysis.loom-completion-witness.v1")
         }
-    }.compactMap { $0["editor_selection"] as? [String: Any] }.max { left, right in
-        ((left["epoch"] as? NSNumber)?.intValue ?? -1) <
-            ((right["epoch"] as? NSNumber)?.intValue ?? -1)
+    }.max { left, right in
+        let leftSelection = left["editor_selection"] as? [String: Any]
+        let rightSelection = right["editor_selection"] as? [String: Any]
+        return ((leftSelection?["epoch"] as? NSNumber)?.intValue ?? -1) <
+            ((rightSelection?["epoch"] as? NSNumber)?.intValue ?? -1)
     }
 }
 
@@ -115,6 +117,15 @@ func bool(_ object: [String: Any]?, _ key: String) -> Bool {
 
 func integer(_ object: [String: Any]?, _ key: String) -> Int? {
     (object?[key] as? NSNumber)?.intValue
+}
+
+func projectionSettled(_ witness: [String: Any]?) -> Bool {
+    guard let preAdmission = witness?["pre_admission"] as? [String: Any],
+          let editVersion = integer(preAdmission, "edit_version"),
+          let savedVersion = integer(preAdmission, "saved_version"),
+          let lifecycle = preAdmission["lifecycle"] as? [String: Any] else { return false }
+    return editVersion == savedVersion &&
+        (lifecycle["reason"] as? String) != "editor_projection_pending"
 }
 
 func selectionMatches(
@@ -145,8 +156,10 @@ let deadline = Date().addingTimeInterval(12)
 var writingSurface: AXUIElement?
 var observedValue = ""
 var observedSelection: CanonicalSelection?
+var observedCompletionWitness: [String: Any]?
 var observedSelectionWitness: [String: Any]?
 var focused = false
+var caretRestoreCount = 0
 var exactSelectionSince: Date?
 var exactSelectionEpoch: Int?
 repeat {
@@ -156,7 +169,8 @@ repeat {
             (attribute(current, kAXValueAttribute as CFString) as? String) ?? ""
         )
         observedSelection = canonicalSelection(current)
-        observedSelectionWitness = editorSelectionWitness()
+        observedCompletionWitness = completionWitness()
+        observedSelectionWitness = observedCompletionWitness?["editor_selection"] as? [String: Any]
         focused = (attribute(current, kAXFocusedAttribute as CFString) as? Bool) == true
     } else {
         observedValue = ""
@@ -164,8 +178,26 @@ repeat {
         observedSelectionWitness = nil
         focused = false
     }
+    if selectionMode == "caret-end",
+       observedValue == expected,
+       focused,
+       projectionSettled(observedCompletionWitness),
+       let current = writingSurface,
+       let selection = observedSelection,
+       selection.canonical.location != expected.utf16.count || selection.canonical.length != 0 {
+        var endRange = CFRange(location: expected.utf16.count, length: 0)
+        if let endRangeValue = AXValueCreate(.cfRange, &endRange),
+           AXUIElementSetAttributeValue(
+               current,
+               kAXSelectedTextRangeAttribute as CFString,
+               endRangeValue
+           ) == .success {
+            caretRestoreCount += 1
+        }
+    }
     if observedValue == expected,
        focused,
+       projectionSettled(observedCompletionWitness),
        selectionMatches(observedSelectionWitness, observedSelection),
        let epoch = integer(observedSelectionWitness, "epoch") {
         if exactSelectionEpoch != epoch {
@@ -184,6 +216,7 @@ repeat {
 guard writingSurface != nil,
       observedValue == expected,
       focused,
+      projectionSettled(observedCompletionWitness),
       selectionMatches(observedSelectionWitness, observedSelection),
       let exactSelectionSince,
       Date().timeIntervalSince(exactSelectionSince) >= 0.25,
@@ -199,6 +232,7 @@ guard writingSurface != nil,
         "(value=\(String(reflecting: observedValue)), expected=\(String(reflecting: expected)), " +
         "focused=\(focused), selection=\(location):\(length), " +
         "raw_selection=\(rawLocation):\(rawLength), mode=\(selectionMode), " +
+        "projection=\(String(describing: observedCompletionWitness?["pre_admission"])), " +
         "internal_selection=\(String(describing: observedSelectionWitness)))\n",
         stderr
     )
@@ -208,6 +242,7 @@ let evidence: [String: Any] = [
     "canonical_editor_value": observedValue,
     "focused": true,
     "selection_mode": selectionMode,
+    "settled_caret_restore_count": caretRestoreCount,
     "selection": [
         "location": observedSelection.canonical.location,
         "length": observedSelection.canonical.length,
@@ -215,7 +250,8 @@ let evidence: [String: Any] = [
         "raw_length": observedSelection.raw.length,
         "terminal_line_break_utf16": observedSelection.terminalLineBreakUtf16
     ],
-    "internal_selection": observedSelectionWitness
+    "internal_selection": observedSelectionWitness,
+    "pre_admission": observedCompletionWitness?["pre_admission"] as? [String: Any] ?? [:]
 ]
 let data = try! JSONSerialization.data(withJSONObject: evidence, options: [.sortedKeys])
 print(String(data: data, encoding: .utf8)!)

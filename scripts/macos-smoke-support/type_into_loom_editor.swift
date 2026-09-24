@@ -111,8 +111,19 @@ var observedEditorValue = ""
 var observedSelection: CFRange?
 var stabilized = false
 var dispatchCount = 0
+var seededStableCount = 0
 let terminalSpace = sentinel.hasSuffix(" ")
 let seededValue = terminalSpace ? String(sentinel.dropLast()) : sentinel
+func postKey(_ virtualKey: CGKeyCode) -> Bool {
+    guard let down = CGEvent(keyboardEventSource: nil, virtualKey: virtualKey, keyDown: true),
+          let up = CGEvent(keyboardEventSource: nil, virtualKey: virtualKey, keyDown: false) else {
+        return false
+    }
+    down.postToPid(pid)
+    Thread.sleep(forTimeInterval: 0.03)
+    up.postToPid(pid)
+    return true
+}
 for _ in 0..<60 {
     guard AXUIElementSetAttributeValue(
         editor,
@@ -140,23 +151,44 @@ for _ in 0..<60 {
         fputs("could not set Loom's exact accessible manuscript caret\n", stderr)
         exit(1)
     }
-    if terminalSpace {
-        guard let spaceDown = CGEvent(
-                keyboardEventSource: nil,
-                virtualKey: 49,
-                keyDown: true
-              ),
-              let spaceUp = CGEvent(
-                keyboardEventSource: nil,
-                virtualKey: 49,
-                keyDown: false
-              ) else {
-            fputs("could not construct Loom's terminal Space key event\n", stderr)
+
+    // AXValue setters return before WebKit has necessarily reconciled its
+    // native text-input state. Posting Space in that gap can accept a stale
+    // platform inline prediction from the replaced value. Require the seeded
+    // value and collapsed end caret to remain jointly exact before exercising
+    // the real key path.
+    let seedDeadline = Date().addingTimeInterval(1.5)
+    var seedExactSince: Date?
+    var seedStable = false
+    repeat {
+        observedEditorValue = stringAttribute(editor, kAXValueAttribute as CFString)
+        observedSelection = rangeAttribute(editor, kAXSelectedTextRangeAttribute as CFString)
+        if observedEditorValue.trimmingCharacters(in: .newlines) == seededValue,
+           observedSelection?.location == seededValue.utf16.count,
+           observedSelection?.length == 0 {
+            seedExactSince = seedExactSince ?? Date()
+            if let seedExactSince,
+               Date().timeIntervalSince(seedExactSince) >= 0.4 {
+                seedStable = true
+                seededStableCount += 1
+                break
+            }
+        } else {
+            seedExactSince = nil
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+    } while Date() < seedDeadline
+    if !seedStable { continue }
+
+    guard postKey(49) else {
+        fputs("could not construct Loom's native input event\n", stderr)
+        exit(1)
+    }
+    if !terminalSpace {
+        guard postKey(51) else {
+            fputs("could not construct Loom's native rollback event\n", stderr)
             exit(1)
         }
-        spaceDown.postToPid(pid)
-        Thread.sleep(forTimeInterval: 0.03)
-        spaceUp.postToPid(pid)
     }
     dispatchCount += 1
 
@@ -194,6 +226,8 @@ guard stabilized,
 let evidence: [String: Any] = [
     "dispatch": "PID-targeted AXValue and AXSelectedTextRange",
     "dispatch_count": dispatchCount,
+    "seeded_stable_count": seededStableCount,
+    "seeded_stable_seconds": 0.4,
     "terminal_space_key_event": terminalSpace,
     "stable_seconds": 0.4,
     "observed_editor_value": true,
