@@ -588,8 +588,16 @@ defer { postKey(58, down: false, flags: []) }
 
 func releaseOptionAndFail(_ message: String) -> Never {
     let fan = fanAccessibility()
+    let surface = editor()
+    let selection = surface.flatMap { selectedRange($0) }
     let diagnostic: [String: Any] = [
         "completion_witness": completionWitness() ?? [:],
+        "frontmost_pid": NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1,
+        "editor_focused": surface.map {
+            (attribute($0, kAXFocusedAttribute as CFString) as? Bool) == true
+        } ?? false,
+        "editor_selection": ["location": selection?.location ?? -1,
+                             "length": selection?.length ?? -1],
         "fan_listbox_observed": fan.listbox,
         "fan_options": fan.options,
         "fan_observations": fan.observations
@@ -597,7 +605,7 @@ func releaseOptionAndFail(_ message: String) -> Never {
     if JSONSerialization.isValidJSONObject(diagnostic),
        let data = try? JSONSerialization.data(withJSONObject: diagnostic, options: [.sortedKeys]),
        let json = String(data: data, encoding: .utf8) {
-        fputs("completion fan diagnostics: \(json)\n", stderr)
+        fputs("completion interaction diagnostics: \(json)\n", stderr)
     }
     postKey(58, down: false, flags: [])
     fputs("\(message)\n", stderr)
@@ -727,8 +735,7 @@ guard let shuttleEnabled = waitForWitness(timeout: 10, { witness in
         !bool(rendered, "optionHeld") &&
         !bool(rendered, "fanVisible")
 }) else {
-    fputs("Shuttle did not hide the inline presentation while retaining the exact cached family\n", stderr)
-    exit(1)
+    releaseOptionAndFail("Shuttle did not hide the inline presentation while retaining the exact cached family")
 }
 guard let shuttleAcceptedBytes = waitForChangedManuscript(from: original, timeout: 30),
       let shuttleAccepted = waitForWitness(timeout: 10, { witness in
@@ -746,8 +753,7 @@ guard let shuttleAcceptedBytes = waitForChangedManuscript(from: original, timeou
               integer(action, "accepted_utf8_bytes") == integer(witness, "accepted_utf8_bytes") &&
               integer(action, "sequence") > integer(lastAction(wordAccepted), "sequence")
       }) else {
-    fputs("Shuttle did not consume exactly one word from the same hidden cached family\n", stderr)
-    exit(1)
+    releaseOptionAndFail("Shuttle did not consume exactly one word from the same hidden cached family")
 }
 guard exactInsertion(shuttleAcceptedBytes, witness: shuttleAccepted) else {
     fputs("Shuttle's persisted byte delta did not equal its authorized cached word\n", stderr)
