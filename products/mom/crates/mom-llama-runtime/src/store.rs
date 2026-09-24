@@ -222,7 +222,6 @@ impl RuntimeStore {
     }
 
     pub(crate) fn open(data_dir: &Path) -> Result<Self> {
-        reject_legacy_plaintext(data_dir)?;
         fs::create_dir_all(data_dir)?;
         let key = resolve_store_key(data_dir)?;
         Self::open_with_key(data_dir, key)
@@ -237,7 +236,6 @@ impl RuntimeStore {
         key: [u8; 32],
         before_creation: impl FnOnce(),
     ) -> Result<Self> {
-        reject_legacy_plaintext(data_dir)?;
         fs::create_dir_all(data_dir)?;
         let store = Self {
             path: data_dir.join(DATABASE_FILE),
@@ -699,30 +697,6 @@ fn disposable_cache_quarantine_namespace(
         timestamp_i64(),
         &digest[..16]
     )
-}
-
-const LEGACY_PLAINTEXT_FILES: &[&str] = &[
-    "settings.json",
-    "conversations.json",
-    "drafts.json",
-    "attachments.json",
-    "mcp-servers.json",
-    "skills.json",
-];
-
-fn reject_legacy_plaintext(data_dir: &Path) -> Result<()> {
-    for name in LEGACY_PLAINTEXT_FILES {
-        let path = data_dir.join(name);
-        match fs::symlink_metadata(&path) {
-            Ok(_) => anyhow::bail!(
-                "Unsupported legacy plaintext store at {}. Move this file out of the product directory before opening the current encrypted store; automatic migration is not supported.",
-                path.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
 }
 
 fn resolve_store_key(data_dir: &Path) -> Result<[u8; 32]> {
@@ -1386,20 +1360,16 @@ mod tests {
     }
 
     #[test]
-    fn legacy_plaintext_is_refused_before_database_creation() -> Result<()> {
-        for name in LEGACY_PLAINTEXT_FILES {
-            let dir = test_dir(name);
-            fs::create_dir_all(&dir)?;
-            let path = dir.join(name);
-            fs::write(&path, b"private legacy source")?;
-            let error = RuntimeStore::open_with_key(&dir, [7; 32])
-                .err()
-                .expect("legacy refused");
-            assert!(error.to_string().contains(name));
-            assert_eq!(fs::read(&path)?, b"private legacy source");
-            assert!(!dir.join(DATABASE_FILE).exists());
-            fs::remove_dir_all(dir)?;
-        }
+    fn unrelated_files_are_not_store_inputs_or_rewritten() -> Result<()> {
+        let dir = test_dir("unrelated-file");
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("settings.json");
+        fs::write(&path, b"not an application store")?;
+        let store = RuntimeStore::open_with_key(&dir, [7; 32])?;
+        store.put("current", &"value")?;
+        assert_eq!(store.get::<String>("current")?.as_deref(), Some("value"));
+        assert_eq!(fs::read(&path)?, b"not an application store");
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 

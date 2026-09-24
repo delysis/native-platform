@@ -18,6 +18,9 @@ Removed:
   current model paths through the existing projection.
 - Missing-field compatibility defaults for attachment lifecycle, message/draft
   attachment linkage and stored approval continuation collections.
+- Mom's filename list that blocked the current encrypted store when unrelated
+  plaintext files were present. Only the current database is a store input;
+  adjacent files are neither imported nor rewritten.
 
 Mom's attachment schema is represented by a single serde enum variant, so every
 deserialization path, including transaction reads, rejects a different tag. Reads
