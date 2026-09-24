@@ -110,21 +110,37 @@ func waitFor(_ predicate: () -> Bool, seconds: TimeInterval = 10) -> Bool {
     } while ProcessInfo.processInfo.systemUptime < deadline
     return false
 }
-func setVisible(_ visible: Bool) {
-    if visible { application.unhide(); _ = application.activate(options: [.activateAllWindows]) }
-    else { _ = application.hide() }
-    _ = AXUIElementSetAttributeValue(ax, kAXHiddenAttribute as CFString, visible ? kCFBooleanFalse : kCFBooleanTrue)
-    // Same PID-only fallback as the original runner; never address Loom by name.
+func hideExactApplication() -> Bool {
+    // macOS applies the three PID-bound visibility mechanisms asynchronously.
+    // Advance to the next mechanism only after the prior one had time to take
+    // effect; issuing all three at once can leave a Tauri window visible.
+    _ = application.hide()
+    if waitFor({ application.isHidden }, seconds: 1) { return true }
+
+    if AXUIElementSetAttributeValue(ax, kAXHiddenAttribute as CFString, kCFBooleanTrue) == .success,
+       waitFor({ application.isHidden }, seconds: 0.5) {
+        return true
+    }
+
     var error: NSDictionary?
-    _ = NSAppleScript(source: "tell application \"System Events\" to set visible of first application process whose unix id is \(pid) to \(visible ? "true" : "false")")?.executeAndReturnError(&error)
-    if visible { _ = AXUIElementSetAttributeValue(ax, kAXFrontmostAttribute as CFString, kCFBooleanTrue) }
+    _ = NSAppleScript(
+        source: "tell application \"System Events\" to set visible of first application process whose unix id is \(pid) to false"
+    )?.executeAndReturnError(&error)
+    return error == nil && waitFor({ application.isHidden }, seconds: 10)
+}
+
+func showExactApplication() {
+    application.unhide()
+    _ = application.activate(options: [.activateAllWindows])
+    _ = AXUIElementSetAttributeValue(ax, kAXHiddenAttribute as CFString, kCFBooleanFalse)
+    _ = AXUIElementSetAttributeValue(ax, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
 }
 guard let stableStore = storeIdentity(), let initial = waitSnapshot(), let stableIdentity = identityBytes(initial) else { fail("no_correlated_terminal_glyph") }
 before = initial
 var finderError: NSDictionary?
 _ = NSAppleScript(source: "tell application id \"com.apple.finder\" to activate")?.executeAndReturnError(&finderError)
 guard finderError == nil, waitFor({ NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier }) else { fail("finder_did_not_take_focus") }
-setVisible(false)
+guard hideExactApplication() else { fail("exact_process_did_not_hide") }
 guard waitFor({ application.isHidden && NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier }) else { fail("exact_process_did_not_hide") }
 stage = "idle"
 let started = ProcessInfo.processInfo.systemUptime
@@ -138,7 +154,7 @@ while ProcessInfo.processInfo.systemUptime - started < 75 {
 }
 let elapsed = ProcessInfo.processInfo.systemUptime - started
 stage = "after_resume"
-setVisible(true)
+showExactApplication()
 var resumeAttempts = 0
 guard waitFor({
     application.unhide()
