@@ -1284,7 +1284,8 @@
     completionController,
     completionContextKey,
     baseSuggestionFamily,
-    true
+    true,
+    mode === 'visual'
   );
   $: boundCompletionSession = completionView.boundSession;
   $: if (boundCompletionSession && !loompadActive) {

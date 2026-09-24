@@ -80,6 +80,8 @@ export interface CompletionControllerState {
   generationIntent: CompletionGenerationIntent | null;
   navigationPending: boolean;
   intentEpoch: number;
+  /** A visual rejection may advance only an untouched default selection. */
+  visualSelectionOrigin: 'default' | 'writer';
   dismissedCandidateIds: string[];
   unpresentableVisualKeys: string[];
   selectionWasExplicit: boolean;
@@ -121,6 +123,7 @@ export function initialCompletionControllerState(): CompletionControllerState {
     generationIntent: null,
     navigationPending: false,
     intentEpoch: 0,
+    visualSelectionOrigin: 'default',
     dismissedCandidateIds: [],
     unpresentableVisualKeys: [],
     selectionWasExplicit: false,
@@ -248,30 +251,35 @@ export function reconcileCompletionController(
       !activeFamily.some((candidate) => candidate.runId === state.activeRunId)
     ? activeFamily[0].runId
     : state.activeRunId;
-  if (activeRunId !== state.activeRunId) selectionWasExplicit = false;
+  const visualSelectionOrigin = session !== state.session
+    ? 'default'
+    : state.visualSelectionOrigin;
   if (
     session === state.session &&
     pendingText === state.pendingText &&
     activeRunId === state.activeRunId &&
-    selectionWasExplicit === state.selectionWasExplicit
+    visualSelectionOrigin === state.visualSelectionOrigin
   ) return state;
-  return { ...state, session, pendingText, activeRunId, selectionWasExplicit };
+  return { ...state, session, pendingText, activeRunId, visualSelectionOrigin };
 }
 
 export function completionControllerView(
   state: CompletionControllerState,
   contextKey: string,
   baseFamily: readonly InlineGhostSuggestion[],
-  sharedPrefixAlternatives = true
+  sharedPrefixAlternatives = true,
+  visualSurface = false
 ): CompletionControllerView {
   const boundSession = state.session?.contextKey === contextKey ? state.session : null;
-  const activeFamily = completionActiveFamily(
+  const unfilteredFamily = completionActiveFamily(
     boundSession,
     state.pendingText,
     baseFamily,
-    sharedPrefixAlternatives,
-    state.unpresentableVisualKeys
+    sharedPrefixAlternatives
   );
+  const activeFamily = visualSurface
+    ? unfilteredFamily.filter((candidate) => !state.unpresentableVisualKeys.includes(candidate.presentationKey))
+    : unfilteredFamily;
   const unconsumeText = boundSession ? completionRollbackText(boundSession) : '';
   const presentation = boundSession && state.pendingText === null
     ? completionPresentation(boundSession) : null;
@@ -279,19 +287,16 @@ export function completionControllerView(
   // candidate identity and end offset for reversal at the editor boundary.
   const rollback = presentation && (boundSession?.presentationsRetired ||
     (presentation.text === '' && unconsumeText !== '')) ? presentation : null;
-  const activePresentationRejected = Boolean(boundSession?.candidates.some((candidate) =>
-    candidate.runId === state.activeRunId &&
-    state.unpresentableVisualKeys.includes(candidate.presentationKey)
-  ));
-  const selected = activePresentationRejected
-    ? null
-    : activeFamily.find((candidate) => candidate.runId === state.activeRunId) ??
-      activeFamily[0] ?? (rollback ? { ...rollback, text: '' } : null);
-  const witnessSelected = activePresentationRejected
-    ? null
-    : boundSession
-      ? selectedCompletionCandidate(boundSession) as InlineGhostSuggestion | null
+  const selectedByActiveRun = activeFamily.find((candidate) => candidate.runId === state.activeRunId) ?? null;
+  const fallback = activeFamily.length === 0
+    ? (rollback ? { ...rollback, text: '' } : null)
+    : state.activeRunId === null || !visualSurface
+      ? activeFamily[0]
       : null;
+  const selected = selectedByActiveRun ?? fallback;
+  const witnessSelected = selected && boundSession
+    ? selectedCompletionCandidate(boundSession) as InlineGhostSuggestion | null
+    : null;
   return {
     boundSession,
     activeFamily,
@@ -503,7 +508,7 @@ export function cycleCompletion(
         ...state,
         session,
         activeRunId: session.selectedRunId,
-        selectionWasExplicit: true
+        visualSelectionOrigin: 'writer'
       },
       effects: [{
         kind: 'announce',
@@ -516,7 +521,11 @@ export function cycleCompletion(
   const next = cycleSuggestionIndex(family.length, current, offset);
   if (next < 0) return { state, effects: [] };
   return {
-    state: { ...state, activeRunId: family[next].runId, selectionWasExplicit: true },
+    state: {
+      ...state,
+      activeRunId: family[next].runId,
+      visualSelectionOrigin: 'writer'
+    },
     effects: [{
       kind: 'announce',
       message: `Suggestion ${next + 1} of ${family.length}`
@@ -583,31 +592,24 @@ export function rejectVisualPresentation(
   ].slice(-64);
   const session = state.session;
   if (
-    !state.selectionWasExplicit &&
-    state.pendingText === null &&
-    session &&
-    session.acceptedChunks.length === 0 &&
-    !session.authorityFrozen &&
-    session.selectedRunId === input.eligible.runId &&
-    state.activeRunId === input.eligible.runId
+    state.visualSelectionOrigin !== 'default' ||
+    !session ||
+    session.acceptedChunks.length > 0 ||
+    session.selectedRunId !== input.eligible.runId ||
+    state.activeRunId !== input.eligible.runId
   ) {
-    const selectedIndex = session.candidates.findIndex(
-      candidate => candidate.runId === session.selectedRunId
-    );
-    const next = session.candidates
-      .map((_, offset) => session.candidates[(selectedIndex + offset + 1) % session.candidates.length])
-      .find(candidate => !unpresentableVisualKeys.includes(candidate.presentationKey));
-    if (next) {
-      return {
-        ...state,
-        session: { ...session, selectedRunId: next.runId },
-        activeRunId: next.runId,
-        unpresentableVisualKeys
-      };
-    }
+    return { ...state, unpresentableVisualKeys };
   }
+
+  const current = session.candidates.findIndex((candidate) => candidate.runId === input.eligible!.runId);
+  const next = session.candidates.slice(current + 1)
+    .concat(session.candidates.slice(0, Math.max(current, 0)))
+    .find((candidate) => !unpresentableVisualKeys.includes(candidate.presentationKey));
+  if (!next) return { ...state, unpresentableVisualKeys, activeRunId: null };
   return {
     ...state,
+    session: { ...session, selectedRunId: next.runId },
+    activeRunId: next.runId,
     unpresentableVisualKeys
   };
 }
