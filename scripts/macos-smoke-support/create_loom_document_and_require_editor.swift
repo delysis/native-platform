@@ -42,12 +42,23 @@ func control(named needle: String) -> AXUIElement? {
     }
 }
 
-guard let window = (attribute(application, kAXWindowsAttribute as CFString) as? [AXUIElement])?.first else {
+func firstWindow() -> AXUIElement? {
+    (attribute(application, kAXWindowsAttribute as CFString) as? [AXUIElement])?.first
+}
+
+NSRunningApplication(processIdentifier: pid)?.activate(options: [])
+let windowDeadline = Date().addingTimeInterval(5)
+var initialWindow: AXUIElement?
+repeat {
+    initialWindow = firstWindow()
+    if initialWindow != nil { break }
+    Thread.sleep(forTimeInterval: 0.05)
+} while Date() < windowDeadline
+guard let window = initialWindow else {
     fputs("could not bind the new-document check to Loom's exact accessible window\n", stderr)
     exit(1)
 }
 let beforeTitle = stringAttribute(window, kAXTitleAttribute as CFString)
-NSRunningApplication(processIdentifier: pid)?.activate(options: [])
 let addDeadline = Date().addingTimeInterval(5)
 var add: AXUIElement?
 repeat {
@@ -87,7 +98,12 @@ let deadline = Date().addingTimeInterval(10)
 var afterTitle = beforeTitle
 var focusedEditor = false
 repeat {
-    afterTitle = stringAttribute(window, kAXTitleAttribute as CFString)
+    // Creating a document may replace WebKit's native accessibility window.
+    // Rebind through the exact application PID instead of reading a detached
+    // pre-command object whose title can never advance.
+    if let currentWindow = firstWindow() {
+        afterTitle = stringAttribute(currentWindow, kAXTitleAttribute as CFString)
+    }
     focusedEditor = descendants().contains { element in
         stringAttribute(element, kAXRoleAttribute as CFString) == kAXTextAreaRole as String &&
             (attribute(element, kAXFocusedAttribute as CFString) as? Bool) == true
