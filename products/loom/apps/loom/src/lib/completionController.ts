@@ -465,6 +465,27 @@ export function cycleCompletion(
   sharedPrefixAlternatives = true
 ): CompletionControllerTransition {
   if (state.session) {
+    // Before any prose is accepted, cycle only through the currently eligible
+    // family. The immutable session retains rejected candidates as evidence,
+    // but they must not regain selection authority through navigation.
+    if (state.session.acceptedChunks.length === 0 && family.length > 0) {
+      const current = family.findIndex(candidate => candidate.runId === state.activeRunId);
+      const next = cycleSuggestionIndex(family.length, current, offset);
+      if (next < 0) return { state, effects: [] };
+      const selectedRunId = family[next].runId;
+      return {
+        state: {
+          ...state,
+          session: { ...state.session, selectedRunId },
+          activeRunId: selectedRunId,
+          visualSelectionOrigin: 'writer'
+        },
+        effects: [{
+          kind: 'announce',
+          message: `Suggestion ${next + 1} of ${family.length}`
+        }]
+      };
+    }
     const session = cycleCompletionSession(state.session, offset, sharedPrefixAlternatives);
     if (session === state.session) return { state, effects: [] };
     const index = session.candidates.findIndex(
