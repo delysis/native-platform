@@ -94,6 +94,7 @@ it.each([
   let releaseBodies!: () => void;
   const bodiesReady = new Promise<void>(resolve => { releaseBodies = resolve; });
   const unexpected: string[] = [];
+  const visualGhostTelemetryPayloads: Record<string, unknown>[] = [];
   // This transport models receipts, not a native store. Only explicit actions
   // below authorize its writes; startup/toggling/hydration must never write.
   let allowedWrite: string | null = null;
@@ -137,6 +138,12 @@ it.each([
       case 'plugin:loom|model_catalog_list': throw { code: 'injected_catalog_unavailable', message: 'catalog intentionally unavailable' };
       case 'plugin:loom|model_list': return [model];
       case 'plugin:loom|inference_status': return { suggestions: null };
+      // This is an observability-only event. Keep its exact empty payload
+      // checked so timing instrumentation cannot become a content channel.
+      case 'plugin:loom|visual_ghost_rendered':
+        expect(args).toEqual({});
+        visualGhostTelemetryPayloads.push(args);
+        return;
       case 'plugin:loom|model_download_list':
       case 'plugin:loom|terminal_list':
       case 'plugin:loom|material_list':
@@ -274,6 +281,7 @@ it.each([
     expect(glyph()).toBe(texts[0]);
     expect(admissions).toBe(1);
     expect(unexpected).toEqual([]); // Includes all hidden writes, extra work, and hosted fallback.
+    expect(visualGhostTelemetryPayloads.length).toBeGreaterThan(0);
     expect(transport.invoke.mock.calls.some(([command]) => String(command).includes('checkpoint'))).toBe(false);
     const writingSurface = page.getByRole('textbox', { name: 'Untitled, manuscript editor', exact: true }).element();
     expect(authorDomText(writingSurface)).toBe(sourceText);
