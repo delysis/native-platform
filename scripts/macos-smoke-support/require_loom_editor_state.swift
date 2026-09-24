@@ -159,6 +159,7 @@ var observedSelection: CanonicalSelection?
 var observedCompletionWitness: [String: Any]?
 var observedSelectionWitness: [String: Any]?
 var focused = false
+var caretRestoreCount = 0
 var exactSelectionSince: Date?
 var exactSelectionEpoch: Int?
 repeat {
@@ -176,6 +177,23 @@ repeat {
         observedSelection = nil
         observedSelectionWitness = nil
         focused = false
+    }
+    if selectionMode == "caret-end",
+       observedValue == expected,
+       focused,
+       projectionSettled(observedCompletionWitness),
+       let current = writingSurface,
+       let selection = observedSelection,
+       selection.canonical.location != expected.utf16.count || selection.canonical.length != 0 {
+        var endRange = CFRange(location: expected.utf16.count, length: 0)
+        if let endRangeValue = AXValueCreate(.cfRange, &endRange),
+           AXUIElementSetAttributeValue(
+               current,
+               kAXSelectedTextRangeAttribute as CFString,
+               endRangeValue
+           ) == .success {
+            caretRestoreCount += 1
+        }
     }
     if observedValue == expected,
        focused,
@@ -224,6 +242,7 @@ let evidence: [String: Any] = [
     "canonical_editor_value": observedValue,
     "focused": true,
     "selection_mode": selectionMode,
+    "settled_caret_restore_count": caretRestoreCount,
     "selection": [
         "location": observedSelection.canonical.location,
         "length": observedSelection.canonical.length,
