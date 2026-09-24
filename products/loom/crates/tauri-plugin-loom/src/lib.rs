@@ -5916,9 +5916,12 @@ async fn model_load_exact_writer<R: Runtime>(
         let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let inspected =
                 inspect_preverified_policy_file(&worker_path, &worker_expectation, || {
+                    // Outer phases include file hashing and path-binding checks.
+                    worker_state.emit_timing("model_backend_inspect_begin");
                     let descriptor = backend
                         .inspect_model(&worker_profile)
                         .map_err(|error| IpcFailure::backend(&error))?;
+                    worker_state.emit_timing("model_backend_inspect_returned");
                     validate_policy_model_descriptor(
                         &descriptor,
                         &worker_path,

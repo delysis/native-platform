@@ -37,6 +37,10 @@ func fail(_ reason: String) -> Never {
     }
     fputs("Loom idle/resume failed at \(stage): \(reason)\n", stderr); exit(1)
 }
+// NSRunningApplication state updates require the main run loop. These
+// standalone helpers do not enter NSApplication.run(); sleeping here can
+// leave isHidden/isTerminated stale across a real hide or resume. Pump the
+// default (common) mode between observations; keep every deadline and guard.
 func guardsHold() -> Bool {
     !application.isTerminated && !guardPaths.contains { manager.fileExists(atPath: $0) }
 }
@@ -79,7 +83,7 @@ func snapshot() -> [String: Any]? {
     child.standardOutput = stdout; child.standardError = stderr
     do { try child.run() } catch { return nil }
     let deadline = ProcessInfo.processInfo.systemUptime + 8
-    while child.isRunning && guardsHold() && ProcessInfo.processInfo.systemUptime < deadline { Thread.sleep(forTimeInterval: 0.05) }
+    while child.isRunning && guardsHold() && ProcessInfo.processInfo.systemUptime < deadline { RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05)) }
     if child.isRunning { child.terminate(); child.waitUntilExit(); return nil } // Only this owned observer, never the app.
     child.waitUntilExit()
     guard child.terminationStatus == 0, let data = try? Data(contentsOf: URL(fileURLWithPath: stdoutPath)), data.count <= 65536,
@@ -97,7 +101,7 @@ func waitSnapshot(matching expected: Data? = nil) -> [String: Any]? {
     repeat {
         guard guardsHold() else { return nil }
         if let value = snapshot(), let identity = identityBytes(value), expected == nil || identity == expected { return value }
-        Thread.sleep(forTimeInterval: 0.05)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
     } while ProcessInfo.processInfo.systemUptime < deadline
     return nil
 }
@@ -106,7 +110,7 @@ func waitFor(_ predicate: () -> Bool, seconds: TimeInterval = 10) -> Bool {
     repeat {
         guard guardsHold() else { return false }
         if predicate() { return true }
-        Thread.sleep(forTimeInterval: 0.05)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
     } while ProcessInfo.processInfo.systemUptime < deadline
     return false
 }
@@ -150,7 +154,7 @@ while ProcessInfo.processInfo.systemUptime - started < 75 {
     guard guardsHold(), application.isHidden,
           NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier,
           storeIdentity() == stableStore else { fail("focus_process_generation_or_terminal_identity_changed") }
-    Thread.sleep(forTimeInterval: 0.05)
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
 }
 let elapsed = ProcessInfo.processInfo.systemUptime - started
 stage = "after_resume"

@@ -35,7 +35,8 @@ while ProcessInfo.processInfo.systemUptime < deadlineUptime {
        NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
         exit(0)
     }
-    Thread.sleep(forTimeInterval: 0.05)
+    // Refresh AppKit's asynchronously observed state, including after unhide.
+    RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
 }
 let frontmostPid = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
 fputs(

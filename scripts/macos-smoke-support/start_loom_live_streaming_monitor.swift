@@ -90,6 +90,27 @@ func namedEditorIndex(_ elements: [(role: String, labels: [String])]) -> Int? {
     return matches.count == 1 ? matches[0] : nil
 }
 
+// Observer-clock durations only: never subtract these from native/plugin or
+// renderer elapsed_ms. Missing/out-of-order samples are absent, not zero latency.
+func inlineObservationTiming(origin: TimeInterval, firstDurableTextAt: TimeInterval?,
+                             visualObservedAt: TimeInterval) -> [String: Int64] {
+    func milliseconds(from start: TimeInterval, to end: TimeInterval) -> Int64? {
+        let value = (end - start) * 1000
+        guard start.isFinite, end.isFinite, value.isFinite,
+              value >= 0, value < Double(Int64.max) else { return nil }
+        return Int64(value)
+    }
+    guard let elapsed = milliseconds(from: origin, to: visualObservedAt) else { return [:] }
+    var timing = ["observer_elapsed_ms": elapsed]
+    if let first = firstDurableTextAt,
+       let prefixElapsed = milliseconds(from: origin, to: first),
+       let presentationDelay = milliseconds(from: first, to: visualObservedAt) {
+        timing["first_durable_text_observed_elapsed_ms"] = prefixElapsed
+        timing["durable_text_to_inline_observed_ms"] = presentationDelay
+    }
+    return timing
+}
+
 func selfTest() {
     var assertions = 0
     var failures = 0
@@ -97,6 +118,20 @@ func selfTest() {
         if !condition { fputs("live observer contract failed: \(message)\n", stderr); failures += 1 }
         assertions += 1
     }
+    check(inlineObservationTiming(origin: 10, firstDurableTextAt: 11, visualObservedAt: 12) ==
+          ["observer_elapsed_ms": 2000, "first_durable_text_observed_elapsed_ms": 1000,
+           "durable_text_to_inline_observed_ms": 1000], "same-clock text/presentation split")
+    check(inlineObservationTiming(origin: 10, firstDurableTextAt: nil, visualObservedAt: 12) ==
+          ["observer_elapsed_ms": 2000], "missing text sample is not zero presentation latency")
+    for invalid in [9.0, 13.0, .nan, .infinity] {
+        check(inlineObservationTiming(origin: 10, firstDurableTextAt: invalid, visualObservedAt: 12) ==
+              ["observer_elapsed_ms": 2000], "invalid text sample is not a timing fact")
+    }
+    check(inlineObservationTiming(origin: 10, firstDurableTextAt: nil, visualObservedAt: 9).isEmpty,
+          "out-of-order visual sample")
+    check(inlineObservationTiming(origin: 0, firstDurableTextAt: nil,
+                                  visualObservedAt: Double.greatestFiniteMagnitude).isEmpty,
+          "overflowing duration")
     let family = ["r1", "r2", "r3", "r4"]
     let key = "stream:r1:7"
     let visual: [String: Any] = ["available": true, "inlineHidden": false, "fanVisible": false,
@@ -196,6 +231,9 @@ guard sqlite3_open_v2(databasePath, &databasePointer, SQLITE_OPEN_READONLY | SQL
 defer { sqlite3_close(database) }
 sqlite3_busy_timeout(database, 50)
 let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+// At most the four admitted run IDs; no text is retained by timing state.
+let observationTimingOrigin = ProcessInfo.processInfo.systemUptime
+var firstDurableTextObservedAt: [String: TimeInterval] = [:]
 var polls = 0, rejected: [String: Int] = [:], lastWitness: [String: Any] = [:]
 var postTerminal: [String: Any] = [:]
 var observedEditorLabels: [[String]] = []
@@ -292,7 +330,8 @@ func cumulativeText(_ run: String, through sequence: Int64?) -> String? {
     return exactSequence ? text : nil
 }
 func sha256(_ text: String) -> String { SHA256.hash(data: Data(text.utf8)).map { String(format: "%02x", $0) }.joined() }
-func reject(_ reason: String) { rejected[reason, default: 0] += 1; Thread.sleep(forTimeInterval: 0.05) }
+// Service AppKit state notifications without changing any observation gate.
+func reject(_ reason: String) { rejected[reason, default: 0] += 1; RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05)) }
 func fail(_ reason: String) -> Never {
     let evidence: [String: Any] = ["schema": "delysis.loom-live-stream-failure.v1", "pid": pid, "reason": reason,
         "polls": polls, "generation_run_count": count() ?? -1, "family_run_ids": familyIds() ?? [],
@@ -315,6 +354,18 @@ while ProcessInfo.processInfo.systemUptime < (terminalDeadline ?? initialDeadlin
     if runningApplication.isTerminated { fail("exact_process_exited") }
     guard let observedCount = count() else { reject("store_unreadable"); continue }
     if observedCount > baseline + 4 { fail("unexpected_generation_run") }
+    // Read-only timing sample before the AX/DOM read, independently of whether
+    // a glyph is present. A timestamp sampled only after projection would hide
+    // presentation delay. Do not promote query failure into an acceptance fact.
+    if !terminalSnapshot, observedCount == baseline + 4, firstDurableTextObservedAt.count < 4,
+       let timingFamily = familyIds(), timingFamily.count == 4 {
+        for run in timingFamily where firstDurableTextObservedAt[run] == nil {
+            if let durable = cumulativeText(run, through: nil),
+               durable.rangeOfCharacter(from: .whitespacesAndNewlines.inverted) != nil {
+                firstDurableTextObservedAt[run] = ProcessInfo.processInfo.systemUptime
+            }
+        }
+    }
     guard let elements = descendants() else { reject("accessibility_truncated"); continue }
     // Focus is a measured prerequisite. The smoke driver establishes it;
     // this observer must not change focus/caret between witness and AX reads.
@@ -376,6 +427,7 @@ while ProcessInfo.processInfo.systemUptime < (terminalDeadline ?? initialDeadlin
           selection.location == manuscript.utf16.count, selection.length == 0,
           editorValueMatches((attribute(editor, kAXValueAttribute as CFString) as? String) ?? "", manuscript: manuscript, glyph: projection.text)
     else { reject("editor_identity_or_caret"); continue }
+    let visualObservedAt = ProcessInfo.processInfo.systemUptime
     guard let durable = cumulativeText(projection.runId, through: projection.sequence), durable.utf8.starts(with: projection.text.utf8) else { reject("event_prefix_mismatch"); continue }
     // Read append-only terminals AFTER the AX/DOM-derived observation. Reading
     // them only before observation cannot establish pre-terminal causality.
@@ -402,7 +454,15 @@ while ProcessInfo.processInfo.systemUptime < (terminalDeadline ?? initialDeadlin
                         "correlated_dom_render": true] }
         reject("not_preterminal"); continue
     }
+    // One marker, only after the unchanged correlated PRE-terminal proof.
+    // This measures observed presentation, not compositor scanout or kernel TTFT.
+    let timing = inlineObservationTiming(origin: observationTimingOrigin,
+        firstDurableTextAt: firstDurableTextObservedAt[projection.runId],
+        visualObservedAt: visualObservedAt)
+    let timingFields = timing.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " ")
+    fputs("loom_timing phase=first_inline_visual_observed \(timingFields)\n", stderr)
     let evidence: [String: Any] = ["schema": "delysis.loom-live-stream-witness.v1", "pid": pid, "database": databasePath,
+        "timing": timing,
         "baseline_generation_runs": baseline, "generation_run_count": observedCount, "family_run_ids": family,
         "open_run_ids_after_accessibility": openAfter, "terminal_count_after_accessibility": 4 - openAfter.count,
         "selected_run_id": projection.runId, "selected_candidate_id": projection.candidateId, "presentation_key": projection.key,
