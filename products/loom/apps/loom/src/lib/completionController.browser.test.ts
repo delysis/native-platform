@@ -20,6 +20,31 @@ function render(mode: 'visual' | 'source', loompad = false, insertsOnAccept = tr
 }
 
 describe('completion controller and editor callback ordering', () => {
+  it.each(['visual', 'source'] as const)('retains the compatible %s fan while Option stays held after acceptance', async (mode) => {
+    const keyboard = userEvent.setup();
+    const harness = render(mode);
+    await page.getByRole('textbox').click();
+    harness.installRefill([' one two', ' one three', ' one four', ' another turn'].map((text, index) => ({
+      candidateId: `candidate-${index}`, presentationKey: `candidate-${index}:1`, runId: `run-${index}`,
+      targetByte: 5, text, insertsOnAccept: true
+    })));
+    await keyboard.keyboard('{Alt>}');
+    await expect.poll(() => page.getByRole('option').all().length).toBe(4);
+    await keyboard.keyboard('{ArrowRight}');
+    const manuscript = () => page.getByRole('status', { name: 'Controller Markdown' }).element().textContent;
+    await expect.poll(manuscript).toBe(mode === 'visual' ? 'Hello one' : 'Hello one ');
+    // Acceptance removes only the incompatible sibling. Physical Option still
+    // exposes the three exact-prefix continuations; native smoke must not demand
+    // that this fan disappear merely because a word was accepted.
+    await expect.poll(() => page.getByRole('option').all().length).toBe(3);
+    await expect.element(page.getByRole('listbox', { name: 'Completion suggestions' })).toBeVisible();
+    await keyboard.keyboard('{ArrowLeft}');
+    await expect.poll(manuscript).toBe('Hello');
+    await expect.poll(() => page.getByRole('option').all().length).toBe(4);
+    await keyboard.keyboard('{/Alt}');
+    await expect.element(page.getByRole('listbox', { name: 'Completion suggestions' })).not.toBeInTheDocument();
+    await keyboard.cleanup();
+  });
   it.each(['visual', 'source'] as const)('refuses a truncated %s DOM preview even with the right presentation key', async (mode) => {
     render(mode);
     const editor = page.getByRole('textbox');

@@ -12,6 +12,23 @@ func exactInsertedCandidatePrefix(original: Data, observed: Data, candidate: Dat
     return observed == expected
 }
 
+// Derive the remaining fan from persisted bytes and independently SHA-verified
+// candidates, not from the controller's assertion about its own alternatives.
+func remainingCandidateIds(original: Data, observed: Data, runIds: [String], candidates: [String: Data]) -> [String]? {
+    guard observed.count > original.count, observed.starts(with: original),
+          Set(runIds).count == runIds.count,
+          runIds.allSatisfy({ candidates[$0] != nil }) else { return nil }
+    let accepted = observed.dropFirst(original.count)
+    return runIds.filter { id in
+        guard let candidate = candidates[id] else { return false }
+        return candidate.count > accepted.count && candidate.starts(with: accepted)
+    }
+}
+
+func remainingFanMatches(expected: [String], observed: [String], visible: Bool) -> Bool {
+    expected == observed && visible == (expected.count > 1)
+}
+
 func insertionContractTests() {
     let original = Data("hello ".utf8), candidate = Data("world again".utf8)
     var checks = 0
@@ -35,6 +52,20 @@ func insertionContractTests() {
     check(!isOwnedManuscriptEditor(role: "AXTextArea", labels: ["Manuscript editor"]), "reject unscoped legacy editor")
     check(!isOwnedManuscriptEditor(role: "AXTextArea", labels: ["Other, manuscript editor"]), "reject different manuscript")
     check(!isOwnedManuscriptEditor(role: "AXButton", labels: ["Untitled, manuscript editor"]), "reject wrong editor role")
+    let ids = ["a", "b", "c", "d"]
+    let bodies = ["a": Data("one two".utf8), "b": Data("one three".utf8),
+                  "c": Data("one four".utf8), "d": Data("another turn".utf8)]
+    let remaining = remainingCandidateIds(original: original, observed: Data("hello one".utf8), runIds: ids, candidates: bodies)
+    check(remaining == ["a", "b", "c"], "preserve compatible original order")
+    check(remainingFanMatches(expected: remaining!, observed: ["a", "b", "c"], visible: true), "held Option retains compatible fan")
+    check(!remainingFanMatches(expected: remaining!, observed: ["a", "b", "c"], visible: false), "reject old hidden-fan decision")
+    check(!remainingFanMatches(expected: remaining!, observed: ids, visible: true), "reject incompatible sibling")
+    check(!remainingFanMatches(expected: remaining!, observed: ["b", "a", "c"], visible: true), "reject reordered mapping")
+    check(remainingFanMatches(expected: ["d"], observed: ["d"], visible: false), "singleton has no fan")
+    check(!remainingFanMatches(expected: ["d"], observed: ["d"], visible: true), "reject singleton fan")
+    check(remainingCandidateIds(original: original, observed: Data("Hello one".utf8), runIds: ids, candidates: bodies) == nil, "reject changed manuscript prefix")
+    check(remainingCandidateIds(original: original, observed: Data("hello one".utf8), runIds: ["missing"], candidates: bodies) == nil, "reject unverified candidate")
+    check(remainingCandidateIds(original: original, observed: Data("hello one two".utf8), runIds: ids, candidates: bodies) == [], "exhausted candidates are not alternatives")
     print("\(checks) insertion-contract assertions passed (not native acceptance)")
 }
 
@@ -288,7 +319,8 @@ func fanAccessibility() -> (
         observations.append(accessibilityObservation(listbox))
         for element in subtree(listbox) {
             for label in strings(element) {
-                guard let ordinal = suggestionOrdinal(label), ordinal.count == 4 else { continue }
+                guard let ordinal = suggestionOrdinal(label), (2...4).contains(ordinal.count),
+                      (1...ordinal.count).contains(ordinal.index) else { continue }
                 let option: [String: Any] = [
                     "index": ordinal.index,
                     "count": ordinal.count,
@@ -308,16 +340,20 @@ func fanAccessibility() -> (
 func exactAccessibleFan(_ witness: [String: Any]) -> [[String: Any]]? {
     let fan = fanAccessibility()
     let candidates = witness["candidates"] as? [[String: Any]] ?? []
+    let alternatives = stringArray(visual(witness), "alternativeRunIds")
     guard fan.listbox,
-          fan.options.count == 4,
+          (2...4).contains(alternatives.count),
+          Set(alternatives).count == alternatives.count,
+          fan.options.count == alternatives.count,
           candidates.count == 4 else {
         return nil
     }
     var enriched: [[String: Any]] = []
     for option in fan.options.sorted(by: { integer($0, "index") < integer($1, "index") }) {
         let index = integer(option, "index")
-        guard index == enriched.count + 1 else { return nil }
-        let candidate = candidates[index - 1]
+        guard index == enriched.count + 1,
+              integer(option, "count") == alternatives.count,
+              let candidate = candidates.first(where: { string($0, "run_id") == alternatives[index - 1] }) else { return nil }
         var joined = option
         joined["run_id"] = string(candidate, "run_id")
         joined["candidate_id"] = string(candidate, "candidate_id")
@@ -606,6 +642,11 @@ guard postKey(124, down: true, flags: [.maskAlternate]),
 guard let accepted = waitForChangedManuscript(from: original, timeout: 30) else {
     releaseOptionAndFail("Option-Right did not persist one cached completion word")
 }
+guard let expectedRemainingIds = remainingCandidateIds(
+    original: original, observed: accepted, runIds: runIds, candidates: expectedCandidates
+) else {
+    releaseOptionAndFail("accepted manuscript could not be bound to the verified candidate family")
+}
 guard let wordAccepted = waitForWitness(timeout: 10, { witness in
     let rendered = visual(witness)
     let action = lastAction(witness)
@@ -614,7 +655,9 @@ guard let wordAccepted = waitForWitness(timeout: 10, { witness in
         integer(witness, "accepted_chunk_count") == 1 &&
         bool(witness, "authority_frozen") &&
         bool(rendered, "optionHeld") &&
-        !bool(rendered, "fanVisible") &&
+        remainingFanMatches(expected: expectedRemainingIds,
+            observed: stringArray(rendered, "alternativeRunIds"), visible: bool(rendered, "fanVisible")) &&
+        (expectedRemainingIds.count < 2 || exactAccessibleFan(witness) != nil) &&
         string(action, "kind") == "option_word" &&
         string(action, "run_id") == initialRunId &&
         integer(action, "sequence") > initialActionSequence
