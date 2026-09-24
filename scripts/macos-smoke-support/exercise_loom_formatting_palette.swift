@@ -185,9 +185,14 @@ func textField(named needle: String) -> AXUIElement? {
     }
 }
 
-guard let editor = descendants().first(where: {
-    (attribute($0, kAXRoleAttribute as CFString) as? String) == kAXTextAreaRole as String
-}),
+func manuscriptEditor() -> AXUIElement? {
+    descendants().first { element in
+        (attribute(element, kAXRoleAttribute as CFString) as? String) ==
+            kAXTextAreaRole as String
+    }
+}
+
+guard let editor = manuscriptEditor(),
       let beforeSelection = canonicalSelection(editor),
       let beforeSelectionWitness = editorSelectionWitness(),
       bool(beforeSelectionWitness, "available"),
@@ -290,8 +295,16 @@ var editorFocused = false
 var exactSelectionSince: Date?
 var exactSelectionEpoch: Int?
 repeat {
-    editorFocused = (attribute(editor, kAXFocusedAttribute as CFString) as? Bool) == true
-    afterSelection = canonicalSelection(editor)
+    // WebKit may replace the native AX text-area object when a paragraph is
+    // structurally rewritten even though the contenteditable DOM owner is
+    // unchanged. Rebind the current accessible manuscript on every sample;
+    // querying the detached pre-command object manufactures focus=false and
+    // a 0:0 selection while the live editor remains correctly focused.
+    let currentEditor = manuscriptEditor()
+    editorFocused = currentEditor.flatMap {
+        attribute($0, kAXFocusedAttribute as CFString) as? Bool
+    } == true
+    afterSelection = currentEditor.flatMap(canonicalSelection)
     afterSelectionWitness = editorSelectionWitness()
     if editorFocused,
        let currentAX = afterSelection,

@@ -916,6 +916,8 @@
       class: 'loom-prosemirror',
       role: 'textbox',
       'aria-multiline': 'true',
+      autocorrect: 'off',
+      autocomplete: 'off',
       spellcheck: 'true'
     };
     const plan = view ? currentGhostTextPlan(view.state) : null;
