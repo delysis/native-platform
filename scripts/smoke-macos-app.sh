@@ -332,6 +332,11 @@ foreground_loom_process() {
   "$SMOKE_HELPERS/foreground_loom_process" "$target_pid"
 }
 
+position_loom_window_right() {
+  target_pid=$1
+  "$SMOKE_HELPERS/position_loom_window_right" "$target_pid"
+}
+
 wait_for_window() {
   target_pid=$1
   "$SMOKE_HELPERS/wait_for_window" "$target_pid"
@@ -1192,6 +1197,13 @@ run_once() {
     echo "packaged app did not expose a window" >&2
     echo "application logs: $stdout_log and $stderr_log" >&2
     return 1
+  fi
+  if [ "$COMPONENT" = loom ]; then
+    if ! loom_window_position=$(position_loom_window_right "$ACTIVE_PID"); then
+      echo "the exact Loom process could not be positioned on the right before native interaction" >&2
+      return 1
+    fi
+    echo "+ Loom window positioned on the right: $loom_window_position"
   fi
   if ! wait_for_readiness "$run_number" "$ACTIVE_PID" "$stderr_log"; then
     echo "application logs: $stdout_log and $stderr_log" >&2

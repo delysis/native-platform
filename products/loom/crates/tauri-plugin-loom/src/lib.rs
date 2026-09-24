@@ -474,6 +474,7 @@ struct PreparedProject {
 
 #[derive(Debug)]
 pub struct PluginState {
+    startup_at: Instant,
     close_requested: AtomicBool,
     exit_authorized: AtomicBool,
     application: Mutex<ApplicationPhase>,
@@ -510,6 +511,15 @@ impl Default for PluginState {
 }
 
 impl PluginState {
+    fn emit_timing(&self, phase: &'static str) {
+        // Timings deliberately carry no prompt, manuscript, model path, or
+        // generated text. They are a local diagnostic timeline only.
+        eprintln!(
+            "loom_timing phase={phase} elapsed_ms={}",
+            self.startup_at.elapsed().as_millis()
+        );
+    }
+
     fn shutdown_inference(&self) -> Result<(), IpcFailure> {
         if let Some(service) = &self.inference {
             tauri::async_runtime::block_on(service.gateway.shutdown()).map_err(|_| {
@@ -535,6 +545,7 @@ impl PluginState {
         let generation_lifecycle = GenerationSupervisor::new(64)
             .expect("the production generation progress capacity is valid");
         Self {
+            startup_at: Instant::now(),
             close_requested: AtomicBool::new(false),
             exit_authorized: AtomicBool::new(false),
             application: Mutex::new(ApplicationPhase::default()),
@@ -2159,6 +2170,7 @@ impl Builder {
                 document_reconciliation_preview,
                 document_reconcile_apply,
                 inference_status,
+                visual_ghost_rendered,
                 build_model_policy_get,
                 model_catalog_list,
                 model_list,
@@ -2216,6 +2228,7 @@ impl Builder {
                         Err(error) => eprintln!("Loom inference: {}", error.message),
                     }
                 }
+                state.emit_timing("native_plugin_ready");
                 app.manage(state);
                 Ok(())
             })
@@ -2277,6 +2290,14 @@ fn inference_status(state: State<'_, PluginState>) -> inference::Status {
         .inference
         .as_ref()
         .map_or_else(inference::Status::default, inference::Service::status)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn visual_ghost_rendered(state: State<'_, PluginState>) {
+    // Native stderr is the packaged acceptance timing stream. This command
+    // accepts no renderer data, so timing cannot carry author content.
+    state.emit_timing("visual_ghost_rendered");
 }
 
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, menu_id: &str) {
@@ -5864,6 +5885,7 @@ async fn model_load_exact_writer<R: Runtime>(
     app: AppHandle<R>,
     state: State<'_, PluginState>,
 ) -> Result<ModelCapabilitySummary, IpcFailure> {
+    state.emit_timing("model_load_requested");
     let (model_load, plan) = {
         let application_admission = lock_application_admission(&state, "local model verification")?;
         let model_load = state.model_loads.reserve(&application_admission)?;
@@ -5890,12 +5912,16 @@ async fn model_load_exact_writer<R: Runtime>(
     tauri::async_runtime::spawn_blocking(move || {
         let _worker_guard = worker_guard;
         let worker_state = worker_app.state::<PluginState>();
+        worker_state.emit_timing("model_load_native_begin");
         let operation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let inspected =
                 inspect_preverified_policy_file(&worker_path, &worker_expectation, || {
+                    // Outer phases include file hashing and path-binding checks.
+                    worker_state.emit_timing("model_backend_inspect_begin");
                     let descriptor = backend
                         .inspect_model(&worker_profile)
                         .map_err(|error| IpcFailure::backend(&error))?;
+                    worker_state.emit_timing("model_backend_inspect_returned");
                     validate_policy_model_descriptor(
                         &descriptor,
                         &worker_path,
@@ -5909,6 +5935,7 @@ async fn model_load_exact_writer<R: Runtime>(
                 &worker_profile,
                 inspected,
             )?;
+            worker_state.emit_timing("model_load_native_ready");
             commit_model_load(
                 &worker_state,
                 &worker_path,
@@ -6608,6 +6635,7 @@ fn commit_model_load(
             ));
         }
     }
+    state.emit_timing("model_load_committed");
     Ok(summary)
 }
 
@@ -8358,6 +8386,7 @@ fn weave_start_inner<R: Runtime>(
     app: &AppHandle<R>,
     state: &State<'_, PluginState>,
 ) -> Result<WeaveStarted, IpcFailure> {
+    state.emit_timing("generation_request_received");
     ensure_application_running(state, "a writing suggestion")?;
     let command_id = parse_command_id(command_id)?;
     let document_id = document_id.parse::<DocumentId>().map_err(|_| {
@@ -8913,6 +8942,7 @@ fn weave_start_inner<R: Runtime>(
             false,
         ));
     }
+    state.emit_timing("generation_native_submit");
     let generation_owner = match native_request.submit(&state.backend) {
         Ok(owner) => owner,
         Err(error) => {

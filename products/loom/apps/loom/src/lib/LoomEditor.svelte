@@ -6,6 +6,9 @@
   import { EditorState, Selection } from 'prosemirror-state';
   import { EditorView } from 'prosemirror-view';
   import { onDestroy, onMount } from 'svelte';
+  import {
+    boundaryKeyKind, textBoundaryDelta, type BoundaryObservation
+  } from './completionBoundaryDiagnostics';
   import { visualTerminalRange, type TerminalSourceRange } from './terminalSelection';
   import { flushMediaObjectDrafts, mediaObjectView } from './mediaObjectView';
   import { objectNavigation } from './objectNavigation';
@@ -111,6 +114,7 @@
   export let onImageAttachmentError: (message: string) => void = () => {};
   export let resolveImageAssetUrl: (markdownPath: string) => string | null = () => null;
   export let onChange: (markdown: string) => void = () => {};
+  export let onBoundaryObservation: ((observation: BoundaryObservation) => void) | undefined = undefined;
   export let onCompositionChange: (active: boolean) => void = () => {};
   export let onImmediateDocumentMutation: () => void = () => {};
   export let onGhostAccept: (candidateId: string, presentationKey: string) => boolean = () => false;
@@ -182,6 +186,65 @@
   let pendingRejectedPresentationIdentity = '';
   let rejectionFrame: number | undefined;
   let selectionAccessibilityEpoch = 0;
+  // Input metadata is correlation, not proof of a human/authorized edit. A
+  // DOM-observer transaction may have no input event at all. Never log data.
+  let boundaryInputSequence = 0;
+  let lastBoundaryInput: { sequence: number; at: number; type: string; trusted: boolean; composing: boolean } | null = null;
+  let lastBoundaryKey: {
+    sequence: number;
+    at: number;
+    kind: string;
+    code: string;
+    alt: boolean;
+    ctrl: boolean;
+    meta: boolean;
+    shift: boolean;
+    trusted: boolean;
+  } | null = null;
+
+  function noteBoundaryInput(event: Event): void {
+    if (!onBoundaryObservation) return;
+    lastBoundaryInput = {
+      sequence: ++boundaryInputSequence, at: Date.now(),
+      type: event instanceof InputEvent ? event.inputType.slice(0, 64) : '',
+      trusted: event.isTrusted, composing: event instanceof InputEvent && event.isComposing
+    };
+  }
+
+  function observeVisualBoundary(
+    kind: BoundaryObservation['kind'],
+    before: string | ProseMirrorNode,
+    after: string | ProseMirrorNode,
+    facts: BoundaryObservation['facts'],
+    incomingSource?: string
+  ): void {
+    if (!onBoundaryObservation) return;
+    let left: string;
+    let right: string;
+    let documentFacts: BoundaryObservation['facts'] = {};
+    try {
+      if (typeof before !== 'string' && typeof after !== 'string') {
+        const textDelta = textBoundaryDelta(before.textContent, after.textContent);
+        documentFacts = {
+          document_text_equal: textDelta.equal,
+          before_document_text_utf8_bytes: textDelta.before_utf8_bytes,
+          after_document_text_utf8_bytes: textDelta.after_utf8_bytes,
+          document_text_terminal_space_removed: textDelta.exact_terminal_space_removed
+        };
+      }
+      left = typeof before === 'string' ? before : serializeVisualMarkdown(before);
+      right = typeof after === 'string' ? after : serializeVisualMarkdown(after);
+    } catch {
+      // Diagnostics must not turn an intermediate editor state into an edit
+      // failure. The real projection path retains its existing error behavior.
+      onBoundaryObservation({ kind, facts: { ...facts, ...documentFacts, serialization_available: false } });
+      return;
+    }
+    onBoundaryObservation({ kind, delta: textBoundaryDelta(left, right), facts: {
+      ...facts, ...documentFacts, serialization_available: true,
+      ...(incomingSource === undefined ? {} : { incoming_roundtrip_exact: incomingSource === right })
+    } });
+  }
 
   function reportCompletionAccessibility(): void {
     const plan = view ? currentGhostTextPlan(view.state) : null;
@@ -423,8 +486,13 @@
       projectionTimer = undefined;
     }
     localDocumentChanged = false;
+    const previousEmitted = lastEmitted;
     lastEmitted = serializeVisualMarkdown(view.state.doc);
     clearBoundaryCache();
+    onBoundaryObservation?.({
+      kind: 'visual_projection', delta: textBoundaryDelta(previousEmitted, lastEmitted),
+      facts: { focused: view.hasFocus(), from: view.state.selection.from, to: view.state.selection.to }
+    });
     onChange(lastEmitted);
     reportSelection(view.state);
   }
@@ -717,22 +785,36 @@
   }
 
   export function acceptGhostWord(requireVisible = true): boolean {
-    if (!view || readonly || composing || !view.hasFocus()) return false;
+    const result = (reason: string): boolean => {
+      onBoundaryObservation?.({ kind: 'visual_shuttle_attempt', facts: {
+        result: reason, require_visible: requireVisible, editor_present: Boolean(view),
+        focused: view?.hasFocus() ?? false, readonly, composing,
+        from: view?.state.selection.from ?? -1, to: view?.state.selection.to ?? -1
+      } });
+      return reason === 'inserted';
+    };
+    // Same guards, in the same order. In particular, hidden Shuttle does NOT
+    // relax focus, exact-caret or controller authority.
+    if (!view) return result('editor_unavailable');
+    if (readonly) return result('readonly');
+    if (composing) return result('composing');
+    if (!view.hasFocus()) return result('editor_unfocused');
     const plan = currentGhostTextPlan(view.state);
-    if (
-      !plan ||
-      (requireVisible && visibleGhostWidgetPresentationKey(view) !== plan.presentationKey) ||
-      selectionBoundary(view.state) !== plan.anchorByteOffset
-    ) return false;
+    if (!plan) return result('plan_unavailable');
+    if (requireVisible && visibleGhostWidgetPresentationKey(view) !== plan.presentationKey) {
+      return result('render_unverified');
+    }
+    if (selectionBoundary(view.state) !== plan.anchorByteOffset) return result('caret_mismatch');
     const word = nextVisualSuggestionWord(plan.text);
-    if (!word || !authorizeCompletionInsertion(
+    if (!word) return result('word_unavailable');
+    if (!authorizeCompletionInsertion(
       plan.candidateId,
       plan.presentationKey,
       word,
       'shuttle_word'
-    )) return false;
+    )) return result('controller_rejected');
     view.dispatch(view.state.tr.insertText(word));
-    return true;
+    return result('inserted');
   }
 
   export function acceptLoompadText(candidateId: string, presentationKey: string, text: string): boolean {
@@ -1091,6 +1173,7 @@
       attributes: editorAttributes(),
       dispatchTransaction(transaction) {
         if (!view) return;
+        const previousDocument = view.state.doc;
         const previousSelection = view.state.selection;
         const selectionMoved = transaction.selectionSet &&
           !transaction.selection.eq(previousSelection);
@@ -1099,6 +1182,30 @@
         const next = view.state.apply(transaction);
         view.updateState(next);
         if (transaction.docChanged) {
+          observeVisualBoundary('visual_transaction', previousDocument, next.doc, {
+            focused: view.hasFocus(), readonly, composing, completion_authorized: completionMutation,
+            before_from: previousSelection.from, before_to: previousSelection.to,
+            after_from: next.selection.from, after_to: next.selection.to,
+            step_count: transaction.steps.length,
+            ui_event: typeof transaction.getMeta('uiEvent') === 'string'
+              ? transaction.getMeta('uiEvent').slice(0, 64) : null,
+            composition_meta: typeof transaction.getMeta('composition') === 'number'
+              ? transaction.getMeta('composition') : null,
+            input_sequence: lastBoundaryInput?.sequence ?? null,
+            input_at_ms: lastBoundaryInput?.at ?? null,
+            input_type: lastBoundaryInput?.type ?? null,
+            input_trusted: lastBoundaryInput?.trusted ?? null,
+            input_composing: lastBoundaryInput?.composing ?? null,
+            key_sequence: lastBoundaryKey?.sequence ?? null,
+            key_at_ms: lastBoundaryKey?.at ?? null,
+            key_kind: lastBoundaryKey?.kind ?? null,
+            key_code: lastBoundaryKey?.code ?? null,
+            key_alt: lastBoundaryKey?.alt ?? null,
+            key_ctrl: lastBoundaryKey?.ctrl ?? null,
+            key_meta: lastBoundaryKey?.meta ?? null,
+            key_shift: lastBoundaryKey?.shift ?? null,
+            key_trusted: lastBoundaryKey?.trusted ?? null
+          });
           invalidateSelectionAccessibility();
           clearFormattingSelection();
           clearBoundaryCache();
@@ -1170,7 +1277,17 @@
         }
       },
       handleDOMEvents: {
-        keydown() {
+        beforeinput(_view, event) {
+          noteBoundaryInput(event);
+          return false;
+        },
+        keydown(_view, event) {
+          if (onBoundaryObservation) lastBoundaryKey = {
+            sequence: ++boundaryInputSequence, at: Date.now(),
+            kind: boundaryKeyKind(event), code: event.code.slice(0, 64),
+            alt: event.altKey, ctrl: event.ctrlKey, meta: event.metaKey,
+            shift: event.shiftKey, trusted: event.isTrusted
+          };
           // A focused editor key event starts a new interaction epoch. Any
           // delayed WebKit repair belongs to the palette activation that came
           // before it and must never overwrite the resulting navigation.
@@ -1224,6 +1341,7 @@
         }
       }
     });
+    observeVisualBoundary('visual_mount', value, view.state.doc, { focused: view.hasFocus() });
     reportSelection(view.state);
     scheduleExternalNormalization(value, initialMarkdown);
     scrollViewport = mount.closest<HTMLElement>('.editor-pane');
@@ -1249,6 +1367,10 @@
     invalidateSelectionAccessibility();
     lastEmitted = normalized;
     const next = stateFor(normalized);
+    observeVisualBoundary('visual_external_value', view.state.doc, next.doc, {
+      incoming_utf8_bytes: new TextEncoder().encode(value).byteLength,
+      normalization_exact: value === normalized, focused: view.hasFocus()
+    }, value);
     view.updateState(next);
     clearBoundaryCache();
     reportSelection(next);

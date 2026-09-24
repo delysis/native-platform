@@ -53,12 +53,18 @@ var stage = "before_idle"
 var before: [String: Any] = [:], after: [String: Any] = [:]
 var observerAttempt = 0
 var observerStem = diagnostic + ".observer"
-var lastVisibilityActions: [String: Any] = [:]
+var visibilityActions: [[String: Any]] = []
 
 func axBoolean(_ name: CFString) -> Bool? {
     var value: CFTypeRef?
     guard AXUIElementCopyAttributeValue(ax, name, &value) == .success else { return nil }
     return value as? Bool
+}
+
+func recordVisibilityAction(_ action: String, _ values: [String: Any]) {
+    var receipt = values
+    receipt["action"] = action
+    visibilityActions.append(receipt)
 }
 
 func fail(_ reason: String) -> Never {
@@ -75,12 +81,16 @@ func fail(_ reason: String) -> Never {
             "application_terminated": application.isTerminated,
             "guard_paths_present": guardPaths.filter { manager.fileExists(atPath: $0) }
         ],
-        "last_visibility_actions": lastVisibilityActions]
+        "last_visibility_actions": visibilityActions]
     if let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]) {
         try? data.write(to: URL(fileURLWithPath: diagnostic), options: [.atomic])
     }
     fputs("Loom idle/resume failed at \(stage): \(reason)\n", stderr); exit(1)
 }
+// NSRunningApplication state updates require the main run loop. These
+// standalone helpers do not enter NSApplication.run(); sleeping here can
+// leave isHidden/isTerminated stale across a real hide or resume. Pump the
+// default (common) mode between observations; keep every deadline and guard.
 func guardsHold() -> Bool {
     !application.isTerminated && !guardPaths.contains { manager.fileExists(atPath: $0) }
 }
@@ -154,38 +164,52 @@ func waitFor(_ predicate: () -> Bool, seconds: TimeInterval = 10) -> Bool {
     } while ProcessInfo.processInfo.systemUptime < deadline
     return false
 }
-func setVisible(_ visible: Bool) {
-    let appkitVisibilityResult = visible ? application.unhide() : application.hide()
-    let appkitActivationResult = visible
-        ? application.activate(options: [.activateAllWindows])
-        : false
-    let axHiddenResult = AXUIElementSetAttributeValue(
-        ax,
-        kAXHiddenAttribute as CFString,
-        visible ? kCFBooleanFalse : kCFBooleanTrue
-    )
-    // Same PID-only fallback as the original runner; never address Loom by name.
+func hideExactApplication() -> Bool {
+    // macOS applies the three PID-bound visibility mechanisms asynchronously.
+    // Advance to the next mechanism only after the prior one had time to take
+    // effect; issuing all three at once can leave a Tauri window visible.
+    let appKitResult = application.hide()
+    recordVisibilityAction("appkit_hide", ["requested_visible": false, "returned": appKitResult])
+    if waitFor({ application.isHidden }, seconds: 1) { return true }
+
+    let axResult = AXUIElementSetAttributeValue(ax, kAXHiddenAttribute as CFString, kCFBooleanTrue)
+    recordVisibilityAction("ax_hide", ["requested_visible": false, "error": axResult.rawValue])
+    if axResult == .success,
+       waitFor({ application.isHidden }, seconds: 0.5) {
+        return true
+    }
+
     var error: NSDictionary?
-    let appleScriptResult = NSAppleScript(source: "tell application \"System Events\" to set visible of first application process whose unix id is \(pid) to \(visible ? "true" : "false")")?.executeAndReturnError(&error)
-    let axFrontmostResult = visible
-        ? AXUIElementSetAttributeValue(ax, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
-        : .success
-    lastVisibilityActions = [
-        "requested_visible": visible,
-        "appkit_visibility_result": appkitVisibilityResult,
-        "appkit_activation_result": appkitActivationResult,
-        "ax_hidden_error": axHiddenResult.rawValue,
-        "ax_frontmost_error": axFrontmostResult.rawValue,
-        "apple_script_returned_value": appleScriptResult != nil,
-        "apple_script_error": error.map { $0.description as Any } ?? NSNull()
-    ]
+    let script = NSAppleScript(
+        source: "tell application \"System Events\" to set visible of first application process whose unix id is \(pid) to false"
+    )?.executeAndReturnError(&error)
+    recordVisibilityAction("system_events_hide", [
+        "requested_visible": false,
+        "returned_value": script != nil,
+        "error": error.map { $0.description as Any } ?? NSNull()
+    ])
+    return error == nil && waitFor({ application.isHidden }, seconds: 10)
+}
+
+func showExactApplication() {
+    let appKitVisibility = application.unhide()
+    let appKitActivation = application.activate(options: [.activateAllWindows])
+    let axHidden = AXUIElementSetAttributeValue(ax, kAXHiddenAttribute as CFString, kCFBooleanFalse)
+    let axFrontmost = AXUIElementSetAttributeValue(ax, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+    recordVisibilityAction("explicit_resume", [
+        "requested_visible": true,
+        "appkit_visibility_returned": appKitVisibility,
+        "appkit_activation_returned": appKitActivation,
+        "ax_hidden_error": axHidden.rawValue,
+        "ax_frontmost_error": axFrontmost.rawValue
+    ])
 }
 guard let stableStore = storeIdentity(), let initial = waitSnapshot(), let stableIdentity = identityBytes(initial) else { fail("no_correlated_terminal_glyph") }
 before = initial
 var finderError: NSDictionary?
 _ = NSAppleScript(source: "tell application id \"com.apple.finder\" to activate")?.executeAndReturnError(&finderError)
 guard finderError == nil, waitFor({ NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier }) else { fail("finder_did_not_take_focus") }
-setVisible(false)
+guard hideExactApplication() else { fail("exact_process_did_not_hide") }
 guard waitFor({ application.isHidden && NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier }) else { fail("exact_process_did_not_hide") }
 stage = "idle"
 let started = ProcessInfo.processInfo.systemUptime
@@ -202,7 +226,7 @@ guard guardsHold(), application.isHidden,
       NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier,
       storeIdentity() == stableStore else { fail("final_idle_invariant_changed") }
 stage = "after_resume"
-setVisible(true)
+showExactApplication()
 var resumeAttempts = 0
 guard waitFor({
     application.unhide()
