@@ -3,7 +3,7 @@ import CoreGraphics
 import Foundation
 
 guard CommandLine.arguments.count == 2, let pid = Int32(CommandLine.arguments[1]) else {
-    fputs("usage: position_loom_window_right <pid>\n", stderr)
+    fputs("usage: position_window_right <pid>\n", stderr)
     exit(2)
 }
 
@@ -26,7 +26,7 @@ func onScreenWindowFrame(for pid: Int32) -> CGRect? {
 }
 
 guard let before = onScreenWindowFrame(for: pid) else {
-    fputs("could not find Loom's exact on-screen window to position\n", stderr)
+    fputs("could not find the exact on-screen window to position\n", stderr)
     exit(1)
 }
 
@@ -35,7 +35,7 @@ var windowsValue: CFTypeRef?
 guard AXUIElementCopyAttributeValue(application, kAXWindowsAttribute as CFString, &windowsValue) == .success,
       let windows = windowsValue as? [AXUIElement],
       let window = windows.first else {
-    fputs("could not bind window positioning to Loom's exact accessibility window\n", stderr)
+    fputs("could not bind window positioning to the exact accessibility window\n", stderr)
     exit(1)
 }
 
@@ -57,7 +57,7 @@ guard let positionValue = AXValueCreate(.cgPoint, &position),
       let sizeValue = AXValueCreate(.cgSize, &size),
       AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, positionValue) == .success,
       AXUIElementSetAttributeValue(window, kAXSizeAttribute as CFString, sizeValue) == .success else {
-    fputs("could not position Loom's exact accessibility window on the right\n", stderr)
+    fputs("could not position the exact accessibility window on the right\n", stderr)
     exit(1)
 }
 
@@ -70,7 +70,7 @@ repeat {
 } while Date() < deadline
 
 guard abs(after.minX - target.minX) < 4, abs(after.width - target.width) < 4 else {
-    fputs("Loom window did not reach the requested right-side frame\n", stderr)
+    fputs("exact window did not reach the requested right-side frame\n", stderr)
     exit(1)
 }
 

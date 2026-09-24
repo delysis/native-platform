@@ -409,6 +409,8 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /PID-targeted Command-A/);
   assert.match(smoke, /NSRunningApplication\.runningApplications/);
   assert.match(smoke, /foreground_loom_process "\$ACTIVE_PID"/);
+  assert.match(smoke, /position_window_right "\$ACTIVE_PID"/);
+  assert.match(smoke, /\+ \$COMPONENT window positioned on the right/);
   assert.match(smoke, /runningApplication\.unhide\(\)/);
   assert.match(smoke, /Activation requested only once at that boundary is lost/);
   assert.match(smoke, /System Events.*frontmost of first application process/s);
