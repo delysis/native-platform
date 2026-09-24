@@ -252,9 +252,15 @@ export function completionControllerView(
 ): CompletionControllerView {
   const boundSession = state.session?.contextKey === contextKey ? state.session : null;
   const activeFamily = completionActiveFamily(boundSession, state.pendingText, baseFamily, sharedPrefixAlternatives);
-  const retired = boundSession?.presentationsRetired ? completionPresentation(boundSession) : null;
+  const unconsumeText = boundSession ? completionRollbackText(boundSession) : '';
+  const presentation = boundSession && state.pendingText === null
+    ? completionPresentation(boundSession) : null;
+  // Exhaustion hides the fan, but the accepted chunk still needs its exact
+  // candidate identity and end offset for reversal at the editor boundary.
+  const rollback = presentation && (boundSession?.presentationsRetired ||
+    (presentation.text === '' && unconsumeText !== '')) ? presentation : null;
   const selected = activeFamily.find((candidate) => candidate.runId === state.activeRunId) ??
-    activeFamily[0] ?? (retired ? { ...retired, text: '' } : null);
+    activeFamily[0] ?? (rollback ? { ...rollback, text: '' } : null);
   const witnessSelected = boundSession
     ? selectedCompletionCandidate(boundSession) as InlineGhostSuggestion | null
     : null;
@@ -268,7 +274,7 @@ export function completionControllerView(
       text: candidate.text,
       runId: candidate.runId
     })),
-    unconsumeText: boundSession ? completionRollbackText(boundSession) : '',
+    unconsumeText,
     witnessSelected
   };
 }

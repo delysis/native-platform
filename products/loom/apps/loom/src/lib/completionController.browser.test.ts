@@ -20,6 +20,26 @@ function render(mode: 'visual' | 'source', loompad = false, insertsOnAccept = tr
 }
 
 describe('completion controller and editor callback ordering', () => {
+  it.each(['visual', 'source'] as const)('reverses full %s fan Return acceptance with no visible remainder', async (mode) => {
+    const keyboard = userEvent.setup();
+    render(mode);
+    const editor = page.getByRole('textbox');
+    await editor.click();
+    const manuscript = () => page.getByRole('status', { name: 'Controller Markdown' }).element().textContent;
+    await keyboard.keyboard('{Alt>}');
+    await expect.poll(() => page.getByRole('option').all().length).toBe(4);
+    await keyboard.keyboard('{Enter}');
+    await expect.poll(manuscript).toBe('Hello one two');
+    await expect.poll(() => page.getByRole('option').all().length).toBe(0);
+    await expect.element(editor).toHaveFocus();
+    await expect.element(page.getByRole('status', { name: 'Controller Action Kind' })).toHaveTextContent('fan_return');
+    await keyboard.keyboard('{ArrowLeft}');
+    await expect.poll(manuscript).toBe('Hello');
+    await expect.poll(() => page.getByRole('option').all().length).toBe(4);
+    await expect.element(editor).toHaveFocus();
+    await keyboard.keyboard('{/Alt}');
+    await keyboard.cleanup();
+  });
   it.each(['visual', 'source'] as const)('retains the compatible %s fan while Option stays held after acceptance', async (mode) => {
     const keyboard = userEvent.setup();
     const harness = render(mode);

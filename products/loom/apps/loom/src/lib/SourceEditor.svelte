@@ -180,6 +180,12 @@
       !plan ||
       !ghostSpan?.isConnected
     ) return;
+    if (plan.text === '' && ghostUnconsumeText !== '') {
+      // An exhausted candidate is a rollback witness, not an offscreen fan.
+      // Keep the physical modifier state so reversal can restore its fan.
+      completionLens = CLOSED_COMPLETION_LENS;
+      return;
+    }
     if (!visibleSourceGhostPlan(plan)) {
       // Viewport clamping cannot supply the missing insertion witness. Close
       // the fixed fan when its mirrored caret has scrolled out of view.

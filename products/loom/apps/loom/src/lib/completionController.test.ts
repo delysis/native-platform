@@ -246,6 +246,31 @@ describe('pure completion controller', () => {
     expect(second.state.session?.acceptedChunks).toEqual([' one ', 'two']);
   });
 
+  it('retains hidden rollback authority after the full remainder is accepted', () => {
+    const inserted = insert('fan_return');
+    expect(inserted.authorized).toBe(true);
+    const accepted = `${manuscript}${family[0].text}`;
+    const state = observeTextMutation(inserted.state, accepted, manuscript, false).state;
+    const view = completionControllerView(state, contextKey, []);
+    expect(view.activeFamily).toEqual([]);
+    expect(view.alternatives).toEqual([]);
+    expect(view.selected).toMatchObject({
+      candidateId: 'candidate-a', text: '', targetByte: 13
+    });
+    expect(view.unconsumeText).toBe(family[0].text);
+    const reversed = authorizeCompletionUnconsume(state, {
+      eligible: view.selected, candidateId: view.selected!.candidateId,
+      presentationKey: view.selected!.presentationKey, text: view.unconsumeText,
+      manuscriptText: accepted
+    });
+    expect(reversed.authorized).toBe(true);
+    expect(reversed.state.pendingText).toBe(manuscript);
+    expect(completionControllerView(reversed.state, contextKey, []).selected).toBeNull();
+    expect(completionControllerView(state, 'another-context', []).selected).toBeNull();
+    const restored = observeTextMutation(reversed.state, manuscript, accepted, false).state;
+    expect(completionControllerView(restored, contextKey, []).activeFamily).toHaveLength(4);
+  });
+
   it('edge-triggers exhaustion while preserving immediate rollback authority', () => {
     const inserted = insert('inline_tab');
     const projected = observeTextMutation(

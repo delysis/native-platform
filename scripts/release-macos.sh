@@ -183,7 +183,7 @@ run pnpm install --frozen-lockfile --offline
 
 case "$COMPONENT" in
   mom)
-    run_exact_test mom-llama-runtime lib unused store::tests::legacy_plaintext_is_refused_before_database_creation
+    run_exact_test mom-llama-runtime lib unused store::tests::unrelated_files_are_not_store_inputs_or_rewritten
     run_exact_test mom-llama-runtime lib unused kv_cache::tests::persistent_cache_corruption_invalidates_and_falls_back_after_reopen
     run_exact_test mom-llama-app bin mom-llama-app app_runtime::tests::direct_native_operation_drains_before_final_join
     ;;

@@ -91,7 +91,7 @@ test("release exact checks contain no duplicate invocations", () => {
 // This is a selection-contract check; actual Rust execution remains a Mac gate.
 test("Mom release selects the current no-migration storage contract", () => {
   const source = fs.readFileSync(releasePath, "utf8");
-  assert.match(source, /^    run_exact_test mom-llama-runtime lib unused store::tests::legacy_plaintext_is_refused_before_database_creation$/m);
+  assert.match(source, /^    run_exact_test mom-llama-runtime lib unused store::tests::unrelated_files_are_not_store_inputs_or_rewritten$/m);
   assert.doesNotMatch(source, /prior_logical_store_import_cleans_plaintext/);
 });
 
