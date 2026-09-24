@@ -1085,7 +1085,12 @@ wait_for_clean_exit() {
   while :; do
     process_state=$(ps -p "$target_pid" -o state= | tr -d ' ')
     case "$process_state" in
-      ""|Z*) break ;;
+      ""|Z*)
+        # LaunchServices can retain a just-exited PID after the process has
+        # drained. Wait for our own registration to disappear before relaunch;
+        # never ignore a different process with the same bundle identifier.
+        if ! running_bundle_pids | grep -Fxq "$target_pid"; then break; fi
+        ;;
     esac
     attempt=$((attempt + 1))
     if [ "$attempt" -ge 300 ]; then

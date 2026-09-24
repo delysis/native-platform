@@ -214,7 +214,9 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /strings\(element\)\.contains\("Completion suggestions"\)/);
   assert.match(smoke, /kAXListRole/);
   assert.match(smoke, /kAXSelectedAttribute/);
-  assert.match(smoke, /let candidate = candidates\[index - 1\]/);
+  assert.match(smoke, /remainingCandidateIds/);
+  assert.match(smoke, /remainingFanMatches/);
+  assert.match(smoke, /string\(\$0, "run_id"\) == alternatives\[index - 1\]/);
   assert.match(smoke, /waitForAccessibleFan/);
   assert.match(smoke, /fan Return did not persist the selected cached remainder/);
   assert.match(smoke, /fan Tab did not persist the selected cached remainder/);
