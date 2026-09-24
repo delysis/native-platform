@@ -20,6 +20,16 @@ function render(mode: 'visual' | 'source', loompad = false, insertsOnAccept = tr
 }
 
 describe('completion controller and editor callback ordering', () => {
+  it('advances a mounted visual editor after its exact first presentation is rejected', async () => {
+    const harness = render('visual');
+    const ghost = () => document.querySelector('.loom-visual-ghost')?.textContent;
+    await expect.poll(ghost).toBe(' one two');
+    harness.rejectVisibleVisualPresentation();
+    await expect.poll(ghost).toBe(' another path');
+    expect(page.getByRole('status', { name: 'Controller Markdown' }).element().textContent).toBe('Hello');
+    expect(page.getByRole('status', { name: 'Controller Actions' }).element().textContent).toBe('0');
+  });
+
   it.each(['visual', 'source'] as const)('reverses full %s fan Return acceptance with no visible remainder', async (mode) => {
     const keyboard = userEvent.setup();
     render(mode);

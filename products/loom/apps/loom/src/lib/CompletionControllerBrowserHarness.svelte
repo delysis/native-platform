@@ -12,6 +12,7 @@
     cycleCompletion,
     initialCompletionControllerState,
     observeTextMutation,
+    rejectVisualPresentation,
     reconcileCompletionController,
     refreshCompletionCandidate
   } from './completionController';
@@ -67,7 +68,13 @@
   let invalidations = 0;
   let controller = initialCompletionControllerState();
 
-  $: controllerView = completionControllerView(controller, contextKey, family);
+  $: controllerView = completionControllerView(
+    controller,
+    contextKey,
+    family,
+    true,
+    mode === 'visual'
+  );
   $: selected = ready ? controllerView.selected : null;
 
   function insert(
@@ -114,6 +121,34 @@
     const applied = next !== controller;
     controller = next;
     return applied;
+  }
+
+  function rejectVisualGhostPresentation(
+    candidateId: string,
+    presentationKey: string,
+    surfaceKey: string,
+    anchorByteOffset: number
+  ): void {
+    controller = rejectVisualPresentation(controller, {
+      mode,
+      eligible: selected,
+      candidateId,
+      presentationKey,
+      surfaceKey,
+      currentSurfaceKey: contextKey,
+      anchorByte: anchorByteOffset
+    });
+  }
+
+  /** Drives the same production callback after a mounted editor has observed a rejected ghost. */
+  export function rejectVisibleVisualPresentation(): void {
+    if (!selected || mode !== 'visual') return;
+    rejectVisualGhostPresentation(
+      selected.candidateId,
+      selected.presentationKey,
+      contextKey,
+      selected.targetByte
+    );
   }
 
   function chooseLoompad(candidate: InlineGhostSuggestion): void {
@@ -199,7 +234,7 @@
         onSelectionChange={(targetByte) => reportCaret(targetByte)}
         onGhostInsert={insert}
         onGhostUnconsume={unconsume}
-        onGhostPresentationRejected={() => {}}
+        onGhostPresentationRejected={rejectVisualGhostPresentation}
       />
     </div>
   {:else}
