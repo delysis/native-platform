@@ -857,12 +857,11 @@ mod automatic_writer_authority {
             build_policy: &BuildModelPolicy,
         ) -> Result<Self, IpcFailure> {
             let kind = match &policy {
-                ValidatedWeavePolicy::AutomaticV2 | ValidatedWeavePolicy::LoompadV2 { .. } => {
-                    AuthorizedWeaveModelKind::Automatic(AutomaticSuggestionAuthority::bind(
-                        loaded,
-                        build_policy,
-                    )?)
-                }
+                ValidatedWeavePolicy::AutomaticV2
+                | ValidatedWeavePolicy::AutomaticV3
+                | ValidatedWeavePolicy::LoompadV2 { .. } => AuthorizedWeaveModelKind::Automatic(
+                    AutomaticSuggestionAuthority::bind(loaded, build_policy)?,
+                ),
                 ValidatedWeavePolicy::ManualV2 { .. } => AuthorizedWeaveModelKind::Manual(loaded),
             };
             Ok(Self { policy, kind })
@@ -2914,6 +2913,7 @@ pub struct WeaveStarted {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum WeavePolicySnapshot {
     AutomaticV2 {},
+    AutomaticV3 {},
     LoompadV2 {
         sample_target: u32,
         batch_offset: u32,
@@ -2944,6 +2944,7 @@ struct ResolvedWeavePolicy {
 #[derive(Debug, PartialEq)]
 enum ValidatedWeavePolicy {
     AutomaticV2,
+    AutomaticV3,
     LoompadV2 {
         sample_target: u32,
         batch_offset: u32,
@@ -9126,6 +9127,7 @@ impl WeavePreset {
 fn validate_weave_policy(policy: WeavePolicySnapshot) -> Result<ValidatedWeavePolicy, IpcFailure> {
     let validated = match policy {
         WeavePolicySnapshot::AutomaticV2 {} => ValidatedWeavePolicy::AutomaticV2,
+        WeavePolicySnapshot::AutomaticV3 {} => ValidatedWeavePolicy::AutomaticV3,
         WeavePolicySnapshot::LoompadV2 {
             sample_target,
             batch_offset,
@@ -9183,20 +9185,25 @@ impl ValidatedWeavePolicy {
     const fn first_word_choices(&self) -> Option<llama_native_types::FirstWordChoicePolicy> {
         match self {
             Self::LoompadV2 { .. } => Some(llama_native_types::FirstWordChoicePolicy::DistinctV2),
+            Self::AutomaticV3 => {
+                Some(llama_native_types::FirstWordChoicePolicy::DistinctPlainTextV3)
+            }
             Self::AutomaticV2 | Self::ManualV2 { .. } => None,
         }
     }
 
     const fn branch_count(&self) -> u32 {
         match self {
-            Self::AutomaticV2 | Self::LoompadV2 { .. } => AUTOMATIC_WEAVE_BRANCH_COUNT_V2,
+            Self::AutomaticV2 | Self::AutomaticV3 | Self::LoompadV2 { .. } => {
+                AUTOMATIC_WEAVE_BRANCH_COUNT_V2
+            }
             Self::ManualV2 { branch_count, .. } => *branch_count,
         }
     }
 
     const fn max_tokens(&self) -> u32 {
         match self {
-            Self::AutomaticV2 => AUTOMATIC_WEAVE_MAX_TOKENS_V2,
+            Self::AutomaticV2 | Self::AutomaticV3 => AUTOMATIC_WEAVE_MAX_TOKENS_V2,
             Self::LoompadV2 { .. } => 128,
             Self::ManualV2 { max_tokens, .. } => *max_tokens,
         }
@@ -9204,16 +9211,22 @@ impl ValidatedWeavePolicy {
 
     const fn temperature(&self) -> f32 {
         match self {
-            Self::AutomaticV2 | Self::LoompadV2 { .. } => AUTOMATIC_WEAVE_TEMPERATURE_V2,
+            Self::AutomaticV2 | Self::AutomaticV3 | Self::LoompadV2 { .. } => {
+                AUTOMATIC_WEAVE_TEMPERATURE_V2
+            }
             Self::ManualV2 { temperature, .. } => *temperature,
         }
     }
 
     fn bind_document_kind(&self, kind: DocumentKind) -> Result<ResolvedWeavePolicy, IpcFailure> {
         let preset = match (self, kind) {
-            (Self::AutomaticV2, DocumentKind::Prose) => WeavePreset::AutomaticProseV2,
-            (Self::AutomaticV2, DocumentKind::Verse) => WeavePreset::AutomaticVerseV2,
-            (Self::AutomaticV2, DocumentKind::Hybrid) => {
+            (Self::AutomaticV2 | Self::AutomaticV3, DocumentKind::Prose) => {
+                WeavePreset::AutomaticProseV2
+            }
+            (Self::AutomaticV2 | Self::AutomaticV3, DocumentKind::Verse) => {
+                WeavePreset::AutomaticVerseV2
+            }
+            (Self::AutomaticV2 | Self::AutomaticV3, DocumentKind::Hybrid) => {
                 return Err(IpcFailure::new(
                     "automatic_hybrid_boundary_unresolved",
                     "automatic suggestions require an authoritative prose or verse block boundary",
@@ -13884,43 +13897,60 @@ mod tests {
 
     #[test]
     fn automatic_policy_has_no_runtime_budget_fields() {
-        let parsed: WeavePolicySnapshot =
-            serde_json::from_str(r#"{"kind":"automatic_v2"}"#).expect("automatic policy");
-        let validated = validate_weave_policy(parsed).expect("validate automatic");
-        assert_eq!(validated, ValidatedWeavePolicy::AutomaticV2);
-        assert_eq!(validated.branch_count(), 4);
-        assert!(
-            serde_json::from_str::<WeavePolicySnapshot>(
-                r#"{"kind":"automatic_v2","max_tokens":2048}"#
-            )
-            .is_err()
+        for (kind, expected) in [
+            ("automatic_v2", ValidatedWeavePolicy::AutomaticV2),
+            ("automatic_v3", ValidatedWeavePolicy::AutomaticV3),
+        ] {
+            let parsed: WeavePolicySnapshot = serde_json::from_value(serde_json::json!({
+                "kind": kind
+            }))
+            .expect("automatic policy");
+            let validated = validate_weave_policy(parsed).expect("validate automatic");
+            assert_eq!(validated, expected);
+            assert_eq!(validated.branch_count(), 4);
+            assert!(
+                serde_json::from_value::<WeavePolicySnapshot>(serde_json::json!({
+                    "kind": kind,
+                    "max_tokens": 2048
+                }))
+                .is_err()
+            );
+        }
+        assert_eq!(ValidatedWeavePolicy::AutomaticV2.first_word_choices(), None);
+        assert_eq!(
+            ValidatedWeavePolicy::AutomaticV3.first_word_choices(),
+            Some(llama_native_types::FirstWordChoicePolicy::DistinctPlainTextV3)
         );
     }
 
     #[test]
     fn automatic_policy_is_bound_by_rust_to_the_authoritative_document_kind() {
-        let policy = ValidatedWeavePolicy::AutomaticV2;
-        assert_eq!(
-            policy
-                .bind_document_kind(DocumentKind::Prose)
-                .expect("prose")
-                .preset,
-            WeavePreset::AutomaticProseV2
-        );
-        assert_eq!(
-            policy
-                .bind_document_kind(DocumentKind::Verse)
-                .expect("verse")
-                .preset,
-            WeavePreset::AutomaticVerseV2
-        );
-        assert_eq!(
-            policy
-                .bind_document_kind(DocumentKind::Hybrid)
-                .expect_err("hybrid has no authoritative caret block")
-                .code,
-            "automatic_hybrid_boundary_unresolved"
-        );
+        for policy in [
+            ValidatedWeavePolicy::AutomaticV2,
+            ValidatedWeavePolicy::AutomaticV3,
+        ] {
+            assert_eq!(
+                policy
+                    .bind_document_kind(DocumentKind::Prose)
+                    .expect("prose")
+                    .preset,
+                WeavePreset::AutomaticProseV2
+            );
+            assert_eq!(
+                policy
+                    .bind_document_kind(DocumentKind::Verse)
+                    .expect("verse")
+                    .preset,
+                WeavePreset::AutomaticVerseV2
+            );
+            assert_eq!(
+                policy
+                    .bind_document_kind(DocumentKind::Hybrid)
+                    .expect_err("hybrid has no authoritative caret block")
+                    .code,
+                "automatic_hybrid_boundary_unresolved"
+            );
+        }
     }
 
     #[test]

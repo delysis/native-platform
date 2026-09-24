@@ -21,9 +21,18 @@ pub const FIRST_WORD_CHOICE_MAX_INITIAL_EXCLUSIONS: usize = FIRST_WORD_CHOICE_MA
 #[serde(rename_all = "snake_case")]
 pub enum FirstWordChoicePolicy {
     DistinctV2,
+    /// Distinct lexical words whose withheld prefix must not begin with a
+    /// complete angle-bracket markup construct. Rejected proposal bytes remain
+    /// in the attempt ledger and never acquire stream authority.
+    DistinctPlainTextV3,
 }
 
 impl FirstWordChoicePolicy {
+    #[must_use]
+    pub const fn rejects_leading_markup(self) -> bool {
+        matches!(self, Self::DistinctPlainTextV3)
+    }
+
     /// Attempt zero preserves the explicit caller seed. Later seeds are the
     /// first little-endian u32 of SHA256(domain || base_le || attempt_le), reduced
     /// modulo u32::MAX to exclude llama.cpp's nondeterministic seed sentinel.
@@ -33,7 +42,12 @@ impl FirstWordChoicePolicy {
             return base_seed;
         }
         let mut digest = Sha256::new();
-        digest.update(b"llama-native:first-word-distinct-v2\0");
+        digest.update(match self {
+            Self::DistinctV2 => b"llama-native:first-word-distinct-v2\0".as_slice(),
+            Self::DistinctPlainTextV3 => {
+                b"llama-native:first-word-distinct-plain-text-v3\0".as_slice()
+            }
+        });
         digest.update(base_seed.to_le_bytes());
         digest.update(attempt.to_le_bytes());
         let bytes = digest.finalize();
@@ -46,10 +60,70 @@ impl FirstWordChoicePolicy {
 pub enum FirstWordChoiceAttemptOutcome {
     Accepted,
     Duplicate,
+    DisallowedPrefix,
     PrefixLimit,
     EndOfGeneration,
     Cancelled,
     InitialSupportExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeadingMarkupStatus {
+    NotMarkup,
+    Pending,
+    Complete,
+}
+
+/// Classify a leading angle-bracket construct without guessing from an
+/// incomplete UTF-8 or token fragment. Leading whitespace is evidence, not
+/// discarded output.
+#[must_use]
+pub fn leading_markup_status(text: &str) -> LeadingMarkupStatus {
+    let prefix = text.trim_start_matches(char::is_whitespace);
+    let bytes = prefix.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return LeadingMarkupStatus::NotMarkup;
+    }
+    if prefix.starts_with("<!--") {
+        return if prefix.contains("-->") {
+            LeadingMarkupStatus::Complete
+        } else {
+            LeadingMarkupStatus::Pending
+        };
+    }
+
+    let mut index = 1;
+    if bytes.get(index) == Some(&b'/') {
+        index += 1;
+    }
+    let Some(first) = bytes.get(index) else {
+        return LeadingMarkupStatus::Pending;
+    };
+    if matches!(first, b'!' | b'?') {
+        return if prefix[index + 1..].contains('>') {
+            LeadingMarkupStatus::Complete
+        } else {
+            LeadingMarkupStatus::Pending
+        };
+    }
+    if !first.is_ascii_alphabetic() {
+        return LeadingMarkupStatus::NotMarkup;
+    }
+    index += 1;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+    {
+        index += 1;
+    }
+    let Some(close) = prefix[index..].find('>') else {
+        return LeadingMarkupStatus::Pending;
+    };
+    if prefix[index..index + close].contains('<') {
+        LeadingMarkupStatus::NotMarkup
+    } else {
+        LeadingMarkupStatus::Complete
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -155,5 +229,59 @@ mod tests {
         assert_eq!(seeds.len(), FIRST_WORD_CHOICE_MAX_ATTEMPTS as usize);
         assert!(!seeds.contains(&u32::MAX));
         assert_eq!(policy.attempt_seed(41, 1), policy.attempt_seed(41, 1));
+        assert_ne!(
+            policy.attempt_seed(41, 1),
+            FirstWordChoicePolicy::DistinctPlainTextV3.attempt_seed(41, 1)
+        );
+    }
+
+    #[test]
+    fn plain_text_policy_waits_for_complete_markup_and_ignores_lookalikes() {
+        for pending in ["<", "<str", "  <strong", "\n\t<strong", "<!-- comment"] {
+            assert_eq!(
+                leading_markup_status(pending),
+                LeadingMarkupStatus::Pending,
+                "{pending:?}"
+            );
+        }
+        for rejected in [
+            "<strong>",
+            "  <strong class=\"sale\">words",
+            "\r\n<strong>words",
+            "</em> prose",
+            "<x-tag/> prose",
+            "<!-- comment --> prose",
+        ] {
+            assert_eq!(
+                leading_markup_status(rejected),
+                LeadingMarkupStatus::Complete,
+                "{rejected:?}"
+            );
+        }
+        for prose in ["<3 forever", "1 < 2", "< word", "ordinary prose"] {
+            assert_eq!(
+                leading_markup_status(prose),
+                LeadingMarkupStatus::NotMarkup,
+                "{prose:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_and_attempt_outcome_have_stable_versioned_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&FirstWordChoicePolicy::DistinctV2).expect("serialize v2"),
+            r#""distinct_v2""#
+        );
+        assert_eq!(
+            serde_json::to_string(&FirstWordChoicePolicy::DistinctPlainTextV3)
+                .expect("serialize v3"),
+            r#""distinct_plain_text_v3""#
+        );
+        assert_eq!(
+            serde_json::to_string(&FirstWordChoiceAttemptOutcome::DisallowedPrefix)
+                .expect("serialize outcome"),
+            r#""disallowed_prefix""#
+        );
     }
 }
