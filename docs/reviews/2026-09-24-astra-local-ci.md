@@ -26,3 +26,12 @@ The original downloaded proposal and its successful and failed sandbox checks
 remain intact outside the repository. Its report explicitly did not claim Rust
 compilation or macOS qualification. Local native product repairs are separate
 changes with their own reproductions and evidence.
+
+The first complete local attempt at `0529790c` passed formatting, policy and CI
+script checks, then failed speech-backend linking. The runner's forced
+`CARGO_NET_OFFLINE=true` made the existing pinned ONNX build script return before
+looking up its already cached binary. The failed receipt records unchanged clean
+source and retains the full linker output. Local integration removed that forced
+override and documented normal locked Cargo/native dependency resolution; it did
+not change vendor code, linkage checks or the ignored-test guard. Frontend cache
+and tool-installation restrictions remain unchanged.

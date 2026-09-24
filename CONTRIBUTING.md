@@ -42,11 +42,14 @@ npx --yes pnpm@11.16.0 --filter @delysis/loom exec playwright install webkit
 ```
 
 The runner requires the pinned pnpm to be available to
-`npx --offline --yes=false pnpm@11.16.0`, uses frozen/offline frontend installation,
-and sets Cargo's offline mode. Missing cached dependencies or native build inputs
-are failures, not permission to substitute tools or skip checks. Existing build
-scripts are trusted local code; offline package-manager settings are not a
-network sandbox. No environment/credential dump is collected.
+`npx --offline --yes=false pnpm@11.16.0` and uses frozen/offline frontend
+installation. Cargo uses locked dependencies with its normal native build setup.
+Leave `CARGO_NET_OFFLINE`, `ORT_OFFLINE` and `ORT_SKIP_DOWNLOAD` unset: the pinned
+ONNX build script treats offline mode as disabling its binary resolution entirely,
+even when the verified runtime is already cached. Missing native inputs may be
+downloaded by the existing build scripts; failures never authorize substituting
+tools or skipping checks. This is not a network sandbox. No environment/credential
+dump is collected.
 
 Use focused checks while editing, including the runner regressions when relevant:
 

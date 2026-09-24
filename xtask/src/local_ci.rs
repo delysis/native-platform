@@ -230,7 +230,6 @@ impl Recorder {
             .env("PATH", &self.path)
             .env("CI", "true")
             .env("CARGO_TERM_COLOR", "never")
-            .env("CARGO_NET_OFFLINE", "true")
             .env("npm_config_offline", "true")
             .env("RUSTUP_AUTO_INSTALL", "0");
         if let Some(channel) = &self.rust_channel {

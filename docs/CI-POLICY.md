@@ -28,7 +28,9 @@ self-test selectors. There is no duplicate ignored-test, package-group or Swift
 self-test selector, and no implicit packaged-product acceptance.
 
 Unlike hosted setup steps, local-ci installs no global tools or browsers. Its
-package-manager operations use offline caches, and a missing prerequisite fails.
+frontend package-manager operations use offline caches. Locked Cargo builds retain
+normal native dependency resolution; forcing Cargo offline disables the pinned
+ONNX build script's cache lookup as well as downloads and prevents linking.
 Explicit setup outside the runner is documented in CONTRIBUTING.md. Workspace
 all-target tests already include xtask's tests; there is no redundant xtask test
 build in the final gate. Filtered frontend commands add `--fail-if-no-match`, so
