@@ -2170,6 +2170,7 @@ impl Builder {
                 document_reconciliation_preview,
                 document_reconcile_apply,
                 inference_status,
+                visual_ghost_rendered,
                 build_model_policy_get,
                 model_catalog_list,
                 model_list,
@@ -2289,6 +2290,14 @@ fn inference_status(state: State<'_, PluginState>) -> inference::Status {
         .inference
         .as_ref()
         .map_or_else(inference::Status::default, inference::Service::status)
+}
+
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+fn visual_ghost_rendered(state: State<'_, PluginState>) {
+    // Native stderr is the packaged acceptance timing stream. This command
+    // accepts no renderer data, so timing cannot carry author content.
+    state.emit_timing("visual_ghost_rendered");
 }
 
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, menu_id: &str) {

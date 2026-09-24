@@ -90,6 +90,7 @@
     removeDocumentContext,
     revealDocument,
     requestApplicationClose,
+    recordVisualGhostRendered,
     saveCoWriter,
     setFocusMode,
     setDocumentContextSnapshot,
@@ -1491,6 +1492,7 @@
     recordStartupTiming('visual_ghost_rendered', {
       candidate_utf8_bytes: new TextEncoder().encode(activeGhostSuggestion.text).byteLength
     });
+    void recordVisualGhostRendered().catch(() => undefined);
   }
   $: shuttleCandidate = shuttleEnabled ? selectedInlineSuggestion : activeGhostSuggestion;
   $: shuttleScheduleKey = completionShuttleScheduleKey(
