@@ -1242,11 +1242,14 @@ describe('real WebKit editor interactions', () => {
       if (mode === 'visual') render('hello', choices);
       else renderSource('hello', choices);
       await expect.element(page.getByText(' one alpha tail', { exact: true }).first()).toBeVisible();
+      const editor = page.getByRole('textbox', {
+        name: mode === 'visual' ? 'Manuscript editor' : 'Markdown source editor'
+      }).element();
+      await expect.poll(() => document.activeElement === editor).toBe(true);
       await userEvent.keyboard('{Tab}');
       const output = page.getByRole('status', { name: mode === 'visual' ? 'Serialized Markdown' : 'Source Markdown' });
       await expect.element(output).toHaveTextContent('hello one');
       const prose = output.element().textContent;
-      const editor = page.getByRole('textbox', { name: mode === 'visual' ? 'Manuscript editor' : 'Markdown source editor' }).element();
       const visibleWord = () => document.querySelector(mode === 'visual' ? '.loom-visual-ghost' : '.loom-source-ghost-text')?.textContent?.trim();
       await expect.poll(visibleWord).toBe('alpha tail');
       dispatchKey(editor, 'keydown', 'ArrowDown', 'ArrowDown', true);
