@@ -7,6 +7,10 @@ func serviceMainRunLoop(for seconds: TimeInterval = 0.05) {
     RunLoop.current.run(until: Date(timeIntervalSinceNow: seconds))
 }
 
+func acceptableBackgroundFocus(_ frontmostPid: pid_t?, loomPid: pid_t) -> Bool {
+    frontmostPid != loomPid
+}
+
 if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--self-test" {
     var timerFired = false
     let timer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: false) { _ in
@@ -24,6 +28,12 @@ if CommandLine.arguments.count == 2 && CommandLine.arguments[1] == "--self-test"
     timer.invalidate()
     guard timerFired else {
         fputs("run-loop wait did not deliver its default-mode timer\n", stderr)
+        exit(1)
+    }
+    guard acceptableBackgroundFocus(nil, loomPid: 41),
+          acceptableBackgroundFocus(42, loomPid: 41),
+          !acceptableBackgroundFocus(41, loomPid: 41) else {
+        fputs("background focus policy did not isolate the exact Loom pid\n", stderr)
         exit(1)
     }
     print("idle/resume run-loop contract passed")
@@ -54,6 +64,7 @@ var before: [String: Any] = [:], after: [String: Any] = [:]
 var observerAttempt = 0
 var observerStem = diagnostic + ".observer"
 var visibilityActions: [[String: Any]] = []
+var backgroundPids = Set<Int32>()
 
 func axBoolean(_ name: CFString) -> Bool? {
     var value: CFTypeRef?
@@ -164,6 +175,13 @@ func waitFor(_ predicate: () -> Bool, seconds: TimeInterval = 10) -> Bool {
     } while ProcessInfo.processInfo.systemUptime < deadline
     return false
 }
+func loomIsNotFrontmost() -> Bool {
+    guard let frontmostPid = NSWorkspace.shared.frontmostApplication?.processIdentifier else {
+        return true
+    }
+    backgroundPids.insert(frontmostPid)
+    return acceptableBackgroundFocus(frontmostPid, loomPid: pid)
+}
 func hideExactApplication() -> Bool {
     // macOS applies the three PID-bound visibility mechanisms asynchronously.
     // Advance to the next mechanism only after the prior one had time to take
@@ -210,20 +228,18 @@ var finderError: NSDictionary?
 _ = NSAppleScript(source: "tell application id \"com.apple.finder\" to activate")?.executeAndReturnError(&finderError)
 guard finderError == nil, waitFor({ NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier }) else { fail("finder_did_not_take_focus") }
 guard hideExactApplication() else { fail("exact_process_did_not_hide") }
-guard waitFor({ application.isHidden && NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier }) else { fail("exact_process_did_not_hide") }
+guard waitFor({ application.isHidden && loomIsNotFrontmost() }) else { fail("exact_process_did_not_hide") }
 stage = "idle"
 let started = ProcessInfo.processInfo.systemUptime
 var polls = 0
 while ProcessInfo.processInfo.systemUptime - started < 75 {
     polls += 1
-    guard guardsHold(), application.isHidden,
-          NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier,
-          storeIdentity() == stableStore else { fail("focus_process_generation_or_terminal_identity_changed") }
+    guard guardsHold(), application.isHidden, loomIsNotFrontmost(),
+          storeIdentity() == stableStore else { fail("process_generation_or_terminal_identity_changed") }
     serviceMainRunLoop()
 }
 let elapsed = ProcessInfo.processInfo.systemUptime - started
-guard guardsHold(), application.isHidden,
-      NSWorkspace.shared.frontmostApplication?.processIdentifier == finder.processIdentifier,
+guard guardsHold(), application.isHidden, loomIsNotFrontmost(),
       storeIdentity() == stableStore else { fail("final_idle_invariant_changed") }
 stage = "after_resume"
 showExactApplication()
@@ -243,6 +259,8 @@ guard waitFor({
 after = resumed
 let result: [String: Any] = ["schema": "delysis.loom-idle-resume-ghost-witness.v1", "pid": pid, "database": dbPath,
     "background_pid": finder.processIdentifier, "application_hidden_during_idle": true, "loom_frontmost_during_idle": false,
+    "background_focus_policy": "any_non_loom_application",
+    "observed_background_pids": backgroundPids.sorted(),
     "minimum_idle_seconds": 75, "actual_idle_seconds": elapsed, "idle_polls": polls, "explicit_resume": true,
     "editor_focused_after_resume": true, "caret_utf16_after_resume": manuscript.utf16.count,
     "generation_runs_before_idle": baseline + 4, "generation_runs_after_resume": baseline + 4,

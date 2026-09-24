@@ -773,6 +773,7 @@ export interface WeaveStartArgs {
   cursorByte: number;
   policy:
     | { kind: 'automatic_v2' }
+    | { kind: 'automatic_v3' }
     | { kind: 'loompad_v2'; sample_target: 4 | 16 | 64 | 256; batch_offset: number }
     | {
         kind: 'manual_v2';

@@ -21,6 +21,9 @@ pub const FIRST_WORD_CHOICE_MAX_INITIAL_EXCLUSIONS: usize = FIRST_WORD_CHOICE_MA
 #[serde(rename_all = "snake_case")]
 pub enum FirstWordChoicePolicy {
     DistinctV2,
+    /// Distinct lexical openings which also reject a completed leading HTML
+    /// tag before any proposal bytes acquire emission authority.
+    DistinctVisualProseV3,
 }
 
 impl FirstWordChoicePolicy {
@@ -33,7 +36,12 @@ impl FirstWordChoicePolicy {
             return base_seed;
         }
         let mut digest = Sha256::new();
-        digest.update(b"llama-native:first-word-distinct-v2\0");
+        digest.update(match self {
+            Self::DistinctV2 => b"llama-native:first-word-distinct-v2\0".as_slice(),
+            Self::DistinctVisualProseV3 => {
+                b"llama-native:first-word-distinct-visual-prose-v3\0".as_slice()
+            }
+        });
         digest.update(base_seed.to_le_bytes());
         digest.update(attempt.to_le_bytes());
         let bytes = digest.finalize();
@@ -46,6 +54,7 @@ impl FirstWordChoicePolicy {
 pub enum FirstWordChoiceAttemptOutcome {
     Accepted,
     Duplicate,
+    DisallowedPrefix,
     PrefixLimit,
     EndOfGeneration,
     Cancelled,
@@ -155,5 +164,9 @@ mod tests {
         assert_eq!(seeds.len(), FIRST_WORD_CHOICE_MAX_ATTEMPTS as usize);
         assert!(!seeds.contains(&u32::MAX));
         assert_eq!(policy.attempt_seed(41, 1), policy.attempt_seed(41, 1));
+        assert_ne!(
+            policy.attempt_seed(41, 1),
+            FirstWordChoicePolicy::DistinctVisualProseV3.attempt_seed(41, 1)
+        );
     }
 }

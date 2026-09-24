@@ -8737,7 +8737,7 @@
         cursorByte: captured.cursorByte,
         policy: captured.speculation
           ? { kind: 'loompad_v2', sample_target: captured.speculation.sampleTarget, batch_offset: captured.speculation.offset }
-          : { kind: 'automatic_v2' }
+          : { kind: 'automatic_v3' }
       });
       if (installWeaveSnapshot(started, captured)) {
         uncertainWeave = null;

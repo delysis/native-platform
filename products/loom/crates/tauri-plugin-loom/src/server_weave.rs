@@ -23,7 +23,9 @@ impl Engine {
         if let Some(scope) = state.inference.as_ref().and_then(|service| {
             service.scope(matches!(
                 policy,
-                ValidatedWeavePolicy::AutomaticV2 | ValidatedWeavePolicy::LoompadV2 { .. }
+                ValidatedWeavePolicy::AutomaticV2
+                    | ValidatedWeavePolicy::AutomaticV3
+                    | ValidatedWeavePolicy::LoompadV2 { .. }
             ))
         }) {
             if policy.first_word_choices().is_some() {

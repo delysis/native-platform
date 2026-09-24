@@ -81,8 +81,24 @@ impl FirstWordGate {
         finished: bool,
         reserved: &mut BTreeSet<String>,
     ) -> Admission {
-        let word_key = complete_first_word_key(text, terminal_token_id.is_some());
-        let outcome = if let Some(word) = &word_key {
+        let visual_prose = self.evidence.policy == FirstWordChoicePolicy::DistinctVisualProseV3;
+        let disallowed_prefix = visual_prose
+            && (completed_leading_html_tag(text)
+                || has_leading_line_break(text)
+                || completed_leading_punctuation_line(text));
+        let pending_html_prefix = self.evidence.policy
+            == FirstWordChoicePolicy::DistinctVisualProseV3
+            && possible_incomplete_leading_html_tag(text);
+        let word_key = (!disallowed_prefix && !pending_html_prefix)
+            .then(|| complete_first_word_key(text, terminal_token_id.is_some()))
+            .flatten();
+        let numeric_only_word = visual_prose
+            && word_key
+                .as_deref()
+                .is_some_and(|word| !word.chars().any(char::is_alphabetic));
+        let outcome = if disallowed_prefix || numeric_only_word {
+            FirstWordChoiceAttemptOutcome::DisallowedPrefix
+        } else if let Some(word) = &word_key {
             if reserved.contains(word) {
                 FirstWordChoiceAttemptOutcome::Duplicate
             } else {
@@ -129,6 +145,52 @@ impl FirstWordGate {
             outcome: FirstWordChoiceAttemptOutcome::Cancelled,
         });
     }
+}
+
+fn leading_non_whitespace(text: &str) -> &str {
+    text.trim_start_matches(char::is_whitespace)
+}
+
+fn possible_html_tag_body(body: &str) -> bool {
+    let body = body.strip_prefix('/').unwrap_or(body);
+    body.chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic())
+        && !body.contains('<')
+}
+
+fn completed_leading_html_tag(text: &str) -> bool {
+    let Some(rest) = leading_non_whitespace(text).strip_prefix('<') else {
+        return false;
+    };
+    let Some(end) = rest.find('>') else {
+        return false;
+    };
+    possible_html_tag_body(&rest[..end])
+}
+
+fn completed_leading_punctuation_line(text: &str) -> bool {
+    let Some((first_line, _)) = leading_non_whitespace(text).split_once('\n') else {
+        return false;
+    };
+    let first_line = first_line.trim_end_matches('\r').trim();
+    !first_line.is_empty()
+        && !first_line
+            .chars()
+            .any(|character| character == '_' || character.is_alphanumeric())
+}
+
+fn has_leading_line_break(text: &str) -> bool {
+    text.chars()
+        .take_while(|character| character.is_whitespace())
+        .any(|character| matches!(character, '\r' | '\n'))
+}
+
+fn possible_incomplete_leading_html_tag(text: &str) -> bool {
+    let Some(rest) = leading_non_whitespace(text).strip_prefix('<') else {
+        return false;
+    };
+    !rest.contains('>') && possible_html_tag_body(rest)
 }
 
 #[cfg(test)]
@@ -183,6 +245,108 @@ mod tests {
             gate.evidence.attempts[1].seed,
             FirstWordChoicePolicy::DistinctV2.attempt_seed(41, 1)
         );
+    }
+
+    #[test]
+    fn visual_prose_policy_withholds_fragmented_html_and_retries_a_complete_tag() {
+        let mut words = BTreeSet::new();
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctVisualProseV3, 41);
+        assert_eq!(
+            gate.observe("<str", &[1], None, false, &mut words),
+            Admission::Pending
+        );
+        assert_eq!(
+            gate.observe("<strong>", &[1, 2], None, false, &mut words),
+            Admission::Retry
+        );
+        assert_eq!(
+            gate.evidence.attempts[0].outcome,
+            FirstWordChoiceAttemptOutcome::DisallowedPrefix
+        );
+        assert_eq!(gate.evidence.attempts[0].word_key, None);
+        assert_eq!(
+            gate.observe(" Across ", &[3], None, false, &mut words),
+            Admission::Accepted
+        );
+        assert_eq!(
+            gate.evidence.attempts[1].word_key.as_deref(),
+            Some("across")
+        );
+    }
+
+    #[test]
+    fn visual_prose_policy_retries_a_completed_punctuation_only_leading_line() {
+        let mut words = BTreeSet::new();
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctVisualProseV3, 41);
+        assert_eq!(
+            gate.observe(".", &[1], None, false, &mut words),
+            Admission::Pending
+        );
+        assert_eq!(
+            gate.observe(
+                ".\nLoom native smoke prose: The",
+                &[1, 2],
+                None,
+                false,
+                &mut words
+            ),
+            Admission::Retry
+        );
+        assert_eq!(
+            gate.evidence.attempts[0].outcome,
+            FirstWordChoiceAttemptOutcome::DisallowedPrefix
+        );
+        assert_eq!(
+            gate.observe("Lantern light ", &[3], None, false, &mut words),
+            Admission::Accepted
+        );
+    }
+
+    #[test]
+    fn visual_prose_policy_retries_leading_line_break_and_numeric_only_word() {
+        let mut words = BTreeSet::new();
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctVisualProseV3, 41);
+        assert_eq!(
+            gate.observe("\nfloor. ", &[1], None, false, &mut words),
+            Admission::Retry
+        );
+        assert_eq!(
+            gate.observe("0805705.", &[2], None, false, &mut words),
+            Admission::Retry
+        );
+        assert_eq!(
+            gate.observe("100-year-old ", &[3], None, false, &mut words),
+            Admission::Accepted
+        );
+        assert!(
+            gate.evidence.attempts[..2].iter().all(|attempt| {
+                attempt.outcome == FirstWordChoiceAttemptOutcome::DisallowedPrefix
+            })
+        );
+    }
+
+    #[test]
+    fn visual_prose_policy_exhausts_bounded_markup_proposals_without_admission() {
+        let mut words = BTreeSet::new();
+        let mut gate = FirstWordGate::new(FirstWordChoicePolicy::DistinctVisualProseV3, 7);
+        for attempt in 0..FIRST_WORD_CHOICE_MAX_ATTEMPTS {
+            let result = gate.observe("<b>", &[attempt as i32], None, false, &mut words);
+            assert_eq!(
+                result,
+                if attempt + 1 == FIRST_WORD_CHOICE_MAX_ATTEMPTS {
+                    Admission::Exhausted
+                } else {
+                    Admission::Retry
+                }
+            );
+        }
+        assert!(gate.evidence.exhausted);
+        assert_eq!(gate.evidence.selected_attempt, None);
+        assert!(words.is_empty());
+        assert!(gate.evidence.attempts.iter().all(|attempt| {
+            attempt.outcome == FirstWordChoiceAttemptOutcome::DisallowedPrefix
+                && attempt.word_key.is_none()
+        }));
     }
 
     #[test]
