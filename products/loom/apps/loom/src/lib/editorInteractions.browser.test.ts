@@ -1391,6 +1391,8 @@ describe('real WebKit editor interactions', () => {
     await expect.poll(serializedMarkdown).toBe('hello there');
     await expect.element(page.getByRole('status', { name: 'Completion Presentation' }))
       .toHaveTextContent('b:1:session:6');
+    await paintTwice();
+    await new Promise((resolve) => window.setTimeout(resolve, 250));
 
     // Option remains physically held throughout. The exhausted presentation
     // is intentionally hidden, but it is still exact rollback authority and

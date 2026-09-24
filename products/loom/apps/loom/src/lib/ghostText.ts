@@ -1080,6 +1080,14 @@ export function createGhostTextPlugin(
         if (editorView.isDestroyed) return;
         const plan = currentGhostTextPlan(editorView.state);
         if (!plan) return;
+        if (plan.text === '' && plan.unconsumeText !== '') {
+          // An exhausted candidate is exact rollback authority, not an
+          // offscreen preview. Its widget is intentionally absent after full
+          // acceptance, but Option must remain held until Option-Left can
+          // restore the selected candidate and its fan.
+          clearFanAccessibility();
+          return;
+        }
         if (
           visibleGhostWidgetPresentationKey(editorView) !== plan.presentationKey
         ) {
