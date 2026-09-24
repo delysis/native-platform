@@ -20,14 +20,22 @@ function render(mode: 'visual' | 'source', loompad = false, insertsOnAccept = tr
 }
 
 describe('completion controller and editor callback ordering', () => {
-  it('advances a mounted visual editor after its exact first presentation is rejected', async () => {
+  it('advances a mounted editor from rejected native HTML to existing-family prose', async () => {
     const harness = render('visual');
     const ghost = () => document.querySelector('.loom-visual-ghost')?.textContent;
     await expect.poll(ghost).toBe(' one two');
-    harness.rejectVisibleVisualPresentation();
-    await expect.poll(ghost).toBe(' another path');
+    const htmlLed = '<strong>I’m going to college shirt</strong> moreover I will buy this floor. He took a deep breath, exhaling slowly. The familiar scent of smoke filled his nostrils, the smell of leather and wood filling the air. He looked at';
+    const plainProse = '18th-century oak furniture, its ancient grain shimmering in the warm glow. The house was silent, a few candles flickered in the corners, casting a soft glow across the room. The woman in the lantern was silent, her';
+    harness.installRefill([
+      { candidateId: 'native-html', presentationKey: 'native-html:presentation',
+        runId: 'native-html-run', targetByte: 5, text: htmlLed, insertsOnAccept: true },
+      { candidateId: 'native-prose', presentationKey: 'native-prose:presentation',
+        runId: 'native-prose-run', targetByte: 5, text: plainProse, insertsOnAccept: true }
+    ]);
+    await expect.poll(ghost).toBe(plainProse);
     expect(page.getByRole('status', { name: 'Controller Markdown' }).element().textContent).toBe('Hello');
     expect(page.getByRole('status', { name: 'Controller Actions' }).element().textContent).toBe('0');
+    expect(page.getByRole('status', { name: 'Controller Invalidations' }).element().textContent).toBe('0');
   });
 
   it.each(['visual', 'source'] as const)('reverses full %s fan Return acceptance with no visible remainder', async (mode) => {

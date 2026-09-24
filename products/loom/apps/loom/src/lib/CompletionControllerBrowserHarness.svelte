@@ -127,7 +127,8 @@
     candidateId: string,
     presentationKey: string,
     surfaceKey: string,
-    anchorByteOffset: number
+    anchorByteOffset: number,
+    selectionPinned: boolean
   ): void {
     controller = rejectVisualPresentation(controller, {
       mode,
@@ -136,19 +137,9 @@
       presentationKey,
       surfaceKey,
       currentSurfaceKey: contextKey,
-      anchorByte: anchorByteOffset
+      anchorByte: anchorByteOffset,
+      selectionPinned
     });
-  }
-
-  /** Drives the same production callback after a mounted editor has observed a rejected ghost. */
-  export function rejectVisibleVisualPresentation(): void {
-    if (!selected || mode !== 'visual') return;
-    rejectVisualGhostPresentation(
-      selected.candidateId,
-      selected.presentationKey,
-      contextKey,
-      selected.targetByte
-    );
   }
 
   function chooseLoompad(candidate: InlineGhostSuggestion): void {
