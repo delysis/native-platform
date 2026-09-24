@@ -750,6 +750,7 @@
   let suggestionWakeQueued = false;
   let autocompleteRetryLedger: AutocompleteRetryLedger = emptyAutocompleteRetryLedger();
   let announcedGhostPresentationKey = '';
+  let timedVisualGhostPresentationKey = '';
   let modelDownloadUrl = '';
   let modelDownloadFileName = '';
   let lastDerivedModelFileName = '';
@@ -1479,6 +1480,17 @@
   ) {
     announcedGhostPresentationKey = activeGhostSuggestion.presentationKey;
     announce('Suggestion available. Tab accepts one word; Option WASD chooses a word.');
+  }
+  $: if (
+    mode === 'visual' &&
+    activeGhostSuggestion &&
+    activeGhostSuggestion.presentationKey === visibleVisualGhostPresentationKey &&
+    activeGhostSuggestion.presentationKey !== timedVisualGhostPresentationKey
+  ) {
+    timedVisualGhostPresentationKey = activeGhostSuggestion.presentationKey;
+    recordStartupTiming('visual_ghost_rendered', {
+      candidate_utf8_bytes: new TextEncoder().encode(activeGhostSuggestion.text).byteLength
+    });
   }
   $: shuttleCandidate = shuttleEnabled ? selectedInlineSuggestion : activeGhostSuggestion;
   $: shuttleScheduleKey = completionShuttleScheduleKey(
