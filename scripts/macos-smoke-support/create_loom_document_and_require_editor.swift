@@ -28,18 +28,28 @@ func descendants() -> [AXUIElement] {
     return queue
 }
 
-func control(named needle: String) -> AXUIElement? {
-    descendants().first { element in
+func controls(named needle: String) -> [AXUIElement] {
+    descendants().filter { element in
         let role = stringAttribute(element, kAXRoleAttribute as CFString)
         guard role == kAXButtonRole as String || role == kAXMenuItemRole as String else {
             return false
         }
-        return [
+        let labels = [
             stringAttribute(element, kAXDescriptionAttribute as CFString),
             stringAttribute(element, kAXTitleAttribute as CFString),
             stringAttribute(element, kAXHelpAttribute as CFString)
-        ].joined(separator: " ").contains(needle)
+        ]
+        return labels.contains(needle) || labels.contains { $0.hasPrefix("\(needle) (") }
     }
+}
+
+func uniqueControl(named needle: String) -> AXUIElement? {
+    let matches = controls(named: needle)
+    guard matches.count == 1 else {
+        fputs("expected one exact '\(needle)' control, observed \(matches.count)\n", stderr)
+        return nil
+    }
+    return matches[0]
 }
 
 func firstWindow() -> AXUIElement? {
@@ -62,7 +72,7 @@ let beforeTitle = stringAttribute(window, kAXTitleAttribute as CFString)
 let addDeadline = Date().addingTimeInterval(5)
 var add: AXUIElement?
 repeat {
-    add = control(named: "Add")
+    add = uniqueControl(named: "Add")
     if add != nil { break }
     Thread.sleep(forTimeInterval: 0.05)
 } while Date() < addDeadline
@@ -81,7 +91,7 @@ if let add {
 let createDeadline = Date().addingTimeInterval(5)
 var create: AXUIElement?
 repeat {
-    create = control(named: "New document")
+    create = uniqueControl(named: "New document")
     if create != nil { break }
     Thread.sleep(forTimeInterval: 0.05)
 } while Date() < createDeadline
