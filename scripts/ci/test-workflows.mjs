@@ -216,6 +216,8 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
   assert.match(smoke, /postKey\(49\)/);
   assert.match(smoke, /virtualKey: virtualKey/);
   assert.match(smoke, /"terminal_space_key_event": terminalSpace/);
+  assert.match(smoke, /"seeded_stable_count": seededStableCount/);
+  assert.match(smoke, /Date\(\)\.timeIntervalSince\(seedExactSince\) >= 0\.4/);
   assert.match(smoke, /event\.postToPid\(pid\)/);
   assert.match(smoke, /native Accessibility input did not stabilize at the exact value and collapsed end caret/);
   assert.match(smoke, /"stable_seconds": 0\.4/);
