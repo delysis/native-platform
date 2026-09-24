@@ -41,6 +41,11 @@
     transferMayContainImageFile
   } from './attachments';
 
+  const ownedCompletionInputAttributes: Record<string, string> = {
+    autocorrect: 'off',
+    autocomplete: 'off'
+  };
+
   export let element: HTMLTextAreaElement | undefined;
   export let value = '';
   export let readonly = false;
@@ -955,6 +960,7 @@
   </div>
   <textarea
     bind:this={element}
+    {...ownedCompletionInputAttributes}
     class:verse
     {value}
     {readonly}

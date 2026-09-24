@@ -130,6 +130,23 @@ describe('real WebKit editor interactions', () => {
     return Boolean(fan && getComputedStyle(fan).display !== 'none' && fan.getClientRects().length > 0);
   }
 
+  it('reserves automatic text completion for Loom while retaining spellcheck', async () => {
+    render('hello');
+    const visual = page.getByRole('textbox', { name: 'Manuscript editor' });
+    await expect.element(visual).toHaveAttribute('autocorrect', 'off');
+    await expect.element(visual).toHaveAttribute('autocomplete', 'off');
+    await expect.element(visual).toHaveAttribute('spellcheck', 'true');
+
+    if (mounted) await unmount(mounted);
+    mounted = null;
+    document.body.replaceChildren();
+    renderSource('hello', []);
+    const source = page.getByRole('textbox', { name: 'Markdown source editor' });
+    await expect.element(source).toHaveAttribute('autocorrect', 'off');
+    await expect.element(source).toHaveAttribute('autocomplete', 'off');
+    await expect.element(source).toHaveAttribute('spellcheck', 'true');
+  });
+
   async function paintTwice(): Promise<void> {
     await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
     await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
