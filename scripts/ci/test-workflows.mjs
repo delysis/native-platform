@@ -392,6 +392,9 @@ test("Loom UI smoke cannot attach to an active editor or invent a model identity
       new RegExp(`exercise_loom_formatting_palette[^\\n]*\\n?[^\\n]*"${action}"`),
     );
   }
+  assert.match(smoke, /func manuscriptEditor\(\) -> AXUIElement\?/);
+  assert.match(smoke, /let currentEditor = manuscriptEditor\(\)/);
+  assert.match(smoke, /afterSelection = currentEditor\.flatMap\(canonicalSelection\)/);
   assert.match(smoke, /PID-targeted Command-A/);
   assert.match(smoke, /NSRunningApplication\.runningApplications/);
   assert.match(smoke, /foreground_loom_process "\$ACTIVE_PID"/);
