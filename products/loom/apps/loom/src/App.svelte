@@ -2547,6 +2547,7 @@
 
   onMount(() => {
     componentMounted = true;
+    recordStartupTiming('renderer_mounted');
     appearance = 'system';
     appearanceMedia = window.matchMedia('(prefers-color-scheme: dark)');
     systemDark = appearanceMedia.matches;
@@ -4481,6 +4482,17 @@
   }
 
   let unavailableWorkspaceWriterKey = '';
+  const startupTimingOrigin = performance.now();
+
+  function recordStartupTiming(phase: string, fields: Record<string, number | boolean> = {}): void {
+    // Keep native acceptance logs useful without recording prose, prompts,
+    // paths, model output, or any author-owned content.
+    console.info('loom_timing', JSON.stringify({
+      phase,
+      elapsed_ms: Math.round(performance.now() - startupTimingOrigin),
+      ...fields
+    }));
+  }
 
   function workspaceWriterKey(): string {
     return `${workspaceTemplateScope}/${workspaceTemplate?.revision_id ?? ''}/${JSON.stringify(workspaceTemplate?.config.model ?? null)}`;
@@ -4516,7 +4528,6 @@
   function queuePreferredWriterRequest(captured: WorkspaceRestoreCapture): void {
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !completionAutomationActive ||
       !workspaceRestoreIsCurrent(captured)
     ) return;
     preferredWriterPending = { ...captured };
@@ -4545,7 +4556,6 @@
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
       !captured ||
-      !completionAutomationActive ||
       currentWriter || unavailableWorkspaceWriterKey === workspaceWriterKey()
     ) return;
     requestPreferredWriterEnsure(captured);
@@ -4561,7 +4571,6 @@
     }
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !completionAutomationActive ||
       !workspaceRestoreIsCurrent(captured)
     ) {
       clearPreferredWriterRequest(captured);
@@ -4591,7 +4600,6 @@
   ): Promise<boolean> {
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !completionAutomationActive ||
       !workspaceRestoreIsCurrent(captured)
     ) return false;
     if (!await prepareWorkspaceWriterTemplate(captured)) return false;
@@ -4603,7 +4611,6 @@
     const refreshed = await refreshModels(captured);
     if (
       !applicationAllowsModelPreparation(applicationClosePhase) ||
-      !completionAutomationActive ||
       !workspaceRestoreIsCurrent(captured)
     ) return false;
     if (!refreshed && modelRefreshInFlightCount > 0) {
@@ -5897,6 +5904,10 @@
       const loadSerial = ++modelLoadSerial;
       modelLoading = true;
       try {
+        recordStartupTiming('model_load_requested', {
+          policy_candidate: Boolean(candidate.profileId),
+          catalog_candidate: Boolean(candidate.catalogId)
+        });
         const discovered = models.find((model) => model.model_path === candidate.modelPath);
         const catalogEntry = candidate.catalogId
           ? curatedModels.find((entry) => entry.catalog_id === candidate.catalogId) ?? null
@@ -5927,6 +5938,7 @@
           await refreshModels(captured);
           continue;
         }
+        recordStartupTiming('model_load_verified');
         return await installLoadedModel(loaded, true, captured);
       } catch (error) {
         if (
@@ -6281,15 +6293,18 @@
   async function restoreCompletionBackground(
     captured: WorkspaceRestoreCapture
   ): Promise<void> {
+    recordStartupTiming('workspace_background_start');
     await restoreCompletionAutomation(captured);
     if (!workspaceRestoreIsCurrent(captured)) return;
     await recoverModelDownloads();
     if (!workspaceRestoreIsCurrent(captured)) return;
     if (!shouldDiscoverModelsOnStartup(completionAutomationActive)) return;
+    recordStartupTiming('writer_preload_queued', { suggestions_enabled: suggestionsEnabled });
     requestPreferredWriterEnsure(captured);
   }
 
   async function restoreDesktopWorkspace(): Promise<void> {
+    recordStartupTiming('workspace_restore_start');
     const restoreSerial = ++workspaceRestoreSerial;
     await restoreBeforeBackgroundWork({
       restore: () => openInitialProject(restoreSerial),
