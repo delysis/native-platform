@@ -1,0 +1,16 @@
+category,examined,coverage,unresolved
+Top-level directories,All 11 root directory names observed,Partial depth,"Complete recursive source tree was not retained as a machine-verifiable, fully read corpus."
+Cargo workspace,All 51 declared main members inventoried,Complete declaration census; selective implementation,Not every member manifest and every source body inspected.
+Excluded/auxiliary workspaces,Main exclusions and EASL/Signal branch workspace families identified,Partial,Full manifests/dependency graphs of each auxiliary/vendor workspace not read.
+pnpm packages,Root plus all 3 declared product package.json files read; Loom packages wildcard absent on pinned main,Declared main package coverage,All vendor/branch-only package manifests and lockfile edges not enumerated.
+Tauri plugins,96 Loom + 9 FTE registration entries preserved,Complete for those two observed build lists,Every permission/capability/caller/type/test chain not traced.
+Application commands,110 Mom invoke-handler entries preserved,Complete for observed Mom list,"FTE app-owned commands, Loom app-owned helpers and all effective capabilities not comprehensively inventoried."
+Branches,77 heads recorded;49 relationships including main identity,49 measured/identity;28 unmeasured,Large compare file views capped at300; exact overlap/stack ancestry not universally verified.
+PRs,84 observed PR records;all10open included,Descriptions/history coverage,Comments/check-run/raw receipt coverage incomplete; no review of every full PR diff.
+Ignored tests,43 declared registry entries preserved,Complete registry coverage,"No independent full-source #[ignore] discovery, build-script hash recomputation or test execution."
+CI groups,All10declared groups identified,Registry coverage,Planner/aggregator/workflow implementation not fully audited.
+Services/products,"Native,Attachment,Information,Speech,Loom,Mom,FTE,EASL and peer/Signal research families covered",Mixed source/contract/history,Depth varies and is labeled; some packages have documentation-only implementation coverage.
+Networking,Main loopback route/bind path and branch network-mode source inspected; other boundaries mapped,Partial implementation audit,Not every socket/client/redirect/OAuth/encryption dependency and caller traced.
+Persistence,Primary store owners/identity/durability contracts mapped,Partial,Every schema/table/migration/transaction/corruption path not enumerated from source.
+Dependencies/licenses,"Root policy,selected manifests,Native pin and vendor families identified",Partial,"Not a complete SBOM, current advisory scan, license clearance or model/data-license audit."
+Native/release evidence,Source and historical claims separated,No new runtime evidence,No build/test/fuzz/browser/native/model/hardware/signing/acceptance command executed.
