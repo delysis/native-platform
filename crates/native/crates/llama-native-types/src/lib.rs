@@ -4,6 +4,7 @@ use std::path::PathBuf;
 mod controlled_generation;
 mod exact_token_budget;
 mod first_word_choices;
+pub mod media_identity;
 mod sampling_fingerprint;
 
 pub use controlled_generation::*;
