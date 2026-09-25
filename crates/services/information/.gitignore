@@ -1,6 +1,0 @@
-/target
-/.information-native
-/configs/*.local.json
-*.part
-*.tmp
-.DS_Store

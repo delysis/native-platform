@@ -1,9 +1,0 @@
-/target/
-/node_modules/
-**/node_modules/
-/dist/
-/.DS_Store
-*.swp
-*.tmp
-products/loom/apps/loom/.vitest-attachments/
-products/loom/apps/loom/src/lib/__screenshots__/
