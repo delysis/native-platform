@@ -31,14 +31,19 @@ these evidence levels by itself.
 | Stream compression | GZIP, BZIP2, XZ, Zstandard | bounded decode then recursive inspection | XZ block dictionaries and Zstd windows are pre-limited independently of output; concatenated XZ streams are unsupported in process |
 | RAR | RAR 4/5 signatures | detected | deliberately unsupported in process; no audited decoder exposes the required memory/step limits |
 | Raster images | PNG, JPEG, GIF, WebP, BMP, TIFF, HEIF, AVIF | PNG/JPEG/GIF/WebP receive a bounded complete payload decode; animations are limited to 120 frames and 128 MiB decoded bytes; the remaining formats receive a structural/dimension probe | only payload-decoded media may be direct; structure-only formats require an explicit transform or remain blocked even when the target names that media type |
-| Vector image | SVG | XML canonicalization; direct when target allows | active/external content is data only and never fetched or executed |
+| Vector image | SVG | bounded XML canonicalization plus retained opaque bytes and active-vector warning | not decoded raster media; rasterization or OCR requires an explicit capability-aware transform; no external fetch or script execution |
 | Audio | WAV, AIFF, CAF, FLAC, MP3, Opus/Vorbis/Speex/FLAC-in-Ogg, M4A | WAV receives a complete sample decode and may be direct; the remaining formats receive a container/frame probe | ambiguous Ogg remains generic; the core never transcribes, and structure-only formats need an explicit transform before direct use |
 | Video | MP4, QuickTime, Theora-in-Ogg, Matroska, WebM, AVI | container probe; direct when target allows, otherwise explicit frame/audio DAG | core does not demux, decode frames, or invoke codecs |
 | Executables | common executable signatures | detected and blocked | never canonicalized or offered as opaque content by the default policy |
 | Unknown binary | anything not proven above | explicit opaque or blocked result | policy-controlled; never treated as text or clean content |
 
-RTF is content-first detected, but remains opaque because a maintained,
-bounded safe-Rust canonicalizer has not yet met this repository's bar.
+RTF is content-first detected and dispatched to the bounded in-process
+`attachment-native-document::rtf` text projector. Its implemented text subset
+handles ANSI/Windows-1252 and Unicode, with limits on nesting, binary lengths,
+Unicode fallback, surrogates and projected output. Embedded objects/pictures,
+hidden content and field instructions are skipped; unsupported codepage modes
+fail explicitly. This is text projection, not a full RTF layout engine or a
+claim that arbitrary RTF content is safe to execute.
 
 ## Transform-needed formats
 

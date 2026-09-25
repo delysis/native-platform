@@ -66,8 +66,9 @@ through the plugin command and should read the returned address.
 - `POST /v1/responses/{id}/cancel`
 - `POST /v1/messages`
 - `POST /v1/messages/count_tokens`
-- `POST /v1beta/models/{model}:generateContent`
-- `POST /v1beta/models/{model}:streamGenerateContent`
+
+Gemini `generateContent` normalization is an **outbound provider adapter**.
+The loopback router does not expose inbound `/v1beta/models/*` Gemini routes.
 
 Use `model: "auto"` to let the router choose among configured, capable models,
 or use a public model ID returned by `/v1/models`.
