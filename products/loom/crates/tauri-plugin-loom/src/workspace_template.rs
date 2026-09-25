@@ -92,7 +92,8 @@ impl PaneConfig {
                 PaneKind::Chat => PanePosition::Right,
                 PaneKind::Terminal | PaneKind::Browser => PanePosition::Bottom,
             },
-            visible: true,
+            // A configuration file or theme change must not enable optional UI.
+            visible: kind == PaneKind::Editor,
             title: None,
             document: None,
             context: if kind == PaneKind::Chat {
@@ -579,17 +580,35 @@ mod tests {
             parse_config(DEFAULT_TEMPLATE).unwrap(),
             WorkspaceConfig::default()
         );
-        assert!(
-            WorkspaceConfig::default()
-                .panes
-                .values()
-                .all(|pane| pane.visible)
-        );
+        assert!(WorkspaceConfig::default().panes["writing"].visible);
+        for name in ["chat", "terminal", "browser"] {
+            assert!(!WorkspaceConfig::default().panes[name].visible);
+        }
         let config = parse_config("```loom-workspace\n[panes.terminal]\nvisible=true\n[panes.reader]\nkind='chat'\ntitle='読み手'\ncontext=['@\"My draft\"','@notes/']\n```\n").unwrap();
         assert!(config.panes["terminal"].visible);
-        assert!(config.panes["chat"].visible);
+        assert!(!config.panes["chat"].visible);
+        assert!(!config.panes["reader"].visible);
         assert_eq!(config.panes["reader"].title.as_deref(), Some("読み手"));
         assert_eq!(config.panes["reader"].position, PanePosition::Right);
+    }
+
+    #[test]
+    fn optional_panes_need_explicit_visibility_even_after_kind_changes() {
+        for settings in [
+            "",
+            "[theme]\nmode='dark'",
+            "[panes.reader]\nkind='chat'",
+            "[panes.browser]\nkind='terminal'",
+        ] {
+            let config = parse_config(&format!("```loom-workspace\n{settings}\n```\n")).unwrap();
+            assert_eq!(config.panes.values().filter(|pane| pane.visible).count(), 1);
+            assert!(config.panes["writing"].visible);
+        }
+        let config = parse_config("```loom-workspace\n[panes.reader]\nkind='chat'\nvisible=true\n[panes.browser]\nvisible=true\n```\n").unwrap();
+        assert!(config.panes["reader"].visible);
+        assert!(config.panes["browser"].visible);
+        assert!(!config.panes["terminal"].visible);
+        assert!(!config.panes["chat"].visible);
     }
 
     #[test]
