@@ -152,16 +152,18 @@ function exceptionRecord(changedPath, exception) {
     class: exception.kind,
     rule: exception.path ?? exception.prefix,
     primary_groups: [...new Set(exception.primary_groups ?? [])].sort(),
+    owner_packages: [...new Set(exception.owner_packages ?? [])].sort(),
     effects: [...new Set(exception.effects ?? [])].sort(),
     evidence: exception.evidence,
   };
 }
 
-function validatePathExceptions(pathExceptions, packageGroups) {
+function validatePathExceptions(pathExceptions, packageGroups, packages) {
   if (pathExceptions.schema !== "native-platform.ci-path-exceptions.v2") {
     throw new Error("CI path exceptions require schema v2");
   }
   const knownGroups = new Set(Object.keys(packageGroups.primary ?? {}));
+  const knownPackages = new Set(packages.map((candidate) => [candidate.name]).flat());
   const matches = new Set();
   for (const exception of requireArray(pathExceptions.rules, "path exception rules")) {
     if (Boolean(exception.path) === Boolean(exception.prefix)) {
@@ -176,6 +178,15 @@ function validatePathExceptions(pathExceptions, packageGroups) {
     for (const group of exception.primary_groups ?? []) {
       if (!knownGroups.has(group)) {
         throw new Error(`path exception names unknown primary group: ${group}`);
+      }
+    }
+    if (exception.owner_packages !== undefined && exception.kind !== "asset") {
+      throw new Error(`only asset exceptions may declare owner packages: ${match}`);
+    }
+    const owners = exception.owner_packages === undefined ? [] : exception.owner_packages;
+    for (const owner of requireArray(owners, `owner packages for ${match}`)) {
+      if (typeof owner !== "string" || !knownPackages.has(owner)) {
+        throw new Error(`asset exception names unknown workspace owner: ${owner}`);
       }
     }
     for (const effect of requireArray(exception.effects, `effects for ${match}`)) {
@@ -193,9 +204,10 @@ export function computeMetadataSelection({
   packageGroups,
   pathExceptions,
 }) {
-  validatePathExceptions(pathExceptions, packageGroups);
   const packages = workspacePackages(metadata, repoRoot, packageGroups);
+  validatePathExceptions(pathExceptions, packageGroups, packages);
   const changedPackages = new Set();
+  const assetOwnerPackages = new Set();
   const exceptionGroups = new Set();
   const effects = new Set();
   const fileClassifications = [];
@@ -220,6 +232,7 @@ export function computeMetadataSelection({
       const record = exceptionRecord(changedPath, exception);
       fileClassifications.push(record);
       for (const group of record.primary_groups) exceptionGroups.add(group);
+      for (const owner of record.owner_packages) assetOwnerPackages.add(owner);
       for (const effect of record.effects) effects.add(effect);
       continue;
     }
@@ -230,9 +243,12 @@ export function computeMetadataSelection({
 
   const forceFull = unknownPaths.length > 0 || effects.has("force_full");
   const reverse = reverseEdges(metadata, packages);
+  // Non-Cargo inputs enter the same graph through their declared owning package.
+  // Consumers come from metadata, never a second hard-coded product dependency map.
+  const seeds = new Set([...changedPackages, ...assetOwnerPackages]);
   const closure = forceFull
     ? packages.map((candidate) => candidate.name)
-    : closureOf(changedPackages, reverse);
+    : closureOf(seeds, reverse);
   const groupByPackage = new Map(
     packages.map((candidate) => [candidate.name, candidate.primaryGroup]),
   );
@@ -250,6 +266,7 @@ export function computeMetadataSelection({
     ],
     workspace_packages: packages.map((candidate) => candidate.name),
     changed_packages: [...changedPackages].sort(),
+    asset_owner_packages: [...assetOwnerPackages].sort(),
     reverse_dependency_closure: closure,
     primary_groups: [...primaryGroups].sort(),
     effects: [...effects].sort(),
@@ -269,6 +286,7 @@ export function unavailableSelection(reason, packageGroups) {
     fallback_reasons: ["metadata_unavailable"],
     workspace_packages: packages,
     changed_packages: [],
+    asset_owner_packages: [],
     reverse_dependency_closure: packages,
     primary_groups: Object.keys(packageGroups.primary ?? {}).sort(),
     effects: ["force_full"],
@@ -299,4 +317,5 @@ export function readCargoMetadata(repoRoot, metadataPath = process.env.CI_CARGO_
   }
   return JSON.parse(result.stdout);
 }
+
 

@@ -32,23 +32,26 @@
     {
       "prefix": "products/mom/apps/mom-llama/ui",
       "kind": "asset",
+      "owner_packages": ["mom-llama-app"],
       "primary_groups": ["product-mom"],
       "effects": ["frontend_mom"],
-      "evidence": "Mom renderer assets live beside the Tauri Cargo package"
+      "evidence": "Mom renderer assets are embedded by mom-llama-app; select its metadata-derived consumers including Loom"
     },
     {
       "path": "products/mom/apps/mom-llama/package.json",
       "kind": "asset",
+      "owner_packages": ["mom-llama-app"],
       "primary_groups": ["product-mom"],
       "effects": ["frontend_mom"],
-      "evidence": "Mom renderer package manifest lives beside the Tauri Cargo package"
+      "evidence": "Mom renderer build inputs belong to mom-llama-app and its metadata-derived consumers"
     },
     {
       "prefix": "products/mom/contracts",
       "kind": "asset",
+      "owner_packages": ["mom-llama-app"],
       "primary_groups": ["product-mom"],
       "effects": [],
-      "evidence": "Mom command and effect contracts are non-Cargo product assets"
+      "evidence": "Mom command and effect contracts are included by mom-llama-app and its metadata-derived consumers"
     },
     {
       "prefix": "products/loom/apps/loom/src",
