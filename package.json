@@ -8,6 +8,7 @@
     "fte:test": "pnpm --filter free-token-energy test",
     "loom:test": "pnpm --filter @delysis/loom test",
     "loom:check": "pnpm --filter @delysis/loom check",
-    "loom:build": "pnpm --filter @delysis/loom build"
+    "loom:build": "pnpm --filter @delysis/loom build",
+    "audit:contracts": "node --test scripts/ci/test-audit-contracts.mjs"
   }
 }

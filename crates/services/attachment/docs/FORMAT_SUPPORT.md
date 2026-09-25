@@ -17,6 +17,7 @@ these evidence levels by itself.
 | Family | Formats | Current evidence | Important boundary |
 |---|---|---|---|
 | Text | UTF-8 text, Markdown, WebVTT, SubRip | detected, canonicalized | UTF-8 byte ranges and global text limit |
+| Rich text | RTF | content-first detected, bounded plain-text canonicalization | ANSI/Unicode subset; input, nesting and output limits; unsupported encodings fail explicitly; embedded objects and field instructions are never evaluated |
 | Structured text | JSON, CSV, TSV, XML, SVG, Jupyter notebooks | structurally validated, canonicalized | no entity resolution, script execution, or external fetch |
 | HTML | HTML | structurally converted to Markdown | Cloudflare-derived `html-to-markdown-rs`; links remain text and resources are not fetched |
 | Email | RFC 822/MIME | recursively inspected, headers/body canonicalized | parts re-enter the same global object queue; names/MIME are untrusted |
@@ -31,14 +32,16 @@ these evidence levels by itself.
 | Stream compression | GZIP, BZIP2, XZ, Zstandard | bounded decode then recursive inspection | XZ block dictionaries and Zstd windows are pre-limited independently of output; concatenated XZ streams are unsupported in process |
 | RAR | RAR 4/5 signatures | detected | deliberately unsupported in process; no audited decoder exposes the required memory/step limits |
 | Raster images | PNG, JPEG, GIF, WebP, BMP, TIFF, HEIF, AVIF | PNG/JPEG/GIF/WebP receive a bounded complete payload decode; animations are limited to 120 frames and 128 MiB decoded bytes; the remaining formats receive a structural/dimension probe | only payload-decoded media may be direct; structure-only formats require an explicit transform or remain blocked even when the target names that media type |
-| Vector image | SVG | XML canonicalization; direct when target allows | active/external content is data only and never fetched or executed |
+| Vector image | SVG | bounded XML text canonicalization plus an opaque original | not decoded raster media; rasterization or OCR requires an explicit transform and receipt; active/external content is never fetched or executed |
 | Audio | WAV, AIFF, CAF, FLAC, MP3, Opus/Vorbis/Speex/FLAC-in-Ogg, M4A | WAV receives a complete sample decode and may be direct; the remaining formats receive a container/frame probe | ambiguous Ogg remains generic; the core never transcribes, and structure-only formats need an explicit transform before direct use |
 | Video | MP4, QuickTime, Theora-in-Ogg, Matroska, WebM, AVI | container probe; direct when target allows, otherwise explicit frame/audio DAG | core does not demux, decode frames, or invoke codecs |
 | Executables | common executable signatures | detected and blocked | never canonicalized or offered as opaque content by the default policy |
 | Unknown binary | anything not proven above | explicit opaque or blocked result | policy-controlled; never treated as text or clean content |
 
-RTF is content-first detected, but remains opaque because a maintained,
-bounded safe-Rust canonicalizer has not yet met this repository's bar.
+RTF is projected by `attachment-native-document/src/rtf.rs`. This is a bounded
+text projection, not full RTF layout or object support. Omitted content and
+unsupported or malformed input retain explicit coverage/failure information;
+detection alone never establishes complete canonicalization.
 
 ## Transform-needed formats
 
@@ -47,7 +50,8 @@ video audio extraction, video frame sampling, PDF rasterization, or another
 document extractor. A request is not evidence the transform ran. The embedding
 application must inject an adapter, enforce its limits, and return a receipt.
 
-`speech-native-kit` is the intended local transcription owner. A separate
+The monorepo
+[`crates/services/speech`](../../speech) service is the local transcription owner. A separate
 killable media worker is the intended owner for general video/PDF raster work.
 Remote fallback never happens automatically.
 

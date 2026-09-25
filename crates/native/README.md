@@ -3,12 +3,16 @@
 Reusable, product-neutral Rust crates for loading GGUF models through llama.cpp
 inside the caller's process.
 
-This repository is deliberately **not an application**. Mom Llama was
-history-preservingly extracted to the private
-[`delysis/mom-llama`](https://github.com/delysis/mom-llama) repository. Routing,
-hosted providers, compatibility APIs, loopback listeners, STT and TTS live in
-[`delysis/free-token-energy`](https://github.com/delysis/free-token-energy).
-The old Mom Llama experiment in capability-system-compiler is non-canonical.
+This directory is the product-neutral Native service inside
+[`delysis/native-platform`](../../README.md), not a standalone application.
+[Mom Llama](../../products/mom) and [Loom](../../products/loom) consume Native
+directly. [Free Token Energy](../../products/fte) owns optional provider routing,
+protocol adapters and loopback listeners. Local STT/TTS belongs to the separate
+[Speech service](../services/speech), not to FTE or the Native engine.
+
+The earlier split repositories and capability-system-compiler experiments are
+historical inputs; the root workspace and its lockfile are the source authority.
+
 
 The runtime does not use `llama-server`, `llama-cli`, localhost, HTTP, TCP or
 SSE for inference. It owns only model loading, scheduling, tokenization,
@@ -61,11 +65,12 @@ for the authoritative repository and dependency map.
 
 ## Gates
 
-Run the required local gates:
+Run from the monorepo root (see [CONTRIBUTING.md](../../CONTRIBUTING.md)
+for product selection and platform prerequisites):
 
 ```sh
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-./scripts/check-architecture.sh
+sh crates/native/scripts/check-architecture.sh
 ```
