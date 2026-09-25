@@ -3,6 +3,7 @@ pub mod chat;
 pub mod composer;
 pub mod config;
 pub mod conversation_store;
+pub mod document;
 pub mod engine;
 pub mod kv_cache;
 pub mod mcp;

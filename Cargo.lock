@@ -4084,6 +4084,7 @@ dependencies = [
  "similar",
  "thiserror 2.0.20",
  "unicode-segmentation",
+ "workspace-document",
 ]
 
 [[package]]
@@ -4436,6 +4437,7 @@ dependencies = [
  "sysinfo",
  "tokio",
  "uuid",
+ "workspace-document",
 ]
 
 [[package]]
@@ -8923,6 +8925,15 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "workspace-document"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "writeable"

@@ -13,14 +13,8 @@ pub(crate) const CONVERSATIONS_NAMESPACE: &str = "conversations.v2";
 pub(crate) const DRAFTS_NAMESPACE: &str = "drafts.v2";
 const NEW_CHAT_DRAFT_KEY: &str = "__new_chat__";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageRole {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
+// One role type, with the same serde wire names and public module path.
+pub use workspace_document::MessageRole;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
