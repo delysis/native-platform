@@ -483,11 +483,14 @@ async fn delete_response(
     ))
 }
 
+mod response_cancel;
+
 async fn cancel_response(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let request_id = state
+    // Release the registry mutex before storage I/O or gateway cancellation.
+    let active = state
         .active_responses
         .lock()
         .map_err(|_| {
@@ -498,26 +501,41 @@ async fn cancel_response(
             )
         })?
         .get(&id)
-        .map(|entry| entry.request_id.clone())
-        .or_else(|| {
+        .map(|entry| entry.request_id.clone());
+    let resolution = response_cancel::reconcile(
+        active,
+        || {
             state
                 .store
                 .get(&id)
-                .ok()
-                .flatten()
-                .map(|response| response.request_id)
-        })
-        .ok_or_else(|| {
-            ApiError::simple(
+                .map(|stored| stored.map(|response| (response.request_id, response.status)))
+        },
+        |request_id| state.gateway.cancel(request_id, CancelTarget::Request),
+    )?;
+    let status = match resolution {
+        response_cancel::CancelResolution::Missing => {
+            return Err(ApiError::simple(
                 StatusCode::NOT_FOUND,
                 "response_not_found",
                 "Response not found",
+            ));
+        }
+        response_cancel::CancelResolution::IdentityConflict => {
+            return Err(ApiError::simple(
+                StatusCode::CONFLICT,
+                "response_identity_conflict",
+                "Stored response and active request identities disagree",
+            ));
+        }
+        other => other.status().ok_or_else(|| {
+            ApiError::simple(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response_state_unavailable",
+                "Response state is unavailable",
             )
-        })?;
-    let cancelled = state.gateway.cancel(&request_id, CancelTarget::Request);
-    Ok(Json(
-        json!({"id":id,"object":"response","status":if cancelled > 0 {"cancelling"} else {"completed"}}),
-    ))
+        })?,
+    };
+    Ok(Json(json!({"id":id,"object":"response","status":status})))
 }
 
 async fn anthropic_messages(
