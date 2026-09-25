@@ -474,31 +474,71 @@ pub(super) fn native_media<'a>(
     store: &ProjectStore,
     values: impl IntoIterator<Item = &'a Value>,
 ) -> Result<Vec<llama_native_types::MediaInput>, IpcFailure> {
-    let mut media = Vec::new();
+    let mut media = crate::terminal_media::MediaAccumulator::default();
+    let mut seen_documents = BTreeMap::new();
     for value in values {
         match value {
             Value::Material { material } => {
-                media.extend(materials::native_media(store, &material.material.id)?);
+                // A library/folder reference is never permission to enumerate
+                // all media in that collection, even when it is named directly.
+                if material.material.kind != MaterialKind::Attachment {
+                    continue;
+                }
+                require_current_media_source(store, material)?;
+                let resolved = materials::native_media(store, &material.material.id)?;
+                require_current_media_source(store, material)?;
+                media.extend(resolved)?;
             }
             Value::Documents { documents } => {
                 for document in documents {
-                    media.extend(
-                        crate::context_attachments::resolve_media_for_document(
-                            store.root(),
-                            &document.document_id.to_string(),
-                            &document.text,
-                        )
-                        .map_err(|error| failure(error.to_string()))?,
-                    );
+                    let exact_bytes = store.read_blob(document.blob_id).map_err(IpcFailure::store)?;
+                    if exact_bytes != document.text.as_bytes() {
+                        return Err(failure("Referenced document text does not match its retained source blob."));
+                    }
+                    let identity = (document.revision_id, document.blob_id);
+                    if let Some(previous) = seen_documents.get(&document.document_id) {
+                        if previous != &identity {
+                            return Err(failure("One reference operation contains conflicting revisions of the same document."));
+                        }
+                        continue;
+                    }
+                    let resolved = crate::context_attachments::resolve_media_for_document(
+                        store.root(),
+                        &document.document_id.to_string(),
+                        &document.text,
+                    ).map_err(|error| failure(error.to_string()))?;
+                    media.extend(resolved)?;
+                    seen_documents.insert(document.document_id, identity);
                 }
             }
             Value::Text(_) | Value::Evidence { .. } | Value::Folder { .. } => {}
         }
     }
-    crate::terminal_media::merge(Vec::new(), media)
+    Ok(media.finish())
+}
+
+fn require_current_media_source(
+    store: &ProjectStore,
+    frozen: &MaterialValue,
+) -> Result<(), IpcFailure> {
+    let current = materials::admit(store, &frozen.material.id, 0)?;
+    if current.source_revision != frozen.source_revision
+        || current.material.kind != frozen.material.kind
+        || current.material.attachment_id != frozen.material.attachment_id
+        || current.material.retention != frozen.material.retention
+    {
+        return Err(failure(
+            "The referenced attachment changed after context admission. Run again to use the new source version.",
+        ));
+    }
+    Ok(())
 }
 
 // These integration fixtures require the supported private project store.
 #[cfg(all(test, unix))]
 #[path = "material_context_tests.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "material_media_admission_tests.rs"]
+mod media_admission_tests;
