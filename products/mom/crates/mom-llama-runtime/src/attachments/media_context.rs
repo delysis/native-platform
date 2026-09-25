@@ -2,6 +2,7 @@
 //! with source availability. This is used by the existing chat preparation path.
 
 use super::*;
+use super::bindings::ResolvedAttachmentWithBindings;
 use llama_native_types::media_identity::MediaAdmission;
 
 pub(super) fn resolve_attachment_set(
@@ -10,9 +11,11 @@ pub(super) fn resolve_attachment_set(
     expected_state: AttachmentState,
     records: &HashMap<&str, &AttachmentRecord>,
     resolution: &mut AttachmentResolution<'_>,
-) -> Result<std::result::Result<ResolvedAttachmentSet, AttachmentContextBlocker>> {
+) -> Result<std::result::Result<ResolvedAttachmentWithBindings, AttachmentContextBlocker>> {
     let mut text = Vec::new();
     let mut media = Vec::new();
+    let mut references = Vec::new();
+    let mut sources = Vec::new();
     for id in ids {
         let Some(record) = records.get(id.as_str()).copied() else {
             return Ok(Err(context_blocker(
@@ -73,6 +76,10 @@ pub(super) fn resolve_attachment_set(
             return Ok(Err(context_blocker("attachment_manifest_invalid", problem.message)));
         }
         let canonical = canonical_text(record, &manifest);
+        match AttachmentContextSource::from_verified(record, &manifest, &canonical) {
+            Ok(source) => sources.push(source),
+            Err(blocked) => return Ok(Err(blocked)),
+        }
         let mut has_representation = !canonical.is_empty();
         if !canonical.is_empty() {
             if let Err(blocked) = resolution.budget.reserve_text(canonical.len()) { return Ok(Err(blocked)); }
@@ -113,6 +120,7 @@ pub(super) fn resolve_attachment_set(
             // Even a shared payload remains an available representation for
             // this exact record. Its occurrence stays in message/draft evidence.
             has_representation = true;
+            references.push(AttachmentMediaReference::from_verified(record, artifact, &item));
             if admission == MediaAdmission::NewPayload {
                 // Preserve Mom's stricter 16-object policy, not Loom's 32.
                 if let Err(blocked) = resolution.budget.reserve_media(blob.byte_len) { return Ok(Err(blocked)); }
@@ -126,7 +134,9 @@ pub(super) fn resolve_attachment_set(
             )));
         }
     }
-    Ok(Ok(ResolvedAttachmentSet { text: text.join("\n\n"), media }))
+    Ok(Ok(ResolvedAttachmentWithBindings {
+        context: ResolvedAttachmentSet { text: text.join("\n\n"), media }, references, sources,
+    }))
 }
 
 #[cfg(test)]
@@ -203,4 +213,44 @@ mod tests {
         let blocked = prepare_chat_attachments("chat", &[], None).expect("typed blocker").expect_err("invalid graph");
         assert_eq!(blocked.blocker.code, "attachment_manifest_invalid");
     }
+
+    #[test]
+    fn scoped_preparation_retains_duplicate_payload_source_bindings() {
+        let session = Session::new();
+        let first = session.image();
+        let second = session.image();
+        let scoped = prepare_scoped_chat_attachments("chat", &[], CurrentAttachmentSelection::Draft)
+            .expect("prepare").expect("admitted");
+        assert_eq!(scoped.media.len(), 1);
+        assert_eq!(scoped.current_media.len(), 2);
+        assert_eq!(scoped.current_media[0].attachment_id, first.id);
+        assert_eq!(scoped.current_media[1].attachment_id, second.id);
+        assert_eq!(scoped.current_media[0].sha256, scoped.current_media[1].sha256);
+        assert_ne!(scoped.current_media[0].media_id, scoped.current_media[1].media_id);
+    }
+
+    #[test]
+    fn history_only_preparation_does_not_consume_or_read_the_current_draft() {
+        let session = Session::new();
+        let image = session.image();
+        crate::conversation_store::draft_update(Some("chat"), "unsent private draft".into(), vec![image.id])
+            .expect("draft");
+        let store = RuntimeStore::current().expect("store");
+        let before = store.get_bytes(DRAFTS_NAMESPACE).expect("draft bytes");
+        let scoped = prepare_scoped_chat_attachments("chat", &[], CurrentAttachmentSelection::HistoryOnly)
+            .expect("prepare").expect("history only");
+        assert!(scoped.draft_snapshot.is_none());
+        assert!(scoped.current_media.is_empty() && scoped.media.is_empty() && scoped.staged_ids.is_empty());
+        assert_eq!(store.get_bytes(DRAFTS_NAMESPACE).expect("unchanged draft"), before);
+    }
+
+    #[test]
+    fn an_invented_regeneration_id_cannot_fall_back_to_empty_attachment_context() {
+        let _session = Session::new();
+        let blocked = prepare_scoped_chat_attachments("chat", &[],
+            CurrentAttachmentSelection::ExistingUser("__snapshot__"))
+            .expect("typed result").expect_err("no matching message");
+        assert_eq!(blocked.blocker.code, "attachment_regeneration_message_missing");
+    }
+
 }

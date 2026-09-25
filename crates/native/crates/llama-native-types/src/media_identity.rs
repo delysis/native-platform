@@ -77,39 +77,54 @@ impl MediaIdentityLedger {
     /// Validate every occurrence before sharing its payload. On error none of
     /// the admitted identities or budgets changes; callers abort the request.
     pub fn admit(&mut self, item: &MediaInput) -> Result<MediaAdmission, MediaIdentityError> {
-        if !valid_metadata(&item.id) || !valid_metadata(&item.mime) {
+        self.admit_parts(&item.id, item.kind, &item.mime, &item.sha256, &item.bytes)
+    }
+
+    /// Validate an occurrence against borrowed immutable payload bytes. Context
+    /// slicing can retain a different occurrence ID without cloning a large
+    /// payload merely to verify it. This performs the same full hash and budget
+    /// checks as `admit`; it is not a trusted-digest or cache-hit shortcut.
+    pub fn admit_parts(
+        &mut self,
+        id: &str,
+        kind: MediaKind,
+        mime: &str,
+        sha256: &str,
+        payload: &[u8],
+    ) -> Result<MediaAdmission, MediaIdentityError> {
+        if !valid_metadata(id) || !valid_metadata(mime) {
             return Err(MediaIdentityError::Metadata);
         }
         if self.occurrences >= MAX_MEDIA_OCCURRENCES {
             return Err(MediaIdentityError::OccurrenceLimit);
         }
-        if item.bytes.len() > MAX_MEDIA_BYTES {
+        if payload.len() > MAX_MEDIA_BYTES {
             return Err(MediaIdentityError::ByteLimit);
         }
         let verified_bytes = self
             .verified_bytes
-            .checked_add(u64::try_from(item.bytes.len()).map_err(|_| MediaIdentityError::ByteLimit)?)
+            .checked_add(u64::try_from(payload.len()).map_err(|_| MediaIdentityError::ByteLimit)?)
             .filter(|bytes| *bytes <= MAX_MEDIA_VERIFICATION_BYTES)
             .ok_or(MediaIdentityError::VerificationLimit)?;
         // A duplicate digest claim is not proof of equality. In particular,
         // neither repeated IDs nor an earlier good occurrence skip this hash.
-        if item.sha256.len() != 64
-            || !item.sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            || format!("{:x}", Sha256::digest(&item.bytes)) != item.sha256
+        if sha256.len() != 64
+            || !sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || format!("{:x}", Sha256::digest(payload)) != sha256
         {
             return Err(MediaIdentityError::Digest);
         }
         let identity = Identity {
-            kind: item.kind,
-            digest: item.sha256.clone(),
-            mime: item.mime.clone(),
+            kind,
+            digest: sha256.to_owned(),
+            mime: mime.to_owned(),
         };
-        if self.identities.get(&item.id).is_some_and(|existing| existing != &identity) {
+        if self.identities.get(id).is_some_and(|existing| existing != &identity) {
             return Err(MediaIdentityError::IdentityConflict);
         }
-        let key = (item.kind, item.sha256.clone());
+        let key = (kind, sha256.to_owned());
         let admission = match self.payloads.get(&key) {
-            Some(mime) if mime != &item.mime => return Err(MediaIdentityError::MimeConflict),
+            Some(existing_mime) if existing_mime != mime => return Err(MediaIdentityError::MimeConflict),
             Some(_) => MediaAdmission::DuplicatePayload,
             None => MediaAdmission::NewPayload,
         };
@@ -117,14 +132,14 @@ impl MediaIdentityLedger {
             if self.payloads.len() >= MAX_MEDIA_PAYLOADS {
                 return Err(MediaIdentityError::PayloadLimit);
             }
-            self.bytes.checked_add(item.bytes.len())
+            self.bytes.checked_add(payload.len())
                 .filter(|bytes| *bytes <= MAX_MEDIA_BYTES)
                 .ok_or(MediaIdentityError::ByteLimit)?
         } else {
             self.bytes
         };
-        self.identities.insert(item.id.clone(), identity);
-        self.payloads.entry(key).or_insert_with(|| item.mime.clone());
+        self.identities.insert(id.to_owned(), identity);
+        self.payloads.entry(key).or_insert_with(|| mime.to_owned());
         self.bytes = bytes;
         self.occurrences += 1;
         self.verified_bytes = verified_bytes;
@@ -244,4 +259,20 @@ mod tests {
         assert_eq!(ledger.admit(&item("extra", b"x")), Err(MediaIdentityError::ByteLimit));
         assert_eq!(ledger.payload_count(), 0);
     }
+
+    #[test]
+    fn borrowed_admission_preserves_occurrences_without_copying_payloads() {
+        let value = item("initial", b"retained payload");
+        let mut ledger = MediaIdentityLedger::default();
+        assert_eq!(ledger.admit(&value), Ok(MediaAdmission::NewPayload));
+        assert_eq!(ledger.admit_parts("selected-alias", value.kind, &value.mime,
+            &value.sha256, &value.bytes), Ok(MediaAdmission::DuplicatePayload));
+        assert_eq!(ledger.payload_count(), 1);
+        assert_eq!(ledger.occurrence_count(), 2);
+        let before = counts(&ledger);
+        assert_eq!(ledger.admit_parts("selected-alias", value.kind, &value.mime,
+            &value.sha256, b"changed payload"), Err(MediaIdentityError::Digest));
+        assert_eq!(counts(&ledger), before);
+    }
+
 }
