@@ -117,6 +117,19 @@ run_exact_test() {
   record_check "$package::$test_name"
 }
 
+# Loom's chat mode embeds this same library. Both packages must retain Mom's
+# existing storage, cache and joined-shutdown checks; the launcher owns no tests.
+# Keep PRODUCT_DIR bound to the package being built, not to this dependency.
+run_mom_preservation_checks() {
+  run_exact_test mom-llama-runtime lib unused store::tests::unrelated_files_are_not_store_inputs_or_rewritten
+  run_exact_test mom-llama-runtime lib unused kv_cache::tests::persistent_cache_corruption_invalidates_and_falls_back_after_reopen
+  run_exact_test mom-llama-app lib unused app_runtime::tests::direct_native_operation_drains_before_final_join
+  run pnpm --dir "$ROOT/products/mom/apps/mom-llama" run check:frontend
+  record_check "@delysis/mom-llama::frontend-check"
+  run pnpm --dir "$ROOT/products/mom/apps/mom-llama" run test:frontend
+  record_check "@delysis/mom-llama::frontend-tests"
+}
+
 require_equal() {
   field=$1
   expected=$2
@@ -183,11 +196,10 @@ run pnpm install --frozen-lockfile --offline
 
 case "$COMPONENT" in
   mom)
-    run_exact_test mom-llama-runtime lib unused store::tests::unrelated_files_are_not_store_inputs_or_rewritten
-    run_exact_test mom-llama-runtime lib unused kv_cache::tests::persistent_cache_corruption_invalidates_and_falls_back_after_reopen
-    run_exact_test mom-llama-app bin mom-llama-app app_runtime::tests::direct_native_operation_drains_before_final_join
+    run_mom_preservation_checks
     ;;
   loom)
+    run_mom_preservation_checks
     run_exact_test loom-store lib unused generation::tests::exact_boundary_suggestion_promotion_survives_store_reopen
     run_exact_test tauri-plugin-loom lib unused tests::close_cancels_active_family_waits_for_terminal_release_and_replays
     run pnpm --dir "$PRODUCT_DIR" test

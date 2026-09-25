@@ -1,3 +1,6 @@
+// Included by the existing consolidation policy job; no separate CI lane.
+import './consolidation-release.test.mjs';
+
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
