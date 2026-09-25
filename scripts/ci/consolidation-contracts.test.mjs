@@ -25,7 +25,8 @@ test('one executable selects existing owners without a subprocess shim', () => {
 });
 test('common roles retain the old serde module export and exact message metadata', () => {
   assert.match(read('products/mom/crates/mom-llama-runtime/src/conversation_store.rs'), /pub use workspace_document::MessageRole;/u);
-  const core = read('crates/workspace-document/src/lib.rs');
+  const core = read('crates/workspace-document/src/projection.rs');
+  assert.match(read('crates/workspace-document/src/lib.rs'), /pub use projection::\*;/u);
   assert.match(core, /serde\(rename_all = "snake_case"\)/u);
   assert.match(core, /pub enum MessageRole/u);
   const adapter = read('products/mom/crates/mom-llama-runtime/src/document.rs');

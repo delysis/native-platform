@@ -728,6 +728,8 @@ pub fn chat_dispatch_stream_in_scope<F>(
 where
     F: FnMut(ChatDispatchStreamEvent) -> Result<()>,
 {
+    // Parse before creating/instantiating any conversation or admitting work.
+    let handles = parse_handles(&input.message)?;
     let (_, selected) =
         crate::conversation_store::get_or_create_conversation(&input.conversation_id)?;
     if selected.kind == ConversationKind::PersonaTemplate {
@@ -747,7 +749,6 @@ where
         };
         input.conversation_id = conversation.id;
     }
-    let handles = parse_handles(&input.message);
     let resolution = resolve_targets(&handles, &input.conversation_id)?;
     if let Some(blocker) = ambiguous_resolution_blocker(&resolution) {
         return Ok(CommandResult::blocked(
@@ -3199,7 +3200,7 @@ where
     }
 
     let addressed = append_attachment_context(
-        &strip_handles(&input.message, &targets),
+        &strip_handles(&input.message, &targets)?,
         &attachment_context.current_text,
     );
     let participant_names = targets
@@ -4739,7 +4740,7 @@ fn handoff_messages(
     };
     let final_message = ChatMessage {
         role: ChatRole::User,
-        content: addressed.trim().to_string(),
+        content: addressed.to_string(),
     };
     let mut messages = Vec::new();
     if let Some(system) = system {
@@ -5154,125 +5155,14 @@ fn invocation_state(results: &[MentionTargetResult]) -> MentionInvocationState {
     }
 }
 
-fn parse_handles(message: &str) -> Vec<String> {
-    let mut handles = Vec::new();
-    for token in mention_tokens(message) {
-        let handle = token.handle.to_ascii_lowercase();
-        if !handles.contains(&handle) {
-            handles.push(handle);
-        }
-    }
-    handles
+fn parse_handles(message: &str) -> Result<Vec<String>> {
+    Ok(workspace_document::references::participant_handles(message)?)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MentionToken<'a> {
-    start: usize,
-    end: usize,
-    handle: &'a str,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CodeDelimiter {
-    marker: char,
-    width: usize,
-}
-
-fn mention_tokens(message: &str) -> Vec<MentionToken<'_>> {
-    let chars = message.char_indices().collect::<Vec<_>>();
-    let mut tokens = Vec::new();
-    let mut code_delimiter: Option<CodeDelimiter> = None;
-    let mut index = 0;
-    while index < chars.len() {
-        let character = chars[index].1;
-        if character == '`' || character == '~' {
-            let marker = character;
-            let mut width = 1;
-            while index + width < chars.len() && chars[index + width].1 == marker {
-                width += 1;
-            }
-            match code_delimiter {
-                Some(open) if open.marker == marker && open.width == width => {
-                    code_delimiter = None;
-                }
-                None if marker == '`' || width >= 3 => {
-                    code_delimiter = Some(CodeDelimiter { marker, width });
-                }
-                _ => {}
-            }
-            index += width;
-            continue;
-        }
-        let explicit_boundary = index == 0 || chars[index - 1].1.is_whitespace();
-        if code_delimiter.is_none()
-            && character == '@'
-            && explicit_boundary
-            && !is_indented_code_position(message, chars[index].0)
-        {
-            let start = chars[index].0 + 1;
-            let mut end = start;
-            index += 1;
-            while index < chars.len()
-                && (chars[index].1.is_ascii_alphanumeric() || chars[index].1 == '-')
-            {
-                end = chars[index].0 + chars[index].1.len_utf8();
-                index += 1;
-            }
-            if end > start {
-                tokens.push(MentionToken {
-                    start: start - 1,
-                    end,
-                    handle: &message[start..end],
-                });
-            }
-        } else {
-            index += 1;
-        }
-    }
-    tokens
-}
-
-fn is_indented_code_position(message: &str, byte_index: usize) -> bool {
-    let line_start = message[..byte_index]
-        .rfind('\n')
-        .map_or(0, |position| position + 1);
-    let prefix = &message[line_start..byte_index];
-    prefix.starts_with('\t') || (prefix.len() >= 4 && prefix.bytes().all(|byte| byte == b' '))
-}
-
-fn strip_handles(message: &str, targets: &[ResolvedTarget]) -> String {
-    let target_handles = targets
-        .iter()
-        .map(|target| {
-            target
-                .conversation
-                .execution_profile
-                .mention_handle
-                .to_ascii_lowercase()
-        })
-        .collect::<BTreeSet<_>>();
-    let removals = mention_tokens(message)
-        .into_iter()
-        .filter(|token| target_handles.contains(&token.handle.to_ascii_lowercase()))
-        .map(|token| {
-            let mut end = token.end;
-            for (offset, character) in message[token.end..].char_indices() {
-                if character.is_whitespace() || character.is_ascii_alphanumeric() {
-                    break;
-                }
-                end = token.end + offset + character.len_utf8();
-            }
-            token.start..end
-        })
-        .collect::<Vec<_>>();
-    let mut stripped = String::with_capacity(message.len());
-    let mut cursor = 0;
-    for removal in removals {
-        stripped.push_str(&message[cursor..removal.start]);
-        cursor = removal.end;
-    }
-    stripped.push_str(&message[cursor..]);
-    stripped.split_whitespace().collect::<Vec<_>>().join(" ")
+fn strip_handles(message: &str, _targets: &[ResolvedTarget]) -> Result<String> {
+    // Resolution already admitted every explicit address, including group
+    // aliases. Expanded member handles are not the address spans in the text.
+    Ok(workspace_document::references::remove_participant_addresses(message)?)
 }
 
 fn append_attachment_context(message: &str, attachment_text: &str) -> String {
@@ -6606,7 +6496,8 @@ mod tests {
     #[test]
     fn mention_parser_is_stable_and_deduplicates_handles() {
         assert_eq!(
-            parse_handles("Ask @evidence-lens and @whole-person, then @evidence-lens."),
+            parse_handles("Ask @evidence-lens and @whole-person, then @evidence-lens.")
+                .expect("bounded addresses"),
             vec!["evidence-lens", "whole-person"]
         );
     }
@@ -6614,10 +6505,12 @@ mod tests {
     #[test]
     fn mention_parser_requires_the_explicit_composer_boundary() {
         assert_eq!(
-            parse_handles("@leading then\t@after-tab and\n@after-newline"),
+            parse_handles("@leading then\t@after-tab and\n@after-newline")
+                .expect("bounded addresses"),
             vec!["leading", "after-tab", "after-newline"]
         );
-        assert!(parse_handles("mail@example.com prefix@embedded (@parenthesized)").is_empty());
+        assert!(parse_handles("mail@example.com prefix@embedded (@parenthesized)")
+            .expect("inert text").is_empty());
     }
 
     #[test]
@@ -6626,6 +6519,7 @@ mod tests {
             parse_handles(
                 "`@inline` and ``@wide-inline``\n```text\n@fenced\n```\n~~~\n@tilde-fenced\n~~~\n    @indented"
             )
+            .expect("inert code")
             .is_empty()
         );
     }
