@@ -357,7 +357,7 @@ async fn mom_llama_runtime_initialize(
     }
 }
 
-fn main() {
+pub fn run() {
     if std::env::args().any(|arg| arg == "--dump-html") {
         match view::render_app(&mom_llama_runtime::OperationScope::detached()) {
             Ok(html) => println!("{html}"),

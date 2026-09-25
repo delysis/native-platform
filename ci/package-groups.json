@@ -2,6 +2,7 @@
   "schema_version": 1,
   "primary": {
     "desktop": [
+      "desktop-launch",
       "desktop-model-defaults",
       "workspace-document"
     ],
@@ -81,6 +82,7 @@
       "attachment-native-inspect",
       "attachment-native-plan",
       "attachment-native-types",
+      "desktop-launch",
       "desktop-model-defaults",
       "fte-loopback",
       "fte-protocols",

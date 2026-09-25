@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/desktop-launch",
     "crates/workspace-document",
     "crates/desktop-model-defaults",
     "crates/native/crates/llama-native-cache",
@@ -65,6 +66,7 @@ repository = "https://github.com/delysis/native-platform"
 publish = false
 
 [workspace.dependencies]
+desktop-launch = { path = "crates/desktop-launch" }
 workspace-document = { path = "crates/workspace-document" }
 desktop-model-defaults = { path = "crates/desktop-model-defaults" }
 anyhow = "1.0.100"
