@@ -1325,6 +1325,8 @@ enum AttachmentGcMode {
 struct AttachmentGcState<'a> {
     conversations_to_write: Option<&'a ConversationDb>,
     drafts_to_write: Option<&'a DraftDb>,
+    expected_conversations: Option<&'a ConversationDb>,
+    expected_drafts: Option<&'a DraftDb>,
     effective_conversations: &'a ConversationDb,
     effective_drafts: &'a DraftDb,
     removed_attachment_ids: &'a BTreeSet<String>,
@@ -1532,6 +1534,8 @@ pub(crate) fn persist_drafts_with_attachment_gc(
     persist_state_with_attachment_gc(AttachmentGcState {
         conversations_to_write: None,
         drafts_to_write: Some(drafts),
+        expected_conversations: Some(&conversations),
+        expected_drafts: None,
         effective_conversations: &conversations,
         effective_drafts: drafts,
         removed_attachment_ids,
@@ -1545,10 +1549,16 @@ pub(crate) fn persist_drafts_with_attachment_gc(
 /// replacement lets conversation deletion remove its staged chips atomically.
 pub(crate) fn persist_conversations_with_attachment_gc(
     conversations: &ConversationDb,
+    expected_conversations: &ConversationDb,
     drafts: Option<&DraftDb>,
+    expected_drafts: Option<&DraftDb>,
     removed_attachment_ids: &BTreeSet<String>,
     deleted_conversation_ids: &BTreeSet<String>,
 ) -> Result<PathBuf> {
+    anyhow::ensure!(
+        drafts.is_some() == expected_drafts.is_some(),
+        "draft replacement requires its pre-mutation snapshot"
+    );
     let _lifecycle = lock_attachment_lifecycle()?;
     let current_drafts;
     let effective_drafts = if let Some(drafts) = drafts {
@@ -1560,6 +1570,8 @@ pub(crate) fn persist_conversations_with_attachment_gc(
     persist_state_with_attachment_gc(AttachmentGcState {
         conversations_to_write: Some(conversations),
         drafts_to_write: drafts,
+        expected_conversations: Some(expected_conversations),
+        expected_drafts: Some(expected_drafts.unwrap_or(effective_drafts)),
         effective_conversations: conversations,
         effective_drafts,
         removed_attachment_ids,
@@ -1581,6 +1593,22 @@ fn persist_state_with_attachment_gc(state: AttachmentGcState<'_>) -> Result<Path
         ATTACHMENTS_NAMESPACE,
         || attachment_snapshot,
         |attachment_db: &mut AttachmentDb, documents| {
+            if let Some(expected) = state.expected_conversations
+                && documents
+                    .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?
+                    .unwrap_or_default()
+                    != *expected
+            {
+                anyhow::bail!("conversation state changed before attachment GC commit");
+            }
+            if let Some(expected) = state.expected_drafts
+                && documents
+                    .get::<DraftDb>(DRAFTS_NAMESPACE)?
+                    .unwrap_or_default()
+                    != *expected
+            {
+                anyhow::bail!("draft state changed before attachment GC commit");
+            }
             let mut removed_manifests = BTreeSet::new();
             let mut removed_objects = BTreeSet::new();
             let mut retained = Vec::with_capacity(attachment_db.attachments.len());
@@ -4413,6 +4441,51 @@ mod tests {
             store
                 .get::<serde_json::Value>("test.consult-input-receipt")
                 .expect("read retained input evidence")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stale_source_deletion_cannot_erase_a_committed_consultation() {
+        let _session = TestDataDir::new("consult-stale-source-deletion");
+        let source = new_conversation("Source");
+        let attachment = stage_text(&source.id, "exact source text");
+        let source = send_staged_attachment(&source.id);
+        let selected = selected_source(&source, &attachment.id);
+        let host = new_conversation("Host");
+        let host_id = host.id.clone();
+        let expected = load_db().expect("read state before source deletion");
+        let mut stale_deletion = expected.clone();
+        stale_deletion
+            .conversations
+            .retain(|conversation| conversation.id != source.id);
+        let removed_ids = BTreeSet::from([attachment.id.clone()]);
+
+        commit_host_with_selected_source(host, &selected, &[], None)
+            .expect("consultation commits before the stale deletion reaches storage");
+        let error = persist_conversations_with_attachment_gc(
+            &stale_deletion,
+            &expected,
+            None,
+            None,
+            &removed_ids,
+            &BTreeSet::from([source.id.clone()]),
+        )
+        .expect_err("stale deletion must not overwrite the committed consultation");
+        assert!(error.to_string().contains("conversation state changed"));
+        assert_eq!(
+            crate::conversation_store::conversation_select(&host_id)
+                .expect("read committed host")
+                .result
+                .expect("host conversation")
+                .messages
+                .len(),
+            1
+        );
+        assert!(
+            crate::conversation_store::conversation_select(&source.id)
+                .expect("read retained source")
+                .result
                 .is_some()
         );
     }

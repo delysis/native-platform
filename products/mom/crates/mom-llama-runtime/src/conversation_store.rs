@@ -473,6 +473,7 @@ pub fn conversation_system_message_update(
 
 pub fn conversation_delete(id: &str) -> Result<CommandResult<ConversationMutation>> {
     let mut db = load_db()?;
+    let expected_db = db.clone();
     let Some(index) = db
         .conversations
         .iter()
@@ -487,6 +488,7 @@ pub fn conversation_delete(id: &str) -> Result<CommandResult<ConversationMutatio
         .flat_map(|message| message.attachment_ids.iter().cloned())
         .collect::<BTreeSet<_>>();
     let mut drafts = load_drafts()?;
+    let expected_drafts = drafts.clone();
     drafts.drafts.retain(|draft| {
         if draft.conversation_id.as_deref() == Some(id) {
             removed_attachment_ids.extend(draft.attachment_ids.iter().cloned());
@@ -503,7 +505,9 @@ pub fn conversation_delete(id: &str) -> Result<CommandResult<ConversationMutatio
     }
     let path = crate::attachments::persist_conversations_with_attachment_gc(
         &db,
+        &expected_db,
         Some(&drafts),
+        Some(&expected_drafts),
         &removed_attachment_ids,
         &BTreeSet::from([id.to_string()]),
     )?;
@@ -698,6 +702,7 @@ pub fn message_delete(
     message_id: &str,
 ) -> Result<CommandResult<ConversationMutation>> {
     let mut db = load_db()?;
+    let expected_db = db.clone();
     let Some(conversation) = db
         .conversations
         .iter_mut()
@@ -762,6 +767,8 @@ pub fn message_delete(
     }
     let path = crate::attachments::persist_conversations_with_attachment_gc(
         &db,
+        &expected_db,
+        None,
         None,
         &removed_attachment_ids,
         &BTreeSet::new(),
