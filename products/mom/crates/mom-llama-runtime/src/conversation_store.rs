@@ -13,6 +13,10 @@ pub(crate) const CONVERSATIONS_NAMESPACE: &str = "conversations.v2";
 pub(crate) const DRAFTS_NAMESPACE: &str = "drafts.v2";
 const NEW_CHAT_DRAFT_KEY: &str = "__new_chat__";
 
+pub(crate) fn valid_occurrence_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+}
+
 // One role type, with the same serde wire names and public module path.
 pub use workspace_document::MessageRole;
 
@@ -1402,6 +1406,9 @@ pub fn save_db(db: &ConversationDb) -> Result<PathBuf> {
 }
 
 pub fn get_or_create_conversation(id: &str) -> Result<(ConversationDb, Conversation)> {
+    if !valid_occurrence_id(id) {
+        anyhow::bail!("invalid conversation occurrence identity");
+    }
     let imported = load_db()?;
     let initially_present = imported
         .conversations

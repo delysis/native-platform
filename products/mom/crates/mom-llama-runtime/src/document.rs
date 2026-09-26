@@ -2,7 +2,7 @@
 //! This is NOT a store codec, chat template, authorization grant or migration.
 //! Full typed Message metadata remains available; display never invents roles.
 
-use crate::conversation_store::{Conversation, Message};
+use crate::conversation_store::{Conversation, Message, valid_occurrence_id};
 use workspace_document::{
     BranchIndex, Document, DocumentError, HistoryError, HistoryNode, MAX_DOCUMENT_BYTES, PartKind,
 };
@@ -21,17 +21,18 @@ impl HistoryNode for Message {
 /// selected head, duplicate IDs, missing ancestry or cycles by guessing a path.
 /// The shared index validates unselected branches as well as the selected one.
 /// Valid inputs retain the existing role-filtered sibling ordering and fields.
-fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
-}
-
 fn checked_index(conversation: &Conversation) -> Result<BranchIndex<'_, Message>, HistoryError> {
-    if !valid_id(&conversation.id) {
+    if !valid_occurrence_id(&conversation.id) {
         return Err(HistoryError::InvalidIdentity);
     }
     let mut bytes = 0_usize;
     for message in &conversation.messages {
-        if !valid_id(&message.id) || message.parent_id.as_deref().is_some_and(|id| !valid_id(id)) {
+        if !valid_occurrence_id(&message.id)
+            || message
+                .parent_id
+                .as_deref()
+                .is_some_and(|id| !valid_occurrence_id(id))
+        {
             return Err(HistoryError::InvalidIdentity);
         }
         if message.conversation_id != conversation.id {
@@ -48,7 +49,7 @@ fn checked_index(conversation: &Conversation) -> Result<BranchIndex<'_, Message>
     if conversation
         .active_leaf_message_id
         .as_deref()
-        .is_some_and(|id| !valid_id(id))
+        .is_some_and(|id| !valid_occurrence_id(id))
     {
         return Err(HistoryError::InvalidIdentity);
     }

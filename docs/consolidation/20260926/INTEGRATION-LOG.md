@@ -24,8 +24,9 @@ implementation source. None of those inputs grants merge or release authority.
 - Use the supplied checked-history adapter's applicable checks: reject invalid
   occurrence IDs, foreign conversation ownership and excessive retained text
   before selecting even an otherwise valid branch. Check unselected branches
-  too, for direct chat and consultation. Keep the published typed history API
-  and exact message metadata.
+  too, for direct chat and consultation. Reject an invalid new chat ID before
+  it can create a stored conversation. Keep the published typed history API and
+  exact message metadata.
 
 ## Remaining product gaps
 
