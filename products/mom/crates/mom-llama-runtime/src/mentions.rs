@@ -1,7 +1,6 @@
-use crate::attachments::{commit_generated_exchange_with_journal, prepare_chat_attachments};
+use crate::attachments::commit_generated_exchange_with_journal;
 mod execution;
 mod handoff;
-use handoff::handoff_messages;
 use crate::attachments::{CurrentAttachmentSelection, prepare_scoped_chat_attachments};
 use crate::chat::{
     ChatSendInput, ChatSendOptions, ChatSendOutput, ChatStreamEvent, native_context_messages,
@@ -10,7 +9,7 @@ use crate::config::{Settings, resolve_settings};
 use crate::conversation_store::{
     CONVERSATIONS_NAMESPACE, Conversation, ConversationDb, ConversationExecutionProfile,
     ConversationKind, Message, MessageAttribution, MessageRole, MessageSpeakerKind, active_leaf_id,
-    active_path_messages, load_db, strip_reserved_attribution_prefix, upsert_conversation,
+    load_db, strip_reserved_attribution_prefix, upsert_conversation,
 };
 use crate::kv_cache::ensure_persona_prefix;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -37,6 +36,7 @@ use crate::tool_loop::{ToolPermissionPolicy, tool_permission_policy, validate_to
 use anyhow::{Result, anyhow};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use fs2::FileExt;
+use handoff::handoff_messages;
 use llama_native_engine::{ControlledGenerationSubmission, NativeModelHandle};
 use llama_native_types::{
     BranchRequest, ChatMessage, ChatRole, ChatTemplateChoice, ConstraintArtifactReference,
@@ -3017,17 +3017,20 @@ where
         ));
     };
     let host_snapshot = crate::document::checked_active_messages(&db.conversations[host_index])?;
-    let attachment_context =
-        match prepare_scoped_chat_attachments(&input.conversation_id, &host_snapshot, CurrentAttachmentSelection::Draft)? {
-            Ok(context) => context,
-            Err(blocked) => {
-                return Ok(CommandResult::blocked(
-                    "mom_llama.chat_dispatch",
-                    &blocked.readiness,
-                    blocked.blocker,
-                ));
-            }
-        };
+    let attachment_context = match prepare_scoped_chat_attachments(
+        &input.conversation_id,
+        &host_snapshot,
+        CurrentAttachmentSelection::Draft,
+    )? {
+        Ok(context) => context,
+        Err(blocked) => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.chat_dispatch",
+                &blocked.readiness,
+                blocked.blocker,
+            ));
+        }
+    };
     if attachment_context
         .draft_snapshot
         .as_ref()
@@ -3276,18 +3279,29 @@ where
                 continue;
             }
         };
-        let cache_use = if handoff.media.is_empty() { match snapshot.profile.chat_template {
-            crate::conversation_store::ChatTemplatePolicy::ModelDefault => ensure_persona_prefix(
-                &handle,
-                &cache_owner(snapshot),
-                &format!("Invited context for @{}", snapshot.handle),
-                &handoff.stable_prefix,
-                &handoff.messages,
-            )?,
-            crate::conversation_store::ChatTemplatePolicy::FrozenSource(_) => None,
-        } } else { None };
-        handoff::retain_input_receipt(&settings.data_dir, &invocation_id,
-            &input.conversation_id, &user_message_id, &handoff.receipt)?;
+        let cache_use = if handoff.media.is_empty() {
+            match snapshot.profile.chat_template {
+                crate::conversation_store::ChatTemplatePolicy::ModelDefault => {
+                    ensure_persona_prefix(
+                        &handle,
+                        &cache_owner(snapshot),
+                        &format!("Invited context for @{}", snapshot.handle),
+                        &handoff.stable_prefix,
+                        &handoff.messages,
+                    )?
+                }
+                crate::conversation_store::ChatTemplatePolicy::FrozenSource(_) => None,
+            }
+        } else {
+            None
+        };
+        handoff::retain_input_receipt(
+            &settings.data_dir,
+            &invocation_id,
+            &input.conversation_id,
+            &user_message_id,
+            &handoff.receipt,
+        )?;
         planned.push(PlannedTarget {
             snapshot: snapshot.clone(),
             model_path: model_path.to_path_buf(),
@@ -3304,8 +3318,8 @@ where
     }
 
     let mut pending_continuations = Vec::new();
-    let completions = execution::execute_groups(scope, &invocation_id, planned,
-        &settings, options, on_event)?;
+    let completions =
+        execution::execute_groups(scope, &invocation_id, planned, &settings, options, on_event)?;
     for (outcome, targets) in completions {
         match outcome {
             Ok(outputs) => {
@@ -3362,8 +3376,11 @@ where
                         } else {
                             (output, Vec::new())
                         };
-                        let cancelled = execution::terminal_cancelled(scope, &invocation_id,
-                            &target.snapshot.target_id)?;
+                        let cancelled = execution::terminal_cancelled(
+                            scope,
+                            &invocation_id,
+                            &target.snapshot.target_id,
+                        )?;
                         let cache_reused = execution::cache_was_reused(&output.metrics.cache);
                         // Retained native output remains immutable; cancellation only
                         // removes its authority to become a new conversation message.
@@ -3371,8 +3388,16 @@ where
                             target_id: target.snapshot.target_id.clone(),
                             handle: target.snapshot.handle.clone(),
                             label: target.snapshot.label.clone(),
-                            state: if cancelled { GenerationState::Cancelled } else { output.state },
-                            text: if cancelled { String::new() } else { strip_reserved_attribution_prefix(&output.text) },
+                            state: if cancelled {
+                                GenerationState::Cancelled
+                            } else {
+                                output.state
+                            },
+                            text: if cancelled {
+                                String::new()
+                            } else {
+                                strip_reserved_attribution_prefix(&output.text)
+                            },
                             model_id: output.model_id,
                             message_id: None,
                             metrics: output.metrics,
@@ -3391,7 +3416,9 @@ where
                         &target.snapshot,
                         if error.code == llama_native_types::NativeErrorCode::Cancelled {
                             GenerationState::Cancelled
-                        } else { GenerationState::Failed },
+                        } else {
+                            GenerationState::Failed
+                        },
                         &error.message,
                     ));
                 }
@@ -3424,10 +3451,14 @@ where
             && !continuation.provisional_output.fake_fixture
             && continuation.provisional_output.state == GenerationState::Completed
     });
-    let real_engine_invoked = invocation.results.iter()
+    let real_engine_invoked = invocation
+        .results
+        .iter()
         .any(|result| result.real_engine_invoked && !result.fake_fixture)
-        || pending_continuations.iter().any(|continuation|
-            continuation.provisional_output.real_engine_invoked && !continuation.provisional_output.fake_fixture);
+        || pending_continuations.iter().any(|continuation| {
+            continuation.provisional_output.real_engine_invoked
+                && !continuation.provisional_output.fake_fixture
+        });
     if !has_completed_response {
         save_invocation(&invocation)?;
         return Ok(CommandResult::blocked_with_evidence(
@@ -3748,13 +3779,6 @@ fn snapshot_target(target: &ResolvedTarget) -> Result<MentionTargetSnapshot> {
         source_messages,
         snapshot_sha256: format!("{:x}", Sha256::digest(encoded)),
     })
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct HandoffMessages {
-    stable_prefix: Vec<ChatMessage>,
-    messages: Vec<ChatMessage>,
 }
 
 fn resolve_mention_tools(
@@ -4480,53 +4504,6 @@ fn authorize_bound_tool<'a>(
     }
 }
 
-// Retain the existing small fitter only as a regression fixture. Production
-// admission uses whole Message units through workspace_document::context.
-#[cfg(test)]
-fn fit_handoff_to_context(
-    mut messages: Vec<ChatMessage>,
-    boundary: &ChatMessage,
-    output_reserve: usize,
-    context_tokens: usize,
-    mut token_count: impl FnMut(&[ChatMessage]) -> std::result::Result<usize, Blocker>,
-) -> std::result::Result<HandoffMessages, Blocker> {
-    loop {
-        let tokens = token_count(&messages)?;
-        if tokens.saturating_add(output_reserve) <= context_tokens {
-            let boundary_index = messages
-                .iter()
-                .position(|message| message == boundary)
-                .unwrap_or_default();
-            return Ok(HandoffMessages {
-                stable_prefix: messages[..boundary_index].to_vec(),
-                messages,
-            });
-        }
-        let boundary_index = messages
-            .iter()
-            .position(|message| message == boundary)
-            .unwrap_or_default();
-        if messages.len() > boundary_index + 2 {
-            messages.remove(boundary_index + 1);
-            continue;
-        }
-        let first_non_system = usize::from(
-            messages
-                .first()
-                .is_some_and(|message| message.role == ChatRole::System),
-        );
-        if boundary_index > first_non_system {
-            messages.remove(first_non_system);
-            continue;
-        }
-        return Err(Blocker::new(
-            "mention_context_too_large",
-            "The persona instructions and addressed message do not fit the target model context.",
-            vec!["Reduce the persona system message or output-token setting.".to_string()],
-        ));
-    }
-}
-
 fn profile_chat_template(profile: &ConversationExecutionProfile) -> ChatTemplateChoice {
     match &profile.chat_template {
         crate::conversation_store::ChatTemplatePolicy::ModelDefault => {
@@ -4799,7 +4776,9 @@ fn invocation_state(results: &[MentionTargetResult]) -> MentionInvocationState {
 }
 
 fn parse_handles(message: &str) -> Result<Vec<String>> {
-    Ok(workspace_document::references::participant_handles(message)?)
+    Ok(workspace_document::references::participant_handles(
+        message,
+    )?)
 }
 
 fn strip_handles(message: &str, _targets: &[ResolvedTarget]) -> Result<String> {
@@ -4857,8 +4836,8 @@ mod tests {
         MentionToolApproval, MentionToolApprovalDecision, MentionToolApprovalResolution,
         MentionToolApprovalState, PersonaToolCallIdentity, PersonaToolDecision,
         StoredMentionInvocation, active_approval_index, ambiguous_resolution_blocker,
-        authorize_bound_tool, finish_stored_mention_invocation, fit_handoff_to_context,
-        mention_tool_instructions, mention_tool_manifest, parse_handles, persona_tool_call_sha256,
+        authorize_bound_tool, finish_stored_mention_invocation, mention_tool_instructions,
+        mention_tool_manifest, parse_handles, persona_tool_call_sha256,
         persona_tool_decision_schema, reconcile_stored_persona_tool_approvals,
         resolve_targets_from_registry, sha256_json_value, unknown_persona_tool_effect_receipt,
         unregister_exact_mentions, validate_resolved_mention_tools,
@@ -4879,8 +4858,8 @@ mod tests {
     use crate::store::RuntimeStore;
     use crate::tool_loop::ToolPermissionPolicy;
     use llama_native_types::{
-        ChatMessage, ChatRole, ChatTemplateChoice, GenerationMetrics, GenerationOutput,
-        GenerationState, ModelFingerprint, NativeModelConfig, NativeTransport, SamplingConfig,
+        ChatTemplateChoice, GenerationMetrics, GenerationOutput, GenerationState, ModelFingerprint,
+        NativeModelConfig, NativeTransport, SamplingConfig,
     };
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet};
@@ -4892,13 +4871,6 @@ mod tests {
     impl Drop for RemoveTestDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn handoff_message(role: ChatRole, content: &str) -> ChatMessage {
-        ChatMessage {
-            role,
-            content: content.to_string(),
         }
     }
 
@@ -6152,8 +6124,11 @@ mod tests {
                 .expect("bounded addresses"),
             vec!["leading", "after-tab", "after-newline"]
         );
-        assert!(parse_handles("mail@example.com prefix@embedded (@parenthesized)")
-            .expect("inert text").is_empty());
+        assert!(
+            parse_handles("mail@example.com prefix@embedded (@parenthesized)")
+                .expect("inert text")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -6411,40 +6386,5 @@ mod tests {
                 .code,
             "mention_tool_manifest_too_large"
         );
-    }
-
-    #[test]
-    fn context_trimming_removes_whole_messages_and_never_drops_the_addressed_message() {
-        let boundary = handoff_message(ChatRole::System, "invitation-boundary");
-        let final_message = handoff_message(ChatRole::User, "mandatory-addressed-message");
-        let messages = vec![
-            handoff_message(ChatRole::System, "persona-system"),
-            handoff_message(ChatRole::User, "older-source"),
-            handoff_message(ChatRole::Assistant, "newer-source"),
-            boundary.clone(),
-            handoff_message(ChatRole::User, "older-host"),
-            handoff_message(ChatRole::Assistant, "newer-host"),
-            final_message.clone(),
-        ];
-        let fitted = fit_handoff_to_context(messages.clone(), &boundary, 2, 5, |candidate| {
-            Ok(candidate.len())
-        })
-        .expect("the mandatory handoff should fit after whole-message trimming");
-        assert_eq!(
-            fitted.messages,
-            vec![messages[0].clone(), boundary.clone(), final_message.clone()],
-            "host context is trimmed before source context and no message is split"
-        );
-        assert_eq!(fitted.messages.last(), Some(&final_message));
-
-        let blocker = fit_handoff_to_context(
-            vec![messages[0].clone(), boundary.clone(), final_message.clone()],
-            &boundary,
-            2,
-            4,
-            |candidate| Ok(candidate.len()),
-        )
-        .expect_err("mandatory system, boundary, addressed message, and reserve cannot be trimmed");
-        assert_eq!(blocker.code, "mention_context_too_large");
     }
 }

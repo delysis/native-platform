@@ -12,9 +12,9 @@
 mod grammar;
 
 pub use grammar::{
-    DocumentReference, MAX_NEURAL_COMMAND_BYTES, MAX_NEURAL_DEPTH,
-    MAX_NEURAL_DOCUMENT_BYTES, MAX_NEURAL_NODES, NeuralCommand, NeuralExpression,
-    NeuralSyntaxError, document_references, parse_neural_command,
+    DocumentReference, MAX_NEURAL_COMMAND_BYTES, MAX_NEURAL_DEPTH, MAX_NEURAL_DOCUMENT_BYTES,
+    MAX_NEURAL_NODES, NeuralCommand, NeuralExpression, NeuralSyntaxError, document_references,
+    parse_neural_command,
 };
 
 /// Bounded, ordered, case-insensitively deduplicated participant addresses.
@@ -60,7 +60,9 @@ fn participant_references(source: &str) -> Result<Vec<DocumentReference>, Neural
         .filter(|reference| {
             // A retained identity link starts with `[`, not `@`. The label is
             // presentation and cannot be rebound to an executable participant.
-            !guarded.iter().any(|range| range.contains(&reference.range.start))
+            !guarded
+                .iter()
+                .any(|range| range.contains(&reference.range.start))
                 && source.as_bytes().get(reference.range.start) == Some(&b'@')
                 && (reference.range.start == 0
                     || source[..reference.range.start]
@@ -157,8 +159,12 @@ mod tests {
             participant_handles(input).expect("bounded input"),
             ["leading", "after-tab", "after-newline"]
         );
-        assert!(document_references(input).expect("context").iter()
-            .any(|reference| reference.name == "passive"));
+        assert!(
+            document_references(input)
+                .expect("context")
+                .iter()
+                .any(|reference| reference.name == "passive")
+        );
     }
 
     #[test]
@@ -168,7 +174,10 @@ mod tests {
             remove_participant_addresses(input).expect("exact removal"),
             "  café\r\n  question, !\n\t`@expert`\n> @expert\n"
         );
-        assert_eq!(participant_handles(input).expect("addresses"), ["consult-group", "expert"]);
+        assert_eq!(
+            participant_handles(input).expect("addresses"),
+            ["consult-group", "expert"]
+        );
     }
 
     #[test]
@@ -178,17 +187,24 @@ mod tests {
                 .expect("complete names"),
             ["whole-person", "expert/notes.md", "expert"]
         );
-        assert_eq!(remove_participant_addresses("@\"whole-person\"\r\n  q")
-            .expect("quoted address"), "\r\n  q");
+        assert_eq!(
+            remove_participant_addresses("@\"whole-person\"\r\n  q").expect("quoted address"),
+            "\r\n  q"
+        );
     }
 
     #[test]
     fn retained_context_identity_never_invokes_its_label() {
         let link = format!("[@expert](loom-material:material-{})", "a".repeat(64));
         assert!(participant_handles(&link).expect("context link").is_empty());
-        assert_eq!(remove_participant_addresses(&link).expect("no invitation"), link);
-        assert_eq!(document_references(&link).expect("retained identity")[0].name,
-            format!("material-{}", "a".repeat(64)));
+        assert_eq!(
+            remove_participant_addresses(&link).expect("no invitation"),
+            link
+        );
+        assert_eq!(
+            document_references(&link).expect("retained identity")[0].name,
+            format!("material-{}", "a".repeat(64))
+        );
     }
 
     #[test]
@@ -199,26 +215,43 @@ mod tests {
 
     #[test]
     fn invocation_never_expands_through_an_unclosed_or_inline_code_region() {
-        for text in ["` unmatched @expert", "prefix ~~~ @expert ~~~", "`` @expert `"] {
+        for text in [
+            "` unmatched @expert",
+            "prefix ~~~ @expert ~~~",
+            "`` @expert `",
+        ] {
             assert!(participant_handles(text).expect("inert code").is_empty());
-            assert_eq!(remove_participant_addresses(text).expect("inert bytes"), text);
+            assert_eq!(
+                remove_participant_addresses(text).expect("inert bytes"),
+                text
+            );
         }
-        assert_eq!(participant_handles("prefix ~~~ @hidden ~~~ @visible").expect("closed region"),
-            ["visible"]);
+        assert_eq!(
+            participant_handles("prefix ~~~ @hidden ~~~ @visible").expect("closed region"),
+            ["visible"]
+        );
     }
 
     #[test]
     fn framed_prompt_budget_counts_every_separator_and_decimal_heading() {
         let overhead = "\nOutput:\n".len();
         let exact = "x".repeat(MAX_NEURAL_DOCUMENT_BYTES - overhead);
-        assert_eq!(render_base_function_prompt(&exact, &[]).expect("exact ceiling").len(),
-            MAX_NEURAL_DOCUMENT_BYTES);
+        assert_eq!(
+            render_base_function_prompt(&exact, &[])
+                .expect("exact ceiling")
+                .len(),
+            MAX_NEURAL_DOCUMENT_BYTES
+        );
         assert!(render_base_function_prompt(&(exact + "x"), &[]).is_err());
         let inputs = vec!["café\r\n"; 12];
         let small = render_base_function_prompt("f", &inputs).expect("small framing");
         let function = "f".repeat(MAX_NEURAL_DOCUMENT_BYTES - small.len() + 1);
-        assert_eq!(render_base_function_prompt(&function, &inputs).expect("numbered framing").len(),
-            MAX_NEURAL_DOCUMENT_BYTES);
+        assert_eq!(
+            render_base_function_prompt(&function, &inputs)
+                .expect("numbered framing")
+                .len(),
+            MAX_NEURAL_DOCUMENT_BYTES
+        );
         assert!(render_base_function_prompt(&(function + "x"), &inputs).is_err());
     }
 }

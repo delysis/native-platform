@@ -924,7 +924,11 @@ fn attachment_bytes(attachment_id: &str) -> Result<Option<Vec<u8>>> {
 
 mod bindings;
 mod scoped_context;
-pub(crate) use bindings::{AttachmentMediaReference, AttachmentContextSource, SelectedAttachmentSource, SelectedAttachmentMedia, SelectedMediaBuilder, native_media_id, validate_selected_attachment_budget};
+pub(crate) use bindings::{
+    AttachmentContextSource, AttachmentMediaReference, SelectedAttachmentMedia,
+    SelectedAttachmentSource, SelectedMediaBuilder, native_media_id,
+    validate_selected_attachment_budget,
+};
 pub(crate) use scoped_context::{
     CurrentAttachmentSelection, ScopedChatAttachmentContext, prepare_scoped_chat_attachments,
 };
@@ -3493,6 +3497,8 @@ mod tests {
             .expect("commit source fixture");
 
         let mut messages = vec![message("snapshot-message", vec![source.id.clone()])];
+        // Production forks remap message ownership before snapshotting.
+        messages[0].conversation_id = "persona".to_string();
         snapshot_message_attachments("persona", &mut messages).expect("snapshot attachment");
         let snapshot_id = messages[0].attachment_ids[0].clone();
         assert_ne!(snapshot_id, source.id);
@@ -3526,6 +3532,16 @@ mod tests {
                 .text_by_message_id
                 .get("snapshot-message")
                 .is_some_and(|text| text.contains("stable source notes"))
+        );
+
+        let mut foreign = messages.clone();
+        foreign[0].conversation_id = "source".to_string();
+        let blocked = prepare_chat_attachments("persona", &foreign, Some("__snapshot__"))
+            .expect("ownership check")
+            .expect_err("a foreign message cannot borrow the snapshot");
+        assert_eq!(
+            blocked.blocker.code,
+            "attachment_message_ownership_mismatch"
         );
     }
 

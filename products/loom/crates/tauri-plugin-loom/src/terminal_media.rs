@@ -5,9 +5,9 @@
 use std::collections::HashSet;
 
 use llama_native_types::MediaInput;
-use llama_native_types::media_identity::{MediaAdmission, MediaIdentityLedger};
 #[cfg(test)]
 use llama_native_types::MediaKind;
+use llama_native_types::media_identity::{MediaAdmission, MediaIdentityLedger};
 use loom_store::{LoadedDocument, ProjectStore};
 #[cfg(test)]
 use sha2::{Digest as _, Sha256};
@@ -15,7 +15,6 @@ use sha2::{Digest as _, Sha256};
 use super::IpcFailure;
 use super::context_attachments::resolve_media_for_document;
 use super::document_bindings::ResolvedDocument;
-
 
 /// The sole ordered media admission/budget implementation for source documents,
 /// references and terminal/context composition. Payload sharing never changes
@@ -39,7 +38,11 @@ impl MediaAccumulator {
 
     fn push(&mut self, item: MediaInput) -> Result<(), IpcFailure> {
         let admission = self.identities.admit(&item).map_err(|error| {
-            if error.is_limit() { limit() } else { invalid(&error.to_string()) }
+            if error.is_limit() {
+                limit()
+            } else {
+                invalid(&error.to_string())
+            }
         })?;
         if admission == MediaAdmission::NewPayload {
             self.items.push(item);
@@ -110,8 +113,11 @@ mod admission_tests {
 
     fn item(id: &str, bytes: &[u8]) -> MediaInput {
         MediaInput {
-            id: id.into(), kind: MediaKind::Audio, mime: "audio/wav".into(),
-            sha256: format!("{:x}", Sha256::digest(bytes)), bytes: bytes.to_vec(),
+            id: id.into(),
+            kind: MediaKind::Audio,
+            mime: "audio/wav".into(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            bytes: bytes.to_vec(),
         }
     }
 
@@ -120,7 +126,10 @@ mod admission_tests {
         let first = item("first", b"one");
         let second = item("second", b"two");
         let duplicate = item("another-occurrence", b"one");
-        assert_eq!(merge(vec![first.clone()], vec![second.clone(), duplicate]).unwrap(), vec![first, second]);
+        assert_eq!(
+            merge(vec![first.clone()], vec![second.clone(), duplicate]).unwrap(),
+            vec![first, second]
+        );
     }
 
     #[test]
@@ -158,8 +167,12 @@ mod admission_tests {
 
     #[test]
     fn count_limit_applies_across_independently_resolved_documents() {
-        let first = (0_u8..16).map(|index| item(&index.to_string(), &[index])).collect();
-        let second = (16_u8..33).map(|index| item(&index.to_string(), &[index])).collect();
+        let first = (0_u8..16)
+            .map(|index| item(&index.to_string(), &[index]))
+            .collect();
+        let second = (16_u8..33)
+            .map(|index| item(&index.to_string(), &[index]))
+            .collect();
         assert!(merge(first, second).is_err());
     }
 

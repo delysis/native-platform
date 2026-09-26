@@ -131,6 +131,12 @@ impl<'a, Node: HistoryNode> BranchIndex<'a, Node> {
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum HistoryError {
+    #[error("document history contains an invalid occurrence identity")]
+    InvalidIdentity,
+    #[error("document history contains an occurrence owned by another document")]
+    OwnershipMismatch,
+    #[error("document history text and reasoning exceed the byte budget")]
+    ByteBudget,
     #[error("document history exceeds the 65536 node budget")]
     NodeBudget,
     #[error("document history contains duplicate occurrence IDs")]

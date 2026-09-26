@@ -491,14 +491,20 @@ pub(super) fn native_media<'a>(
             }
             Value::Documents { documents } => {
                 for document in documents {
-                    let exact_bytes = store.read_blob(document.blob_id).map_err(IpcFailure::store)?;
+                    let exact_bytes = store
+                        .read_blob(document.blob_id)
+                        .map_err(IpcFailure::store)?;
                     if exact_bytes != document.text.as_bytes() {
-                        return Err(failure("Referenced document text does not match its retained source blob."));
+                        return Err(failure(
+                            "Referenced document text does not match its retained source blob.",
+                        ));
                     }
                     let identity = (document.revision_id, document.blob_id);
                     if let Some(previous) = seen_documents.get(&document.document_id) {
                         if previous != &identity {
-                            return Err(failure("One reference operation contains conflicting revisions of the same document."));
+                            return Err(failure(
+                                "One reference operation contains conflicting revisions of the same document.",
+                            ));
                         }
                         continue;
                     }
@@ -506,7 +512,8 @@ pub(super) fn native_media<'a>(
                         store.root(),
                         &document.document_id.to_string(),
                         &document.text,
-                    ).map_err(|error| failure(error.to_string()))?;
+                    )
+                    .map_err(|error| failure(error.to_string()))?;
                     media.extend(resolved)?;
                     seen_documents.insert(document.document_id, identity);
                 }

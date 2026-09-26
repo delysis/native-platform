@@ -109,7 +109,9 @@ impl MediaIdentityLedger {
         // A duplicate digest claim is not proof of equality. In particular,
         // neither repeated IDs nor an earlier good occurrence skip this hash.
         if sha256.len() != 64
-            || !sha256.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || format!("{:x}", Sha256::digest(payload)) != sha256
         {
             return Err(MediaIdentityError::Digest);
@@ -119,12 +121,18 @@ impl MediaIdentityLedger {
             digest: sha256.to_owned(),
             mime: mime.to_owned(),
         };
-        if self.identities.get(id).is_some_and(|existing| existing != &identity) {
+        if self
+            .identities
+            .get(id)
+            .is_some_and(|existing| existing != &identity)
+        {
             return Err(MediaIdentityError::IdentityConflict);
         }
         let key = (kind, sha256.to_owned());
         let admission = match self.payloads.get(&key) {
-            Some(existing_mime) if existing_mime != mime => return Err(MediaIdentityError::MimeConflict),
+            Some(existing_mime) if existing_mime != mime => {
+                return Err(MediaIdentityError::MimeConflict);
+            }
             Some(_) => MediaAdmission::DuplicatePayload,
             None => MediaAdmission::NewPayload,
         };
@@ -132,7 +140,8 @@ impl MediaIdentityLedger {
             if self.payloads.len() >= MAX_MEDIA_PAYLOADS {
                 return Err(MediaIdentityError::PayloadLimit);
             }
-            self.bytes.checked_add(payload.len())
+            self.bytes
+                .checked_add(payload.len())
                 .filter(|bytes| *bytes <= MAX_MEDIA_BYTES)
                 .ok_or(MediaIdentityError::ByteLimit)?
         } else {
@@ -146,13 +155,20 @@ impl MediaIdentityLedger {
         Ok(admission)
     }
 
-    pub fn payload_count(&self) -> usize { self.payloads.len() }
-    pub const fn byte_len(&self) -> usize { self.bytes }
-    pub const fn occurrence_count(&self) -> usize { self.occurrences }
+    pub fn payload_count(&self) -> usize {
+        self.payloads.len()
+    }
+    pub const fn byte_len(&self) -> usize {
+        self.bytes
+    }
+    pub const fn occurrence_count(&self) -> usize {
+        self.occurrences
+    }
 }
 
 fn valid_metadata(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_METADATA_BYTES
+    !value.is_empty()
+        && value.len() <= MAX_METADATA_BYTES
         && !value.chars().any(char::is_control)
         && value.trim() == value
 }
@@ -164,20 +180,37 @@ mod tests {
     // These bytes test identity only; they are not asserted to be decoded media.
     fn item(id: &str, bytes: &[u8]) -> MediaInput {
         MediaInput {
-            id: id.into(), kind: MediaKind::Image, mime: "image/png".into(),
-            sha256: format!("{:x}", Sha256::digest(bytes)), bytes: bytes.to_vec(),
+            id: id.into(),
+            kind: MediaKind::Image,
+            mime: "image/png".into(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+            bytes: bytes.to_vec(),
         }
     }
     fn counts(ledger: &MediaIdentityLedger) -> (usize, usize, usize, u64) {
-        (ledger.payload_count(), ledger.byte_len(), ledger.occurrence_count(), ledger.verified_bytes)
+        (
+            ledger.payload_count(),
+            ledger.byte_len(),
+            ledger.occurrence_count(),
+            ledger.verified_bytes,
+        )
     }
 
     #[test]
     fn sharing_counts_every_occurrence_but_only_one_payload() {
         let mut ledger = MediaIdentityLedger::default();
-        assert_eq!(ledger.admit(&item("first", b"same")), Ok(MediaAdmission::NewPayload));
-        assert_eq!(ledger.admit(&item("second", b"same")), Ok(MediaAdmission::DuplicatePayload));
-        assert_eq!(ledger.admit(&item("first", b"same")), Ok(MediaAdmission::DuplicatePayload));
+        assert_eq!(
+            ledger.admit(&item("first", b"same")),
+            Ok(MediaAdmission::NewPayload)
+        );
+        assert_eq!(
+            ledger.admit(&item("second", b"same")),
+            Ok(MediaAdmission::DuplicatePayload)
+        );
+        assert_eq!(
+            ledger.admit(&item("first", b"same")),
+            Ok(MediaAdmission::DuplicatePayload)
+        );
         assert_eq!(counts(&ledger), (1, 4, 3, 12));
     }
 
@@ -201,7 +234,10 @@ mod tests {
         let mut ledger = MediaIdentityLedger::default();
         ledger.admit(&item("first", b"original")).expect("original");
         let before = counts(&ledger);
-        assert_eq!(ledger.admit(&item("first", b"changed")), Err(MediaIdentityError::IdentityConflict));
+        assert_eq!(
+            ledger.admit(&item("first", b"changed")),
+            Err(MediaIdentityError::IdentityConflict)
+        );
         let mut mime = item("second", b"original");
         mime.mime = "image/jpeg".into();
         assert_eq!(ledger.admit(&mime), Err(MediaIdentityError::MimeConflict));
@@ -211,7 +247,9 @@ mod tests {
     #[test]
     fn different_modalities_do_not_share_a_payload() {
         let mut ledger = MediaIdentityLedger::default();
-        ledger.admit(&item("image", b"bytes")).expect("image identity");
+        ledger
+            .admit(&item("image", b"bytes"))
+            .expect("image identity");
         let mut audio = item("audio", b"bytes");
         audio.kind = MediaKind::Audio;
         audio.mime = "audio/wav".into();
@@ -238,25 +276,45 @@ mod tests {
     fn repeated_occurrences_cannot_bypass_work_limits() {
         let value = item("same", b"x");
         let mut ledger = MediaIdentityLedger::default();
-        for _ in 0..MAX_MEDIA_OCCURRENCES { ledger.admit(&value).expect("within cap"); }
+        for _ in 0..MAX_MEDIA_OCCURRENCES {
+            ledger.admit(&value).expect("within cap");
+        }
         let before = counts(&ledger);
-        assert_eq!(ledger.admit(&value), Err(MediaIdentityError::OccurrenceLimit));
+        assert_eq!(
+            ledger.admit(&value),
+            Err(MediaIdentityError::OccurrenceLimit)
+        );
         assert_eq!(counts(&ledger), before);
         let mut ledger = MediaIdentityLedger {
-            verified_bytes: MAX_MEDIA_VERIFICATION_BYTES, ..MediaIdentityLedger::default()
+            verified_bytes: MAX_MEDIA_VERIFICATION_BYTES,
+            ..MediaIdentityLedger::default()
         };
-        assert_eq!(ledger.admit(&value), Err(MediaIdentityError::VerificationLimit));
+        assert_eq!(
+            ledger.admit(&value),
+            Err(MediaIdentityError::VerificationLimit)
+        );
     }
 
     #[test]
     fn payload_and_aggregate_byte_limits_remain_independent() {
         let mut ledger = MediaIdentityLedger::default();
         for index in 0..MAX_MEDIA_PAYLOADS {
-            ledger.admit(&item(&index.to_string(), &index.to_le_bytes())).expect("within cap");
+            ledger
+                .admit(&item(&index.to_string(), &index.to_le_bytes()))
+                .expect("within cap");
         }
-        assert_eq!(ledger.admit(&item("extra", b"extra")), Err(MediaIdentityError::PayloadLimit));
-        let mut ledger = MediaIdentityLedger { bytes: MAX_MEDIA_BYTES, ..MediaIdentityLedger::default() };
-        assert_eq!(ledger.admit(&item("extra", b"x")), Err(MediaIdentityError::ByteLimit));
+        assert_eq!(
+            ledger.admit(&item("extra", b"extra")),
+            Err(MediaIdentityError::PayloadLimit)
+        );
+        let mut ledger = MediaIdentityLedger {
+            bytes: MAX_MEDIA_BYTES,
+            ..MediaIdentityLedger::default()
+        };
+        assert_eq!(
+            ledger.admit(&item("extra", b"x")),
+            Err(MediaIdentityError::ByteLimit)
+        );
         assert_eq!(ledger.payload_count(), 0);
     }
 
@@ -265,14 +323,29 @@ mod tests {
         let value = item("initial", b"retained payload");
         let mut ledger = MediaIdentityLedger::default();
         assert_eq!(ledger.admit(&value), Ok(MediaAdmission::NewPayload));
-        assert_eq!(ledger.admit_parts("selected-alias", value.kind, &value.mime,
-            &value.sha256, &value.bytes), Ok(MediaAdmission::DuplicatePayload));
+        assert_eq!(
+            ledger.admit_parts(
+                "selected-alias",
+                value.kind,
+                &value.mime,
+                &value.sha256,
+                &value.bytes
+            ),
+            Ok(MediaAdmission::DuplicatePayload)
+        );
         assert_eq!(ledger.payload_count(), 1);
         assert_eq!(ledger.occurrence_count(), 2);
         let before = counts(&ledger);
-        assert_eq!(ledger.admit_parts("selected-alias", value.kind, &value.mime,
-            &value.sha256, b"changed payload"), Err(MediaIdentityError::Digest));
+        assert_eq!(
+            ledger.admit_parts(
+                "selected-alias",
+                value.kind,
+                &value.mime,
+                &value.sha256,
+                b"changed payload"
+            ),
+            Err(MediaIdentityError::Digest)
+        );
         assert_eq!(counts(&ledger), before);
     }
-
 }

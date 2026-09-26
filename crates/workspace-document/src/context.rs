@@ -45,12 +45,24 @@ pub struct ContextSelection {
 }
 
 impl ContextSelection {
-    pub fn source(&self) -> Range<usize> { self.source.clone() }
-    pub fn host(&self) -> Range<usize> { self.host.clone() }
-    pub const fn omitted_source_units(&self) -> usize { self.source.start }
-    pub const fn omitted_host_units(&self) -> usize { self.host.start }
-    pub const fn measured_prompt_tokens(&self) -> usize { self.measured_prompt_tokens }
-    pub const fn measurements(&self) -> usize { self.measurements }
+    pub fn source(&self) -> Range<usize> {
+        self.source.clone()
+    }
+    pub fn host(&self) -> Range<usize> {
+        self.host.clone()
+    }
+    pub const fn omitted_source_units(&self) -> usize {
+        self.source.start
+    }
+    pub const fn omitted_host_units(&self) -> usize {
+        self.host.start
+    }
+    pub const fn measured_prompt_tokens(&self) -> usize {
+        self.measured_prompt_tokens
+    }
+    pub const fn measurements(&self) -> usize {
+        self.measurements
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -76,7 +88,8 @@ pub fn select_context<E>(
     if budget.context_tokens == 0 || budget.output_tokens >= budget.context_tokens {
         return Err(ContextSelectionError::InvalidBudget);
     }
-    if source_units.checked_add(host_units)
+    if source_units
+        .checked_add(host_units)
         .is_none_or(|count| count > MAX_DOCUMENT_PARTS)
     {
         return Err(ContextSelectionError::UnitLimit);
@@ -93,7 +106,9 @@ pub fn select_context<E>(
     if budget.source_tokens != 0 {
         for start in (0..source_units).rev() {
             let tokens = bounded_measure(ContextMeasure::Source(start..source_units))?;
-            if tokens > budget.source_tokens { break; }
+            if tokens > budget.source_tokens {
+                break;
+            }
             source_start = start;
         }
     }
@@ -101,7 +116,9 @@ pub fn select_context<E>(
     if budget.host_tokens != 0 {
         for start in (0..host_units).rev() {
             let tokens = bounded_measure(ContextMeasure::Host(start..host_units))?;
-            if tokens > budget.host_tokens { break; }
+            if tokens > budget.host_tokens {
+                break;
+            }
             host_start = start;
         }
     }
@@ -110,7 +127,8 @@ pub fn select_context<E>(
             source: source_start..source_units,
             host: host_start..host_units,
         })?;
-        if tokens.checked_add(budget.output_tokens)
+        if tokens
+            .checked_add(budget.output_tokens)
             .is_some_and(|total| total <= budget.context_tokens)
         {
             return Ok(ContextSelection {
@@ -135,7 +153,12 @@ mod tests {
     use super::*;
 
     fn budget() -> ContextBudget {
-        ContextBudget { source_tokens: 50, host_tokens: 50, context_tokens: 100, output_tokens: 10 }
+        ContextBudget {
+            source_tokens: 50,
+            host_tokens: 50,
+            context_tokens: 100,
+            output_tokens: 10,
+        }
     }
     fn cost(request: ContextMeasure) -> Result<usize, &'static str> {
         Ok(match request {
@@ -156,14 +179,23 @@ mod tests {
 
     #[test]
     fn zero_history_budgets_never_read_or_measure_disallowed_history() {
-        let selected = select_context(ContextBudget { source_tokens: 0, host_tokens: 0, ..budget() },
-            8, 7, |request| match request {
+        let selected = select_context(
+            ContextBudget {
+                source_tokens: 0,
+                host_tokens: 0,
+                ..budget()
+            },
+            8,
+            7,
+            |request| match request {
                 ContextMeasure::Complete { source, host } => {
                     assert!(source.is_empty() && host.is_empty());
                     Ok::<_, &str>(20)
                 }
                 _ => panic!("disabled history must not be measured"),
-            }).expect("mandatory input fits");
+            },
+        )
+        .expect("mandatory input fits");
         assert_eq!(selected.source(), 8..8);
         assert_eq!(selected.host(), 7..7);
         assert_eq!(selected.measurements(), 1);
@@ -176,7 +208,8 @@ mod tests {
                 ContextMeasure::Source(_) | ContextMeasure::Host(_) => 1,
                 ContextMeasure::Complete { source, host } => 80 + 6 * (source.len() + host.len()),
             })
-        }).expect("trim complete units");
+        })
+        .expect("trim complete units");
         assert_eq!(selected.host(), 2..2);
         assert_eq!(selected.source(), 1..2);
         assert_eq!(selected.measured_prompt_tokens(), 86);
@@ -184,59 +217,97 @@ mod tests {
 
     #[test]
     fn attribution_and_body_are_selected_as_one_unit_not_separate_messages() {
-        let units = [["speaker metadata", "answer"], ["other metadata", "other answer"]];
-        let selected = select_context(ContextBudget { source_tokens: 10, host_tokens: 0, ..budget() },
-            units.len(), 0, |request| {
+        let units = [
+            ["speaker metadata", "answer"],
+            ["other metadata", "other answer"],
+        ];
+        let selected = select_context(
+            ContextBudget {
+                source_tokens: 10,
+                host_tokens: 0,
+                ..budget()
+            },
+            units.len(),
+            0,
+            |request| {
                 Ok::<_, &str>(match request {
                     ContextMeasure::Source(range) => units[range].len() * 10,
                     ContextMeasure::Complete { source, .. } => units[source].len() * 10 + 20,
                     _ => panic!("no host units"),
                 })
-            }).expect("one complete source unit");
-        assert_eq!(&units[selected.source()], &[["other metadata", "other answer"]]);
+            },
+        )
+        .expect("one complete source unit");
+        assert_eq!(
+            &units[selected.source()],
+            &[["other metadata", "other answer"]]
+        );
     }
 
     #[test]
     fn tokenization_errors_are_not_treated_as_empty_or_overlarge_history() {
-        assert_eq!(select_context(budget(), 1, 0, |_| Err("tokenizer unavailable")),
-            Err(ContextSelectionError::Measurement("tokenizer unavailable")));
+        assert_eq!(
+            select_context(budget(), 1, 0, |_| Err("tokenizer unavailable")),
+            Err(ContextSelectionError::Measurement("tokenizer unavailable"))
+        );
     }
 
     #[test]
     fn mandatory_input_is_never_shortened() {
-        assert_eq!(select_context(budget(), 0, 0, |_| Ok::<_, &str>(91)),
-            Err(ContextSelectionError::MandatoryInputTooLarge));
+        assert_eq!(
+            select_context(budget(), 0, 0, |_| Ok::<_, &str>(91)),
+            Err(ContextSelectionError::MandatoryInputTooLarge)
+        );
         assert!(select_context(budget(), 0, 0, |_| Ok::<_, &str>(90)).is_ok());
     }
 
     #[test]
     fn overflowing_counts_fail_closed() {
-        assert_eq!(select_context(budget(), 0, 0, |_| Ok::<_, &str>(usize::MAX)),
-            Err(ContextSelectionError::MandatoryInputTooLarge));
-        assert_eq!(select_context(budget(), usize::MAX, 1, cost),
-            Err(ContextSelectionError::UnitLimit));
+        assert_eq!(
+            select_context(budget(), 0, 0, |_| Ok::<_, &str>(usize::MAX)),
+            Err(ContextSelectionError::MandatoryInputTooLarge)
+        );
+        assert_eq!(
+            select_context(budget(), usize::MAX, 1, cost),
+            Err(ContextSelectionError::UnitLimit)
+        );
     }
 
     #[test]
     fn invalid_budgets_have_no_measurement_side_effect() {
         for invalid in [
-            ContextBudget { context_tokens: 0, ..budget() },
-            ContextBudget { output_tokens: 100, ..budget() },
-            ContextBudget { output_tokens: usize::MAX, ..budget() },
+            ContextBudget {
+                context_tokens: 0,
+                ..budget()
+            },
+            ContextBudget {
+                output_tokens: 100,
+                ..budget()
+            },
+            ContextBudget {
+                output_tokens: usize::MAX,
+                ..budget()
+            },
         ] {
-            assert_eq!(select_context(invalid, 0, 0,
-                |_| -> Result<usize, &str> { panic!("invalid budget") }),
-                Err(ContextSelectionError::InvalidBudget));
+            assert_eq!(
+                select_context(invalid, 0, 0, |_| -> Result<usize, &str> {
+                    panic!("invalid budget")
+                }),
+                Err(ContextSelectionError::InvalidBudget)
+            );
         }
     }
 
     #[test]
     fn zero_token_inputs_cannot_force_unbounded_measurement_work() {
         let mut calls = 0;
-        assert_eq!(select_context(budget(), MAX_CONTEXT_MEASUREMENTS + 1, 0, |_| {
-            calls += 1;
-            Ok::<_, &str>(0)
-        }), Err(ContextSelectionError::MeasurementLimit));
+        assert_eq!(
+            select_context(budget(), MAX_CONTEXT_MEASUREMENTS + 1, 0, |_| {
+                calls += 1;
+                Ok::<_, &str>(0)
+            }),
+            Err(ContextSelectionError::MeasurementLimit)
+        );
         assert_eq!(calls, MAX_CONTEXT_MEASUREMENTS);
     }
 }

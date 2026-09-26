@@ -355,7 +355,9 @@ function plannedAssetChange(t, changedPath, staleOwner = false) {
   const syntheticRecords = Object.entries(groups.primary).flatMap(([group, names]) =>
     names.map(name => ({ name, root: `fixture/${group}/${name}` })));
   const metadata = metadataFixture(syntheticRecords, { "loom-app": ["mom-llama-app"] });
-  const portableRoot = directory.split(path.sep).join("/");
+  // macOS may create the fixture under /var while process.cwd() resolves it
+  // through /private/var. Cargo manifest paths and the planner must agree.
+  const portableRoot = fs.realpathSync(directory).split(path.sep).join("/");
   write("metadata.json", JSON.stringify(metadata).replaceAll(repoRoot, portableRoot));
   write("empty-git-config", "");
   const env = {
