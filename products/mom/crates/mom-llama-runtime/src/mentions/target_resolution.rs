@@ -1,8 +1,9 @@
-// Included in mentions.rs so all existing dispatch and regression callers use
-// the same resolver. Lexing remains owned by workspace-document; this function
-// resolves inert, already-parsed handles and performs no I/O or inference.
+//! Resolve the already-parsed handles used by dispatch and regression tests.
+//! Lexing remains in workspace-document; this module performs no I/O or inference.
 
-fn checked_resolve_targets_from_registry(
+use super::*;
+
+pub(super) fn checked_resolve_targets_from_registry(
     handles: &[String],
     host_id: &str,
     conversations: &[Conversation],
@@ -11,17 +12,29 @@ fn checked_resolve_targets_from_registry(
     let mut by_handle = BTreeMap::<String, Vec<&Conversation>>::new();
     let mut by_id = BTreeMap::<&str, Vec<&Conversation>>::new();
     for conversation in conversations {
-        by_id.entry(&conversation.id).or_default().push(conversation);
+        by_id
+            .entry(&conversation.id)
+            .or_default()
+            .push(conversation);
         if !conversation.execution_profile.mention_handle.is_empty() {
-            by_handle.entry(conversation.execution_profile.mention_handle.to_ascii_lowercase())
-                .or_default().push(conversation);
+            by_handle
+                .entry(
+                    conversation
+                        .execution_profile
+                        .mention_handle
+                        .to_ascii_lowercase(),
+                )
+                .or_default()
+                .push(conversation);
         }
     }
     let mut groups_by_handle = BTreeMap::<String, Vec<&crate::personas::PersonaGroup>>::new();
     for group in groups {
         if !group.mention_handle.is_empty() {
-            groups_by_handle.entry(group.mention_handle.to_ascii_lowercase())
-                .or_default().push(group);
+            groups_by_handle
+                .entry(group.mention_handle.to_ascii_lowercase())
+                .or_default()
+                .push(group);
         }
     }
     let mut resolved = Vec::new();
@@ -47,9 +60,10 @@ fn checked_resolve_targets_from_registry(
                     continue;
                 }
                 match matches.first() {
-                    Some(conversation) if conversation.id != host_id
-                        && conversation.kind == ConversationKind::PersonaTemplate
-                        && group_seen.insert(conversation.id.clone()) =>
+                    Some(conversation)
+                        if conversation.id != host_id
+                            && conversation.kind == ConversationKind::PersonaTemplate
+                            && group_seen.insert(conversation.id.clone()) =>
                     {
                         group_targets.push(ResolvedTarget {
                             kind: MentionTargetKind::Persona,
@@ -67,11 +81,16 @@ fn checked_resolve_targets_from_registry(
                 unresolved.push(handle.clone());
             } else {
                 for target in group_targets {
-                    if seen.insert(target.conversation.id.clone()) { resolved.push(target); }
+                    if seen.insert(target.conversation.id.clone()) {
+                        resolved.push(target);
+                    }
                 }
             }
         } else if let Some(conversation) = conversation_matches.first() {
-            if by_id.get(conversation.id.as_str()).is_some_and(|matches| matches.len() != 1) {
+            if by_id
+                .get(conversation.id.as_str())
+                .is_some_and(|matches| matches.len() != 1)
+            {
                 ambiguous.push(handle.clone());
             } else if conversation.id == host_id {
                 unresolved.push(handle.clone());
@@ -79,7 +98,9 @@ fn checked_resolve_targets_from_registry(
                 resolved.push(ResolvedTarget {
                     kind: if conversation.kind == ConversationKind::PersonaTemplate {
                         MentionTargetKind::Persona
-                    } else { MentionTargetKind::LiveChat },
+                    } else {
+                        MentionTargetKind::LiveChat
+                    },
                     conversation: (**conversation).clone(),
                 });
             }
@@ -89,7 +110,11 @@ fn checked_resolve_targets_from_registry(
             unresolved.push(handle.clone());
         }
     }
-    TargetResolution { targets: resolved, unresolved, ambiguous }
+    TargetResolution {
+        targets: resolved,
+        unresolved,
+        ambiguous,
+    }
 }
 
 #[cfg(test)]
@@ -98,29 +123,60 @@ mod target_resolution_tests {
 
     fn conversation(id: &str, handle: &str, kind: ConversationKind) -> Conversation {
         Conversation {
-            id: id.into(), title: format!("Title {id}"), created_at: "1".into(), updated_at: "1".into(),
-            kind, execution_profile: ConversationExecutionProfile {
-                mention_handle: handle.into(), ..ConversationExecutionProfile::default()
-            }, selected_model_path: None, source_conversation_id: None, source_message_id: None,
-            branch_root_message_id: None, active_leaf_message_id: None,
-            current_skill_ids: Vec::new(), messages: Vec::new(),
+            id: id.into(),
+            title: format!("Title {id}"),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            kind,
+            execution_profile: ConversationExecutionProfile {
+                mention_handle: handle.into(),
+                ..ConversationExecutionProfile::default()
+            },
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: None,
+            current_skill_ids: Vec::new(),
+            messages: Vec::new(),
         }
     }
-    fn persona(id: &str) -> Conversation { conversation(id, id, ConversationKind::PersonaTemplate) }
+    fn persona(id: &str) -> Conversation {
+        conversation(id, id, ConversationKind::PersonaTemplate)
+    }
     fn group(handle: &str, members: &[&str]) -> crate::personas::PersonaGroup {
         crate::personas::PersonaGroup {
-            id: format!("group-{handle}"), name: handle.into(), mention_handle: handle.into(),
+            id: format!("group-{handle}"),
+            name: handle.into(),
+            mention_handle: handle.into(),
             persona_ids: members.iter().map(|id| (*id).into()).collect(),
-            created_at: "1".into(), updated_at: "1".into(),
+            created_at: "1".into(),
+            updated_at: "1".into(),
         }
     }
-    fn resolve(handles: &[&str], host: &str, conversations: &[Conversation], groups: &[crate::personas::PersonaGroup]) -> TargetResolution {
+    fn resolve(
+        handles: &[&str],
+        host: &str,
+        conversations: &[Conversation],
+        groups: &[crate::personas::PersonaGroup],
+    ) -> TargetResolution {
         // Exercise the existing production entry point, not just the new helper.
-        resolve_targets_from_registry(&handles.iter().map(|value| (*value).into()).collect::<Vec<_>>(),
-            host, conversations, groups)
+        resolve_targets_from_registry(
+            &handles
+                .iter()
+                .map(|value| (*value).into())
+                .collect::<Vec<_>>(),
+            host,
+            conversations,
+            groups,
+        )
     }
     fn ids(result: &TargetResolution) -> Vec<&str> {
-        result.targets.iter().map(|target| target.conversation.id.as_str()).collect()
+        result
+            .targets
+            .iter()
+            .map(|target| target.conversation.id.as_str())
+            .collect()
     }
     fn no_error(result: &TargetResolution) {
         assert!(result.unresolved.is_empty(), "{:?}", result.unresolved);
@@ -129,26 +185,45 @@ mod target_resolution_tests {
 
     #[test]
     fn group_then_direct_member_is_not_an_unresolved_mention() {
-        let result = resolve(&["team", "a"], "host", &[persona("a"), persona("b")], &[group("team", &["a", "b"])]);
+        let result = resolve(
+            &["team", "a"],
+            "host",
+            &[persona("a"), persona("b")],
+            &[group("team", &["a", "b"])],
+        );
         no_error(&result);
         assert_eq!(ids(&result), ["a", "b"]);
     }
     #[test]
     fn direct_then_group_keeps_first_occurrence_order_without_double_inference() {
-        let result = resolve(&["b", "team", "a"], "host", &[persona("a"), persona("b")], &[group("team", &["a", "b"])]);
+        let result = resolve(
+            &["b", "team", "a"],
+            "host",
+            &[persona("a"), persona("b")],
+            &[group("team", &["a", "b"])],
+        );
         no_error(&result);
         assert_eq!(ids(&result), ["b", "a"]);
     }
     #[test]
     fn overlapping_groups_deduplicate_targets_but_keep_explicit_order() {
-        let result = resolve(&["first", "second"], "host", &[persona("a"), persona("b"), persona("c")],
-            &[group("first", &["b", "a"]), group("second", &["a", "c"])]);
+        let result = resolve(
+            &["first", "second"],
+            "host",
+            &[persona("a"), persona("b"), persona("c")],
+            &[group("first", &["b", "a"]), group("second", &["a", "c"])],
+        );
         no_error(&result);
         assert_eq!(ids(&result), ["b", "a", "c"]);
     }
     #[test]
     fn a_group_cannot_bypass_the_direct_self_consult_restriction() {
-        let result = resolve(&["team"], "a", &[persona("a"), persona("b")], &[group("team", &["b", "a"])]);
+        let result = resolve(
+            &["team"],
+            "a",
+            &[persona("a"), persona("b")],
+            &[group("team", &["b", "a"])],
+        );
         assert!(result.targets.is_empty());
         assert_eq!(result.unresolved, ["team"]);
         let direct = resolve(&["a"], "a", &[persona("a")], &[]);
@@ -157,7 +232,10 @@ mod target_resolution_tests {
     }
     #[test]
     fn duplicate_occurrence_ids_with_distinct_handles_are_ambiguous() {
-        let registry = [persona("a"), conversation("a", "alias", ConversationKind::PersonaTemplate)];
+        let registry = [
+            persona("a"),
+            conversation("a", "alias", ConversationKind::PersonaTemplate),
+        ];
         for handle in ["a", "alias", "team"] {
             let result = resolve(&[handle], "host", &registry, &[group("team", &["a"])]);
             assert!(result.targets.is_empty());
@@ -166,7 +244,10 @@ mod target_resolution_tests {
     }
     #[test]
     fn conflicting_group_and_conversation_handles_do_not_choose_by_registry_order() {
-        for registry in [vec![persona("a"), persona("team")], vec![persona("team"), persona("a")]] {
+        for registry in [
+            vec![persona("a"), persona("team")],
+            vec![persona("team"), persona("a")],
+        ] {
             let result = resolve(&["team"], "host", &registry, &[group("team", &["a"])]);
             assert!(result.targets.is_empty());
             assert_eq!(result.ambiguous, ["team"]);
@@ -174,8 +255,16 @@ mod target_resolution_tests {
     }
     #[test]
     fn invalid_group_membership_never_invokes_a_valid_subset() {
-        let registry = [persona("a"), conversation("chat", "chat", ConversationKind::Chat)];
-        for members in [&[][..], &["a", "missing"][..], &["a", "a"][..], &["a", "chat"][..]] {
+        let registry = [
+            persona("a"),
+            conversation("chat", "chat", ConversationKind::Chat),
+        ];
+        for members in [
+            &[][..],
+            &["a", "missing"][..],
+            &["a", "a"][..],
+            &["a", "chat"][..],
+        ] {
             let result = resolve(&["team"], "host", &registry, &[group("team", members)]);
             assert!(result.targets.is_empty());
             assert_eq!(result.unresolved, ["team"]);
@@ -196,14 +285,23 @@ mod target_resolution_tests {
     }
     #[test]
     fn duplicate_group_handles_are_not_silently_resolved() {
-        let result = resolve(&["team"], "host", &[persona("a"), persona("b")],
-            &[group("team", &["a"]), group("team", &["b"])]);
+        let result = resolve(
+            &["team"],
+            "host",
+            &[persona("a"), persona("b")],
+            &[group("team", &["a"]), group("team", &["b"])],
+        );
         assert!(result.targets.is_empty());
         assert_eq!(result.ambiguous, ["team"]);
     }
     #[test]
     fn registry_case_normalization_preserves_existing_parsed_handle_semantics() {
-        let result = resolve(&["alice"], "host", &[conversation("a", "Alice", ConversationKind::Chat)], &[]);
+        let result = resolve(
+            &["alice"],
+            "host",
+            &[conversation("a", "Alice", ConversationKind::Chat)],
+            &[],
+        );
         no_error(&result);
         assert_eq!(ids(&result), ["a"]);
         assert_eq!(result.targets[0].kind, MentionTargetKind::LiveChat);

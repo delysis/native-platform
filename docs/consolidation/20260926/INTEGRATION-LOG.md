@@ -13,6 +13,9 @@ implementation source. None of those inputs grants merge or release authority.
 - Correct the owned-asset planner's disposable-repository fixture on macOS:
   `/var` and `/private/var` must resolve to the same root. Keep the new
   dependency-derived Loom and macOS selection for Mom's embedded assets.
+- Keep the exact Mom storage release check after its move into the shared
+  Mom/Loom helper, and load mention target resolution as a normal Rust module
+  so the ignored-test source guard can inspect it.
 - Correct the forked-Persona attachment fixture to remap its message owner as
   the production fork already does. Retain a negative witness that a foreign
   message cannot borrow the snapshot.

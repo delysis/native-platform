@@ -1,6 +1,7 @@
 use crate::attachments::commit_generated_exchange_with_journal;
 mod execution;
 mod handoff;
+mod target_resolution;
 use crate::attachments::{CurrentAttachmentSelection, prepare_scoped_chat_attachments};
 use crate::chat::{
     ChatSendInput, ChatSendOptions, ChatSendOutput, ChatStreamEvent, native_context_messages,
@@ -3749,7 +3750,7 @@ fn resolve_targets(handles: &[String], host_id: &str) -> Result<TargetResolution
     ))
 }
 
-include!("mentions/target_resolution.rs");
+use target_resolution::checked_resolve_targets_from_registry;
 
 fn resolve_targets_from_registry(
     handles: &[String],
