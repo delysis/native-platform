@@ -40,6 +40,35 @@ implementation source. None of those inputs grants merge or release authority.
 | 6 | Generic EASL text/editing history is preserved but not extracted into a separate, dependency-closed research line. The Loom-specific EASL frontend remains parked. | Separate build and source/provenance review; no change to the production Tauri frontend during extraction. |
 | 7 | The Gemma 4 Metal ZIP contains research shaders with a group-64 ABI that differs from the rvLLM campaign's current packed format; its short attention prototype uses contiguous rather than paged KV. | Port one role-specific candidate to current storage and paged-cache rules, compile, run guard-byte/correctness and checkpoint-quality gates, then controlled role and route timings. No default-route promotion from source inspection. |
 
+## Single-surface cutover target
+
+The intended Loom product is one normal Tauri window with one sidebar for
+documents and encrypted chats, and one central work area that opens the selected
+chat or notepad. `loom-app --mode document|chat` is a transitional shell selector,
+not this product. Loom's current `WorkspacePane` chat path uses FTE, while the
+scoped Mom consultation commands, encrypted conversation store and shutdown
+owner remain in the separate Mom shell. Combining their controls without
+reconciling native model ownership would merely keep two frontends inside one
+process.
+
+The elimination receipt must identify source actually deleted after parity.
+At this tree, Mom's `view.rs` plus its `ui/*.js`, `ui/*.css` and `ui/*.html`
+total 11,205 physical lines. They are a presentation-removal target, not a
+current saving or a promise that every line can vanish. The old Mom executable,
+the `desktop-launch` shell selector and any duplicate Loom chat renderer need
+an explicit disposition too. Preserve Mom's typed chat, citation, tool,
+approval, cache, store and cancellation behavior while replacing presentation;
+preserve Loom's exact UTF-8 document and completion behavior. Only a real
+one-window journey with the existing encrypted identity, a cited `@expert`
+consult, cancellation and joined quit/relaunch can authorize old-shell removal.
+
+EASL view research now lives in the private `delysis/easl` repository at
+`2369e0b18e4cdeb9d69b86725f81eefb7e07caf0`. Its filtered service history,
+working accessibility snapshot and distinct research heads are retained there.
+The current consolidation tree and `origin/main` already omit the EASL service
+directory. The old detached checkout's uncommitted EASL work remains untouched;
+the separate repository is not yet a qualified Tauri WebView replacement.
+
 ## Qualification boundary
 
 Focused source, Node, Rust and lint results belong to the exact repaired tree.
