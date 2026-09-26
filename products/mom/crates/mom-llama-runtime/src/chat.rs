@@ -3,8 +3,8 @@ use crate::attachments::{
 };
 use crate::config::{normalize_optional_path, resolve_settings, upstream_setting_string};
 use crate::conversation_store::{
-    ChatTemplatePolicy, Message, MessageRole, active_leaf_id, active_path_messages,
-    get_or_create_conversation, load_db, strip_reserved_attribution_prefix,
+    ChatTemplatePolicy, Message, MessageRole, active_leaf_id, get_or_create_conversation, load_db,
+    strip_reserved_attribution_prefix,
 };
 use crate::kv_cache::{
     compatible_conversation_prefix, ensure_persona_prefix, invalidate_cache,
@@ -440,17 +440,18 @@ pub fn chat_regenerate_in_scope(
     options: ChatSendOptions,
 ) -> Result<CommandResult<ChatSendOutput>> {
     let db = load_db()?;
-    let Some(message) = db
+    let message = match db
         .conversations
         .iter()
         .find(|conversation| conversation.id == conversation_id)
-        .and_then(|conversation| {
-            active_path_messages(conversation)
-                .into_iter()
-                .rev()
-                .find(|message| message.role == MessageRole::User)
-        })
-    else {
+    {
+        Some(conversation) => crate::document::checked_active_messages(conversation)?
+            .into_iter()
+            .rev()
+            .find(|message| message.role == MessageRole::User),
+        None => None,
+    };
+    let Some(message) = message else {
         return Ok(CommandResult::blocked(
             "mom_llama.chat_regenerate",
             "stub_blocked",
@@ -534,7 +535,7 @@ where
         conversation.selected_model_path.clone(),
         conversation.execution_profile.mmproj_path.clone(),
     );
-    let active_messages = active_path_messages(&conversation);
+    let active_messages = crate::document::checked_active_messages(&conversation)?;
     let attachment_context = match prepare_chat_attachments(
         &input.conversation_id,
         &active_messages,
