@@ -34,7 +34,7 @@ implementation source. None of those inputs grants merge or release authority.
 | --- | --- | --- |
 | 1 | The normal Loom executable still chooses one of two retained Tauri shells. Mom's scoped consult dispatcher is not yet owned by one shared Loom runtime or exposed through one simple chat/document surface. | One real `@expert` call from the normal Loom window with a cited attachment, genuine cache receipts, exact source reopen, cancellation and joined quit/relaunch under one owner. |
 | 2 | Native media markers are appended at the final user turn. A source map retains historical occurrence identity, but the model does not receive an image at its original historical chat position. Media with bound tools remains explicitly blocked; audio is transcription-first and video/opaque media remain unsupported. | Typed media placement and tool continuation design, followed by exact per-target privacy and native model checks. Do not erase media to make a tool call work. |
-| 3 | Attachment sources are selected and recorded before native generation, but the final conversation transaction does not revalidate all selected source occurrences against concurrent removal or replacement. The supplied `consult_sources.rs` sketches transactional retention but has not been compiled against this stack. | Integrate a transaction-bound source check and deletion impact rule, then test a source removal racing a consult commit. A retained source map alone is not citation validity. |
+| 3 | A candidate check now revalidates each selected attachment occurrence's conversation/message ownership, committed state, root, canonical manifest/text identity and current policy inside the final conversation/journal transaction. Deterministic unchanged, staged-current, removal and same-ID replacement tests exercise that boundary. This is not yet a real cited native consultation. | Qualify the candidate through the exact clean-tree gate and a real consultation. Decide how a later source deletion affects retained citations before treating them as durable. |
 | 4 | New encrypted consult input/output receipt namespaces have no completed retention and Persona-removal impact decision. | Review removal, preservation and read authority using a real retained invocation. |
 | 5 | The frozen 77-head ledger proves ancestry and recovers one history validator. It does not semantically qualify the 20 divergent heads or the one ahead head. | Compare each unique delta to current main and this stack; integrate useful changes by exact source and feature journey. Preserve original heads. |
 | 6 | The generic EASL service and its research history now live in the separate private `delysis/easl` repository. It is not yet a qualified Tauri view replacement, and the Loom-specific EASL frontend remains parked. | Keep EASL research and native accessibility qualification in that repository. Do not restore EASL to the production Loom frontend during chat/document consolidation. |
@@ -87,10 +87,12 @@ real `@expert` consultation with a supported text attachment and genuine cache
 receipt, reopen the exact cited source, cancel a second attempt, and quit and
 relaunch with joined ownership. A selected attachment occurrence must be
 revalidated in the final conversation transaction before its citation can be
-committed; the existing `commit_generated_exchange_with_journal` call path is
-the integration point to review. Only after this journey works should one
-sidebar select between document and chat identities. Deleting the old Mom
-renderer remains gated on the full command and packaged-native journey ledger.
+committed. The candidate guard in `commit_generated_exchange_with_journal`
+checks the prepared source against authoritative documents in that transaction;
+it still needs the real cited journey and later-deletion policy. Only after this
+journey works should one sidebar select between document and chat identities.
+Deleting the old Mom renderer remains gated on the full command and packaged
+native journey ledger.
 
 EASL view research now lives in the private `delysis/easl` repository at
 `2369e0b18e4cdeb9d69b86725f81eefb7e07caf0`. Its filtered service history,

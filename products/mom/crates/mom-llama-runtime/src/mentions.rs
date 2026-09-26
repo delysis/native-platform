@@ -1,4 +1,4 @@
-use crate::attachments::commit_generated_exchange_with_journal;
+use crate::attachments::{StaleConsultSource, commit_generated_exchange_with_journal};
 mod execution;
 mod handoff;
 mod target_resolution;
@@ -3174,6 +3174,7 @@ where
             &attachment_context.staged_ids,
             &user_message_id,
             attachment_context.draft_snapshot.as_ref(),
+            &[],
             INVOCATIONS_NAMESPACE,
             MentionInvocationDb::default,
             |invocations| {
@@ -3205,6 +3206,7 @@ where
         .collect::<Vec<_>>()
         .join(", ");
     let mut planned = Vec::new();
+    let mut selected_sources = Vec::new();
     for (order, target) in targets.iter().enumerate() {
         let snapshot = &snapshots[order];
         let model_path = snapshot
@@ -3303,6 +3305,7 @@ where
             &user_message_id,
             &handoff.receipt,
         )?;
+        selected_sources.extend(handoff.receipt.attachment_sources.iter().cloned());
         planned.push(PlannedTarget {
             snapshot: snapshot.clone(),
             model_path: model_path.to_path_buf(),
@@ -3507,7 +3510,7 @@ where
         )
         .collect::<Vec<_>>();
     let host = host.clone();
-    let (conversation_path, ()) = commit_generated_exchange_with_journal(
+    let (conversation_path, ()) = match commit_generated_exchange_with_journal(
         commit_db,
         host,
         expected_active_leaf.as_deref(),
@@ -3515,13 +3518,28 @@ where
         &attachment_context.staged_ids,
         &user_message_id,
         attachment_context.draft_snapshot.as_ref(),
+        &selected_sources,
         INVOCATIONS_NAMESPACE,
         MentionInvocationDb::default,
         |invocations| {
             upsert_invocation_with_continuations(invocations, &invocation, pending_continuations)
         },
         write_active_approval_index,
-    )?;
+    ) {
+        Ok(committed) => committed,
+        Err(error) if error.is::<StaleConsultSource>() => {
+            return Ok(CommandResult::blocked(
+                "mom_llama.chat_dispatch",
+                "stub_blocked",
+                Blocker::new(
+                    "consult_source_stale",
+                    "A selected consultation source changed before the response could be saved.",
+                    vec!["Reopen the source and retry the consultation.".to_string()],
+                ),
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     Ok(CommandResult::passed(
         "mom_llama.chat_dispatch",
         "real_prompt_smoke_passed",

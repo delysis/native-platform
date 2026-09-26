@@ -43,7 +43,7 @@ pub(super) struct ContextInputReceipt {
     text_prompt_tokens: usize,
     native_media_tokens: Option<usize>,
     media_sources: Vec<SelectedAttachmentMedia>,
-    attachment_sources: Vec<SelectedAttachmentSource>,
+    pub(super) attachment_sources: Vec<SelectedAttachmentSource>,
 }
 
 struct Unit<'a> {

@@ -1023,6 +1023,7 @@ pub(crate) fn commit_generated_exchange_with_journal<T, R>(
     staged_ids: &[String],
     user_message_id: &str,
     expected_draft: Option<&DraftMessage>,
+    selected_sources: &[SelectedAttachmentSource],
     journal_namespace: &str,
     journal_default: impl FnOnce() -> T,
     journal_mutation: impl FnOnce(&mut T) -> Result<R>,
@@ -1041,6 +1042,7 @@ where
     let conversation_snapshot = load_db().unwrap_or(fallback_db);
     let attachment_snapshot = load_attachment_db()?;
     let draft_snapshot = load_drafts()?;
+    let current_policy_fingerprint = attachment_host()?.policy_fingerprint().to_string();
     let result =
         store.mutate_documents(journal_namespace, journal_default, |journal, documents| {
             let mut conversation_db = documents
@@ -1083,6 +1085,14 @@ where
                 record.message_id = user_message_id.to_string();
             }
 
+            validate_selected_sources_in_documents(
+                documents,
+                &conversation_db,
+                &attachment_db,
+                selected_sources,
+                &current_policy_fingerprint,
+            )?;
+
             let mut drafts = documents.get(DRAFTS_NAMESPACE)?.unwrap_or(draft_snapshot);
             consume_exact_draft(&mut drafts, expected_draft, staged_ids);
 
@@ -1097,6 +1107,110 @@ where
             Ok(result)
         })?;
     Ok((store.path().to_path_buf(), result))
+}
+
+#[derive(Debug)]
+pub(crate) struct StaleConsultSource {
+    detail: String,
+}
+
+impl std::fmt::Display for StaleConsultSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "selected consultation source is stale: {}",
+            self.detail
+        )
+    }
+}
+
+impl std::error::Error for StaleConsultSource {}
+
+fn stale_consult_source(detail: impl Into<String>) -> anyhow::Error {
+    StaleConsultSource {
+        detail: detail.into(),
+    }
+    .into()
+}
+
+fn validate_selected_sources_in_documents(
+    documents: &DocumentMutations<'_, '_, '_>,
+    conversations: &ConversationDb,
+    attachments: &AttachmentDb,
+    selected_sources: &[SelectedAttachmentSource],
+    current_policy_fingerprint: &str,
+) -> Result<()> {
+    for source in selected_sources {
+        let mut owners = conversations
+            .conversations
+            .iter()
+            .filter(|conversation| conversation.id == source.conversation_id);
+        let Some(owner) = owners.next() else {
+            return Err(stale_consult_source("the owning conversation was removed"));
+        };
+        if owners.next().is_some() {
+            return Err(stale_consult_source(
+                "the owning conversation identity is ambiguous",
+            ));
+        }
+        let mut messages = owner
+            .messages
+            .iter()
+            .filter(|message| message.id == source.message_id);
+        let Some(message) = messages.next() else {
+            return Err(stale_consult_source("the owning message was removed"));
+        };
+        if messages.next().is_some()
+            || message.conversation_id != source.conversation_id
+            || message
+                .attachment_ids
+                .iter()
+                .filter(|id| *id == &source.representation.attachment_id)
+                .count()
+                != 1
+        {
+            return Err(stale_consult_source("the attachment occurrence changed"));
+        }
+        let mut records = attachments
+            .attachments
+            .iter()
+            .filter(|record| record.id == source.representation.attachment_id);
+        let Some(record) = records.next() else {
+            return Err(stale_consult_source("the attachment was removed"));
+        };
+        if records.next().is_some()
+            || record.conversation_id != source.conversation_id
+            || record.message_id != source.message_id
+            || record.state != AttachmentState::Committed
+            || record.sha256 != source.representation.root_sha256
+        {
+            return Err(stale_consult_source(
+                "the attachment identity or ownership changed",
+            ));
+        }
+        let Some(namespace) = record.manifest_namespace.as_deref() else {
+            return Err(stale_consult_source(
+                "the canonical representation was removed",
+            ));
+        };
+        let Some(manifest) = documents.get::<AttachmentManifest>(namespace)? else {
+            return Err(stale_consult_source(
+                "the canonical representation was removed",
+            ));
+        };
+        validate_preview_manifest(record, &manifest)
+            .map_err(|problem| stale_consult_source(problem.message))?;
+        if manifest.policy_fingerprint != current_policy_fingerprint {
+            return Err(stale_consult_source("the attachment safety policy changed"));
+        }
+        let text = canonical_text(record, &manifest);
+        let current = AttachmentContextSource::from_verified(record, &manifest, &text)
+            .map_err(|blocked| stale_consult_source(blocked.blocker.message))?;
+        if current != source.representation {
+            return Err(stale_consult_source("the selected representation changed"));
+        }
+    }
+    Ok(())
 }
 
 fn consume_exact_draft(
@@ -4126,6 +4240,7 @@ mod tests {
             std::slice::from_ref(&staged.id),
             &user.id,
             None,
+            &[],
             "test.mention-journal",
             Journal::default,
             |journal| {
@@ -4164,6 +4279,212 @@ mod tests {
                 .expect("derived projection read")
                 .is_none()
         );
+    }
+
+    #[derive(Default, Serialize, Deserialize)]
+    struct ConsultJournal {
+        committed: bool,
+    }
+
+    fn selected_source(
+        conversation: &Conversation,
+        attachment_id: &str,
+    ) -> SelectedAttachmentSource {
+        let owner = conversation
+            .messages
+            .iter()
+            .find(|message| message.attachment_ids.iter().any(|id| id == attachment_id))
+            .expect("source message owns the attachment");
+        let active = crate::document::checked_active_messages(conversation)
+            .expect("validated source history");
+        let context = prepare_scoped_chat_attachments(
+            &conversation.id,
+            &active,
+            CurrentAttachmentSelection::HistoryOnly,
+        )
+        .expect("prepare source attachments")
+        .expect("source attachment context");
+        let representation = context
+            .sources_by_message_id
+            .get(&owner.id)
+            .expect("selected source representation")
+            .iter()
+            .find(|source| source.attachment_id == attachment_id)
+            .expect("exact attachment source")
+            .clone();
+        SelectedAttachmentSource {
+            conversation_id: conversation.id.clone(),
+            message_id: owner.id.clone(),
+            representation,
+        }
+    }
+
+    fn commit_host_with_selected_source(
+        mut host: Conversation,
+        source: &SelectedAttachmentSource,
+        staged_ids: &[String],
+        expected_draft: Option<&DraftMessage>,
+    ) -> Result<(PathBuf, ())> {
+        let mut user = message("consult-user", staged_ids.to_vec());
+        user.conversation_id = host.id.clone();
+        host.messages.push(user.clone());
+        host.active_leaf_message_id = Some(user.id.clone());
+        commit_generated_exchange_with_journal(
+            load_db()?,
+            host,
+            None,
+            std::slice::from_ref(&user.id),
+            staged_ids,
+            &user.id,
+            expected_draft,
+            std::slice::from_ref(source),
+            "test.consult-source-journal",
+            ConsultJournal::default,
+            |journal| {
+                journal.committed = true;
+                Ok(())
+            },
+            |_, _| Ok(()),
+        )
+    }
+
+    #[test]
+    fn unchanged_consult_source_commits_with_the_generated_message() {
+        let _session = TestDataDir::new("consult-source-unchanged");
+        let source = new_conversation("Source");
+        let attachment = stage_text(&source.id, "exact source text");
+        let source = send_staged_attachment(&source.id);
+        let selected = selected_source(&source, &attachment.id);
+        let host = new_conversation("Host");
+        let host_id = host.id.clone();
+
+        commit_host_with_selected_source(host, &selected, &[], None).expect("exact source commit");
+        let committed = crate::conversation_store::conversation_select(&host_id)
+            .expect("read committed host")
+            .result
+            .expect("host conversation");
+        assert_eq!(committed.messages.len(), 1);
+        assert!(
+            RuntimeStore::current()
+                .expect("store")
+                .get::<ConsultJournal>("test.consult-source-journal")
+                .expect("read journal")
+                .is_some_and(|journal| journal.committed)
+        );
+    }
+
+    #[test]
+    fn removed_consult_source_fails_in_the_real_commit_transaction() {
+        let _session = TestDataDir::new("consult-source-removed");
+        let source = new_conversation("Source");
+        let attachment = stage_text(&source.id, "exact source text");
+        let source = send_staged_attachment(&source.id);
+        let selected = selected_source(&source, &attachment.id);
+        let host = new_conversation("Host");
+        let host_id = host.id.clone();
+        let store = RuntimeStore::current().expect("store");
+        store
+            .put(
+                "test.consult-input-receipt",
+                &serde_json::json!({ "planned": true }),
+            )
+            .expect("retain pre-generation evidence");
+
+        crate::conversation_store::conversation_delete(&source.id)
+            .expect("concurrent source removal");
+        let error = commit_host_with_selected_source(host, &selected, &[], None)
+            .expect_err("removed source must abort the transaction");
+        assert!(error.is::<StaleConsultSource>());
+        assert!(
+            crate::conversation_store::conversation_select(&host_id)
+                .expect("read unchanged host")
+                .result
+                .expect("host conversation")
+                .messages
+                .is_empty()
+        );
+        assert!(
+            store
+                .get::<ConsultJournal>("test.consult-source-journal")
+                .expect("read rolled-back journal")
+                .is_none()
+        );
+        assert!(
+            store
+                .get::<serde_json::Value>("test.consult-input-receipt")
+                .expect("read retained input evidence")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn same_id_consult_source_replacement_fails_before_publication() {
+        let _session = TestDataDir::new("consult-source-replaced");
+        let source = new_conversation("Source");
+        let attachment = stage_text(&source.id, "exact source text");
+        let source = send_staged_attachment(&source.id);
+        let selected = selected_source(&source, &attachment.id);
+        let host = new_conversation("Host");
+        let host_id = host.id.clone();
+
+        RuntimeStore::current()
+            .expect("store")
+            .mutate_documents(ATTACHMENTS_NAMESPACE, AttachmentDb::default, |db, _| {
+                db.attachments
+                    .iter_mut()
+                    .find(|record| record.id == attachment.id)
+                    .expect("exact source record")
+                    .file_name = "same-id replacement.txt".to_string();
+                Ok(())
+            })
+            .expect("replace representation under the same attachment ID");
+        let error = commit_host_with_selected_source(host, &selected, &[], None)
+            .expect_err("changed representation must abort the transaction");
+        assert!(error.is::<StaleConsultSource>());
+        assert!(
+            crate::conversation_store::conversation_select(&host_id)
+                .expect("read unchanged host")
+                .result
+                .expect("host conversation")
+                .messages
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn newly_staged_consult_source_is_validated_after_its_atomic_message_binding() {
+        let _session = TestDataDir::new("consult-current-staged-source");
+        let host = new_conversation("Host");
+        let staged = stage_text(&host.id, "current attached notes");
+        let context =
+            prepare_scoped_chat_attachments(&host.id, &[], CurrentAttachmentSelection::Draft)
+                .expect("prepare current attachment")
+                .expect("current attachment context");
+        let source = SelectedAttachmentSource {
+            conversation_id: host.id.clone(),
+            message_id: "consult-user".to_string(),
+            representation: context
+                .current_sources
+                .iter()
+                .find(|source| source.attachment_id == staged.id)
+                .expect("exact current source")
+                .clone(),
+        };
+        commit_host_with_selected_source(
+            host,
+            &source,
+            std::slice::from_ref(&staged.id),
+            context.draft_snapshot.as_ref(),
+        )
+        .expect("current source commits only with the new message and attachment");
+        let record = load_attachment_db()
+            .expect("committed attachment index")
+            .attachments
+            .into_iter()
+            .find(|record| record.id == staged.id)
+            .expect("retained current attachment");
+        assert_eq!(record.state, AttachmentState::Committed);
+        assert_eq!(record.message_id, "consult-user");
     }
 
     #[test]
