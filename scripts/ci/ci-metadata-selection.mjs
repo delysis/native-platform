@@ -317,5 +317,3 @@ export function readCargoMetadata(repoRoot, metadataPath = process.env.CI_CARGO_
   }
   return JSON.parse(result.stdout);
 }
-
-
