@@ -2675,10 +2675,6 @@ fn run_worker(
                 cancellations,
                 request_lease,
             } => {
-                context.clear_kv_cache();
-                sequence_token_counts.clear();
-                sequence_token_ids.clear();
-                resident_text_prefix.invalidate();
                 if let Err(error) =
                     begin_generation_command(&request_lease, command_class, &speculative_admission)
                 {
@@ -2724,12 +2720,26 @@ fn run_worker(
                             &event_tx,
                             &mut retained_events,
                             &cancellations,
-                            SequenceTracking {
-                                token_counts: &mut sequence_token_counts,
-                                token_ids: &mut sequence_token_ids,
+                            controlled_runtime::ControlledSequenceState {
+                                tracking: SequenceTracking {
+                                    token_counts: &mut sequence_token_counts,
+                                    token_ids: &mut sequence_token_ids,
+                                },
+                                binding: &resident_prefix_binding,
+                                resident: &mut resident_text_prefix,
                             },
                         )
                     });
+                if execution.is_err()
+                    || cancellations
+                        .iter()
+                        .any(|flag| flag.load(Ordering::Acquire))
+                {
+                    context.clear_kv_cache();
+                    sequence_token_counts.clear();
+                    sequence_token_ids.clear();
+                    resident_text_prefix.invalidate();
+                }
                 if execution.is_err() {
                     controlled_runtime::emit_missing_failed_terminals(
                         &event_tx,
@@ -2758,6 +2768,15 @@ fn run_worker(
                         Arc::clone(&worker_identity),
                     )
                 });
+                if !result
+                    .as_ref()
+                    .is_ok_and(|completion| completion.has_live_authority())
+                {
+                    context.clear_kv_cache();
+                    sequence_token_counts.clear();
+                    sequence_token_ids.clear();
+                    resident_text_prefix.invalidate();
+                }
                 set_status_state(&status, ModelRuntimeState::Ready, 0);
                 let _ = request_lease.completed_or_failed(result.is_ok());
                 let _ = result_tx.send(result);

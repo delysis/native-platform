@@ -117,6 +117,7 @@ pub enum VerifiedControlledGenerationTerminal {
 /// used by the live batched execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ControlledRuntimeCostEvidence {
+    resident_prefix_tokens: usize,
     conditional_shared_prefix_tokens: usize,
     unconditional_shared_prefix_tokens: usize,
     physical_prompt_evaluations: u64,
@@ -125,6 +126,12 @@ pub struct ControlledRuntimeCostEvidence {
 }
 
 impl ControlledRuntimeCostEvidence {
+    /// Exact sequence-zero prompt positions retained from this owner worker.
+    #[must_use]
+    pub const fn resident_prefix_tokens(self) -> usize {
+        self.resident_prefix_tokens
+    }
+
     #[must_use]
     pub const fn conditional_shared_prefix_tokens(self) -> usize {
         self.conditional_shared_prefix_tokens
@@ -271,6 +278,9 @@ pub(crate) struct ControlledGenerationCompletion {
 }
 
 impl ControlledGenerationCompletion {
+    pub(crate) fn has_live_authority(&self) -> bool {
+        self.authority.is_ok()
+    }
     fn authority_rejected(output: ControlledGenerationBatchOutput, error: NativeError) -> Self {
         Self {
             output,
@@ -685,12 +695,38 @@ fn controlled_runtime_cost(
         )
     })?;
     Ok(ControlledRuntimeCostEvidence {
+        resident_prefix_tokens: 0,
         conditional_shared_prefix_tokens: conditional_shared,
         unconditional_shared_prefix_tokens: unconditional_shared,
         physical_prompt_evaluations,
         reserved_physical_context_cells,
         sequence_slots: request.cost().total_sequence_slots(),
     })
+}
+
+fn controlled_cost_with_resident(
+    request: &ControlledGenerationBatchRequest,
+    resident_prefix_tokens: usize,
+) -> NativeResult<ControlledRuntimeCostEvidence> {
+    let mut cost = controlled_runtime_cost(request)?;
+    if resident_prefix_tokens != 0
+        && (request.cases().len() != 1
+            || request.control().uses_same_model_cfg()
+            || is_disabled_control_baseline(request)
+            || resident_prefix_tokens >= request.cases()[0].conditional_prompt().token_ids().len())
+    {
+        return Err(generation_verification_error(
+            "invalid controlled resident prefix shape",
+        ));
+    }
+    // Reuse removes evaluations, not reserved context cells or logical admission
+    // charges. The final prompt token is always evaluated for fresh logits.
+    cost.physical_prompt_evaluations = cost
+        .physical_prompt_evaluations
+        .checked_sub(resident_prefix_tokens as u64)
+        .ok_or_else(|| generation_verification_error("resident prefix accounting underflow"))?;
+    cost.resident_prefix_tokens = resident_prefix_tokens;
+    Ok(cost)
 }
 
 fn token_id_shared_prefix<'a>(mut prompts: impl Iterator<Item = &'a [i32]>) -> usize {
@@ -1051,6 +1087,7 @@ impl RuntimeControlLedger {
             ledger.u64(*count);
         }
         ledger.u64(runtime_cost.conditional_shared_prefix_tokens as u64);
+        ledger.u64(runtime_cost.resident_prefix_tokens as u64);
         ledger.u64(runtime_cost.unconditional_shared_prefix_tokens as u64);
         ledger.u64(runtime_cost.physical_prompt_evaluations);
         ledger.u64(runtime_cost.reserved_physical_context_cells);
@@ -1097,6 +1134,12 @@ impl RuntimeControlLedger {
     }
 }
 
+pub(crate) struct ControlledSequenceState<'a> {
+    pub tracking: SequenceTracking<'a>,
+    pub binding: &'a ResidentTextPrefixBinding,
+    pub resident: &'a mut ResidentTextPrefixCache,
+}
+
 pub(crate) fn execute_controlled_generation(
     model: &LlamaModel,
     context: &mut LlamaContext<'_>,
@@ -1104,10 +1147,14 @@ pub(crate) fn execute_controlled_generation(
     event_tx: &Sender<GenerationEvent>,
     retained_events: &mut Vec<GenerationEvent>,
     cancellations: &[Arc<AtomicBool>],
-    tracking: SequenceTracking<'_>,
+    state: ControlledSequenceState<'_>,
 ) -> NativeResult<ControlledExecution> {
     validate_live_request(model, submission)?;
     if is_disabled_control_baseline(submission.request()) {
+        state.resident.invalidate();
+        context.clear_kv_cache();
+        state.tracking.token_counts.clear();
+        state.tracking.token_ids.clear();
         return execute_disabled_baseline(
             model,
             context,
@@ -1115,7 +1162,7 @@ pub(crate) fn execute_controlled_generation(
             event_tx,
             retained_events,
             cancellations,
-            tracking,
+            state.tracking,
         );
     }
     execute_active_controls(
@@ -1125,7 +1172,7 @@ pub(crate) fn execute_controlled_generation(
         event_tx,
         retained_events,
         cancellations,
-        tracking,
+        state,
     )
 }
 
@@ -1375,6 +1422,7 @@ struct ActiveControlledCase {
 }
 
 struct ControlledPrefillLayout {
+    resident_prefix_tokens: usize,
     cfg: bool,
     conditional_shared_prefix: usize,
     conditional_logit_indexes: Vec<i32>,
@@ -1422,8 +1470,13 @@ fn execute_active_controls(
     event_tx: &Sender<GenerationEvent>,
     retained_events: &mut Vec<GenerationEvent>,
     cancellations: &[Arc<AtomicBool>],
-    mut tracking: SequenceTracking<'_>,
+    state: ControlledSequenceState<'_>,
 ) -> NativeResult<ControlledExecution> {
+    let ControlledSequenceState {
+        mut tracking,
+        binding,
+        resident,
+    } = state;
     let request = submission.request();
     let compiled_grammar = compile_constraint(submission)?;
     let vocabulary_size = usize::try_from(model.n_vocab()).map_err(|_| {
@@ -1467,6 +1520,21 @@ fn execute_active_controls(
         })
         .collect::<Vec<_>>();
     let started = Instant::now();
+    let resident_prefix = if request.cases().len() == 1
+        && !request.control().uses_same_model_cfg()
+        && !cancellations[0].load(Ordering::Acquire)
+        && tracking.token_counts.get(&0).copied() == tracking.token_ids.get(&0).map(Vec::len)
+        && tracking
+            .token_ids
+            .get(&0)
+            .is_some_and(|tokens| tokens == &resident.token_ids)
+    {
+        resident.reusable_tokens(binding, &conditional_tokens)
+    } else {
+        0
+    };
+    // No failing or partially decoded execution can retain reuse authority.
+    resident.invalidate();
     for case_index in 0..request.cases().len() {
         emit_controlled_event(
             event_tx,
@@ -1485,6 +1553,7 @@ fn execute_active_controls(
         &conditional_tokens,
         &unconditional_tokens,
         &mut tracking,
+        resident_prefix,
         cancellations,
     )?;
     let mut cases = request
@@ -1707,7 +1776,7 @@ fn execute_active_controls(
                     restored_prefix_tokens: 0,
                     replayed_prefix_tokens: 0,
                     batch_shared_prefix_tokens: layout.conditional_shared_prefix,
-                    resident_prefix_tokens: 0,
+                    resident_prefix_tokens: layout.resident_prefix_tokens,
                 },
             },
             real_engine_invoked: true,
@@ -1721,11 +1790,21 @@ fn execute_active_controls(
         )?);
         terminal_sampled_token_ids.push(active.terminal_sampled_token_id);
     }
+    if request.cases().len() == 1
+        && !layout.cfg
+        && outputs[0].generation().state == GenerationState::Completed
+    {
+        resident.commit(
+            binding,
+            tracking.token_counts.get(&0).copied(),
+            tracking.token_ids.get(&0),
+        );
+    }
     Ok(ControlledExecution {
         outputs,
         terminal_sampled_token_ids,
         runtime_ledger,
-        runtime_cost: controlled_runtime_cost(request)?,
+        runtime_cost: controlled_cost_with_resident(request, layout.resident_prefix_tokens)?,
     })
 }
 
@@ -1837,6 +1916,7 @@ fn prefill_controlled_batch(
     conditional: &[Vec<LlamaToken>],
     unconditional: &[Option<Vec<LlamaToken>>],
     tracking: &mut SequenceTracking<'_>,
+    resident_prefix_tokens: usize,
     cancellations: &[Arc<AtomicBool>],
 ) -> NativeResult<ControlledPrefillLayout> {
     if conditional.len() != request.cases().len()
@@ -1892,17 +1972,46 @@ fn prefill_controlled_batch(
         conditional.len() + unconditional_sets.len(),
         context.n_batch(),
     )?;
-    context.clear_kv_cache();
+    controlled_cost_with_resident(request, resident_prefix_tokens)?;
+    if resident_prefix_tokens == 0 {
+        context.clear_kv_cache();
+    } else {
+        context
+            .clear_kv_cache_seq(Some(0), Some(resident_prefix_tokens as u32), None)
+            .map_err(|error| {
+                native_decode_error("failed to crop controlled resident prefix", error)
+            })?;
+        for sequence in tracking.token_ids.keys().copied().filter(|id| *id != 0) {
+            let sequence = u32::try_from(sequence)
+                .map_err(|_| generation_verification_error("negative tracked sequence"))?;
+            context
+                .clear_kv_cache_seq(Some(sequence), None, None)
+                .map_err(|error| {
+                    native_decode_error("failed to clear prior controlled sequence", error)
+                })?;
+        }
+    }
     tracking.token_counts.clear();
     tracking.token_ids.clear();
-    prefill_controlled_group(
-        context,
-        conditional,
-        &conditional_sequences,
-        conditional_shared_prefix,
-        "conditional",
-        cancellations,
-    )?;
+    if resident_prefix_tokens > 0 {
+        ignore_prefill_cancellation(decode_tokens_chunked_cancellable(
+            context,
+            &conditional[0][resident_prefix_tokens..conditional[0].len() - 1],
+            0,
+            resident_prefix_tokens as i32,
+            false,
+            || cancellations[0].load(Ordering::Acquire),
+        ))?;
+    } else {
+        prefill_controlled_group(
+            context,
+            conditional,
+            &conditional_sequences,
+            conditional_shared_prefix,
+            "conditional",
+            cancellations,
+        )?;
+    }
     if cfg {
         prefill_controlled_group(
             context,
@@ -1983,6 +2092,7 @@ fn prefill_controlled_batch(
         }
     }
     Ok(ControlledPrefillLayout {
+        resident_prefix_tokens,
         cfg,
         conditional_shared_prefix,
         conditional_logit_indexes,
@@ -3064,7 +3174,7 @@ fn verify_controlled_authority(
         artifacts,
     } = verification;
     let request = output.request();
-    if runtime_cost != controlled_runtime_cost(request)?
+    if runtime_cost != controlled_cost_with_resident(request, runtime_cost.resident_prefix_tokens)?
         || admitted_request_sha256 != request.fingerprint_sha256()
         || output.receipt().request_sha256() != admitted_request_sha256
         || request.control().writer().fingerprint() != fingerprint
@@ -3186,6 +3296,9 @@ fn verify_controlled_authority(
                 != runtime_cost.conditional_shared_prefix_tokens
             || generation.metrics.cache.supplied_prefix_tokens != 0
             || generation.metrics.cache.restored_prefix_tokens != 0
+            || generation.metrics.cache.replayed_prefix_tokens != 0
+            || generation.metrics.cache.resident_prefix_tokens
+                != runtime_cost.resident_prefix_tokens
             || generation.metrics.cache.batch_shared_prefix_tokens
                 != runtime_cost.conditional_shared_prefix_tokens
         {
@@ -3928,6 +4041,48 @@ mod tests {
     }
 
     #[test]
+    fn resident_controlled_cost_keeps_admission_charge_and_replays_final_token() {
+        let active = request(
+            vec![GuidanceControl::PowerSampling {
+                exponent: ExactF32::new(1.1).expect("exponent"),
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let cold = controlled_runtime_cost(&active).expect("cold cost");
+        let warm = controlled_cost_with_resident(&active, 2).expect("warm cost");
+        assert_eq!(
+            warm.physical_prompt_evaluations(),
+            cold.physical_prompt_evaluations() - 2
+        );
+        assert_eq!(
+            warm.reserved_physical_context_cells(),
+            cold.reserved_physical_context_cells()
+        );
+        assert_eq!(warm.sequence_slots(), cold.sequence_slots());
+        assert_eq!(active.cost().exact_prompt_tokens(), 3);
+        assert!(controlled_cost_with_resident(&active, 3).is_err());
+        let baseline = request(Vec::new(), Vec::new(), Vec::new());
+        assert!(controlled_cost_with_resident(&baseline, 1).is_err());
+        let cfg = request(
+            vec![GuidanceControl::SameModelCfg {
+                scale: ExactF32::new(1.2).expect("scale"),
+                rescale: None,
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(controlled_cost_with_resident(&cfg, 1).is_err());
+        let multi = ControlledGenerationBatchRequest::new(
+            "multi".into(),
+            vec![case("a", false), case("b", false)],
+            active.control().clone(),
+        )
+        .expect("batch");
+        assert!(controlled_cost_with_resident(&multi, 1).is_err());
+    }
+
+    #[test]
     fn zero_decision_cancellation_preserves_a_diagnostic_ledger_not_authority() {
         let request = request(Vec::new(), Vec::new(), Vec::new());
         let cost = controlled_runtime_cost(&request).expect("cost");
@@ -4514,6 +4669,40 @@ mod tests {
             constrained.output().cases()[0]
                 .generation()
                 .real_engine_invoked
+        );
+
+        let warmed = handle
+            .generate_controlled(ControlledGenerationSubmission::new(
+                constrained.output().request().clone(),
+                Some(schema.to_string()),
+            )?)?
+            .wait_verified()?;
+        let reused = warmed.runtime_cost().resident_prefix_tokens();
+        assert_eq!(reused, prompt.len() - 1);
+        assert_eq!(warmed.runtime_cost().physical_prompt_evaluations(), 1);
+        assert_eq!(
+            warmed.output().cases()[0]
+                .generation()
+                .metrics
+                .cache
+                .resident_prefix_tokens,
+            reused
+        );
+        assert_eq!(
+            warmed.output().cases()[0].generation().generated_token_ids,
+            constrained.output().cases()[0]
+                .generation()
+                .generated_token_ids
+        );
+        let serialized = serde_json::to_string(warmed.output())?;
+        let restored: ControlledGenerationBatchOutput = serde_json::from_str(&serialized)?;
+        assert_eq!(
+            restored.cases()[0]
+                .generation()
+                .metrics
+                .cache
+                .resident_prefix_tokens,
+            reused
         );
 
         let gbnf = r#"root ::= "A""#;
