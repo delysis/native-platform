@@ -7,7 +7,9 @@ use crate::now_ms;
 use crate::receipts::{Blocker, CommandResult};
 use crate::store::{DocumentMutations, DocumentSnapshot, RuntimeStore};
 use anyhow::{Context, Result, anyhow};
-use attachment_native_host::{AttachmentHost, AttachmentHostConfig, ProvidedAttachment};
+use attachment_native_host::{
+    AttachmentHost, AttachmentHostConfig, CanonicalizedAttachment, ProvidedAttachment,
+};
 use attachment_native_types::{
     ArtifactPayload, AttachmentBundle, AttachmentGraph, AttachmentReceipt, BlobValidationGrade,
     CanonicalArtifact, Coverage, DetectedFormat, MediaFamily, ObjectId, SegmentKind, TextFormat,
@@ -472,20 +474,20 @@ pub fn attachment_import_pasted_text(
     )
 }
 
-fn canonicalize_and_stage(
-    scope: &crate::OperationScope,
-    conversation_id: &str,
-    source_path: String,
-    provided: ProvidedAttachment,
-    command: &str,
+struct CanonicalAttachmentRecord {
+    record: AttachmentRecord,
+    manifest: AttachmentManifest,
+    blobs: Vec<(String, Vec<u8>)>,
+}
+
+fn canonical_attachment_record(
+    canonicalized: CanonicalizedAttachment,
     host: &AttachmentHost,
+    conversation_id: &str,
+    file_name: String,
+    source_path: String,
     attachment_id: Option<&str>,
-) -> Result<CommandResult<AttachmentImportOutput>> {
-    let file_name = provided.display_name.clone();
-    let canonicalized = match host.inspect_and_canonicalize(provided) {
-        Ok(canonicalized) => canonicalized,
-        Err(error) => return Ok(attachment_error_result(command, error)),
-    };
+) -> Result<CanonicalAttachmentRecord> {
     let root_id = canonicalized.bundle.graph.root.clone();
     let root = canonicalized
         .bundle
@@ -533,6 +535,48 @@ fn canonicalize_and_stage(
         policy_fingerprint: host.policy_fingerprint().to_string(),
         receipt: Some(canonicalized.receipt),
     };
+    let blobs = canonicalized
+        .bundle
+        .blobs
+        .into_iter()
+        .map(|(id, bytes)| (object_namespace(&id), bytes.as_ref().to_vec()))
+        .collect();
+    Ok(CanonicalAttachmentRecord {
+        record,
+        manifest,
+        blobs,
+    })
+}
+
+fn canonicalize_and_stage(
+    scope: &crate::OperationScope,
+    conversation_id: &str,
+    source_path: String,
+    provided: ProvidedAttachment,
+    command: &str,
+    host: &AttachmentHost,
+    attachment_id: Option<&str>,
+) -> Result<CommandResult<AttachmentImportOutput>> {
+    let file_name = provided.display_name.clone();
+    let canonicalized = match host.inspect_and_canonicalize(provided) {
+        Ok(canonicalized) => canonicalized,
+        Err(error) => return Ok(attachment_error_result(command, error)),
+    };
+    let prepared = canonical_attachment_record(
+        canonicalized,
+        host,
+        conversation_id,
+        file_name,
+        source_path,
+        attachment_id,
+    )?;
+    let record = prepared.record;
+    let id = record.id.clone();
+    let manifest_namespace = record
+        .manifest_namespace
+        .clone()
+        .expect("canonical record manifest");
+    let manifest = prepared.manifest;
     let _lifecycle = lock_attachment_lifecycle()?;
     let mut attachment_db = load_attachment_db()?;
     attachment_db.attachments.insert(0, record.clone());
@@ -548,9 +592,7 @@ fn canonicalize_and_stage(
         (DRAFTS_NAMESPACE.to_string(), serde_json::to_vec(&draft_db)?),
         (manifest_namespace, serde_json::to_vec(&manifest)?),
     ];
-    for (object_id, bytes) in canonicalized.bundle.blobs {
-        documents.push((object_namespace(&object_id), bytes.as_ref().to_vec()));
-    }
+    documents.extend(prepared.blobs);
     store.put_documents_atomically(documents)?;
     let settings = resolve_settings()?;
     let (multimodal_ready, multimodal_blocker) = multimodal_readiness(
@@ -4808,3 +4850,6 @@ mod tests {
         assert_eq!(blocked.blocker.code, "attachment_content_mismatch");
     }
 }
+
+mod document_chat;
+pub use document_chat::prepare_document_chat_in_scope;

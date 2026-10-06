@@ -579,7 +579,7 @@ impl EmbeddedMom {
             lease,
             operations.clone(),
             input,
-            context,
+            Some(context),
             on_event,
         );
         let mut dispatch = std::pin::pin!(dispatch);

@@ -183,3 +183,25 @@ rather than overwriting that draft. Source-owned draft/context recovery behind
 the existing composer is therefore an additional blocker for cancellation and
 relaunch qualification. It must preserve failed inputs and distinguish these
 adapter-owned snapshots from unrelated draft edits or attachments.
+
+
+## Cancelled draft recovery repair
+
+Document chat preparation now commits the complete canonical context, exact draft
+ownership snapshot and immutable encrypted input receipt in one Mom SQLite
+transaction. A later send can replace only that unchanged adapter-owned draft.
+Matching text alone cannot claim a foreign draft. Unrelated edits or attachments
+fail closed, and no new context is published on refusal. Superseded failed input
+text, attachment records, manifests and source bytes remain retained; they are
+not included in the next request. An ordinary completed send consumes the draft
+through Mom's existing final transaction. Preparation also handles an empty
+context selection, so removing explicit context cannot strand an earlier draft.
+
+The new ownership schema is explicit and incompatible records are rejected.
+There is no migration or implicit source restoration. Four real-store tests
+cover reopening after cancellation, preservation of failed source bytes and two
+immutable input receipts, protection of unrelated and matching foreign drafts,
+and cancellation before preparation. Mom's broader library checks pass (241
+runtime and 73 application tests), as do strict Rust checks. These remain
+component evidence; native cancellation/relaunch and the normal-window model
+consultation still require exact packaged qualification.
