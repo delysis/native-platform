@@ -205,3 +205,18 @@ and cancellation before preparation. Mom's broader library checks pass (241
 runtime and 73 application tests), as do strict Rust checks. These remain
 component evidence; native cancellation/relaunch and the normal-window model
 consultation still require exact packaged qualification.
+
+
+## Exact 80210b29 native survey
+
+The clean 80210b29 consolidated gate passed all 58 component records; its archive
+built and passed ad hoc signature verification. The source-bound native survey
+observed the restored original Message control and the pane's generic
+"Open and save a document first" refusal. App.preparePaneRun still requires a
+loaded document writing model before every pane send, despite native Mom chat
+not requiring that model. A binding correction must preserve document flush and
+source identity checks while removing this writing-model prerequisite for chat.
+No scripted Send occurred, and no Mom consultation is verified. Unscripted hello
+text appeared in the fixture manuscript and composer; its cause is not attributed.
+A later observation found no accessible window while the process existed. The
+survey and fixture state remain preserved under loom-original-pane-native-80210b29-01.
