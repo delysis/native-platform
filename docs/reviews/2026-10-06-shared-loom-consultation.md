@@ -220,3 +220,24 @@ No scripted Send occurred, and no Mom consultation is verified. Unscripted hello
 text appeared in the fixture manuscript and composer; its cause is not attributed.
 A later observation found no accessible window while the process existed. The
 survey and fixture state remain preserved under loom-original-pane-native-80210b29-01.
+
+## Original pane admission and initial composer size
+
+The user reported another visible regression. Comparing the pane, App and global
+styles with initial main 637e60b6 found no source differences before this repair;
+that source comparison does not establish native presentation fidelity. The
+restoration alone therefore did not resolve the user's reported behavior.
+
+Chat now preserves the same source flush, checkpoint and scope checks without
+requiring or activating the manuscript writing model. Other pane types retain
+that prerequisite. Mom still owns its actual chat execution profile and engine
+admission; no placeholder model is supplied. The existing textarea now has an
+explicit 36px initial height, retaining its original manual vertical resize and
+120px upper limit. Transcript rendering and controls are unchanged.
+
+A real-App WebKit regression injects only the native transport, starts with no
+writing model, collapses the main pane using its existing control, sends the
+original message with exact document/revision/blob/context, and requires the
+retained reply to render. It also checks compact composer geometry before and
+after collapse and reply, and rejects writing-model activation during send.
+This transport fixture is not a real Mom consultation or native-window acceptance.

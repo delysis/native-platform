@@ -2,7 +2,7 @@ import { mount, tick, unmount } from 'svelte';
 import { afterEach, expect, it, vi } from 'vitest';
 import { page, userEvent } from 'vitest/browser';
 import type { BoundaryEntry } from './completionBoundaryDiagnostics';
-import type { BranchBody, BranchCard, CompletionSnapshot, DesktopGenerationEnvelope, ModelCapabilitySummary, OpenDocument, ProjectSnapshot, WeaveStarted } from './types';
+import type { BranchBody, BranchCard, CompletionSnapshot, DesktopGenerationEnvelope, ModelCapabilitySummary, OpenDocument, ProjectSnapshot, TerminalRun, WeaveStarted } from './types';
 import '../app.css';
 
 // Only the external native transport is injected. App, IPC ordering, snapshot
@@ -46,6 +46,68 @@ function completionWitness(): Record<string, any> {
   return JSON.parse(document.querySelector('[aria-label="Completion session witness"]')?.textContent ?? '{}');
 }
 function glyph(): string | null { return document.querySelector('.loom-visual-ghost')?.textContent ?? null; }
+
+it('sends from the original chat pane without a manuscript writer and keeps its composer compact', async () => {
+  restoreStorage = Object.entries(localStorage); localStorage.clear();
+  restoreNative = Object.getOwnPropertyDescriptor(window, '__TAURI_INTERNALS__');
+  Object.defineProperty(window, '__TAURI_INTERNALS__', { configurable: true, value: {} });
+  const blob = await sha256('Original manuscript');
+  const opened: OpenDocument = { summary: {
+    document_id: 'doc-1', relative_path: 'Untitled.md', title: 'Untitled', kind: 'prose',
+    revision_id: 'revision-1', active_blob_id: blob, word_count: 2, externally_modified: false
+  }, visible_blob_id: blob, text: 'Original manuscript', transient_draft: null };
+  const project: ProjectSnapshot = { project_id: 'project-1', session_id: 'session-1', title: 'writing',
+    root: '/injected/writing', schema_version: 1, pending_recovery: 0, documents: [opened.summary] };
+  const calls: string[] = [];
+  let submitted: Record<string, any> | null = null;
+  let retainedRun: TerminalRun | null = null;
+  transport.invoke.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
+    calls.push(command);
+    switch (command) {
+      case 'plugin:loom|application_close_pending': return false;
+      case 'plugin:loom|project_current': return project;
+      case 'plugin:loom|document_open': return opened;
+      case 'plugin:loom|document_context_list': return { markdown: '', attachments: [], materials: [], revision: 'context-1' };
+      case 'plugin:loom|workspace_template_get': return { enabled: true, document_id: null, revision_id: null, error: null,
+        config: { panes: { chat: { kind: 'chat', position: 'right', visible: true, title: null, document: null, context: ['@document'] } } } };
+      case 'plugin:loom|build_model_policy_get': return null;
+      case 'plugin:loom|model_catalog_list': return [];
+      case 'plugin:loom|model_list': return [];
+      case 'plugin:loom|inference_status': return { suggestions: null };
+      case 'plugin:loom|completion_snapshot': return { project_id: project.project_id, session_id: project.session_id,
+        document_id: opened.summary.document_id, branches: [], active_operations: [], next_cursor: null, has_more: false };
+      case 'plugin:loom|model_download_list':
+      case 'plugin:loom|material_list':
+      case 'plugin:loom|co_writer_list': return [];
+      case 'plugin:loom|terminal_list': return retainedRun ? [retainedRun] : [];
+      case 'plugin:loom|suggestions_set':
+      case 'plugin:loom|focus_mode_set': return;
+      case 'plugin:loom|terminal_run':
+        submitted = args;
+        retainedRun = { run_id: args.commandId, status: 'completed', expression: args.expression, presentation: args.presentation,
+          output_document_id: null, output_relative_path: null, preview: 'Transport fixture reply', error: null, created_at_ms: 1 };
+        return retainedRun;
+      default: throw new Error(`Unexpected native operation: ${command}`);
+    }
+  });
+  const target = document.createElement('div'); document.body.append(target);
+  mounted = mount(App, { target });
+  const input = page.getByRole('textbox', { name: 'Message', exact: true });
+  await expect.element(input).toBeVisible();
+  expect(input.element().getBoundingClientRect().height).toBeLessThanOrEqual(40);
+  await page.getByRole('button', { name: 'Collapse main pane', exact: true }).click();
+  expect(input.element().getBoundingClientRect().height).toBeLessThanOrEqual(40);
+  await input.fill('@mom hello');
+  const beforeSend = calls.length;
+  await userEvent.keyboard('{Enter}');
+  await expect.poll(() => submitted).not.toBeNull();
+  expect(submitted).toMatchObject({ documentId: 'doc-1', sourceRevisionId: 'revision-1', expectedVisibleBlobId: blob,
+    turnBoundary: 'chat', presentation: { pane_id: 'chat', input: '@mom hello' }, contextReferences: ['Untitled.md'] });
+  expect(calls.slice(beforeSend).filter(command => /model|weave_start/.test(command))).toEqual([]);
+  expect(document.querySelector('[role="alert"]')?.textContent ?? '').not.toContain('Open and save');
+  await expect.element(page.getByText('Transport fixture reply', { exact: true })).toBeVisible();
+  expect(input.element().getBoundingClientRect().height).toBeLessThanOrEqual(40);
+});
 const terminalSpaceSentinel = 'Loom native smoke prose: The lantern crossed the quiet room, casting a narrow pool of light across the ';
 function authorDomText(editor: Element): string {
   const copy = editor.cloneNode(true) as Element;

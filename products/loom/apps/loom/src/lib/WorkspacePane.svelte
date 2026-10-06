@@ -374,7 +374,7 @@
   .composer-actions { display:flex; align-items:center; gap:5px; }
   .composer-actions button { min-height:26px; padding:2px 6px; }
   .send { margin-left:auto; width:28px; }
-  textarea { width:100%; box-sizing:border-box; min-width:0; min-height:28px; max-height:120px; padding:7px 9px; resize:vertical; background:var(--paper-deep); color:inherit; font:inherit; border:1px solid var(--line-soft); border-radius:8px; }
+  textarea { width:100%; box-sizing:border-box; min-width:0; height:36px; min-height:28px; max-height:120px; padding:7px 9px; resize:vertical; background:var(--paper-deep); color:inherit; font:inherit; border:1px solid var(--line-soft); border-radius:8px; }
   button { min-height:30px; padding:4px 8px; cursor:pointer; }
   .error { color:var(--danger); font-size:.8rem; padding:4px 8px; }
   .empty { opacity:.65; }
