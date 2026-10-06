@@ -545,33 +545,57 @@ pub async fn mom_llama_chat_dispatch(
     }
     let stream_conversation = conversation.clone();
     let lease = runtime.admit(command_spec("mom_llama_chat_dispatch"))?;
-    let operations = runtime.operation_scope();
     let runtime = runtime.inner().clone();
     let events = window.clone();
-    blocking_command(lease, move || {
-        let result = mom_llama_runtime::chat_dispatch_stream_in_scope(
-            &operations,
-            mom_llama_runtime::MentionDispatchInput {
-                conversation_id: conversation,
-                message,
-            },
-            ChatSendOptions::default(),
-            Some(move |event| {
-                events
-                    .emit("mom_llama_chat_dispatch_stream", &event)
-                    .map_err(anyhow::Error::new)?;
-                if let Some(request) = &client_request {
-                    events.emit("loom_mom_chat_dispatch_stream", serde_json::json!({
-                        "client_request": request, "conversation_id": stream_conversation, "event": event,
-                    })).map_err(anyhow::Error::new)?;
-                }
-                Ok(())
-            }),
-        )?;
-        observe_dispatch_approvals(&runtime, &result)?;
-        Ok(result)
-    })
-    .await
+    let result = dispatch_typed(
+        runtime,
+        lease,
+        mom_llama_runtime::MentionDispatchInput {
+            conversation_id: conversation,
+            message,
+        },
+        Some(move |event| {
+            events
+                .emit("mom_llama_chat_dispatch_stream", &event)
+                .map_err(anyhow::Error::new)?;
+            if let Some(request) = &client_request {
+                events.emit("loom_mom_chat_dispatch_stream", serde_json::json!({
+                    "client_request": request, "conversation_id": stream_conversation, "event": event,
+                })).map_err(anyhow::Error::new)?;
+            }
+            Ok(())
+        }),
+    )
+    .await?;
+    command_value(Ok(result))
+}
+
+/// Preserve the structured command receipt until the caller chooses its
+/// presentation. Both embedding and Tauri use the same supervised execution.
+pub(crate) async fn dispatch_typed<F>(
+    runtime: AppRuntimeHandle,
+    lease: AppWorkLease,
+    input: mom_llama_runtime::MentionDispatchInput,
+    on_event: Option<F>,
+) -> Result<mom_llama_runtime::CommandResult<ChatDispatchOutput>, String>
+where
+    F: FnMut(mom_llama_runtime::ChatDispatchStreamEvent) -> anyhow::Result<()> + Send + 'static,
+{
+    let operations = runtime.operation_scope();
+    lease
+        .run_blocking_with_cancellation_evidence(move || {
+            let result = mom_llama_runtime::chat_dispatch_stream_in_scope(
+                &operations,
+                input,
+                ChatSendOptions::default(),
+                on_event,
+            )
+            .map_err(to_error)?;
+            observe_dispatch_approvals(&runtime, &result).map_err(to_error)?;
+            let cancelled = result.has_authoritative_cancellation_evidence();
+            Ok((result, cancelled))
+        })
+        .await
 }
 
 #[tauri::command]

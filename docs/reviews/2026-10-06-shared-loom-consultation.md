@@ -82,8 +82,9 @@ Neither this failure nor the template correction is called packaged acceptance.
 
 ## Returned architectural review: remaining authority gaps
 
-Shared residency locks do not yet serialize cross-product generation. Opening
-chat requests document cancellation without awaiting terminal work. The injected
+Shared residency locks do not yet serialize cross-product generation. The removed
+overlay requested document cancellation without awaiting terminal work; the new
+native binding must establish that terminal boundary before conflicting work. The injected
 concrete document runtime still carries an application finalizer, although its
 erased execution interface and native client cannot finalize the host. These
 are unresolved architecture requirements from the returned proposal. Early Stop
@@ -102,3 +103,29 @@ backend remains available, but its normal-window integration is not accepted.
 The latest exact-window attempt failed before Send, with no model consultation
 submitted. Its logs and source-bound failed receipt are preserved. The accessible
 window disappeared while the process remained alive; its cause is not proven.
+
+
+## Chat-as-document integration boundary
+
+The user explicitly selected the existing Loom WorkspacePane chat and the
+chat-as-document model. The current difference between Loom output documents
+and Mom conversation records is an implementation detail, not a functional
+reason to replace the pane or introduce a second sidebar/composer. Message
+branches, personas, attachment occurrences, approvals and citation identities
+must remain structured metadata behind ordinary document presentation.
+
+EmbeddedMom now exposes typed native dispatch with the same encrypted startup,
+application admission, operation supervisor, approval registration and
+executor-authoritative cancellation evidence as the existing Tauri command.
+The Tauri command uses that same implementation. The result remains a structured
+CommandResult containing native message/invocation identities; it is not reduced
+to output text or recast as a fabricated terminal receipt. Dispatch rejects a
+service from a different application before startup. The frontend is unchanged.
+
+This is a reusable service boundary, not completed pane integration. Durable
+Loom-document/pane-to-conversation binding, retained document projection with
+native receipt metadata, source-context admission and cancellation before native
+registration remain necessary. Separate Mom and Loom persistence must not be
+represented as one atomic transaction: a Mom commit followed by a failed document
+projection needs an honest retained outcome and replay recovery. The real
+source-occurrence check remains in Mom's final SQLite commit transaction.

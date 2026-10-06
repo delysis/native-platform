@@ -290,6 +290,10 @@ async fn mom_llama_runtime_initialize(
     app: AppHandle,
     startup: State<'_, StartupController>,
 ) -> Result<(), String> {
+    initialize_runtime(app, &startup).await
+}
+
+async fn initialize_runtime(app: AppHandle, startup: &StartupController) -> Result<(), String> {
     let retry_cached_failure = match startup.begin_initialization()? {
         StartupAction::AlreadyReady => return Ok(()),
         StartupAction::Initialize {
@@ -510,6 +514,34 @@ impl EmbeddedMom {
             .manage(self.clone())
             .manage(self.startup.clone())
             .invoke_handler(command_handler())
+    }
+
+    /// Execute an ordinary Mom turn through the same admission and worker
+    /// supervisor as the Tauri command. The caller owns its document projection;
+    /// this result retains the authoritative message and invocation identities.
+    pub async fn dispatch<F>(
+        &self,
+        app: AppHandle,
+        input: mom_llama_runtime::MentionDispatchInput,
+        on_event: Option<F>,
+    ) -> Result<mom_llama_runtime::CommandResult<mom_llama_runtime::ChatDispatchOutput>, String>
+    where
+        F: FnMut(mom_llama_runtime::ChatDispatchStreamEvent) -> anyhow::Result<()> + Send + 'static,
+    {
+        let registered = app
+            .try_state::<Self>()
+            .ok_or_else(|| "Mom service is not registered in this application".to_string())?;
+        if !Arc::ptr_eq(&self.startup.state, &registered.startup.state) {
+            return Err("Mom service belongs to another application".to_string());
+        }
+        initialize_runtime(app.clone(), &self.startup).await?;
+        let runtime = app
+            .try_state::<AppRuntimeHandle>()
+            .ok_or_else(|| "Mom runtime was not installed after startup".to_string())?
+            .inner()
+            .clone();
+        let lease = runtime.admit(command_registry::command_spec("mom_llama_chat_dispatch"))?;
+        commands::dispatch_typed(runtime, lease, input, on_event).await
     }
 
     pub async fn drain(&self) -> Result<(), String> {
