@@ -6130,7 +6130,7 @@ fn apply_model_chat_template(
 // fixture. Recognizing a few marker substrings is unsafe: a behaviorally
 // different Jinja program can retain every marker while changing framing.
 const GEMMA4_CANONICAL_TEMPLATE_SHA256: &str =
-    "2dfbfc7d538912f4ea11d29d85b4e25d7bc26386e53f57529f1d707c28b5828c";
+    "ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4";
 
 fn is_supported_gemma4_template(source: &str) -> bool {
     format!("{:x}", Sha256::digest(source.as_bytes())) == GEMMA4_CANONICAL_TEMPLATE_SHA256
@@ -7362,6 +7362,23 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn gemma4_template_dispatch_admits_the_frozen_model_and_rejects_modified_source() {
+        let canonical =
+            include_str!("../tests/fixtures/gemma4-google-canonical-chat-template.jinja");
+        assert!(is_supported_gemma4_template(canonical));
+        let changed = canonical.replace(
+            "{%- for message in loop_messages -%}",
+            "{%- for message in loop_messages | reverse -%}",
+        );
+        assert_ne!(canonical, changed);
+        for marker in ["enable_thinking | default(false)", "<|turn>", "<turn|>"] {
+            assert!(canonical.contains(marker) && changed.contains(marker));
+        }
+        assert!(!is_supported_gemma4_template(&changed));
+        assert!(!is_supported_gemma4_template(&format!("{canonical}\n")));
     }
 
     #[test]

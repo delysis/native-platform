@@ -47,3 +47,28 @@ normal-window qualification. This slice adds integration code and does not yet
 claim the intended net SLOC reduction. EASL implementation is already absent from this candidate; only its history-
 preservation tooling remains. The predecessor records its private extraction.
 This slice does not qualify an EASL Tauri replacement or import its experiments.
+
+
+## Native follow-up: canonical template pin
+
+Actual Metal loading exposed an incorrect hash introduced in `53320b94`. The
+pin `2dfbfc7d...` did not describe the named frozen Google GGUF. The cached
+`29d097773436b69ff9feafd636ab4cf873786537` model's full SHA-256 matches its
+content-addressed blob `93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b`.
+Its exact 18,683-byte `tokenizer.chat_template` has SHA-256
+`ae53464bf3be25802b3a5b37def7fd89667067d7577049b3b2d74c4d8de4c6d4`.
+
+The text-only non-thinking source path was checked against the existing renderer:
+system framing, trimmed content, consecutive assistant turns, discarded thought
+history, turn closure and the empty thought channel for generation. The fixture
+is extracted unchanged from that model. The pin is corrected; there is still
+one accepted identity, with no marker heuristic or unknown-template fallback.
+A positive fixture test now exercises admission. Reversing message order while
+retaining every former marker, and adding a byte to the source, both fail closed.
+The earlier template-rejected native attempts are retained as failed evidence.
+
+The `5a0e80e0` archive was built and signed, but its no-model smoke failed after
+the seeded manuscript was replaced by unrelated text during formatting. Its
+selection guard correctly refused qualification. That unexpected input's cause
+is unresolved; the failed archive, logs, manuscript and store are preserved.
+Neither this failure nor the template correction is called packaged acceptance.
