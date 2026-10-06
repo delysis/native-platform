@@ -9877,7 +9877,7 @@
 </svelte:head>
 
 <div class="app-shell" class:chat-open={chatWorkAreaOpen}>
-  {#if chatWorkAreaOpen}<ChatWorkArea onDocuments={() => chatWorkAreaOpen = false} />{/if}
+  {#if chatWorkAreaOpen}<ChatWorkArea onDocuments={() => chatWorkAreaOpen = false} onTitlebarDrag={startTitlebarDrag} />{/if}
   <div style="display: contents" inert={chatWorkAreaOpen}>
   {#if project}
     <div

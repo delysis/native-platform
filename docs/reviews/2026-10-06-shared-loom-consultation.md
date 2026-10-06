@@ -44,5 +44,6 @@ The document outline and chat list still need to become one shared sidebar.
 The standalone Mom renderer and `--mode chat` root remain during this acceptance
 slice; retiring them and their renderer-specific tests should follow successful
 normal-window qualification. This slice adds integration code and does not yet
-claim the intended net SLOC reduction. EASL extraction is separate unfinished
-work; none of its unqualified changes are included here.
+claim the intended net SLOC reduction. EASL implementation is already absent from this candidate; only its history-
+preservation tooling remains. The predecessor records its private extraction.
+This slice does not qualify an EASL Tauri replacement or import its experiments.

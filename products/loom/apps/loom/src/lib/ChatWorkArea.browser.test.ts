@@ -1,7 +1,7 @@
 import { mount, unmount } from 'svelte';
 import { afterEach, expect, test, vi } from 'vitest';
 import { page } from 'vitest/browser';
-const fixture = vi.hoisted(() => ({ open: vi.fn(), list: vi.fn(), documents: vi.fn() }));
+const fixture = vi.hoisted(() => ({ open: vi.fn(), list: vi.fn(), documents: vi.fn(), drag: vi.fn() }));
 vi.mock('./chatSession', async () => {
   const { writable } = await import('svelte/store');
   return {
@@ -15,12 +15,15 @@ let mounted: ReturnType<typeof mount> | undefined;
 afterEach(async () => { if (mounted) await unmount(mounted); mounted = undefined; document.body.replaceChildren(); vi.clearAllMocks(); });
 function render(width: number) {
   const target = document.createElement('div'); target.style.cssText = `position:relative;width:${width}px;height:700px`;
-  document.body.append(target); mounted = mount(ChatWorkArea, { target, props: { onDocuments: fixture.documents } }); return target;
+  document.body.append(target); mounted = mount(ChatWorkArea, { target, props: { onDocuments: fixture.documents, onTitlebarDrag: fixture.drag } }); return target;
 }
 test('opens the retained attributed source, keeps untrusted text inert, and displays a stale blocker', async () => {
   const source = { conversation_id: 'source-chat', message_id: 'source-message', representation: { attachment_id: 'attachment', root_sha256: 'a'.repeat(64), manifest_sha256: 'b'.repeat(64), artifact_ids: ['text'] } };
   fixture.list.mockResolvedValue([source]); fixture.open.mockResolvedValue({ source, canonical_text: '<img src="https://example.com/tracker"> Retained source.' });
   render(1200);
+  expect(document.querySelector('aside header')!.getBoundingClientRect().top).toBeGreaterThanOrEqual(36);
+  document.querySelector('.chat-titlebar')!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, button: 0 }));
+  expect(fixture.drag).toHaveBeenCalledOnce();
   await expect.element(page.getByText('<script>untrusted()</script> Exact answer.', { exact: true })).toBeVisible();
   expect(document.querySelector('.message-content script')).toBeNull();
   await page.getByRole('button', { name: 'Sources', exact: true }).click();

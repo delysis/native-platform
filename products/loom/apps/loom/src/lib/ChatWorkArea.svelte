@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { chatSession, initializeChat, selectChat, newChat, updateChatDraft, sendChat, stopChat, attachChatFile, pasteChatSource, listConsultSources, openConsultSource, type Message, type Source } from './chatSession';
   export let onDocuments: () => void;
+  export let onTitlebarDrag: (event: MouseEvent) => void = () => {};
   let sourceText = '';
   let sourceError = '';
   let sourceTitle = '';
@@ -45,7 +46,7 @@
     </nav>
   </aside>
   <main>
-    <header><h1>{$chatSession.selected?.title ?? 'Chat'}</h1>{#if $chatSession.loading}<span role="status">Opening local chats…</span>{/if}</header>
+    <header class="chat-titlebar" role="presentation" on:mousedown={onTitlebarDrag}><h1>{$chatSession.selected?.title ?? 'Chat'}</h1>{#if $chatSession.loading}<span role="status">Opening local chats…</span>{/if}</header>
     {#if $chatSession.error}<p class="error" role="alert">{$chatSession.error}</p>{/if}
     {#if !$chatSession.ready && !$chatSession.loading}<button type="button" on:click={() => void initializeChat()}>Open local chats</button>{/if}
     <div class="messages" aria-label="Chat messages">
@@ -98,7 +99,7 @@
 
 <style>
   .chat-work-area { position: absolute; inset: 0; z-index: 20; display: grid; grid-template-columns: minmax(160px, 220px) minmax(0, 1fr); background: var(--paper, #faf8f4); color: var(--ink, #25231f); }
-  aside { border-right: 1px solid #d7d2c9; overflow: auto; padding: 12px; }
+  aside { border-right: 1px solid #d7d2c9; overflow: auto; padding: 48px 12px 12px; }
   header, .composer-controls { display: flex; align-items: center; gap: 10px; }
   header { flex-wrap: wrap; } h1 { font-size: 1.1rem; } h2 { font-size: 1rem; }
   nav { display: flex; flex-direction: column; margin-top: 16px; gap: 6px; } nav button { text-align: left; overflow-wrap: anywhere; } nav button.selected { background: #e6e0d5; }
