@@ -7,8 +7,9 @@ use std::time::Duration;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use llama_native_engine::{GenerationTicket, NativeModelHandle, TryWaitOutcome};
 use llama_native_host::{
-    HostCachePolicy, HostSlotShutdown, JoinedHostSlot, JoinedNativeHost, NativeHost,
-    NativeHostConfig, ProcessExitJoinedNativeHost,
+    ApplicationNativeFinalizer, HostCachePolicy, HostSlotShutdown, JoinedApplicationNative,
+    JoinedHostSlot, JoinedNativeHost, NativeClient, NativeHost, NativeHostConfig,
+    ProcessExitJoinedApplicationNative, ProcessExitJoinedNativeHost,
 };
 use llama_native_types::{
     GenerationBatchRequest, GenerationEvent, GenerationOutput, NativeError, NativeErrorCode,
@@ -87,19 +88,28 @@ impl CompleteModelRelease {
 #[derive(Debug)]
 #[must_use = "joined native-runtime authority must be consumed by application shutdown"]
 pub struct JoinedLlamaRuntime {
-    native: JoinedNativeHost,
+    native: RuntimeJoined,
 }
 
 impl JoinedLlamaRuntime {
     #[must_use]
-    pub const fn joined_worker_count(&self) -> usize {
-        self.native.joined_worker_count()
+    pub fn joined_worker_count(&self) -> usize {
+        match &self.native {
+            RuntimeJoined::Owned(proof) => proof.joined_worker_count(),
+            RuntimeJoined::Shared(proof) => proof.joined_worker_count(),
+        }
     }
 
     /// Returns true only for the concrete runtime instance that joined.
     #[must_use]
     pub fn belongs_to(&self, runtime: &NativeHostRuntime) -> bool {
-        self.native.belongs_to(&runtime.host)
+        match (&self.native, &runtime.host) {
+            (RuntimeJoined::Owned(proof), RuntimeHost::Owned(host)) => proof.belongs_to(host),
+            (RuntimeJoined::Shared(proof), RuntimeHost::Shared { client, .. }) => {
+                proof.belongs_to(client)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -108,20 +118,31 @@ impl JoinedLlamaRuntime {
 #[derive(Debug)]
 #[must_use = "process teardown must retain the joined native-runtime drain fact"]
 pub struct ProcessExitJoinedLlamaRuntime {
-    native: ProcessExitJoinedNativeHost,
+    native: RuntimeProcessExitJoined,
 }
 
 impl ProcessExitJoinedLlamaRuntime {
     /// Number of native owners consumed by this drain invocation.
     #[must_use]
-    pub const fn joined_worker_count(&self) -> usize {
-        self.native.joined_worker_count()
+    pub fn joined_worker_count(&self) -> usize {
+        match &self.native {
+            RuntimeProcessExitJoined::Owned(proof) => proof.joined_worker_count(),
+            RuntimeProcessExitJoined::Shared(proof) => proof.joined_worker_count(),
+        }
     }
 
     /// Returns true only for the concrete runtime instance that drained.
     #[must_use]
     pub fn belongs_to(&self, runtime: &NativeHostRuntime) -> bool {
-        self.native.belongs_to(&runtime.host)
+        match (&self.native, &runtime.host) {
+            (RuntimeProcessExitJoined::Owned(proof), RuntimeHost::Owned(host)) => {
+                proof.belongs_to(host)
+            }
+            (RuntimeProcessExitJoined::Shared(proof), RuntimeHost::Shared { client, .. }) => {
+                proof.belongs_to(client)
+            }
+            _ => false,
+        }
     }
 }
 
@@ -166,8 +187,102 @@ struct ResidencyLedger {
 }
 
 #[derive(Debug)]
+enum RuntimeJoined {
+    Owned(JoinedNativeHost),
+    Shared(JoinedApplicationNative),
+}
+#[derive(Debug)]
+enum RuntimeProcessExitJoined {
+    Owned(ProcessExitJoinedNativeHost),
+    Shared(ProcessExitJoinedApplicationNative),
+}
+#[derive(Debug)]
+enum RuntimeHost {
+    Owned(Box<NativeHost>),
+    Shared {
+        client: NativeClient,
+        finalizer: Arc<dyn ApplicationNativeFinalizer>,
+    },
+}
+impl RuntimeHost {
+    fn acquire(
+        &self,
+        config: llama_native_types::NativeModelConfig,
+    ) -> Result<NativeModelHandle, NativeError> {
+        match self {
+            Self::Owned(host) => host.acquire(config),
+            Self::Shared { client, .. } => client.acquire(config),
+        }
+    }
+    fn slots(&self) -> Result<Vec<llama_native_host::HostSlotStatus>, NativeError> {
+        match self {
+            Self::Owned(host) => host.try_slots(),
+            Self::Shared { client, .. } => client.slots(),
+        }
+    }
+    fn slot_for_handle(
+        &self,
+        handle: &NativeModelHandle,
+    ) -> Result<Option<llama_native_host::HostSlotStatus>, NativeError> {
+        match self {
+            Self::Shared { client, .. } => client.slot_for_handle(handle),
+            Self::Owned(host) => {
+                for slot in host.try_slots()? {
+                    if host
+                        .try_handle(slot.slot_id)?
+                        .is_some_and(|resident| resident.is_same_worker(handle))
+                    {
+                        return Ok(Some(slot));
+                    }
+                }
+                Ok(None)
+            }
+        }
+    }
+    fn shutdown_slot_joined(&self, slot: usize) -> Result<HostSlotShutdown, NativeError> {
+        match self {
+            Self::Owned(host) => host.shutdown_slot_joined(slot),
+            Self::Shared { client, .. } => client.release_slots(&[slot]).map(|mut joined| {
+                joined
+                    .pop()
+                    .map_or(HostSlotShutdown::Vacant, HostSlotShutdown::Joined)
+            }),
+        }
+    }
+    fn owns_slot_proof(&self, proof: &JoinedHostSlot) -> bool {
+        match self {
+            Self::Owned(host) => proof.belongs_to(host),
+            Self::Shared { client, .. } => client.owns_joined_slot(proof),
+        }
+    }
+    fn shutdown_joined(&self) -> Result<RuntimeJoined, NativeError> {
+        match self {
+            Self::Owned(host) => host.shutdown_joined().map(RuntimeJoined::Owned),
+            Self::Shared { finalizer, .. } => {
+                finalizer.shutdown_joined().map(RuntimeJoined::Shared)
+            }
+        }
+    }
+    fn owns_joined_proof(&self, proof: &RuntimeJoined) -> bool {
+        match (self, proof) {
+            (Self::Owned(host), RuntimeJoined::Owned(proof)) => proof.belongs_to(host),
+            (Self::Shared { client, .. }, RuntimeJoined::Shared(proof)) => proof.belongs_to(client),
+            _ => false,
+        }
+    }
+    fn shutdown_for_process_exit(&self) -> RuntimeProcessExitJoined {
+        match self {
+            Self::Owned(host) => RuntimeProcessExitJoined::Owned(host.shutdown_for_process_exit()),
+            Self::Shared { finalizer, .. } => {
+                RuntimeProcessExitJoined::Shared(finalizer.shutdown_for_process_exit())
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct NativeHostRuntime {
-    host: NativeHost,
+    host: RuntimeHost,
     memory_budget_bytes: u64,
     residency: Mutex<ResidencyLedger>,
 }
@@ -177,7 +292,20 @@ impl NativeHostRuntime {
     pub fn new(config: NativeHostConfig) -> Self {
         Self {
             memory_budget_bytes: config.memory_budget_bytes,
-            host: NativeHost::new(config),
+            host: RuntimeHost::Owned(Box::new(NativeHost::new(config))),
+            residency: Mutex::new(ResidencyLedger::default()),
+        }
+    }
+
+    /// Embedded adapter: the composition root retains native finalization.
+    #[must_use]
+    pub fn from_application(
+        client: NativeClient,
+        finalizer: Arc<dyn ApplicationNativeFinalizer>,
+    ) -> Self {
+        Self {
+            host: RuntimeHost::Shared { client, finalizer },
+            memory_budget_bytes: 0,
             residency: Mutex::new(ResidencyLedger::default()),
         }
     }
@@ -201,7 +329,10 @@ impl NativeHostRuntime {
             projector_file_bytes,
             system.available_memory(),
             system.total_memory(),
-            self.memory_budget_bytes,
+            match &self.host {
+                RuntimeHost::Owned(_) => self.memory_budget_bytes,
+                RuntimeHost::Shared { client, .. } => client.memory_budget_bytes().unwrap_or(0),
+            },
             maximum_context_tokens,
         )
     }
@@ -236,27 +367,19 @@ impl NativeHostRuntime {
         handle: &NativeModelHandle,
     ) -> Result<JoinedHostSlot, NativeError> {
         let mut residency = self.lock_residency()?;
-        let (slot_id, model_path) = self
-            .host
-            .slots()
-            .into_iter()
-            .find_map(|slot| {
-                self.host
-                    .handle(slot.slot_id)
-                    .filter(|resident| resident.is_same_worker(handle))
-                    .map(|_| (slot.slot_id, slot.model_path))
-            })
-            .ok_or_else(|| {
-                NativeError::new(
-                    NativeErrorCode::InvalidConfig,
-                    "research handle does not belong to a live slot in this host",
-                )
-            })?;
+        let slot = self.host.slot_for_handle(handle)?.ok_or_else(|| {
+            NativeError::new(
+                NativeErrorCode::InvalidConfig,
+                "research handle does not belong to a live slot claimed by this runtime",
+            )
+        })?;
+        let slot_id = slot.slot_id;
+        let model_path = slot.model_path;
         match self.host.shutdown_slot_joined(slot_id)? {
-            HostSlotShutdown::Joined(joined) if joined.belongs_to(&self.host) => {
+            HostSlotShutdown::Joined(joined) if self.host.owns_slot_proof(&joined) => {
                 let has_survivor = self
                     .host
-                    .slots()
+                    .slots()?
                     .iter()
                     .any(|slot| slot.model_path == model_path);
                 if !has_survivor {
@@ -279,7 +402,7 @@ impl NativeHostRuntime {
     /// model worker owned by it has been joined.
     pub fn shutdown_joined(&self) -> Result<JoinedLlamaRuntime, NativeError> {
         let mut residency = self.lock_residency()?;
-        let slots = self.host.slots();
+        let slots = self.host.slots()?;
         if slots.is_empty() && !residency.model_paths.is_empty() {
             return Err(unobservable_residency_error(
                 "tracked models remained while the native host reported no slots",
@@ -296,7 +419,7 @@ impl NativeHostRuntime {
         }
 
         let native = self.host.shutdown_joined()?;
-        if !native.belongs_to(&self.host) {
+        if !self.host.owns_joined_proof(&native) {
             return Err(NativeError::new(
                 NativeErrorCode::Internal,
                 "native host returned shutdown authority for a different host instance",
@@ -377,7 +500,7 @@ impl BatchRuntime for NativeHostRuntime {
         let mut residency = self.lock_residency()?;
         let slot_ids = self
             .host
-            .slots()
+            .slots()?
             .into_iter()
             .filter(|slot| slot.model_path == profile.model_path)
             .map(|slot| slot.slot_id)
@@ -393,24 +516,29 @@ impl BatchRuntime for NativeHostRuntime {
 
         residency.model_paths.insert(profile.model_path.clone());
         let matched = slot_ids.len();
-        let mut joined_slots = Vec::with_capacity(matched);
-        for slot_id in &slot_ids {
-            match self.host.shutdown_slot_joined(*slot_id)? {
-                HostSlotShutdown::Joined(joined) if joined.belongs_to(&self.host) => {
-                    joined_slots.push(joined);
-                }
-                HostSlotShutdown::Joined(_) | HostSlotShutdown::Vacant => {
-                    return Err(incomplete_release_error(
-                        matched,
-                        joined_slots.len(),
-                        self.host.slots().len(),
-                    ));
+        let joined_slots = if let RuntimeHost::Shared { client, .. } = &self.host {
+            client.release_slots(&slot_ids)?
+        } else {
+            let mut joined_slots = Vec::with_capacity(matched);
+            for slot_id in &slot_ids {
+                match self.host.shutdown_slot_joined(*slot_id)? {
+                    HostSlotShutdown::Joined(joined) if self.host.owns_slot_proof(&joined) => {
+                        joined_slots.push(joined);
+                    }
+                    HostSlotShutdown::Joined(_) | HostSlotShutdown::Vacant => {
+                        return Err(incomplete_release_error(
+                            matched,
+                            joined_slots.len(),
+                            self.host.slots()?.len(),
+                        ));
+                    }
                 }
             }
-        }
+            joined_slots
+        };
         let survivors = self
             .host
-            .slots()
+            .slots()?
             .into_iter()
             .filter(|slot| slot.model_path == profile.model_path)
             .count();

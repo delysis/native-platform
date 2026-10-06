@@ -1,6 +1,8 @@
 use crate::attachments::{StaleConsultSource, commit_generated_exchange_with_journal};
 mod execution;
 mod handoff;
+mod sources;
+pub use sources::{ConsultSourcePreview, consult_source_open, consult_sources};
 mod target_resolution;
 use crate::attachments::{CurrentAttachmentSelection, prepare_scoped_chat_attachments};
 use crate::chat::{

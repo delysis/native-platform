@@ -924,9 +924,9 @@ fn attachment_bytes(attachment_id: &str) -> Result<Option<Vec<u8>>> {
 
 mod bindings;
 mod scoped_context;
+pub use bindings::{AttachmentContextSource, SelectedAttachmentSource};
 pub(crate) use bindings::{
-    AttachmentContextSource, AttachmentMediaReference, SelectedAttachmentMedia,
-    SelectedAttachmentSource, SelectedMediaBuilder, native_media_id,
+    AttachmentMediaReference, SelectedAttachmentMedia, SelectedMediaBuilder, native_media_id,
     validate_selected_attachment_budget,
 };
 pub(crate) use scoped_context::{
@@ -1140,6 +1140,22 @@ fn validate_selected_sources_in_documents(
     selected_sources: &[SelectedAttachmentSource],
     current_policy_fingerprint: &str,
 ) -> Result<()> {
+    validate_selected_sources(
+        |namespace| documents.get::<AttachmentManifest>(namespace),
+        conversations,
+        attachments,
+        selected_sources,
+        current_policy_fingerprint,
+    )
+}
+
+fn validate_selected_sources(
+    read_manifest: impl Fn(&str) -> Result<Option<AttachmentManifest>>,
+    conversations: &ConversationDb,
+    attachments: &AttachmentDb,
+    selected_sources: &[SelectedAttachmentSource],
+    current_policy_fingerprint: &str,
+) -> Result<()> {
     for source in selected_sources {
         let mut owners = conversations
             .conversations
@@ -1193,7 +1209,7 @@ fn validate_selected_sources_in_documents(
                 "the canonical representation was removed",
             ));
         };
-        let Some(manifest) = documents.get::<AttachmentManifest>(namespace)? else {
+        let Some(manifest) = read_manifest(namespace)? else {
             return Err(stale_consult_source(
                 "the canonical representation was removed",
             ));
@@ -1211,6 +1227,48 @@ fn validate_selected_sources_in_documents(
         }
     }
     Ok(())
+}
+
+/// Reopen only the server-retained occurrence, with the same validation used at
+/// commit. Deletion leaves the citation evidence intact but makes opening stale.
+pub(crate) fn open_selected_source_in_snapshot(
+    snapshot: &DocumentSnapshot<'_, '_, '_>,
+    source: &SelectedAttachmentSource,
+) -> Result<String> {
+    let conversations = snapshot
+        .get::<ConversationDb>(CONVERSATIONS_NAMESPACE)?
+        .unwrap_or_default();
+    let attachments = snapshot
+        .get::<AttachmentDb>(ATTACHMENTS_NAMESPACE)?
+        .unwrap_or_default();
+    let policy = attachment_host()?.policy_fingerprint().to_string();
+    validate_selected_sources(
+        |namespace| snapshot.get::<AttachmentManifest>(namespace),
+        &conversations,
+        &attachments,
+        std::slice::from_ref(source),
+        &policy,
+    )?;
+    let record = attachments
+        .attachments
+        .iter()
+        .find(|record| record.id == source.representation.attachment_id)
+        .ok_or_else(|| stale_consult_source("the attachment was removed"))?;
+    let manifest = snapshot
+        .get::<AttachmentManifest>(
+            record
+                .manifest_namespace
+                .as_deref()
+                .ok_or_else(|| stale_consult_source("the canonical representation was removed"))?,
+        )?
+        .ok_or_else(|| stale_consult_source("the canonical representation was removed"))?;
+    let text = canonical_text(record, &manifest);
+    if text.len() > MAX_ATTACHMENT_PREVIEW_TEXT_BYTES {
+        return Err(anyhow!(
+            "the exact source exceeds the canonical text preview limit"
+        ));
+    }
+    Ok(text)
 }
 
 fn consume_exact_draft(
@@ -4398,6 +4456,40 @@ mod tests {
                 .get::<ConsultJournal>("test.consult-source-journal")
                 .expect("read journal")
                 .is_some_and(|journal| journal.committed)
+        );
+    }
+
+    #[test]
+    fn citation_reopen_rechecks_occurrence_and_preserves_evidence_after_deletion() {
+        let _session = TestDataDir::new("consult-source-reopen");
+        let source = new_conversation("Source");
+        let attachment = stage_text(&source.id, "exact source text");
+        let source = send_staged_attachment(&source.id);
+        let selected = selected_source(&source, &attachment.id);
+        let store = RuntimeStore::current().expect("store");
+        store
+            .put("test.retained-consult-source", &selected)
+            .expect("retain source evidence");
+        let opened = store
+            .read_documents(|snapshot| open_selected_source_in_snapshot(snapshot, &selected))
+            .expect("open exact occurrence");
+        assert!(opened.contains("exact source text"));
+        let mut changed = selected.clone();
+        changed.representation.manifest_sha256 = "0".repeat(64);
+        let changed_error = store
+            .read_documents(|snapshot| open_selected_source_in_snapshot(snapshot, &changed))
+            .expect_err("changed representation must fail");
+        assert!(changed_error.is::<StaleConsultSource>());
+        crate::conversation_store::conversation_delete(&source.id).expect("delete source later");
+        let error = store
+            .read_documents(|snapshot| open_selected_source_in_snapshot(snapshot, &selected))
+            .expect_err("deleted occurrence must remain stale");
+        assert!(error.is::<StaleConsultSource>());
+        assert_eq!(
+            store
+                .get::<SelectedAttachmentSource>("test.retained-consult-source")
+                .expect("read retained evidence"),
+            Some(selected)
         );
     }
 

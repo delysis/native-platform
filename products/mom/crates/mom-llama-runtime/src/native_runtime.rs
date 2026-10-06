@@ -6,8 +6,8 @@ use crate::store::{DocumentMutations, DocumentSnapshot};
 use llama_native_cache::{PrefixCacheMetadata, PrefixCacheValue};
 use llama_native_engine::NativeModelHandle;
 use llama_native_host::{
-    HostCachePolicy, NativeHost, NativeHostConfig, PrefixCachePromotionLease, PrefixCacheStore,
-    SystemClock,
+    ApplicationHost, HostCachePolicy, NativeClient, NativeHost, NativeHostConfig,
+    PrefixCachePromotionLease, PrefixCacheStore, SystemClock,
 };
 use llama_native_types::{NativeError, NativeErrorCode, NativeModelConfig, ResidentModelStatus};
 use serde::{Deserialize, Serialize};
@@ -28,12 +28,117 @@ const PERSISTENT_PREFIX_CACHE_MAX_ENTRIES: usize = 128;
 const PERSISTENT_PREFIX_CACHE_MAX_BYTES: usize = 512 * 1024 * 1024;
 const PRODUCT_PREFIX_CACHE_NAMESPACE: &str = "mom-llama";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ProductHostKey {
     memory_budget_bytes: u64,
     max_slots: usize,
     data_dir: PathBuf,
     cache_policy: KvCachePolicy,
+}
+
+/// Inject Mom's encrypted cache and immutable host policy into the shared owner.
+pub fn application_host() -> Result<ApplicationHost, NativeError> {
+    let settings = crate::config::resolve_settings().map_err(prefix_store_error)?;
+    let key = host_key(&settings);
+    Ok(ApplicationHost {
+        host: create_product_host(&key)?,
+        binding: host_binding(&key)?,
+        memory_budget_bytes: key.memory_budget_bytes,
+    })
+}
+
+pub fn shared_operation_scope(
+    settings: &Settings,
+    client: NativeClient,
+) -> anyhow::Result<OperationScope> {
+    let key = host_key(settings);
+    let expected = host_binding(&key).map_err(|error| anyhow::anyhow!(error.message))?;
+    if client
+        .binding()
+        .map_err(|error| anyhow::anyhow!(error.message))?
+        != expected
+    {
+        anyhow::bail!("shared native host settings changed; restart Loom to apply them");
+    }
+    Ok(OperationScope::for_shared_host(client, key))
+}
+
+fn host_binding(key: &ProductHostKey) -> Result<String, NativeError> {
+    let bytes = serde_json::to_vec(key)
+        .map_err(|error| NativeError::new(NativeErrorCode::Internal, error.to_string()))?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+pub(crate) enum NativeHostAccess {
+    Owned(Arc<NativeHost>),
+    Shared(NativeClient),
+}
+
+impl NativeHostAccess {
+    fn acquire(&self, config: NativeModelConfig) -> Result<NativeModelHandle, NativeError> {
+        match self {
+            Self::Owned(host) => host.acquire(config),
+            Self::Shared(client) => client.acquire(config),
+        }
+    }
+    fn resident(
+        &self,
+        config: &NativeModelConfig,
+    ) -> Result<Option<NativeModelHandle>, NativeError> {
+        match self {
+            Self::Owned(host) => host.resident(config),
+            Self::Shared(client) => client.resident(config),
+        }
+    }
+    fn handle(&self, slot: usize) -> Option<NativeModelHandle> {
+        match self {
+            Self::Owned(host) => host.handle(slot),
+            Self::Shared(client) => client.handle(slot).ok().flatten(),
+        }
+    }
+    fn slots(&self) -> Vec<llama_native_host::HostSlotStatus> {
+        match self {
+            Self::Owned(host) => host.slots(),
+            Self::Shared(client) => client.slots().unwrap_or_default(),
+        }
+    }
+    fn load_into_slot(
+        &self,
+        slot: usize,
+        config: NativeModelConfig,
+    ) -> Result<NativeModelHandle, NativeError> {
+        match self {
+            Self::Owned(host) => host.load_into_slot(slot, config),
+            Self::Shared(client) => client.load_into_slot(slot, config),
+        }
+    }
+    fn clear_cache(&self) -> Result<usize, NativeError> {
+        match self {
+            Self::Owned(host) => host.clear_cache(),
+            Self::Shared(client) => client.clear_cache(),
+        }
+    }
+    fn invalidate_live_cache_owner(&self, owner: &str) -> Result<usize, NativeError> {
+        match self {
+            Self::Owned(host) => host.invalidate_live_cache_owner(owner),
+            Self::Shared(client) => client.invalidate_live_cache_owner(owner),
+        }
+    }
+    fn unload(&self, slot: usize) -> bool {
+        match self {
+            Self::Owned(host) => host.unload(slot),
+            Self::Shared(client) => client.release_slots(&[slot]).is_ok(),
+        }
+    }
+    fn unload_all(&self) -> usize {
+        match self {
+            Self::Owned(host) => host.unload_all(),
+            Self::Shared(client) => client
+                .claimed_slots()
+                .and_then(|slots| client.release_slots(&slots))
+                .map_or(0, |joined| joined.len()),
+        }
+    }
 }
 
 /// Composition-root owner. Every caller receives its explicit operation scope;
@@ -175,7 +280,7 @@ pub(crate) fn invalidate_loaded_native_cache_owner(
     scope: &OperationScope,
     owner_id: &str,
 ) -> anyhow::Result<usize> {
-    let Some(host) = scope.native_host() else {
+    let Some(host) = scope.native_access() else {
         return Ok(0);
     };
     host.invalidate_live_cache_owner(owner_id)
@@ -360,14 +465,14 @@ pub fn clear_native_prefix_cache(
     scope: &crate::OperationScope,
     settings: &Settings,
 ) -> anyhow::Result<usize> {
-    with_host(scope, settings, NativeHost::clear_cache)
+    with_host(scope, settings, NativeHostAccess::clear_cache)
         .map_err(|blocked| anyhow::anyhow!(blocked.blocker.message))
 }
 
 fn with_host<T>(
     scope: &OperationScope,
     settings: &Settings,
-    operation: impl FnOnce(&NativeHost) -> Result<T, NativeError>,
+    operation: impl FnOnce(&NativeHostAccess) -> Result<T, NativeError>,
 ) -> Result<T, ValidationBlocker> {
     if !scope.matches_native_key(&host_key(settings)) {
         return Err(native_blocker(
@@ -375,7 +480,7 @@ fn with_host<T>(
             "Host-level native settings changed; restart Mom Llama to apply them.",
         ));
     }
-    let host = scope.native_host().ok_or_else(|| {
+    let host = scope.native_access().ok_or_else(|| {
         native_blocker(
             "product_native_host_unavailable",
             "This operation scope has no running native host.",
@@ -543,7 +648,7 @@ pub fn resident_model_for_slot(
 
 pub fn resident_status(scope: &OperationScope) -> Option<ResidentModelStatus> {
     scope
-        .native_host()?
+        .native_access()?
         .slots()
         .into_iter()
         .find(|slot| slot.slot_id == 0)
@@ -552,7 +657,7 @@ pub fn resident_status(scope: &OperationScope) -> Option<ResidentModelStatus> {
 
 pub fn resident_slots(scope: &OperationScope) -> Vec<ResidentSlotStatus> {
     scope
-        .native_host()
+        .native_access()
         .into_iter()
         .flat_map(|host| host.slots())
         .map(|slot| ResidentSlotStatus {
@@ -566,12 +671,14 @@ pub fn resident_slots(scope: &OperationScope) -> Vec<ResidentSlotStatus> {
 }
 
 pub fn unload_resident_slot(scope: &OperationScope, slot_id: usize) -> bool {
-    scope.native_host().is_some_and(|host| host.unload(slot_id))
+    scope
+        .native_access()
+        .is_some_and(|host| host.unload(slot_id))
 }
 
 pub fn unload_resident_model(scope: &OperationScope) -> bool {
     scope
-        .native_host()
+        .native_access()
         .is_some_and(|host| host.unload_all() > 0)
 }
 

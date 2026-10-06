@@ -331,6 +331,28 @@ enum PersonaGroupCommand {
 
 #[derive(Debug, Subcommand)]
 enum MentionCommand {
+    Sources {
+        #[arg(long)]
+        invocation: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        json: bool,
+    },
+    SourceOpen {
+        #[arg(long)]
+        invocation: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        message: String,
+        #[arg(long)]
+        attachment: String,
+        #[arg(long)]
+        json: bool,
+    },
     Dispatch {
         #[arg(long)]
         conversation: String,
@@ -1193,6 +1215,31 @@ fn run() -> Result<()> {
                 )?,
                 json,
             ),
+            MentionCommand::Sources {
+                invocation,
+                target,
+                json,
+            } => print_result(
+                mom_llama_runtime::consult_sources(&invocation, &target)?,
+                json,
+            ),
+            MentionCommand::SourceOpen {
+                invocation,
+                target,
+                conversation,
+                message,
+                attachment,
+                json,
+            } => print_result(
+                mom_llama_runtime::consult_source_open(
+                    &invocation,
+                    &target,
+                    &conversation,
+                    &message,
+                    &attachment,
+                )?,
+                json,
+            ),
             MentionCommand::Candidates {
                 query,
                 conversation,
@@ -1710,7 +1757,10 @@ fn command_uses_native(command: &Command) -> bool {
         ),
         Command::Mention { command } => !matches!(
             command,
-            MentionCommand::Candidates { .. } | MentionCommand::ApprovalList { .. }
+            MentionCommand::Candidates { .. }
+                | MentionCommand::Sources { .. }
+                | MentionCommand::SourceOpen { .. }
+                | MentionCommand::ApprovalList { .. }
         ),
         Command::ToolLoop { command } => matches!(
             command,

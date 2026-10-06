@@ -65,16 +65,16 @@ pub use mcp::{
     mcp_list_servers, mcp_list_tools_in_scope, mcp_read_resource_in_scope, mcp_status,
 };
 pub use mentions::{
-    ChatDispatchOutput, ChatDispatchStreamEvent, MentionCancelOutput, MentionCandidate,
-    MentionDispatchInput, MentionInvocation, MentionInvocationState, MentionStreamEvent,
-    MentionSynthesisOutput, MentionTargetKind, MentionTargetResult, MentionTargetSnapshot,
-    MentionToolApproval, MentionToolApprovalDecision, MentionToolApprovalResolution,
-    MentionToolApprovalState, MentionToolEffectOutcome, PersonaToolApprovalRecovery,
-    chat_dispatch_in_scope, chat_dispatch_stream_in_scope, mention_cancel_in_scope,
-    mention_candidates, mention_dispatch_in_scope, mention_synthesize,
-    mention_tool_approval_decide_in_scope, mention_tool_approval_decide_with_recovery_in_scope,
-    mention_tool_approval_list, reconcile_persona_tool_approvals,
-    reconcile_persona_tool_approvals_command,
+    ChatDispatchOutput, ChatDispatchStreamEvent, ConsultSourcePreview, MentionCancelOutput,
+    MentionCandidate, MentionDispatchInput, MentionInvocation, MentionInvocationState,
+    MentionStreamEvent, MentionSynthesisOutput, MentionTargetKind, MentionTargetResult,
+    MentionTargetSnapshot, MentionToolApproval, MentionToolApprovalDecision,
+    MentionToolApprovalResolution, MentionToolApprovalState, MentionToolEffectOutcome,
+    PersonaToolApprovalRecovery, chat_dispatch_in_scope, chat_dispatch_stream_in_scope,
+    consult_source_open, consult_sources, mention_cancel_in_scope, mention_candidates,
+    mention_dispatch_in_scope, mention_synthesize, mention_tool_approval_decide_in_scope,
+    mention_tool_approval_decide_with_recovery_in_scope, mention_tool_approval_list,
+    reconcile_persona_tool_approvals, reconcile_persona_tool_approvals_command,
 };
 pub use models::{
     ModelSelectionIntent, begin_model_selection, conversation_model_select_and_load,

@@ -1,4 +1,4 @@
-use llama_native_host::NativeHost;
+use llama_native_host::{NativeClient, NativeHost};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -161,6 +161,7 @@ struct OperationRegistries {
 
 struct OperationScopeInner {
     native_host: Weak<NativeHost>,
+    shared_client: Option<NativeClient>,
     quiescing: AtomicBool,
     native_key: Option<crate::native_runtime::ProductHostKey>,
     registries: Mutex<OperationRegistries>,
@@ -192,10 +193,34 @@ impl OperationScope {
         Self::new(Arc::downgrade(host), Some(key))
     }
 
+    pub(crate) fn for_shared_host(
+        client: NativeClient,
+        key: crate::native_runtime::ProductHostKey,
+    ) -> Self {
+        Self::with_client(Weak::new(), Some(client), Some(key))
+    }
+
+    pub(crate) fn native_access(&self) -> Option<crate::native_runtime::NativeHostAccess> {
+        if self.0.quiescing.load(Ordering::Acquire) || self.0.registries.is_poisoned() {
+            return None;
+        }
+        self.0
+            .shared_client
+            .as_ref()
+            .map(|client| crate::native_runtime::NativeHostAccess::Shared(client.clone()))
+            .or_else(|| {
+                self.0
+                    .native_host
+                    .upgrade()
+                    .map(crate::native_runtime::NativeHostAccess::Owned)
+            })
+    }
+
     pub(crate) fn matches_native_key(&self, key: &crate::native_runtime::ProductHostKey) -> bool {
         self.0.native_key.as_ref().is_none_or(|bound| bound == key)
     }
 
+    #[cfg(test)]
     pub(crate) fn native_host(&self) -> Option<Arc<NativeHost>> {
         if self.0.quiescing.load(Ordering::Acquire) || self.0.registries.is_poisoned() {
             return None;
@@ -207,8 +232,17 @@ impl OperationScope {
         native_host: Weak<NativeHost>,
         native_key: Option<crate::native_runtime::ProductHostKey>,
     ) -> Self {
+        Self::with_client(native_host, None, native_key)
+    }
+
+    fn with_client(
+        native_host: Weak<NativeHost>,
+        shared_client: Option<NativeClient>,
+        native_key: Option<crate::native_runtime::ProductHostKey>,
+    ) -> Self {
         Self(Arc::new(OperationScopeInner {
             native_host,
+            shared_client,
             quiescing: AtomicBool::new(false),
             native_key,
             registries: Mutex::new(OperationRegistries {
@@ -367,6 +401,9 @@ impl OperationScope {
     }
 
     pub(crate) fn cancel_native(&self, request_id: &str, branch_id: Option<&str>) -> usize {
+        if let Some(client) = &self.0.shared_client {
+            return client.cancel(request_id, branch_id);
+        }
         self.0
             .native_host
             .upgrade()
@@ -374,6 +411,9 @@ impl OperationScope {
     }
 
     pub(crate) fn skip_native_reasoning(&self, request_id: &str, branch_id: Option<&str>) -> usize {
+        if let Some(client) = &self.0.shared_client {
+            return client.skip_reasoning(request_id, branch_id);
+        }
         self.0
             .native_host
             .upgrade()

@@ -4039,8 +4039,12 @@ name = "loom-app"
 version = "0.1.0"
 dependencies = [
  "desktop-launch",
+ "llama-native-host",
+ "llama-native-types",
+ "loom-backend-llama",
  "loom-types",
  "mom-llama-app",
+ "mom-llama-runtime",
  "sha2 0.10.9",
  "tauri",
  "tauri-build",

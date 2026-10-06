@@ -14,6 +14,15 @@
   import { workspaceRows, workspaceCopyDestination } from './lib/workspaceTree';
   import { readWorkspaceFolders, rememberWorkspaceFolder, type WorkspaceFolder } from './lib/workspaceFolders';
   import WorkspacePane from './lib/WorkspacePane.svelte';
+  import ChatWorkArea from './lib/ChatWorkArea.svelte';
+  let chatWorkAreaOpen = false;
+  function openChatWorkArea(): void {
+    if (compositionActive || !flushEditors()) return;
+    invalidateCompletionForCaretNavigation();
+    cancelSuggestionTimer();
+    void cancelActiveBranches();
+    chatWorkAreaOpen = true;
+  }
   import MaterialView from './lib/MaterialView.svelte';
   import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, readMaterialEvidence } from './lib/ipc';
   import { materialReferenceMarkdown, materialQuotationMarkdown, importedMaterialMarkdown, isDatabasePath, type MaterialEntry, type MaterialEvidence } from './lib/materials';
@@ -1121,7 +1130,7 @@
   const suggestionsRetryDelayMs = 350;
   const maximumAutomaticSuggestionRetries = 1;
   const maximumAutocompleteRetryWaits = 50;
-  $: completionSurfaceVisible = mainPaneOpen && !customMain && !activeMaterial && !materialsOpen;
+  $: completionSurfaceVisible = !chatWorkAreaOpen && mainPaneOpen && !customMain && !activeMaterial && !materialsOpen;
   $: completionAutomationActive = completionSurfaceVisible && completionEngineEnabled({ autocomplete: suggestionsEnabled, shuttle: shuttleEnabled });
   function completionAutomationEnabled(
     autocomplete = suggestionsEnabled,
@@ -9867,7 +9876,9 @@
   <meta name="description" content="Loom — a local-first writing environment for prose and poetry" />
 </svelte:head>
 
-<div class="app-shell">
+<div class="app-shell" class:chat-open={chatWorkAreaOpen}>
+  {#if chatWorkAreaOpen}<ChatWorkArea onDocuments={() => chatWorkAreaOpen = false} />{/if}
+  <div style="display: contents" inert={chatWorkAreaOpen}>
   {#if project}
     <div
       class="canvas-controls"
@@ -9915,6 +9926,7 @@
         on:mousedown={startTitlebarDrag}
       ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
       <div class="canvas-controls-right" data-no-window-drag>
+        <button class="titlebar-button" type="button" on:click={openChatWorkArea} aria-label="Open chats">Chat</button>
         {#each paneSlots.filter(slot => slot.selected) as slot (slot.position)}
           {@const title = slot.selected![1].title ?? slot.selected![0]}
           <button class="titlebar-button" class:active={!hiddenPaneSlots.has(slot.position)} type="button"
@@ -10589,6 +10601,7 @@
           </div>
         {/if}
         <div class="welcome-actions">
+          <button class="secondary-button" type="button" disabled={!desktop} on:click={openChatWorkArea}>Chat</button>
           {#if errorMessage && desktop}
             <button class="secondary-button" type="button" on:click={retryInitialProject} disabled={opening}>
               Retry
@@ -11027,4 +11040,5 @@
   <div class="sr-only" role="note" aria-label="Completion session witness">
     {completionAccessibilityWitness}
   </div>
+</div>
 </div>

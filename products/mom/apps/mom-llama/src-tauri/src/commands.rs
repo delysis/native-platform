@@ -532,7 +532,18 @@ pub async fn mom_llama_chat_dispatch(
     window: Window,
     conversation: String,
     message: String,
+    client_request: Option<String>,
 ) -> Result<Value, String> {
+    if client_request.as_ref().is_some_and(|request| {
+        request.is_empty()
+            || request.len() > 64
+            || !request
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return Err("chat dispatch correlation must be a bounded ASCII identifier".into());
+    }
+    let stream_conversation = conversation.clone();
     let lease = runtime.admit(command_spec("mom_llama_chat_dispatch"))?;
     let operations = runtime.operation_scope();
     let runtime = runtime.inner().clone();
@@ -549,11 +560,51 @@ pub async fn mom_llama_chat_dispatch(
                 events
                     .emit("mom_llama_chat_dispatch_stream", &event)
                     .map_err(anyhow::Error::new)?;
+                if let Some(request) = &client_request {
+                    events.emit("loom_mom_chat_dispatch_stream", serde_json::json!({
+                        "client_request": request, "conversation_id": stream_conversation, "event": event,
+                    })).map_err(anyhow::Error::new)?;
+                }
                 Ok(())
             }),
         )?;
         observe_dispatch_approvals(&runtime, &result)?;
         Ok(result)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_consult_sources(
+    runtime: State<'_, AppRuntimeHandle>,
+    invocation: String,
+    target: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_consult_sources"))?;
+    blocking_command(lease, move || {
+        mom_llama_runtime::consult_sources(&invocation, &target)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn mom_llama_consult_source_open(
+    runtime: State<'_, AppRuntimeHandle>,
+    invocation: String,
+    target: String,
+    conversation: String,
+    message: String,
+    attachment: String,
+) -> Result<Value, String> {
+    let lease = runtime.admit(command_spec("mom_llama_consult_source_open"))?;
+    blocking_command(lease, move || {
+        mom_llama_runtime::consult_source_open(
+            &invocation,
+            &target,
+            &conversation,
+            &message,
+            &attachment,
+        )
     })
     .await
 }

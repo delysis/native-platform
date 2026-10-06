@@ -1,4 +1,4 @@
-use llama_native_host::{NativeHost, ProcessExitJoinedNativeHost};
+use llama_native_host::{NativeClient, NativeHost, ProcessExitJoinedNativeHost};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -101,10 +101,24 @@ impl std::fmt::Display for AppShutdownError {
 
 impl std::error::Error for AppShutdownError {}
 
+enum AppNativeHost {
+    Owned(Arc<NativeHost>),
+    Shared(NativeClient),
+}
+
+impl AppNativeHost {
+    fn cancel(&self, request: &str, branch: Option<&str>) -> usize {
+        match self {
+            Self::Owned(host) => host.cancel(request, branch),
+            Self::Shared(client) => client.cancel(request, branch),
+        }
+    }
+}
+
 struct AppRuntime {
     lifecycle: Mutex<AppLifecycle>,
     work_drained: Notify,
-    native_host: Arc<NativeHost>,
+    native_host: AppNativeHost,
     speech: Arc<MomSpeech>,
     information: Arc<MomInformation>,
     _native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
@@ -522,7 +536,7 @@ impl Drop for AppWorkLease {
 }
 
 struct AppRuntimeConstruction {
-    native_host: Arc<NativeHost>,
+    native_host: AppNativeHost,
     speech: Arc<MomSpeech>,
     information: Arc<MomInformation>,
     native_owner: Option<mom_llama_runtime::native_runtime::ProductRuntimeOwner>,
@@ -545,7 +559,7 @@ impl AppRuntimeHandle {
         let persona_approval_authority = persona_approval_recovery.clone();
         Self::with_operation_supervisor(AppRuntimeConstruction {
             operation_scope: native_owner.operation_scope(),
-            native_host,
+            native_host: AppNativeHost::Owned(native_host),
             speech,
             information,
             native_owner: Some(native_owner),
@@ -559,6 +573,30 @@ impl AppRuntimeHandle {
         })
     }
 
+    pub(crate) fn new_shared(
+        client: NativeClient,
+        operation_scope: mom_llama_runtime::OperationScope,
+        persona_approval_recovery: mom_llama_runtime::PersonaToolApprovalRecovery,
+        speech: Arc<MomSpeech>,
+        information: Arc<MomInformation>,
+    ) -> Self {
+        let authority = persona_approval_recovery.clone();
+        Self::with_operation_supervisor(AppRuntimeConstruction {
+            native_host: AppNativeHost::Shared(client),
+            operation_scope,
+            speech,
+            information,
+            native_owner: None,
+            native_finalizer: Arc::new(ProductNativeFinalizer),
+            operation_supervisor: OperationSupervisor::new(),
+            persona_approval_reconciler: Arc::new(RuntimePersonaApprovalReconciler {
+                recovery: persona_approval_recovery,
+            }),
+            persona_approval_recovery_interval: PERSONA_APPROVAL_RECOVERY_INTERVAL,
+            persona_approval_authority: Some(authority),
+        })
+    }
+
     #[cfg(test)]
     fn with_finalizers(
         native_host: Arc<NativeHost>,
@@ -567,7 +605,7 @@ impl AppRuntimeHandle {
     ) -> Self {
         Self::with_operation_supervisor(AppRuntimeConstruction {
             operation_scope: mom_llama_runtime::OperationScope::for_native_host(&native_host),
-            native_host,
+            native_host: AppNativeHost::Owned(native_host),
             speech: MomSpeech::empty_for_tests(),
             information: MomInformation::empty_for_tests(),
             native_owner,
@@ -774,6 +812,14 @@ impl AppRuntimeHandle {
         true
     }
 
+    /// Drain embedded product services without finalizing the application host.
+    pub(crate) async fn drain_shared_services(
+        &self,
+    ) -> Result<AppShutdownSummary, AppShutdownError> {
+        assert!(matches!(&self.0.native_host, AppNativeHost::Shared(_)));
+        self.shutdown().await
+    }
+
     pub async fn shutdown(&self) -> Result<AppShutdownSummary, AppShutdownError> {
         self.begin_quiesce();
         self.0
@@ -859,27 +905,26 @@ impl AppRuntimeHandle {
                 // so the resident set cannot grow after
                 // this observation. Preserve its cardinality even if the
                 // finalizer fails before returning joined evidence.
-                let native_worker_ids = self
-                    .0
-                    .native_host
-                    .slots()
-                    .into_iter()
-                    .map(|slot| format!("mom-native-slot-{}", slot.slot_id))
-                    .collect::<Vec<_>>();
+                let (native_worker_ids, native_error, joined_native_worker_count, native_host_joined) =
+                    match &self.0.native_host {
+                        AppNativeHost::Owned(host) => {
+                            let workers = host.slots().into_iter()
+                                .map(|slot| format!("mom-native-slot-{}", slot.slot_id)).collect::<Vec<_>>();
+                            match self.0.native_finalizer.shutdown(host) {
+                                Ok(receipt) => {
+                                    let count = receipt.joined_worker_count();
+                                    self.0.joined_native_host.lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner).replace(receipt);
+                                    (workers, None, count, true)
+                                }
+                                Err(error) => (workers, Some(error), 0, false),
+                            }
+                        }
+                        // The application coordinator joins the shared host only
+                        // after both product domains have drained.
+                        AppNativeHost::Shared(_) => (Vec::new(), None, 0, false),
+                    };
                 let expected_native_worker_count = native_worker_ids.len();
-                let joined = self.0.native_finalizer.shutdown(&self.0.native_host);
-                let (native_error, joined_native_worker_count) = match joined {
-                    Ok(receipt) => {
-                        let count = receipt.joined_worker_count();
-                        self.0
-                            .joined_native_host
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .replace(receipt);
-                        (None, count)
-                    }
-                    Err(error) => (Some(error.to_string()), 0),
-                };
                 let operation_supervisor_phase = supervisor.phase;
                 let active_operation_count = supervisor.active_operations;
                 let retained_operation_task_count = supervisor.retained_tasks;
@@ -906,7 +951,7 @@ impl AppRuntimeHandle {
                     started_at_unix_ms,
                     completed_at_unix_ms: unix_time_ms(),
                     elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    native_host_joined: native_error.is_none(),
+                    native_host_joined,
                     speech_host_joined,
                     speech_active_operation_count,
                     speech_retained_playback_count,
@@ -1005,6 +1050,52 @@ mod tests {
         // only where that storage capability is implemented; independent
         // supervisor and approval-worker tests remain portable.
         runtime_with_finalizer(Arc::new(AtomicBool::new(false)))
+    }
+
+    #[tokio::test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    async fn embedded_services_drain_before_the_application_native_join() {
+        let host = Arc::new(NativeHost::new(NativeHostConfig::default()));
+        let captured = Arc::clone(&host);
+        let owner = llama_native_host::ApplicationNativeOwner::new(move || {
+            Ok(llama_native_host::ApplicationHost {
+                host: Arc::clone(&captured),
+                binding: "test-binding".into(),
+                memory_budget_bytes: 1024,
+            })
+        });
+        let client = owner.client().expect("chat client");
+        assert_eq!(
+            client.binding().expect("initialize shared host"),
+            "test-binding"
+        );
+        let runtime = AppRuntimeHandle::with_operation_supervisor(super::AppRuntimeConstruction {
+            native_host: super::AppNativeHost::Shared(client.clone()),
+            operation_scope: mom_llama_runtime::OperationScope::for_native_host(&host),
+            speech: MomSpeech::empty_for_tests(),
+            information: MomInformation::empty_for_tests(),
+            native_owner: None,
+            native_finalizer: Arc::new(RecordingFinalizer {
+                called: Arc::new(AtomicBool::new(false)),
+            }),
+            operation_supervisor: OperationSupervisor::new(),
+            persona_approval_reconciler: Arc::new(super::NoopPersonaApprovalReconciler),
+            persona_approval_recovery_interval: super::PERSONA_APPROVAL_RECOVERY_INTERVAL,
+            persona_approval_authority: None,
+        });
+        let receipt = runtime
+            .drain_shared_services()
+            .await
+            .expect("shared services drained");
+        assert!(!receipt.native_host_joined);
+        assert_eq!(receipt.joined_native_worker_count, 0);
+        assert_eq!(
+            client.binding().expect("product did not finalize host"),
+            "test-binding"
+        );
+        let proof = owner.shutdown_joined().expect("sole application join");
+        assert!(proof.belongs_to(&client));
+        assert!(client.binding().is_err());
     }
 
     struct RecordingFinalizer {
@@ -1117,7 +1208,7 @@ mod tests {
         let native_called = Arc::new(AtomicBool::new(false));
         let runtime = AppRuntimeHandle::with_operation_supervisor(AppRuntimeConstruction {
             operation_scope: mom_llama_runtime::OperationScope::for_native_host(&host),
-            native_host: host,
+            native_host: super::AppNativeHost::Owned(host),
             speech: MomSpeech::empty_for_tests(),
             information: MomInformation::empty_for_tests(),
             native_owner: None,

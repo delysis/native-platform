@@ -26,6 +26,23 @@ const fn mcp_process_ui_supported() -> bool {
 }
 
 pub const CONTROL_SPECS: &[ControlSpec] = &[
+    // The normal Loom chat projection uses these same product operations.
+    ControlSpec {
+        affordance: "consult.consult_sources",
+        command: "mom_llama.consult_sources",
+        tauri_command: "mom_llama_consult_sources",
+        cli: "mom-llama mention sources --invocation <id> --target <id> --json",
+        effect: "mom_llama.effects.conversation_store.v1",
+        label: "Consultation sources",
+    },
+    ControlSpec {
+        affordance: "consult.consult_source_open",
+        command: "mom_llama.consult_source_open",
+        tauri_command: "mom_llama_consult_source_open",
+        cli: "mom-llama mention source-open --invocation <id> --target <id> --conversation <id> --message <id> --attachment <id> --json",
+        effect: "mom_llama.effects.conversation_store.v1",
+        label: "Open exact source occurrence",
+    },
     ControlSpec {
         affordance: "layout.sidebar_toggle",
         command: "mom_llama.conversation_list",

@@ -370,8 +370,8 @@ mod tests {
 /// Path-free exact representation evidence. Artifact IDs retain the existing
 /// canonical text segments/page coordinates in the inspected manifest; the
 /// manifest digest prevents a later same-ID replacement from changing citations.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct AttachmentContextSource {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AttachmentContextSource {
     pub attachment_id: String,
     pub root_sha256: String,
     pub policy_fingerprint: String,
@@ -410,8 +410,8 @@ impl AttachmentContextSource {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct SelectedAttachmentSource {
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SelectedAttachmentSource {
     pub conversation_id: String,
     pub message_id: String,
     pub representation: AttachmentContextSource,
