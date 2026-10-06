@@ -68,6 +68,10 @@ export function updateChatDraft(message: string, attachmentIds = get(chatSession
   draftLane = draftLane.catch(() => undefined).then(() => nativeChat<Draft>('draft_update', { conversation, message, attachmentIds: attachments }));
   void draftLane.catch(failure);
 }
+export async function flushChatDraft(): Promise<boolean> {
+  try { await draftLane; return true; }
+  catch (error) { failure(error); return false; }
+}
 export async function attachChatFile(): Promise<void> {
   const state = get(chatSession);
   if (!state.selected) return;

@@ -15,6 +15,7 @@
   import { readWorkspaceFolders, rememberWorkspaceFolder, type WorkspaceFolder } from './lib/workspaceFolders';
   import WorkspacePane from './lib/WorkspacePane.svelte';
   import ChatWorkArea from './lib/ChatWorkArea.svelte';
+  import { chatSession, initializeChat, selectChat, newChat, flushChatDraft } from './lib/chatSession';
   let chatWorkAreaOpen = false;
   function openChatWorkArea(): void {
     if (compositionActive || !flushEditors()) return;
@@ -22,6 +23,18 @@
     cancelSuggestionTimer();
     void cancelActiveBranches();
     chatWorkAreaOpen = true;
+    outlineOpen = true;
+    void initializeChat();
+  }
+  function openSavedChat(id: string): void {
+    openChatWorkArea();
+    if (chatWorkAreaOpen) void selectChat(id);
+  }
+  async function createChatInWorkArea(): Promise<void> {
+    openChatWorkArea();
+    if (!chatWorkAreaOpen) return;
+    await initializeChat();
+    if (chatWorkAreaOpen && $chatSession.ready) await newChat();
   }
   import MaterialView from './lib/MaterialView.svelte';
   import { listMaterials, bindAttachmentMaterial, addLibraryMaterial, addLibraryMaterialPath, readMaterialEvidence } from './lib/ipc';
@@ -1470,7 +1483,7 @@
           : currentWriter
             ? 'Ready'
             : 'Set up';
-  $: nativeWindowTitle = activeMaterial?.name ?? (materialsOpen ? 'Add sources' : null) ?? document?.summary.title ?? project?.title ?? 'Loom';
+  $: nativeWindowTitle = (chatWorkAreaOpen ? $chatSession.selected?.title ?? 'Chat' : null) ?? activeMaterial?.name ?? (materialsOpen ? 'Add sources' : null) ?? document?.summary.title ?? project?.title ?? 'Loom';
   $: workspaceTheme = workspaceTemplate?.error ? null : workspaceTemplate?.config.theme;
   $: resolvedAppearance = resolveAppearance(appearanceOverride ? appearance : workspaceTheme?.mode ?? 'system', systemDark);
   $: if (desktop) void syncNativeWindowTitle(nativeWindowTitle);
@@ -6446,6 +6459,7 @@
   }
 
   async function newDocument(): Promise<void> {
+    chatWorkAreaOpen = false;
     if (!project || fileCommandInFlight || editorReadonly) return;
     if (!flushEditors()) return;
     fileCommandInFlight = true;
@@ -6474,6 +6488,7 @@
   }
 
   async function exportCopy(): Promise<void> {
+    if (chatWorkAreaOpen) { recordFailure(new Error('Select a document to export its text.')); return; }
     if (!project || !document || fileCommandInFlight || editorReadonly) return;
     if (!flushEditors()) return;
     fileCommandInFlight = true;
@@ -6509,7 +6524,8 @@
             void openAnotherProject();
             break;
           case 'save':
-            if (flushEditors()) void saveNow();
+            if (chatWorkAreaOpen) void flushChatDraft();
+            else if (flushEditors()) void saveNow();
             break;
           case 'export_copy':
             void exportCopy();
@@ -8362,6 +8378,12 @@
   function handleGlobalKeydown(event: KeyboardEvent): void {
     if (event.defaultPrevented) return;
     if (event.key === 'Escape' && addMenuOpen) { event.preventDefault(); addMenuOpen = false; return; }
+    if (chatWorkAreaOpen) {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault(); void flushChatDraft();
+      }
+      return;
+    }
     if (event.key === 'Escape' && (activeMaterial || materialsOpen)) { event.preventDefault(); closeMaterial(); return; }
     if (event.key === 'Escape' && spokenAudio) { event.preventDefault(); stopReadAloud(); return; }
     if (event.key === 'Escape' && documentContextTarget) {
@@ -9877,8 +9899,6 @@
 </svelte:head>
 
 <div class="app-shell" class:chat-open={chatWorkAreaOpen}>
-  {#if chatWorkAreaOpen}<ChatWorkArea onDocuments={() => chatWorkAreaOpen = false} onTitlebarDrag={startTitlebarDrag} />{/if}
-  <div style="display: contents" inert={chatWorkAreaOpen}>
   {#if project}
     <div
       class="canvas-controls"
@@ -9911,7 +9931,8 @@
           ><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10" /></svg></button>
           {#if addMenuOpen}
             <div class="material-add-menu" role="menu" aria-label="Add">
-              <button role="menuitem" title="New document (⌘N)" on:click={() => { addMenuOpen = false; closeMaterial(); void newDocument(); }}>New document</button>
+              <button role="menuitem" title="New document (⌘N)" on:click={() => { addMenuOpen = false; chatWorkAreaOpen = false; closeMaterial(); void newDocument(); }}>New document</button>
+              <button role="menuitem" on:click={() => { addMenuOpen = false; void createChatInWorkArea(); }}>New chat</button>
               <button role="menuitem" on:click={() => void chooseMaterialFiles()}>Add files…</button>
               <button role="menuitem" on:click={() => void chooseMaterialLibrary()}>Open library…</button>
               <button role="menuitem" on:click={openMaterialConnections}>Connect sources…</button>
@@ -9926,7 +9947,8 @@
         on:mousedown={startTitlebarDrag}
       ><span class="titlebar-document-title">{nativeWindowTitle}</span></div>
       <div class="canvas-controls-right" data-no-window-drag>
-        <button class="titlebar-button" type="button" on:click={openChatWorkArea} aria-label="Open chats">Chat</button>
+        <button class="titlebar-button" class:active={chatWorkAreaOpen} type="button" on:click={() => { if (chatWorkAreaOpen) chatWorkAreaOpen = false; else openChatWorkArea(); }} aria-label={chatWorkAreaOpen ? 'Return to document' : 'Open chats'} title={chatWorkAreaOpen ? 'Document' : 'Chat'}><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M3 3h10v7H7l-4 3Z" /></svg></button>
+        {#if !chatWorkAreaOpen}
         {#each paneSlots.filter(slot => slot.selected) as slot (slot.position)}
           {@const title = slot.selected![1].title ?? slot.selected![0]}
           <button class="titlebar-button" class:active={!hiddenPaneSlots.has(slot.position)} type="button"
@@ -9991,13 +10013,14 @@
         </button>
         {/if}
 
+        {/if}
       </div>
     </div>
   {/if}
 
   {#if project}
     <div bind:clientWidth={workspaceWidth} bind:clientHeight={workspaceHeight} class:outline-open={outlineOpen} class="workspace-grid"
-      style={`grid-template-columns:${outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0}px ${mainColumn} ${sideColumn}; grid-template-rows:${bottomOnly ? '0px minmax(0,1fr)' : `minmax(0,1fr) ${bottomPaneOpen ? Math.min(bottomHeight, workspaceHeight * 0.6) : 0}px`};`}>
+      style={`grid-template-columns:${outlineOpen ? Math.min(outlineWidth, outlineLimit) : 0}px ${chatWorkAreaOpen ? 'minmax(0,1fr)' : mainColumn} ${chatWorkAreaOpen ? '0px' : sideColumn}; grid-template-rows:${chatWorkAreaOpen ? 'minmax(0,1fr) 0px' : bottomOnly ? '0px minmax(0,1fr)' : `minmax(0,1fr) ${bottomPaneOpen ? Math.min(bottomHeight, workspaceHeight * 0.6) : 0}px`};`}>
       <aside
         id="project-outline"
         bind:this={outlineElement}
@@ -10030,7 +10053,7 @@
               </button>
             {:else if 'material' in row}
               <button class="folder-row material-row" class:active={activeMaterial?.id === row.material.id} type="button" title={row.path}
-                style={`padding-left: ${8 + row.depth * 14}px`} on:click={() => openMaterial(row.material)}>
+                style={`padding-left: ${8 + row.depth * 14}px`} on:click={() => { chatWorkAreaOpen = false; openMaterial(row.material); }}>
                 <span>{row.material.name}</span>{#if row.material.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}
               </button>
             {:else}
@@ -10060,7 +10083,7 @@
               class="document-row-group"
               class:template-file={row.path.split('/').at(-1)?.startsWith('.')}
               style={`padding-left: ${row.depth * 14}px`}
-              class:active={candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}
+              class:active={!chatWorkAreaOpen && candidate.document_id === (reconciliation?.document_id ?? document?.summary.document_id)}
             >
               <button
                 class="document-row"
@@ -10069,7 +10092,7 @@
                 disabled={editorReadonly}
                 aria-haspopup="menu"
                 aria-expanded={documentContextTarget?.documentId === candidate.document_id}
-                on:click={(event) => handleDocumentRowClick(event, candidate)}
+                on:click={(event) => { const fromChat = chatWorkAreaOpen; chatWorkAreaOpen = false; if (!fromChat || candidate.document_id !== document?.summary.document_id) handleDocumentRowClick(event, candidate); }}
                 on:contextmenu={(event) => handleDocumentContextPointer(event, candidate)}
                 on:keydown={(event) => handleDocumentContextKey(event, candidate)}
                 on:pointerdown={(event) => beginDocumentContextLongPress(event, candidate)}
@@ -10101,7 +10124,7 @@
           {/each}
           {#each visibleMaterials as item (item.id)}
             <button class="folder-row material-row" class:active={activeMaterial?.id === item.id} type="button" title={item.name}
-              on:click={() => openMaterial(item)}>
+              on:click={() => { chatWorkAreaOpen = false; openMaterial(item); }}>
               <svg aria-hidden="true" viewBox="0 0 16 16">{#if item.kind === 'library'}<path d="M2 4h4l1.5 1.5H14v7H2Z"/>{:else}<path d="M4 2h5l3 3v9H4Z M9 2v4h3"/>{/if}</svg>
               <span>{item.name}</span>{#if item.pinned}<span class="material-pin" aria-label="Pinned">•</span>{/if}
             </button>
@@ -10109,6 +10132,16 @@
             </div>
             {/if}
           {/each}
+          {#if $chatSession.ready}
+            <div class="sidebar-section-label">Chats</div>
+            {#each $chatSession.conversations.filter(chat => !search.trim() || chat.title.toLowerCase().includes(search.toLowerCase())) as chat (chat.id)}
+              <div class="document-row-group" class:active={chatWorkAreaOpen && $chatSession.selected?.id === chat.id}>
+                <button class="document-row" type="button" aria-current={chatWorkAreaOpen && $chatSession.selected?.id === chat.id ? 'page' : undefined} on:click={() => openSavedChat(chat.id)}>
+                  <span class="document-label"><strong>{chat.title}</strong></span>
+                </button>
+              </div>
+            {/each}
+          {/if}
         </nav>
         {#if folderWarnings.length > 0}
           <details class="folder-warnings">
@@ -10174,20 +10207,21 @@
         {/if}
       </aside>
 
-      <main id="manuscript" class="manuscript-area" tabindex="-1" class:workspace-main-hidden={!mainPaneOpen || (customMain && !activeMaterial && !materialsOpen)}>
-        {#if activeMaterial}
+      <main id="manuscript" class="manuscript-area" tabindex="-1" class:workspace-main-hidden={!chatWorkAreaOpen && (!mainPaneOpen || (customMain && !activeMaterial && !materialsOpen))}>
+        {#if chatWorkAreaOpen}<ChatWorkArea />{/if}
+        {#if activeMaterial && !chatWorkAreaOpen}
           {#key `${project.session_id}/${activeMaterial.id}/${activeMaterialEvidence?.id ?? ""}`}
             <MaterialView projectId={project.project_id} sessionId={project.session_id} material={activeMaterial}
               initialEvidence={activeMaterialEvidence} originTitle={materialOrigin?.title ?? null} onClose={closeMaterial} onUse={useMaterialReference} onOpenDocument={openMaterialWriting}
               removable={materialEntries.some(item => item.id === activeMaterial?.id)} onRemoved={materialRemoved} onChanged={materialChanged} onReopen={() => void chooseMaterialLibrary()} />
           {/key}
-        {:else if materialsOpen}
+        {:else if materialsOpen && !chatWorkAreaOpen}
           <section class="material-connect-view" aria-label="Add sources">
             <PaneHeader title="Add sources" onCollapse={closeMaterial} />
             {#if document}{#key project.session_id}<ImportSources projectId={project.project_id} sessionId={project.session_id} onOpen={openImportedSource} onImported={addImportedSources} />{/key}{/if}
           </section>
         {/if}
-        <div class="writing-content" class:material-covered={Boolean(activeMaterial) || materialsOpen} inert={Boolean(activeMaterial) || materialsOpen}>
+        <div class="writing-content" class:material-covered={chatWorkAreaOpen || Boolean(activeMaterial) || materialsOpen} inert={chatWorkAreaOpen || Boolean(activeMaterial) || materialsOpen}>
         {#if document && contextPaneOpen}
           <div
             bind:this={contextPaneElement}
@@ -10549,7 +10583,7 @@
       {#each paneSlots as slot (slot.position)}
         {#if slot.selected && (slot.position !== 'main' || customMain)}
           {@const selected = slot.selected}
-          <aside class:hidden-pane={hiddenPaneSlots.has(slot.position) || (slot.position === 'main' && (Boolean(activeMaterial) || materialsOpen))} class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
+          <aside class:hidden-pane={chatWorkAreaOpen || hiddenPaneSlots.has(slot.position) || (slot.position === 'main' && (Boolean(activeMaterial) || materialsOpen))} class={`workspace-pane-slot workspace-pane-${slot.position}`} aria-label={selected[1].title ?? selected[0]}>
             {#if slot.position === 'right'}<PaneDivider edge="left" label="Resize right pane" size={Math.min(rightWidth, rightLimit)} min={180} max={rightLimit} onResize={(size) => rightWidth = size} />{/if}
             {#if slot.position === 'bottom'}<PaneDivider edge="top" label="Resize bottom pane" size={Math.min(bottomHeight, workspaceHeight * 0.6)} min={100} max={workspaceHeight * 0.6} onResize={(size) => bottomHeight = size} />{/if}
             <PaneHeader title={selected[1].title ?? selected[0]} choices={slot.choices} selected={selected[0]}
@@ -10564,7 +10598,7 @@
       {/each}
 
     </div>
-      <div class="terminal-dock" bind:clientHeight={terminalDockHeight} class:closed={!terminalOpen} style={`height:${effectiveTerminalHeight}px`}>
+      <div class="terminal-dock" bind:clientHeight={terminalDockHeight} class:closed={!terminalOpen || chatWorkAreaOpen} style={`height:${chatWorkAreaOpen ? 0 : effectiveTerminalHeight}px`}>
       {#if terminalOpen}<PaneDivider edge="top" label="Resize terminal" size={effectiveTerminalHeight} min={100} max={terminalLimit} onResize={(size) => terminalHeight = size} />{/if}
       <TerminalPane
         bind:open={terminalOpen}
@@ -11040,5 +11074,4 @@
   <div class="sr-only" role="note" aria-label="Completion session witness">
     {completionAccessibilityWitness}
   </div>
-</div>
 </div>

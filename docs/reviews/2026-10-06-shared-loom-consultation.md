@@ -40,7 +40,12 @@ relaunch remain required. Completion-affecting promotion also requires the
 existing Visual/Source/Ghost/Loompad acceptance journey. Run one consolidated
 local gate on a committed unchanged candidate, then qualify that exact bundle.
 
-The document outline and chat list still need to become one shared sidebar.
+The document outline and chat list now share the existing sidebar. Chat selection
+hides the document panes while retaining their mounted editors. The initial
+replacement chat overlay was rejected by the user as a UX regression and removed.
+The native chat binding reuses the existing ChatTurn/Markdown presentation,
+compact composer layout, titlebar and document-row styles. Persona choices
+appear only while typing an @ mention; there is no permanent persona grid.
 The standalone Mom renderer and `--mode chat` root remain during this acceptance
 slice; retiring them and their renderer-specific tests should follow successful
 normal-window qualification. This slice adds integration code and does not yet
@@ -72,3 +77,16 @@ the seeded manuscript was replaced by unrelated text during formatting. Its
 selection guard correctly refused qualification. That unexpected input's cause
 is unresolved; the failed archive, logs, manuscript and store are preserved.
 Neither this failure nor the template correction is called packaged acceptance.
+
+## Returned architectural review: remaining authority gaps
+
+Shared residency locks do not yet serialize cross-product generation. Opening
+chat requests document cancellation without awaiting terminal work. The injected
+concrete document runtime still carries an application finalizer, although its
+erased execution interface and native client cannot finalize the host. These
+are unresolved architecture requirements from the returned proposal. Early Stop
+has renderer coverage; cancellation before native mention registration needs an
+actual boundary test. Packaged chat/model and active-work quit qualification
+remain required. The successful real Metal CLI consultation/cache/source-reopen
+receipts do not qualify the shared window. The first shared-window automation
+attempt did not send a consultation and is retained as incomplete evidence.
