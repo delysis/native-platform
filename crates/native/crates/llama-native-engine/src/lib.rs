@@ -2840,6 +2840,16 @@ fn run_worker(
                     if result.is_ok() {
                         sequence_token_counts.insert(destination_sequence_id, state.token_count);
                         sequence_token_ids.insert(destination_sequence_id, state.token_ids);
+                        // Only an authenticated import from this live worker
+                        // restores an already evaluated KV prefix. Checked token
+                        // replay must not gain physical prefill reuse authority.
+                        resident_text_prefix.commit_restore(
+                            &resident_prefix_binding,
+                            destination_sequence_id,
+                            result.as_ref().ok(),
+                            sequence_token_counts.get(&0).copied(),
+                            sequence_token_ids.get(&0),
+                        );
                     } else {
                         // Raw import and decode may fail after partial mutation.
                         // Discard every sequence, including valid peer sequences,
@@ -5566,6 +5576,18 @@ struct ResidentTextPrefixCache {
 }
 
 impl ResidentTextPrefixCache {
+    fn commit_restore(
+        &mut self,
+        binding: &ResidentTextPrefixBinding,
+        sequence_id: i32,
+        kind: Option<&SequenceRestoreKind>,
+        count: Option<usize>,
+        tokens: Option<&Vec<i32>>,
+    ) {
+        if sequence_id == 0 && kind == Some(&SequenceRestoreKind::NativeState) {
+            self.commit(binding, count, tokens);
+        }
+    }
     fn new(binding: ResidentTextPrefixBinding) -> Self {
         Self {
             binding,
@@ -10762,6 +10784,33 @@ mod tests {
         assert!(!permits_resident_text_reuse(true, false));
         assert!(!permits_resident_text_reuse(false, true));
         assert!(!permits_resident_text_reuse(true, true));
+    }
+
+    #[test]
+    fn restored_resident_authority_requires_an_owned_native_import_to_sequence_zero() {
+        let worker = Arc::new(WorkerIdentity::default());
+        let binding = ResidentTextPrefixBinding::new(&test_model_fingerprint("restored"), &worker);
+        let mut cache = ResidentTextPrefixCache::new(binding.clone());
+        let saved = vec![1, 2, 3];
+        let prompt = vec![vec![1, 2, 3, 4].into_iter().map(LlamaToken::new).collect()];
+        for (sequence, kind) in [
+            (0, SequenceRestoreKind::TokenReplay),
+            (1, SequenceRestoreKind::NativeState),
+        ] {
+            cache.commit_restore(&binding, sequence, Some(&kind), Some(3), Some(&saved));
+            assert_eq!(cache.reusable_tokens(&binding, &prompt), 0);
+        }
+        cache.commit_restore(
+            &binding,
+            0,
+            Some(&SequenceRestoreKind::NativeState),
+            Some(3),
+            Some(&saved),
+        );
+        assert_eq!(cache.reusable_tokens(&binding, &prompt), 3);
+        cache.invalidate();
+        cache.commit_restore(&binding, 0, None, Some(3), Some(&saved));
+        assert_eq!(cache.reusable_tokens(&binding, &prompt), 0);
     }
 
     #[test]
