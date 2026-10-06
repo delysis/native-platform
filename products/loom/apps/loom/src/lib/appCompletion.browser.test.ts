@@ -128,11 +128,6 @@ it.each([
   }
   transport.invoke.mockImplementation(async (command: string, args: Record<string, any> = {}) => {
     switch (command) {
-      case 'mom_llama_runtime_initialize': return;
-      case 'mom_llama_conversation_list': return {result:[{id:'native-chat',title:'Native consultation',kind:'chat'}]};
-      case 'mom_llama_conversation_select': return {result:{id:'native-chat',title:'Native consultation',kind:'chat',messages:[{id:'native-reply',role:'assistant',content:'A retained native reply.'}]}};
-      case 'mom_llama_draft_get': return {result:{message:'',attachment_ids:[]}};
-      case 'mom_llama_mention_candidates': return {result:[]};
       case 'plugin:loom|application_close_pending': return false;
       case 'plugin:loom|project_current': return project;
       case 'plugin:loom|document_open': return opened;
@@ -510,33 +505,6 @@ it.each([
       expect(checkpoints).toEqual([]);
       expect(completionWitness().pre_admission.caret_byte).toBe(sourceBytes);
       expect(completionWitness().boundary_trace.first_terminal_space_loss).toBeNull();
-    }
-    if (!reenable && !unusableLastPartial && sourceText === 'hello') {
-      stage = 'shared sidebar chat selection retains the mounted manuscript';
-      const editorBefore = document.querySelector('.loom-prosemirror');
-      await page.getByRole('button', {name:'Open chats',exact:true}).click();
-      await expect.element(page.getByRole('button', {name:'Native consultation',exact:true})).toBeVisible();
-      await expect.element(page.getByText('A retained native reply.', { exact: true })).toBeVisible();
-      expect(document.querySelectorAll('#project-outline')).toHaveLength(1);
-      expect(document.querySelector('.chat-work-area aside')).toBeNull();
-      expect(document.querySelector('.loom-prosemirror')).toBe(editorBefore);
-      expect(getComputedStyle(document.querySelector('.writing-content')!).display).toBe('none');
-      expect(authorDomText(editorBefore!)).toBe(sourceText);
-      const originalScheme = document.documentElement.style.colorScheme;
-      for (const scheme of ['light', 'dark']) {
-        document.documentElement.style.colorScheme = scheme;
-        await page.screenshot({path:`__screenshots__/restored-chat-${scheme}.png`});
-      }
-      await page.viewport(540,800);
-      expect(document.querySelector('.app-shell')!.scrollWidth).toBeLessThanOrEqual(540);
-      expect(document.querySelector('.chat-work-area')!.getBoundingClientRect().width).toBeGreaterThan(200);
-      await page.screenshot({path:'__screenshots__/restored-chat-compact.png'});
-      await page.viewport(1200,800);
-      document.documentElement.style.colorScheme = originalScheme;
-      await page.getByRole('button', {name:'Return to document',exact:true}).click();
-      expect(document.querySelector('.loom-prosemirror')).toBe(editorBefore);
-      expect(getComputedStyle(document.querySelector('.writing-content')!).display).not.toBe('none');
-      expect(authorDomText(editorBefore!)).toBe(sourceText);
     }
   } catch (error) {
     // Failure context only: distinguish DOM/controller refusal from an IPC or

@@ -1,17 +1,20 @@
 # Normal Loom consultation integration
 
-This slice adds a chat work area to the normal Loom document window. The
-composition root injects one lazy native owner into the document backend and
+This branch retains native backend groundwork for normal-window consultation.
+The frontend is restored to its pre-integration version after the user rejected
+the replacement layouts. The composition root injects one lazy native owner into the document backend and
 Mom's existing encrypted product runtime. Native clients retain model-slot
 claims; a product cannot release a slot retained by the other product. Mom's
 operations, approval recovery and speech drain before the application joins
 native workers. An unused application owner does not unlock or construct a host.
 
-The view calls the existing typed product commands. Pending replies retain their
-original chat and client request; hiding the work area or switching chats cannot
-redirect them. Listener installation precedes dispatch. Draft writes are ordered
-in Mom's encrypted store, and a failed write blocks Send. Opening chat revokes
-completion presentation and makes the mounted document surface inert.
+The first native chat overlay and its second layout revision were rejected by
+the user. The Loom frontend, including App, styles and ChatTurn, is restored
+exactly to the pre-integration cfb0 source. The replacement component and its
+unused controller are removed. Backend composition and citation-validation
+changes are retained. Normal-window Mom wiring is therefore unfinished again;
+it must use the existing WorkspacePane chat interface without a replacement
+surface or unrelated visual changes.
 
 Consultation sources are loaded from the immutable retained input receipt for
 one committed native target. The API rejects missing, mismatched, incompatible
@@ -29,10 +32,10 @@ old citations. A retained source list is descriptive evidence, not read authorit
 
 ## Qualification and remaining consolidation
 
-Focused checks cover service drain before the sole host join, lazy startup,
-foreign residency conflicts, citation reopening after deletion, exact input
-identity, draft-write failure, request correlation, early Stop, inert rendered
-text and compact layout. These are component checks. Previous cfb0 bundle
+Backend checks cover service drain before the sole host join, lazy startup,
+foreign residency conflicts, citation reopening after deletion and exact input
+identity. The original WorkspacePane, ChatTurn and real-App browser checks pass
+on the restored frontend. These are component checks. Previous cfb0 bundle
 launch/quit/relaunch receipts do not qualify this changed tree.
 
 Exact packaged real-model consultation, cache reuse/restart, active-work quit and
@@ -40,12 +43,11 @@ relaunch remain required. Completion-affecting promotion also requires the
 existing Visual/Source/Ghost/Loompad acceptance journey. Run one consolidated
 local gate on a committed unchanged candidate, then qualify that exact bundle.
 
-The document outline and chat list now share the existing sidebar. Chat selection
-hides the document panes while retaining their mounted editors. The initial
-replacement chat overlay was rejected by the user as a UX regression and removed.
-The native chat binding reuses the existing ChatTurn/Markdown presentation,
-compact composer layout, titlebar and document-row styles. Persona choices
-appear only while typing an @ mention; there is no permanent persona grid.
+The restored original sidebar and chat pane are the required presentation.
+The permissible layout change is hiding the middle document pane in chat mode.
+Shared document/chat selection still needs native wiring, and must preserve the
+existing chat composer and interaction behavior. The rendered replacement
+previews and component tests did not establish that requirement.
 The standalone Mom renderer and `--mode chat` root remain during this acceptance
 slice; retiring them and their renderer-specific tests should follow successful
 normal-window qualification. This slice adds integration code and does not yet
@@ -90,3 +92,13 @@ actual boundary test. Packaged chat/model and active-work quit qualification
 remain required. The successful real Metal CLI consultation/cache/source-reopen
 receipts do not qualify the shared window. The first shared-window automation
 attempt did not send a consultation and is retained as incomplete evidence.
+
+## User correction: preserve the existing chat pane
+
+The user rejected both replacement layouts and reported a blank chat pane in the
+running build. The corrected source restores the whole frontend to cfb0 rather
+than treating a visually similar new component as restoration. The native
+backend remains available, but its normal-window integration is not accepted.
+The latest exact-window attempt failed before Send, with no model consultation
+submitted. Its logs and source-bound failed receipt are preserved. The accessible
+window disappeared while the process remained alive; its cause is not proven.

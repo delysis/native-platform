@@ -3,24 +3,20 @@
   import { presentChatText } from './chatPresentation';
   import type { TerminalRun } from './types';
 
-  export let run: TerminalRun | undefined = undefined;
-  export let input: string | undefined = undefined;
-  export let label = 'Response';
+  export let run: TerminalRun;
   export let output: string;
   export let pinned = false;
   export let onOpen: (() => void) | undefined = undefined;
   export let onPin: (() => void) | undefined = undefined;
   $: content = presentChatText(output);
-  $: query = input ?? run?.presentation?.input;
 </script>
 
 <article class="chat-turn" aria-label="Conversation turn">
-  {#if query}
-    <div class="query" role="group" aria-label="You">{query}</div>
+  {#if run.presentation?.input}
+    <div class="query" role="group" aria-label="You">{run.presentation.input}</div>
   {/if}
-  {#if output || run}
-  <div class="response" role="group" aria-label={label}>
-    {#each run?.events ?? [] as event}
+  <div class="response" role="group" aria-label="Response">
+    {#each run.events ?? [] as event}
       {#if event.detail}
         <details class="activity">
           <summary>{event.label}</summary>
@@ -32,20 +28,19 @@
     {/each}
     {#each content.thoughts as thought, index}
       <details class="thinking">
-        <summary>Thinking{content.thoughts.length > 1 ? ` ${index + 1}` : ''}{!thought.complete && run?.status === 'running' ? '…' : ''}</summary>
+        <summary>Thinking{content.thoughts.length > 1 ? ` ${index + 1}` : ''}{!thought.complete && run.status === 'running' ? '…' : ''}</summary>
         <div class="thought-text"><ChatMarkdown text={thought.text} /></div>
-        {#if !thought.complete && run?.status !== 'running'}<p class="interrupted">Thinking ended before a response.</p>{/if}
+        {#if !thought.complete && run.status !== 'running'}<p class="interrupted">Thinking ended before a response.</p>{/if}
       </details>
     {/each}
     {#if content.answer}<div class="output"><ChatMarkdown text={content.answer} /></div>{/if}
-    {#if run?.status === 'running'}
+    {#if run.status === 'running'}
       <p class="status" role="status"><span class="working-dot" aria-hidden="true"></span>Working…</p>
-    {:else if run?.status === 'cancelled'}
+    {:else if run.status === 'cancelled'}
       <p class="status" role="status">Stopped</p>
-    {:else if run?.status === 'failed'}
+    {:else if run.status === 'failed'}
       <p class="failure" role="status">Couldn’t finish{run.error ? `: ${run.error}` : '.'}</p>
     {/if}
-    <slot />
     {#if onOpen || onPin}
       <div class="turn-actions">
         {#if onOpen}<button aria-label="Open output document" on:click={onOpen}>Open</button>{/if}
@@ -53,7 +48,6 @@
       </div>
     {/if}
   </div>
-  {/if}
 </article>
 
 <style>
