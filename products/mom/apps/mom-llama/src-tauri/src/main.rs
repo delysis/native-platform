@@ -528,6 +528,32 @@ impl EmbeddedMom {
     where
         F: FnMut(mom_llama_runtime::ChatDispatchStreamEvent) -> anyhow::Result<()> + Send + 'static,
     {
+        self.dispatch_cancellable(
+            app,
+            input,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            on_event,
+        )
+        .await
+    }
+
+    /// Cancellation is local to this dispatch and is reswept until its owned
+    /// worker reaches a terminal result. Cancelling never drops a live worker.
+    pub async fn dispatch_cancellable<F>(
+        &self,
+        app: AppHandle,
+        input: mom_llama_runtime::MentionDispatchInput,
+        context: Vec<String>,
+        cancelled: Arc<AtomicBool>,
+        on_event: Option<F>,
+    ) -> Result<mom_llama_runtime::CommandResult<mom_llama_runtime::ChatDispatchOutput>, String>
+    where
+        F: FnMut(mom_llama_runtime::ChatDispatchStreamEvent) -> anyhow::Result<()> + Send + 'static,
+    {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("Mom dispatch was cancelled before startup".into());
+        }
         let registered = app
             .try_state::<Self>()
             .ok_or_else(|| "Mom service is not registered in this application".to_string())?;
@@ -540,8 +566,34 @@ impl EmbeddedMom {
             .ok_or_else(|| "Mom runtime was not installed after startup".to_string())?
             .inner()
             .clone();
+        if cancelled.load(Ordering::Acquire) {
+            return Err("Mom dispatch was cancelled during startup".into());
+        }
+        let operations = runtime
+            .operation_scope()
+            .child()
+            .map_err(|error| error.to_string())?;
         let lease = runtime.admit(command_registry::command_spec("mom_llama_chat_dispatch"))?;
-        commands::dispatch_typed(runtime, lease, input, on_event).await
+        let dispatch = commands::dispatch_typed_in_scope(
+            runtime,
+            lease,
+            operations.clone(),
+            input,
+            context,
+            on_event,
+        );
+        let mut dispatch = std::pin::pin!(dispatch);
+        let mut sweep = tokio::time::interval(std::time::Duration::from_millis(25));
+        loop {
+            tokio::select! {
+                result = &mut dispatch => return result,
+                _ = sweep.tick() => {
+                    if cancelled.load(Ordering::Acquire) {
+                        operations.request_cancellation();
+                    }
+                }
+            }
+        }
     }
 
     pub async fn drain(&self) -> Result<(), String> {

@@ -24,6 +24,11 @@ mod speech_input;
 mod terminal;
 mod terminal_media;
 mod terminal_receipts;
+mod workspace_chat;
+pub use workspace_chat::{
+    WorkspaceChatExecutor, WorkspaceChatFuture, WorkspaceChatOutput, WorkspaceChatRequest,
+    WorkspaceChatService,
+};
 mod workspace_copy;
 mod workspace_preview;
 mod workspace_template;

@@ -4038,6 +4038,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 name = "loom-app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "desktop-launch",
  "llama-native-host",
  "llama-native-types",
@@ -4045,6 +4046,7 @@ dependencies = [
  "loom-types",
  "mom-llama-app",
  "mom-llama-runtime",
+ "serde_json",
  "sha2 0.10.9",
  "tauri",
  "tauri-build",

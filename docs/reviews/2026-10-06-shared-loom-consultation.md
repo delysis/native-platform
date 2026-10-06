@@ -12,9 +12,9 @@ The first native chat overlay and its second layout revision were rejected by
 the user. The Loom frontend, including App, styles and ChatTurn, is restored
 exactly to the pre-integration cfb0 source. The replacement component and its
 unused controller are removed. Backend composition and citation-validation
-changes are retained. Normal-window Mom wiring is therefore unfinished again;
-it must use the existing WorkspacePane chat interface without a replacement
-surface or unrelated visual changes.
+changes are retained. The native document binding below now connects the
+existing WorkspacePane request to Mom without a replacement surface or unrelated
+visual changes. Normal-window real-model qualification remains unfinished.
 
 Consultation sources are loaded from the immutable retained input receipt for
 one committed native target. The API rejects missing, mismatched, incompatible
@@ -129,3 +129,57 @@ registration remain necessary. Separate Mom and Loom persistence must not be
 represented as one atomic transaction: a Mom commit followed by a failed document
 projection needs an honest retained outcome and replay recovery. The real
 source-occurrence check remains in Mom's final SQLite commit transaction.
+
+
+## Native document binding implementation
+
+The normal desktop root now registers a typed Mom workspace executor. The
+existing terminal request selects it for chat turns; editor/functions and browser
+experiments retain their own execution path. The original presentation.input
+is the human message. Its obsolete flattened expression is never executed or
+imported as canonical Mom history. Project/pane identity deterministically binds
+the same conversation across session reopening, matching the existing pane's
+project-wide history scope.
+
+Existing text references, including bounded folder/library consultation, use
+Loom's admitted bindings and retrieval/cancellation checks. Their exact selected
+text snapshots are canonicalized as untrusted Mom draft attachments. Native
+message/invocation/cache identities are retained with ordinary generated Markdown
+output documents. The sidecar carries compact execution receipts rather than a
+plaintext copy of Mom's encrypted source conversations. Fixture results cannot
+pass the normal root executor's native-result check.
+
+Each embedded dispatch has an independent child operation scope. Stop repeatedly
+requests cancellation until that dispatch terminates; application quit cancels
+and counts children, including operations registered after cancellation. Children
+share the original native client and cannot construct a second owner. Child count
+is bounded and finished scopes are reclaimed. Backend tests cover exact text,
+source preservation, native routing without a document model, real document
+projection and replay without a second dispatch. These are component fixtures,
+not a real-model or packaged-window acceptance claim.
+
+Mom commits and Loom projections remain separate transactions. A durable immutable
+chat-committed receipt precedes document projection; failure leaves evidence and
+replay never silently dispatches again. Automatic repair of failed projection is
+still unfinished. Additional authored document instructions and Loom attachment
+or media context currently fail with explicit typed blockers; they are not
+silently omitted or represented as supported. Persona-owned Mom attachments
+continue through Mom's existing canonical path and final source-occurrence
+transaction validator. Model/profile controls, streaming projection, exact native
+window qualification and the permitted middle-pane collapse remain follow-ups.
+The original frontend remains byte-for-byte unchanged.
+
+
+Preserved pre-Mom output rows are not automatically imported as canonical Mom
+messages. Editing an output document does not yet invoke Mom's message-edit /
+branch operation. The document model controls are not yet synchronized with
+Mom conversation execution profiles. These are functional consolidation gaps
+behind the retained interface and must be resolved before claiming one complete
+chat-as-document product or retiring the standalone Mom renderer.
+
+A cancelled or failed context-bearing send can retain a Mom draft whose text
+must match admission. A different subsequent message currently fails closed
+rather than overwriting that draft. Source-owned draft/context recovery behind
+the existing composer is therefore an additional blocker for cancellation and
+relaunch qualification. It must preserve failed inputs and distinguish these
+adapter-owned snapshots from unrelated draft edits or attachments.

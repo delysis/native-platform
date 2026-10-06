@@ -77,6 +77,17 @@ impl TerminalFixture {
         presentation: Option<TerminalPresentation>,
         boundary: Option<TerminalTurnBoundary>,
     ) -> Result<TerminalRun, IpcFailure> {
+        self.run_with_context(id, expression, presentation, boundary, None)
+    }
+
+    fn run_with_context(
+        &self,
+        id: CommandId,
+        expression: &str,
+        presentation: Option<TerminalPresentation>,
+        boundary: Option<TerminalTurnBoundary>,
+        context: Option<Vec<String>>,
+    ) -> Result<TerminalRun, IpcFailure> {
         tauri::async_runtime::block_on(terminal_run(
             self.project_id.clone(),
             self.session_id.clone(),
@@ -88,7 +99,7 @@ impl TerminalFixture {
             0,
             expression.into(),
             presentation,
-            None,
+            context,
             boundary,
             self.app.handle().clone(),
             self.app.state::<PluginState>(),
@@ -785,4 +796,99 @@ fn chat_turn_boundary_binds_sampling_and_command_replay() {
         )
         .expect_err("chat boundaries cannot silently change function expressions");
     assert!(invalid.message.contains("plain prompt"));
+}
+
+#[test]
+fn workspace_chat_retains_a_real_document_and_replays_without_dispatching_again() {
+    struct Executor(Arc<AtomicUsize>);
+    impl crate::WorkspaceChatExecutor<tauri::test::MockRuntime> for Executor {
+        fn dispatch(
+            &self,
+            _app: AppHandle<tauri::test::MockRuntime>,
+            request: crate::WorkspaceChatRequest,
+            _cancelled: Arc<AtomicBool>,
+        ) -> crate::WorkspaceChatFuture {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                assert_eq!(request.pane_id, "chat");
+                assert_eq!(request.message, "@mom Original human input");
+                assert_eq!(request.context.len(), 1);
+                let context: serde_json::Value =
+                    serde_json::from_str(&request.context[0]).expect("text snapshot");
+                assert_eq!(context["reference"], "Draft.md");
+                assert_eq!(
+                    context["text"],
+                    "The first idea is α. @Unresolved stays literal.\n"
+                );
+                Ok(crate::WorkspaceChatOutput {
+                    conversation_id: "component-only-conversation".into(),
+                    text: "Component fixture response α\n".into(),
+                    receipt: serde_json::json!({"fake_fixture": true}),
+                })
+            })
+        }
+    }
+    let fixture = TerminalFixture::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    assert!(
+        fixture
+            .app
+            .manage(crate::WorkspaceChatService::new(Arc::new(Executor(
+                calls.clone()
+            ))))
+    );
+    let id = CommandId::new();
+    let presentation = Some(TerminalPresentation {
+        pane_id: "chat".into(),
+        input: "@mom Original human input".into(),
+    });
+    fixture
+        .run_with_context(
+            id,
+            "An obsolete flat transcript is never executed",
+            presentation.clone(),
+            Some(TerminalTurnBoundary::Chat),
+            Some(vec!["Draft.md".into()]),
+        )
+        .expect("admit chat without a Loom model");
+    let run = fixture.wait(id);
+    assert_eq!(run.status, "completed");
+    assert!(run.output_document_id.is_some());
+    let receipt = read_receipt(&fixture.root(), &id.to_string(), true)
+        .expect("receipt")
+        .expect("committed receipt");
+    assert!(receipt.model.is_none());
+    assert_eq!(
+        receipt
+            .workspace_chat
+            .as_ref()
+            .expect("native metadata")
+            .conversation_id,
+        "component-only-conversation"
+    );
+    fixture.with_store(|store| {
+        let output = store
+            .read_document(
+                run.output_relative_path
+                    .as_ref()
+                    .expect("ordinary Markdown path"),
+            )
+            .expect("output document");
+        assert_eq!(output.text, "Component fixture response α\n");
+        assert_eq!(
+            store.read_document("Draft.md").expect("source").text,
+            fixture.source.text
+        );
+    });
+    let replay = fixture
+        .run_with_context(
+            id,
+            "An obsolete flat transcript is never executed",
+            presentation,
+            Some(TerminalTurnBoundary::Chat),
+            Some(vec!["Draft.md".into()]),
+        )
+        .expect("replay");
+    assert_eq!(replay.output_document_id, run.output_document_id);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

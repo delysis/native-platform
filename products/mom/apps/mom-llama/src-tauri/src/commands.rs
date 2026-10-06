@@ -582,8 +582,52 @@ where
     F: FnMut(mom_llama_runtime::ChatDispatchStreamEvent) -> anyhow::Result<()> + Send + 'static,
 {
     let operations = runtime.operation_scope();
+    dispatch_typed_in_scope(runtime, lease, operations, input, Vec::new(), on_event).await
+}
+
+pub(crate) async fn dispatch_typed_in_scope<F>(
+    runtime: AppRuntimeHandle,
+    lease: AppWorkLease,
+    operations: mom_llama_runtime::OperationScope,
+    input: mom_llama_runtime::MentionDispatchInput,
+    context: Vec<String>,
+    on_event: Option<F>,
+) -> Result<mom_llama_runtime::CommandResult<ChatDispatchOutput>, String>
+where
+    F: FnMut(mom_llama_runtime::ChatDispatchStreamEvent) -> anyhow::Result<()> + Send + 'static,
+{
     lease
         .run_blocking_with_cancellation_evidence(move || {
+            if !context.is_empty() {
+                let draft =
+                    mom_llama_runtime::draft_get(Some(&input.conversation_id)).map_err(to_error)?;
+                let draft = draft
+                    .result
+                    .ok_or_else(|| "Mom draft could not be read".to_string())?;
+                if !draft.message.is_empty() && draft.message != input.message {
+                    return Err("Mom draft changed before document context admission".into());
+                }
+                mom_llama_runtime::draft_update(
+                    Some(&input.conversation_id),
+                    input.message.clone(),
+                    draft.attachment_ids,
+                )
+                .map_err(to_error)?;
+                for text in context {
+                    if operations.cancellation_requested() {
+                        return Err("Mom dispatch was cancelled before context admission".into());
+                    }
+                    let imported = mom_llama_runtime::attachment_import_pasted_text(
+                        &operations,
+                        &input.conversation_id,
+                        text,
+                    )
+                    .map_err(to_error)?;
+                    if let Some(blocker) = imported.blocker {
+                        return Err(format!("{}: {}", blocker.code, blocker.message));
+                    }
+                }
+            }
             let result = mom_llama_runtime::chat_dispatch_stream_in_scope(
                 &operations,
                 input,

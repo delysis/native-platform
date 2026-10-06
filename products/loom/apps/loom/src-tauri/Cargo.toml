@@ -22,6 +22,8 @@ tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
 desktop-launch.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
 loom-types = { path = "../../../crates/loom-types" }
 sha2.workspace = true
 tauri = { version = "2.11.5", features = [] }

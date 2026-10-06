@@ -39,6 +39,18 @@ pub(super) fn read(root: &Path, id: &str, finished: bool) -> Result<Option<Vec<u
     }
 }
 
+pub(super) fn write_chat_commit(root: &Path, id: &str, bytes: &[u8]) -> Result<(), IpcFailure> {
+    let name = file_name(id, false)?.replace(".started.json", ".chat-committed.json");
+    validate_bytes(bytes)?;
+    #[cfg(all(unix, not(any(target_os = "redox", target_os = "espidf"))))]
+    return unix::write(root, &name, bytes, || Ok(()));
+    #[cfg(not(all(unix, not(any(target_os = "redox", target_os = "espidf")))))]
+    {
+        let _ = (root, name);
+        Err(failure("Receipt storage is unsupported on this platform."))
+    }
+}
+
 fn file_name(id: &str, finished: bool) -> Result<String, IpcFailure> {
     let parsed: loom_types::CommandId = id
         .parse()
