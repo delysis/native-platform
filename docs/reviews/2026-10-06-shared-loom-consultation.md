@@ -241,3 +241,36 @@ original message with exact document/revision/blob/context, and requires the
 retained reply to render. It also checks compact composer geometry before and
 after collapse and reply, and rejects writing-model activation during send.
 This transport fixture is not a real Mom consultation or native-window acceptance.
+
+## Exact 7abf2f98 packaged consultation
+
+The clean unchanged 7abf2f98 gate passed all 58 component records, and its ad hoc
+signed archive built and verified successfully. The exact extracted executable
+submitted one question through the original Message control with no manuscript
+writer loaded. The retained terminal receipt has model=null, the exact original
+source revision/blob and original question, and a completed genuine Mom mention
+dispatch: real_engine_invoked=true, fake_fixture=false, cache_reused=true. Its
+answer records seven blue jars and cites the retained Orchard source. The reply
+became an ordinary registered Markdown document; the original manuscript and
+workspace template bytes remained unchanged.
+
+Both exact retained occurrences (persona source and document context snapshot)
+reopened through the source API with matching metadata and canonical SHA-256.
+The final source validation remains inside Mom's existing SQLite commit mutation;
+its real transaction stale-source and rollback tests passed in this tree's gate.
+Ordinary idle Quit exited the owned process, drained its operation worker and
+released the Metal context. Relaunch restored the reply in the existing pane.
+A source-bound screen capture confirms the visible answer; native geometry
+measured a 36-point composer before dispatch and after relaunch.
+
+AX enumeration intermittently reported no windows even while the screen capture
+showed the app and retained reply. These observations do not establish a crashed
+or disappeared window. The initially unverified display is superseded by the
+relaunch capture; the failed AX observations remain retained. No question was
+silently resent. Evidence is in loom-chat-native-7abf2f98-01 outside the repository.
+
+This qualifies one normal-window consultation, genuine document projection,
+source occurrence reopening and ordinary idle quit/relaunch. Active-work quit,
+live streaming projection, the full Visual/Source/Ghost/Loompad journey and the
+remaining consolidation gaps above are still outstanding. It does not qualify
+main promotion, release distribution, notarization or cross-platform behavior.
