@@ -158,3 +158,13 @@ Optional `LLAMA_NATIVE_KIT_KEYCHAIN_TRACE=1` logs PID, opaque account prefix,
 operation and begin/end boundaries. It excludes passwords, keys and paths.
 This distinguishes duplicate app requests from multiple dialogs within one OS
 request. 246 runtime tests pass; real dialog-count acceptance remains pending.
+
+The user also observed two prompts with the direct lookup build. Its native trace
+contains exactly one read begin/end pair for one PID/account, followed by runtime
+ready; changing the lookup API did not establish the requested fix. The delivered
+review bundle was ad hoc signed. It has now been signed and strictly verified
+with the available Apple Development identity, without changing store contents
+or ACLs. Candidate packaging already supports `DELYSIS_SIGNING_IDENTITY`;
+`docs/releases/macos.md` now specifies this for Keychain review. Native prompt
+count for the signed build is pending user observation. Do not claim acceptance
+from the single request trace alone.

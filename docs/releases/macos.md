@@ -21,6 +21,23 @@ Before tagging a stable release, use that candidate to exercise an active local
 operation and the applicable backup/restore rollback. These are product checks,
 not fields to rubber-stamp in a manifest.
 
+## Keychain review
+
+Use a consistent Apple Development or Developer ID signing identity for local
+Keychain review. Candidate packaging already accepts this identity:
+
+```sh
+export DELYSIS_SIGNING_IDENTITY='Apple Development: Your Name (TEAMID)'
+scripts/release-macos.sh mom candidate
+```
+
+Ad hoc signatures bind authorization to one executable version; rebuilding
+changes that identity. They do not qualify prompt counts across builds. Preserve
+the same data directory and signing identity when testing first access, reopen
+and a subsequent build. Do not replace credentials or relax access controls to
+suppress prompts. Apple describes this identity behavior in
+[TN3127](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
+
 ## Stable package
 
 Stable packaging requires an exact annotated component tag at `HEAD`:
