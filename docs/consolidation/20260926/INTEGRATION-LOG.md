@@ -264,3 +264,10 @@ reopened intact. No model work or additional layout changes were required.
 - Review receipts are under the existing mama-llama-review-20261008T132539Z
   evidence directory. This slice does not qualify the old credential repair,
   hosted CI, main promotion or the full cross-platform/model release journey.
+
+- The first consolidated gate passed workspace tests and doctests, then rejected
+  unnecessary references and assertion `unwrap()` calls under strict Clippy.
+  These were repaired without changing behavior; a pre-existing mention-error
+  test also now uses `std::slice::from_ref`. Focused Clippy for Mom runtime, app
+  and CLI passes. The first gate remains preserved at mom-single-draft-20261008/
+  local-ci; the final unchanged-tree gate uses local-ci-final.

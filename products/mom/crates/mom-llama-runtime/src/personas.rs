@@ -1368,8 +1368,8 @@ pub(crate) fn instantiate_from_documents(
         .unwrap_or_default();
     profile.mention_handle = unique_handle(db, &groups.groups, &format!("{}-chat", persona.title));
     profile.version = 1;
-    let mut messages = remap_messages(&id, active_path_messages(&persona));
-    crate::attachments::snapshot_message_attachments_from_documents(&id, &mut messages, documents)?;
+    let mut messages = remap_messages(id, active_path_messages(&persona));
+    crate::attachments::snapshot_message_attachments_from_documents(id, &mut messages, documents)?;
     let conversation = Conversation {
         id: id.to_string(),
         title: title
@@ -2672,7 +2672,7 @@ mod tests {
             None,
             None,
         )
-        .unwrap();
+        .expect("valid isolated draft and Persona fixture");
         let handles: Vec<_> = db
             .conversations
             .iter()
@@ -2685,14 +2685,15 @@ mod tests {
             .conversations
             .iter_mut()
             .find(|c| c.id == "persona-robin_smith")
-            .unwrap();
+            .expect("valid isolated draft and Persona fixture");
         robin.execution_profile.mention_handle = "my-robin".into();
-        reconcile_builtin_personas(&mut db, &mut groups, catalog, "short-v2", None, None).unwrap();
+        reconcile_builtin_personas(&mut db, &mut groups, catalog, "short-v2", None, None)
+            .expect("valid isolated draft and Persona fixture");
         assert_eq!(
             db.conversations
                 .iter()
                 .find(|c| c.id == "persona-robin_smith")
-                .unwrap()
+                .expect("valid isolated draft and Persona fixture")
                 .execution_profile
                 .mention_handle,
             "my-robin"
@@ -2703,38 +2704,55 @@ mod tests {
     fn one_unsent_draft_survives_navigation_and_transfers_once() {
         use crate::conversation_store::*;
         let session = TestDataDir::new("single-unsent-draft");
-        super::ensure_builtin_catalog().unwrap();
-        let before = load_db().unwrap().conversations;
+        super::ensure_builtin_catalog().expect("valid isolated draft and Persona fixture");
+        let before = load_db()
+            .expect("valid isolated draft and Persona fixture")
+            .conversations;
         let persona = before
             .iter()
             .find(|c| c.kind == ConversationKind::PersonaTemplate)
-            .unwrap();
-        assert!(conversation_draft_submit().unwrap().blocker.is_some());
-        conversation_draft_open(None).unwrap();
-        draft_update(Some("default"), "unsent work".into(), vec![]).unwrap();
+            .expect("valid isolated draft and Persona fixture");
+        assert!(
+            conversation_draft_submit()
+                .expect("valid isolated draft and Persona fixture")
+                .blocker
+                .is_some()
+        );
+        conversation_draft_open(None).expect("valid isolated draft and Persona fixture");
+        draft_update(Some("default"), "unsent work".into(), vec![])
+            .expect("valid isolated draft and Persona fixture");
         let pasted = crate::attachments::attachment_import_pasted_text(
             &crate::OperationScope::detached(),
             "default",
             "source evidence".into(),
         )
-        .unwrap()
+        .expect("valid isolated draft and Persona fixture")
         .result
-        .unwrap()
+        .expect("valid isolated draft and Persona fixture")
         .attachment
         .id;
-        conversation_draft_open(Some(persona.id.clone())).unwrap();
-        conversation_draft_open(None).unwrap();
-        assert_eq!(load_db().unwrap().conversations, before);
-        conversation_select(&persona.id).unwrap();
+        conversation_draft_open(Some(persona.id.clone()))
+            .expect("valid isolated draft and Persona fixture");
+        conversation_draft_open(None).expect("valid isolated draft and Persona fixture");
+        assert_eq!(
+            load_db()
+                .expect("valid isolated draft and Persona fixture")
+                .conversations,
+            before
+        );
+        conversation_select(&persona.id).expect("valid isolated draft and Persona fixture");
         // Reopen from durable documents after leaving the draft.
-        conversation_draft_open(None).unwrap();
-        let draft = draft_get(Some("default")).unwrap().result.unwrap();
+        conversation_draft_open(None).expect("valid isolated draft and Persona fixture");
+        let draft = draft_get(Some("default"))
+            .expect("valid isolated draft and Persona fixture")
+            .result
+            .expect("valid isolated draft and Persona fixture");
         assert_eq!(draft.message, "unsent work");
         assert_eq!(draft.attachment_ids, vec![pasted.clone()]);
         assert_eq!(
             conversation_draft_preview()
-                .unwrap()
-                .unwrap()
+                .expect("valid isolated draft and Persona fixture")
+                .expect("valid isolated draft and Persona fixture")
                 .source_conversation_id
                 .as_deref(),
             Some(persona.id.as_str())
@@ -2747,7 +2765,8 @@ mod tests {
                 thread::spawn(move || {
                     set_data_dir_override_for_tests(Some(path));
                     start.wait();
-                    let result = conversation_draft_submit().unwrap();
+                    let result = conversation_draft_submit()
+                        .expect("valid isolated draft and Persona fixture");
                     set_data_dir_override_for_tests(None);
                     result
                 })
@@ -2756,7 +2775,11 @@ mod tests {
         start.wait();
         let results: Vec<_> = workers
             .into_iter()
-            .map(|worker| worker.join().unwrap())
+            .map(|worker| {
+                worker
+                    .join()
+                    .expect("valid isolated draft and Persona fixture")
+            })
             .collect();
         assert_eq!(
             results
@@ -2769,54 +2792,66 @@ mod tests {
         let chat = results
             .iter()
             .find_map(|result| result.result.as_ref())
-            .unwrap();
+            .expect("valid isolated draft and Persona fixture");
         assert_eq!(
             chat.source_conversation_id.as_deref(),
             Some(persona.id.as_str())
         );
         assert_eq!(
-            draft_get(Some(&chat.id)).unwrap().result.unwrap().message,
+            draft_get(Some(&chat.id))
+                .expect("valid isolated draft and Persona fixture")
+                .result
+                .expect("valid isolated draft and Persona fixture")
+                .message,
             "unsent work"
         );
         assert_eq!(
             draft_get(Some(&chat.id))
-                .unwrap()
+                .expect("valid isolated draft and Persona fixture")
                 .result
-                .unwrap()
+                .expect("valid isolated draft and Persona fixture")
                 .attachment_ids,
             vec![pasted.clone()]
         );
         assert!(
             draft_get(Some("default"))
-                .unwrap()
+                .expect("valid isolated draft and Persona fixture")
                 .result
-                .unwrap()
+                .expect("valid isolated draft and Persona fixture")
                 .message
                 .is_empty()
         );
         let records = crate::attachments::attachment_list(Some(&chat.id))
-            .unwrap()
+            .expect("valid isolated draft and Persona fixture")
             .result
-            .unwrap();
+            .expect("valid isolated draft and Persona fixture");
         assert!(
             records
                 .iter()
                 .any(|record| record.id == pasted && record.conversation_id == chat.id)
         );
-        let after = load_db().unwrap();
+        let after = load_db().expect("valid isolated draft and Persona fixture");
         assert_eq!(after.conversations.len(), before.len() + 1);
         assert_eq!(
             after
                 .conversations
                 .iter()
                 .find(|c| c.id == persona.id)
-                .unwrap(),
+                .expect("valid isolated draft and Persona fixture"),
             persona
         );
-        conversation_draft_open(None).unwrap();
-        assert!(conversation_draft_preview().unwrap().is_none());
-        draft_update(Some("default"), "ordinary draft".into(), vec![]).unwrap();
-        let ordinary = conversation_draft_submit().unwrap().result.unwrap();
+        conversation_draft_open(None).expect("valid isolated draft and Persona fixture");
+        assert!(
+            conversation_draft_preview()
+                .expect("valid isolated draft and Persona fixture")
+                .is_none()
+        );
+        draft_update(Some("default"), "ordinary draft".into(), vec![])
+            .expect("valid isolated draft and Persona fixture");
+        let ordinary = conversation_draft_submit()
+            .expect("valid isolated draft and Persona fixture")
+            .result
+            .expect("valid isolated draft and Persona fixture");
         assert_eq!(ordinary.source_conversation_id, None);
     }
 

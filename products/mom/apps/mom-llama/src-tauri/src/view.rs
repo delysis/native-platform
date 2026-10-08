@@ -1419,7 +1419,7 @@ pub fn render_app(scope: &mom_llama_runtime::OperationScope) -> Result<String> {
         .as_ref()
         .map(|conversation| conversation.id.as_str())
         .unwrap_or("default");
-    let draft = mom_llama_runtime::draft_get(Some(&current_conversation_id))?;
+    let draft = mom_llama_runtime::draft_get(Some(current_conversation_id))?;
     Ok(app_markup(AppProjection {
         settings: &settings,
         engine: &engine,

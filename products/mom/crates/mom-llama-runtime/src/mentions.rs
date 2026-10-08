@@ -5117,7 +5117,7 @@ mod tests {
             "Host-level native settings changed; restart Mom Llama to apply them.",
         );
         assert_eq!(
-            super::failed_target_message(&[result.clone()]),
+            super::failed_target_message(std::slice::from_ref(&result)),
             format!("@{}: {}", result.handle, result.text)
         );
         assert_eq!(
