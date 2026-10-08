@@ -714,7 +714,7 @@ fn resolve_store_key(data_dir: &Path) -> Result<[u8; 32]> {
     {
         let account = keychain_account(data_dir);
         cached_installation_key(&account, &INSTALLATION_KEYS, || {
-            load_or_create_macos_key(&account)
+            load_or_create_macos_key(&account, data_dir.join(DATABASE_FILE).exists())
         })
     }
     #[cfg(not(target_os = "macos"))]
@@ -1492,6 +1492,35 @@ mod tests {
         assert_eq!(second, first);
         assert_eq!(calls.get(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn concurrent_startup_requests_share_one_installation_key_lookup() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let cache = OnceLock::new();
+        let starts = Barrier::new(8);
+        let calls = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        starts.wait();
+                        cached_installation_key("startup", &cache, || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Ok([8; 32])
+                        })
+                        .expect("startup key")
+                    })
+                })
+                .collect();
+            for handle in handles {
+                assert_eq!(handle.join().expect("startup worker"), [8; 32]);
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

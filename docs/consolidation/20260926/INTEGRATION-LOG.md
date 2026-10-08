@@ -108,3 +108,36 @@ Focused source, Node, Rust and lint results belong to the exact repaired tree.
 The clean-tree `xtask local-ci` receipt, hosted CI and packaged macOS/model/GUI
 acceptance must be reported separately. A passing component gate does not
 qualify the simplified Loom product, historical media semantics or a release.
+
+## 2026-10-08 Mom review: consultation settings and Keychain
+
+Three retained Gabor consultation failures in the review profile report
+`Host-level native settings changed; restart Mom Llama to apply them.` No
+model engine was invoked. Typed settings defaulted to four slots while their
+UI projection defaulted to one; an unrelated display update synchronized the
+projection into native settings and invalidated the bound host identity.
+Resolution now derives that projection from the typed value, and both defaults
+agree. Explicit slot changes still apply and retain the host restart guard.
+Failed consult dispatch exposes each retained target cause. A read-only CLI
+`mention history` command returns the latest eight attempts for an exact host
+without executing work or returning frozen tool continuations.
+
+Fresh-store Keychain initialization now attempts create-only insertion directly
+instead of first requesting a password lookup. Duplicate insertion recovers
+an existing credential; it never replaces that credential. Existing databases
+retain the single lookup path. The process cache serializes concurrent startup
+lookups. A separate diagnostic CLI and distinct review profiles can independently
+request OS access; they must not be counted as one app launch.
+
+Validation: 246 runtime tests, 75 app tests, and 10 CLI integration tests pass
+(one CLI test ignored). The macOS app build and bundle signature verification
+pass. The preceding test run failed because a new test accidentally consumed an
+existing platform attribute; the attribute placement was repaired and the full
+runtime suite rerun. Logs are retained in the Oct 8 Mama review evidence folder.
+
+Remaining native qualification: the rebuilt app is waiting for authorization to
+its existing encrypted review store. Computer Use explicitly refuses Apple
+SecurityAgent, so the user must operate that dialog. Neither the number of OS
+dialogs on a completely fresh installation nor a real post-repair persona reply
+is qualified by unit tests. These fixes are review-branch work, not main or
+release acceptance. No additional interface layout changes were made.

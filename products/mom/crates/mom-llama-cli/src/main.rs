@@ -331,6 +331,12 @@ enum PersonaGroupCommand {
 
 #[derive(Debug, Subcommand)]
 enum MentionCommand {
+    History {
+        #[arg(long)]
+        conversation: String,
+        #[arg(long)]
+        json: bool,
+    },
     Sources {
         #[arg(long)]
         invocation: String,
@@ -1200,6 +1206,9 @@ fn run() -> Result<()> {
             }
         },
         Command::Mention { command } => match command {
+            MentionCommand::History { conversation, json } => {
+                print_result(mom_llama_runtime::mention_history(&conversation)?, json)
+            }
             MentionCommand::Dispatch {
                 conversation,
                 message,
@@ -1758,6 +1767,7 @@ fn command_uses_native(command: &Command) -> bool {
         Command::Mention { command } => !matches!(
             command,
             MentionCommand::Candidates { .. }
+                | MentionCommand::History { .. }
                 | MentionCommand::Sources { .. }
                 | MentionCommand::SourceOpen { .. }
                 | MentionCommand::ApprovalList { .. }

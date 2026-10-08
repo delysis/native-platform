@@ -438,7 +438,10 @@ pub fn upstream_settings_defaults() -> BTreeMap<String, Value> {
         ("agenticMaxToolPreviewLines".to_string(), json!(25)),
         ("mcpNativeEnabled".to_string(), json!(false)),
         ("mmprojPath".to_string(), json!("")),
-        ("nativeModelSlots".to_string(), json!(1)),
+        (
+            "nativeModelSlots".to_string(),
+            json!(default_parallel_sequences()),
+        ),
         ("nativeMemoryBudgetMiB".to_string(), json!(8192)),
         (MEMORY_BUDGET_MODE_KEY.to_string(), json!("auto")),
         ("nativeDevice".to_string(), json!("auto")),
@@ -544,6 +547,12 @@ fn settings_from_document_with_model_sources(
     settings.mmproj_path = normalize_optional_path(settings.mmproj_path);
     reconcile_resident_memory_budget_for_runtime(&mut settings);
     merge_missing_setting_defaults(&mut settings);
+    // The typed value is authoritative when loading persisted settings. Keep
+    // its UI projection coherent before an unrelated settings update can sync it.
+    settings.upstream_settings.insert(
+        "nativeModelSlots".to_string(),
+        json!(settings.max_parallel_sequences),
+    );
     let cache_policy = settings.kv_cache_policy;
     set_cache_policy(&mut settings, cache_policy);
     if let Some(model) = normalize_optional_path(runtime_model) {
@@ -1114,6 +1123,50 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_update_preserves_native_slots_and_explicit_slot_update_applies() -> Result<()> {
+        let data_dir =
+            std::env::temp_dir().join(format!("mom-slot-settings-{}", uuid::Uuid::new_v4()));
+        set_data_dir_override_for_tests(Some(data_dir.clone()));
+        let outcome = (|| -> Result<()> {
+            let initial = resolve_settings()?;
+            assert_eq!(initial.max_parallel_sequences, default_parallel_sequences());
+            assert_eq!(
+                initial.upstream_settings["nativeModelSlots"],
+                json!(initial.max_parallel_sequences)
+            );
+            // Reproduce an existing store whose UI projection contradicted its
+            // typed native configuration, then change only presentation.
+            let mut stored = initial.clone();
+            stored
+                .upstream_settings
+                .insert("nativeModelSlots".into(), json!(1));
+            save_settings(&stored)?;
+            settings_update(SettingsUpdate {
+                upstream_settings: Some(BTreeMap::from([("theme".into(), json!("dark"))])),
+                ..Default::default()
+            })?;
+            let after = resolve_settings()?;
+            assert_eq!(after.max_parallel_sequences, initial.max_parallel_sequences);
+            assert_eq!(
+                after.resident_memory_budget_bytes,
+                initial.resident_memory_budget_bytes
+            );
+            assert_eq!(after.kv_cache_policy, initial.kv_cache_policy);
+            settings_update(SettingsUpdate {
+                upstream_settings: Some(BTreeMap::from([("nativeModelSlots".into(), json!(2))])),
+                ..Default::default()
+            })?;
+            assert_eq!(resolve_settings()?.max_parallel_sequences, 2);
+            Ok(())
+        })();
+        set_data_dir_override_for_tests(None);
+        if data_dir.exists() {
+            fs::remove_dir_all(data_dir)?;
+        }
+        outcome
+    }
 
     #[test]
     fn adjacent_settings_file_is_not_imported_or_rewritten() -> Result<()> {

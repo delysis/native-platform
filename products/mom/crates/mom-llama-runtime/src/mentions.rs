@@ -626,6 +626,42 @@ fn resume_lease_is_live_for_recovery(
     Ok(false)
 }
 
+fn failed_target_message(results: &[MentionTargetResult]) -> String {
+    let failures: Vec<_> = results
+        .iter()
+        .filter(|result| result.state == GenerationState::Failed && !result.text.trim().is_empty())
+        .map(|result| format!("@{}: {}", result.handle, result.text.trim()))
+        .collect();
+    if failures.is_empty() {
+        "None of the invited local models completed a response.".to_string()
+    } else {
+        failures.join("\n")
+    }
+}
+
+/// Read retained consultation attempts without changing drafts or retrying work.
+pub fn mention_history(conversation_id: &str) -> Result<CommandResult<Vec<MentionInvocation>>> {
+    let journal: MentionInvocationDb = RuntimeStore::current()?
+        .get(INVOCATIONS_NAMESPACE)?
+        .unwrap_or_default();
+    let invocations = journal
+        .invocations
+        .into_iter()
+        .filter(|stored| stored.host_conversation_id == conversation_id)
+        .take(8)
+        .map(|stored| stored.invocation)
+        .collect();
+    Ok(CommandResult::passed(
+        "mom_llama.mention_history",
+        "contracted",
+        invocations,
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    ))
+}
+
 pub fn mention_candidates(
     query: &str,
     current_conversation_id: Option<&str>,
@@ -3472,8 +3508,8 @@ where
             "blocked_native_runtime",
             Blocker::new(
                 "mention_targets_failed",
-                "None of the invited local models completed a response.",
-                vec!["Check the target Personas' model profiles and context budgets.".to_string()],
+                failed_target_message(&invocation.results),
+                Vec::new(),
             ),
             vec![RuntimeStore::current()?.path().display().to_string()],
             Vec::new(),
@@ -5070,6 +5106,24 @@ mod tests {
                 resume_lease_id: None,
             }],
         }
+    }
+
+    #[test]
+    fn failed_consult_reports_the_retained_target_cause() {
+        let stored = frozen_approval_record(u128::MAX);
+        let result = super::blocked_target_result(
+            &stored.invocation.targets[0],
+            GenerationState::Failed,
+            "Host-level native settings changed; restart Mom Llama to apply them.",
+        );
+        assert_eq!(
+            super::failed_target_message(&[result.clone()]),
+            format!("@{}: {}", result.handle, result.text)
+        );
+        assert_eq!(
+            super::failed_target_message(&[]),
+            "None of the invited local models completed a response."
+        );
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
