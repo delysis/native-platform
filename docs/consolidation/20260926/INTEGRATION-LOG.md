@@ -227,3 +227,13 @@ pass. The live native window at its 640px minimum shows a fully visible composer
 beside the sidebar and continuous sidebar color through the title bar. A wider
 collapsed-sidebar view was also observed. A subsequent resize attempt was
 interrupted by a user window change; no additional resize acceptance is claimed.
+
+### 2026-10-08 title-bar alignment
+
+The 38pt web toolbar centered controls at 19pt while the native window buttons
+were centered at 16pt. Added 6pt bottom padding to that toolbar only in windowed
+macOS mode, putting its controls on the observed 16pt axis and retaining the
+pane edge. Fullscreen retains the existing centering. Rebuilt and strictly
+verified the signed review app; the native screenshot shows sidebar and settings
+icon centers aligned with the stoplights. The user's four-message conversation
+reopened intact. No model work or additional layout changes were required.

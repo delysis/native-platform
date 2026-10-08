@@ -125,6 +125,9 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 
 .chrome .icon-button { width: 30px; height: 30px; flex: 0 0 30px; }
 html[data-native-platform="macos"]:not(.native-fullscreen) { --titlebar-leading-inset: 76px; }
+/* AppKit centers its window buttons at 16pt; keep the 38pt toolbar's
+   controls on that axis while retaining the existing pane top edge. */
+html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bottom: 6px; }
 .chrome .icon { width: 18px; height: 18px; }
 .titlebar-drag-surface { position: relative; flex: 1; height: 100%; min-width: 28px; }
 
