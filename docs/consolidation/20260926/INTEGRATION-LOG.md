@@ -141,3 +141,20 @@ SecurityAgent, so the user must operate that dialog. Neither the number of OS
 dialogs on a completely fresh installation nor a real post-repair persona reply
 is qualified by unit tests. These fixes are review-branch work, not main or
 release acceptance. No additional interface layout changes were made.
+
+### Keychain review correction
+
+The user observed two permission dialogs in the rebuilt 81e3095b app, including
+an existing-key access dialog. This falsifies prompt-count acceptance of the
+fresh-store optimization. The store cache tests prove application arbitration,
+not macOS dialog behavior.
+
+The follow-up reads through the safe macOS `find_generic_password` wrapper,
+which invokes `SecKeychainFindGenericPassword` once and returns password and item
+together. This uses the same file-based Keychain family as create-only insertion;
+the service, account, credential contents and authorization policy are retained.
+No credential overwrite, ACL change or automatic permission approval is added.
+Optional `LLAMA_NATIVE_KIT_KEYCHAIN_TRACE=1` logs PID, opaque account prefix,
+operation and begin/end boundaries. It excludes passwords, keys and paths.
+This distinguishes duplicate app requests from multiple dialogs within one OS
+request. 246 runtime tests pass; real dialog-count acceptance remains pending.

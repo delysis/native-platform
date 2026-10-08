@@ -36,14 +36,22 @@ fn load_or_create(
 
 #[cfg(target_os = "macos")]
 pub(super) fn load_or_create_macos_key(account: &str, existing_store: bool) -> Result<[u8; 32]> {
-    use security_framework::passwords::get_generic_password;
+    use security_framework::os::macos::passwords::find_generic_password;
     const ITEM_NOT_FOUND: i32 = -25300;
     load_or_create(
         existing_store,
-        || match get_generic_password(super::KEYCHAIN_SERVICE, account) {
-            Ok(key) => Ok(Some(key)),
-            Err(error) if error.code() == ITEM_NOT_FOUND => Ok(None),
-            Err(error) => Err(error.into()),
+        || {
+            trace_keychain_request("read", account, "begin");
+            // Read through the same file-based Keychain API used for insertion.
+            // This safe wrapper makes one SecKeychainFindGenericPassword call
+            // and returns the password together with the item; no second read.
+            let result = find_generic_password(None, super::KEYCHAIN_SERVICE, account);
+            trace_keychain_request("read", account, "end");
+            match result {
+                Ok((key, _item)) => Ok(Some(key.to_owned())),
+                Err(error) if error.code() == ITEM_NOT_FOUND => Ok(None),
+                Err(error) => Err(error.into()),
+            }
         },
         || {
             let mut key = [0; 32];
@@ -59,14 +67,29 @@ pub(super) fn load_or_create_macos_key(account: &str, existing_store: bool) -> R
 fn create_macos_key(account: &str, key: &[u8; 32]) -> Result<KeyCreation> {
     use security_framework::os::macos::keychain::SecKeychain;
     const DUPLICATE_ITEM: i32 = -25299;
-    // The existing SecItem query uses the default file-based macOS keychain
-    // (no data-protection/synchronizable attributes). Preserve that policy and
-    // service/account. This pinned safe add never updates an existing item,
-    // unlike set_generic_password. No unsafe code or dependency change.
-    match SecKeychain::default()?.add_generic_password(super::KEYCHAIN_SERVICE, account, key) {
+    // Preserve the default file-based keychain and service/account identity.
+    // Create-only insertion must never update an existing encryption key.
+    trace_keychain_request("create", account, "begin");
+    let result =
+        SecKeychain::default()?.add_generic_password(super::KEYCHAIN_SERVICE, account, key);
+    trace_keychain_request("create", account, "end");
+    match result {
         Ok(()) => Ok(KeyCreation::Created),
         Err(error) if error.code() == DUPLICATE_ITEM => Ok(KeyCreation::AlreadyExists),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn trace_keychain_request(operation: &str, account: &str, phase: &str) {
+    if std::env::var("LLAMA_NATIVE_KIT_KEYCHAIN_TRACE").as_deref() == Ok("1") {
+        // Only an opaque account prefix and request boundaries. Never key bytes,
+        // passwords, returned data, or the user's filesystem path.
+        eprintln!(
+            "mom-keychain pid={} account={} operation={operation} phase={phase}",
+            std::process::id(),
+            account.get(..12).unwrap_or(account)
+        );
     }
 }
 
