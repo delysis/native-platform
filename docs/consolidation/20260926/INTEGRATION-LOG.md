@@ -350,3 +350,8 @@ remain follow-ups; legacy Keychain qualification remains open. Promotion still
 requires the clean unchanged-tree component gate and exact packaged native writer,
 embedded context, active-work quit and relaunch journeys. The Mac was locked during
 this review, so native inspection currently awaits unlocking, not source approval.
+
+The first clean-tree gate stopped at the reviewed build-script digest: the new
+read-only command changed Loom's COMMANDS list. The exact one-line addition was
+reviewed and its registry digest updated; no ignored-test entry, authority check
+or gate requirement was relaxed. The failed 7368b545 receipt remains retained.
