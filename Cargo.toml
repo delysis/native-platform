@@ -203,6 +203,11 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
+# Rust's Mach-O stripping can misalign a compiler plugin's LINKEDIT string pool.
+# Keep host build dependencies loadable; shipping release code still strips symbols.
+[profile.release.build-override]
+strip = "none"
+
 [patch.crates-io]
 # GTK3 still requires the 0.18 API. Backport the upstream VariantStrIter fix.
 glib = { path = "vendor/glib" }

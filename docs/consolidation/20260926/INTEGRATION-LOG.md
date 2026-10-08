@@ -365,3 +365,19 @@ Mom runtime and Loom application all pass strict focused Clippy. The interrupted
 qualification retains 2,079 passing workspace tests and its source-change/lint
 failures; it is not a clean-tree pass. Qualification is rerun after committing
 these generated files and the command annotation together.
+
+## 2026-10-08 — Packaged release compiler-plugin repair
+
+The exact 2d76966c component gate passed all 58 steps on clean unchanged source,
+including 188 CI checks, 2,079 workspace tests and 172 WebKit browser tests.
+Packaging then failed with E0463 for ctor_proc_macro despite an existing library.
+A targeted rebuild reproduced the failure. Direct dlopen established the actual
+loader error: mis-aligned LINKEDIT string pool (offset 0x5CFD4), matching the
+upstream Rust issue https://github.com/rust-lang/rust/issues/157750. The failed
+library and its fingerprint/hash are retained outside the checkout.
+
+A bounded cargo release build of ctor with build-override strip=none passes,
+where the original profile fails. The workspace now records that setting for
+host build dependencies; the product release profile retains symbol stripping.
+This changes the exact candidate tree, so the final component gate and packaging
+are rerun for the new commit. It does not establish native UI/model acceptance.
