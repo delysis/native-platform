@@ -213,3 +213,17 @@ Apple's tool. Computer Use refuses both Terminal and SecurityAgent. A prepared
 local `Mom-Keychain-Repair.command` captures the repair status and before/after
 ciphertext database hashes. Native acceptance remains pending that authorization
 and the subsequent old-store dialog-count check; do not mark the goal complete.
+
+### 2026-10-08 narrow native sidebar layout
+
+The max-width 900px rule reset chat's left edge to zero while retaining the
+visible fixed sidebar, placing the composer beneath it. Removed that reset and
+the large sidebar overlay shadow. An open sidebar now reserves its width at
+all supported window widths, and the toolbar uses the same sidebar background
+up to the pane boundary. When narrow settings suppress the sidebar, the toolbar
+also returns to the chat background. Removed a redundant desktop sidebar rule.
+The app rebuild and strict signed-bundle verification pass; 25 frontend tests
+pass. The live native window at its 640px minimum shows a fully visible composer
+beside the sidebar and continuous sidebar color through the title bar. A wider
+collapsed-sidebar view was also observed. A subsequent resize attempt was
+interrupted by a user window change; no additional resize acceptance is claimed.
