@@ -7,6 +7,9 @@ or live chat can be invited into an ordinary chat by its unique `@handle`.
 
 ## Product behavior
 
+- New Chat and Persona clicks reuse one encrypted unsent draft. Text and attachments
+  survive navigation and restart. The first submission atomically creates a chat
+  and transfers the draft; empty drafts never enter the conversation list.
 - Chat, generation, streaming and cancellation use the exact model profile of
   the active conversation.
 - A Persona is a versioned conversation branch plus an execution profile:

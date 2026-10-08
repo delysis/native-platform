@@ -288,7 +288,7 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 .empty-line { padding: 28px 12px; text-align: center; }
 .sidebar-persona-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 30px;
+  grid-template-columns: minmax(0, 1fr);
   align-items: center;
   gap: 4px;
   min-width: 0;
@@ -296,13 +296,9 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
   border-radius: 7px;
 }
 .sidebar-persona-row:hover, .sidebar-persona-row:focus-within { background: var(--surface); }
-.sidebar-persona-copy { display: flex; align-items: baseline; min-width: 0; gap: 6px; padding: 5px 0; }
-.sidebar-persona-copy span, .sidebar-persona-copy small {
-  display: block;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
+.sidebar-persona-copy { display: flex; align-items: baseline; min-width: 0; gap: 6px; padding: 5px 0; width: 100%; text-align: left; color: var(--text); background: transparent; border: 0; cursor: pointer; }
+.sidebar-persona-copy span { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.sidebar-persona-copy small { flex: 0 0 auto; }
 .sidebar-persona-copy span { font-size: 14px; font-weight: 600; }
 .sidebar-persona-copy small { color: var(--muted); font-size: 12px; }
 .sidebar-persona-row .persona-menu-trigger { width: 30px; height: 30px; color: var(--muted); }
@@ -1213,3 +1209,8 @@ html[data-native-platform="macos"]:not(.native-fullscreen) .chrome { padding-bot
 @media (max-height: 700px) {
   .landing { margin-bottom: 22px; }
 }
+
+.chrome .nav-search { flex: 1 1 280px; max-width: 440px; grid-template-columns: minmax(0, 1fr) 30px 30px; }
+.chrome .nav-search input { height: 28px; border-radius: 14px; }
+.sidebar-resizer { position: absolute; top: 0; bottom: 0; right: 0; width: 6px; cursor: col-resize; touch-action: none; }
+.sidebar-resizer:hover, .sidebar-resizer:focus-visible { background: var(--border); }

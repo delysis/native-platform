@@ -140,6 +140,8 @@ pub static COMMAND_SPECS: &[CommandSpec] = &[
     mutation("mom_llama_chat_skip_reasoning", true, true),
     long("mom_llama_chat_regenerate", true, true),
     long("mom_llama_chat_continue", true, true),
+    mutation("mom_llama_conversation_draft_open", true, false),
+    mutation("mom_llama_conversation_draft_submit", true, false),
     mutation("mom_llama_conversation_new", true, false),
     read("mom_llama_conversation_list", true, false),
     mutation("mom_llama_conversation_select", true, false),

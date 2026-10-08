@@ -1355,6 +1355,30 @@ pub(crate) fn snapshot_message_attachments(
     )
 }
 
+/// Move only the submitted new-chat draft's staged occurrences. Caller holds
+/// the attachment lifecycle lock and the encrypted store transaction.
+pub(crate) fn transfer_new_draft_attachments(
+    documents: &mut crate::store::DocumentMutations<'_, '_, '_>,
+    ids: &[String],
+    conversation: &str,
+) -> Result<()> {
+    let mut db: AttachmentDb = documents.get(ATTACHMENTS_NAMESPACE)?.unwrap_or_default();
+    for id in ids {
+        let record = db
+            .attachments
+            .iter_mut()
+            .find(|record| record.id == *id)
+            .ok_or_else(|| anyhow!("Draft attachment no longer exists"))?;
+        anyhow::ensure!(
+            record.conversation_id == "default" && record.state == AttachmentState::Staged,
+            "Draft attachment ownership changed"
+        );
+        record.conversation_id = conversation.to_string();
+    }
+    documents.put_bytes(ATTACHMENTS_NAMESPACE, &serde_json::to_vec(&db)?)?;
+    Ok(())
+}
+
 pub(crate) fn snapshot_message_attachments_from_documents(
     target_conversation_id: &str,
     messages: &mut [Message],

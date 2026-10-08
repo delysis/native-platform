@@ -706,6 +706,8 @@
   const refreshSidebar = async () => {
     const replacement = await swap(".sidebar", "mom_llama_render_sidebar_fragment");
     applySidebarSectionState(replacement);
+    const separator = replacement?.querySelector(".sidebar-resizer");
+    separator?.setAttribute("aria-valuenow", String(Math.round(replacement.getBoundingClientRect().width)));
     return replacement;
   };
   const refreshSettings = async (section = "general") => {
@@ -1142,6 +1144,7 @@
   const openPersonaFreeze = (button) => {
     const modal = document.getElementById("persona-freeze-modal");
     if (!modal) return;
+    modal.dataset.conversation = selectedConversation();
     formField(modal, "freeze_message").value = button.dataset.message || "";
     formField(modal, "freeze_name").value = "";
     formField(modal, "freeze_handle").value = "";
@@ -1521,7 +1524,11 @@
     if (form) form.classList.toggle("is-hidden", !enabled);
     if (list) list.classList.toggle("is-hidden", enabled);
     if (results) results.classList.toggle("is-hidden", !enabled);
-    if (enabled) form?.querySelector("input[name='query']")?.focus();
+    document.querySelector(".search-toggle")?.classList.toggle("is-hidden", enabled);
+    if (enabled) {
+      shell()?.classList.add("sidebar-open");
+      form?.querySelector("input[name='query']")?.focus();
+    } else document.querySelector(".search-toggle")?.focus();
   };
 
   const commandMetadata = (element, spec) => {
@@ -1679,10 +1686,19 @@
     }
     hits.forEach((hit) => {
       const item = document.createElement("li");
+      if (hit.kind === "persona_template") {
+        item.dataset.personaMenuTarget = "true";
+        item.dataset.persona = hit.conversation_id;
+      } else {
+        item.dataset.conversationMenuTarget = "true";
+        item.dataset.conversation = hit.conversation_id;
+        item.dataset.message = hit.active_leaf_message_id || "";
+      }
       const button = createCommandElement("button", DYNAMIC_CONTROL_SPECS.conversationSelect);
       button.type = "button";
       button.className = "conversation-item search-hit";
-      button.dataset.action = "conversation-select";
+      button.dataset.action = hit.kind === "persona_template" ? "persona-draft-open" : "conversation-select";
+      button.dataset.persona = hit.conversation_id;
       button.dataset.conversation = hit.conversation_id;
       const title = document.createElement("span");
       title.textContent = hit.title || hit.conversation_id;
@@ -2420,6 +2436,22 @@
     }
   };
 
+  const retainComposerDraft = async () => {
+    const form = document.getElementById("chat-form");
+    if (form && form.dataset.busy !== "true") await persistDraftNow(formField(form, "message")?.value || "", draftAttachmentIds(form));
+  };
+
+  const openNewDraft = async (persona = null) => {
+    await retainComposerDraft();
+    const result = await invoke("mom_llama_conversation_draft_open", { persona });
+    report(result);
+    if (result?.status !== "blocked") {
+      closeSettings();
+      await refreshConversationProjection();
+      focusComposer();
+    }
+  };
+
   const actionHandlers = {
     "sidebar-toggle": async () => {
       await invoke("mom_llama_conversation_list");
@@ -2503,13 +2535,13 @@
     "mention-tool-approve": async () => decidePersonaToolApproval("approve"),
     "mention-tool-deny": async () => decidePersonaToolApproval("deny"),
     "conversation-new": async () => {
-      const result = await invoke("mom_llama_conversation_new", { title: "New chat" });
-      report(result); await refreshConversationProjection();
+      await openNewDraft();
     },
     "conversation-list": async () => refreshConversationProjection(),
     "conversation-search-open": async () => { setSearchMode(true); await search(); },
     "conversation-search-close": async () => setSearchMode(false),
     "conversation-select": async (button) => {
+      await retainComposerDraft();
       const result = await invoke("mom_llama_conversation_select", { conversation: button.dataset.conversation });
       report(result); await refreshConversationProjection();
     },
@@ -2708,7 +2740,7 @@
       const modal = document.getElementById("persona-freeze-modal");
       const history = modal?.querySelector('[name="freeze_history"]:checked')?.value || "full";
       const result = await invoke("mom_llama_persona_freeze", {
-        conversation: selectedConversation(),
+        conversation: modal.dataset.conversation,
         message: formValue(modal, "freeze_message"),
         name: formValue(modal, "freeze_name"),
         handle: formValue(modal, "freeze_handle"),
@@ -2723,15 +2755,11 @@
     "persona-edit": async (button) => openPersonaProfile(button.dataset.persona),
     "persona-profile-open": async (button) => openPersonaProfile(button.dataset.persona),
     "persona-menu-open": async (button) => openPersonaMenu(button),
+    "persona-draft-open": async (button) => openNewDraft(button.dataset.persona),
     "persona-menu-start": async () => {
       const persona = document.getElementById("persona-context-menu")?.dataset.persona;
       closePersonaMenu(false);
-      const result = await instantiatePersona(persona);
-      if (result?.status !== "blocked") {
-        closeSettings();
-        await refreshConversationProjection();
-        focusComposer();
-      }
+      await openNewDraft(persona);
     },
     "persona-menu-edit": async () => {
       const persona = document.getElementById("persona-context-menu")?.dataset.persona;
@@ -2746,13 +2774,7 @@
     },
     "persona-removal-close": async () => setModalVisibility("persona-removal-modal", false),
     "persona-removal-commit": async () => commitPersonaRemoval(),
-    "persona-instantiate": async (button) => {
-      const result = await instantiatePersona(button.dataset.persona);
-      if (result?.status !== "blocked") {
-        closeSettings();
-        await refreshConversationProjection();
-      }
-    },
+    "persona-instantiate": async (button) => openNewDraft(button.dataset.persona),
     "persona-update": async () => {
       const result = await invoke("mom_llama_persona_update", { profile: personaProfileFromEditor() });
       report(result);
@@ -2845,7 +2867,7 @@
       if (!path) return;
       const sourceConversation = selectedConversation();
       let conversation = sourceConversation;
-      if (selectedConversationKind() === "persona_template") {
+      if (sourceConversation !== "default" && selectedConversationKind() === "persona_template") {
         const instantiated = await instantiatePersona(sourceConversation);
         if (instantiated?.status === "blocked" || !instantiated?.result?.id) return;
         conversation = instantiated.result.id;
@@ -2857,7 +2879,7 @@
           attachmentIds: [],
         });
       }
-      await persistDraftNow(message, [], conversation);
+      await persistDraftNow(message, draftAttachmentIds(form), conversation);
       const result = await invoke("mom_llama_attachment_import", { conversation, path });
       report(result);
       if (result?.status !== "blocked") await refreshConversationProjection();
@@ -3201,11 +3223,89 @@
     try { await handler(button); } catch (error) { reportError(error); }
   });
 
+  const popupRowMenu = async (target, point = null) => {
+    const Menu = window.__TAURI__?.menu?.Menu;
+    if (!Menu) throw new Error("Native contextual menus are unavailable.");
+    const safeAction = (action) => async () => {
+      try { await action(); } catch (error) { reportError(error); }
+    };
+    let items;
+    if (target.dataset.personaMenuTarget) {
+      const persona = target.dataset.persona;
+      items = [
+        { id: "start", text: "Chat", action: safeAction(() => openNewDraft(persona)) },
+        { id: "edit", text: "Edit", action: safeAction(() => openPersonaProfile(persona)) },
+        { id: "remove", text: "Remove", action: safeAction(() => openPersonaRemoval(persona)) },
+      ];
+    } else {
+      const conversation = target.dataset.conversation;
+      items = [
+        { id: "delete", text: "Delete", action: safeAction(async () => {
+          await retainComposerDraft();
+          report(await invoke("mom_llama_conversation_delete", { conversation }));
+          await refreshConversationProjection();
+        }) },
+        { id: "save-persona", text: "Save as Persona…", enabled: !!target.dataset.message,
+          action: safeAction(async () => {
+            await actionHandlers["conversation-select"]({ dataset: { conversation } });
+            openPersonaFreeze(target);
+          }) },
+      ];
+    }
+    const menu = await Menu.new({ items });
+    const rect = target.getBoundingClientRect();
+    const anchor = point || { x: rect.left, y: rect.bottom };
+    await menu.popup(new window.__TAURI__.dpi.LogicalPosition(anchor.x, anchor.y));
+    // Tauri callbacks outlive popup(), which returns as soon as it is shown.
+    // Retain this resource until another menu replaces it.
+    if (popupRowMenu.previous) await popupRowMenu.previous.close();
+    popupRowMenu.previous = menu;
+  };
+
   document.addEventListener("contextmenu", (event) => {
-    const target = event.target.closest('[data-persona-menu-target="true"]');
+    const target = event.target.closest('[data-persona-menu-target="true"], [data-conversation-menu-target="true"]');
     if (!target) return;
     event.preventDefault();
-    openPersonaMenu(target, { x: event.clientX, y: event.clientY });
+    popupRowMenu(target, { x: event.clientX, y: event.clientY }).catch(reportError);
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && event.target.closest("#conversation-search-form")) {
+      event.preventDefault();
+      setSearchMode(false);
+    }
+    if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) {
+      const target = event.target.closest('[data-persona-menu-target="true"], [data-conversation-menu-target="true"]');
+      if (target) {
+        event.preventDefault();
+        popupRowMenu(target).catch(reportError);
+      }
+    }
+    if (event.target.matches(".sidebar-resizer") && ["ArrowLeft", "ArrowRight"].includes(event.key)) {
+      event.preventDefault();
+      resizeSidebar(document.querySelector(".sidebar").getBoundingClientRect().width + (event.key === "ArrowRight" ? 16 : -16));
+    }
+  });
+
+  const resizeSidebar = (width) => {
+    const clamped = Math.max(180, Math.min(width, 480, window.innerWidth - 300));
+    document.documentElement.style.setProperty("--sidebar-width", `${clamped}px`);
+    document.querySelector(".sidebar-resizer")?.setAttribute("aria-valuenow", String(Math.round(clamped)));
+    localStorage.setItem("mom-sidebar-width", String(clamped));
+  };
+  const storedSidebarWidth = Number(localStorage.getItem("mom-sidebar-width"));
+  if (storedSidebarWidth) resizeSidebar(storedSidebarWidth);
+  window.addEventListener("resize", () => resizeSidebar(document.querySelector(".sidebar")?.getBoundingClientRect().width || 256));
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.target.matches(".sidebar-resizer")) return;
+    event.preventDefault();
+    const separator = event.target;
+    separator.setPointerCapture(event.pointerId);
+    separator.onpointermove = (move) => resizeSidebar(move.clientX);
+    separator.onpointerup = separator.onpointercancel = () => {
+      separator.onpointermove = null;
+      separator.releasePointerCapture(event.pointerId);
+    };
   });
 
   document.addEventListener("submit", async (event) => {
@@ -3228,7 +3328,8 @@
         const textarea = formField(form, "message");
         try {
           if (sourceConversation === "default") {
-            const created = await invoke("mom_llama_conversation_new", { title: "New chat" });
+            await persistDraftNow(message, attachmentIds, sourceConversation);
+            const created = await invoke("mom_llama_conversation_draft_submit");
             report(created);
             if (created?.status === "blocked" || !created?.result?.id) return;
             conversation = created.result.id;
@@ -3253,7 +3354,7 @@
           }
           activeDispatchConversation = conversation;
           await persistDraftNow(message, attachmentIds, conversation);
-          if (conversation !== sourceConversation) {
+          if (conversation !== sourceConversation && sourceConversation !== "default") {
             await invoke("mom_llama_draft_update", {
               conversation: sourceConversation,
               message: "",

@@ -187,6 +187,8 @@ pub struct ConversationExport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationSearchHit {
     pub conversation_id: String,
+    pub kind: ConversationKind,
+    pub active_leaf_message_id: Option<String>,
     pub title: String,
     pub snippet: String,
     pub message_count: usize,
@@ -259,34 +261,144 @@ pub struct TextAttachmentImport {
     pub bytes: u64,
 }
 
+const NEW_CHAT_CONTEXT_NAMESPACE: &str = "conversation.new-draft-context.v1";
+
+/// Opening a composer selects one durable draft, never a saved conversation.
+pub fn conversation_draft_open(persona: Option<String>) -> Result<CommandResult<Option<String>>> {
+    let store = RuntimeStore::current()?;
+    let result = store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            let current: Option<String> = documents
+                .get(NEW_CHAT_CONTEXT_NAMESPACE)?
+                .unwrap_or_default();
+            let selected = persona.or(current);
+            if let Some(id) = &selected {
+                anyhow::ensure!(
+                    db.conversations
+                        .iter()
+                        .any(|conversation| conversation.id == *id
+                            && conversation.kind == ConversationKind::PersonaTemplate),
+                    "Persona is unavailable"
+                );
+            }
+            documents.put_bytes(NEW_CHAT_CONTEXT_NAMESPACE, &serde_json::to_vec(&selected)?)?;
+            db.selected_conversation_id = Some("default".to_string());
+            Ok(selected)
+        },
+    )?;
+    Ok(CommandResult::passed(
+        "mom_llama.conversation_draft_open",
+        "contracted",
+        result,
+        Vec::new(),
+        Vec::new(),
+        false,
+        false,
+    ))
+}
+
+pub fn conversation_draft_preview() -> Result<Option<Conversation>> {
+    let persona: Option<String> = RuntimeStore::current()?
+        .get(NEW_CHAT_CONTEXT_NAMESPACE)?
+        .unwrap_or_default();
+    let Some(persona) = persona else {
+        return Ok(None);
+    };
+    let mut preview = load_db()?
+        .conversations
+        .into_iter()
+        .find(|conversation| {
+            conversation.id == persona && conversation.kind == ConversationKind::PersonaTemplate
+        })
+        .ok_or_else(|| anyhow::anyhow!("Draft Persona is unavailable"))?;
+    preview.source_conversation_id = Some(preview.id.clone());
+    preview.id = "default".to_string();
+    preview.messages.clear();
+    preview.active_leaf_message_id = None;
+    Ok(Some(preview))
+}
+
+/// Materialize only after the shared draft has a submitted message or attachment.
+pub fn conversation_draft_submit() -> Result<CommandResult<Conversation>> {
+    crate::personas::ensure_builtin_catalog()?;
+    let store = RuntimeStore::current()?;
+    let _attachments = crate::attachments::lock_attachment_lifecycle()?;
+    let settings = resolve_settings()?;
+    let result = store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            let mut drafts: DraftDb = documents.get(DRAFTS_NAMESPACE)?.unwrap_or_default();
+            let Some(index) = drafts.drafts.iter().position(|draft| {
+                draft_key(draft.conversation_id.as_deref()) == NEW_CHAT_DRAFT_KEY
+            }) else {
+                return Ok(Err(Blocker::new("empty_draft", "Empty draft", Vec::new())));
+            };
+            if drafts.drafts[index].message.trim().is_empty()
+                && drafts.drafts[index].attachment_ids.is_empty()
+            {
+                return Ok(Err(Blocker::new("empty_draft", "Empty draft", Vec::new())));
+            }
+            let persona: Option<String> = documents
+                .get(NEW_CHAT_CONTEXT_NAMESPACE)?
+                .unwrap_or_default();
+            let id = Uuid::new_v4().to_string();
+            let now = now_ms().to_string();
+            let conversation = if let Some(persona) = persona {
+                match crate::personas::instantiate_from_documents(
+                    db, documents, &persona, None, &id, &now,
+                )? {
+                    Ok(conversation) => conversation,
+                    Err(blocker) => return Ok(Err(blocker)),
+                }
+            } else {
+                let conversation = new_conversation(None, &settings, id, now);
+                db.selected_conversation_id = Some(conversation.id.clone());
+                db.conversations.insert(0, conversation.clone());
+                conversation
+            };
+            // Creation and transfer share one encrypted store transaction. A repeated
+            // submission sees no new draft and cannot create another empty chat.
+            crate::attachments::transfer_new_draft_attachments(
+                documents,
+                &drafts.drafts[index].attachment_ids,
+                &conversation.id,
+            )?;
+            drafts.drafts[index].conversation_id = Some(conversation.id.clone());
+            documents.put_bytes(DRAFTS_NAMESPACE, &serde_json::to_vec(&drafts)?)?;
+            documents.put_bytes(
+                NEW_CHAT_CONTEXT_NAMESPACE,
+                &serde_json::to_vec(&None::<String>)?,
+            )?;
+            Ok(Ok(conversation))
+        },
+    )?;
+    match result {
+        Ok(conversation) => Ok(CommandResult::passed(
+            "mom_llama.conversation_draft_submit",
+            "contracted",
+            conversation,
+            vec![store.path().display().to_string()],
+            Vec::new(),
+            false,
+            false,
+        )),
+        Err(blocker) => Ok(CommandResult::blocked(
+            "mom_llama.conversation_draft_submit",
+            "blocked_draft",
+            blocker,
+        )),
+    }
+}
+
 pub fn conversation_new(title: Option<String>) -> Result<CommandResult<Conversation>> {
     let mut db = load_db()?;
     let now = now_ms().to_string();
     let settings = resolve_settings()?;
     let id = Uuid::new_v4().to_string();
-    let title = title.unwrap_or_else(|| "New chat".to_string());
-    let mention_handle = new_chat_handle(&title, &id);
-    let conversation = Conversation {
-        id,
-        title,
-        created_at: now.clone(),
-        updated_at: now,
-        kind: ConversationKind::Chat,
-        execution_profile: ConversationExecutionProfile {
-            mention_handle,
-            model_path: settings.model_path.clone(),
-            mmproj_path: settings.mmproj_path.clone(),
-            sampling: Some(settings.sampling_config()),
-            ..ConversationExecutionProfile::default()
-        },
-        selected_model_path: settings.model_path,
-        source_conversation_id: None,
-        source_message_id: None,
-        branch_root_message_id: None,
-        active_leaf_message_id: None,
-        current_skill_ids: Vec::new(),
-        messages: Vec::new(),
-    };
+    let conversation = new_conversation(title, &settings, id, now);
     db.selected_conversation_id = Some(conversation.id.clone());
     db.conversations.insert(0, conversation.clone());
     let path = save_db(&db)?;
@@ -299,6 +411,37 @@ pub fn conversation_new(title: Option<String>) -> Result<CommandResult<Conversat
         false,
         false,
     ))
+}
+
+fn new_conversation(
+    title: Option<String>,
+    settings: &crate::config::Settings,
+    id: String,
+    now: String,
+) -> Conversation {
+    let title = title.unwrap_or_else(|| "New chat".to_string());
+    let mention_handle = new_chat_handle(&title, &id);
+    Conversation {
+        id,
+        title,
+        created_at: now.clone(),
+        updated_at: now,
+        kind: ConversationKind::Chat,
+        execution_profile: ConversationExecutionProfile {
+            mention_handle,
+            model_path: settings.model_path.clone(),
+            mmproj_path: settings.mmproj_path.clone(),
+            sampling: Some(settings.sampling_config()),
+            ..ConversationExecutionProfile::default()
+        },
+        selected_model_path: settings.model_path.clone(),
+        source_conversation_id: None,
+        source_message_id: None,
+        branch_root_message_id: None,
+        active_leaf_message_id: None,
+        current_skill_ids: Vec::new(),
+        messages: Vec::new(),
+    }
 }
 
 fn new_chat_handle(title: &str, id: &str) -> String {
@@ -391,6 +534,8 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
                 .unwrap_or_else(|| conversation.title.clone());
             Some(ConversationSearchHit {
                 conversation_id: conversation.id.clone(),
+                kind: conversation.kind,
+                active_leaf_message_id: conversation.active_leaf_message_id.clone(),
                 title: conversation.title.clone(),
                 snippet,
                 message_count: conversation.messages.len(),
@@ -1563,7 +1708,10 @@ pub(crate) fn load_drafts() -> Result<DraftDb> {
 }
 
 fn draft_key(conversation_id: Option<&str>) -> String {
-    conversation_id.unwrap_or(NEW_CHAT_DRAFT_KEY).to_string()
+    match conversation_id {
+        None | Some("default") => NEW_CHAT_DRAFT_KEY.to_string(),
+        Some(id) => id.to_string(),
+    }
 }
 
 #[cfg(test)]

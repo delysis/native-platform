@@ -237,3 +237,30 @@ pane edge. Fullscreen retains the existing centering. Rebuilt and strictly
 verified the signed review app; the native screenshot shows sidebar and settings
 icon centers aligned with the stoplights. The user's four-message conversation
 reopened intact. No model work or additional layout changes were required.
+
+
+## 2026-10-08 — One unsent chat draft and sidebar controls
+
+- Every GUI New Chat or Persona start uses the same encrypted unsent draft.
+  Navigation flushes text and attachments; restarting retains the draft and
+  its selected Persona. First submission creates the chat and transfers staged
+  attachment ownership in one store transaction. Empty/repeated submissions
+  cannot create additional records. Existing saved history remains intact.
+- Persona rows show full names and short primary handles. Catalog-managed
+  handles use first names, with first-last for collisions; customized profiles
+  retain their handles. Titlebar New Chat/Search replace sidebar navigation.
+  Sidebar width can be dragged or changed with arrow keys on its separator.
+- macOS native contextual menus provide Persona Chat/Edit/Remove and saved-chat
+  Delete/Save as Persona. Search results preserve object kind so Persona actions
+  cannot bypass the guarded removal flow. Branch replaces per-message freezing;
+  saving a Persona binds the dialog to the target conversation.
+- Focused results before consolidated gate: 248 runtime tests, 75 app tests,
+  29 frontend tests passed. New storage regression exercises navigation,
+  restart-bound data, simultaneous submissions, attachment transfer and immutable
+  template preservation. Native review verified unsent text across repeated
+  New Chat, Persona selection, saved-chat navigation and process restart; actual
+  native menus and draggable width; first Persona submission produced one chat
+  and a real local GGUF response `OK`.
+- Review receipts are under the existing mama-llama-review-20261008T132539Z
+  evidence directory. This slice does not qualify the old credential repair,
+  hosted CI, main promotion or the full cross-platform/model release journey.

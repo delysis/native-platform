@@ -482,6 +482,16 @@ enum ConversationCommand {
         #[arg(long)]
         json: bool,
     },
+    DraftOpen {
+        #[arg(long)]
+        persona: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    DraftSubmit {
+        #[arg(long)]
+        json: bool,
+    },
     DraftGet {
         #[arg(long)]
         conversation: Option<String>,
@@ -1442,6 +1452,12 @@ fn run() -> Result<()> {
                 mom_llama_runtime::conversation_siblings(&conversation)?,
                 json,
             ),
+            ConversationCommand::DraftOpen { persona, json } => {
+                print_result(mom_llama_runtime::conversation_draft_open(persona)?, json)
+            }
+            ConversationCommand::DraftSubmit { json } => {
+                print_result(mom_llama_runtime::conversation_draft_submit()?, json)
+            }
             ConversationCommand::DraftGet { conversation, json } => {
                 print_result(mom_llama_runtime::draft_get(conversation.as_deref())?, json)
             }

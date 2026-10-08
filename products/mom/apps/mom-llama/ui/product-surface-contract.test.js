@@ -155,12 +155,15 @@ test("the sidebar exposes only the compact authoritative Persona menu", () => {
     'id="sidebar-persona-list"',
     'class="sidebar-persona-row"',
     'data-persona-menu-target="true"',
-    'aria-haspopup="menu" aria-expanded="false"',
-    'aria-controls="persona-context-menu"',
-    'data-action="persona-menu-open"',
+    'data-action="persona-draft-open"',
   ]) {
     assert.ok(sidebar.includes(marker), `missing compact Persona marker: ${marker}`);
   }
+  assert.ok(!sidebar.includes('data-action="persona-menu-open"'));
+  assert.ok(!sidebar.includes('data-action="settings-section"'));
+  assert.ok(sidebar.includes('class="sidebar-resizer"'));
+  assert.ok(bridge.includes('await Menu.new({ items })'));
+  assert.ok(bridge.includes('data-conversation-menu-target'));
   assert.ok(viewProduction.includes("fn persona_projection()"));
   assert.ok(!sidebar.includes("mom_llama_runtime::persona_list()"));
 

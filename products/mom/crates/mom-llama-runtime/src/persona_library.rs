@@ -14,7 +14,8 @@ pub(crate) struct BuiltinPersona {
     pub model_slot: Option<usize>,
 }
 
-pub(crate) const LIBRARY_REVISION: &str = "therapy-consult-personas-09557b34-2026-08-03";
+pub(crate) const LIBRARY_REVISION: &str =
+    "therapy-consult-personas-09557b34-2026-10-08-short-handles";
 
 #[derive(Debug, Deserialize)]
 struct SourcePersona {

@@ -430,6 +430,8 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
         commands::mom_llama_persona_group_create,
         commands::mom_llama_persona_group_update,
         commands::mom_llama_persona_group_delete,
+        commands::mom_llama_conversation_draft_open,
+        commands::mom_llama_conversation_draft_submit,
         commands::mom_llama_conversation_new,
         commands::mom_llama_conversation_list,
         commands::mom_llama_conversation_select,

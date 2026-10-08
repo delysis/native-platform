@@ -967,6 +967,23 @@ pub async fn mom_llama_chat_continue(
 }
 
 #[tauri::command]
+pub fn mom_llama_conversation_draft_open(
+    runtime: State<'_, AppRuntimeHandle>,
+    persona: Option<String>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_draft_open"))?;
+    command_value(mom_llama_runtime::conversation_draft_open(persona))
+}
+
+#[tauri::command]
+pub fn mom_llama_conversation_draft_submit(
+    runtime: State<'_, AppRuntimeHandle>,
+) -> Result<Value, String> {
+    let _lease = runtime.admit(command_spec("mom_llama_conversation_draft_submit"))?;
+    command_value(mom_llama_runtime::conversation_draft_submit())
+}
+
+#[tauri::command]
 pub fn mom_llama_conversation_new(
     runtime: State<'_, AppRuntimeHandle>,
     title: Option<String>,

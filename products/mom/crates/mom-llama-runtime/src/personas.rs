@@ -1288,85 +1288,7 @@ fn persona_instantiate_inner(
         CONVERSATIONS_NAMESPACE,
         ConversationDb::default,
         |db, documents| {
-            if persona_cache_owner_is_removed_from_documents(documents, persona_id)? {
-                return Ok(Err(Blocker::new(
-                    "persona_not_found",
-                    "The Persona is no longer discoverable in the library.",
-                    vec!["Refresh Personas in Settings.".to_string()],
-                )));
-            }
-            reject_removed_conversation_writes_from_documents(db, documents)?;
-            let Some(persona) = db
-                .conversations
-                .iter()
-                .find(|conversation| {
-                    conversation.id == persona_id
-                        && conversation.kind == ConversationKind::PersonaTemplate
-                })
-                .cloned()
-            else {
-                return Ok(Err(Blocker::new(
-                    "persona_not_found",
-                    "The Persona no longer exists.",
-                    vec!["Refresh Personas in Settings.".to_string()],
-                )));
-            };
-            let current_version = build_persona_version(&persona)?;
-            let versions = documents
-                .get::<PersonaVersionDb>(PERSONA_VERSIONS_NAMESPACE)?
-                .unwrap_or_default();
-            if !versions.versions.iter().any(|version| {
-                version.persona_id == current_version.persona_id
-                    && version.version == current_version.version
-                    && version.profile_sha256 == current_version.profile_sha256
-                    && version.conversation_sha256 == current_version.conversation_sha256
-            }) {
-                return Ok(Err(Blocker::new(
-                    "persona_version_unavailable",
-                    "The current Persona version has no exact immutable version record.",
-                    vec![
-                        "Refresh or re-save the Persona before starting a conversation."
-                            .to_string(),
-                    ],
-                )));
-            }
-            let mut profile = persona.execution_profile.clone();
-            profile.tool_bindings = match normalize_tools(profile.tool_bindings) {
-                Ok(tools) => tools,
-                Err(blocker) => return Ok(Err(blocker)),
-            };
-            let groups = documents
-                .get::<PersonaGroupDb>(GROUPS_NAMESPACE)?
-                .unwrap_or_default();
-            profile.mention_handle =
-                unique_handle(db, &groups.groups, &format!("{}-chat", persona.title));
-            profile.version = 1;
-            let mut messages = remap_messages(&id, active_path_messages(&persona));
-            crate::attachments::snapshot_message_attachments_from_documents(
-                &id,
-                &mut messages,
-                documents,
-            )?;
-            let conversation = Conversation {
-                id: id.clone(),
-                title: title
-                    .clone()
-                    .unwrap_or_else(|| format!("Chat with {}", persona.title)),
-                created_at: now.clone(),
-                updated_at: now.clone(),
-                kind: ConversationKind::Chat,
-                execution_profile: profile.clone(),
-                selected_model_path: profile.model_path.clone(),
-                source_conversation_id: Some(persona.id),
-                source_message_id: persona.active_leaf_message_id,
-                branch_root_message_id: None,
-                active_leaf_message_id: messages.last().map(|message| message.id.clone()),
-                current_skill_ids: persona.current_skill_ids,
-                messages,
-            };
-            db.selected_conversation_id = Some(id.clone());
-            db.conversations.insert(0, conversation.clone());
-            Ok(Ok(conversation))
+            instantiate_from_documents(db, documents, persona_id, title.clone(), &id, &now)
         },
     )?;
     let conversation = match admitted {
@@ -1388,6 +1310,86 @@ fn persona_instantiate_inner(
         false,
         false,
     ))
+}
+
+pub(crate) fn instantiate_from_documents(
+    db: &mut ConversationDb,
+    documents: &mut DocumentMutations<'_, '_, '_>,
+    persona_id: &str,
+    title: Option<String>,
+    id: &str,
+    now: &str,
+) -> Result<std::result::Result<Conversation, Blocker>> {
+    if persona_cache_owner_is_removed_from_documents(documents, persona_id)? {
+        return Ok(Err(Blocker::new(
+            "persona_not_found",
+            "The Persona is no longer discoverable in the library.",
+            vec!["Refresh Personas in Settings.".to_string()],
+        )));
+    }
+    reject_removed_conversation_writes_from_documents(db, documents)?;
+    let Some(persona) = db
+        .conversations
+        .iter()
+        .find(|conversation| {
+            conversation.id == persona_id && conversation.kind == ConversationKind::PersonaTemplate
+        })
+        .cloned()
+    else {
+        return Ok(Err(Blocker::new(
+            "persona_not_found",
+            "The Persona no longer exists.",
+            vec!["Refresh Personas in Settings.".to_string()],
+        )));
+    };
+    let current_version = build_persona_version(&persona)?;
+    let versions = documents
+        .get::<PersonaVersionDb>(PERSONA_VERSIONS_NAMESPACE)?
+        .unwrap_or_default();
+    if !versions.versions.iter().any(|version| {
+        version.persona_id == current_version.persona_id
+            && version.version == current_version.version
+            && version.profile_sha256 == current_version.profile_sha256
+            && version.conversation_sha256 == current_version.conversation_sha256
+    }) {
+        return Ok(Err(Blocker::new(
+            "persona_version_unavailable",
+            "The current Persona version has no exact immutable version record.",
+            vec!["Refresh or re-save the Persona before starting a conversation.".to_string()],
+        )));
+    }
+    let mut profile = persona.execution_profile.clone();
+    profile.tool_bindings = match normalize_tools(profile.tool_bindings) {
+        Ok(tools) => tools,
+        Err(blocker) => return Ok(Err(blocker)),
+    };
+    let groups = documents
+        .get::<PersonaGroupDb>(GROUPS_NAMESPACE)?
+        .unwrap_or_default();
+    profile.mention_handle = unique_handle(db, &groups.groups, &format!("{}-chat", persona.title));
+    profile.version = 1;
+    let mut messages = remap_messages(&id, active_path_messages(&persona));
+    crate::attachments::snapshot_message_attachments_from_documents(&id, &mut messages, documents)?;
+    let conversation = Conversation {
+        id: id.to_string(),
+        title: title
+            .clone()
+            .unwrap_or_else(|| format!("Chat with {}", persona.title)),
+        created_at: now.to_string(),
+        updated_at: now.to_string(),
+        kind: ConversationKind::Chat,
+        execution_profile: profile.clone(),
+        selected_model_path: profile.model_path.clone(),
+        source_conversation_id: Some(persona.id),
+        source_message_id: persona.active_leaf_message_id,
+        branch_root_message_id: None,
+        active_leaf_message_id: messages.last().map(|message| message.id.to_string()),
+        current_skill_ids: persona.current_skill_ids,
+        messages,
+    };
+    db.selected_conversation_id = Some(id.to_string());
+    db.conversations.insert(0, conversation.clone());
+    Ok(Ok(conversation))
 }
 
 pub fn persona_group_list() -> Result<CommandResult<Vec<PersonaGroup>>> {
@@ -1571,7 +1573,7 @@ fn write_group(
     ))
 }
 
-fn ensure_builtin_catalog() -> Result<()> {
+pub(crate) fn ensure_builtin_catalog() -> Result<()> {
     let mut groups = load_group_db()?;
     if groups.catalog_revision.as_deref() == Some(LIBRARY_REVISION) {
         return Ok(());
@@ -1604,7 +1606,54 @@ fn reconcile_builtin_personas(
     default_mmproj_path: Option<PathBuf>,
 ) -> Result<Vec<Conversation>> {
     let mut versioned_ids = BTreeSet::new();
+    let handles: HashMap<String, String> = catalog
+        .iter()
+        .map(|source| {
+            let first = source.id.split('_').next().unwrap_or(&source.id);
+            let collides = catalog
+                .iter()
+                .filter(|other| other.id.split('_').next() == Some(first))
+                .count()
+                > 1
+                || conversations.conversations.iter().any(|other| {
+                    other.kind == ConversationKind::PersonaTemplate
+                        && other.id != format!("persona-{}", source.id)
+                        && !catalog
+                            .iter()
+                            .any(|entry| other.id == format!("persona-{}", entry.id))
+                        && slug(other.title.split_whitespace().next().unwrap_or("")) == first
+                });
+            let preferred = if collides {
+                let name = source
+                    .label
+                    .split('(')
+                    .next()
+                    .unwrap_or(&source.label)
+                    .trim();
+                format!(
+                    "{first}-{}",
+                    slug(name.split_whitespace().last().unwrap_or(first))
+                )
+            } else {
+                first.to_string()
+            };
+            let available = !conversations.conversations.iter().any(|other| {
+                other.id != format!("persona-{}", source.id)
+                    && normalize_handle(&other.execution_profile.mention_handle) == preferred
+            }) && !groups
+                .groups
+                .iter()
+                .any(|group| normalize_handle(&group.mention_handle) == preferred);
+            let handle = if available {
+                preferred
+            } else {
+                unique_handle(conversations, &groups.groups, &source.id.replace('_', "-"))
+            };
+            (source.id.clone(), handle)
+        })
+        .collect();
     for source in catalog {
+        let desired_handle = handles[&source.id].clone();
         let id = format!("persona-{}", source.id);
         let catalog_entry_sha256 = sha256_json(&source)?;
         let prior = groups
@@ -1636,11 +1685,13 @@ fn reconcile_builtin_personas(
                 if ownership == BuiltinPersonaOwnership::CatalogManaged {
                     let persona = &mut conversations.conversations[index];
                     let changed = persona.title != source.label
+                        || persona.execution_profile.mention_handle != desired_handle
                         || persona.kind != ConversationKind::PersonaTemplate
                         || persona.execution_profile.system_message.as_deref()
                             != Some(source.perspective_prompt.as_str());
                     if changed {
                         persona.title = source.label.clone();
+                        persona.execution_profile.mention_handle = desired_handle.clone();
                         persona.kind = ConversationKind::PersonaTemplate;
                         persona.execution_profile.system_message =
                             Some(source.perspective_prompt.clone());
@@ -1689,14 +1740,7 @@ fn reconcile_builtin_personas(
             continue;
         }
 
-        let desired_handle = source.id.replace('_', "-");
-        let handle = if conversations.conversations.iter().any(|conversation| {
-            normalize_handle(&conversation.execution_profile.mention_handle) == desired_handle
-        }) {
-            unique_handle(conversations, &groups.groups, &source.label)
-        } else {
-            desired_handle
-        };
+        let handle = desired_handle;
         let now = now_ms().to_string();
         let persona = Conversation {
             id: id.clone(),
@@ -2607,6 +2651,173 @@ mod tests {
             .expect("idempotent removal output");
         assert!(repeated.already_removed);
         assert_eq!(repeated.impact, impact);
+    }
+
+    #[test]
+    fn catalog_handles_use_first_names_and_disambiguate_shared_first_names() {
+        let mut db = ConversationDb::default();
+        let mut groups = PersonaGroupDb::default();
+        let mut first = catalog_persona("Alex Green", "one");
+        first.id = "alex_green".into();
+        let mut second = catalog_persona("Alex Brown", "two");
+        second.id = "alex_brown".into();
+        let mut third = catalog_persona("Robin Smith", "three");
+        third.id = "robin_smith".into();
+        let catalog = vec![first, second, third];
+        reconcile_builtin_personas(
+            &mut db,
+            &mut groups,
+            catalog.clone(),
+            "short-v1",
+            None,
+            None,
+        )
+        .unwrap();
+        let handles: Vec<_> = db
+            .conversations
+            .iter()
+            .map(|c| c.execution_profile.mention_handle.as_str())
+            .collect();
+        assert!(handles.contains(&"alex-green"));
+        assert!(handles.contains(&"alex-brown"));
+        assert!(handles.contains(&"robin"));
+        let robin = db
+            .conversations
+            .iter_mut()
+            .find(|c| c.id == "persona-robin_smith")
+            .unwrap();
+        robin.execution_profile.mention_handle = "my-robin".into();
+        reconcile_builtin_personas(&mut db, &mut groups, catalog, "short-v2", None, None).unwrap();
+        assert_eq!(
+            db.conversations
+                .iter()
+                .find(|c| c.id == "persona-robin_smith")
+                .unwrap()
+                .execution_profile
+                .mention_handle,
+            "my-robin"
+        );
+    }
+
+    #[test]
+    fn one_unsent_draft_survives_navigation_and_transfers_once() {
+        use crate::conversation_store::*;
+        let session = TestDataDir::new("single-unsent-draft");
+        super::ensure_builtin_catalog().unwrap();
+        let before = load_db().unwrap().conversations;
+        let persona = before
+            .iter()
+            .find(|c| c.kind == ConversationKind::PersonaTemplate)
+            .unwrap();
+        assert!(conversation_draft_submit().unwrap().blocker.is_some());
+        conversation_draft_open(None).unwrap();
+        draft_update(Some("default"), "unsent work".into(), vec![]).unwrap();
+        let pasted = crate::attachments::attachment_import_pasted_text(
+            &crate::OperationScope::detached(),
+            "default",
+            "source evidence".into(),
+        )
+        .unwrap()
+        .result
+        .unwrap()
+        .attachment
+        .id;
+        conversation_draft_open(Some(persona.id.clone())).unwrap();
+        conversation_draft_open(None).unwrap();
+        assert_eq!(load_db().unwrap().conversations, before);
+        conversation_select(&persona.id).unwrap();
+        // Reopen from durable documents after leaving the draft.
+        conversation_draft_open(None).unwrap();
+        let draft = draft_get(Some("default")).unwrap().result.unwrap();
+        assert_eq!(draft.message, "unsent work");
+        assert_eq!(draft.attachment_ids, vec![pasted.clone()]);
+        assert_eq!(
+            conversation_draft_preview()
+                .unwrap()
+                .unwrap()
+                .source_conversation_id
+                .as_deref(),
+            Some(persona.id.as_str())
+        );
+        let start = Arc::new(Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let start = Arc::clone(&start);
+                let path = session.path.clone();
+                thread::spawn(move || {
+                    set_data_dir_override_for_tests(Some(path));
+                    start.wait();
+                    let result = conversation_draft_submit().unwrap();
+                    set_data_dir_override_for_tests(None);
+                    result
+                })
+            })
+            .collect();
+        start.wait();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.result.is_some())
+                .count(),
+            1,
+            "{results:?}"
+        );
+        let chat = results
+            .iter()
+            .find_map(|result| result.result.as_ref())
+            .unwrap();
+        assert_eq!(
+            chat.source_conversation_id.as_deref(),
+            Some(persona.id.as_str())
+        );
+        assert_eq!(
+            draft_get(Some(&chat.id)).unwrap().result.unwrap().message,
+            "unsent work"
+        );
+        assert_eq!(
+            draft_get(Some(&chat.id))
+                .unwrap()
+                .result
+                .unwrap()
+                .attachment_ids,
+            vec![pasted.clone()]
+        );
+        assert!(
+            draft_get(Some("default"))
+                .unwrap()
+                .result
+                .unwrap()
+                .message
+                .is_empty()
+        );
+        let records = crate::attachments::attachment_list(Some(&chat.id))
+            .unwrap()
+            .result
+            .unwrap();
+        assert!(
+            records
+                .iter()
+                .any(|record| record.id == pasted && record.conversation_id == chat.id)
+        );
+        let after = load_db().unwrap();
+        assert_eq!(after.conversations.len(), before.len() + 1);
+        assert_eq!(
+            after
+                .conversations
+                .iter()
+                .find(|c| c.id == persona.id)
+                .unwrap(),
+            persona
+        );
+        conversation_draft_open(None).unwrap();
+        assert!(conversation_draft_preview().unwrap().is_none());
+        draft_update(Some("default"), "ordinary draft".into(), vec![]).unwrap();
+        let ordinary = conversation_draft_submit().unwrap().result.unwrap();
+        assert_eq!(ordinary.source_conversation_id, None);
     }
 
     #[test]
