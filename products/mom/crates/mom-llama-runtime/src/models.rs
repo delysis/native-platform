@@ -266,7 +266,7 @@ pub fn conversation_model_select_and_load(
         ));
     }
     let expected_profile_version = conversation.execution_profile.version;
-    let settings = match settings_for_model_selection(model_path) {
+    let mut settings = match settings_for_model_selection(model_path) {
         Ok(settings) => settings,
         Err(blocked) => {
             return Ok(CommandResult::blocked(
@@ -276,6 +276,8 @@ pub fn conversation_model_select_and_load(
             ));
         }
     };
+    // A chat-specific model must fit the same host-wide context as other chats.
+    settings.context_tokens = resolve_settings()?.context_tokens;
     if let Err(blocked) = crate::native_runtime::resident_model_for_profile(
         scope,
         &settings,
@@ -384,6 +386,7 @@ fn settings_for_model_selection(
             })
     })?;
     bind_model_pair(&mut settings, model_path, mmproj_path);
+    crate::memory_policy::reconcile_context(&mut settings);
     Ok(settings)
 }
 
@@ -429,7 +432,6 @@ fn persist_default_model_selection(
     let model_path = prepared.model_path.clone();
     let mmproj_path = prepared.mmproj_path.clone();
     let expected_device = prepared.native_device;
-    let expected_context_tokens = prepared.context_tokens;
     let expected_batch_tokens = prepared.batch_tokens;
     let expected_parallel_sequences = prepared.max_parallel_sequences;
     let expected_memory_budget = prepared.resident_memory_budget_bytes;
@@ -456,7 +458,6 @@ fn persist_default_model_selection(
         |current: &mut Settings| {
             crate::config::reconcile_resident_memory_budget_for_runtime(current);
             let host_settings_unchanged = current.native_device == expected_device
-                && current.context_tokens == expected_context_tokens
                 && current.batch_tokens == expected_batch_tokens
                 && current.max_parallel_sequences == expected_parallel_sequences
                 && current.resident_memory_budget_bytes == expected_memory_budget;
@@ -473,6 +474,7 @@ fn persist_default_model_selection(
             current.data_dir = data_dir.clone();
             current.model_path = model_path.clone();
             current.mmproj_path = mmproj_path.clone();
+            current.context_tokens = prepared.context_tokens;
             current.upstream_settings.insert(
                 "mmprojPath".to_string(),
                 json!(

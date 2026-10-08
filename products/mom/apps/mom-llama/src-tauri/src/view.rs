@@ -1538,6 +1538,7 @@ fn app_markup(projection: AppProjection<'_>) -> Markup {
             }
             (chat_view_with_draft(settings, engine, models, active.as_ref(), Some(draft)))
             (settings_sidebar(settings, models, personas, active.as_ref()))
+            (conversation_rename_modal())
             (persona_freeze_modal())
             (persona_context_menu())
             (persona_removal_modal())
@@ -1838,7 +1839,8 @@ fn sidebar(
                                 .filter(|conversation| conversation.kind == ConversationKind::Chat) {
                                 @let active = active_id == Some(conversation.id.as_str());
                                 li data-conversation-menu-target="true" data-conversation=(conversation.id.clone())
-                                    data-message=(conversation.active_leaf_message_id.clone().unwrap_or_default()) {
+                                    data-message=(conversation.active_leaf_message_id.clone().unwrap_or_default())
+                                    data-conversation-title=(conversation.title.clone()) {
                                     button type="button"
                                         class=(format!("conversation-item {}", if active { "active" } else { "" }))
                                         data-affordance="conversation.select"
@@ -1849,7 +1851,6 @@ fn sidebar(
                                         data-action="conversation-select"
                                         data-conversation=(conversation.id.clone()) {
                                         span { (conversation.title.clone()) }
-                                        small { (message_count(conversation)) }
                                     }
                                 }
                             }
@@ -2815,14 +2816,9 @@ fn persona_settings(
     html! {
         section class="settings-card persona-library" {
             h3 { "Personas" }
-            p class="field-help" {
-                "Use a Persona's menu to start a conversation, edit its profile, or remove it from the library."
-            }
             div id="persona-list" class="persona-list" {
                 @if let Some(blocker) = &personas.blocker {
                     (store_blocker(blocker))
-                } @else if personas.value.is_empty() {
-                    p class="empty-line" { "Freeze any message from its context menu to create a persona." }
                 }
                 @for persona in &personas.value {
                     div class="persona-row" data-persona-menu-target="true"
@@ -2895,24 +2891,6 @@ fn persona_settings(
                     data-cli="mom-llama persona update --profile <json> --json"
                     data-effect="mom_llama.effects.conversation_store.v1" {}
             }
-            div class="native-number-grid" {
-                (command_input("Persona history tokens", "persona_source_tokens", "4096", "persona.update"))
-                (command_input("Host context tokens", "persona_host_tokens", "2048", "persona.update"))
-            }
-            @if mcp_process_ui_supported() {
-                label class="field" { span { "Attached external-process tools" }
-                    textarea name="persona_tools" rows="3" placeholder="server/tool, one per line"
-                        data-affordance="persona.update" data-command="mom_llama.persona_update"
-                        data-tauri-command="mom_llama_persona_update"
-                        data-cli="mom-llama persona update --profile <json> --json"
-                        data-effect="mom_llama.effects.conversation_store.v1" {}
-                    small {
-                        "Only these stable bindings may be offered during an invited response. "
-                        (MCP_PROCESS_AUTHORITY_WARNING) " "
-                        (PERSONA_MCP_EXECUTABLE_IDENTITY_NOTICE)
-                    }
-                }
-            }
             div class="button-strip" {
                 (button("persona.update", Some("persona-update"), "primary-button", false))
             }
@@ -2941,7 +2919,6 @@ fn persona_model_selector(models: &CommandResult<Vec<ModelInfo>>) -> Markup {
                     }
                 }
             }
-            small { "Choose a discovered local model, or inherit the default for new chats." }
         }
     }
 }
@@ -3031,6 +3008,35 @@ fn consult_settings(personas: &StoreProjection<Vec<Conversation>>) -> Markup {
             div class="button-strip" {
                 (button("persona_group.create", Some("persona-group-save"), "primary-button persona-group-create", false))
                 (button("persona_group.update", Some("persona-group-save"), "primary-button persona-group-update is-hidden", false))
+            }
+        }
+    }
+}
+
+fn conversation_rename_modal() -> Markup {
+    let rename = control("conversation.rename");
+    html! {
+        div id="conversation-rename-modal" class="modal-backdrop is-hidden" hidden[true] aria-hidden="true" {
+            form id="conversation-rename-form" class="compact-dialog" role="dialog" aria-modal="true"
+                aria-labelledby="conversation-rename-title"
+                data-affordance=(rename.affordance) data-command=(rename.command)
+                data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect) {
+                header class="modal-title-row" {
+                    h2 id="conversation-rename-title" { "Rename" }
+                    button type="button" class="icon-button" aria-label="Cancel"
+                        data-affordance=(rename.affordance) data-command=(rename.command)
+                        data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect)
+                        data-action="conversation-rename-close" { (icon_markup("x")) }
+                }
+                label class="field" {
+                    span { "Name" }
+                    input name="conversation_title" required aria-label="Name"
+                        data-affordance=(rename.affordance) data-command=(rename.command)
+                        data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect);
+                }
+                button type="submit" class="primary-button"
+                    data-affordance=(rename.affordance) data-command=(rename.command)
+                    data-tauri-command=(rename.tauri_command) data-cli=(rename.cli) data-effect=(rename.effect) { "Save" }
             }
         }
     }
@@ -3942,14 +3948,6 @@ fn json_value_to_form_value(value: &Value) -> String {
     }
 }
 
-fn message_count(conversation: &Conversation) -> String {
-    match conversation.messages.len() {
-        0 => "No messages".to_string(),
-        1 => "1 message".to_string(),
-        count => format!("{count} messages"),
-    }
-}
-
 fn file_name(path: &Path) -> String {
     path.file_name()
         .and_then(|value| value.to_str())
@@ -4114,7 +4112,7 @@ mod tests {
         assert!(html.contains("Bessel van der Kolk"));
         assert!(!html.contains(r#"data-action="skills-open""#));
         assert!(!html.contains(r#"data-action="persona-open""#));
-        assert!(html.contains("Use a Persona's menu to start a conversation"));
+        assert!(!html.contains("Use a Persona's menu to start a conversation"));
         assert!(!html.contains("Edits version this template"));
         assert!(!html.contains(r#"class="persona-template-banner""#));
         assert!(html.contains(r#"id="mention-candidates" class="mention-candidates is-hidden""#));
@@ -5345,11 +5343,9 @@ mod tests {
             blocker: None,
         };
         let editor = persona_settings(&personas, &empty_models()).into_string();
-        assert_eq!(
-            editor.contains(r#"name="persona_tools""#),
-            mcp_process_ui_supported(),
-            "Persona MCP bindings must be absent outside macOS and Linux"
-        );
+        assert!(!editor.contains(r#"name="persona_tools""#));
+        assert!(!editor.contains(r#"name="persona_source_tokens""#));
+        assert!(!editor.contains(r#"name="persona_host_tokens""#));
         assert!(editor.contains(r#"name="persona_model_choice""#));
         assert!(editor.contains("Use default model"));
         assert!(!editor.contains(r#"name="persona_model_path""#));

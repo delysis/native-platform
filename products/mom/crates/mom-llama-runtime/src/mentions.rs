@@ -3287,7 +3287,7 @@ where
                 continue;
             }
         };
-        let tools = match resolve_mention_tools(&snapshot.profile.tool_bindings) {
+        let tools = match resolve_mention_tools(&[]) {
             Ok(tools) => tools,
             Err(blocker) => {
                 invocation.results.push(blocked_target_result(

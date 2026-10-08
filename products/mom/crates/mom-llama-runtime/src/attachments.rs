@@ -2895,19 +2895,20 @@ fn merge_generated_conversation(
     if active_branch_is_unchanged {
         existing.active_leaf_message_id = conversation.active_leaf_message_id.clone();
     }
-    if is_placeholder_title(&existing.title, &existing.id)
-        && !is_placeholder_title(&conversation.title, &conversation.id)
-    {
-        existing.title = conversation.title.clone();
+    if crate::conversation_store::is_placeholder_title(&existing.title, &existing.id) {
+        existing.title = if crate::conversation_store::is_placeholder_title(
+            &conversation.title,
+            &conversation.id,
+        ) {
+            crate::conversation_store::display_title(existing)
+        } else {
+            conversation.title.clone()
+        };
     }
     if timestamp_value(&conversation.updated_at) > timestamp_value(&existing.updated_at) {
         existing.updated_at = conversation.updated_at.clone();
     }
     Ok(())
-}
-
-fn is_placeholder_title(title: &str, conversation_id: &str) -> bool {
-    matches!(title, "New chat" | "Default chat") || title == conversation_id
 }
 
 fn timestamp_value(value: &str) -> u128 {

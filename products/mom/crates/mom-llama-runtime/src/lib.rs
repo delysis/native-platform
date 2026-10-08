@@ -7,6 +7,7 @@ pub mod document;
 pub mod engine;
 pub mod kv_cache;
 pub mod mcp;
+mod memory_policy;
 pub mod mentions;
 pub mod models;
 pub mod native_runtime;

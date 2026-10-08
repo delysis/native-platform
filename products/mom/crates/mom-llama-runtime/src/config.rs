@@ -15,8 +15,6 @@ pub(crate) const SETTINGS_NAMESPACE: &str = "settings.v2";
 const DEFAULT_MAX_TOKENS: u32 = 512;
 const GIB: u64 = 1024 * 1024 * 1024;
 const FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 8 * GIB;
-const MIN_AUTO_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 2 * GIB;
-const MAX_AUTO_RESIDENT_MEMORY_BUDGET_BYTES: u64 = 64 * GIB;
 const MEMORY_BUDGET_MODE_KEY: &str = "nativeMemoryBudgetMode";
 const COMPILED_DEFAULT_MODEL_PATH: Option<&str> = option_env!("MOM_LLAMA_DEFAULT_MODEL_PATH");
 const COMPILED_DEFAULT_MMPROJ_PATH: Option<&str> = option_env!("MOM_LLAMA_DEFAULT_MMPROJ_PATH");
@@ -316,7 +314,7 @@ fn default_resident_memory_budget_bytes() -> u64 {
     automatic_resident_memory_budget(physical_memory_bytes())
 }
 
-fn physical_memory_bytes() -> Option<u64> {
+pub(crate) fn physical_memory_bytes() -> Option<u64> {
     static PHYSICAL_MEMORY: OnceLock<Option<u64>> = OnceLock::new();
     *PHYSICAL_MEMORY.get_or_init(|| {
         let system = System::new_with_specifics(
@@ -329,10 +327,7 @@ fn physical_memory_bytes() -> Option<u64> {
 
 fn automatic_resident_memory_budget(physical_memory_bytes: Option<u64>) -> u64 {
     match physical_memory_bytes {
-        Some(bytes) => (bytes / 2).clamp(
-            MIN_AUTO_RESIDENT_MEMORY_BUDGET_BYTES,
-            MAX_AUTO_RESIDENT_MEMORY_BUDGET_BYTES,
-        ),
+        Some(bytes) => bytes - bytes.div_ceil(3),
         None => FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES,
     }
 }
@@ -355,8 +350,9 @@ fn reconcile_resident_memory_budget(settings: &mut Settings, physical_memory: Op
     if mode == ResidentMemoryBudgetMode::Auto {
         settings.resident_memory_budget_bytes = automatic_resident_memory_budget(physical_memory);
     } else {
-        settings.resident_memory_budget_bytes =
-            settings.resident_memory_budget_bytes.max(256 * 1024 * 1024);
+        settings.resident_memory_budget_bytes = settings
+            .resident_memory_budget_bytes
+            .min(automatic_resident_memory_budget(physical_memory));
     }
     let bytes = settings.resident_memory_budget_bytes;
     write_resident_memory_budget_projection(&mut settings.upstream_settings, mode, bytes);
@@ -501,8 +497,18 @@ pub(crate) fn settings_from_document(
     if settings.model_path.is_none() && data_dir_override().is_none() {
         let cached = desktop_model_defaults::hugging_face_hub_cache_dir()
             .and_then(|cache| desktop_model_defaults::cached_default_model(&cache));
+        let cached = cached.filter(|candidate| {
+            physical_memory_bytes().is_some_and(|ram| {
+                crate::memory_policy::weights_fit(
+                    &candidate.model,
+                    candidate.projector.as_deref(),
+                    ram,
+                )
+            })
+        });
         apply_cached_default_model(&mut settings, cached);
     }
+    crate::memory_policy::reconcile_context(&mut settings);
     Ok(settings)
 }
 
@@ -808,6 +814,8 @@ pub fn settings_update(update: SettingsUpdate) -> Result<CommandResult<Settings>
     {
         settings.theme = Some(theme.to_string());
     }
+    reconcile_resident_memory_budget_for_runtime(&mut settings);
+    crate::memory_policy::reconcile_context(&mut settings);
     let path = save_settings(&settings)?;
     Ok(CommandResult::passed(
         "mom_llama.settings_update",
@@ -1302,15 +1310,27 @@ mod tests {
     }
 
     #[test]
-    fn automatic_memory_budget_is_half_of_ram_with_conservative_bounds() {
+    fn automatic_memory_budget_is_at_most_two_thirds_of_ram() {
         assert_eq!(
             automatic_resident_memory_budget(None),
             FALLBACK_RESIDENT_MEMORY_BUDGET_BYTES
         );
-        assert_eq!(automatic_resident_memory_budget(Some(GIB)), 2 * GIB);
-        assert_eq!(automatic_resident_memory_budget(Some(16 * GIB)), 8 * GIB);
-        assert_eq!(automatic_resident_memory_budget(Some(128 * GIB)), 64 * GIB);
-        assert_eq!(automatic_resident_memory_budget(Some(512 * GIB)), 64 * GIB);
+        assert_eq!(
+            automatic_resident_memory_budget(Some(GIB)),
+            GIB - GIB.div_ceil(3)
+        );
+        assert_eq!(
+            automatic_resident_memory_budget(Some(16 * GIB)),
+            16 * GIB - (16 * GIB).div_ceil(3)
+        );
+        assert_eq!(
+            automatic_resident_memory_budget(Some(128 * GIB)),
+            128 * GIB - (128 * GIB).div_ceil(3)
+        );
+        assert_eq!(
+            automatic_resident_memory_budget(Some(512 * GIB)),
+            512 * GIB - (512 * GIB).div_ceil(3)
+        );
     }
 
     #[test]
@@ -1338,7 +1358,10 @@ mod tests {
 
         let mut automatic = Settings::defaults_for_data_dir(std::env::temp_dir());
         reconcile_resident_memory_budget(&mut automatic, Some(128 * GIB));
-        assert_eq!(automatic.resident_memory_budget_bytes, 64 * GIB);
+        assert_eq!(
+            automatic.resident_memory_budget_bytes,
+            128 * GIB - (128 * GIB).div_ceil(3)
+        );
         assert_eq!(
             automatic.upstream_settings.get(MEMORY_BUDGET_MODE_KEY),
             Some(&json!("auto"))

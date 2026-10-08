@@ -46,7 +46,15 @@ fn attention_layout(config: &NativeModelConfig) -> Option<AttentionLayout> {
     let architecture = metadata.val_str(index)?;
     if !matches!(
         architecture,
-        "llama" | "qwen2" | "qwen3" | "qwen2moe" | "qwen3moe" | "gemma" | "gemma2"
+        "llama"
+            | "qwen2"
+            | "qwen3"
+            | "qwen2moe"
+            | "qwen3moe"
+            | "gemma"
+            | "gemma2"
+            | "gemma3"
+            | "gemma4"
     ) {
         return None;
     }
@@ -59,8 +67,14 @@ fn attention_layout(config: &NativeModelConfig) -> Option<AttentionLayout> {
     let layout = AttentionLayout {
         layers: read("block_count")?,
         kv_heads: read("attention.head_count_kv").unwrap_or(heads),
-        key_width: read("attention.key_length").unwrap_or(embedding / heads),
-        value_width: read("attention.value_length").unwrap_or(embedding / heads),
+        // Budget every layer as full attention at the larger global/SWA width.
+        // Ignoring sliding windows and shared KV deliberately over-reserves.
+        key_width: read("attention.key_length")
+            .unwrap_or(embedding / heads)
+            .max(read("attention.key_length_swa").unwrap_or(0)),
+        value_width: read("attention.value_length")
+            .unwrap_or(embedding / heads)
+            .max(read("attention.value_length_swa").unwrap_or(0)),
     };
     (layout.layers > 0 && layout.kv_heads > 0 && layout.key_width > 0 && layout.value_width > 0)
         .then_some(layout)
@@ -81,6 +95,22 @@ pub fn estimate_memory_reservation(
         projector_bytes,
         attention_layout(config),
     )
+}
+
+/// Training context capacity from GGUF metadata, without loading tensor weights.
+#[must_use]
+pub fn model_context_capacity(config: &NativeModelConfig) -> Option<u32> {
+    let metadata = GgufContext::from_file(&config.model_path)?;
+    let index = metadata.find_key("general.architecture");
+    if index < 0 || metadata.kv_type(index) != llama_cpp_sys_2::GGUF_TYPE_STRING {
+        return None;
+    }
+    let architecture = metadata.val_str(index)?;
+    u32::try_from(read_u32(
+        &metadata,
+        &format!("{architecture}.context_length"),
+    )?)
+    .ok()
 }
 
 fn scaled_reserve(bytes: u64, units: u64, baseline: u64) -> u64 {

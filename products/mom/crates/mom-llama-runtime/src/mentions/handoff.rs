@@ -197,13 +197,9 @@ pub(super) fn handoff_messages(
             "The invited model has no resident fingerprint.",
         )
     })?;
-    // Source history never reads another conversation's draft. Zero source
-    // history is an explicit exclusion, including its attachment contents.
-    let source_messages = if snapshot.profile.source_history_tokens == 0 {
-        &[][..]
-    } else {
-        snapshot.source_messages.as_slice()
-    };
+    // Source and host history share the actual global model context. Frozen
+    // profile token caps no longer grant or withhold context authority.
+    let source_messages = snapshot.source_messages.as_slice();
     let source_context = prepare_scoped_chat_attachments(
         &snapshot.target_id,
         source_messages,
@@ -246,8 +242,8 @@ pub(super) fn handoff_messages(
         .validate()
         .map_err(|error| blocker("mention_sampling_invalid", error.message))?;
     let budget = ContextBudget {
-        source_tokens: snapshot.profile.source_history_tokens as usize,
-        host_tokens: snapshot.profile.host_context_tokens as usize,
+        source_tokens: settings.context_tokens as usize,
+        host_tokens: settings.context_tokens as usize,
         context_tokens: (settings.context_tokens.min(fingerprint.context_tokens)) as usize,
         output_tokens: sampling.max_tokens as usize,
     };

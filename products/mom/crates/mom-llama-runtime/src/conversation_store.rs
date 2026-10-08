@@ -354,7 +354,12 @@ pub fn conversation_draft_submit() -> Result<CommandResult<Conversation>> {
                     Err(blocker) => return Ok(Err(blocker)),
                 }
             } else {
-                let conversation = new_conversation(None, &settings, id, now);
+                let conversation = new_conversation(
+                    title_from_text(&drafts.drafts[index].message),
+                    &settings,
+                    id,
+                    now,
+                );
                 db.selected_conversation_id = Some(conversation.id.clone());
                 db.conversations.insert(0, conversation.clone());
                 conversation
@@ -475,7 +480,13 @@ pub fn conversation_list() -> Result<CommandResult<Vec<Conversation>>> {
     Ok(CommandResult::passed(
         "mom_llama.conversation_list",
         "contracted",
-        db.conversations,
+        db.conversations
+            .into_iter()
+            .map(|mut conversation| {
+                conversation.title = display_title(&conversation);
+                conversation
+            })
+            .collect::<Vec<_>>(),
         Vec::new(),
         Vec::new(),
         false,
@@ -521,8 +532,8 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
         .conversations
         .iter()
         .filter_map(|conversation| {
-            let title_matches =
-                query.is_empty() || conversation.title.to_lowercase().contains(&query);
+            let title = display_title(conversation);
+            let title_matches = query.is_empty() || title.to_lowercase().contains(&query);
             let message_match = conversation.messages.iter().find(|message| {
                 query.is_empty() || message.content.to_lowercase().contains(&query)
             });
@@ -531,12 +542,12 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
             }
             let snippet = message_match
                 .map(|message| snippet(&message.content, &query))
-                .unwrap_or_else(|| conversation.title.clone());
+                .unwrap_or_else(|| title.clone());
             Some(ConversationSearchHit {
                 conversation_id: conversation.id.clone(),
                 kind: conversation.kind,
                 active_leaf_message_id: conversation.active_leaf_message_id.clone(),
-                title: conversation.title.clone(),
+                title,
                 snippet,
                 message_count: conversation.messages.len(),
                 updated_at: conversation.updated_at.clone(),
@@ -1363,8 +1374,45 @@ pub fn active_path_messages(conversation: &Conversation) -> Vec<Message> {
     path
 }
 
+pub(crate) fn is_placeholder_title(title: &str, conversation_id: &str) -> bool {
+    matches!(title, "New chat" | "Default chat" | "Untitled conversation")
+        || title == conversation_id
+}
+
+fn title_from_text(text: &str) -> Option<String> {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| {
+            let line = line.trim();
+            let mut title = line.chars().take(64).collect::<String>();
+            if title.len() < line.len() {
+                title.push_str("...");
+            }
+            title
+        })
+}
+
+pub(crate) fn first_line_title(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .find(|message| message.role == MessageRole::User)
+        .and_then(|message| title_from_text(&message.content))
+        .unwrap_or_else(|| "New chat".to_string())
+}
+
+pub(crate) fn display_title(conversation: &Conversation) -> String {
+    if conversation.kind == ConversationKind::Chat
+        && is_placeholder_title(&conversation.title, &conversation.id)
+    {
+        first_line_title(&active_path_messages(conversation))
+    } else {
+        conversation.title.clone()
+    }
+}
+
 pub fn project_conversation(conversation: &Conversation) -> Conversation {
     let mut projected = conversation.clone();
+    projected.title = display_title(conversation);
     normalize_conversation_model_paths(&mut projected);
     projected.messages = active_path_messages(conversation);
     projected.active_leaf_message_id = projected.messages.last().map(|message| message.id.clone());
@@ -1741,6 +1789,42 @@ mod tests {
             attribution: None,
             attachment_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn placeholder_titles_follow_the_first_user_message_and_manual_titles_survive() {
+        let mut conversation = Conversation {
+            id: "title-test".into(),
+            title: "New chat".into(),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            kind: ConversationKind::Chat,
+            execution_profile: ConversationExecutionProfile::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: Some("reply".into()),
+            current_skill_ids: vec![],
+            messages: vec![
+                message("user", None, MessageRole::User, "Actual subject\nDetails"),
+                message("reply", Some("user"), MessageRole::Assistant, "Response"),
+            ],
+        };
+        assert_eq!(super::display_title(&conversation), "Actual subject");
+        assert_eq!(project_conversation(&conversation).title, "Actual subject");
+        assert_eq!(
+            conversation.title, "New chat",
+            "projection does not rewrite stored history"
+        );
+        conversation.title = "Chosen name".into();
+        assert_eq!(super::display_title(&conversation), "Chosen name");
+        assert!(super::title_from_text(" \n ").is_none());
+        assert!(
+            super::title_from_text(&"é".repeat(80))
+                .expect("Unicode title")
+                .ends_with("...")
+        );
     }
 
     #[test]

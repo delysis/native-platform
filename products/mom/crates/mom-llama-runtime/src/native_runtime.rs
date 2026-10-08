@@ -433,11 +433,12 @@ fn create_product_host(key: &ProductHostKey) -> Result<Arc<NativeHost>, NativeEr
         crate::store::RuntimeStore::open(&key.data_dir).map_err(prefix_store_error)?;
     let host = NativeHost::with_dependencies(
         NativeHostConfig {
-            memory_budget_bytes: key.memory_budget_bytes,
+            memory_budget_bytes: crate::memory_policy::resident_budget(key.memory_budget_bytes),
+            memory_cache_bytes: crate::memory_policy::prefix_cache_bytes(key.memory_budget_bytes)
+                as usize,
             max_slots: key.max_slots,
             cache_namespace: PRODUCT_PREFIX_CACHE_NAMESPACE.to_string(),
             cache_policy: host_cache_policy(key.cache_policy),
-            ..NativeHostConfig::default()
         },
         Arc::new(SystemClock),
         Some(Arc::new(ProductPrefixCacheStore {
@@ -506,6 +507,7 @@ pub(crate) fn model_configuration_for_profile(
     config.mmproj_path = mmproj_path
         .filter(|path| !path.as_os_str().is_empty())
         .map(Path::to_path_buf);
+    crate::memory_policy::validate_profile(settings, &config)?;
     Ok(config)
 }
 

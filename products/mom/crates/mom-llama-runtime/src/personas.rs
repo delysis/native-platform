@@ -83,6 +83,7 @@ pub struct PersonaFreezeInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct PersonaUpdateInput {
     pub persona_id: String,
     pub name: String,
@@ -94,9 +95,6 @@ pub struct PersonaUpdateInput {
     pub system_message: Option<String>,
     pub sampling: Option<llama_native_types::SamplingConfig>,
     pub chat_template: ChatTemplatePolicy,
-    pub tool_bindings: Vec<ToolBinding>,
-    pub source_history_tokens: u32,
-    pub host_context_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -407,9 +405,6 @@ pub fn persona_update(
         system_message,
         sampling,
         chat_template,
-        tool_bindings,
-        source_history_tokens,
-        host_context_tokens,
     } = input;
     if auto_discover_mmproj {
         if let Some(model_path) = model_path.as_deref()
@@ -436,16 +431,7 @@ pub fn persona_update(
             };
         }
     }
-    let tool_bindings = match normalize_tools(tool_bindings) {
-        Ok(tools) => tools,
-        Err(blocker) => {
-            return Ok(CommandResult::blocked(
-                "mom_llama.persona_update",
-                "stub_blocked",
-                blocker,
-            ));
-        }
-    };
+
     ensure_builtin_catalog()?;
     if let ChatTemplatePolicy::FrozenSource(template) = &chat_template {
         if template.trim().is_empty() {
@@ -552,9 +538,9 @@ pub fn persona_update(
                     .filter(|value| !value.trim().is_empty()),
                 sampling: sampling.clone(),
                 chat_template: chat_template.clone(),
-                tool_bindings: tool_bindings.clone(),
-                source_history_tokens: source_history_tokens.clamp(0, 32768),
-                host_context_tokens: host_context_tokens.clamp(0, 32768),
+                tool_bindings: Vec::new(),
+                source_history_tokens: 0,
+                host_context_tokens: 0,
                 version: persona.execution_profile.version.saturating_add(1),
             };
             persona.selected_model_path = model_path.clone();
@@ -2624,9 +2610,6 @@ mod tests {
                 system_message: None,
                 sampling: None,
                 chat_template: crate::conversation_store::ChatTemplatePolicy::ModelDefault,
-                tool_bindings: Vec::new(),
-                source_history_tokens: 4096,
-                host_context_tokens: 2048,
             },
         )
         .expect("stale Persona update returns a typed blocker");

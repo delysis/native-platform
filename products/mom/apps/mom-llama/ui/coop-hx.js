@@ -1141,6 +1141,25 @@
   const slugHandle = (value) => String(value || "")
     .trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "");
 
+  const openConversationRename = (target) => {
+    const modal = document.getElementById("conversation-rename-modal");
+    if (!modal) return;
+    modal.dataset.conversation = target.dataset.conversation;
+    const field = formField(modal, "conversation_title");
+    field.value = target.dataset.conversationTitle || target.querySelector?.("span")?.textContent || "";
+    setModalVisibility("conversation-rename-modal", true);
+    field.focus();
+    field.select();
+  };
+
+  const selectConversation = async (conversation) => {
+    await retainComposerDraft();
+    const result = await invoke("mom_llama_conversation_select", { conversation });
+    report(result);
+    await refreshConversationProjection();
+    return result;
+  };
+
   const openPersonaFreeze = (button) => {
     const modal = document.getElementById("persona-freeze-modal");
     if (!modal) return;
@@ -1150,18 +1169,6 @@
     formField(modal, "freeze_handle").value = "";
     setModalVisibility("persona-freeze-modal", true);
     formField(modal, "freeze_name")?.focus();
-  };
-
-  const personaTools = (value) => {
-    const bindings = String(value || "").split(/\r?\n/)
-      .map((line) => line.trim()).filter(Boolean).map((line) => {
-        const [server, ...tool] = line.split("/");
-        return { server: server.trim(), tool: tool.join("/").trim() };
-      }).filter((binding) => binding.server && binding.tool);
-    if (bindings.length > MAX_PERSONA_TOOL_BINDINGS) {
-      throw new Error(`A Persona may attach at most ${MAX_PERSONA_TOOL_BINDINGS} tools.`);
-    }
-    return bindings;
   };
 
   const setPersonaEditor = (persona) => {
@@ -1187,15 +1194,8 @@
       modelChoice.value = modelPath;
     }
     formField(editor, "persona_system_message").value = profile.system_message || "";
-    formField(editor, "persona_source_tokens").value = profile.source_history_tokens ?? 4096;
-    formField(editor, "persona_host_tokens").value = profile.host_context_tokens ?? 2048;
-    const toolsField = formField(editor, "persona_tools");
-    if (toolsField) {
-      toolsField.value = (profile.tool_bindings || [])
-        .map((binding) => `${binding.server}/${binding.tool}`).join("\n");
-    }
-    const frozen = profile.chat_template && typeof profile.chat_template === "object"
-      ? profile.chat_template.frozen_source : null;
+    const frozen = profile.chat_template?.kind === "frozen_source"
+      ? profile.chat_template.template : null;
     formField(editor, "persona_chat_template_policy").value = frozen == null ? "model_default" : "frozen_source";
     formField(editor, "persona_chat_template").value = frozen || "";
     editor.querySelector(".persona-template-source")?.classList.toggle("is-hidden", frozen == null);
@@ -1337,8 +1337,8 @@
     const profile = current.execution_profile || {};
     const modelPath = formValue(editor, "persona_model_choice") || null;
     const template = formValue(editor, "persona_chat_template_policy") === "frozen_source"
-      ? { frozen_source: formValue(editor, "persona_chat_template") }
-      : "model_default";
+      ? { kind: "frozen_source", template: formValue(editor, "persona_chat_template") }
+      : { kind: "model_default" };
     return {
       persona_id: formValue(editor, "persona_id"),
       name: formValue(editor, "persona_name"),
@@ -1353,11 +1353,6 @@
       system_message: formValue(editor, "persona_system_message") || null,
       sampling: profile.sampling || null,
       chat_template: template,
-      tool_bindings: mcpProcessUiSupported()
-        ? personaTools(formValue(editor, "persona_tools"))
-        : (profile.tool_bindings || []),
-      source_history_tokens: Math.max(0, Math.trunc(Number(formValue(editor, "persona_source_tokens") || 4096))),
-      host_context_tokens: Math.max(0, Math.trunc(Number(formValue(editor, "persona_host_tokens") || 2048))),
     };
   };
 
@@ -1692,6 +1687,7 @@
       } else {
         item.dataset.conversationMenuTarget = "true";
         item.dataset.conversation = hit.conversation_id;
+        item.dataset.conversationTitle = hit.title;
         item.dataset.message = hit.active_leaf_message_id || "";
       }
       const button = createCommandElement("button", DYNAMIC_CONTROL_SPECS.conversationSelect);
@@ -1703,7 +1699,7 @@
       const title = document.createElement("span");
       title.textContent = hit.title || hit.conversation_id;
       const detail = document.createElement("small");
-      detail.textContent = hit.snippet || `${hit.message_count || 0} messages`;
+      detail.textContent = hit.snippet || "";
       button.append(title, detail);
       item.appendChild(button);
       list.appendChild(item);
@@ -2541,10 +2537,11 @@
     "conversation-search-open": async () => { setSearchMode(true); await search(); },
     "conversation-search-close": async () => setSearchMode(false),
     "conversation-select": async (button) => {
-      await retainComposerDraft();
-      const result = await invoke("mom_llama_conversation_select", { conversation: button.dataset.conversation });
-      report(result); await refreshConversationProjection();
+      if (button.dataset.conversation === selectedConversation()) {
+        openConversationRename(button.closest?.("[data-conversation-menu-target]") || button);
+      } else await selectConversation(button.dataset.conversation);
     },
+    "conversation-rename-close": async () => setModalVisibility("conversation-rename-modal", false),
     "chat-cancel": async () => report(await invoke("mom_llama_chat_cancel", { conversation: activeDispatchConversation || selectedConversation() })),
     "chat-skip-reasoning": async (button) => {
       const result = await invoke("mom_llama_chat_skip_reasoning", { conversation: selectedConversation() });
@@ -3240,6 +3237,7 @@
     } else {
       const conversation = target.dataset.conversation;
       items = [
+        { id: "rename", text: "Rename…", action: safeAction(() => openConversationRename(target)) },
         { id: "delete", text: "Delete", action: safeAction(async () => {
           await retainComposerDraft();
           report(await invoke("mom_llama_conversation_delete", { conversation }));
@@ -3247,7 +3245,7 @@
         }) },
         { id: "save-persona", text: "Save as Persona…", enabled: !!target.dataset.message,
           action: safeAction(async () => {
-            await actionHandlers["conversation-select"]({ dataset: { conversation } });
+            if (selectedConversation() !== conversation) await selectConversation(conversation);
             openPersonaFreeze(target);
           }) },
       ];
@@ -3270,6 +3268,10 @@
   });
 
   document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && event.target.closest("#conversation-rename-modal")) {
+      event.preventDefault();
+      setModalVisibility("conversation-rename-modal", false);
+    }
     if (event.key === "Escape" && event.target.closest("#conversation-search-form")) {
       event.preventDefault();
       setSearchMode(false);
@@ -3392,6 +3394,17 @@
         } finally {
           activeDispatchConversation = null;
           releaseChatBusy(dispatchLease);
+        }
+      }
+      if (form.id === "conversation-rename-form") {
+        const modal = document.getElementById("conversation-rename-modal");
+        const title = formValue(form, "conversation_title").trim();
+        if (!title) return;
+        const result = await invoke("mom_llama_conversation_rename", { conversation: modal.dataset.conversation, title });
+        report(result);
+        if (result?.status !== "blocked") {
+          setModalVisibility("conversation-rename-modal", false);
+          await refreshConversationProjection();
         }
       }
       if (form.id === "settings-form") {

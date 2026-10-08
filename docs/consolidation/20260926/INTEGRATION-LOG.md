@@ -271,3 +271,33 @@ reopened intact. No model work or additional layout changes were required.
   test also now uses `std::slice::from_ref`. Focused Clippy for Mom runtime, app
   and CLI passes. The first gate remains preserved at mom-single-draft-20261008/
   local-ci; the final unchanged-tree gate uses local-ci-final.
+
+
+## 2026-10-08 — Global RAM planning and chat naming
+
+- Removed editable Persona history/context limits and tool bindings. Ordinary
+  invited responses use global context policy and cannot offer Persona MCP tools.
+  Immutable historical profile fields remain provenance only; explicit global
+  MCP and existing journal recovery remain separate backend capabilities.
+- Model/projector weights must fit within half of physical RAM. Global context
+  is derived from supported GGUF attention metadata and declared capacity, with
+  weights, KV, workspace, sequence metadata and prefix copies budgeted inside
+  two thirds of RAM. Manual legacy budgets are clamped to that ceiling. Unknown
+  recurrent/MLA layouts fail admission rather than relying on a heuristic.
+  Gemma 4 key/value metadata was checked against the pinned llama.cpp source;
+  sliding-window/shared-KV savings are deliberately ignored conservatively.
+  These are admission estimates, not hard RSS limits or all-hardware acceptance.
+- Titles derive from the first user message until renamed; sidebar counts are
+  removed. Selected-name click opens Rename, also available in native menus.
+- Native inspection on the signed review profile verified no Persona context/tool
+  controls, selected-name rename and native Rename/Delete/Save as Persona menu.
+  The open Robert Miller profile edits were retained across update and saved.
+  This exposed and repaired the frontend's invalid ChatTemplatePolicy JSON shape;
+  its two supported tagged forms now have a frontend regression test.
+  A real Gemma 4 request with the automatic plan returned `OK`.
+- Focused receipts: runtime 251 passed, app 75 passed, frontend 30 passed,
+  engine 157 passed/10 opt-in ignored, strict focused Clippy passed. An explicit
+  real-GGUF metadata estimate test passed without loading tensors. Receipts:
+  mom-memory-policy-20261008. The consolidated settled-tree gate is recorded
+  separately there. Compact native review, old credential prompt repair and
+  full release/model journey remain unqualified; no main promotion claimed.

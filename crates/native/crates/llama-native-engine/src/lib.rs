@@ -8,7 +8,9 @@ mod first_word_runtime;
 mod generation_admission;
 mod memory_estimate;
 mod operation_registry;
-pub use memory_estimate::{MemoryEstimateBasis, NativeMemoryEstimate, estimate_memory_reservation};
+pub use memory_estimate::{
+    MemoryEstimateBasis, NativeMemoryEstimate, estimate_memory_reservation, model_context_capacity,
+};
 mod state_buffer;
 
 pub use controlled_runtime::{

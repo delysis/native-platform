@@ -921,9 +921,9 @@ where
     conversation.messages.push(assistant_message);
     conversation.active_leaf_message_id = Some(assistant_message_id.clone());
     if upstream_setting_bool(&settings, "titleGenerationUseFirstLine")
-        && should_replace_title(&conversation.title, &conversation.id)
+        && crate::conversation_store::is_placeholder_title(&conversation.title, &conversation.id)
     {
-        conversation.title = first_line_title(&conversation.messages);
+        conversation.title = crate::conversation_store::first_line_title(&conversation.messages);
     }
     conversation.updated_at = now_ms().to_string();
     conversation.selected_model_path = settings.model_path.clone();
@@ -1269,27 +1269,6 @@ pub(crate) fn upstream_setting_bool(settings: &crate::config::Settings, key: &st
         .get(key)
         .and_then(Value::as_bool)
         .unwrap_or(false)
-}
-
-fn should_replace_title(title: &str, conversation_id: &str) -> bool {
-    matches!(title, "New chat" | "Default chat" | "Untitled conversation")
-        || title == conversation_id
-}
-
-fn first_line_title(messages: &[Message]) -> String {
-    messages
-        .iter()
-        .find(|message| message.role == MessageRole::User)
-        .and_then(|message| message.content.lines().find(|line| !line.trim().is_empty()))
-        .map(|line| {
-            let mut title = line.trim().chars().take(64).collect::<String>();
-            if title.len() < line.trim().len() {
-                title.push_str("...");
-            }
-            title
-        })
-        .filter(|title| !title.is_empty())
-        .unwrap_or_else(|| "New chat".to_string())
 }
 
 fn retag_chat_result(result: &mut CommandResult<ChatSendOutput>, command: &str) {
