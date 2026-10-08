@@ -8,7 +8,28 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
+
+/// Presentation may inspect this capability, but cannot select or change it.
+/// Only installing the native executor opts into the unfinished Mom route.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceChatRoute {
+    #[default]
+    Loom,
+    MomExperimental,
+}
+
+/// Use exactly the executor-presence test used by `terminal_run`. A chat pane
+/// alone never grants a writer exemption. There is no renderer-side setter.
+#[tauri::command]
+pub(crate) fn workspace_chat_route<R: Runtime>(app: AppHandle<R>) -> WorkspaceChatRoute {
+    if app.try_state::<WorkspaceChatService<R>>().is_some() {
+        WorkspaceChatRoute::MomExperimental
+    } else {
+        WorkspaceChatRoute::Loom
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceChatRequest {

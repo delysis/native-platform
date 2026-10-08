@@ -25,6 +25,7 @@ Open and edit Loom's app-owned default project or a user-selected project. Gener
 - `allow-document-create`
 - `allow-workspace-template-get`
 - `allow-workspace-template-enable`
+- `allow-workspace-chat-route`
 - `allow-document-rename`
 - `allow-document-delete`
 - `allow-attachment-ingest`
@@ -2548,6 +2549,32 @@ Enables the weave_status command without any pre-configured scope.
 <td>
 
 Denies the weave_status command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:allow-workspace-chat-route`
+
+</td>
+<td>
+
+Enables the workspace_chat_route command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`loom:deny-workspace-chat-route`
+
+</td>
+<td>
+
+Denies the workspace_chat_route command without any pre-configured scope.
 
 </td>
 </tr>

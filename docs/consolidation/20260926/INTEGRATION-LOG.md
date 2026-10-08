@@ -313,3 +313,40 @@ The regression fails on the pre-fix behavior with `Draft Persona is unavailable`
 and passes after repair. All 16 Persona tests pass. The failed initial test
 assertion and the genuine pre-fix failure remain in mom-promotion-review-20261008.
 This correction does not qualify the remaining normal-Loom promotion journeys.
+
+## 2026-10-08 — Source-bound promotion review repairs
+
+Astra reviewed exact candidate bf7f0235 against main and found four defects:
+sidebar rename could replace a concurrent reply with a stale registry; retained
+source links could be omitted from Mom context; the default replacement ignored
+original Loom history/output edits; and ordinary chat no longer followed Loom's
+selected model. Review and delivered patches are retained in
+`mom-promotion-review-20261008` outside this checkout.
+
+- Rename now reads and edits metadata in the authoritative IMMEDIATE transaction.
+  Chat selection used the same stale registry pattern and now uses that transaction
+  boundary too. Concurrent native-store tests preserve all 128 committed messages
+  during 64 sidebar mutations. Reintroducing the old rename write pattern loses
+  the messages; the failing negative-control receipt is retained.
+- Mom workspace dispatch resolves explicit retained links through the existing
+  reference/grant/snapshot/media gates; bare Persona addresses retain their grammar.
+  Actual command/store tests show a missing source blocks before dispatch and the
+  valid retained text reaches the executor. Both fail with the previous callsite.
+- Ordinary Loom uses its original writer/chat route by default. Mom workspace
+  dispatch is a native-only experimental opt-in, not a renderer setting. A read-only
+  capability reports the same executor-presence predicate as dispatch; unknown or
+  stale capability cannot waive writer admission. WorkspacePane remains unchanged.
+  This is the review's allowed fallback, not completed Mom history/edit/model parity.
+- Focused local checks: eight plugin chat tests, eleven real-App browser tests,
+  twenty-two portable route checks, and Svelte validation (zero errors/warnings).
+  The portable source guard was corrected for rustfmt's equivalent match-arm form;
+  its initial failure is retained. The new suite uses the CI `test-*.mjs` convention
+  so the settled-tree gate actually discovers it.
+
+The signed standalone Mom development snapshot retains its earlier UI/runtime
+improvements. This does not complete one-renderer consolidation or remove its
+remaining duplicate renderer. Streaming/projection recovery and chat-only layout
+remain follow-ups; legacy Keychain qualification remains open. Promotion still
+requires the clean unchanged-tree component gate and exact packaged native writer,
+embedded context, active-work quit and relaunch journeys. The Mac was locked during
+this review, so native inspection currently awaits unlocking, not source approval.

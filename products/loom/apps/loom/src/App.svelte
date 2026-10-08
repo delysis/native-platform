@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { convertFileSrc } from '@tauri-apps/api/core';
+  import { convertFileSrc, invoke } from '@tauri-apps/api/core';
   import { getCurrentWindow } from '@tauri-apps/api/window';
   import LoomEditor from './lib/LoomEditor.svelte';
   import TerminalPane from './lib/TerminalPane.svelte';
@@ -9842,15 +9842,23 @@
     paneSelection = { ...paneSelection, [position]: id };
   }
 
-  async function preparePaneRun(requireWritingModel = true): Promise<OpenDocument | null> {
+  async function preparePaneRun(chat = false): Promise<OpenDocument | null> {
     if (!project || !document || editorReadonly || compositionActive || !flushEditors()) return null;
     const expected = { projectId: project.project_id, sessionId: project.session_id, documentId: document.summary.document_id, epoch: documentEpoch, text: documentText };
     const current = () => terminalScopeIsCurrent(expected.projectId, expected.sessionId) && document?.summary.document_id === expected.documentId && documentEpoch === expected.epoch && documentText === expected.text;
     cancelSuggestionTimer();
     await cancelActiveBranches();
     if (!current() || !await flushCurrentDocument() || !current()) return null;
-    // Mom owns chat model selection. Document-bound panes still checkpoint the
-    // exact source, but a chat must not activate the manuscript writer.
+    // Match the actual native route, not the pane's visual kind. Ordinary Loom
+    // chat uses the selected Loom writer; explicit Mom opt-in retains Persona
+    // model authority. An unavailable/unknown capability must not waive admission.
+    let requireWritingModel = true;
+    if (chat) {
+      const route = await invoke<unknown>('plugin:loom|workspace_chat_route');
+      if (!current()) return null;
+      if (route !== 'loom' && route !== 'mom_experimental') throw new Error('Loom could not verify the chat execution route.');
+      requireWritingModel = route === 'loom';
+    }
     if (requireWritingModel && !currentModel && !await loadPreferredSuggestionModel(currentWorkspaceCapture() ?? undefined)) return null;
     if (!current() || (requireWritingModel && !currentModel)) return null;
     return document;
@@ -10546,7 +10554,7 @@
               selectionDisabled={busyPaneSlots.has(slot.position)} onSelect={(id) => selectPane(slot.position, id)} onCollapse={() => togglePane(slot.position)} />
             {#each slot.choices as [paneId, paneConfig] (paneId)}
               <div class="workspace-pane-content" class:hidden-pane={paneId !== selected[0]}>
-            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={(text) => updateText(text, 'workspace', paneId)} beforeRun={() => preparePaneRun(paneConfig.kind !== 'chat')} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
+            <WorkspacePane bind:this={paneEditors[paneId]} paneId={paneId} config={paneConfig} projectId={project.project_id} sessionId={project.session_id} documents={project.documents} source={document} value={documentText} readonly={editorReadonly} onChange={(text) => updateText(text, 'workspace', paneId)} beforeRun={() => preparePaneRun(paneConfig.kind === 'chat')} beforeAttachmentImport={persistCurrentContextText} onContextChanged={adoptAuthoritativeContext} onOpenDocument={(id) => void openPaneDocument(id)} onRunsChanged={() => { void refreshTerminalRuns(); scheduleProjectFilesystemRefresh(0); }} pinnedOutputs={pinnedOutputs} onPinOutput={toggleOutputPin} onFocus={() => materialOriginPane = paneId} onCompositionChange={(active) => paneComposing = { ...paneComposing, [paneId]: active }} onBusyChange={(busy) => paneBusy = { ...paneBusy, [paneId]: busy }} />
               </div>
             {/each}
           </aside>

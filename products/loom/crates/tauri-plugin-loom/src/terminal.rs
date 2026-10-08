@@ -387,6 +387,25 @@ fn prompt_reference_names(
     }
 }
 
+fn workspace_chat_reference_names(
+    input: &str,
+    configured: Option<&[String]>,
+) -> Result<BTreeSet<String>, IpcFailure> {
+    let configured = configured.unwrap_or_default();
+    validate_explicit_references(configured)?;
+    let mut names = configured.iter().cloned().collect::<BTreeSet<_>>();
+    // Retained links inserted by the existing pane are passive source identity,
+    // not Persona addresses. Resolve them through the existing grant, snapshot
+    // and media gates before dispatch; never reinterpret their friendly labels.
+    // Bare @addresses remain Mom's participant grammar.
+    for reference in document_references(input).map_err(io_failure)? {
+        if input.as_bytes().get(reference.range.start) == Some(&b'[') {
+            names.insert(reference.name);
+        }
+    }
+    Ok(names)
+}
+
 fn bounded(value: String) -> Result<String, IpcFailure> {
     if value.len() > MAX_PROMPT_BYTES {
         Err(failure(
@@ -567,11 +586,7 @@ pub(super) async fn terminal_run<R: Runtime>(
             if text.trim().is_empty() {
                 return Err(failure("Write a message to send."));
             }
-            names = context_references
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
+            names = workspace_chat_reference_names(text, context_references.as_deref())?;
         }
         NeuralCommand::Prompt(text) => {
             names = prompt_reference_names(

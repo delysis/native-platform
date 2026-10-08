@@ -495,34 +495,35 @@ pub fn conversation_list() -> Result<CommandResult<Vec<Conversation>>> {
 }
 
 pub fn conversation_select(id: &str) -> Result<CommandResult<Conversation>> {
-    let mut db = load_db()?;
-    let Some(conversation) = db
-        .conversations
-        .iter()
-        .find(|conversation| conversation.id == id)
-        .cloned()
-    else {
-        return Ok(CommandResult::blocked(
-            "mom_llama.conversation_select",
-            "stub_blocked",
-            Blocker::new(
-                "conversation_not_found",
-                format!("Conversation {id} was not found."),
-                vec!["Run `mom-llama conversation list --json`.".to_string()],
-            ),
-        ));
+    let store = RuntimeStore::current()?;
+    let Some(conversation) = select_conversation_in_store(&store, id)? else {
+        return Ok(conversation_not_found("mom_llama.conversation_select", id));
     };
-    db.selected_conversation_id = Some(id.to_string());
-    let path = save_db(&db)?;
     Ok(CommandResult::passed(
         "mom_llama.conversation_select",
         "contracted",
         project_conversation(&conversation),
-        vec![path.display().to_string()],
+        vec![store.path().display().to_string()],
         Vec::new(),
         false,
         false,
     ))
+}
+
+fn select_conversation_in_store(store: &RuntimeStore, id: &str) -> Result<Option<Conversation>> {
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
+            let Some(conversation) = db.conversations.iter().find(|item| item.id == id).cloned()
+            else {
+                return Ok(None);
+            };
+            db.selected_conversation_id = Some(id.to_string());
+            Ok(Some(conversation))
+        },
+    )
 }
 
 pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<ConversationSearchHit>>> {
@@ -566,30 +567,47 @@ pub fn conversation_search(query: &str) -> Result<CommandResult<Vec<Conversation
 }
 
 pub fn conversation_rename(id: &str, title: String) -> Result<CommandResult<Conversation>> {
-    let mut db = load_db()?;
-    let Some(conversation) = db
-        .conversations
-        .iter_mut()
-        .find(|conversation| conversation.id == id)
-    else {
+    let store = RuntimeStore::current()?;
+    let Some(result) = rename_conversation_in_store(&store, id, &title)? else {
         return Ok(conversation_not_found("mom_llama.conversation_rename", id));
     };
-    conversation.title = title.trim().to_string();
-    if conversation.title.is_empty() {
-        conversation.title = "Untitled conversation".to_string();
-    }
-    conversation.updated_at = now_ms().to_string();
-    let result = conversation.clone();
-    let path = save_db(&db)?;
     Ok(CommandResult::passed(
         "mom_llama.conversation_rename",
         "contracted",
         result,
-        vec![path.display().to_string()],
+        vec![store.path().display().to_string()],
         Vec::new(),
         false,
         false,
     ))
+}
+
+fn rename_conversation_in_store(
+    store: &RuntimeStore,
+    id: &str,
+    title: &str,
+) -> Result<Option<Conversation>> {
+    // Native reply commits run concurrently with sidebar commands. Read and
+    // change only this conversation's metadata under the store's IMMEDIATE
+    // transaction; never replace the registry from a pre-transaction snapshot.
+    store.mutate_documents(
+        CONVERSATIONS_NAMESPACE,
+        ConversationDb::default,
+        |db, documents| {
+            crate::personas::reject_removed_conversation_writes_from_documents(db, documents)?;
+            let Some(conversation) = db.conversations.iter_mut().find(|item| item.id == id) else {
+                return Ok(None);
+            };
+            let title = title.trim();
+            conversation.title = if title.is_empty() {
+                "Untitled conversation".to_string()
+            } else {
+                title.to_string()
+            };
+            conversation.updated_at = now_ms().to_string();
+            Ok(Some(conversation.clone()))
+        },
+    )
 }
 
 pub fn conversation_system_message_update(
@@ -1877,5 +1895,275 @@ mod tests {
         assert_eq!(projected.selected_model_path, None);
         assert_eq!(projected.execution_profile.model_path, None);
         assert_eq!(projected.execution_profile.mmproj_path, None);
+    }
+
+    #[cfg(unix)]
+    fn with_rename_store(test: impl FnOnce(&crate::store::RuntimeStore) -> anyhow::Result<()>) {
+        let directory = std::env::temp_dir().join(format!("mom-rename-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("create isolated store directory");
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _remove = Remove(directory.clone());
+        let store =
+            crate::store::RuntimeStore::open(&directory).expect("open encrypted test store");
+        test(&store).expect("rename store regression");
+    }
+
+    #[cfg(unix)]
+    fn rename_fixture(id: &str) -> Conversation {
+        Conversation {
+            id: id.into(),
+            title: "Original title".into(),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            kind: ConversationKind::Chat,
+            execution_profile: ConversationExecutionProfile::default(),
+            selected_model_path: None,
+            source_conversation_id: None,
+            source_message_id: None,
+            branch_root_message_id: None,
+            active_leaf_message_id: None,
+            current_skill_ids: Vec::new(),
+            messages: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_preserves_committed_replies_other_chats_selection_and_draft() {
+        with_rename_store(|store| {
+            let mut db = super::ConversationDb {
+                conversations: vec![rename_fixture("host")],
+                selected_conversation_id: Some("host".into()),
+            };
+            store.put(super::CONVERSATIONS_NAMESPACE, &db)?;
+            // Work committed since the sidebar displayed the old title must
+            // survive. Reopen the real store to verify durable preservation.
+            db.conversations[0].messages = vec![
+                message("user", None, MessageRole::User, "Preserve my input"),
+                message(
+                    "reply",
+                    Some("user"),
+                    MessageRole::Assistant,
+                    "Native reply",
+                ),
+            ];
+            db.conversations[0].active_leaf_message_id = Some("reply".into());
+            db.conversations.push(rename_fixture("other"));
+            db.selected_conversation_id = Some("other".into());
+            store.put(super::CONVERSATIONS_NAMESPACE, &db)?;
+            let draft = super::DraftDb {
+                drafts: vec![super::DraftMessage {
+                    conversation_id: Some("default".into()),
+                    message: "Unsent input".into(),
+                    attachment_ids: Vec::new(),
+                    updated_at: "2".into(),
+                }],
+            };
+            store.put(super::DRAFTS_NAMESPACE, &draft)?;
+            let result = super::rename_conversation_in_store(store, "host", "  Chosen title  ")?
+                .expect("existing conversation");
+            assert_eq!(result.title, "Chosen title");
+            assert_eq!(result.messages, db.conversations[0].messages);
+            db.conversations[0].title = result.title;
+            db.conversations[0].updated_at = result.updated_at;
+            let reopened =
+                crate::store::RuntimeStore::open(store.path().parent().expect("store parent"))?;
+            assert_eq!(
+                reopened.get::<super::ConversationDb>(super::CONVERSATIONS_NAMESPACE)?,
+                Some(db)
+            );
+            assert_eq!(
+                reopened.get::<super::DraftDb>(super::DRAFTS_NAMESPACE)?,
+                Some(draft)
+            );
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_rename_never_discards_committed_messages() {
+        with_rename_store(|store| {
+            store.put(
+                super::CONVERSATIONS_NAMESPACE,
+                &super::ConversationDb {
+                    conversations: vec![rename_fixture("host")],
+                    selected_conversation_id: Some("host".into()),
+                },
+            )?;
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|threads| {
+                let writer = threads.spawn(|| -> anyhow::Result<()> {
+                    start.wait();
+                    for turn in 0..64 {
+                        store.mutate_documents(
+                            super::CONVERSATIONS_NAMESPACE,
+                            super::ConversationDb::default,
+                            |db, _| {
+                                let host = &mut db.conversations[0];
+                                let user_id = format!("user-{turn}");
+                                let reply_id = format!("reply-{turn}");
+                                let mut user = message(
+                                    &user_id,
+                                    host.active_leaf_message_id.as_deref(),
+                                    MessageRole::User,
+                                    "User input",
+                                );
+                                let mut reply = message(
+                                    &reply_id,
+                                    Some(&user_id),
+                                    MessageRole::Assistant,
+                                    "Committed reply",
+                                );
+                                user.conversation_id = "host".into();
+                                reply.conversation_id = "host".into();
+                                host.messages.extend([user, reply]);
+                                host.active_leaf_message_id = Some(reply_id);
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    Ok(())
+                });
+                let renamer = threads.spawn(|| -> anyhow::Result<()> {
+                    start.wait();
+                    for iteration in 0..64 {
+                        assert!(
+                            super::rename_conversation_in_store(
+                                store,
+                                "host",
+                                &format!("Title {iteration}")
+                            )?
+                            .is_some()
+                        );
+                    }
+                    Ok(())
+                });
+                writer.join().expect("writer thread")?;
+                renamer.join().expect("rename thread")?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            let db = store
+                .get::<super::ConversationDb>(super::CONVERSATIONS_NAMESPACE)?
+                .expect("retained conversations");
+            assert_eq!(db.conversations[0].messages.len(), 128);
+            assert_eq!(
+                db.conversations[0].active_leaf_message_id.as_deref(),
+                Some("reply-63")
+            );
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_selection_never_discards_committed_messages() {
+        with_rename_store(|store| {
+            store.put(
+                super::CONVERSATIONS_NAMESPACE,
+                &super::ConversationDb {
+                    conversations: vec![rename_fixture("host")],
+                    selected_conversation_id: Some("host".into()),
+                },
+            )?;
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|threads| {
+                let writer = threads.spawn(|| -> anyhow::Result<()> {
+                    start.wait();
+                    for turn in 0..64 {
+                        store.mutate_documents(
+                            super::CONVERSATIONS_NAMESPACE,
+                            super::ConversationDb::default,
+                            |db, _| {
+                                let host = &mut db.conversations[0];
+                                let user_id = format!("user-{turn}");
+                                let reply_id = format!("reply-{turn}");
+                                let mut user = message(
+                                    &user_id,
+                                    host.active_leaf_message_id.as_deref(),
+                                    MessageRole::User,
+                                    "User input",
+                                );
+                                let mut reply = message(
+                                    &reply_id,
+                                    Some(&user_id),
+                                    MessageRole::Assistant,
+                                    "Committed reply",
+                                );
+                                user.conversation_id = "host".into();
+                                reply.conversation_id = "host".into();
+                                host.messages.extend([user, reply]);
+                                host.active_leaf_message_id = Some(reply_id);
+                                Ok(())
+                            },
+                        )?;
+                    }
+                    Ok(())
+                });
+                let renamer = threads.spawn(|| -> anyhow::Result<()> {
+                    start.wait();
+                    for _ in 0..64 {
+                        assert!(super::select_conversation_in_store(store, "host")?.is_some());
+                    }
+                    Ok(())
+                });
+                writer.join().expect("writer thread")?;
+                renamer.join().expect("rename thread")?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            let db = store
+                .get::<super::ConversationDb>(super::CONVERSATIONS_NAMESPACE)?
+                .expect("retained conversations");
+            assert_eq!(db.conversations[0].messages.len(), 128);
+            assert_eq!(
+                db.conversations[0].active_leaf_message_id.as_deref(),
+                Some("reply-63")
+            );
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_does_not_resurrect_a_removed_conversation() {
+        with_rename_store(|store| {
+            let original = super::ConversationDb {
+                conversations: vec![rename_fixture("host")],
+                selected_conversation_id: Some("host".into()),
+            };
+            store.put(super::CONVERSATIONS_NAMESPACE, &original)?;
+            let current = super::ConversationDb {
+                conversations: vec![rename_fixture("other")],
+                selected_conversation_id: Some("other".into()),
+            };
+            store.put(super::CONVERSATIONS_NAMESPACE, &current)?;
+            assert!(super::rename_conversation_in_store(store, "host", "Gone")?.is_none());
+            assert_eq!(
+                store.get::<super::ConversationDb>(super::CONVERSATIONS_NAMESPACE)?,
+                Some(current)
+            );
+            Ok(())
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_retains_the_existing_blank_title_policy() {
+        with_rename_store(|store| {
+            let db = super::ConversationDb {
+                conversations: vec![rename_fixture("host")],
+                selected_conversation_id: Some("host".into()),
+            };
+            store.put(super::CONVERSATIONS_NAMESPACE, &db)?;
+            let result = super::rename_conversation_in_store(store, "host", " \n\t ")?
+                .expect("existing conversation");
+            assert_eq!(result.title, "Untitled conversation");
+            Ok(())
+        });
     }
 }

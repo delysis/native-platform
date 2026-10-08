@@ -40,11 +40,25 @@ impl Application {
         &self,
         builder: tauri::Builder<tauri::Wry>,
     ) -> tauri::Builder<tauri::Wry> {
-        let builder = builder.manage(tauri_plugin_loom::WorkspaceChatService::new(Arc::new(
-            MomWorkspaceExecutor {
-                mom: self.mom.clone(),
-            },
-        )));
+        self.configure_workspace_chat(builder, tauri_plugin_loom::WorkspaceChatRoute::default())
+    }
+
+    /// Native-only opt-in. The Mom route cannot become the ordinary default
+    /// until retained Loom history/output revisions and model choice have
+    /// authority-correct parity. This does not change the standalone Mom app.
+    pub(crate) fn configure_workspace_chat(
+        &self,
+        builder: tauri::Builder<tauri::Wry>,
+        route: tauri_plugin_loom::WorkspaceChatRoute,
+    ) -> tauri::Builder<tauri::Wry> {
+        let builder = match route {
+            tauri_plugin_loom::WorkspaceChatRoute::Loom => builder,
+            tauri_plugin_loom::WorkspaceChatRoute::MomExperimental => builder.manage(
+                tauri_plugin_loom::WorkspaceChatService::new(Arc::new(MomWorkspaceExecutor {
+                    mom: self.mom.clone(),
+                })),
+            ),
+        };
         self.mom.configure(builder)
     }
 

@@ -27,7 +27,7 @@ mod terminal_receipts;
 mod workspace_chat;
 pub use workspace_chat::{
     WorkspaceChatExecutor, WorkspaceChatFuture, WorkspaceChatOutput, WorkspaceChatRequest,
-    WorkspaceChatService,
+    WorkspaceChatRoute, WorkspaceChatService,
 };
 mod workspace_copy;
 mod workspace_preview;
@@ -2216,6 +2216,7 @@ impl Builder {
                 branch_body,
                 weave_status,
                 weave_start,
+                workspace_chat::workspace_chat_route,
                 terminal_run,
                 terminal_list,
                 terminal_cancel,
@@ -11958,7 +11959,7 @@ mod tests {
         }
     }
 
-    fn test_loaded_model(path: &Path, stable_model_id: &str) -> LoadedModel {
+    pub(super) fn test_loaded_model(path: &Path, stable_model_id: &str) -> LoadedModel {
         let expectation = test_policy_expectation(stable_model_id.as_bytes());
         LoadedModel {
             selected_path: path.to_path_buf(),

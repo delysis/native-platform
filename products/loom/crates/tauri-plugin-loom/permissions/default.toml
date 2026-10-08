@@ -25,6 +25,7 @@ permissions = [
   "allow-document-create",
   "allow-workspace-template-get",
   "allow-workspace-template-enable",
+  "allow-workspace-chat-route",
   "allow-document-rename",
   "allow-document-delete",
   "allow-attachment-ingest",

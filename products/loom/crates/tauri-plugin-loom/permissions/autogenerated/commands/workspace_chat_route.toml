@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-workspace-chat-route"
+description = "Enables the workspace_chat_route command without any pre-configured scope."
+commands.allow = ["workspace_chat_route"]
+
+[[permission]]
+identifier = "deny-workspace-chat-route"
+description = "Denies the workspace_chat_route command without any pre-configured scope."
+commands.deny = ["workspace_chat_route"]

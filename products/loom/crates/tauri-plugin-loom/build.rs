@@ -83,6 +83,7 @@ const COMMANDS: &[&str] = &[
     "branch_body",
     "weave_status",
     "weave_start",
+    "workspace_chat_route",
     "terminal_run",
     "terminal_list",
     "terminal_cancel",
