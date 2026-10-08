@@ -793,6 +793,13 @@ fn persona_remove_from_library_inner_in_scope(
                     anyhow::bail!("Persona disappeared inside its removal transaction");
                 };
                 let persona_snapshot = conversations.conversations.remove(index);
+                // The shared unsent draft belongs to the user, not this template.
+                // Detach its removed Persona atomically while retaining all input.
+                let namespace = crate::conversation_store::NEW_CHAT_CONTEXT_NAMESPACE;
+                let pending: Option<String> = documents.get(namespace)?.unwrap_or_default();
+                if pending.as_deref() == Some(input.persona_id.as_str()) {
+                    documents.put_bytes(namespace, &serde_json::to_vec(&None::<String>)?)?;
+                }
                 if conversations.selected_conversation_id.as_deref()
                     == Some(input.persona_id.as_str())
                 {
@@ -2442,6 +2449,52 @@ mod tests {
         let provenance = &groups.builtin_persona_provenance[0];
         assert_eq!(provenance.ownership, BuiltinPersonaOwnership::UserModified);
         assert_eq!(provenance.observed_persona_sha256, "deleted");
+    }
+
+    #[test]
+    fn removing_pending_persona_retains_and_detaches_the_single_unsent_draft() {
+        let scope = crate::OperationScope::detached();
+        let _session = TestDataDir::new("pending-draft");
+        let (store, persona, _) = seed_removal_fixture();
+        crate::conversation_store::conversation_draft_open(Some(persona.id.clone()))
+            .expect("select pending Persona");
+        crate::conversation_store::draft_update(Some("default"), "Unsent user text".into(), vec![])
+            .expect("retain single draft");
+        let before = crate::conversation_store::draft_get(Some("default"))
+            .expect("read draft")
+            .result;
+        let impact = persona_removal_preview_in_scope(&scope, &persona.id)
+            .expect("preview")
+            .result
+            .expect("impact");
+        let removed = persona_remove_from_library_in_scope(
+            &scope,
+            PersonaRemovalCommitInput {
+                persona_id: persona.id,
+                persona_version: impact.persona_version,
+                impact_sha256: impact.impact_sha256,
+            },
+        )
+        .expect("remove Persona");
+        assert!(removed.blocker.is_none());
+        assert!(removed.result.is_some());
+        assert!(
+            crate::conversation_store::conversation_draft_preview()
+                .expect("draft remains renderable")
+                .is_none()
+        );
+        assert_eq!(
+            crate::conversation_store::draft_get(Some("default"))
+                .expect("preserved input")
+                .result,
+            before
+        );
+        assert_eq!(
+            store
+                .get::<Option<String>>(crate::conversation_store::NEW_CHAT_CONTEXT_NAMESPACE)
+                .expect("pending selection"),
+            Some(None)
+        );
     }
 
     #[test]

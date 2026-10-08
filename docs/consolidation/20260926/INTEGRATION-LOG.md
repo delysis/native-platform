@@ -301,3 +301,15 @@ reopened intact. No model work or additional layout changes were required.
   mom-memory-policy-20261008. The consolidated settled-tree gate is recorded
   separately there. Compact native review, old credential prompt repair and
   full release/model journey remain unqualified; no main promotion claimed.
+
+
+## 2026-10-08 — Promotion review: pending Persona removal
+
+Review of the single-draft lifecycle found that removing its selected Persona
+left the pending Persona reference intact, causing draft projection to fail.
+Removal now clears that reference inside the same authoritative transaction;
+the user's single unsent draft and its attachment ownership are retained.
+The regression fails on the pre-fix behavior with `Draft Persona is unavailable`
+and passes after repair. All 16 Persona tests pass. The failed initial test
+assertion and the genuine pre-fix failure remain in mom-promotion-review-20261008.
+This correction does not qualify the remaining normal-Loom promotion journeys.

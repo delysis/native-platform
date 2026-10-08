@@ -261,7 +261,7 @@ pub struct TextAttachmentImport {
     pub bytes: u64,
 }
 
-const NEW_CHAT_CONTEXT_NAMESPACE: &str = "conversation.new-draft-context.v1";
+pub(crate) const NEW_CHAT_CONTEXT_NAMESPACE: &str = "conversation.new-draft-context.v1";
 
 /// Opening a composer selects one durable draft, never a saved conversation.
 pub fn conversation_draft_open(persona: Option<String>) -> Result<CommandResult<Option<String>>> {
