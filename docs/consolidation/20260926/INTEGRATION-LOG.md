@@ -183,3 +183,33 @@ dialog. Reopen recorded one read request and also reached the visible interface
 with no permission dialog. This qualifies those two native journeys, not the
 old credential: its double authorization remains an unresolved legacy-store
 limitation. Do not describe a data reset as a general existing-store repair.
+
+### 2026-10-08 existing-credential root cause and repair
+
+The macOS `securityd` log identifies two checks for the exact old Mom credential:
+ordinary item ACL authorization (action 24) trusts the original ad hoc Loom
+bundle's designated code hash `fb823aa99c83bb6858969416a463610877d7dcd7`; partition
+integrity authorization (action 65538) rejects both later ad hoc hashes and the
+Apple-signed Mom team. This is the direct cause of the two distinct screenshots,
+not a second Rust key-provider call. The read/creation API experiments and a new
+profile do not repair that old partition.
+
+Boom's `App/Sources/Boom/Persistence.swift` uses one locked process session,
+SecItem generic-password queries and creation, with WhenUnlockedThisDeviceOnly.
+Loom's connected imports use the native keyring store. Neither provides a
+special technique that bypasses partition integrity. Mom already has the
+serialized process cache. Stable signing prevents new credentials being tied
+to changing ad hoc hashes, but existing ad hoc partitions require a targeted
+credential metadata repair.
+
+`scripts/repair-mom-keychain.sh` validates the exact signed Mom bundle, stable
+TeamIdentifier and existing database, selects one existing credential by the
+runtime's exact data-directory hash, and applies Apple's partition-list repair.
+It keeps trusted-application ACLs and key bytes intact. There is no broad
+keychain mutation, credential read, replacement or deletion. Check mode passed
+on the original encrypted review store; shell syntax passed. The actual repair
+requires the user to enter the Keychain password interactively, as mandated by
+Apple's tool. Computer Use refuses both Terminal and SecurityAgent. A prepared
+local `Mom-Keychain-Repair.command` captures the repair status and before/after
+ciphertext database hashes. Native acceptance remains pending that authorization
+and the subsequent old-store dialog-count check; do not mark the goal complete.
