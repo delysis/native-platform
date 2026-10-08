@@ -12,9 +12,12 @@
 <body>
   <main id="app" data-runtime="tauri-maud-htmx" data-native-core-only="true">
     <section class="boot">
-      <h1>Mom Llama</h1>
-      <p id="startup-status" role="status">Unlocking Mom Llama's encrypted local data…</p>
+      <p id="startup-status" role="status">Opening</p>
       <button id="startup-retry" class="primary-button" type="button" hidden>Retry</button>
+      <details id="startup-details" hidden>
+        <summary>Details</summary>
+        <pre id="startup-error"></pre>
+      </details>
     </section>
   </main>
 </body>

@@ -1650,17 +1650,7 @@ fn chat_view_with_draft(
                 }
             }
             @if empty {
-                section class="landing" aria-label="Empty chat" {
-                    @if let Some(persona) = active.filter(|conversation| {
-                        conversation.kind == ConversationKind::PersonaTemplate
-                    }) {
-                        h1 { (persona.title.clone()) }
-                        p { "@" (persona.execution_profile.mention_handle.clone()) }
-                    } @else {
-                        h1 { "Mom Llama" }
-                        p { "Type a message or upload files to get started" }
-                    }
-                }
+                section class="landing" aria-label="Empty chat" {}
             } @else {
                 section class="message-stream" aria-label="Messages" {
                     @for message in active.map(|conversation| conversation.messages.as_slice()).unwrap_or(&[]) {
@@ -3725,164 +3715,32 @@ fn control(key: &str) -> &'static ControlSpec {
 }
 
 fn markdown_content(content: &str) -> Markup {
-    let mut blocks = Vec::new();
-    let mut in_code = false;
-    let mut code_lang = String::new();
-    let mut code = Vec::new();
-    let mut paragraph = Vec::new();
-    let mut list = Vec::new();
-    let mut table = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim_end();
-        if trimmed.starts_with("```") {
-            if in_code {
-                blocks.push(markdown_code_block(&code_lang, &code.join("\n")));
-                code.clear();
-                code_lang.clear();
-                in_code = false;
-            } else {
-                flush_paragraph(&mut blocks, &mut paragraph);
-                flush_list(&mut blocks, &mut list);
-                flush_table(&mut blocks, &mut table);
-                code_lang = trimmed.trim_start_matches("```").trim().to_string();
-                in_code = true;
-            }
-            continue;
-        }
-        if in_code {
-            code.push(trimmed.to_string());
-            continue;
-        }
-        let plain = trimmed.trim();
-        if plain.is_empty() {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_list(&mut blocks, &mut list);
-            flush_table(&mut blocks, &mut table);
-        } else if is_table_line(plain) {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_list(&mut blocks, &mut list);
-            let cells = markdown_table_cells(plain);
-            if !is_table_separator(&cells) {
-                table.push(cells);
-            }
-        } else if let Some(heading) = plain.strip_prefix("### ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_list(&mut blocks, &mut list);
-            flush_table(&mut blocks, &mut table);
-            blocks.push(html! { h4 { (heading) } });
-        } else if let Some(heading) = plain.strip_prefix("## ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_list(&mut blocks, &mut list);
-            flush_table(&mut blocks, &mut table);
-            blocks.push(html! { h3 { (heading) } });
-        } else if let Some(heading) = plain.strip_prefix("# ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_list(&mut blocks, &mut list);
-            flush_table(&mut blocks, &mut table);
-            blocks.push(html! { h2 { (heading) } });
-        } else if let Some(quote) = plain.strip_prefix("> ") {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_list(&mut blocks, &mut list);
-            flush_table(&mut blocks, &mut table);
-            blocks.push(html! { blockquote { (quote) } });
-        } else if let Some(item) = plain
-            .strip_prefix("- ")
-            .or_else(|| plain.strip_prefix("* "))
-        {
-            flush_paragraph(&mut blocks, &mut paragraph);
-            flush_table(&mut blocks, &mut table);
-            list.push(item.to_string());
-        } else {
-            flush_list(&mut blocks, &mut list);
-            flush_table(&mut blocks, &mut table);
-            paragraph.push(plain.to_string());
-        }
-    }
-    if in_code {
-        blocks.push(markdown_code_block(&code_lang, &code.join("\n")));
-    }
-    flush_paragraph(&mut blocks, &mut paragraph);
-    flush_list(&mut blocks, &mut list);
-    flush_table(&mut blocks, &mut table);
-    html! { div class="markdown-content" { @for block in blocks { (block) } } }
-}
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
-fn markdown_code_block(language: &str, code: &str) -> Markup {
-    html! {
-        figure class="code-block" {
-            @if !language.is_empty() {
-                figcaption { (language) }
-            }
-            pre { code { (code) } }
+    // Model text is untrusted. The parser owns Markdown syntax; raw HTML stays
+    // literal, links have explicit schemes, and images never fetch remote bytes.
+    let mut links = Vec::new();
+    let events = Parser::new_ext(
+        content,
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
+    )
+    .filter_map(|event| match event {
+        Event::Html(text) | Event::InlineHtml(text) => Some(Event::Text(text)),
+        Event::Start(Tag::Link { ref dest_url, .. }) => {
+            let allowed = dest_url.starts_with("https://")
+                || dest_url.starts_with("http://")
+                || dest_url.starts_with("mailto:")
+                || dest_url.starts_with('#');
+            links.push(allowed);
+            allowed.then_some(event)
         }
-    }
-}
-
-fn flush_paragraph(blocks: &mut Vec<Markup>, paragraph: &mut Vec<String>) {
-    if paragraph.is_empty() {
-        return;
-    }
-    let text = paragraph.join("\n");
-    blocks.push(html! { p { (text) } });
-    paragraph.clear();
-}
-
-fn flush_list(blocks: &mut Vec<Markup>, list: &mut Vec<String>) {
-    if list.is_empty() {
-        return;
-    }
-    blocks.push(html! { ul { @for item in list.iter() { li { (item) } } } });
-    list.clear();
-}
-
-fn flush_table(blocks: &mut Vec<Markup>, table: &mut Vec<Vec<String>>) {
-    if table.is_empty() {
-        return;
-    }
-    let headers = table.first().cloned().unwrap_or_default();
-    let rows = if table.len() > 1 { &table[1..] } else { &[] };
-    blocks.push(html! {
-        table class="markdown-table" {
-            thead {
-                tr {
-                    @for header in &headers {
-                        th { (header) }
-                    }
-                }
-            }
-            tbody {
-                @for row in rows {
-                    tr {
-                        @for cell in row {
-                            td { (cell) }
-                        }
-                    }
-                }
-            }
-        }
+        Event::End(TagEnd::Link) => links.pop().unwrap_or(false).then_some(event),
+        Event::Start(Tag::Image { .. }) | Event::End(TagEnd::Image) => None,
+        _ => Some(event),
     });
-    table.clear();
-}
-
-fn is_table_line(line: &str) -> bool {
-    line.starts_with('|') && line.ends_with('|') && line.matches('|').count() >= 2
-}
-
-fn markdown_table_cells(line: &str) -> Vec<String> {
-    line.trim_matches('|')
-        .split('|')
-        .map(|cell| cell.trim().to_string())
-        .collect()
-}
-
-fn is_table_separator(cells: &[String]) -> bool {
-    !cells.is_empty()
-        && cells.iter().all(|cell| {
-            let cell = cell.trim();
-            !cell.is_empty()
-                && cell.chars().all(|ch| matches!(ch, '-' | ':' | ' '))
-                && cell.chars().any(|ch| ch == '-')
-        })
+    let mut rendered = String::new();
+    pulldown_cmark::html::push_html(&mut rendered, events);
+    html! { div class="markdown-content" { (PreEscaped(rendered)) } }
 }
 
 fn active_conversation(
@@ -4687,10 +4545,40 @@ mod tests {
     }
 
     #[test]
+    fn markdown_inline_formatting_and_nested_lists_render_as_elements() {
+        let rendered = markdown_content(
+            "## Why slow?\n\nIf you mean **response speed**, use *local* `timing`.\n\n1. **First**\n   - Nested **detail**\n2. Second\n\n> A **quoted** source\n\n```rust\nlet x = \"**literal**\";\n```",
+        ).into_string();
+        assert!(rendered.contains("<strong>response speed</strong>"));
+        assert!(rendered.contains("<em>local</em>"));
+        assert!(rendered.contains("<code>timing</code>"));
+        assert!(rendered.contains("<ol>"));
+        assert!(rendered.contains("<ul>"));
+        assert!(rendered.contains("<strong>detail</strong>"));
+        assert!(rendered.contains("<blockquote>"));
+        assert!(rendered.contains("<strong>quoted</strong>"));
+        assert!(rendered.contains("class=\"language-rust\""));
+        assert!(rendered.contains("**literal**"));
+    }
+
+    #[test]
+    fn markdown_cannot_execute_html_or_fetch_model_supplied_images() {
+        let rendered = markdown_content(
+            "<script>alert(1)</script>\n\n<img src=\"https://example.com/private\" onerror=\"alert(2)\">\n\n[bad](javascript:alert%281%29) ![image label](https://example.com/image) [good](https://example.com)",
+        ).into_string();
+        assert!(!rendered.contains("<script>"));
+        assert!(!rendered.contains("<img"));
+        assert!(!rendered.contains("href=\"javascript:"));
+        assert!(rendered.contains("&lt;script&gt;"));
+        assert!(rendered.contains("image label"));
+        assert!(rendered.contains("href=\"https://example.com\""));
+    }
+
+    #[test]
     fn markdown_tables_render_without_frontend_runtime() {
         let html =
             markdown_content("| Name | Value |\n| --- | --- |\n| Cache | Ready |").into_string();
-        assert!(html.contains(r#"<table class="markdown-table">"#));
+        assert!(html.contains("<table>"));
         assert!(html.contains("<th>Name</th>"));
         assert!(html.contains("<td>Ready</td>"));
     }

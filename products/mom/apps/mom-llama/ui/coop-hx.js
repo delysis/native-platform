@@ -3573,11 +3573,17 @@
   const boot = async () => {
     const status = document.getElementById("startup-status");
     const retry = document.getElementById("startup-retry");
+    const details = document.getElementById("startup-details");
+    const diagnostic = document.getElementById("startup-error");
     const initialize = async () => {
       if (status) {
         status.classList.remove("startup-error");
-        status.textContent = "Unlocking Mom Llama's encrypted local data…";
+        status.textContent = "Opening";
+        status.removeAttribute("title");
+        status.removeAttribute("aria-label");
       }
+      if (details) { details.hidden = true; details.open = false; }
+      if (diagnostic) diagnostic.textContent = "";
       if (retry) {
         retry.hidden = true;
         retry.disabled = true;
@@ -3598,8 +3604,12 @@
       } catch (error) {
         if (status) {
           status.classList.add("startup-error");
-          status.textContent = `${String(error)} Approve Keychain access, then retry.`;
+          status.textContent = "Unavailable";
+          status.title = String(error);
+          status.setAttribute("aria-label", String(error));
         }
+        if (diagnostic) diagnostic.textContent = String(error);
+        if (details) details.hidden = false;
         if (retry) {
           retry.hidden = false;
           retry.disabled = false;

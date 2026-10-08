@@ -37,6 +37,7 @@ information-native-attachment-bridge.workspace = true
 information-native-backend-sqlite.workspace = true
 chrono.workspace = true
 maud = "0.26"
+pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["html"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2.workspace = true
