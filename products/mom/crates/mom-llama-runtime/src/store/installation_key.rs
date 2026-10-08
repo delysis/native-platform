@@ -36,19 +36,16 @@ fn load_or_create(
 
 #[cfg(target_os = "macos")]
 pub(super) fn load_or_create_macos_key(account: &str, existing_store: bool) -> Result<[u8; 32]> {
-    use security_framework::os::macos::passwords::find_generic_password;
+    use security_framework::passwords::get_generic_password;
     const ITEM_NOT_FOUND: i32 = -25300;
     load_or_create(
         existing_store,
         || {
             trace_keychain_request("read", account, "begin");
-            // Read through the same file-based Keychain API used for insertion.
-            // This safe wrapper makes one SecKeychainFindGenericPassword call
-            // and returns the password together with the item; no second read.
-            let result = find_generic_password(None, super::KEYCHAIN_SERVICE, account);
+            let result = get_generic_password(super::KEYCHAIN_SERVICE, account);
             trace_keychain_request("read", account, "end");
             match result {
-                Ok((key, _item)) => Ok(Some(key.to_owned())),
+                Ok(key) => Ok(Some(key)),
                 Err(error) if error.code() == ITEM_NOT_FOUND => Ok(None),
                 Err(error) => Err(error.into()),
             }

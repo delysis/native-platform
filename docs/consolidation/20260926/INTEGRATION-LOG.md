@@ -168,3 +168,18 @@ or ACLs. Candidate packaging already supports `DELYSIS_SIGNING_IDENTITY`;
 `docs/releases/macos.md` now specifies this for Keychain review. Native prompt
 count for the signed build is pending user observation. Do not claim acceptance
 from the single request trace alone.
+
+The signed build also produced both dialogs against the existing review
+credential: confidential-information authorization, then key authorization.
+Stable signing alone does not repair that credential. No access control bypass
+was attempted. The unsuccessful legacy lookup API experiment is removed;
+the modern SecItem lookup and request tracing remain.
+
+With the user's existing-data-disposable authorization, the old review directory
+is preserved and a fresh encrypted review profile was created by the signed app
+at `review-data-signed-fresh` in the Oct 8 evidence folder. Its first launch
+recorded one create request and reached the visible interface with no permission
+dialog. Reopen recorded one read request and also reached the visible interface
+with no permission dialog. This qualifies those two native journeys, not the
+old credential: its double authorization remains an unresolved legacy-store
+limitation. Do not describe a data reset as a general existing-store repair.
