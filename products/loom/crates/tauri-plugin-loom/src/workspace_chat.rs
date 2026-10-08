@@ -23,6 +23,8 @@ pub enum WorkspaceChatRoute {
 /// Use exactly the executor-presence test used by `terminal_run`. A chat pane
 /// alone never grants a writer exemption. There is no renderer-side setter.
 #[tauri::command]
+// Tauri injects an owned AppHandle through CommandArg; borrowed handles are not command arguments.
+#[allow(clippy::needless_pass_by_value)]
 pub(crate) fn workspace_chat_route<R: Runtime>(app: AppHandle<R>) -> WorkspaceChatRoute {
     if app.try_state::<WorkspaceChatService<R>>().is_some() {
         WorkspaceChatRoute::MomExperimental

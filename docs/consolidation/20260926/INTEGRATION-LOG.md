@@ -355,3 +355,13 @@ The first clean-tree gate stopped at the reviewed build-script digest: the new
 read-only command changed Loom's COMMANDS list. The exact one-line addition was
 reviewed and its registry digest updated; no ignored-test entry, authority check
 or gate requirement was relaxed. The failed 7368b545 receipt remains retained.
+
+Application compilation regenerated its three checked-in ACL/schema files for
+`workspace_chat_route`; those files now accompany the plugin metadata. Strict
+Clippy also required the command's owned AppHandle argument to document Tauri's
+CommandArg constraint (Tauri does not inject a borrowed AppHandle). A narrowly
+scoped lint annotation records that framework boundary. The affected plugin,
+Mom runtime and Loom application all pass strict focused Clippy. The interrupted
+qualification retains 2,079 passing workspace tests and its source-change/lint
+failures; it is not a clean-tree pass. Qualification is rerun after committing
+these generated files and the command annotation together.
